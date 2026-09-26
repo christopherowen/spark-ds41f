@@ -56,4 +56,44 @@ modeset host setting (display), which does not touch inference.
 
 ## Results
 
-Pending.
+Runs: `results/private/bench/dsp-{b1,m1,b2,m2,t1,f1,k5trace}` (4 samples per
+point, 8 for pooled arms). Every arm passed LRU 5/5 with no failed requests;
+dgx1's lowest MemAvailable was 6.3-6.5 GiB (k5trace: 6.48 GiB with graphs
+captured to 48 rows, 1.45 GiB of graphs).
+
+- **Base (r4a, all new paths off)** matches the r3 reference at every
+  reference point. The reference `prose` and `code` cells are 100% reasoning
+  text; with reasoning off, accepted drafts per step rise from 1.19 to 1.48
+  (prose) and 1.89 to 2.28 (code), and `json-nothink` accepts 2.25.
+- **Pinned cost curves** do not remove the boot-to-boot spread: b2 reuses
+  b1's curves and still moves up to 8% at single points. The spread follows
+  acceptance, because temperature-0 outputs differ between identical
+  requests (4 distinct outputs of 4 at one stream on every case). Single-
+  stream step time (1 + accepted per step) / tok/s is stable to ±0.1-0.5 ms
+  and is the sharper measure of cost changes.
+- **Marginal rule** (pooled m1+m2 against b1+b2): reasoning text 2-5% slower
+  (prose c2 -5.2 ±3.0%, code c8 -4.3 ±2.5%), answers unchanged; it verifies
+  more rows (+0.1 to +0.9 ms per step). Rejected.
+- **Gathered Markov bias** (top-k 1024): the drafter falls from 5.38 to 4.47 ms
+  at one request (pinned curves), steps are 0.6-0.9 ms shorter, but accepted
+  drafts fall 2-9% (code c8 1.72 to 1.65, prose c8 1.13 to 1.03): throughput
+  neutral. The biased argmax sometimes lies outside the top 1,024 base
+  candidates.
+- **Fast cores** (container on the ten X925 cores): neutral everywhere;
+  host thread placement is not limiting.
+- **Five-draft trace** (replay.py): the logged accepted counts equal the
+  matching prefix of the replayed stream in 19,654 of 19,654 steps. Raw
+  confidences are calibrated (mean confidence against conditional
+  acceptance by position: 0.78/0.77, 0.72/0.71, 0.71/0.73, 0.71/0.74,
+  0.73/0.75), so calibration buys nothing. Depth 5 commits 3.26 tokens per
+  request-step against 2.72 at depth 3 on the same drafts; priced with the
+  pinned curves, verification policy moves throughput by under 5% even for
+  an oracle.
+- **Five drafts live** (the trace arm, pessimistic because it copies tensors
+  every step): code and JSON answers +5-13% (accepted 2.9-3.2 per step),
+  reasoning text and prose answers -3-8%. Single-stream steps grow by 5-7 ms
+  for about one more verified row plus 0.9 ms of drafting, while the pinned
+  curves price a verified row at about 0.4 ms: the startup profile's
+  identical dummy tokens route to the same experts and under-price
+  verification. Patch 0009 profiles on distinct tokens; the follow-up is in
+  `experiments/2026-09-27-lil-head` (`k5real`).
