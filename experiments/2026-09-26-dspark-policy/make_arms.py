@@ -66,6 +66,15 @@ arms = {
 # ten Cortex-X925 cores (CPUs 5-9 and 15-19) instead of all twenty.
 arms["fastcores"] = arm()
 arms["fastcores"]["container"]["docker_run_args"].append("--cpuset-cpus=5-9,15-19")
+# Deterministic reduction orders: the routed-MoE combine without atomics and
+# dense split-K through the FP32 workspace reducer instead of atomic BF16.
+arms["det"] = arm(
+    {
+        "B12X_DYNAMIC_DETERMINISTIC_OUTPUT": "1",
+        "B12X_DENSE_SPLITK_TURBO": "0",
+        "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-det",
+    }
+)
 k5 = arms["k5trace"]["serve_args"]
 k5[k5.index("--max-cudagraph-capture-size") + 1] = "48"
 compilation = json.loads(k5[k5.index("--compilation-config") + 1])
