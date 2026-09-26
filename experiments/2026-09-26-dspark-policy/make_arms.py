@@ -56,7 +56,7 @@ arms = {
     "k5trace": arm(
         {
             "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k5",
-            "SPARK3_DSPARK_TRACE": "/cache/kkref/dspark-trace/k5.jsonl",
+            "SPARK3_DSPARK_TRACE": "/cache/dspark-trace/k5.jsonl",
         },
         cache="vllm-r4a-k5",
         num_speculative_tokens=5,

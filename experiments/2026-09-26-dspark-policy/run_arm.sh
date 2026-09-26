@@ -17,7 +17,7 @@ for _ in $(seq 1 60); do
   [ "$avail" -ge 100 ] && break
   sleep 5
 done
-mkdir -p cache/kkref/dspark-trace
+mkdir -p cache/dspark-trace
 echo "$(date -u +%FT%TZ) start $arm as $label (dgx1 MemAvailable ${avail} GiB)"
 bin/spark3 --cluster-config "$E/cluster-$arm.json" cluster start --replace --apply | grep -v 'docker run'
 bin/spark3 --cluster-config "$E/cluster-$arm.json" doctor --live || true
