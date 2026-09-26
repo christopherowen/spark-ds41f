@@ -1,4 +1,4 @@
-From 9e03aeaa1bc68ab9e4e411bda141c858f05f37f4 Mon Sep 17 00:00:00 2001
+From 0efc23a4936f0c3c4a6f2bd5e777b94da63be084 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 23:10:28 +0200
 Subject: [PATCH] feat(spec-decode): marginal-rate rule for DSpark adaptive
@@ -27,10 +27,10 @@ every draft it keeps.
  2 files changed, 62 insertions(+), 2 deletions(-)
 
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
-index bc5d1fb0e5..4fccbf6876 100644
+index 3e55a2f082..364a81fd2a 100644
 --- a/tests/v1/spec_decode/test_adaptive_verification.py
 +++ b/tests/v1/spec_decode/test_adaptive_verification.py
-@@ -698,3 +698,32 @@ def test_pinned_cost_curves_only_from_rank_zero(monkeypatch, tmp_path):
+@@ -717,3 +717,32 @@ def test_pinned_cost_curves_only_from_rank_zero(monkeypatch, tmp_path):
      curves = ([(1, 2.0)], [(4, 40.0)], {1: [(4, 40.0)]})
      assert _pinning_manager()._pin_cost_curves(*curves) == curves
      assert not list(tmp_path.iterdir())
@@ -64,7 +64,7 @@ index bc5d1fb0e5..4fccbf6876 100644
 +    assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 2
 +    assert manager._rates[1] >= 0.1
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index 8e7b94c22e..90c4261b44 100644
+index 3262a9a4f6..3543473687 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 @@ -32,6 +32,11 @@ _PROFILE_REPLAYS = int(os.environ.get("SPARK3_DSPARK_PROFILE_REPLAYS", "5"))
@@ -79,7 +79,7 @@ index 8e7b94c22e..90c4261b44 100644
  
  if TYPE_CHECKING:
      from vllm.config import VllmConfig
-@@ -148,6 +153,8 @@ def preparation_tail_sizes(
+@@ -153,6 +158,8 @@ def preparation_tail_sizes(
  
  
  class AdaptiveVerificationManager:
@@ -88,7 +88,7 @@ index 8e7b94c22e..90c4261b44 100644
      def __init__(
          self,
          req_states: "RequestState",
-@@ -167,6 +174,14 @@ class AdaptiveVerificationManager:
+@@ -172,6 +179,14 @@ class AdaptiveVerificationManager:
          # address the compacted layout, so the budget must fit one chunk.
          self._max_total_logits = max_total_logits
          self.cost_scale = cost_scale
@@ -103,7 +103,7 @@ index 8e7b94c22e..90c4261b44 100644
          self.query_start_loc = query_start_loc
          self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
          # Largest cudagraph-captured token count; above it nothing pads.
-@@ -545,8 +560,24 @@ class AdaptiveVerificationManager:
+@@ -550,8 +565,24 @@ class AdaptiveVerificationManager:
              req_id: int(num_tokens)
              for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
          }
@@ -127,9 +127,9 @@ index 8e7b94c22e..90c4261b44 100644
 +        else:
 +            utilities = num_tokens_to_estimated_accepted_tokens / costs
 +            draft_budget = int(np.argmax(utilities))
-         logger.debug(
-             "DSpark adaptive verification selected %d/%d draft rows for %d "
-             "requests at cost scale %.3g (selected utility %.4g, full utility "
+         # The confidences come from an estimator that learns only from admitted
+         # drafts, so a long run of empty budgets would leave it without the
+         # evidence to ever admit one again. Periodically verify one draft per
 -- 
 2.43.0
 
