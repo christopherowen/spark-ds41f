@@ -33,6 +33,7 @@ a pinned cost directory.
 | `base` | none (all new paths off; pinned curves in `dspark-costs/k3`) |
 | `marginal` | `SPARK3_DSPARK_VERIFY_RULE=marginal`, cost scale 1.0 (the marginal rule prices drafts directly; scale 2.0 would double-count) |
 | `topk` | `dspark_draft_topk` 1024; own pinned curves and compile cache |
+| `fastcores` | container restricted to the ten Cortex-X925 cores (`--cpuset-cpus=5-9,15-19`); the RoCE proxy threads have no affinity and can otherwise run on the slower A725 cores |
 | `k5trace` | 5 drafts, capture sizes to 48, trace to `dspark-trace/k5.jsonl`; replay only, never timed |
 
 ## Workload

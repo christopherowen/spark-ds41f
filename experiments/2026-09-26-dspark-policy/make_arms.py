@@ -62,6 +62,10 @@ arms = {
         num_speculative_tokens=5,
     ),
 }
+# Every host thread (API server, engine core, workers, RoCE proxies) on the
+# ten Cortex-X925 cores (CPUs 5-9 and 15-19) instead of all twenty.
+arms["fastcores"] = arm()
+arms["fastcores"]["container"]["docker_run_args"].append("--cpuset-cpus=5-9,15-19")
 k5 = arms["k5trace"]["serve_args"]
 k5[k5.index("--max-cudagraph-capture-size") + 1] = "48"
 compilation = json.loads(k5[k5.index("--compilation-config") + 1])

@@ -1,14 +1,14 @@
 #!/bin/bash
 # usage: sequence.sh   (on dgx1, deployment checkout at this experiment's commit)
-# Runs the timed arms in ABAB order, then the gathered-bias arm, then the
-# five-draft trace (replay data only, few samples). Each arm is left up
+# Runs the timed arms in ABAB order, then the gathered-bias and fast-core
+# arms, then the five-draft trace (replay data only, few samples). Each arm is left up
 # until the next one stops it.
 set -u
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-26-dspark-policy
 CASES=prose,code,prose-nothink,code-nothink,json-nothink
 log() { echo "$(date -u +%FT%TZ) $*"; }
-for step in base:b1 marginal:m1 base:b2 marginal:m2 topk:t1; do
+for step in base:b1 marginal:m1 base:b2 marginal:m2 topk:t1 fastcores:f1; do
   arm=${step%%:*}
   label=${step##*:}
   log "arm $arm ($label)"
