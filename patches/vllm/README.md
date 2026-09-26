@@ -63,6 +63,14 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   offline at temperature 0. It copies tensors to the host every step: replay
   runs only. Output unchanged.
 
-Applying the series to the base yields patch head `ba8193a7` and tree
-`f8b044c5` (on the r4 base `01f1b874`, with 0002: `0ccd0f62`, tree
+- `0009-dspark-profile-distinct-tokens.patch`
+  (`SPARK3_DSPARK_PROFILE_TOKENS=random`) runs adaptive verification's
+  startup cost profile on a fixed pseudo-random token sequence, identical on
+  every rank, and on its embeddings where the model takes inputs_embeds.
+  Dummy batches otherwise repeat token 0, every row routes to the same
+  experts, and the profile prices extra verification rows at almost nothing.
+  Output unchanged. Upstream status: candidate, not submitted.
+
+Applying the series to the base yields patch head `7e3ca5a6` and tree
+`2b59dbc2` (on the r4 base `01f1b874`, with 0002: `0ccd0f62`, tree
 `0debe853`).

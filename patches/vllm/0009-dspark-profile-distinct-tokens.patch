@@ -1,0 +1,160 @@
+From 9eab95c31a999f596e0fe788c5c8122577b5c00a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 00:47:25 +0200
+Subject: [PATCH] feat(spec-decode): profile adaptive verification on distinct
+ tokens
+
+Adaptive verification prices draft budgets from a startup profile of
+dummy batches, and every dummy batch repeats token 0 (and, where the model
+takes inputs_embeds, one unused embedding buffer). Identical rows route to
+the same experts, so the profile barely charges for extra verification
+rows, while real draft rows are distinct tokens that read more expert
+weights. The resulting tables price verification far below its real cost.
+
+With SPARK3_DSPARK_PROFILE_TOKENS=random the cost profile runs on a fixed
+pseudo-random token sequence (seed 0, identical on every rank), copied by
+InputBatch.make_dummy in place of zeros, and on the embeddings of those
+tokens where the model takes inputs_embeds. Graph capture and every other
+dummy run are unchanged; the embedding buffer is restored afterwards.
+Output is unchanged.
+---
+ tests/v1/worker/test_dummy_input_ids.py | 20 ++++++++++
+ vllm/v1/worker/gpu/input_batch.py       |  9 ++++-
+ vllm/v1/worker/gpu/model_runner.py      | 51 ++++++++++++++++++++++---
+ 3 files changed, 73 insertions(+), 7 deletions(-)
+ create mode 100644 tests/v1/worker/test_dummy_input_ids.py
+
+diff --git a/tests/v1/worker/test_dummy_input_ids.py b/tests/v1/worker/test_dummy_input_ids.py
+new file mode 100644
+index 0000000000..a16e4c6983
+--- /dev/null
++++ b/tests/v1/worker/test_dummy_input_ids.py
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_dummy_batches_use_profile_token_ids_when_set():
++    buffers = InputBuffers(max_num_reqs=4, max_num_tokens=16, device=torch.device("cuda"))
++    buffers.input_ids.fill_(7)
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    assert torch.equal(batch.input_ids.cpu(), torch.zeros(8, dtype=torch.int32))
++
++    ids = torch.arange(100, 116, dtype=torch.int32, device="cuda")
++    buffers.dummy_input_ids = ids
++    batch = InputBatch.make_dummy(2, 8, buffers)
++    assert torch.equal(batch.input_ids.cpu(), ids[:8].cpu())
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 81b24b8b5e..042530d4c5 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -33,6 +33,9 @@ class InputBuffers:
+         self.device = device
+ 
+         self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
++        # Token ids dummy batches copy in place of zeros (None: zeros). Set only
++        # while profiling, so dummy tokens route like real ones.
++        self.dummy_input_ids: torch.Tensor | None = None
+         self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+         self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+         self.query_start_loc = torch.zeros(
+@@ -179,7 +182,11 @@ class InputBatch:
+         input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
+         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
+ 
+-        input_ids = input_buffers.input_ids[:num_tokens].zero_()
++        input_ids = input_buffers.input_ids[:num_tokens]
++        if input_buffers.dummy_input_ids is not None:
++            input_ids.copy_(input_buffers.dummy_input_ids[:num_tokens])
++        else:
++            input_ids.zero_()
+         positions = input_buffers.positions[:num_tokens].zero_()
+ 
+         input_buffers.is_padding[:num_tokens].fill_(True)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 995719cd56..1c7ad06007 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -17,8 +17,10 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
+ instead of embedding feature-specific logic directly.
+ """
+ 
++import contextlib
+ import functools
+ import gc
++import os
+ import time
+ from collections.abc import Callable
+ from contextlib import AbstractContextManager
+@@ -837,6 +839,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+     @torch.inference_mode()
+     @step_eplb_after(is_dummy=True)
++    @contextlib.contextmanager
++    def _profile_token_ids(self):
++        """Feed distinct token ids to the adaptive-verification cost profile.
++
++        Dummy batches repeat token 0, so every row routes to the same experts
++        and the profile prices extra verification rows at almost nothing.
++        With SPARK3_DSPARK_PROFILE_TOKENS=random the profile runs on a fixed
++        pseudo-random token sequence (the same on every rank), and on its
++        embeddings where the model takes inputs_embeds.
++        """
++        if os.environ.get("SPARK3_DSPARK_PROFILE_TOKENS", "zeros") != "random":
++            yield
++            return
++        generator = torch.Generator(device=self.device).manual_seed(0)
++        ids = torch.randint(
++            1000,
++            min(self.vocab_size, 100000),
++            (self.input_buffers.input_ids.shape[0],),
++            generator=generator,
++            device=self.device,
++            dtype=torch.int32,
++        )
++        buffers = self.input_buffers
++        buffers.dummy_input_ids = ids
++        embeds = None
++        if self.uses_inputs_embeds:
++            embeds = self.model_state.dummy_inputs_embeds(ids.shape[0])
++            saved = embeds.clone()
++            embeds.copy_(self.model.embed_input_ids(ids[: embeds.shape[0]]))
++        try:
++            yield
++        finally:
++            buffers.dummy_input_ids = None
++            if embeds is not None:
++                embeds.copy_(saved)
++
+     def _dummy_run(
+         self,
+         num_tokens: int,
+@@ -1232,12 +1270,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         with use_workspace_lane(self._draft_workspace_lane):
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None:
+-                        self.adaptive_verification.profile_costs(
+-                            self._dummy_run,
+-                            self.step_timing,
+-                            self.cudagraph_manager.captured_token_counts(),
+-                            self.cudagraph_manager.captured_full_batch_shapes(),
+-                        )
++                        with self._profile_token_ids():
++                            self.adaptive_verification.profile_costs(
++                                self._dummy_run,
++                                self.step_timing,
++                                self.cudagraph_manager.captured_token_counts(),
++                                self.cudagraph_manager.captured_full_batch_shapes(),
++                            )
+                     self.kv_connector.reset_capture_state()
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+-- 
+2.43.0
+

@@ -11,7 +11,7 @@ E = Path(__file__).resolve().parent
 ROOT = E.parents[1]
 TAG = "vllm-ds41f-kkref:04c30fa98e79-r5a"
 LABELS = {
-    "local.spark3.vllm.tree": "f8b044c503d478442582f55cc2412ee4f03dd9ec",
+    "local.spark3.vllm.tree": "2b59dbc21901f9fb70a2a34f964c4a55f563e542",
     "local.spark3.b12x.tree": "f77d175f0605b1cedae57caf8f00d535198318c2",
 }
 base = json.loads((ROOT / "config/cluster.json").read_text())
@@ -44,6 +44,12 @@ arms = {
     "nol2": arm({
         "VLLM_DS41_L2_PREFETCH": "0",
         "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-r5-nol2",
+    }),
+    # Cost profile on distinct tokens (patch 0009), so extra verification rows
+    # are priced with realistic expert routing.
+    "realprof": arm({
+        "SPARK3_DSPARK_PROFILE_TOKENS": "random",
+        "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-r5-realprof",
     }),
 }
 for name, cfg in arms.items():

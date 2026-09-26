@@ -1,12 +1,13 @@
 #!/bin/bash
 # usage: sequence.sh   (on dgx1, deployment checkout at this experiment's commit)
-# Alternates the rebased stack with and without L2 weight prefetch.
+# Alternates the rebased stack with and without L2 weight prefetch, then
+# runs the distinct-token cost profile twice.
 set -u
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-27-lil-head
 CASES=prose,code,prose-nothink,code-nothink,json-nothink
 log() { echo "$(date -u +%FT%TZ) $*"; }
-for step in base:b1 nol2:n1 base:b2 nol2:n2; do
+for step in base:b1 nol2:n1 base:b2 nol2:n2 realprof:r1 realprof:r2; do
   arm=${step%%:*}
   label=${step##*:}
   log "arm $arm ($label)"

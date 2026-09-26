@@ -3,7 +3,7 @@
 Base: the promoted configuration on candidate image
 `vllm-ds41f-kkref:04c30fa98e79-r5a`: Local Inference Lab
 `integration/karmic-kraken-beta` vLLM `04c30fa9` and B12X `e39b437b`, with
-vLLM patches 0001 and 0003-0008 (tree `f8b044c5`) and the switchless
+vLLM patches 0001 and 0003-0009 (tree `2b59dbc2`) and the switchless
 RoCEnante patch (tree `f77d175f`). Compared with the r4a arms of
 `experiments/2026-09-26-dspark-policy` (vLLM `01f1b874`, B12X `0f846212`,
 patch 0002 on).
@@ -26,6 +26,10 @@ patch 0002 on).
    LRU 5/5 and the same memory guards.
 2. L2 weight prefetch accounts for a measurable part of any gain
    (`base` against `nol2`, alternating boots).
+3. Profiling adaptive verification on distinct tokens (patch 0009) raises
+   the modeled cost of extra verification rows toward their real cost, so
+   adaptive verification trims weak drafts and throughput rises where
+   acceptance is low (prose).
 
 ## Arms
 
@@ -37,11 +41,12 @@ per arm.
 |---|---|
 | `base` | none: base defaults (L2 prefetch and Engram overlap on) |
 | `nol2` | `VLLM_DS41_L2_PREFETCH=0` |
+| `realprof` | `SPARK3_DSPARK_PROFILE_TOKENS=random` (patch 0009); own pinned curves |
 
 ## Workload and gates
 
 As in `experiments/2026-09-26-dspark-policy`: `sequence.sh` runs base,
-nol2, base, nol2 with the LRU gate and the five-case decode matrix at
+nol2, base, nol2, realprof, realprof with the LRU gate and the five-case decode matrix at
 1/2/4/8 streams. `--allow-mismatch` because `doctor --live` reports only
 the nvidia-drm modeset host setting.
 
