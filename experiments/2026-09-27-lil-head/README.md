@@ -30,6 +30,11 @@ patch 0002 on).
    the modeled cost of extra verification rows toward their real cost, so
    adaptive verification trims weak drafts and throughput rises where
    acceptance is low (prose).
+4. Five drafts, the drafter's trained block, beat three once graphs cover
+   eight streams (capture to 48 rows). A temperature-0 trace
+   (`experiments/2026-09-26-dspark-policy`, `replay.py`) commits about 20%
+   more tokens per step at depth 5 than at depth 3 on the same drafts, and
+   shows the raw confidences are calibrated within 2 points per position.
 
 ## Arms
 
@@ -41,12 +46,15 @@ per arm.
 |---|---|
 | `base` | none: base defaults (L2 prefetch and Engram overlap on) |
 | `nol2` | `VLLM_DS41_L2_PREFETCH=0` |
+| `k5` | five drafts, capture sizes to 48; own pinned curves and compile cache |
+| `k5real` | `k5` with the distinct-token profile and cost scale 1.0 |
 | `realprof` | `SPARK3_DSPARK_PROFILE_TOKENS=random` (patch 0009); own pinned curves |
 
 ## Workload and gates
 
 As in `experiments/2026-09-26-dspark-policy`: `sequence.sh` runs base,
-nol2, base, nol2, realprof, realprof with the LRU gate and the five-case decode matrix at
+nol2, base, nol2, realprof, realprof; `sequence_k5.sh` then runs k5,
+k5real, k5, k5real with the LRU gate and the five-case decode matrix at
 1/2/4/8 streams. `--allow-mismatch` because `doctor --live` reports only
 the nvidia-drm modeset host setting.
 

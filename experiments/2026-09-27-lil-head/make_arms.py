@@ -52,5 +52,37 @@ arms = {
         "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-r5-realprof",
     }),
 }
+
+
+def five_drafts(cfg: dict, **spec) -> dict:
+    """Five drafts (the drafter's trained block) with graphs up to 8 x 6 rows."""
+    args = cfg["serve_args"]
+    i = args.index("--speculative-config")
+    speculative = json.loads(args[i + 1])
+    speculative.update(num_speculative_tokens=5, **spec)
+    args[i + 1] = json.dumps(speculative, separators=(",", ":"))
+    args[args.index("--max-cudagraph-capture-size") + 1] = "48"
+    i = args.index("--compilation-config")
+    compilation = json.loads(args[i + 1])
+    compilation["cudagraph_capture_sizes"] += [40, 48]
+    args[i + 1] = json.dumps(compilation, separators=(",", ":"))
+    return cfg
+
+
+arms["k5"] = five_drafts(arm({
+    "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k5-r5",
+    "VLLM_CACHE_DIR": "/cache/kkref/jit/vllm-r5-k5",
+    "VLLM_CACHE_ROOT": "/cache/kkref/jit/vllm-r5-k5",
+}))
+# Distinct-token profile prices verification rows directly, so cost scale 1.
+arms["k5real"] = five_drafts(
+    arm({
+        "SPARK3_DSPARK_PROFILE_TOKENS": "random",
+        "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k5-r5-realprof",
+        "VLLM_CACHE_DIR": "/cache/kkref/jit/vllm-r5-k5",
+        "VLLM_CACHE_ROOT": "/cache/kkref/jit/vllm-r5-k5",
+    }),
+    adaptive_verification_cost_scale=1.0,
+)
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
