@@ -49,7 +49,10 @@ Edit these for your site, then run `bin/spark3 doctor`:
 - `config/cluster.json`: `distributed.master_addr` (the head node's management
   IP), `host.home`, `deployment.repository` if you use a fork, and the interface
   names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and
-  `NCCL_IB_HCA`.
+  `NCCL_IB_HCA`. Keep `distributed.master_port` below the head node's
+  ephemeral port range (`sysctl net.ipv4.ip_local_port_range`); inside it, an
+  outgoing connection can hold the port and the head fails to start. The site
+  range starts at 10000, so the port is 9999.
 
 ## Model
 
