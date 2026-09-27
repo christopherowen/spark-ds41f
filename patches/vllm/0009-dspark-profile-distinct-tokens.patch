@@ -1,4 +1,4 @@
-From 5a03ebf75d4ef2dd1c78675f4d986ef9d851e4e9 Mon Sep 17 00:00:00 2001
+From 6a84c8d4c476de7d07fa54d056dcb72da1ef04e3 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 00:47:25 +0200
 Subject: [PATCH] feat(spec-decode): profile adaptive verification on distinct
@@ -90,7 +90,7 @@ index 81b24b8b5e..96994eb773 100644
  
          logits_indices = query_start_loc[1:] - 1
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 995719cd56..5e672d6f83 100644
+index 995719cd56..2a29379ad1 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -17,8 +17,10 @@ hidden. Prefer utility functions defined elsewhere and call them from here,
@@ -104,10 +104,10 @@ index 995719cd56..5e672d6f83 100644
  import time
  from collections.abc import Callable
  from contextlib import AbstractContextManager
-@@ -837,6 +839,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -835,6 +837,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_blocks=self.kv_cache_config.num_blocks,
+         )
  
-     @torch.inference_mode()
-     @step_eplb_after(is_dummy=True)
 +    @contextlib.contextmanager
 +    def _profile_token_ids(self):
 +        """Feed distinct token ids to the adaptive-verification cost profile.
@@ -145,9 +145,9 @@ index 995719cd56..5e672d6f83 100644
 +            if embeds is not None:
 +                embeds.copy_(saved)
 +
+     @torch.inference_mode()
+     @step_eplb_after(is_dummy=True)
      def _dummy_run(
-         self,
-         num_tokens: int,
 @@ -1232,12 +1271,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                          with use_workspace_lane(self._draft_workspace_lane):
                              self.speculator.capture()

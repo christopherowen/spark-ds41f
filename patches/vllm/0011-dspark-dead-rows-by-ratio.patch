@@ -1,0 +1,828 @@
+From 138b562f114bc73723128a4e0f21e49a7bb8445c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:00:00 +0200
+Subject: [PATCH] perf(spec-decode): dead DSpark verification rows by expected
+ tokens per ms
+
+A fixed survival cut (SPARK3_DSPARK_DEAD_ROWS_TAU) cannot follow the
+break-even survival of a verification row, which is the row's price times
+the step's token rate. At one stream a live row reads about 5 ms of routed
+experts and a dead row costs about 0.5 ms; at eight streams rows share
+experts, a live row costs less and each token is worth less time.
+
+With SPARK3_DSPARK_DEAD_ROWS=ratio, adaptive verification profiles the FULL
+graph shapes a second time at startup, on real (routed) rows. The host
+budget still comes from the padded-row profile, where a scheduled row costs
+what a dead one does. Each step the host also stages, for every live-draft
+count L within that budget, the step's cost: the draft, every scheduled row
+as padding, and the real-row increment of the anchors plus L live drafts.
+The draft combine ranks the batch's admitted drafts by this step's
+survival and keeps live the L most likely to survive that maximizes
+expected tokens per millisecond; the other rows become dead rows as with the
+fixed cut. Each program ranks the whole batch (up to 64 requests), so no
+kernel or host sync is added. Beyond the captured shapes there is no
+real-row price and every scheduled draft stays live. Off by default; output
+is unchanged because the target verifies every committed token.
+---
+ tests/v1/worker/test_dead_rows.py             | 102 ++++++-
+ vllm/v1/worker/gpu/input_batch.py             | 133 ++++++++-
+ vllm/v1/worker/gpu/model_runner.py            |  26 +-
+ .../gpu/spec_decode/adaptive_verification.py  | 262 ++++++++++++++----
+ 4 files changed, 448 insertions(+), 75 deletions(-)
+
+diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
+index d86a6aaaaa..67f37bc0a1 100644
+--- a/tests/v1/worker/test_dead_rows.py
++++ b/tests/v1/worker/test_dead_rows.py
+@@ -2,14 +2,20 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import math
++from types import SimpleNamespace
+ 
++import numpy as np
+ import pytest
+ import torch
+ 
+ from vllm.v1.worker.gpu.input_batch import (
++    DeadRows,
+     combine_sampled_and_draft_tokens,
+     get_num_sampled_and_rejected,
+ )
++from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++    AdaptiveVerificationManager,
++)
+ 
+ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+ 
+@@ -41,7 +47,7 @@ def test_dead_rows_mark_rows_past_the_survival_cut():
+     confidence[1] = torch.tensor([0.4, 0.9, 0.9, 0.9, 0.9])
+     is_padding = torch.zeros(24, dtype=torch.bool, device=dev)
+     cut = torch.empty(3, dtype=torch.int32, device=dev)
+-    ids_dead = _combine((confidence, is_padding, cut, math.log(0.5)))
++    ids_dead = _combine(DeadRows(confidence, is_padding, cut, math.log(0.5)))
+     ids_plain = _combine(None)
+     assert torch.equal(ids_dead, ids_plain)
+     assert cut.tolist() == [2, 0, 9]  # the prefill request is never clamped
+@@ -51,6 +57,100 @@ def test_dead_rows_mark_rows_past_the_survival_cut():
+     assert torch.equal(is_padding.cpu(), expected)
+ 
+ 
++def _reference_live(confidence, num_drafts, costs):
++    """Live drafts per request maximizing expected tokens / cost."""
++    slots = []
++    for row, (conf, n) in enumerate(zip(confidence, num_drafts)):
++        log_survival = 0.0
++        for k in range(n):
++            log_survival += math.log(conf[k])
++            slots.append((log_survival, row))
++    slots.sort(key=lambda slot: -slot[0])
++    expected = [costs[0]]
++    for log_survival, _ in slots:
++        expected.append(expected[-1] + math.exp(log_survival))
++    utility = [e / c for e, c in zip(expected, costs[1:])]
++    return slots, utility
++
++
++def test_dead_rows_by_ratio_keep_the_best_live_count():
++    dev = "cuda"
++    rng = np.random.default_rng(0)
++    max_reqs, steps = 8, 5
++    for case in range(200):
++        num_reqs = int(rng.integers(1, max_reqs + 1))
++        num_drafts = rng.integers(0, steps + 1, size=num_reqs)
++        num_drafts[-1] = 0 if case % 3 == 0 else num_drafts[-1]  # a prefill
++        confidence = torch.tensor(
++            rng.uniform(0.02, 0.98, size=(max_reqs, steps)),
++            dtype=torch.float32, device=dev,
++        )
++        slots = rng.permutation(max_reqs)[:num_reqs]
++        query_lens = np.where(num_drafts > 0, num_drafts + 1, 4)
++        query_start_loc = np.concatenate(([0], np.cumsum(query_lens)))
++        num_tokens = int(query_start_loc[-1])
++        prefill_len = np.full(max_reqs, 20)
++        seq_lens = np.where(num_drafts > 0, 40 + query_lens, 12)
++        cu_num_logits = np.concatenate(([0], np.cumsum(num_drafts + 1)))
++        total = int(num_drafts.sum())
++        # A fixed cost plus a random routed cost per live row.
++        routed = np.cumsum(rng.uniform(0.5, 6.0, size=total + 1)[::-1])[::-1]
++        costs = np.concatenate(
++            ([np.count_nonzero(num_drafts) + 0.5], 20.0 + routed[0] - routed)
++        ).astype(np.float32)
++        live_costs = torch.zeros(max_reqs * steps + 2, device=dev)
++        live_costs[: costs.shape[0]] = torch.from_numpy(costs)
++
++        is_padding = torch.zeros(num_tokens + 4, dtype=torch.bool, device=dev)
++        cut = torch.empty(num_reqs, dtype=torch.int32, device=dev)
++        i32 = dict(dtype=torch.int32, device=dev)
++        combine_sampled_and_draft_tokens(
++            torch.zeros(num_tokens + 4, **i32),
++            torch.tensor(slots, **i32),
++            torch.zeros(max_reqs, **i32),
++            torch.tensor(query_start_loc, **i32),
++            torch.tensor(seq_lens, **i32),
++            torch.tensor(prefill_len, **i32),
++            torch.zeros(max_reqs, steps, **i32),
++            torch.tensor(cu_num_logits, **i32),
++            int(cu_num_logits[-1]),
++            1,
++            dead_rows=DeadRows(confidence, is_padding, cut, live_costs=live_costs),
++        )
++        conf_rows = confidence.cpu().numpy()[slots].astype(np.float64)
++        ranked, utility = _reference_live(conf_rows, num_drafts, costs.tolist())
++        live = cut.cpu().numpy()
++        live = np.where(num_drafts > 0, live, 0)
++        num_live = int(live.sum())
++        # The kernel's live count is (float32-)optimal and made of the most
++        # likely drafts, a prefix of each request.
++        assert utility[num_live] >= max(utility) * (1 - 1e-5), case
++        expected_live = np.zeros(num_reqs, dtype=np.int64)
++        for _, row in ranked[:num_live]:
++            expected_live[row] += 1
++        assert np.array_equal(live, expected_live), case
++        rows = np.zeros(num_tokens + 4, dtype=bool)
++        for row in range(num_reqs):
++            end = query_start_loc[row + 1]
++            rows[end - num_drafts[row] + live[row] : end] = True
++        assert np.array_equal(is_padding.cpu().numpy(), rows), case
++
++
++def test_live_costs_price_live_rows_over_padding():
++    padded = np.array([10.0, 20.0, 21.0, 22.0, 23.0, 24.0])
++    live = np.array([10.0, 26.0, 32.0, 38.0, 44.0, np.nan])
++    fake = SimpleNamespace(live_verify_tables_by_num_reqs={1: live})
++    costs = AdaptiveVerificationManager.live_costs(fake, 1, 1, 1, 3, 5.0, padded)
++    # 1 anchor row, budget 3: fixed = draft 5 + padded[4] 23; routed = live - pad.
++    assert costs.tolist() == [1.0, 34.0, 39.0, 44.0, 49.0]
++    # No real-row price for 5 rows: every scheduled draft stays live.
++    costs = AdaptiveVerificationManager.live_costs(fake, 1, 1, 1, 4, 5.0, padded)
++    assert costs.tolist() == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
++    # Unprofiled request count: same.
++    costs = AdaptiveVerificationManager.live_costs(fake, 2, 2, 2, 1, 5.0, padded)
++    assert costs.tolist() == [2.0, 1.0, 1.0]
++
++
+ def test_dead_row_cut_clamps_committed_tokens():
+     dev = "cuda"
+     num_sampled = torch.tensor([6, 1, 4], dtype=torch.int32, device=dev)
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index ee83039f68..7e7ca789ca 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -419,6 +419,59 @@ def prepare_pos_seq_lens(
+     )
+ 
+ 
++@triton.jit
++def _live_rows_threshold(
++    batch_idx,
++    num_reqs,
++    idx_mapping_ptr,
++    cu_num_logits_ptr,
++    confidence_ptr,
++    confidence_stride,
++    live_cost_ptr,
++    BLOCK_SIZE: tl.constexpr,
++    NUM_NEW_SAMPLED_TOKENS: tl.constexpr,
++    REQ_BLOCK: tl.constexpr,
++):
++    """This request's log survivals and the batch's log survival threshold.
++
++    live_cost_ptr holds [expected tokens with no live draft, cost of 0 live
++    drafts, cost of 1, ...]. The kept drafts are the L most likely to survive,
++    for the L that maximizes (expected tokens) / cost(L), so the threshold is
++    the L-th highest log survival (+inf when no draft pays).
++    """
++    block = tl.arange(0, BLOCK_SIZE)
++    reqs = tl.arange(0, REQ_BLOCK)
++    req_mask = reqs < num_reqs
++    starts = tl.load(cu_num_logits_ptr + reqs, mask=req_mask, other=0)
++    ends = tl.load(cu_num_logits_ptr + reqs + 1, mask=req_mask, other=0)
++    num_drafts = tl.where(req_mask, ends - starts - NUM_NEW_SAMPLED_TOKENS, 0)
++    slots = tl.load(idx_mapping_ptr + reqs, mask=req_mask, other=0)
++    valid = block[None, :] < num_drafts[:, None]
++    confidence = tl.load(
++        confidence_ptr + slots[:, None] * confidence_stride + block[None, :],
++        mask=valid,
++        other=1.0,
++    )
++    log_survival = tl.where(valid, tl.cumsum(tl.log(confidence), axis=1), -float("inf"))
++    ranked = tl.sort(
++        tl.reshape(log_survival, [REQ_BLOCK * BLOCK_SIZE]), descending=True
++    )
++    rank = tl.arange(0, REQ_BLOCK * BLOCK_SIZE)
++    in_budget = rank < tl.sum(num_drafts, axis=0)
++    base_tokens = tl.load(live_cost_ptr)
++    # expected[i]: expected tokens with the i + 1 most likely drafts live.
++    expected = base_tokens + tl.cumsum(tl.exp(ranked), axis=0)
++    cost = tl.load(live_cost_ptr + 2 + rank, mask=in_budget, other=1.0)
++    utility = tl.where(in_budget, expected / cost, 0.0)
++    best = tl.argmax(utility, axis=0)
++    pays = tl.max(utility, axis=0) > base_tokens / tl.load(live_cost_ptr + 1)
++    threshold = tl.where(
++        pays, tl.sum(tl.where(rank == best, ranked, 0.0), axis=0), float("inf")
++    )
++    own = tl.sum(tl.where(reqs[:, None] == batch_idx, log_survival, 0.0), axis=0)
++    return own, threshold
++
++
+ @triton.jit
+ def _combine_sampled_and_draft_tokens_kernel(
+     input_ids_ptr,
+@@ -436,9 +489,13 @@ def _combine_sampled_and_draft_tokens_kernel(
+     is_padding_ptr,
+     dead_cut_ptr,
+     log_tau,
++    live_cost_ptr,
++    num_reqs,
+     BLOCK_SIZE: tl.constexpr,
+     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
+     DEAD_ROWS: tl.constexpr = False,
++    DEAD_ROWS_RATIO: tl.constexpr = False,
++    REQ_BLOCK: tl.constexpr = 1,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+@@ -492,12 +549,30 @@ def _combine_sampled_and_draft_tokens_kernel(
+             # step's confidences. Rows past the first draft below the
+             # threshold become padding, which routed MoE skips; the sampled
+             # fix-up then commits at most one token past the last live row.
+-            confidence = tl.load(
+-                confidence_ptr + req_state_idx * confidence_stride + block,
+-                mask=mask,
+-                other=1.0,
+-            )
+-            log_survival = tl.cumsum(tl.log(confidence), axis=0)
++            if DEAD_ROWS_RATIO:
++                # The threshold is the batch's: every program ranks all
++                # admitted drafts by survival and keeps the live count that
++                # maximizes expected tokens per millisecond, pricing each
++                # count with the host's per-step cost vector.
++                log_survival, log_tau = _live_rows_threshold(
++                    batch_idx,
++                    num_reqs,
++                    idx_mapping_ptr,
++                    cu_num_logits_ptr,
++                    confidence_ptr,
++                    confidence_stride,
++                    live_cost_ptr,
++                    BLOCK_SIZE,
++                    NUM_NEW_SAMPLED_TOKENS,
++                    REQ_BLOCK,
++                )
++            else:
++                confidence = tl.load(
++                    confidence_ptr + req_state_idx * confidence_stride + block,
++                    mask=mask,
++                    other=1.0,
++                )
++                log_survival = tl.cumsum(tl.log(confidence), axis=0)
+             cut = tl.sum(((log_survival >= log_tau) & mask).to(tl.int32), axis=0)
+             tl.store(dead_cut_ptr + batch_idx, cut)
+             tl.store(
+@@ -507,6 +582,26 @@ def _combine_sampled_and_draft_tokens_kernel(
+             )
+ 
+ 
++@dataclass
++class DeadRows:
++    """Verification rows to leave out of routed MoE, decided on device.
++
++    confidence: per-slot draft confidences, [max_num_reqs, num_steps].
++    is_padding: the batch's padding flags; dead rows are set in place.
++    cut: per-request output, the number of live drafts.
++    log_tau: log of a fixed survival threshold (unused with live_costs).
++    live_costs: [expected tokens with no live draft, step cost with 0, 1, ...
++        live drafts]; when set, the threshold maximizes expected tokens per
++        millisecond across the batch.
++    """
++
++    confidence: torch.Tensor
++    is_padding: torch.Tensor
++    cut: torch.Tensor
++    log_tau: float = 0.0
++    live_costs: torch.Tensor | None = None
++
++
+ def combine_sampled_and_draft_tokens(
+     input_ids: torch.Tensor,
+     idx_mapping: torch.Tensor,
+@@ -518,10 +613,9 @@ def combine_sampled_and_draft_tokens(
+     cu_num_logits: torch.Tensor,
+     num_logits: int,
+     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
+-    dead_rows: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
++    dead_rows: "DeadRows | None" = None,
+ ) -> torch.Tensor:
+-    """``dead_rows`` = (per-slot draft confidences, is_padding, per-request cut
+-    output, log of the survival threshold) marks low-survival draft rows."""
++    """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
+     assert num_new_sampled_tokens in (0, 1), (
+         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
+     )
+@@ -546,13 +640,28 @@ def combine_sampled_and_draft_tokens(
+         cu_num_logits,
+         logits_indices,
+         *(
+-            (dead_rows[0], dead_rows[0].stride(0), dead_rows[1].view(torch.uint8),
+-             dead_rows[2], dead_rows[3])
++            (
++                dead_rows.confidence,
++                dead_rows.confidence.stride(0),
++                dead_rows.is_padding.view(torch.uint8),
++                dead_rows.cut,
++                dead_rows.log_tau,
++                dead_rows.live_costs
++                if dead_rows.live_costs is not None
++                else dead_rows.confidence,
++            )
+             if dead_rows is not None
+-            else (input_ids, 0, input_ids, input_ids, 0.0)
++            else (input_ids, 0, input_ids, input_ids, 0.0, input_ids)
+         ),
++        num_reqs,
+         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
+         DEAD_ROWS=dead_rows is not None,
++        DEAD_ROWS_RATIO=dead_rows is not None and dead_rows.live_costs is not None,
++        REQ_BLOCK=(
++            triton.next_power_of_2(dead_rows.confidence.shape[0])
++            if dead_rows is not None
++            else 1
++        ),
+         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
+         # last sampled token in addition to all draft tokens.
+         BLOCK_SIZE=triton.next_power_of_2(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ce0f869573..60e50aa63d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -838,17 +838,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+ 
+     @contextlib.contextmanager
+-    def _profile_token_ids(self):
++    def _profile_token_ids(self, real_rows: bool | None = None):
+         """Feed distinct token ids to the adaptive-verification cost profile.
+ 
+         Dummy batches repeat token 0 and mark every row as padding, which
+         the MoE routers skip, so the profile leaves out routed-expert work,
+-        the cost that grows with every verification row. With
+-        SPARK3_DSPARK_PROFILE_TOKENS=random the profile runs on a fixed
+-        pseudo-random token sequence (the same on every rank) as real rows,
+-        and on its embeddings where the model takes inputs_embeds.
++        the cost that grows with every verification row. With real_rows
++        (default: SPARK3_DSPARK_PROFILE_TOKENS=random) the profile runs on a
++        fixed pseudo-random token sequence (the same on every rank) as real
++        rows, and on its embeddings where the model takes inputs_embeds.
+         """
+-        if os.environ.get("SPARK3_DSPARK_PROFILE_TOKENS", "zeros") != "random":
++        if real_rows is None:
++            real_rows = (
++                os.environ.get("SPARK3_DSPARK_PROFILE_TOKENS", "zeros") == "random"
++            )
++        if not real_rows:
+             yield
+             return
+         generator = torch.Generator(device=self.device).manual_seed(0)
+@@ -1277,6 +1281,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                                 self.step_timing,
+                                 self.cudagraph_manager.captured_token_counts(),
+                                 self.cudagraph_manager.captured_full_batch_shapes(),
++                                live_rows=functools.partial(
++                                    self._profile_token_ids, True
++                                ),
+                             )
+                     self.kv_connector.reset_capture_state()
+ 
+@@ -1620,14 +1627,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
+-        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU) are marked inside
+-        # the draft combine; sample() clamps committed tokens to live rows.
++        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU or
++        # SPARK3_DSPARK_DEAD_ROWS=ratio) are marked inside the draft combine;
++        # sample() clamps committed tokens to live rows.
+         dead_rows = None
+         if adaptive_verification is not None and self.batch_sharder is None:
+             dead_rows = adaptive_verification.dead_row_args(
+                 self.input_buffers.is_padding, num_reqs
+             )
+-        self._dead_row_cut = dead_rows[2] if dead_rows is not None else None
++        self._dead_row_cut = dead_rows.cut if dead_rows is not None else None
+ 
+         # Some input token ids are directly read from the last sampled tokens
+         # and draft tokens. Also, get the logits indices to sample tokens from.
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index c2ae274001..3e31a70498 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -7,6 +7,7 @@ import json
+ import os
+ from collections import defaultdict
+ from collections.abc import Callable, Iterable, Iterator, Mapping
++from contextlib import AbstractContextManager
+ from typing import TYPE_CHECKING
+ 
+ import numpy as np
+@@ -25,6 +26,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+     get_query_lens_mismatch_unsupported_backend,
+ )
++from vllm.v1.worker.gpu.input_batch import DeadRows
+ 
+ logger = init_logger(__name__)
+ _PROFILE_REPLAYS = int(os.environ.get("SPARK3_DSPARK_PROFILE_REPLAYS", "5"))
+@@ -42,6 +44,12 @@ _VERIFY_RULE = os.environ.get("SPARK3_DSPARK_VERIFY_RULE", "ratio")
+ # token past its last live row. Decided on device, inside the draft combine,
+ # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
+ _DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
++# SPARK3_DSPARK_DEAD_ROWS=ratio decides dead rows by cost instead: of the rows
++# the host budget scheduled, the device keeps live the drafts most likely to
++# survive, as many as maximize this step's expected tokens per millisecond.
++# A live row is priced by a second startup profile on real (routed) rows, a
++# dead row by the padded-row profile the host budget uses.
++_DEAD_ROWS_RULE = os.environ.get("SPARK3_DSPARK_DEAD_ROWS", "")
+ _RATE_ALPHA = float(os.environ.get("SPARK3_DSPARK_RATE_ALPHA", "0.1"))
+ 
+ if TYPE_CHECKING:
+@@ -101,6 +109,64 @@ _assign_draft_token_budget_compiled = torch.compile(
+ )
+ 
+ 
++def median_curve(points: Iterable[tuple[int, float]]) -> list[tuple[int, float]]:
++    grouped: defaultdict[int, list[float]] = defaultdict(list)
++    for key, value in points:
++        grouped[key].append(value)
++    return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
++
++
++def verify_curves_by_num_reqs_from(
++    samples: Iterable[StepTimingSample],
++) -> dict[int, list[tuple[int, float]]]:
++    samples = [s for s in samples if s.full_cudagraph]
++    return {
++        num_reqs: median_curve(
++            (s.num_target_tokens, s.forward_ms)
++            for s in samples
++            if s.num_reqs == num_reqs
++        )
++        for num_reqs in sorted({s.num_reqs for s in samples})
++    }
++
++
++def build_tables_by_num_reqs(
++    verify_curves_by_num_reqs: Mapping[int, list[tuple[int, float]]],
++    max_num_reqs: int,
++    max_batch_tokens: int,
++    beyond: np.ndarray,
++) -> dict[int, np.ndarray]:
++    """Per-request-count verify tables from FULL graph shape curves.
++
++    FULL replay pads both tokens and requests. A request count may have only
++    one exact shape; extending that point prices all larger graphs as free
++    verification, so each count follows the smallest compatible padded shape.
++    Token counts beyond the captured shapes take ``beyond``.
++    """
++    full_shapes = sorted(
++        (num_tokens, padded_reqs, cost)
++        for padded_reqs, curve in verify_curves_by_num_reqs.items()
++        for num_tokens, cost in curve
++    )
++    tables = {}
++    for num_reqs in range(1, max_num_reqs + 1):
++        curve: dict[int, float] = {}
++        for num_tokens, padded_reqs, cost in full_shapes:
++            if padded_reqs >= num_reqs:
++                curve.setdefault(num_tokens, cost)
++        if not curve:
++            continue
++        xs = np.asarray(list(curve))
++        ys = np.maximum.accumulate(list(curve.values()))
++        limit = min(int(xs[-1]), max_batch_tokens)
++        table = beyond.copy()
++        table[: limit + 1] = np.maximum(
++            ys[np.searchsorted(xs, np.arange(limit + 1), side="left")], 1e-6
++        )
++        tables[num_reqs] = table
++    return tables
++
++
+ def build_cost_tables_from_curves(
+     draft_curve: list[tuple[int, float]],
+     verify_curve: list[tuple[int, float]],
+@@ -165,6 +231,8 @@ def preparation_tail_sizes(
+ 
+ class AdaptiveVerificationManager:
+     _verify_rule = "ratio"
++    dead_rows_ratio = False
++    _live_costs_np: np.ndarray | None = None
+ 
+     def __init__(
+         self,
+@@ -192,13 +260,49 @@ class AdaptiveVerificationManager:
+             )
+         self._verify_rule = _VERIFY_RULE
+         self.dead_rows_tau = _DEAD_ROWS_TAU
++        if _DEAD_ROWS_RULE not in ("", "ratio"):
++            raise ValueError(
++                "SPARK3_DSPARK_DEAD_ROWS must be ratio or unset, got "
++                f"{_DEAD_ROWS_RULE!r}"
++            )
++        self.dead_rows_ratio = _DEAD_ROWS_RULE == "ratio"
++        if self.dead_rows_ratio and self.dead_rows_tau > 0:
++            raise ValueError(
++                "Set SPARK3_DSPARK_DEAD_ROWS=ratio or SPARK3_DSPARK_DEAD_ROWS_TAU, "
++                "not both"
++            )
++        if self.dead_rows_ratio and (
++            os.environ.get("SPARK3_DSPARK_PROFILE_TOKENS", "zeros") != "zeros"
++        ):
++            raise ValueError(
++                "SPARK3_DSPARK_DEAD_ROWS=ratio prices scheduled rows on the padded-"
++                "row profile and profiles real rows itself; unset "
++                "SPARK3_DSPARK_PROFILE_TOKENS"
++            )
++        if self.dead_rows_ratio and req_states.max_num_reqs > 64:
++            raise ValueError(
++                "SPARK3_DSPARK_DEAD_ROWS=ratio ranks the whole batch in one program "
++                f"and supports up to 64 requests, not {req_states.max_num_reqs}"
++            )
+         self._dead_row_cut = torch.empty(
+             req_states.max_num_reqs, dtype=torch.int32, device=device
+         )
++        # Per-step live-row costs (see DeadRows.live_costs), staged by
++        # get_num_tokens and copied by reallocate_drafts.
++        self._live_costs = torch.empty(
++            req_states.max_num_reqs * self.num_speculative_steps + 2,
++            dtype=torch.float32,
++            device=device,
++        )
++        self._live_costs_np: np.ndarray | None = None
++        # Real-row verification costs per request count; NaN where unprofiled.
++        self.live_verify_tables_by_num_reqs: dict[int, np.ndarray] = {}
+         if self.dead_rows_tau > 0:
+             logger.info(
+                 "DSpark dead verification rows below survival %.3g", self.dead_rows_tau
+             )
++        if self.dead_rows_ratio:
++            logger.info("DSpark dead verification rows by expected tokens per ms")
+         # Achieved expected tokens per millisecond, per request count. Every
+         # rank derives it from the same broadcast confidences and cost tables.
+         self._rates: dict[int, float] = {}
+@@ -247,6 +351,7 @@ class AdaptiveVerificationManager:
+         full_batch_shapes: list[tuple[int, int]] | None = None,
+         *,
+         replays: int = _PROFILE_REPLAYS,
++        tail: bool = True,
+     ) -> Iterator[dict[str, int]]:
+         """Dummy-run kwargs whose step timings seed the cost tables.
+ 
+@@ -266,10 +371,11 @@ class AdaptiveVerificationManager:
+         # Also profile beyond the capture limit: real steps run there
+         # (piecewise/eager) and linear extrapolation badly underestimates
+         # them. These runs double as JIT warmup for the piecewise shapes.
+-        profile_shapes.extend(
+-            (num_tokens, None)
+-            for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
+-        )
++        if tail:
++            profile_shapes.extend(
++                (num_tokens, None)
++                for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
++            )
+         for replay in range(replays):
+             shapes = profile_shapes if replay % 2 == 0 else reversed(profile_shapes)
+             for num_tokens, num_reqs in shapes:
+@@ -287,8 +393,14 @@ class AdaptiveVerificationManager:
+         step_timing: StepTimingCollector,
+         capture_sizes: list[int],
+         full_batch_shapes: list[tuple[int, int]],
++        live_rows: Callable[[], AbstractContextManager] | None = None,
+     ) -> None:
+-        """Warm every shape, then sample rounds to limit startup/order bias."""
++        """Warm every shape, then sample rounds to limit startup/order bias.
++
++        With dead rows by ratio, ``live_rows`` makes dummy rows real (routed)
++        rows, and the full graph shapes are profiled again under it to price
++        live verification rows.
++        """
+         for batch in self.batches_to_profile(
+             capture_sizes, full_batch_shapes, replays=1
+         ):
+@@ -297,16 +409,22 @@ class AdaptiveVerificationManager:
+             for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
+                 run_dummy(**batch)
+         self.set_initial_cost_curves(timings)
++        if not self.dead_rows_ratio:
++            return
++        assert live_rows is not None
++        with live_rows():
++            for batch in self.batches_to_profile(
++                capture_sizes, full_batch_shapes, replays=1, tail=False
++            ):
++                run_dummy(**batch)
++            with step_timing.collect() as timings:
++                for batch in self.batches_to_profile(
++                    capture_sizes, full_batch_shapes, tail=False
++                ):
++                    run_dummy(**batch)
++        self.set_live_cost_curves(timings)
+ 
+     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
+-        def median_curve(
+-            points: Iterable[tuple[int, float]],
+-        ) -> list[tuple[int, float]]:
+-            grouped: defaultdict[int, list[float]] = defaultdict(list)
+-            for key, value in points:
+-                grouped[key].append(value)
+-            return [(k, float(np.median(v))) for k, v in sorted(grouped.items())]
+-
+         # Draft curve: eager-target steps inflate drafter timings (the CPU is
+         # still launching kernels, opening gaps between the drafter's events),
+         # and request counts — unlike token counts — collide across execution
+@@ -317,14 +435,7 @@ class AdaptiveVerificationManager:
+         verify_curve = median_curve(
+             (s.num_target_tokens, s.forward_ms) for s in samples
+         )
+-        verify_curves_by_num_reqs = {
+-            num_reqs: median_curve(
+-                (s.num_target_tokens, s.forward_ms)
+-                for s in samples
+-                if s.full_cudagraph and s.num_reqs == num_reqs
+-            )
+-            for num_reqs in sorted({s.num_reqs for s in samples if s.full_cudagraph})
+-        }
++        verify_curves_by_num_reqs = verify_curves_by_num_reqs_from(samples)
+         draft_curve, verify_curve, verify_curves_by_num_reqs = self._pin_cost_curves(
+             draft_curve, verify_curve, verify_curves_by_num_reqs
+         )
+@@ -334,11 +445,30 @@ class AdaptiveVerificationManager:
+             verify_curves_by_num_reqs=verify_curves_by_num_reqs,
+         )
+ 
++    def set_live_cost_curves(self, samples: list[StepTimingSample]) -> None:
++        """Real-row verification costs of the FULL graph shapes, for dead rows."""
++        curves = verify_curves_by_num_reqs_from(samples)
++        _, _, curves = self._pin_cost_curves([], [], curves, rows="live")
++        curves = get_tp_group().broadcast_object(curves, src=0)
++        if not curves:
++            raise RuntimeError("Could not profile real-row verification costs")
++        assert self.cost_tables is not None
++        self.live_verify_tables_by_num_reqs = build_tables_by_num_reqs(
++            curves,
++            self.req_states.max_num_reqs,
++            self.req_states.max_num_batched_tokens,
++            np.full_like(self.cost_tables[1], np.nan),
++        )
++        logger.debug(
++            "DSpark live-row verify tables: %s", self.live_verify_tables_by_num_reqs
++        )
++
+     def _pin_cost_curves(
+         self,
+         draft_curve: list[tuple[int, float]],
+         verify_curve: list[tuple[int, float]],
+         verify_curves_by_num_reqs: dict[int, list[tuple[int, float]]],
++        rows: str = "padded",
+     ) -> tuple[
+         list[tuple[int, float]],
+         list[tuple[int, float]],
+@@ -377,6 +507,8 @@ class AdaptiveVerificationManager:
+                 for n, curve in sorted(verify_curves_by_num_reqs.items())
+             },
+         }
++        if rows != "padded":
++            key["rows"] = rows
+         digest = hashlib.sha256(
+             json.dumps(key, sort_keys=True).encode()
+         ).hexdigest()[:16]
+@@ -447,31 +579,13 @@ class AdaptiveVerificationManager:
+             max_batch_tokens,
+             self._cudagraph_limit,
+         )
+-        # FULL replay pads both tokens and requests. A request count may have
+-        # only one exact shape; extending that point prices all larger graphs
+-        # as free verification. Follow the smallest compatible padded shape.
+-        full_shapes = sorted(
+-            (num_tokens, padded_reqs, cost)
+-            for padded_reqs, curve in (verify_curves_by_num_reqs or {}).items()
+-            for num_tokens, cost in curve
+-        )
+-        self.verify_cost_tables_by_num_reqs = {}
+-        for num_reqs in range(1, max_num_reqs + 1):
+-            curve: dict[int, float] = {}
+-            for num_tokens, padded_reqs, cost in full_shapes:
+-                if padded_reqs >= num_reqs:
+-                    curve.setdefault(num_tokens, cost)
+-            if not curve:
+-                continue
+-            xs = np.asarray(list(curve))
+-            ys = np.maximum.accumulate(list(curve.values()))
+-            limit = min(int(xs[-1]), max_batch_tokens)
+-            table = self.cost_tables[1].copy()
+-            table[: limit + 1] = np.maximum(
+-                ys[np.searchsorted(xs, np.arange(limit + 1), side="left")], 1e-6
+-            )
+-            # Beyond the captured shapes, retain the measured eager costs.
+-            self.verify_cost_tables_by_num_reqs[num_reqs] = table
++        # Beyond the captured shapes, retain the measured eager costs.
++        self.verify_cost_tables_by_num_reqs = build_tables_by_num_reqs(
++            verify_curves_by_num_reqs or {},
++            max_num_reqs,
++            max_batch_tokens,
++            self.cost_tables[1],
++        )
+         logger.debug(
+             "DSpark cost tables: %s; per-request verify tables: %s",
+             self.cost_tables,
+@@ -631,8 +745,41 @@ class AdaptiveVerificationManager:
+             num_non_draft_tokens_per_req,
+             draft_budget,
+         )
++        if self.dead_rows_ratio:
++            self._live_costs_np = self.live_costs(
++                num_reqs,
++                num_sampling_requests,
++                num_non_draft_tokens_total,
++                draft_budget,
++                draft_cost_ms[num_reqs],
++                verify_cost_ms,
++            )
+         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+ 
++    def live_costs(
++        self,
++        num_reqs: int,
++        num_sampling_requests: int,
++        num_non_draft_tokens: int,
++        draft_budget: int,
++        draft_ms: float,
++        padded_verify_ms: np.ndarray,
++    ) -> np.ndarray:
++        """DeadRows.live_costs for this step: live drafts cost their real-row
++        increment over the padded rows, and the step always pays for every
++        scheduled row as padding. Without a real-row price (beyond the captured
++        shapes) every cost is equal, so every scheduled draft stays live."""
++        costs = np.empty(draft_budget + 2, dtype=np.float32)
++        costs[0] = num_sampling_requests
++        live_verify_ms = self.live_verify_tables_by_num_reqs.get(num_reqs)
++        rows = np.arange(num_non_draft_tokens, num_non_draft_tokens + draft_budget + 1)
++        if live_verify_ms is None or np.isnan(live_verify_ms[rows[-1]]):
++            costs[1:] = 1.0
++            return costs
++        routed_ms = np.maximum(live_verify_ms[rows] - padded_verify_ms[rows], 0.0)
++        costs[1:] = draft_ms + padded_verify_ms[rows[-1]] + routed_ms
++        return costs
++
+     def compact_batch(
+         self,
+         num_draft_tokens_per_req: np.ndarray,
+@@ -673,21 +820,27 @@ class AdaptiveVerificationManager:
+         draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
+         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
+ 
+-    def dead_row_args(
+-        self, is_padding: torch.Tensor, num_reqs: int
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None:
++    def dead_row_args(self, is_padding: torch.Tensor, num_reqs: int) -> DeadRows | None:
+         """Arguments for the fused dead-row marking, or None when disabled.
+ 
+-        The confidences are the current drafts', broadcast from rank 0, so
+-        every rank marks the same rows.
++        The confidences are the current drafts', broadcast from rank 0, and
++        the live costs derive from rank 0's cost tables, so every rank marks
++        the same rows.
+         """
++        if self.dead_rows_ratio:
++            return DeadRows(
++                self._confidence_probs,
++                is_padding,
++                self._dead_row_cut[:num_reqs],
++                live_costs=self._live_costs,
++            )
+         if self.dead_rows_tau <= 0:
+             return None
+-        return (
++        return DeadRows(
+             self._confidence_probs,
+             is_padding,
+             self._dead_row_cut[:num_reqs],
+-            float(np.log(self.dead_rows_tau)),
++            log_tau=float(np.log(self.dead_rows_tau)),
+         )
+ 
+     def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+@@ -730,6 +883,9 @@ class AdaptiveVerificationManager:
+                     self.num_speculative_steps,
+                 )
+ 
++        if self._live_costs_np is not None:
++            live_costs, self._live_costs_np = self._live_costs_np, None
++            async_tensor_h2d(live_costs, out=self._live_costs[: live_costs.shape[0]])
+         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
+         self._cu_num_logits[:1].zero_()
+-- 
+2.43.0
+

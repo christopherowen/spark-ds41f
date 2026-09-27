@@ -95,7 +95,16 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   decides. Off by default; output unchanged. Upstream status: candidate, not
   submitted.
 
-Applying 0001-0010 to the base yields patch head `a6ec0420` and tree
-`e9409518` (0001-0009: `d7234353`, tree
-`f250542a` (on the r4 base `01f1b874`: patch head `84f0b5dc`, tree
-`ee3a0fd4`).
+- `0011-dspark-dead-rows-by-ratio.patch` (`SPARK3_DSPARK_DEAD_ROWS=ratio`)
+  decides dead rows by cost instead of a fixed cut. A second startup profile
+  prices live verification rows on real (routed) rows; each step the host
+  stages the cost of every live-draft count inside its budget, and the draft
+  combine keeps live the drafts most likely to survive, as many as maximize
+  expected tokens per millisecond. Off by default; output unchanged.
+  Upstream status: candidate, not submitted.
+
+Applying 0001-0011 to the base yields patch head `138b562f` and tree
+`7b839dc1`. The promoted image carries an earlier 0009 that moved
+`_dummy_run`'s decorators onto its new helper; 0001-0009 then gave patch
+head `d7234353`, tree `f250542a` (on the r4 base `01f1b874`: patch head
+`84f0b5dc`, tree `ee3a0fd4`).

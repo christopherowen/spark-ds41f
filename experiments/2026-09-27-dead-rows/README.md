@@ -40,4 +40,40 @@ one and eight streams, three samples). Memory guards unchanged.
 
 ## Results
 
-Pending.
+One session (2026-09-27, 11:50-12:40 UTC), lean screen, three samples per
+point. The three `control` runs are pooled (nine samples); single control
+runs differ from each other by up to 11% on single-stream prose points.
+Throughput change against the pooled control:
+
+| Point | dead03 | dead05 | dead01 | budget01 | budget02 |
+|---|---|---|---|---|---|
+| prose c1 | +3% | -4% | +11% | +11% | +3% |
+| code c1 | +4% | -9% | +4% | +4% | +4% |
+| prose answer c1 | +7% | -2% | +15% | +4% | +10% |
+| code answer c1 | +7% | +1% | +6% | +1% | +3% |
+| prose c8 | -10% | -14% | -11% | 0% | +2% |
+| code c8 | +1% | -7% | -5% | +3% | +1% |
+| prose answer c8 | -7% | -10% | -7% | +3% | +1% |
+| code answer c8 | -1% | -6% | +1% | -1% | +5% |
+
+Single-stream step time (ms) against the pooled control:
+
+| Arm | prose | code | prose answer | code answer |
+|---|---|---|---|---|
+| control | 54.7 | 58.6 | 55.7 | 60.0 |
+| dead03 | 46.6 | 52.7 | 50.3 | 56.8 |
+| budget02 | 48.1 | 56.3 | 51.6 | 58.5 |
+
+- Dead rows skip their routed experts as intended: with every draft
+  scheduled and a 0.3 cut, single-stream steps are 3-8 ms shorter.
+- A cut that schedules every draft loses 5-14% at eight streams. There the
+  48 scheduled rows still pay attention, logits and sampling, and rows share
+  experts, so a dead row saves less.
+- Inside the promoted host budget, the cut no longer loses at eight streams.
+  budget02 (0.2) is positive at every point, +3.6% on average; budget01 is
+  +3.2%. Each point is within noise.
+- τ 0.5 cuts accepted drafts faster than it saves time.
+- The break-even survival is the price of a live row times the step's token
+  rate, and both change with concurrency. A fixed τ cannot follow it; see
+  `experiments/2026-09-27-dead-rows-ratio`.
+- Quality gate LRU 5/5 in every arm; dgx1 minimum MemAvailable 6.1-6.5 GiB.
