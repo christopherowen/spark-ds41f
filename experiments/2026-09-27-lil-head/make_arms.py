@@ -53,6 +53,19 @@ arms = {
     }),
 }
 
+# Isolate the rebase's per-step cost: the base's Engram overlap off (disk
+# rows read before the launch) and the generic B12X paged decode off.
+arms["engramoff"] = arm({
+    "VLLM_DS41_ENGRAM_OVERLAP": "0",
+    "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-r5-engramoff",
+    "VLLM_CACHE_DIR": "/cache/kkref/jit/vllm-r5-engramoff",
+    "VLLM_CACHE_ROOT": "/cache/kkref/jit/vllm-r5-engramoff",
+})
+arms["pagedoff"] = arm({
+    "VLLM_B12X_PAGED_DECODE": "0",
+    "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/k3-r5-pagedoff",
+})
+
 
 def five_drafts(cfg: dict, **spec) -> dict:
     """Five drafts (the drafter's trained block) with graphs up to 8 x 6 rows."""

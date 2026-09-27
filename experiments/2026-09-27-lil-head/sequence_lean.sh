@@ -10,13 +10,15 @@ P=experiments/2026-09-26-dspark-policy
 LEAN=(--suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink
       --concurrency 1,8 --min-samples 3 --max-samples 3)
 log() { echo "$(date -u +%FT%TZ) $*"; }
-for step in base:s-base realprof:s-realprof k5real:s-k5real k5:s-k5 nol2:s-nol2; do
+for step in ${STEPS:-base:s-base realprof:s-realprof k5real:s-k5real k5:s-k5 nol2:s-nol2}; do
   arm=${step%%:*}
   label=${step##*:}
   log "arm $arm ($label)"
   $E/run_arm.sh "$arm" "$label" "${LEAN[@]}"
   log "arm $arm ($label) exit $?"
 done
-log "arm det (s-det)"
-$P/run_arm.sh det s-det "${LEAN[@]}"
-log "arm det (s-det) exit $?"
+if [ -z "${STEPS:-}" ]; then
+  log "arm det (s-det)"
+  $P/run_arm.sh det s-det "${LEAN[@]}"
+  log "arm det (s-det) exit $?"
+fi

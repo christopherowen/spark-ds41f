@@ -46,6 +46,8 @@ per arm.
 |---|---|
 | `base` | none: base defaults (L2 prefetch and Engram overlap on) |
 | `nol2` | `VLLM_DS41_L2_PREFETCH=0` |
+| `engramoff` | `VLLM_DS41_ENGRAM_OVERLAP=0`: disk Engram rows read before the launch; own compile cache (the overlap changes the traced graph) |
+| `pagedoff` | `VLLM_B12X_PAGED_DECODE=0` |
 | `k5` | five drafts, capture sizes to 48; own pinned curves and compile cache |
 | `k5real` | `k5` with the distinct-token profile and cost scale 1.0 |
 | `realprof` | `SPARK3_DSPARK_PROFILE_TOKENS=random` (patch 0009); own pinned curves |
