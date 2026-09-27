@@ -69,6 +69,23 @@ RUN --mount=type=secret,id=github_token,required=false \
     test -f /opt/vllm-native/vllm/_C_stable_libtorch.abi3.so; \
     test -f /opt/vllm-native/vllm/_moe_C_stable_libtorch.abi3.so
 
+# NCCL 2.30.7 (the base image's nvidia-nccl-cu13 wheel), rebuilt from the
+# pinned release tag with patches/nccl for SM121 only. The runtime stage
+# replaces the wheel's libnccl.so.2 with it.
+FROM ${BASE_IMAGE} AS nccl-builder
+
+USER root
+
+COPY --from=nccl-source . /workspace/nccl/
+ARG NCCL_COMPILE_JOBS=4
+RUN set -eux; \
+    make -C /workspace/nccl -j${NCCL_COMPILE_JOBS} src.build \
+      CUDA_HOME=/usr/local/cuda \
+      NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"; \
+    mkdir -p /opt/nccl; \
+    cp -L /workspace/nccl/build/lib/libnccl.so.2 /opt/nccl/libnccl.so.2; \
+    sha256sum /opt/nccl/libnccl.so.2 | cut -d" " -f1 > /opt/nccl/libnccl.so.2.sha256
+
 FROM ${BASE_IMAGE}
 
 ARG BASE_IMAGE_NAME=unrecorded
@@ -83,6 +100,11 @@ ARG B12X_REF=unrecorded
 ARG B12X_REVISION=unrecorded
 ARG B12X_PATCH_HEAD=unrecorded
 ARG B12X_TREE=unrecorded
+ARG NCCL_UPSTREAM=unrecorded
+ARG NCCL_REF=unrecorded
+ARG NCCL_REVISION=unrecorded
+ARG NCCL_PATCH_HEAD=unrecorded
+ARG NCCL_TREE=unrecorded
 ARG DEPLOYMENT_COMMIT=uncommitted
 
 LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark3-vllm-ds41f" \
@@ -98,7 +120,12 @@ LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark3
       local.spark3.b12x.ref="${B12X_REF}" \
       local.spark3.b12x.revision="${B12X_REVISION}" \
       local.spark3.b12x.patch-head="${B12X_PATCH_HEAD}" \
-      local.spark3.b12x.tree="${B12X_TREE}"
+      local.spark3.b12x.tree="${B12X_TREE}" \
+      local.spark3.nccl.upstream="${NCCL_UPSTREAM}" \
+      local.spark3.nccl.ref="${NCCL_REF}" \
+      local.spark3.nccl.revision="${NCCL_REVISION}" \
+      local.spark3.nccl.patch-head="${NCCL_PATCH_HEAD}" \
+      local.spark3.nccl.tree="${NCCL_TREE}"
 
 USER root
 
@@ -111,6 +138,12 @@ COPY --from=vllm-native-builder \
   /opt/vllm-native/vllm/_moe_C_stable_libtorch.abi3.so \
   /opt/spark3/candidate/vllm/vllm/_moe_C_stable_libtorch.abi3.so
 COPY --from=cutlass-dsl-wheels . /tmp/cutlass-dsl-wheels/
+COPY --from=nccl-builder /opt/nccl/ /opt/spark3/nccl/
+RUN set -eux; \
+    target=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2; \
+    test -f "$target"; \
+    install -m 0755 /opt/spark3/nccl/libnccl.so.2 "$target"; \
+    rm /opt/spark3/nccl/libnccl.so.2
 
 # B12X builds its io_uring disk row reader at first use; it needs the header.
 RUN apt-get update \
@@ -174,6 +207,15 @@ print("RoCE proxy ABI", load().roce_abi_version())
 native_path = _build()
 linked = subprocess.check_output(["ldd", native_path], text=True)
 assert "liburing.so" in linked, "B12X was built without io_uring row staging"
+import hashlib
+
+import torch
+
+assert torch.cuda.nccl.version() == (2, 30, 7), torch.cuda.nccl.version()
+nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+with open(nccl, "rb") as handle:
+    built = open("/opt/spark3/nccl/libnccl.so.2.sha256").read().strip()
+    assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
 for name in ("_C_stable_libtorch", "_moe_C_stable_libtorch"):
     with open(f"/opt/spark3/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
         assert handle.read(4) == b"\x7fELF"

@@ -288,7 +288,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     source_manifest = read_json(
         upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
     )
-    for name in ("vllm", "b12x"):
+    for name in BUILD_PROJECTS:
         wanted = source_manifest[name].get("patchset_sha256")
         actual = patchset_sha256(upstreams["sources"][name])
         if wanted != actual:
@@ -1340,9 +1340,11 @@ BUILD_ROOT = ROOT / ".work/build"
 # Bump when the directory layout or context export changes, so older
 # directories are re-prepared.
 BUILD_LAYOUT = 2
-BUILD_PROJECTS = ("vllm", "b12x")
-BUILD_PARTS = ("vllm", "b12x", "cutlass", "wheels")
-BUILD_CONTEXTS = ("vllm-source", "b12x-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions")
+BUILD_PROJECTS = ("vllm", "b12x", "nccl")
+BUILD_PARTS = ("vllm", "b12x", "nccl", "cutlass", "wheels")
+BUILD_CONTEXTS = (
+    "vllm-source", "b12x-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions"
+)
 # git am with a fixed committer and committer date reproduces the recorded
 # patch heads byte for byte.
 PATCH_COMMITTER = ("Christopher Owen", "3221756+christopherowen@users.noreply.github.com")
@@ -1639,7 +1641,7 @@ def command_build_prepare(args: argparse.Namespace) -> int:
         print("partial preparation; run bin/spark3 build prepare for the complete inputs")
         return 0
     context = directory / "context"
-    for name in ("vllm", "b12x", "cutlass"):
+    for name in (*BUILD_PROJECTS, "cutlass"):
         export_source(directory / "src" / name, context / f"{name}-source")
     deleted = vllm_deletions(directory, inputs)
     deletions = context / "vllm-deletions"
