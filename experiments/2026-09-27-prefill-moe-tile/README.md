@@ -37,4 +37,26 @@ patch that selects M32 only in the prefill band.
 
 ## Results
 
-Pending.
+One session (2026-09-27, 17:10-17:35 UTC). Cold prefill of real text
+(`--prefill-text source`, two repeats), tok/s by prompt length (actual
+tokens in brackets), and single-stream decode step time:
+
+| Arm | 4K (3854) | 16K (14768) | 32K (28937) | 64K (57122) | prose / code answer / explain step |
+|---|---|---|---|---|---|
+| control | 3574 | 3440 | 3427 | 3399 | 47.6 / 54.3 / 48.6 ms |
+| tile32 | 3593 | 3469 | 3462 | 3444 | 48.1 / 53.9 / 48.6 ms |
+| simple | 3570 | 3432 | 3427 | 3384 | 48.8 / 54.0 / 49.8 ms |
+| control-b | 3554 | 3420 | 3420 | 3397 | 48.5 / 54.0 / 49.2 ms |
+
+- `tile32` gains a consistent +0.8% to +1.4% on prefill (repeats agree
+  within about 0.5%) and leaves decode unchanged. The override still runs
+  the materialized two-phase kernels (B12X's `W4A8Materialized*`), so this
+  is not the fused persistent M32 kernel that B12X's planner describes; that
+  also needs `B12X_DYNAMIC_W4A8_MATERIALIZED=0`, not tested here.
+- `simple` changes nothing: the 42 MB prefill all-reduces are bound by the
+  RoCE link (a three-rank ring moves about 56 MB per rank in 3.1 ms, about
+  145 Gb/s), not by NCCL's protocol choice.
+- Neither is adopted. The prefill levers that remain are sequence-parallel
+  prefill (the per-row hyper-connection work, about 150 ms per 4K chunk,
+  repeated on every rank) and the fused MoE path.
+- Quality gate LRU 5/5 in every arm; dgx1 minimum MemAvailable 6.2 GiB.
