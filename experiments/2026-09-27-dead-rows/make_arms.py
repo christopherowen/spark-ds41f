@@ -31,6 +31,11 @@ arms = {
     # Every draft scheduled; rows past the survival cut are dead.
     "dead03": arm({"SPARK3_DSPARK_VERIFY_RULE": "all", "SPARK3_DSPARK_DEAD_ROWS_TAU": "0.3"}),
     "dead05": arm({"SPARK3_DSPARK_VERIFY_RULE": "all", "SPARK3_DSPARK_DEAD_ROWS_TAU": "0.5"}),
+    # Host budget as promoted (caps the row count at high batch, where dead
+    # rows still pay attention, logits and sampling), with the on-device cut
+    # applied inside it.
+    "budget01": arm({"SPARK3_DSPARK_DEAD_ROWS_TAU": "0.1"}),
+    "budget02": arm({"SPARK3_DSPARK_DEAD_ROWS_TAU": "0.2"}),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")

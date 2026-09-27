@@ -29,6 +29,7 @@ verifying three drafts with this step's confidences at one stream.
 | `control` | r5d image only (dead rows off) |
 | `dead03` | `SPARK3_DSPARK_VERIFY_RULE=all`, `SPARK3_DSPARK_DEAD_ROWS_TAU=0.3` |
 | `dead05` | as `dead03` with 0.5 |
+| `budget01`, `budget02` | promoted host budget (ratio rule, cost scale 2) with the on-device cut at 0.1 or 0.2 inside it |
 
 ## Workload and gates
 
