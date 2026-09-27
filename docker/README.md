@@ -3,10 +3,13 @@
 `docker/Dockerfile` builds the promoted image: Local Inference Lab's
 karmic-kraken-beta vLLM and B12X with the local patch series, on the canonical
 vLLM ARM64 nightly `af1c0149`. Only vLLM's `_C_stable_libtorch` and
-`_moe_C_stable_libtorch` are rebuilt, for SM121. FlashInfer 0.6.18.post1 comes
-from the base image. The r1 and r2 images came from the same recipe in
-`experiments/2026-09-23-karmic-kraken-reference/`; the running r3 image
-(`vllm-ds41f-kkref:01f1b874c774-r3`) is the first built by `bin/spark3 build`.
+`_moe_C_stable_libtorch` are rebuilt, for SM121, and NCCL 2.30.7 (the base
+image's version) is rebuilt from its release tag with `patches/nccl`, replacing
+the wheel's `libnccl.so.2`; the image build checks the installed library's
+version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
+and r2 images came from the same recipe in
+`experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
+`bin/spark3 build`, and the running image is `vllm-ds41f-kkref:04c30fa98e79-r5c`.
 
 ```sh
 bin/spark3 build prepare        # create or repair the build directory
@@ -21,7 +24,7 @@ bin/spark3 build smoke          # rerun the GPU import smoke
 `upstreams.lock.json` and the source manifest it names determine every build
 input:
 
-- the vLLM and B12X revisions;
+- the vLLM, B12X and NCCL revisions;
 - the patch-series fingerprints, recorded patch heads, and trees;
 - the CUTLASS revision;
 - the CuTe DSL wheel lock;
@@ -32,10 +35,11 @@ A hash of those inputs names the directory:
 ```
 .work/build/vllm-<12>-b12x-<12>-<input hash>/
   inputs.json            # the inputs and a content digest of each context
-  src/vllm, src/b12x     # pinned revision + git am of patches/*/series
+  src/vllm, src/b12x, src/nccl  # pinned revision + git am of patches/*/series
   src/cutlass            # pinned CUTLASS revision (headers only)
   context/vllm-source    # clean exports: no .git, no bytecode
   context/b12x-source
+  context/nccl-source
   context/cutlass-source
   context/cutlass-dsl-wheels   # hash-verified wheels
   context/vllm-deletions/deleted.txt

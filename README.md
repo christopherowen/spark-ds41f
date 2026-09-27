@@ -11,19 +11,23 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-25-karmic-kraken-r3-vision-kernel70.json](manifests/baselines/2026-09-25-karmic-kraken-r3-vision-kernel70.json):
+[manifests/baselines/2026-09-27-karmic-kraken-r5c.json](manifests/baselines/2026-09-27-karmic-kraken-r5c.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
   `vm.watermark_boost_factor=0`;
 - direct dual ConnectX-7 paths between every pair of nodes;
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
-  projection sharding and asynchronous Engram row patches) and B12X (plus the switchless RoCEnante patch),
-  with B12X attention, linear, MoE, and mHC kernels;
+  projection sharding, asynchronous Engram rows, and two tool-call and
+  image-cache fixes) and B12X (plus the switchless RoCEnante patch), with B12X
+  attention, linear, MoE, and mHC kernels and L2 weight prefetch during decode;
+- NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
+  (NVIDIA/nccl#2393), which prevents a proxy-thread hang;
 - DeepSeek V4.1 Flash native FP8/FP4 weights, unchanged, with the vision
   tower loaded (up to four images per request);
-- DSpark speculative decoding with three draft tokens and block rejection,
-  full CUDA graphs for decode batches up to 32 tokens;
+- DSpark speculative decoding with five draft tokens (the drafter's trained
+  block) and block rejection, full CUDA graphs for decode batches up to 48
+  tokens;
 - B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
   model's SwiGLU clamp and caused the incoherence seen in earlier images;
 - 131,072-token per-request limit, eight admitted sequences, and 575,304 KV
@@ -43,34 +47,42 @@ To reproduce the deployment on your own three Sparks, follow
 ## Performance
 
 Current baseline, measured with `bin/spark3 bench` from dgx1: prose and code
-prompts, temperature 0, reasoning on, 256 output tokens.
+prompts, temperature 0, 256 output tokens. With reasoning on (the server
+default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 43.9 | 45.6 | 0.24 s |
-| prose | 2 | 71.8 | 38.4 | 0.36 s |
-| prose | 4 | 106.4 | 28.9 | 0.47 s |
-| prose | 8 | 161.0 | 22.1 | 0.59 s |
-| code | 1 | 54.0 | 56.9 | 0.26 s |
-| code | 2 | 86.3 | 47.3 | 0.37 s |
-| code | 4 | 126.2 | 34.6 | 0.48 s |
-| code | 8 | 179.3 | 25.2 | 0.57 s |
+| prose | 1 | 44.7 | 46.4 | 0.23 s |
+| prose | 2 | 69.0 | 36.9 | 0.36 s |
+| prose | 4 | 101.2 | 28.0 | 0.48 s |
+| prose | 8 | 150.0 | 20.8 | 0.55 s |
+| code | 1 | 56.4 | 59.2 | 0.23 s |
+| code | 2 | 83.2 | 45.8 | 0.37 s |
+| code | 4 | 125.4 | 35.2 | 0.50 s |
+| code | 8 | 180.0 | 25.5 | 0.58 s |
+
+With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
+
+| Prompt | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| prose | 46.4 | 79.3 | 117.4 | 164.3 |
+| code | 68.5 | 104.2 | 151.4 | 237.0 |
+| JSON | 67.1 | 96.7 | 152.6 | 227.6 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Single-stream decode step | about 49 ms; 1.2 accepted drafts per step on prose, 1.8 on code |
-| Image input | up to 4 images per request; both image checks pass, answered in 1.3-1.6 s |
+| Single-stream decode step | about 52 ms on prose and 56 ms on code; accepted drafts per step 1.4 (prose), 2.4 (code), 3.1 (code answers) |
 | Cold prefill | 2K 3.9k, 32K 4.2k, 64K 4.1k tok/s |
-| Prefix-cache replay, 32K prompt | 7.59 s cold, 0.27 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.7 tok/s per stream |
+| Prefix-cache replay, 32K prompt | 7.56 s cold, 0.26 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.0 tok/s per stream |
 | KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.9 GiB MemAvailable during startup (5 GiB guard), 6.3 GiB under load (3 GiB guard) |
+| Host memory headroom | dgx1 at least 6.2 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
-The quick default takes three or four samples per decode point, about ±4-9%
-at 95% confidence. Single boots of one configuration vary by about 3%.
-Reports: [decode](manifests/benchmarks/2026-09-25-karmic-kraken-r3-vision-kernel70.json),
-[prefill, prefix cache, and admission](manifests/benchmarks/2026-09-25-karmic-kraken-r3-vision-kernel70-capacity.json).
+The quick default takes three or four samples per decode point, about ±2-12%
+at 95% confidence; temperature-0 outputs differ between identical requests,
+which moves acceptance from sample to sample. Report:
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-27-karmic-kraken-r5c.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract

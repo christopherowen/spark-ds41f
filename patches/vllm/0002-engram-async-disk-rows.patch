@@ -1,6 +1,6 @@
-From 5904466eaa5fa96715e1657734c4e8275fe77854 Mon Sep 17 00:00:00 2001
+From 769d4f812fa2d74ca729f4c4967d6ca42fedd7a4 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
-Date: Fri, 25 Sep 2026 01:30:00 +0200
+Date: Sun, 27 Sep 2026 10:30:00 +0200
 Subject: [PATCH] perf(deepseek-v4.1): read disk Engram rows beside the forward
  launch
 
@@ -25,13 +25,19 @@ Off by default. Disk tables always carry the flag and the forward always
 waits on it, so traced and captured graphs are identical with the path on
 or off (the compile cache does not key on the environment); with it off the
 flag stays 1. The rows and their decode are unchanged, only their timing.
+
+On this base the Engram overlap (VLLM_DS41_ENGRAM_OVERLAP) reads both
+tables on a worker thread that also launches the row gathers, and every
+Engram layer spins in the graph on one epoch; it saves less than this path
+on three DGX Sparks. The two are exclusive: with SPARK3_ENGRAM_ASYNC=1 the
+preparation raises unless VLLM_DS41_ENGRAM_OVERLAP=0.
 ---
- vllm/models/deepseek_v4_1/common/engram.py | 248 +++++++++++++++++++++
- vllm/models/deepseek_v4_1/nvidia/model.py  |  52 +++++
- 2 files changed, 300 insertions(+)
+ vllm/models/deepseek_v4_1/common/engram.py | 249 +++++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/model.py  |  57 +++++
+ 2 files changed, 306 insertions(+)
 
 diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
-index b1373cbbe..f38c96cde 100644
+index 8349bfd366..c0112d6066 100644
 --- a/vllm/models/deepseek_v4_1/common/engram.py
 +++ b/vllm/models/deepseek_v4_1/common/engram.py
 @@ -2,6 +2,9 @@
@@ -44,14 +50,14 @@ index b1373cbbe..f38c96cde 100644
  from functools import lru_cache
  
  import torch
-@@ -29,6 +32,7 @@ from vllm.utils.b12x import (
+@@ -28,6 +31,7 @@ from vllm.utils.b12x import (
+     PreparationResourceUnavailableError,
      set_b12x_preparation_provider,
  )
- from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
 +from vllm.utils.torch_utils import direct_register_custom_op
+ from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
  
  
- _FP8_BLOCK_ROWS = 32
 @@ -69,6 +73,124 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
  logger = init_logger(__name__)
  DEAD_ID = -1
@@ -177,11 +183,11 @@ index b1373cbbe..f38c96cde 100644
  
  @lru_cache(maxsize=2)
  def _token_map(path, revision, trust_remote_code):
-@@ -625,6 +747,97 @@ class ParallelEngramEmbedding(nn.Module):
-         )
-         self._disk_prepared_rows = indices.shape[0]
+@@ -628,6 +750,98 @@ class ParallelEngramEmbedding(nn.Module):
+             out[indices.shape[0] : self._disk_prepared_rows].zero_()
+         return self._disk_binding
  
-+    def stage_disk(self, indices, out, num_tokens, flag, side_stream):
++    def stage_disk_async(self, indices, out, num_tokens, flag, side_stream):
 +        """Main thread: stage the IDs and queue the gated decode; no disk I/O."""
 +        from b12x.sequence.engram._kernels import lookup_op
 +
@@ -250,7 +256,7 @@ index b1373cbbe..f38c96cde 100644
 +            )
 +        return indices.shape[0], count, sequence
 +
-+    def finish_disk(self, job):
++    def read_disk_async(self, job):
 +        """Reader thread, host work only: wait for the IDs, read the rows."""
 +        tokens, count, sequence = job
 +        cache = self.disk_table._cache
@@ -272,10 +278,11 @@ index b1373cbbe..f38c96cde 100644
 +        if ENGRAM_ASYNC_TRACE:
 +            logger.info("engram-async rows read table=%x sequence=%d", id(self), sequence)
 +
++
      def lookup_native(self, indices, out):
          if self.plan.prepared is None:
              raise PreparationResourceUnavailableError(
-@@ -866,6 +1079,35 @@ class Engram(nn.Module):
+@@ -891,6 +1105,35 @@ class Engram(nn.Module):
          self.norm_weights.copy_(
              (self.q_weight.float() * self.k_weight.float()).flatten()
          )
@@ -297,21 +304,21 @@ index b1373cbbe..f38c96cde 100644
 +    def async_rows(self) -> bool:
 +        return getattr(self, "_async_rows", False)
 +
-+    def stage_disk(self, hash_ids, num_tokens, side_stream):
++    def stage_disk_async(self, hash_ids, num_tokens, side_stream):
 +        self.invalidate_disk_output()
-+        job = self.embed_tokens.stage_disk(
++        job = self.embed_tokens.stage_disk_async(
 +            hash_ids, self.staged_rows, num_tokens, self._rows_flag, side_stream
 +        )
 +        self._disk_prepared_tokens = hash_ids.shape[0]
 +        self._disk_prepared = True
 +        return job
 +
-+    def finish_disk(self, job):
-+        self.embed_tokens.finish_disk(job)
++    def read_disk_async(self, job):
++        self.embed_tokens.read_disk_async(job)
  
      def prepare_embeddings(self, hash_ids):
          self.embed_tokens.lookup(hash_ids, self.staged_rows)
-@@ -890,6 +1132,10 @@ class Engram(nn.Module):
+@@ -924,6 +1167,10 @@ class Engram(nn.Module):
          self.invalidate_disk_output(clear=True)
          self._disk_prepared_tokens = num_tokens
          self._disk_prepared = True
@@ -322,22 +329,22 @@ index b1373cbbe..f38c96cde 100644
  
      def forward(self, hidden_states, hash_ids, token_mask=None):
          if (
-@@ -901,6 +1147,8 @@ class Engram(nn.Module):
-             )
-         ):
+@@ -937,6 +1184,8 @@ class Engram(nn.Module):
              raise RuntimeError("Disk Engram output is not prepared")
+         if self.overlap_epochs is not None:
+             _wait_engram_rows[(1,)](*self.overlap_epochs, 5000)
 +        if getattr(self, "_rows_flag", None) is not None:
 +            torch.ops.vllm.spark3_engram_wait_rows(self.staged_rows, self._rows_flag_key)
          rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
          kv = self.wkv(rows)
          state = hidden_states.flatten(1)
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index a1b59941a..7fefeb403 100644
+index 61f62a4033..e22daa141c 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
-@@ -410,11 +410,45 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-         else:
-             self._mtp_hidden_buffer = None
+@@ -529,12 +529,46 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             )
+         self._engram_job = pool.submit(lookup)
  
 +    def _engram_reader(self):
 +        """One reader thread and side stream for asynchronous disk Engram rows."""
@@ -345,7 +352,7 @@ index a1b59941a..7fefeb403 100644
 +            import concurrent.futures
 +
 +            device = torch.cuda.current_device()
-+            self._engram_side_stream = torch.cuda.Stream(device=device)
++            self._engram_rows_stream = torch.cuda.Stream(device=device)
 +            self._engram_executor = concurrent.futures.ThreadPoolExecutor(
 +                1,
 +                thread_name_prefix="engram-rows",
@@ -359,7 +366,7 @@ index a1b59941a..7fefeb403 100644
 +        failure = None
 +        for engram, job in jobs:
 +            try:
-+                engram.finish_disk(job)
++                engram.read_disk_async(job)
 +            except BaseException as error:  # every gate is released regardless
 +                failure = failure or error
 +        if failure is not None:
@@ -377,23 +384,29 @@ index a1b59941a..7fefeb403 100644
              raise RuntimeError(
                  "Disk Engram preparation must run outside compile/capture"
              )
+         self._finish_engram_job()
 +        self.join_engram_reader()
          engrams = tuple(
              layer.engram
              for layer in islice(self.layers, self.start_layer, self.end_layer)
-@@ -433,6 +467,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -553,6 +587,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  lookback_token_ids,
                  hashes,
              )
 +            if engrams and all(engram.async_rows for engram in engrams):
++                if self._engram_overlap:
++                    raise RuntimeError(
++                        "SPARK3_ENGRAM_ASYNC=1 replaces the base Engram overlap; "
++                        "set VLLM_DS41_ENGRAM_OVERLAP=0"
++                    )
 +                self._engram_reader()
 +                jobs = [
 +                    (
 +                        engram,
-+                        engram.stage_disk(
++                        engram.stage_disk_async(
 +                            hashes[:, engram.layer_hash_index],
 +                            self.engram_hash.num_tokens,
-+                            self._engram_side_stream,
++                            self._engram_rows_stream,
 +                        ),
 +                    )
 +                    for engram in engrams
@@ -402,17 +415,17 @@ index a1b59941a..7fefeb403 100644
 +                    self._read_engram_rows, jobs
 +                )
 +                return
-             for engram in engrams:
-                 engram.prepare_disk(
-                     hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens
-@@ -450,6 +501,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
-             raise RuntimeError(
+             # One batch lets the per-layer disk reads overlap on the host.
+             bindings = [
+                 engram.stage_disk(
+@@ -581,6 +637,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  "Disk Engram preparation must run outside compile/capture"
              )
+         self._finish_engram_job()
 +        self.join_engram_reader()
-         self.prepared_engram_hashes.fill_(-1)
-         for layer in islice(self.layers, self.start_layer, self.end_layer):
-             if getattr(layer, "engram", None) is not None:
+         if self._engram_overlap:
+             # Dummy rows are ready at once; order after the last side-stream
+             # publication so an older epoch cannot overwrite this one.
 -- 
-2.54.0 (Apple Git-157)
+2.43.0
 

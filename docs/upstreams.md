@@ -3,15 +3,20 @@
 `upstreams.lock.json` is the machine-readable authority. The current chain is:
 
 ```text
-local-inference-lab/vllm integration/karmic-kraken-beta @ 01f1b874
+local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
         (canonical base vllm-project/vllm @ 0f8fa53a)
         + patches/vllm/series (Engram projection TP padding,
-                               asynchronous Engram rows)
+                               asynchronous Engram rows, DSML tool
+                               parameters, multimodal block hashes;
+                               DSpark tools off by default)
                     \
-                     vllm-ds41f-kkref:01f1b874c774-r3 (sha256:9c9ca541…)
-                    /
-local-inference-lab/b12x integration/karmic-kraken-beta @ 0f846212
+local-inference-lab/b12x integration/karmic-kraken-beta @ e39b437b
         + patches/b12x/series (switchless RoCEnante routing)
+                     ---- vllm-ds41f-kkref:04c30fa98e79-r5c (sha256:18e69ad5…)
+                    /
+NVIDIA/nccl v2.30.7-1 @ 73cf1122
+        + patches/nccl/series (IB send-path fence), replacing the base
+          image's nvidia-nccl-cu13 libnccl.so.2
 
 deepseek-ai/DeepSeek-V4.1-Flash @ dba1be0a (unchanged; TP3 head padding is in
         the serving source, so no config overlay is mounted)
@@ -29,6 +34,7 @@ Inference Lab integration branch is the serving source.
 | `vllm` | `local-inference-lab/vllm` (`integration/karmic-kraken-beta`) | `christopherowen/vllm` | serving source; canonical `vllm-project/vllm` main is parked |
 | `vllm_base_image` | `docker.io/vllm/vllm-openai` | not applicable | official CUDA/Torch/native-extension foundation |
 | `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`) | not created yet | DS4.1 kernels and RoCEnante transport |
+| `nccl` | `NVIDIA/nccl` (tag `v2.30.7-1`) | not created yet | the base image's NCCL version, rebuilt for SM121 with `patches/nccl` |
 | `flashinfer` | `flashinfer-ai/flashinfer` | not created yet | not a promoted build input (the runtime base supplies 0.6.18.post1) |
 | `cutlass` | `NVIDIA/cutlass` | not created yet | SM121 stable-extension headers at `v4.7.1` |
 | `cutlass_dsl` | NVIDIA packages on PyPI | not applicable | SHA-256-locked ARM64 CuTe DSL wheel set |
