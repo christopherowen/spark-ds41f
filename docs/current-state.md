@@ -1,13 +1,13 @@
 # Current state
 
 Promoted 2026-09-27 as
-[`2026-09-27-karmic-kraken-r5e`](../manifests/baselines/2026-09-27-karmic-kraken-r5e.json)
+[`2026-09-27-karmic-kraken-r5f`](../manifests/baselines/2026-09-27-karmic-kraken-r5f.json)
 and running on all three nodes from `config/cluster.json`.
 
 | Setting | Active value |
 |---|---:|
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0011 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante patch, NCCL 2.30.7 + IB send-path fence |
-| Image | `vllm-ds41f-kkref:04c30fa98e79-r5e`, one digest on all ranks, built by `bin/spark3 build` |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0013 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante patch, NCCL 2.30.7 + IB send-path fence |
+| Image | `vllm-ds41f-kkref:04c30fa98e79-r5f`, one digest on all ranks, built by `bin/spark3 build` |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia` with `kho=off`, driver 580.178.04, no desktop |
 | Tensor parallel ranks | 3 |
 | Maximum model length | 131,072 tokens |
@@ -17,7 +17,7 @@ and running on all three nodes from `config/cluster.json`.
 | Explicit KV memory | 1.4 GiB per rank |
 | Reported KV capacity | 575,304 tokens (4.39x full 131K windows) |
 | Image input | vision tower loaded, up to 4 images per request, no host preprocessing cache |
-| DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection |
+| DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts, NVFP4 drafter head and Markov projection |
 | CUDA graphs | full, capture sizes 1-48 |
 | B12X W4A8 tiny decode | disabled (`B12X_W4A8_TINY_DECODE=0`) |
 | Engram projection | sharded across ranks (`projection_tp`) |
@@ -30,9 +30,9 @@ and running on all three nodes from `config/cluster.json`.
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 
 Measured on this configuration: LRU coherence gate 5/5; single-stream
-prose/code about 45/56 tok/s with reasoning, code answers 73 tok/s; code at
-eight streams 175 tok/s (225 tok/s for code answers); cold prefill
-2K 3.8k, 32K 4.1k, 64K 4.0k tok/s; dgx1 minimum MemAvailable 5.86 GiB under load.
+prose/code about 49/62 tok/s with reasoning, code answers 76 tok/s; code at
+eight streams 178 tok/s (231 tok/s for code answers); cold prefill
+2K 3.9k, 32K 4.2k, 64K 4.1k tok/s (4K 3.5k, 14K 3.4k, 36K 3.4k, 61K 3.4k on real text); dgx1 minimum MemAvailable 6.21 GiB under load.
 The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
 [`2026-09-20-live`](../manifests/baselines/2026-09-20-live.json).
