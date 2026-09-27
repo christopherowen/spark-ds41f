@@ -103,8 +103,22 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   expected tokens per millisecond. Off by default; output unchanged.
   Upstream status: candidate, not submitted.
 
-Applying 0001-0011 to the base yields patch head `138b562f` and tree
-`7b839dc1`. The promoted image carries an earlier 0009 that moved
-`_dummy_run`'s decorators onto its new helper; 0001-0009 then gave patch
+- `0012-dspark-vocab-parallel-greedy.patch`
+  (`SPARK3_DSPARK_VOCAB_PARALLEL`) keeps greedy DSpark drafting sharded by
+  vocabulary: the Markov projection is sharded like the LM head, each rank
+  reduces its shard to a (max, index) pair, and only the pairs are gathered.
+  The drafts are unchanged. Off by default; output unchanged. Upstream
+  status: candidate, not submitted.
+
+- `0013-dspark-main-proj-column-parallel.patch`
+  (`SPARK3_DSPARK_MAIN_PROJ_TP`) column-shards the drafter's replicated
+  `main_proj` with 0001's padded column-parallel linear and gathers the
+  output. Off by default; output unchanged. Upstream status: candidate, not
+  submitted.
+
+Applying 0001-0013 to the base yields patch head `83bbd172` and tree
+`fa5fb6b2`. 0001-0011, the promoted r5e image, give patch head `138b562f`
+and tree `7b839dc1`. The r5c image carried an earlier 0009 that moved
+`_dummy_run`'s decorators onto its new helper; its 0001-0009 gave patch
 head `d7234353`, tree `f250542a` (on the r4 base `01f1b874`: patch head
 `84f0b5dc`, tree `ee3a0fd4`).

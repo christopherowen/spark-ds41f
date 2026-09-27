@@ -1,0 +1,399 @@
+From e306364b33b2a95c4f7ef17d0a2a42991e30fa67 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 18:00:00 +0200
+Subject: [PATCH] perf(spec-decode): vocabulary-parallel greedy DSpark drafts
+
+Greedy DSpark drafting all-gathers the full-vocabulary draft logits, and
+every rank reads the whole replicated Markov projection (129280 x 256
+bf16, 66 MB) once per draft position: about 330 MB per step at five
+drafts, most of the drafter's time at one stream.
+
+With SPARK3_DSPARK_VOCAB_PARALLEL=1 the Markov projection is sharded by
+vocabulary rows like the LM head. Each rank reduces base logits plus
+Markov bias over its own shard to a (max, global index) pair in the same
+fused kernel, the pairs are all-gathered (8 bytes per request and rank),
+and a small kernel keeps the first maximum. Shards hold ascending index
+ranges, so ties and NaNs resolve as in the full-vocabulary argmax and the
+drafts are unchanged; the target verifies every token as before. Greedy
+drafting over the full target vocabulary only; other paths are untouched.
+Off by default.
+---
+ .../spec_decode/test_dspark_vocab_parallel.py | 63 ++++++++++++
+ vllm/model_executor/models/qwen3_dspark.py    |  5 +-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 53 ++++++++++
+ .../worker/gpu/spec_decode/dspark/greedy.py   | 97 +++++++++++++++++++
+ .../gpu/spec_decode/dspark/speculator.py      | 41 +++++++-
+ 5 files changed, 256 insertions(+), 3 deletions(-)
+ create mode 100644 tests/v1/spec_decode/test_dspark_vocab_parallel.py
+
+diff --git a/tests/v1/spec_decode/test_dspark_vocab_parallel.py b/tests/v1/spec_decode/test_dspark_vocab_parallel.py
+new file mode 100644
+index 0000000000..e92bdab524
+--- /dev/null
++++ b/tests/v1/spec_decode/test_dspark_vocab_parallel.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
++    greedy_markov_shard_pair,
++    sample_greedy_markov,
++    scratch_shape,
++    select_first_argmax,
++)
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++
++
++def _sharded(base, bias, ranks, padded):
++    """Reduce per-shard pairs as TP ranks would, padding each shard like a
++    vocabulary-parallel head (the padded columns are never read)."""
++    rows, vocab = base.shape
++    per_rank = -(-vocab // ranks)
++    values = torch.empty(scratch_shape(rows, padded), dtype=torch.float32, device="cuda")
++    indices = torch.empty(scratch_shape(rows, padded), dtype=torch.int32, device="cuda")
++    pairs = []
++    for rank in range(ranks):
++        start = rank * per_rank
++        stop = min(vocab, start + per_rank)
++        shard_base = torch.full((rows, padded), 7.0, dtype=base.dtype, device="cuda")
++        shard_bias = torch.full((rows, padded), 7.0, dtype=bias.dtype, device="cuda")
++        shard_base[:, : stop - start] = base[:, start:stop]
++        shard_bias[:, : stop - start] = bias[:, start:stop]
++        pair = torch.empty(rows, 2, dtype=torch.float32, device="cuda")
++        greedy_markov_shard_pair(
++            shard_base[:, : stop - start], shard_bias[:, : stop - start], start,
++            pair, values, indices,
++        )
++        pairs.append(pair)
++    out = torch.empty(rows, 5, dtype=torch.int64, device="cuda")[:, 2]
++    select_first_argmax(torch.cat(pairs, dim=-1), out)
++    return out
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("ranks", [1, 2, 3])
++def test_shard_pairs_reproduce_the_full_argmax(dtype, ranks):
++    torch.manual_seed(0)
++    rows, vocab = 8, 129280
++    base = torch.randn(rows, vocab, device="cuda").to(dtype)
++    bias = torch.randn(rows, vocab, device="cuda").to(dtype)
++    # Ties across shard boundaries resolve to the lowest index; NaN wins.
++    base[1, [100, 50000, 120000]] = 30
++    bias[1, [100, 50000, 120000]] = 0
++    base[2, [90000, 20000]] = 40
++    bias[2, [90000, 20000]] = 0
++    base[3, 70000] = float("nan")
++    expected = torch.empty(rows, dtype=torch.int64, device="cuda")
++    values = torch.empty(scratch_shape(rows, vocab), dtype=torch.float32, device="cuda")
++    indices = torch.empty(scratch_shape(rows, vocab), dtype=torch.int32, device="cuda")
++    sample_greedy_markov(base, bias, expected, values, indices)
++    assert torch.equal(expected, (base + bias).argmax(dim=-1))
++    got = _sharded(base, bias, ranks, padded=-(-vocab // ranks) + 64)
++    assert got.tolist() == expected.tolist()
++    assert expected[1].item() == 100 and expected[2].item() == 20000 and expected[3].item() == 70000
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 63a3629bdc..036aee23f1 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -68,16 +68,19 @@ class DSparkMarkovHead(nn.Module):
+         quant_config: QuantizationConfig | None = None,
+         retain_weight_for_gather: bool = False,
+         lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
++        vocab_parallel: bool = False,
+     ) -> None:
+         super().__init__()
+         self.markov_w1 = nn.Embedding(vocab_size, markov_rank)
++        # vocab_parallel shards the projection by vocabulary rows like the
++        # LM head, for callers that reduce the draft argmax across shards.
+         self.markov_w2 = ParallelLMHead(
+             draft_vocab_size,
+             markov_rank,
+             bias=False,
+             quant_config=quant_config,
+             prefix=maybe_prefix(prefix, "markov_w2"),
+-            disable_tp=True,
++            disable_tp=not vocab_parallel,
+             lm_head_quantization=lm_head_quantization,
+         )
+         self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index e366310b02..e3535ea1fe 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
+ """
+ 
+ import copy
++import os
+ from bisect import bisect_left
+ from collections.abc import Iterable
+ 
+@@ -75,6 +76,20 @@ from .model import (
+ 
+ logger = init_logger(__name__)
+ 
++
++def _vocab_parallel_greedy() -> bool:
++    """SPARK3_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
++    vocabulary and reduce greedy drafts across ranks (see
++    DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
++    if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
++        return False
++    if envs.VLLM_DS41_MARKOV_NVFP4:
++        raise ValueError(
++            "SPARK3_DSPARK_VOCAB_PARALLEL shards the bf16 Markov projection; "
++            "unset VLLM_DS41_MARKOV_NVFP4"
++        )
++    return get_tensor_model_parallel_world_size() > 1
++
+ # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
+ # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
+ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+@@ -386,6 +401,7 @@ class DSparkDeepseekV4Model(nn.Module):
+             # An NVFP4 transition head fits the GB10 L2, so the sequential
+             # draft positions after the first reread it from L2.
+             lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
++            vocab_parallel=_vocab_parallel_greedy(),
+         )
+         self.confidence_head: DSparkConfidenceHead | None = None
+         if getattr(config, "enable_confidence_head", True):
+@@ -605,6 +621,33 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
++    # --- Vocabulary-parallel greedy drafting (SPARK3_DSPARK_VOCAB_PARALLEL) ---
++    # Each rank keeps its vocabulary shard of the draft logits and Markov bias
++    # and reduces only (max, index) pairs across ranks: exact greedy drafts
++    # without the draft-logits all-gather or a replicated Markov projection.
++
++    @property
++    def vocab_parallel_greedy(self) -> bool:
++        return not self.model.markov_head.markov_w2.disable_tp
++
++    @property
++    def draft_vocab_shard(self) -> tuple[int, int]:
++        """(first global vocabulary index, real entries) of this rank's shard."""
++        assert self.lm_head is not None
++        shard = self.lm_head.shard_indices
++        return shard.org_vocab_start_index, shard.num_org_elements
++
++    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        assert self.lm_head is not None
++        return self.logits_processor(
++            self.lm_head, self.model.norm(hidden_states), skip_gather=True
++        )
++
++    def markov_bias_local(self, markov_embed: torch.Tensor) -> torch.Tensor:
++        return self.logits_processor(
++            self.model.markov_head.markov_w2, markov_embed, skip_gather=True
++        )
++
+     def apply_markov_bias_gathered(
+         self,
+         markov_embed: torch.Tensor,
+@@ -759,6 +802,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return loaded_params
+ 
+     def process_weights_after_loading(self) -> None:
++        if self.vocab_parallel_greedy:
++            assert self.lm_head is not None
++            head, markov = self.lm_head.shard_indices, self.model.markov_head.markov_w2.shard_indices
++            if (head.org_vocab_start_index, head.num_org_elements) != (
++                markov.org_vocab_start_index, markov.num_org_elements
++            ):
++                raise RuntimeError(
++                    "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
++                    f"projection sharded alike: {head} != {markov}"
++                )
+         self.logits_processor.prepare_b12x_vocab_projection(
+             self.model.markov_head.markov_w2
+         )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index f8f00a1f6a..a3f6da8a08 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -64,6 +64,103 @@ def _finish_argmax(
+     tl.store(output + row * output_stride, result)
+ 
+ 
++@triton.jit
++def _finish_argmax_pair(
++    values,
++    indices,
++    pairs,
++    vocab_start,
++    PARTS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    part = tl.arange(0, BLOCK)
++    value = tl.load(values + row * PARTS + part, part < PARTS, other=-float("inf"))
++    index = tl.load(indices + row * PARTS + part, part < PARTS, other=2147483647)
++    best, result = tl.reduce((value, index), 0, _first_argmax)
++    tl.store(pairs + row * 2, best)
++    tl.store(pairs + row * 2 + 1, (result + vocab_start).to(tl.float32))
++
++
++@triton.jit
++def _select_first_argmax(
++    pairs,
++    output,
++    output_stride,
++    RANKS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0)
++    rank = tl.arange(0, BLOCK)
++    value = tl.load(pairs + row * 2 * RANKS + 2 * rank, rank < RANKS, other=-float("inf"))
++    index = tl.load(pairs + row * 2 * RANKS + 2 * rank + 1, rank < RANKS, other=1073741824.0)
++    _, result = tl.reduce((value, index.to(tl.int32)), 0, _first_argmax)
++    tl.store(output + row * output_stride, result)
++
++
++def greedy_markov_shard_pair(
++    base_logits: torch.Tensor,
++    markov_bias: torch.Tensor,
++    vocab_start: int,
++    pairs: torch.Tensor,
++    partial_values: torch.Tensor,
++    partial_indices: torch.Tensor,
++) -> None:
++    """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
++    over one vocabulary shard into FP32 ``pairs`` ([rows, 2]).
++
++    The value keeps the materialized sum's rounding, and the index is the
++    shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
++    2**24). All-gathering the pairs across shards and passing them to
++    ``select_first_argmax`` reproduces the full-vocabulary argmax, ties and
++    NaNs included, because shards hold ascending index ranges.
++    """
++    if base_logits.shape != markov_bias.shape:
++        raise ValueError(
++            "DSpark greedy base logits and Markov bias must have identical shapes: "
++            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
++        )
++    rows, vocab = base_logits.shape
++    if vocab_start + vocab > 1 << 24:
++        raise ValueError("vocabulary indices must stay exact in FP32")
++    parts = triton.cdiv(vocab, _BLOCK)
++    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
++        raise ValueError("DSpark greedy scratch is smaller than the logits require")
++    _partial_argmax[(rows, parts)](
++        base_logits,
++        markov_bias,
++        partial_values,
++        partial_indices,
++        base_logits.stride(0),
++        markov_bias.stride(0),
++        vocab,
++        parts,
++        _BLOCK,
++    )
++    _finish_argmax_pair[(rows,)](
++        partial_values,
++        partial_indices,
++        pairs,
++        vocab_start,
++        parts,
++        triton.next_power_of_2(parts),
++    )
++
++
++def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
++    """Reduce all-gathered shard pairs ([rows, 2 * ranks], FP32) to the first
++    maximum's global index, written to ``output`` (one per row)."""
++    rows, width = pairs.shape
++    ranks = width // 2
++    _select_first_argmax[(rows,)](
++        pairs,
++        output,
++        output.stride(0),
++        ranks,
++        triton.next_power_of_2(ranks),
++    )
++
++
+ def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
+     return max_requests, triton.cdiv(vocabulary_size, _BLOCK)
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index bc861577bb..3191852d4b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -32,7 +32,10 @@ from vllm.config.compilation import CUDAGraphMode
+ from vllm.logger import init_logger
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
++    greedy_markov_shard_pair,
++    select_first_argmax,
+     sample_greedy_markov,
+     scratch_shape,
+ )
+@@ -95,6 +98,11 @@ class DSparkSpeculator(DFlashSpeculator):
+         self._greedy_partial_indices = torch.empty(
+             shape, dtype=torch.int32, device=device
+         )
++        # Per-request (max, global index) of this rank's vocabulary shard,
++        # for vocabulary-parallel greedy drafts.
++        self._greedy_shard_pairs = torch.empty(
++            (self.max_num_reqs, 2), dtype=torch.float32, device=device
++        )
+ 
+     @property
+     def attn_vllm_config(self) -> VllmConfig:
+@@ -200,8 +208,20 @@ class DSparkSpeculator(DFlashSpeculator):
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+-        # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        # Greedy drafts over full target vocabularies can stay sharded: each
++        # rank reduces its shard and only (max, index) pairs are gathered.
++        vocab_parallel = (
++            getattr(self.model, "vocab_parallel_greedy", False)
++            and self.draft_logits is None
++            and self.model.draft_id_to_target_id is None
++            and self.acceptance_estimator is None
++        )
++        if vocab_parallel:
++            vocab_start, shard_vocab = self.model.draft_vocab_shard
++            base_logits = self.model.compute_draft_logits_local(sample_hidden)
++        else:
++            # Draft-vocab logits; sampled ids are remapped to target vocab below.
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -218,6 +238,23 @@ class DSparkSpeculator(DFlashSpeculator):
+             markov_embed = self.model.markov_embed(prev)
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
++            if vocab_parallel:
++                bias = self.model.markov_bias_local(markov_embed)
++                pairs = self._greedy_shard_pairs[:num_reqs]
++                greedy_markov_shard_pair(
++                    base_logits[:, i, :shard_vocab],
++                    bias[:, :shard_vocab],
++                    vocab_start,
++                    pairs,
++                    self._greedy_partial_values,
++                    self._greedy_partial_indices,
++                )
++                draft_sampled_i = self.draft_tokens[:num_reqs, i]
++                select_first_argmax(
++                    tensor_model_parallel_all_gather(pairs, dim=-1), draft_sampled_i
++                )
++                prev = draft_sampled_i
++                continue
+             bias = self.model.markov_bias(markov_embed)
+             if (
+                 self.draft_logits is None
+-- 
+2.43.0
+
