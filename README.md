@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-27-karmic-kraken-r5c.json](manifests/baselines/2026-09-27-karmic-kraken-r5c.json):
+[manifests/baselines/2026-09-27-karmic-kraken-r5e.json](manifests/baselines/2026-09-27-karmic-kraken-r5e.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -27,7 +27,8 @@ The active baseline is recorded in
   tower loaded (up to four images per request);
 - DSpark speculative decoding with five draft tokens (the drafter's trained
   block) and block rejection, full CUDA graphs for decode batches up to 48
-  tokens;
+  tokens; verification rows whose drafts are unlikely to survive skip the
+  routed experts;
 - B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
   model's SwiGLU clamp and caused the incoherence seen in earlier images;
 - 131,072-token per-request limit, eight admitted sequences, and 575,304 KV
@@ -52,37 +53,37 @@ default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 44.7 | 46.4 | 0.23 s |
-| prose | 2 | 69.0 | 36.9 | 0.36 s |
-| prose | 4 | 101.2 | 28.0 | 0.48 s |
-| prose | 8 | 150.0 | 20.8 | 0.55 s |
-| code | 1 | 56.4 | 59.2 | 0.23 s |
-| code | 2 | 83.2 | 45.8 | 0.37 s |
-| code | 4 | 125.4 | 35.2 | 0.50 s |
-| code | 8 | 180.0 | 25.5 | 0.58 s |
+| prose | 1 | 45.4 | 47.1 | 0.23 s |
+| prose | 2 | 70.2 | 37.6 | 0.36 s |
+| prose | 4 | 104.1 | 28.7 | 0.46 s |
+| prose | 8 | 147.6 | 20.7 | 0.61 s |
+| code | 1 | 56.2 | 59.2 | 0.25 s |
+| code | 2 | 83.2 | 46.0 | 0.37 s |
+| code | 4 | 121.2 | 34.2 | 0.51 s |
+| code | 8 | 174.8 | 24.9 | 0.60 s |
 
 With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 
 | Prompt | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| prose | 46.4 | 79.3 | 117.4 | 164.3 |
-| code | 68.5 | 104.2 | 151.4 | 237.0 |
-| JSON | 67.1 | 96.7 | 152.6 | 227.6 |
+| prose | 48.9 | 77.4 | 115.2 | 159.0 |
+| code | 72.7 | 104.1 | 156.5 | 225.2 |
+| JSON | 67.8 | 100.9 | 153.4 | 227.6 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Single-stream decode step | about 52 ms on prose and 56 ms on code; accepted drafts per step 1.4 (prose), 2.4 (code), 3.1 (code answers) |
-| Cold prefill | 2K 3.9k, 32K 4.2k, 64K 4.1k tok/s |
-| Prefix-cache replay, 32K prompt | 7.56 s cold, 0.26 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.0 tok/s per stream |
+| Single-stream decode step | about 47 ms on prose and 53 ms on code; accepted drafts per step 1.2 (prose), 2.1 (code), 3.2 (code answers) |
+| Cold prefill | 2K 3.8k, 32K 4.1k, 64K 4.0k tok/s |
+| Prefix-cache replay, 32K prompt | 7.68 s cold, 0.27 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.1 tok/s per stream |
 | KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.6 GiB MemAvailable during startup (5 GiB guard), 6.2 GiB under load (3 GiB guard) |
+| Host memory headroom | dgx1 at least 5.86 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
 The quick default takes three or four samples per decode point, about ±2-12%
 at 95% confidence; temperature-0 outputs differ between identical requests,
 which moves acceptance from sample to sample. Report:
-[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-27-karmic-kraken-r5c.json).
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-27-karmic-kraken-r5e.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract
