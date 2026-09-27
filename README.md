@@ -183,10 +183,28 @@ Suites of the full run, in order (`--suites` selects a subset):
   Single boots of one configuration differ by about 3%, because adaptive
   verification profiles its costs at startup, so effects smaller than that
   need several boots per arm.
+  `--decode-cases` selects other cases. `prose-nothink`, `code-nothink` and
+  `json-nothink` turn reasoning off to measure the answer itself. The
+  `portable` group (`count`, `explain`, `tasks`, `rows`, `math`, `chat`,
+  `essay`, `story`, `chat-sampled`) follows the protocol public DGX Spark
+  benchmarks use, so figures line up with theirs:
+  - reasoning off, and exactly 256 tokens (`min_tokens` with `ignore_eos`);
+  - a distinct prompt per stream, and distinct code tasks for `tasks`;
+  - workloads from a number sequence through code and JSON to free prose;
+  - `chat-sampled` at temperature 0.7.
+
+  Every decode point also reports `decode_window_tps`: the tokens after each
+  stream's first, over the span from the earliest first token to the latest
+  last token. It leaves out prefill and the start stagger of a concurrent
+  wave.
 - `sampled`: DSpark accepted drafts per step at temperature 1.0 from the
   engine counters, 32 requests per case at concurrency 1 and 4.
 - `prefill`: cold prefill at 2K, 32K, 64K, and 128K tokens, three unique
-  uncached prompts each.
+  uncached prompts each. `--prefill-text` chooses the text:
+  - `filler` (the default) repeats 18 words, so its Engram rows stay cached;
+  - `novel` uses random pseudo-words, whose rows are read from disk;
+  - `source` uses real text, the Python standard library's source and
+    docstrings.
 - `prefix`: a 32K prompt followed by two identical replays, reporting cold and
   warm TTFT and the cache hit rate.
 - `admission`: four concurrent 64K-token contexts; all four must run at once

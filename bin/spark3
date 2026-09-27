@@ -7,6 +7,7 @@ import argparse
 import ast
 import concurrent.futures
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -18,12 +19,14 @@ import signal
 import socket
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1905,14 +1908,36 @@ DECODE_PROMPTS = {
         "complexity after the code."
     ),
 }
+DECODE_TOKENS = 256
+
+
+class DecodeCase(NamedTuple):
+    """One decode workload.
+
+    prompt: one prompt, or a tuple of distinct prompts given to successive
+        streams (cycled, with a stream tag once they repeat).
+    per_stream: tag a single prompt with each stream's number, so concurrent
+        streams neither share a prefix-cache block nor produce one output.
+    fixed_length: generate exactly DECODE_TOKENS tokens (min_tokens and
+        ignore_eos), so every stack and sample measures the same length.
+    """
+
+    prompt: str | tuple[str, ...]
+    template_kwargs: dict | None = None
+    fixed_length: bool = False
+    per_stream: bool = False
+    temperature: float = 0.0
+    top_p: float | None = None
+
+
 # Extra decode cases, selected with --decode-cases. The server reasons by
 # default, so most of what "prose" and "code" measure is reasoning text; the
 # -nothink cases turn reasoning off to measure the answer itself, where draft
 # acceptance differs most.
 DECODE_CASES = {
-    "prose-nothink": (DECODE_PROMPTS["prose"], {"thinking": False}),
-    "code-nothink": (DECODE_PROMPTS["code"], {"thinking": False}),
-    "json-nothink": (
+    "prose-nothink": DecodeCase(DECODE_PROMPTS["prose"], {"thinking": False}),
+    "code-nothink": DecodeCase(DECODE_PROMPTS["code"], {"thinking": False}),
+    "json-nothink": DecodeCase(
         "Return only a JSON array of twelve objects describing fictional "
         "library books, with no prose and no code fence. Each object has "
         "the keys title, author, year, genres (an array of two strings), "
@@ -1921,7 +1946,76 @@ DECODE_CASES = {
         {"thinking": False},
     ),
 }
-DECODE_CASES.update((case, (prompt, None)) for case, prompt in DECODE_PROMPTS.items())
+DECODE_CASES.update((case, DecodeCase(prompt)) for case, prompt in DECODE_PROMPTS.items())
+# Portable cases follow the protocol public DGX Spark benchmarks use, so
+# figures line up with theirs: reasoning off, exactly 256 tokens, a distinct
+# prompt per stream, and workloads from highly predictable (a count) to
+# free-running prose and sampled chat.
+PORTABLE_CODE_TAIL = (
+    "Reply with Python source only: no comments, no docstrings, no Markdown "
+    "fences. After it, write unit tests and any helpers they need, and keep "
+    "writing code."
+)
+PORTABLE_CODE_TASKS = tuple(
+    f"{name}\n{spec}\n{PORTABLE_CODE_TAIL}"
+    for name, spec in (
+        ("flatten", "def flatten(items) -> list: flatten arbitrarily nested lists of ints, preserving order."),
+        ("stack", "class Stack: push, pop, peek and is_empty over a list, raising IndexError on underflow."),
+        ("palindrome", "def is_palindrome(text) -> bool: ignore case and every non-alphanumeric character."),
+        ("word_counts", "def word_counts(text) -> dict: count words case-insensitively, ignoring punctuation."),
+        ("matmul", "def matmul(a, b) -> list: multiply two matrices given as lists of rows, checking shapes."),
+        ("trie", "class Trie: insert(word), contains(word) and starts_with(prefix) over nested dicts."),
+        ("roman", "def roman_to_int(text) -> int: convert a Roman numeral, including subtractive pairs."),
+        ("rotate", "def rotate(nums, k) -> list: rotate a list right by k positions, for any integer k."),
+    )
+)
+PORTABLE_CASES = {
+    "count": "Count upward from 1 to 400. Write only the numbers, separated by single spaces, and nothing else.",
+    "explain": (
+        "Explain step by step how a B-tree index works in a database: node "
+        "layout, search, insertion with node splits, deletion with merges, and "
+        "the cost of each operation. Be thorough and precise."
+    ),
+    "tasks": PORTABLE_CODE_TASKS,
+    "rows": (
+        "Output only a JSON array of invented server telemetry records. Each "
+        "record has hostname, rack, cpuPct, memPct, diskIops, netMbps and "
+        "status. Produce as many records as you can, with no Markdown and no "
+        "commentary."
+    ),
+    "math": (
+        "Solve this step by step, showing every calculation: a train leaves a "
+        "station at 9:40 at 84 km/h, and a second train follows on the same "
+        "track at 10:15 at 112 km/h. When and how far from the station does "
+        "the second train catch the first? Then write and solve three similar "
+        "problems with different numbers."
+    ),
+    "chat": (
+        "Explain to a curious twelve-year-old how the heart pumps blood around "
+        "the body, why it beats faster during exercise, and what blood pressure "
+        "means. Be friendly and concrete."
+    ),
+    "essay": (
+        "Write a flowing essay of about 900 words on the history of bridges, "
+        "from rope bridges and Roman arches to modern cable-stayed spans. Use "
+        "full paragraphs only: no headings, no lists and no Markdown."
+    ),
+    "story": (
+        "Write continuous literary prose of about 900 words following a "
+        "mountain town through one winter, seen by a baker, a schoolteacher "
+        "and a snowplough driver. No headings and no lists."
+    ),
+}
+DECODE_CASES.update(
+    (case, DecodeCase(prompt, {"thinking": False}, fixed_length=True, per_stream=True))
+    for case, prompt in PORTABLE_CASES.items()
+)
+DECODE_CASES["chat-sampled"] = DecodeCase(
+    PORTABLE_CASES["chat"], {"thinking": False}, fixed_length=True, per_stream=True,
+    temperature=0.7, top_p=0.95,
+)
+# Names --decode-cases expands.
+DECODE_CASE_GROUPS = {"portable": [*PORTABLE_CASES, "chat-sampled"]}
 SAMPLED_PROMPTS = {
     "prose": (
         "Write a short essay about how rivers shape the land and the people "
@@ -2045,6 +2139,7 @@ def stream_request(
     )
     started = time.perf_counter()
     first: float | None = None
+    last: float | None = None
     status: int | None = None
     usage: dict = {}
     content: list[str] = []
@@ -2081,6 +2176,7 @@ def stream_request(
                         first = time.perf_counter()
                     if not emitted:
                         continue
+                    last = time.perf_counter()
                     digest.update(emitted.encode())
                     for key in ("reasoning_content", "reasoning"):
                         if isinstance(delta.get(key), str):
@@ -2106,6 +2202,10 @@ def stream_request(
         "reasoning_chars": reasoning_chars,
         "content_chars": content_chars,
         "error": error,
+        # Absolute clock readings; Bench.run turns them into offsets from the
+        # sample's start (first_s, last_s).
+        "first_at": first,
+        "last_at": last,
     }
     if keep_content:
         result["content"] = "".join(content)
@@ -2395,6 +2495,10 @@ class Bench:
                     self.halt("interrupted")
                     raise
             wall = time.perf_counter() - started
+            for result in results:
+                for key in ("first", "last"):
+                    at = result.pop(f"{key}_at", None)
+                    result[f"{key}_s"] = None if at is None else round(at - started, 4)
             peaks = peak.finish()
             self.sent += len(payloads)
             if self.stop.is_set():
@@ -2428,6 +2532,48 @@ def chat_payload(model: str, prompt: str, max_tokens: int, **extra) -> tuple[str
     return "/v1/chat/completions", payload
 
 
+def decode_payloads(model: str, case: str, concurrency: int) -> list[tuple[str, dict]]:
+    spec = DECODE_CASES[case]
+    extra: dict = {}
+    if spec.template_kwargs:
+        extra["chat_template_kwargs"] = spec.template_kwargs
+    if spec.fixed_length:
+        extra.update(min_tokens=DECODE_TOKENS, ignore_eos=True)
+    if spec.top_p is not None:
+        extra["top_p"] = spec.top_p
+    payloads = []
+    for stream in range(concurrency):
+        if isinstance(spec.prompt, tuple):
+            prompt = spec.prompt[stream % len(spec.prompt)]
+            if stream >= len(spec.prompt):
+                prompt = f"[stream {stream + 1}]\n{prompt}"
+        elif spec.per_stream and concurrency > 1:
+            prompt = f"{spec.prompt} (stream {stream + 1}/{concurrency})"
+        else:
+            prompt = spec.prompt
+        seed = 42 + stream if spec.temperature else 42
+        payloads.append(
+            chat_payload(model, prompt, DECODE_TOKENS, temperature=spec.temperature, seed=seed, **extra)
+        )
+    return payloads
+
+
+def decode_window_tps(requests: list[dict]) -> float | None:
+    """Tokens after each stream's first, over the span from the earliest first
+    token to the latest last token: aggregate decode without prefill or the
+    start stagger of a concurrent wave."""
+    ok = [
+        request for request in requests
+        if request.get("ok") and request.get("first_s") is not None
+        and request.get("last_s") is not None and (request.get("completion_tokens") or 0) > 1
+    ]
+    if not ok:
+        return None
+    window = max(request["last_s"] for request in ok) - min(request["first_s"] for request in ok)
+    tokens = sum(request["completion_tokens"] - 1 for request in ok)
+    return round(tokens / window, 3) if window > 0 else None
+
+
 def filler(tokens: int, seed: int) -> str:
     # About one token per word for these plain lowercase words.
     body = " ".join(FILLER_WORDS[(i * 7 + seed) % len(FILLER_WORDS)] for i in range(tokens))
@@ -2447,6 +2593,34 @@ def novel_text(tokens: int, seed: int) -> str:
         for _ in range(int(tokens * 0.8))
     )
     return f"Document {seed}:\n" + " ".join(words)
+
+
+# Python source averages a little over three characters per token.
+SOURCE_CHARS_PER_TOKEN = 3.2
+
+
+@functools.cache
+def standard_library_sources() -> tuple[Path, ...]:
+    root = Path(sysconfig.get_paths()["stdlib"])
+    return tuple(sorted(path for path in root.glob("*.py") if path.stat().st_size > 4096))
+
+
+def source_text(tokens: int, seed: int) -> str:
+    """Real text: the Python standard library's source and docstrings, read
+    from a seeded file onward, like the documentation and code prompts
+    public benchmarks prefill with. The first line keeps every prompt's
+    prefix unique."""
+    files = standard_library_sources()
+    index = random.Random(seed).randrange(len(files))
+    chars = int(tokens * SOURCE_CHARS_PER_TOKEN)
+    parts: list[str] = []
+    size = 0
+    while size < chars:
+        text = files[index % len(files)].read_text(encoding="utf-8", errors="replace")
+        parts.append(text)
+        size += len(text)
+        index += 1
+    return f"Document {seed}:\n" + "".join(parts)[:chars]
 
 
 def acceptance(metrics: dict) -> float | None:
@@ -2475,8 +2649,8 @@ def step_times_ms(samples: list[dict]) -> list[float]:
 
 
 def compact(results: list[dict]) -> list[dict]:
-    keys = ("ok", "ttft_s", "prompt_tokens", "completion_tokens", "decode_tps", "output_sha256",
-            "reasoning_chars", "content_chars", "error")
+    keys = ("ok", "ttft_s", "first_s", "last_s", "prompt_tokens", "completion_tokens", "decode_tps",
+            "output_sha256", "reasoning_chars", "content_chars", "error")
     return [{key: result[key] for key in keys if key in result} for result in results]
 
 
@@ -2524,10 +2698,7 @@ def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) 
 
     def sample(point: str) -> dict:
         case, concurrency = point.rsplit("-c", 1)
-        prompt, template_kwargs = DECODE_CASES[case]
-        extra = {"chat_template_kwargs": template_kwargs} if template_kwargs else {}
-        payload = chat_payload(options.model, prompt, 256, temperature=0, seed=42, **extra)
-        return bench.run(point, [payload] * int(concurrency))
+        return bench.run(point, decode_payloads(options.model, case, int(concurrency)))
 
     print("  warmup: one discarded sample per point", flush=True)
     for point in rng.sample(points, len(points)):
@@ -2546,6 +2717,7 @@ def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) 
             drafts = metrics["spec_decode_num_drafts"]
             samples[point].append({
                 "tps": round(tokens / result["wall_s"], 3),
+                "decode_window_tps": decode_window_tps(requests),
                 "accepted_per_draft": acceptance(metrics),
                 # Adaptive verification trims draft rows per step; step time
                 # follows the rows it keeps, so record them with each sample.
@@ -2572,6 +2744,7 @@ def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) 
         ok = [request for request in requests if request["ok"]]
         summary[point] = {
             "tps": describe([entry["tps"] for entry in entries]),
+            "decode_window_tps": describe([entry["decode_window_tps"] for entry in entries if entry.get("decode_window_tps")]),
             "per_stream_decode_tps": describe([request["decode_tps"] for request in ok if request["decode_tps"]]),
             "ttft_s": describe([request["ttft_s"] for request in ok]),
             "accepted_per_draft": describe([entry["accepted_per_draft"] for entry in entries if entry["accepted_per_draft"] is not None]),
@@ -2621,7 +2794,7 @@ def suite_sampled(bench: Bench, options: argparse.Namespace, rng: random.Random)
 
 def suite_prefill(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
     """Cold prefill: unique uncached prompts, one output token."""
-    prefill_text = novel_text if options.prefill_text == "novel" else filler
+    prefill_text = {"filler": filler, "novel": novel_text, "source": source_text}[options.prefill_text]
     sizes = [size for size in options.prefill_sizes if size < options.max_model_len - 64]
     samples: dict[str, list[dict]] = {str(size): [] for size in sizes}
     for _ in range(options.prefill_repeats):
@@ -2871,6 +3044,9 @@ def command_bench(args: argparse.Namespace) -> int:
     max_seqs = int(serve_arg(cluster, "--max-num-seqs") or 1)
     if not args.concurrency or max(args.concurrency) > max_seqs or min(args.concurrency) < 1:
         raise SystemExit(f"--concurrency values must be between 1 and --max-num-seqs ({max_seqs})")
+    args.decode_cases = list(dict.fromkeys(
+        expanded for case in args.decode_cases for expanded in DECODE_CASE_GROUPS.get(case, [case])
+    ))
     unknown_cases = sorted(set(args.decode_cases) - set(DECODE_CASES))
     if unknown_cases:
         raise SystemExit(f"unknown decode cases: {', '.join(unknown_cases)}")
@@ -3123,14 +3299,18 @@ def parser() -> argparse.ArgumentParser:
         "--decode-cases",
         type=lambda value: [case.strip() for case in value.split(",") if case.strip()],
         default=["prose", "code"],
-        help=f"comma-separated decode cases (default prose,code): {', '.join(DECODE_CASES)}",
+        help=(
+            "comma-separated decode cases (default prose,code): "
+            f"{', '.join(DECODE_CASES)}; groups: {', '.join(DECODE_CASE_GROUPS)}"
+        ),
     )
     bench.add_argument(
         "--prefill-text",
-        choices=("filler", "novel"),
+        choices=("filler", "novel", "source"),
         default="filler",
-        help="cold-prefill prompt text: the repeating filler (default) or random "
-        "pseudo-words whose Engram rows are not cached",
+        help="cold-prefill prompt text: the repeating filler (default), random "
+        "pseudo-words whose Engram rows are not cached, or real text (Python "
+        "standard-library source)",
     )
     bench.add_argument("--sampled-requests", type=int, default=32)
     bench.add_argument("--prefill-sizes", type=int_list, default=[2048, 32768, 65536, 131072])

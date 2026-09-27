@@ -87,8 +87,53 @@ class ParsingTest(unittest.TestCase):
 
     def test_decode_cases_keep_the_reference_prompts(self) -> None:
         for case, prompt in spark3.DECODE_PROMPTS.items():
-            self.assertEqual(spark3.DECODE_CASES[case], (prompt, None))
-        self.assertEqual(spark3.DECODE_CASES["code-nothink"][1], {"thinking": False})
+            self.assertEqual(spark3.DECODE_CASES[case], spark3.DecodeCase(prompt))
+            payloads = spark3.decode_payloads("m", case, 4)
+            self.assertEqual([payload for _, payload in payloads], [payloads[0][1]] * 4)
+            self.assertEqual(payloads[0][1]["temperature"], 0)
+            self.assertEqual(payloads[0][1]["seed"], 42)
+            self.assertNotIn("min_tokens", payloads[0][1])
+        self.assertEqual(spark3.DECODE_CASES["code-nothink"].template_kwargs, {"thinking": False})
+
+    def test_portable_cases_fix_the_length_and_vary_by_stream(self) -> None:
+        self.assertEqual(
+            spark3.DECODE_CASE_GROUPS["portable"],
+            ["count", "explain", "tasks", "rows", "math", "chat", "essay", "story", "chat-sampled"],
+        )
+        for case in spark3.DECODE_CASE_GROUPS["portable"]:
+            payloads = [payload for _, payload in spark3.decode_payloads("m", case, 8)]
+            self.assertEqual(len({payload["messages"][0]["content"] for payload in payloads}), 8, case)
+            for payload in payloads:
+                self.assertEqual(payload["min_tokens"], 256)
+                self.assertEqual(payload["max_tokens"], 256)
+                self.assertTrue(payload["ignore_eos"])
+                self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
+        # One stream gets the exact prompt; code streams get distinct tasks,
+        # tagged once the tasks repeat.
+        single = spark3.decode_payloads("m", "count", 1)[0][1]
+        self.assertEqual(single["messages"][0]["content"], spark3.PORTABLE_CASES["count"])
+        tasks = [payload["messages"][0]["content"] for _, payload in spark3.decode_payloads("m", "tasks", 10)]
+        self.assertEqual(tasks[0], spark3.PORTABLE_CODE_TASKS[0])
+        self.assertEqual(tasks[9], f"[stream 10]\n{spark3.PORTABLE_CODE_TASKS[1]}")
+        sampled = [payload for _, payload in spark3.decode_payloads("m", "chat-sampled", 2)]
+        self.assertEqual([(p["temperature"], p["top_p"], p["seed"]) for p in sampled], [(0.7, 0.95, 42), (0.7, 0.95, 43)])
+
+    def test_decode_window_excludes_prefill_and_start_stagger(self) -> None:
+        requests = [
+            {"ok": True, "first_s": 0.2, "last_s": 2.2, "completion_tokens": 101},
+            {"ok": True, "first_s": 0.4, "last_s": 3.2, "completion_tokens": 201},
+            {"ok": False, "first_s": 0.1, "last_s": 9.0, "completion_tokens": 50},
+        ]
+        self.assertEqual(spark3.decode_window_tps(requests), 100.0)
+        self.assertIsNone(spark3.decode_window_tps([{"ok": True, "first_s": None, "last_s": None, "completion_tokens": 9}]))
+
+    def test_source_text_is_real_reproducible_text(self) -> None:
+        text = spark3.source_text(20000, 3)
+        self.assertEqual(text, spark3.source_text(20000, 3))
+        self.assertNotEqual(text, spark3.source_text(20000, 4))
+        self.assertTrue(text.startswith("Document 3:\n"))
+        self.assertEqual(len(text), len("Document 3:\n") + int(20000 * spark3.SOURCE_CHARS_PER_TOKEN))
+        self.assertIn("def ", text)
 
     def test_assess_lru(self) -> None:
         good = "```python\nclass LRU:\n    def get(self, key):\n        pass\n    def put(self, key, value):\n        pass\n```"
@@ -137,6 +182,8 @@ class StreamTest(unittest.TestCase):
         self.assertEqual(result["reasoning_chars"], 6)
         self.assertEqual(result["content_chars"], 5)
         self.assertEqual(spark3.reasoning_share([result]), 0.545)
+        # The last token is the last emitted text, not the usage chunk.
+        self.assertLessEqual(result["first_at"], result["last_at"])
 
     def test_completion_stream_counts_an_empty_first_token(self) -> None:
         url = self.serve(
