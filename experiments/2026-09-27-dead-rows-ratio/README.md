@@ -54,4 +54,36 @@ Memory guards unchanged.
 
 ## Results
 
-Pending.
+Two ratio runs (13:48-14:05 local, six samples per point) against the three
+pooled r5d controls of `experiments/2026-09-27-dead-rows` (nine samples),
+same day and protocol. budget02 (fixed 0.2 cut inside the host budget) for
+reference:
+
+| Point | ratio | budget02 |
+|---|---|---|
+| prose c1 | +7.3% | +3.4% |
+| code c1 | +1.4% | +4.0% |
+| prose answer c1 | +9.3% | +10.1% |
+| code answer c1 | +4.1% | +2.8% |
+| prose c8 | -0.5% | +1.8% |
+| code c8 | +3.1% | +0.9% |
+| prose answer c8 | -0.6% | +0.5% |
+| code answer c8 | -1.7% | +5.1% |
+| mean | +2.8% | +3.6% |
+
+Single-stream step time (ms): control 54.7 / 58.6 / 55.7 / 60.0 (prose, code,
+prose answer, code answer); ratio 47.4 / 53.3 / 49.5 / 56.2; budget02
+48.1 / 56.3 / 51.6 / 58.5.
+
+- At one stream the cost rule shortens steps the most (4-7 ms) and gains
+  +5.5% on average.
+- At eight streams it is neutral: it cuts prose acceptance from 1.17 to
+  0.93 accepted drafts per step and saves only enough time to offset that.
+  The replay predicted +3.4%. The live-row price comes from a profile of
+  random, uncorrelated tokens in graphs of different sizes. Real drafts share
+  experts, and a dead row sits inside a fixed graph, so at eight streams a
+  dead row saves less than priced and the rule cuts too much.
+- Not a completion-stagger effect: aggregate throughput over the summed
+  per-request rates (0.89-0.92) and the spread of per-request rates match
+  the control.
+- Quality gate LRU 5/5; dgx1 minimum MemAvailable 6.4 GiB.
