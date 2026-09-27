@@ -86,6 +86,16 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   a verified row at about 0.4 ms against several milliseconds in real
   steps. Output unchanged. Upstream status: candidate, not submitted.
 
-Applying 0001-0009 to the base yields patch head `d7234353` and tree
+- `0010-dspark-dead-verification-rows.patch`
+  (`SPARK3_DSPARK_DEAD_ROWS_TAU`) marks verification rows past each
+  request's confidence cut (survival of this step's drafts below the
+  threshold) as padding inside the draft combine, so routed MoE reads no
+  expert weights for them, and commits at most one token past the last live
+  row. `SPARK3_DSPARK_VERIFY_RULE=all` schedules every draft so the cut alone
+  decides. Off by default; output unchanged. Upstream status: candidate, not
+  submitted.
+
+Applying 0001-0010 to the base yields patch head `a6ec0420` and tree
+`e9409518` (0001-0009: `d7234353`, tree
 `f250542a` (on the r4 base `01f1b874`: patch head `84f0b5dc`, tree
 `ee3a0fd4`).
