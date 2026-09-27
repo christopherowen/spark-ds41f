@@ -26,6 +26,9 @@ arms = {
     # Every dynamic W4A8 MoE launch on the M32 tile (the fused persistent
     # kernel), prefill and decode alike.
     "tile32": arm("tile32", {"B12X_DYNAMIC_TILE_MN": "32x128"}),
+    # NCCL's Simple protocol for the prefill all-reduces (decode collectives
+    # use the RoCE one-shot kernel, not NCCL).
+    "simple": arm("simple", {"NCCL_PROTO": "Simple"}),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")

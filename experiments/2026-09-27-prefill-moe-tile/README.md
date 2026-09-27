@@ -1,4 +1,4 @@
-# Prefill MoE tile: M32 fused kernel against the M64 split path
+# Prefill: M32 fused MoE tile and NCCL's Simple protocol
 
 Base: the promoted configuration (`2026-09-27-karmic-kraken-r5e`).
 
@@ -13,16 +13,23 @@ tactics by 16-36% through the DeepSeek V4 TP2 prefill band. That rule is
 keyed to V4's 256 experts and 1024-wide slice, so it never selects M32 for
 V4.1 at TP3. Does M32 win here too?
 
+The same chunk spends about 142 ms in 45 NCCL all-reduces of 42 MB each,
+run as `RING_LL`: `NCCL_PROTO=^LL128` still lets NCCL's tuner pick the
+low-latency protocol for large messages, at about 13.5 GB/s. Decode
+collectives use the RoCE one-shot kernel, so NCCL carries only these. Does
+the Simple protocol move them faster?
+
 ## Arms
 
 | Arm | Change from the promoted configuration |
 |---|---|
 | `control` | none |
 | `tile32` | `B12X_DYNAMIC_TILE_MN=32x128` (every dynamic MoE launch, decode included) |
+| `simple` | `NCCL_PROTO=Simple` |
 
 ## Workload and gates
 
-`sequence.sh`: control, tile32, control again. Each runs the LRU gate,
+`sequence.sh`: control, tile32, simple, control again. Each runs the LRU gate,
 single-stream decode (prose and code answers, `explain`), and cold prefill
 of real text (`--prefill-text source`) at about 4K, 16K, 32K and 64K tokens,
 two repeats. If prefill gains but decode loses, the follow-up is a B12X
