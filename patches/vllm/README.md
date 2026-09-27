@@ -1,6 +1,6 @@
 # vLLM patch stack
 
-Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
+Base: `local-inference-lab/vllm@01f1b874c774b4fade087d5f311970ee53745e01`
 (`integration/karmic-kraken-beta`).
 
 - `0001-engram-projection-tp-padding.patch` lets `engram_config.projection_tp`
@@ -8,15 +8,25 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   not divide by the TP size (TP3): the output is padded to whole 32-row
   block-FP8 scale blocks per rank, the last rank's missing checkpoint rows are
   zero-filled through `allow_tp_padding`, and the gathered output is sliced
-  back. On the r2 base it yielded tree `90fdd043`. Evidence:
+  back. Applying it to the base yields tree `90fdd043`, the promoted image's
+  `local.spark3.vllm.tree` label. Evidence:
   `experiments/2026-09-24-improvement-leads/`. Upstream status: candidate for
   Local Inference Lab, not submitted.
 
-- The former `0002-engram-async-disk-rows.patch` is not carried on this
-  base: its Engram overlap (`VLLM_DS41_ENGRAM_OVERLAP`, on by default) reads
-  both disk tables on a worker thread with B12X `run_lookups` and gates the
-  Engram layers in the graph. The r4 series (base `01f1b874`) still carries
-  0002; see `manifests/sources/2026-09-26-r4-candidate-source.json`.
+- `0002-engram-async-disk-rows.patch` (`SPARK3_ENGRAM_ASYNC=1`) reads disk
+  Engram rows on a reader thread while the forward graph launches, instead of
+  finishing both layers' reads before the launch. The main thread queues the
+  row decode on a side stream behind a host gate and resets a per-layer ready
+  flag; the reader thread only waits for the row IDs, reads the rows, and
+  releases the gate (also on failure); each Engram layer waits on its flag,
+  captured into the CUDA graph. Graphs are identical with the path on or off.
+  Quality: the rows and their decode are unchanged, only their timing; a
+  20 ms injected read delay lengthened steps by 27 ms with quality and
+  acceptance unchanged, showing the gate holds. Applying 0001-0002 to the base
+  yields tree `033fd0cc`. Evidence: `experiments/2026-09-24-three-leads/`
+  and `experiments/2026-09-25-engram-async-ab/`. Upstream status: candidate
+  for Local Inference Lab, not submitted.
+
 
 - `0003-dsml-optional-string-attribute.patch` keeps DSML tool parameters
   that omit `string="true|false"`; the V4 and V4.1 parsers dropped them
@@ -66,11 +76,13 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
 - `0009-dspark-profile-distinct-tokens.patch`
   (`SPARK3_DSPARK_PROFILE_TOKENS=random`) runs adaptive verification's
   startup cost profile on a fixed pseudo-random token sequence, identical on
-  every rank, and on its embeddings where the model takes inputs_embeds.
-  Dummy batches otherwise repeat token 0, every row routes to the same
-  experts, and the profile prices extra verification rows at almost nothing.
-  Output unchanged. Upstream status: candidate, not submitted.
+  every rank, as real rows rather than padding, and on its embeddings where
+  the model takes inputs_embeds. Dummy rows are otherwise padding, which the
+  MoE routers skip, so the profile leaves out routed-expert work and prices
+  a verified row at about 0.4 ms against several milliseconds in real
+  steps. Output unchanged. Upstream status: candidate, not submitted.
 
-Applying the series to the base yields patch head `7e3ca5a6` and tree
-`2b59dbc2` (on the r4 base `01f1b874`, with 0002: `0ccd0f62`, tree
-`0debe853`).
+Applying 0001-0009 to the base yields patch head `84f0b5dc` and tree
+`ee3a0fd4`. The rebase onto the Local Inference Lab heads
+(`experiments/2026-09-27-lil-head`, source manifest
+`2026-09-27-r5-candidate-source.json`) measured slower and is not carried.

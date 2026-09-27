@@ -60,4 +60,32 @@ the nvidia-drm modeset host setting.
 
 ## Results
 
-Pending.
+Screening runs (`sequence_lean.sh`, `results/private/bench/lil-s-*`): one
+boot per arm, three samples at one and eight streams. Every arm passed LRU
+5/5; dgx1's lowest MemAvailable was 5.95-6.58 GiB (r5 base 5.95 GiB, about
+0.4 GiB below r4a). Single-stream step times (ms):
+
+| Arm | prose | code | prose-nothink | code-nothink |
+|---|---:|---:|---:|---:|
+| r4a base (policy b1+b2) | 49.81 | 51.98 | 50.67 | 52.42 |
+| r5 `base` | 51.05 | 53.61 | 51.73 | 53.36 |
+| r5 `nol2` | 52.07 | 53.46 | 52.25 | 53.69 |
+| r5 `realprof` | 51.96 | 53.67 | 52.19 | 53.79 |
+| r5 `k5real` | 55.62 | 58.71 | 57.43 | 60.37 |
+| r5 `k5` | 53.38 | 58.18 | 55.52 | 59.99 |
+
+- The rebased stack is 1.0-1.6 ms per step slower than r4a (code c8
+  -3.5 ±1.7%). L2 prefetch helps it (without it, steps are another 0.5-1 ms
+  slower and code c8 is -6.5 ±1.2% against r4a), so the loss lies elsewhere
+  in the rebase, most likely the base's Engram overlap replacing patch 0002.
+  Not carried forward.
+- `realprof` changes nothing: patch 0009 as first written randomized the
+  tokens but left dummy rows marked as padding, which the MoE routers skip,
+  so its cost curves match the zero-token profile. Patch 0009 now also
+  marks the profile rows as real (`experiments/2026-09-27-dspark-depth5`).
+- Five drafts: code answers +17.6 ±4.9% (cost scale 1) and +13.7 ±4.5%
+  (cost scale 2) at one stream, 3.1-3.3 accepted drafts per step against
+  2.24; reasoning and prose within noise (-7 to +11% at wide intervals).
+- The disk-Engram path of `base`, `realprof` and the five-draft arms is the
+  base's overlap; the determinism arm ran on r4a (`experiments/2026-09-26-
+  dspark-policy`).
