@@ -56,7 +56,12 @@ tokens in brackets), and single-stream decode step time:
 - `simple` changes nothing: the 42 MB prefill all-reduces are bound by the
   RoCE link (a three-rank ring moves about 56 MB per rank in 3.1 ms, about
   145 Gb/s), not by NCCL's protocol choice.
-- Neither is adopted. The prefill levers that remain are sequence-parallel
+- `tile32f` (19:32 UTC, on the r5f configuration, with
+  `B12X_DYNAMIC_W4A8_MATERIALIZED=0` so M32 runs the fused persistent kernel)
+  prefilled 3575 / 3418 / 3433 / 3347 tok/s against 3585 / 3460 / 3439 / 3421
+  for the same-afternoon r5f control (`experiments/2026-09-27-prefill-sp`,
+  `s3-control`): no gain, and dgx1 minimum MemAvailable fell to 5.78 GiB.
+- None is adopted. The prefill levers that remain are sequence-parallel
   prefill (the per-row hyper-connection work, about 150 ms per 4K chunk,
   repeated on every rank) and the fused MoE path.
 - Quality gate LRU 5/5 in every arm; dgx1 minimum MemAvailable 6.2 GiB.
