@@ -116,8 +116,8 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   output. Off by default; output unchanged. Upstream status: candidate, not
   submitted.
 
-Applying 0001-0013 to the base yields patch head `83bbd172` and tree
-`fa5fb6b2`. 0001-0011, the promoted r5e image, give patch head `138b562f`
+Applying 0001-0013 to the base yields patch head `0a00c7b3` and tree
+`73a843bb`. 0001-0011, the promoted r5e image, give patch head `138b562f`
 and tree `7b839dc1`. The r5c image carried an earlier 0009 that moved
 `_dummy_run`'s decorators onto its new helper; its 0001-0009 gave patch
 head `d7234353`, tree `f250542a` (on the r4 base `01f1b874`: patch head

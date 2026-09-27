@@ -25,15 +25,21 @@ keep the drafts and the output unchanged. How much of the step do they save?
 | `control` | none (no overlay) |
 | `vp` | overlay, `SPARK3_DSPARK_VOCAB_PARALLEL=1` |
 | `vpmp` | overlay, `SPARK3_DSPARK_VOCAB_PARALLEL=1`, `SPARK3_DSPARK_MAIN_PROJ_TP=1` |
+| `combo` | as `vpmp`, plus `VLLM_DS41_DRAFT_NVFP4_HEAD=1` and `VLLM_DS41_MARKOV_NVFP4=1` (vocabulary-parallel drafts over an NVFP4 Markov shard) |
 
 ## Workload and gates
 
-`test_overlay.sh` runs the patch tests on dgx3 first. `sequence.sh` runs vp,
-vpmp and a control, each with the LRU gate and the lean decode screen
+`test_overlay.sh` runs the patch tests on dgx3 first. `sequence.sh` runs a
+control, vp, vpmp, combo and a second control, each with the LRU gate and the lean decode screen
 (reasoning and answer cases plus `explain`, one and eight streams, three
 samples). Decide on single-stream step time and accepted drafts per step;
 the drafts should be unchanged, so acceptance should match the control.
 
 ## Results
+
+The first attempt (16:13 UTC) failed at startup: 0012 checked the draft
+head's partition in `process_weights_after_loading`, before the loader binds
+the shared head. 0012 now checks on first use, and also admits the NVFP4
+Markov projection for the `combo` arm.
 
 Pending.

@@ -1,4 +1,4 @@
-From e306364b33b2a95c4f7ef17d0a2a42991e30fa67 Mon Sep 17 00:00:00 2001
+From 900235e16c765ae718efae9549ef5cd47e0d464c Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 18:00:00 +0200
 Subject: [PATCH] perf(spec-decode): vocabulary-parallel greedy DSpark drafts
@@ -20,10 +20,10 @@ Off by default.
 ---
  .../spec_decode/test_dspark_vocab_parallel.py | 63 ++++++++++++
  vllm/model_executor/models/qwen3_dspark.py    |  5 +-
- vllm/models/deepseek_v4_1/nvidia/dspark.py    | 53 ++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 49 ++++++++++
  .../worker/gpu/spec_decode/dspark/greedy.py   | 97 +++++++++++++++++++
  .../gpu/spec_decode/dspark/speculator.py      | 41 +++++++-
- 5 files changed, 256 insertions(+), 3 deletions(-)
+ 5 files changed, 252 insertions(+), 3 deletions(-)
  create mode 100644 tests/v1/spec_decode/test_dspark_vocab_parallel.py
 
 diff --git a/tests/v1/spec_decode/test_dspark_vocab_parallel.py b/tests/v1/spec_decode/test_dspark_vocab_parallel.py
@@ -121,7 +121,7 @@ index 63a3629bdc..036aee23f1 100644
          )
          self.markov_w2._retain_weight_for_gather = retain_weight_for_gather
 diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
-index e366310b02..e3535ea1fe 100644
+index e366310b02..0c00cd61b1 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
 @@ -11,6 +11,7 @@ include the future query tokens in the top-k indices for each query token.
@@ -132,7 +132,7 @@ index e366310b02..e3535ea1fe 100644
  from bisect import bisect_left
  from collections.abc import Iterable
  
-@@ -75,6 +76,20 @@ from .model import (
+@@ -75,6 +76,15 @@ from .model import (
  
  logger = init_logger(__name__)
  
@@ -143,17 +143,12 @@ index e366310b02..e3535ea1fe 100644
 +    DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
 +    if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
 +        return False
-+    if envs.VLLM_DS41_MARKOV_NVFP4:
-+        raise ValueError(
-+            "SPARK3_DSPARK_VOCAB_PARALLEL shards the bf16 Markov projection; "
-+            "unset VLLM_DS41_MARKOV_NVFP4"
-+        )
 +    return get_tensor_model_parallel_world_size() > 1
 +
  # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
  # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
  _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
-@@ -386,6 +401,7 @@ class DSparkDeepseekV4Model(nn.Module):
+@@ -386,6 +396,7 @@ class DSparkDeepseekV4Model(nn.Module):
              # An NVFP4 transition head fits the GB10 L2, so the sequential
              # draft positions after the first reread it from L2.
              lm_head_quantization="nvfp4" if envs.VLLM_DS41_MARKOV_NVFP4 else None,
@@ -161,7 +156,7 @@ index e366310b02..e3535ea1fe 100644
          )
          self.confidence_head: DSparkConfidenceHead | None = None
          if getattr(config, "enable_confidence_head", True):
-@@ -605,6 +621,33 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+@@ -605,6 +616,44 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
      def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
          return self.model.markov_head.bias(markov_embed, self.logits_processor)
  
@@ -176,10 +171,21 @@ index e366310b02..e3535ea1fe 100644
 +
 +    @property
 +    def draft_vocab_shard(self) -> tuple[int, int]:
-+        """(first global vocabulary index, real entries) of this rank's shard."""
++        """(first global vocabulary index, real entries) of this rank's shard.
++
++        The draft head is bound only after loading, so the check that it and
++        the Markov projection share one partition runs here, on first use.
++        """
 +        assert self.lm_head is not None
-+        shard = self.lm_head.shard_indices
-+        return shard.org_vocab_start_index, shard.num_org_elements
++        head = self.lm_head.shard_indices
++        markov = self.model.markov_head.markov_w2.shard_indices
++        shard = head.org_vocab_start_index, head.num_org_elements
++        if shard != (markov.org_vocab_start_index, markov.num_org_elements):
++            raise RuntimeError(
++                "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
++                f"projection sharded alike: {head} != {markov}"
++            )
++        return shard
 +
 +    def compute_draft_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
 +        assert self.lm_head is not None
@@ -195,23 +201,6 @@ index e366310b02..e3535ea1fe 100644
      def apply_markov_bias_gathered(
          self,
          markov_embed: torch.Tensor,
-@@ -759,6 +802,16 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
-         return loaded_params
- 
-     def process_weights_after_loading(self) -> None:
-+        if self.vocab_parallel_greedy:
-+            assert self.lm_head is not None
-+            head, markov = self.lm_head.shard_indices, self.model.markov_head.markov_w2.shard_indices
-+            if (head.org_vocab_start_index, head.num_org_elements) != (
-+                markov.org_vocab_start_index, markov.num_org_elements
-+            ):
-+                raise RuntimeError(
-+                    "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
-+                    f"projection sharded alike: {head} != {markov}"
-+                )
-         self.logits_processor.prepare_b12x_vocab_projection(
-             self.model.markov_head.markov_w2
-         )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
 index f8f00a1f6a..a3f6da8a08 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py

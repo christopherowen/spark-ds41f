@@ -42,6 +42,15 @@ arms = {
     "vp": arm("vp", {"SPARK3_DSPARK_VOCAB_PARALLEL": "1"}),
     # Plus the column-sharded main_proj (patch 0013).
     "vpmp": arm("vpmp", {"SPARK3_DSPARK_VOCAB_PARALLEL": "1", "SPARK3_DSPARK_MAIN_PROJ_TP": "1"}),
+    # Everything drafter-side: vocabulary-parallel drafts over an NVFP4 Markov
+    # shard and the NVFP4 drafter head (experiments/2026-09-27-draft-precision),
+    # plus the column-sharded main_proj.
+    "combo": arm("combo", {
+        "SPARK3_DSPARK_VOCAB_PARALLEL": "1",
+        "SPARK3_DSPARK_MAIN_PROJ_TP": "1",
+        "VLLM_DS41_DRAFT_NVFP4_HEAD": "1",
+        "VLLM_DS41_MARKOV_NVFP4": "1",
+    }),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
