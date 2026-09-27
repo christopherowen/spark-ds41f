@@ -40,5 +40,19 @@ arms = {
     # Prefill forwards of 2048 tokens or more run sequence-parallel.
     "sp": arm("sp", {"SPARK3_DS41_PREFILL_SP_MIN_ROWS": "2048"}, overlay=True),
 }
+# Profiling variant of the sp arm (capture_prefill.py records one prefill).
+profile = copy.deepcopy(arms["sp"])
+profile["serve_args"] += [
+    "--profiler-config",
+    json.dumps({
+        "profiler": "torch",
+        "torch_profiler_dir": "/cache/kkref/profiles/r5f-sp",
+        "torch_profiler_with_stack": False,
+        "ignore_frontend": True,
+        "max_iterations": 24,
+        "torch_profiler_use_gzip": True,
+    }),
+]
+arms["sp-profile"] = profile
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
