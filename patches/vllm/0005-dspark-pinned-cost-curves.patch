@@ -1,4 +1,4 @@
-From 2facfb8a4d79dffabeaa90e71ab8af93df7c31e8 Mon Sep 17 00:00:00 2001
+From 6365f1301191eb1e829d48c99907b2e87c6415c6 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 23:09:28 +0200
 Subject: [PATCH] feat(spec-decode): pin DSpark adaptive verification cost
@@ -23,13 +23,13 @@ profile. Unset, behavior is unchanged.
  2 files changed, 139 insertions(+), 1 deletion(-)
 
 diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
-index 028e3540d2..3e55a2f082 100644
+index a9578a1b13..bc5d1fb0e5 100644
 --- a/tests/v1/spec_decode/test_adaptive_verification.py
 +++ b/tests/v1/spec_decode/test_adaptive_verification.py
-@@ -675,3 +675,45 @@ def test_budget_probes_after_steps_without_drafts():
-         manager.get_num_tokens({"low": 3}, {"low": [1, 2]})
-         budgets.append(manager._batch_budget[2])
-     assert budgets == ([0] * (idle - 1) + [1]) * 2
+@@ -656,3 +656,45 @@ def test_tp_confidence_publication_keeps_graph_and_request_budgets_consistent():
+     torch.multiprocessing.spawn(
+         _run_tp_confidence_consistency, args=(get_open_port(),), nprocs=2, join=True
+     )
 +
 +
 +def _pinning_manager() -> AdaptiveVerificationManager:
@@ -73,7 +73,7 @@ index 028e3540d2..3e55a2f082 100644
 +    assert _pinning_manager()._pin_cost_curves(*curves) == curves
 +    assert not list(tmp_path.iterdir())
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index af15b9742f..3262a9a4f6 100644
+index bc2c35cc09..8e7b94c22e 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 @@ -2,6 +2,9 @@
@@ -99,7 +99,7 @@ index af15b9742f..3262a9a4f6 100644
  
  if TYPE_CHECKING:
      from vllm.config import VllmConfig
-@@ -288,12 +295,101 @@ class AdaptiveVerificationManager:
+@@ -283,12 +290,101 @@ class AdaptiveVerificationManager:
              )
              for num_reqs in sorted({s.num_reqs for s in samples if s.full_cudagraph})
          }

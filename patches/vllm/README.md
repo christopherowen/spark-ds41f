@@ -1,6 +1,6 @@
 # vLLM patch stack
 
-Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
+Base: `local-inference-lab/vllm@01f1b874c774b4fade087d5f311970ee53745e01`
 (`integration/karmic-kraken-beta`).
 
 - `0001-engram-projection-tp-padding.patch` lets `engram_config.projection_tp`
@@ -8,7 +8,8 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   not divide by the TP size (TP3): the output is padded to whole 32-row
   block-FP8 scale blocks per rank, the last rank's missing checkpoint rows are
   zero-filled through `allow_tp_padding`, and the gathered output is sliced
-  back. On the r2 base it yielded tree `90fdd043`. Evidence:
+  back. Applying it to the base yields tree `90fdd043`, the promoted image's
+  `local.spark3.vllm.tree` label. Evidence:
   `experiments/2026-09-24-improvement-leads/`. Upstream status: candidate for
   Local Inference Lab, not submitted.
 
@@ -22,14 +23,9 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   Quality: the rows and their decode are unchanged, only their timing; a
   20 ms injected read delay lengthened steps by 27 ms with quality and
   acceptance unchanged, showing the gate holds. Applying 0001-0002 to the base
-  yields tree `033fd0cc` on the r3 base. Evidence:
-  `experiments/2026-09-24-three-leads/` and
-  `experiments/2026-09-25-engram-async-ab/`. On this base the Engram overlap
-  (`VLLM_DS41_ENGRAM_OVERLAP`, on by default) is the base's own version of
-  the same idea, and saves less on three Sparks
-  (`experiments/2026-09-27-lil-head`); the two are exclusive, and the path
-  raises unless `VLLM_DS41_ENGRAM_OVERLAP=0`. Upstream status: candidate for
-  Local Inference Lab, not submitted.
+  yields tree `033fd0cc`. Evidence: `experiments/2026-09-24-three-leads/`
+  and `experiments/2026-09-25-engram-async-ab/`. Upstream status: candidate
+  for Local Inference Lab, not submitted.
 
 
 - `0003-dsml-optional-string-attribute.patch` keeps DSML tool parameters
@@ -86,6 +82,7 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   a verified row at about 0.4 ms against several milliseconds in real
   steps. Output unchanged. Upstream status: candidate, not submitted.
 
-Applying 0001-0009 to the base yields patch head `d7234353` and tree
-`f250542a` (on the r4 base `01f1b874`: patch head `84f0b5dc`, tree
-`ee3a0fd4`).
+Applying 0001-0009 to the base yields patch head `84f0b5dc` and tree
+`ee3a0fd4`. The rebase onto the Local Inference Lab heads
+(`experiments/2026-09-27-lil-head`, source manifest
+`2026-09-27-r5-candidate-source.json`) measured slower and is not carried.

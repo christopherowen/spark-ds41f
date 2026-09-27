@@ -1,4 +1,4 @@
-From 2dfae76574490e6c1ad657f0d46e5e0f3f7f3ff2 Mon Sep 17 00:00:00 2001
+From 7ea79d934133572ae3140e0e24fba72670ef51f5 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 12:59:55 +0200
 Subject: [PATCH] fix(deepseek-v4.1): shard the Engram projection at any TP
@@ -29,7 +29,7 @@ Upstream status: local candidate for local-inference-lab/vllm, not submitted.
  1 file changed, 39 insertions(+), 1 deletion(-)
 
 diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
-index ea6ada094e..8349bfd366 100644
+index 0cd652bf1..b1373cbbe 100644
 --- a/vllm/models/deepseek_v4_1/common/engram.py
 +++ b/vllm/models/deepseek_v4_1/common/engram.py
 @@ -30,6 +30,42 @@ from vllm.utils.b12x import (
@@ -75,9 +75,9 @@ index ea6ada094e..8349bfd366 100644
  logger = init_logger(__name__)
  DEAD_ID = -1
  
-@@ -667,7 +703,9 @@ class Engram(nn.Module):
-         # (ready, expected, failed) epochs when disk rows arrive asynchronously.
-         self.overlap_epochs: tuple[torch.Tensor, ...] | None = None
+@@ -642,7 +678,9 @@ class Engram(nn.Module):
+         self._disk_prepared = False
+         self._disk_prepared_tokens = 0
          projection_tp = getattr(layout, "projection_tp", False)
 -        projection_cls = ColumnParallelLinear if projection_tp else ReplicatedLinear
 +        projection_cls = (
@@ -87,5 +87,5 @@ index ea6ada094e..8349bfd366 100644
              6144,
              self.dim * (self.hc_mult + 1),
 -- 
-2.43.0
+2.54.0 (Apple Git-157)
 

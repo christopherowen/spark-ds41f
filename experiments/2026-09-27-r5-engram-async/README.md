@@ -29,4 +29,22 @@ prefill at 2K and 32K; memory guards unchanged.
 
 ## Results
 
-Pending.
+`results/private/bench/ea-s-r5c`, one boot, three samples: LRU 5/5, no failed
+requests; the asynchronous path logged "asynchronous disk Engram rows
+enabled"; NCCL 2.30.7 (patched build) loaded; graphs 0.99 GiB (r4a about
+0); dgx1's lowest MemAvailable 6.5 GiB. Cold prefill 3,572-3,854 tok/s at 2K
+and 4,051-4,167 tok/s at 32K (on NCCL), as on r3.
+
+| Single-stream step (ms) | prose | code | prose-nothink | code-nothink |
+|---|---:|---:|---:|---:|
+| r4a base | 49.81 | 51.98 | 50.67 | 52.42 |
+| r5 base (overlap) | 51.06 | 53.63 | 51.90 | 53.64 |
+| r5c (patch 0002) | 49.64 | 52.79 | 50.82 | 53.42 |
+
+- Patch 0002 recovers 1.2-1.4 ms per step against the base overlap: prose
+  steps now match r4a (L2 prefetch included), code steps remain 0.8-1.0 ms
+  slower.
+- At eight streams r5c is 4.5-6.4% below r4a on every case (code c8
+  -6.1 ±1.6%, prose-nothink c8 -6.4 ±2.2%), as r5 was: the rebase loses at
+  batch size for a reason other than Engram.
+- Not adopted: the lock returns to r4c.
