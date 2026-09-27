@@ -25,5 +25,20 @@ arms = {
     # Every forward above the decode graph sizes (the code raises 1 to 49).
     "always": arm({"SPARK3_DS41_PREFILL_SP_MIN_ROWS": "1"}),
 }
+# Patch 0018 mounted over the r5g image (overlay.sh of
+# experiments/2026-09-27-prefill-sp): no setting, SP above the decode sizes,
+# small reduce-scatters over the RoCE all-reduce.
+import subprocess
+FILES = subprocess.check_output(
+    ["git", "-C", str(Path.home() / "projects/spark3-vllm-ds41f/.work/upstreams/vllm"),
+     "diff", "--name-only", "spark3/r5f-check", "spark3/r5f-sp", "--", "vllm"],
+    text=True,
+).split()
+always2 = arm({})
+always2["container"]["mounts"] += [
+    [f"{{home}}/spark3-overlay/r5f-sp/{f}", f"/opt/spark3/candidate/vllm/{f}", "ro"] for f in FILES
+]
+always2["environment"].pop("SPARK3_DS41_PREFILL_SP_MIN_ROWS", None)
+arms["always2"] = always2
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
