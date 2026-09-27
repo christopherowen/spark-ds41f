@@ -62,6 +62,17 @@ the nvidia-drm modeset host setting.
 
 ## Results
 
+**Correction (same-protocol control).** These comparisons used the r4a runs
+of `experiments/2026-09-26-dspark-policy` (b1, b2: full five-case matrix,
+the night before) as the reference. A lean-protocol r4a control run on the
+same image and config the next morning (`dsp-s-r4a-now`) read 0.9-1.2 ms per
+single-stream step slower and 3-7% lower at eight streams than b1+b2, so
+lean arms must be compared with lean controls. Against that control the
+rebase is not slower: r5 (base Engram overlap) 51.06/53.63 ms against r4a
+50.68/53.16 ms (prose/code steps), and r5c (patch 0002 re-ported, patched
+NCCL, two boots) 50.18/53.06 ms, even with r4a and r4c at eight streams;
+`experiments/2026-09-27-r5-engram-async` has the pooled table.
+
 Screening runs (`sequence_lean.sh`, `results/private/bench/lil-s-*`): one
 boot per arm, three samples at one and eight streams. Every arm passed LRU
 5/5; dgx1's lowest MemAvailable was 5.95-6.58 GiB (r5 base 5.95 GiB, about

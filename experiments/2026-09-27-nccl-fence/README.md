@@ -25,4 +25,14 @@ must match the r4a base within noise.
 
 ## Results
 
-Pending.
+`nf-s-r4c`, `nf-s-r4c-b` (lean screen; the first boot also ran cold prefill):
+the image build's checks passed (installed NCCL reports 2.30.7 through
+`ncclGetVersion` and matches the built library's checksum); LRU 5/5 on both
+boots; cold prefill 3,878-3,894 tok/s at 2K and 4,103-4,207 tok/s at 32K,
+where the all-reduces run on NCCL; dgx1's lowest MemAvailable 6.45-6.56
+GiB. Single-stream steps 51.37/53.53/51.73/53.72 ms (prose, code,
+prose-nothink, code-nothink) against a same-morning lean r4a control
+50.68/53.16/51.77/53.60 ms: within noise except prose (+0.7 ms), and even
+at eight streams. The patched NCCL costs nothing measurable. (The first
+build failed its own check: `torch.cuda.nccl.version()` reports the NCCL
+torch was compiled against, 2.29.7; the check now asks the library.)
