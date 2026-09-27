@@ -207,12 +207,15 @@ print("RoCE proxy ABI", load().roce_abi_version())
 native_path = _build()
 linked = subprocess.check_output(["ldd", native_path], text=True)
 assert "liburing.so" in linked, "B12X was built without io_uring row staging"
+import ctypes
 import hashlib
 
-import torch
-
-assert torch.cuda.nccl.version() == (2, 30, 7), torch.cuda.nccl.version()
+# torch.cuda.nccl.version() reports the NCCL torch was compiled against, so
+# ask the installed library itself (NCCL_VERSION_CODE 2.30.7 = 23007).
 nccl = "/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2"
+version = ctypes.c_int()
+assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0
+assert version.value == 23007, version.value
 with open(nccl, "rb") as handle:
     built = open("/opt/spark3/nccl/libnccl.so.2.sha256").read().strip()
     assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
