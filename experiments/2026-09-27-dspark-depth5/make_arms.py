@@ -48,6 +48,12 @@ def arm(env: dict, cache: str, drafts: int) -> dict:
 arms = {
     "k3real": arm({"SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/r4b-k3-real"}, "vllm-r4a", 3),
     "k5real": arm({"SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/r4b-k5-real"}, "vllm-r4a-k5", 5),
+    # With verification priced on real rows, the per-step ratio rule trims
+    # drafts that beat the long-run rate; the marginal rule keeps them.
+    "k3realm": arm({"SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/r4b-k3-real",
+                    "SPARK3_DSPARK_VERIFY_RULE": "marginal"}, "vllm-r4a", 3),
+    "k5realm": arm({"SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/r4b-k5-real",
+                    "SPARK3_DSPARK_VERIFY_RULE": "marginal"}, "vllm-r4a-k5", 5),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")

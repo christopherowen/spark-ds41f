@@ -29,6 +29,7 @@ answers without losing on reasoning or prose, against the r4a base
 |---|---|
 | `k3real` | r4b image, distinct-token profile, cost scale 1.0, three drafts |
 | `k5real` | as `k3real` with five drafts and graphs to 48 rows |
+| `k3realm`, `k5realm` | as `k3real`, `k5real` with the marginal verification rule (patch 0006); they reuse those arms' pinned curves |
 
 Both drop `--default-chat-template-kwargs` like the other candidate arms.
 

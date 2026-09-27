@@ -7,7 +7,7 @@ E=experiments/2026-09-27-dspark-depth5
 LEAN=(--suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink
       --concurrency 1,8 --min-samples 3 --max-samples 3)
 log() { echo "$(date -u +%FT%TZ) $*"; }
-for step in k3real:s-k3real k5real:s-k5real; do
+for step in ${STEPS:-k3real:s-k3real k5real:s-k5real}; do
   arm=${step%%:*}
   label=${step##*:}
   log "arm $arm ($label)"
