@@ -1,0 +1,907 @@
+From c11a2261f3b3be0ae1c1c632a88e39ad39a870a2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 20:00:45 +0200
+Subject: [PATCH] perf(deepseek-v4.1): sequence-parallel prefill decoder
+ dataflow
+
+Stage 2 of the prefill-only sequence-parallel mode. When a forward uses SP
+each rank keeps L = Tp / TP rows between collectives, where Tp = TP *
+ceil(T / TP):
+
+- The embedding reduce-scatter result stays local; inputs_embeds are sliced.
+- The residual, mixes and carried layer output are local, so the mHC pre,
+  post and post_pre kernels, both norms and the Engram gate run on L rows.
+- Attention all-gathers its input to T rows behind the opaque attention op
+  (the rows are scoped to the call with a context variable), runs every
+  projection, indexer, compressor, KV cache write and sparse MLA on all
+  rows as before, writes WO into a zero-padded Tp-row buffer and
+  reduce-scatters it instead of the all-reduce.
+- The MoE input is gathered to T rows with the full input_ids; gate, top-k,
+  routed and shared experts run as before, and the runner reduce-scatters
+  shared + routed from a zero-padded buffer instead of its final all-reduce,
+  still firing the L2 prefetch pre-reduce hook first.
+- Engram keeps its staged-row all-reduce and runs wkv on every row, then
+  gates only this rank's real rows; pad rows pass through.
+- The final collapse and norm run locally and are gathered to T rows, as
+  are the aux hidden states a drafter consumes. DSpark reads only those, so
+  its pre-collapse MTP buffer is left alone under SP; other drafters gather
+  it.
+
+Kernels never see more than T rows and gathered tensors are used as [:T].
+Decode, the default path and every weight are unchanged.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 350 +++++++++++++++++-
+ .../layers/fused_moe/runner/moe_runner.py     |  57 ++-
+ vllm/models/deepseek_v4/nvidia/model.py       |  30 +-
+ vllm/models/deepseek_v4_1/attention.py        |  35 +-
+ vllm/models/deepseek_v4_1/common/engram.py    |  21 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  50 ++-
+ vllm/models/deepseek_v4_1/sp_prefill.py       |  58 ++-
+ 7 files changed, 568 insertions(+), 33 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index f6eb56dc05..c1af8f63b7 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -2,14 +2,17 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Prefill sequence parallelism: row layout, threshold and CPU collectives.
+ 
+-The collectives are simulated in one process: every rank's contribution is
+-computed first, then each rank's collective result is assembled from them.
++The collectives are simulated in one process, either by computing every
++rank's contribution first or by running the ranks in lockstep threads.
+ """
+ 
++import threading
++from concurrent.futures import ThreadPoolExecutor
+ from types import SimpleNamespace
+ 
+ import pytest
+ import torch
++from torch import nn
+ 
+ from vllm.models.deepseek_v4_1 import sp_prefill
+ 
+@@ -221,3 +224,346 @@ def test_embedding_reduce_scatter_has_one_owner_per_token(monkeypatch):
+     torch.testing.assert_close(sum(buffers), expected, rtol=0, atol=0)
+     with pytest.raises(ValueError):
+         embedding.VocabParallelEmbedding.forward_reduce_scatter(layer, ids, 8)
++
++
++@pytest.mark.parametrize("num_tokens", (9, 10, 11))
++def test_local_slice_zero_pads_the_last_rank(num_tokens):
++    full = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
++    full += 1
++    for rank in range(3):
++        layout = sp_prefill.SPRows(num_tokens, 3, rank)
++        local = layout.local_slice(full)
++        real = layout.real_rows
++        assert local.shape == (layout.local_rows, 2)
++        torch.testing.assert_close(
++            local[:real], full[layout.start : layout.start + real], rtol=0, atol=0
++        )
++        assert not local[real:].any()
++    with pytest.raises(ValueError):
++        sp_prefill.SPRows(num_tokens, 3, 0).local_slice(full[1:])
++
++
++def test_activate_scopes_the_rows():
++    outer, inner = sp_prefill.SPRows(9, 3, 0), sp_prefill.SPRows(12, 3, 1)
++    assert sp_prefill.current() is None
++    with sp_prefill.activate(outer):
++        assert sp_prefill.current() is outer
++        with pytest.raises(RuntimeError), sp_prefill.activate(inner):
++            assert sp_prefill.current() is inner
++            raise RuntimeError
++        assert sp_prefill.current() is outer
++    assert sp_prefill.current() is None
++
++
++def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatch):
++    from vllm.model_executor.layers.fused_moe.runner import moe_runner
++
++    events = []
++
++    def reduce_scatter(states, dim):
++        events.append(("reduce_scatter", states.clone(), dim))
++        return states.chunk(3)[1]
++
++    monkeypatch.setattr(
++        moe_runner, "tensor_model_parallel_reduce_scatter", reduce_scatter
++    )
++    runner = SimpleNamespace(
++        moe_config=SimpleNamespace(
++            is_sequence_parallel=False, skip_final_all_reduce=False
++        ),
++        router=object(),
++        _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
++    )
++    shared = torch.arange(20, dtype=torch.float32).reshape(10, 2)
++    fused = torch.full((10, 2), 0.5)
++    output = moe_runner.MoERunner._reduce_scatter_final_output(
++        runner, shared, fused, 12, None, False
++    )
++    assert events[0] == ("hook", 10)
++    _, states, dim = events[1]
++    assert dim == 0 and states.shape == (12, 2)
++    torch.testing.assert_close(states[:10], shared + fused, rtol=0, atol=0)
++    assert not states[10:].any()
++    torch.testing.assert_close(output, states[4:8], rtol=0, atol=0)
++    with pytest.raises(NotImplementedError):
++        moe_runner.MoERunner._reduce_scatter_final_output(
++            runner, shared, fused, 12, None, True
++        )
++
++
++def test_engram_gates_only_the_real_local_rows(monkeypatch):
++    pytest.importorskip("b12x")
++    from vllm.models.deepseek_v4_1.common import engram as engram_ops
++
++    tokens, streams, width = 10, 2, 4
++
++    def mix(state, kv, norm_weights, *, eps, plan, out, token_mask=None):
++        assert kv.shape[0] == state.shape[0] == out.shape[0]
++        gate = kv[:, : state.shape[1]]
++        if token_mask is not None:
++            assert token_mask.shape == (state.shape[0],)
++            gate = gate * token_mask[:, None]
++        return out.copy_(state + gate)
++
++    monkeypatch.setattr(engram_ops.hyperconnection, "run_engram_mix", mix)
++    monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
++    staged = torch.randn(tokens, 6)
++    engram = SimpleNamespace(
++        embed_tokens=SimpleNamespace(table_memory="device"),
++        overlap_epochs=None,
++        staged_rows=staged,
++        wkv=lambda rows: rows.repeat(1, 2),
++        norm_weights=None,
++        eps=1e-6,
++        mix_plans={False: None, True: None},
++    )
++    hidden = torch.randn(tokens, streams, width)
++    hash_ids = torch.zeros(tokens, 24, dtype=torch.int64)
++    mask = torch.arange(tokens) % 3 != 1
++    full = engram_ops.Engram.forward(engram, hidden, hash_ids, mask)
++    for rank in range(3):
++        layout = sp_prefill.SPRows(tokens, 3, rank)
++        local = layout.local_slice(hidden)
++        output = engram_ops.Engram.forward(
++            engram, local, hash_ids, mask, sp_rows=layout
++        )
++        real = layout.real_rows
++        assert output.shape == local.shape
++        torch.testing.assert_close(
++            output[:real], full[layout.start : layout.start + real], rtol=0, atol=0
++        )
++        torch.testing.assert_close(output[real:], local[real:], rtol=0, atol=0)
++
++
++# --- Whole-model dataflow on lockstep CPU ranks -----------------------------
++
++# Rank shares of every TP partial sum; the shares sum to one.
++_SHARES = (0.5, 0.25, 0.25)
++
++
++class _World:
++    """Lockstep all-gather and reduce-scatter for ranks run in threads."""
++
++    def __init__(self, size):
++        self.size = size
++        self.barrier = threading.Barrier(size, timeout=60)
++        self.slots = [None] * size
++        self.local = threading.local()
++
++    @property
++    def rank(self):
++        return self.local.rank
++
++    def _exchange(self, x):
++        self.slots[self.rank] = x
++        self.barrier.wait()
++        values = list(self.slots)
++        self.barrier.wait()
++        return values
++
++    def all_gather(self, x, dim):
++        assert dim == 0
++        return torch.cat(self._exchange(x), dim=0)
++
++    def reduce_scatter(self, x, dim):
++        assert dim == 0
++        return sum(self._exchange(x)).chunk(self.size)[self.rank].clone()
++
++    def run(self, fn):
++        def rank_main(rank):
++            self.local.rank = rank
++            return fn(rank)
++
++        with ThreadPoolExecutor(self.size) as pool:
++            futures = [pool.submit(rank_main, rank) for rank in range(self.size)]
++            return [future.result() for future in futures]
++
++
++class _Mix:
++    """Row-wise stand-in for the native mHC kernels."""
++
++    def collapse(self, hidden, mix=None):
++        if mix is None:
++            return hidden.mean(dim=1)
++        return (hidden * mix[:, :, None]).sum(dim=1)
++
++    def post(self, x, residual, post, comb):
++        return residual + x[:, None, :] * 0.25
++
++    def pre(self, residual, fn, scale, base, norm, pre, **previous):
++        if previous.get("previous_output") is not None:
++            residual = self.post(previous["previous_output"], residual, None, None)
++        if residual.ndim == 2:
++            residual = residual[:, None, :].expand(-1, 4, -1).clone()
++        rows = residual.shape[0]
++        mix = residual.new_zeros((rows, 4))
++        mix[:, 0] = 0.75
++        mix[:, 1] = 0.25
++        return (
++            residual,
++            residual.new_full((rows, 4), 0.25),
++            torch.eye(4).expand(rows, 4, 4),
++            residual[:, 0, :] * 0.5 + residual[:, 1, :] * 0.5,
++            mix,
++        )
++
++    def post_pre(self, x, residual, post, comb, fn, scale, base, norm, pre):
++        return self.pre(self.post(x, residual, post, comb), fn, scale, base, norm, pre)
++
++
++def _partial(world, rows, result):
++    """This rank's zero-padded TP share of ``result``, reduce-scattered."""
++    padded = result.new_zeros((rows, *result.shape[1:]))
++    padded[: result.shape[0]] = result * _SHARES[world.rank]
++    return world.reduce_scatter(padded, 0)
++
++
++class _Attention(nn.Module):
++    """Honors the SP contract of DeepseekV4Attention._forward."""
++
++    def __init__(self, index, world, local_rows):
++        super().__init__()
++        self.index, self.world, self.local_rows = index, world, local_rows
++
++    def forward(self, positions, hidden, scaling, *, global_kv_ready=None):
++        rows = sp_prefill.current()
++        if rows is not None:
++            self.local_rows.append(hidden.shape[0])
++            hidden = rows.gather(hidden)
++        # The cross-row term shows whether attention saw every row.
++        result = (
++            hidden * 0.5
++            + hidden.mean(dim=0)
++            + positions[:, None].float() * 0.01
++            + self.index
++        )
++        if rows is None:
++            return result
++        return _partial(self.world, rows.padded_rows, result)
++
++
++class _Experts(nn.Module):
++    def __init__(self, world):
++        super().__init__()
++        self.world = world
++
++    def forward(self, hidden, ids, *, reduce_scatter_rows=None):
++        result = hidden * 0.25 + hidden.sum(dim=0) * 0.01 + ids[:, None].float() * 0.02
++        if reduce_scatter_rows is None:
++            return result
++        return _partial(self.world, reduce_scatter_rows, result)
++
++
++class _Layer(nn.Module):
++    def __init__(self, index, world, local_rows):
++        super().__init__()
++        self.engram = None
++        self.hc_mult = 4
++        self._b12x_mhc = _Mix()
++        self.attn = _Attention(index, world, local_rows)
++        self.ffn = _Experts(world)
++        for name in (
++            "hc_attn_fn_broadcast",
++            "hc_attn_fn",
++            "hc_attn_scale",
++            "hc_attn_base",
++            "hc_ffn_fn",
++            "hc_ffn_scale",
++            "hc_ffn_base",
++        ):
++            setattr(self, name, torch.ones(1))
++        self.attn_norm = self.ffn_norm = SimpleNamespace(weight=torch.ones(2))
++
++    def forward(self, *args, **kwargs):
++        from vllm.models.deepseek_v4_1.nvidia import model as native
++
++        return native.DeepseekV4DecoderLayer.forward(self, *args, **kwargs)
++
++
++class _Embedding:
++    """Vocabulary-parallel embedding: rank r owns ids with id % N == r."""
++
++    def __init__(self, table, world):
++        self.table, self.world = table, world
++
++    def forward_reduce_scatter(self, ids, padded_rows):
++        owned = (ids % self.world.size == self.world.rank)[:, None]
++        padded = self.table.new_zeros((padded_rows, self.table.shape[1]))
++        padded[: ids.numel()] = self.table[ids] * owned
++        return self.world.reduce_scatter(padded, 0)
++
++
++@pytest.mark.parametrize("num_tokens", (9, 10, 11))
++@pytest.mark.parametrize("use_embeds", (False, True))
++@pytest.mark.parametrize("skip_mtp_buffer", (False, True))
++def test_model_forward_matches_full_rows(
++    monkeypatch, num_tokens, use_embeds, skip_mtp_buffer
++):
++    pytest.importorskip("b12x")
++    from vllm.models.deepseek_v4_1.nvidia import model as native
++
++    world = _World(3)
++    monkeypatch.setattr(
++        native,
++        "get_pp_group",
++        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
++    )
++    monkeypatch.setattr(native, "get_tensor_model_parallel_world_size", lambda: 3)
++    monkeypatch.setattr(native, "get_tensor_model_parallel_rank", lambda: world.rank)
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_all_gather", world.all_gather
++    )
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_reduce_scatter", world.reduce_scatter
++    )
++    # Float64 keeps the reordered TP partial sums well inside the tolerance.
++    table = torch.randn(16, 2, dtype=torch.float64)
++    ids = (torch.arange(num_tokens) * 7) % 16
++    positions = torch.arange(100, 100 + num_tokens)
++
++    def run(min_rows, local_rows):
++        buffer = torch.full((16, 8), -7.0, dtype=torch.float64)
++        target = SimpleNamespace(
++            embed_input_ids=lambda input_ids: table[input_ids],
++            embed_tokens=_Embedding(table, world),
++            use_mega_moe=False,
++            use_sequence_parallel=False,
++            prefill_sp_min_rows=min_rows,
++            prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
++            disk_engram=False,
++            engram_hash=None,
++            start_layer=0,
++            end_layer=3,
++            ced_decoder_start=None,
++            layers=nn.ModuleList(_Layer(i, world, local_rows) for i in range(3)),
++            aux_hidden_state_layers={2, 3},
++            _mtp_hidden_buffer=buffer,
++            # L2 prefetch is on by default on SM121; its plans are built.
++            _l2pf_ready=True,
++            norm=lambda hidden: hidden * 2,
++        )
++        output, aux = native.DeepseekV4Model.forward(
++            target,
++            ids,
++            positions,
++            None,
++            inputs_embeds=table[ids] if use_embeds else None,
++        )
++        return output, aux, buffer
++
++    expected, expected_aux, expected_buffer = run(0, [])
++    local_rows = [[] for _ in range(3)]
++    results = world.run(lambda rank: run(4, local_rows[rank]))
++    layout = sp_prefill.SPRows(num_tokens, 3, 0)
++    for rank, (output, aux, buffer) in enumerate(results):
++        # Attention received only this rank's rows in every layer.
++        assert local_rows[rank] == [layout.local_rows] * 3
++        torch.testing.assert_close(output, expected, rtol=1e-9, atol=1e-9)
++        assert len(aux) == len(expected_aux) == 2
++        for actual, value in zip(aux, expected_aux):
++            torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
++        if skip_mtp_buffer:
++            assert (buffer == -7).all()
++        else:
++            torch.testing.assert_close(buffer, expected_buffer, rtol=1e-9, atol=1e-9)
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 71695fbde7..8a47192e13 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -13,6 +13,7 @@ from vllm.distributed import (
+     get_ep_group,
+     get_pcp_group,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.distributed.eplb.eplb_state import EplbLayerState
+ from vllm.forward_context import (
+@@ -526,6 +527,48 @@ class MoERunner(MoERunnerInterface):
+ 
+         return states[..., :trunc_size] if trunc_size is not None else states
+ 
++    def _reduce_scatter_final_output(
++        self,
++        shared_output: torch.Tensor | None,
++        fused_output: torch.Tensor,
++        padded_rows: int,
++        trunc_size: int | None,
++        output_is_reduced: bool,
++    ) -> torch.Tensor:
++        """Sequence-parallel replacement for the late all-reduce.
++
++        The combined output is written into a ``padded_rows`` buffer whose
++        trailing rows are zero and reduce-scattered along dim 0, so TP rank r
++        receives rows ``[r * padded_rows // tp, (r + 1) * padded_rows // tp)``.
++        """
++        if (
++            output_is_reduced
++            or self.moe_config.is_sequence_parallel
++            or self.moe_config.skip_final_all_reduce
++            or isinstance(self.router, ZeroExpertRouter)
++        ):
++            raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
++        rows = fused_output.shape[0]
++        dtype = (
++            fused_output.dtype
++            if shared_output is None
++            else torch.result_type(shared_output, fused_output)
++        )
++        states = fused_output.new_empty(
++            (padded_rows, *fused_output.shape[1:]), dtype=dtype
++        )
++        states[rows:].zero_()
++        if shared_output is None:
++            states[:rows].copy_(fused_output)
++        else:
++            torch.add(shared_output, fused_output, out=states[:rows])
++        # The same model-installed callback the all-reduce path fires.
++        _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
++        if _hook is not None:
++            _hook(rows)
++        states = tensor_model_parallel_reduce_scatter(states, dim=0)
++        return states[..., :trunc_size] if trunc_size is not None else states
++
+     def _encode_layer_name(self) -> str | LayerName:
+         if _USE_LAYERNAME:
+             return LayerName(self.layer_name)
+@@ -726,15 +769,19 @@ class MoERunner(MoERunnerInterface):
+         router_logits: torch.Tensor,
+         input_ids: torch.Tensor | None = None,
+         shared_experts_input: torch.Tensor | None = None,
++        *,
++        reduce_scatter_rows: int | None = None,
+     ) -> torch.Tensor:
+         """Invoke the fused moe layer.
+ 
+         Input:
+         - hidden_states
+         - router_logits
++        - reduce_scatter_rows: sequence parallelism; reduce-scatter the output,
++          zero-padded to this many rows, along dim 0 instead of all-reducing
+ 
+         Output:
+-        - The new hidden_states.
++        - The new hidden_states (this rank's rows with reduce_scatter_rows).
+ 
+         Calling sequence
+         - forward
+@@ -822,6 +869,14 @@ class MoERunner(MoERunnerInterface):
+         # Apply output transform (e.g. latent -> full dim)
+         fused_output = self.apply_routed_output_transform(fused_output)
+ 
++        if reduce_scatter_rows is not None:
++            return self._reduce_scatter_final_output(
++                shared_output,
++                fused_output,
++                reduce_scatter_rows,
++                og_hidden_dim_post_xform,
++                fused_output_is_reduced,
++            )
+         if shared_output is not None:
+             result = shared_output + fused_output
+         else:
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index e21c7292fa..3cc704baae 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -1035,8 +1035,18 @@ class DeepseekV4MoE(nn.Module):
+         self.n_local_experts = self.n_local_physical_experts
+ 
+     def forward(
+-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++        *,
++        reduce_scatter_rows: int | None = None,
+     ) -> torch.Tensor:
++        """Route ``hidden_states`` through the experts.
++
++        ``reduce_scatter_rows`` (sequence parallelism) replaces the final TP
++        all-reduce with a dim-0 reduce-scatter of the output padded to that
++        many rows; the result holds this rank's rows only.
++        """
+         if self.gate.tid2eid is not None and input_ids is None:
+             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+         # getattr for test doubles that fake the gate module.
+@@ -1045,7 +1055,11 @@ class DeepseekV4MoE(nn.Module):
+             raise ValueError("DeepSeek V4 vision MoE routing requires input_ids.")
+ 
+         if not self.use_mega_moe:
+-            return self._forward_fused_moe(hidden_states, input_ids)
++            return self._forward_fused_moe(
++                hidden_states, input_ids, reduce_scatter_rows
++            )
++        if reduce_scatter_rows is not None:
++            raise NotImplementedError("DeepSeek V4 MegaMoE output reduce-scatter")
+ 
+         org_shape = hidden_states.shape
+         router_logits, _ = self.gate(hidden_states)
+@@ -1085,9 +1099,19 @@ class DeepseekV4MoE(nn.Module):
+         return final_hidden_states.view(org_shape)
+ 
+     def _forward_fused_moe(
+-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
++        self,
++        hidden_states: torch.Tensor,
++        input_ids: torch.Tensor | None = None,
++        reduce_scatter_rows: int | None = None,
+     ) -> torch.Tensor:
+         org_shape = hidden_states.shape
++        if reduce_scatter_rows is not None:
++            return self.experts(
++                hidden_states=hidden_states,
++                router_logits=hidden_states,
++                input_ids=input_ids,
++                reduce_scatter_rows=reduce_scatter_rows,
++            ).to(hidden_states.dtype)
+         final_hidden_states = self.experts(
+             hidden_states=hidden_states,
+             router_logits=hidden_states,
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 62327b41eb..55ebc83720 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -28,7 +28,7 @@ from vllm.model_executor.layers.linear import (
+     UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.utils import set_weight_attrs
+-from vllm.models.deepseek_v4_1 import l2_prefetch
++from vllm.models.deepseek_v4_1 import l2_prefetch, sp_prefill
+ from vllm.models.deepseek_v4_1.b12x_layers import (
+     B12xFP8LinearMethod,
+     B12xLinearMethod,
+@@ -1312,6 +1312,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             raise PreparationResourceUnavailableError(
+                 "V4.1 attention metadata is not prepared"
+             )
++        sp_rows = sp_prefill.current()
++        if sp_rows is not None:
++            # Sequence-parallel prefill: attention runs on every row.
++            hidden_states = sp_rows.gather(hidden_states)
+         rows = hidden_states.shape[0]
+         qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+         qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+@@ -1371,7 +1375,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 )
+                 index_query = (iq_data, iq_scale, iw)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+-        return self._o_proj(output, positions, is_prefill=is_prefill)
++        return self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
+ 
+     @eager_break_during_capture
+     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
+@@ -1725,7 +1729,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             )
+         return self._wo_plans[key]
+ 
+-    def _o_proj(self, o, positions, *, is_prefill=False):
++    def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
+         from b12x.preparation import require_prepared
+ 
+         rows = o.shape[0]
+@@ -1750,12 +1754,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             rope_dim=self.rope_head_dim,
+         )
+         # The custom attention result must outlive reuse of the workspace arena.
+-        output = torch.empty_strided(
+-            (rows, weights.hidden, 1),
+-            (weights.hidden, 1, rows * weights.hidden),
+-            dtype=torch.bfloat16,
+-            device=o.device,
+-        )
++        if sp_rows is None:
++            output = torch.empty_strided(
++                (rows, weights.hidden, 1),
++                (weights.hidden, 1, rows * weights.hidden),
++                dtype=torch.bfloat16,
++                device=o.device,
++            )
++        else:
++            if rows != sp_rows.num_tokens:
++                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
++            # Leading rows of the zero-padded buffer the reduce-scatter reads.
++            padded = sp_rows.empty_padded((weights.hidden,), torch.bfloat16, o.device)
++            output = padded.as_strided(
++                (rows, weights.hidden, 1), (weights.hidden, 1, rows * weights.hidden)
++            )
+         binding = replace(binding, output=output)
+         # The model owns the plan and weights; graph pools manage activation
+         # lifetimes. Keep only the borrowed workspace, not layer activations.
+@@ -1768,6 +1781,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         if local.dtype != torch.bfloat16:
+             raise TypeError("V4.1 WO projection must return BF16")
+         l2_prefetch.issue(self._l2pf_ffn, rows)
++        if sp_rows is not None:
++            if local.data_ptr() != padded.data_ptr():
++                raise RuntimeError("V4.1 WO projection ignored its padded output")
++            return sp_rows.reduce_scatter(padded)
+         if get_tensor_model_parallel_world_size() > 1:
+             local = get_tp_group().all_reduce(local)
+         return local
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index c0112d6066..ad7d463624 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -1172,7 +1172,13 @@ class Engram(nn.Module):
+             if ENGRAM_ASYNC_TRACE:
+                 logger.info("engram-async dummy tokens=%d", num_tokens)
+ 
+-    def forward(self, hidden_states, hash_ids, token_mask=None):
++    def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
++        """Gate ``hidden_states`` with this layer's Engram rows.
++
++        With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
++        this rank's rows while ``hash_ids`` and ``token_mask`` cover every
++        token; the lookup and projection still run on every row.
++        """
+         if (
+             self.embed_tokens.table_memory == "disk"
+             and not torch.compiler.is_compiling()
+@@ -1190,13 +1196,24 @@ class Engram(nn.Module):
+         kv = self.wkv(rows)
+         state = hidden_states.flatten(1)
+         out = torch.empty_like(state)
++        mix_out = out
++        if sp_rows is not None:
++            # Gate the real local rows; the trailing pad rows pass through.
++            start, real = sp_rows.start, sp_rows.real_rows
++            if real < state.shape[0]:
++                out[real:].copy_(state[real:])
++            if real == 0:
++                return out.view_as(hidden_states)
++            state, mix_out, kv = state[:real], out[:real], kv[start : start + real]
++            if token_mask is not None:
++                token_mask = token_mask[start : start + real]
+         hyperconnection.run_engram_mix(
+             state,
+             kv,
+             self.norm_weights,
+             eps=self.eps,
+             plan=self.mix_plans[token_mask is not None],
+-            out=out,
++            out=mix_out,
+             token_mask=token_mask,
+         )
+         return out.view_as(hidden_states)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 4101086526..6156a7c1e6 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -273,6 +273,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         engram_hashes: torch.Tensor | None = None,
+         engram_mask: torch.Tensor | None = None,
+         ced_indices: torch.Tensor | None = None,
++        sp_rows: sp_prefill.SPRows | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         previous_output = x if residual is not None else None
+         apply_engram = self.engram is not None and engram_hashes is not None
+@@ -288,7 +289,10 @@ class DeepseekV4DecoderLayer(nn.Module):
+                     residual[:, None, :].expand(-1, self.hc_mult, -1).contiguous()
+                 )
+             residual = self.engram(
+-                residual, engram_hashes[:, self.engram.layer_hash_index], engram_mask
++                residual,
++                engram_hashes[:, self.engram.layer_hash_index],
++                engram_mask,
++                sp_rows=sp_rows,
+             )
+         fn = self.hc_attn_fn_broadcast if residual.ndim == 2 else self.hc_attn_fn
+         residual, post_mix, res_mix, x, attn_pre = self._b12x_mhc.pre(
+@@ -315,7 +319,12 @@ class DeepseekV4DecoderLayer(nn.Module):
+             positions = gather_rows(positions, ced_indices)
+             if input_ids is not None:
+                 input_ids = gather_rows(input_ids, ced_indices)
+-        x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++        if sp_rows is None:
++            x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++        else:
++            # SP: attention gathers every row and reduce-scatters its output.
++            with sp_prefill.activate(sp_rows):
++                x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+         residual, post_mix, res_mix, x, ffn_pre = self._b12x_mhc.post_pre(
+             x,
+             residual,
+@@ -327,7 +336,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+             self.ffn_norm.weight,
+             attn_pre,
+         )
+-        x = self.ffn(x, input_ids)
++        if sp_rows is None:
++            x = self.ffn(x, input_ids)
++        else:
++            # SP: route every row; the TP partial sum is reduce-scattered.
++            x = self.ffn(
++                sp_rows.gather(x), input_ids, reduce_scatter_rows=sp_rows.padded_rows
++            )
+         return x, residual, post_mix, res_mix, ffn_pre
+ 
+ 
+@@ -498,6 +513,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             )
+         else:
+             self._mtp_hidden_buffer = None
++        # DSpark drafts from the aux hidden states only; SP leaves this buffer.
++        self.prefill_sp_skips_mtp_buffer = (
++            spec_config is not None and spec_config.use_dspark()
++        )
+ 
+     def _engram_stream(self) -> torch.cuda.Stream:
+         stream = getattr(self, "_engram_side_stream", None)
+@@ -706,13 +725,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             )
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+-                hidden_states = inputs_embeds
++                hidden_states = (
++                    inputs_embeds if sp is None else sp.local_slice(inputs_embeds)
++                )
+             elif sp is not None:
+-                # Stage 1: the exact embedding reduce-scatter, gathered back.
+-                hidden_states = sp.gather(
+-                    self.embed_tokens.forward_reduce_scatter(
+-                        input_ids, sp.padded_rows
+-                    )
++                # One vocabulary shard owns each token: the reduce-scatter is
++                # exact and leaves this rank's rows.
++                hidden_states = self.embed_tokens.forward_reduce_scatter(
++                    input_ids, sp.padded_rows
+                 )
+             else:
+                 hidden_states = self.embed_input_ids(input_ids)
+@@ -814,6 +834,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 engram_hashes,
+                 engram_mask,
+                 ced_indices=boundary_indices,
++                sp_rows=sp,
+             )
+             if boundary_indices is not None:
+                 positions = gather_rows(positions, ced_indices)
+@@ -828,6 +849,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 aux_hidden_state = layer._b12x_mhc.collapse(aux_recon)
+                 if self.use_sequence_parallel:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
++                elif sp is not None:
++                    aux_hidden_state = sp.gather(aux_hidden_state)
+                 if decoder_compacted:
+                     aux_hidden_state = scatter_rows(
+                         aux_hidden_state, ced_indices, full_num_tokens
+@@ -856,10 +879,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+ 
+         # MTP needs full HC states; otherwise collapse and normalize locally
+         # before gathering to reduce communication.
+-        if self._mtp_hidden_buffer is not None:
++        if self._mtp_hidden_buffer is not None and not (
++            sp is not None and self.prefill_sp_skips_mtp_buffer
++        ):
+             if self.use_sequence_parallel:
+                 hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+                 pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
++            elif sp is not None:
++                hidden_states, pre_mix = sp.gather(hidden_states), sp.gather(pre_mix)
++                sp = None  # every row from here on
+             buffer_states = (
+                 scatter_rows(hidden_states, ced_indices, full_num_tokens)
+                 if decoder_compacted
+@@ -875,6 +903,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
+             # Without MTP, gather only the collapsed and normalized hidden states.
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
++        if sp is not None:
++            hidden_states = sp.gather(hidden_states)
+         if decoder_compacted:
+             hidden_states = scatter_rows(hidden_states, ced_indices, full_num_tokens)
+         if len(aux_hidden_states) > 0:
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index d8c9b48a22..563a6e98dc 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -30,15 +30,31 @@ parallelism and request boundary checkpoints.
+ - The last rank's local rows can include pad rows. They stay finite and are
+   never read back into real outputs.
+ 
+-## Stage 1
+-
+-Only the embedding is sequence-parallel: its all-reduce becomes a
+-reduce-scatter (each token has one owning vocabulary shard, so the sum is
+-exact) that is immediately all-gathered back to T rows. Everything else runs
+-on full rows as without SP, so logits are bit-identical with SP on or off.
++## Where each op runs
++
++- Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
++  attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
++- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention (q/kv
++  projections, ``wq_b``, indexer, compressor, KV cache writes, sparse MLA,
++  WO), and the MoE gate, top-k, routed and shared experts.
++
++Per decoder layer: all-gather before attention (inside
++``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
++the rows from ``current()``), reduce-scatter after WO instead of the
++all-reduce, all-gather before the MoE, and reduce-scatter of the MoE output
++(shared + routed) instead of the runner's final all-reduce. The embedding
++reduce-scatters its masked partial rows (each token has one owning
++vocabulary shard, so the sum is exact); ``inputs_embeds`` are sliced. After
++the final collapse and norm, and for every aux hidden state a drafter
++consumes, the rows are gathered back to T. DSpark drafts from the aux hidden
++states only, so its pre-collapse MTP buffer is not filled under SP; other
++drafters gather it.
+ """
+ 
+ import os
++from collections.abc import Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -151,6 +167,18 @@ class SPRows:
+         padded[self.num_tokens :].zero_()
+         return padded
+ 
++    def local_slice(self, x: torch.Tensor) -> torch.Tensor:
++        """This rank's L rows of a T-row tensor; pad rows are zero."""
++        if x.shape[0] != self.num_tokens:
++            raise ValueError(f"SP slice expects {self.num_tokens} rows, got {x.shape}")
++        real = self.real_rows
++        rows = x[self.start : self.start + real]
++        if real == self.local_rows:
++            return rows
++        local = x.new_zeros((self.local_rows, *x.shape[1:]))
++        local[:real].copy_(rows)
++        return local
++
+ 
+ def plan_rows(
+     num_tokens: int, min_rows: int, world_size: int, rank: int
+@@ -161,3 +189,21 @@ def plan_rows(
+     if not 0 <= rank < world_size:
+         raise ValueError(f"TP rank {rank} is outside world size {world_size}")
+     return SPRows(num_tokens, world_size, rank)
++
++
++_ROWS: ContextVar[SPRows | None] = ContextVar("ds41_prefill_sp_rows", default=None)
++
++
++def current() -> SPRows | None:
++    """The SP rows of the attention call in progress, if any."""
++    return _ROWS.get()
++
++
++@contextmanager
++def activate(rows: SPRows) -> Iterator[None]:
++    """Expose ``rows`` across the opaque attention op boundary."""
++    token = _ROWS.set(rows)
++    try:
++        yield
++    finally:
++        _ROWS.reset(token)
+-- 
+2.43.0
+

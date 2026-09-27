@@ -1,0 +1,606 @@
+From f6ea9a77a6916c51160abc4397bd22dc74ef221d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 19:50:49 +0200
+Subject: [PATCH] feat(deepseek-v4.1): prefill sequence-parallel state and
+ embedding reduce-scatter
+
+Stage 1 of a prefill-only sequence-parallel mode for TP > 1. With
+SPARK3_DS41_PREFILL_SP_MIN_ROWS set, DeepseekV4Model.forward decides per
+forward from the token count T (every rank shares it) whether to use SP,
+never under CED compaction, pipeline parallelism, static sequence
+parallelism or request boundary checkpoints, and never for decode-sized
+forwards: the threshold is raised above the CUDA graph sizes and
+max_num_seqs * (1 + num_speculative_tokens).
+
+The vocabulary-parallel embedding reduce-scatters its masked partial rows
+from a zero-padded buffer of Tp = TP * ceil(T / TP) rows. Each token has one
+owning shard, so the sum is exact; this stage gathers the rows straight back,
+so the forward is bit-identical to SP off while exercising the padding,
+collectives and row layout. The static _use_sequence_parallel flag stays off
+and no module or weight changes.
+---
+ tests/models/test_deepseek_v4_1_ced_model.py  |   1 +
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 223 ++++++++++++++++++
+ vllm/_custom_ops.py                           |  15 +-
+ .../layers/vocab_parallel_embedding.py        |  58 +++++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  21 +-
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 163 +++++++++++++
+ 6 files changed, 474 insertions(+), 7 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_sp_prefill.py
+ create mode 100644 vllm/models/deepseek_v4_1/sp_prefill.py
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index d0e23bc5d9..3137ab2421 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -253,6 +253,7 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         embed_input_ids=lambda _: inputs,
+         use_mega_moe=False,
+         use_sequence_parallel=False,
++        prefill_sp_min_rows=0,
+         disk_engram=False,
+         engram_hash=None,
+         start_layer=0,
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+new file mode 100644
+index 0000000000..f6eb56dc05
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill sequence parallelism: row layout, threshold and CPU collectives.
++
++The collectives are simulated in one process: every rank's contribution is
++computed first, then each rank's collective result is assembled from them.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v4_1 import sp_prefill
++
++WORLD_SIZES = (2, 3, 4)
++# T mod 3 = 0, 1, 2 around the 4096-row prefill chunk, plus small edge cases.
++TOKEN_COUNTS = (1, 2, 4, 7, 4095, 4096, 4097, 4098)
++
++
++@pytest.mark.parametrize(
++    ("raw", "rows"), [(None, 0), ("", 0), (" ", 0), ("0", 0), ("2048", 2048)]
++)
++def test_min_rows_from_env(monkeypatch, raw, rows):
++    if raw is None:
++        monkeypatch.delenv(sp_prefill.MIN_ROWS_ENV, raising=False)
++    else:
++        monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, raw)
++    assert sp_prefill.min_rows_from_env() == rows
++
++
++def test_min_rows_from_env_rejects_negative(monkeypatch):
++    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "-1")
++    with pytest.raises(ValueError):
++        sp_prefill.min_rows_from_env()
++
++
++@pytest.mark.parametrize("world_size", WORLD_SIZES)
++@pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)
++def test_row_layout_partitions_real_rows(world_size, num_tokens):
++    layouts = [
++        sp_prefill.SPRows(num_tokens, world_size, rank) for rank in range(world_size)
++    ]
++    padded = layouts[0].padded_rows
++    local = layouts[0].local_rows
++    assert padded % world_size == 0
++    assert 0 <= padded - num_tokens < world_size
++    assert local * world_size == padded
++    covered = []
++    for rank, layout in enumerate(layouts):
++        assert (layout.padded_rows, layout.local_rows) == (padded, local)
++        assert layout.start == rank * local
++        assert 0 <= layout.real_rows <= local
++        covered.extend(range(layout.start, layout.start + layout.real_rows))
++        if layout.real_rows < local:
++            # Only trailing ranks own padding, and nothing real follows it.
++            assert all(later.real_rows == 0 for later in layouts[rank + 1 :])
++    assert covered == list(range(num_tokens))
++    assert sum(local - layout.real_rows for layout in layouts) == padded - num_tokens
++
++
++@pytest.mark.parametrize("num_tokens", (4096, 4097, 4098))
++def test_row_layout_for_the_prefill_chunk_at_tp3(num_tokens):
++    last = sp_prefill.SPRows(num_tokens, 3, 2)
++    assert last.padded_rows == 4098
++    assert last.local_rows == 1366
++    assert last.start == 2732
++    assert last.real_rows == num_tokens - 2732
++
++
++def test_plan_rows_threshold():
++    assert sp_prefill.plan_rows(4096, 0, 3, 0) is None
++    assert sp_prefill.plan_rows(4096, 2048, 1, 0) is None
++    assert sp_prefill.plan_rows(2047, 2048, 3, 0) is None
++    assert sp_prefill.plan_rows(2048, 2048, 3, 1) == sp_prefill.SPRows(2048, 3, 1)
++    with pytest.raises(ValueError):
++        sp_prefill.plan_rows(4096, 2048, 3, 3)
++
++
++def _config(
++    *,
++    tp=3,
++    pp=1,
++    capture=48,
++    seqs=8,
++    spec_tokens=5,
++    boundary=False,
++):
++    return SimpleNamespace(
++        parallel_config=SimpleNamespace(
++            tensor_parallel_size=tp, pipeline_parallel_size=pp
++        ),
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=capture),
++        scheduler_config=SimpleNamespace(max_num_seqs=seqs),
++        speculative_config=(
++            None
++            if spec_tokens is None
++            else SimpleNamespace(num_speculative_tokens=spec_tokens)
++        ),
++        use_request_boundary_checkpoints=boundary,
++    )
++
++
++def test_resolve_min_rows(monkeypatch):
++    monkeypatch.delenv(sp_prefill.MIN_ROWS_ENV, raising=False)
++    # Off needs no configuration at all.
++    assert sp_prefill.resolve_min_rows(None) == 0
++    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "1024")
++    assert sp_prefill.resolve_min_rows(_config()) == 1024
++    # Raised above every decode forward: graphs and max_num_seqs * (1 + k).
++    monkeypatch.setenv(sp_prefill.MIN_ROWS_ENV, "16")
++    assert sp_prefill.resolve_min_rows(_config()) == 49
++    assert sp_prefill.resolve_min_rows(_config(capture=512)) == 513
++    assert sp_prefill.resolve_min_rows(_config(capture=None, spec_tokens=None)) == 16
++    for disabled in (
++        _config(tp=1),
++        _config(pp=2),
++        _config(boundary=True),
++    ):
++        assert sp_prefill.resolve_min_rows(disabled) == 0
++    assert (
++        sp_prefill.resolve_min_rows(_config(), static_sequence_parallel=True) == 0
++    )
++
++
++def _simulate_reduce_scatter(monkeypatch, layouts, contributions):
++    """Install a reduce-scatter that returns each rank's slice of the sum."""
++    total = sum(contributions)
++    calls = iter(range(len(layouts)))
++
++    def reduce_scatter(padded, dim):
++        rank = next(calls)
++        assert dim == 0 and padded is contributions[rank]
++        return total.chunk(len(layouts))[rank].clone()
++
++    monkeypatch.setattr(
++        sp_prefill, "tensor_model_parallel_reduce_scatter", reduce_scatter
++    )
++
++
++@pytest.mark.parametrize("num_tokens", (9, 10, 11))
++def test_reduce_scatter_then_gather_round_trips(monkeypatch, num_tokens):
++    world = 3
++    full = torch.arange(num_tokens * 2, dtype=torch.float32).reshape(num_tokens, 2)
++    layouts = [sp_prefill.SPRows(num_tokens, world, rank) for rank in range(world)]
++    # Partial sums whose exact total is `full`, as TP row-parallel outputs.
++    contributions = []
++    for layout, weight in zip(layouts, (1.0, 2.0, -2.0)):
++        padded = layout.empty_padded((2,), torch.float32, torch.device("cpu"))
++        assert padded.shape == (layout.padded_rows, 2)
++        assert not padded[num_tokens:].any()
++        padded[:num_tokens] = full * weight
++        contributions.append(padded)
++    _simulate_reduce_scatter(monkeypatch, layouts, contributions)
++    local = [
++        layout.reduce_scatter(padded)
++        for layout, padded in zip(layouts, contributions)
++    ]
++    for layout, rows in zip(layouts, local):
++        assert rows.shape == (layout.local_rows, 2)
++        real = layout.real_rows
++        torch.testing.assert_close(
++            rows[:real], full[layout.start : layout.start + real], rtol=0, atol=0
++        )
++        assert not rows[real:].any()
++
++    def all_gather(x, dim):
++        assert dim == 0
++        return torch.cat(local, dim=0)
++
++    monkeypatch.setattr(sp_prefill, "tensor_model_parallel_all_gather", all_gather)
++    for layout, rows in zip(layouts, local):
++        torch.testing.assert_close(layout.gather(rows), full, rtol=0, atol=0)
++    with pytest.raises(ValueError):
++        layouts[0].gather(full)
++    with pytest.raises(ValueError):
++        layouts[0].reduce_scatter(torch.zeros(layouts[0].padded_rows + 1, 2))
++
++
++def test_embedding_reduce_scatter_has_one_owner_per_token(monkeypatch):
++    from vllm.model_executor.layers import vocab_parallel_embedding as embedding
++
++    vocab, width, world = 12, 3, 3
++    shard = vocab // world
++    table = torch.arange(vocab * width, dtype=torch.float32).reshape(vocab, width)
++    table += 1
++    ids = torch.tensor([0, 11, 5, 4, 7, 3, 9])
++    padded_rows = 9
++    buffers = []
++
++    def reduce_scatter(padded, dim):
++        assert dim == 0
++        buffers.append(padded.clone())
++        return padded
++
++    monkeypatch.setattr(
++        embedding, "tensor_model_parallel_reduce_scatter", reduce_scatter
++    )
++    for rank in range(world):
++        rows = table[rank * shard : (rank + 1) * shard]
++        layer = SimpleNamespace(
++            tp_size=world,
++            parallel_group=None,
++            use_fused_embedding=False,
++            shard_indices=SimpleNamespace(
++                org_vocab_start_index=rank * shard,
++                org_vocab_end_index=(rank + 1) * shard,
++                num_org_vocab_padding=0,
++                added_vocab_start_index=vocab,
++                added_vocab_end_index=vocab,
++            ),
++            quant_method=SimpleNamespace(
++                embedding=lambda _, local_ids, rows=rows: rows[local_ids].clone()
++            ),
++        )
++        embedding.VocabParallelEmbedding.forward_reduce_scatter(
++            layer, ids, padded_rows
++        )
++    expected = torch.zeros(padded_rows, width)
++    expected[: ids.numel()] = table[ids]
++    torch.testing.assert_close(sum(buffers), expected, rtol=0, atol=0)
++    with pytest.raises(ValueError):
++        embedding.VocabParallelEmbedding.forward_reduce_scatter(layer, ids, 8)
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 3311215016..33553884f2 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -255,6 +255,7 @@ def vocab_parallel_embedding(
+     num_org_vocab_padding: int,
+     added_vocab_start_index: int,
+     added_vocab_end_index: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     """Gather the embedding rows owned by this rank, zeros for the others.
+ 
+@@ -265,16 +266,18 @@ def vocab_parallel_embedding(
+     Args:
+         input_ids: ``[num_tokens]`` int32 or int64 token ids.
+         weight: ``[num_embeddings_per_partition, embedding_dim]`` shard.
++        out: optional contiguous ``[num_tokens, embedding_dim]`` destination.
+ 
+     Returns:
+         ``[num_tokens, embedding_dim]`` partial embeddings.
+     """
+-    out = torch.empty(
+-        input_ids.shape[0],
+-        weight.shape[1],
+-        dtype=weight.dtype,
+-        device=weight.device,
+-    )
++    if out is None:
++        out = torch.empty(
++            input_ids.shape[0],
++            weight.shape[1],
++            dtype=weight.dtype,
++            device=weight.device,
++        )
+     torch.ops._C.vocab_parallel_embedding(
+         out,
+         input_ids,
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index bb56178ec2..faacb7d041 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -18,6 +18,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
+     tensor_model_parallel_all_reduce,
++    tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.logger import init_logger
+ from vllm.model_executor.custom_op import PluggableLayer
+@@ -692,6 +693,63 @@ class VocabParallelEmbedding(PluggableLayer):
+             return self.parallel_group.all_reduce(output_parallel)
+         return tensor_model_parallel_all_reduce(output_parallel)
+ 
++    def forward_reduce_scatter(
++        self, input_: torch.Tensor, padded_rows: int
++    ) -> torch.Tensor:
++        """Embed ``input_`` and reduce-scatter the rows over the TP group.
++
++        For sequence parallelism: the partial embeddings are written into a
++        ``padded_rows`` buffer whose trailing rows are zero, and rank r
++        receives rows ``[r * padded_rows // tp_size, (r + 1) * ...)`` of the
++        full embeddings. Each token has one owning shard, so the reduction is
++        exact, as in :meth:`forward`.
++        """
++        rows = input_.shape[0]
++        if (
++            self.tp_size == 1
++            or self.parallel_group is not None
++            or input_.ndim != 1
++            or padded_rows < rows
++            or padded_rows % self.tp_size
++        ):
++            raise ValueError(
++                "Embedding reduce-scatter needs 1-D ids, the default TP group "
++                f"and padded rows divisible by it (rows={rows}, "
++                f"padded_rows={padded_rows}, tp_size={self.tp_size})"
++            )
++        if self.use_fused_embedding:
++            output_parallel = torch.empty(
++                (padded_rows, self.weight.shape[1]),
++                dtype=self.weight.dtype,
++                device=self.weight.device,
++            )
++            ops.vocab_parallel_embedding(
++                input_,
++                self.weight,
++                self.shard_indices.org_vocab_start_index,
++                self.shard_indices.org_vocab_end_index,
++                self.shard_indices.num_org_vocab_padding,
++                self.shard_indices.added_vocab_start_index,
++                self.shard_indices.added_vocab_end_index,
++                out=output_parallel[:rows],
++            )
++        else:
++            masked_input, input_mask = get_masked_input_and_mask(
++                input_,
++                self.shard_indices.org_vocab_start_index,
++                self.shard_indices.org_vocab_end_index,
++                self.shard_indices.num_org_vocab_padding,
++                self.shard_indices.added_vocab_start_index,
++                self.shard_indices.added_vocab_end_index,
++            )
++            local = self.quant_method.embedding(self, masked_input.long())
++            if local.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
++                raise NotImplementedError("FP8 embedding reduce-scatter")
++            output_parallel = local.new_empty((padded_rows, *local.shape[1:]))
++            output_parallel[:rows].copy_(local.masked_fill_(input_mask[:, None], 0))
++        output_parallel[rows:].zero_()
++        return tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
++
+     def extra_repr(self) -> str:
+         s = f"num_embeddings={self.num_embeddings}"
+         s += f", num_embeddings_per_partition={self.num_embeddings_per_partition}"
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index e22daa141c..4101086526 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -64,7 +64,7 @@ from vllm.utils.b12x import (
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+ 
+-from .. import l2_prefetch
++from .. import l2_prefetch, sp_prefill
+ from ..b12x_layers import B12xLinearMethod, B12xMHC
+ from ..b12x_layers import B12xRMSNorm as RMSNorm
+ from ..ced import ced_decoder_start, gather_rows, scatter_rows
+@@ -364,6 +364,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         self.parallel_config = vllm_config.parallel_config
+         self.use_mega_moe = False
+         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
++        # Per-forward prefill sequence parallelism (0 = off); see sp_prefill.
++        self.prefill_sp_min_rows = sp_prefill.resolve_min_rows(
++            vllm_config, static_sequence_parallel=self.use_sequence_parallel
++        )
+         if vllm_config.parallel_config.use_ubatching:
+             raise ValueError(
+                 "V4.1 fixed native layer buffers require ubatching/DBO disabled"
+@@ -692,9 +696,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         lookback_token_ids: torch.Tensor | None = None,
+         ced_indices: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
++        sp = None
++        if self.prefill_sp_min_rows and ced_indices is None:
++            sp = sp_prefill.plan_rows(
++                positions.shape[0],
++                self.prefill_sp_min_rows,
++                get_tensor_model_parallel_world_size(),
++                get_tensor_model_parallel_rank(),
++            )
+         if get_pp_group().is_first_rank:
+             if inputs_embeds is not None:
+                 hidden_states = inputs_embeds
++            elif sp is not None:
++                # Stage 1: the exact embedding reduce-scatter, gathered back.
++                hidden_states = sp.gather(
++                    self.embed_tokens.forward_reduce_scatter(
++                        input_ids, sp.padded_rows
++                    )
++                )
+             else:
+                 hidden_states = self.embed_input_ids(input_ids)
+         else:
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+new file mode 100644
+index 0000000000..d8c9b48a22
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill sequence parallelism (SP) for DeepSeek V4.1 tensor parallelism.
++
++## Mode
++
++At tensor parallel size N every rank repeats the row-wise work of a decoder
++layer (mHC mixes, norms, the Engram gate, the residual carry) on every token.
++For a long prefill forward, SP turns the per-layer all-reduces into dim-0
++reduce-scatters so that each rank owns 1/N of the rows for that work, and
++all-gathers the rows back before the ops that need all of them. Weights stay
++exactly as in ordinary TP; nothing is replicated. The static
++``_use_sequence_parallel`` construction flag stays off: this mode changes no
++module.
++
++Enable with ``SPARK3_DS41_PREFILL_SP_MIN_ROWS=<rows>``; unset or 0 keeps it
++off. ``DeepseekV4Model.forward`` decides per forward from the token count T,
++which every rank shares, so no agreement between ranks is needed. The
++threshold is raised above the decode token counts (CUDA graph sizes and
++``max_num_seqs * (1 + num_speculative_tokens)``), so decode never uses SP. SP
++is also off for CED compaction, pipeline parallelism, static sequence
++parallelism and request boundary checkpoints.
++
++## Rows
++
++- Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
++  rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
++- Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
++- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero.
++- The last rank's local rows can include pad rows. They stay finite and are
++  never read back into real outputs.
++
++## Stage 1
++
++Only the embedding is sequence-parallel: its all-reduce becomes a
++reduce-scatter (each token has one owning vocabulary shard, so the sum is
++exact) that is immediately all-gathered back to T rows. Everything else runs
++on full rows as without SP, so logits are bit-identical with SP on or off.
++"""
++
++import os
++from dataclasses import dataclass
++
++import torch
++
++from vllm.distributed import (
++    tensor_model_parallel_all_gather,
++    tensor_model_parallel_reduce_scatter,
++)
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++MIN_ROWS_ENV = "SPARK3_DS41_PREFILL_SP_MIN_ROWS"
++
++
++def min_rows_from_env() -> int:
++    """The requested SP threshold in tokens; unset, empty or 0 is off."""
++    raw = os.environ.get(MIN_ROWS_ENV, "").strip()
++    rows = int(raw) if raw else 0
++    if rows < 0:
++        raise ValueError(f"{MIN_ROWS_ENV} must be >= 0, got {rows}")
++    return rows
++
++
++def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) -> int:
++    """The effective SP threshold for this model instance; 0 is off."""
++    requested = min_rows_from_env()
++    if requested <= 0:
++        return 0
++    parallel = vllm_config.parallel_config
++    reason = None
++    if parallel.tensor_parallel_size <= 1:
++        reason = "tensor parallel size is 1"
++    elif parallel.pipeline_parallel_size != 1:
++        reason = "pipeline parallelism keeps full-row intermediate tensors"
++    elif static_sequence_parallel:
++        reason = "static sequence parallelism is enabled"
++    elif vllm_config.use_request_boundary_checkpoints:
++        reason = "request boundary checkpoints are enabled"
++    if reason is not None:
++        logger.warning("%s=%d ignored: %s", MIN_ROWS_ENV, requested, reason)
++        return 0
++    spec = vllm_config.speculative_config
++    decode_rows = max(
++        vllm_config.compilation_config.max_cudagraph_capture_size or 0,
++        vllm_config.scheduler_config.max_num_seqs
++        * (1 + (spec.num_speculative_tokens if spec is not None else 0)),
++        parallel.tensor_parallel_size,
++    )
++    rows = max(requested, decode_rows + 1)
++    if rows != requested:
++        logger.warning(
++            "%s=%d raised to %d: decode forwards of up to %d tokens never use it",
++            MIN_ROWS_ENV,
++            requested,
++            rows,
++            decode_rows,
++        )
++    logger.info("DeepSeek V4.1 prefill sequence parallelism from %d tokens", rows)
++    return rows
++
++
++@dataclass(frozen=True)
++class SPRows:
++    """Row layout of one sequence-parallel forward on one TP rank."""
++
++    num_tokens: int
++    world_size: int
++    rank: int
++
++    @property
++    def padded_rows(self) -> int:
++        """Tp: rows seen by collectives, T rounded up to a multiple of N."""
++        return -(-self.num_tokens // self.world_size) * self.world_size
++
++    @property
++    def local_rows(self) -> int:
++        """L: rows this rank owns between collectives."""
++        return self.padded_rows // self.world_size
++
++    @property
++    def start(self) -> int:
++        """First padded row owned by this rank."""
++        return self.rank * self.local_rows
++
++    @property
++    def real_rows(self) -> int:
++        """Leading local rows that are real tokens; the rest are padding."""
++        return max(0, min(self.local_rows, self.num_tokens - self.start))
++
++    def gather(self, x: torch.Tensor) -> torch.Tensor:
++        """All-gather this rank's L rows into the first T rows."""
++        if x.shape[0] != self.local_rows:
++            raise ValueError(f"SP gather expects {self.local_rows} rows, got {x.shape}")
++        return tensor_model_parallel_all_gather(x, dim=0)[: self.num_tokens]
++
++    def reduce_scatter(self, padded: torch.Tensor) -> torch.Tensor:
++        """Sum a zero-padded Tp-row buffer over the ranks into this rank's rows."""
++        if padded.shape[0] != self.padded_rows:
++            raise ValueError(
++                f"SP reduce-scatter expects {self.padded_rows} rows, got {padded.shape}"
++            )
++        return tensor_model_parallel_reduce_scatter(padded, dim=0)
++
++    def empty_padded(
++        self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
++    ) -> torch.Tensor:
++        """A Tp-row buffer whose pad rows (T and beyond) are zero."""
++        padded = torch.empty((self.padded_rows, *row_shape), dtype=dtype, device=device)
++        padded[self.num_tokens :].zero_()
++        return padded
++
++
++def plan_rows(
++    num_tokens: int, min_rows: int, world_size: int, rank: int
++) -> SPRows | None:
++    """The SP row layout for a forward of ``num_tokens`` tokens, or None."""
++    if min_rows <= 0 or world_size <= 1 or num_tokens < min_rows:
++        return None
++    if not 0 <= rank < world_size:
++        raise ValueError(f"TP rank {rank} is outside world size {world_size}")
++    return SPRows(num_tokens, world_size, rank)
+-- 
+2.43.0
+

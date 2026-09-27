@@ -1,0 +1,109 @@
+From 6151f609ef0d768fcbcc77b0448f658c776ac199 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 21:19:12 +0200
+Subject: [PATCH] perf(deepseek-v4.1): local attention front under
+ sequence-parallel prefill
+
+In attention layers without a compressor the hidden state feeds only
+fused_wqa_wkv, the q/kv norms and the indexer's weights_proj, all
+row-wise. Under SP run them on this rank's rows and all-gather their
+product (q_lora + kv + index weights, 1856 columns) instead of the 5120
+hidden columns: a third of the gather bytes and a third of the replicated
+projection. Layers with a compressor still gather the hidden state, which
+the global KV build reads.
+---
+ vllm/models/deepseek_v4_1/attention.py  | 43 +++++++++++++++++++------
+ vllm/models/deepseek_v4_1/sp_prefill.py |  9 ++++--
+ 2 files changed, 40 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 55ebc83720..271c872e71 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1313,13 +1313,34 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 "V4.1 attention metadata is not prepared"
+             )
+         sp_rows = sp_prefill.current()
+-        if sp_rows is not None:
+-            # Sequence-parallel prefill: attention runs on every row.
+-            hidden_states = sp_rows.gather(hidden_states)
+-        rows = hidden_states.shape[0]
+-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+-        qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+-        qr, kv = self.q_norm(qr), self.kv_norm(kv)
++        index_weights = None
++        if sp_rows is not None and self.compressor is None:
++            # Sequence-parallel prefill without a compressor: the row-wise front
++            # (projection, norms, index weights) runs on this rank's rows, and
++            # its product, narrower than the hidden state, is gathered.
++            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++            parts = [self.q_norm(qr), self.kv_norm(kv)]
++            if self.indexer is not None:
++                parts.append(self.indexer.weights_proj(hidden_states))
++            if len({part.dtype for part in parts}) == 1:
++                widths = [part.shape[-1] for part in parts]
++                parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(widths, dim=-1)
++            else:
++                parts = [sp_rows.gather(part) for part in parts]
++            qr, kv = parts[0].contiguous(), parts[1].contiguous()
++            if self.indexer is not None:
++                index_weights = parts[2].contiguous()
++            hidden_states = None
++            rows = sp_rows.num_tokens
++        else:
++            if sp_rows is not None:
++                # Sequence-parallel prefill: attention runs on every row.
++                hidden_states = sp_rows.gather(hidden_states)
++            rows = hidden_states.shape[0]
++            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
++            qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++            qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         l2_prefetch.issue(self._l2pf_wo, rows)
+         q = _rotated(
+@@ -1342,7 +1363,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa = self._query_metadata(original_swa)
+             is_prefill = not swa.is_decode
+             self._cache_context_kv(kv, positions)
+-            if swa is original_swa:
++            if swa is original_swa and hidden_states is not None:
+                 self._prepare_global_kv(positions, hidden_states)
+             index_query = None
+             if self.indexer is not None:
+@@ -1366,7 +1387,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                         q_mxfp4=iq_data[offset:end],
+                         q_scales=iq_scale[offset:end],
+                     )
+-                weights = self.indexer.weights_proj(hidden_states)
++                weights = (
++                    index_weights
++                    if index_weights is not None
++                    else self.indexer.weights_proj(hidden_states)
++                )
+                 iw = torch.empty_like(weights)
+                 weight_scale.scale_index_weights(
+                     weights,
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 2e9c4236ca..ff688894d9 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -37,9 +37,12 @@ decoder's global KV from every row and then compacts.
+ 
+ - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
+   attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
+-- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention (q/kv
+-  projections, ``wq_b``, indexer, compressor, KV cache writes, sparse MLA,
+-  WO), and the MoE gate, top-k, routed and shared experts.
++- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention
++  (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
++  MoE gate, top-k, routed and shared experts.
++- In attention layers without a compressor, the row-wise front
++  (``fused_wqa_wkv``, the q/kv norms and the index weights) runs on local
++  rows and its narrower product is gathered instead of the hidden state.
+ 
+ Per decoder layer: all-gather before attention (inside
+ ``DeepseekV4Attention._forward``, behind the opaque attention op, which reads
+-- 
+2.43.0
+

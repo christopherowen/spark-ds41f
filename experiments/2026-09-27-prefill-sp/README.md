@@ -45,4 +45,28 @@ arm's own run-to-run spread.
 
 ## Results
 
-Pending.
+- First attempt (18:26 UTC): no change in prefill. The profile showed SP
+  never engaged: every DeepSeek V4.1 prefill uses CED compaction, which the
+  first version excluded. With CED only the encoder layers before
+  `ced_decoder_start` run on every row, so a third commit runs SP through
+  them and gathers the carried rows before the boundary layer.
+- CED-aware SP (19:03 UTC, same-session control): +7.8% to +8.4%.
+  Per 4K chunk, hyper-connection time fell from 152 to 57 ms. The
+  reduce-scatters and all-gathers each cost about half an all-reduce, so
+  communication was neutral: kernel time went from 1134 to 1043 ms.
+- With the local attention front (fourth commit, 19:20 UTC):
+
+| Arm | 4K (3854) | 16K (14768) | 32K (28937) | 64K (57122) |
+|---|---|---|---|---|
+| control | 3585 | 3460 | 3439 | 3421 |
+| sp | 3912 | 3799 | 3752 | 3744 |
+| change | +9.1% | +9.8% | +9.1% | +9.4% |
+
+- Correctness: the ~5.7K-token needle is answered correctly in every arm.
+  Prompt logprobs of a ~4.2K-token prompt differ from the control by 0.011
+  on average (median 0.00000), no more than the control differs from
+  itself between identical runs (0.012-0.014).
+- Single-stream decode step times are unchanged. LRU 5/5 in every arm;
+  dgx1 minimum MemAvailable 6.25-6.62 GiB.
+- The unit tests pass. The upstream CED model test fails two cases on the
+  unmodified image too (its fake model lacks `_l2pf_ready`).

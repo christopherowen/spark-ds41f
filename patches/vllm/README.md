@@ -116,8 +116,25 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   output. Off by default; output unchanged. Upstream status: candidate, not
   submitted.
 
-Applying 0001-0013 to the base yields patch head `0a00c7b3` and tree
-`73a843bb`. 0001-0011, the promoted r5e image, give patch head `138b562f`
+- `0014`-`0017` (`deepseek-v41-prefill-sp-*`, `SPARK3_DS41_PREFILL_SP_MIN_ROWS`)
+  add sequence-parallel prefill. For prefill forwards above the threshold,
+  each decoder layer's all-reduces become dim-0 reduce-scatters, and each
+  rank runs the row-wise work between them (hyper-connection mixes, norms,
+  the Engram gate, the residual) on a third of the rows:
+  - 0014 holds the per-forward state and reduce-scatters the embedding;
+  - 0015 carries the decoder dataflow (attention and MoE gather their
+    inputs and reduce-scatter their outputs);
+  - 0016 covers the CED encoder layers and gathers the carried rows before
+    the boundary layer;
+  - 0017 runs the attention front (`fused_wqa_wkv`, norms, index weights) on
+    local rows and gathers its narrower product.
+  Decode never engages (the threshold is raised above every decode token
+  count). Off by default; output differs only by the reduce-scatter's
+  summation order. Upstream status: candidate, not submitted.
+
+Applying 0001-0017 to the base yields patch head `6151f609` and tree
+`5e088694`. 0001-0013, the r5f image, give patch head `0a00c7b3` and tree
+`73a843bb`. 0001-0011, the r5e image, give patch head `138b562f`
 and tree `7b839dc1`. The r5c image carried an earlier 0009 that moved
 `_dummy_run`'s decorators onto its new helper; its 0001-0009 gave patch
 head `d7234353`, tree `f250542a` (on the r4 base `01f1b874`: patch head

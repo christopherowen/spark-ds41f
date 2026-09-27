@@ -54,5 +54,13 @@ profile["serve_args"] += [
     }),
 ]
 arms["sp-profile"] = profile
+# Promotion candidate: SP on the r5g image (patches 0001-0017, built), no overlay.
+candidate = arm("r5g", {"SPARK3_DS41_PREFILL_SP_MIN_ROWS": "2048"}, overlay=False)
+candidate["environment"]["VLLM_CACHE_DIR"] = candidate["environment"]["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5g"
+candidate["container"]["image"] = "vllm-ds41f-kkref:04c30fa98e79-r5g"
+candidate["container"]["expected_labels"]["local.spark3.vllm.tree"] = (
+    "5e088694df62bebb8cddbe9dce0a5e529b536627"
+)
+arms["candidate"] = candidate
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
