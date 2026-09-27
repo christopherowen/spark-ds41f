@@ -2585,18 +2585,20 @@ def novel_text(tokens: int, seed: int) -> str:
 
     The filler repeats 18 words, so its Engram rows stay in the page cache
     and "cold" prefill never reads the tables from disk. Words of two to
-    four random letters average a little over one token each.
+    four random letters average 1.9 tokens each (measured on the served
+    tokenizer at 4K-64K).
     """
     rng = random.Random(seed)
     words = (
         "".join(rng.choice(NOVEL_LETTERS) for _ in range(rng.randint(2, 4)))
-        for _ in range(int(tokens * 0.8))
+        for _ in range(int(tokens / 1.9))
     )
     return f"Document {seed}:\n" + " ".join(words)
 
 
-# Python source averages a little over three characters per token.
-SOURCE_CHARS_PER_TOKEN = 3.2
+# Python standard-library source averages about 3.8 characters per token on
+# the served tokenizer (2.6-4.3 depending on the files, measured at 4K-64K).
+SOURCE_CHARS_PER_TOKEN = 3.8
 
 
 @functools.cache
