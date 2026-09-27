@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-27-karmic-kraken-r5f.json](manifests/baselines/2026-09-27-karmic-kraken-r5f.json):
+[manifests/baselines/2026-09-27-karmic-kraken-r5g.json](manifests/baselines/2026-09-27-karmic-kraken-r5g.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -30,6 +30,8 @@ The active baseline is recorded in
   tokens; verification rows whose drafts are unlikely to survive skip the
   routed experts, and greedy drafts stay sharded by vocabulary over an NVFP4
   drafter head and Markov projection;
+- sequence-parallel prefill from 2,048 tokens: the encoder layers' row-wise
+  work runs on a third of the rows per rank;
 - B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
   model's SwiGLU clamp and caused the incoherence seen in earlier images;
 - 131,072-token per-request limit, eight admitted sequences, and 575,304 KV
@@ -54,38 +56,38 @@ default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 49.5 | 51.8 | 0.25 s |
-| prose | 2 | 73.4 | 39.4 | 0.36 s |
-| prose | 4 | 109.9 | 30.0 | 0.47 s |
-| prose | 8 | 157.2 | 21.5 | 0.56 s |
-| code | 1 | 61.6 | 65.1 | 0.24 s |
-| code | 2 | 86.7 | 47.9 | 0.38 s |
-| code | 4 | 129.7 | 36.9 | 0.46 s |
-| code | 8 | 177.9 | 25.3 | 0.57 s |
+| prose | 1 | 50.8 | 53.0 | 0.23 s |
+| prose | 2 | 73.6 | 39.0 | 0.36 s |
+| prose | 4 | 107.1 | 29.1 | 0.47 s |
+| prose | 8 | 155.4 | 21.5 | 0.58 s |
+| code | 1 | 59.4 | 62.8 | 0.25 s |
+| code | 2 | 88.5 | 48.6 | 0.37 s |
+| code | 4 | 127.7 | 35.9 | 0.46 s |
+| code | 8 | 185.6 | 26.1 | 0.57 s |
 
 With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 
 | Prompt | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| prose | 53.5 | 79.7 | 116.6 | 167.1 |
-| code | 75.7 | 113.1 | 166.1 | 230.7 |
-| JSON | 74.5 | 102.9 | 157.9 | 230.3 |
+| prose | 55.8 | 81.5 | 118.2 | 167.1 |
+| code | 76.9 | 109.5 | 162.5 | 238.9 |
+| JSON | 72.8 | 105.7 | 158.9 | 228.1 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Single-stream decode step | about 44 ms on prose and 50 ms on code; accepted drafts per step 1.3 (prose), 2.2 (code), 3.1 (code answers) |
-| Cold prefill, repeated filler | 2K 3.9k, 32K 4.2k, 64K 4.1k tok/s |
-| Cold prefill, real text (Python source) | 4K 3.5k, 14K 3.4k, 36K 3.4k, 61K 3.4k tok/s |
-| Prefix-cache replay, 32K prompt | 7.64 s cold, 0.26 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.7 tok/s per stream |
+| Single-stream decode step | about 44 ms on prose and 49 ms on code; accepted drafts per step 1.3 (prose), 2.0 (code), 3.3 (code answers) |
+| Cold prefill, repeated filler | 2K 3.9k, 32K 4.6k, 64K 4.6k tok/s |
+| Cold prefill, real text (Python source) | 4K 3.8k, 14K 3.8k, 36K 3.7k, 61K 3.7k tok/s |
+| Prefix-cache replay, 32K prompt | 6.78 s cold, 0.26 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 32%, 12.9 tok/s per stream |
 | KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.21 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
+| Host memory headroom | dgx1 at least 6.54 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
 The quick default takes three or four samples per decode point, about ±2-12%
 at 95% confidence; temperature-0 outputs differ between identical requests,
 which moves acceptance from sample to sample. Report:
-[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-27-karmic-kraken-r5f.json).
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-27-karmic-kraken-r5g.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract
