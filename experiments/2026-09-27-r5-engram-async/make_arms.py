@@ -30,3 +30,19 @@ environment["VLLM_DS41_ENGRAM_OVERLAP"] = "0"
 environment["VLLM_CACHE_DIR"] = environment["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5c"
 cfg["environment"] = dict(sorted(environment.items()))
 (E / "cluster-r5c.json").write_text(json.dumps(cfg, indent=2) + "\n")
+
+# Five drafts, the drafter's trained block, with graphs for eight streams at
+# 1 + 5 rows each; adaptive verification as promoted (cost scale 2.0).
+k5 = copy.deepcopy(cfg)
+args = k5["serve_args"]
+i = args.index("--speculative-config")
+speculative = json.loads(args[i + 1])
+speculative["num_speculative_tokens"] = 5
+args[i + 1] = json.dumps(speculative, separators=(",", ":"))
+args[args.index("--max-cudagraph-capture-size") + 1] = "48"
+i = args.index("--compilation-config")
+compilation = json.loads(args[i + 1])
+compilation["cudagraph_capture_sizes"] += [40, 48]
+args[i + 1] = json.dumps(compilation, separators=(",", ":"))
+k5["environment"]["VLLM_CACHE_DIR"] = k5["environment"]["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5c-k5"
+(E / "cluster-r5c-k5.json").write_text(json.dumps(k5, indent=2) + "\n")
