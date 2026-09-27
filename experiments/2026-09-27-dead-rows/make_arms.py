@@ -12,14 +12,15 @@ ROOT = E.parents[1]
 base = json.loads((ROOT / "config/cluster.json").read_text())
 
 
-def arm(env: dict) -> dict:
+def arm(env: dict, image: str = "r5d") -> dict:
     cfg = copy.deepcopy(base)
-    cfg["container"]["image"] = "vllm-ds41f-kkref:04c30fa98e79-r5d"
-    cfg["container"]["expected_labels"]["local.spark3.vllm.tree"] = (
-        "e94095189f47352b7a936b0a69eeda86cc114e43"
-    )
+    cfg["container"]["image"] = f"vllm-ds41f-kkref:04c30fa98e79-{image}"
+    cfg["container"]["expected_labels"]["local.spark3.vllm.tree"] = {
+        "r5d": "e94095189f47352b7a936b0a69eeda86cc114e43",
+        "r5e": "7b839dc1954f91cf1406e1775fad3c16d207ab53",
+    }[image]
     environment = cfg["environment"]
-    environment["VLLM_CACHE_DIR"] = environment["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5d-k5"
+    environment["VLLM_CACHE_DIR"] = environment["VLLM_CACHE_ROOT"] = f"/cache/kkref/jit/vllm-{image}-k5"
     environment.update(env)
     cfg["environment"] = dict(sorted(environment.items()))
     return cfg
@@ -37,6 +38,8 @@ arms = {
     "budget01": arm({"SPARK3_DSPARK_DEAD_ROWS_TAU": "0.1"}),
     "budget02": arm({"SPARK3_DSPARK_DEAD_ROWS_TAU": "0.2"}),
     "dead01": arm({"SPARK3_DSPARK_VERIFY_RULE": "all", "SPARK3_DSPARK_DEAD_ROWS_TAU": "0.1"}),
+    # Promotion candidate: budget02 on the r5e image (patches 0001-0011).
+    "candidate": arm({"SPARK3_DSPARK_DEAD_ROWS_TAU": "0.2"}, image="r5e"),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
