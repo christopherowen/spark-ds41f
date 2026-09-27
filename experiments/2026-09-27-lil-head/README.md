@@ -91,3 +91,23 @@ boot per arm, three samples at one and eight streams. Every arm passed LRU
 - The disk-Engram path of `base`, `realprof` and the five-draft arms is the
   base's overlap; the determinism arm ran on r4a (`experiments/2026-09-26-
   dspark-policy`).
+
+Isolation runs (`lil-s-nol2b`, `lil-s-baseb`, `lil-s-engramoff`,
+`lil-s-pagedoff`), one boot each, pooled with the first pair where
+repeated. Single-stream step times (ms):
+
+| Arm | prose | code | prose-nothink | code-nothink |
+|---|---:|---:|---:|---:|
+| r5 `base` (2 boots) | 51.06 | 53.63 | 51.90 | 53.64 |
+| r5 `nol2` (2 boots) | 52.29 | 53.75 | 52.67 | 53.84 |
+| r5 `engramoff` | 51.48 | 54.36 | 52.32 | 54.68 |
+| r5 `pagedoff` | 51.23 | 53.92 | 52.00 | 53.75 |
+
+- L2 weight prefetch saves 1.2 ms per prose step (-2.4%, significant) and
+  0.8 ms per prose-nothink step; code steps and throughput at eight streams
+  do not change measurably (code c8 +1.2 ±1.7% pooled).
+- The base's Engram overlap saves only 0.4-1.0 ms per step against reading
+  the rows before the launch (and 4-6% at eight streams), where patch 0002
+  saved about 1.85 ms on r3: most of the rebase's loss. Patch 0002 is
+  re-ported in `experiments/2026-09-27-r5-engram-async`.
+- The generic B12X paged decode does not touch DeepSeek V4.1 (no change).
