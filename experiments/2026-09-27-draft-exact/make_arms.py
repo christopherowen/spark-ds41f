@@ -52,5 +52,19 @@ arms = {
         "VLLM_DS41_MARKOV_NVFP4": "1",
     }),
 }
+# Promotion candidate: the combo on the r5f image (patches 0001-0013, built),
+# without the overlay.
+candidate = arm("r5f", {
+    "SPARK3_DSPARK_VOCAB_PARALLEL": "1",
+    "SPARK3_DSPARK_MAIN_PROJ_TP": "1",
+    "VLLM_DS41_DRAFT_NVFP4_HEAD": "1",
+    "VLLM_DS41_MARKOV_NVFP4": "1",
+}, overlay=False)
+candidate["environment"]["VLLM_CACHE_DIR"] = candidate["environment"]["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5f"
+candidate["container"]["image"] = "vllm-ds41f-kkref:04c30fa98e79-r5f"
+candidate["container"]["expected_labels"]["local.spark3.vllm.tree"] = (
+    "73a843bb61bd97a6be04755c0824049b090d0746"
+)
+arms["candidate"] = candidate
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
