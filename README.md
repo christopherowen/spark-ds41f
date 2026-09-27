@@ -77,7 +77,7 @@ With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 | Prefix-cache replay, 32K prompt | 7.56 s cold, 0.26 s warm |
 | Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 12.0 tok/s per stream |
 | KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.2 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
+| Host memory headroom | dgx1 at least 6.6 GiB MemAvailable during startup (5 GiB guard), 6.2 GiB under load (3 GiB guard) |
 
 The quick default takes three or four samples per decode point, about ±2-12%
 at 95% confidence; temperature-0 outputs differ between identical requests,

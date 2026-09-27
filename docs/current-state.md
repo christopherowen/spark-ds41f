@@ -32,7 +32,8 @@ and running on all three nodes from `config/cluster.json`.
 Measured on this configuration: LRU coherence gate 5/5; single-stream
 prose/code about 45/56 tok/s with reasoning, code answers 69 tok/s; code at
 eight streams 180 tok/s (237 tok/s for code answers); cold prefill 3.9-4.2k
-tok/s; dgx1 minimum MemAvailable 6.2 GiB under load. The previous state
+tok/s; dgx1 minimum MemAvailable 6.6 GiB during startup and 6.2 GiB under
+load; both image checks pass. The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
 [`2026-09-20-live`](../manifests/baselines/2026-09-20-live.json).
 
