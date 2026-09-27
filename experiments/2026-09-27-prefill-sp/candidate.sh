@@ -35,7 +35,7 @@ bin/spark3 --cluster-config $E/cluster-candidate.json bench --allow-mismatch --c
   --decode-cases prose,code,prose-nothink,code-nothink,json-nothink \
   --output results/private/bench/r5g-reference
 log "bench exit $?"
-bin/spark3 --cluster-config $E/cluster-candidate.json bench --allow-mismatch --compare none --suites prefill \\
+bin/spark3 --cluster-config $E/cluster-candidate.json bench --allow-mismatch --compare none --suites prefill \
   --prefill-text source --prefill-sizes 4096,16384,32768,65536 --prefill-repeats 2 \
   --output results/private/bench/r5g-prefill-source
 log "real-text prefill exit $?"
