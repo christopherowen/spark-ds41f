@@ -29,6 +29,9 @@ arms = {
     # NCCL's Simple protocol for the prefill all-reduces (decode collectives
     # use the RoCE one-shot kernel, not NCCL).
     "simple": arm("simple", {"NCCL_PROTO": "Simple"}),
+    # The M32 tile without the materialized two-phase path: the fused
+    # persistent kernel B12X's planner describes for GB10.
+    "tile32f": arm("tile32f", {"B12X_DYNAMIC_TILE_MN": "32x128", "B12X_DYNAMIC_W4A8_MATERIALIZED": "0"}),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
