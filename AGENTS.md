@@ -2,7 +2,8 @@
 
 Read `README.md`, `docs/methodology.md`, `docs/upstreams.md`, `docs/inspiration.md`,
 `docker/README.md`, `config/cluster.json`, and the current baseline manifest
-before changing runtime or build state.
+before changing runtime or build state. For performance work, `TODO.md` lists
+the open levers, measured dead ends, and the lean screening routine.
 
 ## Sources of truth
 
