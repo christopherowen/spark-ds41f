@@ -9,7 +9,7 @@ the wheel's `libnccl.so.2`; the image build checks the installed library's
 version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
-`bin/spark3 build`, and the running image is `vllm-ds41f-kkref:04c30fa98e79-r5g`.
+`bin/spark3 build`, and the running image is `vllm-ds41f-kkref:04c30fa98e79-r5h`.
 
 ```sh
 bin/spark3 build prepare        # create or repair the build directory

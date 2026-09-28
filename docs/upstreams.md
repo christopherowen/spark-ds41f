@@ -8,12 +8,14 @@ local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
         + patches/vllm/series (Engram projection TP padding,
                                asynchronous Engram rows, DSML tool
                                parameters, multimodal block hashes;
-                               dead verification rows; other DSpark
-                               tools off by default)
+                               dead verification rows; sequence-
+                               parallel prefill; one-read custom-op
+                               defaults; other DSpark tools off by
+                               default)
                     \
 local-inference-lab/b12x integration/karmic-kraken-beta @ e39b437b
         + patches/b12x/series (switchless RoCEnante routing)
-                     ---- vllm-ds41f-kkref:04c30fa98e79-r5g (sha256:acbb3fc3…)
+                     ---- vllm-ds41f-kkref:04c30fa98e79-r5h (sha256:be93745a…)
                     /
 NVIDIA/nccl v2.30.7-1 @ 73cf1122
         + patches/nccl/series (IB send-path fence), replacing the base
