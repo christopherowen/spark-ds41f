@@ -34,12 +34,25 @@ FILES = subprocess.check_output(
      "diff", "--name-only", "spark3/r5f-check", "spark3/r5f-sp", "--", "vllm"],
     text=True,
 ).split()
-always2 = arm({})
-always2["container"]["mounts"] += [
-    [f"{{home}}/spark3-overlay/r5f-sp/{f}", f"/opt/spark3/candidate/vllm/{f}", "ro"] for f in FILES
-]
-always2["environment"].pop("SPARK3_DS41_PREFILL_SP_MIN_ROWS", None)
-arms["always2"] = always2
+# The branch also carries patch 0019 (custom-op fill_defaults reads the schema
+# once, in vllm/env_override.py), screened on its own as "fd".
+FD_FILES = ["vllm/env_override.py"]
+
+
+def overlay(files: list[str], sp: bool) -> dict:
+    cfg = arm({})
+    cfg["container"]["mounts"] += [
+        [f"{{home}}/spark3-overlay/r5f-sp/{f}", f"/opt/spark3/candidate/vllm/{f}", "ro"]
+        for f in files
+    ]
+    if sp:
+        cfg["environment"].pop("SPARK3_DS41_PREFILL_SP_MIN_ROWS", None)
+    return cfg
+
+
+arms["always2"] = overlay([f for f in FILES if f not in FD_FILES], sp=True)
+arms["fd"] = overlay(FD_FILES, sp=False)
+arms["both"] = overlay(FILES, sp=True)
 # Profiling variants (capture_tiny.py records a few ~73-token prefills).
 for name in ("current", "always2"):
     profile = copy.deepcopy(arms[name])
