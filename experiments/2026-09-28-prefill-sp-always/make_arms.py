@@ -40,5 +40,20 @@ always2["container"]["mounts"] += [
 ]
 always2["environment"].pop("SPARK3_DS41_PREFILL_SP_MIN_ROWS", None)
 arms["always2"] = always2
+# Profiling variants (capture_tiny.py records a few ~73-token prefills).
+for name in ("current", "always2"):
+    profile = copy.deepcopy(arms[name])
+    profile["serve_args"] += [
+        "--profiler-config",
+        json.dumps({
+            "profiler": "torch",
+            "torch_profiler_dir": f"/cache/kkref/profiles/spa-{name}",
+            "torch_profiler_with_stack": False,
+            "ignore_frontend": True,
+            "max_iterations": 32,
+            "torch_profiler_use_gzip": True,
+        }),
+    ]
+    arms[f"{name}-profile"] = profile
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
