@@ -1,6 +1,6 @@
 #!/bin/bash
 # usage: profile.sh   (on dgx1, deployment checkout at this experiment's commit)
-# One boot each of current-profile and always2-profile (or \$ARMS); capture_tiny.py records
+# One boot each of current-profile and always2-profile (or $ARMS); capture_tiny.py records
 # six ~73-token prefills per arm. Traces land in cache/kkref/profiles/spa-ARM/.
 set -u
 cd ~/projects/spark3-vllm-ds41f
