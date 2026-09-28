@@ -168,8 +168,9 @@ RUN set -eux; \
     rm -f /tmp/vllm-deleted.txt; \
     test -f /opt/spark3/candidate/vllm/vllm/third_party/flashmla/flash_mla_interface.py
 
-# B12X declares CuTe DSL 4.6.2 exactly, as did the weekend image. Install the
-# hash-locked wheel set over the nightly's 4.7.1, then B12X without dependencies.
+# The nightly base installs CuTe DSL 4.7.1, which vLLM and quack-kernels require;
+# patches/b12x moves B12X's exact pin to it. Reinstall the hash-locked wheel set
+# (the same version) and B12X without dependencies.
 RUN set -eux; \
     python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
       /tmp/cutlass-dsl-wheels/*.whl; \
@@ -188,6 +189,25 @@ for raw_requirement in metadata.requires("b12x") or ():
     installed = metadata.version(requirement.name)
     if requirement.specifier and installed not in requirement.specifier:
         raise RuntimeError(f"B12X requires {requirement}, but {installed} is installed")
+
+# Every package built on CuTe DSL must accept the installed version: a locked
+# wheel set older than one consumer's requirement silently breaks that consumer
+# (quack-kernels 0.6.5 imports cutlass.base_dsl.enums, new in 4.7).
+SHARED = ("nvidia-cutlass-dsl", "quack-kernels")
+for consumer in ("vllm", "quack-kernels", "flashinfer-python", "nvidia-cudnn-frontend", "tokenspeed-mla"):
+    try:
+        requirements = metadata.requires(consumer) or ()
+    except metadata.PackageNotFoundError:
+        continue
+    for raw_requirement in requirements:
+        requirement = Requirement(raw_requirement)
+        if not requirement.name.startswith(SHARED):
+            continue
+        if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+            continue
+        installed = metadata.version(requirement.name)
+        if requirement.specifier and installed not in requirement.specifier:
+            raise RuntimeError(f"{consumer} requires {requirement}, but {installed} is installed")
 PY
 
 ENV PYTHONPATH=/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x
@@ -196,7 +216,9 @@ RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import importlib.metadata as metadata
 import subprocess
 
-assert metadata.version("nvidia-cutlass-dsl") == "4.6.2"
+assert metadata.version("nvidia-cutlass-dsl") == "4.7.1"
+import cutlass.base_dsl.enums  # noqa: F401  (quack-kernels, the DS4.1 L2 prefetch)
+import quack.compile_utils  # noqa: F401
 import b12x.attention.compressed_sparse_mla  # noqa: F401
 import b12x.comm.roce  # noqa: F401
 import b12x.integration.vllm.loader  # noqa: F401

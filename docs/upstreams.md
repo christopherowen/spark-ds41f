@@ -65,6 +65,14 @@ To evaluate a newer upstream, create a branch in that prepared tree, rebase the
 small patch series, build a new immutable image tag, and record it as an experiment.
 Do not advance `upstreams.lock.json` merely because a newer commit exists.
 
+Shared runtime packages move forward, never back. CuTe DSL is used by vLLM,
+quack-kernels, B12X, FlashInfer and the cuDNN frontend; the locked wheel set in
+`requirements/cutlass-dsl-aarch64.txt` must satisfy every one of them and must
+not be older than the version the vLLM base image installs. When a component
+pins an older version, patch the component's pin forward and qualify it rather
+than downgrading the others. The image build checks each consumer's declared
+requirement and fails on a mismatch.
+
 ## Contributing back
 
 One conceptual local patch should become one upstream branch and pull request.
