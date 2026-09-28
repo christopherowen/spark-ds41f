@@ -44,5 +44,12 @@ arms = {
         "CUBLAS_LOGDEST_DBG": "/cache/kkref/cublas-log/blas.log",
     }),
 }
+# Skip vLLM's multimodal encoder profile at startup: it pushes a maximum-size
+# dummy image (8,649 patches) through the vision tower, the only boot user of
+# cuBLASLt's PTX-only epilogue kernels. KV memory is explicit, so the profile
+# does not size anything; the first image request then warms the encoder.
+skip_mm = arm({})
+skip_mm["serve_args"] = skip_mm["serve_args"] + ["--skip-mm-profiling"]
+arms["skip-mm"] = skip_mm
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
