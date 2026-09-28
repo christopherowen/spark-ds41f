@@ -25,7 +25,9 @@ def processes() -> list[tuple[str, str]]:
     found = []
     for line in top.stdout.splitlines()[1:]:
         pid, _, args = line.strip().partition(" ")
-        if "python" in args or args.startswith("VLLM::"):
+        # Every process: vLLM renames its workers (VLLM::Worker_TP0), and py-spy
+        # reports the live name in each dump; skip only the resource tracker.
+        if "resource_tracker" not in args:
             found.append((pid, args.strip()[:60]))
     return found
 
