@@ -14,8 +14,8 @@ local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
                                default)
                     \
 local-inference-lab/b12x integration/karmic-kraken-beta @ e39b437b
-        + patches/b12x/series (switchless RoCEnante routing)
-                     ---- vllm-ds41f-kkref:04c30fa98e79-r5h (sha256:be93745a…)
+        + patches/b12x/series (switchless RoCEnante routing, CuTe DSL 4.7.1)
+                     ---- vllm-ds41f-kkref:04c30fa98e79-r5i (sha256:63981361…)
                     /
 NVIDIA/nccl v2.30.7-1 @ 73cf1122
         + patches/nccl/series (IB send-path fence), replacing the base

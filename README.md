@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-28-karmic-kraken-r5h.json](manifests/baselines/2026-09-28-karmic-kraken-r5h.json):
+[manifests/baselines/2026-09-28-karmic-kraken-r5i.json](manifests/baselines/2026-09-28-karmic-kraken-r5i.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -19,8 +19,10 @@ The active baseline is recorded in
 - direct dual ConnectX-7 paths between every pair of nodes;
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
   projection sharding, asynchronous Engram rows, and two tool-call and
-  image-cache fixes) and B12X (plus the switchless RoCEnante patch), with B12X
-  attention, linear, MoE, and mHC kernels and L2 weight prefetch during decode;
+  image-cache fixes) and B12X (plus the switchless RoCEnante patch, and its
+  CuTe DSL pin moved to the 4.7.1 that vLLM requires), with B12X attention,
+  linear, MoE, and mHC kernels and L2 weight prefetch during decode (the
+  next layer's weights stream into L2 while latency-bound kernels run);
 - NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
   (NVIDIA/nccl#2393), which prevents a proxy-thread hang;
 - DeepSeek V4.1 Flash native FP8/FP4 weights, unchanged, with the vision
@@ -60,38 +62,38 @@ default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 49.0 | 50.9 | 0.22 s |
-| prose | 2 | 74.1 | 40.3 | 0.33 s |
-| prose | 4 | 110.3 | 31.2 | 0.43 s |
-| prose | 8 | 157.8 | 21.9 | 0.51 s |
-| code | 1 | 59.6 | 62.6 | 0.23 s |
-| code | 2 | 89.7 | 49.1 | 0.31 s |
-| code | 4 | 129.2 | 36.5 | 0.43 s |
-| code | 8 | 182.5 | 25.9 | 0.54 s |
+| prose | 1 | 49.7 | 51.6 | 0.20 s |
+| prose | 2 | 74.9 | 39.7 | 0.34 s |
+| prose | 4 | 110.3 | 30.4 | 0.44 s |
+| prose | 8 | 164.0 | 22.7 | 0.53 s |
+| code | 1 | 62.6 | 66.0 | 0.22 s |
+| code | 2 | 89.4 | 49.5 | 0.33 s |
+| code | 4 | 137.0 | 38.8 | 0.47 s |
+| code | 8 | 188.4 | 26.7 | 0.57 s |
 
 With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 
 | Prompt | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| prose | 55.2 | 82.9 | 123.8 | 167.7 |
-| code | 77.4 | 112.6 | 172.5 | 236.8 |
-| JSON | 73.9 | 107.5 | 161.8 | 235.8 |
+| prose | 55.9 | 84.0 | 126.4 | 172.2 |
+| code | 78.9 | 112.2 | 169.3 | 226.2 |
+| JSON | 78.5 | 106.8 | 164.2 | 241.1 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Single-stream decode step | about 43 ms on prose and 49 ms on code; accepted drafts per step 1.2 (prose), 2.1 (code), 3.2 (code answers) |
+| Single-stream decode step | about 42 ms on prose and 48 ms on code; accepted drafts per step 1.2 (prose), 2.2 (code), 3.1 (code answers) |
 | Cold prefill, repeated filler | 2K 4.3k, 32K 4.8k, 64K 4.6k tok/s |
-| Cold prefill, real text (Python source) | 4K 3.8k, 14K 3.8k, 36K 3.7k, 61K 3.7k tok/s |
-| Prefix-cache replay, 32K prompt | 6.68 s cold, 0.25 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 13.2 tok/s per stream |
+| Cold prefill, real text (Python source) | 4K 3.8k, 14K 3.8k, 36K 3.8k, 61K 3.8k tok/s |
+| Prefix-cache replay, 32K prompt | 6.65 s cold, 0.25 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 13.6 tok/s per stream |
 | KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.59 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
+| Host memory headroom | dgx1 at least 6.44 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
 The quick default takes three or four samples per decode point, about ±2-12%
 at 95% confidence; temperature-0 outputs differ between identical requests,
 which moves acceptance from sample to sample. Report:
-[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-28-karmic-kraken-r5h.json).
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract

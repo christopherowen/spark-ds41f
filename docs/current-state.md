@@ -1,13 +1,13 @@
 # Current state
 
 Promoted 2026-09-28 as
-[`2026-09-28-karmic-kraken-r5h`](../manifests/baselines/2026-09-28-karmic-kraken-r5h.json)
+[`2026-09-28-karmic-kraken-r5i`](../manifests/baselines/2026-09-28-karmic-kraken-r5i.json)
 and running on all three nodes from `config/cluster.json`.
 
 | Setting | Active value |
 |---|---:|
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0019 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante patch, NCCL 2.30.7 + IB send-path fence |
-| Image | `vllm-ds41f-kkref:04c30fa98e79-r5h`, one digest on all ranks, built by `bin/spark3 build` |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0019 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante and CuTe DSL 4.7.1 pin patches, NCCL 2.30.7 + IB send-path fence |
+| Image | `vllm-ds41f-kkref:04c30fa98e79-r5i`, one digest on all ranks, built by `bin/spark3 build` |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia` with `kho=off`, driver 580.178.04, no desktop |
 | Tensor parallel ranks | 3 |
 | Maximum model length | 131,072 tokens |
@@ -23,7 +23,7 @@ and running on all three nodes from `config/cluster.json`.
 | B12X W4A8 tiny decode | disabled (`B12X_W4A8_TINY_DECODE=0`) |
 | Engram projection | sharded across ranks (`projection_tp`) |
 | Engram rows | read beside the forward launch (`SPARK3_ENGRAM_ASYNC=1`); base overlap off (`VLLM_DS41_ENGRAM_OVERLAP=0`) |
-| L2 weight prefetch | on (base default on SM121) |
+| L2 weight prefetch | on (base default on SM121; runs since r5i) |
 | B12X autotune | disabled |
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |
 | Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s); hosts set `vm.watermark_boost_factor=0` |
@@ -31,9 +31,9 @@ and running on all three nodes from `config/cluster.json`.
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 
 Measured on this configuration: LRU coherence gate 5/5; single-stream
-prose/code about 49/60 tok/s with reasoning, code answers 77 tok/s; code at
-eight streams 183 tok/s (237 tok/s for code answers); cold prefill
-2K 4.3k, 32K 4.8k, 64K 4.6k tok/s (4K 3.8k, 14K 3.8k, 36K 3.7k, 61K 3.7k on real text); dgx1 minimum MemAvailable 6.59 GiB under load.
+prose/code about 50/63 tok/s with reasoning, code answers 79 tok/s; code at
+eight streams 188 tok/s (226 tok/s for code answers); cold prefill
+2K 4.3k, 32K 4.8k, 64K 4.6k tok/s (4K 3.8k, 14K 3.8k, 36K 3.8k, 61K 3.8k on real text); dgx1 minimum MemAvailable 6.44 GiB under load.
 The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
 [`2026-09-20-live`](../manifests/baselines/2026-09-20-live.json).

@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20260928T043356Z",
+  "container_name": "dsv41-karmic-kraken",
+  "image_tag": "vllm-ds41f-kkref:04c30fa98e79-r5i",
+  "image_id": "sha256:63981361635232c97e4e2b0aa9dd9c145639700a5b3bd570fc9e901381cf1185",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:63981361635232c97e4e2b0aa9dd9c145639700a5b3bd570fc9e901381cf1185",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:63981361635232c97e4e2b0aa9dd9c145639700a5b3bd570fc9e901381cf1185",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:63981361635232c97e4e2b0aa9dd9c145639700a5b3bd570fc9e901381cf1185",
+      "role": "headless-rank-2"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "04c30fa98e7917fee0a24c739ea503ce1e22538d",
+    "vllm_patch_head": "c42e75cfead71db6c61d44b19d715326f25247f1",
+    "vllm_tree": "17f5431dd169d4dec917736608b14a52443b8fe8",
+    "b12x_repository": "https://github.com/local-inference-lab/b12x",
+    "b12x_ref": "integration/karmic-kraken-beta",
+    "b12x_revision": "e39b437bf7d5c6784fbee8dc7e87073dde753445",
+    "b12x_patch_head": "bbd69d1697ab49942aadc094670ad98b0fe9dbd2",
+    "b12x_tree": "ec4cced90ce8323adae2856a6b46935f41980847",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "7522cb27e30c4370ebc62b20f45826c7f0962588",
+    "nccl_tree": "47687d2a75b06fdff1b752dbf08bb87f12ca98bb",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "image_build_deployment_commit": "f046668e39dd7abdf2cffbb5b85defbb1dc6c3cb",
+    "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "image_build_recipe": "bin/spark3 build (docker/Dockerfile)"
+  },
+  "runtime_choices": {
+    "B12X_W4A8_TINY_DECODE": "0 (tiny decode omits swiglu_limit; see experiment README)",
+    "B12X_AUTOTUNE": "0 (autotune race budget is free memory // 2 on unified memory)",
+    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP 3, adaptive verification cost scale 2, dead verification rows below survival 0.2, block rejection; greedy drafts vocabulary-parallel (vLLM patch 0012) over an NVFP4 Markov projection with an NVFP4 drafter head, and a column-sharded drafter main_proj (0013)",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-48 (adds 40 and 48 for eight streams at 1 + 5 rows)",
+    "max_num_batched_tokens": 4096,
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): it saved 0 configs, and only the sampler uses FlashInfer",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "read beside the forward launch (SPARK3_ENGRAM_ASYNC=1, vLLM patch 0002 re-ported); the base's Engram overlap is off (VLLM_DS41_ENGRAM_OVERLAP=0)",
+    "compile_cache": "/cache/kkref/jit/vllm-r5i",
+    "multimodal": "vision tower loaded (no --language-model-only), up to 4 images per request; --mm-processor-cache-gb 0 (vLLM's default 4 GiB host cache would come out of dgx1's guard margin)",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+    "l2_prefetch": "on (the base's default on SM121): side-stream L2 prefetch of the next decode projections; it compiles from r5i on (quack-kernels needs CuTe DSL 4.7), so earlier baselines recorded it on while it disabled itself at startup",
+    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence) in place of the base image's wheel",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens at TP 3; vLLM patches 0014-0018, no setting): per-layer all-reduces become reduce-scatters, row-wise work runs on a third of the rows, CED encoder layers only",
+    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit) and TileLang cache on the /cache mount, beside the B12X, CuTe DSL, FlashInfer and Triton caches"
+  },
+  "capacity": {
+    "kv_cache_bytes_per_rank": 1503238553,
+    "kv_cache_tokens": 575304,
+    "kv_bytes_per_token_per_rank": 2613,
+    "max_model_len": 131072,
+    "max_num_seqs": 8,
+    "reported_full_context_concurrency": 4.39,
+    "graph_capture_gib": 1.52,
+    "vision_tower_gib": 0.9
+  },
+  "change_from_previous": "CuTe DSL 4.7.1 everywhere: the image had installed B12X's exact 4.6.2 pin over the 4.7.1 that vLLM and quack-kernels require, which broke quack-kernels and made vLLM's DS4.1 L2 weight prefetch disable itself at every startup (recorded as on since r5c). B12X patch 0002 moves its pin forward, the wheel lock follows, and the image build now fails when any CuTe DSL consumer's requirement is not met. The prefetch now runs. The driver's PTX JIT cache and TileLang's cache move onto the persistent mount.",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-09-28-cute-dsl-471/",
+      "experiments/2026-09-28-boot-time/"
+    ],
+    "summary": "B12X kernel tests identical on 4.6.2 and 4.7.1; two-run screen: single-stream decode steps 0.6-1.5 ms shorter than r5h (prefetch worth 1.3-2.1 ms against r5i without it), eight streams +0.7 to +6.5%, LRU 5/5 on every run. Reference run on this configuration: LRU 5/5, lowest dgx1 MemAvailable 6.44 GiB under load"
+  },
+  "build": {
+    "image": "vllm-ds41f-kkref:04c30fa98e79-r5i",
+    "image_id": "sha256:63981361635232c97e4e2b0aa9dd9c145639700a5b3bd570fc9e901381cf1185",
+    "elapsed_seconds": 35,
+    "min_available_gib": 115.7,
+    "built_utc": "2026-09-28T03:07:15Z",
+    "build_directory": ".work/build/vllm-04c30fa98e79-b12x-e39b437bf7d5-<input hash>"
+  },
+  "benchmark_reference": "manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json",
+  "previous_baseline": "2026-09-28-karmic-kraken-r5h",
+  "capacity_benchmark_reference": "manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia with kho=off (nvidia-spark-grub-kho 1.0-1)",
+    "nvidia_driver": "580.178.04",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0"
+  }
+}
