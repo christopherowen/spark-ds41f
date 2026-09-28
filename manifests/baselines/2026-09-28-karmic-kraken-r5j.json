@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20260928T052054Z",
+  "container_name": "dsv41-karmic-kraken",
+  "image_tag": "vllm-ds41f-kkref:04c30fa98e79-r5j",
+  "image_id": "sha256:9cd03b490db025cd16cb6d8e1689712c7446a80e6e33fc5f3502007a467e331d",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:9cd03b490db025cd16cb6d8e1689712c7446a80e6e33fc5f3502007a467e331d",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:9cd03b490db025cd16cb6d8e1689712c7446a80e6e33fc5f3502007a467e331d",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:9cd03b490db025cd16cb6d8e1689712c7446a80e6e33fc5f3502007a467e331d",
+      "role": "headless-rank-2"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "04c30fa98e7917fee0a24c739ea503ce1e22538d",
+    "vllm_patch_head": "58bff2b16003acfe0dc2fd09ee039a9c75bfb122",
+    "vllm_tree": "bf8910a6dfdd7fb18be9dc4714cd0ce9346b0485",
+    "b12x_repository": "https://github.com/local-inference-lab/b12x",
+    "b12x_ref": "integration/karmic-kraken-beta",
+    "b12x_revision": "e39b437bf7d5c6784fbee8dc7e87073dde753445",
+    "b12x_patch_head": "bbd69d1697ab49942aadc094670ad98b0fe9dbd2",
+    "b12x_tree": "ec4cced90ce8323adae2856a6b46935f41980847",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "7522cb27e30c4370ebc62b20f45826c7f0962588",
+    "nccl_tree": "47687d2a75b06fdff1b752dbf08bb87f12ca98bb",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "image_build_deployment_commit": "cb44ad8481cbb49e2c8834a9b52c01f4e5150b7f",
+    "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "image_build_recipe": "bin/spark3 build (docker/Dockerfile)"
+  },
+  "runtime_choices": {
+    "B12X_W4A8_TINY_DECODE": "0 (tiny decode omits swiglu_limit; see experiment README)",
+    "B12X_AUTOTUNE": "0 (autotune race budget is free memory // 2 on unified memory)",
+    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP 3, adaptive verification cost scale 2, dead verification rows below survival 0.2, block rejection; greedy drafts vocabulary-parallel (vLLM patch 0012) over an NVFP4 Markov projection with an NVFP4 drafter head, and a column-sharded drafter main_proj (0013)",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-48 (adds 40 and 48 for eight streams at 1 + 5 rows)",
+    "max_num_batched_tokens": 4096,
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): it saved 0 configs, and only the sampler uses FlashInfer",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "read beside the forward launch (SPARK3_ENGRAM_ASYNC=1, vLLM patch 0002 re-ported); the base's Engram overlap is off (VLLM_DS41_ENGRAM_OVERLAP=0)",
+    "compile_cache": "/cache/kkref/jit/vllm-r5j",
+    "multimodal": "vision tower loaded (no --language-model-only), up to 4 images per request; --mm-processor-cache-gb 0 (vLLM's default 4 GiB host cache would come out of dgx1's guard margin)",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+    "l2_prefetch": "on (the base's default on SM121): side-stream L2 prefetch of the next decode projections; it compiles from r5i on (quack-kernels needs CuTe DSL 4.7), so earlier baselines recorded it on while it disabled itself at startup",
+    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence) in place of the base image's wheel",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens at TP 3; vLLM patches 0014-0018, no setting): per-layer all-reduces become reduce-scatters, row-wise work runs on a third of the rows, CED encoder layers only",
+    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit) and TileLang cache on the /cache mount, beside the B12X, CuTe DSL, FlashInfer and Triton caches",
+    "jit_warmup": "the dead-row variants of the draft combine and sampled/rejected-count Triton kernels are compiled at warmup (vLLM patch 0020); no kernel compiles after readiness"
+  },
+  "capacity": {
+    "kv_cache_bytes_per_rank": 1503238553,
+    "kv_cache_tokens": 575304,
+    "kv_bytes_per_token_per_rank": 2613,
+    "max_model_len": 131072,
+    "max_num_seqs": 8,
+    "reported_full_context_concurrency": 4.39,
+    "graph_capture_gib": 1.52,
+    "vision_tower_gib": 0.9
+  },
+  "change_from_previous": "vLLM patch 0020: kernel warmup runs with adaptive verification off, so the first served request compiled the DEAD_ROWS variants of two Triton kernels (568 ms to first token against about 210 ms afterwards). They are now compiled at the end of warmup. Serving is otherwise unchanged, so the r5i reference numbers stand.",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-09-28-warm-dead-rows/"
+    ],
+    "summary": "no kernel compiled after readiness on any rank; LRU 5/5; lowest dgx1 MemAvailable 6.36 GiB during the gate. Decode and prefill are those of r5i (the change only moves compilation into startup)."
+  },
+  "build": {
+    "image": "vllm-ds41f-kkref:04c30fa98e79-r5j",
+    "image_id": "sha256:9cd03b490db025cd16cb6d8e1689712c7446a80e6e33fc5f3502007a467e331d",
+    "elapsed_seconds": 474,
+    "min_available_gib": 80.8,
+    "built_utc": "2026-09-28T05:13:39Z",
+    "build_directory": ".work/build/vllm-04c30fa98e79-b12x-e39b437bf7d5-<input hash>"
+  },
+  "benchmark_reference": "manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json",
+  "previous_baseline": "2026-09-28-karmic-kraken-r5i",
+  "capacity_benchmark_reference": "manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia with kho=off (nvidia-spark-grub-kho 1.0-1)",
+    "nvidia_driver": "580.178.04",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0"
+  }
+}

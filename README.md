@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-28-karmic-kraken-r5i.json](manifests/baselines/2026-09-28-karmic-kraken-r5i.json):
+[manifests/baselines/2026-09-28-karmic-kraken-r5j.json](manifests/baselines/2026-09-28-karmic-kraken-r5j.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and

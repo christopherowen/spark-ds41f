@@ -1,13 +1,13 @@
 # Current state
 
 Promoted 2026-09-28 as
-[`2026-09-28-karmic-kraken-r5i`](../manifests/baselines/2026-09-28-karmic-kraken-r5i.json)
+[`2026-09-28-karmic-kraken-r5j`](../manifests/baselines/2026-09-28-karmic-kraken-r5j.json)
 and running on all three nodes from `config/cluster.json`.
 
 | Setting | Active value |
 |---|---:|
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0019 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante and CuTe DSL 4.7.1 pin patches, NCCL 2.30.7 + IB send-path fence |
-| Image | `vllm-ds41f-kkref:04c30fa98e79-r5i`, one digest on all ranks, built by `bin/spark3 build` |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0020 (0005-0009 and 0011 off by default), B12X `e39b437b` + switchless RoCEnante and CuTe DSL 4.7.1 pin patches, NCCL 2.30.7 + IB send-path fence |
+| Image | `vllm-ds41f-kkref:04c30fa98e79-r5j`, one digest on all ranks, built by `bin/spark3 build` |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia` with `kho=off`, driver 580.178.04, no desktop |
 | Tensor parallel ranks | 3 |
 | Maximum model length | 131,072 tokens |

@@ -22,4 +22,18 @@ no decode or prefill bench is run for it.
 
 ## Results
 
-Pending.
+2026-09-28, `check.sh` and one restart without a rebuild:
+
+| Boot | First request, first token | Next three | Serving-time compilations |
+|---|---|---|---|
+| r5i, fresh boot | 568 ms | 206-251 ms | 2 per rank |
+| r5j, right after the image build | 1244 ms | 171-218 ms | 0 |
+| r5j, restarted | 579 ms | 202-212 ms | 0 |
+
+LRU 5/5; lowest dgx1 MemAvailable 6.36 GiB during the gate.
+
+No kernel compiles after readiness any more. The two compilations were not
+what made the first request slow, though: without them the first request still
+takes about 0.37 s longer to its first token than the next ones, from another
+first-use cost not identified here. The 1244 ms run followed the image build and
+copy, which leave the host page cache cold.
