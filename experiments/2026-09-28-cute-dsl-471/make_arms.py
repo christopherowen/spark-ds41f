@@ -33,6 +33,13 @@ arms = {
     "candidate": candidate({}),
     # The same image with the prefetch off: separates the upgrade from it.
     "candidate-nol2": candidate({"VLLM_DS41_L2_PREFETCH": "0"}),
+    # Promotion candidate: r5i with the driver's PTX JIT cache and TileLang's
+    # cache on the persistent mount (experiments/2026-09-28-boot-time).
+    "final": candidate({
+        "CUDA_CACHE_PATH": "/cache/kkref/jit/nv-compute",
+        "CUDA_CACHE_MAXSIZE": "4294967296",
+        "TILELANG_CACHE_DIR": "/cache/kkref/jit/tilelang",
+    }),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
