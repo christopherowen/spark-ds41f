@@ -117,14 +117,30 @@ def ssh_target(nodes: dict, node: dict) -> str:
     return f"{nodes['ssh_user']}@{node.get('ssh_host', node['name'])}"
 
 
+SSH_CONTROL_DIR = Path(tempfile.gettempdir()) / f"spark3-ssh-{os.getuid()}"
+
+
+def ssh_options() -> list[str]:
+    """Batch-mode SSH options that reuse one connection per node.
+
+    A fresh connection between the Sparks takes about 0.3 s and a
+    multiplexed call about 6 ms; a cluster start makes dozens of calls.
+    """
+    SSH_CONTROL_DIR.mkdir(mode=0o700, exist_ok=True)
+    return [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={SSH_CONTROL_DIR}/%C",
+        "-o", "ControlPersist=120",
+    ]
+
+
 def run_ssh(nodes: dict, node: dict, *command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
+            *ssh_options(),
             ssh_target(nodes, node),
             shlex.join(command),
         ],
@@ -939,7 +955,7 @@ def wait_for_api(cluster: dict, nodes: dict) -> None:
         if result.returncode == 0:
             print("API ready; JIT/autotuning startup has completed", flush=True)
             return
-        time.sleep(10)
+        time.sleep(1)
     unreachable = ", ".join(sorted(unreachable_since))
     suffix = f"; unreachable nodes: {unreachable}" if unreachable else ""
     raise RuntimeError(f"API did not become ready within {timeout}s{suffix}")
@@ -1095,6 +1111,11 @@ def command_cluster_start(args: argparse.Namespace) -> int:
     backup_suffix = f"pre-{int(time.time())}"
     backups: dict[str, str] = {}
     started: list[dict] = []
+    launch_began = time.monotonic()
+
+    def elapsed() -> str:
+        return f"+{time.monotonic() - launch_began:.1f}s"
+
     try:
         for node in nodes["nodes"]:
             stop_memguard(cluster, nodes, node)
@@ -1135,8 +1156,9 @@ def command_cluster_start(args: argparse.Namespace) -> int:
                 detail = result.stderr.strip() or result.stdout.strip()
                 raise RuntimeError(f"{node['name']}: launch failed: {detail}")
             started.append(node)
-            print(f"{node['name']}: launched {result.stdout.strip()}", flush=True)
+            print(f"{node['name']}: launched {result.stdout.strip()} ({elapsed()})", flush=True)
         wait_for_api(cluster, nodes)
+        print(f"API ready at {elapsed()}", flush=True)
         start_memguards(cluster, nodes, config_relative, "steady")
     except (RuntimeError, KeyboardInterrupt) as error:
         detail = str(error) if str(error) else "cluster start interrupted"
@@ -1166,7 +1188,7 @@ def command_cluster_start(args: argparse.Namespace) -> int:
             result = run_ssh(nodes, node, "docker", "rm", backup)
             if result.returncode:
                 print(f"WARN: {node['name']}: retained backup container {backup}")
-    print("cluster ready; memory guards are active on all nodes")
+    print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
     return 0
 
 
