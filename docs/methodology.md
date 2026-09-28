@@ -32,20 +32,22 @@ repeat both sides.
 The stable suite must cover:
 
 1. single-stream code and prose decode;
-2. concurrency 1, 2, 4, and the promoted normal Strix concurrency;
+2. concurrency 1, 2, 4, and the promoted normal agent-workload concurrency;
 3. cold prefill at representative short, 32K, 64K, and long-context sizes;
 4. prefix-cache replay where applicable;
 5. the four-long-context admission target;
-6. an end-to-end Strix workload with fixed scope and tool policy;
+6. an end-to-end agent workload with fixed scope and tool policy;
 7. minimum available host memory, swap movement, KV use, OOMs, allocation retries,
    request failures, and output-integrity gates.
 
-`bin/spark3 bench` implements items 1-5 and 7; the Strix workload remains
-manual. Wrap a Strix run in `bin/spark3 workload --json <path> -- <command>`
+`bin/spark3 bench` implements items 1-5 and 7; the agent workload remains
+manual. Wrap an agent run in `bin/spark3 workload --json <path> -- <command>`
 to record the server side of that window without sending requests: requests
 per hour, prompt and output lengths, prefix-cache share, draft acceptance by
 position, the share of engine steps carrying prefill, latency quantiles, and
-peak load. Findings per hour come from Strix's own report. Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
+peak load. Findings per hour come from the agent's own report.
+
+Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
 counts, and variability across complete runs. Performance is not accepted at the
 expense of model quality or silent request rejection.
 

@@ -9,9 +9,9 @@ owner.
 ## Goal
 
 Step time and the bench matrix are proxies. The outcome that matters is
-end-to-end Strix throughput: findings per hour on a fixed scope and tool policy.
-Record the server side of every Strix run with
-`bin/spark3 workload --json <path> -- <strix command>` (read-only; it sends no
+end-to-end throughput of the production agent workload: findings per hour on a
+fixed scope and tool policy. Record the server side of every agent run with
+`bin/spark3 workload --json <path> -- <agent command>` (read-only; it sends no
 requests) and judge candidates on that whenever a change could shift the
 result.
 
@@ -83,7 +83,7 @@ and eight streams for every decode change.
   Build only for promotion.
 - **Queue arms unattended** with a `setsid -f` chain, `ssh -n` and logs in
   `~/tl-logs`. Keep other GPU work off the nodes while an arm is timing, and
-  keep bench load off the service while Strix is running.
+  keep bench load off the service while the agent workload is running.
 - **Check every candidate's boot log for silent fallbacks** (`disabled`,
   `fallback`, `compile failed`) and for any JIT compilation after readiness.
   The L2 weight prefetch was advertised from r5c but failed to compile until
@@ -116,8 +116,8 @@ and eight streams for every decode change.
 
 ## Mixed prefill and decode
 
-Strix interleaves long prefill bursts with decode phases, and this is the gap
-between the bench and production. The bench measures decode and prefill
+The agent workload interleaves long prefill bursts with decode phases, and this
+is the gap between the bench and production. The bench measures decode and prefill
 separately.
 
 - **What happens today.** The batched-token budget is 4,096. A step that

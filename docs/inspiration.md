@@ -102,7 +102,7 @@ For every candidate idea:
 3. Create one experiment under `experiments/YYYY-MM-DD-short-name/` with the
    promoted commit as its base and one intended causal change.
 4. Run the repository benchmark matrix, including quality gates, memory
-   observations, four-request admission, and the Strix workload where relevant.
+   observations, four-request admission, and the agent workload where relevant.
 5. Reject changes that trade away native-weight quality unless a separate,
    explicitly named quality/performance profile is requested.
 6. Prefer a small patch suitable for its canonical upstream. Carry it locally
