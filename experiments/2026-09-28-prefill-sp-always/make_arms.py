@@ -55,5 +55,11 @@ for name in ("current", "always2"):
         }),
     ]
     arms[f"{name}-profile"] = profile
+# Python call stacks for the host side of the current arm (slower, attribution only).
+stack = copy.deepcopy(arms["current-profile"])
+config = json.loads(stack["serve_args"][-1])
+config.update(torch_profiler_dir="/cache/kkref/profiles/spa-current-stack", torch_profiler_with_stack=True)
+stack["serve_args"][-1] = json.dumps(config)
+arms["current-stack"] = stack
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
