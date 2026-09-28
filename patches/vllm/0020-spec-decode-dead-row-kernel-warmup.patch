@@ -1,0 +1,97 @@
+From 72c0247a4884f9f69f295a9bc9a77c8fe19aa634 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 07:03:44 +0200
+Subject: [PATCH] perf(spec-decode): compile the dead-row draft kernels at
+ warmup
+
+Kernel warmup runs with adaptive verification off (its costs are not
+calibrated yet), so the DEAD_ROWS variants of the draft combine and the
+sampled/rejected counts were first compiled by the first served request:
+on three DGX Sparks it took 568 ms to first token against 206-251 ms
+afterwards, and every rank logged both kernels as compiled during
+inference. After restoring the manager, launch both kernels through
+their serving wrappers with the persistent buffers and serving dtypes,
+for one request and for several (Triton specializes num_reqs == 1).
+---
+ vllm/v1/worker/gpu/warmup.py | 58 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 69d273902d..e17d7d37d4 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -27,6 +27,10 @@ from vllm.v1.kv_cache_interface import (
+ )
+ from vllm.v1.request import Request
+ from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
++from vllm.v1.worker.gpu.input_batch import (
++    combine_sampled_and_draft_tokens,
++    get_num_sampled_and_rejected,
++)
+ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
+ 
+@@ -251,6 +255,60 @@ def warmup_kernels(
+         if adaptive_sampling:
+             assert rejection_sampler is not None
+             rejection_sampler.enable_adaptive_verification = True
++    _warmup_dead_row_kernels(model_runner)
++
++
++def _warmup_dead_row_kernels(model_runner: GPUModelRunner) -> None:
++    """Compile the dead-row variants of the draft combine and sampled counts.
++
++    The warmup above runs with adaptive verification off, so the Triton
++    kernels specialized on DEAD_ROWS were first compiled by the first served
++    request. Launch them here through the serving wrappers, with the
++    persistent buffers and dtypes they see in serving, for one request and for
++    several (Triton specializes num_reqs == 1). The buffers they write are
++    per-step scratch.
++    """
++    adaptive_verification = model_runner.adaptive_verification
++    if adaptive_verification is None or model_runner.batch_sharder is not None:
++        return
++    buffers = model_runner.input_buffers
++    req_states = model_runner.req_states
++    device = buffers.input_ids.device
++    per_req = model_runner.num_speculative_steps + 1
++    for num_reqs in (1, 2):
++        dead_rows = adaptive_verification.dead_row_args(buffers.is_padding, num_reqs)
++        if dead_rows is None:
++            return
++        idx_mapping = torch.zeros(num_reqs, dtype=torch.int64, device=device)
++        query_start_loc = buffers.query_start_loc[: num_reqs + 1]
++        query_start_loc.copy_(
++            torch.arange(0, (num_reqs + 1) * per_req, per_req, dtype=torch.int32)
++        )
++        seq_lens = buffers.seq_lens[:num_reqs]
++        seq_lens.fill_(per_req)
++        cu_num_logits = query_start_loc.clone()
++        combine_sampled_and_draft_tokens(
++            buffers.input_ids,
++            idx_mapping,
++            req_states.last_sampled_tokens,
++            query_start_loc,
++            seq_lens,
++            req_states.prefill_len.gpu,
++            req_states.draft_tokens,
++            cu_num_logits,
++            num_reqs * per_req,
++            model_runner.model_state.num_new_sampled_tokens_per_step,
++            dead_rows=dead_rows,
++        )
++        get_num_sampled_and_rejected(
++            seq_lens.new_ones(num_reqs),
++            seq_lens,
++            cu_num_logits,
++            idx_mapping,
++            req_states.prefill_len.gpu,
++            dead_rows.cut,
++        )
++    torch.accelerator.synchronize()
+ 
+ 
+ def _warmup_kernels(
+-- 
+2.43.0
+

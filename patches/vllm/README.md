@@ -151,8 +151,15 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   arguments returned; output unchanged. Upstream status: the bug is still in
   PyTorch main; not submitted.
 
-Applying 0001-0019 to the base yields patch head `c42e75cf` and tree
-`17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree
+- `0020-spec-decode-dead-row-kernel-warmup.patch` compiles the DEAD_ROWS variants of the draft combine and the
+  sampled/rejected-count Triton kernels at warmup. Kernel warmup runs with
+  adaptive verification off, so the first served request compiled them (568 ms
+  to first token against about 210 ms afterwards). Output unchanged. Upstream
+  status: candidate, not submitted.
+
+Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
+`bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`
+and tree `17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree
 `5e088694`. 0001-0013, the r5f image, give patch head `0a00c7b3` and tree
 `73a843bb`. 0001-0011, the r5e image, give patch head `138b562f`
 and tree `7b839dc1`. The r5c image carried an earlier 0009 that moved
