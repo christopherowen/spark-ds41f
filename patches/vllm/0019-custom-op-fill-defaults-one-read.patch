@@ -1,0 +1,123 @@
+From 748e15dd650516195a73212c4d250b7da789f021 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 02:50:55 +0200
+Subject: [PATCH] perf: read the custom-op schema once in fill_defaults
+
+torch.library.custom_op registers an ADInplaceOrView kernel for ops with
+mutates_args that calls torch._library.utils.fill_defaults on every eager
+call. That function reads schema.arguments, a property that builds a new
+list of every argument, inside its per-argument loop, so its cost is
+quadratic in the argument count: a 64-argument op costs 873 us per call
+against 48 us with one read (GB10, torch 2.13).
+
+B12X's dynamic MoE launch is such an op. On a 60-token DeepSeek V4.1
+prefill it spent about 0.8 ms of host time per MoE layer here while the
+GPU waited, a third of the forward's idle time; vLLM's own mutating ops
+(mHC pre) pay it too. env_override now installs a version that reads the
+list once and returns the same arguments.
+---
+ tests/test_custom_op_fill_defaults.py | 43 +++++++++++++++++++++++++++
+ vllm/env_override.py                  | 37 +++++++++++++++++++++++
+ 2 files changed, 80 insertions(+)
+ create mode 100644 tests/test_custom_op_fill_defaults.py
+
+diff --git a/tests/test_custom_op_fill_defaults.py b/tests/test_custom_op_fill_defaults.py
+new file mode 100644
+index 0000000000..d587fe7b95
+--- /dev/null
++++ b/tests/test_custom_op_fill_defaults.py
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for the one-read custom-op fill_defaults override in env_override.py."""
++
++import torch
++import torch._library.utils as library_utils
++
++from vllm.env_override import _fill_defaults_one_read
++
++SCHEMA = torch._C.parse_schema(
++    "f(Tensor a, int b=3, *, float c=1.5, str d='x', int[] e=[1, 2]) -> ()"
++)
++
++
++def test_installed_by_env_override():
++    assert library_utils.fill_defaults is _fill_defaults_one_read
++
++
++def test_positional_defaults_and_kwarg_only_defaults():
++    a = torch.zeros(1)
++    args, kwargs = _fill_defaults_one_read(SCHEMA, (a,), {})
++    assert args == (a, 3)
++    assert kwargs == {"c": 1.5, "d": "x", "e": [1, 2]}
++
++
++def test_given_values_win():
++    a = torch.zeros(1)
++    args, kwargs = _fill_defaults_one_read(SCHEMA, (a, 7), {"c": 2.5, "e": [4]})
++    assert args == (a, 7)
++    assert kwargs == {"c": 2.5, "d": "x", "e": [4]}
++
++
++def test_mutating_custom_op_still_bumps_versions():
++    @torch.library.custom_op("vllm_test::fill_defaults_bump", mutates_args=("out",))
++    def bump(x: torch.Tensor, out: torch.Tensor, scale: float = 2.0) -> None:
++        out.copy_(x * scale)
++
++    x, out = torch.ones(2), torch.zeros(2)
++    before = out._version
++    with torch.no_grad():
++        torch.ops.vllm_test.fill_defaults_bump(x, out)
++    assert out._version > before
++    assert torch.equal(out, torch.full((2,), 2.0))
+diff --git a/vllm/env_override.py b/vllm/env_override.py
+index a6b3c373fa..a9e58ae227 100644
+--- a/vllm/env_override.py
++++ b/vllm/env_override.py
+@@ -920,6 +920,43 @@ def _patch_inductor_fallback_allow_list() -> None:
+ 
+ _patch_inductor_fallback_allow_list()
+ 
++# ============================================================
++# torch custom-op fill_defaults: one read of the schema
++# ============================================================
++# The ADInplaceOrView kernel that torch.library.custom_op registers for ops
++# with mutates_args calls torch._library.utils.fill_defaults on every eager
++# call. It reads schema.arguments, a property that builds a new list of every
++# argument, once per argument: quadratic in the argument count. A 64-argument
++# mutating op (B12X's dynamic MoE launch) spends about 0.8 ms of host time per
++# call there, which leaves the GPU idle through short prefills. PyTorch main
++# still reads it in the loop; remove this once upstream reads it once.
++
++
++def _fill_defaults_one_read(schema, args, kwargs):
++    """torch._library.utils.fill_defaults, reading ``schema.arguments`` once."""
++    new_args = []
++    new_kwargs = {}
++    for i, info in enumerate(schema.arguments):
++        if info.kwarg_only:
++            if info.name in kwargs:
++                new_kwargs[info.name] = kwargs[info.name]
++            else:
++                new_kwargs[info.name] = info.default_value
++        elif i < len(args):
++            new_args.append(args[i])
++        else:
++            new_args.append(info.default_value)
++    return tuple(new_args), new_kwargs
++
++
++def _patch_custom_op_fill_defaults() -> None:
++    import torch._library.utils as library_utils
++
++    library_utils.fill_defaults = _fill_defaults_one_read
++
++
++_patch_custom_op_fill_defaults()
++
+ # ============================================================
+ # Triton Autotuner determinism
+ # ============================================================
+-- 
+2.43.0
+

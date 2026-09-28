@@ -74,5 +74,15 @@ config = json.loads(stack["serve_args"][-1])
 config.update(torch_profiler_dir="/cache/kkref/profiles/spa-current-stack", torch_profiler_with_stack=True)
 stack["serve_args"][-1] = json.dumps(config)
 arms["current-stack"] = stack
+# Promotion candidate: the r5h image (patches 0001-0019, built), no overlay and
+# no SP setting.
+candidate = arm({})
+candidate["environment"].pop("SPARK3_DS41_PREFILL_SP_MIN_ROWS", None)
+candidate["environment"]["VLLM_CACHE_DIR"] = candidate["environment"]["VLLM_CACHE_ROOT"] = "/cache/kkref/jit/vllm-r5h"
+candidate["container"]["image"] = "vllm-ds41f-kkref:04c30fa98e79-r5h"
+candidate["container"]["expected_labels"]["local.spark3.vllm.tree"] = (
+    "17f5431dd169d4dec917736608b14a52443b8fe8"
+)
+arms["candidate"] = candidate
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")

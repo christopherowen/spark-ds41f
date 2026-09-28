@@ -116,8 +116,8 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   output. Off by default; output unchanged. Upstream status: candidate, not
   submitted.
 
-- `0014`-`0017` (`deepseek-v41-prefill-sp-*`, `SPARK3_DS41_PREFILL_SP_MIN_ROWS`)
-  add sequence-parallel prefill. For prefill forwards above the threshold,
+- `0014`-`0017` (`deepseek-v41-prefill-sp-*`) add sequence-parallel
+  prefill. For prefill forwards above the threshold,
   each decoder layer's all-reduces become dim-0 reduce-scatters, and each
   rank runs the row-wise work between them (hyper-connection mixes, norms,
   the Engram gate, the residual) on a third of the rows:
@@ -128,11 +128,31 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
     the boundary layer;
   - 0017 runs the attention front (`fused_wqa_wkv`, norms, index weights) on
     local rows and gathers its narrower product.
-  Decode never engages (the threshold is raised above every decode token
-  count). Off by default; output differs only by the reduce-scatter's
-  summation order. Upstream status: candidate, not submitted.
+  Decode never engages. With 0014-0017 alone the threshold is
+  `SPARK3_DS41_PREFILL_SP_MIN_ROWS` (unset is off); output differs only by
+  the reduce-scatter's summation order. Upstream status: candidate, not
+  submitted.
 
-Applying 0001-0017 to the base yields patch head `6151f609` and tree
+- `0018-deepseek-v41-prefill-sp-transport-threshold.patch` removes that
+  setting. A forward runs sequence-parallel when it is prompt processing
+  (larger than every decode forward) and its padded hidden-state message
+  exceeds what the one-shot RoCE all-reduce takes, so that the
+  reduce-scatter really scatters: below that SP only adds two all-gathers
+  per layer. With the 2 MiB RoCE limit and 5120 bf16 hidden rows that is
+  205 tokens at TP 3. The RoCE communicator exposes its limit as
+  `all_reduce_max_bytes`. Upstream status: candidate, not submitted.
+
+- `0019-custom-op-fill-defaults-one-read.patch` makes `vllm/env_override.py`
+  install a `torch._library.utils.fill_defaults` that reads
+  `schema.arguments` once. torch's version reads it once per argument
+  (quadratic), from the ADInplaceOrView kernel of every mutating
+  `torch.library.custom_op`; B12X's 64-argument dynamic MoE launch spent
+  about 0.8 ms of host time per call there (873 us against 48 us). Same
+  arguments returned; output unchanged. Upstream status: the bug is still in
+  PyTorch main; not submitted.
+
+Applying 0001-0019 to the base yields patch head `c42e75cf` and tree
+`17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree
 `5e088694`. 0001-0013, the r5f image, give patch head `0a00c7b3` and tree
 `73a843bb`. 0001-0011, the r5e image, give patch head `138b562f`
 and tree `7b839dc1`. The r5c image carried an earlier 0009 that moved
