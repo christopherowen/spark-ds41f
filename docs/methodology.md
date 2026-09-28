@@ -41,7 +41,11 @@ The stable suite must cover:
    request failures, and output-integrity gates.
 
 `bin/spark3 bench` implements items 1-5 and 7; the Strix workload remains
-manual. Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
+manual. Wrap a Strix run in `bin/spark3 workload --json <path> -- <command>`
+to record the server side of that window without sending requests: requests
+per hour, prompt and output lengths, prefix-cache share, draft acceptance by
+position, the share of engine steps carrying prefill, latency quantiles, and
+peak load. Findings per hour come from Strix's own report. Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
 counts, and variability across complete runs. Performance is not accepted at the
 expense of model quality or silent request rejection.
 

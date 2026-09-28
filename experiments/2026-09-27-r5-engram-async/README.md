@@ -42,8 +42,9 @@ and 4,051-4,167 tok/s at 32K (on NCCL), as on r3.
 | r5c (patch 0002) | 49.64 | 52.79 | 50.82 | 53.42 |
 
 - Patch 0002 recovers 1.2-1.4 ms per step against the base overlap: prose
-  steps now match r4a (L2 prefetch included), code steps remain 0.8-1.0 ms
-  slower.
+  steps now match r4a, code steps remain 0.8-1.0 ms slower. (Correction,
+  2026-09-28: the L2 prefetch did not run on r5c; it failed to compile until
+  r5i.)
 - Against the r4a runs of the night before (full matrix) r5c looked 4.5-6.4%
   lower at eight streams, but a lean r4a control the same morning showed
   that gap is the protocol, not the stack.

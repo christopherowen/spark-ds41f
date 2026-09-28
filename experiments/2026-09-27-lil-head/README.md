@@ -62,6 +62,15 @@ the nvidia-drm modeset host setting.
 
 ## Results
 
+**Correction (2026-09-28): the L2 weight prefetch never ran in these arms.** Every
+r5 image before r5i logged `[l2_prefetch] disabled: kernel compile failed: No module
+named 'cutlass.base_dsl.enums'` (CuTe DSL 4.6.2; see
+`experiments/2026-09-28-cute-dsl-471`), so `base` and `nol2` ran identical code.
+The 1.2 ms (-2.4%, "significant") prose-step difference below is boot-to-boot
+noise, not the prefetch: a null comparison pooled over two boots per arm can
+read as significant. The measured value of the running prefetch is 1.3-2.1 ms
+per step (r5i against r5i with `VLLM_DS41_L2_PREFETCH=0`).
+
 **Correction (same-protocol control).** These comparisons used the r4a runs
 of `experiments/2026-09-26-dspark-policy` (b1, b2: full five-case matrix,
 the night before) as the reference. A lean-protocol r4a control run on the
