@@ -35,6 +35,14 @@ arms = {
     "nccl-info": arm({**PERSIST, **NCCL_TIMINGS}),
     # NCCL's GPU-initiated networking setup, off (NCCL_GIN_ENABLE=0).
     "nogin": arm({**PERSIST, **NCCL_TIMINGS, "NCCL_GIN_ENABLE": "0"}),
+    # Diagnostic: cuBLAS and cuBLASLt log every call (which GEMMs run at boot,
+    # and whether serving calls cuBLAS at all). One file per process.
+    "cublas-log": arm({
+        "CUBLASLT_LOG_LEVEL": "5",
+        "CUBLASLT_LOG_FILE": "/cache/kkref/cublas-log/lt.%i",
+        "CUBLAS_LOGINFO_DBG": "1",
+        "CUBLAS_LOGDEST_DBG": "/cache/kkref/cublas-log/blas.log",
+    }),
 }
 for name, cfg in arms.items():
     (E / f"cluster-{name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
