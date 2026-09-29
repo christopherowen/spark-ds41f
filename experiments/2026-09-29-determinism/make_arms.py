@@ -51,9 +51,18 @@ detslice["environment"]["B12X_DENSE_SPLITK_TURBO"] = "0"
 detslice_noovl = copy.deepcopy(detslice)
 detslice_noovl["environment"]["VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD"] = "0"
 
+# Diagnostic: detslice with the debug-only MoE checksum log (vLLM runner).
+detslice_dbg = copy.deepcopy(detslice)
+RUNNER = "/opt/spark3/candidate/vllm/vllm/model_executor/layers/fused_moe/runner"
+for name in ("moe_runner.py", "checksum_debug.py"):
+    detslice_dbg["container"]["mounts"].append(
+        ["{home}/spark3-overlay/moe-checksum/" + name, f"{RUNNER}/{name}", "ro"]
+    )
+detslice_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
-                     ("detslice-noovl", detslice_noovl)):
+                     ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)

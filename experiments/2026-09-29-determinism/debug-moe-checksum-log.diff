@@ -1,0 +1,112 @@
+diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+new file mode 100644
+index 0000000000..46d242d2b7
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+@@ -0,0 +1,84 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only MoE checksum log for reproducibility investigations.
++
++Enabled only by ``SPARK3_MOE_CHECKSUM_DIR``; unset means no work at all.
++Every MoE runner call appends one row to a device-resident log:
++(layer slot, rows, sum(input), sum(shared-expert output), sum(routed output)),
++indexed on the device, so CUDA-graph replays record as well as eager calls.
++A watcher thread writes ``rank<r>-<count>.pt`` into the directory whenever
++the ``dump`` file there changes. Compare two identical requests to find the
++first call whose input matches but whose shared or routed output does not.
++"""
++
++import os
++import threading
++import time
++
++import torch
++
++DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
++ENABLED = bool(DIRECTORY)
++_CAPACITY = 1 << 17
++_log: "_Log | None" = None
++
++
++class _Log:
++    def __init__(self, device: torch.device) -> None:
++        self.rows = torch.zeros(_CAPACITY, 5, dtype=torch.float64, device=device)
++        self.count = torch.zeros(1, dtype=torch.int64, device=device)
++        self.slots: dict[int, int] = {}
++        threading.Thread(target=self._watch, daemon=True).start()
++
++    def record(self, owner, x, shared, routed) -> None:
++        slot = self.slots.setdefault(id(owner), len(self.slots))
++        # Fill kernels, not host copies: this also runs under graph capture.
++        header = torch.cat(
++            [
++                torch.full((1,), float(slot), dtype=torch.float64, device=x.device),
++                torch.full((1,), float(x.shape[0]), dtype=torch.float64, device=x.device),
++            ]
++        )
++        shared_sum = (
++            shared.double().sum().reshape(1)
++            if shared is not None
++            else torch.zeros(1, dtype=torch.float64, device=x.device)
++        )
++        values = torch.cat(
++            [header, x.double().sum().reshape(1), shared_sum, routed.double().sum().reshape(1)]
++        )
++        index = self.count.remainder(_CAPACITY)
++        self.rows.index_copy_(0, index, values.unsqueeze(0))
++        self.count.add_(1)
++
++    def _watch(self) -> None:
++        rank = (
++            torch.distributed.get_rank()
++            if torch.distributed.is_available() and torch.distributed.is_initialized()
++            else int(os.environ.get("RANK", "0"))
++        )
++        trigger = os.path.join(DIRECTORY, "dump")
++        seen = None
++        while True:
++            time.sleep(1.0)
++            try:
++                stamp = os.stat(trigger).st_mtime_ns
++            except FileNotFoundError:
++                continue
++            if stamp == seen:
++                continue
++            seen = stamp
++            count = int(self.count.item())
++            rows = self.rows[: min(count, _CAPACITY)].cpu()
++            torch.save(
++                {"count": count, "rows": rows},
++                os.path.join(DIRECTORY, f"rank{rank}-{count}.pt"),
++            )
++
++
++def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
++    """Append one checksum row; call only when ENABLED."""
++    global _log
++    if _log is None:
++        os.makedirs(DIRECTORY, exist_ok=True)
++        _log = _Log(x.device)
++    _log.record(owner, x, shared, routed)
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 8a47192e13..9408ff63d5 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
+     MoERunnerInterface,
+ )
++from vllm.model_executor.layers.fused_moe.runner import checksum_debug
+ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+     SharedExperts,
+     SharedExpertsOrder,
+@@ -869,6 +870,9 @@ class MoERunner(MoERunnerInterface):
+         # Apply output transform (e.g. latent -> full dim)
+         fused_output = self.apply_routed_output_transform(fused_output)
+ 
++        if checksum_debug.ENABLED:
++            checksum_debug.record(self, hidden_states, shared_output, fused_output)
++
+         if reduce_scatter_rows is not None:
+             return self._reduce_scatter_final_output(
+                 shared_output,
