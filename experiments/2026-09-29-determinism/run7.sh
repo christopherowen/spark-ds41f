@@ -25,7 +25,9 @@ done
 sleep 15
 for n in dgx1 dgx2 dgx3; do
   ssh -n "$n" "docker exec dsv41-karmic-kraken ls /cache/kkref/moe-checksums/"
-  ssh -n "$n" "docker exec dsv41-karmic-kraken sh -c 'cat /cache/kkref/moe-checksums/rank*.pt'" > "$out/$n.pt"
+  for kind in runner tags; do
+    ssh -n "$n" "docker exec dsv41-karmic-kraken sh -c 'cat /cache/kkref/moe-checksums/rank*-$kind-*.pt'" > "$out/$n-$kind.pt"
+  done
 done
 ls -la "$out"
 stop_all

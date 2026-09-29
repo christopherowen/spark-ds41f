@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..46d242d2b7
+index 0000000000..b1212652cd
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,114 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -11,9 +11,11 @@ index 0000000000..46d242d2b7
 +Every MoE runner call appends one row to a device-resident log:
 +(layer slot, rows, sum(input), sum(shared-expert output), sum(routed output)),
 +indexed on the device, so CUDA-graph replays record as well as eager calls.
-+A watcher thread writes ``rank<r>-<count>.pt`` into the directory whenever
-+the ``dump`` file there changes. Compare two identical requests to find the
-+first call whose input matches but whose shared or routed output does not.
++Tagged calls (``record_tag``, e.g. inside the shared-expert MLP, which may run
++on a side stream) go to a second log so the two never share a counter.
++A watcher thread writes ``rank<r>-<log>-<count>.pt`` into the directory
++whenever the ``dump`` file there changes. Compare two identical requests to
++find the first call whose input matches but whose outputs do not.
 +"""
 +
 +import os
@@ -29,11 +31,27 @@ index 0000000000..46d242d2b7
 +
 +
 +class _Log:
-+    def __init__(self, device: torch.device) -> None:
++    def __init__(self, device: torch.device, name: str) -> None:
++        self.name = name
 +        self.rows = torch.zeros(_CAPACITY, 5, dtype=torch.float64, device=device)
 +        self.count = torch.zeros(1, dtype=torch.int64, device=device)
 +        self.slots: dict[int, int] = {}
 +        threading.Thread(target=self._watch, daemon=True).start()
++
++    def record_tag(self, owner, tag: int, x) -> None:
++        slot = self.slots.setdefault(id(owner), len(self.slots))
++        values = torch.cat(
++            [
++                torch.full((1,), float(slot), dtype=torch.float64, device=x.device),
++                torch.full((1,), float(x.shape[0]), dtype=torch.float64, device=x.device),
++                torch.full((1,), float(tag), dtype=torch.float64, device=x.device),
++                x.double().sum().reshape(1),
++                x.double().abs().sum().reshape(1),
++            ]
++        )
++        index = self.count.remainder(_CAPACITY)
++        self.rows.index_copy_(0, index, values.unsqueeze(0))
++        self.count.add_(1)
 +
 +    def record(self, owner, x, shared, routed) -> None:
 +        slot = self.slots.setdefault(id(owner), len(self.slots))
@@ -77,8 +95,11 @@ index 0000000000..46d242d2b7
 +            rows = self.rows[: min(count, _CAPACITY)].cpu()
 +            torch.save(
 +                {"count": count, "rows": rows},
-+                os.path.join(DIRECTORY, f"rank{rank}-{count}.pt"),
++                os.path.join(DIRECTORY, f"rank{rank}-{self.name}-{count}.pt"),
 +            )
++
++
++_tag_log: "_Log | None" = None
 +
 +
 +def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
@@ -86,8 +107,17 @@ index 0000000000..46d242d2b7
 +    global _log
 +    if _log is None:
 +        os.makedirs(DIRECTORY, exist_ok=True)
-+        _log = _Log(x.device)
++        _log = _Log(x.device, "runner")
 +    _log.record(owner, x, shared, routed)
++
++
++def record_tag(owner, tag: int, x: torch.Tensor) -> None:
++    """Append (slot, rows, tag, sum, abs sum) to the tag log; only when ENABLED."""
++    global _tag_log
++    if _tag_log is None:
++        os.makedirs(DIRECTORY, exist_ok=True)
++        _tag_log = _Log(x.device, "tags")
++    _tag_log.record_tag(owner, tag, x)
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 index 8a47192e13..9408ff63d5 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
@@ -110,3 +140,33 @@ index 8a47192e13..9408ff63d5 100644
          if reduce_scatter_rows is not None:
              return self._reduce_scatter_final_output(
                  shared_output,
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 3cc704baae..ad35c77a53 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -7,6 +7,7 @@ from itertools import islice
+ 
+ import regex as re
+ import torch
++from vllm.model_executor.layers.fused_moe.runner import checksum_debug
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -159,9 +160,17 @@ class DeepseekV4MLP(nn.Module):
+             self.act_fn = SiluAndMul()
+ 
+     def forward(self, x):
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 0, x)
+         gate_up, _ = self.gate_up_proj(x)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 1, gate_up)
+         x = self.act_fn(gate_up)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 2, x)
+         x, _ = self.down_proj(x)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 3, x)
+         return x
+ 
+ 

@@ -58,6 +58,10 @@ for name in ("moe_runner.py", "checksum_debug.py"):
     detslice_dbg["container"]["mounts"].append(
         ["{home}/spark3-overlay/moe-checksum/" + name, f"{RUNNER}/{name}", "ro"]
     )
+detslice_dbg["container"]["mounts"].append(
+    ["{home}/spark3-overlay/moe-checksum/model.py",
+     "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4/nvidia/model.py", "ro"]
+)
 detslice_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
 
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
