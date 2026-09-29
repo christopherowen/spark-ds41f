@@ -38,4 +38,36 @@ allowed to cost some speed.
 
 ## Results
 
-Pending.
+Build: 477 s, image `sha256:5416f8ff`, the same digest on all three nodes.
+Against the reference arm (`weights-256k`, r5j image with patch 0021 mounted),
+same protocol, 2026-09-29:
+
+| | Reference | `candidate-auto` (FP8 attention) | `candidate` (BF16 attention) |
+|---|---:|---:|---:|
+| Quality gate | 5/5 | 5/5 | 5/5 |
+| Needle at 177,654 tokens | 3/3 | 3/3 | 3/3 |
+| Logprob gap mean / p95 / max | 0.0612 / 0.305 / 8.23 | 0.0506 / 0.265 / 2.54 | 0.0445 / 0.246 / 2.19 |
+| Prefill argmax differs | 3.62% | 2.84% | 2.84% |
+| Single-stream step, prose / code (ms) | 41.9 / 47.6 | 42.1 / 48.3 | 42.5 / 47.6 |
+| 8 streams prose / code / answers (tok/s) | 166 / 184 / 172 / 236 | 165 / 185 / 170 / 232 | 159 / 183 / 167 / 237 |
+| Real-text prefill 64K / 131K / 200K (tok/s) | 3.77k / 3.58k / 3.45k | 3.70k / 3.55k / 3.41k | 3.60k / 3.43k / 3.32k |
+| Four 180K contexts, per stream | 11.65 tok/s | 11.92 tok/s | 11.00 tok/s |
+| Lowest MemAvailable dgx1 / dgx2 / dgx3 (GiB) | 5.89 / 7.42 / 7.33 | 6.14 / 7.39 / 7.32 | 5.38 / 6.89 / 6.79 |
+
+Patch 0024 and B12X #435 account for the consistency gain: the worst
+decode/prefill disagreement fell from 8.2 to 2.5 nats and prefill's argmax
+differs on 22% fewer tokens. BF16 attention (0023) cut the mean gap by a
+further 12% but cost 0.5-0.76 GiB of headroom on every node (dgx1 also swapped
+0.03 GiB), 8% of decode with four 180K contexts and 3% of long prefill, so the
+owner chose to promote without it (`VLLM_DS41_ATTENTION_COMPUTE=auto`) until
+a teacher-forced fidelity test against `=reference` quantifies its gain. The
+DRM file closes after the carve-out import: 0 DRM clients on every node, and
+dgx3's HDMI console shows its login prompt.
+
+`reference.sh` ran the promotion reference on the running `candidate-auto`
+arm (`manifests/benchmarks/2026-09-29-karmic-kraken-r5k.json`): decode within
+noise of r5j at every point, filler prefill 2K 4.2k to 131K 4.3k, real-text
+prefill 3.9k at 4K to 3.4k at 200K, prefix replay 6.71 s cold and 0.27 s warm,
+four 64K contexts at 13.4 tok/s per stream and 20% of the cache, and a lowest
+dgx1 MemAvailable of 6.03 GiB (the 256K limit costs about 0.4 GiB against
+131K). Promoted as r5k.

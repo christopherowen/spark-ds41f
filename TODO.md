@@ -33,22 +33,25 @@ before tuning anything on this basis.
 
 ## Current reference
 
-`manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json`. r5j changed only
-warmup (two Triton kernels compile before readiness) and carries r5i's numbers;
-re-measure on the next promotion. Aggregate tok/s across all streams,
-temperature 0, 256 output tokens:
+`manifests/benchmarks/2026-09-29-karmic-kraken-r5k.json` (256K limit, 2.2 GiB
+of KV, 1,348,708 tokens). Aggregate tok/s across all streams, temperature 0,
+256 output tokens:
 
 | Workload | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| JSON, answer only | 78.5 | 106.8 | 164.2 | 241.1 |
-| Code, answer only | 78.9 | 112.2 | 169.3 | 226.2 |
-| Code, reasoning on | 62.6 | 89.4 | 137.0 | 188.4 |
-| Prose, answer only | 55.9 | 84.0 | 126.4 | 172.2 |
-| Prose, reasoning on | 49.7 | 74.9 | 110.3 | 164.0 |
+| JSON, answer only | 75.1 | 110.0 | 171.4 | 243.9 |
+| Code, answer only | 80.1 | 113.2 | 160.9 | 235.6 |
+| Code, reasoning on | 59.2 | 90.7 | 133.0 | 185.5 |
+| Prose, answer only | 57.2 | 86.3 | 122.9 | 172.6 |
+| Prose, reasoning on | 49.8 | 78.7 | 114.5 | 168.0 |
 
-- **Time to first token (short prompts):** 178-221 ms at one stream and
-  443-568 ms at eight.
-- **Real-text prefill:** 3.8k tok/s from 4K to 61K tokens.
+- **Time to first token (short prompts):** 0.21-0.23 s at one stream and
+  about 0.52 s at eight.
+- **Real-text prefill:** 3.9k tok/s at 4K, 3.7k at 64K, 3.4k at 200K.
+- **Quality:** `experiments/2026-09-29-r5k/consistency.py` measures the
+  decode-versus-prefill logprob gap on greedy generations (r5k: 0.0506 mean,
+  2.84% argmax disagreement); use it for any change that touches decode-only
+  state.
 
 A step-time saving is a fixed cost per step. At one stream it converts almost
 fully into tok/s. At eight streams the step is longer (up to 48 verified rows,
@@ -100,7 +103,8 @@ and eight streams for every decode change.
 ## Memory and safety
 
 - dgx1 hosts rank 0 and the API server, so it is always the tightest node:
-  6.44 GiB minimum MemAvailable under load on r5j. Check its headroom before
+  6.03 GiB minimum MemAvailable under load on r5k (the 256K limit costs about
+  0.4 GiB). Check its headroom before
   anything else, and never lower the guards (5 GiB at startup, 3 GiB steady).
 - Known to cross the startup guard on dgx1: 8,192 batched tokens, draft TP 1,
   full in-engine B12X autotune.
@@ -267,12 +271,21 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
   - If a deployment needs no images, `--limit-mm-per-prompt {"image":0}` or
     `--language-model-only` stubs the tower and skips its weights. That's the
     owner's decision, since image input is a promoted feature.
-- **Display reserve:** each node's firmware sets aside memory for a display. On
-  dgx1 and dgx2 nothing is connected; dgx3 has an HDMI output connected. Using
-  that reserve for KV needs `nvidia-drm` fbdev off, so it is the owner's
-  decision. Verify MemAvailable neutrality and bandwidth on all three nodes
-  first.
+- **Display reserve:** in use since r5k for the embedding and output head
+  (842.5 MiB per rank of the 2,032 MiB the firmware reserves; dgx3 keeps its
+  8 MiB console framebuffer). The GPU mapping streams at full speed but is
+  uncached with small pages, so only data read once per step belongs there;
+  about 1.2 GiB is still free. `experiments/2026-09-29-display-carveout-kv` has
+  the access-speed measurements.
 - **Do not raise `min_free_kbytes`;** it eats the margin the guards protect.
+
+## Quality
+
+- **BF16 sparse attention** (patch 0023, off in configuration): measure its
+  fidelity with a teacher-forced comparison against
+  `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before
+  enabling it. It cost 0.5-0.76 GiB of headroom and 8% of decode with four
+  180K contexts for a 12% smaller decode/prefill logprob gap.
 
 ## Upstream and hygiene
 

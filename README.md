@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-28-karmic-kraken-r5j.json](manifests/baselines/2026-09-28-karmic-kraken-r5j.json):
+[manifests/baselines/2026-09-29-karmic-kraken-r5k.json](manifests/baselines/2026-09-29-karmic-kraken-r5k.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -20,13 +20,19 @@ The active baseline is recorded in
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
   projection sharding, asynchronous Engram rows, and two tool-call and
   image-cache fixes) and B12X (plus the switchless RoCEnante patch, and its
-  CuTe DSL pin moved to the 4.7.1 that vLLM requires), with B12X attention,
+  CuTe DSL pin moved to the 4.7.1 that vLLM requires; its FP4 KV writer
+  rounds like DeepSeek's reference quantizer), with B12X attention,
   linear, MoE, and mHC kernels and L2 weight prefetch during decode (the
   next layer's weights stream into L2 while latency-bound kernels run);
 - NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
   (NVIDIA/nccl#2393), which prevents a proxy-thread hang;
 - DeepSeek V4.1 Flash native FP8/FP4 weights, unchanged, with the vision
-  tower loaded (up to four images per request);
+  tower loaded (up to four images per request); the embedding and output-head
+  weights (842.5 MiB per rank) live in the GB10 display carve-out, the
+  firmware's scanout reserve that ordinary allocations never use, which frees
+  that memory for the KV cache while the text console keeps its framebuffer;
+- the ratio-2 compressor carries its open pair across decode steps, so
+  compressed entries for generated tokens match the ones prefill builds;
 - DSpark speculative decoding with five draft tokens (the drafter's trained
   block) and block rejection, full CUDA graphs for decode batches up to 48
   tokens; verification rows whose drafts are unlikely to survive skip the
@@ -40,8 +46,8 @@ The active baseline is recorded in
   host at every MoE launch;
 - B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
   model's SwiGLU clamp and caused the incoherence seen in earlier images;
-- 131,072-token per-request limit, eight admitted sequences, and 575,304 KV
-  tokens in a 1.4 GiB-per-rank cache;
+- 262,144-token per-request limit, eight admitted sequences, and 1,348,708
+  KV tokens (5.1 full windows) in a 2.2 GiB-per-rank cache;
 - one concurrent prefill, 4,096 batched tokens, and fail-closed 5 GiB startup
   and 3 GiB steady memory guards;
 - FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): only the
@@ -62,38 +68,40 @@ default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 49.7 | 51.6 | 0.20 s |
-| prose | 2 | 74.9 | 39.7 | 0.34 s |
-| prose | 4 | 110.3 | 30.4 | 0.44 s |
-| prose | 8 | 164.0 | 22.7 | 0.53 s |
-| code | 1 | 62.6 | 66.0 | 0.22 s |
-| code | 2 | 89.4 | 49.5 | 0.33 s |
-| code | 4 | 137.0 | 38.8 | 0.47 s |
-| code | 8 | 188.4 | 26.7 | 0.57 s |
+| prose | 1 | 49.8 | 51.8 | 0.21 s |
+| prose | 2 | 78.7 | 42.1 | 0.33 s |
+| prose | 4 | 114.5 | 31.4 | 0.45 s |
+| prose | 8 | 168.0 | 22.9 | 0.52 s |
+| code | 1 | 59.2 | 62.2 | 0.23 s |
+| code | 2 | 90.7 | 48.5 | 0.33 s |
+| code | 4 | 133.0 | 37.9 | 0.45 s |
+| code | 8 | 185.5 | 26.5 | 0.53 s |
 
 With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 
 | Prompt | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| prose | 55.9 | 84.0 | 126.4 | 172.2 |
-| code | 78.9 | 112.2 | 169.3 | 226.2 |
-| JSON | 78.5 | 106.8 | 164.2 | 241.1 |
+| prose | 57.2 | 86.3 | 122.9 | 172.6 |
+| code | 80.1 | 113.2 | 160.9 | 235.6 |
+| JSON | 75.1 | 110.0 | 171.4 | 243.9 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Single-stream decode step | about 42 ms on prose and 48 ms on code; accepted drafts per step 1.2 (prose), 2.2 (code), 3.1 (code answers) |
-| Cold prefill, repeated filler | 2K 4.3k, 32K 4.8k, 64K 4.6k tok/s |
-| Cold prefill, real text (Python source) | 4K 3.8k, 14K 3.8k, 36K 3.8k, 61K 3.8k tok/s |
-| Prefix-cache replay, 32K prompt | 6.65 s cold, 0.25 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 31%, 13.6 tok/s per stream |
-| KV capacity | 575,304 tokens in 1.4 GiB per rank (4.4 full 131K contexts) |
-| Host memory headroom | dgx1 at least 6.44 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
+| Long-context retrieval (phrase at 10%, 50%, 90% depth) | 3/3 at 177,654 tokens |
+| Single-stream decode step | about 41 ms on prose and 47 ms on code; accepted drafts per step 1.1 (prose), 1.9 (code), 3.2 (code answers) |
+| Cold prefill, repeated filler | 2K 4.2k, 32K 4.7k, 64K 4.6k, 131K 4.3k tok/s |
+| Cold prefill, real text (Python source) | 4K 3.9k, 16K 3.7k, 32K 3.7k, 64K 3.7k, 131K 3.6k, 200K 3.4k tok/s |
+| Prefix-cache replay, 32K prompt | 6.71 s cold, 0.27 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 20%, 13.4 tok/s per stream |
+| Four concurrent 180K contexts | all admitted without preemption, peak KV use 36%, 11.9 tok/s per stream |
+| KV capacity | 1,348,708 tokens in 2.2 GiB per rank (5.1 full 256K contexts) |
+| Host memory headroom | dgx1 at least 6.03 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
 The quick default takes three or four samples per decode point, about ±2-12%
 at 95% confidence; temperature-0 outputs differ between identical requests,
 which moves acceptance from sample to sample. Report:
-[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-28-karmic-kraken-r5i.json).
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5k.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract
