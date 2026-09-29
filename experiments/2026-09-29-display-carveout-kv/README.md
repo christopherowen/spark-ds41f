@@ -49,7 +49,7 @@ correctly. Through torch, a 1 GiB copy into the imported backing runs at
 1. `make_arms.py` writes `cluster-carveout.json` from `config/cluster.json`:
    the DRM card device, the overlay mounts, `SPARK3_KV_DISPLAY_CARVEOUT=1`,
    and `--kv-cache-memory-bytes 2130706432`.
-2. `overlay.sh` prepares vLLM with patches 0001-0021 (tree `52e9d1a1`) and
+2. `overlay.sh` prepares vLLM with patches 0001-0021 (tree `2f8e61c6`) and
    copies the two changed runtime files to every node.
 3. `run_arm.sh control control` benchmarks the running r5j service; then
    `run_arm.sh carveout carveout` starts the arm and runs the same protocol:

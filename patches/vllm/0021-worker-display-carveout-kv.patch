@@ -1,4 +1,4 @@
-From 1570aae2b43c5acbe1c53d029c8cb20d8f9881f7 Mon Sep 17 00:00:00 2001
+From f054760c86f47f6394dd896a816a8ffcdb24a70e Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 08:34:44 +0200
 Subject: [PATCH] feat(worker): back the KV cache with the GB10 display
@@ -17,19 +17,19 @@ the GPU and CPU round-trips without mismatches. The worker refuses to start
 if the carve-out cannot hold the backing, so the cache never falls back into
 ordinary memory.
 ---
- tests/v1/worker/test_display_carveout.py |  23 +++
- vllm/v1/worker/display_carveout.py       | 173 +++++++++++++++++++++++
+ tests/v1/worker/test_display_carveout.py |  30 ++++
+ vllm/v1/worker/display_carveout.py       | 182 +++++++++++++++++++++++
  vllm/v1/worker/utils.py                  |   6 +-
- 3 files changed, 201 insertions(+), 1 deletion(-)
+ 3 files changed, 217 insertions(+), 1 deletion(-)
  create mode 100644 tests/v1/worker/test_display_carveout.py
  create mode 100644 vllm/v1/worker/display_carveout.py
 
 diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
 new file mode 100644
-index 0000000000..c444338d43
+index 0000000000..dd3371f6ca
 --- /dev/null
 +++ b/tests/v1/worker/test_display_carveout.py
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,30 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Tests for the display carve-out KV backing (vllm/v1/worker/display_carveout.py)."""
@@ -52,13 +52,20 @@ index 0000000000..c444338d43
 +def test_missing_drm_node_refuses(monkeypatch):
 +    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
 +    with pytest.raises(RuntimeError, match="display carve-out cannot hold"):
-+        display_carveout.allocate(16 << 20, torch.device("cuda"))
++        display_carveout.allocate(512 << 20, torch.device("cuda"))
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
++def test_small_startup_caches_stay_in_ordinary_memory(monkeypatch):
++    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
++    tensor = display_carveout.allocate(8 << 20, torch.device("cuda"))
++    assert tensor.numel() == 8 << 20 and not tensor.any()
 diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
 new file mode 100644
-index 0000000000..08c84bd380
+index 0000000000..7969a8715a
 --- /dev/null
 +++ b/vllm/v1/worker/display_carveout.py
-@@ -0,0 +1,173 @@
+@@ -0,0 +1,182 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""KV cache backing in the GB10 display carve-out.
@@ -101,6 +108,8 @@ index 0000000000..08c84bd380
 +_DUMB_BPP = 32
 +_ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
 +_GRANULE = 16 << 20
++# Temporary startup KV caches are a few MiB; serving caches are GiB-scale.
++_SERVING_MIN_BYTES = 256 << 20
 +_CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
 +
 +
@@ -208,7 +217,14 @@ index 0000000000..08c84bd380
 +
 +
 +def allocate(nbytes: int, device: torch.device) -> torch.Tensor:
-+    """A zeroed int8 tensor of ``nbytes`` backed by the display carve-out."""
++    """A zeroed int8 tensor of ``nbytes`` backed by the display carve-out.
++
++    Startup also allocates small temporary KV caches (the memory-profiling
++    pass, B12X preparation blocks); those stay in ordinary memory so they do
++    not strand carve-out space the serving cache needs.
++    """
++    if nbytes < _SERVING_MIN_BYTES:
++        return torch.zeros(nbytes, dtype=torch.int8, device=device)
 +    assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
 +    assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
 +    rounded = -(-nbytes // _GRANULE) * _GRANULE

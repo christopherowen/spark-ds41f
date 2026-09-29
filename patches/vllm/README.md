@@ -161,13 +161,15 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   carve-out when `SPARK3_KV_DISPLAY_CARVEOUT=1`: a DRM dumb buffer from the
   firmware scanout reserve, exported as a dma-buf and imported with
   `cuImportExternalMemory` (about 95% of ordinary memory bandwidth). The
-  worker refuses to start if the carve-out cannot hold the backing. Output
+  worker refuses to start if the carve-out cannot hold the backing; startup
+  KV caches under 256 MiB (profiling, B12X preparation) stay in ordinary
+  memory. Output
   unchanged; inert without the variable. Tests:
   `tests/v1/worker/test_display_carveout.py`. Upstream status: candidate, not
   submitted.
 
-Applying 0001-0021 to the base yields patch head `6db4d969` and tree
-`52e9d1a1`.
+Applying 0001-0021 to the base yields patch head `d0d429a6` and tree
+`2f8e61c6`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`
 and tree `17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree

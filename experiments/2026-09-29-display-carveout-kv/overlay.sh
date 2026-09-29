@@ -16,7 +16,7 @@ for p in $(grep -v "^#" patches/vllm/series | grep -v "^$"); do
     -c user.email="3221756+christopherowen@users.noreply.github.com" \
     am --quiet --committer-date-is-author-date "$PWD/patches/vllm/$p"
 done
-[ "$(git -C "$T" rev-parse HEAD^{tree})" = 52e9d1a1f1ceec1a6e25ec41664d526737100b04 ]
+[ "$(git -C "$T" rev-parse HEAD^{tree})" = 2f8e61c627328182b49cd025f0cd32d77c21e059 ]
 rm -rf "$O"
 for f in vllm/v1/worker/utils.py vllm/v1/worker/display_carveout.py; do
   mkdir -p "$O/$(dirname $f)"
@@ -26,4 +26,4 @@ for host in dgx2 dgx3; do
   ssh "$host" "rm -rf $O && mkdir -p ~/spark3-overlay"
   tar cf - -C ~/spark3-overlay display-kv | ssh "$host" "tar xf - -C ~/spark3-overlay"
 done
-echo "overlay written from tree 52e9d1a1 to $O on dgx1-3"
+echo "overlay written from tree 2f8e61c6 to $O on dgx1-3"
