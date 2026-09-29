@@ -101,12 +101,15 @@ manifest.update(
     evidence={
         "experiments": ["experiments/2026-09-29-indexer-split/", "experiments/2026-09-29-r5l/"],
         "summary": (
-            f"LRU {quality}/5; needle retrieval {NEEDLE}; split check on 473,494 rows per "
-            "encoder indexer layer: split-versus-full differences within 2-8% of a second "
+            f"LRU {quality}/5; needle retrieval {NEEDLE}; split check on 473,461 rows per "
+            "encoder indexer layer: split-versus-full differences within 2-7% of a second "
             "full-row run's (radix top-k ties), none in deterministic layers, no unwritten rows "
-            "or candidate changes; carve-out unit tests 10/10 in the image and two debug-mode "
-            f"carve-out checks per node in the check boot; real-text prefill {source_row} tok/s; decode within noise of "
-            f"r5k; lowest dgx1 MemAvailable {dgx1_min:.2f} GiB in the reference run."
+            "or candidate changes, and zero differences of either kind with the B12X "
+            "lowest-position tie-break (experiments/2026-09-29-topk-ties); carve-out unit tests "
+            "10/10 in the image and two debug-mode carve-out checks per node in the check boot; "
+            f"real-text prefill {source_row} tok/s; decode matched r5k in an alternating "
+            "screen (r5k, r5l, ties twice each); lowest dgx1 MemAvailable "
+            f"{dgx1_min:.2f} GiB in the reference run."
         ),
     },
     benchmark_reference=str(REF),
@@ -248,9 +251,12 @@ new = old + (
     "  temperature-0 outputs differing between identical requests. The technical\n"
     "  report sets no tie rule; DeepSeek's reference (`inference/model.py`,\n"
     "  `torch.topk`) is repeatable, and dgpp (docs/inspiration.md) pins exact ties\n"
-    "  to the lower index with a composite (score, index) key inside an exact radix\n"
-    "  select. Adopt the same rule in B12X's threshold bucket if it costs nothing on\n"
-    "  the 200K chunk.\n"
+    "  to the lower index. `experiments/2026-09-29-topk-ties` adds that rule to\n"
+    "  B12X (patch 0003 there): selections become exact (zero differences between\n"
+    "  runs or against the split), prefill and decode cost nothing measurable and\n"
+    "  acceptance does not change. Whole outputs still differ between identical\n"
+    "  requests (6 of 6 distinct at one stream), so other nondeterminism remains.\n"
+    "  Promote it with the next image (r5m).\n"
 )
 assert old in text
 text = text.replace(old, new, 1)
