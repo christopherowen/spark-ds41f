@@ -107,4 +107,31 @@ the control's; the reported KV capacity rises by about 55%.
 
 ## Results
 
-Arm 2 pending.
+Same protocol as the arm 1 control (r5j), 2026-09-29. Every rank logged
+`Display carve-out holds 842.5 MiB of streamed weights (embed_tokens, lm_head);
+ordinary memory freed: 934-950 MiB`.
+
+| | r5j control | `weights` (131K) | `weights-256k` |
+|---|---:|---:|---:|
+| Context limit | 131,072 | 131,072 | 262,144 |
+| KV capacity (vLLM) | 575,304 tokens, 4.39x | 904,074 tokens, 6.90x | 1,348,708 tokens, 5.14x |
+| Quality gate | 5/5 | 5/5 | 5/5 |
+| Single-stream step, prose / code (ms) | 42.8 / 46.2 | 43.6 / 47.4 | 41.9 / 47.6 |
+| Single-stream step, answers prose / code (ms) | 44.3 / 49.4 | 44.8 / 49.7 | 44.5 / 49.8 |
+| 8 streams prose / code / answers (tok/s) | 164 / 187 / 175 / 232 | 164 / 183 / 175 / 243 | 166 / 184 / 172 / 236 |
+| Real-text prefill 2-4K / 32-64K (tok/s) | 3.13k / 3.72-3.74k | 3.13k / 3.73-3.76k | 3.88k / 3.77k |
+| Real-text prefill 131K / 200K (tok/s) | | | 3.58k / 3.45k |
+| Four 64K contexts, per stream | 13.8 tok/s, KV 32% | 13.4 tok/s, KV 20% | |
+| Four 180K contexts, per stream | | | 11.7 tok/s, KV 35% |
+| Lowest MemAvailable dgx1 / dgx2 / dgx3 (GiB) | 5.58 / 7.54 / 7.31 | 6.32 / 7.46 / 7.51 | 5.89 / 7.42 / 7.33 |
+
+`needle.py` on `weights-256k` at 177,654 prompt tokens retrieved the phrase at
+depths 0.1, 0.5 and 0.9 (3/3; 52, 47 and 25 s).
+
+The `weights` arm meets every acceptance criterion: decode, prefill and
+admission are within noise of the control, the quality gate passes, and the
+lowest MemAvailable is no lower. The `weights-256k` arm also serves 256K
+prompts, with KV for five full windows and four 180K contexts at 35% of the
+cache; the longer limit costs dgx1 about 0.4 GiB against `weights`, still
+above the control. Candidate for promotion as r5k: patch 0021, the DRM card
+device, `SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, 2.2 GiB of KV and a 256K limit.
