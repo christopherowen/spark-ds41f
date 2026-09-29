@@ -1,19 +1,26 @@
 #!/bin/bash
 # usage: overlay.sh   (on dgx1, deployment checkout)
-# Prepares vLLM with patches 0001-0021 and writes patch 0021's runtime files to
-# ~/spark3-overlay/display-kv on every node for mounting over the r5j image.
+# Applies vLLM patches 0001-0021 to the base in a throwaway worktree, the way
+# bin/spark3 build prepare does, checks the tree, and copies patch 0021 runtime
+# files to ~/spark3-overlay/display-kv on every node for mounting over r5j.
 set -eu
 cd ~/projects/spark3-vllm-ds41f
-V=.work/upstreams/vllm
+V=$PWD/.work/upstreams/vllm
 O=~/spark3-overlay/display-kv
-bin/spark3 upstream prepare vllm >/dev/null
-# prepare applies the series to the working tree without committing it.
-git -C $V add -A
-[ "$(git -C $V write-tree)" = 52e9d1a1f1ceec1a6e25ec41664d526737100b04 ]
-rm -rf $O
+BASE=04c30fa98e7917fee0a24c739ea503ce1e22538d
+T=$(mktemp -d /tmp/display-kv.XXXX)
+trap "git -C $V worktree remove --force $T" EXIT
+git -C "$V" worktree add -q --detach "$T" "$BASE"
+for p in $(grep -v "^#" patches/vllm/series | grep -v "^$"); do
+  git -C "$T" -c user.name="Christopher Owen" \
+    -c user.email="3221756+christopherowen@users.noreply.github.com" \
+    am --quiet --committer-date-is-author-date "$PWD/patches/vllm/$p"
+done
+[ "$(git -C "$T" rev-parse HEAD^{tree})" = 52e9d1a1f1ceec1a6e25ec41664d526737100b04 ]
+rm -rf "$O"
 for f in vllm/v1/worker/utils.py vllm/v1/worker/display_carveout.py; do
   mkdir -p "$O/$(dirname $f)"
-  cp "$V/$f" "$O/$f"
+  cp "$T/$f" "$O/$f"
 done
 for host in dgx2 dgx3; do
   ssh "$host" "rm -rf $O && mkdir -p ~/spark3-overlay"
