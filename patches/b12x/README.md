@@ -22,6 +22,18 @@ CuTe compile-cache integrity check (#418, `2fca4df8`).
   startup. 0001-0002 on the base yield patch head `7409da7a` and tree
   `640c8544` (on the r5j base `e39b437b`: `bbd69d16`, `ec4cced9`).
 
+- `0003-dsa-topk-position-ties.patch` breaks exact top-k score ties by lowest
+  logical position in the DSA radix top-k. The buffered arm's last round and
+  the exact overflow fallback used to hand the remaining slots to whichever
+  tied candidates reached a shared-memory counter first, so identical runs
+  selected different positions (78% of DS4.1 layer 2's prefill rows, about 5 of
+  512). An exact radix over the position key now chooses them; the FP8 fused
+  indexer is unchanged. DeepSeek's reference (`torch.topk`) repeats for the same
+  scores and dgpp pins the same lower-index rule. Measured in
+  `experiments/2026-09-29-topk-ties`: zero selection differences, no prefill or
+  decode cost, acceptance unchanged. 0001-0003 on the base yield patch head
+  `47c70835` and tree `35299956`.
+
 Not in the series: the W4A8 tiny-decode `swiglu_limit` fix
 (`experiments/2026-09-23-karmic-kraken-reference/patches/b12x/0002-tiny-decode-swiglu-limit.patch`)
 is an upstream contribution. The promoted runtime disables tiny decode instead
