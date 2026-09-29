@@ -1,0 +1,50 @@
+== repeat check, slice partials on
+m=  1 route_output=(36, 5120) finite=True repeats=[True, False, False, False, False, False, False, False] max_diff=0.75 history_same=False history_diff=0.5
+m=  3 route_output=(108, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m=  5 route_output=(180, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m=  6 route_output=(216, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m= 16 route_output=(576, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m= 48 route_output=(1728, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+FAIL
+== repeat check, slice partials off
+m=  1 route_output=(6, 5120) finite=True repeats=[True, False, False, False, False, False, False, False] max_diff=0.5 history_same=False history_diff=1
+m=  3 route_output=(18, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m=  5 route_output=(30, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m=  6 route_output=(36, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m= 16 route_output=(96, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+m= 48 route_output=(288, 5120) finite=True repeats=[True, True, True, True, True, True, True, True] max_diff=0 history_same=True history_diff=0
+FAIL
+== compute-sanitizer initcheck, m=1, slice partials on
+========= COMPUTE-SANITIZER
+Traceback (most recent call last):
+  File "/tmp/moe_repeat_check.py", line 52, in <module>
+    prepared = fused_moe.prepare_weights(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark3/candidate/b12x/b12x/moe/fused_moe/api.py", line 76, in prepare_weights
+    return _prepare_weights(plan=plan, weights=weights)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark3/candidate/b12x/b12x/moe/fused_moe/planning.py", line 355, in prepare_weights
+    prepared = prepare_b12x_fp4_moe_weights(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark3/candidate/b12x/b12x/moe/fused_moe/_impl.py", line 6724, in prepare_b12x_fp4_moe_weights
+    value = _prepare_w4a8_from_e8m0_source(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark3/candidate/b12x/b12x/moe/fused_moe/_impl.py", line 6304, in _prepare_w4a8_from_e8m0_source
+    w2_rp = _logical_weight_to_w4a8_rp_inplace(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark3/candidate/b12x/b12x/moe/fused_moe/_impl.py", line 5170, in _logical_weight_to_w4a8_rp_inplace
+    q_chunk = torch.empty(
+              ^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+========= Target application returned an error
+========= ERROR SUMMARY: 0 errors
+== compute-sanitizer initcheck, m=6, slice partials on
+========= COMPUTE-SANITIZER
+========= Error: process didn't terminate successfully
+========= Target application returned an error
+========= ERROR SUMMARY: 0 errors
+== compute-sanitizer racecheck, m=1, slice partials on
+========= COMPUTE-SANITIZER

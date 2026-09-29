@@ -47,8 +47,13 @@ for name in SLICES_FILES:
 detslice["environment"]["B12X_DYNAMIC_DETERMINISTIC_OUTPUT"] = "1"
 detslice["environment"]["B12X_DENSE_SPLITK_TURBO"] = "0"
 
+# Diagnostic: detslice without the shared-expert side-stream overlap.
+detslice_noovl = copy.deepcopy(detslice)
+detslice_noovl["environment"]["VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD"] = "0"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
-                     ("detfast-t", detfast_t), ("detslice", detslice)):
+                     ("detfast-t", detfast_t), ("detslice", detslice),
+                     ("detslice-noovl", detslice_noovl)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
