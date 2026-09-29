@@ -7,19 +7,19 @@ Date: 2026-09-29. Base: promoted r5k.
 - vLLM 0025 splits the replicated indexer's rows across the TP ranks during
   sequence-parallel prefill (`experiments/2026-09-29-indexer-split`): -5% per
   4,096-token chunk at 64K of context to -15% at 200K, decode unchanged.
-- vLLM 0026 adds an opt-in integrity check of the weights held in the display
-  carve-out: with `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` above 0 the worker
-  checksums them before and after the copy and re-checks them on a side
-  stream at that interval; a mismatch stops the engine. The candidate turns
-  it on at 300 s for long unattended runs, with a removal review due
-  2026-10-29 (`TODO.md`).
+- vLLM 0026 adds a debug-mode integrity check of the weights held in the
+  display carve-out, off in configuration: with
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` above 0 the worker checksums them
+  before and after the copy and re-checks them on a side stream at that
+  interval after graph capture; a mismatch kills the worker. Unset, it adds no
+  work.
 
 ## Arms
 
 | Arm | What it is |
 |---|---|
-| `candidate` | the r5l image (vLLM tree `3b024a40`), r5k's configuration, `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS=300` |
-| `candidate-check` | `candidate` with `SPARK3_DS41_INDEXER_SPLIT_CHECK=1` and the carve-out check every 60 s |
+| `candidate` | the r5l image (vLLM tree `c108cd6d`), r5k's configuration |
+| `candidate-check` | `candidate` with `SPARK3_DS41_INDEXER_SPLIT_CHECK=1` and the debug-mode carve-out check every 60 s |
 
 ## Method
 
@@ -83,4 +83,18 @@ on dgx3: 842 MiB peak for one table, 32 MiB when summed in 16 MiB chunks, same
 value and 9 ms either way). Patch 0026 now sums in chunks, and the image was
 rebuilt. The second image's results are under `results/private/r5l/second-image/`
 and `results/private/bench/r5l-*-second`.
+
+## Third build
+
+The third image (`sha256:d4cfa69a…`, vLLM tree `3b024a40`) summed the
+checksum in chunks. Its carve-out tests passed 10/10 on dgx3 and its split
+check matched the second's (layer 2: 1,853,906 split positions against
+1,818,807 between full-row runs; layers 20-36: none). Its reference run was
+stopped during prefill: the owner ruled that the check must not run in
+production, only as a debug mode, and that quality work must not add
+computation to serving. Patch 0026 now starts its thread once after graph
+capture instead of testing a flag before every engine step, stops the engine
+by killing the worker, and is off in configuration; the image was rebuilt
+(vLLM tree `c108cd6d`). The third image's results are under
+`results/private/r5l/third-image/`.
 

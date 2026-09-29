@@ -212,18 +212,17 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   Selections are unchanged beyond those ties. Upstream status: candidate, not
   submitted.
 
-- `0026-worker-display-carveout-integrity.patch` adds an opt-in integrity
-  check of the weights held in the display carve-out. With
-  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` above 0 (unset or 0, the default,
-  turns it off) the worker checksums them before and after the copy and, from
-  the first engine step, re-checks them on a side stream at that interval. A
-  mismatch, or a check that cannot run, is logged and stops the engine at its
-  next step, so a driver fault that reused the carve-out cannot serve wrong
-  logits silently. The configuration turns it on at 300 s; removal review due
-  2026-10-29 (`TODO.md`). Upstream status: Spark-specific, not for upstream.
+- `0026-worker-display-carveout-integrity.patch` adds a debug-mode integrity
+  check of the weights held in the display carve-out, for chasing a driver
+  fault that reused that memory. Unset or 0, the production setting,
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` adds no work: one test at load time
+  and nothing in the serving loop. Above 0, the worker checksums the weights
+  before and after the copy and, after graph capture, re-checks them on a side
+  stream at that interval; a mismatch, or a check that cannot run, is logged
+  and kills the worker. Upstream status: Spark-specific, not for upstream.
 
-Applying 0001-0026 to the base yields patch head `80c2b66b` and tree
-`3b024a40`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
+Applying 0001-0026 to the base yields patch head `0a682781` and tree
+`c108cd6d`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
 `9ba14ba1`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`

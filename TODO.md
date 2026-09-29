@@ -117,14 +117,11 @@ and eight streams for every decode change.
   owner's decisions, and any host change goes to all three nodes. Stop the
   service before rebooting a node, and don't restart inference while it is in
   use.
-- **Review by 2026-10-29: remove the display carve-out integrity check.**
-  Patch 0026 is opt-in; r5l's launch configuration turns it on with
-  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS=300` for long unattended runs, on a
-  reviewer's request. It guards against a driver fault that reuses the
-  carve-out under the worker's mapping, which analysis rates unlikely. If no
-  node has logged `display carve-out weights changed` by then (grep the
-  container logs, or the agent run's records), drop the variable from
-  `config/cluster.json` and patch 0026 from the series.
+- **Carve-out integrity check is a debug mode.** Patch 0026's
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` stays unset in production; set it
+  (for example to 60) only to chase a suspected carve-out fault. It costs
+  about 20 ms per check and nothing when unset. Serving-path changes for
+  quality must not add computation.
 
 ## Mixed prefill and decode
 

@@ -1,7 +1,7 @@
-From 7ee4e798748c577a57fcac9b8a12ede49cc3dd8d Mon Sep 17 00:00:00 2001
+From debdaa6bbc7caa5eacbe8137e090823037224e7c Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 16:40:00 +0200
-Subject: [PATCH 2/2] feat(worker): optional integrity check of the display
+Subject: [PATCH 2/2] feat(worker): debug-mode integrity check of the display
  carve-out weights
 
 The embedding and output-head weights in the GB10 display carve-out are
@@ -11,27 +11,36 @@ private to the worker, and the scanout heap never hands out a range in use.
 A driver fault that reused that memory would still make the model serve
 wrong embeddings or logits without any error.
 
-With SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS set above 0 (unset or 0, the
-default, turns every check off), the worker checksums every moved weight
-(the sum of its 32-bit words in 64 bits, so any flipped bit changes it)
-before and after the copy and refuses to start if they differ. From the
-first engine step, after startup's graph captures, a background thread
-re-checks them on a side stream at that interval; a check takes about 20 ms
-for the 842.5 MiB of a DS4.1 rank. The sum runs in 16 MiB chunks: a 64-bit
-sum casts its input first, and over a whole table the check stream's pool
-would keep 842 MiB. A mismatch, or a check that cannot run, is logged at
-once and raises at the next engine step, which stops the engine.
+For debugging such a fault, SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS above 0
+turns on an integrity check. Unset or 0, the production setting, it adds no
+work: one test at load time and nothing in the serving loop. When on, the
+worker checksums every moved weight (the sum of its 32-bit words in 64 bits,
+so any flipped bit changes it) before and after the copy and refuses to
+start if they differ; after graph capture a background thread re-checks
+them on a side stream at that interval, about 20 ms for the 842.5 MiB of a
+DS4.1 rank. The sum runs in 16 MiB chunks: a 64-bit sum casts its input
+first, and over a whole table the check stream's pool would keep 842 MiB. A
+mismatch, or a check that cannot run, is logged and kills the worker, which
+stops the engine.
 ---
- tests/v1/worker/test_display_carveout.py |  77 ++++++++++++-
- vllm/v1/worker/display_carveout.py       | 136 ++++++++++++++++++++++-
- vllm/v1/worker/gpu/model_runner.py       |   1 +
- 3 files changed, 211 insertions(+), 3 deletions(-)
+ tests/v1/worker/test_display_carveout.py |  80 ++++++++++++-
+ vllm/v1/worker/display_carveout.py       | 145 ++++++++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py       |   2 +
+ 3 files changed, 224 insertions(+), 3 deletions(-)
 
 diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
-index f6e695b1e2..81e30ea628 100644
+index f6e695b1e2..f76c3b949a 100644
 --- a/tests/v1/worker/test_display_carveout.py
 +++ b/tests/v1/worker/test_display_carveout.py
-@@ -38,6 +38,59 @@ def tables(monkeypatch):
+@@ -5,6 +5,7 @@
+ import ctypes
+ import os
+ import pathlib
++import time
+ 
+ import pytest
+ import torch
+@@ -38,6 +39,61 @@ def tables(monkeypatch):
      monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
  
  
@@ -64,34 +73,36 @@ index f6e695b1e2..81e30ea628 100644
 +    assert extra <= 2 * 8 * display_carveout._CHECK_CHUNK_WORDS, extra
 +
 +
-+def test_integrity_check_stops_the_engine_after_a_change(monkeypatch):
++def test_integrity_check_stops_the_worker_after_a_change():
 +    weight = torch.randn(64, 48, dtype=torch.bfloat16)
++    stopped: list[str] = []
 +    check = display_carveout._IntegrityCheck(
 +        [("lm_head.weight", weight)],
 +        [int(display_carveout._checksum(weight))],
 +        torch.device("cpu"),
-+        interval=0,
++        interval=0.01,
++        on_failure=stopped.append,
 +    )
-+    monkeypatch.setattr(display_carveout, "_integrity", check)
 +    check.check()
 +    assert check.failure is None and check.passed == 1
-+    display_carveout.verify()
 +    weight[3, 4] = weight[3, 4] + 1
-+    check.check()
-+    assert "lm_head.weight" in check.failure
-+    with pytest.raises(RuntimeError, match="display carve-out weights changed"):
-+        display_carveout.verify()
++    check.start()
++    for _ in range(500):
++        if stopped:
++            break
++        time.sleep(0.01)
++    assert stopped and "lm_head.weight" in stopped[0]
 +
 +
-+def test_verify_without_carveout_is_a_no_op(monkeypatch):
++def test_start_checks_without_carveout_is_a_no_op(monkeypatch):
 +    monkeypatch.setattr(display_carveout, "_integrity", None)
-+    display_carveout.verify()
++    display_carveout.start_checks()
 +
 +
  def test_struct_layouts_match_cuda_h():
      assert ctypes.sizeof(display_carveout._ExternalMemoryHandleDesc) == 104
      assert ctypes.sizeof(display_carveout._ExternalMemoryBufferDesc) == 88
-@@ -61,7 +114,9 @@ def test_missing_drm_node_refuses(tables, monkeypatch):
+@@ -61,7 +117,9 @@ def test_missing_drm_node_refuses(tables, monkeypatch):
  @pytest.mark.skipif(
      not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
  )
@@ -102,7 +113,7 @@ index f6e695b1e2..81e30ea628 100644
      model = _model("cuda")
      before = {
          name: weight.detach().clone() for name, weight in model.named_parameters()
-@@ -72,7 +127,27 @@ def test_relocation_preserves_values(tables):
+@@ -72,7 +130,27 @@ def test_relocation_preserves_values(tables):
      assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
      for name, weight in model.named_parameters():
          assert torch.equal(weight, before[name]), name
@@ -129,12 +140,12 @@ index f6e695b1e2..81e30ea628 100644
 +    monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 0.0)
 +    display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
 +    assert display_carveout._integrity is None
-+    display_carveout.verify()
++    display_carveout.start_checks()
 diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
-index ea4ee73d21..029968a430 100644
+index ea4ee73d21..0497c77589 100644
 --- a/vllm/v1/worker/display_carveout.py
 +++ b/vllm/v1/worker/display_carveout.py
-@@ -22,14 +22,29 @@ With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
+@@ -22,14 +22,33 @@ With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
  the carve-out right after loading, before any kernel plan or graph captures
  them, and returns their ordinary memory to the allocator for the KV cache. It
  refuses to start if the carve-out cannot hold them.
@@ -145,11 +156,14 @@ index ea4ee73d21..029968a430 100644
 +surfaces, and the scanout heap never hands out a range in use. A driver fault
 +or GPU reset could still leave the mapping on memory that something else
 +reuses, and the result would be wrong embeddings or logits with no error.
-+With ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` set above 0 (unset or 0 turns
-+every check off), the worker checksums every moved weight before and after the
-+copy, and once serving starts re-checks it from a background thread on a side
-+stream at that interval (about 20 ms per check for the 842.5 MiB of a DS4.1
-+rank). A mismatch is logged at once and stops the engine at its next step.
++
++For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
++turns on an integrity check; production leaves it unset, which adds no work
++at all. The worker then checksums every moved weight before and after the
++copy and, from the end of graph capture, re-checks it from a background
++thread on a side stream at that interval (about 20 ms per check for the
++842.5 MiB of a DS4.1 rank). A mismatch is logged and kills the worker, which
++stops the engine; nothing runs in the serving loop.
  """
  
  from __future__ import annotations
@@ -158,13 +172,14 @@ index ea4ee73d21..029968a430 100644
  import ctypes
  import fcntl
  import os
++import signal
  import struct
 +import threading
 +import time
  
  import torch
  
-@@ -39,6 +54,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
+@@ -39,6 +58,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
  logger = init_logger(__name__)
  
  _REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
@@ -174,7 +189,7 @@ index ea4ee73d21..029968a430 100644
  _DRM_NODE = "/dev/dri/card0"
  
  _DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
-@@ -164,6 +182,105 @@ def required() -> bool:
+@@ -164,6 +186,110 @@ def required() -> bool:
      return _REQUIRED
  
  
@@ -191,8 +206,14 @@ index ea4ee73d21..029968a430 100644
 +    return torch.stack([part.sum(dtype=torch.int64) for part in parts]).sum()
 +
 +
++def _kill_worker(reason: str) -> None:
++    """Stop the engine from a background thread: its executor sees the worker die."""
++    logger.error("Stopping the worker: %s", reason)
++    os.kill(os.getpid(), signal.SIGKILL)
++
++
 +class _IntegrityCheck:
-+    """Periodic checksums of the weights held in the carve-out."""
++    """Periodic checksums of the weights held in the carve-out (debug mode)."""
 +
 +    def __init__(
 +        self,
@@ -200,11 +221,13 @@ index ea4ee73d21..029968a430 100644
 +        expected: list[int],
 +        device: torch.device,
 +        interval: float,
++        on_failure=_kill_worker,
 +    ):
 +        self.weights = weights
 +        self.expected = expected
 +        self.device = device
 +        self.interval = interval
++        self.on_failure = on_failure
 +        self.failure: str | None = None
 +        self.passed = 0
 +        self._started = False
@@ -258,29 +281,26 @@ index ea4ee73d21..029968a430 100644
 +                # A check that cannot run must not pass silently either.
 +                self.failure = f"display carve-out integrity check failed: {error!r}"
 +                logger.exception("Display carve-out integrity check failed")
++        self.on_failure(self.failure)
 +
 +
 +_integrity: _IntegrityCheck | None = None
 +
 +
-+def verify() -> None:
-+    """Raise if the carve-out weights changed; start the periodic check.
++def start_checks() -> None:
++    """Start the debug-mode periodic check, if on; called once after graph capture.
 +
-+    Called before every engine step. The first call comes after startup's
-+    graph captures, so the check's side-stream work never meets a capture.
++    Starting after the last capture keeps the check's side-stream work away
++    from graph captures.
 +    """
-+    check = _integrity
-+    if check is None:
-+        return
-+    if check.failure is not None:
-+        raise RuntimeError(check.failure)
-+    check.start()
++    if _integrity is not None:
++        _integrity.start()
 +
 +
  def _nbytes(tensor: torch.Tensor) -> int:
      return tensor.numel() * tensor.element_size()
  
-@@ -213,20 +330,35 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
+@@ -213,20 +339,35 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
      backing = torch.as_tensor(carveout, device=device)
      assert backing.data_ptr() == carveout.pointer.value
      free_before = torch.cuda.mem_get_info(device)[0]
@@ -312,24 +332,25 @@ index ea4ee73d21..029968a430 100644
      logger.info(
          "Display carve-out holds %.1f MiB of streamed weights (%s); "
 -        "ordinary memory freed: %.1f MiB",
-+        "ordinary memory freed: %.1f MiB; integrity check %s",
++        "ordinary memory freed: %.1f MiB; debug integrity check %s",
          sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
          ", ".join(name for name, _ in weights),
          freed / (1 << 20),
 +        f"every {_CHECK_SECONDS:g} s" if checking else "off",
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index a75d9850db..758f0ed596 100644
+index a75d9850db..b6e8565a8d 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1929,6 +1929,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
-         profile_all_kv_cache_groups: bool = False,
-     ) -> ModelRunnerOutput | IntermediateTensors | None:
-         if not dummy_run:
-+            display_carveout.verify()
-             # Update the request states.
-             self.update_pp_decode_requests()
-             self.finish_requests(scheduler_output)
+@@ -1298,6 +1298,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Lock workspace to prevent resizing during execution. A resize after
+             # capture frees the static cuda graph buffer.
+             lock_workspace()
++            # Debug mode only: carve-out checks begin after the last capture.
++            display_carveout.start_checks()
+ 
+         end_time = time.perf_counter()
+         elapsed_time = end_time - start_time
 -- 
 2.54.0 (Apple Git-157)
 

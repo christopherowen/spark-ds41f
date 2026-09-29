@@ -95,10 +95,8 @@ manifest.update(
         "sequence-parallel prefill: each rank scores and selects top-k positions for its own "
         "rows and all-gathers them, which removes two thirds of the indexer on every rank "
         "(one 4,096-token chunk: -5% at 64K of context, -10% at 131K, -15% at 200K). "
-        "vLLM 0026 adds an opt-in integrity check of the display carve-out weights, on in "
-        "configuration (SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS=300; removal review due "
-        "2026-10-29): checksums before and after the copy and every 300 s on a side stream, "
-        "stopping the engine on a mismatch."
+        "vLLM 0026 adds a debug-mode integrity check of the display carve-out weights "
+        "(SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS), off in configuration and free when off."
     ),
     evidence={
         "experiments": ["experiments/2026-09-29-indexer-split/", "experiments/2026-09-29-r5l/"],
@@ -106,8 +104,8 @@ manifest.update(
             f"LRU {quality}/5; needle retrieval {NEEDLE}; split check on 473,494 rows per "
             "encoder indexer layer: split-versus-full differences within 2-8% of a second "
             "full-row run's (radix top-k ties), none in deterministic layers, no unwritten rows "
-            "or candidate changes; carve-out unit tests 8/8 in the image and two carve-out "
-            f"checks per node; real-text prefill {source_row} tok/s; decode within noise of "
+            "or candidate changes; carve-out unit tests 10/10 in the image and two debug-mode "
+            f"carve-out checks per node in the check boot; real-text prefill {source_row} tok/s; decode within noise of "
             f"r5k; lowest dgx1 MemAvailable {dgx1_min:.2f} GiB in the reference run."
         ),
     },
@@ -124,10 +122,7 @@ manifest["source_identity"].update(
 manifest["runtime_choices"].update(
     indexer_split="always under sequence-parallel prefill (patch 0025; "
     "SPARK3_DS41_INDEXER_SPLIT_CHECK=1 validates it against the full-row indexer)",
-    display_carveout_check=(
-        "SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS=300 (patch 0026, opt-in); removal review due "
-        "2026-10-29"
-    ),
+    display_carveout_check="off (SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
 )
 manifest["build"].update(
     image=TAG, image_id=IMAGE_ID, elapsed_seconds=BUILD_SECONDS, min_available_gib=BUILD_MIN_GIB,
@@ -147,18 +142,13 @@ sub("docs/upstreams.md", "(sha256:5416f8ff…)", f"(sha256:{IMAGE_ID[7:15]}…)"
 cs = "docs/current-state.md"
 sub(cs, "Promoted 2026-09-28 as", "Promoted 2026-09-29 as")
 sub(cs, "patches 0001-0024 (0005-0009 and 0011 off by default; 0023 off in configuration)",
-    "patches 0001-0026 (0005-0009 and 0011 off by default; 0023 off in configuration; 0026 "
-    "opt-in and on)")
+    "patches 0001-0026 (0005-0009, 0011 and 0026 off by default; 0023 off in configuration)")
 sub(cs, "| Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the "
     "one-shot RoCE all-reduce; CED encoder layers (patches 0014-0018) |",
     "| Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the "
     "one-shot RoCE all-reduce; CED encoder layers (patches 0014-0018) |\n"
     "| Indexer under sequence parallelism | each rank scores and selects its own rows and "
     "all-gathers the top-k positions (patch 0025) |")
-sub(cs, "the DRM file closes after the import, so the text console keeps drawing |",
-    "the DRM file closes after the import, so the text console keeps drawing; integrity "
-    "check every 300 s (`SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`, patch 0026, removal review "
-    "due 2026-10-29) |")
 text = Path(cs).read_text()
 start = text.index("Measured on this configuration:")
 end = text.index("The previous state")
@@ -184,9 +174,6 @@ sub(rd, "- sequence-parallel prefill once a prompt chunk's reduce-scatter outgro
     "  work runs on a third of the rows per rank, and so does the sparse-attention\n"
     "  indexer, whose cost grows with context depth (a 4,096-token chunk at 200K\n"
     "  of context runs 15% faster);\n")
-sub(rd, "  that memory for the KV cache while the text console keeps its framebuffer;\n",
-    "  that memory for the KV cache while the text console keeps its framebuffer,\n"
-    "  and the worker checksums them every 300 s;\n")
 rows = []
 for case in ("prose", "code"):
     for streams in (1, 2, 4, 8):
