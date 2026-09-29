@@ -27,6 +27,15 @@ continue. The unit has a 40-second outer bound and treats only GNU `timeout`'s
 expected 124 status as successful; it does not mask Plymouth or alter kernel
 command-line splash settings.
 
+`grub-console.cfg` becomes `/etc/default/grub.d/zz-spark-console.cfg`. It sorts
+after every other drop-in and removes `splash` from the kernel command line that
+`dgxstation-grub`'s `menu.cfg` sets, keeping `quiet`. With the splash, Plymouth
+leaves the active console in graphics mode after it quits, so an attached display
+or KVM shows no text console. `apply` regenerates the boot menu when it still
+passes `splash` and switches the active console to text mode at once; the
+command-line change takes effect at the next reboot, which must follow a stopped
+service. `check` fails until that reboot.
+
 Install or verify the policy from a clean, published checkout on each node:
 
 ```sh

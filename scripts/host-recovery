@@ -20,7 +20,21 @@ files=(
   "spark-management-health:/usr/local/libexec/spark-management-health:0755"
   "spark-management-health.service:/etc/systemd/system/spark-management-health.service:0644"
   "spark-management-health.timer:/etc/systemd/system/spark-management-health.timer:0644"
+  "grub-console.cfg:/etc/default/grub.d/zz-spark-console.cfg:0644"
 )
+
+# KDGETMODE / KDSETMODE on the active virtual console: 0 is text, 1 graphics.
+console_mode() {
+  local vt
+  vt=$(cat /sys/class/tty/tty0/active)
+  sudo -n python3 -c 'import fcntl, struct, sys; f = open(sys.argv[1], "rb"); print(struct.unpack("i", fcntl.ioctl(f, 0x4B3B, struct.pack("i", 0)))[0])' "/dev/$vt"
+}
+
+console_text() {
+  local vt
+  vt=$(cat /sys/class/tty/tty0/active)
+  sudo -n python3 -c 'import fcntl, sys; fcntl.ioctl(open(sys.argv[1], "r+b", buffering=0), 0x4B3A, 0)' "/dev/$vt"
+}
 
 check_files() {
   local failed=0 entry source destination mode actual_mode sshd_effective legacy
@@ -65,6 +79,18 @@ check_files() {
       failed=1
     fi
   done
+  if sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg | grep -qw splash; then
+    echo "boot configuration still passes splash (run sudo update-grub)" >&2
+    failed=1
+  fi
+  if grep -qw splash /proc/cmdline; then
+    echo "running kernel was booted with splash; reboot with the service stopped" >&2
+    failed=1
+  fi
+  if [[ "$(console_mode)" != 0 ]]; then
+    echo "active console $(cat /sys/class/tty/tty0/active) is in graphics mode" >&2
+    failed=1
+  fi
   if ! systemctl is-enabled --quiet spark-management-health.timer \
     || ! systemctl is-active --quiet spark-management-health.timer; then
     echo "spark-management-health.timer is not enabled and active" >&2
@@ -127,6 +153,13 @@ for legacy in \
   /etc/sysctl.d/90-law-watchdog.conf; do
   sudo -n rm -f "$legacy" "$legacy.spark3-migrated"
 done
+
+# Regenerate the boot menu when it still passes splash, and switch the active
+# console to text mode now (the next boot keeps it without splash).
+if sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg | grep -qw splash; then
+  sudo -n update-grub >/dev/null 2>&1
+fi
+console_text
 
 sudo -n sshd -t
 sudo -n systemctl daemon-reload

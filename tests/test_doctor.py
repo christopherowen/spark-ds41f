@@ -26,7 +26,10 @@ class DesktopTest(unittest.TestCase):
 
     def test_display_manager_started_by_hand_is_reported(self) -> None:
         problems = spark3.desktop_problems("dgx3", "multi-user.target\nactive\n")
-        self.assertEqual(problems, ["dgx3: display manager is active"])
+        self.assertEqual(
+            problems,
+            ["dgx3: display manager is active; run sudo systemctl disable --now display-manager.service"],
+        )
 
     def test_missing_output_is_reported(self) -> None:
         problems = spark3.desktop_problems("dgx1", "")
@@ -60,6 +63,7 @@ class BootOrderTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("UEFI: PXE IPv4 Realtek PCIe 10 GBE Family Controller", problems[0])
         self.assertIn("BootOrder 0002,0004", problems[0])
+        self.assertIn("run sudo efibootmgr --bootorder 0004,0002", problems[0])
 
     def test_fixed_order_passes(self) -> None:
         fixed = DGX3_PXE_FIRST_BOOT.replace("BootOrder: 0002,0004", "BootOrder: 0004,0002")
@@ -77,6 +81,8 @@ FAN_WORKING = (
     "fbdev=Y\n"
     "drm_masters=\n"
     "console=tty1:0\n"
+    "cmdline_splash=0\n"
+    "grub_splash=0\n"
     "kernel=7.0.0-1019-nvidia\n"
     "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
@@ -126,7 +132,11 @@ class ConsoleTest(unittest.TestCase):
         )
         self.assertEqual(
             problems,
-            ["dgx3: VLLM::Worker_TP/2855221 holds DRM master, so the text console cannot draw"],
+            [
+                "dgx3: VLLM::Worker_TP/2855221 holds DRM master, so the text console cannot "
+                "draw; stop or restart that process (the serving worker releases the device "
+                "right after startup)"
+            ],
         )
 
     def test_unreadable_drm_clients_are_reported(self) -> None:
@@ -144,6 +154,28 @@ class ConsoleTest(unittest.TestCase):
         problems = spark3.console_mode_problems("dgx3", facts(console="tty1:"))
         self.assertEqual(problems, ["dgx3: cannot read the active console mode"])
 
+    def test_splash_boot_is_reported_with_its_fix(self) -> None:
+        problems = spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("scripts/host-recovery apply", problems[0])
+        self.assertIn("zz-spark-console.cfg", problems[0])
+
+    def test_configured_splash_removal_waits_for_a_reboot(self) -> None:
+        problems = spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("reboot with the service stopped to apply", problems[0])
+
+    def test_no_splash_passes(self) -> None:
+        self.assertEqual(spark3.splash_problems("dgx1", facts()), [])
+
+    def test_every_console_problem_names_a_fix(self) -> None:
+        for problems in (
+            spark3.fbdev_problems("dgx3", facts(fbdev="N")),
+            spark3.console_mode_problems("dgx3", facts(console="tty1:1")),
+            spark3.modeset_problems("dgx3", facts(modeset="N")),
+        ):
+            self.assertRegex(problems[0], r"; (run|remove) ")
+
     def test_modeset_message_names_the_carveout(self) -> None:
         problems = spark3.modeset_problems("dgx1", facts(modeset="N"))
         self.assertIn("display carve-out cannot be allocated", problems[0])
@@ -158,7 +190,8 @@ class FanControlTest(unittest.TestCase):
             "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0", fan_service="/inactive")
         )
         self.assertEqual(
-            problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia"]
+            problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia; run "
+                "sudo dkms autoinstall -k 7.0.0-1019-nvidia"]
         )
 
     def test_unloaded_module_is_reported(self) -> None:
@@ -177,7 +210,8 @@ class FanControlTest(unittest.TestCase):
     def test_stopped_daemon_is_reported(self) -> None:
         problems = spark3.fan_control_problems("dgx1", facts(fan_service="enabled/failed"))
         self.assertEqual(
-            problems, ["dgx1: dgx-fan-control.service is enabled/failed, expected enabled/active"]
+            problems, ["dgx1: dgx-fan-control.service is enabled/failed, expected enabled/active; "
+                "run sudo systemctl enable --now dgx-fan-control.service"]
         )
 
 

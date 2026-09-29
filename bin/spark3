@@ -336,10 +336,14 @@ def desktop_problems(node_name: str, output: str) -> list[str]:
     if default_target != "multi-user.target":
         problems.append(
             f"{node_name}: boots to {default_target or 'an unknown target'}, "
-            "expected multi-user.target (no desktop)"
+            "expected multi-user.target (no desktop); run "
+            "sudo systemctl set-default multi-user.target"
         )
     if manager in ("active", "activating", "reloading"):
-        problems.append(f"{node_name}: display manager is {manager}")
+        problems.append(
+            f"{node_name}: display manager is {manager}; run "
+            "sudo systemctl disable --now display-manager.service"
+        )
     return problems
 
 
@@ -358,19 +362,35 @@ def boot_order_problems(node_name: str, output: str) -> list[str]:
             entries[match.group(1).upper()] = match.group(2)
     if not order:
         return [f"{node_name}: cannot read the UEFI boot order"]
+    def installed(entry: str) -> bool:
+        return (
+            entry.split("\t")[0].strip().lower() == "ubuntu"
+            or "\\efi\\ubuntu\\" in entry.lower()
+        )
+
     first = entries.get(order[0], "")
     label = first.split("\t")[0].strip()
-    if label.lower() == "ubuntu" or "\\efi\\ubuntu\\" in first.lower():
+    if installed(first):
         return []
+    ubuntu = next((number for number in order if installed(entries.get(number, ""))), None)
+    ubuntu = ubuntu or next((number for number, entry in entries.items() if installed(entry)), None)
+    fix = (
+        "run sudo efibootmgr --bootorder "
+        + ",".join([ubuntu] + [number for number in order if number != ubuntu])
+        if ubuntu
+        else "no installed-OS boot entry exists; reinstall the boot loader with grub-install"
+    )
     return [
         f"{node_name}: UEFI boots {label or 'entry ' + order[0]!r} before the installed OS "
-        f"(BootOrder {','.join(order)})"
+        f"(BootOrder {','.join(order)}); {fix}"
     ]
 
 
 HOST_FACTS_QUERY = """
 printf 'modeset=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)"
 printf 'fbdev=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
+printf 'cmdline_splash=%s\\n' "$(grep -cw splash /proc/cmdline)"
+printf 'grub_splash=%s\\n' "$(sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg 2>/dev/null | grep -cw splash)"
 clients=/sys/kernel/debug/dri/0/clients
 if sudo -n test -r "$clients"; then
   printf 'drm_masters=%s\\n' "$(sudo -n cat "$clients" | awk 'NR > 1 && $4 == "y" {print $1 "/" $2}' | paste -sd, -)"
@@ -413,7 +433,8 @@ def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     return [
         f"{node_name}: nvidia-drm modeset is {value or 'unreadable'}, expected Y "
         "(a display attached after boot stays dark and the display carve-out cannot "
-        "be allocated; purge nvidia-drm-options-modeset0)"
+        "be allocated); run sudo apt purge nvidia-drm-options-modeset0 and reboot "
+        "with the service stopped"
     ]
 
 
@@ -429,7 +450,9 @@ def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         return []
     return [
         f"{node_name}: nvidia-drm fbdev is {value or 'unreadable'}, expected Y "
-        "(an attached display gets no text console)"
+        "(an attached display gets no text console); remove the nvidia-drm fbdev=0 "
+        "option (grep -rn fbdev /etc/modprobe.d), run sudo update-initramfs -u, and "
+        "reboot with the service stopped"
     ]
 
 
@@ -445,7 +468,11 @@ def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         return []
     if value == "unreadable":
         return [f"{node_name}: cannot read the DRM clients (/sys/kernel/debug/dri/0/clients)"]
-    return [f"{node_name}: {value} holds DRM master, so the text console cannot draw"]
+    return [
+        f"{node_name}: {value} holds DRM master, so the text console cannot draw; stop "
+        "or restart that process (the serving worker releases the device right after "
+        "startup)"
+    ]
 
 
 def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
@@ -460,10 +487,33 @@ def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     if mode == "1":
         return [
             f"{node_name}: the active console ({console}) is in graphics mode, so an "
-            "attached display shows no text (the boot splash leaves it there; KDSETMODE "
-            "KD_TEXT restores it until the next boot)"
+            "attached display shows no text; run scripts/host-recovery apply on the node "
+            "(it switches the console to text mode now and removes splash from later boots)"
         ]
     return [f"{node_name}: cannot read the active console mode"]
+
+
+def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when the kernel boots with the Plymouth splash.
+
+    Plymouth leaves the active console in graphics mode after it quits, so an
+    attached display shows no text console after a boot. host-recovery
+    installs /etc/default/grub.d/zz-spark-console.cfg, which drops splash from
+    the command line that dgxstation-grub's menu.cfg sets.
+    """
+    if facts.get("cmdline_splash", "0") == "0":
+        return []
+    if facts.get("grub_splash") == "0":
+        return [
+            f"{node_name}: booted with splash, but the boot configuration omits it now; "
+            "reboot with the service stopped to apply"
+        ]
+    return [
+        f"{node_name}: the kernel command line has splash, which leaves the console in "
+        "graphics mode after boot; run scripts/host-recovery apply on the node (it "
+        "installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then "
+        "reboot with the service stopped"
+    ]
 
 
 def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
@@ -475,9 +525,16 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     """
     kernel = facts.get("kernel") or "the running kernel"
     if "installed" not in facts.get("fan_dkms", ""):
-        return [f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}"]
+        return [
+            f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}; run "
+            f"sudo dkms autoinstall -k {facts.get('kernel') or '$(uname -r)'}"
+        ]
     if facts.get("fan_module") != "1":
-        return [f"{node_name}: dgx_ec_fan_control is not loaded (is the fleet signing key enrolled?)"]
+        return [
+            f"{node_name}: dgx_ec_fan_control is not loaded; run sudo modprobe "
+            "dgx_ec_fan_control (if it is refused, check that the fleet signing key is "
+            "enrolled with mokutil --list-enrolled)"
+        ]
     if facts.get("fan_cooling_device") != "1":
         return [
             f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
@@ -486,7 +543,7 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     if facts.get("fan_service") != "enabled/active":
         return [
             f"{node_name}: dgx-fan-control.service is {facts.get('fan_service') or 'unknown'}, "
-            "expected enabled/active"
+            "expected enabled/active; run sudo systemctl enable --now dgx-fan-control.service"
         ]
     return []
 
@@ -592,6 +649,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(fbdev_problems(node["name"], facts))
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
+        problems.extend(splash_problems(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
