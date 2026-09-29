@@ -1,0 +1,306 @@
+From aba3950e4cd3e3c48de4bbbf18cc0f51f2cdb13e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 16:40:00 +0200
+Subject: [PATCH 2/2] feat(worker): optional integrity check of the display
+ carve-out weights
+
+The embedding and output-head weights in the GB10 display carve-out are
+written once, by the copy after loading. Nothing else can reach them: the
+DRM file and buffer handle close after the dma-buf export, the dma-buf stays
+private to the worker, and the scanout heap never hands out a range in use.
+A driver fault that reused that memory would still make the model serve
+wrong embeddings or logits without any error.
+
+With SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS set above 0 (unset or 0, the
+default, turns every check off), the worker checksums every moved weight
+(the sum of its 32-bit words in 64 bits, so any flipped bit changes it)
+before and after the copy and refuses to start if they differ. From the
+first engine step, after startup's graph captures, a background thread
+re-checks them on a side stream at that interval; a check reads the
+842.5 MiB in about 4 ms. A mismatch, or a check that cannot run, is logged
+at once and raises at the next engine step, which stops the engine.
+---
+ tests/v1/worker/test_display_carveout.py |  58 +++++++++-
+ vllm/v1/worker/display_carveout.py       | 128 ++++++++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py       |   1 +
+ 3 files changed, 184 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
+index f6e695b1e2..913295a6b6 100644
+--- a/tests/v1/worker/test_display_carveout.py
++++ b/tests/v1/worker/test_display_carveout.py
+@@ -38,6 +38,40 @@ def tables(monkeypatch):
+     monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
+ 
+ 
++def test_checksum_sees_one_flipped_bit():
++    weight = torch.randn(64, 48, dtype=torch.bfloat16)
++    before = int(display_carveout._checksum(weight))
++    for bit in (0, 7, 15):
++        flipped = weight.clone()
++        flipped.view(torch.int16)[5, 9] ^= 1 << bit
++        assert int(display_carveout._checksum(flipped)) != before, bit
++    assert int(display_carveout._checksum(weight.clone())) == before
++
++
++def test_integrity_check_stops_the_engine_after_a_change(monkeypatch):
++    weight = torch.randn(64, 48, dtype=torch.bfloat16)
++    check = display_carveout._IntegrityCheck(
++        [("lm_head.weight", weight)],
++        [int(display_carveout._checksum(weight))],
++        torch.device("cpu"),
++        interval=0,
++    )
++    monkeypatch.setattr(display_carveout, "_integrity", check)
++    check.check()
++    assert check.failure is None and check.passed == 1
++    display_carveout.verify()
++    weight[3, 4] = weight[3, 4] + 1
++    check.check()
++    assert "lm_head.weight" in check.failure
++    with pytest.raises(RuntimeError, match="display carve-out weights changed"):
++        display_carveout.verify()
++
++
++def test_verify_without_carveout_is_a_no_op(monkeypatch):
++    monkeypatch.setattr(display_carveout, "_integrity", None)
++    display_carveout.verify()
++
++
+ def test_struct_layouts_match_cuda_h():
+     assert ctypes.sizeof(display_carveout._ExternalMemoryHandleDesc) == 104
+     assert ctypes.sizeof(display_carveout._ExternalMemoryBufferDesc) == 88
+@@ -61,7 +95,9 @@ def test_missing_drm_node_refuses(tables, monkeypatch):
+ @pytest.mark.skipif(
+     not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
+ )
+-def test_relocation_preserves_values(tables):
++def test_relocation_preserves_values(tables, monkeypatch):
++    monkeypatch.setattr(display_carveout, "_integrity", None)
++    monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 300.0)
+     model = _model("cuda")
+     before = {
+         name: weight.detach().clone() for name, weight in model.named_parameters()
+@@ -72,7 +108,27 @@ def test_relocation_preserves_values(tables):
+     assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
+     for name, weight in model.named_parameters():
+         assert torch.equal(weight, before[name]), name
++    # With the check on, its baseline covers both moved tables and still matches.
++    check = display_carveout._integrity
++    assert [name for name, _ in check.weights] == [
++        "embed_tokens.weight",
++        "lm_head.weight",
++    ]
++    check.check()
++    assert check.failure is None
+     # No DRM file stays open, so the worker never keeps DRM master (which would
+     # stop the kernel's framebuffer console from drawing).
+     fds = pathlib.Path("/proc/self/fd")
+     assert not [fd for fd in fds.iterdir() if os.path.realpath(fd) == "/dev/dri/card0"]
++
++
++@needs_cuda
++@pytest.mark.skipif(
++    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
++)
++def test_integrity_check_is_off_by_default(tables, monkeypatch):
++    monkeypatch.setattr(display_carveout, "_integrity", None)
++    monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 0.0)
++    display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
++    assert display_carveout._integrity is None
++    display_carveout.verify()
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+index ea4ee73d21..f531dd72d0 100644
+--- a/vllm/v1/worker/display_carveout.py
++++ b/vllm/v1/worker/display_carveout.py
+@@ -22,14 +22,29 @@ With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
+ the carve-out right after loading, before any kernel plan or graph captures
+ them, and returns their ordinary memory to the allocator for the KV cache. It
+ refuses to start if the carve-out cannot hold them.
++
++Nothing writes the weights after the copy, and nothing else can reach them:
++the DRM file and its buffer handle close right after the export, the dma-buf
++stays private to the worker, the display engine only scans out its own
++surfaces, and the scanout heap never hands out a range in use. A driver fault
++or GPU reset could still leave the mapping on memory that something else
++reuses, and the result would be wrong embeddings or logits with no error.
++With ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` set above 0 (unset or 0 turns
++every check off), the worker checksums every moved weight before and after the
++copy, and once serving starts re-checks it from a background thread on a side
++stream at that interval (about 4 ms of reads per check). A mismatch is logged
++at once and stops the engine at its next step.
+ """
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import ctypes
+ import fcntl
+ import os
+ import struct
++import threading
++import time
+ 
+ import torch
+ 
+@@ -39,6 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
+ logger = init_logger(__name__)
+ 
+ _REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
++_CHECK_SECONDS = float(os.environ.get("SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS", "0"))
+ _DRM_NODE = "/dev/dri/card0"
+ 
+ _DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
+@@ -164,6 +180,99 @@ def required() -> bool:
+     return _REQUIRED
+ 
+ 
++def _checksum(tensor: torch.Tensor) -> torch.Tensor:
++    """The sum of the tensor's 32-bit words in 64 bits: any flipped bit changes it."""
++    raw = tensor.detach().reshape(-1).view(torch.uint8)
++    words = raw.view(torch.int32) if raw.numel() % 4 == 0 else raw
++    return words.sum(dtype=torch.int64)
++
++
++class _IntegrityCheck:
++    """Periodic checksums of the weights held in the carve-out."""
++
++    def __init__(
++        self,
++        weights: list[tuple[str, torch.Tensor]],
++        expected: list[int],
++        device: torch.device,
++        interval: float,
++    ):
++        self.weights = weights
++        self.expected = expected
++        self.device = device
++        self.interval = interval
++        self.failure: str | None = None
++        self.passed = 0
++        self._started = False
++        self._stream = torch.cuda.Stream(device) if device.type == "cuda" else None
++
++    def sums(self) -> list[int]:
++        stream = (
++            torch.cuda.stream(self._stream)
++            if self._stream is not None
++            else contextlib.nullcontext()
++        )
++        with stream:
++            return torch.stack(
++                [_checksum(weight) for _, weight in self.weights]
++            ).tolist()
++
++    def check(self) -> None:
++        changed = [
++            f"{name} (checksum {want:#x}, now {got:#x})"
++            for (name, _), want, got in zip(self.weights, self.expected, self.sums())
++            if want != got
++        ]
++        if changed:
++            self.failure = "display carve-out weights changed: " + "; ".join(changed)
++            logger.error("%s", self.failure)
++            return
++        self.passed += 1
++        if self.passed == 1 or self.passed % 12 == 0:
++            logger.info(
++                "Display carve-out integrity check %d passed (every %g s)",
++                self.passed,
++                self.interval,
++            )
++
++    def start(self) -> None:
++        if self._started or self.interval <= 0:
++            return
++        self._started = True
++        threading.Thread(
++            target=self._run, name="display-carveout-check", daemon=True
++        ).start()
++
++    def _run(self) -> None:
++        if self._stream is not None:
++            torch.cuda.set_device(self.device)
++        while self.failure is None:
++            time.sleep(self.interval)
++            try:
++                self.check()
++            except Exception as error:
++                # A check that cannot run must not pass silently either.
++                self.failure = f"display carve-out integrity check failed: {error!r}"
++                logger.exception("Display carve-out integrity check failed")
++
++
++_integrity: _IntegrityCheck | None = None
++
++
++def verify() -> None:
++    """Raise if the carve-out weights changed; start the periodic check.
++
++    Called before every engine step. The first call comes after startup's
++    graph captures, so the check's side-stream work never meets a capture.
++    """
++    check = _integrity
++    if check is None:
++        return
++    if check.failure is not None:
++        raise RuntimeError(check.failure)
++    check.start()
++
++
+ def _nbytes(tensor: torch.Tensor) -> int:
+     return tensor.numel() * tensor.element_size()
+ 
+@@ -213,20 +322,35 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
+     backing = torch.as_tensor(carveout, device=device)
+     assert backing.data_ptr() == carveout.pointer.value
+     free_before = torch.cuda.mem_get_info(device)[0]
++    checking = _CHECK_SECONDS > 0
++    if checking:
++        expected = [int(_checksum(weight.data)) for _, weight in weights]
++    held: list[tuple[str, torch.Tensor]] = []
+     offset = 0
+-    for (_, weight), span in zip(weights, spans):
++    for (name, weight), span in zip(weights, spans):
+         moved = backing[offset : offset + _nbytes(weight)].view(weight.dtype)
+         moved = moved.view(weight.shape)
+         moved.copy_(weight.data)
+         weight.data = moved
++        held.append((name, moved))
+         offset += span
+     torch.cuda.synchronize(device)
++    if checking:
++        global _integrity
++        _integrity = _IntegrityCheck(held, expected, device, _CHECK_SECONDS)
++        _integrity.check()
++        if _integrity.failure is not None:
++            raise RuntimeError(
++                f"copy into the display carve-out failed: {_integrity.failure}"
++            )
++        _integrity.passed = 0
+     torch.cuda.empty_cache()
+     freed = torch.cuda.mem_get_info(device)[0] - free_before
+     logger.info(
+         "Display carve-out holds %.1f MiB of streamed weights (%s); "
+-        "ordinary memory freed: %.1f MiB",
++        "ordinary memory freed: %.1f MiB; integrity check %s",
+         sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
+         ", ".join(name for name, _ in weights),
+         freed / (1 << 20),
++        f"every {_CHECK_SECONDS:g} s" if checking else "off",
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a75d9850db..758f0ed596 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1929,6 +1929,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         profile_all_kv_cache_groups: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
++            display_carveout.verify()
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+-- 
+2.54.0 (Apple Git-157)
+

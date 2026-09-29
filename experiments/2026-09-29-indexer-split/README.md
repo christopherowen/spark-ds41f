@@ -21,7 +21,7 @@ and 200K of context.
 | Arm | What it is |
 |---|---|
 | `baseline-profile` | promoted r5k with the torch profiler (no Python stacks) |
-| `split` | patch 0025 (`0025-deepseek-v41-indexer-sp-split.patch`) mounted over r5k's attention module by `overlay.sh` |
+| `split` | the first version of patch 0025 (tree `d82a42e2`) mounted over r5k's attention module by `overlay.sh` at commit `c811b4a` |
 | `split-check` | `split` with `SPARK3_DS41_INDEXER_SPLIT_CHECK=1`: every rank also runs the full-row indexer and compares its rows |
 
 ## Method
@@ -59,3 +59,37 @@ score layer 20's 16,384 candidates.
 Splitting the rows removes two thirds of the indexer on every rank: about
 11, 76, 145 and 216 ms per chunk at these depths (1%, 7%, 12% and 16%), less
 one all-gather of 2.7 MiB per rank for each of the eight indexer layers.
+
+## Split runs
+
+`run_split.sh`, 2026-09-29, with the first version of patch 0025.
+
+`split-check` (four background decode streams) found differences: on every
+sequence-parallel forward, layers 2, 8 and 14 selected different top-k
+positions for most rows on all three ranks (for example 1,351 of rank 0's
+1,366 rows at layer 2), while layers 20-36 and the candidate lists matched.
+Those three are the only indexer layers whose head weights come from
+`weights_proj` over the gathered hidden state, and the first version ran that
+BF16 projection on each rank's 1,366 rows instead of all 4,096: its GEMV
+rounds differently at another row count. Layers 20-36 compute the weights on
+local rows in both paths. The FP8 query projection quantizes per row and
+matched. The promoted patch 0025 (`patches/vllm/0025-deepseek-v41-indexer-sp-split.patch`,
+tree `09f7e369` over r5k) runs the head-weight projection on every row and
+slices it; `experiments/2026-09-29-r5l` re-checks it in the built image.
+
+`split` timings, server-side prefill of one 4,096-token chunk (two rounds):
+
+| Depth | r5k (ms) | split (ms) | Change |
+|---:|---:|---:|---:|
+| 8K | 1,035 | 1,038 / 1,039 | 0% |
+| 64K | 1,155 | 1,094 / 1,092 | -5.4% |
+| 131K | 1,254 | 1,127 / 1,121 | -10.4% |
+| 200K | 1,368 | 1,167 / 1,160 | -14.9% |
+
+The lean screen (`results/private/bench/indexer-split-split`) against r5k's
+`candidate-auto` screen: quality 5/5; real-text prefill 32K 3,863 against
+3,781 tok/s (+2.2%), 64K 3,825 against 3,696 (+3.5%), 131K 3,783 against
+3,569 (+6.0%); decode unchanged (prose 50.4 and 161.7 tok/s at 1 and 8
+streams against 50.0 and 164.6, code at eight streams 187.4 against 184.6;
+single-stream code 59.0 against 66.1 tok/s came from acceptance, 1.90 against
+2.38 drafts per step, while its step time fell from 48.3 to 46.6 ms).

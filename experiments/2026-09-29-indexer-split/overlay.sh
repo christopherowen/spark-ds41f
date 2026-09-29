@@ -1,8 +1,10 @@
 #!/bin/bash
 # usage: overlay.sh   (on dgx1, deployment checkout)
-# Applies vLLM patches 0001-0024 and this experiment's 0025 to the base in a
-# throwaway worktree, checks both trees, and copies the patched attention
+# Applies vLLM patches 0001-0024 and this experiment's first 0025 to the base
+# in a throwaway worktree, checks both trees, and copies the patched attention
 # module to ~/spark3-overlay/indexer-split on every node for mounting over r5k.
+# Historical: the first 0025 lives at commit c811b4a; the fixed one is
+# patches/vllm/0025 (see README).
 set -eu
 cd ~/projects/spark3-vllm-ds41f
 E=$PWD/experiments/2026-09-29-indexer-split

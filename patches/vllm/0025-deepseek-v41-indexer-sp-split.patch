@@ -1,8 +1,8 @@
-From d85dfb6201e75d7b95c9c88c5c76e7640fcda7fa Mon Sep 17 00:00:00 2001
+From 6c8d3a96bc5b18b507815392928ec4c0ac275831 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 16:20:00 +0200
-Subject: [PATCH] perf(deepseek-v4.1): split the indexer's rows across ranks in
- SP prefill
+Subject: [PATCH 1/2] perf(deepseek-v4.1): split the indexer's rows across
+ ranks in SP prefill
 
 Sequence-parallel prefill gathers every row before attention, and the
 indexer is replicated: each TP rank projected, scored and selected the same
@@ -13,18 +13,21 @@ depth. On one 4,096-token chunk at TP 3 it took 36 ms at 8K of context and
 Under SP each rank now builds index queries and selects positions only for
 its own rows (SPRows.start to start + real_rows), then all-gathers the
 selected positions into the shared top-k buffer before sparse MLA. Rows are
-independent, so the selection is unchanged. Candidate-source outputs stay
-rank-local: the later candidate layers read only the same rank's rows.
-Decode and non-SP forwards keep the full-row path.
+independent. The BF16 head-weight projection still runs on every row and is
+sliced afterwards: its GEMV rounds differently at another row count, which
+moved selections on the ratio-2 layers. The FP8 query projection quantizes
+per row and is row-count invariant. Candidate-source outputs stay rank-local:
+the later candidate layers read only the same rank's rows. Decode and non-SP
+forwards keep the full-row path.
 
 SPARK3_DS41_INDEXER_SPLIT_CHECK=1 additionally runs the full-row indexer
 under SP and logs any row whose split selection or candidates differ.
 ---
- vllm/models/deepseek_v4_1/attention.py | 269 +++++++++++++++++--------
- 1 file changed, 189 insertions(+), 80 deletions(-)
+ vllm/models/deepseek_v4_1/attention.py | 281 ++++++++++++++++++-------
+ 1 file changed, 201 insertions(+), 80 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 84c36a4509..0f7210703f 100644
+index 84c36a4509..1ee3e9378a 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -3,6 +3,7 @@
@@ -56,7 +59,7 @@ index 84c36a4509..0f7210703f 100644
  
  def _source(prefix, layer):
      return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
-@@ -1378,41 +1386,102 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1378,41 +1386,114 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  self._prepare_global_kv(positions, hidden_states)
              index_query = None
              if self.indexer is not None:
@@ -133,10 +136,13 @@ index 84c36a4509..0f7210703f 100644
 +                q_mxfp4=iq_data[offset:end],
 +                q_scales=iq_scale[offset:end],
 +            )
++        # The BF16 head-weight projection runs on every row: its GEMV rounds
++        # differently at another row count, which would move top-k selections.
++        # The FP8 wq_b quantizes per row and does not depend on the row count.
 +        weights = (
 +            index_weights[first:last]
 +            if index_weights is not None
-+            else self.indexer.weights_proj(hidden_states[first:last])
++            else self.indexer.weights_proj(hidden_states)[first:last]
 +        )
 +        iw = torch.empty_like(weights)
 +        weight_scale.scale_index_weights(
@@ -150,7 +156,14 @@ index 84c36a4509..0f7210703f 100644
 +        """Compare this rank's split selection with the full-row indexer."""
 +        real = split.real_rows
 +        rows = slice(split.start, split.start + real)
-+        bad = int((selected[:real] != expected).any(dim=-1).sum())
++        actual = selected[:real]
++        bad = int((actual != expected).any(dim=-1).sum())
++        # Rows whose selected sets differ, ignoring the order of positions.
++        bad_sets = int(
++            (actual.sort(dim=-1).values != expected.sort(dim=-1).values)
++            .any(dim=-1)
++            .sum()
++        )
 +        bad_candidates = 0
 +        if expected_candidates is not None:
 +            candidates, lengths = expected_candidates
@@ -165,13 +178,15 @@ index 84c36a4509..0f7210703f 100644
 +        if bad or bad_candidates:
 +            logger.warning(
 +                "DeepSeek V4.1 indexer split check: layer %d rank %d rows %d-%d of "
-+                "%d: %d top-k rows and %d candidate rows differ from the full indexer",
++                "%d: %d top-k rows (%d as sets) and %d candidate rows differ from "
++                "the full indexer",
 +                self.layer_id,
 +                split.rank,
 +                rows.start,
 +                rows.stop,
 +                split.num_tokens,
 +                bad,
++                bad_sets,
 +                bad_candidates,
 +            )
 +        elif checks == 1 or checks % 50 == 0:
@@ -189,7 +204,7 @@ index 84c36a4509..0f7210703f 100644
      @eager_break_during_capture
      def forward_mqa(self, q, kv, positions, output, *, index_query=None):
          metadata = get_forward_context().attn_metadata
-@@ -1443,7 +1512,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1443,7 +1524,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          # survive in the source-owned buffer until their reuse interval ends.
          if self.indexer is not None:
              index_mode = "decode" if mode == "decode" else "prefill"
@@ -198,7 +213,7 @@ index 84c36a4509..0f7210703f 100644
              im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
              score_width = None
              if (
-@@ -1467,59 +1536,99 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1467,59 +1548,99 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  chunk_rows = self._short_index_shape[0]
                  index_pages = self._short_index_pages
              index_width = index_pages.shape[1]

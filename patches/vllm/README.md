@@ -197,7 +197,28 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   candidate, not submitted (upstream `706428761` changes the block-table
   mapping but not this check).
 
-Applying 0001-0024 to the base yields patch head `59d1113b` and tree
+- `0025-deepseek-v41-indexer-sp-split.patch` splits the indexer's rows across
+  the TP ranks during sequence-parallel prefill. The indexer is replicated, so
+  every rank used to score and select the same top-k positions for every row
+  of the chunk; its cost grows with context depth (17 ms of a 4,096-token
+  chunk at 8K, 323 ms at 200K). Each rank now builds index queries and selects
+  positions for its own rows and all-gathers the selections before sparse
+  MLA. The BF16 head-weight projection still runs on every row, because its
+  GEMV rounds differently at another row count.
+  `SPARK3_DS41_INDEXER_SPLIT_CHECK=1` also runs the full-row indexer and logs
+  any row that differs (validation only). Output is unchanged. Upstream
+  status: candidate, not submitted.
+
+- `0026-worker-display-carveout-integrity.patch` checksums the weights held in
+  the display carve-out before and after the copy, and from the first engine
+  step re-checks them on a side stream every
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` (default 300, 0 disables). A
+  mismatch, or a check that cannot run, is logged and stops the engine at its
+  next step, so a driver fault that moved the mapping cannot serve wrong
+  logits silently. Upstream status: Spark-specific, not for upstream.
+
+Applying 0001-0026 to the base yields patch head `97de3474` and tree
+`66293624`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
 `9ba14ba1`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`

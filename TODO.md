@@ -117,6 +117,14 @@ and eight streams for every decode change.
   owner's decisions, and any host change goes to all three nodes. Stop the
   service before rebooting a node, and don't restart inference while it is in
   use.
+- **Review by 2026-10-29: remove the display carve-out integrity check.**
+  Patch 0026 is opt-in; r5l's launch configuration turns it on with
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS=300` for long unattended runs, on a
+  reviewer's request. It guards against a driver fault that reuses the
+  carve-out under the worker's mapping, which analysis rates unlikely. If no
+  node has logged `display carve-out weights changed` by then (grep the
+  container logs, or the agent run's records), drop the variable from
+  `config/cluster.json` and patch 0026 from the series.
 
 ## Mixed prefill and decode
 
@@ -226,10 +234,14 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
   rectification compared every tensor argument with `Tensor.__eq__`, costing
   ~200 µs per 20-tensor launch on 4.6.2; re-measure on 4.7.1 and patch forward
   if it remains.
-- **Real-text prefill is flat at 3.8k tok/s.** The last chunk profile
-  (4K: MoE 353 ms, attention 272, mHC 152, NCCL 142, dense 101) predates
-  sequence-parallel prefill; profile it again before choosing a target. Prefill
-  all-reduces are limited by the RoCE link at ~145 Gb/s. Check whether large
+- **Prefill chunk profile (r5k, 2026-09-29, one 4,096-token chunk under
+  sequence parallelism; `experiments/2026-09-29-indexer-split`):** routed MoE
+  355 ms, sparse MLA 256, dense GEMMs and mHC 198, collectives 162-173 (the
+  NCCL ring reduce-scatters and all-gathers of SP, ~126 ms), indexer 17 ms at
+  8K of context and 323 ms at 200K. Patch 0025 split the indexer's rows across
+  the ranks (-5% at 64K to -15% at 200K per chunk). What remains of it is the
+  MXFP4 score kernel at about 64 TFLOP/s, a kernel lever. The SP collectives
+  exceed the RoCE one-shot limits and run on NCCL: check whether large
   transfers use every available port and PCIe path.
 - **Prefix-cache retention:** agent prompts are 64-100K tokens and live on
   cache hits. Add a probe for retention around block boundaries and under
