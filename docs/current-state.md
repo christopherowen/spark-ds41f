@@ -1,13 +1,13 @@
 # Current state
 
-Promoted 2026-09-28 as
-[`2026-09-29-karmic-kraken-r5k`](../manifests/baselines/2026-09-29-karmic-kraken-r5k.json)
+Promoted 2026-09-29 as
+[`2026-09-29-karmic-kraken-r5l`](../manifests/baselines/2026-09-29-karmic-kraken-r5l.json)
 and running on all three nodes from `config/cluster.json`.
 
 | Setting | Active value |
 |---|---:|
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0024 (0005-0009 and 0011 off by default; 0023 off in configuration), B12X `f8069b2c` + switchless RoCEnante and CuTe DSL 4.7.1 pin patches, NCCL 2.30.7 + IB send-path fence |
-| Image | `vllm-ds41f-kkref:04c30fa98e79-r5k`, one digest on all ranks, built by `bin/spark3 build` |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0026 (0005-0009, 0011 and 0026 off by default; 0023 off in configuration), B12X `f8069b2c` + switchless RoCEnante and CuTe DSL 4.7.1 pin patches, NCCL 2.30.7 + IB send-path fence |
+| Image | `vllm-ds41f-kkref:04c30fa98e79-r5l`, one digest on all ranks, built by `bin/spark3 build` |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia` with `kho=off`, driver 580.178.04, no desktop |
 | Tensor parallel ranks | 3 |
 | Maximum model length | 262,144 tokens |
@@ -15,6 +15,7 @@ and running on all three nodes from `config/cluster.json`.
 | Maximum parallel prefills | 1 |
 | Batched-token budget | 4,096 |
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers (patches 0014-0018) |
+| Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025) |
 | Explicit KV memory | 2.2 GiB per rank |
 | Reported KV capacity | 1,348,708 tokens (5.14x full 256K windows) |
 | Display carve-out | embedding and output-head weights (842.5 MiB per rank) in the firmware scanout reserve (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
@@ -32,12 +33,12 @@ and running on all three nodes from `config/cluster.json`.
 | Async scheduling | enabled |
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 
-Measured on this configuration: LRU coherence gate 5/5; needle retrieval 3/3
-at 177,654 tokens; single-stream prose/code about 50/59 tok/s with reasoning,
-code answers 80 tok/s; code at eight streams 185 tok/s (236 tok/s for code
-answers); cold prefill 2K 4.2k, 32K 4.7k, 64K 4.6k, 131K 4.3k tok/s (4K 3.9k,
-64K 3.7k, 131K 3.6k, 200K 3.4k on real text); dgx1 minimum MemAvailable
-6.03 GiB under load.
+Measured on this configuration: LRU coherence gate 5/5; needle retrieval
+3/3 at 152,914 tokens; single-stream prose/code about 50/60 tok/s with reasoning,
+code answers 81 tok/s; code at eight streams 187 tok/s (233 tok/s for code
+answers); cold prefill 2K 4.4k, 32K 4.9k, 64K 4.9k, 131K 4.7k tok/s
+(4K 3.9k, 16K 3.8k, 32K 3.8k, 64K 3.8k, 131K 3.8k, 200K 3.8k on real text); dgx1 minimum
+MemAvailable 6.38 GiB under load.
 The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
 [`2026-09-20-live`](../manifests/baselines/2026-09-20-live.json).

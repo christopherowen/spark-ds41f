@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-29-karmic-kraken-r5k.json](manifests/baselines/2026-09-29-karmic-kraken-r5k.json):
+[manifests/baselines/2026-09-29-karmic-kraken-r5l.json](manifests/baselines/2026-09-29-karmic-kraken-r5l.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -40,7 +40,9 @@ The active baseline is recorded in
   drafter head and Markov projection;
 - sequence-parallel prefill once a prompt chunk's reduce-scatter outgrows
   the one-shot RoCE all-reduce (205 tokens): the encoder layers' row-wise
-  work runs on a third of the rows per rank;
+  work runs on a third of the rows per rank, and so does the sparse-attention
+  indexer, whose cost grows with context depth (a 4,096-token chunk at 200K
+  of context runs 15% faster);
 - mutating custom ops read their argument schema once per call, not once per
   argument as torch does, which keeps short prompts from waiting on the
   host at every MoE launch;
@@ -68,40 +70,41 @@ default) every measured token is reasoning text:
 
 | Prompt | Streams | Aggregate tok/s | Per-stream decode tok/s | First token |
 |---|---:|---:|---:|---:|
-| prose | 1 | 49.8 | 51.8 | 0.21 s |
-| prose | 2 | 78.7 | 42.1 | 0.33 s |
-| prose | 4 | 114.5 | 31.4 | 0.45 s |
-| prose | 8 | 168.0 | 22.9 | 0.52 s |
-| code | 1 | 59.2 | 62.2 | 0.23 s |
-| code | 2 | 90.7 | 48.5 | 0.33 s |
-| code | 4 | 133.0 | 37.9 | 0.45 s |
-| code | 8 | 185.5 | 26.5 | 0.53 s |
+| prose | 1 | 50.3 | 52.2 | 0.20 s |
+| prose | 2 | 76.1 | 41.4 | 0.33 s |
+| prose | 4 | 111.8 | 31.0 | 0.42 s |
+| prose | 8 | 162.0 | 22.4 | 0.53 s |
+| code | 1 | 59.7 | 62.8 | 0.23 s |
+| code | 2 | 90.4 | 49.6 | 0.35 s |
+| code | 4 | 131.4 | 36.6 | 0.45 s |
+| code | 8 | 187.4 | 26.6 | 0.55 s |
 
 With reasoning off (the answer itself), aggregate tok/s at 1/2/4/8 streams:
 
 | Prompt | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| prose | 57.2 | 86.3 | 122.9 | 172.6 |
-| code | 80.1 | 113.2 | 160.9 | 235.6 |
-| JSON | 75.1 | 110.0 | 171.4 | 243.9 |
+| prose | 59.1 | 84.8 | 124.9 | 174.5 |
+| code | 80.6 | 118.2 | 165.1 | 233.0 |
+| JSON | 77.0 | 109.7 | 165.2 | 234.3 |
 
 | Other measurements | |
 |---|---|
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 |
-| Long-context retrieval (phrase at 10%, 50%, 90% depth) | 3/3 at 177,654 tokens |
-| Single-stream decode step | about 41 ms on prose and 47 ms on code; accepted drafts per step 1.1 (prose), 1.9 (code), 3.2 (code answers) |
-| Cold prefill, repeated filler | 2K 4.2k, 32K 4.7k, 64K 4.6k, 131K 4.3k tok/s |
-| Cold prefill, real text (Python source) | 4K 3.9k, 16K 3.7k, 32K 3.7k, 64K 3.7k, 131K 3.6k, 200K 3.4k tok/s |
-| Prefix-cache replay, 32K prompt | 6.71 s cold, 0.27 s warm |
-| Four concurrent 64K contexts | all admitted without preemption, peak KV use 20%, 13.4 tok/s per stream |
-| Four concurrent 180K contexts | all admitted without preemption, peak KV use 36%, 11.9 tok/s per stream |
+| Long-context retrieval (phrase at 10%, 50%, 90% depth) | 3/3 at 152,914 tokens |
+| Single-stream decode step | about 42 ms on prose and 47 ms on code; accepted drafts per step 1.2 (prose), 1.9 (code), 3.2 (code answers) |
+| Cold prefill, repeated filler | 2K 4.4k, 32K 4.9k, 64K 4.9k, 131K 4.7k tok/s |
+| Cold prefill, real text (Python source) | 4K 3.9k, 16K 3.8k, 32K 3.8k, 64K 3.8k, 131K 3.8k, 200K 3.8k tok/s |
+| Prefix-cache replay, 32K prompt | 6.47 s cold, 0.24 s warm |
+| Four concurrent 64K contexts | all admitted without preemption, peak KV use 20%, 13.1 tok/s per stream |
+| Four concurrent 180K contexts (r5k) | all admitted without preemption, peak KV use 36%, 11.9 tok/s per stream |
 | KV capacity | 1,348,708 tokens in 2.2 GiB per rank (5.1 full 256K contexts) |
-| Host memory headroom | dgx1 at least 6.03 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
+| Host memory headroom | dgx1 at least 6.38 GiB MemAvailable under load (3 GiB guard); startup passes the 5 GiB guard |
 
 The quick default takes three or four samples per decode point, about ±2-12%
-at 95% confidence; temperature-0 outputs differ between identical requests,
-which moves acceptance from sample to sample. Report:
-[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5k.json).
+at 95% confidence; temperature-0 outputs differ between identical requests
+(the indexer's radix top-k keeps an arbitrary subset of positions tied at its
+threshold), which moves acceptance from sample to sample. Report:
+[decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5l.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
 ## Repository contract

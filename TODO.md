@@ -33,21 +33,21 @@ before tuning anything on this basis.
 
 ## Current reference
 
-`manifests/benchmarks/2026-09-29-karmic-kraken-r5k.json` (256K limit, 2.2 GiB
+`manifests/benchmarks/2026-09-29-karmic-kraken-r5l.json` (256K limit, 2.2 GiB
 of KV, 1,348,708 tokens). Aggregate tok/s across all streams, temperature 0,
 256 output tokens:
 
 | Workload | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| JSON, answer only | 75.1 | 110.0 | 171.4 | 243.9 |
-| Code, answer only | 80.1 | 113.2 | 160.9 | 235.6 |
-| Code, reasoning on | 59.2 | 90.7 | 133.0 | 185.5 |
-| Prose, answer only | 57.2 | 86.3 | 122.9 | 172.6 |
-| Prose, reasoning on | 49.8 | 78.7 | 114.5 | 168.0 |
+| JSON, answer only | 77.0 | 109.7 | 165.2 | 234.3 |
+| Code, answer only | 80.6 | 118.2 | 165.1 | 233.0 |
+| Code, reasoning on | 59.7 | 90.4 | 131.4 | 187.4 |
+| Prose, answer only | 59.1 | 84.8 | 124.9 | 174.5 |
+| Prose, reasoning on | 50.3 | 76.1 | 111.8 | 162.0 |
 
 - **Time to first token (short prompts):** 0.21-0.23 s at one stream and
   about 0.52 s at eight.
-- **Real-text prefill:** 3.9k tok/s at 4K, 3.7k at 64K, 3.4k at 200K.
+- **Real-text prefill:** 3.9k tok/s at 4K, 3.8k at 64K, 3.8k at 200K.
 - **Quality:** `experiments/2026-09-29-r5k/consistency.py` measures the
   decode-versus-prefill logprob gap on greedy generations (r5k: 0.0506 mean,
   2.84% argmax disagreement); use it for any change that touches decode-only
@@ -290,6 +290,22 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Quality
 
+- **Indexer ties make runs irreproducible.** B12X's tiled radix top-k (the
+  full-width selection of indexer layers 2, 8 and 14) keeps an arbitrary
+  subset of the positions tied at its 512th score through shared-memory
+  atomics: two identical full-row runs chose different sets for 78% of layer
+  2's rows, about 5 of 512 positions each (at most 36;
+  `experiments/2026-09-29-r5l`, `check_summary.py`). Tied positions carry equal
+  scores, but the choice changes which keys attention reads and likely explains
+  temperature-0 outputs differing between identical requests. The technical
+  report sets no tie rule; DeepSeek's reference (`inference/model.py`,
+  `torch.topk`) is repeatable, and dgpp (docs/inspiration.md) pins exact ties
+  to the lower index. `experiments/2026-09-29-topk-ties` adds that rule to
+  B12X (patch 0003 there): selections become exact (zero differences between
+  runs or against the split), prefill and decode cost nothing measurable and
+  acceptance does not change. Whole outputs still differ between identical
+  requests (6 of 6 distinct at one stream), so other nondeterminism remains.
+  Promote it with the next image (r5m).
 - **BF16 sparse attention** (patch 0023, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before

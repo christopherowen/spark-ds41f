@@ -70,10 +70,15 @@ filler_row = ", ".join(
     f"{label} {k(fil[size])}" for label, size in (("2K", 2048), ("32K", 32768), ("64K", 65536),
                                                    ("131K", 131072))
 )
-built = subprocess.run(
+# Docker reports the local offset (dgx1 runs CEST); record UTC.
+created = subprocess.run(
     ["docker", "image", "inspect", TAG, "--format", "{{.Created}}"],
     capture_output=True, text=True, check=True,
-).stdout.strip()[:19] + "Z"
+).stdout.strip()
+built = subprocess.run(
+    ["date", "-u", "-d", created, "+%Y-%m-%dT%H:%M:%SZ"],
+    capture_output=True, text=True, check=True,
+).stdout.strip()
 
 # 1. Configuration: the candidate arm, as run for the reference.
 arm = json.loads(Path("experiments/2026-09-29-r5l/cluster-candidate.json").read_text())
