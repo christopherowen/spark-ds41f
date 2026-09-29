@@ -51,7 +51,11 @@ active without stranding an installation performed through Tailscale.
 desktop services that serve nothing on a headless inference node: Bluetooth,
 CUPS with cups-browsed, and snapd (every installed snap is a desktop
 application; Docker, the NVIDIA driver, Tailscale and DKMS come from apt).
-`check` and `bin/spark3 doctor --live` report any that is enabled or running.
-fwupd stays: it delivers the embedded-controller, UEFI, ConnectX-7 and NVMe
-firmware from LVFS.
+`check` and `bin/spark3 doctor --live` warn about any that is enabled or running;
+a warning never fails either command or blocks a benchmark.
+fwupd stays installed: it delivers the embedded-controller, UEFI, ConnectX-7
+and NVMe firmware from LVFS. `apply` disables only its daily refresh timer and
+stops the resident daemon; `sudo fwupdmgr refresh`, `get-updates` and `update`
+start the daemon on demand over D-Bus (stop it again with
+`sudo systemctl stop fwupd` afterwards).
 

@@ -184,7 +184,7 @@ class ConsoleTest(unittest.TestCase):
 
 class IdleServicesTest(unittest.TestCase):
     def test_idle_services_are_reported_with_their_fix(self) -> None:
-        problems = spark3.idle_service_problems(
+        problems = spark3.idle_service_warnings(
             "dgx2", facts(idle_services="bluetooth.service,snapd.socket")
         )
         self.assertEqual(len(problems), 1)
@@ -195,14 +195,38 @@ class IdleServicesTest(unittest.TestCase):
         self.assertIn("scripts/host-recovery apply", problems[0])
 
     def test_no_idle_services_pass(self) -> None:
-        self.assertEqual(spark3.idle_service_problems("dgx2", facts()), [])
+        self.assertEqual(spark3.idle_service_warnings("dgx2", facts()), [])
         self.assertEqual(
-            spark3.idle_service_problems("dgx2", spark3.host_facts("modeset=Y\n")), []
+            spark3.idle_service_warnings("dgx2", spark3.host_facts("modeset=Y\n")), []
         )
+
+    def test_warnings_do_not_fail_doctor(self) -> None:
+        import contextlib
+        import io
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = spark3.report_doctor([], ["dgx2: snapd.service running"], live=True)
+        self.assertEqual(status, 0)
+        self.assertIn("WARN: dgx2: snapd.service running", output.getvalue())
+        self.assertIn("configuration OK; live cluster matches with 1 warning", output.getvalue())
+
+    def test_problems_fail_doctor_as_errors(self) -> None:
+        import contextlib
+        import io
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = spark3.report_doctor(["dgx1: container is not running"], [], live=True)
+        self.assertEqual(status, 1)
+        self.assertIn("ERROR: dgx1: container is not running", output.getvalue())
 
     def test_query_lists_every_idle_unit(self) -> None:
         for unit in spark3.IDLE_SERVICES:
             self.assertIn(unit, spark3.HOST_FACTS_QUERY)
+        # fwupd.service itself runs legitimately after a manual fwupdmgr call.
+        self.assertIn("fwupd-refresh.timer", spark3.IDLE_SERVICES)
+        self.assertNotIn("fwupd.service", spark3.IDLE_SERVICES)
 
 
 class FanControlTest(unittest.TestCase):

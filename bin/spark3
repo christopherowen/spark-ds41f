@@ -397,6 +397,7 @@ IDLE_SERVICES = (
     "snapd.service",
     "snapd.socket",
     "snapd.seeded.service",
+    "fwupd-refresh.timer",
 )
 
 HOST_FACTS_QUERY = """
@@ -540,12 +541,15 @@ def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     ]
 
 
-def idle_service_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when desktop services run on a headless inference node.
+def idle_service_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Warnings when desktop services run on a headless inference node.
 
     Bluetooth, CUPS, cups-browsed and snapd (every installed snap is a desktop
     application) each hold memory on every node, up to about 50 MiB, and
-    cups-browsed listens on the network. host-recovery disables them.
+    cups-browsed listens on the network. fwupd's daily refresh timer keeps its
+    daemon resident; fwupdmgr starts the daemon on demand without it.
+    host-recovery disables them. These are warnings: they cost a little memory
+    and do not fail doctor or block a benchmark.
     """
     units = [unit for unit in facts.get("idle_services", "").split(",") if unit]
     if not units:
@@ -677,7 +681,14 @@ def clock_latch_problems(node_name: str, facts: dict[str, str], serving: bool) -
     ]
 
 
-def live_doctor(cluster: dict, nodes: dict) -> list[str]:
+def live_doctor(
+    cluster: dict, nodes: dict, warnings: list[str] | None = None
+) -> list[str]:
+    """Problems that make the live cluster differ from its configuration.
+
+    Findings that only cost a little, such as idle desktop services, go to
+    ``warnings`` when a list is given and never count as problems.
+    """
     problems: list[str] = []
     name = cluster["container"]["name"]
     for node in nodes["nodes"]:
@@ -691,7 +702,8 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))
-        problems.extend(idle_service_problems(node["name"], facts))
+        if warnings is not None:
+            warnings.extend(idle_service_warnings(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
@@ -740,17 +752,28 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     return problems
 
 
+def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
+    """Print warnings and problems; only problems fail."""
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for problem in problems:
+        print(f"ERROR: {problem}")
+    if problems:
+        return 1
+    summary = "configuration OK" + ("; live cluster matches" if live else "")
+    if warnings:
+        summary += f" with {len(warnings)} warning" + ("s" if len(warnings) > 1 else "")
+    print(summary)
+    return 0
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     cluster, nodes, upstreams = configuration(args)
     problems = local_doctor(cluster, nodes, upstreams)
+    warnings: list[str] = []
     if args.live:
-        problems.extend(live_doctor(cluster, nodes))
-    if problems:
-        for problem in problems:
-            print(f"WARN: {problem}")
-        return 1
-    print("configuration OK" + ("; live cluster matches" if args.live else ""))
-    return 0
+        problems.extend(live_doctor(cluster, nodes, warnings))
+    return report_doctor(problems, warnings, args.live)
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -3362,7 +3385,9 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
             "container_started_at": started_at or None,
             "checkout": checkout.stdout.strip() or None,
         }
-    identity["live_problems"] = live_doctor(cluster, nodes)
+    warnings: list[str] = []
+    identity["live_problems"] = live_doctor(cluster, nodes, warnings)
+    identity["live_warnings"] = warnings
     return identity
 
 
@@ -3510,9 +3535,11 @@ def command_bench(args: argparse.Namespace) -> int:
         return 1 if regressions else 0
 
     identity = bench_identity(cluster, nodes, config_name, config_path)
+    for warning in identity["live_warnings"]:
+        print(f"WARN: {warning}")
     if identity["live_problems"]:
         for problem in identity["live_problems"]:
-            print(f"WARN: {problem}")
+            print(f"ERROR: {problem}")
         if not args.allow_mismatch:
             print("refusing to benchmark a cluster that differs from its configuration")
             return 1
