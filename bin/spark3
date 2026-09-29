@@ -397,7 +397,10 @@ IDLE_SERVICES = (
     "snapd.service",
     "snapd.socket",
     "snapd.seeded.service",
+    "snapd.snap-repair.timer",
     "fwupd-refresh.timer",
+    "dgx-dashboard.service",
+    "dgx-dashboard-admin.service",
 )
 
 HOST_FACTS_QUERY = """
@@ -547,7 +550,9 @@ def idle_service_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
     Bluetooth, CUPS, cups-browsed and snapd (every installed snap is a desktop
     application) each hold memory on every node, up to about 50 MiB, and
     cups-browsed listens on the network. fwupd's daily refresh timer keeps its
-    daemon resident; fwupdmgr starts the daemon on demand without it.
+    daemon resident; fwupdmgr starts the daemon on demand without it. NVIDIA's
+    DGX Dashboard runs periodic update checks (spark-ota-check) that peak near
+    850 MiB and wake fwupd and PackageKit.
     host-recovery disables them. These are warnings: they cost a little memory
     and do not fail doctor or block a benchmark.
     """

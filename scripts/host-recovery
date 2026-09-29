@@ -26,13 +26,16 @@ files=(
 # Desktop services that serve nothing on a headless inference node (every
 # installed snap is a desktop application), and fwupd's daily refresh, which
 # keeps its daemon resident: fwupdmgr starts the daemon on demand over D-Bus.
+# NVIDIA's DGX Dashboard polls for updates (spark-ota-check), which wakes fwupd
+# and PackageKit and peaks near 850 MiB.
 # apply also disables the display manager, gdm3, which Ubuntu aliases as
 # display-manager.service.
 idle_units=(
   bluetooth.service
   cups.service cups.socket cups.path cups-browsed.service
-  snapd.service snapd.socket snapd.seeded.service
+  snapd.service snapd.socket snapd.seeded.service snapd.snap-repair.timer
   fwupd-refresh.timer
+  dgx-dashboard.service dgx-dashboard-admin.service
 )
 
 # KDGETMODE / KDSETMODE on the active virtual console: 0 is text, 1 graphics.

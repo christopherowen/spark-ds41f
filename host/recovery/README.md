@@ -49,8 +49,13 @@ active without stranding an installation performed through Tailscale.
 
 `scripts/host-recovery apply` also disables the display manager (`gdm3`) and
 desktop services that serve nothing on a headless inference node: Bluetooth,
-CUPS with cups-browsed, and snapd (every installed snap is a desktop
-application; Docker, the NVIDIA driver, Tailscale and DKMS come from apt).
+CUPS with cups-browsed, snapd and its repair timer (every installed snap is a
+desktop application; Docker, the NVIDIA driver, Tailscale and DKMS come from
+apt), and NVIDIA's DGX Dashboard, whose periodic update checks
+(`/opt/nvidia/spark-ota-check`) peak near 850 MiB and wake fwupd and
+PackageKit. Re-enable the dashboard with
+`sudo systemctl enable --now dgx-dashboard.service dgx-dashboard-admin.service`
+when its web interface is wanted.
 `check` and `bin/spark3 doctor --live` warn about any that is enabled or running;
 a warning never fails either command or blocks a benchmark.
 fwupd stays installed: it delivers the embedded-controller, UEFI, ConnectX-7
