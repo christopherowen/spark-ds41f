@@ -290,22 +290,13 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Quality
 
-- **Indexer ties make runs irreproducible.** B12X's tiled radix top-k (the
-  full-width selection of indexer layers 2, 8 and 14) keeps an arbitrary
-  subset of the positions tied at its 512th score through shared-memory
-  atomics: two identical full-row runs chose different sets for 78% of layer
-  2's rows, about 5 of 512 positions each (at most 36;
-  `experiments/2026-09-29-r5l`, `check_summary.py`). Tied positions carry equal
-  scores, but the choice changes which keys attention reads and likely explains
-  temperature-0 outputs differing between identical requests. The technical
-  report sets no tie rule; DeepSeek's reference (`inference/model.py`,
-  `torch.topk`) is repeatable, and dgpp (docs/inspiration.md) pins exact ties
-  to the lower index. `experiments/2026-09-29-topk-ties` adds that rule to
-  B12X (patch 0003 there): selections become exact (zero differences between
-  runs or against the split), prefill and decode cost nothing measurable and
-  acceptance does not change. Whole outputs still differ between identical
-  requests (6 of 6 distinct at one stream), so other nondeterminism remains.
-  Promote it with the next image (r5m).
+- **Temperature-0 outputs still vary between identical requests** (6 of 6
+  distinct at one stream). r5m's B12X 0003 made indexer selections exact
+  (`experiments/2026-09-29-topk-ties`), so the rest comes from elsewhere:
+  verification batch shapes that change with acceptance, and kernels whose
+  summation order varies. A deterministic profile would need batch-invariant
+  verify kernels; measure its cost before proposing it.
+
 - **BF16 sparse attention** (patch 0023, off in configuration): measure its
   fidelity with a teacher-forced comparison against
   `VLLM_DS41_ATTENTION_COMPUTE=reference` on long agent transcripts before

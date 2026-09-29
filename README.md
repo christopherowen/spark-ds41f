@@ -11,7 +11,7 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-29-karmic-kraken-r5l.json](manifests/baselines/2026-09-29-karmic-kraken-r5l.json):
+[manifests/baselines/2026-09-29-karmic-kraken-r5m.json](manifests/baselines/2026-09-29-karmic-kraken-r5m.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
@@ -21,7 +21,8 @@ The active baseline is recorded in
   projection sharding, asynchronous Engram rows, and two tool-call and
   image-cache fixes) and B12X (plus the switchless RoCEnante patch, and its
   CuTe DSL pin moved to the 4.7.1 that vLLM requires; its FP4 KV writer
-  rounds like DeepSeek's reference quantizer), with B12X attention,
+  rounds like DeepSeek's reference quantizer, and its indexer top-k breaks
+  score ties by position, so selections repeat), with B12X attention,
   linear, MoE, and mHC kernels and L2 weight prefetch during decode (the
   next layer's weights stream into L2 while latency-bound kernels run);
 - NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
@@ -64,7 +65,8 @@ To reproduce the deployment on your own three Sparks, follow
 
 ## Performance
 
-Current baseline, measured with `bin/spark3 bench` from dgx1: prose and code
+Measured on r5l (r5m differs only by the top-k tie rule, measured neutral) with
+`bin/spark3 bench` from dgx1: prose and code
 prompts, temperature 0, 256 output tokens. With reasoning on (the server
 default) every measured token is reasoning text:
 
