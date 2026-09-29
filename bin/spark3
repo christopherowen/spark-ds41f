@@ -226,6 +226,17 @@ def tracked_secret_problems() -> list[str]:
     return problems
 
 
+class Warn(str):
+    """A doctor finding that does not fail doctor or block a benchmark.
+
+    Errors are what breaks serving, safety or a required capability now: the
+    display carve-out and the kept text console (modeset, fbdev, DRM master,
+    console mode), fan control, RoCE GIDs, the GPU clock and any difference from
+    the promoted configuration. Warnings are latent (effective at the next
+    boot), cost a little, or could not be read.
+    """
+
+
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems: list[str] = []
     node_list = nodes.get("nodes", [])
@@ -296,14 +307,14 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""
     )
     if not watchlist:
-        problems.append("missing improvement watchlist docs/inspiration.md")
+        problems.append(Warn("missing improvement watchlist docs/inspiration.md"))
     for name, reference in upstreams.get("references", {}).items():
         if reference.get("kind") != "git-watch":
-            problems.append(f"{name}: reference kind must be git-watch")
+            problems.append(Warn(f"{name}: reference kind must be git-watch"))
         if not reference.get("url") or not reference.get("role"):
-            problems.append(f"{name}: reference URL and role are required")
+            problems.append(Warn(f"{name}: reference URL and role are required"))
         elif reference["url"] not in watchlist:
-            problems.append(f"{name}: reference URL is absent from the watchlist")
+            problems.append(Warn(f"{name}: reference URL is absent from the watchlist"))
     source_manifest = read_json(
         upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
     )
@@ -335,9 +346,11 @@ def desktop_problems(node_name: str, output: str) -> list[str]:
     problems = []
     if default_target != "multi-user.target":
         problems.append(
-            f"{node_name}: boots to {default_target or 'an unknown target'}, "
-            "expected multi-user.target (no desktop); run "
-            "sudo systemctl set-default multi-user.target"
+            Warn(
+                f"{node_name}: boots to {default_target or 'an unknown target'}, "
+                "expected multi-user.target (no desktop); run "
+                "sudo systemctl set-default multi-user.target"
+            )
         )
     if manager in ("active", "activating", "reloading"):
         problems.append(
@@ -361,7 +374,7 @@ def boot_order_problems(node_name: str, output: str) -> list[str]:
         elif match := re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)", line):
             entries[match.group(1).upper()] = match.group(2)
     if not order:
-        return [f"{node_name}: cannot read the UEFI boot order"]
+        return [Warn(f"{node_name}: cannot read the UEFI boot order")]
     def installed(entry: str) -> bool:
         return (
             entry.split("\t")[0].strip().lower() == "ubuntu"
@@ -381,8 +394,10 @@ def boot_order_problems(node_name: str, output: str) -> list[str]:
         else "no installed-OS boot entry exists; reinstall the boot loader with grub-install"
     )
     return [
-        f"{node_name}: UEFI boots {label or 'entry ' + order[0]!r} before the installed OS "
-        f"(BootOrder {','.join(order)}); {fix}"
+        Warn(
+            f"{node_name}: UEFI boots {label or 'entry ' + order[0]!r} before the "
+            f"installed OS (BootOrder {','.join(order)}); {fix}"
+        )
     ]
 
 
@@ -447,7 +462,7 @@ def host_facts(output: str) -> dict[str, str]:
 
 
 def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when nvidia-drm does not drive displays (kernel mode setting).
+    """Problems when nvidia-drm does not drive displays (kernel mode setting, required).
 
     Without it only the firmware framebuffer shows a console, and only for a
     display attached at boot: a monitor or KVM connected later stays dark.
@@ -467,7 +482,7 @@ def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 
 
 def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when nvidia-drm provides no framebuffer console.
+    """Problems when nvidia-drm provides no framebuffer console (required).
 
     With fbdev off, a display attached to the node shows no text console. The
     console framebuffer takes 8 MiB of the display carve-out at 1920x1080,
@@ -495,7 +510,9 @@ def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     if not value:
         return []
     if value == "unreadable":
-        return [f"{node_name}: cannot read the DRM clients (/sys/kernel/debug/dri/0/clients)"]
+        return [
+            Warn(f"{node_name}: cannot read the DRM clients (/sys/kernel/debug/dri/0/clients)")
+        ]
     return [
         f"{node_name}: {value} holds DRM master, so the text console cannot draw; stop "
         "or restart that process (the serving worker releases the device right after "
@@ -518,11 +535,14 @@ def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
             "attached display shows no text; run scripts/host-recovery apply on the node "
             "(it switches the console to text mode now and removes splash from later boots)"
         ]
-    return [f"{node_name}: cannot read the active console mode"]
+    return [Warn(f"{node_name}: cannot read the active console mode")]
 
 
 def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
-    """Problems when the kernel boots with the Plymouth splash.
+    """Warnings when the kernel boots with the Plymouth splash.
+
+    Latent until the next boot: console_mode_problems reports a console that
+    is in graphics mode now.
 
     Plymouth leaves the active console in graphics mode after it quits, so an
     attached display shows no text console after a boot. host-recovery
@@ -533,14 +553,18 @@ def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         return []
     if facts.get("grub_splash") == "0":
         return [
-            f"{node_name}: booted with splash, but the boot configuration omits it now; "
-            "reboot with the service stopped to apply"
+            Warn(
+                f"{node_name}: booted with splash, but the boot configuration omits it "
+                "now; reboot with the service stopped to apply"
+            )
         ]
     return [
-        f"{node_name}: the kernel command line has splash, which leaves the console in "
-        "graphics mode after boot; run scripts/host-recovery apply on the node (it "
-        "installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then "
-        "reboot with the service stopped"
+        Warn(
+            f"{node_name}: the kernel command line has splash, which leaves the console "
+            "in graphics mode after boot; run scripts/host-recovery apply on the node (it "
+            "installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), "
+            "then reboot with the service stopped"
+        )
     ]
 
 
@@ -560,9 +584,11 @@ def idle_service_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
     if not units:
         return []
     return [
-        f"{node_name}: {', '.join(units)} enabled or running, though unused on a "
-        f"headless inference node; run sudo systemctl disable --now {' '.join(units)} "
-        "(scripts/host-recovery apply does the same)"
+        Warn(
+            f"{node_name}: {', '.join(units)} enabled or running, though unused on a "
+            f"headless inference node; run sudo systemctl disable --now "
+            f"{' '.join(units)} (scripts/host-recovery apply does the same)"
+        )
     ]
 
 
@@ -677,7 +703,7 @@ def clock_latch_problems(node_name: str, facts: dict[str, str], serving: bool) -
     try:
         clock_mhz = float(clock)
     except ValueError:
-        return [f"{node_name}: cannot read the GPU clock"]
+        return [Warn(f"{node_name}: cannot read the GPU clock")]
     if clock_mhz >= LATCHED_CLOCK_MHZ:
         return []
     return [
@@ -686,14 +712,8 @@ def clock_latch_problems(node_name: str, facts: dict[str, str], serving: bool) -
     ]
 
 
-def live_doctor(
-    cluster: dict, nodes: dict, warnings: list[str] | None = None
-) -> list[str]:
-    """Problems that make the live cluster differ from its configuration.
-
-    Findings that only cost a little, such as idle desktop services, go to
-    ``warnings`` when a list is given and never count as problems.
-    """
+def live_doctor(cluster: dict, nodes: dict) -> list[str]:
+    """Findings about the live cluster: errors, and Warn for the minor ones."""
     problems: list[str] = []
     name = cluster["container"]["name"]
     for node in nodes["nodes"]:
@@ -707,8 +727,7 @@ def live_doctor(
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))
-        if warnings is not None:
-            warnings.extend(idle_service_warnings(node["name"], facts))
+        problems.extend(idle_service_warnings(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
@@ -757,6 +776,13 @@ def live_doctor(
     return problems
 
 
+def split_findings(findings: list[str]) -> tuple[list[str], list[str]]:
+    """Errors and warnings, each in their original order."""
+    errors = [finding for finding in findings if not isinstance(finding, Warn)]
+    warnings = [finding for finding in findings if isinstance(finding, Warn)]
+    return errors, warnings
+
+
 def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
     """Print warnings and problems; only problems fail."""
     for warning in warnings:
@@ -774,10 +800,10 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 
 def command_doctor(args: argparse.Namespace) -> int:
     cluster, nodes, upstreams = configuration(args)
-    problems = local_doctor(cluster, nodes, upstreams)
-    warnings: list[str] = []
+    findings = local_doctor(cluster, nodes, upstreams)
     if args.live:
-        problems.extend(live_doctor(cluster, nodes, warnings))
+        findings.extend(live_doctor(cluster, nodes))
+    problems, warnings = split_findings(findings)
     return report_doctor(problems, warnings, args.live)
 
 
@@ -820,7 +846,9 @@ def deployment_order(nodes: dict) -> list[dict]:
 
 
 def require_local_deployment_state(cluster: dict, nodes: dict, upstreams: dict) -> str:
-    problems = local_doctor(cluster, nodes, upstreams)
+    problems, warnings = split_findings(local_doctor(cluster, nodes, upstreams))
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
     dirty = repository_dirty()
     if dirty:
         problems.append("deployment requires a clean local repository")
@@ -3390,9 +3418,9 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
             "container_started_at": started_at or None,
             "checkout": checkout.stdout.strip() or None,
         }
-    warnings: list[str] = []
-    identity["live_problems"] = live_doctor(cluster, nodes, warnings)
-    identity["live_warnings"] = warnings
+    problems, warnings = split_findings(live_doctor(cluster, nodes))
+    identity["live_problems"] = [str(problem) for problem in problems]
+    identity["live_warnings"] = [str(warning) for warning in warnings]
     return identity
 
 

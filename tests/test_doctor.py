@@ -229,6 +229,45 @@ class IdleServicesTest(unittest.TestCase):
         self.assertNotIn("fwupd.service", spark3.IDLE_SERVICES)
 
 
+class SeverityTest(unittest.TestCase):
+    """Required capabilities are errors; latent or minor findings are warnings."""
+
+    def test_required_display_pieces_are_errors(self) -> None:
+        for problems in (
+            spark3.modeset_problems("dgx1", facts(modeset="N")),
+            spark3.fbdev_problems("dgx1", facts(fbdev="N")),
+            spark3.drm_master_problems("dgx1", facts(drm_masters="Xorg/123")),
+            spark3.console_mode_problems("dgx1", facts(console="tty1:1")),
+        ):
+            self.assertEqual(len(problems), 1)
+            self.assertNotIsInstance(problems[0], spark3.Warn)
+
+    def test_latent_and_unreadable_findings_warn(self) -> None:
+        for problems in (
+            spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1")),
+            spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0")),
+            spark3.drm_master_problems("dgx1", facts(drm_masters="unreadable")),
+            spark3.console_mode_problems("dgx1", facts(console="tty1:")),
+            spark3.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
+            spark3.desktop_problems("dgx1", "graphical.target\ninactive\n"),
+            spark3.boot_order_problems("dgx1", ""),
+        ):
+            self.assertEqual(len(problems), 1)
+            self.assertIsInstance(problems[0], spark3.Warn)
+
+    def test_running_display_manager_is_an_error(self) -> None:
+        problems = spark3.desktop_problems("dgx1", "multi-user.target\nactive\n")
+        self.assertEqual(len(problems), 1)
+        self.assertNotIsInstance(problems[0], spark3.Warn)
+
+    def test_split_findings_keeps_order(self) -> None:
+        errors, warnings = spark3.split_findings(
+            ["a", spark3.Warn("b"), "c", spark3.Warn("d")]
+        )
+        self.assertEqual(errors, ["a", "c"])
+        self.assertEqual(warnings, ["b", "d"])
+
+
 class FanControlTest(unittest.TestCase):
     def test_working_fan_floor_passes(self) -> None:
         self.assertEqual(spark3.fan_control_problems("dgx1", facts()), [])
