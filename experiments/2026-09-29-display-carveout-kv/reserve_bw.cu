@@ -42,6 +42,25 @@ __global__ void gather(const uint4 *p, size_t nblocks, size_t span16, uint4 *sin
     if (a.x == 0xdeadbeef) *sink = a;
 }
 
+
+// Random small-record gather: each warp reads one 576-byte record (36 x 16 B)
+// at a hashed offset anywhere in the buffer, like sparse-attention top-k reads.
+__global__ void gather_rand(const uint4 *p, size_t nrec, uint4 *sink, int iters) {
+    uint4 a = {0, 0, 0, 0};
+    size_t warp = (blockIdx.x * (size_t)blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+    size_t nwarps = gridDim.x * (size_t)blockDim.x / 32;
+    for (int it = 0; it < iters; it++) {
+        size_t r = ((warp + it * nwarps) * 11400714819323198485ull >> 17) % nrec;
+        const uint4 *q = p + r * 36;
+        for (size_t i = lane; i < 36; i += 32) { uint4 v = q[i]; a.x ^= v.x; a.y ^= v.y; }
+    }
+    if (a.x == 0xdeadbeef) *sink = a;
+}
+static void launch_rand(void *a) {
+    struct Arg { void *p; size_t bytes; uint4 *sink; } *x = (struct Arg *)a;
+    gather_rand<<<1024, 256>>>((uint4 *)x->p, x->bytes / 576, x->sink, 16);
+}
+
 static float timed(void (*launch)(void *), void *arg, int reps) {
     cudaEvent_t s, e; cudaEventCreate(&s); cudaEventCreate(&e);
     launch(arg); CK(cudaDeviceSynchronize());
@@ -62,6 +81,9 @@ static void launch_gather(void *a) {
 static void report(const char *name, void *p, size_t bytes, uint4 *sink) {
     Arg a = {p, bytes, sink};
     float r = timed(launch_rd, &a, 10), w = timed(launch_wr, &a, 10), g = timed(launch_gather, &a, 10);
+    float q = timed(launch_rand, &a, 10);
+    size_t qbytes = (size_t)1024 * 256 / 32 * 16 * 576;
+    printf("%-10s random 576 B records: %6.1f GB/s  (%.2f M records/ms)\n", name, qbytes / q / 1e6, qbytes / 576 / q / 1e6);
     size_t gbytes = (size_t)1024 * 256 / 32 * 4 * 64 * 1024;
     printf("%-10s read %6.1f GB/s  write %6.1f GB/s  gather(64K spans) %6.1f GB/s\n",
            name, bytes / r / 1e6, bytes / w / 1e6, gbytes / g / 1e6);
@@ -104,8 +126,8 @@ int main(int argc, char **argv) {
            (void *)dev, (uint64_t)host == dev ? "yes" : "no");
     if (rc) return 1;
     report("carve-out", (void *)dev, c.size, sink);
-    void *ord; CK(cudaMalloc(&ord, 1ul << 30));
-    report("cudaMalloc", ord, 1ul << 30, sink);
+    void *ord; CK(cudaMalloc(&ord, c.size));
+    report("cudaMalloc", ord, c.size, sink);
     cudaFree(ord);
     cuMemHostUnregister(host); munmap(host, c.size);
     struct drm_mode_destroy_dumb d = {c.handle}; ioctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &d);

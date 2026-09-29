@@ -157,19 +157,21 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   to first token against about 210 ms afterwards). Output unchanged. Upstream
   status: candidate, not submitted.
 
-- `0021-worker-display-carveout-kv.patch` backs the KV cache with the GB10 display
-  carve-out when `SPARK3_KV_DISPLAY_CARVEOUT=1`: a DRM dumb buffer from the
-  firmware scanout reserve, exported as a dma-buf and imported with
-  `cuImportExternalMemory` (about 95% of ordinary memory bandwidth). The
-  worker refuses to start if the carve-out cannot hold the backing; startup
-  KV caches under 256 MiB (profiling, B12X preparation) stay in ordinary
-  memory. Output
-  unchanged; inert without the variable. Tests:
-  `tests/v1/worker/test_display_carveout.py`. Upstream status: candidate, not
-  submitted.
+- `0021-worker-display-carveout-weights.patch` keeps the vocabulary-sized
+  embedding and output-head weights in the GB10 display carve-out when
+  `SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`: a DRM dumb buffer from the firmware
+  scanout reserve, exported as a dma-buf and imported with
+  `cuImportExternalMemory`, filled right after loading and before kernel
+  plans or graphs capture the weights. Their ordinary memory (842.5 MiB per
+  rank) returns to the allocator for the KV cache. The mapping streams at full
+  speed but gives no reuse, so only these read-once tables move; the KV cache
+  in the carve-out cost 8% at eight streams. The worker refuses to start if
+  the carve-out cannot hold them. Output unchanged (bit-identical copies);
+  inert without the variable. Tests: `tests/v1/worker/test_display_carveout.py`.
+  Upstream status: candidate, not submitted.
 
-Applying 0001-0021 to the base yields patch head `d0d429a6` and tree
-`2f8e61c6`.
+Applying 0001-0021 to the base yields patch head `2d0d714c` and tree
+`19270e20`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`
 and tree `17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree

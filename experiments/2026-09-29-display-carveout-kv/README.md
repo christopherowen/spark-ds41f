@@ -1,13 +1,10 @@
-# KV cache in the display carve-out
+# Display carve-out
 
 **Base:** r5j (`2026-09-28-karmic-kraken-r5j`), image
 `vllm-ds41f-kkref:04c30fa98e79-r5j`.
 
-**Variable:** where the KV cache lives and how large it is. The promoted
-configuration allocates 1.4 GiB of KV per rank from ordinary memory. The
-`carveout` arm takes the whole backing, 2,032 MiB per rank, from the display
-carve-out (vLLM patch 0021, `SPARK3_KV_DISPLAY_CARVEOUT=1`), leaving ordinary
-memory free.
+**Goal:** use the memory the firmware reserves for a display, which every
+node leaves idle, to hold more KV cache, while keeping a text console.
 
 ## The carve-out
 
@@ -15,8 +12,8 @@ The firmware reserves 2.10 GiB at the top of physical memory on every node
 (`1fe30cc000-20693fffff`, reserved in `/proc/iomem`). The GPU driver turns
 the `DISPLAY_FRM` part of it into a scanout heap
 (`memmgrCreateScanoutCarveoutHeap_GB10B`). Its size comes from the firmware;
-no module or kernel parameter changes it. Linux and ordinary CUDA allocations
-never use it.
+no module or kernel parameter changes it (nvidia-drm has only `modeset` and
+`fbdev`). Linux and ordinary CUDA allocations never use it.
 
 nvidia-drm serves DRM dumb buffers from that heap. Measured on 2026-09-29 with
 `nvidia_drm modeset=Y fbdev=Y`, no reboot and no host change:
@@ -27,41 +24,87 @@ nvidia-drm serves DRM dumb buffers from that heap. Measured on 2026-09-29 with
 | dgx2 | none | 2,040 MiB | none (−0.04 GiB noise) |
 | dgx3 | 1920x1080 HDMI console (`/dev/fb0`) | 2,032 MiB | none (−0.03 GiB noise) |
 
-The console framebuffer takes 8 MiB. The arm uses 2,032 MiB on every node, so
-dgx3 keeps its console and dgx1 and dgx2 keep 8 MiB for one.
+The console framebuffer takes 8 MiB.
 
-GPU access depends on how the buffer reaches CUDA (`reserve_bw.cu` style
-probe on dgx2, 2,032 MiB, streaming uint4 kernels):
+## How the GPU sees it
 
-| Path | Read | Write | 64 KiB gather |
+A dumb buffer exported as a dma-buf and imported with `cuImportExternalMemory`
+round-trips data correctly (GPU fill and verify of 266M words, CPU spot reads,
+a CPU write read by the GPU, `cudaMemset`). Its access speed on dgx2
+(`reserve_bw.cu`, 2,032 MiB):
+
+| Access | dma-buf import | CPU mapping as I/O memory | `cudaMalloc` |
 |---|---:|---:|---:|
-| dma-buf export, `cuImportExternalMemory` | 235 GB/s | 204 GB/s | 240 GB/s |
-| CPU mapping registered as I/O memory | 164 GB/s | 113 GB/s | 167 GB/s |
-| `cudaMalloc` | 254 GB/s | 187 GB/s | 250 GB/s |
+| Sequential read | 235 GB/s | 164 GB/s | 235 GB/s |
+| Sequential write | 207 GB/s | 113 GB/s | 196 GB/s |
+| 64 KiB spans | 244 GB/s | 168 GB/s | 236 GB/s |
+| Random 576-byte records | 7 GB/s | 10 GB/s | 221 GB/s |
 
-Patch 0021 uses the dma-buf import. A GPU fill and verify of all 266M words,
-CPU spot reads, a CPU write read by the GPU, and `cudaMemset` all round-trip
-correctly. Through torch, a 1 GiB copy into the imported backing runs at
-235 GB/s against 236 GB/s for ordinary memory.
+BF16 matmuls with the weight in the carve-out (`gemm_place.py`), against the
+same weight in ordinary memory:
+
+| Shape | Carve-out / ordinary |
+|---|---:|
+| M 8649, K 1024, N 3072 (vision tower) | 2.31x |
+| M 8649, K 1024, N 5632 | 2.23x |
+| M 8649, K 2816, N 1024 | 2.36x |
+| M 6, K 5120, N 16384 | 0.96x |
+| M 48, K 5120, N 16384 | 1.10x |
+| M 6, K 5120, N 43136 (output head) | 0.90x |
+
+The mapping streams at full speed but gives no reuse: anything read more than
+once per pass, or read at random, pays full memory latency every time.
+
+## Arm 1: KV cache in the carve-out (rejected)
+
+Patch 0021's first version took the whole KV backing, 2,032 MiB per rank,
+from the carve-out. Against a same-day r5j control (same lean protocol, the
+control on a service that had been up for 25 hours):
+
+| | r5j control | KV in carve-out |
+|---|---:|---:|
+| KV capacity | 575,304 tokens | 815,471 tokens (+42%) |
+| Quality gate | 5/5 | 5/5 |
+| Lowest MemAvailable dgx1 / dgx2 / dgx3 | 5.58 / 7.54 / 7.31 GiB | 7.85 / 8.98 / 8.89 GiB |
+| Single-stream step, prose / code | 42.8 / 46.2 ms | 42.5 / 48.2 ms |
+| 8 streams, prose / code / answers | 164 / 187 / 175 / 232 tok/s | 150 / 172 / 161 / 222 tok/s |
+| Real-text prefill 2K / 32K / 64K | 3.13k / 3.72k / 3.74k | 2.86k / 3.44k / 3.32k tok/s |
+| Four 64K contexts, per stream | 13.8 tok/s | 12.7 tok/s |
+
+Single-stream decode was unchanged, but everything that gathers or re-reads
+more KV lost 4-11%, consistent with the random-access numbers above. Its first
+start also failed: startup allocates two small temporary KV caches (0.2 MiB
+for profiling, 7.4 MiB for B12X preparation), which each took a 16 MiB
+carve-out buffer and left too little for the serving cache.
+
+## Arm 2: embedding and output head in the carve-out
+
+Patch 0021 now moves the two vocabulary-sized tables that are read once per
+step, the embedding table (row lookups) and the output head (only multiplied
+by decode rows and prefill's sampled positions), into the carve-out right
+after loading, before kernel plans and graphs capture them. The DSpark drafter
+aliases both, so they move together. That frees 842.5 MiB of ordinary memory
+per rank (two 43,136 x 5,120 BF16 tables), and the `weights` arm grows the KV
+cache by 0.8 GiB of it, to 2.2 GiB (about 900K tokens); `weights-256k` also
+raises the context limit to 262,144 tokens.
 
 ## Method
 
-1. `make_arms.py` writes `cluster-carveout.json` from `config/cluster.json`:
-   the DRM card device, the overlay mounts, `SPARK3_KV_DISPLAY_CARVEOUT=1`,
-   and `--kv-cache-memory-bytes 2130706432`.
-2. `overlay.sh` prepares vLLM with patches 0001-0021 (tree `2f8e61c6`) and
-   copies the two changed runtime files to every node.
-3. `run_arm.sh control control` benchmarks the running r5j service; then
-   `run_arm.sh carveout carveout` starts the arm and runs the same protocol:
-   quality gate, decode for prose, code and their answer-only cases at 1 and
-   8 streams (3 samples), real-text prefill, and four concurrent 64K
-   contexts.
+1. `make_arms.py` writes `cluster-weights.json` and `cluster-weights-256k.json`
+   from `config/cluster.json`: the DRM card device, the overlay mounts,
+   `SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, and the larger KV size.
+2. `overlay.sh` applies patches 0001-0021 (tree `19270e20`) in a throwaway
+   worktree and copies the two changed runtime files to every node.
+3. `run_arm.sh ARM LABEL [bench options]` starts an arm under the launcher's
+   memory guards and runs the same protocol as the control: quality gate,
+   decode for prose, code and their answer-only cases at 1 and 8 streams
+   (3 samples), real-text prefill, and four concurrent 64K contexts. The 256K
+   arm adds longer prefill and admission sizes and `needle.py`.
 
-**Acceptance:** the quality gate passes; decode, prefill and the 64K
-admission rate are within noise of the control; MemAvailable under load rises
-by about the old KV size on every node; the reported KV capacity rises by
-about 42%.
+**Acceptance:** the quality gate passes; decode, prefill and the 64K admission
+rate are within noise of the control; MemAvailable under load is no lower than
+the control's; the reported KV capacity rises by about 55%.
 
 ## Results
 
-Pending.
+Arm 2 pending.

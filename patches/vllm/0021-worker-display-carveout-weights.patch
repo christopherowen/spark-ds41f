@@ -1,0 +1,364 @@
+From aabc6d540b9430d406f979c8355acc64fedf2b77 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 08:34:44 +0200
+Subject: [PATCH] feat(worker): keep embedding and output-head weights in the
+ GB10 display carve-out
+
+DGX Spark firmware reserves about 2 GiB at the top of physical memory for
+display scanout. Ordinary allocations never use it, and a text console takes
+only its framebuffer (8 MiB at 1920x1080). With
+SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 the worker moves the vocabulary-sized
+embedding and output-head weights into a DRM dumb buffer from that carve-out
+(exported as a dma-buf, imported with cuImportExternalMemory) right after
+loading, before kernel plans or graphs capture them, and returns their
+ordinary memory for the KV cache.
+
+Measured on GB10, the imported mapping streams at full speed but gives no
+reuse: sequential reads run at 235 GB/s and a 6-row GEMV over the 43K-row
+head runs 10% faster than from ordinary memory, while random 576-byte reads
+run at 7 GB/s against 221 GB/s and large-M GEMMs run 2.3x slower. Holding the
+KV cache there cost 8% at eight streams and in prefill, so only these
+read-once tables move. The worker refuses to start if the carve-out cannot
+hold them.
+---
+ tests/v1/worker/test_display_carveout.py |  73 ++++++++
+ vllm/v1/worker/display_carveout.py       | 223 +++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py       |   5 +
+ 3 files changed, 301 insertions(+)
+ create mode 100644 tests/v1/worker/test_display_carveout.py
+ create mode 100644 vllm/v1/worker/display_carveout.py
+
+diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
+new file mode 100644
+index 0000000000..b816ac810c
+--- /dev/null
++++ b/tests/v1/worker/test_display_carveout.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tests for the display carve-out weight placement (display_carveout.py)."""
++
++import ctypes
++import os
++
++import pytest
++import torch
++
++from vllm.v1.worker import display_carveout
++
++needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++
++class _Table(torch.nn.Module):
++    def __init__(self, rows: int, width: int, device: str):
++        super().__init__()
++        self.weight = torch.nn.Parameter(
++            torch.randn(rows, width, dtype=torch.bfloat16, device=device),
++            requires_grad=False,
++        )
++
++
++def _model(device: str) -> torch.nn.Module:
++    model = torch.nn.Module()
++    model.embed_tokens = _Table(8192, 4096, device)  # 64 MiB
++    model.lm_head = _Table(8192, 4096, device)
++    model.small = _Table(16, 64, device)
++    model.drafter = torch.nn.Module()
++    model.drafter.lm_head = model.lm_head  # aliased, like the DSpark drafter
++    return model
++
++
++@pytest.fixture
++def tables(monkeypatch):
++    monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
++
++
++def test_struct_layouts_match_cuda_h():
++    assert ctypes.sizeof(display_carveout._ExternalMemoryHandleDesc) == 104
++    assert ctypes.sizeof(display_carveout._ExternalMemoryBufferDesc) == 88
++    assert display_carveout._ExternalMemoryHandleDesc.size.offset == 24
++
++
++@needs_cuda
++def test_selects_large_tables_once(tables):
++    names = [name for name, _ in display_carveout.streamed_weights(_model("cuda"))]
++    assert names == ["embed_tokens.weight", "lm_head.weight"]
++
++
++@needs_cuda
++def test_missing_drm_node_refuses(tables, monkeypatch):
++    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
++    with pytest.raises(RuntimeError, match="display carve-out cannot hold"):
++        display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
++
++
++@needs_cuda
++@pytest.mark.skipif(
++    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
++)
++def test_relocation_preserves_values(tables):
++    model = _model("cuda")
++    before = {
++        name: weight.detach().clone() for name, weight in model.named_parameters()
++    }
++    head_ptr = model.lm_head.weight.data_ptr()
++    display_carveout.relocate_streamed_weights(model, torch.device("cuda"))
++    assert model.lm_head.weight.data_ptr() != head_ptr
++    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
++    for name, weight in model.named_parameters():
++        assert torch.equal(weight, before[name]), name
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+new file mode 100644
+index 0000000000..2a6775f79c
+--- /dev/null
++++ b/vllm/v1/worker/display_carveout.py
+@@ -0,0 +1,223 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Embedding and output-head weights in the GB10 display carve-out.
++
++DGX Spark firmware reserves about 2 GiB at the top of physical memory for
++display scanout surfaces (the DISPLAY_FRM carve-out). Linux and ordinary CUDA
++allocations never use it, so on a headless node it sits idle; a text console
++takes only its framebuffer (8 MiB at 1920x1080). nvidia-drm serves DRM dumb
++buffers from that carve-out, and a dumb buffer exported as a dma-buf and
++imported with ``cuImportExternalMemory`` is readable by kernels.
++
++Measured on GB10, the imported mapping streams at full speed (235 GB/s
++sequential reads; a 6-row GEMV over a 43K-row head runs 10% faster than from
++ordinary memory) but gives no reuse: random 576-byte reads run at 7 GB/s
++against 221 GB/s, and large-M GEMMs that re-read their weights run 2.3x
++slower. So only data read once per step belongs there. The embedding table
++(row lookups) and the output head (only ever multiplied by decode rows and
++prefill's sampled positions) qualify, while the KV cache, which attention
++gathers and re-reads, does not: holding it there cost 8% at eight streams.
++
++With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
++the carve-out right after loading, before any kernel plan or graph captures
++them, and returns their ordinary memory to the allocator for the KV cache. It
++refuses to start if the carve-out cannot hold them.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import fcntl
++import os
++import struct
++
++import torch
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
++
++logger = init_logger(__name__)
++
++_REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
++_DRM_NODE = "/dev/dri/card0"
++
++_DRM_IOCTL_MODE_CREATE_DUMB = 0xC02064B2
++_DRM_IOCTL_PRIME_HANDLE_TO_FD = 0xC00C642D
++_DUMB_WIDTH = 4096
++_DUMB_BPP = 32
++_ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
++_GRANULE = 16 << 20
++_ALIGN = 4096
++# Vocabulary-sized tables only; small embeddings stay where they are.
++_MIN_WEIGHT_BYTES = 64 << 20
++_CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
++
++
++class _Win32Handle(ctypes.Structure):
++    _fields_ = [("handle", ctypes.c_void_p), ("name", ctypes.c_void_p)]
++
++
++class _HandleUnion(ctypes.Union):
++    _fields_ = [
++        ("fd", ctypes.c_int),
++        ("win32", _Win32Handle),
++        ("nvSciBufObject", ctypes.c_void_p),
++    ]
++
++
++class _ExternalMemoryHandleDesc(ctypes.Structure):
++    _fields_ = [
++        ("type", ctypes.c_int),
++        ("handle", _HandleUnion),
++        ("size", ctypes.c_ulonglong),
++        ("flags", ctypes.c_uint),
++        ("reserved", ctypes.c_uint * 16),
++    ]
++
++
++class _ExternalMemoryBufferDesc(ctypes.Structure):
++    _fields_ = [
++        ("offset", ctypes.c_ulonglong),
++        ("size", ctypes.c_ulonglong),
++        ("flags", ctypes.c_uint),
++        ("reserved", ctypes.c_uint * 16),
++    ]
++
++
++class _Carveout:
++    """One dumb buffer imported into CUDA; alive for the whole process."""
++
++    def __init__(self, nbytes: int):
++        self.nbytes = nbytes
++        self.drm_fd = os.open(_DRM_NODE, os.O_RDWR | os.O_CLOEXEC)
++        request = bytearray(
++            struct.pack(
++                "IIIIIIQ", nbytes // _ROW_BYTES, _DUMB_WIDTH, _DUMB_BPP, 0, 0, 0, 0
++            )
++        )
++        fcntl.ioctl(self.drm_fd, _DRM_IOCTL_MODE_CREATE_DUMB, request)
++        _, _, _, _, self.handle, _, size = struct.unpack("IIIIIIQ", request)
++        if size != nbytes:
++            raise RuntimeError(
++                f"display carve-out returned {size} bytes, asked for {nbytes}"
++            )
++        prime = bytearray(struct.pack("IIi", self.handle, os.O_CLOEXEC | os.O_RDWR, -1))
++        fcntl.ioctl(self.drm_fd, _DRM_IOCTL_PRIME_HANDLE_TO_FD, prime)
++        self.dmabuf_fd = struct.unpack("IIi", prime)[2]
++
++        cuda = ctypes.CDLL("libcuda.so.1")
++        desc = _ExternalMemoryHandleDesc()
++        desc.type = _CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD
++        desc.handle.fd = self.dmabuf_fd
++        desc.size = nbytes
++        self.external = ctypes.c_void_p()
++        _check(
++            cuda,
++            cuda.cuImportExternalMemory(
++                ctypes.byref(self.external), ctypes.byref(desc)
++            ),
++            "cuImportExternalMemory",
++        )
++        buffer = _ExternalMemoryBufferDesc()
++        buffer.size = nbytes
++        self.pointer = ctypes.c_ulonglong()
++        _check(
++            cuda,
++            cuda.cuExternalMemoryGetMappedBuffer(
++                ctypes.byref(self.pointer), self.external, ctypes.byref(buffer)
++            ),
++            "cuExternalMemoryGetMappedBuffer",
++        )
++
++    @property
++    def __cuda_array_interface__(self):
++        return {
++            "shape": (self.nbytes,),
++            "typestr": "|i1",
++            "data": (self.pointer.value, False),
++            "version": 3,
++            "strides": None,
++        }
++
++
++def _check(cuda, status: int, what: str) -> None:
++    if status:
++        text = ctypes.c_char_p()
++        cuda.cuGetErrorString(status, ctypes.byref(text))
++        detail = text.value.decode() if text.value else status
++        raise RuntimeError(f"{what} failed: {detail}")
++
++
++_carveouts: list[_Carveout] = []
++
++
++def required() -> bool:
++    return _REQUIRED
++
++
++def _nbytes(tensor: torch.Tensor) -> int:
++    return tensor.numel() * tensor.element_size()
++
++
++def streamed_weights(model: torch.nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
++    """Vocabulary-sized embedding and output-head weights, deduplicated.
++
++    ``ParallelLMHead`` is a ``VocabParallelEmbedding``; a drafter that aliases
++    the target's modules shares their parameters, so each tensor appears once.
++    """
++    found: dict[int, tuple[str, torch.nn.Parameter]] = {}
++    for name, module in model.named_modules():
++        if not isinstance(module, VocabParallelEmbedding):
++            continue
++        weight = getattr(module, "weight", None)
++        if (
++            isinstance(weight, torch.nn.Parameter)
++            and weight.is_cuda
++            and weight.is_contiguous()
++            and _nbytes(weight) >= _MIN_WEIGHT_BYTES
++        ):
++            found.setdefault(weight.data_ptr(), (f"{name}.weight", weight))
++    return list(found.values())
++
++
++def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
++    """Move the embedding and output-head weights into the display carve-out."""
++    assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
++    assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
++    weights = streamed_weights(model)
++    if not weights:
++        raise RuntimeError(
++            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
++            "vocabulary-sized embedding or output-head weights"
++        )
++    spans = [-(-_nbytes(weight) // _ALIGN) * _ALIGN for _, weight in weights]
++    rounded = -(-sum(spans) // _GRANULE) * _GRANULE
++    torch.cuda.synchronize(device)
++    try:
++        carveout = _Carveout(rounded)
++    except OSError as error:
++        raise RuntimeError(
++            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
++            f"hold {rounded >> 20} MiB of weights ({_DRM_NODE}: {error})"
++        ) from error
++    _carveouts.append(carveout)
++    backing = torch.as_tensor(carveout, device=device)
++    assert backing.data_ptr() == carveout.pointer.value
++    free_before = torch.cuda.mem_get_info(device)[0]
++    offset = 0
++    for (_, weight), span in zip(weights, spans):
++        moved = backing[offset : offset + _nbytes(weight)].view(weight.dtype)
++        moved = moved.view(weight.shape)
++        moved.copy_(weight.data)
++        weight.data = moved
++        offset += span
++    torch.cuda.synchronize(device)
++    torch.cuda.empty_cache()
++    freed = torch.cuda.mem_get_info(device)[0] - free_before
++    logger.info(
++        "Display carve-out holds %.1f MiB of streamed weights (%s); "
++        "ordinary memory freed: %.1f MiB",
++        sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
++        ", ".join(name for name, _ in weights),
++        freed / (1 << 20),
++    )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 60e50aa63d..a75d9850db 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -87,6 +87,7 @@ from vllm.v1.watermarking.spec_decode import (
+     create_speculative_target_watermarker,
+     speculative_target_watermark_key,
+ )
++from vllm.v1.worker import display_carveout
+ from vllm.v1.worker.block_table import get_block_table_width
+ from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
+ from vllm.v1.worker.gpu import pcp_manager as pcp
+@@ -445,6 +446,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     eplb_models_added = self.eplb.maybe_register_speculator(
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
++            # Before any kernel plan or graph sees the weights; the drafter
++            # aliases the target's embedding and head, so both move together.
++            if display_carveout.required():
++                display_carveout.relocate_streamed_weights(self.model, self.device)
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+-- 
+2.54.0 (Apple Git-157)
+
