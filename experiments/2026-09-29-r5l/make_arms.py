@@ -7,7 +7,7 @@ from pathlib import Path
 E = Path("experiments/2026-09-29-r5l")
 TAG = "vllm-ds41f-kkref:04c30fa98e79-r5l"
 TREES = {
-    "local.spark3.vllm.tree": "d1886d36ab243dc6c886b4a9306b7f453e2174b9",
+    "local.spark3.vllm.tree": "3b024a40ac2daa12a742c35c629fbdc7b0bd6ea9",
     "local.spark3.b12x.tree": "640c8544b3242e858c962ad6de98febd8f74e8e3",
 }
 CACHE = "/cache/kkref/jit/vllm-r5l"

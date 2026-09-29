@@ -205,20 +205,25 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   positions for its own rows and all-gathers the selections before sparse
   MLA. The BF16 head-weight projection still runs on every row, because its
   GEMV rounds differently at another row count.
-  `SPARK3_DS41_INDEXER_SPLIT_CHECK=1` also runs the full-row indexer and logs
-  any row that differs (validation only). Output is unchanged. Upstream
-  status: candidate, not submitted.
+  `SPARK3_DS41_INDEXER_SPLIT_CHECK=1` also runs the full-row indexer twice and
+  logs how far the split's selections differ from the first run beside the
+  second run's spread (validation only): B12X's radix top-k keeps an arbitrary
+  subset of the positions tied at its threshold, so full-row runs differ too.
+  Selections are unchanged beyond those ties. Upstream status: candidate, not
+  submitted.
 
-- `0026-worker-display-carveout-integrity.patch` checksums the weights held in
-  the display carve-out before and after the copy, and from the first engine
-  step re-checks them on a side stream every
-  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` (default 300, 0 disables). A
+- `0026-worker-display-carveout-integrity.patch` adds an opt-in integrity
+  check of the weights held in the display carve-out. With
+  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` above 0 (unset or 0, the default,
+  turns it off) the worker checksums them before and after the copy and, from
+  the first engine step, re-checks them on a side stream at that interval. A
   mismatch, or a check that cannot run, is logged and stops the engine at its
-  next step, so a driver fault that moved the mapping cannot serve wrong
-  logits silently. Upstream status: Spark-specific, not for upstream.
+  next step, so a driver fault that reused the carve-out cannot serve wrong
+  logits silently. The configuration turns it on at 300 s; removal review due
+  2026-10-29 (`TODO.md`). Upstream status: Spark-specific, not for upstream.
 
-Applying 0001-0026 to the base yields patch head `62360ca4` and tree
-`d1886d36`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
+Applying 0001-0026 to the base yields patch head `80c2b66b` and tree
+`3b024a40`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
 `9ba14ba1`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`

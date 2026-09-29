@@ -6,6 +6,11 @@ set -euo pipefail
 cd ~/projects/spark3-vllm-ds41f
 TAG=vllm-ds41f-kkref:04c30fa98e79-r5l
 log() { echo "$(date -u +%FT%TZ) $*"; }
+# Refuse before stopping anything: bin/spark3 build never overwrites a tag.
+if docker image inspect "$TAG" >/dev/null 2>&1; then
+  log "$TAG already exists; remove it or pick a new tag"
+  exit 1
+fi
 for config in config/cluster.json experiments/2026-09-29-r5l/cluster-*.json \
     experiments/2026-09-29-indexer-split/cluster-*.json experiments/2026-09-29-r5k/cluster-*.json; do
   bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true

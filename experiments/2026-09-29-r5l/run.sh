@@ -24,9 +24,11 @@ start() {
   bin/spark3 --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
 }
 start candidate-check
+# On dgx3: beside rank 0 and the API server, dgx1 leaves a second CUDA process
+# too little memory for the tests' 64 MiB tables.
 T=/opt/spark3/candidate/vllm/tests/v1/worker
-docker exec -w /tmp dsv41-karmic-kraken python3 -m pytest -q -p no:cacheprovider --confcutdir=$T \
-  $T/test_display_carveout.py 2>&1 | tail -3 | tee "$out/carveout-tests.txt"
+ssh -n dgx3 docker exec -w /tmp dsv41-karmic-kraken python3 -m pytest -q -p no:cacheprovider \
+  --confcutdir=$T $T/test_display_carveout.py 2>&1 | tail -3 | tee "$out/carveout-tests.txt"
 python3 experiments/2026-09-29-indexer-split/capture_depth.py http://10.0.1.71:8000 --rounds 1 --background 4 \
   | tee "$out/check-depth.jsonl"
 log "check capture exit ${PIPESTATUS[0]}"
