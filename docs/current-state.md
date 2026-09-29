@@ -17,7 +17,7 @@ and running on all three nodes from `config/cluster.json`.
 | Prefill sequence parallelism | from 205 tokens, where the reduce-scatter exceeds the one-shot RoCE all-reduce; CED encoder layers (patches 0014-0018) |
 | Explicit KV memory | 2.2 GiB per rank |
 | Reported KV capacity | 1,348,708 tokens (5.14x full 256K windows) |
-| Display carve-out | embedding and output-head weights (842.5 MiB per rank) in the firmware scanout reserve (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
+| Display carve-out | embedding and output-head weights (842.5 MiB per rank) in the firmware scanout reserve (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse-attention arithmetic | B12X's tuned choice (`VLLM_DS41_ATTENTION_COMPUTE=auto`); BF16 (patch 0023) is available and off pending a fidelity test |
 | Image input | vision tower loaded, up to 4 images per request, no host preprocessing cache |
 | DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts, NVFP4 drafter head and Markov projection |

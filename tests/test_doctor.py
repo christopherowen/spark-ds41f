@@ -79,6 +79,7 @@ class BootOrderTest(unittest.TestCase):
 FAN_WORKING = (
     "modeset=Y\n"
     "fbdev=Y\n"
+    "drm_card=0\n"
     "drm_masters=\n"
     "console=tty1:0\n"
     "cmdline_splash=0\n"
@@ -231,6 +232,14 @@ class IdleServicesTest(unittest.TestCase):
 
 class SeverityTest(unittest.TestCase):
     """Required capabilities are errors; latent or minor findings are warnings."""
+
+    def test_missing_nvidia_card_is_an_error(self) -> None:
+        self.assertEqual(spark3.drm_card_problems("dgx3", facts()), [])
+        self.assertEqual(spark3.drm_card_problems("dgx3", facts(drm_card="1")), [])
+        problems = spark3.drm_card_problems("dgx3", facts(drm_card=""))
+        self.assertEqual(len(problems), 1)
+        self.assertNotIsInstance(problems[0], spark3.Warn)
+        self.assertIn("display carve-out cannot be allocated", problems[0])
 
     def test_required_display_pieces_are_errors(self) -> None:
         for problems in (

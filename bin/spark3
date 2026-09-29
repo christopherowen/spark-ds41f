@@ -423,7 +423,12 @@ printf 'modeset=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/modeset 
 printf 'fbdev=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
 printf 'cmdline_splash=%s\\n' "$(grep -cw splash /proc/cmdline)"
 printf 'grub_splash=%s\\n' "$(sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg 2>/dev/null | grep -cw splash)"
-clients=/sys/kernel/debug/dri/0/clients
+card=""
+for entry in /sys/class/drm/card[0-9]*; do
+  [ "$(basename "$(readlink "$entry/device/driver")")" = nvidia ] && card=${entry##*/card}
+done
+printf 'drm_card=%s\\n' "$card"
+clients=/sys/kernel/debug/dri/$card/clients
 if sudo -n test -r "$clients"; then
   printf 'drm_masters=%s\\n' "$(sudo -n cat "$clients" | awk 'NR > 1 && $4 == "y" {print $1 "/" $2}' | paste -sd, -)"
 else
@@ -499,6 +504,23 @@ def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     ]
 
 
+def drm_card_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when no DRM card belongs to the nvidia driver.
+
+    The display carve-out (vLLM patch 0021) allocates through that card, which
+    the container receives by its PCI path
+    (/dev/dri/by-path/pci-000f:01:00.0-card): a node that boots with a display
+    attached registers simpledrm first, so the GPU can be card1 there.
+    """
+    if facts.get("drm_card"):
+        return []
+    return [
+        f"{node_name}: no DRM card belongs to the nvidia driver, so the display "
+        "carve-out cannot be allocated; check that nvidia-drm is loaded with "
+        "modeset=Y (ls -l /dev/dri/by-path)"
+    ]
+
+
 def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     """Problems when a userspace process holds DRM master.
 
@@ -511,7 +533,10 @@ def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         return []
     if value == "unreadable":
         return [
-            Warn(f"{node_name}: cannot read the DRM clients (/sys/kernel/debug/dri/0/clients)")
+            Warn(
+                f"{node_name}: cannot read the DRM clients "
+                "(/sys/kernel/debug/dri/<card>/clients)"
+            )
         ]
     return [
         f"{node_name}: {value} holds DRM master, so the text console cannot draw; stop "
@@ -724,6 +749,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         facts = host_facts(remote_shell(nodes, node, HOST_FACTS_QUERY).stdout)
         problems.extend(modeset_problems(node["name"], facts))
         problems.extend(fbdev_problems(node["name"], facts))
+        problems.extend(drm_card_problems(node["name"], facts))
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))
