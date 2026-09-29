@@ -171,6 +171,7 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   weights. Output unchanged (bit-identical copies); inert without the
   variable. Tests: `tests/v1/worker/test_display_carveout.py`. Upstream
   status: candidate, not submitted.
+  Prior art: coolbho3k (emihuang) discovered that the headless GB10 display reserve is usable from CUDA and published it first, in [coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark](https://github.com/coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark) `878e0ee` (2026-09-17) and an [NVIDIA forum post](https://forums.developer.nvidia.com/t/383583/1). That approach registers the mapped DRM display buffer with `cuMemHostRegister(DEVICEMAP | IOMEMORY)` to back KV cache. This patch imports the buffer as a dma-buf instead (235 against 164 GB/s here) and closes the DRM file so the console keeps drawing.
 
 - `0022-deepseek-v41-decode-metadata-graph-memory.patch` backports Local
   Inference Lab `ce4be0a112`: decode sparse-MLA page metadata is an ordinary

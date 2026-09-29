@@ -6,6 +6,10 @@
 **Goal:** use the memory the firmware reserves for a display, which every
 node leaves idle, to hold more KV cache, while keeping a text console.
 
+## Prior art
+
+coolbho3k (emihuang) discovered that the headless GB10 display reserve is usable from CUDA and published it first, in [coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark](https://github.com/coolbho3k/DeepSeek-v4.1-Flash-2x-DGX-Spark) `878e0ee` (2026-09-17) and an [NVIDIA forum post](https://forums.developer.nvidia.com/t/383583/1). That approach registers the mapped DRM display buffer with `cuMemHostRegister(DEVICEMAP | IOMEMORY)` to back KV cache. jspark3 v1.8.0 later adopted that code (credited in its third-party notices), and jontaylor/gb10-ram-reclaim hands the region to Linux instead. This experiment measured both access paths and places read-once weights there rather than KV (see below).
+
 ## The carve-out
 
 The firmware reserves 2.10 GiB at the top of physical memory on every node
