@@ -165,13 +165,40 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   plans or graphs capture the weights. Their ordinary memory (842.5 MiB per
   rank) returns to the allocator for the KV cache. The mapping streams at full
   speed but gives no reuse, so only these read-once tables move; the KV cache
-  in the carve-out cost 8% at eight streams. The worker refuses to start if
-  the carve-out cannot hold them. Output unchanged (bit-identical copies);
-  inert without the variable. Tests: `tests/v1/worker/test_display_carveout.py`.
-  Upstream status: candidate, not submitted.
+  in the carve-out cost 8% at eight streams. The DRM file closes right after
+  the export, so the worker never keeps DRM master and the text console keeps
+  drawing. The worker refuses to start if the carve-out cannot hold the
+  weights. Output unchanged (bit-identical copies); inert without the
+  variable. Tests: `tests/v1/worker/test_display_carveout.py`. Upstream
+  status: candidate, not submitted.
 
-Applying 0001-0021 to the base yields patch head `2d0d714c` and tree
-`19270e20`.
+- `0022-deepseek-v41-decode-metadata-graph-memory.patch` backports Local
+  Inference Lab `ce4be0a112`: decode sparse-MLA page metadata is an ordinary
+  graph-pool activation instead of a per-graph capture resource, so graphs no
+  longer each pin a copy sized by the context limit. Bit-exact. Upstream
+  status: in integration/karmic-kraken-beta.
+
+- `0023-deepseek-v41-bf16-sparse-attention.patch` backports the attention half
+  of Local Inference Lab `40371c7bb0`: V4.1 sparse attention uses BF16
+  arithmetic by default instead of B12X's FP8 internals (about 3% relative
+  error against DeepSeek's reference `sparse_attn`);
+  `VLLM_DS41_ATTENTION_COMPUTE=auto` restores the tuner's choice and
+  `=reference` also runs decode rows single-pass. Output moves toward the
+  reference. The FP32 output-head default from the same commit is not carried.
+  Upstream status: in integration/karmic-kraken-beta.
+
+- `0024-deepseek-v41-compressor-ring-decode.patch` makes the ratio-2
+  compressor ring receive its partial state during decode. The ring's
+  `CircularBufferSpec` takes no slot-mapping row, and the metadata builder
+  dropped every row without a slot, so nothing was saved and steps starting
+  at an odd position read a zeroed predecessor. Ring rows now take validity
+  from the request range, position and block. Output moves toward the
+  prefill result for tokens generated during decode. Upstream status:
+  candidate, not submitted (upstream `706428761` changes the block-table
+  mapping but not this check).
+
+Applying 0001-0024 to the base yields patch head `59d1113b` and tree
+`9ba14ba1`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`
 and tree `17f5431d`. 0001-0017, the r5g image, give patch head `6151f609` and tree

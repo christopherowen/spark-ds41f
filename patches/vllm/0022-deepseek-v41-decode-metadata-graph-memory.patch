@@ -1,0 +1,65 @@
+From dc6c5b396511c0c717a5db3f763e32f0d0862386 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:11:29 +0200
+Subject: [PATCH] perf(deepseek-v4.1): share decode page metadata across CUDA
+ graphs
+
+Backport of Local Inference Lab ce4be0a112 (integration/karmic-kraken-beta).
+Decode attention computes its sparse-MLA page metadata once per KV-cache
+group per forward, and those tensors were registered as graph capture
+resources, so every captured graph pinned a private copy whose size scales
+with the context limit. Every replay rewrites the metadata before reading
+it, so the graph pool can reuse one allocation across graph shapes. Output
+is bit-exact; the saving grows with --max-model-len.
+---
+ vllm/models/deepseek_v4_1/attention.py | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 271c872e71..75a9823897 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1513,13 +1513,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+         metadata_specs = self._attention_workspace_specs[mode]
+-        buffers = current_workspace_manager().get_simultaneous(
++        arena = current_workspace_manager().get_simultaneous(
+             *metadata_specs,
+             *((spec.shape, spec.dtype) for spec in state.scratch_plan.scratch_specs()),
+         )
++        buffers = arena
+         metadata_count = len(metadata_specs)
+         # Decode layers sharing cache groups map identical pages, so the first
+         # layer of each group keeps its metadata for the rest of the forward.
++        # Every replay rewrites it before use, so it is an ordinary graph-pool
++        # activation: retaining it would pin one copy per captured graph.
+         if mode == "decode":
+             key = (
+                 id(swa),
+@@ -1537,10 +1540,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     torch.empty(shape, dtype=dtype, device=q.device)
+                     for shape, dtype in metadata_specs
+                 )
+-                retain_cuda_graph_capture_resource(metadata_buffers)
+                 self._write_decode_metadata(metadata_buffers, swa, main, rows)
+                 entry = shared[key] = (swa, main, metadata_buffers)
+-            buffers = [*entry[2], *buffers[metadata_count:]]
++            buffers = [*entry[2], *arena[metadata_count:]]
+         else:
+             self._write_decode_metadata(buffers, swa, main, rows)
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+@@ -1559,8 +1561,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             swa_lengths=swa_lengths[:rows],
+             **kwargs,
+         )
+-        # Keep scratch and metadata, not aliases of the transient query storage.
+-        retain_cuda_graph_capture_resource(buffers)
++        # Keep the borrowed arena, not aliases of the transient query storage.
++        retain_cuda_graph_capture_resource(arena)
+         mla.run(
+             binding=binding,
+             swa_k_cache=self.swa_cache_layer.kv_cache,
+-- 
+2.54.0 (Apple Git-157)
+

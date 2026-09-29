@@ -1,7 +1,9 @@
 # B12X patch stack
 
-Base: `local-inference-lab/b12x@e39b437bf7d5c6784fbee8dc7e87073dde753445`
-(`integration/karmic-kraken-beta`), which contains upstream correctness commit
+Base: `local-inference-lab/b12x@f8069b2c0be1311df3b112591c6b8876a843f8be`
+(`integration/karmic-kraken-beta`, #435: the V4.1 FP4 KV writer divides like
+DeepSeek's reference quantizer, `aef9df3c`), which also contains upstream
+correctness commit
 `02407f65`, concurrent Engram table reads (`run_lookups`, `6e2090bc`) and the
 CuTe compile-cache integrity check (#418, `2fca4df8`).
 
@@ -17,8 +19,8 @@ CuTe compile-cache integrity check (#418, `2fca4df8`).
   the vLLM nightly base installs and vLLM and quack-kernels require (4.7.0 and
   4.7.1 add features and fix bugs without API removals). Holding 4.6.2 had
   broken quack-kernels, which disabled vLLM's DS4.1 L2 weight prefetch at
-  startup. 0001-0002 on the base yield patch head `bbd69d16` and tree
-  `ec4cced9`.
+  startup. 0001-0002 on the base yield patch head `7409da7a` and tree
+  `640c8544` (on the r5j base `e39b437b`: `bbd69d16`, `ec4cced9`).
 
 Not in the series: the W4A8 tiny-decode `swiglu_limit` fix
 (`experiments/2026-09-23-karmic-kraken-reference/patches/b12x/0002-tiny-decode-swiglu-limit.patch`)

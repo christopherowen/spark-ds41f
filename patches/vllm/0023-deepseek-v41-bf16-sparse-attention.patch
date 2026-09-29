@@ -1,0 +1,151 @@
+From ee9e56f8d942101ac1ef75100ed47e34e2b495e8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:11:29 +0200
+Subject: [PATCH] fix(deepseek-v4.1): BF16 sparse-attention arithmetic by
+ default
+
+Backport of the attention half of Local Inference Lab 40371c7bb0. B12X's V4.1
+attention tuner may pick FP8 internals (Q and P quantized, the cache
+re-encoded to FP8), about 3% relative error against DeepSeek's reference
+sparse_attn. VLLM_DS41_ATTENTION_COMPUTE pins BF16 arithmetic by default;
+=reference also runs decode rows single-pass (bit-exact with the reference
+kernel) and =auto keeps the tuner's choice. The FP32 output-head default from
+the same upstream commit is not carried.
+---
+ vllm/envs.py                           | 13 ++++++
+ vllm/models/deepseek_v4_1/attention.py | 57 +++++++++++++++-----------
+ 2 files changed, 47 insertions(+), 23 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 1eee6d9e20..8052fb1d50 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -212,6 +212,7 @@ if TYPE_CHECKING:
+     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+     VLLM_DS41_MARKOV_NVFP4: bool = False
+     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
++    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+@@ -1753,6 +1754,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DS41_DRAFT_NVFP4_HEAD": lambda: bool(
+         int(os.getenv("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"))
+     ),
++    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
++    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
++    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
++    # decode rows single-pass, which reproduces the reference kernel's
++    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
++    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
++    # re-encoded; about 3% relative error) or BF16 per plan.
++    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
++        "VLLM_DS41_ATTENTION_COMPUTE",
++        "bf16",
++        ["bf16", "reference", "auto"],
++    ),
+     # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 75a9823897..84c36a4509 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -14,6 +14,7 @@ from b12x.attention.compressed_sparse_mla import rotary, weight_scale
+ from b12x.gemm import wo_projection
+ from torch import nn
+ 
++from vllm import envs
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import CacheConfig
+ from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+@@ -676,10 +677,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         )
+         self._attention_workspace_specs = {}
+         self._attention_declarations = {}
++        compute = envs.VLLM_DS41_ATTENTION_COMPUTE
+         for mode, capacity in (
+             ("decode", min(self.capacity, decode_rows)),
+             ("extend", self.capacity),
+         ):
++            # "reference" gives decode rows the single-pass kernel as well.
++            kernel_mode = "extend" if compute == "reference" else mode
+             caps = mla.Caps(
+                 device=device,
+                 num_q_heads=self.n_local_heads,
+@@ -690,12 +694,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 swa_page_size=self.swa_cache_layer.block_size,
+                 indexed_page_size=self._main_page,
+                 max_page_table_width=self._main_width,
+-                mode=mode,
++                mode=kernel_mode,
+                 # DSpark's two-span reservation can exceed the generic
+                 # 256-row cutoff even when replaying a six-row C1 graph.
+                 # Keep the entire reserved decode capacity on its decode
+                 # split contract; prefill retains its separate plan.
+-                decode_row_capacity=capacity if mode == "decode" else None,
++                decode_row_capacity=capacity if kernel_mode == "decode" else None,
+                 cache_format="deepseek_v41",
+                 use_cuda_graph=True,
+             )
+@@ -705,29 +709,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 if self.compress_ratio
+                 else None
+             )
+-            declaration = mla.plan(
+-                caps,
+-                invocation=mla.invocation_from_descriptors(
+-                    q={
+-                        "shape": (capacity, self.n_local_heads, 512),
+-                        "stride": (self.n_local_heads * 512, 512, 1),
+-                        "alignment": 16,
+-                        "dtype": "bfloat16",
+-                    },
+-                    swa_cache=descriptor(
+-                        swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
+-                    ),
+-                    indexed_cache=(
+-                        descriptor(
+-                            indexed_cache, page_size=self._main_page, kind="indexed"
+-                        )
+-                        if self.compress_ratio
+-                        else None
+-                    ),
+-                    attn_sink_present=True,
+-                    output_mode="provided",
++            invocation = mla.invocation_from_descriptors(
++                q={
++                    "shape": (capacity, self.n_local_heads, 512),
++                    "stride": (self.n_local_heads * 512, 512, 1),
++                    "alignment": 16,
++                    "dtype": "bfloat16",
++                },
++                swa_cache=descriptor(
++                    swa_cache, page_size=self.swa_cache_layer.block_size, kind="swa"
+                 ),
++                indexed_cache=(
++                    descriptor(indexed_cache, page_size=self._main_page, kind="indexed")
++                    if self.compress_ratio
++                    else None
++                ),
++                attn_sink_present=True,
++                output_mode="provided",
+             )
++            declaration = mla.plan(caps, invocation=invocation)
++            if compute != "auto":
++                # Pin BF16 arithmetic; the split/single-pass lowering stays the
++                # plan's own default for this query.
++                default = declaration.contract.default_config(declaration.query, None)
++                declaration = mla.plan(
++                    caps,
++                    invocation=invocation,
++                    override=replace(
++                        default, v41_compute_mode="bf16", v41_heads_per_block=16
++                    ),
++                )
+             metadata_specs = (
+                 ((capacity, self.swa_width), torch.int32),
+                 ((capacity,), torch.int32),
+-- 
+2.54.0 (Apple Git-157)
+

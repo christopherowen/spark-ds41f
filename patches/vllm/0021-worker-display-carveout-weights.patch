@@ -1,4 +1,4 @@
-From aabc6d540b9430d406f979c8355acc64fedf2b77 Mon Sep 17 00:00:00 2001
+From 0a76939e747d1c6f6d18259192166f1ff6df5bba Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 08:34:44 +0200
 Subject: [PATCH] feat(worker): keep embedding and output-head weights in the
@@ -21,25 +21,26 @@ KV cache there cost 8% at eight streams and in prefill, so only these
 read-once tables move. The worker refuses to start if the carve-out cannot
 hold them.
 ---
- tests/v1/worker/test_display_carveout.py |  73 ++++++++
- vllm/v1/worker/display_carveout.py       | 223 +++++++++++++++++++++++
+ tests/v1/worker/test_display_carveout.py |  78 ++++++++
+ vllm/v1/worker/display_carveout.py       | 232 +++++++++++++++++++++++
  vllm/v1/worker/gpu/model_runner.py       |   5 +
- 3 files changed, 301 insertions(+)
+ 3 files changed, 315 insertions(+)
  create mode 100644 tests/v1/worker/test_display_carveout.py
  create mode 100644 vllm/v1/worker/display_carveout.py
 
 diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
 new file mode 100644
-index 0000000000..b816ac810c
+index 0000000000..f6e695b1e2
 --- /dev/null
 +++ b/tests/v1/worker/test_display_carveout.py
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,78 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Tests for the display carve-out weight placement (display_carveout.py)."""
 +
 +import ctypes
 +import os
++import pathlib
 +
 +import pytest
 +import torch
@@ -107,12 +108,16 @@ index 0000000000..b816ac810c
 +    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
 +    for name, weight in model.named_parameters():
 +        assert torch.equal(weight, before[name]), name
++    # No DRM file stays open, so the worker never keeps DRM master (which would
++    # stop the kernel's framebuffer console from drawing).
++    fds = pathlib.Path("/proc/self/fd")
++    assert not [fd for fd in fds.iterdir() if os.path.realpath(fd) == "/dev/dri/card0"]
 diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
 new file mode 100644
-index 0000000000..2a6775f79c
+index 0000000000..ea4ee73d21
 --- /dev/null
 +++ b/vllm/v1/worker/display_carveout.py
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,232 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Embedding and output-head weights in the GB10 display carve-out.
@@ -200,25 +205,34 @@ index 0000000000..2a6775f79c
 +
 +
 +class _Carveout:
-+    """One dumb buffer imported into CUDA; alive for the whole process."""
++    """One dumb buffer imported into CUDA; alive for the whole process.
++
++    The DRM file is held only while creating and exporting the buffer: the
++    first opener of a card with no display server becomes DRM master, and the
++    kernel's framebuffer console stops drawing while a userspace master exists.
++    The exported dma-buf keeps the buffer alive after the file closes.
++    """
 +
 +    def __init__(self, nbytes: int):
 +        self.nbytes = nbytes
-+        self.drm_fd = os.open(_DRM_NODE, os.O_RDWR | os.O_CLOEXEC)
-+        request = bytearray(
-+            struct.pack(
-+                "IIIIIIQ", nbytes // _ROW_BYTES, _DUMB_WIDTH, _DUMB_BPP, 0, 0, 0, 0
++        drm_fd = os.open(_DRM_NODE, os.O_RDWR | os.O_CLOEXEC)
++        try:
++            request = bytearray(
++                struct.pack(
++                    "IIIIIIQ", nbytes // _ROW_BYTES, _DUMB_WIDTH, _DUMB_BPP, 0, 0, 0, 0
++                )
 +            )
-+        )
-+        fcntl.ioctl(self.drm_fd, _DRM_IOCTL_MODE_CREATE_DUMB, request)
-+        _, _, _, _, self.handle, _, size = struct.unpack("IIIIIIQ", request)
-+        if size != nbytes:
-+            raise RuntimeError(
-+                f"display carve-out returned {size} bytes, asked for {nbytes}"
-+            )
-+        prime = bytearray(struct.pack("IIi", self.handle, os.O_CLOEXEC | os.O_RDWR, -1))
-+        fcntl.ioctl(self.drm_fd, _DRM_IOCTL_PRIME_HANDLE_TO_FD, prime)
-+        self.dmabuf_fd = struct.unpack("IIi", prime)[2]
++            fcntl.ioctl(drm_fd, _DRM_IOCTL_MODE_CREATE_DUMB, request)
++            _, _, _, _, handle, _, size = struct.unpack("IIIIIIQ", request)
++            if size != nbytes:
++                raise RuntimeError(
++                    f"display carve-out returned {size} bytes, asked for {nbytes}"
++                )
++            prime = bytearray(struct.pack("IIi", handle, os.O_CLOEXEC | os.O_RDWR, -1))
++            fcntl.ioctl(drm_fd, _DRM_IOCTL_PRIME_HANDLE_TO_FD, prime)
++            self.dmabuf_fd = struct.unpack("IIi", prime)[2]
++        finally:
++            os.close(drm_fd)
 +
 +        cuda = ctypes.CDLL("libcuda.so.1")
 +        desc = _ExternalMemoryHandleDesc()
