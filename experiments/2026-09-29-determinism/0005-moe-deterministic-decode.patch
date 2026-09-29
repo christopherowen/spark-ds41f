@@ -1,0 +1,106 @@
+From 3b17ed266913447cb0f7e2b717ebc2b4db72c276 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 23:00:30 +0200
+Subject: [PATCH] perf(moe): keep the W4A8 decode regime for deterministic
+ output
+
+A deterministic request excluded the shared-input W4A8 decode regime, and
+with it direct routing, so decode launches fell back to grouped routing with
+per-route input quantization: DeepSeek V4.1 Flash decode steps grew 12-14%.
+
+Every piece of that regime already has a deterministic form. The routing
+front-end records the token-major pair index, materialized phase 1 recovers
+the token for the shared input, phase 2 stores each (pair, column) location
+once instead of scattering it with BF16 atomics, and the fixed-order top-k sum
+reduces the routes. Admit deterministic output in the decode-regime predicate
+so deterministic launches use the same kernels as atomic ones.
+---
+ b12x/moe/fused_moe/_impl.py                 |  9 +++++++--
+ tests/preparation/test_tuning_predicates.py | 20 ++++++++------------
+ 2 files changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index 927aefb8..b4944ebc 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -1874,7 +1874,13 @@ def _w4a8_dynamic_decode_candidate(
+     deterministic_output: bool,
+     planned_tile_m: int | None = None,
+ ) -> bool:
+-    """Whether prepared W4A8 should use its shared-input decode regime."""
++    """Whether prepared W4A8 should use its shared-input decode regime.
++
++    Deterministic output is admitted: the routing front-end records token-major
++    pair indices, phase 1 recovers the token for the shared input, phase 2
++    stores each (pair, column) location once, and the fixed-order top-k sum
++    reduces them, whether routes are grouped or direct.
++    """
+ 
+     return bool(
+         _normalize_quant_mode(quant_mode) == "w4a8_mx"
+@@ -1890,7 +1896,6 @@ def _w4a8_dynamic_decode_candidate(
+         )
+         == (16, 128)
+         and _dynamic_work_source() != "ready_queue"
+-        and not deterministic_output
+     )
+ 
+ 
+diff --git a/tests/preparation/test_tuning_predicates.py b/tests/preparation/test_tuning_predicates.py
+index 219d58b4..14d9ff37 100644
+--- a/tests/preparation/test_tuning_predicates.py
++++ b/tests/preparation/test_tuning_predicates.py
+@@ -785,20 +785,20 @@ def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability)
+ 
+ 
+ @pytest.mark.parametrize("tiny_decode", ("1", "0"))
+-@pytest.mark.parametrize("tokens", (1, 4, 5))
+-def test_deterministic_request_plans_fixed_order_route_reduction(
++@pytest.mark.parametrize("tokens", (1, 4, 5, 6))
++def test_deterministic_request_keeps_the_w4a8_decode_plan(
+     monkeypatch, tokens, tiny_decode
+ ):
+     from b12x.moe.fused_moe import _tuning as component
+     from b12x.moe.fused_moe._impl import _heuristic_moe_decode_config
+ 
+     monkeypatch.setenv("B12X_W4A8_TINY_DECODE", tiny_decode)
+-
+     _, original = _contract_and_query(
+         "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
+     )
+-    # DeepSeek V4.1 Flash at TP3: tiny decode below five tokens, direct routing
+-    # through 32 routed rows, both of which scatter routes with atomics.
++    # DeepSeek V4.1 Flash at TP3. Tiny decode (below five tokens) scatters
++    # routes with atomics and has no deterministic form; the dynamic decode
++    # regime, direct or grouped, stores routes for the fixed-order top-k sum.
+     query = replace(
+         original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
+         source_format="fp4_e8m0_k32", num_experts=384, hidden_size=5120,
+@@ -807,21 +807,17 @@ def test_deterministic_request_plans_fixed_order_route_reduction(
+         w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
+     )
+     device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
++    route = "direct" if tokens <= 5 else "grouped"
+     atomic = _heuristic_moe_decode_config(query, device)
+     assert (atomic.backend, atomic.dynamic_route_mode) == (
+-        ("micro", None) if tokens <= 4 and tiny_decode == "1" else ("dynamic", "direct")
++        ("micro", None) if tokens <= 4 and tiny_decode == "1" else ("dynamic", route)
+     )
+     deterministic = replace(query, deterministic_output=True)
+     config = _heuristic_moe_decode_config(deterministic, device)
+-    assert (config.backend, config.dynamic_route_mode) == ("dynamic", "grouped")
++    assert (config.backend, config.dynamic_route_mode) == ("dynamic", route)
+     component._materialize_tuning(
+         deterministic, device, component.TUNING.encode_config(config)
+     )
+-    direct = component.TUNING.encode_config(replace(config, dynamic_route_mode="direct"))
+-    if atomic.backend == "dynamic":
+-        component._materialize_tuning(query, device, direct)
+-    with pytest.raises(ValueError, match="direct routing"):
+-        component._materialize_tuning(deterministic, device, direct)
+ 
+ 
+ def test_planned_deterministic_output_matches_launch_resolution(monkeypatch):
+-- 
+2.54.0 (Apple Git-157)
+

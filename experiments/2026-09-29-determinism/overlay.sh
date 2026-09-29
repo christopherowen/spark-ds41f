@@ -1,8 +1,9 @@
 #!/bin/bash
 # usage: overlay.sh   (on dgx1, deployment checkout)
-# Applies the B12X series (r5m tree 35299956) and this experiment's 0004 in a
-# throwaway worktree, checks both trees, and copies the three patched MoE
-# planning modules to ~/spark3-overlay/det-planning on every node.
+# Applies the B12X series (r5m tree 35299956), then this experiment's 0004 and
+# 0005, in a throwaway worktree, checks each tree, and copies the patched MoE
+# planning modules to every node: ~/spark3-overlay/det-planning (0004) and
+# ~/spark3-overlay/det-decode (0004 and 0005).
 set -eu
 cd ~/projects/spark3-vllm-ds41f
 E=$PWD/experiments/2026-09-29-determinism
@@ -24,16 +25,22 @@ done
 [ "$(git -C "$T" rev-parse HEAD^{tree})" = 35299956ce4954b71a7bc3b0529e3c6417fa975f ]
 apply "$E/0004-moe-deterministic-planning.patch"
 [ "$(git -C "$T" rev-parse HEAD^{tree})" = 66d62dc5f8894717540803cf34153c5ec48e26ab ]
-rm -rf "$O"
-for f in $FILES; do
-  mkdir -p "$O/$(dirname $f)"
-  cp "$T/$f" "$O/$f"
-done
-for host in dgx2 dgx3; do
-  ssh "$host" "rm -rf $O && mkdir -p ~/spark3-overlay"
-  tar cf - -C ~/spark3-overlay det-planning | ssh "$host" "tar xf - -C ~/spark3-overlay"
-done
-for host in dgx1 dgx2 dgx3; do
-  ssh "$host" "cd $O && sha256sum $FILES"
-done
-echo "overlay written from B12X tree 66d62dc5 to $O on dgx1-3"
+write() {
+  rm -rf "$1"
+  for f in $FILES; do
+    mkdir -p "$1/$(dirname $f)"
+    cp "$T/$f" "$1/$f"
+  done
+  for host in dgx2 dgx3; do
+    ssh "$host" "rm -rf $1 && mkdir -p ~/spark3-overlay"
+    tar cf - -C ~/spark3-overlay "$(basename $1)" | ssh "$host" "tar xf - -C ~/spark3-overlay"
+  done
+  for host in dgx1 dgx2 dgx3; do
+    ssh "$host" "cd $1 && sha256sum $FILES"
+  done
+}
+write "$O"
+apply "$E/0005-moe-deterministic-decode.patch"
+[ "$(git -C "$T" rev-parse HEAD^{tree})" = f422b9110ed29c900e8c9e7254fed65ec3773024 ]
+write ~/spark3-overlay/det-decode
+echo "overlays written from B12X trees 66d62dc5 (det-planning) and f422b911 (det-decode) on dgx1-3"

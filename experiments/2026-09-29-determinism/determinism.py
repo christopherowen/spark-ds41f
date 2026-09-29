@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Where do identical temperature-0 requests start to differ?
 
-usage: determinism.py BASE_URL [--repeats N] [--tokens N] [--shared-cache]
+usage: determinism.py BASE_URL [--repeats N] [--tokens N] [--shared-cache] [--save PATH]
 
 Each prompt is sent N times at one stream with the same parameters. By default
 every request gets a fresh cache salt, so each run prefills the whole prompt the
 same way; --shared-cache reuses one salt (later runs hit the prefix cache).
 Per prompt it reports distinct outputs, the first token index where each run
 departs from run 0, and the largest chosen-token logprob difference before that
-point (0 means bit-identical logits up to the flip).
+point (0 means bit-identical logits up to the flip). --save writes run 0's
+tokens and logprobs per prompt, for comparing arms with each other.
 """
 import json
 import sys
@@ -25,6 +26,7 @@ def option(name, default):
 REPEATS = option("--repeats", 5)
 TOKENS = option("--tokens", 256)
 SHARED = "--shared-cache" in sys.argv
+SAVE = sys.argv[sys.argv.index("--save") + 1] if "--save" in sys.argv else None
 PROMPTS = {
     "prose": "Explain in a few paragraphs why the sky is blue at noon and red at sunset.",
     "code": "Write a Python function that merges overlapping intervals, with a docstring and tests.",
@@ -52,10 +54,12 @@ with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     model = json.load(response)["data"][0]["id"]
 shared_salt = uuid.uuid4().hex
 report = {}
+saved = {}
 for name, prompt in PROMPTS.items():
     runs = [request(model, prompt, shared_salt if SHARED else uuid.uuid4().hex)
             for _ in range(REPEATS)]
     base = runs[0]
+    saved[name] = base
     rows = []
     for index, run in enumerate(runs[1:], start=1):
         first = next((i for i, (a, b) in enumerate(zip(base, run)) if a[0] != b[0]),
@@ -71,3 +75,6 @@ for name, prompt in PROMPTS.items():
     distinct = len({tuple(t for t, _, _ in run) for run in runs})
     report[name] = {"distinct": f"{distinct}/{REPEATS}", "length": len(base), "runs": rows}
     print(json.dumps({name: report[name]}), flush=True)
+if SAVE:
+    with open(SAVE, "w") as handle:
+        json.dump(saved, handle)

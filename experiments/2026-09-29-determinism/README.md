@@ -43,6 +43,38 @@ patched planning modules mounted over the image (`overlay.sh`):
 changed token, first logprob difference), one round of prefill chunk timings,
 and a lean decode screen.
 
-## Results
+## Round 1 (`run.sh`)
+
+Determinism probe, five identical requests per prompt:
+
+| Arm | Distinct outputs | First logprob difference |
+|---|---|---|
+| r5m | 5/5, 5/5, 5/5 | token 0 in every run |
+| det | 5/5, 5/5, 5/5 | token 1 (prose, code), 3 (JSON) |
+| detsk | 1/5, 1/5, 1/5 | none, except one code run at token 227 (same token) |
+
+So the routed-MoE combine made prefill irreproducible and split-K turbo made
+decode irreproducible; with both in a fixed order, outputs repeat.
+
+Cost against r5m in the same session:
+
+| Arm | Prefill chunk, 8K-200K | Decode step at one stream (prose, JSON) | Eight streams (prose, JSON) |
+|---|---|---|---|
+| r5m | 1032-1158 ms | 41.6, 48.0 ms | 171, 238 tok/s |
+| det | +0.2 to +0.6% | 46.4, 54.8 ms | 145, 210 tok/s |
+| detsk | 0.0 to +0.4% | 45.7, 54.4 ms | 143, 212 tok/s |
+
+The decode loss is not the reduction: B12X's decode-regime predicate rejected
+deterministic output, so decode fell back to grouped routing without the
+shared-input decode kernels. Split-K turbo off added nothing measurable.
+
+## Round 2 (`run2.sh`)
+
+`0005-moe-deterministic-decode.patch` admits deterministic output in the W4A8
+decode regime: the front-end already records pair indices, phase 1 recovers
+the token for the shared input and phase 2 stores each route once, so
+deterministic launches use the same kernels as atomic ones plus the
+fixed-order top-k sum. Arms `detfast` (0004+0005, split-K through the FP32
+reducer) and `detfast-t` (split-K turbo kept); decode alternates with r5m.
 
 Pending.
