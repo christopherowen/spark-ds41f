@@ -1,0 +1,352 @@
+From d85dfb6201e75d7b95c9c88c5c76e7640fcda7fa Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 16:20:00 +0200
+Subject: [PATCH] perf(deepseek-v4.1): split the indexer's rows across ranks in
+ SP prefill
+
+Sequence-parallel prefill gathers every row before attention, and the
+indexer is replicated: each TP rank projected, scored and selected the same
+top-k positions for every row of the chunk. Scoring grows with context
+depth. On one 4,096-token chunk at TP 3 it took 36 ms at 8K of context and
+342 ms at 200K, 25% of the chunk and all of its growth with depth.
+
+Under SP each rank now builds index queries and selects positions only for
+its own rows (SPRows.start to start + real_rows), then all-gathers the
+selected positions into the shared top-k buffer before sparse MLA. Rows are
+independent, so the selection is unchanged. Candidate-source outputs stay
+rank-local: the later candidate layers read only the same rank's rows.
+Decode and non-SP forwards keep the full-row path.
+
+SPARK3_DS41_INDEXER_SPLIT_CHECK=1 additionally runs the full-row indexer
+under SP and logs any row whose split selection or candidates differ.
+---
+ vllm/models/deepseek_v4_1/attention.py | 269 +++++++++++++++++--------
+ 1 file changed, 189 insertions(+), 80 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 84c36a4509..0f7210703f 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -3,6 +3,7 @@
+ """V4.1 Full/Reindex/Reuse topology with native b12x compute only."""
+ 
+ import math
++import os
+ from dataclasses import replace
+ from typing import cast
+ 
+@@ -19,6 +20,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import CacheConfig
+ from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import (
+     ColumnParallelLinear,
+@@ -58,6 +60,12 @@ from vllm.v1.worker.workspace import (
+     retain_cuda_graph_capture_resource,
+ )
+ 
++logger = init_logger(__name__)
++
++# Validation only: under a sequence-parallel indexer split, every rank also runs
++# the full-row indexer and compares its own rows with the split result.
++_INDEX_SPLIT_CHECK = os.environ.get("SPARK3_DS41_INDEXER_SPLIT_CHECK") == "1"
++
+ 
+ def _source(prefix, layer):
+     return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
+@@ -1378,41 +1386,102 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 self._prepare_global_kv(positions, hidden_states)
+             index_query = None
+             if self.indexer is not None:
+-                h = self.indexer.heads
+-                iq = self.indexer.wq_b(qr).view(rows, h, 128)
+-                iq = _rotated(
+-                    iq,
+-                    positions,
+-                    self.rotary_emb.cos_sin_cache,
+-                    plan=self._helper_plan("index_query"),
++                # Sequence-parallel prefill: the indexer is replicated, so each
++                # rank scores and selects only its own rows, and forward_mqa
++                # gathers the selected positions. Every row is independent.
++                split = sp_rows if sp_rows is not None and not swa.is_decode else None
++                first = split.start if split is not None else 0
++                last = first + split.real_rows if split is not None else rows
++                query = self._index_query(
++                    qr, positions, hidden_states, index_weights, first, last, swa
+                 )
+-                iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=q.device)
+-                iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=q.device)
+-                index_mode = "decode" if swa.is_decode else "prefill"
+-                chunk_rows = self.DECODE_CHUNK if swa.is_decode else self.INDEX_CHUNK
+-                for offset in range(0, rows, chunk_rows):
+-                    end = min(offset + chunk_rows, rows)
+-                    dsa_indexer.quantize_q_mxfp4(
+-                        self._index_plan(index_mode, end - offset),
+-                        iq[offset:end],
+-                        q_mxfp4=iq_data[offset:end],
+-                        q_scales=iq_scale[offset:end],
++                reference = None
++                if split is not None and _INDEX_SPLIT_CHECK:
++                    reference = self._index_query(
++                        qr, positions, hidden_states, index_weights, 0, rows, swa
+                     )
+-                weights = (
+-                    index_weights
+-                    if index_weights is not None
+-                    else self.indexer.weights_proj(hidden_states)
+-                )
+-                iw = torch.empty_like(weights)
+-                weight_scale.scale_index_weights(
+-                    weights,
+-                    out=iw,
+-                    plan=self._helper_plan("index_weights"),
+-                )
+-                index_query = (iq_data, iq_scale, iw)
++                index_query = (*query, split, reference)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
+         return self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
+ 
++    def _index_query(
++        self, qr, positions, hidden_states, index_weights, first, last, swa
++    ):
++        """MXFP4 index queries and scaled head weights for rows [first, last)."""
++        rows = last - first
++        h = self.indexer.heads
++        iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
++        iq = _rotated(
++            iq,
++            positions[first:last],
++            self.rotary_emb.cos_sin_cache,
++            plan=self._helper_plan("index_query"),
++        )
++        iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
++        iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
++        index_mode = "decode" if swa.is_decode else "prefill"
++        chunk_rows = self.DECODE_CHUNK if swa.is_decode else self.INDEX_CHUNK
++        for offset in range(0, rows, chunk_rows):
++            end = min(offset + chunk_rows, rows)
++            dsa_indexer.quantize_q_mxfp4(
++                self._index_plan(index_mode, end - offset),
++                iq[offset:end],
++                q_mxfp4=iq_data[offset:end],
++                q_scales=iq_scale[offset:end],
++            )
++        weights = (
++            index_weights[first:last]
++            if index_weights is not None
++            else self.indexer.weights_proj(hidden_states[first:last])
++        )
++        iw = torch.empty_like(weights)
++        weight_scale.scale_index_weights(
++            weights,
++            out=iw,
++            plan=self._helper_plan("index_weights"),
++        )
++        return iq_data, iq_scale, iw
++
++    def _check_index_split(self, split, selected, expected, expected_candidates):
++        """Compare this rank's split selection with the full-row indexer."""
++        real = split.real_rows
++        rows = slice(split.start, split.start + real)
++        bad = int((selected[:real] != expected).any(dim=-1).sum())
++        bad_candidates = 0
++        if expected_candidates is not None:
++            candidates, lengths = expected_candidates
++            bad_candidates = int(
++                (
++                    (self._candidates[rows] != candidates).any(dim=-1)
++                    | (self._candidate_lens[rows] != lengths)
++                ).sum()
++            )
++        checks = getattr(self, "_split_checks", 0) + 1
++        self._split_checks = checks
++        if bad or bad_candidates:
++            logger.warning(
++                "DeepSeek V4.1 indexer split check: layer %d rank %d rows %d-%d of "
++                "%d: %d top-k rows and %d candidate rows differ from the full indexer",
++                self.layer_id,
++                split.rank,
++                rows.start,
++                rows.stop,
++                split.num_tokens,
++                bad,
++                bad_candidates,
++            )
++        elif checks == 1 or checks % 50 == 0:
++            logger.info(
++                "DeepSeek V4.1 indexer split check: layer %d rank %d, %d forwards "
++                "match the full indexer (last: rows %d-%d of %d)",
++                self.layer_id,
++                split.rank,
++                checks,
++                rows.start,
++                rows.stop,
++                split.num_tokens,
++            )
++
+     @eager_break_during_capture
+     def forward_mqa(self, q, kv, positions, output, *, index_query=None):
+         metadata = get_forward_context().attn_metadata
+@@ -1443,7 +1512,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         # survive in the source-owned buffer until their reuse interval ends.
+         if self.indexer is not None:
+             index_mode = "decode" if mode == "decode" else "prefill"
+-            iq_data, iq_scale, iw = index_query
++            *query, split, reference = index_query
+             im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
+             score_width = None
+             if (
+@@ -1467,59 +1536,99 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 chunk_rows = self._short_index_shape[0]
+                 index_pages = self._short_index_pages
+             index_width = index_pages.shape[1]
+-            for offset in range(0, rows, chunk_rows):
+-                end = min(offset + chunk_rows, rows)
+-                count = end - offset
+-                _pages[(count, triton.cdiv(index_width, 128))](
+-                    im.req_id_per_token,
+-                    im.block_table,
+-                    index_pages,
+-                    offset,
+-                    im.block_table.stride(0),
+-                    min(im.block_table.shape[1], index_width),
+-                    index_width,
+-                    128,
+-                )
+-                candidate_args = {}
+-                if self.layer_id == self.candidate_source_layer:
+-                    candidate_args = dict(
+-                        candidate_output=self._candidates[offset:end],
+-                        candidate_output_lengths=self._candidate_lens[offset:end],
+-                    )
+-                elif self.layer_id > self.candidate_source_layer:
+-                    source = self._context[
+-                        _source(self.prefix, self.candidate_source_layer)
+-                    ]
+-                    candidate_args = dict(
+-                        candidate_indices=source._candidates[offset:end],
+-                        candidate_lengths=source._candidate_lens[offset:end],
++
++            def select_rows(query, first, selected):
++                # Query rows start at global row `first`; metadata and
++                # candidates are indexed by global row, `selected` by query row.
++                iq_data, iq_scale, iw = query
++                index_rows = iq_data.shape[0]
++                for offset in range(0, index_rows, chunk_rows):
++                    end = min(offset + chunk_rows, index_rows)
++                    count = end - offset
++                    row, row_end = first + offset, first + end
++                    _pages[(count, triton.cdiv(index_width, 128))](
++                        im.req_id_per_token,
++                        im.block_table,
++                        index_pages,
++                        row,
++                        im.block_table.stride(0),
++                        min(im.block_table.shape[1], index_width),
++                        index_width,
++                        128,
+                     )
+-                index_plan = self._index_plan(index_mode, count)
+-                scratch = current_workspace_manager().get_simultaneous(
+-                    *(
+-                        (spec.shape, spec.dtype)
+-                        for spec in dsa_indexer.scratch_specs(
+-                            index_plan, device=iq_data.device
++                    candidate_args = {}
++                    if self.layer_id == self.candidate_source_layer:
++                        candidate_args = dict(
++                            candidate_output=self._candidates[row:row_end],
++                            candidate_output_lengths=self._candidate_lens[row:row_end],
++                        )
++                    elif self.layer_id > self.candidate_source_layer:
++                        source = self._context[
++                            _source(self.prefix, self.candidate_source_layer)
++                        ]
++                        candidate_args = dict(
++                            candidate_indices=source._candidates[row:row_end],
++                            candidate_lengths=source._candidate_lens[row:row_end],
++                        )
++                    index_plan = self._index_plan(index_mode, count)
++                    scratch = current_workspace_manager().get_simultaneous(
++                        *(
++                            (spec.shape, spec.dtype)
++                            for spec in dsa_indexer.scratch_specs(
++                                index_plan, device=iq_data.device
++                            )
+                         )
+                     )
++                    binding = dsa_indexer.bind(
++                        index_plan,
++                        scratch=scratch,
++                        q_mxfp4=iq_data[offset:end],
++                        q_scales=iq_scale[offset:end],
++                        query_weights=iw[offset:end],
++                        index_k_cache=self.indexer.k_cache.kv_cache,
++                        page_table=index_pages[:count],
++                        cache_lengths=im.cache_lengths[row:row_end],
++                        active_width=self._active,
++                        score_width=score_width,
++                        output_indices=selected[offset:end],
++                        **candidate_args,
++                    )
++                    retain_cuda_graph_capture_resource(scratch)
++                    dsa_indexer.score(binding)
++                    dsa_indexer.select(binding)
++
++            if split is None:
++                select_rows(query, 0, self.topk_indices_buffer)
++            else:
++                real = split.real_rows
++                local = slice(split.start, split.start + real)
++                selected = torch.empty(
++                    (split.local_rows, 512), dtype=torch.int32, device=q.device
+                 )
+-                binding = dsa_indexer.bind(
+-                    index_plan,
+-                    scratch=scratch,
+-                    q_mxfp4=iq_data[offset:end],
+-                    q_scales=iq_scale[offset:end],
+-                    query_weights=iw[offset:end],
+-                    index_k_cache=self.indexer.k_cache.kv_cache,
+-                    page_table=index_pages[:count],
+-                    cache_lengths=im.cache_lengths[offset:end],
+-                    active_width=self._active,
+-                    score_width=score_width,
+-                    output_indices=self.topk_indices_buffer[offset:end],
+-                    **candidate_args,
+-                )
+-                retain_cuda_graph_capture_resource(scratch)
+-                dsa_indexer.score(binding)
+-                dsa_indexer.select(binding)
++                owns_candidates = self.layer_id == self.candidate_source_layer
++                expected = expected_candidates = None
++                if reference is not None:
++                    # Sentinels make unwritten rows visible to the comparison.
++                    self.topk_indices_buffer[:rows].fill_(-2)
++                    if owns_candidates:
++                        self._candidates[:rows].fill_(-2)
++                        self._candidate_lens[:rows].fill_(-2)
++                    select_rows(reference, 0, self.topk_indices_buffer)
++                    expected = self.topk_indices_buffer[local].clone()
++                    selected.fill_(-2)
++                    if owns_candidates:
++                        expected_candidates = (
++                            self._candidates[local].clone(),
++                            self._candidate_lens[local].clone(),
++                        )
++                        self._candidates[local].fill_(-2)
++                        self._candidate_lens[local].fill_(-2)
++                select_rows(query, split.start, selected)
++                if reference is not None:
++                    self._check_index_split(
++                        split, selected, expected, expected_candidates
++                    )
++                self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+-- 
+2.54.0 (Apple Git-157)
+

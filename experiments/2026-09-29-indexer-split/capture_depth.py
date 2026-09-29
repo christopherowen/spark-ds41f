@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Time, then profile, one 4,096-token prefill chunk at several context depths.
 
-usage: capture_depth.py BASE_URL [--profile]   (a DeepSeek V4.1 arm must be serving)
+usage: capture_depth.py BASE_URL [--profile] [--rounds N] [--background N]
+(a DeepSeek V4.1 arm must be serving)
 
 One real-text document is tokenized once. For each round and depth D, a request
 with a fresh cache salt prefills the document's first D - 4096 tokens, and a
@@ -12,12 +13,17 @@ its measured requests, so the profiler window of the last round (--profile)
 holds only the measured chunks, in depth order. Server-side prefill time comes
 from vllm:request_prefill_time_seconds, so the frontend's handling of a long
 token list does not count.
+
+--background N keeps N short-prompt generations decoding throughout, so the
+sequence-parallel forwards also carry other requests' decode rows (for
+correctness checks; the timings then include them).
 """
 import importlib.machinery
 import importlib.util
 import json
 import re
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -31,9 +37,16 @@ loader.exec_module(spark3)
 
 BASE = sys.argv[1].rstrip("/")
 PROFILE = "--profile" in sys.argv[2:]
+
+
+def option(name, default):
+    return int(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+
 CHUNK = 4096
 DEPTHS = (8192, 65536, 131072, 200704)
-ROUNDS = 3
+ROUNDS = option("--rounds", 3)
+BACKGROUND = option("--background", 0)
 
 
 def post(path, body=None):
@@ -60,6 +73,21 @@ with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
 tokens = post("/tokenize", {"model": model, "prompt": spark3.source_text(215_000, 29)})["tokens"]
 assert len(tokens) >= DEPTHS[-1], f"document has only {len(tokens)} tokens"
 print(f"document {len(tokens)} tokens", flush=True)
+done = threading.Event()
+
+
+def background(seed):
+    prompt = spark3.source_text(600, seed) + "\n\nSummarize the code above in detail."
+    while not done.is_set():
+        post("/v1/completions", {"model": model, "prompt": prompt, "max_tokens": 1500,
+                                 "temperature": 0, "ignore_eos": True,
+                                 "cache_salt": uuid.uuid4().hex})
+
+
+workers = [threading.Thread(target=background, args=(300 + i,), daemon=True)
+           for i in range(BACKGROUND)]
+for worker in workers:
+    worker.start()
 for round_ in range(ROUNDS):
     profiled = PROFILE and round_ == ROUNDS - 1
     salts = {depth: uuid.uuid4().hex for depth in DEPTHS}
@@ -80,3 +108,4 @@ for round_ in range(ROUNDS):
                           "client_ms": round(1000 * client, 1)}), flush=True)
     if profiled:
         post("/stop_profile")
+done.set()
