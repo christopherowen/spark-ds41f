@@ -245,9 +245,12 @@ new = old + (
     "  2's rows, about 5 of 512 positions each (at most 36;\n"
     "  `experiments/2026-09-29-r5l`, `check_summary.py`). Tied positions carry equal\n"
     "  scores, but the choice changes which keys attention reads and likely explains\n"
-    "  temperature-0 outputs differing between identical requests. A deterministic\n"
-    "  tie-break (lowest position) in the threshold bucket would make runs\n"
-    "  reproducible; check its cost on the 200K chunk.\n"
+    "  temperature-0 outputs differing between identical requests. The technical\n"
+    "  report sets no tie rule; DeepSeek's reference (`inference/model.py`,\n"
+    "  `torch.topk`) is repeatable, and dgpp (docs/inspiration.md) pins exact ties\n"
+    "  to the lower index with a composite (score, index) key inside an exact radix\n"
+    "  select. Adopt the same rule in B12X's threshold bucket if it costs nothing on\n"
+    "  the 200K chunk.\n"
 )
 assert old in text
 text = text.replace(old, new, 1)

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Summarize SPARK3_DS41_INDEXER_SPLIT_CHECK logs; exit 1 if the split fails.
 
-usage: check_summary.py LOG...   (docker logs lines from candidate-check)
+usage: check_summary.py [--exact] LOG...   (docker logs lines from candidate-check)
 
 Per layer: forwards checked, rows compared, and positions that differ from the
 first full-row run, for the split and for a second full-row run. The radix
 top-k keeps an arbitrary subset of the positions tied at its threshold, so the
 second run measures the spread the split may show. The split fails on any
 unwritten row or changed candidate list, on any difference in a layer whose
-full-row runs agree, or on more than twice the full-row spread.
+full-row runs agree, or on more than twice the full-row spread. With --exact
+(a top-k that breaks ties deterministically) any difference fails.
 """
 import re
 import sys
@@ -20,8 +21,9 @@ LINE = re.compile(
     r"full vs full (\d+) rows, (\d+) positions \(max (\d+)\); "
     r"(\d+) unwritten rows; (\d+) candidate rows differ"
 )
+EXACT = "--exact" in sys.argv[1:]
 totals = defaultdict(lambda: defaultdict(int))
-for path in sys.argv[1:]:
+for path in [arg for arg in sys.argv[1:] if arg != "--exact"]:
     for line in open(path, errors="replace"):
         match = LINE.search(line)
         if not match:
@@ -50,6 +52,7 @@ for layer in sorted(totals):
         or t["candidates"]
         or (t["repeat_positions"] == 0 and t["split_positions"] > 0)
         or t["split_positions"] > 2 * t["repeat_positions"]
+        or (EXACT and (t["split_positions"] or t["repeat_positions"]))
     )
     failed |= bool(bad)
     print(
