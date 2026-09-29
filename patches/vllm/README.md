@@ -217,8 +217,8 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   next step, so a driver fault that moved the mapping cannot serve wrong
   logits silently. Upstream status: Spark-specific, not for upstream.
 
-Applying 0001-0026 to the base yields patch head `97de3474` and tree
-`66293624`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
+Applying 0001-0026 to the base yields patch head `62360ca4` and tree
+`d1886d36`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
 `9ba14ba1`.
 Applying 0001-0020 to the base yields patch head `58bff2b1` and tree
 `bf8910a6`. 0001-0019, the r5h and r5i images, give patch head `c42e75cf`

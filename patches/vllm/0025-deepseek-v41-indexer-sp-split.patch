@@ -1,4 +1,4 @@
-From 6c8d3a96bc5b18b507815392928ec4c0ac275831 Mon Sep 17 00:00:00 2001
+From 3d3c56a5bd270f26b13bd649c0718c7561f31c48 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 16:20:00 +0200
 Subject: [PATCH 1/2] perf(deepseek-v4.1): split the indexer's rows across
@@ -21,13 +21,16 @@ the later candidate layers read only the same rank's rows. Decode and non-SP
 forwards keep the full-row path.
 
 SPARK3_DS41_INDEXER_SPLIT_CHECK=1 additionally runs the full-row indexer
-under SP and logs any row whose split selection or candidates differ.
+twice under SP and logs, per layer, how far the split's selections differ
+from the first run beside how far the second run does: the radix top-k keeps
+an arbitrary subset of the positions tied at its threshold, so full-row runs
+differ too. Unwritten rows and changed candidate lists are warnings.
 ---
- vllm/models/deepseek_v4_1/attention.py | 281 ++++++++++++++++++-------
- 1 file changed, 201 insertions(+), 80 deletions(-)
+ vllm/models/deepseek_v4_1/attention.py | 305 ++++++++++++++++++-------
+ 1 file changed, 225 insertions(+), 80 deletions(-)
 
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 84c36a4509..1ee3e9378a 100644
+index 84c36a4509..86ffd89daf 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -3,6 +3,7 @@
@@ -53,13 +56,13 @@ index 84c36a4509..1ee3e9378a 100644
 +logger = init_logger(__name__)
 +
 +# Validation only: under a sequence-parallel indexer split, every rank also runs
-+# the full-row indexer and compares its own rows with the split result.
++# the full-row indexer twice and compares its own rows with the split result.
 +_INDEX_SPLIT_CHECK = os.environ.get("SPARK3_DS41_INDEXER_SPLIT_CHECK") == "1"
 +
  
  def _source(prefix, layer):
      return re.sub(r"(layers\.)\d+", rf"\g<1>{layer}", prefix)
-@@ -1378,41 +1386,114 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1378,41 +1386,131 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  self._prepare_global_kv(positions, hidden_states)
              index_query = None
              if self.indexer is not None:
@@ -152,17 +155,42 @@ index 84c36a4509..1ee3e9378a 100644
 +        )
 +        return iq_data, iq_scale, iw
 +
-+    def _check_index_split(self, split, selected, expected, expected_candidates):
-+        """Compare this rank's split selection with the full-row indexer."""
++    @staticmethod
++    def _selection_spread(actual, expected):
++        """Rows whose selected positions differ, and positions absent from `expected`.
++
++        Unused slots (-1) are ignored; only real positions count.
++        """
++        actual = actual.sort(dim=-1).values
++        expected = expected.sort(dim=-1).values
++        where = torch.searchsorted(expected, actual).clamp_max(expected.shape[-1] - 1)
++        missing = ((expected.gather(-1, where) != actual) & (actual >= 0)).sum(dim=-1)
++        return (
++            int((missing > 0).sum()),
++            int(missing.sum()),
++            int(missing.max()) if missing.numel() else 0,
++        )
++
++    def _check_index_split(
++        self, split, selected, expected, repeat, expected_candidates
++    ):
++        """Compare this rank's split selection with the full-row indexer.
++
++        The radix top-k keeps an arbitrary subset of the positions tied at its
++        threshold, so two full-row runs can differ; `repeat` is a second run
++        and measures that spread. The split passes when it differs from the
++        first run no more than that, writes every row, and leaves the
++        candidate lists unchanged.
++        """
 +        real = split.real_rows
 +        rows = slice(split.start, split.start + real)
 +        actual = selected[:real]
-+        bad = int((actual != expected).any(dim=-1).sum())
-+        # Rows whose selected sets differ, ignoring the order of positions.
-+        bad_sets = int(
-+            (actual.sort(dim=-1).values != expected.sort(dim=-1).values)
-+            .any(dim=-1)
-+            .sum()
++        unwritten = int((actual == -2).any(dim=-1).sum())
++        split_rows, split_positions, split_max = self._selection_spread(
++            actual, expected
++        )
++        repeat_rows, repeat_positions, repeat_max = self._selection_spread(
++            repeat, expected
 +        )
 +        bad_candidates = 0
 +        if expected_candidates is not None:
@@ -173,38 +201,30 @@ index 84c36a4509..1ee3e9378a 100644
 +                    | (self._candidate_lens[rows] != lengths)
 +                ).sum()
 +            )
-+        checks = getattr(self, "_split_checks", 0) + 1
-+        self._split_checks = checks
-+        if bad or bad_candidates:
-+            logger.warning(
-+                "DeepSeek V4.1 indexer split check: layer %d rank %d rows %d-%d of "
-+                "%d: %d top-k rows (%d as sets) and %d candidate rows differ from "
-+                "the full indexer",
-+                self.layer_id,
-+                split.rank,
-+                rows.start,
-+                rows.stop,
-+                split.num_tokens,
-+                bad,
-+                bad_sets,
-+                bad_candidates,
-+            )
-+        elif checks == 1 or checks % 50 == 0:
-+            logger.info(
-+                "DeepSeek V4.1 indexer split check: layer %d rank %d, %d forwards "
-+                "match the full indexer (last: rows %d-%d of %d)",
-+                self.layer_id,
-+                split.rank,
-+                checks,
-+                rows.start,
-+                rows.stop,
-+                split.num_tokens,
-+            )
++        log = logger.warning if unwritten or bad_candidates else logger.info
++        log(
++            "DeepSeek V4.1 indexer split check: layer %d rank %d rows %d-%d of %d: "
++            "split vs full %d rows, %d positions (max %d); full vs full %d rows, "
++            "%d positions (max %d); %d unwritten rows; %d candidate rows differ",
++            self.layer_id,
++            split.rank,
++            rows.start,
++            rows.stop,
++            split.num_tokens,
++            split_rows,
++            split_positions,
++            split_max,
++            repeat_rows,
++            repeat_positions,
++            repeat_max,
++            unwritten,
++            bad_candidates,
++        )
 +
      @eager_break_during_capture
      def forward_mqa(self, q, kv, positions, output, *, index_query=None):
          metadata = get_forward_context().attn_metadata
-@@ -1443,7 +1524,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1443,7 +1541,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
          # survive in the source-owned buffer until their reuse interval ends.
          if self.indexer is not None:
              index_mode = "decode" if mode == "decode" else "prefill"
@@ -213,7 +233,7 @@ index 84c36a4509..1ee3e9378a 100644
              im = self._query_metadata(metadata[self.indexer.k_cache.prefix])
              score_width = None
              if (
-@@ -1467,59 +1548,99 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+@@ -1467,59 +1565,106 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                  chunk_rows = self._short_index_shape[0]
                  index_pages = self._short_index_pages
              index_width = index_pages.shape[1]
@@ -336,7 +356,7 @@ index 84c36a4509..1ee3e9378a 100644
 -                dsa_indexer.score(binding)
 -                dsa_indexer.select(binding)
 +                owns_candidates = self.layer_id == self.candidate_source_layer
-+                expected = expected_candidates = None
++                expected = repeat = expected_candidates = None
 +                if reference is not None:
 +                    # Sentinels make unwritten rows visible to the comparison.
 +                    self.topk_indices_buffer[:rows].fill_(-2)
@@ -345,18 +365,25 @@ index 84c36a4509..1ee3e9378a 100644
 +                        self._candidate_lens[:rows].fill_(-2)
 +                    select_rows(reference, 0, self.topk_indices_buffer)
 +                    expected = self.topk_indices_buffer[local].clone()
-+                    selected.fill_(-2)
 +                    if owns_candidates:
 +                        expected_candidates = (
 +                            self._candidates[local].clone(),
 +                            self._candidate_lens[local].clone(),
 +                        )
++                    # A second full-row run measures the top-k's own spread.
++                    repeat = torch.full(
++                        (rows, 512), -2, dtype=torch.int32, device=q.device
++                    )
++                    select_rows(reference, 0, repeat)
++                    repeat = repeat[local]
++                    selected.fill_(-2)
++                    if owns_candidates:
 +                        self._candidates[local].fill_(-2)
 +                        self._candidate_lens[local].fill_(-2)
 +                select_rows(query, split.start, selected)
 +                if reference is not None:
 +                    self._check_index_split(
-+                        split, selected, expected, expected_candidates
++                        split, selected, expected, repeat, expected_candidates
 +                    )
 +                self.topk_indices_buffer[:rows].copy_(split.gather(selected))
  

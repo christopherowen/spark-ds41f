@@ -2,8 +2,8 @@
 # usage: run.sh   (on dgx1, deployment checkout at this experiment's commit, after build.sh)
 # 1. candidate-check: the carve-out unit tests inside the running image, then
 #    capture_depth.py with four background decode streams. Every rank compares
-#    its split indexer rows with the full-row indexer; any differing row, or a
-#    node without a passed carve-out check, stops the run here.
+#    its split indexer rows with two full-row runs; a failed check_summary.py
+#    verdict, or a node without a passed carve-out check, stops the run here.
 # 2. candidate: the reference bench, real-text prefill to 200K and the needle
 #    check. The candidate stays up.
 set -uo pipefail
@@ -24,23 +24,24 @@ start() {
   bin/spark3 --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
 }
 start candidate-check
-docker cp -q "$HOME/projects/spark3-vllm-ds41f/.work/upstreams/vllm/tests/v1/worker/test_display_carveout.py" \
-  dsv41-karmic-kraken:/tmp/test_display_carveout.py 2>/dev/null
-docker exec -w /tmp dsv41-karmic-kraken python3 -m pytest -q -p no:cacheprovider /tmp/test_display_carveout.py 2>&1 \
-  | tail -3 | tee "$out/carveout-tests.txt"
+T=/opt/spark3/candidate/vllm/tests/v1/worker
+docker exec -w /tmp dsv41-karmic-kraken python3 -m pytest -q -p no:cacheprovider --confcutdir=$T \
+  $T/test_display_carveout.py 2>&1 | tail -3 | tee "$out/carveout-tests.txt"
 python3 experiments/2026-09-29-indexer-split/capture_depth.py http://10.0.1.71:8000 --rounds 1 --background 4 \
   | tee "$out/check-depth.jsonl"
 log "check capture exit ${PIPESTATUS[0]}"
 sleep 70  # at least one more carve-out check on every node
-bad=0
 for n in dgx1 dgx2 dgx3; do
   ssh -n "$n" "docker logs dsv41-karmic-kraken 2>&1 | grep -E 'indexer split check|Display carve-out' > /tmp/r5l-check-\$(hostname).log; true"
   scp -q "$n:/tmp/r5l-check-$n.log" "$out/check-$n.log"
-  match=$(grep -c 'match the full' "$out/check-$n.log")
-  differ=$(grep -c 'differ from the full' "$out/check-$n.log")
+done
+bad=0
+python3 $E/check_summary.py "$out"/check-dgx*.log | tee "$out/check-summary.txt"
+[ "${PIPESTATUS[0]}" = 0 ] || bad=1
+for n in dgx1 dgx2 dgx3; do
   carve=$(grep -c 'Display carve-out integrity check .* passed' "$out/check-$n.log")
-  echo "$n: $match matching reports, $differ differing reports, $carve carve-out checks passed" | tee -a "$out/check-summary.txt"
-  if [ "$differ" != 0 ] || [ "$carve" = 0 ]; then bad=1; fi
+  echo "$n: $carve carve-out checks passed" | tee -a "$out/check-summary.txt"
+  [ "$carve" = 0 ] && bad=1
 done
 if [ "$bad" != 0 ]; then log "check failed; stopping before the candidate"; exit 1; fi
 start candidate
