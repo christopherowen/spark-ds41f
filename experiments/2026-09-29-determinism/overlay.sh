@@ -1,9 +1,10 @@
 #!/bin/bash
 # usage: overlay.sh   (on dgx1, deployment checkout)
-# Applies the B12X series (r5m tree 35299956), then this experiment's 0004 and
-# 0005, in a throwaway worktree, checks each tree, and copies the patched MoE
-# planning modules to every node: ~/spark3-overlay/det-planning (0004) and
-# ~/spark3-overlay/det-decode (0004 and 0005).
+# Applies the B12X series (r5m tree 35299956), then this experiment's 0004,
+# 0005 and 0006, in a throwaway worktree, checks each tree, and copies the
+# patched MoE modules to every node: ~/spark3-overlay/det-planning (0004),
+# det-decode (0004-0005) and det-slices (0004-0006, with the kernel, its SiLU
+# wrapper and the two patched test files).
 set -eu
 cd ~/projects/spark3-vllm-ds41f
 E=$PWD/experiments/2026-09-29-determinism
@@ -43,4 +44,9 @@ write "$O"
 apply "$E/0005-moe-deterministic-decode.patch"
 [ "$(git -C "$T" rev-parse HEAD^{tree})" = f422b9110ed29c900e8c9e7254fed65ec3773024 ]
 write ~/spark3-overlay/det-decode
-echo "overlays written from B12X trees 66d62dc5 (det-planning) and f422b911 (det-decode) on dgx1-3"
+apply "$E/0006-moe-deterministic-slice-partials.patch"
+[ "$(git -C "$T" rev-parse HEAD^{tree})" = 44709de4b96dd6134cf14e9a9bcc838aa6c22d83 ]
+FILES="$FILES b12x/moe/_shared/kernels/dynamic.py b12x/moe/_shared/kernels/silu.py
+  tests/moe/test_w4a8_migration_corpus.py tests/preparation/test_tuning_predicates.py"
+write ~/spark3-overlay/det-slices
+echo "overlays written from B12X trees 66d62dc5 (det-planning), f422b911 (det-decode) and 44709de4 (det-slices) on dgx1-3"

@@ -1,0 +1,524 @@
+From c3eefe3832276228b4ed7aa168bd24fd20b1fba1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 00:22:41 +0200
+Subject: [PATCH] perf(moe): deterministic fused decode keeps one task per
+ slice
+
+Deterministic output made the fused dynamic kernel collapse every N128
+intermediate slice of an M tile into one task and accumulate the slices into
+the route row by read-modify-write. The atomic path runs one task per slice
+and adds each FC2 partial atomically, so at decode (tens of routed rows, a
+few M tiles) the collapse left most of the resident grid idle: DeepSeek V4.1
+Flash decode fell 9-17% with deterministic output.
+
+For W4A8 SiLU launches without a materialized intermediate, keep one task
+per slice and store each slice's FC2 partial in its own route-output row,
+pair * slices + slice, with one vector store. The fixed-order top-k sum then
+reduces num_topk * slices rows per token. Every valid location has one
+producer, so phase 0 only zeros the rows of pairs routed to no local expert.
+One helper resolves the slice count for planning (route-output capacity),
+the kernel specialization and the top-k sum; launches whose partial rows
+would exceed 8192, and materialized launches (split, M=1, fused phase B),
+keep one row per pair. The flag joins the compile key only when set, so
+atomic and existing deterministic specializations keep their keys.
+---
+ b12x/moe/_shared/kernels/dynamic.py         |  61 +++++++-
+ b12x/moe/_shared/kernels/silu.py            |   2 +
+ b12x/moe/fused_moe/_impl.py                 | 156 ++++++++++++++++++--
+ tests/moe/test_w4a8_migration_corpus.py     |  71 +++++++++
+ tests/preparation/test_tuning_predicates.py |  33 +++++
+ 5 files changed, 305 insertions(+), 18 deletions(-)
+
+diff --git a/b12x/moe/_shared/kernels/dynamic.py b/b12x/moe/_shared/kernels/dynamic.py
+index 38e18bf0..99637b50 100644
+--- a/b12x/moe/_shared/kernels/dynamic.py
++++ b/b12x/moe/_shared/kernels/dynamic.py
+@@ -110,6 +110,7 @@ from b12x.moe._shared.kernels.mxfp6_moe import (
+     moe_mxfp6_store_expanded_global,
+ )
+ from b12x._lib.intrinsics import (
++    pack_f32x2_to_bfloat2,
+     scatter_add_bf16x2,
+     scatter_add_v4_bf16x2,
+ )
+@@ -797,6 +798,7 @@ class MoEDynamicKernelBackend:
+         dynamic_down_scale: bool = False,
+         share_input_across_experts: bool = False,
+         deterministic_output: bool = False,
++        deterministic_slice_partials: bool = False,
+         num_topk: int = 1,
+         swap_ab: bool = False,
+         separate_w13_halves: bool = False,
+@@ -1013,6 +1015,21 @@ class MoEDynamicKernelBackend:
+             self.w4a8_split_materialized or self.nvfp4_split_materialized
+         )
+         self.external_materialized_fc2 = self.external_materialized_fc1
++        # Deterministic fused FC2 normally collapses every intermediate slice
++        # of an M tile into one task and accumulates the slices into the route
++        # row.  Slice partials keep the atomic path's one task per slice: each
++        # task stores its FC2 partial into row ``pair * slices + slice`` and the
++        # fixed-order top-k sum reduces routes and slices together.
++        self.deterministic_slice_partials = bool(deterministic_slice_partials)
++        if self.deterministic_slice_partials and not (
++            deterministic_output and not self.materialize_intermediate
++        ):
++            # Materialized launches (split, M=1, or the fused phase B) compute
++            # FC2 over the full intermediate in one task per output location.
++            raise ValueError(
++                "deterministic slice partials require deterministic output from "
++                "the fused FC2 epilogue (no materialized intermediate)"
++            )
+         if int(num_topk) <= 0:
+             raise ValueError(f"num_topk must be positive, got {num_topk}")
+         self.num_topk = int(num_topk)
+@@ -3322,7 +3339,9 @@ class MoEDynamicKernelBackend:
+         # intermediate tile.  Fused deterministic consumers can collapse the
+         # same domain to one all-slices slot per M tile.
+         if cutlass.const_expr(
+-            self.deterministic_output and not self.external_materialized_fc1
++            self.deterministic_output
++            and not self.external_materialized_fc1
++            and not self.deterministic_slice_partials
+         ):
+             task_slice_chunk = route_gate_tile_cnt
+         materialized_num_groups = (
+@@ -3350,7 +3369,27 @@ class MoEDynamicKernelBackend:
+         # top-k kernel overwrites every caller-output location afterward.  Its
+         # routed scratch therefore needs no 4x-output clear; poison/replay
+         # coverage verifies that phase 2 really overwrites the full domain.
+-        if cutlass.const_expr(
++        if cutlass.const_expr(self.deterministic_slice_partials):
++            # Every valid (pair, slice, column) location has exactly one
++            # producer.  Rows of pairs routed to no local expert are never
++            # produced, so zero those; the top-k sum reads every live row.
++            partial_row_vecs = cols_u32 // Int32(4)
++            partial_vecs = total_pairs * route_gate_tile_cnt * partial_row_vecs
++            zero_u32 = Uint32(0)
++            zv = flat_tid
++            while zv < partial_vecs:
++                partial_row = zv // partial_row_vecs
++                zero_expert = topk_ids[partial_row // route_gate_tile_cnt].to(Int32)
++                if zero_expert < Int32(0) or zero_expert >= num_experts:
++                    st_global_v4_u32(
++                        scatter_base + Int64(zv) * Int64(16),
++                        zero_u32,
++                        zero_u32,
++                        zero_u32,
++                        zero_u32,
++                    )
++                zv += flat_stride
++        elif cutlass.const_expr(
+             not (self.deterministic_output and self.external_materialized_fc2)
+         ):
+             scatter_rows = Int32(scatter_output.shape[0])
+@@ -8392,7 +8431,23 @@ class MoEDynamicKernelBackend:
+                                                 epi_buffer,
+                                             ]
+                                         )
+-                                    if cutlass.const_expr(self.deterministic_output):
++                                    if cutlass.const_expr(
++                                        self.deterministic_slice_partials
++                                    ):
++                                        partial_row = tok * route_gate_tile_cnt + (
++                                            task_slice_begin_idx + slice_idx
++                                        )
++                                        st_global_v4_u32(
++                                            get_ptr_as_int64(
++                                                scatter_output,
++                                                partial_row * scatter_N + global_col,
++                                            ),
++                                            pack_f32x2_to_bfloat2(sc_v0, sc_v1),
++                                            pack_f32x2_to_bfloat2(sc_v2, sc_v3),
++                                            pack_f32x2_to_bfloat2(sc_v4, sc_v5),
++                                            pack_f32x2_to_bfloat2(sc_v6, sc_v7),
++                                        )
++                                    elif cutlass.const_expr(self.deterministic_output):
+                                         scatter_output[tok, global_col] = (
+                                             cutlass.BFloat16(
+                                                 cutlass.Float32(
+diff --git a/b12x/moe/_shared/kernels/silu.py b/b12x/moe/_shared/kernels/silu.py
+index 922d73ec..36f267fe 100644
+--- a/b12x/moe/_shared/kernels/silu.py
++++ b/b12x/moe/_shared/kernels/silu.py
+@@ -79,6 +79,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
+         dynamic_down_scale: bool = False,
+         share_input_across_experts: bool = False,
+         deterministic_output: bool = False,
++        deterministic_slice_partials: bool = False,
+         num_topk: int = 1,
+         swap_ab: bool = False,
+         separate_w13_halves: bool = False,
+@@ -106,6 +107,7 @@ class MoEDynamicKernelSilu(MoEDynamicKernelBackend):
+             dynamic_down_scale=dynamic_down_scale,
+             share_input_across_experts=share_input_across_experts,
+             deterministic_output=deterministic_output,
++            deterministic_slice_partials=deterministic_slice_partials,
+             num_topk=num_topk,
+             swap_ab=swap_ab,
+             separate_w13_halves=separate_w13_halves,
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index b4944ebc..55e2b9b5 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -2131,6 +2131,68 @@ def _w4a8_dynamic_materialized_enabled(
+     )
+ 
+ 
++# Bound on the route-output rows slice partials may use (routed pairs times
++# intermediate slices), so the partials never outgrow a prefill-sized plan.
++_DETERMINISTIC_SLICE_PARTIAL_MAX_ROWS = 8192
++
++
++def _dynamic_deterministic_route_slices(
++    *,
++    quant_mode: str,
++    activation: str,
++    num_experts: int,
++    k: int,
++    n: int,
++    num_topk: int,
++    planned_num_tokens: int,
++    w4a8_repacked: bool,
++    w4a8_n64_repacked: bool,
++    share_input_across_experts: bool,
++    deterministic_output: bool,
++    planned_tile_m: int | None,
++) -> int:
++    """Route-output rows per routed pair for one dynamic launch.
++
++    Deterministic fused FC2 either collapses every intermediate slice of an M
++    tile into one task (one row per pair) or, for W4A8 SiLU launches small
++    enough that the collapse starves the grid, keeps one task per slice and
++    stores each slice's partial in its own row: ``pair * slices + slice``.
++    The fixed-order top-k sum then reduces ``num_topk * slices`` rows per
++    token.  Launches with a materialized intermediate (split, M=1, or the
++    fused phase B) already compute FC2 once per output location and keep one
++    row per pair.  Planning, the kernel and the top-k sum all resolve the
++    count here.
++    """
++    if not deterministic_output:
++        return 1
++    quant_mode = _normalize_quant_mode(quant_mode)
++    activation = _get_activation_kernel_spec(activation, quant_mode=quant_mode).activation
++    if quant_mode != "w4a8_mx" or activation != "silu" or not w4a8_repacked:
++        return 1
++    if int(n) % 128 != 0 and not w4a8_n64_repacked:
++        n = _dynamic_kernel_intermediate_size(n, quant_mode)
++    routed_rows = int(planned_num_tokens) * int(num_topk)
++    materialize = bool(w4a8_n64_repacked) or _w4a8_dynamic_materialized_enabled(
++        quant_mode=quant_mode,
++        activation=activation,
++        num_tokens=int(planned_num_tokens),
++        routed_rows=routed_rows,
++        num_experts=num_experts,
++        k=k,
++        n=n,
++        w4a8_repacked=w4a8_repacked,
++        share_input_across_experts=share_input_across_experts or bool(w4a8_n64_repacked),
++        deterministic_output=deterministic_output,
++        planned_tile_m=planned_tile_m,
++    )
++    if materialize:
++        return 1
++    slices = max(1, (int(n) + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N)
++    if slices == 1 or routed_rows * slices > _DETERMINISTIC_SLICE_PARTIAL_MAX_ROWS:
++        return 1
++    return slices
++
++
+ def _dynamic_materialized_intermediate_bytes(
+     *, quant_mode: str, rows_padded: int, n: int
+ ) -> int:
+@@ -3862,6 +3924,20 @@ def _plan_core_workspace(
+     # that production-default policy; the opt-in deterministic reduction owns
+     # a distinct fixed-capacity plan with one row per routed pair.
+     route_output_rows = max(int(routed_rows), 1) if deterministic_output else 1
++    # Deterministic W4A8 SiLU launches may keep one row per (route,
++    # intermediate slice); see _dynamic_deterministic_route_slices.  Reserve
++    # the partial rows whenever they fit its bound: the weight layout and
++    # shared-input choice that settle the launch are not known here, and the
++    # launch checks this capacity.
++    route_slices = (dynamic_kernel_n + _LEVEL_TILE_N - 1) // _LEVEL_TILE_N
++    if (
++        deterministic_output
++        and quant_mode == "w4a8_mx"
++        and activation_spec.activation == "silu"
++        and route_slices > 1
++        and int(routed_rows) * route_slices <= _DETERMINISTIC_SLICE_PARTIAL_MAX_ROWS
++    ):
++        route_output_rows = int(routed_rows) * route_slices
+     # Materialized W4A8 phase 1 writes one E4M3 byte per activation plus one
+     # UE8M0 byte per K32 block.  This storage must not alias route_output:
+     # deterministic phase 2 writes one BF16 row per token-major route there
+@@ -10734,6 +10810,7 @@ def _get_dynamic_kernel(
+     trellis_intermediate_hadamard: bool = False,
+     planned_tile_m: int | None = None,
+     planned_num_tokens: int | None = None,
++    deterministic_slice_partials: bool = False,
+ ):
+     quant_mode = _normalize_quant_mode(quant_mode)
+     # w6a8_mx rides the nvfp4-shaped launch ABI (no repack/residual operands)
+@@ -10847,6 +10924,9 @@ def _get_dynamic_kernel(
+         int(trellis_bits),
+         bool(trellis_intermediate_hadamard),
+     )
++    if deterministic_slice_partials:
++        # Appended only when set, so every existing specialization keeps its key.
++        cache_key += ("deterministic_slice_partials",)
+     reuse_compiled = _first_env(
+         "B12X_DYNAMIC_REUSE_COMPILED",
+         "B12X_LEVEL10_REUSE_COMPILED",
+@@ -10883,6 +10963,8 @@ def _get_dynamic_kernel(
+     )
+     kernel_kwargs["share_input_across_experts"] = share_input_across_experts
+     kernel_kwargs["deterministic_output"] = bool(deterministic_output)
++    if deterministic_slice_partials:
++        kernel_kwargs["deterministic_slice_partials"] = True
+     kernel_kwargs["num_topk"] = int(num_topk)
+     kernel_kwargs["swap_ab"] = swap_ab
+     kernel_kwargs["separate_w13_halves"] = separate_w13_halves
+@@ -11430,6 +11512,31 @@ def _launch_dynamic_flat(
+             effective_mac,
+             policy_max_active_clusters,
+         )
++    route_slices = _dynamic_deterministic_route_slices(
++        quant_mode=quant_mode,
++        activation=activation,
++        num_experts=E,
++        k=k,
++        n=n,
++        num_topk=num_topk,
++        planned_num_tokens=planned_num_tokens,
++        w4a8_repacked=w4a8_repacked,
++        w4a8_n64_repacked=w4a8_n64_repacked,
++        share_input_across_experts=share_input_across_experts,
++        deterministic_output=deterministic_output,
++        planned_tile_m=planned_tile_m,
++    )
++    if route_slices > 1:
++        if materialize_intermediate:
++            raise RuntimeError(
++                "deterministic slice partials were planned for a materialized launch"
++            )
++        if scatter_output.shape[0] < planned_num_tokens * num_topk * route_slices:
++            raise RuntimeError(
++                "deterministic slice partials exceed the planned route-output "
++                f"capacity: need {planned_num_tokens * num_topk * route_slices} rows, "
++                f"got {scatter_output.shape[0]}"
++            )
+     # Do not enlarge this grid beyond the measured resident count: the fused
+     # kernel has a resident-grid barrier, so over-launching would deadlock.
+     compiled, mac = _get_dynamic_kernel(
+@@ -11458,6 +11565,7 @@ def _launch_dynamic_flat(
+         trellis_intermediate_hadamard=trellis_intermediate_hadamard,
+         planned_tile_m=planned_tile_m,
+         planned_num_tokens=planned_num_tokens,
++        deterministic_slice_partials=route_slices > 1,
+     )
+     if volatile_launch_state and not external_route_plan:
+         barrier_count.zero_()
+@@ -13269,6 +13377,20 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+                 "the W4A8-MX weight plan did not materialize its required "
+                 "QMMA representation"
+             )
++        dynamic_w4a8_n64_repacked = bool(getattr(prepared_payload, "n64_repack", False))
++        dynamic_share_input = (
++            (
++                quant_mode == "nvfp4"
++                and decode_config.nvfp4_share_input
++            )
++            or (
++                dynamic_w4a8_prepared is not None
++                and _env_flag(
++                    _DYNAMIC_W4A8_SHARE_INPUT_ENV,
++                    default=(dense_w4a8_candidate or decode_w4a8_candidate),
++                )
++            )
++        )
+         _launch_dynamic(
+             workspace=s,
+             weights=wv,
+@@ -13289,7 +13411,7 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+             activation=activation,
+             quant_mode=quant_mode,
+             w4a8_prepared=dynamic_w4a8_prepared,
+-            w4a8_n64_repacked=bool(getattr(prepared_payload, "n64_repack", False)),
++            w4a8_n64_repacked=dynamic_w4a8_n64_repacked,
+             nvfp4_materialize_intermediate=decode_config.nvfp4_materialize_intermediate,
+             deterministic_output=deterministic_output,
+             swiglu_limit=swiglu_limit,
+@@ -13304,26 +13426,30 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+             planned_tile_m=planned_tile_m,
+             planned_num_tokens=plan.routed_rows // plan.num_topk,
+             dynamic_route_mode=decode_config.dynamic_route_mode or "",
+-            share_input_across_experts=(
+-                (
+-                    quant_mode == "nvfp4"
+-                    and decode_config.nvfp4_share_input
+-                )
+-                or (
+-                    dynamic_w4a8_prepared is not None
+-                    and _env_flag(
+-                        _DYNAMIC_W4A8_SHARE_INPUT_ENV,
+-                        default=(dense_w4a8_candidate or decode_w4a8_candidate),
+-                    )
+-                )
+-            ),
++            share_input_across_experts=dynamic_share_input,
+         )
+         if deterministic_output:
++            # Slice partials hold one row per (route, intermediate slice); the
++            # sum reduces routes and slices in one fixed order.
++            route_slices = _dynamic_deterministic_route_slices(
++                quant_mode=quant_mode,
++                activation=activation,
++                num_experts=weight_E,
++                k=k,
++                n=n,
++                num_topk=num_topk,
++                planned_num_tokens=plan.routed_rows // plan.num_topk,
++                w4a8_repacked=dynamic_w4a8_prepared is not None,
++                w4a8_n64_repacked=dynamic_w4a8_n64_repacked,
++                share_input_across_experts=dynamic_share_input,
++                deterministic_output=True,
++                planned_tile_m=planned_tile_m,
++            )
+             _launch_dynamic_topk_sum(
+                 route_output=s.route_output,
+                 output=scatter_output,
+                 m=m,
+-                num_topk=num_topk,
++                num_topk=num_topk * route_slices,
+                 k=k,
+                 stream=stream,
+             )
+diff --git a/tests/moe/test_w4a8_migration_corpus.py b/tests/moe/test_w4a8_migration_corpus.py
+index aec7993b..2d80fd54 100644
+--- a/tests/moe/test_w4a8_migration_corpus.py
++++ b/tests/moe/test_w4a8_migration_corpus.py
+@@ -16,6 +16,7 @@ from .test_w4a8_mx_tp_moe import (
+     _E,
+     _K,
+     _N,
++    _TOPK,
+     _prepare,
+     _routed_inputs,
+     _weights,
+@@ -387,3 +388,73 @@ def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
+         b12x_moe_fp4(binding=replace(atomic_binding, deterministic_output=True))
+     del atomic_graph, graph
+     bindings.close()
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
++@pytest.mark.parametrize("m", [3, 6, 40])
++def test_w4a8_deterministic_slice_partials_match_oracle_and_repeat(
++    monkeypatch: pytest.MonkeyPatch,
++    m: int,
++) -> None:
++    """Deterministic fused decode keeps one task per slice and repeats exactly."""
++
++    require_b12x()
++    from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
++
++    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
++    monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
++    clear_tp_moe_caches()
++    device = torch.device("cuda")
++    weights = _weights(seed=3_100 + m)
++    x, topk_ids, topk_weights = _routed_inputs(m, 3_200 + m)
++    reference = moe_reference_w4a8_mx(
++        x.float(),
++        weights["w13_fp4"],
++        weights["w13_mx"],
++        None,
++        weights["alphas"],
++        weights["w2_fp4"],
++        weights["w2_mx"],
++        None,
++        weights["alphas"],
++        topk_ids,
++        topk_weights,
++        _E,
++        _K,
++        _N,
++        activation="silu",
++    )
++    prepared = _prepare(weights)
++    output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
++    with make_tp_moe_fp4_binding(
++        a=x,
++        experts=prepared,
++        topk_weights=topk_weights.contiguous(),
++        topk_ids=topk_ids.contiguous(),
++        output=output,
++        input_scales_static=True,
++        quant_mode="w4a8_mx",
++    ) as binding:
++        assert binding.deterministic_output
++        # One route-output row per (routed pair, N128 intermediate slice).
++        assert tuple(binding.route_output.shape) == (m * _TOPK * (_N // 128), _K)
++
++        def launch() -> None:
++            b12x_moe_fp4(binding=binding)
++
++        launch()
++        torch.cuda.synchronize()
++        _assert_dynamic_oracle(output, reference, context=("slice-partials", m))
++        first = output.clone()
++        for _ in range(3):
++            output.fill_(float("nan"))
++            launch()
++            torch.cuda.synchronize()
++            assert torch.equal(output, first)
++        graph = _capture_and_replay(launch)
++        for sentinel in (float("nan"), 997.0):
++            output.fill_(sentinel)
++            graph.replay()
++            torch.cuda.synchronize()
++            assert torch.equal(output, first)
++        del graph
+diff --git a/tests/preparation/test_tuning_predicates.py b/tests/preparation/test_tuning_predicates.py
+index 14d9ff37..9ea2347c 100644
+--- a/tests/preparation/test_tuning_predicates.py
++++ b/tests/preparation/test_tuning_predicates.py
+@@ -835,3 +835,36 @@ def test_planned_deterministic_output_matches_launch_resolution(monkeypatch):
+     assert _planned_deterministic_output(
+         RoutingSpec(deterministic_output=False), ("w4a8_mx",)
+     ) is False
++
++
++@pytest.mark.parametrize(
++    ("tokens", "deterministic", "slices"),
++    (
++        (6, True, 6),  # one-stream verify: fused M16, one task per slice
++        (48, True, 6),  # eight streams
++        (1, True, 1),  # M=1 materializes the intermediate
++        (1000, True, 1),  # partials would exceed the row bound: collapse
++        (4096, True, 1),  # prefill chunk: split-materialized M64
++        (6, False, 1),  # atomic scatter
++    ),
++)
++def test_deterministic_route_slices_for_ds41_tp3(monkeypatch, tokens, deterministic, slices):
++    from b12x.moe.fused_moe._impl import _dynamic_deterministic_route_slices
++
++    for name in ("B12X_DYNAMIC_W4A8_MATERIALIZED", "B12X_DYNAMIC_TILE_MN",
++                 "B12X_DYNAMIC_WORK_SOURCE"):
++        monkeypatch.delenv(name, raising=False)
++    assert _dynamic_deterministic_route_slices(
++        quant_mode="w4a8_mx",
++        activation="silu",
++        num_experts=384,
++        k=5120,
++        n=768,
++        num_topk=6,
++        planned_num_tokens=tokens,
++        w4a8_repacked=True,
++        w4a8_n64_repacked=False,
++        share_input_across_experts=True,
++        deterministic_output=deterministic,
++        planned_tile_m=None,
++    ) == slices
+-- 
+2.54.0 (Apple Git-157)
+

@@ -111,3 +111,18 @@ its FC2 partial into its own row (pair x slices + slice) and the fixed-order
 top-k sum reduces routes and slices together, for launches whose partial rows
 fit the planned route-output capacity (every decode shape); larger launches
 keep the collapsed form.
+
+## Round 4: slice partials (`run4.sh`)
+
+`0006-moe-deterministic-slice-partials.patch`: for W4A8 SiLU launches without
+a materialized intermediate (every DS4.1 decode batch: fused M16), the
+deterministic kernel keeps the atomic path's one task per N128 intermediate
+slice and stores each slice's FC2 partial in its own route-output row
+(pair x slices + slice); the fixed-order top-k sum reduces num_topk x slices
+rows per token (36 for DS4.1: six routes, six slices). Materialized launches
+(split M64 prefill, M=1, fused phase B) and launches whose partials would pass
+8192 rows keep one row per pair. B12X planner tests 165/165. `run4.sh` runs
+the GPU tests with the cluster stopped, then screens arm `detslice` (0004-0006,
+split-K through the FP32 reducer) against r5m.
+
+Pending.

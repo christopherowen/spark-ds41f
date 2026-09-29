@@ -7,6 +7,15 @@ from pathlib import Path
 E = Path("experiments/2026-09-29-determinism")
 OVERLAY = "{home}/spark3-overlay/det-planning/b12x/moe/fused_moe"
 DECODE_OVERLAY = "{home}/spark3-overlay/det-decode/b12x/moe/fused_moe"
+SLICES_OVERLAY = "{home}/spark3-overlay/det-slices/b12x"
+SLICES_TARGET = "/opt/spark3/candidate/b12x/b12x"
+SLICES_FILES = (
+    "moe/fused_moe/_impl.py",
+    "moe/fused_moe/_preparation.py",
+    "moe/fused_moe/_tuning.py",
+    "moe/_shared/kernels/dynamic.py",
+    "moe/_shared/kernels/silu.py",
+)
 TARGET = "/opt/spark3/candidate/b12x/b12x/moe/fused_moe"
 
 base = json.loads(Path("config/cluster.json").read_text())
@@ -28,8 +37,18 @@ detfast_t["environment"]["B12X_DYNAMIC_DETERMINISTIC_OUTPUT"] = "1"
 detfast = copy.deepcopy(detfast_t)
 detfast["environment"]["B12X_DENSE_SPLITK_TURBO"] = "0"
 
+# 0006 as well: deterministic fused decode keeps one task per intermediate
+# slice and stores slice partials for the fixed-order sum.
+detslice = copy.deepcopy(base)
+for name in SLICES_FILES:
+    detslice["container"]["mounts"].append(
+        [f"{SLICES_OVERLAY}/{name}", f"{SLICES_TARGET}/{name}", "ro"]
+    )
+detslice["environment"]["B12X_DYNAMIC_DETERMINISTIC_OUTPUT"] = "1"
+detslice["environment"]["B12X_DENSE_SPLITK_TURBO"] = "0"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
-                     ("detfast-t", detfast_t)):
+                     ("detfast-t", detfast_t), ("detslice", detslice)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
