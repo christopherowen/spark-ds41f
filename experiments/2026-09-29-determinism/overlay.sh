@@ -45,8 +45,8 @@ apply "$E/0005-moe-deterministic-decode.patch"
 [ "$(git -C "$T" rev-parse HEAD^{tree})" = f422b9110ed29c900e8c9e7254fed65ec3773024 ]
 write ~/spark3-overlay/det-decode
 apply "$E/0006-moe-deterministic-slice-partials.patch"
-[ "$(git -C "$T" rev-parse HEAD^{tree})" = 44709de4b96dd6134cf14e9a9bcc838aa6c22d83 ]
-FILES="$FILES b12x/moe/_shared/kernels/dynamic.py b12x/moe/_shared/kernels/silu.py
-  tests/moe/test_w4a8_migration_corpus.py tests/preparation/test_tuning_predicates.py"
+[ "$(git -C "$T" rev-parse HEAD^{tree})" = 74d9ba1345409c96bed3713b3a3da3d33661df7a ]
+FILES="$FILES b12x/moe/_shared/kernels/dynamic.py b12x/moe/_shared/kernels/silu.py \
+tests/moe/test_w4a8_dynamic_kernel.py tests/preparation/test_tuning_predicates.py"
 write ~/spark3-overlay/det-slices
-echo "overlays written from B12X trees 66d62dc5 (det-planning), f422b911 (det-decode) and 44709de4 (det-slices) on dgx1-3"
+echo "overlays written from B12X trees 66d62dc5 (det-planning), f422b911 (det-decode) and 74d9ba13 (det-slices) on dgx1-3"

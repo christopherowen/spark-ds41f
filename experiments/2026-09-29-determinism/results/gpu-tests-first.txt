@@ -1,0 +1,462 @@
+.FFFF                                                                    [100%]
+=================================== FAILURES ===================================
+___ test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph ____
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe073ffa88710>
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    def test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Prove the serving materialized route/phase1/phase2 prefill graph."""
+    
+        require_b12x()
+        from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
+    
+        monkeypatch.setenv("B12X_DYNAMIC_TILE_MN", "64x128")
+        monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+        clear_tp_moe_caches()
+        device = torch.device("cuda")
+        m = 4096
+        weights = _weights(seed=3_000)
+        x, topk_ids, topk_weights = _routed_inputs(m, 3_001)
+        reference = moe_reference_w4a8_mx(
+            x.float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            topk_ids,
+            topk_weights,
+            _E,
+            _K,
+            _N,
+            activation="silu",
+        )
+        # Weight preparation below is deliberately destructive: the runtime layout
+        # reuses the checkpoint allocations.  Build both logical-weight oracles
+        # before that ownership transfer rather than interpreting repacked bytes as
+        # the original checkpoint layout on live replay.
+        live_x_value, live_ids_value, live_weights_value = _routed_inputs(m, 3_002)
+        live_reference = moe_reference_w4a8_mx(
+            live_x_value.float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            live_ids_value,
+            live_weights_value,
+            _E,
+            _K,
+            _N,
+            activation="silu",
+        )
+        prepared = _prepare(weights)
+        output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
+        bindings = ExitStack()
+>       binding = bindings.enter_context(make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        ))
+
+tests/moe/test_w4a8_migration_corpus.py:241: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/contextlib.py:526: in enter_context
+    result = _enter(cm)
+             ^^^^^^^^^^
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+a = tensor([[-2.2812,  2.7656, -1.3203,  ...,  4.1875, -2.3750, -0.5938],
+        [ 1.5469,  3.2812,  2.0312,  ...,  4.250...],
+        [ 1.1172,  4.5625, -2.6094,  ...,  0.4590,  1.3906, -1.5391]],
+       device='cuda:0', dtype=torch.bfloat16)
+experts = B12XFP4ExpertWeights(plan=MoEWeightPreparationPlan(specs=(MoESpec(quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', ...dtype=torch.bfloat16, source_format='fp4_e8m0_k32', w13_layout='w13', n64_repack=False)), immutable_input_scales=False)
+topk_weights = tensor([[0.3606, 0.3048, 0.1742, 0.1604],
+        [0.3850, 0.2097, 0.2050, 0.2003],
+        [0.3222, 0.2712, 0.2238, 0... 0.2403, 0.1952],
+        [0.3615, 0.2646, 0.2436, 0.1303],
+        [0.3331, 0.2435, 0.2213, 0.2021]], device='cuda:0')
+topk_ids = tensor([[ 2, 15, 10, 12],
+        [ 3,  7, 10, 14],
+        [10,  7,  6,  5],
+        ...,
+        [ 6,  5, 15,  1],
+        [12,  8, 10, 13],
+        [ 0,  8, 14,  1]], device='cuda:0', dtype=torch.int32)
+apply_router_weight_on_input = False
+output = tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]...        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+input_scales_static = True, fast_math = None, quant_mode = 'w4a8_mx'
+swiglu_limit = None, swiglu_alpha = None, swiglu_beta = None
+
+    @contextmanager
+    def make_tp_moe_fp4_binding(
+        *,
+        a: torch.Tensor,
+        experts: object,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool = False,
+        output: torch.Tensor | None = None,
+        input_scales_static: bool = False,
+        fast_math: bool | None = None,
+        quant_mode: str | None = None,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
+    ) -> Iterator[object]:
+        """Prepare one exact-M execution and yield its real caller-owned binding."""
+        from b12x.moe import fused_moe
+        from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
+        from b12x.preparation.types import require_prepared
+    
+        if not isinstance(experts, fused_moe.PreparedExperts):
+>           raise TypeError("experts must be canonical fused_moe.PreparedExperts")
+E           TypeError: experts must be canonical fused_moe.PreparedExperts
+
+tests/_reference/helpers.py:174: TypeError
+______ test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[3] _______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe073ff89a810>, m = 3
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("m", [3, 6, 40])
+    def test_w4a8_deterministic_slice_partials_match_oracle_and_repeat(
+        monkeypatch: pytest.MonkeyPatch,
+        m: int,
+    ) -> None:
+        """Deterministic fused decode keeps one task per slice and repeats exactly."""
+    
+        require_b12x()
+        from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
+    
+        monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+        monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+        clear_tp_moe_caches()
+        device = torch.device("cuda")
+        weights = _weights(seed=3_100 + m)
+        x, topk_ids, topk_weights = _routed_inputs(m, 3_200 + m)
+        reference = moe_reference_w4a8_mx(
+            x.float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            topk_ids,
+            topk_weights,
+            _E,
+            _K,
+            _N,
+            activation="silu",
+        )
+        prepared = _prepare(weights)
+        output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
+>       with make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        ) as binding:
+
+tests/moe/test_w4a8_migration_corpus.py:429: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+a = tensor([[ 1.3438,  0.9844,  1.4922,  ..., -0.3965,  0.5234,  0.4160],
+        [-3.3906, -3.2188, -2.0625,  ..., -4.000...],
+        [-4.6250, -1.5078, -0.0337,  ..., -3.1875,  0.6289,  1.9609]],
+       device='cuda:0', dtype=torch.bfloat16)
+experts = B12XFP4ExpertWeights(plan=MoEWeightPreparationPlan(specs=(MoESpec(quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', ...dtype=torch.bfloat16, source_format='fp4_e8m0_k32', w13_layout='w13', n64_repack=False)), immutable_input_scales=False)
+topk_weights = tensor([[0.5841, 0.1609, 0.1601, 0.0949],
+        [0.2697, 0.2663, 0.2594, 0.2046],
+        [0.4384, 0.2204, 0.2154, 0.1258]], device='cuda:0')
+topk_ids = tensor([[13,  7,  2,  8],
+        [12, 15, 11,  9],
+        [11,  4,  3,  5]], device='cuda:0', dtype=torch.int32)
+apply_router_weight_on_input = False
+output = tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+input_scales_static = True, fast_math = None, quant_mode = 'w4a8_mx'
+swiglu_limit = None, swiglu_alpha = None, swiglu_beta = None
+
+    @contextmanager
+    def make_tp_moe_fp4_binding(
+        *,
+        a: torch.Tensor,
+        experts: object,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool = False,
+        output: torch.Tensor | None = None,
+        input_scales_static: bool = False,
+        fast_math: bool | None = None,
+        quant_mode: str | None = None,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
+    ) -> Iterator[object]:
+        """Prepare one exact-M execution and yield its real caller-owned binding."""
+        from b12x.moe import fused_moe
+        from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
+        from b12x.preparation.types import require_prepared
+    
+        if not isinstance(experts, fused_moe.PreparedExperts):
+>           raise TypeError("experts must be canonical fused_moe.PreparedExperts")
+E           TypeError: experts must be canonical fused_moe.PreparedExperts
+
+tests/_reference/helpers.py:174: TypeError
+______ test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[6] _______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe073ff4e1940>, m = 6
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("m", [3, 6, 40])
+    def test_w4a8_deterministic_slice_partials_match_oracle_and_repeat(
+        monkeypatch: pytest.MonkeyPatch,
+        m: int,
+    ) -> None:
+        """Deterministic fused decode keeps one task per slice and repeats exactly."""
+    
+        require_b12x()
+        from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
+    
+        monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+        monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+        clear_tp_moe_caches()
+        device = torch.device("cuda")
+        weights = _weights(seed=3_100 + m)
+        x, topk_ids, topk_weights = _routed_inputs(m, 3_200 + m)
+        reference = moe_reference_w4a8_mx(
+            x.float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            topk_ids,
+            topk_weights,
+            _E,
+            _K,
+            _N,
+            activation="silu",
+        )
+        prepared = _prepare(weights)
+        output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
+>       with make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        ) as binding:
+
+tests/moe/test_w4a8_migration_corpus.py:429: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+a = tensor([[-1.2891, -0.2275,  1.0000,  ...,  1.1719,  0.5586,  0.8398],
+        [-1.7969,  0.8438,  1.7891,  ...,  0.597...],
+        [ 0.7695, -1.2734,  0.4902,  ..., -0.5508, -4.4688, -0.2559]],
+       device='cuda:0', dtype=torch.bfloat16)
+experts = B12XFP4ExpertWeights(plan=MoEWeightPreparationPlan(specs=(MoESpec(quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', ...dtype=torch.bfloat16, source_format='fp4_e8m0_k32', w13_layout='w13', n64_repack=False)), immutable_input_scales=False)
+topk_weights = tensor([[0.3769, 0.3101, 0.1883, 0.1246],
+        [0.7406, 0.1440, 0.0599, 0.0555],
+        [0.4773, 0.2181, 0.1681, 0... 0.1497, 0.1173],
+        [0.4416, 0.2070, 0.1908, 0.1607],
+        [0.3494, 0.2969, 0.2066, 0.1470]], device='cuda:0')
+topk_ids = tensor([[ 7,  8,  0, 14],
+        [ 1,  7, 13, 15],
+        [12, 15,  1,  9],
+        [ 0, 14, 11, 10],
+        [ 7,  4,  1, 11],
+        [ 9, 13,  5,  2]], device='cuda:0', dtype=torch.int32)
+apply_router_weight_on_input = False
+output = tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]...        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+input_scales_static = True, fast_math = None, quant_mode = 'w4a8_mx'
+swiglu_limit = None, swiglu_alpha = None, swiglu_beta = None
+
+    @contextmanager
+    def make_tp_moe_fp4_binding(
+        *,
+        a: torch.Tensor,
+        experts: object,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool = False,
+        output: torch.Tensor | None = None,
+        input_scales_static: bool = False,
+        fast_math: bool | None = None,
+        quant_mode: str | None = None,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
+    ) -> Iterator[object]:
+        """Prepare one exact-M execution and yield its real caller-owned binding."""
+        from b12x.moe import fused_moe
+        from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
+        from b12x.preparation.types import require_prepared
+    
+        if not isinstance(experts, fused_moe.PreparedExperts):
+>           raise TypeError("experts must be canonical fused_moe.PreparedExperts")
+E           TypeError: experts must be canonical fused_moe.PreparedExperts
+
+tests/_reference/helpers.py:174: TypeError
+______ test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[40] ______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0xe073ff4e0980>, m = 40
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.parametrize("m", [3, 6, 40])
+    def test_w4a8_deterministic_slice_partials_match_oracle_and_repeat(
+        monkeypatch: pytest.MonkeyPatch,
+        m: int,
+    ) -> None:
+        """Deterministic fused decode keeps one task per slice and repeats exactly."""
+    
+        require_b12x()
+        from b12x.moe.fused_moe._impl import b12x_moe_fp4, clear_tp_moe_caches
+    
+        monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+        monkeypatch.delenv("B12X_DYNAMIC_TILE_MN", raising=False)
+        clear_tp_moe_caches()
+        device = torch.device("cuda")
+        weights = _weights(seed=3_100 + m)
+        x, topk_ids, topk_weights = _routed_inputs(m, 3_200 + m)
+        reference = moe_reference_w4a8_mx(
+            x.float(),
+            weights["w13_fp4"],
+            weights["w13_mx"],
+            None,
+            weights["alphas"],
+            weights["w2_fp4"],
+            weights["w2_mx"],
+            None,
+            weights["alphas"],
+            topk_ids,
+            topk_weights,
+            _E,
+            _K,
+            _N,
+            activation="silu",
+        )
+        prepared = _prepare(weights)
+        output = torch.zeros(m, _K, dtype=torch.bfloat16, device=device)
+>       with make_tp_moe_fp4_binding(
+            a=x,
+            experts=prepared,
+            topk_weights=topk_weights.contiguous(),
+            topk_ids=topk_ids.contiguous(),
+            output=output,
+            input_scales_static=True,
+            quant_mode="w4a8_mx",
+        ) as binding:
+
+tests/moe/test_w4a8_migration_corpus.py:429: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+a = tensor([[-1.6328,  1.1641, -0.8047,  ...,  1.2266, -3.6250,  0.1777],
+        [ 2.3281, -2.7969,  1.6797,  ..., -1.054...],
+        [ 2.1562,  3.3438,  2.5469,  ...,  3.5156, -0.3242, -0.8633]],
+       device='cuda:0', dtype=torch.bfloat16)
+experts = B12XFP4ExpertWeights(plan=MoEWeightPreparationPlan(specs=(MoESpec(quant_mode='w4a8_mx', source_format='fp4_e8m0_k32', ...dtype=torch.bfloat16, source_format='fp4_e8m0_k32', w13_layout='w13', n64_repack=False)), immutable_input_scales=False)
+topk_weights = tensor([[0.3299, 0.2561, 0.2089, 0.2051],
+        [0.2884, 0.2875, 0.2129, 0.2112],
+        [0.4049, 0.2193, 0.2167, 0... 0.2052, 0.1923],
+        [0.3879, 0.3470, 0.1415, 0.1235],
+        [0.5507, 0.1961, 0.1371, 0.1161]], device='cuda:0')
+topk_ids = tensor([[10, 15,  3,  0],
+        [ 1, 15,  5,  4],
+        [ 8, 12, 10, 15],
+        [ 3,  8,  1,  9],
+        [10, 1...13],
+        [13, 10,  2,  1],
+        [ 9,  3,  5, 11],
+        [13,  4, 15,  7]], device='cuda:0', dtype=torch.int32)
+apply_router_weight_on_input = False
+output = tensor([[0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]...        [0., 0., 0.,  ..., 0., 0., 0.],
+        [0., 0., 0.,  ..., 0., 0., 0.]], device='cuda:0', dtype=torch.bfloat16)
+input_scales_static = True, fast_math = None, quant_mode = 'w4a8_mx'
+swiglu_limit = None, swiglu_alpha = None, swiglu_beta = None
+
+    @contextmanager
+    def make_tp_moe_fp4_binding(
+        *,
+        a: torch.Tensor,
+        experts: object,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool = False,
+        output: torch.Tensor | None = None,
+        input_scales_static: bool = False,
+        fast_math: bool | None = None,
+        quant_mode: str | None = None,
+        swiglu_limit: float | None = None,
+        swiglu_alpha: float | None = None,
+        swiglu_beta: float | None = None,
+    ) -> Iterator[object]:
+        """Prepare one exact-M execution and yield its real caller-owned binding."""
+        from b12x.moe import fused_moe
+        from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
+        from b12x.preparation.types import require_prepared
+    
+        if not isinstance(experts, fused_moe.PreparedExperts):
+>           raise TypeError("experts must be canonical fused_moe.PreparedExperts")
+E           TypeError: experts must be canonical fused_moe.PreparedExperts
+
+tests/_reference/helpers.py:174: TypeError
+=========================== short test summary info ============================
+FAILED tests/moe/test_w4a8_migration_corpus.py::test_w4a8_materialized_routing_phase1_phase2_matches_oracle_under_graph
+FAILED tests/moe/test_w4a8_migration_corpus.py::test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[3]
+FAILED tests/moe/test_w4a8_migration_corpus.py::test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[6]
+FAILED tests/moe/test_w4a8_migration_corpus.py::test_w4a8_deterministic_slice_partials_match_oracle_and_repeat[40]
+4 failed, 1 passed, 19 deselected in 27.42s
+corpus exit 1
+.                                                                        [100%]
+1 passed, 41 deselected in 1.68s
+bindings exit 0
