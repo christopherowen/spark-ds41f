@@ -12,7 +12,10 @@ whether every output equals the first and the route-output rows planned.
 Before every launch the route-output rows are poisoned with NaN, so a row the
 top-k sum reads but no kernel wrote makes the output non-finite. --no-slices
 disables slice partials (the round-2 detfast behaviour) for an A/B; --only,
---reps and --no-graph shrink the run for compute-sanitizer.
+--reps and --no-graph shrink the run for compute-sanitizer. Each token count
+also runs a history check: launch input A, a different input B in the same
+binding, then A again; A's two outputs must be equal, or the launch depends on
+state an earlier launch left behind (as serving's varied history would).
 """
 import os
 import sys
@@ -99,14 +102,34 @@ for m in (1, 3, 5, 6, 16, 48):
                 graph.replay()
                 torch.cuda.synchronize()
                 outs.append(output.clone())
+        # History: A, then B (other tokens and routes), then A again.
+        x_a, ids_a, w_a = x.clone(), topk_ids.clone(), topk_weights.clone()
+        output.fill_(float("nan"))
+        launch()
+        torch.cuda.synchronize()
+        history_a = output.clone()
+        x.mul_(-0.75)
+        topk_ids.add_(1).remainder_(E)
+        topk_weights.copy_(topk_weights.flip(-1))
+        output.fill_(float("nan"))
+        launch()
+        torch.cuda.synchronize()
+        x.copy_(x_a)
+        topk_ids.copy_(ids_a)
+        topk_weights.copy_(w_a)
+        output.fill_(float("nan"))
+        launch()
+        torch.cuda.synchronize()
+        history_same = torch.equal(output, history_a)
+        history_diff = (output.float() - history_a.float()).abs().max().item()
         first = outs[0]
         same = [torch.equal(o, first) for o in outs]
         worst = max((o.float() - first.float()).abs().max().item() for o in outs)
         finite = all(bool(torch.isfinite(o).all()) for o in outs)
         rows = tuple(binding.route_output.shape)
-        print(f"m={m:3d} route_output={rows} finite={finite} repeats={same} max_diff={worst:.3g}",
-              flush=True)
-        failures += (not all(same)) or (not finite)
+        print(f"m={m:3d} route_output={rows} finite={finite} repeats={same} max_diff={worst:.3g} "
+              f"history_same={history_same} history_diff={history_diff:.3g}", flush=True)
+        failures += (not all(same)) or (not finite) or (not history_same)
         del graph
 print("FAIL" if failures else "OK", flush=True)
 sys.exit(1 if failures else 0)
