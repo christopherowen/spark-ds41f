@@ -370,6 +370,15 @@ def boot_order_problems(node_name: str, output: str) -> list[str]:
 
 HOST_FACTS_QUERY = """
 printf 'modeset=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)"
+printf 'fbdev=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
+clients=/sys/kernel/debug/dri/0/clients
+if sudo -n test -r "$clients"; then
+  printf 'drm_masters=%s\\n' "$(sudo -n cat "$clients" | awk 'NR > 1 && $4 == "y" {print $1 "/" $2}' | paste -sd, -)"
+else
+  printf 'drm_masters=unreadable\\n'
+fi
+vt=$(cat /sys/class/tty/tty0/active 2>/dev/null)
+printf 'console=%s:%s\\n' "$vt" "$(sudo -n python3 -c 'import fcntl, struct, sys; f = open(sys.argv[1], "rb"); print(struct.unpack("i", fcntl.ioctl(f, 0x4B3B, struct.pack("i", 0)))[0])' "/dev/$vt" 2>/dev/null)"
 printf 'kernel=%s\\n' "$(uname -r)"
 printf 'fan_dkms=%s\\n' "$(dkms status -m dgx-spark-fan-control -k "$(uname -r)" 2>/dev/null | head -1)"
 printf 'fan_module=%s\\n' "$(grep -c '^dgx_ec_fan_control ' /proc/modules)"
@@ -394,14 +403,67 @@ def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 
     Without it only the firmware framebuffer shows a console, and only for a
     display attached at boot: a monitor or KVM connected later stays dark.
+    nvidia-drm also offers DRM dumb buffers only with mode setting, so the
+    display carve-out that holds the embedding and output head (vLLM patch
+    0021) cannot be allocated and the worker refuses to start.
     """
     value = facts.get("modeset", "")
     if value == "Y":
         return []
     return [
         f"{node_name}: nvidia-drm modeset is {value or 'unreadable'}, expected Y "
-        "(a display attached after boot stays dark; purge nvidia-drm-options-modeset0)"
+        "(a display attached after boot stays dark and the display carve-out cannot "
+        "be allocated; purge nvidia-drm-options-modeset0)"
     ]
+
+
+def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when nvidia-drm provides no framebuffer console.
+
+    With fbdev off, a display attached to the node shows no text console. The
+    console framebuffer takes 8 MiB of the display carve-out at 1920x1080,
+    which the serving configuration leaves free.
+    """
+    value = facts.get("fbdev", "")
+    if value == "Y":
+        return []
+    return [
+        f"{node_name}: nvidia-drm fbdev is {value or 'unreadable'}, expected Y "
+        "(an attached display gets no text console)"
+    ]
+
+
+def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when a userspace process holds DRM master.
+
+    The kernel's framebuffer console stops drawing while a userspace master
+    exists. The serving worker closes its DRM file right after importing the
+    display carve-out, so nothing should hold master on these headless nodes.
+    """
+    value = facts.get("drm_masters", "unreadable")
+    if not value:
+        return []
+    if value == "unreadable":
+        return [f"{node_name}: cannot read the DRM clients (/sys/kernel/debug/dri/0/clients)"]
+    return [f"{node_name}: {value} holds DRM master, so the text console cannot draw"]
+
+
+def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when the active virtual console is in graphics mode.
+
+    The boot splash can leave it there after Plymouth quits; the kernel then
+    draws no text on an attached display although fbcon is available.
+    """
+    console, _, mode = facts.get("console", "").partition(":")
+    if mode == "0":
+        return []
+    if mode == "1":
+        return [
+            f"{node_name}: the active console ({console}) is in graphics mode, so an "
+            "attached display shows no text (the boot splash leaves it there; KDSETMODE "
+            "KD_TEXT restores it until the next boot)"
+        ]
+    return [f"{node_name}: cannot read the active console mode"]
 
 
 def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
@@ -527,6 +589,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(boot_order_problems(node["name"], boot.stdout))
         facts = host_facts(remote_shell(nodes, node, HOST_FACTS_QUERY).stdout)
         problems.extend(modeset_problems(node["name"], facts))
+        problems.extend(fbdev_problems(node["name"], facts))
+        problems.extend(drm_master_problems(node["name"], facts))
+        problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))

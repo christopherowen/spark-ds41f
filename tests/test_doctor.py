@@ -74,6 +74,9 @@ class BootOrderTest(unittest.TestCase):
 
 FAN_WORKING = (
     "modeset=Y\n"
+    "fbdev=Y\n"
+    "drm_masters=\n"
+    "console=tty1:0\n"
     "kernel=7.0.0-1019-nvidia\n"
     "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
@@ -100,6 +103,50 @@ class ModesetTest(unittest.TestCase):
     def test_unreadable_mode_setting_is_reported(self) -> None:
         problems = spark3.modeset_problems("dgx1", facts(modeset=""))
         self.assertIn("modeset is unreadable", problems[0])
+
+
+class ConsoleTest(unittest.TestCase):
+    def test_working_console_passes(self) -> None:
+        self.assertEqual(spark3.fbdev_problems("dgx3", facts()), [])
+        self.assertEqual(spark3.drm_master_problems("dgx3", facts()), [])
+        self.assertEqual(spark3.console_mode_problems("dgx3", facts()), [])
+
+    def test_fbdev_off_is_reported(self) -> None:
+        problems = spark3.fbdev_problems("dgx3", facts(fbdev="N"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("fbdev is N, expected Y", problems[0])
+
+    def test_unreadable_fbdev_is_reported(self) -> None:
+        problems = spark3.fbdev_problems("dgx3", facts(fbdev=""))
+        self.assertIn("fbdev is unreadable", problems[0])
+
+    def test_drm_master_holder_is_reported(self) -> None:
+        problems = spark3.drm_master_problems(
+            "dgx3", facts(drm_masters="VLLM::Worker_TP/2855221")
+        )
+        self.assertEqual(
+            problems,
+            ["dgx3: VLLM::Worker_TP/2855221 holds DRM master, so the text console cannot draw"],
+        )
+
+    def test_unreadable_drm_clients_are_reported(self) -> None:
+        problems = spark3.drm_master_problems("dgx3", facts(drm_masters="unreadable"))
+        self.assertIn("cannot read the DRM clients", problems[0])
+        missing = spark3.host_facts("modeset=Y\n")
+        self.assertIn("cannot read the DRM clients", spark3.drm_master_problems("dgx3", missing)[0])
+
+    def test_graphics_mode_console_is_reported(self) -> None:
+        problems = spark3.console_mode_problems("dgx3", facts(console="tty1:1"))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("the active console (tty1) is in graphics mode", problems[0])
+
+    def test_unreadable_console_mode_is_reported(self) -> None:
+        problems = spark3.console_mode_problems("dgx3", facts(console="tty1:"))
+        self.assertEqual(problems, ["dgx3: cannot read the active console mode"])
+
+    def test_modeset_message_names_the_carveout(self) -> None:
+        problems = spark3.modeset_problems("dgx1", facts(modeset="N"))
+        self.assertIn("display carve-out cannot be allocated", problems[0])
 
 
 class FanControlTest(unittest.TestCase):
