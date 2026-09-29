@@ -23,6 +23,15 @@ files=(
   "grub-console.cfg:/etc/default/grub.d/zz-spark-console.cfg:0644"
 )
 
+# Desktop services that serve nothing on a headless inference node (every
+# installed snap is a desktop application). apply also disables the display
+# manager, gdm3, which Ubuntu aliases as display-manager.service.
+idle_units=(
+  bluetooth.service
+  cups.service cups.socket cups.path cups-browsed.service
+  snapd.service snapd.socket snapd.seeded.service
+)
+
 # KDGETMODE / KDSETMODE on the active virtual console: 0 is text, 1 graphics.
 console_mode() {
   local vt
@@ -127,6 +136,14 @@ check_files() {
     echo "kernel recovery sysctls are not active" >&2
     failed=1
   fi
+  local unit state
+  for unit in display-manager.service "${idle_units[@]}"; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    if systemctl is-active --quiet "$unit" || [[ "$state" == enabled || "$state" == alias ]]; then
+      echo "$unit is enabled or running (${state:-unknown}); headless nodes keep it off" >&2
+      failed=1
+    fi
+  done
   if ((failed)); then
     return 1
   fi
@@ -160,6 +177,13 @@ if sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg | grep -q
   sudo -n update-grub >/dev/null 2>&1
 fi
 console_text
+
+# Keep the display manager and the idle desktop services off.
+for unit in gdm3.service "${idle_units[@]}"; do
+  if systemctl cat "$unit" >/dev/null 2>&1; then
+    sudo -n systemctl disable --now "$unit" >/dev/null 2>&1
+  fi
+done
 
 sudo -n sshd -t
 sudo -n systemctl daemon-reload

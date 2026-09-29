@@ -46,3 +46,12 @@ scripts/host-recovery check
 `apply` validates `sshd` before changing either listener. Fresh SSH and
 Tailscale processes are scheduled after the command exits so the OOM policy is
 active without stranding an installation performed through Tailscale.
+
+`scripts/host-recovery apply` also disables the display manager (`gdm3`) and
+desktop services that serve nothing on a headless inference node: Bluetooth,
+CUPS with cups-browsed, and snapd (every installed snap is a desktop
+application; Docker, the NVIDIA driver, Tailscale and DKMS come from apt).
+`check` and `bin/spark3 doctor --live` report any that is enabled or running.
+fwupd stays: it delivers the embedded-controller, UEFI, ConnectX-7 and NVMe
+firmware from LVFS.
+

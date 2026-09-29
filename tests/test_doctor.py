@@ -83,6 +83,7 @@ FAN_WORKING = (
     "console=tty1:0\n"
     "cmdline_splash=0\n"
     "grub_splash=0\n"
+    "idle_services=\n"
     "kernel=7.0.0-1019-nvidia\n"
     "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
@@ -179,6 +180,29 @@ class ConsoleTest(unittest.TestCase):
     def test_modeset_message_names_the_carveout(self) -> None:
         problems = spark3.modeset_problems("dgx1", facts(modeset="N"))
         self.assertIn("display carve-out cannot be allocated", problems[0])
+
+
+class IdleServicesTest(unittest.TestCase):
+    def test_idle_services_are_reported_with_their_fix(self) -> None:
+        problems = spark3.idle_service_problems(
+            "dgx2", facts(idle_services="bluetooth.service,snapd.socket")
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bluetooth.service, snapd.socket enabled or running", problems[0])
+        self.assertIn(
+            "sudo systemctl disable --now bluetooth.service snapd.socket", problems[0]
+        )
+        self.assertIn("scripts/host-recovery apply", problems[0])
+
+    def test_no_idle_services_pass(self) -> None:
+        self.assertEqual(spark3.idle_service_problems("dgx2", facts()), [])
+        self.assertEqual(
+            spark3.idle_service_problems("dgx2", spark3.host_facts("modeset=Y\n")), []
+        )
+
+    def test_query_lists_every_idle_unit(self) -> None:
+        for unit in spark3.IDLE_SERVICES:
+            self.assertIn(unit, spark3.HOST_FACTS_QUERY)
 
 
 class FanControlTest(unittest.TestCase):

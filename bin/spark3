@@ -386,6 +386,19 @@ def boot_order_problems(node_name: str, output: str) -> list[str]:
     ]
 
 
+# Desktop services that serve nothing on a headless inference node:
+# scripts/host-recovery disables them (the display manager has its own check).
+IDLE_SERVICES = (
+    "bluetooth.service",
+    "cups.service",
+    "cups.socket",
+    "cups.path",
+    "cups-browsed.service",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+)
+
 HOST_FACTS_QUERY = """
 printf 'modeset=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)"
 printf 'fbdev=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
@@ -407,6 +420,17 @@ printf 'fan_service=%s/%s\\n' "$(systemctl is-enabled dgx-fan-control.service 2>
   "$(systemctl is-active dgx-fan-control.service 2>/dev/null)"
 printf 'gpu=%s\\n' "$(nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)"
 """
+HOST_FACTS_QUERY += (
+    r"""printf 'idle_services=%s\n' "$(for unit in """
+    + " ".join(IDLE_SERVICES)
+    + r"""; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null)
+  if systemctl is-active --quiet "$unit" || [ "$state" = enabled ] || [ "$state" = alias ]; then
+    printf '%s\n' "$unit"
+  fi
+done | paste -sd, -)"
+"""
+)
 
 
 def host_facts(output: str) -> dict[str, str]:
@@ -513,6 +537,23 @@ def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         "graphics mode after boot; run scripts/host-recovery apply on the node (it "
         "installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), then "
         "reboot with the service stopped"
+    ]
+
+
+def idle_service_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when desktop services run on a headless inference node.
+
+    Bluetooth, CUPS, cups-browsed and snapd (every installed snap is a desktop
+    application) each hold memory on every node, up to about 50 MiB, and
+    cups-browsed listens on the network. host-recovery disables them.
+    """
+    units = [unit for unit in facts.get("idle_services", "").split(",") if unit]
+    if not units:
+        return []
+    return [
+        f"{node_name}: {', '.join(units)} enabled or running, though unused on a "
+        f"headless inference node; run sudo systemctl disable --now {' '.join(units)} "
+        "(scripts/host-recovery apply does the same)"
     ]
 
 
@@ -650,6 +691,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(drm_master_problems(node["name"], facts))
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))
+        problems.extend(idle_service_problems(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
