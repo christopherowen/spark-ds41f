@@ -20,3 +20,10 @@ args = arm["serve_args"]
 args[args.index("--kv-cache-memory-bytes") + 1] = str(CARVEOUT_BYTES)
 (E / "cluster-carveout.json").write_text(json.dumps(arm, indent=2) + "\n")
 print("wrote", E / "cluster-carveout.json")
+
+# The same backing with a 256K context limit: about 3.1 full windows fit.
+long = copy.deepcopy(arm)
+largs = long["serve_args"]
+largs[largs.index("--max-model-len") + 1] = str(256 * 1024)
+(E / "cluster-carveout-256k.json").write_text(json.dumps(long, indent=2) + "\n")
+print("wrote", E / "cluster-carveout-256k.json")

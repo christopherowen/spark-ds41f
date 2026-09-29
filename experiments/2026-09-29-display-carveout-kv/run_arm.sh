@@ -1,14 +1,15 @@
 #!/bin/bash
-# usage: run_arm.sh ARM LABEL   (on dgx1, deployment checkout)
+# usage: run_arm.sh ARM LABEL [bench options...]   (on dgx1, deployment checkout)
 # ARM "control" benchmarks the running promoted service without restarting it.
 # Any other ARM stops every service, starts cluster-ARM.json under the
 # launcher's memory guards, and benchmarks it. Results go to
 # results/private/bench/dcv-LABEL; the arm stays up.
-set -eu
+set -euo pipefail
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-29-display-carveout-kv
 arm=$1
 label=$2
+shift 2
 config=config/cluster.json
 if [ "$arm" != control ]; then
   config=$E/cluster-$arm.json
@@ -26,4 +27,4 @@ done
 bin/spark3 --cluster-config "$config" bench --allow-mismatch --compare none \
   --suites quality,decode,prefill,admission --decode-cases prose,code,prose-nothink,code-nothink \
   --concurrency 1,8 --min-samples 3 --max-samples 3 --prefill-text source \
-  --output "results/private/bench/dcv-$label"
+  --output "results/private/bench/dcv-$label" "$@"
