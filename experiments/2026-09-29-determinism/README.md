@@ -77,4 +77,37 @@ deterministic launches use the same kernels as atomic ones plus the
 fixed-order top-k sum. Arms `detfast` (0004+0005, split-K through the FP32
 reducer) and `detfast-t` (split-K turbo kept); decode alternates with r5m.
 
-Pending.
+- detfast repeats exactly (5/5 identical, no logprob difference anywhere) and
+  its tokens and logprobs equal detsk's bit for bit, in a separate boot: the
+  decode-regime kernels with fixed-order routes compute exactly what the
+  grouped path does. detfast-t varies from the first decode token, so four-way
+  split-K turbo is the decode source.
+- Prefill: detfast within +/-0.15% of r5m at every depth.
+- Decode did not recover: detfast -9% (prose) to -17% (JSON) at one stream and
+  -15% at eight against r5m (two boots each); detfast-t the same.
+
+## Round 3: decode profile (`run3.sh`)
+
+One single-stream JSON request each on r5m and detfast (rank 0):
+
+| Kernel | r5m | detfast |
+|---|---|---|
+| Fused dynamic MoE (target, 96 CTAs), mean per call | 566 us | 619 us |
+| Its p10 / p90 | 334 / 734 us | 402 / 890 us |
+| Drafter MoE (90 CTAs), median | 244 us | 383 us |
+| Fixed-order top-k sum, per call | - | 2 us |
+
+The reduction is not the cost. With deterministic output the fused kernel
+collapses every intermediate slice of an M tile into one task
+(`dynamic.py`, `task_slice_chunk = route_gate_tile_cnt`) and accumulates the
+slices into the route row by read-modify-write. The atomic path also splits
+FC2's reduction over the intermediate dimension: one task per 128-column
+slice, six for DS4.1's 768, each adding its partial atomically. At decode
+(36 routed rows at one stream) the collapse leaves most of the 96 CTAs idle;
+prefill has M tiles to spare, so it pays nothing.
+
+Next: keep the slice split and make it deterministic. Each slice task stores
+its FC2 partial into its own row (pair x slices + slice) and the fixed-order
+top-k sum reduces routes and slices together, for launches whose partial rows
+fit the planned route-output capacity (every decode shape); larger launches
+keep the collapsed form.
