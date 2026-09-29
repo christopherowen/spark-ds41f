@@ -33,3 +33,20 @@ for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
+
+# Decode profiles: r5m and detfast with the torch profiler (profile_decode.py).
+for name, config in (("r5m-prof", base), ("detfast-prof", detfast)):
+    profiled = copy.deepcopy(config)
+    profiled["serve_args"] += [
+        "--profiler-config",
+        json.dumps({
+            "profiler": "torch",
+            "torch_profiler_dir": f"/cache/kkref/profiles/det-{name}",
+            "torch_profiler_with_stack": False,
+            "ignore_frontend": True,
+            "torch_profiler_use_gzip": True,
+        }),
+    ]
+    path = E / f"cluster-{name}.json"
+    path.write_text(json.dumps(profiled, indent=2) + "\n")
+    print("wrote", path)
