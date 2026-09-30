@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Repeat a tagged target beside background mixes, with per-step traces on every rank.
 
-usage: trace_mixes.py BASE_URL OUT_DIR [--repeats R] [--tokens T] [--prompts json,prose]
+usage: trace_mixes.py BASE_URL OUT_DIR [--repeats R] [--tokens T] [--prompts json,prose,long]
 (on dgx1, a batch-trace arm serving: SPARK3_MOE_CHECKSUM_DIR=/cache/kkref/moe-checksums)
 
 For each target prompt, mix and repeat: reset the debug logs on all three
@@ -28,9 +28,22 @@ def arg(name, default):
 
 
 REPEATS, TOKENS = int(arg("--repeats", "3")), int(arg("--tokens", "128"))
+NOTES = " ".join(
+    f"Note {i}: the {c} lighthouse at {p} was built in {1700 + 7 * i} and first lit with {f}."
+    for i, (c, p, f) in enumerate(
+        (color, place, fuel)
+        for color in ("red", "white", "striped", "black", "grey")
+        for place in ("the northern cape", "a harbour mouth", "an offshore reef", "the river delta",
+                      "a granite island", "the old breakwater", "a sandbar", "the fjord entrance")
+        for fuel in ("whale oil",)
+    )
+)
 PROMPTS = {
     "json": "Return a JSON object describing three fictional planets with name, mass and moons.",
     "prose": "Write a short paragraph about the history of the lighthouse.",
+    # About 900 prompt tokens: one prefill chunk far above the 192-row small plans.
+    "long": "Here are forty notes about lighthouses. " + NOTES
+            + " Summarize what these notes say about when the lighthouses were built.",
 }
 PROMPTS = {k: v for k, v in PROMPTS.items() if k in arg("--prompts", "json,prose").split(",")}
 BACKGROUND = [
