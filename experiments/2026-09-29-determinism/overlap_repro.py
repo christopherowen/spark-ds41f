@@ -40,25 +40,33 @@ device = torch.device("cuda")
 
 
 @contextmanager
-def linear_plan(in_features, out_features, packed):
-    caps = bfl.Caps(device=device, max_tokens=M, in_features=in_features,
-                    out_features=out_features, source_dtype=torch.bfloat16,
-                    output_dtype=torch.bfloat16, block_size=(32, 32), output_mode="provided")
-    plan = bfl.plan(caps)
-    source = torch.randn(M, in_features, device=device, dtype=torch.bfloat16)
+def linear_plans(specs):
+    """Prepare every block-FP8 linear in one session, left unfrozen.
 
-    def prepare(state):
-        spec, = state.scratch.scratch_specs()
-        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
-        output = torch.empty((M, out_features, 1), dtype=torch.bfloat16, device=device)
-        binding = state.bind(scratch=scratch, source=source, packed_weight=packed, output=output)
-        return PreparedCall(run=lambda: state.run_binding(binding), output=output,
-                            owners=(scratch, binding))
+    Freezing is process-wide; the routed MoE binding prepared afterwards
+    freezes once everything has compiled.
+    """
+    plans, requests = [], []
+    for in_features, out_features, packed in specs:
+        caps = bfl.Caps(device=device, max_tokens=M, in_features=in_features,
+                        out_features=out_features, source_dtype=torch.bfloat16,
+                        output_dtype=torch.bfloat16, block_size=(32, 32), output_mode="provided")
+        plan = bfl.plan(caps)
+        source = torch.randn(M, in_features, device=device, dtype=torch.bfloat16)
 
+        def prepare(state, source=source, packed=packed, out_features=out_features):
+            spec, = state.scratch.scratch_specs()
+            scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+            output = torch.empty((M, out_features, 1), dtype=torch.bfloat16, device=device)
+            binding = state.bind(scratch=scratch, source=source, packed_weight=packed, output=output)
+            return PreparedCall(run=lambda: state.run_binding(binding), output=output,
+                                owners=(scratch, binding))
+
+        plans.append(plan)
+        requests.append(plan.request(name=f"bfl-{out_features}", prepare_call=prepare))
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(name=f"bfl-{out_features}", prepare_call=prepare),))
-        session.freeze()
-        yield plan
+        session.prepare(tuple(requests))
+        yield plans
 
 
 def linear(plan, packed, x, scratch):
@@ -98,8 +106,7 @@ routed_out = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
 side = torch.cuda.Stream()
 
 with ExitStack() as stack:
-    plan13 = stack.enter_context(linear_plan(K, 2 * SHARED, p13))
-    plan2 = stack.enter_context(linear_plan(SHARED, K, p2))
+    plan13, plan2 = stack.enter_context(linear_plans([(K, 2 * SHARED, p13), (SHARED, K, p2)]))
     binding = stack.enter_context(make_tp_moe_fp4_binding(
         a=x, experts=experts, topk_weights=topk_weights, topk_ids=topk_ids,
         output=routed_out, input_scales_static=True, quant_mode="w4a8_mx"))
