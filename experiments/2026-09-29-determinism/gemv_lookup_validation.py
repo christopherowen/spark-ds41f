@@ -41,7 +41,6 @@ from safetensors import safe_open  # noqa: E402
 
 from b12x.gemm import bf16_gemv  # noqa: E402
 from b12x.gemm import block_fp8_linear as bfl  # noqa: E402
-from b12x.gemm.block_fp8_linear._tuning import TUNING as FP8_TUNING  # noqa: E402
 from b12x.gemm.bf16_gemv._tuning import default_config  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
 
@@ -139,13 +138,6 @@ for cap in CAPS:
 
     fp8_plans[cap] = plan
     requests.append(plan.request(name=f"wq_b-{cap}", prepare_call=prepare_fp8))
-configs = {}
-for cap in CAPS:
-    config = FP8_TUNING.default_config(fp8_plans[cap].query, device)
-    configs.setdefault(str(config), []).append(cap)
-print("wq_b (block FP8 1280->11264) dense configuration by capacity:", flush=True)
-for config, caps in configs.items():
-    print(f"  {caps}: {config[:300]}", flush=True)
 
 
 def rows_of(gates, name, width):
@@ -155,6 +147,12 @@ def rows_of(gates, name, width):
 
 with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
     session.prepare(tuple(requests))
+    configs = {}
+    for cap in CAPS:
+        configs.setdefault(str(fp8_plans[cap].selection.config), []).append(cap)
+    print("wq_b (block FP8 1280->11264) selected configuration by capacity:", flush=True)
+    for config, caps in configs.items():
+        print(f"  {caps}: {config[:400]}", flush=True)
 
     def run(label, x, cap):
         weight, out_dtype = SHAPES[label]

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """First tensor where a tagged target's rows differ between two traced runs, attention included.
 
-usage: analyze_trace2.py OUT_DIR PROMPT      (runs from trace_mixes.py on an attn-trace arm)
+usage: analyze_trace2.py OUT_DIR PROMPT [--main | --drafter]   (runs from trace_mixes.py on an
+                                                                 attn-trace arm)
 
 analyze_trace.py, extended with the attn-trace overlay's attention log. For
 every run of PROMPT and rank, the target's rows are found in each step from
@@ -16,7 +17,9 @@ its mix: output identity, the target's schedule, and the first record where
 its rows differ while its row count matches, with the indexer's score width
 and mode in that step (tag 23; it depends on the batch's longest sequence).
 Each run's schedule is summarized: the target's rows, padded batch and
-request count per appearance.
+request count per appearance. --main compares only the main model's layers,
+--drafter only the drafter's, so a drafter difference does not hide a later
+main-model one.
 """
 import glob
 import hashlib
@@ -28,6 +31,7 @@ import sys
 import torch
 
 OUT, PROMPT = sys.argv[1], sys.argv[2]
+ONLY = 0 if "--main" in sys.argv else 1 if "--drafter" in sys.argv else None
 SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
@@ -170,7 +174,7 @@ def compare(a, b):
             other = {label: s for _, label, s in pb["items"]}
             for key, label, sa in pa["items"]:
                 sb = other.get(label)
-                if sb is None:
+                if sb is None or (ONLY is not None and key[0] != ONLY):
                     continue
                 if not torch.equal(sa, sb):
                     rows = (sa != sb).nonzero().flatten().tolist()
