@@ -1,7 +1,7 @@
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 --- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	1970-01-01 01:00:00.000000000 +0100
-+++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 15:46:42.824530150 +0200
-@@ -0,0 +1,393 @@
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:00:15.066210313 +0200
+@@ -0,0 +1,398 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -341,6 +341,13 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
 +
 +
 +def _watch() -> None:
++    # The logs are inference tensors: in-place resets need inference mode, and
++    # its guard lasts only as long as the context manager is held.
++    with torch.inference_mode():
++        _watch_loop()
++
++
++def _watch_loop() -> None:
 +    rank = (
 +        torch.distributed.get_rank()
 +        if torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -355,8 +362,6 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
 +    # Triggers that predate this process are stale; act only on later touches
 +    # (never during startup capture, where a device read would fail).
 +    seen = {kind: stamp(kind) for kind in ("reset", "dump")}
-+    # The logs are inference tensors: in-place resets need inference mode.
-+    torch.inference_mode().__enter__()
 +    while True:
 +        time.sleep(1.0)
 +        for kind in ("reset", "dump"):
@@ -396,8 +401,8 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
 +            except Exception as error:  # debug tool: report, keep watching
 +                print(f"checksum_debug {kind} failed: {error!r}", flush=True)
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
---- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 15:46:42.819265450 +0200
-+++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 15:46:42.820551549 +0200
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:00:15.060084786 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:00:15.061084787 +0200
 @@ -42,6 +42,7 @@
  from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
      MoERunnerInterface,
@@ -426,8 +431,8 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/mod
          with self._sequence_parallel_context():
              # TODO(bnell): parts of the dispatch/combine steps will go away once
 diff -ruN a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
---- a/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 15:46:42.811265431 +0200
-+++ b/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 15:46:42.812631322 +0200
+--- a/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:00:15.049084773 +0200
++++ b/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:00:15.051084775 +0200
 @@ -6,7 +6,10 @@
  from itertools import islice
  
@@ -560,8 +565,8 @@ diff -ruN a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nv
  
  
 diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
---- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 15:46:42.826265466 +0200
-+++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 15:46:42.828081614 +0200
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:00:15.069084796 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:00:15.070910222 +0200
 @@ -30,6 +30,7 @@
      RowParallelLinear,
      UnquantizedLinearMethod,
@@ -657,8 +662,8 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
              plan,
              scratch=buffers[metadata_count:],
 diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
---- a/vllm/v1/worker/gpu/model_runner.py	2026-09-30 15:46:42.815265440 +0200
-+++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-30 15:46:42.816817636 +0200
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:00:15.055084780 +0200
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:00:15.057009518 +0200
 @@ -29,6 +29,7 @@
  
  import numpy as np
