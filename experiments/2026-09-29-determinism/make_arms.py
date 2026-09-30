@@ -106,13 +106,23 @@ detslice_noeng["environment"]["SPARK3_ENGRAM_ASYNC"] = "0"
 detslice_nol2 = copy.deepcopy(detslice)
 detslice_nol2["environment"]["VLLM_DS41_L2_PREFETCH"] = "0"
 
+# 0007: the dense GEMM fences its generic stage reads before the TMA refill
+# (overlay_fence.sh), with the side-stream overlap kept on.
+FENCE = ["{home}/spark3-overlay/gemm-fence/b12x/_lib/dense_gemm.py",
+         "/opt/spark3/candidate/b12x/b12x/_lib/dense_gemm.py", "ro"]
+detslice_fence = copy.deepcopy(detslice)
+detslice_fence["container"]["mounts"].append(FENCE)
+r5m_fence = copy.deepcopy(base)
+r5m_fence["container"]["mounts"].append(FENCE)
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
                      ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
                      ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager),
                      ("r5m-dbg", r5m_dbg), ("detslice-noeng", detslice_noeng),
                      ("detslice-nol2", detslice_nol2), ("detslice-static", detslice_static),
-                     ("detslice-probe", detslice_probe)):
+                     ("detslice-probe", detslice_probe), ("detslice-fence", detslice_fence),
+                     ("r5m-fence", r5m_fence)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
