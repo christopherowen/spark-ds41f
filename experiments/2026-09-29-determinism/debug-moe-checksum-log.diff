@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..b1212652cd
+index 0000000000..9fa344f4b4
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,125 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -27,7 +27,16 @@ index 0000000000..b1212652cd
 +DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
 +ENABLED = bool(DIRECTORY)
 +_CAPACITY = 1 << 17
++# Decode steps and short prompts only: large batches would grow the cached
++# memory pool (system memory on GB10) past the startup memory guard.
++_MAX_ROWS = 64
 +_log: "_Log | None" = None
++
++
++def _sum(x: torch.Tensor) -> torch.Tensor:
++    # FP32 accumulation reads the BF16 input in place: no full-size copy for
++    # captured graphs to retain. One BF16 ulp anywhere still moves the sum.
++    return torch.sum(x, dtype=torch.float32).double().reshape(1)
 +
 +
 +class _Log:
@@ -45,8 +54,8 @@ index 0000000000..b1212652cd
 +                torch.full((1,), float(slot), dtype=torch.float64, device=x.device),
 +                torch.full((1,), float(x.shape[0]), dtype=torch.float64, device=x.device),
 +                torch.full((1,), float(tag), dtype=torch.float64, device=x.device),
-+                x.double().sum().reshape(1),
-+                x.double().abs().sum().reshape(1),
++                _sum(x),
++                torch.linalg.vector_norm(x, 1, dtype=torch.float32).double().reshape(1),
 +            ]
 +        )
 +        index = self.count.remainder(_CAPACITY)
@@ -63,13 +72,11 @@ index 0000000000..b1212652cd
 +            ]
 +        )
 +        shared_sum = (
-+            shared.double().sum().reshape(1)
++            _sum(shared)
 +            if shared is not None
 +            else torch.zeros(1, dtype=torch.float64, device=x.device)
 +        )
-+        values = torch.cat(
-+            [header, x.double().sum().reshape(1), shared_sum, routed.double().sum().reshape(1)]
-+        )
++        values = torch.cat([header, _sum(x), shared_sum, _sum(routed)])
 +        index = self.count.remainder(_CAPACITY)
 +        self.rows.index_copy_(0, index, values.unsqueeze(0))
 +        self.count.add_(1)
@@ -105,6 +112,8 @@ index 0000000000..b1212652cd
 +def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
 +    """Append one checksum row; call only when ENABLED."""
 +    global _log
++    if x.shape[0] > _MAX_ROWS:
++        return
 +    if _log is None:
 +        os.makedirs(DIRECTORY, exist_ok=True)
 +        _log = _Log(x.device, "runner")
@@ -114,6 +123,8 @@ index 0000000000..b1212652cd
 +def record_tag(owner, tag: int, x: torch.Tensor) -> None:
 +    """Append (slot, rows, tag, sum, abs sum) to the tag log; only when ENABLED."""
 +    global _tag_log
++    if x.shape[0] > _MAX_ROWS:
++        return
 +    if _tag_log is None:
 +        os.makedirs(DIRECTORY, exist_ok=True)
 +        _tag_log = _Log(x.device, "tags")
