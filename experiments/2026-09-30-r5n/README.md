@@ -36,4 +36,19 @@ quality 5/5, needle pass, doctor clean.
 
 ## Results
 
-Pending.
+`screen.sh` (2026-09-30, overlay SHA-256 `ffc7c4a4…` on every node):
+
+| | overlay (0004) | r5m | change |
+|---|---|---|---|
+| prefill, 4,096-token chunk at 8K / 64K / 131K / 200K | 1033 / 1085 / 1117 / 1158 ms | 1025 / 1085 / 1116 / 1153 ms | +0.73 / +0.02 / +0.13 / +0.46% |
+| prose step, one stream | 42.23, 42.35 ms | 41.61, 42.52 ms | +0.5% |
+| JSON step, one stream | 48.06, 48.31 ms | 48.19, 47.93 ms | +0.3% |
+| prose, eight streams | 164.0, 165.0 tok/s | 168.9, 166.0 tok/s | -1.8% |
+| JSON, eight streams | 241.0, 241.1 tok/s | 241.1, 241.3 tok/s | -0.1% |
+
+Prefill (two rounds each) is within the overlay's own round-to-round spread
+(about 1% at 8K and 200K). Decode alternated overlay, r5m, overlay, r5m, six
+samples each. Everything is within the alternating spread except prose at
+eight streams, which is borderline: -1.8% against r5m's own 1.7% boot-to-boot
+spread (the second pair differs by 0.6%). Recorded as a possible small cost,
+not as none; eight-stream JSON and both step times are level.
