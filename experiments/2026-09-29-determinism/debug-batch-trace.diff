@@ -1,0 +1,476 @@
+diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+new file mode 100644
+index 0000000000..48bdd20d59
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+@@ -0,0 +1,261 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Debug-only MoE checksum log for reproducibility investigations.
++
++Enabled only by ``SPARK3_MOE_CHECKSUM_DIR``; unset means no work at all.
++Every MoE runner call with at most 64 rows appends one record to a device
++log: (layer slot, rows, per-row sums of the input, of the shared-expert output
++and of the routed output). Tagged calls (``record_tag``, e.g. inside the
++shared-expert MLP, which may run on a side stream) append (slot, rows, tag,
++per-row sums) to a second log, so the two never share a counter. Per-row sums
++matter: batches are padded, and padding rows carry stale values.
++Records are indexed on the device, so CUDA-graph replays record too, and the
++logs allocate nothing after construction (captured graphs keep no segments).
++A watcher thread zeroes both counters when ``<dir>/reset`` changes and writes
++``rank<r>-<log>-<count>.pt`` when ``<dir>/dump`` changes.
++"""
++
++import os
++import threading
++import time
++
++import torch
++
++DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
++ENABLED = bool(DIRECTORY)
++# Rows recorded per call and log capacities; the defaults keep the original
++# layout (64 rows, 4096 runner and 65536 tag records).
++_MAX_ROWS = int(os.environ.get("SPARK3_MOE_CHECKSUM_ROWS", "64"))
++_RUNNER_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_RUNNER_CAPACITY", "4096"))
++_TAGS_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_TAGS_CAPACITY", "65536"))
++_SCHEDULE_CAPACITY = 4096
++_SCHEDULE_REQS = 17
++_MARKER = -1.0
++_SLOTS = 256
++_logs: dict[str, "_Log"] = {}
++
++
++class _Log:
++    def __init__(self, device: torch.device, name: str, width: int, capacity: int) -> None:
++        self.name = name
++        self.capacity = capacity
++        self.rows = torch.zeros(capacity, width, dtype=torch.float32, device=device)
++        self.stage = torch.zeros(_SLOTS, width, dtype=torch.float32, device=device)
++        self.count = torch.zeros(1, dtype=torch.int64, device=device)
++        self.index = torch.zeros(1, dtype=torch.int64, device=device)
++        self.slots: dict[int, int] = {}
++        self.names: list[str] = []
++
++    def slot(self, owner) -> int:
++        key = id(owner)
++        if key not in self.slots:
++            self.slots[key] = len(self.slots)
++            self.names.append(
++                str(
++                    getattr(owner, "layer_name", None)
++                    or getattr(getattr(owner, "gate_up_proj", None), "prefix", None)
++                    or type(owner).__name__
++                )
++            )
++        slot = self.slots[key]
++        if slot >= _SLOTS:
++            raise RuntimeError("checksum log slot table is full")
++        return slot
++
++    def row_sums(self, x: torch.Tensor, out: torch.Tensor) -> None:
++        torch.sum(x.reshape(x.shape[0], -1), dim=1, dtype=torch.float32, out=out)
++
++    def append(self, slot: int) -> None:
++        torch.remainder(self.count, self.capacity, out=self.index)
++        self.rows.index_copy_(0, self.index, self.stage[slot : slot + 1])
++        self.count.add_(1)
++
++
++def _log(name: str, device: torch.device, width: int, capacity: int) -> _Log:
++    log = _logs.get(name)
++    if log is None:
++        os.makedirs(DIRECTORY, exist_ok=True)
++        log = _logs[name] = _Log(device, name, width, capacity)
++        if len(_logs) == 1:
++            threading.Thread(target=_watch, daemon=True).start()
++    return log
++
++
++def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
++    """Append one runner record; call only when ENABLED."""
++    rows = x.shape[0]
++    if rows > _MAX_ROWS:
++        return
++    log = _log("runner", x.device, 2 + 3 * _MAX_ROWS, _RUNNER_CAPACITY)
++    slot = log.slot(owner)
++    stage = log.stage[slot]
++    stage.zero_()
++    stage[0].fill_(slot)
++    stage[1].fill_(rows)
++    log.row_sums(x, stage[2 : 2 + rows])
++    if shared is not None:
++        log.row_sums(shared, stage[2 + _MAX_ROWS : 2 + _MAX_ROWS + rows])
++    log.row_sums(routed, stage[2 + 2 * _MAX_ROWS : 2 + 2 * _MAX_ROWS + rows])
++    log.append(slot)
++
++
++def record_tag(owner, tag: int, x: torch.Tensor) -> None:
++    """Append one tagged record (slot, rows, tag, per-row sums); only when ENABLED."""
++    rows = x.shape[0]
++    if rows > _MAX_ROWS:
++        return
++    log = _log("tags", x.device, 3 + _MAX_ROWS, _TAGS_CAPACITY)
++    slot = log.slot(owner)
++    stage = log.stage[slot]
++    stage.zero_()
++    stage[0].fill_(slot)
++    stage[1].fill_(rows)
++    stage[2].fill_(tag)
++    log.row_sums(x, stage[3 : 3 + rows])
++    log.append(slot)
++
++
++_schedule_host: list[dict] = []
++_step = [0]
++
++
++def record_schedule(req_ids, num_tokens: int, padded: int, query_start_loc: torch.Tensor,
++                    num_reqs: int, is_padding: torch.Tensor | None) -> None:
++    """Append one step of the scheduled batch; call only when ENABLED.
++
++    Device log (allocation-free, stream-ordered after the batch is built):
++    step, requests, padded rows, query_start_loc (actual row offsets after
++    adaptive verification reallocates drafts) and the first rows' dead/padding
++    flags. Host list: the step's request ids and token counts. A marker record
++    (slot -1, rows = padded, then the step) goes into the runner and tag logs so
++    their per-layer records can be split by step.
++    """
++    step = _step[0]
++    _step[0] += 1
++    device = query_start_loc.device
++    log = _log("schedule", device, 3 + _SCHEDULE_REQS + _MAX_ROWS, _SCHEDULE_CAPACITY)
++    stage = log.stage[0]
++    stage.zero_()
++    stage[0].fill_(step)
++    stage[1].fill_(num_reqs)
++    stage[2].fill_(padded)
++    n = min(num_reqs + 1, _SCHEDULE_REQS, query_start_loc.numel())
++    stage[3 : 3 + n].copy_(query_start_loc[:n])
++    if is_padding is not None:
++        m = min(padded, _MAX_ROWS, is_padding.numel())
++        stage[3 + _SCHEDULE_REQS : 3 + _SCHEDULE_REQS + m].copy_(is_padding[:m])
++    log.append(0)
++    for name, width, capacity, step_col in (("runner", 2 + 3 * _MAX_ROWS, _RUNNER_CAPACITY, 2),
++                                            ("tags", 3 + _MAX_ROWS, _TAGS_CAPACITY, 3)):
++        marker_log = _log(name, device, width, capacity)
++        mark = marker_log.stage[_SLOTS - 1]
++        mark.zero_()
++        mark[0].fill_(_MARKER)
++        mark[1].fill_(padded)
++        if name == "tags":
++            mark[2].fill_(_MARKER)
++        mark[step_col].fill_(step)
++        marker_log.append(_SLOTS - 1)
++    _schedule_host.append({"step": step, "req_ids": [str(r) for r in req_ids],
++                           "num_tokens": int(num_tokens), "padded": int(padded)})
++
++
++_captures: dict[int, dict] = {}
++
++
++def capture_first_mismatch(owner, first, second, tensors, weights) -> None:
++    """Keep exact copies of ``tensors`` from the first call where ``first`` != ``second``.
++
++    Device-side and graph-safe: a latch keeps only the first mismatch, a
++    counter counts all of them, and the tags log count stamps the moment.
++    ``weights`` are copied to the host at dump time for layers that captured.
++    """
++    entry = _captures.get(id(owner))
++    if entry is None:
++        log = _logs["tags"]
++        entry = _captures[id(owner)] = {
++            "name": log.names[log.slot(owner)],
++            "buffers": {k: torch.zeros_like(v) for k, v in tensors.items()},
++            "latch": torch.zeros((), dtype=torch.bool, device=first.device),
++            "mismatches": torch.zeros((), dtype=torch.int64, device=first.device),
++            "calls": torch.zeros((), dtype=torch.int64, device=first.device),
++            "at": torch.zeros(1, dtype=torch.int64, device=first.device),
++            "weights": weights,
++        }
++    differs = torch.ne(first, second).any()
++    take = differs & ~entry["latch"]
++    entry["latch"] |= differs
++    entry["mismatches"] += differs
++    entry["calls"] += 1
++    for key, source in tensors.items():
++        buffer = entry["buffers"][key]
++        buffer.copy_(torch.where(take, source, buffer))
++    entry["at"].copy_(torch.where(take, _logs["tags"].count, entry["at"]))
++
++
++def _dump_captures(rank: int, count: int) -> None:
++    if not _captures:
++        return
++    out = {}
++    with_weights = 0  # weights only for the first few latched layers (~4 MB each)
++    for entry in _captures.values():
++        latched = bool(entry["latch"].item())
++        keep_weights = latched and with_weights < 4
++        with_weights += keep_weights
++        out[entry["name"]] = {
++            "latched": latched,
++            "mismatches": int(entry["mismatches"].item()),
++            "calls": int(entry["calls"].item()),
++            "at": int(entry["at"].item()),
++            "buffers": {k: v.cpu() for k, v in entry["buffers"].items()} if latched else {},
++            "weights": {k: v.cpu() for k, v in entry["weights"].items()} if keep_weights else {},
++        }
++    torch.save(out, os.path.join(DIRECTORY, f"rank{rank}-captures-{count}.pt"))
++
++
++def _watch() -> None:
++    rank = (
++        torch.distributed.get_rank()
++        if torch.distributed.is_available() and torch.distributed.is_initialized()
++        else int(os.environ.get("RANK", "0"))
++    )
++    def stamp(kind: str) -> int | None:
++        try:
++            return os.stat(os.path.join(DIRECTORY, kind)).st_mtime_ns
++        except FileNotFoundError:
++            return None
++
++    # Triggers that predate this process are stale; act only on later touches
++    # (never during startup capture, where a device read would fail).
++    seen = {kind: stamp(kind) for kind in ("reset", "dump")}
++    while True:
++        time.sleep(1.0)
++        for kind in ("reset", "dump"):
++            current = stamp(kind)
++            if current is None or current == seen[kind]:
++                continue
++            seen[kind] = current
++            try:
++                for log in list(_logs.values()):
++                    if kind == "reset":
++                        log.count.zero_()
++                        _schedule_host.clear()
++                        _step[0] = 0
++                    else:
++                        count = int(log.count.item())
++                        rows = log.rows[: min(count, log.capacity)].cpu()
++                        torch.save(
++                            {"count": count, "capacity": log.capacity, "rows": rows,
++                             "names": list(log.names), "max_rows": _MAX_ROWS,
++                             "schedule_reqs": _SCHEDULE_REQS},
++                            os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
++                        )
++                if kind == "dump" and "tags" in _logs:
++                    _dump_captures(rank, int(_logs["tags"].count.item()))
++                if kind == "dump" and "schedule" in _logs:
++                    import json
++
++                    with open(os.path.join(DIRECTORY, f"rank{rank}-schedule-host-"
++                                           f"{int(_logs['schedule'].count.item())}.json"), "w") as f:
++                        json.dump(list(_schedule_host), f)
++            except Exception as error:  # debug tool: report, keep watching
++                print(f"checksum_debug {kind} failed: {error!r}", flush=True)
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 8a47192e13..9408ff63d5 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
+ from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
+     MoERunnerInterface,
+ )
++from vllm.model_executor.layers.fused_moe.runner import checksum_debug
+ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+     SharedExperts,
+     SharedExpertsOrder,
+@@ -869,6 +870,9 @@ class MoERunner(MoERunnerInterface):
+         # Apply output transform (e.g. latent -> full dim)
+         fused_output = self.apply_routed_output_transform(fused_output)
+ 
++        if checksum_debug.ENABLED:
++            checksum_debug.record(self, hidden_states, shared_output, fused_output)
++
+         if reduce_scatter_rows is not None:
+             return self._reduce_scatter_final_output(
+                 shared_output,
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index a2a2495318..cb602b0a22 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -3,6 +3,8 @@
+ from collections.abc import Callable
+ from enum import IntEnum
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -228,6 +230,12 @@ class SharedExperts(torch.nn.Module):
+ 
+         assert self._output[self._output_idx] is None
+ 
++        if workspace is not None and os.environ.get("SPARK3_PRIVATE_SHARED_SCRATCH") == "1":
++            # Debug only: a private scratch tensor instead of the arena lease,
++            # to tell scratch aliasing from kernel nondeterminism.
++            workspace = torch.empty_like(workspace)
++            if self._stream is not None:
++                workspace.record_stream(self._stream)
+         with use_preallocated_workspace(workspace):
+             if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+                 self._output[self._output_idx] = self._run_in_aux_stream(
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 3cc704baae..a0ed708028 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -6,7 +6,10 @@ from inspect import signature
+ from itertools import islice
+ 
+ import regex as re
++import os
++
+ import torch
++from vllm.model_executor.layers.fused_moe.runner import checksum_debug
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -158,10 +161,119 @@ class DeepseekV4MLP(nn.Module):
+         else:
+             self.act_fn = SiluAndMul()
+ 
++    def _forward_static(self, x):
++        """Debug only: fixed per-layer buffers instead of caching-allocator tensors.
++
++        Same kernels (V4.1 block32 linear op, clamped SiLU-and-mul), different
++        memory: separates an allocator interaction from arithmetic.
++        """
++        from vllm.models.deepseek_v4_1.b12x_layers import _block32_linear
++        from vllm.v1.worker.workspace import current_preallocated_workspace
++
++        rows = x.shape[0]
++        buffers = self.__dict__.setdefault("_static_buffers", {})
++        if rows not in buffers:
++            width = self.gate_up_proj.weight.shape[0]
++            buffers[rows] = (
++                torch.empty((rows, width), dtype=torch.bfloat16, device=x.device),
++                torch.empty((rows, width // 2), dtype=torch.bfloat16, device=x.device),
++                torch.empty((rows, self.down_proj.weight.shape[0]), dtype=torch.bfloat16,
++                            device=x.device),
++            )
++        gate_up, act, down = buffers[rows]
++        scratch = current_preallocated_workspace()
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 0, x)
++        _block32_linear(x, gate_up, self.gate_up_proj.b12x_key, scratch)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 1, gate_up)
++        self.act_fn.op(act, gate_up, self.act_fn.swiglu_limit, self.act_fn.alpha, self.act_fn.beta)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 2, act)
++        _block32_linear(act, down, self.down_proj.b12x_key, scratch)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 3, down)
++            if os.environ.get("SPARK3_SHARED_RECOMPUTE") == "1":
++                self._record_down_state(act, down, scratch, rows)
++        return down
++
++    def _record_down_state(self, act, down, scratch, rows):
++        """Debug only: what the down projection saw, and a second run.
++
++        Tags 4-6 checksum the packed weight storage (values, MMA scales, tiled
++        values) through zero-copy byte views, tag 10 the shared unit alpha.
++        Tag 7 recomputes the GEMM into a second buffer right away; tags 8 and
++        9 then re-read the input and the first result. Changed weights, a
++        second result that disagrees, or buffers that change after they were
++        written each point somewhere different.
++        """
++        from b12x._lib import dense_gemm
++        from vllm.models.deepseek_v4_1.b12x_layers import _block32_linear
++
++        views = self.__dict__.get("_down_state_views")
++        if views is None:
++            def bytes64(tensor):
++                if tensor is None:
++                    return None
++                flat = torch.empty(0, dtype=torch.uint8, device=tensor.device)
++                flat.set_(tensor.untyped_storage())
++                usable = flat.numel() // 64 * 64
++                return flat[:usable].view(64, -1)
++
++            packed = self.down_proj.b12x_weight.weight
++            views = self._down_state_views = (
++                bytes64(packed.values),
++                bytes64(packed.scale_mma),
++                bytes64(getattr(packed, "values_tiled", None)),
++            )
++        for tag, view in zip((4, 5, 6), views):
++            if view is not None:
++                checksum_debug.record_tag(self, tag, view)
++        second = self.__dict__.setdefault("_down_second", {})
++        if rows not in second:
++            second[rows] = torch.empty_like(down)
++        capture = rows == 6 and scratch is not None
++        if capture:
++            first_scratch = self.__dict__.get("_first_scratch")
++            if first_scratch is None or first_scratch.numel() != scratch.numel():
++                first_scratch = self._first_scratch = torch.empty_like(scratch)
++            first_scratch.copy_(scratch)
++        _block32_linear(act, second[rows], self.down_proj.b12x_key, scratch)
++        checksum_debug.record_tag(self, 7, second[rows])
++        if capture:
++            checksum_debug.capture_first_mismatch(
++                self, down, second[rows],
++                {"act": act, "first": down, "second": second[rows],
++                 "first_scratch": self._first_scratch, "second_scratch": scratch},
++                {"values": self.down_proj.b12x_weight.weight.values,
++                 "scale_rows": self.down_proj.b12x_weight.weight.scale_rows},
++            )
++        checksum_debug.record_tag(self, 8, act)
++        checksum_debug.record_tag(self, 9, down)
++        alpha = dense_gemm._ALPHA_ONE_CACHE.get(("cuda", act.device.index))
++        if alpha is not None:
++            checksum_debug.record_tag(self, 10, alpha.view(1, -1))
++
+     def forward(self, x):
++        if (
++            os.environ.get("SPARK3_SHARED_STATIC_BUFFERS") == "1"
++            and x.shape[0] <= 64
++            and hasattr(self.gate_up_proj, "b12x_key")
++            and hasattr(self.down_proj, "b12x_key")
++            and hasattr(self.act_fn, "op")
++        ):
++            return self._forward_static(x)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 0, x)
+         gate_up, _ = self.gate_up_proj(x)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 1, gate_up)
+         x = self.act_fn(gate_up)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 2, x)
+         x, _ = self.down_proj(x)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 3, x)
+         return x
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b6e8565a8d..d9f1e843f9 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -29,6 +29,7 @@ from typing import Any, NamedTuple
+ 
+ import numpy as np
+ import torch
++from vllm.model_executor.layers.fused_moe.runner import checksum_debug
+ import torch.nn as nn
+ 
+ import vllm.envs as envs
+@@ -1660,6 +1661,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             dead_rows=dead_rows,
+         )
+ 
++        if checksum_debug.ENABLED:
++            # Debug only (SPARK3_MOE_CHECKSUM_DIR): the step's actual row layout.
++            checksum_debug.record_schedule(
++                req_ids, num_tokens, num_tokens_after_padding, query_start_loc,
++                num_reqs, self.input_buffers.is_padding,
++            )
++
+         fast_prefill = None
+         if self.fast_prefill is not None:
+             fast_prefill = self.fast_prefill.prepare(
