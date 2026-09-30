@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """First tensor where a tagged target's rows differ between two traced runs, attention included.
 
-usage: analyze_trace2.py OUT_DIR PROMPT [--main | --drafter]   (runs from trace_mixes.py on an
-                                                                 attn-trace arm)
+usage: analyze_trace2.py OUT_DIR PROMPT [--main | --drafter] [--chain N]   (runs from
+                                                  trace_mixes.py on an attn-trace arm)
 
 analyze_trace.py, extended with the attn-trace overlay's attention log. For
 every run of PROMPT and rank, the target's rows are found in each step from
@@ -19,7 +19,8 @@ and mode in that step (tag 23; it depends on the batch's longest sequence).
 Each run's schedule is summarized: the target's rows, padded batch and
 request count per appearance. --main compares only the main model's layers,
 --drafter only the drafter's, so a drafter difference does not hide a later
-main-model one.
+main-model one. --chain N also lists the first N differing records of that
+appearance in execution order, to see which difference propagates.
 """
 import glob
 import hashlib
@@ -32,6 +33,7 @@ import torch
 
 OUT, PROMPT = sys.argv[1], sys.argv[2]
 ONLY = 0 if "--main" in sys.argv else 1 if "--drafter" in sys.argv else None
+CHAIN = int(sys.argv[sys.argv.index("--chain") + 1]) if "--chain" in sys.argv else 0
 SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
@@ -185,6 +187,14 @@ def compare(a, b):
                              f"{pb['batch_reqs']} reqs): {label} differs on target rows {rows[:8]}"
                              f"{' of ' + str(len(sa)) if len(rows) > 8 else ''}; indexer width/mode/chunk "
                              f"there {pa['widths'].get(lk)} vs {pb['widths'].get(lk)}")
+                    if CHAIN:
+                        chain = []
+                        for _, label2, s2 in pa["items"]:
+                            t2 = other.get(label2)
+                            if t2 is not None and not torch.equal(s2, t2) and len(chain) < CHAIN:
+                                n_bad = int((s2 != t2).sum())
+                                chain.append(f"{label2.split('model.')[-1]}({n_bad})")
+                        first += " | chain: " + " ".join(chain)
                     break
             if first:
                 break

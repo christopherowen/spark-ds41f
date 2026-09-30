@@ -28,10 +28,12 @@ carry no debug overlay or logging. detm-r5o-lookup-variant-exact and
 detm-r5o-lookup-mhc-variant-exact are the second trace arm with attn-exact
 (attn-probe with exact per-row fingerprints in place of sums and the fused
 projection's raw q and kv latents), without and with the mHC fix
-(vllm-0028-mhc-smallest-capacity.patch, overlay gemv-lookup-mhc). Their KV
-caches are 1.5 GiB smaller than r5o's: the exact fingerprints' temporaries in
-the captured graphs pushed the first boots of both below dgx1's startup guard
-during graph capture.
+(vllm-0028-mhc-smallest-capacity.patch, overlay gemv-lookup-mhc).
+detm-r5o-lookup-mhc-bi-variant-exact also plans the torch-backend GEMV
+capacities on SIMT (vllm-0029-gemv-batch-invariant-backend.patch, overlay
+gemv-lookup-mhc-bi, VLLM_DS41_BATCH_INVARIANT=1). The exact arms' KV caches
+are about 1.9 GiB smaller than r5o's (0.3 GiB, about 180K tokens); boots with
+0.7 GiB stopped at the startup guard during graph capture.
 """
 import copy
 import json
@@ -93,6 +95,8 @@ def traced(arm, shrink_mib, overlay="attn-trace", lookup="gemv-lookup"):
     return trace
 
 
+bi_trace = traced(detm_variant_pin, 1936, overlay="attn-exact", lookup="gemv-lookup-mhc-bi")
+bi_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
 probe = traced(detm_variant_pin, 768, overlay="attn-probe")
 probe["environment"]["SPARK3_DEBUG_RECOMPUTE"] = "1"
 r5o_lookup_variant = with_lookup(r5o_pin)
@@ -101,9 +105,10 @@ mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),
-                  ("detm-r5o-lookup-variant-exact", traced(detm_variant_pin, 1536, overlay="attn-exact")),
+                  ("detm-r5o-lookup-variant-exact", traced(detm_variant_pin, 1936, overlay="attn-exact")),
                   ("detm-r5o-lookup-mhc-variant-exact",
-                   traced(detm_variant_pin, 1536, overlay="attn-exact", lookup="gemv-lookup-mhc")),
+                   traced(detm_variant_pin, 1936, overlay="attn-exact", lookup="gemv-lookup-mhc")),
+                  ("detm-r5o-lookup-mhc-bi-variant-exact", bi_trace),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
