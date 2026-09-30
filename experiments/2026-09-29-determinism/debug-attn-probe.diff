@@ -1,0 +1,53 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+--- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:49:00.537612672 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:49:00.539116214 +0200
+@@ -35,6 +35,9 @@
+ _TAGS_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_TAGS_CAPACITY", "65536"))
+ _ATTN_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_ATTN_CAPACITY", "49152"))
+ _GATE_ROWS = int(os.environ.get("SPARK3_GATE_CAPTURE_ROWS", "0"))
++# Probe: recompute the first layers' query projection (same call, private
++# scratch, batch shifted by one row) and record each beside the served one.
++RECOMPUTE = os.environ.get("SPARK3_DEBUG_RECOMPUTE") == "1"
+ # Index sums are reduced modulo a prime below 2**24, exact in the float32 log.
+ _HASH_PRIME = 16777213
+ _SCHEDULE_CAPACITY = 4096
+diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:49:00.542880453 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:49:00.544200522 +0200
+@@ -1378,6 +1378,8 @@
+         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         if checksum_debug.ENABLED:
+             checksum_debug.record_attn(self, 24, q)
++            if checksum_debug.RECOMPUTE and self.layer_id <= 3:
++                self._probe_query_projection(qr)
+         l2_prefetch.issue(self._l2pf_wo, rows)
+         q = _rotated(
+             q,
+@@ -1428,6 +1430,27 @@
+             checksum_debug.record_attn(self, 22, out)
+         return out
+ 
++    def _probe_query_projection(self, qr):
++        """Debug probe: the served wq_b beside three recomputations (tags 25-27).
++
++        25: the same call again (shared preallocated workspace); 26: the same
++        rows with a private scratch; 27: the rows behind a copy of row 0, so the
++        batch grows by one and every row moves down one position.
++        """
++        from bisect import bisect_left
++
++        layer = self.wq_b
++        again = self.wq_b(qr)
++        checksum_debug.record_attn(self, 25, again)
++        rows = qr.shape[0]
++        (spec,) = layer.b12x_plans[bisect_left(layer.b12x_capacities, rows)].scratch_specs()
++        private = torch.empty(spec.shape, dtype=spec.dtype, device=qr.device)
++        out = torch.empty((rows, layer.weight.shape[0]), dtype=torch.bfloat16, device=qr.device)
++        torch.ops.vllm.dsv41_block32_linear(qr, out, layer.b12x_key, private)
++        checksum_debug.record_attn(self, 26, out)
++        shifted = self.wq_b(torch.cat([qr[:1], qr]))[1:]
++        checksum_debug.record_attn(self, 27, shifted)
++
+     def _index_query(
+         self, qr, positions, hidden_states, index_weights, first, last, swa
+     ):

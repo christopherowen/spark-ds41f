@@ -21,8 +21,10 @@ adds: detm-r5o-lookup-variant-trace (the trace arm on det-variant, the
 det-masked files with that fix; KV cache 768 MiB smaller, after its first boot
 also stopped 21 MB short of the guard), r5o-lookup-variant-pin (r5o, the lookup and
 the fix on production's _preparation.py, overlay moe-variant) and
-detm-r5o-lookup-variant-pin. The performance arms carry no debug overlay or
-logging.
+detm-r5o-lookup-variant-pin. detm-r5o-lookup-variant-probe is the second
+trace arm with the attn-probe overlay (attn-trace plus a recompute probe of the
+first layers' query projection, SPARK3_DEBUG_RECOMPUTE=1). The performance arms
+carry no debug overlay or logging.
 """
 import copy
 import json
@@ -69,10 +71,10 @@ for f in DET:
 detm_variant_pin["environment"].update(detm_pin["environment"])
 
 
-def traced(arm, shrink_mib):
+def traced(arm, shrink_mib, overlay="attn-trace"):
     trace = with_lookup(arm)
     for name, target in TRACE.items():
-        mount(trace, f"attn-trace/{name}", f"{VLLM}/{target}")
+        mount(trace, f"{overlay}/{name}", f"{VLLM}/{target}")
     trace["environment"].update(
         SPARK3_MOE_CHECKSUM_DIR="/cache/kkref/moe-checksums", SPARK3_MOE_CHECKSUM_ROWS="64",
         SPARK3_MOE_CHECKSUM_RUNNER_CAPACITY="8192", SPARK3_MOE_CHECKSUM_TAGS_CAPACITY="16384",
@@ -84,11 +86,14 @@ def traced(arm, shrink_mib):
     return trace
 
 
+probe = traced(detm_variant_pin, 768, overlay="attn-probe")
+probe["environment"]["SPARK3_DEBUG_RECOMPUTE"] = "1"
 r5o_lookup_variant = with_lookup(r5o_pin)
 mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
       f"{B12X}/moe/fused_moe/_preparation.py")
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
+                  ("detm-r5o-lookup-variant-probe", probe),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
