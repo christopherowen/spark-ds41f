@@ -10,11 +10,14 @@ vLLM's own call factory, and binds every live batch to that plan, which
 chooses a launch for the live row count. DS4.1 TP3 shapes (384 experts,
 hidden 5120, intermediate 768, top 6, W4A8, synthetic weights). Nineteen fixed
 target rows with fixed routing (the JSON prefill's row count) run alone and
-inside batches of R rows (1-64 and larger) at the start, middle and end; each
-target row is compared bitwise with the same row alone. Two warm sets: the
-capture sizes only, and every prepared count below the limit seen in
-serving's gate capture; 19 is in neither.
+inside batches of R rows (19-64 and larger) at the start, middle and end.
+Batch sizes are grouped by the exact bits of the target rows: one group means
+batch-invariant; the group holding the solo 19-row call is marked. (A single
+row alone takes the M=1 launch, which differs from every batch.) Two warm
+sets: the capture sizes only, and every prepared count below the limit seen
+in serving's gate capture; 19 is in neither.
 """
+import hashlib
 import os
 import sys
 
@@ -90,31 +93,20 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
             fused_moe.run(binding=binding)
             return out
 
-        alone = torch.cat([run(xt[i:i + 1], wt[i:i + 1], it[i:i + 1]) for i in range(T)])
         solo = run(xt, wt, it)
-        torch.cuda.synchronize()
-        print(f"[{name}] target alone as 19 rows vs each row alone: "
-              f"{'=' if torch.equal(solo, alone) else 'DIFF'} "
-              f"({int((solo != alone).any(1).sum())}/{T} rows)", flush=True)
-        bad = []
-        for R in list(range(1, 65)) + [72, 96, 128, 192, 256, 384, 512]:
-            if R < T:
-                cases = [("start", xt[:R], wt[:R], it[:R], 0, R)]
-            else:
-                n = R - T
-                nx, nw, ni = (p[:n] for p in pool)
-                cases = [(pos, torch.cat([nx[:k], xt, nx[k:]]), torch.cat([nw[:k], wt, nw[k:]]),
-                          torch.cat([ni[:k], it, ni[k:]]), k, T)
-                         for pos, k in (("start", 0), ("middle", n // 2), ("end", n))]
-            for pos, x, w, ids, k, t in cases:
-                out = run(x, w, ids)[k:k + t]
-                if not torch.equal(out, alone[:t]):
-                    bad.append((R, pos, int((out != alone[:t]).any(1).sum()), t))
-        torch.cuda.synchronize()
-        if bad:
-            by_r = sorted({b[0] for b in bad})
-            print(f"[{name}] target rows differ from rows alone at R in {by_r}", flush=True)
-            print(f"[{name}] equal at R in {sorted(set(list(range(1, 65)) + [72, 96, 128, 192, 256, 384, 512]) - set(by_r))}",
-                  flush=True)
-        else:
-            print(f"[{name}] every target row equals the row alone at every R and position", flush=True)
+        again = run(xt, wt, it)
+        print(f"[{name}] the solo 19-row call repeated: {'=' if torch.equal(solo, again) else 'DIFF'}", flush=True)
+        groups = {}
+        for R in list(range(T, 65)) + [72, 96, 128, 192, 256, 384, 512]:
+            n = R - T
+            nx, nw, ni = (p[:n] for p in pool)
+            for pos, k in (("start", 0), ("middle", n // 2), ("end", n)) if n else (("solo", 0),):
+                out = run(torch.cat([nx[:k], xt, nx[k:]]), torch.cat([nw[:k], wt, nw[k:]]),
+                          torch.cat([ni[:k], it, ni[k:]]))[k:k + T]
+                key = hashlib.sha256(out.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:8]
+                groups.setdefault(key, []).append(f"{R}{pos[0] if n else ''}")
+        solo_key = hashlib.sha256(solo.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:8]
+        print(f"[{name}] {len(groups)} groups of batch sizes by the target rows' bits "
+              f"(s/m/e = target at start/middle/end):", flush=True)
+        for key, members in groups.items():
+            print(f"  {key}{' (solo 19 rows)' if key == solo_key else ''}: {' '.join(members)}", flush=True)
