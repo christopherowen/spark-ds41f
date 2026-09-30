@@ -9,9 +9,12 @@ token and prefix) computed in two decode steps of equal size with different
 layer-0 routed outputs and identical MoE input and router logits: the row moved
 from a draft slot to the bonus slot of its verify block. This replays one
 target row through serving's one-plan path (every prepared count warm) at
-every position of batches of 2-8 rows and of 28, with three different sets of
-neighbours each, and groups the target row's output by its exact bits. It
-also checks each call repeats bitwise.
+every position of batches of 2-8 rows and of 28, with three sets of random
+neighbours and one set routed to the target's own experts (as hash routing
+does for draft tokens), and groups the target row's output by its exact bits.
+It also checks each call repeats bitwise. Run it with
+B12X_DYNAMIC_W4A8_MATERIALIZED=0 to take the single-row launch off its
+materialized path.
 
 ---- earlier docstring (moe_serving_replay.py) follows ----
 
@@ -106,9 +109,18 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
 
     xt, wt, it = rows(1, 1)
     groups, repeat_bad = {}, 0
+    print(f"B12X_DYNAMIC_W4A8_MATERIALIZED={os.environ.get('B12X_DYNAMIC_W4A8_MATERIALIZED', 'default')}",
+          flush=True)
     for R in (1, 2, 3, 4, 5, 6, 7, 8, 28):
-        for seed in (2, 3, 4):
-            nx, nw, ni = rows(R - 1, seed) if R > 1 else (xt[:0], wt[:0], it[:0])
+        for seed in (2, 3, 4, "shared"):
+            if R == 1:
+                nx, nw, ni = xt[:0], wt[:0], it[:0]
+            elif seed == "shared":  # neighbours routed to the target's experts, shuffled
+                nx, nw, _ = rows(R - 1, 5)
+                gen = torch.Generator(device="cpu").manual_seed(R)
+                ni = torch.stack([it[0][torch.randperm(TOPK, generator=gen)] for _ in range(R - 1)]).to(device)
+            else:
+                nx, nw, ni = rows(R - 1, seed)
             for i in range(R):
                 x = torch.cat([nx[:i], xt, nx[i:]])
                 w = torch.cat([nw[:i], wt, nw[i:]])
