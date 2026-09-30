@@ -1,0 +1,350 @@
+From 40f559a0e298bb6eaa65f6a5e9072675bb5ca87e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:54:12 +0200
+Subject: [PATCH] perf(moe): masked slice-partial top-k sum without dead-route
+ clearing
+
+With slice partials the deterministic fused kernel cleared the six
+partial rows of every pair routed to no local expert, and the fixed-order
+top-k sum read all num_topk * slices rows per token, dead ones included.
+Dead verification rows arrive as such pairs, so at eight streams the
+clearing and the reads grow with speculative work that never counts.
+
+The top-k sum now takes the route ids for slice partials, reads each
+(token, route) expert id once and skips the rows of routes outside
+[0, num_experts), summing live rows in the same route-then-slice order
+eight columns per thread with 16-byte accesses; the kernel no longer
+clears those rows. Results match the previous order bitwise (a skipped
+row was an added +0.0). The mask and slice count join the top-k sum's
+compile key only when set.
+---
+ b12x/moe/_shared/kernels/dynamic.py      |  21 +----
+ b12x/moe/_shared/kernels/w4a16/kernel.py | 103 +++++++++++++++++++++++
+ b12x/moe/fused_moe/_impl.py              |  20 +++++
+ tests/moe/test_w4a8_dynamic_kernel.py    |  35 ++++++--
+ 4 files changed, 156 insertions(+), 23 deletions(-)
+
+diff --git a/b12x/moe/_shared/kernels/dynamic.py b/b12x/moe/_shared/kernels/dynamic.py
+index 99637b50..011aca60 100644
+--- a/b12x/moe/_shared/kernels/dynamic.py
++++ b/b12x/moe/_shared/kernels/dynamic.py
+@@ -3371,24 +3371,9 @@ class MoEDynamicKernelBackend:
+         # coverage verifies that phase 2 really overwrites the full domain.
+         if cutlass.const_expr(self.deterministic_slice_partials):
+             # Every valid (pair, slice, column) location has exactly one
+-            # producer.  Rows of pairs routed to no local expert are never
+-            # produced, so zero those; the top-k sum reads every live row.
+-            partial_row_vecs = cols_u32 // Int32(4)
+-            partial_vecs = total_pairs * route_gate_tile_cnt * partial_row_vecs
+-            zero_u32 = Uint32(0)
+-            zv = flat_tid
+-            while zv < partial_vecs:
+-                partial_row = zv // partial_row_vecs
+-                zero_expert = topk_ids[partial_row // route_gate_tile_cnt].to(Int32)
+-                if zero_expert < Int32(0) or zero_expert >= num_experts:
+-                    st_global_v4_u32(
+-                        scatter_base + Int64(zv) * Int64(16),
+-                        zero_u32,
+-                        zero_u32,
+-                        zero_u32,
+-                        zero_u32,
+-                    )
+-                zv += flat_stride
++            # producer, and the masked top-k sum skips the rows of pairs routed
++            # to no local expert, so nothing needs clearing.
++            pass
+         elif cutlass.const_expr(
+             not (self.deterministic_output and self.external_materialized_fc2)
+         ):
+diff --git a/b12x/moe/_shared/kernels/w4a16/kernel.py b/b12x/moe/_shared/kernels/w4a16/kernel.py
+index be523025..b1815379 100644
+--- a/b12x/moe/_shared/kernels/w4a16/kernel.py
++++ b/b12x/moe/_shared/kernels/w4a16/kernel.py
+@@ -463,6 +463,29 @@ _LARGE_BATCH_TILE_CONFIGS = (
+ )
+ 
+ 
++@dsl_user_op
++def _pack_f32x2_to_bfloat2_rn(x0, x1, *, loc=None, ip=None) -> Uint32:
++    """Pack two FP32 values into BF16x2, round to nearest, no saturation.
++
++    Same rounding as the plain top-k sum's scalar ``cutlass.BFloat16(x)``
++    (unlike the intrinsics' ``satfinite`` pack), so both paths agree bitwise.
++    """
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
++                cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
++            ],
++            "cvt.rn.bf16x2.f32 $0, $2, $1;",
++            "=r,f,f",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++        )
++    )
++
++
+ def _covering_count(total: int, quantum: int) -> int:
+     return (total + quantum - 1) // quantum
+ 
+@@ -8711,11 +8734,28 @@ class W4A16TopKSumKernel:
+         broadcast_svh: bool = False,
+         float32_output: bool = False,
+         apply_topk_weights: bool = False,
++        route_slices: int = 1,
++        mask_invalid_routes: bool = False,
+     ):
+         if element_dtype not in {"bf16", "fp16"}:
+             raise ValueError(f"unsupported element_dtype {element_dtype!r}")
+         if topk <= 0 or hidden_size <= 0:
+             raise ValueError("topk and hidden_size must be positive")
++        # Masked slice sum (deterministic dynamic MoE with slice partials): the
++        # route output holds route_slices rows per (token, route); rows of
++        # routes whose expert id is outside [0, route_num_experts) were never
++        # produced and are skipped instead of read as zeros. Live rows are
++        # summed in the same order as the plain path, eight columns a thread.
++        self.route_slices = int(route_slices)
++        self.mask_invalid_routes = bool(mask_invalid_routes)
++        if self.mask_invalid_routes and (
++            element_dtype != "bf16" or full_rotation or use_expert_map or float32_output
++            or apply_topk_weights or hidden_size % 8 or topk % self.route_slices
++        ):
++            raise ValueError(
++                "masked top-k sum requires BF16 routes and output, no rotation, "
++                "expert map or router weights, hidden_size % 8 == 0 and whole slices"
++            )
+         if apply_topk_weights and full_rotation:
+             raise ValueError("full-rotation top-k sum already applies router weights")
+         # Plain path: multiply each route by its FP32 router weight (FC2 then
+@@ -8823,6 +8863,9 @@ class W4A16TopKSumKernel:
+             # consequently launched only 28 active warps and serialized all
+             # 16 routes in each of them.
+             grid = (total, 1, 1)
++        elif cutlass.const_expr(self.mask_invalid_routes):
++            total = active_m * Int32(self.hidden_size // 8)
++            grid = (_covering_count(total, self.cta_threads), 1, 1)
+         else:
+             total = active_m * Int32(self.hidden_size)
+             grid = (_covering_count(total, self.cta_threads), 1, 1)
+@@ -8857,6 +8900,53 @@ class W4A16TopKSumKernel:
+     ):
+         tidx, _, _ = cute.arch.thread_idx()
+         bidx, _, _ = cute.arch.block_idx()
++        if cutlass.const_expr(self.mask_invalid_routes):
++            vecs_per_row = Int32(self.hidden_size // 8)
++            idx = Int32(bidx) * Int32(self.cta_threads) + Int32(tidx)
++            if idx < active_m * vecs_per_row:
++                token = idx // vecs_per_row
++                col = (idx - token * vecs_per_row) * Int32(8)
++                fc2_base = get_ptr_as_int64(fc2_flat, Int32(0))
++                one = cutlass.Float32(1.0)
++                a0 = cutlass.Float32(0.0)
++                a1 = cutlass.Float32(0.0)
++                a2 = cutlass.Float32(0.0)
++                a3 = cutlass.Float32(0.0)
++                a4 = cutlass.Float32(0.0)
++                a5 = cutlass.Float32(0.0)
++                a6 = cutlass.Float32(0.0)
++                a7 = cutlass.Float32(0.0)
++                routes = self.topk // self.route_slices
++                for route in cutlass.range_constexpr(routes):
++                    expert = route_expert_ids_flat[token * Int32(routes) + Int32(route)].to(Int32)
++                    if expert >= Int32(0) and expert < route_num_experts:
++                        for s in cutlass.range_constexpr(self.route_slices):
++                            row = token * Int32(self.topk) + Int32(route * self.route_slices + s)
++                            w0, w1, w2, w3 = ld_global_v4_u32(
++                                fc2_base
++                                + (Int64(row) * Int64(self.hidden_size) + Int64(col)) * Int64(2)
++                            )
++                            f0, f1 = bfloat2_to_float2_scaled(w0, one)
++                            f2, f3 = bfloat2_to_float2_scaled(w1, one)
++                            f4, f5 = bfloat2_to_float2_scaled(w2, one)
++                            f6, f7 = bfloat2_to_float2_scaled(w3, one)
++                            a0 += f0
++                            a1 += f1
++                            a2 += f2
++                            a3 += f3
++                            a4 += f4
++                            a5 += f5
++                            a6 += f6
++                            a7 += f7
++                st_global_v4_u32(
++                    get_ptr_as_int64(output_flat, Int32(0))
++                    + (Int64(token) * Int64(self.hidden_size) + Int64(col)) * Int64(2),
++                    _pack_f32x2_to_bfloat2_rn(a0, a1),
++                    _pack_f32x2_to_bfloat2_rn(a2, a3),
++                    _pack_f32x2_to_bfloat2_rn(a4, a5),
++                    _pack_f32x2_to_bfloat2_rn(a6, a7),
++                )
++            return
+         if cutlass.const_expr(
+             self.intermediate_hadamard and self.broadcast_svh
+         ):
+@@ -10657,6 +10747,8 @@ def compile_w4a16_topk_sum(
+     broadcast_svh: bool = False,
+     float32_output: bool = False,
+     apply_topk_weights: bool | None = None,
++    route_slices: int = 1,
++    mask_invalid_routes: bool = False,
+ ) -> W4A16TopKSumCompileResult:
+     cutlass_dtype = _cutlass_element_dtype(element_dtype)
+     if route_ids_dtype not in (torch.int32, torch.int64):
+@@ -10682,6 +10774,9 @@ def compile_w4a16_topk_sum(
+         bool(float32_output),
+         apply_topk_weights,
+     )
++    if mask_invalid_routes:
++        # Joins the key only when set, so existing specializations keep theirs.
++        cache_key += (("masked_slices", int(route_slices)),)
+     cached = _SUM_CACHE.get(cache_key)
+     if cached is not None:
+         return attach_programs(
+@@ -10722,6 +10817,8 @@ def compile_w4a16_topk_sum(
+         broadcast_svh=broadcast_svh,
+         float32_output=float32_output,
+         apply_topk_weights=apply_topk_weights,
++        route_slices=route_slices,
++        mask_invalid_routes=mask_invalid_routes,
+     )
+     raise_if_kernel_resolution_frozen(
+         "cute.compile", target=kernel, cache_key=cache_key
+@@ -11790,6 +11887,7 @@ def _w4a16_topk_sum_launch_flat(
+     expert_map: torch.Tensor | None = None,
+     svh_table: torch.Tensor | None = None,
+     launcher: W4A16TopKSumCompileResult | None = None,
++    route_valid_experts: int | None = None,
+ ) -> None:
+     full_rotation = bool(full_rotation)
+     intermediate_hadamard = bool(intermediate_hadamard)
+@@ -11797,6 +11895,11 @@ def _w4a16_topk_sum_launch_flat(
+         torch.int32 if route_expert_ids is None else route_expert_ids.dtype
+     )
+     route_num_experts = 0 if expert_map is None else int(expert_map.numel())
++    if route_valid_experts is not None:
++        # Masked slice sum: expert ids in [0, route_valid_experts) are live.
++        if expert_map is not None or route_expert_ids is None:
++            raise ValueError("route_valid_experts needs route ids and no expert map")
++        route_num_experts = int(route_valid_experts)
+     broadcast_svh = (
+         full_rotation
+         and svh_table is not None
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index 55e2b9b5..8848ec54 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -12146,7 +12146,16 @@ def _launch_dynamic_topk_sum(
+     num_topk: int,
+     k: int,
+     stream,
++    route_ids: torch.Tensor | None = None,
++    route_slices: int = 1,
++    num_experts: int = 0,
+ ) -> None:
++    """Fixed-order sum of the route output's ``num_topk`` rows per token.
++
++    With ``route_slices > 1`` (slice partials) the rows come in groups of
++    ``route_slices`` per route, and groups whose ``route_ids`` entry is outside
++    ``[0, num_experts)`` are skipped: the fused kernel never writes them.
++    """
+     if route_output.numel() < m * num_topk * k:
+         raise RuntimeError(
+             "top-k reduction exceeds the planned route-output capacity: "
+@@ -12157,14 +12166,20 @@ def _launch_dynamic_topk_sum(
+     )
+ 
+     element_dtype = _w4a16_element_dtype(route_output.dtype)
++    masked = route_slices > 1
++    if masked and (route_ids is None or num_experts <= 0 or num_topk % route_slices):
++        raise ValueError("a slice-partial top-k sum needs route ids and the expert count")
+     # Dynamic kernels write router-weighted routes: an unweighted sum.
+     launcher = compile_w4a16_topk_sum(
+         m=m,
+         topk=num_topk,
+         hidden_size=k,
+         element_dtype=element_dtype,
++        route_ids_dtype=route_ids.dtype if masked else torch.int32,
+         float32_output=output.dtype == torch.float32,
+         apply_topk_weights=False,
++        route_slices=route_slices,
++        mask_invalid_routes=masked,
+     )
+     from b12x.moe._shared.kernels.w4a16.kernel import _w4a16_topk_sum_launch_flat
+ 
+@@ -12177,6 +12192,8 @@ def _launch_dynamic_topk_sum(
+         element_dtype,
+         int(stream),
+         launcher=launcher,
++        route_expert_ids=route_ids if masked else None,
++        route_valid_experts=num_experts if masked else None,
+     )
+ 
+ 
+@@ -13452,6 +13469,9 @@ def b12x_moe_fp4(*, binding: TPMoEFP4Binding) -> torch.Tensor:
+                 num_topk=num_topk * route_slices,
+                 k=k,
+                 stream=stream,
++                route_ids=flat_ids,
++                route_slices=route_slices,
++                num_experts=weight_E,
+             )
+     else:
+         _launch_micro(
+diff --git a/tests/moe/test_w4a8_dynamic_kernel.py b/tests/moe/test_w4a8_dynamic_kernel.py
+index 388b9fe2..753d1b18 100644
+--- a/tests/moe/test_w4a8_dynamic_kernel.py
++++ b/tests/moe/test_w4a8_dynamic_kernel.py
+@@ -798,10 +798,34 @@ def _run_w4a8_dynamic(
+             return scatter_output, reference, _relaunch, state
+         return scatter_output, reference, _relaunch
+     if deterministic_slice_partials:
+-        # The fixed-order top-k sum: routes, then slices, in FP32.
+-        reduced = (
+-            scatter_output.view(m, top_k * gate_tile_cnt, K).float().sum(dim=1)
+-        ).to(torch.bfloat16)
++        # The masked fixed-order top-k sum: routes, then slices, in FP32,
++        # skipping routes to no expert (their rows stay NaN-poisoned: the
++        # kernel no longer clears them). Checked bitwise against the same
++        # order computed here.
++        from b12x.moe.fused_moe._impl import _launch_dynamic_topk_sum
++
++        reduced = torch.empty(m, K, dtype=torch.bfloat16, device=device)
++        _launch_dynamic_topk_sum(
++            route_output=scatter_output,
++            output=reduced,
++            m=m,
++            num_topk=top_k * gate_tile_cnt,
++            k=K,
++            stream=torch.cuda.current_stream().cuda_stream,
++            route_ids=flat_ids,
++            route_slices=gate_tile_cnt,
++            num_experts=E,
++        )
++        torch.cuda.synchronize()
++        live = (topk_ids >= 0) & (topk_ids < E)
++        parts = scatter_output.view(m, top_k, gate_tile_cnt, K).float()
++        expected = torch.zeros(m, K, dtype=torch.float32, device=device)
++        for route in range(top_k):
++            for part in range(gate_tile_cnt):
++                expected = expected + torch.where(
++                    live[:, route, None].to(device), parts[:, route, part], 0.0
++                )
++        assert torch.equal(reduced, expected.to(torch.bfloat16)), "masked sum differs"
+         return reduced, reference
+     return scatter_output, reference
+ 
+@@ -1205,7 +1229,8 @@ def test_w4a8_deterministic_slice_partials_match_oracle_and_repeat(
+     """Slice partials cover every (pair, slice, column) and repeat exactly.
+ 
+     DS4.1 TP3 decode shape in miniature: six N128 slices, top-6 routes, M16
+-    tiles.  Rows of inactive routes are zeroed by the kernel, not produced.
++    tiles.  Rows of inactive routes are neither produced nor cleared; the
++    masked top-k sum skips them.
+     """
+ 
+     require_b12x()
+-- 
+2.54.0 (Apple Git-157)
+
