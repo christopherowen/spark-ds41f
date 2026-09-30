@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..9fa344f4b4
+index 0000000000..aba64ff737
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,124 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -26,60 +26,59 @@ index 0000000000..9fa344f4b4
 +
 +DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
 +ENABLED = bool(DIRECTORY)
-+_CAPACITY = 1 << 17
++_CAPACITY = 1 << 15
++_SLOTS = 256
 +# Decode steps and short prompts only: large batches would grow the cached
 +# memory pool (system memory on GB10) past the startup memory guard.
 +_MAX_ROWS = 64
 +_log: "_Log | None" = None
 +
 +
-+def _sum(x: torch.Tensor) -> torch.Tensor:
-+    # FP32 accumulation reads the BF16 input in place: no full-size copy for
-+    # captured graphs to retain. One BF16 ulp anywhere still moves the sum.
-+    return torch.sum(x, dtype=torch.float32).double().reshape(1)
-+
-+
 +class _Log:
++    """Allocation-free after construction: captured graphs keep no new segments."""
++
 +    def __init__(self, device: torch.device, name: str) -> None:
 +        self.name = name
-+        self.rows = torch.zeros(_CAPACITY, 5, dtype=torch.float64, device=device)
++        self.rows = torch.zeros(_CAPACITY, 5, dtype=torch.float32, device=device)
++        self.stage = torch.zeros(_SLOTS, 5, dtype=torch.float32, device=device)
 +        self.count = torch.zeros(1, dtype=torch.int64, device=device)
++        self.index = torch.zeros(1, dtype=torch.int64, device=device)
 +        self.slots: dict[int, int] = {}
 +        threading.Thread(target=self._watch, daemon=True).start()
 +
-+    def record_tag(self, owner, tag: int, x) -> None:
-+        slot = self.slots.setdefault(id(owner), len(self.slots))
-+        values = torch.cat(
-+            [
-+                torch.full((1,), float(slot), dtype=torch.float64, device=x.device),
-+                torch.full((1,), float(x.shape[0]), dtype=torch.float64, device=x.device),
-+                torch.full((1,), float(tag), dtype=torch.float64, device=x.device),
-+                _sum(x),
-+                torch.linalg.vector_norm(x, 1, dtype=torch.float32).double().reshape(1),
-+            ]
-+        )
-+        index = self.count.remainder(_CAPACITY)
-+        self.rows.index_copy_(0, index, values.unsqueeze(0))
++    def _append(self, slot: int) -> None:
++        torch.remainder(self.count, _CAPACITY, out=self.index)
++        self.rows.index_copy_(0, self.index, self.stage[slot : slot + 1])
 +        self.count.add_(1)
 +
-+    def record(self, owner, x, shared, routed) -> None:
++    def _slot(self, owner) -> int:
 +        slot = self.slots.setdefault(id(owner), len(self.slots))
-+        # Fill kernels, not host copies: this also runs under graph capture.
-+        header = torch.cat(
-+            [
-+                torch.full((1,), float(slot), dtype=torch.float64, device=x.device),
-+                torch.full((1,), float(x.shape[0]), dtype=torch.float64, device=x.device),
-+            ]
-+        )
-+        shared_sum = (
-+            _sum(shared)
-+            if shared is not None
-+            else torch.zeros(1, dtype=torch.float64, device=x.device)
-+        )
-+        values = torch.cat([header, _sum(x), shared_sum, _sum(routed)])
-+        index = self.count.remainder(_CAPACITY)
-+        self.rows.index_copy_(0, index, values.unsqueeze(0))
-+        self.count.add_(1)
++        if slot >= _SLOTS:
++            raise RuntimeError("checksum log slot table is full")
++        return slot
++
++    def record_tag(self, owner, tag: int, x) -> None:
++        slot = self._slot(owner)
++        stage = self.stage[slot]
++        stage[0].fill_(slot)
++        stage[1].fill_(x.shape[0])
++        stage[2].fill_(tag)
++        torch.sum(x, dtype=torch.float32, out=stage[3])
++        torch.linalg.vector_norm(x, 1, dtype=torch.float32, out=stage[4])
++        self._append(slot)
++
++    def record(self, owner, x, shared, routed) -> None:
++        slot = self._slot(owner)
++        stage = self.stage[slot]
++        stage[0].fill_(slot)
++        stage[1].fill_(x.shape[0])
++        torch.sum(x, dtype=torch.float32, out=stage[2])
++        if shared is None:
++            stage[3].zero_()
++        else:
++            torch.sum(shared, dtype=torch.float32, out=stage[3])
++        torch.sum(routed, dtype=torch.float32, out=stage[4])
++        self._append(slot)
 +
 +    def _watch(self) -> None:
 +        rank = (
