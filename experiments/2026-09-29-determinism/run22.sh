@@ -48,7 +48,7 @@ for pair in atomic:det-slices slices:det-slices masked:det-masked; do
   mode=${pair%%:*}; overlay=${pair#*:}
   echo "== ncu $mode"
   run r5m $overlay "-e B12X_DENSE_SPLITK_TURBO=0" /opt/nvidia/nsight-compute/2025.3.1/ncu --csv --page raw --metrics $M \
-    -k regex:"MoEDynamic|TopKSum" python3 /tmp/moe_combine_bench.py --mode $mode --ncu --rows 6,48 --dead 0,0.5
+    -k regex:"MoEDynamic|TopKSum" python3 /tmp/moe_combine_bench.py --mode $mode --ncu --rows 6,28,48 --dead 0,0.5
 done
 for image in r5m r5n; do
   echo "== gemm timing $image"
