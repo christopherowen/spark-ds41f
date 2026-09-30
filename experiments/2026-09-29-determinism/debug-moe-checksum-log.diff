@@ -1,6 +1,6 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..aba64ff737
+index 0000000000..ede2ea854d
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 @@ -0,0 +1,124 @@
@@ -63,8 +63,8 @@ index 0000000000..aba64ff737
 +        stage[0].fill_(slot)
 +        stage[1].fill_(x.shape[0])
 +        stage[2].fill_(tag)
-+        torch.sum(x, dtype=torch.float32, out=stage[3])
-+        torch.linalg.vector_norm(x, 1, dtype=torch.float32, out=stage[4])
++        torch.sum(x.reshape(-1), dim=0, dtype=torch.float32, out=stage[3])
++        torch.linalg.vector_norm(x.reshape(-1), 1, dim=0, dtype=torch.float32, out=stage[4])
 +        self._append(slot)
 +
 +    def record(self, owner, x, shared, routed) -> None:
@@ -72,12 +72,12 @@ index 0000000000..aba64ff737
 +        stage = self.stage[slot]
 +        stage[0].fill_(slot)
 +        stage[1].fill_(x.shape[0])
-+        torch.sum(x, dtype=torch.float32, out=stage[2])
++        torch.sum(x.reshape(-1), dim=0, dtype=torch.float32, out=stage[2])
 +        if shared is None:
 +            stage[3].zero_()
 +        else:
-+            torch.sum(shared, dtype=torch.float32, out=stage[3])
-+        torch.sum(routed, dtype=torch.float32, out=stage[4])
++            torch.sum(shared.reshape(-1), dim=0, dtype=torch.float32, out=stage[3])
++        torch.sum(routed.reshape(-1), dim=0, dtype=torch.float32, out=stage[4])
 +        self._append(slot)
 +
 +    def _watch(self) -> None:
