@@ -345,3 +345,185 @@ the row count instead, and stay invariant.
 Next: the same lookup for the GEMV linears (smallest capacity at or above the
 rows), retrace to see where the target first differs then, and locate the
 attention-side difference.
+
+## Round 13: smallest prepared capacity (`run26`-`run31`, r5o)
+
+Two independently reviewable changes, each kept apart from the debug
+instrumentation:
+
+- `vllm-0027-gemv-smallest-capacity.patch` (vLLM, on the r5o series head
+  `0a682781`): the V4.1 BF16 GEMV projections (router gate, index head weights
+  and key, compressor) take the smallest prepared capacity at or above the row
+  count instead of the exact count or else the largest (4096-row) plan.
+  Overlay `gemv-lookup`. Tests: a new host test of the lookup for both
+  `B12xLinearMethod` and the compressor (fails on the old code); the existing
+  GPU tests of both pass (3/3, 2/2). `git diff --check` clean.
+- `b12x-0006-moe-smallest-variant.patch` (B12X, on r5o's `bb40849f`): a live
+  token count binds to the smallest planned fused-MoE variant instead of the
+  prefill capacity. Overlays `moe-variant` (production `_preparation.py`) and
+  `det-variant` (the det-masked files). B12X's host-only variant-selection
+  tests: 26/26 with the two updated tests (the old code fails both).
+
+Debug only, behind `SPARK3_MOE_CHECKSUM_DIR` and `SPARK3_GATE_CAPTURE_ROWS`:
+`debug-attn-trace.diff` (overlay `attn-trace`) adds per-row checksums of the
+attention (input, q and kv latents, the query projection, rotated q, the
+compressor latent and index key on emitted rows, index head weights, the
+selected positions and their order, lengths, output, projected output) and of
+the router logits, captures the first router gate call after each reset on
+rank 0 (input rows, FP32 logits, served weights), dumps each native linear's
+selected configuration per capacity, and fixes the watcher's reset
+(`torch.inference_mode().__enter__()` on a temporary released the guard at
+once, so every reset had failed and round 12's logs were rings). All arms pin
+the r5o screen's cost table. The trace arms' KV caches are 256 and 768 MiB
+smaller than r5o's: their first boots stopped 57 and 21 MB short of dgx1's
+5 GiB startup memory guard.
+
+### The GEMV lookup, validated on captured inputs (`gemv_lookup_validation.py`)
+
+The attn-trace arm captured, on rank 0, every layer's first gate call after a
+reset during the solo JSON (19 rows) and prose (15 rows) prefills, with the
+served weights. Serving prepares 35 capacities, not just the 14 graph sizes (1-8,
+10, 12, 14, 15, 16, 20, 21, 24, 25, 28, 30, 32, 35, 40, 42, 48, 49, 56, 72, 96,
+192, 384 ... 4091, 4096), so 15 was already exact and 19 was not.
+
+- Fidelity: all 86 captured calls (43 gates, both prompts) reproduce serving's
+  logits bitwise through the plan the new lookup picks, and every row equals
+  itself computed alone. The old lookup would have run the JSON prefill on the
+  4096-row plan (max |d| 9.5e-7).
+- Router gate and ratio-2 compressor (FP32 out): SIMT at capacities up to 192,
+  the TMA prefill kernel from 384. With the new lookup every target row equals
+  the row alone at every batch of 1-192 rows, target at the start, middle or
+  end; batches of 255 and more (384-row plan) differ. The old lookup differed
+  at every unprepared count from 9 rows on.
+- Index head weights (32 x 5120) and the ratio-1 compressor (BF16 out): SIMT up
+  to 8 rows, then the torch backend (cuBLAS picks its kernel by M). The index
+  head weights differ from the row alone at 9-16 and from 128 rows with either
+  lookup (max |d| 0.031): the lookup cannot fix a backend that is row-count
+  dependent by itself. Index key and drafter gate: invariant everywhere.
+- wq_b (block FP8, rank 0's 1280 -> 11264): invariant at every batch and
+  position; split-K 1 at every capacity (tiles 16/32/64).
+- Kernel time per call (CUDA graph): unchanged except where the old lookup ran
+  the big plan (router gate at 19 rows 35.9 -> 28.2 us, ratio-1 compressor
+  35.9 -> 15.0 us) and at 33 rows, where the 35-row SIMT plan is slower than
+  the prefill kernel (gate 36.0 -> 42.2 us, ratio-2 compressor 35.8 -> 54.5 us).
+
+### Trace 1: the lookup alone (`detm-r5o-lookup-trace`)
+
+JSON and prose targets, five background mixes, three repeats each; the target's
+schedule is recorded per step (rows, padded batch, requests).
+
+- Identical target schedules gave identical target outputs and identical
+  main-model records in every pair (JSON mix 0 x3, mix 3 r0/r1; prose mix 0 x3,
+  mix 2 r0/r2).
+- JSON, solo against every mix: the router logits now match on all 19 prefill
+  rows, and so do the MoE input and shared output, but layer 0's routed output
+  still differs. Prose, solo against every mix: the first difference moves from
+  round 12's layer-3 MoE input to layer 0's block-FP8 query projection (wq_b),
+  on 4 of the 15 rows.
+- Repeats of a mix whose schedules differ first differ at wq_b (16 against 12
+  rows), at layer 2's index head weights (16 against 20 rows; the torch
+  backend), at layer 0's routed output (24 against 27, 28 against 39 rows), or
+  only after the drafter changed the drafts and with them the schedule.
+- The drafter's layer 40 differs even at identical schedules (attention
+  output with matching attention input); it changes drafts, not verified
+  tokens, but then the schedule.
+
+### The MoE through serving's one-plan path (`moe_serving_replay.py`)
+
+Serving plans the routed MoE once (the fixed graph sizes plus the 4096-token
+limit as warm counts) and binds every live batch to it; B12X's `variant_for`
+took the exact planned variant, else the prefill capacity. Replayed through
+that path (vLLM's own call factory, DS4.1 TP3 shapes, synthetic weights,
+deterministic mode), with batch sizes grouped by the exact bits of 19 target
+rows (every fixed batch repeats bitwise):
+
+| Warm counts | Before (det-masked) | With b12x-0006 (det-variant) |
+|---|---|---|
+| graph sizes | 20, 24, 28, 32, 40, 48 in one group; every other size 19-512 (the solo call among them) in another | 19-48 in one group; 49-512 (prefill capacity) in another |
+| every prepared count | prepared sizes 20-192 in one group; unprepared sizes and 256, 512 in a second; 384 in a third | 19-192 in one group; 256-512 in another |
+
+That is round 12's JSON divergence with the gate fixed: a 19-token prefill
+alone ran the prefill-capacity launch, the same rows in a 28-48-row batch
+ran a planned variant. With the fix, the first R target rows alone also equal
+the solo call's first R rows for R = 2-18; a single row alone takes the M=1
+launch and still differs.
+
+### Trace 2: both fixes (`detm-r5o-lookup-variant-trace`)
+
+- JSON, solo against every mix: layer 0 now matches entirely, attention and MoE
+  (routed output included). The first difference is layer 1's attention input
+  on the same 4 of 19 rows (7, 8, 10, 17) whatever the mix's padding (28, 32,
+  40, 48) or the target's offset. Layer 1 is an Engram layer: its hashed rows
+  go through a block-FP8 projection (`wkv`) before the mix.
+- Prose, solo against every mix: still layer 0's wq_b, on the same 4 of 15
+  rows (0, 3, 7, 10) at every padding (24, 32, 48). Serving's dumped
+  configurations are identical for 16 and 24-48 rows (tile 32 x 128, split-K
+  1), matching the replay, which finds wq_b batch-invariant. So the remaining
+  first divergences are block-FP8 linears that behave differently in serving
+  than in isolation.
+- Mix 1's prose repeats now match entirely (round 12 and trace 1 split at the
+  MoE). Other repeats first differ at wq_b (16 against 12 rows), at the index
+  head weights (16 against 20), or after the drafter changed the schedule.
+- Identical schedules still give identical outputs.
+
+### Performance (one boot per arm, pinned cost table, no debug overlay)
+
+`run30.sh`, `tables_lookup.py`; cost table `dspark-costs-e9eb8edaf99252b3.json`,
+SHA-256 `5dc8961a`, loaded at every boot. Decode: tokens per second (95%
+interval over six samples), GPU step time, verified and accepted drafts per
+draft event.
+
+| Point | r5o | + GEMV lookup | + lookup + MoE variant | det. MoE | det. + both |
+|---|---|---|---|---|---|
+| prose c1 tps | 50.88 ±4.3% | 51.82 ±4.4% | 51.05 ±5.9% | 51.67 ±0.5% | 48.19 ±0.3% |
+| step ms | 42.46 | 42.40 | 42.58 | 43.16 | 42.63 |
+| verified / accepted | 3.248 / 1.249 | 3.261 / 1.290 | 3.249 / 1.261 | 3.336 / 1.327 | 3.215 / 1.132 |
+| JSON c1 tps | 76.92 ±5.1% | 77.06 ±2.4% | 77.16 ±2.5% | 73.96 ±0.3% | 77.31 ±0.6% |
+| step ms | 48.35 | 48.54 | 48.16 | 48.15 | 49.73 |
+| verified / accepted | 4.521 / 2.929 | 4.522 / 2.959 | 4.502 / 2.934 | 4.391 / 2.754 | 4.587 / 3.079 |
+| prose c8 tps | 160.52 ±1.5% | 160.57 ±2.0% | 162.06 ±1.1% | 164.26 ±0.3% | 153.19 ±0.2% |
+| verified / accepted | 2.408 / 1.224 | 2.436 / 1.239 | 2.411 / 1.226 | 2.226 / 1.120 | 2.332 / 1.130 |
+| JSON c8 tps | 231.01 ±3.0% | 235.83 ±2.1% | 236.43 ±4.5% | 226.71 ±0.1% | 228.48 ±1.8% |
+| verified / accepted | 3.520 / 2.871 | 3.513 / 2.881 | 3.550 / 2.937 | 3.549 / 2.934 | 3.501 / 2.873 |
+
+- Production path: neither change moves decode beyond its interval (lookup
+  -0.0 to +2.1%, lookup and variant +0.3 to +2.3%), with verification work
+  and step time matched (verified per draft within 1.2%, step within 0.4 ms).
+  Graph-sized decode batches were exact matches before and after.
+- Deterministic path: prose -6.7% at one and eight streams, JSON +4.5% and
+  +0.8%. Accepted drafts move the same way (prose c1 1.327 -> 1.132, JSON c1
+  2.754 -> 3.079): the fixes change the arm's numerics, so it writes different
+  text with different acceptance; step time moves -0.5 ms (prose c1) and
+  +1.6 ms (JSON c1). Its intervals are tight because its repeats are identical,
+  which understates content variation.
+- Short prompts (`ttft_short.py`, request time of a 7-68-token prompt with one
+  generated token, median of seven): the lookup is 1-5 ms faster than r5o
+  (17-30 tokens 162 -> 157 ms); with the MoE variant too, 3-7 ms slower than
+  r5o, including at lengths the variant change cannot touch. With one boot per
+  arm these few-millisecond differences include boot-to-boot variation and are
+  not established.
+
+### Probe: the block-FP8 query projection in serving (`run31`)
+
+`detm-r5o-lookup-variant-probe` recomputes the first four layers' query
+projection beside the served call (`debug-attn-probe.diff`, batches up to 256
+rows; the first boot failed because the 4096-row profile run asked for 4097).
+Over 20 traced runs (JSON and prose, five mixes, two repeats), all three ranks:
+the served wq_b equals the same call repeated, the same rows with a private
+scratch, and the rows moved one position down in a batch one row larger, in
+all 15,929 layer-steps (`analyze_probe.py`). In serving, wq_b is repeatable
+and independent of the shared workspace, of position and of batch size.
+
+Yet the prose target still first differs at q_proj on rows 0, 3, 7 and 10
+between its solo prefill and every mix, with the q latent before it and the
+attention input matching. The input must differ: the trace compares per-row
+sums, and a sum hides flipped low bits that cancel. Every "first difference"
+in this round is therefore an upper bound on where the divergence starts (a
+differing sum is a real difference; an equal one is not proof of equality).
+The MoE and GEMV mechanisms stand on their replays, not on the sums.
+
+Next: an exact per-row fingerprint (the bit patterns, position-weighted,
+modulo a prime) in place of the sums, to find where the prose and Engram
+divergences really begin; batch-invariant replacements for the torch-backend
+GEMVs (index head weights, ratio-1 compressor); and the drafter's
+fixed-schedule difference.
