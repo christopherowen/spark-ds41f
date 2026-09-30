@@ -2,7 +2,8 @@
 """Compare a tagged target's rows across runs by what they compute: position and input token.
 
 usage: analyze_trace3.py OUT_DIR PROMPT [--chain N] [--node dgx1|dgx2|dgx3]   (runs from
-       trace_mixes.py on an attn-exact2 arm, which records row positions and tokens; rank 0 by default)
+       trace_mixes.py on an attn-exact2 or attn-exact3 arm, which record row positions and tokens;
+       rank 0 by default; attn-exact3's wide logs, which hold long prefill steps, are merged in)
 
 Steps cannot be paired by number once two runs accept drafts differently, so
 each target row is keyed by (position, input token). A row is comparable only
@@ -85,13 +86,16 @@ def load_run(run_dir, node="dgx1"):
     target = json.load(open(os.path.join(run_dir, "target.json")))
     d = os.path.join(run_dir, node)
     runner, tags, attn, sched = (latest(d, k) for k in ("runner", "tags", "attn", "schedule"))
+    wide = {k: latest(d, f"{k}_wide") for k in ("runner", "tags", "attn")}
     host = json.load(open(sorted(glob.glob(os.path.join(d, "rank*-schedule-host-*.json")),
                                  key=lambda f: int(f.rsplit("-", 1)[1][:-5]))[-1]))
     host = {h["step"]: h for h in host}
     m, reqs = sched["max_rows"], sched["schedule_reqs"]
     dev = {int(row[0].item()): row for row in chronological(sched)}
-    run_steps, tag_steps = steps_of(runner, 2, 2), steps_of(tags, 3, 3, tag_col=2)
-    attn_steps = steps_of(attn, 3, 3, tag_col=2)
+    run_steps = steps_of(runner, 2, 2)
+    runner_src = [(log, steps_of(log, 2, 2)) for log in (runner, wide["runner"]) if log is not None]
+    tag_src = [(log, steps_of(log, 3, 3, tag_col=2)) for log in (tags, wide["tags"]) if log is not None]
+    attn_src = [(log, steps_of(log, 3, 3, tag_col=2)) for log in (attn, wide["attn"]) if log is not None]
     prompt_len = target["prompt_tokens"]
     rows = []  # (position, token, comparable, {label: value}, step)
     dead_rows = 0
@@ -112,32 +116,35 @@ def load_run(run_dir, node="dgx1"):
         tok = [int(v) for v in row[base + m + a: base + m + b].tolist()]
         dead = [bool(v) for v in row[3 + reqs + a: 3 + reqs + b].tolist()]
         records = [{} for _ in range(b - a)]
-        for slot, tag, n, sums in attn_steps.get(step, []):
-            layer = main_layer(attn["names"][slot])
-            if layer is None or b > n or tag not in ATTN:
-                continue
-            key = (layer, 1, 1) if tag == 30 else (layer, 0, ORDER.index(tag)) if tag in ORDER else None
-            if key is None:
-                continue
-            for i in range(b - a):
-                records[i][(key, ATTN[tag])] = float(sums[a + i, 0])
-        for slot, _, n, sums in run_steps[step]:
-            layer = main_layer(runner["names"][slot])
-            if layer is None or b > n:
-                continue
-            for i in range(b - a):
-                records[i][((layer, 1, 0), "moe_input")] = float(sums[a + i, 0])
-                records[i][((layer, 3, 0), "shared_out")] = float(sums[a + i, 1])
-                records[i][((layer, 4, 0), "routed_out")] = float(sums[a + i, 2])
-        for slot, tag, n, sums in tag_steps.get(step, []):
-            layer = main_layer(tags["names"][slot])
-            if layer is None or b > n or tag not in SHARED:
-                continue
-            for i in range(b - a):
-                records[i][((layer, 2, tag), SHARED[tag])] = float(sums[a + i, 0])
+        for log, steps in attn_src:
+            for slot, tag, n, sums in steps.get(step, []):
+                layer = main_layer(log["names"][slot])
+                if layer is None or b > n or tag not in ATTN:
+                    continue
+                key = (layer, 1, 1) if tag == 30 else (layer, 0, ORDER.index(tag)) if tag in ORDER else None
+                if key is None:
+                    continue
+                for i in range(b - a):
+                    records[i][(key, ATTN[tag])] = float(sums[a + i, 0])
+        for log, steps in runner_src:
+            for slot, _, n, sums in steps.get(step, []):
+                layer = main_layer(log["names"][slot])
+                if layer is None or b > n:
+                    continue
+                for i in range(b - a):
+                    records[i][((layer, 1, 0), "moe_input")] = float(sums[a + i, 0])
+                    records[i][((layer, 3, 0), "shared_out")] = float(sums[a + i, 1])
+                    records[i][((layer, 4, 0), "routed_out")] = float(sums[a + i, 2])
+        for log, steps in tag_src:
+            for slot, tag, n, sums in steps.get(step, []):
+                layer = main_layer(log["names"][slot])
+                if layer is None or b > n or tag not in SHARED:
+                    continue
+                for i in range(b - a):
+                    records[i][((layer, 2, tag), SHARED[tag])] = float(sums[a + i, 0])
         generated = target["tokens_ids"] if "tokens_ids" in target else None
         for i in range(b - a):
-            ok = not dead[i]
+            ok = not dead[i] and bool(records[i])
             for j in range(i):  # earlier rows of this block fed the accepted token?
                 if pos[j] >= prompt_len:
                     g = pos[j] - prompt_len

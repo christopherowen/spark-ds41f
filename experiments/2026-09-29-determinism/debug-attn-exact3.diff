@@ -1,0 +1,165 @@
+--- a/checksum_debug.py
++++ b/checksum_debug.py
+@@ -44,11 +44,21 @@
+ RECOMPUTE = os.environ.get("SPARK3_DEBUG_RECOMPUTE") == "1"
+ # Index sums are reduced modulo a prime below 2**24, exact in the float32 log.
+ _HASH_PRIME = 16777213
+-_SCHEDULE_CAPACITY = 4096
++_SCHEDULE_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY", "4096"))
+ _SCHEDULE_REQS = 17
+ _MARKER = -1.0
+ _SLOTS = 256
+ _logs: dict[str, "_Log"] = {}
++# Wide logs: calls with more than _MAX_ROWS and at most _WIDE_ROWS rows (a long
++# prefill) go to separate "<log>_wide" logs, which decode steps never touch, so
++# a prefill step survives the decode steps before a dump. Off (0) by default.
++_WIDE_ROWS = int(os.environ.get("SPARK3_MOE_CHECKSUM_WIDE_ROWS", "0"))
++_WIDE_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_WIDE_CAPACITY", "4096"))
++_ROWS = max(_MAX_ROWS, _WIDE_ROWS)  # rows per step in the schedule log
++_WIDTH = {"runner": lambda m: 2 + 3 * m, "tags": lambda m: 3 + m, "attn": lambda m: 3 + m}
++_CAPACITY = {"runner": (_RUNNER_CAPACITY, max(64, _WIDE_CAPACITY // 8)),
++             "tags": (_TAGS_CAPACITY, _WIDE_CAPACITY // 2),
++             "attn": (_ATTN_CAPACITY, _WIDE_CAPACITY)}
+ 
+ 
+ def _name(owner) -> str:
+@@ -61,8 +71,10 @@
+ 
+ 
+ class _Log:
+-    def __init__(self, device: torch.device, name: str, width: int, capacity: int) -> None:
++    def __init__(self, device: torch.device, name: str, width: int, capacity: int,
++                 max_rows: int = _MAX_ROWS) -> None:
+         self.name = name
++        self.max_rows = max_rows
+         self.capacity = capacity
+         self.rows = torch.zeros(capacity, width, dtype=torch.float32, device=device)
+         self.stage = torch.zeros(_SLOTS, width, dtype=torch.float32, device=device)
+@@ -139,22 +151,33 @@
+     total = tl.sum(acc, axis=0) % 16777213
+     tl.store(out + row, total.to(tl.float32))
+ 
+-def _log(name: str, device: torch.device, width: int, capacity: int) -> _Log:
++def _log(name: str, device: torch.device, width: int, capacity: int,
++         max_rows: int = _MAX_ROWS) -> _Log:
+     log = _logs.get(name)
+     if log is None:
+         os.makedirs(DIRECTORY, exist_ok=True)
+-        log = _logs[name] = _Log(device, name, width, capacity)
++        log = _logs[name] = _Log(device, name, width, capacity, max_rows)
+         if len(_logs) == 1:
+             threading.Thread(target=_watch, daemon=True).start()
+     return log
+ 
+ 
++def _log_for(kind: str, rows: int, device: torch.device) -> tuple[_Log | None, int]:
++    """The log for a call of ``rows`` rows and its rows per record, or (None, 0) to skip."""
++    if rows <= _MAX_ROWS:
++        return _log(kind, device, _WIDTH[kind](_MAX_ROWS), _CAPACITY[kind][0]), _MAX_ROWS
++    if rows <= _WIDE_ROWS:
++        return _log(f"{kind}_wide", device, _WIDTH[kind](_WIDE_ROWS), _CAPACITY[kind][1],
++                    _WIDE_ROWS), _WIDE_ROWS
++    return None, 0
++
++
+ def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
+     """Append one runner record; call only when ENABLED."""
+     rows = x.shape[0]
+-    if rows > _MAX_ROWS:
++    log, m = _log_for("runner", rows, x.device)
++    if log is None:
+         return
+-    log = _log("runner", x.device, 2 + 3 * _MAX_ROWS, _RUNNER_CAPACITY)
+     slot = log.slot(owner)
+     stage = log.stage[slot]
+     stage.zero_()
+@@ -162,17 +185,17 @@
+     stage[1].fill_(rows)
+     log.row_sums(x, stage[2 : 2 + rows])
+     if shared is not None:
+-        log.row_sums(shared, stage[2 + _MAX_ROWS : 2 + _MAX_ROWS + rows])
+-    log.row_sums(routed, stage[2 + 2 * _MAX_ROWS : 2 + 2 * _MAX_ROWS + rows])
++        log.row_sums(shared, stage[2 + m : 2 + m + rows])
++    log.row_sums(routed, stage[2 + 2 * m : 2 + 2 * m + rows])
+     log.append(slot)
+ 
+ 
+ def record_tag(owner, tag: int, x: torch.Tensor) -> None:
+     """Append one tagged record (slot, rows, tag, per-row sums); only when ENABLED."""
+     rows = x.shape[0]
+-    if rows > _MAX_ROWS:
++    log, _ = _log_for("tags", rows, x.device)
++    if log is None:
+         return
+-    log = _log("tags", x.device, 3 + _MAX_ROWS, _TAGS_CAPACITY)
+     slot = log.slot(owner)
+     stage = log.stage[slot]
+     stage.zero_()
+@@ -186,9 +209,9 @@
+ def record_attn(owner, tag: int, x: torch.Tensor) -> None:
+     """Append one attention record (slot, rows, tag, per-row sums); only when ENABLED."""
+     rows = x.shape[0]
+-    if rows > _MAX_ROWS:
++    log, _ = _log_for("attn", rows, x.device)
++    if log is None:
+         return
+-    log = _log("attn", x.device, 3 + _MAX_ROWS, _ATTN_CAPACITY)
+     slot = log.slot(owner)
+     stage = log.stage[slot]
+     stage.zero_()
+@@ -212,7 +235,7 @@
+     19: the lengths. Both sums are reduced modulo a prime below 2**24.
+     """
+     rows = indices.shape[0]
+-    if rows > _MAX_ROWS:
++    if rows > _ROWS:
+         return
+     j = torch.arange(indices.shape[1], device=indices.device)
+     valid = (j < lengths.reshape(rows, 1)) & (indices >= 0)
+@@ -366,7 +389,7 @@
+     step = _step[0]
+     _step[0] += 1
+     device = query_start_loc.device
+-    log = _log("schedule", device, 3 + _SCHEDULE_REQS + 3 * _MAX_ROWS, _SCHEDULE_CAPACITY)
++    log = _log("schedule", device, 3 + _SCHEDULE_REQS + 3 * _ROWS, _SCHEDULE_CAPACITY, _ROWS)
+     stage = log.stage[0]
+     stage.zero_()
+     stage[0].fill_(step)
+@@ -375,20 +398,20 @@
+     n = min(num_reqs + 1, _SCHEDULE_REQS, query_start_loc.numel())
+     stage[3 : 3 + n].copy_(query_start_loc[:n])
+     if is_padding is not None:
+-        m = min(padded, _MAX_ROWS, is_padding.numel())
++        m = min(padded, _ROWS, is_padding.numel())
+         stage[3 + _SCHEDULE_REQS : 3 + _SCHEDULE_REQS + m].copy_(is_padding[:m])
+     # Each row's position and input token (exact in float32), so rows can be
+     # matched across runs by what they compute rather than by step number.
+-    base = 3 + _SCHEDULE_REQS + _MAX_ROWS
+-    for offset, values in ((0, positions), (_MAX_ROWS, input_ids)):
++    base = 3 + _SCHEDULE_REQS + _ROWS
++    for offset, values in ((0, positions), (_ROWS, input_ids)):
+         if values is not None:
+-            m = min(padded, _MAX_ROWS, values.numel())
++            m = min(padded, _ROWS, values.numel())
+             stage[base + offset : base + offset + m].copy_(values[:m])
+     log.append(0)
+-    for name, width, capacity, step_col in (("runner", 2 + 3 * _MAX_ROWS, _RUNNER_CAPACITY, 2),
+-                                            ("tags", 3 + _MAX_ROWS, _TAGS_CAPACITY, 3),
+-                                            ("attn", 3 + _MAX_ROWS, _ATTN_CAPACITY, 3)):
+-        marker_log = _log(name, device, width, capacity)
++    sizes = (_MAX_ROWS, _WIDE_ROWS) if _WIDE_ROWS > _MAX_ROWS else (_MAX_ROWS,)
++    for name, rows in ((n, r) for r in sizes for n in ("runner", "tags", "attn")):
++        step_col = 2 if name == "runner" else 3
++        marker_log, _ = _log_for(name, rows, device)
+         mark = marker_log.stage[_SLOTS - 1]
+         mark.zero_()
+         mark[0].fill_(_MARKER)
+@@ -498,7 +521,7 @@
+                         rows = log.rows[: min(count, log.capacity)].cpu()
+                         torch.save(
+                             {"count": count, "capacity": log.capacity, "rows": rows,
+-                             "names": list(log.names), "max_rows": _MAX_ROWS,
++                             "names": list(log.names), "max_rows": log.max_rows,
+                              "schedule_reqs": _SCHEDULE_REQS},
+                             os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
+                         )

@@ -44,7 +44,10 @@ arm with attn-exact2, which also records each row's position and input token), d
 the fixes that are always on: 0027, 0028 and b12x-0006). detm-r5o-final-trace
 adds 0009-moe-deterministic-single-row.patch (overlay det-variant2: the
 det-variant files with a deterministic single row kept off the M=1
-materialized launch).
+materialized launch). detm-r5o-final-wide-trace is that arm with attn-exact3
+(debug-attn-exact3.diff on attn-exact2: calls of 65-1088 rows, a long prefill,
+go to separate wide logs that decode steps never overwrite; the schedule log
+holds 1088 rows per step and 1024 steps).
 """
 import copy
 import json
@@ -120,6 +123,11 @@ for f in DET:
 detm_variant2_pin["environment"].update(detm_pin["environment"])
 final_trace = traced(detm_variant2_pin, 1790, overlay="attn-exact2", lookup="gemv-lookup-mhc-bi-fp8")
 final_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
+final_wide = traced(detm_variant2_pin, 1790, overlay="attn-exact3", lookup="gemv-lookup-mhc-bi-fp8")
+final_wide["environment"].update(
+    VLLM_DS41_BATCH_INVARIANT="1", SPARK3_MOE_CHECKSUM_WIDE_ROWS="1088",
+    SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="4096", SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="1024",
+)
 probe = traced(detm_variant_pin, 768, overlay="attn-probe")
 probe["environment"]["SPARK3_DEBUG_RECOMPUTE"] = "1"
 r5o_lookup_variant = with_lookup(r5o_pin)
@@ -139,6 +147,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-bi-trace", bi_full_trace), ("detm-r5o-bi-pin", bi_full_pin),
                   ("r5o-lookup-mhc-variant-pin", r5o_lookup_mhc_variant),
                   ("detm-r5o-final-trace", final_trace),
+                  ("detm-r5o-final-wide-trace", final_wide),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
