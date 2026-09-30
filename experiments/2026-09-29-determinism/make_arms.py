@@ -99,7 +99,7 @@ for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
     print("wrote", path)
 
 # Decode profiles: r5m and detfast with the torch profiler (profile_decode.py).
-for name, config in (("r5m-prof", base), ("detfast-prof", detfast)):
+for name, config in (("r5m-prof", base), ("detfast-prof", detfast), ("detslice-prof", detslice)):
     profiled = copy.deepcopy(config)
     profiled["serve_args"] += [
         "--profiler-config",
