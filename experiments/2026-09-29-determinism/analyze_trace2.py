@@ -35,10 +35,11 @@ ONLY = 0 if "--main" in sys.argv else 1 if "--drafter" in sys.argv else None
 SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
-        20: "window_len", 21: "attn_output", 22: "o_proj", 24: "q_proj", 30: "router_logits"}
+        20: "window_len", 21: "attn_output", 22: "o_proj", 24: "q_proj", 28: "q_raw", 29: "kv_raw",
+        30: "router_logits"}
 # Execution order within a layer: attention records, then the MoE input, the
 # router logits (tag 30, recorded by the MoE runner), the shared expert, outputs.
-ATTN_ORDER = (10, 11, 12, 24, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+ATTN_ORDER = (10, 28, 29, 11, 12, 24, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 MODES = {0: "decode", 1: "prefill", 2: "prefill_short"}
 
 

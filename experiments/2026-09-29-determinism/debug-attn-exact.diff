@@ -1,0 +1,80 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+--- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 18:17:39.738668322 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 18:17:39.739684051 +0200
+@@ -3,8 +3,10 @@
+ 
+ Enabled only by ``SPARK3_MOE_CHECKSUM_DIR``; unset means no work at all.
+ Every MoE runner call with at most 64 rows appends one record to a device
+-log: (layer slot, rows, per-row sums of the input, of the shared-expert output
+-and of the routed output). Tagged calls (``record_tag``, e.g. inside the
++log: (layer slot, rows, per-row fingerprints of the input, of the shared-expert
++output and of the routed output). A fingerprint is exact: the row's bit
++patterns, weighted by position, modulo a prime below 2**24 (so it is exact in
++the float32 log); two rows share one only if equal or with probability 6e-8. Tagged calls (``record_tag``, e.g. inside the
+ shared-expert MLP, which may run on a side stream) append (slot, rows, tag,
+ per-row sums) to a second log, so the two never share a counter. Per-row sums
+ matter: batches are padded, and padding rows carry stale values.
+@@ -78,7 +80,23 @@
+         return slot
+ 
+     def row_sums(self, x: torch.Tensor, out: torch.Tensor) -> None:
+-        torch.sum(x.reshape(x.shape[0], -1), dim=1, dtype=torch.float32, out=out)
++        """Exact per-row fingerprints (the name predates them; sums could hide
++        flipped low bits that cancel)."""
++        flat = x.reshape(x.shape[0], -1)
++        if flat.dtype == torch.bool:
++            flat = flat.to(torch.uint8)
++        size = flat.element_size()
++        if flat.is_floating_point():
++            bits = flat.contiguous().view({2: torch.int16, 4: torch.int32}[size]).long()
++            bits &= 0xFFFF if size == 2 else 0xFFFFFFFF
++        else:
++            bits = flat.long()
++        bits = torch.remainder(bits, _HASH_PRIME)
++        weights = torch.remainder(
++            torch.arange(1, bits.shape[1] + 1, dtype=torch.int64, device=x.device) * 40503 + 7,
++            1048573,
++        )
++        out.copy_(torch.remainder((bits * weights).sum(dim=1), _HASH_PRIME))
+ 
+     def append(self, slot: int) -> None:
+         torch.remainder(self.count, self.capacity, out=self.index)
+@@ -271,10 +289,21 @@
+         out[name] = entry
+     import gc
+ 
+-    # The routed MoE's planned variants (warm counts), once per distinct set.
+-    counts = {tuple(o._plan_key[0]) for o in gc.get_objects()
+-              if type(o).__name__ == "B12xExperts" and getattr(o, "_plan_key", None)}
+-    out["moe_variants"] = sorted(list(c) for c in counts)
++    # The routed MoE's planned variants and mHC's per-operation plan counts,
++    # once per distinct set (matched on instance attributes, not class names).
++    moe, mhc = set(), set()
++    for o in gc.get_objects():
++        state = getattr(o, "__dict__", None)
++        if not isinstance(state, dict):
++            continue
++        key = state.get("_plan_key")
++        if isinstance(key, tuple) and key and isinstance(key[0], tuple):
++            moe.add(tuple(key[0]))
++        plans = state.get("_plans")
++        if type(o).__name__ == "B12xMHC" and isinstance(plans, dict) and plans:
++            mhc.add(tuple(sorted(plans)))
++    out["moe_variants"] = sorted(list(c) for c in moe)
++    out["mhc_plans"] = [sorted({rows for _, rows in keys}) for keys in sorted(mhc)]
+     with open(path, "w") as f:
+         json.dump(out, f, indent=1)
+ 
+diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 18:17:39.743389896 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 18:17:39.744455721 +0200
+@@ -1364,6 +1364,9 @@
+             rows = hidden_states.shape[0]
+             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
++            if checksum_debug.ENABLED:
++                checksum_debug.record_attn(self, 28, qr)
++                checksum_debug.record_attn(self, 29, kv)
+             qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         if checksum_debug.ENABLED:
+             for role in ("fused_wqa_wkv", "wq_b"):

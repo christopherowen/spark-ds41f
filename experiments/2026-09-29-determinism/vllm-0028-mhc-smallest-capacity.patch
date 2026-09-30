@@ -1,0 +1,100 @@
+From c88abfeaec05e50488ef67538b09e43e65c68ab2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 18:16:42 +0200
+Subject: [PATCH] fix(deepseek-v4.1): pick the smallest prepared mHC plan for a
+ live count
+
+B12xMHC prepares one plan per operation (pre, post_pre, post) and warm token
+count: the fixed serving sizes and the batch token limit. _plan_for took the
+exact count and otherwise the largest plan. Each capacity selects its own
+kernel, so a count between prepared sizes, such as a 15- or 19-token prefill
+alone, mixed its rows differently than the same rows padded into a prepared
+batch, and the attention and FFN inputs of every layer depended on what else
+was scheduled.
+
+Take the smallest prepared plan at or above the live count instead; counts
+above the largest fixed size still use the largest plan.
+---
+ ...test_deepseek_v4_1_prepared_projections.py | 27 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 25 +++++++++++------
+ 2 files changed, 44 insertions(+), 8 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index 0f7ec2743..7caabfd05 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -128,6 +128,33 @@ def test_projections_take_the_smallest_prepared_capacity(monkeypatch):
+         B12xLinearMethod().apply(layer, torch.empty(4097, 16, dtype=torch.bfloat16))
+ 
+ 
++def test_mhc_takes_the_smallest_prepared_plan(monkeypatch):
++    """Counts between prepared mHC sizes use the next larger plan, not the largest."""
++    from vllm.models.deepseek_v4_1 import b12x_layers
++
++    monkeypatch.setattr(b12x_layers, "_execution_capacities", lambda: (1, 8, 4096))
++    module = b12x_layers.B12xMHC(
++        SimpleNamespace(
++            hidden_size=5120,
++            rms_norm_eps=1e-20,
++            hc_eps=1e-6,
++            hc_sinkhorn_iters=20,
++            hc_mult=4,
++        )
++    )
++    module._plans = {
++        (operation, rows): (operation, rows)
++        for operation in ("pre", "post")
++        for rows in (1, 8, 20, 4096)
++    }
++    for tokens, rows in ((0, 1), (1, 1), (5, 8), (19, 20), (21, 4096), (4096, 4096)):
++        assert module._plan_for("pre", tokens) == ("pre", rows)
++    with pytest.raises(RuntimeError, match="exceeds prepared capacity 4096"):
++        module._plan_for("post", 4097)
++    with pytest.raises(RuntimeError, match="exceeds prepared capacity 0"):
++        module._plan_for("post_pre", 1)
++
++
+ @torch.no_grad()
+ def test_mhc_weighted_collapse_and_mean_use_prepared_plans(monkeypatch):
+     from b12x.preparation import PreparationSession
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index e5f09353b..d0a9663fd 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -703,16 +703,25 @@ class B12xMHC(nn.Module):
+         self._layer_name = _encode_layer_name(name)
+ 
+     def _plan_for(self, operation, tokens):
++        """The smallest prepared plan for ``operation`` that holds ``tokens``.
++
++        Each capacity selects its own kernel, so a count between prepared sizes
++        must not fall back to the largest plan: it would compute a row
++        differently than the same row padded into a prepared batch.
++        """
+         tokens = int(tokens)
+-        exact = self._plans.get((operation, tokens))
+-        if exact is not None:
+-            return exact
+-        capacity = max((rows for op, rows in self._plans if op == operation), default=0)
+-        if 0 <= tokens <= capacity and capacity:
+-            return self._plans[(operation, capacity)]
+-        raise RuntimeError(
+-            f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {capacity}"
++        capacity = min(
++            (rows for op, rows in self._plans if op == operation and rows >= tokens),
++            default=None,
+         )
++        if tokens < 0 or capacity is None:
++            largest = max(
++                (rows for op, rows in self._plans if op == operation), default=0
++            )
++            raise RuntimeError(
++                f"B12x mHC {operation} live M={tokens} exceeds prepared capacity {largest}"
++            )
++        return self._plans[(operation, capacity)]
+ 
+     def get_b12x_preparation_units(
+         self, layer, workload: B12xWorkload
+-- 
+2.43.0
+
