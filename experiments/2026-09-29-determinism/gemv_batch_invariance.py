@@ -31,7 +31,7 @@ torch.manual_seed(20260930)
 
 def gemv_plans(weight):
     plans, requests = {}, []
-    for cap in CAPS:
+    for cap in CAPS + (4096,):
         query = bf16_gemv.GemvQuery(
             source_dtype="bfloat16", weight_dtype="bfloat16", output_dtype="float32",
             max_rows=cap, in_features=weight.shape[1], out_features=weight.shape[0],
@@ -93,6 +93,21 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
         out = torch.empty((x.shape[0], n, 1), dtype=torch.bfloat16, device=device)
         bfl.run(binding=bfl.bind(plans[cap], scratch=scratch, source=x, packed_weight=packed, output=out))
         return out[:, :, 0]
+
+    # Serving's V4.1 linear looks up the plan for the exact row count and falls
+    # back to the maximum-capacity plan (4096 rows) otherwise: an unpadded
+    # 19-row prefill runs the big plan, a padded 28-row batch the small one.
+    target = (torch.randn(T, 5120, device=device) * 0.5).to(torch.bfloat16)
+    served_alone = gate(target.contiguous(), 4096).clone()
+    small_alone = gate(target.contiguous(), 19).clone()
+    nb = (torch.randn(28 - T, 5120, device=device) * 0.5).to(torch.bfloat16)
+    served_mixed = gate(torch.cat([target, nb]).contiguous(), 28)[:T].clone()
+    torch.cuda.synchronize()
+    diff = (served_alone - served_mixed).abs()
+    print(f"router gate, serving's lookup: 19 rows alone on the 4096-row plan vs the 19-row plan "
+          f"{'=' if torch.equal(served_alone, small_alone) else 'DIFF'}; vs 28-row batch on the 28-row plan "
+          f"{'=' if torch.equal(served_alone, served_mixed) else 'DIFF'} (max |d| {diff.max().item():.3g}, "
+          f"rows differing {int((diff > 0).any(1).sum())}/{T})", flush=True)
 
     for label, fn, k in (("router gate (bf16 gemv 5120->384)", gate, 5120),
                          ("shared gate_up (block-FP8 5120->1536)", lambda x, c: linear("gate_up", x, c), 5120),
