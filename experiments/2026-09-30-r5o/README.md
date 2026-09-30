@@ -46,4 +46,29 @@ verification counters; SASS gate clean; quality 5/5; needle pass; doctor clean.
 
 ## Results
 
-Pending.
+`screen.sh` (2026-09-30, overlay SHA-256s checked on every node; pinned table
+`dspark-costs-e9eb8edaf99252b3.json`, SHA-256 `5dc8961a…`, written by the first
+r5n boot and reused by the other three):
+
+Long-prompt repeatability (6,705 prompt tokens, five runs): deterministic MoE
+1/5 without and 1/5 with the fence, zero first-token logprob difference. The
+prompt did not expose the race in serving; 0005 rests on the SASS evidence and
+the standalone reproduction, and costs no repeatability.
+
+| prefill, 4,096-token chunk (three rounds) | r5n | overlay | change |
+|---|---|---|---|
+| 8K | 1031.8 ms (spread 0.12%) | 1032.2 ms (0.54%) | +0.05% |
+| 64K | 1085.7 ms (0.29%) | 1090.3 ms (0.39%) | +0.42% |
+| 131K | 1115.0 ms (0.43%) | 1117.8 ms (0.50%) | +0.25% |
+| 200K | 1155.6 ms (0.95%) | 1154.7 ms (0.27%) | -0.07% |
+
+| decode, alternating (tables.py) | r5n | overlay |
+|---|---|---|
+| prose step, one stream | 41.86, 41.99 ms | 41.97, 42.06 ms |
+| JSON step, one stream | 48.26, 48.40 ms | 48.45, 48.25 ms |
+| prose, eight streams (verified / accepted per draft) | 160.4, 160.9 tok/s (2.45, 2.41 / 1.23, 1.23) | 163.4, 161.2 tok/s (2.39, 2.43 / 1.20, 1.23) |
+| JSON, eight streams (verified / accepted per draft) | 232.8, 235.2 tok/s (3.55, 3.50 / 2.90, 2.90) | 241.3, 241.3 tok/s (3.55, 3.52 / 2.91, 2.89) |
+
+Prefill is within the round-to-round spread except 64K (+0.42% against 0.3-0.4%
+spreads, below half a percent); step times move by at most 0.3%; eight-stream
+throughput is level or higher with matched verification work.

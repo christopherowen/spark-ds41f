@@ -15,7 +15,12 @@ PREV = "2026-09-30-karmic-kraken-r5n"
 TAG = "vllm-ds41f-kkref:04c30fa98e79-r5o"
 PREV_TAG = "vllm-ds41f-kkref:04c30fa98e79-r5n"
 RESULTS = Path.home() / "projects/spark3-vllm-ds41f/results/private"
-SCREEN = "SCREEN_SUMMARY"  # filled in from screen.sh's receipts before running
+SCREEN = (
+    "Overlay screen of the shipped files against r5n on one pinned cost table: prefill chunks "
+    "at 8K-200K within 0.42% (three rounds each); decode alternating twice: step times within "
+    "0.3%, eight-stream throughput level or higher at matched verified and accepted drafts per "
+    "draft; long-prompt repeatability of the deterministic MoE unchanged (1/5 with and without)."
+)
 
 
 def sub(path, old, new, count=1):
