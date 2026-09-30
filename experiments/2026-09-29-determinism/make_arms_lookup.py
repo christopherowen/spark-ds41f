@@ -51,7 +51,11 @@ holds 1088 rows per step and 1024 steps). vllm-0031-reduce-scatter-rank-order-ba
 (overlay gemv-lookup-mhc-bi-fp8-rs: 0027-0031) adds each row's partials of the
 TP reduce-scatter in rank order in batch-invariant mode; prefill sequence
 parallelism reduce-scatters twice per layer: detm-r5o-rs-trace (the wide trace
-arm with it) and detm-r5o-bi-rs-pin (performance).
+arm with it) and detm-r5o-bi-rs-pin (performance). Its second version adds the
+chunks as the RoCE one-shot all-reduce does (float32, rank order, one
+rounding; the first rounded after each BF16 add), so a row matches between
+reduce-scattered and all-reduced steps: overlay gemv-lookup-mhc-bi-fp8-rs2,
+detm-r5o-rs2-trace and detm-r5o-bi-rs2-pin.
 """
 import copy
 import json
@@ -130,9 +134,9 @@ final_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
 RS = "distributed/device_communicators/cuda_communicator.py"
 
 
-def with_rs(arm):
+def with_rs(arm, overlay="gemv-lookup-mhc-bi-fp8-rs"):
     arm = copy.deepcopy(arm)
-    mount(arm, f"gemv-lookup-mhc-bi-fp8-rs/vllm/{RS}", f"{VLLM}/{RS}")
+    mount(arm, f"{overlay}/vllm/{RS}", f"{VLLM}/{RS}")
     return arm
 
 
@@ -162,6 +166,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-final-trace", final_trace),
                   ("detm-r5o-final-wide-trace", final_wide),
                   ("detm-r5o-rs-trace", with_rs(final_wide)), ("detm-r5o-bi-rs-pin", with_rs(bi_full_pin)),
+                  ("detm-r5o-rs2-trace", with_rs(final_wide, "gemv-lookup-mhc-bi-fp8-rs2")),
+                  ("detm-r5o-bi-rs2-pin", with_rs(bi_full_pin, "gemv-lookup-mhc-bi-fp8-rs2")),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
