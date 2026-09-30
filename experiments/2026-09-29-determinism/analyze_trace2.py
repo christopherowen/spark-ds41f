@@ -20,7 +20,10 @@ Each run's schedule is summarized: the target's rows, padded batch and
 request count per appearance. --main compares only the main model's layers,
 --drafter only the drafter's, so a drafter difference does not hide a later
 main-model one. --chain N also lists the first N differing records of that
-appearance in execution order, to see which difference propagates.
+appearance in execution order, to see which difference propagates. Where the
+target's row counts differ (the drafter proposed differently), only each
+step's first row is compared: its input is the last accepted token at the same
+position, so it is comparable while the outputs so far are identical.
 """
 import glob
 import hashlib
@@ -167,9 +170,7 @@ def compare(a, b):
         sched_same = [(p["rows"], p["padded"]) for p in xa] == [(p["rows"], p["padded"]) for p in xb]
         first = None
         for k, (pa, pb) in enumerate(zip(xa, xb)):
-            if pa["rows"] != pb["rows"]:
-                first = f"appearance {k}: target rows {pa['rows']} vs {pb['rows']} (stopped)"
-                break
+            head = pa["rows"] != pb["rows"]  # compare each step's first row only
             if not (pa["recorded"] and pb["recorded"]):
                 first = (f"appearance {k}: batch above the log's row limit (padded {pa['padded']} vs "
                          f"{pb['padded']}), not recorded (stopped)")
@@ -179,19 +180,26 @@ def compare(a, b):
                 sb = other.get(label)
                 if sb is None or (ONLY is not None and key[0] != ONLY):
                     continue
+                if head:
+                    sa, sb = sa[:1], sb[:1]
                 if not torch.equal(sa, sb):
                     rows = (sa != sb).nonzero().flatten().tolist()
                     lk = key[:2]
-                    first = (f"appearance {k} (rows {pa['rows']} at offset {pa['offset']} vs {pb['offset']}, "
+                    first = (f"appearance {k}{' (first rows only)' if head else ''} "
+                             f"(rows {pa['rows']} vs {pb['rows']} at offset {pa['offset']} vs {pb['offset']}, "
                              f"padded {pa['padded']} vs {pb['padded']}, batch {pa['batch_reqs']} vs "
                              f"{pb['batch_reqs']} reqs): {label} differs on target rows {rows[:8]}"
                              f"{' of ' + str(len(sa)) if len(rows) > 8 else ''}; indexer width/mode/chunk "
                              f"there {pa['widths'].get(lk)} vs {pb['widths'].get(lk)}")
                     if CHAIN:
                         chain = []
-                        for _, label2, s2 in pa["items"]:
+                        for key2, label2, s2 in pa["items"]:
                             t2 = other.get(label2)
-                            if t2 is not None and not torch.equal(s2, t2) and len(chain) < CHAIN:
+                            if t2 is None or (ONLY is not None and key2[0] != ONLY):
+                                continue
+                            if head:
+                                s2, t2 = s2[:1], t2[:1]
+                            if not torch.equal(s2, t2) and len(chain) < CHAIN:
                                 n_bad = int((s2 != t2).sum())
                                 chain.append(f"{label2.split('model.')[-1]}({n_bad})")
                         first += " | chain: " + " ".join(chain)

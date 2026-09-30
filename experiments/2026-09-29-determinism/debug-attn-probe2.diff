@@ -1,0 +1,39 @@
+diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 22:42:57.090074761 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 22:42:57.091000970 +0200
+@@ -1801,6 +1801,35 @@
+             out=output,
+             cache_format="deepseek_v41",
+         )
++        if checksum_debug.ENABLED and checksum_debug.RECOMPUTE and self.layer_id in (2, 14):
++            # Debug probe (tag 31): the first rows recomputed one at a time from
++            # their own per-row inputs; equal to the batched rows if the kernel
++            # is row-independent.
++            singles = []
++            for r in range(min(rows, 8)):
++                one = torch.empty_like(output[r : r + 1])
++                row_kwargs = {k: v[r : r + 1] for k, v in kwargs.items()}
++                mla.run(
++                    binding=mla.bind(
++                        plan,
++                        scratch=buffers[metadata_count:],
++                        q=q[r : r + 1],
++                        swa_indices=swa_indices[r : r + 1],
++                        swa_lengths=swa_lengths[r : r + 1],
++                        **row_kwargs,
++                    ),
++                    swa_k_cache=self.swa_cache_layer.kv_cache,
++                    indexed_k_cache=self._owner().kv_cache if main is not None else None,
++                    swa_page_size=self.swa_cache_layer.block_size,
++                    indexed_page_size=self._main_page,
++                    sm_scale=512**-0.5,
++                    attn_sink=self.attn_sink,
++                    out=one,
++                    cache_format="deepseek_v41",
++                )
++                singles.append(one)
++            if singles:
++                checksum_debug.record_attn(self, 31, torch.cat(singles))
+ 
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         swa_indices, swa_lengths, top_lengths = buffers[:3]

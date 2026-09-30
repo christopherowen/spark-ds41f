@@ -10,8 +10,11 @@ rows with a private scratch (26) and the rows shifted one position down in a
 batch one row larger (27). A 24/25 mismatch means the served call is not
 repeatable at a fixed batch (a race); 24/26 alone points at the shared
 workspace; 24/27 alone means the result depends on the row's position or the
-batch size. Prints, per comparison, the steps and rows that differ and the
-batch sizes where they occur.
+batch size. Tag 31: layers 2 and 14's attention output for the step's first
+rows (up to 8) recomputed one row at a time, against the batched output (tag
+21): a mismatch means the attention kernel depends on the other rows. Prints,
+per comparison, the steps and rows that differ and the batch sizes where they
+occur.
 """
 import glob
 import os
@@ -21,7 +24,8 @@ from collections import Counter, defaultdict
 import torch
 
 OUT = sys.argv[1]
-LABELS = {25: "repeat", 26: "private scratch", 27: "shifted batch"}
+LABELS = {25: "repeat", 26: "private scratch", 27: "shifted batch", 31: "attention row by row"}
+BASE = {25: 24, 26: 24, 27: 24, 31: 21}
 
 
 def latest(node_dir, kind):
@@ -52,13 +56,11 @@ for run in sorted(glob.glob(os.path.join(OUT, "*-m*-r*"))):
         for r in list(chronological(log)) + [None]:
             if r is None or r[0].item() == -1.0:
                 for (slot, _), records in current.items():
-                    served = records.get(24)
-                    if served is None:
-                        continue
                     for tag in LABELS:
-                        other = records.get(tag)
-                        if other is None:
+                        served, other = records.get(BASE[tag]), records.get(tag)
+                        if served is None or other is None:
                             continue
+                        served = served[: len(other)]
                         checked[tag] += 1
                         bad = (served != other).nonzero().flatten().tolist()
                         if bad:
@@ -67,7 +69,7 @@ for run in sorted(glob.glob(os.path.join(OUT, "*-m*-r*"))):
                 current = {}
                 continue
             slot, n, tag = int(r[0].item()), int(r[1].item()), int(r[2].item())
-            if tag in (24, *LABELS):
+            if tag in (21, 24, *LABELS):
                 current.setdefault((slot, 0), {})[tag] = r[3:3 + n].clone()
 for tag, label in LABELS.items():
     n_bad = sum(totals[tag].values())

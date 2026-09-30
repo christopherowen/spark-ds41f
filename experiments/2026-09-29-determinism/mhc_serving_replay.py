@@ -38,6 +38,7 @@ GRAPH = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48)
 PREPARED = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 15, 16, 20, 21, 24, 25, 28, 30, 32, 35, 40, 42, 48, 49, 56,
             72, 96, 192, 384, 768, 1536, 3072, 4091)
 b12x_layers._execution_capacities = lambda: (1, 8, LIMIT)
+TARGETS = tuple(int(v) for v in os.environ.get("MHC_TARGETS", "19,15").split(","))
 index = json.load(open("/models/model.safetensors.index.json"))["weight_map"]
 
 
@@ -100,7 +101,7 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
             "post": torch.rand(700, 4, generator=gen, device=device),
             "comb": torch.rand(700, 4, 4, generator=gen, device=device),
             "pre": torch.softmax(torch.randn(700, 4, generator=gen, device=device), dim=-1)}
-    sizes = list(range(15, 65)) + [72, 96, 128, 192, 256, 384, 512]
+    sizes = list(range(3, 65)) + [72, 96, 128, 192, 256, 384, 512]
     for (layer, warm_name), (owner, module, _) in setups.items():
         operations = (("layer-0 pre (2-D embedding)",) if layer == 0
                       else ("pre (4-stream residual)", "post_pre"))
@@ -125,7 +126,7 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
                                               owner.ffn_norm.weight, take("pre"))
                     return out
 
-                for T in (19, 15):
+                for T in TARGETS:
                     target = torch.arange(600, 600 + T, device=device)
                     solo = digest([t[:T] for t in call(target)])
                     groups = {}
