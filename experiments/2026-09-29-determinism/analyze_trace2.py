@@ -129,7 +129,8 @@ def load_run(run_dir):
                 if seen[label] > 1:
                     items[i] = (key, f"{label}#{seen[label]}", s)
             appearances.append({"step": step, "rows": b - a, "offset": a, "padded": h["padded"],
-                                "batch_reqs": len(h["req_ids"]), "items": items, "widths": widths})
+                                "batch_reqs": len(h["req_ids"]), "items": items, "widths": widths,
+                                "recorded": any(label.endswith("moe_input") for _, label, _ in items)})
         ranks[node] = appearances
     return target, ranks
 
@@ -155,6 +156,10 @@ def compare(a, b):
         for k, (pa, pb) in enumerate(zip(xa, xb)):
             if pa["rows"] != pb["rows"]:
                 first = f"appearance {k}: target rows {pa['rows']} vs {pb['rows']} (stopped)"
+                break
+            if not (pa["recorded"] and pb["recorded"]):
+                first = (f"appearance {k}: batch above the log's row limit (padded {pa['padded']} vs "
+                         f"{pb['padded']}), not recorded (stopped)")
                 break
             other = {label: s for _, label, s in pb["items"]}
             for key, label, sa in pa["items"]:

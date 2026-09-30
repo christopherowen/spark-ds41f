@@ -8,7 +8,11 @@ detm-r5o-lookup-trace: detm-r5o-trace's deterministic MoE (det-masked
 overlay), plus the gemv-lookup overlay (the two files of
 vllm-0027-gemv-smallest-capacity.patch) and the attn-trace debug overlay
 (batch-trace plus attention checksums and the first-call router gate capture
-on rank 0), all behind SPARK3_MOE_CHECKSUM_DIR / SPARK3_GATE_CAPTURE_ROWS.
+on rank 0), all behind SPARK3_MOE_CHECKSUM_DIR / SPARK3_GATE_CAPTURE_ROWS. Its
+KV cache is 256 MiB smaller than r5o's so the debug logs fit above dgx1's
+5 GiB startup memory guard (the first boot with 128-row logs stopped 57 MB
+short); the traced requests use a small fraction of it, and the cache size
+moves page placement, not arithmetic.
 r5o-pin, r5o-lookup-pin: production r5o without and with the lookup overlay.
 detm-r5o-pin, detm-r5o-lookup-pin: the deterministic MoE without and with it.
 The four performance arms carry no debug overlay or logging.
@@ -56,10 +60,13 @@ trace = with_lookup(detm_pin)
 for name, target in TRACE.items():
     mount(trace, f"attn-trace/{name}", f"{VLLM}/{target}")
 trace["environment"].update(
-    SPARK3_MOE_CHECKSUM_DIR="/cache/kkref/moe-checksums", SPARK3_MOE_CHECKSUM_ROWS="128",
+    SPARK3_MOE_CHECKSUM_DIR="/cache/kkref/moe-checksums", SPARK3_MOE_CHECKSUM_ROWS="64",
     SPARK3_MOE_CHECKSUM_RUNNER_CAPACITY="8192", SPARK3_MOE_CHECKSUM_TAGS_CAPACITY="16384",
-    SPARK3_MOE_CHECKSUM_ATTN_CAPACITY="98304", SPARK3_GATE_CAPTURE_ROWS="64",
+    SPARK3_MOE_CHECKSUM_ATTN_CAPACITY="65536", SPARK3_GATE_CAPTURE_ROWS="32",
 )
+args = trace["serve_args"]
+kv = args.index("--kv-cache-memory-bytes") + 1
+args[kv] = str(int(args[kv]) - 256 * 2**20)
 for name, arm in (("detm-r5o-lookup-trace", trace), ("r5o-pin", r5o_pin),
                   ("r5o-lookup-pin", with_lookup(r5o_pin)), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin))):
