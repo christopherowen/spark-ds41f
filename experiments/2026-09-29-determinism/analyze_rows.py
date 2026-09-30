@@ -18,23 +18,39 @@ M = 64
 
 def load(path):
     log = torch.load(path)
-    return log["rows"][: min(log["count"], log["capacity"])]
+    rows, count, cap = log["rows"], log["count"], log["capacity"]
+    if count > cap:  # ring wrapped: unroll to chronological order
+        k = count % cap
+        rows = torch.cat([rows[k:], rows[:k]])
+    return rows
 
 
 def split(rows, slot_col, first_value_col, tag_col=None):
-    n0 = int(rows[0, 1])
-    base = rows[0, first_value_col : first_value_col + n0]
-    for s in range(1, rows.shape[0]):
-        r = rows[s]
-        if int(r[0]) == int(rows[0, 0]) and int(r[1]) == n0 and (tag_col is None or int(r[tag_col]) == int(rows[0, tag_col])):
-            if torch.equal(r[first_value_col : first_value_col + n0], base):
-                return s
-    raise SystemExit("request 2 start not found")
+    """Return (start1, start2): the last two slot-0 records with equal input rows.
+
+    Both requests start with an identical prefill, so request starts are the
+    latest pair of slot-0 (tag-0) records whose per-row inputs match exactly.
+    """
+    # Requests' prefills are short (at most 32 rows); startup warmups are longer.
+    # Compare the first four rows only: padding rows at the end carry stale values.
+    cand = [i for i in range(rows.shape[0]) if int(rows[i, 0]) == 0
+            and (tag_col is None or int(rows[i, tag_col]) == 0) and 6 < int(rows[i, 1]) <= 32]
+    for j in reversed(cand):
+        n = int(rows[j, 1])
+        for i in reversed([c for c in cand if c < j]):
+            if int(rows[i, 1]) == n and torch.equal(
+                rows[i, first_value_col : first_value_col + 4],
+                rows[j, first_value_col : first_value_col + 4],
+            ):
+                return i, j
+    raise SystemExit("two identical prefills not found")
 
 
 runner = load(sys.argv[1])
-s = split(runner, 0, 2)
-print(f"runner: {runner.shape[0]} records, request 2 starts at {s}")
+r0, s = split(runner, 0, 2)
+runner = runner[r0:]
+s -= r0
+print(f"runner: request 1 at {r0}, request 2 at +{s}")
 names = ("shared", "routed")
 reported = False
 for i in range(min(s, runner.shape[0] - s)):
@@ -58,8 +74,10 @@ if not reported:
     print("no input-equal row with a different output in the runner log")
 
 tags = load(sys.argv[2])
-st = split(tags, 0, 3, tag_col=2)
-print(f"tags: {tags.shape[0]} records, request 2 starts at {st}")
+t0, st = split(tags, 0, 3, tag_col=2)
+tags = tags[t0:]
+st -= t0
+print(f"tags: request 1 at {t0}, request 2 at +{st}")
 labels = ("input", "gate_up", "act", "down")
 prev_input_eq = None
 for i in range(min(st, tags.shape[0] - st)):
