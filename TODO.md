@@ -295,11 +295,10 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Quality
 
-- **Two more TMA stage-release races in r5n** (`experiments/2026-09-30-proxy-fence-audit`):
-  the mHC TF32 prefill projection (609/12000 wrong beside the routed MoE, 59 beside
-  a copy) and the BF16 GEMV prefill (up to 45/12000) release TMA-filled stages
-  with shared loads pending, like the dense GEMM before r5n; fences remove them.
-  mHC runs in every layer's prefill: qualify and promote the fix next.
+- **TMA stage releases outside DS4.1's serving set** (`experiments/2026-09-30-proxy-fence-audit`):
+  r5o fences every serving kernel the audit found; still open upstream are the
+  NVFP4/W6A8 MoE releases, a SASS pass over kernels DS4.1 does not run, two
+  single-stage write-after-read races in raw paged kernels, and mbarrier init fences.
 
 - **Temperature-0 outputs still vary between identical requests** on r5n: the
   atomic MoE combine and split-K turbo change summation order run to run
