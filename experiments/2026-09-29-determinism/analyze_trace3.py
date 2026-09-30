@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare a tagged target's rows across runs by what they compute: position and input token.
 
-usage: analyze_trace3.py OUT_DIR PROMPT [--chain N]   (runs from trace_mixes.py on an attn-exact2
-                                                       arm, which records row positions and tokens)
+usage: analyze_trace3.py OUT_DIR PROMPT [--chain N] [--node dgx1|dgx2|dgx3]   (runs from
+       trace_mixes.py on an attn-exact2 arm, which records row positions and tokens; rank 0 by default)
 
 Steps cannot be paired by number once two runs accept drafts differently, so
 each target row is keyed by (position, input token). A row is comparable only
@@ -11,6 +11,8 @@ row when every earlier row of its verify block was fed the token the run
 finally generated there. For every pair of runs (each run against the first
 solo run and the first run of its mix), rows comparable in both, with the same
 key and a prefix both runs share (before their first differing output token),
+and not marked dead or padding in its step (DSpark computes a dead
+verification row's shape but skips its experts, and verifies it again later),
 are compared record by record in execution order (main model only): attention,
 MoE input, router logits, shared expert, outputs. Reports output identity,
 comparable rows, and the first (lowest position, earliest record) difference
@@ -28,6 +30,7 @@ import torch
 
 OUT, PROMPT = sys.argv[1], sys.argv[2]
 CHAIN = int(sys.argv[sys.argv.index("--chain") + 1]) if "--chain" in sys.argv else 8
+NODE = sys.argv[sys.argv.index("--node") + 1] if "--node" in sys.argv else "dgx1"
 SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
@@ -91,6 +94,7 @@ def load_run(run_dir, node="dgx1"):
     attn_steps = steps_of(attn, 3, 3, tag_col=2)
     prompt_len = target["prompt_tokens"]
     rows = []  # (position, token, comparable, {label: value}, step)
+    dead_rows = 0
     for step in sorted(run_steps):
         h = host.get(step)
         if h is None or step not in dev:
@@ -106,6 +110,7 @@ def load_run(run_dir, node="dgx1"):
             continue
         pos = [int(v) for v in row[base + a: base + b].tolist()]
         tok = [int(v) for v in row[base + m + a: base + m + b].tolist()]
+        dead = [bool(v) for v in row[3 + reqs + a: 3 + reqs + b].tolist()]
         records = [{} for _ in range(b - a)]
         for slot, tag, n, sums in attn_steps.get(step, []):
             layer = main_layer(attn["names"][slot])
@@ -132,14 +137,16 @@ def load_run(run_dir, node="dgx1"):
                 records[i][((layer, 2, tag), SHARED[tag])] = float(sums[a + i, 0])
         generated = target["tokens_ids"] if "tokens_ids" in target else None
         for i in range(b - a):
-            ok = True
+            ok = not dead[i]
             for j in range(i):  # earlier rows of this block fed the accepted token?
                 if pos[j] >= prompt_len:
                     g = pos[j] - prompt_len
                     if generated is None or g >= len(generated) or generated[g] != tok[j]:
                         ok = False
                         break
+            dead_rows += dead[i]
             rows.append((pos[i], tok[i], ok, records[i], step))
+    target["dead_rows"] = dead_rows
     return target, rows
 
 
@@ -190,12 +197,14 @@ def self_check(rows):
     return repeats, bad
 
 
-runs = {os.path.basename(d): load_run(d) for d in sorted(glob.glob(os.path.join(OUT, f"{PROMPT}-m*-r*")))}
+runs = {os.path.basename(d): load_run(d, NODE)
+        for d in sorted(glob.glob(os.path.join(OUT, f"{PROMPT}-m*-r*")))}
 if runs and "tokens_ids" not in next(iter(runs.values()))[0]:
     print("note: target.json has no token ids; generated rows after the first are not checked for prefix")
 for name, (target, rows) in runs.items():
     repeats, bad = self_check(rows)
-    print(json.dumps({"run": name, "rows": len(rows), "comparable": sum(r[2] for r in rows),
+    print(json.dumps({"run": name, "rows": len(rows), "dead": target["dead_rows"],
+                      "comparable": sum(r[2] for r in rows),
                       "recomputed_rows": repeats, "recomputed_mismatch": bad[:3]}))
 ref = f"{PROMPT}-m0-r0"
 for name in sorted(runs):
