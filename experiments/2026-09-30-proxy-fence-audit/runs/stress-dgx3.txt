@@ -1,0 +1,58 @@
+2026-09-30T08:11:42Z image files (shipped r5m, 0008 inputs):
+d92cf099a097df66627a968e711a40366817b238f1efa7a68d43286e3708edc4  b12x/gemm/bf16_gemv/_prefill.py
+e731c748d618117a5c0cb7bf6d8027adb01775f4124a907178fc3273fc85b32c  b12x/norm/mhc/_kernels.py
+9c03103a3ac22558f4289d906411bea3dba8e394de34c52e1f9807e3300d13b0  b12x/attention/_shared/contiguous/forward.py
+969fb9b20dcdb5ad9cf92674c687a4b55d7319908adede9928236cd34ead0bd1  b12x/gemm/bf16_gemv/_prefill.py
+fe5b00e967f80dbffe751bb6e140a65842540c6ea664e1b1ce0e9f0ea21908bb  b12x/norm/mhc/_kernels.py
+94e95478f0d2d2f20c2d61af5ceb2c8ffe08286ee7d3bab8695774e6f8e9fb2e  b12x/attention/_shared/contiguous/forward.py
+== shipped
+2026-09-30T08:11:42Z shipped --target dense --sizes 6,48 --rounds 60 --calls 200
+dense down rows 6: alone-stable True, 43.96 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+dense down rows 48: alone-stable True, 43.53 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 12/12000
+FAIL
+2026-09-30T08:12:09Z shipped --target dense exit 1
+2026-09-30T08:12:09Z shipped --target bf16prefill --sizes 256,1024 --rounds 60 --calls 200
+bf16prefill n 384 rows 256: alone-stable True, 45.11 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 384 rows 1024: alone-stable True, 80.66 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 15/12000
+bf16prefill n 512 rows 256: alone-stable True, 45.13 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 512 rows 1024: alone-stable True, 117.21 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 45/12000
+bf16prefill n 1024 rows 256: alone-stable True, 79.45 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 2/12000
+bf16prefill n 1024 rows 1024: alone-stable True, 242.50 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 25/12000
+FAIL
+2026-09-30T08:13:07Z shipped --target bf16prefill exit 1
+2026-09-30T08:13:07Z shipped --target mhc --sizes 256,1024 --rounds 60 --calls 200
+mhc rows 256: alone-stable True, 50.00 us/call alone; alone: wrong 0/12000; copy: wrong 29/12000; moe: wrong 0/12000
+mhc rows 1024: alone-stable True, 214.14 us/call alone; alone: wrong 0/12000; copy: wrong 59/12000; moe: wrong 609/12000
+FAIL
+2026-09-30T08:13:38Z shipped --target mhc exit 1
+2026-09-30T08:13:38Z shipped --target varlen --sizes 1024,4096 --rounds 30 --calls 100
+varlen tokens 1024: alone-stable True, 72.13 us/call alone; alone: wrong 0/3000; copy: wrong 0/3000; moe: wrong 0/3000
+varlen tokens 4096: alone-stable True, 960.56 us/call alone; alone: wrong 0/3000; copy: wrong 0/3000; moe: wrong 0/3000
+OK
+2026-09-30T08:14:06Z shipped --target varlen exit 0
+== 0008
+2026-09-30T08:14:06Z fenced --target bf16prefill --sizes 256,1024 --rounds 60 --calls 200
+bf16prefill n 384 rows 256: alone-stable True, 45.41 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 384 rows 1024: alone-stable True, 82.09 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 512 rows 256: alone-stable True, 45.58 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 512 rows 1024: alone-stable True, 119.28 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 1024 rows 256: alone-stable True, 80.34 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+bf16prefill n 1024 rows 1024: alone-stable True, 246.20 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+OK
+2026-09-30T08:15:09Z fenced --target bf16prefill exit 0
+2026-09-30T08:15:09Z fenced --target mhc --sizes 256,1024 --rounds 60 --calls 200
+mhc rows 256: alone-stable True, 49.13 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+mhc rows 1024: alone-stable True, 218.04 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+OK
+2026-09-30T08:15:41Z fenced --target mhc exit 0
+2026-09-30T08:15:41Z fenced --target varlen --sizes 1024,4096 --rounds 30 --calls 100
+varlen tokens 1024: alone-stable True, 72.21 us/call alone; alone: wrong 0/3000; copy: wrong 0/3000; moe: wrong 0/3000
+varlen tokens 4096: alone-stable True, 968.47 us/call alone; alone: wrong 0/3000; copy: wrong 0/3000; moe: wrong 0/3000
+OK
+2026-09-30T08:16:10Z fenced --target varlen exit 0
+2026-09-30T08:16:10Z done
+2026-09-30T08:16:37Z shipped --target varlen --sizes 256,512 --rounds 60 --calls 200
+varlen tokens 256: alone-stable True, 28.21 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+varlen tokens 512: alone-stable True, 28.10 us/call alone; alone: wrong 0/12000; copy: wrong 0/12000; moe: wrong 0/12000
+OK
+2026-09-30T08:17:02Z varlen retry done
