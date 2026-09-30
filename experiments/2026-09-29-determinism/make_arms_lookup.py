@@ -18,7 +18,8 @@ detm-r5o-pin, detm-r5o-lookup-pin: the deterministic MoE without and with it.
 The MoE variant fix (b12x-0006-moe-smallest-variant.patch: a live token count
 binds to the smallest planned fused-MoE variant, not the prefill capacity)
 adds: detm-r5o-lookup-variant-trace (the trace arm on det-variant, the
-det-masked files with that fix), r5o-lookup-variant-pin (r5o, the lookup and
+det-masked files with that fix; KV cache 768 MiB smaller, after its first boot
+also stopped 21 MB short of the guard), r5o-lookup-variant-pin (r5o, the lookup and
 the fix on production's _preparation.py, overlay moe-variant) and
 detm-r5o-lookup-variant-pin. The performance arms carry no debug overlay or
 logging.
@@ -68,7 +69,7 @@ for f in DET:
 detm_variant_pin["environment"].update(detm_pin["environment"])
 
 
-def traced(arm):
+def traced(arm, shrink_mib):
     trace = with_lookup(arm)
     for name, target in TRACE.items():
         mount(trace, f"attn-trace/{name}", f"{VLLM}/{target}")
@@ -79,15 +80,15 @@ def traced(arm):
     )
     args = trace["serve_args"]
     kv = args.index("--kv-cache-memory-bytes") + 1
-    args[kv] = str(int(args[kv]) - 256 * 2**20)
+    args[kv] = str(int(args[kv]) - shrink_mib * 2**20)
     return trace
 
 
 r5o_lookup_variant = with_lookup(r5o_pin)
 mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
       f"{B12X}/moe/fused_moe/_preparation.py")
-for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin)),
-                  ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin)),
+for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
+                  ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
