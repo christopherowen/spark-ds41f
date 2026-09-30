@@ -198,21 +198,67 @@ index a2a2495318..cb602b0a22 100644
              if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
                  self._output[self._output_idx] = self._run_in_aux_stream(
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 3cc704baae..ad35c77a53 100644
+index 3cc704baae..47e0e99a89 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
-@@ -7,6 +7,7 @@ from itertools import islice
+@@ -6,7 +6,10 @@ from inspect import signature
+ from itertools import islice
  
  import regex as re
++import os
++
  import torch
 +from vllm.model_executor.layers.fused_moe.runner import checksum_debug
  import torch.nn as nn
  
  import vllm.envs as envs
-@@ -159,9 +160,17 @@ class DeepseekV4MLP(nn.Module):
+@@ -158,10 +161,60 @@ class DeepseekV4MLP(nn.Module):
+         else:
              self.act_fn = SiluAndMul()
  
++    def _forward_static(self, x):
++        """Debug only: fixed per-layer buffers instead of caching-allocator tensors.
++
++        Same kernels (V4.1 block32 linear op, clamped SiLU-and-mul), different
++        memory: separates an allocator interaction from arithmetic.
++        """
++        from vllm.models.deepseek_v4_1.b12x_layers import _block32_linear
++        from vllm.v1.worker.workspace import current_preallocated_workspace
++
++        rows = x.shape[0]
++        buffers = self.__dict__.setdefault("_static_buffers", {})
++        if rows not in buffers:
++            width = self.gate_up_proj.weight.shape[0]
++            buffers[rows] = (
++                torch.empty((rows, width), dtype=torch.bfloat16, device=x.device),
++                torch.empty((rows, width // 2), dtype=torch.bfloat16, device=x.device),
++                torch.empty((rows, self.down_proj.weight.shape[0]), dtype=torch.bfloat16,
++                            device=x.device),
++            )
++        gate_up, act, down = buffers[rows]
++        scratch = current_preallocated_workspace()
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 0, x)
++        _block32_linear(x, gate_up, self.gate_up_proj.b12x_key, scratch)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 1, gate_up)
++        self.act_fn.op(act, gate_up, self.act_fn.swiglu_limit, self.act_fn.alpha, self.act_fn.beta)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 2, act)
++        _block32_linear(act, down, self.down_proj.b12x_key, scratch)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_tag(self, 3, down)
++        return down
++
      def forward(self, x):
++        if (
++            os.environ.get("SPARK3_SHARED_STATIC_BUFFERS") == "1"
++            and x.shape[0] <= 64
++            and hasattr(self.gate_up_proj, "b12x_key")
++            and hasattr(self.down_proj, "b12x_key")
++            and hasattr(self.act_fn, "op")
++        ):
++            return self._forward_static(x)
 +        if checksum_debug.ENABLED:
 +            checksum_debug.record_tag(self, 0, x)
          gate_up, _ = self.gate_up_proj(x)
