@@ -1,6 +1,6 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..1e8fb7de75
+index 0000000000..c53a2faf18
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 @@ -0,0 +1,145 @@
@@ -102,7 +102,7 @@ index 0000000000..1e8fb7de75
 +    rows = x.shape[0]
 +    if rows > _MAX_ROWS:
 +        return
-+    log = _log("tags", x.device, 3 + _MAX_ROWS, 16384)
++    log = _log("tags", x.device, 3 + _MAX_ROWS, 65536)
 +    slot = log.slot(owner)
 +    stage = log.stage[slot]
 +    stage.zero_()
@@ -198,7 +198,7 @@ index a2a2495318..cb602b0a22 100644
              if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
                  self._output[self._output_idx] = self._run_in_aux_stream(
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 3cc704baae..47e0e99a89 100644
+index 3cc704baae..854020b311 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -6,7 +6,10 @@ from inspect import signature
@@ -212,7 +212,7 @@ index 3cc704baae..47e0e99a89 100644
  import torch.nn as nn
  
  import vllm.envs as envs
-@@ -158,10 +161,60 @@ class DeepseekV4MLP(nn.Module):
+@@ -158,10 +161,105 @@ class DeepseekV4MLP(nn.Module):
          else:
              self.act_fn = SiluAndMul()
  
@@ -248,7 +248,52 @@ index 3cc704baae..47e0e99a89 100644
 +        _block32_linear(act, down, self.down_proj.b12x_key, scratch)
 +        if checksum_debug.ENABLED:
 +            checksum_debug.record_tag(self, 3, down)
++            if os.environ.get("SPARK3_SHARED_RECOMPUTE") == "1":
++                self._record_down_state(act, down, scratch, rows)
 +        return down
++
++    def _record_down_state(self, act, down, scratch, rows):
++        """Debug only: what the down projection saw, and a second run.
++
++        Tags 4-6 checksum the packed weight storage (values, MMA scales, tiled
++        values) through zero-copy byte views, tag 10 the shared unit alpha.
++        Tag 7 recomputes the GEMM into a second buffer right away; tags 8 and
++        9 then re-read the input and the first result. Changed weights, a
++        second result that disagrees, or buffers that change after they were
++        written each point somewhere different.
++        """
++        from b12x._lib import dense_gemm
++        from vllm.models.deepseek_v4_1.b12x_layers import _block32_linear
++
++        views = self.__dict__.get("_down_state_views")
++        if views is None:
++            def bytes64(tensor):
++                if tensor is None:
++                    return None
++                flat = torch.empty(0, dtype=torch.uint8, device=tensor.device)
++                flat.set_(tensor.untyped_storage())
++                usable = flat.numel() // 64 * 64
++                return flat[:usable].view(64, -1)
++
++            packed = self.down_proj.b12x_weight.weight
++            views = self._down_state_views = (
++                bytes64(packed.values),
++                bytes64(packed.scale_mma),
++                bytes64(getattr(packed, "values_tiled", None)),
++            )
++        for tag, view in zip((4, 5, 6), views):
++            if view is not None:
++                checksum_debug.record_tag(self, tag, view)
++        second = self.__dict__.setdefault("_down_second", {})
++        if rows not in second:
++            second[rows] = torch.empty_like(down)
++        _block32_linear(act, second[rows], self.down_proj.b12x_key, scratch)
++        checksum_debug.record_tag(self, 7, second[rows])
++        checksum_debug.record_tag(self, 8, act)
++        checksum_debug.record_tag(self, 9, down)
++        alpha = dense_gemm._ALPHA_ONE_CACHE.get(("cuda", act.device.index))
++        if alpha is not None:
++            checksum_debug.record_tag(self, 10, alpha.view(1, -1))
 +
      def forward(self, x):
 +        if (

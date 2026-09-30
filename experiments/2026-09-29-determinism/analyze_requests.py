@@ -78,6 +78,8 @@ input_eq = None
 for i in range(min(s2 - s1, end - s2)):
     a, b = rows[s1 + i], rows[s2 + i]
     n, tag = int(a[1]), int(a[2])
+    if tag > 3:  # down-state probes: analyze_down_state.py
+        continue
     eq = a[3 : 3 + n] == b[3 : 3 + n]
     if tag == 0:
         input_eq = eq

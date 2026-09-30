@@ -94,6 +94,11 @@ r5m_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
 detslice_static = copy.deepcopy(detslice_dbg)
 detslice_static["environment"]["SPARK3_SHARED_STATIC_BUFFERS"] = "1"
 
+# Diagnostic: the static arm plus down-projection probes (weight and alpha
+# checksums, an immediate recompute, re-reads of its input and output).
+detslice_probe = copy.deepcopy(detslice_static)
+detslice_probe["environment"]["SPARK3_SHARED_RECOMPUTE"] = "1"
+
 # Bisection with the side-stream overlap kept: synchronous Engram rows, and
 # no L2 weight prefetch.
 detslice_noeng = copy.deepcopy(detslice)
@@ -106,7 +111,8 @@ for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
                      ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager),
                      ("r5m-dbg", r5m_dbg), ("detslice-noeng", detslice_noeng),
-                     ("detslice-nol2", detslice_nol2), ("detslice-static", detslice_static)):
+                     ("detslice-nol2", detslice_nol2), ("detslice-static", detslice_static),
+                     ("detslice-probe", detslice_probe)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
