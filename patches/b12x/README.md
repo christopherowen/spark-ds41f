@@ -34,6 +34,20 @@ CuTe compile-cache integrity check (#418, `2fca4df8`).
   decode cost, acceptance unchanged. 0001-0003 on the base yield patch head
   `47c70835` and tree `35299956`.
 
+- `0004-gemm-fence-stage-reads-before-tma-refill.patch` fences the async proxy
+  before each dense GEMM mainloop stage release on the TMA load path. The MMA
+  warps read a stage through the generic proxy (ldmatrix, scale-factor
+  copies) and released it right after issuing the last k block's copies; the
+  refill that permits is a TMA write, which the release's ordering does not
+  cover. When another kernel's CTAs share the SM, a delayed copy read the
+  next k tile: DS4.1's shared-expert down projection returned wrong columns
+  in about 5% of decode calls beside the routed MoE (compute-sanitizer's
+  racecheck does not track TMA writes). Found and measured in
+  `experiments/2026-09-29-determinism` (0007 there) and
+  `experiments/2026-09-30-r5n`: 20/12000 wrong to 0/12000 in the standalone
+  stress, no serving cost. 0001-0004 on the base yield patch head `8d08c583`
+  and tree `693aaed5`.
+
 Not in the series: the W4A8 tiny-decode `swiglu_limit` fix
 (`experiments/2026-09-23-karmic-kraken-reference/patches/b12x/0002-tiny-decode-swiglu-limit.patch`)
 is an upstream contribution. The promoted runtime disables tiny decode instead
