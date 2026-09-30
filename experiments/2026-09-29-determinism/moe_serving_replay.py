@@ -10,7 +10,8 @@ vLLM's own call factory, and binds every live batch to that plan, which
 chooses a launch for the live row count. DS4.1 TP3 shapes (384 experts,
 hidden 5120, intermediate 768, top 6, W4A8, synthetic weights). Nineteen fixed
 target rows with fixed routing (the JSON prefill's row count) run alone and
-inside batches of R rows (19-64 and larger) at the start, middle and end.
+inside batches of R rows (19-64 and larger) at the start, middle and end,
+and the first R target rows (R 1-18) run alone.
 Batch sizes are grouped by the exact bits of the target rows: one group means
 batch-invariant; the group holding the solo 19-row call is marked. (A single
 row alone takes the M=1 launch, which differs from every batch.) Two warm
@@ -105,6 +106,9 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
                           torch.cat([ni[:k], it, ni[k:]]))[k:k + T]
                 key = hashlib.sha256(out.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:8]
                 groups.setdefault(key, []).append(f"{R}{pos[0] if n else ''}")
+        short = [R for R in range(1, T) if not torch.equal(run(xt[:R], wt[:R], it[:R]), solo[:R])]
+        print(f"[{name}] the first R target rows alone vs the solo call's first R rows, R 1-18: "
+              f"{'all equal' if not short else 'differ at R in ' + str(short)}", flush=True)
         solo_key = hashlib.sha256(solo.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:8]
         print(f"[{name}] {len(groups)} groups of batch sizes by the target rows' bits "
               f"(s/m/e = target at start/middle/end):", flush=True)

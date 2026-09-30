@@ -15,7 +15,13 @@ short); the traced requests use a small fraction of it, and the cache size
 moves page placement, not arithmetic.
 r5o-pin, r5o-lookup-pin: production r5o without and with the lookup overlay.
 detm-r5o-pin, detm-r5o-lookup-pin: the deterministic MoE without and with it.
-The four performance arms carry no debug overlay or logging.
+The MoE variant fix (b12x-0006-moe-smallest-variant.patch: a live token count
+binds to the smallest planned fused-MoE variant, not the prefill capacity)
+adds: detm-r5o-lookup-variant-trace (the trace arm on det-variant, the
+det-masked files with that fix), r5o-lookup-variant-pin (r5o, the lookup and
+the fix on production's _preparation.py, overlay moe-variant) and
+detm-r5o-lookup-variant-pin. The performance arms carry no debug overlay or
+logging.
 """
 import copy
 import json
@@ -56,20 +62,36 @@ detm_pin = copy.deepcopy(r5o_pin)
 for f in DET:
     mount(detm_pin, f"det-masked/b12x/{f}", f"{B12X}/{f}")
 detm_pin["environment"].update(B12X_DYNAMIC_DETERMINISTIC_OUTPUT="1", B12X_DENSE_SPLITK_TURBO="0")
-trace = with_lookup(detm_pin)
-for name, target in TRACE.items():
-    mount(trace, f"attn-trace/{name}", f"{VLLM}/{target}")
-trace["environment"].update(
-    SPARK3_MOE_CHECKSUM_DIR="/cache/kkref/moe-checksums", SPARK3_MOE_CHECKSUM_ROWS="64",
-    SPARK3_MOE_CHECKSUM_RUNNER_CAPACITY="8192", SPARK3_MOE_CHECKSUM_TAGS_CAPACITY="16384",
-    SPARK3_MOE_CHECKSUM_ATTN_CAPACITY="65536", SPARK3_GATE_CAPTURE_ROWS="32",
-)
-args = trace["serve_args"]
-kv = args.index("--kv-cache-memory-bytes") + 1
-args[kv] = str(int(args[kv]) - 256 * 2**20)
-for name, arm in (("detm-r5o-lookup-trace", trace), ("r5o-pin", r5o_pin),
-                  ("r5o-lookup-pin", with_lookup(r5o_pin)), ("detm-r5o-pin", detm_pin),
-                  ("detm-r5o-lookup-pin", with_lookup(detm_pin))):
+detm_variant_pin = copy.deepcopy(r5o_pin)
+for f in DET:
+    mount(detm_variant_pin, f"det-variant/b12x/{f}", f"{B12X}/{f}")
+detm_variant_pin["environment"].update(detm_pin["environment"])
+
+
+def traced(arm):
+    trace = with_lookup(arm)
+    for name, target in TRACE.items():
+        mount(trace, f"attn-trace/{name}", f"{VLLM}/{target}")
+    trace["environment"].update(
+        SPARK3_MOE_CHECKSUM_DIR="/cache/kkref/moe-checksums", SPARK3_MOE_CHECKSUM_ROWS="64",
+        SPARK3_MOE_CHECKSUM_RUNNER_CAPACITY="8192", SPARK3_MOE_CHECKSUM_TAGS_CAPACITY="16384",
+        SPARK3_MOE_CHECKSUM_ATTN_CAPACITY="65536", SPARK3_GATE_CAPTURE_ROWS="32",
+    )
+    args = trace["serve_args"]
+    kv = args.index("--kv-cache-memory-bytes") + 1
+    args[kv] = str(int(args[kv]) - 256 * 2**20)
+    return trace
+
+
+r5o_lookup_variant = with_lookup(r5o_pin)
+mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
+      f"{B12X}/moe/fused_moe/_preparation.py")
+for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin)),
+                  ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin)),
+                  ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
+                  ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
+                  ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
+                  ("detm-r5o-lookup-variant-pin", with_lookup(detm_variant_pin))):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(arm, indent=2) + "\n")
     print("wrote", path)
