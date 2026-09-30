@@ -9,8 +9,8 @@ the device schedule and host request ids; per appearance, the records are put
 in execution order within each layer: attention (input, normalized q and kv
 latents, rotated q, compressor latent and index key on emitted rows, index
 head weights, selected positions and their order, lengths, attention output,
-projected output), then the MoE (input, shared-expert internals, shared and
-routed output); main-model layers first, then the drafter. Every run is
+projected output), then the MoE (input, router logits, shared-expert
+internals, shared and routed output); main-model layers first, then the drafter. Every run is
 compared with the first run of mix 0 and every repeat with the first run of
 its mix: output identity, the target's schedule, and the first record where
 its rows differ while its row count matches, with the indexer's score width
@@ -31,7 +31,10 @@ OUT, PROMPT = sys.argv[1], sys.argv[2]
 SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
-        20: "window_len", 21: "attn_output", 22: "o_proj"}
+        20: "window_len", 21: "attn_output", 22: "o_proj", 24: "q_proj", 30: "router_logits"}
+# Execution order within a layer: attention records, then the MoE input, the
+# router logits (tag 30, recorded by the MoE runner), the shared expert, outputs.
+ATTN_ORDER = (10, 11, 12, 24, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
 MODES = {0: "decode", 1: "prefill", 2: "prefill_short"}
 
 
@@ -110,8 +113,11 @@ def load_run(run_dir):
                 if tag == 23:
                     v = sums[:3, 0].tolist()
                     widths[layer_key(name)] = (int(v[0]), MODES.get(int(v[1]), v[1]), int(v[2]))
+                elif tag == 30 and b <= n:
+                    items.append(((*layer_key(name), 1, 1), f"{name}:{ATTN[tag]}", sums[a:b, 0]))
                 elif tag in ATTN and b <= n:
-                    items.append(((*layer_key(name), 0, tag), f"{name}:{ATTN[tag]}", sums[a:b, 0]))
+                    items.append(((*layer_key(name), 0, ATTN_ORDER.index(tag)), f"{name}:{ATTN[tag]}",
+                                  sums[a:b, 0]))
             for slot, _, n, sums in run_steps[step]:
                 if b <= n:
                     name = names[slot]

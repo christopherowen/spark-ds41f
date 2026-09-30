@@ -1,6 +1,6 @@
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 --- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	1970-01-01 01:00:00.000000000 +0100
-+++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:00:15.066210313 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:03:37.587373095 +0200
 @@ -0,0 +1,398 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
@@ -401,8 +401,8 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
 +            except Exception as error:  # debug tool: report, keep watching
 +                print(f"checksum_debug {kind} failed: {error!r}", flush=True)
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
---- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:00:15.060084786 +0200
-+++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:00:15.061084787 +0200
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:03:37.578353049 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py	2026-09-30 16:03:37.579993964 +0200
 @@ -42,6 +42,7 @@
  from vllm.model_executor.layers.fused_moe.runner.moe_runner_interface import (
      MoERunnerInterface,
@@ -421,18 +421,19 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/mod
          if reduce_scatter_rows is not None:
              return self._reduce_scatter_final_output(
                  shared_output,
-@@ -1009,6 +1013,8 @@
+@@ -1009,6 +1013,9 @@
                  router_logits = F.linear(hidden_states, self._combined_gate_weight)
              else:
                  router_logits, _ = self.gate(hidden_states)
 +                if checksum_debug.ENABLED:
 +                    checksum_debug.capture_gate(self, hidden_states, router_logits, self.gate)
++                    checksum_debug.record_attn(self, 30, router_logits)
  
          with self._sequence_parallel_context():
              # TODO(bnell): parts of the dispatch/combine steps will go away once
 diff -ruN a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
---- a/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:00:15.049084773 +0200
-+++ b/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:00:15.051084775 +0200
+--- a/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:03:37.567353033 +0200
++++ b/vllm/models/deepseek_v4/nvidia/model.py	2026-09-30 16:03:37.568862348 +0200
 @@ -6,7 +6,10 @@
  from itertools import islice
  
@@ -565,8 +566,8 @@ diff -ruN a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nv
  
  
 diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
---- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:00:15.069084796 +0200
-+++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:00:15.070910222 +0200
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:03:37.591353069 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:03:37.593025599 +0200
 @@ -30,6 +30,7 @@
      RowParallelLinear,
      UnquantizedLinearMethod,
@@ -586,7 +587,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
          key = _rotated(
              key,
              positions,
-@@ -1360,6 +1365,11 @@
+@@ -1360,7 +1365,14 @@
              qr_kv, _ = self.fused_wqa_wkv(hidden_states)
              qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
              qr, kv = self.q_norm(qr), self.kv_norm(kv)
@@ -596,9 +597,12 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
 +            checksum_debug.record_attn(self, 11, qr)
 +            checksum_debug.record_attn(self, 12, kv)
          q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++        if checksum_debug.ENABLED:
++            checksum_debug.record_attn(self, 24, q)
          l2_prefetch.issue(self._l2pf_wo, rows)
          q = _rotated(
-@@ -1369,6 +1379,8 @@
+             q,
+@@ -1369,6 +1381,8 @@
              plan=self._helper_plan("q"),
          )
          output = torch.empty_like(q)
@@ -607,7 +611,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
          metadata = cast(
              dict[str, DeepseekV41B12xMetadata] | None,
              get_forward_context().attn_metadata,
-@@ -1402,7 +1414,12 @@
+@@ -1402,7 +1416,12 @@
                      )
                  index_query = (*query, split, reference)
              self.forward_mqa(q, kv, positions, output, index_query=index_query)
@@ -621,7 +625,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
  
      def _index_query(
          self, qr, positions, hidden_states, index_weights, first, last, swa
-@@ -1443,6 +1460,8 @@
+@@ -1443,6 +1462,8 @@
              out=iw,
              plan=self._helper_plan("index_weights"),
          )
@@ -630,7 +634,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
          return iq_data, iq_scale, iw
  
      @staticmethod
-@@ -1565,6 +1584,17 @@
+@@ -1565,6 +1586,17 @@
                  chunk_rows = self._short_index_shape[0]
                  index_pages = self._short_index_pages
              index_width = index_pages.shape[1]
@@ -648,7 +652,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
  
              def select_rows(query, first, selected):
                  # Query rows start at global row `first`; metadata and
-@@ -1709,6 +1739,12 @@
+@@ -1709,6 +1741,12 @@
                  indexed_lengths=top_lengths[:rows],
                  indexed_page_table=buffers[3][:rows],
              )
@@ -662,8 +666,8 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
              plan,
              scratch=buffers[metadata_count:],
 diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
---- a/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:00:15.055084780 +0200
-+++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:00:15.057009518 +0200
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:03:37.573353042 +0200
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-30 16:03:37.574822260 +0200
 @@ -29,6 +29,7 @@
  
  import numpy as np
