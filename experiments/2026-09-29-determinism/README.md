@@ -305,3 +305,43 @@ kernel 10% slower in serving: the same comparison with the L2 weight prefetch
 off, and the fixed-shape bench with routing captured from serving. Batch
 invariance would need composition-independent kernel choices (split-K,
 tiles, attention splits); size that before proposing the mode.
+
+## Round 12: where batch composition enters (`run23.sh`-`run25.sh`, r5o)
+
+Arm `detm-r5o-trace`: r5o, the deterministic MoE (0004-0006, 0008), the r5o
+screen's pinned cost table, and the batch-trace debug overlay
+(`debug-batch-trace.diff`): per-row sums of every MoE layer and the shared
+expert for up to 256 rows, plus a per-step log of the scheduled batch (row
+offsets after draft reallocation, dead rows, request ids). `trace_mixes.py`
+sent a tagged target (JSON and prose) beside five background mixes, three
+times each; `analyze_trace.py` compares the target's own rows.
+
+- Identical target schedules gave identical outputs in every pair (JSON: mix 0,
+  2 and 3 repeats; prose: mix 0 and several others). Repeats of a mix diverged
+  only when their schedules did (for example one verify step padded to 16 rows
+  against 12).
+- JSON, against the target alone: every mix first differs in the target's own
+  prefill (same 19 prompt tokens; 19 rows alone, 28-40 with neighbours), at
+  layer 0's routed-expert output. The MoE input and the shared expert's output
+  match.
+- Prose: the prefill first differs at layer 3's MoE input on one row, so
+  upstream of the MoE (attention, indexer or mHC), not yet located.
+- The drafter's first layer sometimes differs with identical schedules; it
+  did not change verified tokens here but can change later schedules.
+
+Replays: the deterministic routed MoE is batch-invariant (`moe_batch_invariance.py`:
+19 fixed rows with fixed routing, identical in batches of 20-48, any position,
+neighbours sharing or avoiding their experts); the router gate GEMV and the
+block-FP8 shared-expert linears give identical bits at every prepared capacity
+from 19 to 48 (`gemv_batch_invariance.py`). The cause is the plan lookup: the
+V4.1 GEMV linears (router gate among them) take the plan for the exact row
+count and fall back to the maximum-capacity plan (4096 rows) otherwise.
+Capture sizes skip 19, so the unpadded 19-row solo prefill ran the 4096-row
+plan, while mixed batches padded to 28-40 ran small plans: the gate's logits
+for the same 19 rows differ (all rows, up to 2.4e-7), and with them the routing
+weights. The block-FP8 linears pick the smallest prepared capacity at or above
+the row count instead, and stay invariant.
+
+Next: the same lookup for the GEMV linears (smallest capacity at or above the
+rows), retrace to see where the target first differs then, and locate the
+attention-side difference.
