@@ -37,7 +37,11 @@ are 1790 MiB smaller than r5o's (0.45 GiB, just above the 0.43 GiB one
 during graph capture, and 0.31 GiB is refused.
 detm-r5o-lookup-mhc-bi-variant-probe is that arm with attn-probe2 (attn-exact
 plus a row-by-row recompute of layers 2 and 14's attention) and
-SPARK3_DEBUG_RECOMPUTE=1.
+SPARK3_DEBUG_RECOMPUTE=1. vllm-0030-block-fp8-no-split-k-batch-invariant.patch
+also plans split-K block-FP8 capacities with one slice in batch-invariant mode
+(overlay gemv-lookup-mhc-bi-fp8: 0027-0030): detm-r5o-bi-trace (exact trace
+arm with attn-exact2, which also records each row's position and input token), detm-r5o-bi-pin (performance), and r5o-lookup-mhc-variant-pin (r5o with
+the fixes that are always on: 0027, 0028 and b12x-0006).
 """
 import copy
 import json
@@ -103,10 +107,17 @@ bi_trace = traced(detm_variant_pin, 1790, overlay="attn-exact", lookup="gemv-loo
 bi_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
 bi_probe = traced(detm_variant_pin, 1790, overlay="attn-probe2", lookup="gemv-lookup-mhc-bi")
 bi_probe["environment"].update(VLLM_DS41_BATCH_INVARIANT="1", SPARK3_DEBUG_RECOMPUTE="1")
+bi_full_trace = traced(detm_variant_pin, 1790, overlay="attn-exact2", lookup="gemv-lookup-mhc-bi-fp8")
+bi_full_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
+bi_full_pin = with_lookup(detm_variant_pin, "gemv-lookup-mhc-bi-fp8")
+bi_full_pin["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
 probe = traced(detm_variant_pin, 768, overlay="attn-probe")
 probe["environment"]["SPARK3_DEBUG_RECOMPUTE"] = "1"
 r5o_lookup_variant = with_lookup(r5o_pin)
 mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
+      f"{B12X}/moe/fused_moe/_preparation.py")
+r5o_lookup_mhc_variant = with_lookup(r5o_pin, "gemv-lookup-mhc")
+mount(r5o_lookup_mhc_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
       f"{B12X}/moe/fused_moe/_preparation.py")
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
@@ -116,6 +127,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                    traced(detm_variant_pin, 1790, overlay="attn-exact", lookup="gemv-lookup-mhc")),
                   ("detm-r5o-lookup-mhc-bi-variant-exact", bi_trace),
                   ("detm-r5o-lookup-mhc-bi-variant-probe", bi_probe),
+                  ("detm-r5o-bi-trace", bi_full_trace), ("detm-r5o-bi-pin", bi_full_pin),
+                  ("r5o-lookup-mhc-variant-pin", r5o_lookup_mhc_variant),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),

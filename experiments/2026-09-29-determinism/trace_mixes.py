@@ -9,7 +9,7 @@ nodes, start the background requests, send the target 0.3 s later with
 X-Request-Id "trace-<prompt>-m<mix>-r<rep>" (so the model runner's step log
 names its rows), dump the logs as soon as the target is done, and copy every rank's
 runner, tag and schedule logs to OUT_DIR/<prompt>-m<mix>-r<rep>/<node>/, with
-the target's tokens and logprobs in target.json. Thinking is off.
+the target's tokens (as token ids) and logprobs in target.json. Thinking is off.
 """
 import json
 import os
@@ -61,7 +61,7 @@ def complete(prompt, tokens, request_id=None, keep=None):
             "chat_template_kwargs": {"thinking": False}}
     headers = {"Content-Type": "application/json"}
     if request_id:
-        body.update(logprobs=True, top_logprobs=1)
+        body.update(logprobs=True, top_logprobs=1, return_tokens_as_token_ids=True)
         headers["X-Request-Id"] = request_id
     request = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers=headers)
@@ -70,7 +70,9 @@ def complete(prompt, tokens, request_id=None, keep=None):
     if keep is not None:
         content = data["choices"][0]["logprobs"]["content"]
         keep.update(tokens=[c["token"] for c in content], logprobs=[c["logprob"] for c in content],
-                    prompt_tokens=data["usage"]["prompt_tokens"])
+                    prompt_tokens=data["usage"]["prompt_tokens"],
+                    tokens_ids=[int(c["token"].split(":", 1)[1]) for c in content
+                                if c["token"].startswith("token_id:")])
 
 
 for name, prompt in PROMPTS.items():

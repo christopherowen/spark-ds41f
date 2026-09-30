@@ -1,0 +1,125 @@
+From 97f03e24aeeb5e73f44e3b233fb32a4a196d056e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:47:51 +0200
+Subject: [PATCH] feat(deepseek-v4.1): plan block-FP8 linears without split-K
+ in batch-invariant mode
+
+The dense tuner splits K across CTAs for small block-FP8 capacities (the
+Engram projection's 1- to 6-row plans use four slices) and not for larger
+ones, so a row reduced in a small decode batch rounds differently than in a
+larger batch. On the traced JSON target this was where its solo decode steps
+(6 rows) first differed from mixed batches (16 rows), at Engram layer 14.
+
+With VLLM_DS41_BATCH_INVARIANT=1, a capacity whose default configuration
+splits K is planned with the same configuration and one slice. Unset, nothing
+changes.
+---
+ ...test_deepseek_v4_1_prepared_projections.py | 45 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 28 +++++++++++-
+ 2 files changed, 72 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index 1e5d3e8e0..ad401ca08 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -158,6 +158,51 @@ def test_batch_invariant_mode_plans_torch_backend_capacities_on_simt(monkeypatch
+     assert b12x_layers._gemv_override(query(384, "float32", 20)) is None
+ 
+ 
++def test_batch_invariant_mode_plans_block_fp8_without_split_k(monkeypatch):
++    """Only split-K defaults change, and only when enabled."""
++    from dataclasses import replace
++
++    from b12x.gemm import block_fp8_linear
++    from b12x.gemm._tuning import DenseGemmConfig
++
++    from vllm.models.deepseek_v4_1 import b12x_layers
++
++    calls = []
++
++    def plan(caps, *, override=None):
++        calls.append(override)
++        return SimpleNamespace(query=caps)
++
++    split = DenseGemmConfig(
++        backend="cutedsl",
++        tile_m=32,
++        tile_n=64,
++        tile_k=128,
++        load_path="tma",
++        swap_ab=False,
++        split_k_slices=4,
++        large_m_unroll=False,
++        target_occupancy=None,
++    )
++    default = [split]
++    monkeypatch.setattr(block_fp8_linear, "plan", plan)
++    monkeypatch.setattr(
++        b12x_layers, "_block32_default_config", lambda query, device: default[0]
++    )
++    caps = SimpleNamespace(device="cpu")
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", False)
++    b12x_layers._block32_plan(caps)
++    assert calls == [None]
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
++    calls.clear()
++    b12x_layers._block32_plan(caps)
++    assert calls == [None, replace(split, split_k_slices=1)]
++    default[0] = replace(split, split_k_slices=1)
++    calls.clear()
++    b12x_layers._block32_plan(caps)
++    assert calls == [None]
++
++
+ def test_mhc_takes_the_smallest_prepared_plan(monkeypatch):
+     """Counts between prepared mHC sizes use the next larger plan, not the largest."""
+     from vllm.models.deepseek_v4_1 import b12x_layers
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 7505e2e2a..8b95895a1 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -239,6 +239,32 @@ def _gemv_override(query):
+     return None
+ 
+ 
++def _block32_plan(caps):
++    """A block-FP8 linear plan; in batch-invariant mode, without split-K.
++
++    The dense tuner splits K across CTAs for small capacities (the Engram
++    projection's 1- to 6-row plans) and not for larger ones, so a row reduced
++    in a small batch rounds differently. The default configuration is kept
++    otherwise.
++    """
++    plan = block_fp8_linear.plan(caps)
++    if not _BATCH_INVARIANT:
++        return plan
++    from dataclasses import replace
++
++    config = _block32_default_config(plan.query, caps.device)
++    if (config.split_k_slices or 1) <= 1:
++        return plan
++    return block_fp8_linear.plan(caps, override=replace(config, split_k_slices=1))
++
++
++def _block32_default_config(query, device):
++    from b12x.gemm.block_fp8_linear._tuning import TUNING
++    from b12x.preparation.device import detect_device
++
++    return TUNING.default_config(query, detect_device(device).identity)
++
++
+ def _smallest_capacity(capacities: tuple[int, ...], rows: int) -> int:
+     """The smallest prepared row capacity that holds ``rows``.
+ 
+@@ -388,7 +414,7 @@ class B12xFP8LinearMethod(LinearMethodBase):
+         )
+         layer.b12x_capacities = _execution_capacities()
+         layer.b12x_plans = tuple(
+-            block_fp8_linear.plan(
++            _block32_plan(
+                 block_fp8_linear.Caps(
+                     device=layer.weight.device,
+                     max_tokens=capacity,
+-- 
+2.43.0
+

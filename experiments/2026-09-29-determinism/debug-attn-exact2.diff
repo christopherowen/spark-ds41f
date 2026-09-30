@@ -1,0 +1,87 @@
+diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
+--- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 22:56:35.828452837 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 22:56:35.829700089 +0200
+@@ -351,7 +351,9 @@
+ 
+ 
+ def record_schedule(req_ids, num_tokens: int, padded: int, query_start_loc: torch.Tensor,
+-                    num_reqs: int, is_padding: torch.Tensor | None) -> None:
++                    num_reqs: int, is_padding: torch.Tensor | None,
++                    positions: torch.Tensor | None = None,
++                    input_ids: torch.Tensor | None = None) -> None:
+     """Append one step of the scheduled batch; call only when ENABLED.
+ 
+     Device log (allocation-free, stream-ordered after the batch is built):
+@@ -364,7 +366,7 @@
+     step = _step[0]
+     _step[0] += 1
+     device = query_start_loc.device
+-    log = _log("schedule", device, 3 + _SCHEDULE_REQS + _MAX_ROWS, _SCHEDULE_CAPACITY)
++    log = _log("schedule", device, 3 + _SCHEDULE_REQS + 3 * _MAX_ROWS, _SCHEDULE_CAPACITY)
+     stage = log.stage[0]
+     stage.zero_()
+     stage[0].fill_(step)
+@@ -375,6 +377,13 @@
+     if is_padding is not None:
+         m = min(padded, _MAX_ROWS, is_padding.numel())
+         stage[3 + _SCHEDULE_REQS : 3 + _SCHEDULE_REQS + m].copy_(is_padding[:m])
++    # Each row's position and input token (exact in float32), so rows can be
++    # matched across runs by what they compute rather than by step number.
++    base = 3 + _SCHEDULE_REQS + _MAX_ROWS
++    for offset, values in ((0, positions), (_MAX_ROWS, input_ids)):
++        if values is not None:
++            m = min(padded, _MAX_ROWS, values.numel())
++            stage[base + offset : base + offset + m].copy_(values[:m])
+     log.append(0)
+     for name, width, capacity, step_col in (("runner", 2 + 3 * _MAX_ROWS, _RUNNER_CAPACITY, 2),
+                                             ("tags", 3 + _MAX_ROWS, _TAGS_CAPACITY, 3),
+diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 22:56:35.833455683 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 22:56:35.834176581 +0200
+@@ -1801,6 +1801,35 @@
+             out=output,
+             cache_format="deepseek_v41",
+         )
++        if checksum_debug.ENABLED and checksum_debug.RECOMPUTE and self.layer_id in (2, 14):
++            # Debug probe (tag 31): the first rows recomputed one at a time from
++            # their own per-row inputs; equal to the batched rows if the kernel
++            # is row-independent.
++            singles = []
++            for r in range(min(rows, 8)):
++                one = torch.empty_like(output[r : r + 1])
++                row_kwargs = {k: v[r : r + 1] for k, v in kwargs.items()}
++                mla.run(
++                    binding=mla.bind(
++                        plan,
++                        scratch=buffers[metadata_count:],
++                        q=q[r : r + 1],
++                        swa_indices=swa_indices[r : r + 1],
++                        swa_lengths=swa_lengths[r : r + 1],
++                        **row_kwargs,
++                    ),
++                    swa_k_cache=self.swa_cache_layer.kv_cache,
++                    indexed_k_cache=self._owner().kv_cache if main is not None else None,
++                    swa_page_size=self.swa_cache_layer.block_size,
++                    indexed_page_size=self._main_page,
++                    sm_scale=512**-0.5,
++                    attn_sink=self.attn_sink,
++                    out=one,
++                    cache_format="deepseek_v41",
++                )
++                singles.append(one)
++            if singles:
++                checksum_debug.record_attn(self, 31, torch.cat(singles))
+ 
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+diff -ruN a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+--- a/vllm/v1/worker/gpu/model_runner.py	2026-09-30 22:56:35.822631894 +0200
++++ b/vllm/v1/worker/gpu/model_runner.py	2026-09-30 22:56:35.823990697 +0200
+@@ -1666,6 +1666,7 @@
+             checksum_debug.record_schedule(
+                 req_ids, num_tokens, num_tokens_after_padding, query_start_loc,
+                 num_reqs, self.input_buffers.is_padding,
++                self.input_buffers.positions, self.input_buffers.input_ids,
+             )
+ 
+         fast_prefill = None
