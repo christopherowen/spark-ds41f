@@ -235,3 +235,73 @@ shared-expert outputs, not only determinism). For the deterministic mode,
 cut the combine cost before promoting it: a fixed-order in-kernel reduction
 of the six slices into one route row (back to six rows per token and the
 2.8 MiB scratch), or a masked top-k sum that skips dead routes.
+
+## Round 9: masked top-k sum (`0008`, `run20.sh`)
+
+Per owner direction, 0007 shipped alone as r5n; 0004-0006 stay experimental.
+`0008-moe-masked-slice-topk-sum.patch` (on 0006, B12X tree `c28e70fd`): the
+top-k sum reads each (token, route) expert id once and skips the slice rows of
+routes to no expert, eight columns a thread, bitwise equal to the previous
+order; the fused kernel no longer clears those rows. Kernel tests 21/21
+(dead-route rows left NaN-poisoned, the real reducer checked bitwise), planner
+tests 165/165 (`run22.sh`; run20's 86 failures came from exporting
+`B12X_DENSE_SPLITK_TURBO=0`, which changes pinned code-generation snapshots).
+
+`moe_combine_bench.py` at fixed shapes (uniformly random routing, so expert
+weight traffic dominates; `combine_table.py`): per call at 48 rows the slice
+combine costs +0.5/+1.2/+2.5% over the atomic one at 0/25/50% dead rows, the
+masked one +0.4/+0.2/-0.2%; its top-k sum falls from 74 to 53 and 34 us as
+rows die, where the unmasked one stays at 70-80 us. Nsight Compute (GB10 has no
+`dram__` counters; sysmem fills and misses stand in): memory reads are the same
+for all three combines; slice partials add 3-20 MiB of writes per call and the
+top-k sum reads 2-17 MiB, almost all L2 misses.
+
+## Round 10: against r5n on one pinned cost table (`run21.sh`)
+
+`make_arms_r5n.py`: `r5n-pin-prof` and `detm-pin-prof` (0004-0006 and 0008,
+split-K through the FP32 reducer) share `SPARK3_DSPARK_COST_DIR`; the first r5n
+boot wrote `dspark-costs-e9eb8edaf99252b3.json` (SHA-256 `3a45eec6…`), every
+later boot reused it. Pinning holds the verification policy, not the realized
+work: the deterministic arm decodes other trajectories.
+
+| two boots each (`pin_table.py`) | r5n | deterministic | change |
+|---|---|---|---|
+| prose, one stream: step | 41.67, 42.21 ms | 42.90, 42.90 ms | +2.3% |
+| JSON, one stream: step | 47.85, 48.90 ms | 47.45, 47.41 ms | -1.9% |
+| prose, eight streams | 162.8, 162.3 tok/s | 167.8, 168.5 tok/s | +3.5% |
+| JSON, eight streams | 240.5, 239.5 tok/s | 219.4, 222.1 tok/s | -8.1% |
+
+Eight-stream JSON verified 3.73 against 3.69 drafts per draft and accepted
+2.89 against 2.97, so throughput still mixes trajectory with kernel cost.
+The profiled window (`profile_c8.py`: the same eight JSON requests on both,
+536 against 527 draft events, 1727 against 1738 verified and 1303 against 1316
+accepted drafts) took 10.84 s against 10.61 s (+2.2%). Its traces
+(`analyze_steps.py`, `moe_grids.py`): the target MoE kernel takes 1596 us per
+call against 1451 (+10%), the top-k sum about 34 us per call more; the rest
+of the step is level. That is the measured bottleneck: the fused kernel with
+slice partials at real routing, not the reduction. The fixed-shape bench
+(round 9) shows only 1.4-2.8% for the same kernel, so the serving penalty
+likely comes from real routing (more expert overlap, so partial traffic is a
+larger share) and from partial writes evicting L2-prefetched weights; neither
+is measured yet.
+
+Repeatability: identical sequential requests repeat exactly with 0008 (1/5 on
+prose, code and JSON). Across batch compositions they do not
+(`determinism_concurrent.py`): the same prompt beside 0, 2, 4 and 7 other
+requests gave 4 distinct outputs of 5 for JSON and prose, first differences
+at tokens 28-57 and 8; the two seven-request mixes agreed for JSON. The mode is
+deterministic for a fixed batch composition, not batch-invariant.
+
+## Round 11: the fence at kernel level (`run22.sh`)
+
+`gemm_fence_timing.py`, identical inputs, r5m image (shipped) against r5n
+(fenced), median kernel time: down projection 6.30/6.37 us at 6 rows and
+8.42/8.13 us at 48, gate_up 29.41/29.70 and 12.10/12.32 us, alone and beside
+the routed MoE alike (-3.8% to +1.8%, both directions): no consistent cost,
+about +/-0.02 ms per step for the shared expert.
+
+Next: before any cross-CTA reduction design, measure what makes the fused
+kernel 10% slower in serving: the same comparison with the L2 weight prefetch
+off, and the fixed-shape bench with routing captured from serving. Batch
+invariance would need composition-independent kernel choices (split-K,
+tiles, attention splits); size that before proposing the mode.
