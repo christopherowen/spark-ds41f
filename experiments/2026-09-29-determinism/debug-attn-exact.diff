@@ -1,6 +1,6 @@
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
---- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 18:17:39.738668322 +0200
-+++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 18:17:39.739684051 +0200
+--- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 21:43:17.909095636 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 21:43:17.910178213 +0200
 @@ -3,8 +3,10 @@
  
  Enabled only by ``SPARK3_MOE_CHECKSUM_DIR``; unset means no work at all.
@@ -14,32 +14,81 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
  shared-expert MLP, which may run on a side stream) append (slot, rows, tag,
  per-row sums) to a second log, so the two never share a counter. Per-row sums
  matter: batches are padded, and padding rows carry stale values.
-@@ -78,7 +80,23 @@
+@@ -26,6 +28,8 @@
+ 
+ import torch
+ 
++from vllm.triton_utils import tl, triton
++
+ DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
+ ENABLED = bool(DIRECTORY)
+ # Rows recorded per call and log capacities; the defaults keep the original
+@@ -78,7 +82,19 @@
          return slot
  
      def row_sums(self, x: torch.Tensor, out: torch.Tensor) -> None:
 -        torch.sum(x.reshape(x.shape[0], -1), dim=1, dtype=torch.float32, out=out)
 +        """Exact per-row fingerprints (the name predates them; sums could hide
-+        flipped low bits that cancel)."""
++        flipped low bits that cancel). One Triton launch for 16- and 32-bit
++        floats, so captured graphs stay small; other dtypes use torch ops."""
 +        flat = x.reshape(x.shape[0], -1)
-+        if flat.dtype == torch.bool:
-+            flat = flat.to(torch.uint8)
-+        size = flat.element_size()
-+        if flat.is_floating_point():
-+            bits = flat.contiguous().view({2: torch.int16, 4: torch.int32}[size]).long()
-+            bits &= 0xFFFF if size == 2 else 0xFFFFFFFF
-+        else:
-+            bits = flat.long()
-+        bits = torch.remainder(bits, _HASH_PRIME)
-+        weights = torch.remainder(
-+            torch.arange(1, bits.shape[1] + 1, dtype=torch.int64, device=x.device) * 40503 + 7,
-+            1048573,
-+        )
-+        out.copy_(torch.remainder((bits * weights).sum(dim=1), _HASH_PRIME))
++        if flat.is_floating_point() and flat.element_size() in (2, 4) and flat.shape[0]:
++            flat = flat.contiguous()
++            bits = flat.view(torch.int16 if flat.element_size() == 2 else torch.int32)
++            _fingerprint_rows[(flat.shape[0],)](
++                bits, out, bits.shape[1], BITS16=flat.element_size() == 2, BLOCK=1024,
++            )
++            return
++        return _fingerprint_torch(flat, out)
++
  
      def append(self, slot: int) -> None:
          torch.remainder(self.count, self.capacity, out=self.index)
-@@ -271,10 +289,21 @@
+@@ -86,6 +102,43 @@
+         self.count.add_(1)
+ 
+ 
++def _fingerprint_torch(flat: torch.Tensor, out: torch.Tensor) -> None:
++    """Reference fingerprint in torch ops (any dtype)."""
++    if flat.dtype == torch.bool:
++        flat = flat.to(torch.uint8)
++    size = flat.element_size()
++    if flat.is_floating_point():
++        bits = flat.contiguous().view({2: torch.int16, 4: torch.int32}[size]).long()
++        bits &= 0xFFFF if size == 2 else 0xFFFFFFFF
++    else:
++        bits = flat.long()
++    bits = torch.remainder(bits, _HASH_PRIME)
++    weights = torch.remainder(
++        torch.arange(1, bits.shape[1] + 1, dtype=torch.int64, device=flat.device) * 40503 + 7,
++        1048573,
++    )
++    out.copy_(torch.remainder((bits * weights).sum(dim=1), _HASH_PRIME))
++
++
++@triton.jit
++def _fingerprint_rows(bits, out, width, BITS16: tl.constexpr, BLOCK: tl.constexpr):
++    """out[row] = sum_j (bits[row, j] mod P) * w_j mod P, w_j = ((j+1)*40503+7) mod 1048573."""
++    row = tl.program_id(0)
++    acc = tl.zeros([BLOCK], dtype=tl.int64)
++    for start in range(0, width, BLOCK):
++        cols = start + tl.arange(0, BLOCK)
++        mask = cols < width
++        value = tl.load(bits + row.to(tl.int64) * width + cols, mask=mask, other=0).to(tl.int64)
++        if BITS16:
++            value = value & 0xFFFF
++        else:
++            value = value & 0xFFFFFFFF
++        value = value % 16777213
++        weight = ((cols + 1).to(tl.int64) * 40503 + 7) % 1048573
++        acc += tl.where(mask, (value * weight) % 16777213, 0)
++    total = tl.sum(acc, axis=0) % 16777213
++    tl.store(out + row, total.to(tl.float32))
++
+ def _log(name: str, device: torch.device, width: int, capacity: int) -> _Log:
+     log = _logs.get(name)
+     if log is None:
+@@ -271,10 +324,21 @@
          out[name] = entry
      import gc
  
@@ -66,8 +115,8 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
          json.dump(out, f, indent=1)
  
 diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
---- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 18:17:39.743389896 +0200
-+++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 18:17:39.744455721 +0200
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 21:43:17.913856601 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 21:43:17.915610459 +0200
 @@ -1364,6 +1364,9 @@
              rows = hidden_states.shape[0]
              qr_kv, _ = self.fused_wqa_wkv(hidden_states)
