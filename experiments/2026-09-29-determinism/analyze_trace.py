@@ -31,9 +31,18 @@ def latest(node_dir, kind):
     return torch.load(files[-1]) if files else None
 
 
+def chronological(log):
+    """The dumped rows in recording order (the logs are rings)."""
+    rows, count, capacity = log["rows"], log["count"], log["capacity"]
+    if count > capacity:
+        k = count % capacity
+        rows = torch.cat([rows[k:], rows[:k]])
+    return rows
+
+
 def steps_of(log, marker_step_col, value_col, tag_col=None):
     """step -> list of (slot, tag, rows, row_sums tensor [rows, k]) in log order."""
-    rows = log["rows"][: min(log["count"], log["capacity"])]
+    rows = chronological(log)
     m = log["max_rows"]
     out, current = {}, None
     for r in rows:
@@ -64,7 +73,7 @@ def load_run(run_dir):
             continue
         host = {h["step"]: h for h in json.load(open(host_files[-1]))}
         dev = {}
-        for row in sched["rows"][: min(sched["count"], sched["capacity"])]:
+        for row in chronological(sched):
             dev[int(row[0].item())] = row
         run_steps = steps_of(runner, 2, 2)
         tag_steps = steps_of(tags, 3, 3, tag_col=2) if tags is not None else {}
