@@ -1,21 +1,23 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..ede2ea854d
+index 0000000000..27af088df7
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,125 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
 +Enabled only by ``SPARK3_MOE_CHECKSUM_DIR``; unset means no work at all.
-+Every MoE runner call appends one row to a device-resident log:
-+(layer slot, rows, sum(input), sum(shared-expert output), sum(routed output)),
-+indexed on the device, so CUDA-graph replays record as well as eager calls.
-+Tagged calls (``record_tag``, e.g. inside the shared-expert MLP, which may run
-+on a side stream) go to a second log so the two never share a counter.
-+A watcher thread writes ``rank<r>-<log>-<count>.pt`` into the directory
-+whenever the ``dump`` file there changes. Compare two identical requests to
-+find the first call whose input matches but whose outputs do not.
++Every MoE runner call with at most 64 rows appends one record to a device
++log: (layer slot, rows, per-row sums of the input, of the shared-expert output
++and of the routed output). Tagged calls (``record_tag``, e.g. inside the
++shared-expert MLP, which may run on a side stream) append (slot, rows, tag,
++per-row sums) to a second log, so the two never share a counter. Per-row sums
++matter: batches are padded, and padding rows carry stale values.
++Records are indexed on the device, so CUDA-graph replays record too, and the
++logs allocate nothing after construction (captured graphs keep no segments).
++A watcher thread zeroes both counters when ``<dir>/reset`` changes and writes
++``rank<r>-<log>-<count>.pt`` when ``<dir>/dump`` changes.
 +"""
 +
 +import os
@@ -26,108 +28,107 @@ index 0000000000..ede2ea854d
 +
 +DIRECTORY = os.environ.get("SPARK3_MOE_CHECKSUM_DIR", "")
 +ENABLED = bool(DIRECTORY)
-+_CAPACITY = 1 << 15
-+_SLOTS = 256
-+# Decode steps and short prompts only: large batches would grow the cached
-+# memory pool (system memory on GB10) past the startup memory guard.
 +_MAX_ROWS = 64
-+_log: "_Log | None" = None
++_SLOTS = 256
++_logs: dict[str, "_Log"] = {}
 +
 +
 +class _Log:
-+    """Allocation-free after construction: captured graphs keep no new segments."""
-+
-+    def __init__(self, device: torch.device, name: str) -> None:
++    def __init__(self, device: torch.device, name: str, width: int, capacity: int) -> None:
 +        self.name = name
-+        self.rows = torch.zeros(_CAPACITY, 5, dtype=torch.float32, device=device)
-+        self.stage = torch.zeros(_SLOTS, 5, dtype=torch.float32, device=device)
++        self.capacity = capacity
++        self.rows = torch.zeros(capacity, width, dtype=torch.float32, device=device)
++        self.stage = torch.zeros(_SLOTS, width, dtype=torch.float32, device=device)
 +        self.count = torch.zeros(1, dtype=torch.int64, device=device)
 +        self.index = torch.zeros(1, dtype=torch.int64, device=device)
 +        self.slots: dict[int, int] = {}
-+        threading.Thread(target=self._watch, daemon=True).start()
 +
-+    def _append(self, slot: int) -> None:
-+        torch.remainder(self.count, _CAPACITY, out=self.index)
-+        self.rows.index_copy_(0, self.index, self.stage[slot : slot + 1])
-+        self.count.add_(1)
-+
-+    def _slot(self, owner) -> int:
++    def slot(self, owner) -> int:
 +        slot = self.slots.setdefault(id(owner), len(self.slots))
 +        if slot >= _SLOTS:
 +            raise RuntimeError("checksum log slot table is full")
 +        return slot
 +
-+    def record_tag(self, owner, tag: int, x) -> None:
-+        slot = self._slot(owner)
-+        stage = self.stage[slot]
-+        stage[0].fill_(slot)
-+        stage[1].fill_(x.shape[0])
-+        stage[2].fill_(tag)
-+        torch.sum(x.reshape(-1), dim=0, dtype=torch.float32, out=stage[3])
-+        torch.linalg.vector_norm(x.reshape(-1), 1, dim=0, dtype=torch.float32, out=stage[4])
-+        self._append(slot)
++    def row_sums(self, x: torch.Tensor, out: torch.Tensor) -> None:
++        torch.sum(x.reshape(x.shape[0], -1), dim=1, dtype=torch.float32, out=out)
 +
-+    def record(self, owner, x, shared, routed) -> None:
-+        slot = self._slot(owner)
-+        stage = self.stage[slot]
-+        stage[0].fill_(slot)
-+        stage[1].fill_(x.shape[0])
-+        torch.sum(x.reshape(-1), dim=0, dtype=torch.float32, out=stage[2])
-+        if shared is None:
-+            stage[3].zero_()
-+        else:
-+            torch.sum(shared.reshape(-1), dim=0, dtype=torch.float32, out=stage[3])
-+        torch.sum(routed.reshape(-1), dim=0, dtype=torch.float32, out=stage[4])
-+        self._append(slot)
-+
-+    def _watch(self) -> None:
-+        rank = (
-+            torch.distributed.get_rank()
-+            if torch.distributed.is_available() and torch.distributed.is_initialized()
-+            else int(os.environ.get("RANK", "0"))
-+        )
-+        trigger = os.path.join(DIRECTORY, "dump")
-+        seen = None
-+        while True:
-+            time.sleep(1.0)
-+            try:
-+                stamp = os.stat(trigger).st_mtime_ns
-+            except FileNotFoundError:
-+                continue
-+            if stamp == seen:
-+                continue
-+            seen = stamp
-+            count = int(self.count.item())
-+            rows = self.rows[: min(count, _CAPACITY)].cpu()
-+            torch.save(
-+                {"count": count, "rows": rows},
-+                os.path.join(DIRECTORY, f"rank{rank}-{self.name}-{count}.pt"),
-+            )
++    def append(self, slot: int) -> None:
++        torch.remainder(self.count, self.capacity, out=self.index)
++        self.rows.index_copy_(0, self.index, self.stage[slot : slot + 1])
++        self.count.add_(1)
 +
 +
-+_tag_log: "_Log | None" = None
++def _log(name: str, device: torch.device, width: int, capacity: int) -> _Log:
++    log = _logs.get(name)
++    if log is None:
++        os.makedirs(DIRECTORY, exist_ok=True)
++        log = _logs[name] = _Log(device, name, width, capacity)
++        if len(_logs) == 1:
++            threading.Thread(target=_watch, daemon=True).start()
++    return log
 +
 +
 +def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
-+    """Append one checksum row; call only when ENABLED."""
-+    global _log
-+    if x.shape[0] > _MAX_ROWS:
++    """Append one runner record; call only when ENABLED."""
++    rows = x.shape[0]
++    if rows > _MAX_ROWS:
 +        return
-+    if _log is None:
-+        os.makedirs(DIRECTORY, exist_ok=True)
-+        _log = _Log(x.device, "runner")
-+    _log.record(owner, x, shared, routed)
++    log = _log("runner", x.device, 2 + 3 * _MAX_ROWS, 4096)
++    slot = log.slot(owner)
++    stage = log.stage[slot]
++    stage.zero_()
++    stage[0].fill_(slot)
++    stage[1].fill_(rows)
++    log.row_sums(x, stage[2 : 2 + rows])
++    if shared is not None:
++        log.row_sums(shared, stage[2 + _MAX_ROWS : 2 + _MAX_ROWS + rows])
++    log.row_sums(routed, stage[2 + 2 * _MAX_ROWS : 2 + 2 * _MAX_ROWS + rows])
++    log.append(slot)
 +
 +
 +def record_tag(owner, tag: int, x: torch.Tensor) -> None:
-+    """Append (slot, rows, tag, sum, abs sum) to the tag log; only when ENABLED."""
-+    global _tag_log
-+    if x.shape[0] > _MAX_ROWS:
++    """Append one tagged record (slot, rows, tag, per-row sums); only when ENABLED."""
++    rows = x.shape[0]
++    if rows > _MAX_ROWS:
 +        return
-+    if _tag_log is None:
-+        os.makedirs(DIRECTORY, exist_ok=True)
-+        _tag_log = _Log(x.device, "tags")
-+    _tag_log.record_tag(owner, tag, x)
++    log = _log("tags", x.device, 3 + _MAX_ROWS, 16384)
++    slot = log.slot(owner)
++    stage = log.stage[slot]
++    stage.zero_()
++    stage[0].fill_(slot)
++    stage[1].fill_(rows)
++    stage[2].fill_(tag)
++    log.row_sums(x, stage[3 : 3 + rows])
++    log.append(slot)
++
++
++def _watch() -> None:
++    rank = (
++        torch.distributed.get_rank()
++        if torch.distributed.is_available() and torch.distributed.is_initialized()
++        else int(os.environ.get("RANK", "0"))
++    )
++    seen: dict[str, int | None] = {"reset": None, "dump": None}
++    while True:
++        time.sleep(1.0)
++        for kind in ("reset", "dump"):
++            try:
++                stamp = os.stat(os.path.join(DIRECTORY, kind)).st_mtime_ns
++            except FileNotFoundError:
++                continue
++            if stamp == seen[kind]:
++                continue
++            seen[kind] = stamp
++            for log in list(_logs.values()):
++                if kind == "reset":
++                    log.count.zero_()
++                else:
++                    count = int(log.count.item())
++                    rows = log.rows[: min(count, log.capacity)].cpu()
++                    torch.save(
++                        {"count": count, "capacity": log.capacity, "rows": rows},
++                        os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
++                    )
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 index 8a47192e13..9408ff63d5 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py

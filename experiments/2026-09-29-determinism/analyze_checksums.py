@@ -15,6 +15,9 @@ import torch
 
 log = torch.load(sys.argv[1])
 rows = log["rows"]
+if log["count"] > rows.shape[0]:  # ring buffer wrapped: unroll to chronological order
+    k = log["count"] % rows.shape[0]
+    rows = torch.cat([rows[k:], rows[:k]])
 prompt_rows = int(sys.argv[2])
 print(f"{log['count']} rows logged")
 slot0 = (rows[:, 0] == 0).nonzero().flatten().tolist()

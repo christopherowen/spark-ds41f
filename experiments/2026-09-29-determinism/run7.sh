@@ -17,6 +17,10 @@ stop_all() {
 stop_all
 log "start detslice-dbg"
 bin/spark3 --cluster-config $E/cluster-detslice-dbg.json cluster start --replace --apply | grep -v 'docker run'
+for n in dgx1 dgx2 dgx3; do
+  ssh -n "$n" "docker exec dsv41-karmic-kraken sh -c 'mkdir -p /cache/kkref/moe-checksums; touch /cache/kkref/moe-checksums/reset'"
+done
+sleep 3
 python3 $E/checksum_requests.py http://10.0.1.71:8000 --tokens 128 | tee "$out/requests.json"
 log "requests exit ${PIPESTATUS[0]}"
 for n in dgx1 dgx2 dgx3; do

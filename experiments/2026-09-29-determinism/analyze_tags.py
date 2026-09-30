@@ -10,7 +10,11 @@ import sys
 
 import torch
 
-rows = torch.load(sys.argv[1])["rows"]
+log = torch.load(sys.argv[1])
+rows = log["rows"]
+if log["count"] > rows.shape[0]:  # ring buffer wrapped: unroll to chronological order
+    k = log["count"] % rows.shape[0]
+    rows = torch.cat([rows[k:], rows[:k]])
 prompt_rows = int(sys.argv[2])
 starts = [i for i in range(rows.shape[0])
           if int(rows[i, 0]) == 0 and int(rows[i, 2]) == 0 and int(rows[i, 1]) == prompt_rows]
