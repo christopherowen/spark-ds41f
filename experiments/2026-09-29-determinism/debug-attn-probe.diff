@@ -1,6 +1,6 @@
 diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
---- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:49:00.537612672 +0200
-+++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 16:49:00.539116214 +0200
+--- a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 17:37:40.710512409 +0200
++++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py	2026-09-30 17:37:40.712544703 +0200
 @@ -35,6 +35,9 @@
  _TAGS_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_TAGS_CAPACITY", "65536"))
  _ATTN_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_ATTN_CAPACITY", "49152"))
@@ -12,8 +12,8 @@ diff -ruN a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm
  _HASH_PRIME = 16777213
  _SCHEDULE_CAPACITY = 4096
 diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
---- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:49:00.542880453 +0200
-+++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 16:49:00.544200522 +0200
+--- a/vllm/models/deepseek_v4_1/attention.py	2026-09-30 17:37:40.714968582 +0200
++++ b/vllm/models/deepseek_v4_1/attention.py	2026-09-30 17:37:40.715536184 +0200
 @@ -1378,6 +1378,8 @@
          q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
          if checksum_debug.ENABLED:
@@ -23,7 +23,7 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
          l2_prefetch.issue(self._l2pf_wo, rows)
          q = _rotated(
              q,
-@@ -1428,6 +1430,27 @@
+@@ -1428,6 +1430,29 @@
              checksum_debug.record_attn(self, 22, out)
          return out
  
@@ -37,6 +37,8 @@ diff -ruN a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/a
 +        from bisect import bisect_left
 +
 +        layer = self.wq_b
++        if qr.shape[0] > 256:  # small batches only (the profile run passes 4096)
++            return
 +        again = self.wq_b(qr)
 +        checksum_debug.record_attn(self, 25, again)
 +        rows = qr.shape[0]
