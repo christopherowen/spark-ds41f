@@ -72,10 +72,14 @@ detslice_priv["container"]["mounts"].append(
 )
 detslice_priv["environment"]["SPARK3_PRIVATE_SHARED_SCRATCH"] = "1"
 
+# Diagnostic: the checksum arm without CUDA graphs (overlap still on).
+detslice_eager = copy.deepcopy(detslice_dbg)
+detslice_eager["serve_args"] += ["--enforce-eager"]
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
                      ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
-                     ("detslice-priv", detslice_priv)):
+                     ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
