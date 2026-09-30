@@ -76,10 +76,24 @@ detslice_priv["environment"]["SPARK3_PRIVATE_SHARED_SCRATCH"] = "1"
 detslice_eager = copy.deepcopy(detslice_dbg)
 detslice_eager["serve_args"] += ["--enforce-eager"]
 
+# Diagnostic: production r5m with the checksum log (does the shared-expert
+# down projection also change for equal input there?).
+r5m_dbg = copy.deepcopy(base)
+for name in ("moe_runner.py", "checksum_debug.py"):
+    r5m_dbg["container"]["mounts"].append(
+        ["{home}/spark3-overlay/moe-checksum/" + name, f"{RUNNER}/{name}", "ro"]
+    )
+r5m_dbg["container"]["mounts"].append(
+    ["{home}/spark3-overlay/moe-checksum/model.py",
+     "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4/nvidia/model.py", "ro"]
+)
+r5m_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
                      ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
-                     ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager)):
+                     ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager),
+                     ("r5m-dbg", r5m_dbg)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
