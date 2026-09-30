@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: run34.sh   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
+# usage: run34.sh [--skip-replay]   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
 #                    det-variant, gemv-lookup-mhc, gemv-lookup-mhc-bi and attn-exact overlays on every node)
 # 1. On dgx3 (cluster stopped): gemv_backend_replay.py (BF16-output GEMVs on the default and the
 #    SIMT backend, and the index-key RMSNorm).
@@ -25,6 +25,7 @@ for n in dgx1 dgx2 dgx3; do
     | sed "s/^/$n /" >> "$out/overlay-bytes-run34.txt"
 done
 stop_all
+if [[ "$*" != *--skip-replay* ]]; then
 ssh -n dgx3 'mkdir -p /tmp/lookup/cache'
 scp -q $E/gemv_backend_replay.py dgx3:/tmp/lookup/
 log "backend replay on dgx3"
@@ -38,6 +39,7 @@ docker run --rm --gpus all --ipc=host \
 REMOTE
 log "backend replay done"
 grep -vE "Warning|warn\(" "$out/gemv-backend-replay.txt" | grep -E "groups|us;|: [0-9]|Error|Traceback" | head -30
+fi
 for arm in "detm-r5o-lookup-mhc-variant-exact trace4 2" "detm-r5o-lookup-mhc-bi-variant-exact trace5 3"; do
   set -- $arm
   stop_all
