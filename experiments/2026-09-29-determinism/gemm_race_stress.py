@@ -117,6 +117,15 @@ with ExitStack() as stack:
         ref = out.clone()
         stable = all(bfl.run(binding=binding) is not None and torch.equal(out, ref)
                      for _ in range(5))
+        start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for _ in range(200):
+            bfl.run(binding=binding)
+        start.record()
+        for _ in range(2000):
+            bfl.run(binding=binding)
+        stop.record()
+        torch.cuda.synchronize()
+        alone_us = start.elapsed_time(stop) * 1000 / 2000
         results = {}
         for mode in ("alone", "copy", "moe"):
             wrong = torch.zeros((), dtype=torch.int64, device=device)
@@ -142,6 +151,7 @@ with ExitStack() as stack:
             failures += int(wrong)
         line = "; ".join(f"{m}: wrong {w}/{t}" + (f" tiles {tl}" if tl else "")
                          for m, (w, t, tl) in results.items())
-        print(f"{SHAPE} cap {cap} rows {rows}: alone-stable {stable}; {line}", flush=True)
+        print(f"{SHAPE} cap {cap} rows {rows}: alone-stable {stable}, {alone_us:.2f} us/call alone "
+              f"(quantize + GEMM, launch-bound); {line}", flush=True)
     print("FAIL" if failures else "OK", flush=True)
     sys.exit(1 if failures else 0)
