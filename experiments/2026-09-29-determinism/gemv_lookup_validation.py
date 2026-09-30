@@ -24,6 +24,9 @@ GATE_WEIGHTS holds the served gate weights.
    5120, BF16 out), the ratio-2 compressor (512 x 5120, FP32 out), the
    ratio-1 compressor (512 x 5120, BF16 out) and the index key (128 x 512,
    BF16 out; the captured rows' first 512 columns stand in for latents).
+3b. The block-FP8 query projection wq_b (layer 0, rank 0's 22 heads: 1280 ->
+   11264), which already takes the smallest capacity: the same sweep with
+   serving's capacities, and each capacity's dense GEMM configuration.
 4. Kernel time per call at a few row counts, old and new plan (CUDA graph
    of 50 calls, replayed 10 times, so launch overhead is excluded).
 """
@@ -37,6 +40,8 @@ import torch  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
 from b12x.gemm import bf16_gemv  # noqa: E402
+from b12x.gemm import block_fp8_linear as bfl  # noqa: E402
+from b12x.gemm.block_fp8_linear._tuning import TUNING as FP8_TUNING  # noqa: E402
 from b12x.gemm.bf16_gemv._tuning import default_config  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
 
@@ -106,6 +111,41 @@ for label, (weight, out_dtype) in SHAPES.items():
         backend = default_config(plans[label, cap].query, device).backend
         backends.setdefault(backend, []).append(cap)
     print(f"{label}: backends by capacity {backends}", flush=True)
+
+
+def checkpoint_raw(name):
+    index = json.load(open("/models/model.safetensors.index.json"))["weight_map"]
+    with safe_open(f"/models/{index[name]}", framework="pt", device="cuda") as f:
+        return f.get_tensor(name)
+
+
+wq_b = checkpoint_raw("layers.0.attn.wq_b.weight")[:11264].contiguous()
+wq_b_scale = checkpoint_raw("layers.0.attn.wq_b.scale")[:11264 // 32].float().contiguous()
+wq_b_packed = bfl.pack_weight(wq_b, wq_b_scale, block_size=(32, 32))
+fp8_plans = {}
+for cap in CAPS:
+    caps = bfl.Caps(device=device, max_tokens=cap, in_features=1280, out_features=11264,
+                    source_dtype=torch.bfloat16, output_dtype=torch.bfloat16,
+                    block_size=(32, 32), output_mode="provided")
+    plan = bfl.plan(caps)
+    src = torch.randn(cap, 1280, device=device, dtype=torch.bfloat16)
+
+    def prepare_fp8(state, src=src):
+        spec, = state.scratch.scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        out = torch.empty((src.shape[0], 11264, 1), dtype=torch.bfloat16, device=device)
+        binding = state.bind(scratch=scratch, source=src, packed_weight=wq_b_packed, output=out)
+        return PreparedCall(run=lambda: state.run_binding(binding), output=out, owners=(scratch, binding))
+
+    fp8_plans[cap] = plan
+    requests.append(plan.request(name=f"wq_b-{cap}", prepare_call=prepare_fp8))
+configs = {}
+for cap in CAPS:
+    config = FP8_TUNING.default_config(fp8_plans[cap].query, device)
+    configs.setdefault(str(config), []).append(cap)
+print("wq_b (block FP8 1280->11264) dense configuration by capacity:", flush=True)
+for config, caps in configs.items():
+    print(f"  {caps}: {config[:300]}", flush=True)
 
 
 def rows_of(gates, name, width):
@@ -189,6 +229,47 @@ with PreparationSession(device=device, autotune=False, compile_workers=2) as ses
             print(f"{label}, {lookup} lookup: differs at R in {by_rows[:40]}"
                   f"{' ...' if len(by_rows) > 40 else ''}; worst R {worst[0]} ({worst[1]}-row plan, {worst[2]}): "
                   f"{worst[3]}/{worst[4]} rows, max |d| {worst[5]:.3g}", flush=True)
+
+    # 3b. block-FP8 wq_b with serving's (smallest-capacity) lookup
+    def fp8(x, cap):
+        spec, = fp8_plans[cap].scratch_specs()
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=device)
+        out = torch.empty((x.shape[0], 11264, 1), dtype=torch.bfloat16, device=device)
+        bfl.run(binding=bfl.bind(fp8_plans[cap], scratch=scratch, source=x.contiguous(),
+                                 packed_weight=wq_b_packed, output=out))
+        return out[:, :, 0]
+
+    target = rows_of(json_gates, target_name, 1280)
+    T = target.shape[0]
+    pool = torch.cat([rows_of(g, n, 1280) for g in (json_gates, prose_gates) for n in names
+                      if g[n]["taken"] and not (g is json_gates and n == target_name)])
+    alone = torch.cat([fp8(target[i:i + 1], 1) for i in range(T)])
+    bad = []
+    for rows in R:
+        cap = new_cap(rows)
+        if rows < T:
+            cases = [("start", target[:rows], 0, rows)]
+        else:
+            n = rows - T
+            nb = pool[(rows * 7) % max(1, pool.shape[0] - n):][:n]
+            cases = [(pos, torch.cat([nb[:k], target, nb[k:]]), k, T)
+                     for pos, k in (("start", 0), ("middle", n // 2), ("end", n))]
+        for pos, batch, k, t in cases:
+            out = fp8(batch, cap)[k:k + t]
+            if not torch.equal(out, alone[:t]):
+                d = (out.float() - alone[:t].float()).abs()
+                bad.append((rows, cap, pos, int((d > 0).any(1).sum()), t, d.max().item()))
+    torch.cuda.synchronize()
+    if bad:
+        worst = max(bad, key=lambda b: b[5])
+        print(f"wq_b (block FP8), serving lookup: differs from rows alone at R in "
+              f"{sorted({b[0] for b in bad})[:40]}; worst R {worst[0]} ({worst[1]}-row plan, {worst[2]}): "
+              f"{worst[3]}/{worst[4]} rows, max |d| {worst[5]:.3g}", flush=True)
+        same = sorted({new_cap(r) for r in R} - {b[1] for b in bad})
+        print(f"  capacities whose rows all equal the rows alone: {same}", flush=True)
+    else:
+        print("wq_b (block FP8), serving lookup: every target row equals the row alone at every R and position",
+              flush=True)
 
     # 4. kernel time per call, inside CUDA graphs
     session.freeze()
