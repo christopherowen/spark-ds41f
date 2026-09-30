@@ -89,11 +89,19 @@ r5m_dbg["container"]["mounts"].append(
 )
 r5m_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
 
+# Bisection with the side-stream overlap kept: synchronous Engram rows, and
+# no L2 weight prefetch.
+detslice_noeng = copy.deepcopy(detslice)
+detslice_noeng["environment"]["SPARK3_ENGRAM_ASYNC"] = "0"
+detslice_nol2 = copy.deepcopy(detslice)
+detslice_nol2["environment"]["VLLM_DS41_L2_PREFETCH"] = "0"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
                      ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
                      ("detslice-priv", detslice_priv), ("detslice-eager", detslice_eager),
-                     ("r5m-dbg", r5m_dbg)):
+                     ("r5m-dbg", r5m_dbg), ("detslice-noeng", detslice_noeng),
+                     ("detslice-nol2", detslice_nol2)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)
