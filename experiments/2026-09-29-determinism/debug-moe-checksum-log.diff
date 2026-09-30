@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..c53a2faf18
+index 0000000000..6e1e618b88
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,200 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -113,6 +113,59 @@ index 0000000000..c53a2faf18
 +    log.append(slot)
 +
 +
++_captures: dict[int, dict] = {}
++
++
++def capture_first_mismatch(owner, first, second, tensors, weights) -> None:
++    """Keep exact copies of ``tensors`` from the first call where ``first`` != ``second``.
++
++    Device-side and graph-safe: a latch keeps only the first mismatch, a
++    counter counts all of them, and the tags log count stamps the moment.
++    ``weights`` are copied to the host at dump time for layers that captured.
++    """
++    entry = _captures.get(id(owner))
++    if entry is None:
++        log = _logs["tags"]
++        entry = _captures[id(owner)] = {
++            "name": log.names[log.slot(owner)],
++            "buffers": {k: torch.zeros_like(v) for k, v in tensors.items()},
++            "latch": torch.zeros((), dtype=torch.bool, device=first.device),
++            "mismatches": torch.zeros((), dtype=torch.int64, device=first.device),
++            "calls": torch.zeros((), dtype=torch.int64, device=first.device),
++            "at": torch.zeros(1, dtype=torch.int64, device=first.device),
++            "weights": weights,
++        }
++    differs = torch.ne(first, second).any()
++    take = differs & ~entry["latch"]
++    entry["latch"] |= differs
++    entry["mismatches"] += differs
++    entry["calls"] += 1
++    for key, source in tensors.items():
++        buffer = entry["buffers"][key]
++        buffer.copy_(torch.where(take, source, buffer))
++    entry["at"].copy_(torch.where(take, _logs["tags"].count, entry["at"]))
++
++
++def _dump_captures(rank: int, count: int) -> None:
++    if not _captures:
++        return
++    out = {}
++    with_weights = 0  # weights only for the first few latched layers (~4 MB each)
++    for entry in _captures.values():
++        latched = bool(entry["latch"].item())
++        keep_weights = latched and with_weights < 4
++        with_weights += keep_weights
++        out[entry["name"]] = {
++            "latched": latched,
++            "mismatches": int(entry["mismatches"].item()),
++            "calls": int(entry["calls"].item()),
++            "at": int(entry["at"].item()),
++            "buffers": {k: v.cpu() for k, v in entry["buffers"].items()} if latched else {},
++            "weights": {k: v.cpu() for k, v in entry["weights"].items()} if keep_weights else {},
++        }
++    torch.save(out, os.path.join(DIRECTORY, f"rank{rank}-captures-{count}.pt"))
++
++
 +def _watch() -> None:
 +    rank = (
 +        torch.distributed.get_rank()
@@ -147,6 +200,8 @@ index 0000000000..c53a2faf18
 +                             "names": list(log.names)},
 +                            os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
 +                        )
++                if kind == "dump" and "tags" in _logs:
++                    _dump_captures(rank, int(_logs["tags"].count.item()))
 +            except Exception as error:  # debug tool: report, keep watching
 +                print(f"checksum_debug {kind} failed: {error!r}", flush=True)
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
@@ -198,7 +253,7 @@ index a2a2495318..cb602b0a22 100644
              if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
                  self._output[self._output_idx] = self._run_in_aux_stream(
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 3cc704baae..854020b311 100644
+index 3cc704baae..a0ed708028 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -6,7 +6,10 @@ from inspect import signature
@@ -212,7 +267,7 @@ index 3cc704baae..854020b311 100644
  import torch.nn as nn
  
  import vllm.envs as envs
-@@ -158,10 +161,105 @@ class DeepseekV4MLP(nn.Module):
+@@ -158,10 +161,119 @@ class DeepseekV4MLP(nn.Module):
          else:
              self.act_fn = SiluAndMul()
  
@@ -287,8 +342,22 @@ index 3cc704baae..854020b311 100644
 +        second = self.__dict__.setdefault("_down_second", {})
 +        if rows not in second:
 +            second[rows] = torch.empty_like(down)
++        capture = rows == 6 and scratch is not None
++        if capture:
++            first_scratch = self.__dict__.get("_first_scratch")
++            if first_scratch is None or first_scratch.numel() != scratch.numel():
++                first_scratch = self._first_scratch = torch.empty_like(scratch)
++            first_scratch.copy_(scratch)
 +        _block32_linear(act, second[rows], self.down_proj.b12x_key, scratch)
 +        checksum_debug.record_tag(self, 7, second[rows])
++        if capture:
++            checksum_debug.capture_first_mismatch(
++                self, down, second[rows],
++                {"act": act, "first": down, "second": second[rows],
++                 "first_scratch": self._first_scratch, "second_scratch": scratch},
++                {"values": self.down_proj.b12x_weight.weight.values,
++                 "scale_rows": self.down_proj.b12x_weight.weight.scale_rows},
++            )
 +        checksum_debug.record_tag(self, 8, act)
 +        checksum_debug.record_tag(self, 9, down)
 +        alpha = dense_gemm._ALPHA_ONE_CACHE.get(("cuda", act.device.index))
