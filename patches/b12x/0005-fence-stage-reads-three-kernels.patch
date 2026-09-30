@@ -1,0 +1,94 @@
+From 6e4da1fbc5b12340adf3390a6596f24a4842ad87 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 09:37:44 +0200
+Subject: [PATCH] fix: fence generic stage reads before TMA refills in three
+ more kernels
+
+The BF16 prefill projection, the mHC TF32 and BF16 prefill projections
+and the contiguous attention forward read each TMA-filled stage through
+the generic proxy (ldmatrix, LDS) and release it with an mbarrier
+arrive. In source the MMAs consume those reads before the release, but
+the compiler schedules the MMAs after it: the sm_121a SASS of the
+compiled r5m kernels issues the empty-barrier arrive with four or five
+shared loads of the stage still outstanding (no scoreboard wait between
+them and the arrive), the same state the dense GEMM was in before its
+fence. The release does not order those reads against the async-proxy
+refill it permits.
+
+Fence the async proxy before each of these stage releases, as the
+dense GEMM now does.
+---
+ b12x/attention/_shared/contiguous/forward.py | 6 ++++++
+ b12x/gemm/bf16_gemv/_prefill.py              | 5 +++++
+ b12x/norm/mhc/_kernels.py                    | 8 ++++++++
+ 3 files changed, 19 insertions(+)
+
+diff --git a/b12x/attention/_shared/contiguous/forward.py b/b12x/attention/_shared/contiguous/forward.py
+index 5eafa965..8d600bfb 100644
+--- a/b12x/attention/_shared/contiguous/forward.py
++++ b/b12x/attention/_shared/contiguous/forward.py
+@@ -1095,6 +1095,11 @@ class ContiguousAttentionForwardKernel:
+             smem_thr_copy_Q,
+             smem_thr_copy_K,
+         )
++        # The last ldmatrix reads of the K (and below, V) stage can still be in
++        # flight here: the compiler may schedule the consuming MMAs after the
++        # release. The refill the release permits is an async-proxy (TMA)
++        # write, which the release does not order.
++        cute.arch.fence_proxy("async.shared", space="cta")
+         pipeline_k.consumer_release(kv_consumer_state)
+ 
+         mask_fn(acc_S, n_block=n_block)
+@@ -1127,6 +1132,7 @@ class ContiguousAttentionForwardKernel:
+             ) if const_expr(is_first_n_block) else None,
+             valid_k=seqlen.seqlen_k - n_block * self.tile_n,
+         )
++        cute.arch.fence_proxy("async.shared", space="cta")
+         pipeline_v.consumer_release(kv_consumer_state)
+         kv_consumer_state.advance()
+         return kv_consumer_state
+diff --git a/b12x/gemm/bf16_gemv/_prefill.py b/b12x/gemm/bf16_gemv/_prefill.py
+index b726b480..accea13d 100644
+--- a/b12x/gemm/bf16_gemv/_prefill.py
++++ b/b12x/gemm/bf16_gemv/_prefill.py
+@@ -321,6 +321,11 @@ class Bf16PrefillKernel:
+                     smem_thr_copy_A,
+                     smem_thr_copy_B,
+                 )
++                # The warp's last ldmatrix reads of this stage can still be in
++                # flight here: the compiler may schedule the MMAs that consume
++                # them after the release. The refill the release permits is an
++                # async-proxy (TMA) write, which the release does not order.
++                cute.arch.fence_proxy("async.shared", space="cta")
+                 load_pipeline.consumer_release(consumer_state)
+                 consumer_state.advance()
+ 
+diff --git a/b12x/norm/mhc/_kernels.py b/b12x/norm/mhc/_kernels.py
+index b4400db1..ed637f79 100644
+--- a/b12x/norm/mhc/_kernels.py
++++ b/b12x/norm/mhc/_kernels.py
+@@ -2511,6 +2511,9 @@ class MHCPrefillBf16ProjectTmaKernel:
+                     smem_thr_copy_A,
+                     smem_thr_copy_B,
+                 )
++                # Generic-proxy stage reads before the TMA refill; see the
++                # TF32 projection's release below.
++                cute.arch.fence_proxy("async.shared", space="cta")
+                 load_pipeline.consumer_release(consumer_state)
+                 consumer_state.advance()
+ 
+@@ -2990,6 +2993,11 @@ class MHCPrefillTf32ProjectTmaKernel:
+                                 )
+                                 acc[warp_mma_n, column] = Float32(0)
+                                 acc_low[warp_mma_n, column] = Float32(0)
++                # The stage's last shared loads can still be in flight here:
++                # the compiler may schedule the MMAs that consume them after
++                # the release. The refill the release permits is an async-proxy
++                # (TMA) write, which the release does not order.
++                cute.arch.fence_proxy("async.shared", space="cta")
+                 load_pipeline.consumer_release(consumer_state)
+                 consumer_state.advance()
+ 
+-- 
+2.43.0
+

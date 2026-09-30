@@ -48,6 +48,18 @@ CuTe compile-cache integrity check (#418, `2fca4df8`).
   stress, no serving cost. 0001-0004 on the base yield patch head `8d08c583`
   and tree `693aaed5`.
 
+- `0005-fence-stage-reads-three-kernels.patch` adds the same fence to the
+  TMA-refilled stage releases of the BF16 prefill projection, the mHC TF32
+  and BF16 TMA prefill projections and the contiguous attention forward. Their
+  source consumes the stage's loads before the release, but the compiled code
+  issues the arrive with four or five shared loads still pending (a scoreboard
+  dataflow over the SASS). Beside co-resident kernels the mHC TF32 projection
+  returned wrong outputs in 609/12000 calls and the BF16 prefill projection in
+  up to 45/12000, none fenced; the attention fence is preventive. From
+  `experiments/2026-09-30-proxy-fence-audit`, qualified in
+  `experiments/2026-09-30-r5o`. 0001-0005 on the base yield patch head
+  `bb40849f` and tree `1a8b9401`.
+
 Not in the series: the W4A8 tiny-decode `swiglu_limit` fix
 (`experiments/2026-09-23-karmic-kraken-reference/patches/b12x/0002-tiny-decode-swiglu-limit.patch`)
 is an upstream contribution. The promoted runtime disables tiny decode instead
