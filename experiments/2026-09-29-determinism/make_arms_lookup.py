@@ -47,7 +47,11 @@ det-variant files with a deterministic single row kept off the M=1
 materialized launch). detm-r5o-final-wide-trace is that arm with attn-exact3
 (debug-attn-exact3.diff on attn-exact2: calls of 65-1088 rows, a long prefill,
 go to separate wide logs that decode steps never overwrite; the schedule log
-holds 1088 rows per step and 1024 steps).
+holds 1088 rows per step and 1024 steps). vllm-0031-reduce-scatter-rank-order-batch-invariant.patch
+(overlay gemv-lookup-mhc-bi-fp8-rs: 0027-0031) adds each row's partials of the
+TP reduce-scatter in rank order in batch-invariant mode; prefill sequence
+parallelism reduce-scatters twice per layer: detm-r5o-rs-trace (the wide trace
+arm with it) and detm-r5o-bi-rs-pin (performance).
 """
 import copy
 import json
@@ -123,6 +127,15 @@ for f in DET:
 detm_variant2_pin["environment"].update(detm_pin["environment"])
 final_trace = traced(detm_variant2_pin, 1790, overlay="attn-exact2", lookup="gemv-lookup-mhc-bi-fp8")
 final_trace["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
+RS = "distributed/device_communicators/cuda_communicator.py"
+
+
+def with_rs(arm):
+    arm = copy.deepcopy(arm)
+    mount(arm, f"gemv-lookup-mhc-bi-fp8-rs/vllm/{RS}", f"{VLLM}/{RS}")
+    return arm
+
+
 final_wide = traced(detm_variant2_pin, 1790, overlay="attn-exact3", lookup="gemv-lookup-mhc-bi-fp8")
 final_wide["environment"].update(
     VLLM_DS41_BATCH_INVARIANT="1", SPARK3_MOE_CHECKSUM_WIDE_ROWS="1088",
@@ -148,6 +161,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("r5o-lookup-mhc-variant-pin", r5o_lookup_mhc_variant),
                   ("detm-r5o-final-trace", final_trace),
                   ("detm-r5o-final-wide-trace", final_wide),
+                  ("detm-r5o-rs-trace", with_rs(final_wide)), ("detm-r5o-bi-rs-pin", with_rs(bi_full_pin)),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
