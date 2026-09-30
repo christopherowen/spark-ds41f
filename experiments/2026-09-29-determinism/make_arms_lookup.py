@@ -28,7 +28,10 @@ carry no debug overlay or logging. detm-r5o-lookup-variant-exact and
 detm-r5o-lookup-mhc-variant-exact are the second trace arm with attn-exact
 (attn-probe with exact per-row fingerprints in place of sums and the fused
 projection's raw q and kv latents), without and with the mHC fix
-(vllm-0028-mhc-smallest-capacity.patch, overlay gemv-lookup-mhc).
+(vllm-0028-mhc-smallest-capacity.patch, overlay gemv-lookup-mhc). Their KV
+caches are 1.5 GiB smaller than r5o's: the exact fingerprints' temporaries in
+the captured graphs pushed the first boots of both below dgx1's startup guard
+during graph capture.
 """
 import copy
 import json
@@ -98,9 +101,9 @@ mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),
-                  ("detm-r5o-lookup-variant-exact", traced(detm_variant_pin, 768, overlay="attn-exact")),
+                  ("detm-r5o-lookup-variant-exact", traced(detm_variant_pin, 1536, overlay="attn-exact")),
                   ("detm-r5o-lookup-mhc-variant-exact",
-                   traced(detm_variant_pin, 768, overlay="attn-exact", lookup="gemv-lookup-mhc")),
+                   traced(detm_variant_pin, 1536, overlay="attn-exact", lookup="gemv-lookup-mhc")),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
