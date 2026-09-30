@@ -64,9 +64,18 @@ detslice_dbg["container"]["mounts"].append(
 )
 detslice_dbg["environment"]["SPARK3_MOE_CHECKSUM_DIR"] = "/cache/kkref/moe-checksums"
 
+# Diagnostic: the checksum arm with a private scratch tensor for the shared
+# experts instead of the arena lease (aliasing vs kernel nondeterminism).
+detslice_priv = copy.deepcopy(detslice_dbg)
+detslice_priv["container"]["mounts"].append(
+    ["{home}/spark3-overlay/moe-checksum/shared_experts.py", f"{RUNNER}/shared_experts.py", "ro"]
+)
+detslice_priv["environment"]["SPARK3_PRIVATE_SHARED_SCRATCH"] = "1"
+
 for name, config in (("det", det), ("detsk", detsk), ("detfast", detfast),
                      ("detfast-t", detfast_t), ("detslice", detslice),
-                     ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg)):
+                     ("detslice-noovl", detslice_noovl), ("detslice-dbg", detslice_dbg),
+                     ("detslice-priv", detslice_priv)):
     path = E / f"cluster-{name}.json"
     path.write_text(json.dumps(config, indent=2) + "\n")
     print("wrote", path)

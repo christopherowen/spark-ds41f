@@ -171,6 +171,32 @@ index 8a47192e13..9408ff63d5 100644
          if reduce_scatter_rows is not None:
              return self._reduce_scatter_final_output(
                  shared_output,
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index a2a2495318..cb602b0a22 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -3,6 +3,8 @@
+ from collections.abc import Callable
+ from enum import IntEnum
+ 
++import os
++
+ import torch
+ 
+ import vllm.envs as envs
+@@ -228,6 +230,12 @@ class SharedExperts(torch.nn.Module):
+ 
+         assert self._output[self._output_idx] is None
+ 
++        if workspace is not None and os.environ.get("SPARK3_PRIVATE_SHARED_SCRATCH") == "1":
++            # Debug only: a private scratch tensor instead of the arena lease,
++            # to tell scratch aliasing from kernel nondeterminism.
++            workspace = torch.empty_like(workspace)
++            if self._stream is not None:
++                workspace.record_stream(self._stream)
+         with use_preallocated_workspace(workspace):
+             if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+                 self._output[self._output_idx] = self._run_in_aux_stream(
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
 index 3cc704baae..ad35c77a53 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py

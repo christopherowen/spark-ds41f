@@ -1,12 +1,13 @@
 #!/bin/bash
-# usage: run7.sh   (on dgx1, deployment checkout at this experiment's commit, after overlay.sh
-#                  and the moe-checksum overlay)
+# usage: run7.sh [ARM]   (on dgx1, deployment checkout at this experiment's commit, after
+#                        overlay.sh and the moe-checksum overlay; ARM defaults to detslice-dbg)
 # Boots detslice-dbg (debug MoE checksum log), sends one request twice, dumps
 # every rank's log, copies them to results, then restores r5m.
 set -uo pipefail
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-29-determinism
-out=results/private/determinism/checksums
+ARM=${1:-detslice-dbg}
+out=results/private/determinism/checksums-$ARM
 mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
@@ -18,8 +19,8 @@ stop_all
 for n in dgx1 dgx2 dgx3; do
   ssh -n "$n" "rm -f ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/dump ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/reset ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/rank*.pt 2>/dev/null; true"
 done
-log "start detslice-dbg"
-bin/spark3 --cluster-config $E/cluster-detslice-dbg.json cluster start --replace --apply | grep -v 'docker run'
+log "start $ARM"
+bin/spark3 --cluster-config $E/cluster-$ARM.json cluster start --replace --apply | grep -v 'docker run'
 dump() {
   for n in dgx1 dgx2 dgx3; do
     ssh -n "$n" "docker exec dsv41-karmic-kraken sh -c 'mkdir -p /cache/kkref/moe-checksums; touch /cache/kkref/moe-checksums/dump'"
