@@ -527,3 +527,281 @@ modulo a prime) in place of the sums, to find where the prose and Engram
 divergences really begin; batch-invariant replacements for the torch-backend
 GEMVs (index head weights, ratio-1 compressor); and the drafter's
 fixed-schedule difference.
+
+
+## Round 14: exact fingerprints and batch invariance (`run32`-`run44`, r5o)
+
+Round 13's first differences rested on per-row sums, which fail both ways:
+flipped low bits can cancel, and `torch.sum` picks its reduction by tensor
+shape, so identical rows sum differently in batches of different sizes (the
+"wq_b difference" was this; the recompute probe had found wq_b invariant).
+From here every checksum is an exact per-row fingerprint: the row's bit
+patterns, position-weighted, modulo a prime below 2^24, in one Triton launch
+(`fingerprint_gpu_check.py`: matches the torch reference in 64 of 64 cases,
+detects each flipped value, replays identically from a CUDA graph). The
+torch-op version multiplied graph nodes and pushed boots below dgx1's
+startup guard; the exact trace arms also run with 0.45 GiB of KV cache (just
+above the 0.43 GiB one 262K-token request needs).
+
+### Causes, each replayed and fixed
+
+| Cause | Fix | Evidence |
+|---|---|---|
+| mHC `pre`/`post_pre` took the exact count, else the 4096 plan (TF32 TMA, split K by 4) | `vllm-0028-mhc-smallest-capacity.patch` | `mhc_serving_replay.py`: pre invariant 3-192 rows, post_pre 3-72; before, unprepared counts grouped with the 4096 plan |
+| BF16-output GEMVs (index head weights, index key, ratio-1 compressor) on the torch backend: cuBLAS switches kernels by M (index weights at 16/17, index key at 64/72) | `vllm-0029-gemv-batch-invariant-backend.patch`: SIMT below 256 rows under `VLLM_DS41_BATCH_INVARIANT=1` | `gemv_backend_replay.py`: SIMT invariant 19-192; index key default split at 64/72 |
+| Block-FP8 Engram projection: 1- to 6-row plans split K four ways | `vllm-0030-block-fp8-no-split-k-batch-invariant.patch`: one slice under the same variable | `engram_wkv_replay.py`: 6-row target alone differed from 7-512 |
+| Deterministic MoE: the M=1 materialized launch is not repeatable | `0009-moe-deterministic-single-row.patch` (determinism series) | `moe_position_replay.py`: 256 calls, one group, all repeat |
+| Prefill sequence parallelism (from 205 tokens): NCCL's reduce-scatter adds a row's partials in an order set by its owning rank and the message size | `vllm-0031-reduce-scatter-rank-order-batch-invariant.patch`: an all-to-all and the one-shot all-reduce's float32 rank-order sum, under the same variable | wide trace below: first difference at exactly the first row whose owner changed; with 0031, one output over 998-1040-row prefills |
+
+Ruled out by probes: the sparse-attention kernel is row-independent
+(`debug-attn-probe2.diff`: each of a step's first rows recomputed alone equals
+the batched row, 3,886 of 3,886 layer-steps); its split count is fixed per
+plan for DS4.1; the MoE is invariant at every position of 2- to 8- and
+28-row batches, with random and shared-expert neighbours.
+
+### Traces
+
+- Trace 3 (GEMV and MoE fixes, exact): layer 0 bit-identical between solo and
+  mixed prefills; JSON first differs at layer 1 (mHC residual), prose at layer
+  20's compressor latent (the index head weights at layers 2-14 differ but do
+  not propagate: a short prompt selects all its compressed entries).
+- Trace 4 (+ mHC): JSON prefill bit-identical at every layer; remaining
+  differences start in torch-backend GEMVs.
+- Trace 5 (+ SIMT): 12 of 12 mixed JSON runs one output, 11 of 12 prose; solo
+  differs at small decode steps (Engram split-K).
+- Trace 6 (+ block-FP8 without split-K): one output per prompt in all 30 runs.
+  `analyze_trace3.py` matches target rows across runs by (position, input
+  token), comparing a row only where its whole prefix is the accepted text and
+  it was not a DSpark dead row (computed for shape, experts skipped, verified
+  again later): every compared row bit-identical in every recorded main-model
+  tensor, on all three ranks (7,266 rows per rank, 44 run pairs), and no row
+  computed twice in a run differs.
+
+### Performance of the five fixes (`run36`, one boot per arm, pinned cost table `5dc8961a`)
+
+`run36.sh`, same method as round 13 (`tables_lookup.py` with run36's arms; cost
+table SHA-256 `5dc8961a` loaded at every boot). "Always-on fixes" is r5o with
+0027, 0028 and b12x-0006; the last arm is the deterministic MoE (0004-0009)
+with all five fixes and `VLLM_DS41_BATCH_INVARIANT=1`.
+
+| Point | r5o | + always-on fixes | det. MoE | det. + all + BI |
+|---|---|---|---|---|
+| prose c1 tps | 50.50 ±3.7% | 50.05 ±3.8% | 51.76 ±0.4% | 50.46 ±0.3% |
+| step ms | 42.75 | 42.18 | 43.18 | 43.30 |
+| verified / accepted | 3.239 / 1.247 | 3.243 / 1.197 | 3.336 / 1.327 | 3.339 / 1.277 |
+| JSON c1 tps | 76.94 ±2.8% | 76.66 ±2.1% | 73.83 ±0.4% | 76.92 ±0.5% |
+| step ms | 48.61 | 48.30 | 48.18 | 48.28 |
+| verified / accepted | 4.540 / 2.956 | 4.521 / 2.926 | 4.391 / 2.754 | 4.462 / 2.938 |
+| prose c8 tps | 161.69 ±0.8% | 162.69 ±1.9% | 164.45 ±3.3% | 163.40 ±1.9% |
+| verified / accepted | 2.417 / 1.226 | 2.409 / 1.220 | 2.244 / 1.125 | 2.333 / 1.196 |
+| JSON c8 tps | 232.19 ±3.3% | 235.25 ±2.2% | 220.48 ±1.8% | 228.53 ±3.8% |
+| verified / accepted | 3.519 / 2.873 | 3.499 / 2.868 | 3.549 / 2.934 | 3.522 / 2.902 |
+
+- Always-on fixes against r5o: -0.9% to +1.3%, every point inside its
+  interval; step time 0.3-0.6 ms lower at one stream.
+- Batch-invariant deterministic arm against r5o: -1.6% to +1.1% (JSON c8 the
+  only loss, inside both intervals). Against the deterministic MoE alone its
+  step time is 0.1 ms higher at one stream: that is the cost of SIMT GEMVs and
+  one-slice Engram projections. Its throughput moves with acceptance (its own
+  text), as in round 13.
+- Short prompts (7-68 tokens, prefill plus one step, median of seven): r5o
+  149-171 ms; always-on fixes 4-7 ms faster at every length; the deterministic
+  MoE 2-5 ms slower than r5o; the batch-invariant arm 3-8 ms faster than r5o
+  (the exact-or-max lookups had sent unprepared prefill sizes to the 4096-row
+  plans). One boot per arm.
+
+### Final validation (`run40`, `detm-r5o-final-trace`: 0027-0030, b12x-0006, 0004-0009, `VLLM_DS41_BATCH_INVARIANT=1`)
+
+Five mixes, three repeats, 128 tokens: JSON 15 of 15 runs one output, prose 15
+of 15. A third target, `long` (998 prompt tokens), gave 7 outputs in 15 runs,
+and its first token's logprob already differed: its output is a function of
+the prefill step's row count alone (998 rows solo; 1009, 1010, 1019, 1021,
+1035, 1040 beside background decodes; equal counts gave equal outputs, even in
+different mixes). The traces fingerprint at most 64 rows per call, so the
+prefill left no records.
+
+### Long prefills: sequence parallelism's reduce-scatter (`run41`)
+
+- `prefill_replay.py` (checkpoint weights, a 998-row target alone and behind or
+  ahead of 1-1000 rows): the V4.1 GEMVs, the block-FP8 query and Engram
+  projections and all three mHC operations are invariant from 998 to 1062 rows
+  (the index head weights on cuBLAS change from 1126 rows). `moe_prefill_replay.py`:
+  the deterministic MoE through serving's one plan is invariant from 998 to 1998
+  rows. (With every prepared count warm, the 1536-row variant does not even
+  repeat; serving does not warm it.)
+- A prefill of T tokens from 205 (serving log; where the hidden-state message outgrows
+  the fixed-order RoCE all-reduce) runs sequence-parallel (`sp_prefill.py`):
+  each rank owns ceil(T/3) rows for the row-wise work, and the WO and MoE
+  outputs are reduce-scattered (NCCL) instead of all-reduced. NCCL adds the
+  three partials of a chunk in an order that depends on the receiving rank
+  (ring rotation) and the message size, so a row that changes owner changes bits.
+- `debug-attn-exact3.diff` (overlay `attn-exact3`) sends calls of 65-1088 rows
+  to separate wide logs that decode steps never overwrite. With it
+  (`detm-r5o-final-wide-trace`, 10 long runs, 4 tokens), on all three ranks:
+  repeats with equal T match in every row; against solo, the first differing
+  row is exactly the first target row whose owner changed (ceil(T/3) minus the
+  target's offset: 326, 325, 319, 308, 305 for T = 1009, 1010, 1019, 1035,
+  1040), every earlier row matches in every record, and the first record to
+  differ is layer 0's MoE input, the first gathered tensor after WO's
+  reduce-scatter; attention output before it matches.
+- `vllm-0031-reduce-scatter-rank-order-batch-invariant.patch`: under
+  `VLLM_DS41_BATCH_INVARIANT=1` the TP reduce-scatter exchanges the chunks
+  (grouped NCCL send/recv on the same communicator, the same bytes) and adds
+  them locally in rank order. Its first version (`run42`, overlay
+  `gemv-lookup-mhc-bi-fp8-rs`) rounded after each BF16 add; the published one
+  (`-rs2`, below) adds as the one-shot all-reduce does. Host tests with three
+  simulated ranks: rank-order sums, one row's partials at every position of
+  two batch sizes reduce to one bit pattern, and per-add rounding is
+  distinguishable (3/3). Base: r5o's vLLM tree (`c108cd6d`); it touches only
+  `cuda_communicator.py` and applies with or without 0027-0030. Quality: a
+  different rounding of the same sums in batch-invariant mode, none
+  otherwise. Not proposed upstream.
+
+### Validation with 0031 (`run42`, `detm-r5o-rs-trace`: the final arm plus 0031, wide logs)
+
+Five mixes, three repeats, 128 tokens:
+
+| Target | Runs | Outputs | Prefill rows seen | Rows compared bitwise per rank (22 run pairs) | Differences |
+|---|---|---|---|---|---|
+| JSON (19 tokens) | 15 | 1 | 19, 28, 32, 40, 48 | 3,550 | 0 |
+| prose (15 tokens) | 15 | 1 | 15, 24, 27, 39, 48 | 3,690 | 0 |
+| long (998 tokens) | 15 | 1 | 998, 1009, 1010, 1018, 1019, 1021, 1035, 1038, 1040 | 25,139 | 0 |
+
+The long target's first logprob is -0.143140 in all 15 runs; on all three
+ranks every recorded main-model tensor of every compared row (prefill rows
+included) matches, and no row computed twice in a run differs. Its text
+differs from run40's solo text: 0031 adds in another (fixed) order than NCCL's
+ring did for these rows.
+
+Performance (`run42.sh`, `tables_rs.py`: one boot per arm, pinned cost table
+`5dc8961a` at every boot, three decode samples, cold prefill of real text with
+three repeats). The last two arms differ only by 0031.
+
+| Point | r5o | det. + all fixes + BI | + 0031 |
+|---|---|---|---|
+| prose c1 tps (step ms) | 50.85 ±6.0% (42.48) | 49.34 ±9.3% (44.29) | 50.43 ±0.6% (43.28) |
+| JSON c1 tps (step ms) | 77.95 ±3.0% (48.45) | 77.11 ±0.2% (48.30) | 77.21 ±0.2% (48.25) |
+| prose c8 tps | 162.39 ±3.6% | 165.66 ±1.7% | 194.97 ±0.2% |
+| JSON c8 tps | 234.72 ±7.8% | 229.33 ±1.1% | 285.11 ±0.7% |
+| prefill 1024 tok/s (TTFT s) | 2154 ±16.3% (0.44) | 2102 ±15.5% (0.45) | 2072 ±20.7% (0.46) |
+| prefill 4096 | 3861 ±6.3% (0.97) | 3891 ±3.7% (0.96) | 3792 ±4.8% (0.99) |
+| prefill 16384 | 3820 ±3.0% (3.86) | 3772 ±5.7% (3.90) | 3735 ±1.4% (3.94) |
+| prefill 65536 | 3857 ±0.4% (15.01) | 3828 ±1.7% (15.12) | 3765 ±1.1% (15.37) |
+
+- One stream: the batch-invariant arms are within 1% of r5o with 0031 (-0.8%,
+  -0.9%), inside r5o's intervals.
+- Prefill: 0031 costs 1.0-2.5% against the same arm without it; the whole
+  batch-invariant stack is 1.8-3.8% below r5o (at 65536 tokens -2.4%,
+  15.37 against 15.01 s, the only difference outside both intervals).
+- Eight streams: the bench sends eight copies of one prompt. With batch
+  invariance the copies write the same text (r5o: 24 distinct outputs over 24
+  requests; without 0031: 6 per sample; with it: 2), so their rows route to
+  the same experts and the MoE does less work: the +20-22% at eight streams
+  is that, not a speedup for varied traffic.
+
+### The next divergence: small and large steps (`run42` bench, `run43`)
+
+With 0031, each eight-stream sample still gives two texts, and the split is
+by prefill: one stream (time to first token 0.20 s) was prefilled alone in a
+small step and writes one text; the seven prefilled together (0.52-0.56 s, one
+sequence-parallel step of about 460 rows) write the other, in every sample.
+The alone-prefilled stream also differs from the one-stream output, because
+its first decode rows ran inside the others' large step. A row computed in a
+small step (graph sizes: SIMT GEMVs, lagged mHC plans, the MoE's graph-size
+variants, decode attention) does not equal the same row computed in a large
+step (the GEMV prefill kernel, TF32 mHC, the MoE's 4096-token variant, extend
+attention, the reduce-scatter). The traced targets never crossed: short
+prompts and every decode row stayed in small steps, the long prompt's prefill
+always ran in large ones.
+
+`c8_trace.py` (`run43`, `detm-r5o-rs-trace`) sends eight copies of an
+87-token prompt at once and treats each stream as a run, so
+`analyze_trace3.py` compares the streams' rows by position and token. Both
+rounds scheduled them alike: stream 0 prefilled alone (87 rows), stream 1
+beside stream 0's first decode rows (93 rows), streams 2-7 together with both
+streams' decode rows (534 rows, sequence-parallel). Streams 0 and 1 match in
+every record of every prompt row (87 against 93 rows); streams 2-7 match each
+other. Against stream 0, streams 2-7 first differ at position 0 in layer 0's
+WO output after its reduction, with every attention record before it equal
+(the query and KV projections, the index, the attention output), and stream
+1's first generated row (computed in the 534-row step) differs from stream 0's
+(93-row step) at the same record. The one-shot RoCE all-reduce that reduces
+steps below 205 rows adds in float32 in rank order and rounds once; 0031's
+first version rounded after each BF16 add.
+
+0031's second version (`run44`, `detm-r5o-rs2-trace`) adds the chunks that
+way (float32, rank order, one rounding; host tests 3/3, one of which shows
+per-add rounding gives other bits). The eight streams again split by prefill
+step (87 rows alone against 615 sequence-parallel), but on rank 0 WO's
+reduced output now matches between the two steps: the first difference moves
+to layer 0's router logits, and the router logits differ in every layer while
+the MoE input and the routed output mostly still match (layer 7's routed
+output is the first to follow). The router gate runs SIMT up to its 192-row
+plan and the TMA prefill kernel from 384 rows (round 13), and the two round
+differently. (Ranks 1 and 2 record WO's output after the reduce-scatter only
+for their own rows, which the analysis maps from row 0, so their WO
+comparisons do not align; rank 0's rows start at 0.)
+
+With the second version the long target stays invariant (`run44`, five
+mixes, two repeats): one output in 10 runs over prefill steps of 998-1040 rows,
+first logprob -0.152026 in each, and every compared row bit-identical on all
+three ranks (13 run pairs, 14,996 rows per rank). The performance above was
+measured with the first version; the second adds one float32 copy of the
+rank's rows per reduce-scatter and was not measured separately.
+
+### What cross-step invariance still needs
+
+The fixes make a row's bits independent of batch composition as long as the
+row is computed in the same kind of step: small steps (up to the graph sizes
+and small-plan ranges) or large prefill steps. A row computed in a small step
+still differs from the same row computed in a large one, and in live serving
+that is routine: a request's decode rows share a step with another request's
+long prefill, and identical prompts prefill in steps of different sizes.
+Every operation would need one arithmetic for every row count in
+batch-invariant mode:
+
+- router gate and ratio-2 compressor (FP32 out): SIMT up to 192 rows, the TMA
+  prefill kernel from 384 (the prefill kernel gave one result for a 998-row
+  target in batches up to 1998 rows; at 19 rows it took 35.9 us against SIMT's
+  28.2 us in round 13);
+- the BF16-output GEMVs: SIMT below 256 rows (0029), torch or the prefill
+  kernel above;
+- mHC: native with lagged prepare up to 72 rows, native 96-192, TF32 TMA from
+  384, and four K splits at 4096;
+- the MoE: the graph-size variants against the 4096-token variant (19-48 and
+  49+ rows differ in the round 13 replay);
+- attention: decode rows inside a mixed step run the extend kernels (not yet
+  traced).
+
+Each needs a replay across 1-4096 rows and a performance screen, since the
+choice trades decode or prefill speed for invariance.
+
+### Scope and limits
+
+- Demonstrated in serving: temperature-0 outputs and every traced main-model
+  tensor bit-identical across batch composition for requests of 15-998 prompt
+  tokens beside up to seven background requests (decode steps up to 48 rows,
+  prefill steps up to 1040 rows, sequence-parallel from 205 tokens), on all
+  three ranks, with every fix and `VLLM_DS41_BATCH_INVARIANT=1`, as long as
+  each row stays in the same kind of step (small, or large prefill).
+- Not invariant: the same row computed in a small step and in a large one
+  (eight identical concurrent requests give two texts); see "What cross-step
+  invariance still needs".
+- Replayed beyond that: the GEMVs, block-FP8 projections and mHC stay
+  invariant for a 998-row target up to 1998-row batches (across capacity
+  changes), except the index head weights on cuBLAS, which change from 1126
+  rows (they matter only once the indexer must choose, above 2048 context
+  tokens); the MoE through serving's plan is invariant to 1998 rows.
+- Not covered: prompts longer than the 4096-token batch budget (chunked
+  prefill, whose chunk boundaries move with the other requests' tokens);
+  prefill steps of 193-997 rows (between the small-plan ranges, where SIMT,
+  the lagged mHC plans and the MoE's graph-size variants hold, and the replayed
+  prefill range); more than eight concurrent requests.
+- Switches: 0029, 0030 and 0031 act only under `VLLM_DS41_BATCH_INVARIANT=1`;
+  the deterministic MoE (0004-0009) only under `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`.
+  0027, 0028 and b12x-0006 are unconditional: they change production numerics
+  for row counts that are not prepared plans, with no measurable cost.
+- The drafter still differs at a fixed schedule; with a batch-invariant target
+  that changes speed, not text (greedy block verification accepts the
+  target's own argmax), which the traces confirm.
+- Nothing here is promoted; promotion needs the owner's acceptance.
