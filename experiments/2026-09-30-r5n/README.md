@@ -48,7 +48,27 @@ quality 5/5, needle pass, doctor clean.
 
 Prefill (two rounds each) is within the overlay's own round-to-round spread
 (about 1% at 8K and 200K). Decode alternated overlay, r5m, overlay, r5m, six
-samples each. Everything is within the alternating spread except prose at
-eight streams, which is borderline: -1.8% against r5m's own 1.7% boot-to-boot
-spread (the second pair differs by 0.6%). Recorded as a possible small cost,
-not as none; eight-stream JSON and both step times are level.
+samples each; step times and eight-stream JSON are level.
+
+The eight-stream prose gap is not a fence measurement. Each boot profiles
+fresh adaptive-verification cost curves (`SPARK3_DSPARK_COST_DIR` unset), and
+the boots verified different amounts of draft work:
+
+| eight-stream prose | throughput | verified per draft | accepted per draft |
+|---|---|---|---|
+| overlay, first boot | 163.96 | 1.909 | 1.138 |
+| r5m, first boot | 168.93 | 1.824 | 1.130 |
+| overlay, second boot | 164.96 | 2.017 | 1.177 |
+| r5m, second boot | 165.97 | 2.019 | 1.186 |
+
+The first pair's -2.9% coincides with 4.7% more verified drafts per draft for
+the same accepted drafts; the second pair, verifying the same amount, differs
+by 0.6%. Across both pairs acceptance is 1.1575 against 1.158. How much of the
+gap comes from startup timing, changed outputs or the fence is not
+established by these receipts. Later comparisons share one pinned cost table
+(`SPARK3_DSPARK_COST_DIR`, vLLM patch 0005) with its hash recorded.
+
+Built image (`build.sh`, `run.sh`): `sha256:23b7b49d…` on all three nodes;
+`dense_gemm.py` identical to the measured overlay everywhere; LRU 5/5; needle
+3/3 at 152,914 tokens; `doctor --live` clean; display carve-out 842.5 MiB per
+rank.

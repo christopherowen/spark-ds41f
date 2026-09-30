@@ -17,9 +17,11 @@ PREV_TAG = "vllm-ds41f-kkref:04c30fa98e79-r5m"
 RESULTS = Path.home() / "projects/spark3-vllm-ds41f/results/private"
 SCREEN = (
     "Overlay screen of the shipped file against r5m: prefill chunks at 8K-200K within 0.73% "
-    "(two rounds each); decode alternating overlay, r5m twice each: step times +0.3-0.5%, "
-    "JSON at eight streams -0.1%, prose at eight streams -1.8% (r5m's own boot-to-boot "
-    "spread 1.7%; recorded as a possible small cost)."
+    "(two rounds each); decode alternating overlay and r5m twice each: step times +0.3-0.5%, "
+    "JSON at eight streams level. Prose at eight streams read -1.8%, but the first pair's "
+    "-2.9% came with 4.7% more verified drafts per draft at equal acceptance (fresh "
+    "adaptive-verification cost curves per boot) and the second pair differs by 0.6%; not "
+    "attributed to the fence."
 )
 
 
@@ -127,14 +129,14 @@ sub(cs, "| Indexer top-k ties | lowest logical position (B12X 0003): selections 
     "shared expert no longer returns wrong columns beside the routed MoE |")
 sub(cs, "Measured on r5l, which differs only by the top-k tie rule (measured neutral):",
     "Measured on r5l, which differs only by the top-k tie rule and the dense GEMM stage fence "
-    "(both measured neutral):")
+    "(neither with a measured cost):")
 rd = "README.md"
 sub(rd, "  score ties by position, so selections repeat), with B12X attention,",
     "  score ties by position, so selections repeat, and its dense GEMM fences\n"
     "  shared-memory stage reads before the TMA refill), with B12X attention,")
 sub(rd, "Measured on r5l (r5m differs only by the top-k tie rule, measured neutral) with",
     "Measured on r5l (r5n differs only by the top-k tie rule and the dense GEMM stage\n"
-    "fence, both measured neutral) with")
+    "fence, neither with a measured cost) with")
 
 # 5. TODO: record what the determinism experiment found.
 todo = Path("TODO.md")
@@ -146,10 +148,11 @@ text = text[:start] + (
     "  atomic routed-MoE combine, four-way split-K turbo, and a dense GEMM race that\n"
     "  also gave wrong shared-expert outputs (fixed in r5n). An experimental\n"
     "  deterministic mode (its 0004-0006, split-K through the FP32 reducer) repeats\n"
-    "  exactly at one stream with no single-stream cost; JSON at eight streams is\n"
-    "  about 4% slower. Before proposing it: profile that cost against r5n with\n"
-    "  verification work held fixed, try a masked top-k sum without dead-route\n"
-    "  clearing, and check repeatability across batch compositions.\n"
+    "  exactly at one stream with no single-stream cost; one unpinned eight-stream\n"
+    "  screen read JSON 3.7% slower, with verification work not held fixed. Its\n"
+    "  0008 (masked top-k sum, no dead-route clearing) matches the atomic combine\n"
+    "  within 0.4% at fixed shapes. Before proposing it: profile against r5n with\n"
+    "  one pinned cost table, and check repeatability across batch compositions.\n"
 ) + text[end:]
 start = text.index("- **Temperature-0 outputs still vary between identical requests**")
 end = text.index("\n- ", start + 10)

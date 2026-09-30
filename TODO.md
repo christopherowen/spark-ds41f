@@ -214,10 +214,15 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
 - **Cost-profile noise.** The startup cost profile takes the median of five
   replays, and is a likely source of the ~3% boot-to-boot variation. Pinned cost
   curves (0005) did not remove the sample noise.
-- **Determinism.** Temperature-0 outputs differ within one boot even at one
-  stream. Suspects: the B12X atomic-scatter MoE combine and atomic split-K.
-  `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1` fails B12X preparation. A deterministic
-  mode would make every acceptance-dependent A/B cheaper.
+- **Determinism.** `experiments/2026-09-29-determinism` found three sources: the
+  atomic routed-MoE combine, four-way split-K turbo, and a dense GEMM race that
+  also gave wrong shared-expert outputs (fixed in r5n). An experimental
+  deterministic mode (its 0004-0006, split-K through the FP32 reducer) repeats
+  exactly at one stream with no single-stream cost; one unpinned eight-stream
+  screen read JSON 3.7% slower, with verification work not held fixed. Its
+  0008 (masked top-k sum, no dead-route clearing) matches the atomic combine
+  within 0.4% at fixed shapes. Before proposing it: profile against r5n with
+  one pinned cost table, and check repeatability across batch compositions.
 
 ## Prefill and first token
 
@@ -290,12 +295,15 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Quality
 
-- **Temperature-0 outputs still vary between identical requests** (6 of 6
-  distinct at one stream). r5m's B12X 0003 made indexer selections exact
-  (`experiments/2026-09-29-topk-ties`), so the rest comes from elsewhere:
-  verification batch shapes that change with acceptance, and kernels whose
-  summation order varies. A deterministic profile would need batch-invariant
-  verify kernels; measure its cost before proposing it.
+- **Two more TMA stage-release races in r5n** (`experiments/2026-09-30-proxy-fence-audit`):
+  the mHC TF32 prefill projection (609/12000 wrong beside the routed MoE, 59 beside
+  a copy) and the BF16 GEMV prefill (up to 45/12000) release TMA-filled stages
+  with shared loads pending, like the dense GEMM before r5n; fences remove them.
+  mHC runs in every layer's prefill: qualify and promote the fix next.
+
+- **Temperature-0 outputs still vary between identical requests** on r5n: the
+  atomic MoE combine and split-K turbo change summation order run to run
+  (see the determinism item under decode).
 
 - **BF16 sparse attention** (patch 0023, off in configuration): measure its
   fidelity with a teacher-forced comparison against
