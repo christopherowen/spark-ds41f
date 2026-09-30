@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Routed-MoE combine cost at fixed verification shapes (GPU; cluster stopped).
 
-usage: moe_combine_bench.py --mode atomic|collapsed|slices [--rows 6,12,24,36,48]
+usage: moe_combine_bench.py --mode atomic|collapsed|slices|masked [--rows 6,12,24,36,48]
                             [--dead 0,0.25,0.5] [--ncu]   (cwd: the B12X checkout)
 
 DS4.1 TP3 routed MoE (384 experts, hidden 5120, intermediate 768, top 6,
 W4A8) at each verification row count, with a fraction of whole rows dead
 (top-k ids -1, as dead verification rows arrive). Modes: atomic (r5n's combine),
 collapsed (deterministic, one task per M tile), slices (deterministic, 0006's
-slice partials and 36-row top-k sum). Work is held fixed by construction: the
+slice partials and 36-row top-k sum), masked (the same with 0008's masked sum,
+from the det-masked overlay). Work is held fixed by construction: the
 same routing for every mode. For each shape, 20 calls are captured in a CUDA
 graph and replayed; the profiler splits the time between the fused MoE kernel
 and the top-k sum. --ncu makes three eager calls per shape instead, for
