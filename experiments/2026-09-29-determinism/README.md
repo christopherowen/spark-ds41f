@@ -125,4 +125,113 @@ rows per token (36 for DS4.1: six routes, six slices). Materialized launches
 the GPU tests with the cluster stopped, then screens arm `detslice` (0004-0006,
 split-K through the FP32 reducer) against r5m.
 
-Pending.
+- Decode mostly recovered. One stream: 47.8 ms per JSON step and 42.4 ms per
+  prose step against r5m's 47.4-48.0 and 41.3-41.7. Eight streams, against
+  the r5m boot between the two detslice boots: prose 164.6 and 164.0 against
+  170.4 tok/s (-3.6%), JSON 225.8 and 225.8 against 244.9 (-7.8%). Prefill
+  within +/-0.15%.
+- The combine is no longer free. The top-k sum now reads 36 rows per token:
+  7.6 us per call against 2.1 us collapsed in the one-stream traces, about
+  0.3 ms per step over 40 layers; at 48 verification rows the route-output
+  scratch is 16.9 MiB instead of 2.8 MiB. There is no eight-stream profile,
+  so the rest of the eight-stream loss is not attributed.
+- Still not deterministic: 5/5 distinct on all three prompts with split-K
+  turbo off. With the side-stream shared-expert overlap off
+  (`VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=0`, arm `detslice-noovl`) it is
+  1/5 with identical logprobs, so the remaining source runs beside the
+  routed MoE.
+
+## Round 5: bisecting the overlap (`run5.sh`-`run13.sh`)
+
+`debug-moe-checksum-log.diff` adds a debug-only device log
+(`SPARK3_MOE_CHECKSUM_DIR`): per-row sums of every MoE layer's input, shared
+and routed outputs, and inside the shared-expert MLP of its input, gate_up,
+activation and down projection. Two identical requests with dumps between
+(`run7.sh`, `analyze_requests.py`) first diverge at layer 3's shared expert
+in the first decode step: input, gate_up and activation equal on every row,
+the down projection different on every row; the all-reduce carries it to the
+other ranks.
+
+Ruled out, each still nondeterministic in serving or exact in isolation:
+private scratch for the shared expert (`detslice-priv`); fixed per-layer
+intermediates instead of caching-allocator tensors (`detslice-static`);
+synchronous Engram (`detslice-noeng`); no L2 weight prefetch
+(`detslice-nol2`); the block-FP8 linear alone, beside a matmul and under graph
+replay (`gemm_concurrency_check.py`), with poisoned scratch
+(`linear_poison_check.py`) and under compute-sanitizer initcheck/racecheck;
+the routed MoE beside the shared chain on another stream
+(`overlap_repro.py`, 30/30 exact).
+
+## Round 6: what the down projection saw (`detslice-probe`)
+
+`SPARK3_SHARED_RECOMPUTE=1` checksums the down projection's packed weights,
+scales and unit alpha, recomputes the GEMM right away into a second buffer,
+and re-reads its input and first output (`analyze_down_state.py`,
+`analyze_recompute.py`). Weights, scales and alpha never change; input and
+output are unchanged afterwards; but the recompute disagrees with the first
+result in 6-7% of six-row decode calls on every rank (never at one to five
+rows), by row sums up to 26.
+
+The first mismatch per layer is then kept bit-exact (device-side latch): the
+input, the scratch after each quantization and both outputs, plus the weights
+of a few layers (`analyze_capture*.py`).
+
+- Both scratch snapshots, the quantized input included, are identical.
+- The first result is wrong on whole columns of a few 64-column tiles, all
+  rows, most often exactly 32 of 64 (one warp's slice), by small amounts;
+  the recompute matches a float64 reference from the decoded operands to
+  1e-6.
+- Exact-operand fits name the wrong operand: the B fragment of a k tile's
+  last 32-wide sub-block taken from the same columns four k tiles later
+  (sub-block 3 from 19, 7 from 23; residual 0.010-0.030). With four stages
+  over six k tiles, k tiles 4 and 5 are the refills of the stages holding
+  k tiles 0 and 1.
+
+## Round 7: cause and fix (`run16.sh`, `run17.sh`)
+
+The dense GEMM's MMA warps read each mainloop stage through the generic proxy
+(ldmatrix, scale-factor copies) and release it right after issuing the last
+k block's copies. The refill that the release permits is a TMA write through
+the async proxy, which the release's ordering does not cover. Alone, the
+copies always finish first; when another kernel's CTAs share the SM and delay
+shared-memory traffic, a copy still in flight reads the refill. compute-
+sanitizer's racecheck does not track TMA writes, which is why it stayed clean.
+
+`gemm_race_stress.py` reproduces it in a minute with the cluster stopped: the
+serving-shaped down projection on a side stream is wrong in 20 of 12000 calls
+at six rows and 1 of 12000 at 48 rows beside the deterministic routed MoE,
+never alone or beside a bandwidth-bound copy. Serving hit it far more often
+(the shared expert is launched right as the routed MoE fills the SMs).
+`0007-gemm-fence-stage-reads-before-tma-refill.patch` fences the async proxy
+before each stage release on the TMA load path: 0 of 12000 at both sizes.
+
+This is not specific to the deterministic mode: production r5m runs the same
+GEMM beside its routed MoE, so its shared-expert outputs are sometimes wrong
+too, invisibly among the atomic-combine noise.
+
+## Round 8: 0007 in serving (`run18.sh`)
+
+Arms `detslice-fence` (0004-0007) and `r5m-fence` (r5m plus 0007), overlap on;
+`overlay_fence.sh` builds the fenced GEMM from the r5m tree.
+
+- `detslice-fence` repeats exactly: 1/5 distinct on prose, code and JSON,
+  zero logprob drift over 256, 256 and 135 tokens.
+- Lean decode screen, one boot each, three samples (the r5m arms vary more:
+  their atomic combine changes acceptance run to run):
+
+  | Arm | prose c1 step | JSON c1 step | prose c8 tok/s | JSON c8 tok/s |
+  |---|---|---|---|---|
+  | r5m (control) | 42.84 ms ±1.4% | 47.92 ms ±3.9% | 163.4 ±3.5% | 236.7 ±7.3% |
+  | `r5m-fence` | 41.52 ms ±1.1% | 48.38 ms ±2.6% | 166.0 ±6.6% | 233.7 ±8.4% |
+  | `detslice-fence` | 42.71 ms ±0.2% | 47.68 ms ±0.2% | 163.8 ±4.2% | 225.1 ±0.5% |
+
+- 0007 costs nothing measurable: step times move within noise, one each way.
+- Deterministic decode now matches r5m at one stream. At eight streams prose
+  is level and JSON is 4.9% below this control (7.8% below round 4's), the
+  0006 combine cost that remains.
+
+Next: 0007 belongs in the production series on its own (it fixes r5m's
+shared-expert outputs, not only determinism). For the deterministic mode,
+cut the combine cost before promoting it: a fixed-order in-kernel reduction
+of the six slices into one route row (back to six rows per token and the
+2.8 MiB scratch), or a masked top-k sum that skips dead routes.
