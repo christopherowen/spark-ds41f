@@ -1,9 +1,9 @@
 diff --git a/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
 new file mode 100644
-index 0000000000..27af088df7
+index 0000000000..7f203bb9ec
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/runner/checksum_debug.py
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,133 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Debug-only MoE checksum log for reproducibility investigations.
 +
@@ -108,27 +108,35 @@ index 0000000000..27af088df7
 +        if torch.distributed.is_available() and torch.distributed.is_initialized()
 +        else int(os.environ.get("RANK", "0"))
 +    )
-+    seen: dict[str, int | None] = {"reset": None, "dump": None}
++    def stamp(kind: str) -> int | None:
++        try:
++            return os.stat(os.path.join(DIRECTORY, kind)).st_mtime_ns
++        except FileNotFoundError:
++            return None
++
++    # Triggers that predate this process are stale; act only on later touches
++    # (never during startup capture, where a device read would fail).
++    seen = {kind: stamp(kind) for kind in ("reset", "dump")}
 +    while True:
 +        time.sleep(1.0)
 +        for kind in ("reset", "dump"):
++            current = stamp(kind)
++            if current is None or current == seen[kind]:
++                continue
++            seen[kind] = current
 +            try:
-+                stamp = os.stat(os.path.join(DIRECTORY, kind)).st_mtime_ns
-+            except FileNotFoundError:
-+                continue
-+            if stamp == seen[kind]:
-+                continue
-+            seen[kind] = stamp
-+            for log in list(_logs.values()):
-+                if kind == "reset":
-+                    log.count.zero_()
-+                else:
-+                    count = int(log.count.item())
-+                    rows = log.rows[: min(count, log.capacity)].cpu()
-+                    torch.save(
-+                        {"count": count, "capacity": log.capacity, "rows": rows},
-+                        os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
-+                    )
++                for log in list(_logs.values()):
++                    if kind == "reset":
++                        log.count.zero_()
++                    else:
++                        count = int(log.count.item())
++                        rows = log.rows[: min(count, log.capacity)].cpu()
++                        torch.save(
++                            {"count": count, "capacity": log.capacity, "rows": rows},
++                            os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
++                        )
++            except Exception as error:  # debug tool: report, keep watching
++                print(f"checksum_debug {kind} failed: {error!r}", flush=True)
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 index 8a47192e13..9408ff63d5 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py

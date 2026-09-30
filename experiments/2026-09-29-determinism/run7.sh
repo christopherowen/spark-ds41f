@@ -15,6 +15,9 @@ stop_all() {
   done
 }
 stop_all
+for n in dgx1 dgx2 dgx3; do
+  ssh -n "$n" "rm -f ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/dump ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/reset ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/rank*.pt 2>/dev/null; true"
+done
 log "start detslice-dbg"
 bin/spark3 --cluster-config $E/cluster-detslice-dbg.json cluster start --replace --apply | grep -v 'docker run'
 for n in dgx1 dgx2 dgx3; do
