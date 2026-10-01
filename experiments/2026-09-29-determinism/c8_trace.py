@@ -21,6 +21,8 @@ import time
 import urllib.request
 import uuid
 
+import trace_io
+
 BASE, OUT = sys.argv[1].rstrip("/"), sys.argv[2]
 
 
@@ -39,10 +41,6 @@ with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     MODEL = json.load(response)["data"][0]["id"]
 
 
-def on_nodes(command):
-    for node in NODES:
-        subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c '{command}'"],
-                       check=True, capture_output=True)
 
 
 def complete(request_id, keep):
@@ -61,8 +59,7 @@ def complete(request_id, keep):
 
 
 for m in range(ROUNDS):
-    on_nodes(f"mkdir -p {LOGDIR}; rm -f {LOGDIR}/rank*; touch {LOGDIR}/reset")
-    time.sleep(2.5)  # the watcher polls once a second
+    trace_io.reset_logs()
     tags = [f"trace-c8-m{m}-r{r}" for r in range(STREAMS)]
     targets = [{} for _ in tags]
     threads = [threading.Thread(target=complete, args=(tag, keep)) for tag, keep in zip(tags, targets)]
@@ -70,19 +67,9 @@ for m in range(ROUNDS):
         t.start()
     for t in threads:
         t.join()
-    on_nodes(f"touch {LOGDIR}/dump")
-    time.sleep(8)
+    trace_io.dump_and_wait()
     logs = os.path.join(OUT, f"logs-m{m}")
-    for node in NODES:
-        node_dir = os.path.join(logs, node)
-        os.makedirs(node_dir, exist_ok=True)
-        files = subprocess.run(
-            ["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c 'cd {LOGDIR} && ls rank*'"],
-            check=True, capture_output=True, text=True).stdout.split()
-        for f in files:
-            with open(os.path.join(node_dir, f), "wb") as handle:
-                subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken cat {LOGDIR}/{f}"],
-                               check=True, stdout=handle)
+    trace_io.fetch_logs({node: os.path.join(logs, node) for node in NODES})
     for r, (tag, target) in enumerate(zip(tags, targets)):
         run_dir = os.path.join(OUT, f"c8-m{m}-r{r}")
         os.makedirs(run_dir, exist_ok=True)

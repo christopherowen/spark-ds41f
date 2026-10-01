@@ -43,6 +43,8 @@ import time
 import urllib.request
 import uuid
 
+import trace_io
+
 BASE, OUT = sys.argv[1].rstrip("/"), sys.argv[2]
 
 
@@ -96,10 +98,6 @@ BACKGROUND = ["List ten prime numbers and explain why each is prime.",
               "Compare TCP and UDP for game networking."]
 
 
-def on_nodes(command):
-    for node in NODES:
-        subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c '{command}'"],
-                       check=True, capture_output=True)
 
 
 def complete(prompt, tokens, tag=None, keep=None, salt=None):
@@ -125,8 +123,7 @@ def complete(prompt, tokens, tag=None, keep=None, salt=None):
 
 def run(scenario, run_name, requests):
     """requests: [(start seconds, prompt, tokens, group or None, name, salt)]; returns the traced targets."""
-    on_nodes(f"mkdir -p {LOGDIR}; rm -f {LOGDIR}/rank*; touch {LOGDIR}/reset")
-    time.sleep(2.5)  # the watcher polls once a second
+    trace_io.reset_logs()
     targets, threads = {}, []
     t0 = time.monotonic()
     for start, prompt, tokens, group, name, salt in sorted(requests, key=lambda r: r[0]):
@@ -140,29 +137,9 @@ def run(scenario, run_name, requests):
         threads.append(thread)
     for thread in threads:
         thread.join()
-    on_nodes(f"touch {LOGDIR}/dump")
-    # The host schedule is written last (after the one-time plan inventory walk).
-    deadline = time.monotonic() + 300
-    while time.monotonic() < deadline:
-        time.sleep(3)
-        ready = [subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c "
-                                 f"'ls {LOGDIR}/rank*-schedule-host-*.json 2>/dev/null | wc -l'"],
-                                capture_output=True, text=True).stdout.strip() for node in NODES]
-        if all(r not in ("", "0") for r in ready):
-            break
-    else:
-        raise RuntimeError(f"{scenario} {run_name}: logs were not dumped on every node")
+    trace_io.dump_and_wait()
     logs = os.path.join(OUT, f"logs-{scenario}-{run_name}")
-    for node in NODES:
-        node_dir = os.path.join(logs, node)
-        os.makedirs(node_dir, exist_ok=True)
-        files = subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c 'cd {LOGDIR} && ls'"],
-                               check=True, capture_output=True, text=True).stdout.split()
-        for f in files:
-            if f.startswith(("rank", "inventory", "plans")):
-                with open(os.path.join(node_dir, f), "wb") as handle:
-                    subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken cat {LOGDIR}/{f}"],
-                                   check=True, stdout=handle)
+    trace_io.fetch_logs({node: os.path.join(logs, node) for node in NODES}, ("rank", "inventory", "plans"))
     for name, target in targets.items():
         run_dir = os.path.join(OUT, f"{target['group']}-{run_name}-{name}")
         os.makedirs(run_dir, exist_ok=True)

@@ -20,6 +20,8 @@ import time
 import urllib.request
 import uuid
 
+import trace_io
+
 BASE, OUT = sys.argv[1].rstrip("/"), sys.argv[2]
 
 
@@ -62,10 +64,6 @@ with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     MODEL = json.load(response)["data"][0]["id"]
 
 
-def on_nodes(command):
-    for node in NODES:
-        subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c '{command}'"],
-                       check=True, capture_output=True)
 
 
 def complete(prompt, tokens, request_id=None, keep=None):
@@ -93,8 +91,7 @@ for name, prompt in PROMPTS.items():
         for r in range(REPEATS):
             tag = f"trace-{name}-m{m}-r{r}"
             run_dir = os.path.join(OUT, f"{name}-m{m}-r{r}")
-            on_nodes(f"mkdir -p {LOGDIR}; rm -f {LOGDIR}/rank*; touch {LOGDIR}/reset")
-            time.sleep(2.5)  # the watcher polls once a second
+            trace_io.reset_logs()
             threads = [threading.Thread(target=complete, args=(BACKGROUND[i][0], BACKGROUND[i][1]))
                        for i in mix]
             for t in threads:
@@ -105,20 +102,10 @@ for name, prompt in PROMPTS.items():
             complete(prompt, TOKENS, request_id=tag, keep=target)
             # Dump as soon as the target is done: the background may run on,
             # and its later steps would wrap the logs over the target's.
-            on_nodes(f"touch {LOGDIR}/dump")
-            time.sleep(8)
+            trace_io.dump_and_wait()
             for t in threads:
                 t.join()
-            for node in NODES:
-                node_dir = os.path.join(run_dir, node)
-                os.makedirs(node_dir, exist_ok=True)
-                files = subprocess.run(
-                    ["ssh", "-n", node, f"docker exec dsv41-karmic-kraken sh -c 'cd {LOGDIR} && ls rank*'"],
-                    check=True, capture_output=True, text=True).stdout.split()
-                for f in files:
-                    with open(os.path.join(node_dir, f), "wb") as handle:
-                        subprocess.run(["ssh", "-n", node, f"docker exec dsv41-karmic-kraken cat {LOGDIR}/{f}"],
-                                       check=True, stdout=handle)
+            trace_io.fetch_logs({node: os.path.join(run_dir, node) for node in NODES})
             json.dump(dict(target, tag=tag, mix=mix), open(os.path.join(run_dir, "target.json"), "w"))
             print(json.dumps({"run": tag, "background": len(mix), "tokens": len(target["tokens"]),
                               "text_head": "".join(target["tokens"][:12])}), flush=True)
