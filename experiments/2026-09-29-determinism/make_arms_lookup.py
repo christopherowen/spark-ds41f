@@ -88,6 +88,10 @@ attention kernel; the step kind from request state; sparse_mla.py and ced.py
 join the mounted files): detm-r5o-ref4a-pin and detm-r5o-ref4a-trace7
 (attn-exact7: attn-exact6's debug attention with 0042 instead of 0035).
 
+ref4b adds vllm-0043 and B12X patch 0007 (overlay gemv-geom: the small-row
+TMA prefill GEMV geometry for decode-sized plans): detm-r5o-ref4b-pin and
+detm-r5o-ref4b-trace7.
+
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
 ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
@@ -268,6 +272,17 @@ mount(mhc_capture, "mhc-capture/b12x_layers.py", f"{VLLM}/models/deepseek_v4_1/b
 mhc_capture["environment"]["SPARK3_DEBUG_MHC_CAPTURE"] = "/cache/kkref/mhc-capture:512:2048"
 
 
+GEMV_GEOMETRY_FILES = ("gemm/bf16_gemv/_prefill.py", "gemm/bf16_gemv/_tuning.py", "gemm/bf16_gemv/_preparation.py")
+
+
+def with_gemv_geometry(arm):
+    """arm with B12X's TMA prefill GEMV launch geometries (overlay gemv-geom, B12X patch 0007)."""
+    arm = copy.deepcopy(arm)
+    for f in GEMV_GEOMETRY_FILES:
+        mount(arm, f"gemv-geom/b12x/{f}", f"{B12X}/{f}")
+    return arm
+
+
 def reference_trace(overlay, ref="ref1"):
     arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup=ref), attention=False, ref=ref)
     mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
@@ -306,6 +321,9 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-ref3c-trace6", reference_trace("attn-exact6", ref="ref3c")),
                   ("detm-r5o-ref4a-pin", with_reference(detm_variant2_pin, attention=True, ref="ref4a")),
                   ("detm-r5o-ref4a-trace7", reference_trace("attn-exact7", ref="ref4a")),
+                  ("detm-r5o-ref4b-pin", with_gemv_geometry(
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4b"))),
+                  ("detm-r5o-ref4b-trace7", with_gemv_geometry(reference_trace("attn-exact7", ref="ref4b"))),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),

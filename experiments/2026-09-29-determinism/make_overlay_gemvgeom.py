@@ -8,8 +8,9 @@ tensor-core product, then a compensated FP32 addition, segments in K order. The 
 compute warp), column tile, K tile and pipeline depth only choose which outputs a CTA computes
 and how loads are staged, not that sequence. The production geometry (64x64 tiles, 64-deep K
 tiles, two stages) stays the default; GEOMETRIES names the others, each with its own compile
-cache key, and backend "prefill_small" selects SMALL (decode sizes: fewer padded rows, a deeper
-pipeline for the latency-bound K loop).
+cache key, and backend "prefill_small" selects small_geometry(N) (decode sizes: fewer padded rows,
+narrower column tiles for more CTAs, a deeper pipeline for the latency-bound K loop). run61:
+every geometry bit-identical to production's at 1-4000 rows for all three served shapes.
 """
 import os
 import re
@@ -32,9 +33,17 @@ old = """class Bf16PrefillKernel:
     num_stages = 2
 """
 new = """DEFAULT_GEOMETRY = (64, 64, 64, 2)  # tile_m, tile_n, tile_k, num_stages (production)
-SMALL_GEOMETRY = (16, 64, 128, 4)
-GEOMETRIES = {DEFAULT_GEOMETRY, SMALL_GEOMETRY, (16, 64, 64, 4), (16, 32, 128, 4), (32, 64, 128, 3),
+GEOMETRIES = {DEFAULT_GEOMETRY, (16, 64, 128, 4), (16, 64, 64, 4), (16, 32, 128, 4), (32, 64, 128, 3),
               (16, 64, 256, 2), (16, 16, 128, 4)}
+
+
+def small_geometry(n):
+    \"\"\"Decode sizes (measured at 1-48 rows): 16-row tiles, 128-deep K tiles, four stages; 16 output
+    columns per CTA for the 384-wide router gate, 32 for the wider compressor projections.\"\"\"
+    return (16, 16 if n <= 384 else 32, 128, 4)
+
+
+SMALL_GEOMETRY = small_geometry
 
 
 class Bf16PrefillKernel:
@@ -120,8 +129,8 @@ block = m.group(0)
 new_block = block.replace('if config.backend == "prefill":', 'if config.backend in ("prefill", "prefill_small"):')
 new_block = new_block.replace("from ._prefill import compile_prefill", "from ._prefill import SMALL_GEOMETRY, DEFAULT_GEOMETRY, compile_prefill")
 new_block = new_block.replace("query.in_features, query.output_dtype)",
-                              "query.in_features, query.output_dtype,\n                                   SMALL_GEOMETRY if config.backend == \"prefill_small\" else DEFAULT_GEOMETRY)")
-assert "SMALL_GEOMETRY if config.backend" in new_block, new_block
+                              "query.in_features, query.output_dtype,\n                                   SMALL_GEOMETRY(query.out_features) if config.backend == \"prefill_small\" else DEFAULT_GEOMETRY)")
+assert "SMALL_GEOMETRY(query.out_features) if config.backend" in new_block, new_block
 open(os.path.join(OUT, "_preparation.py"), "w").write(r.replace(block, new_block))
 print(block)
 print("wrote", OUT)

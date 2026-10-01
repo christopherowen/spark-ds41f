@@ -1,0 +1,54 @@
+From 67928a521c9bfe5687c38e7a145eec0cc4f2108b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 15:03:50 +0200
+Subject: [PATCH] feat(deepseek-v4.1): small-row geometry for decode-sized
+ prefill-kernel GEMV plans
+
+With VLLM_DS41_BATCH_INVARIANT=1 the router gate and compressor projections
+run the TMA prefill GEMV kernel at every capacity (one row-invariant
+arithmetic). At decode sizes its K loop is latency-bound: 38 us per call at
+1-48 rows against 11 us for SIMT. Plans of up to 64 rows now take B12X's
+"prefill_small" launch geometry (16-row tiles, 16 or 32 output columns per
+CTA, 128-deep K tiles, four stages; B12X patch 0007), which keeps each
+output's ordered compensated accumulation over K. Replayed on serving hidden
+states: bit-identical to the production geometry at 1-4000 rows in both
+positions for all three shapes; 17 us (router) and 21-23 us (compressors) per
+call at 4-6 rows. Falls back to the production geometry when the B12X build
+lacks it.
+---
+ vllm/models/deepseek_v4_1/b12x_layers.py | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index ff81dd02d..b43ff1680 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -239,7 +239,24 @@ def _gemv_override(query):
+         return None
+     from b12x.gemm.bf16_gemv._tuning import GemvConfig, _prefill_eligible
+ 
+-    return GemvConfig(backend="prefill" if _prefill_eligible(query) else "simt")
++    if not _prefill_eligible(query):
++        return GemvConfig(backend="simt")
++    # Decode-sized plans launch the same kernel with 16-row tiles and a deeper
++    # K pipeline (B12X backend "prefill_small"): the K loop is latency-bound at
++    # a few rows, and the geometry does not change a row's arithmetic.
++    small = query.max_rows <= _GEMV_SMALL_ROWS and _prefill_small_available()
++    return GemvConfig(backend="prefill_small" if small else "prefill")
++
++
++_GEMV_SMALL_ROWS = 64
++
++
++def _prefill_small_available() -> bool:
++    try:
++        from b12x.gemm.bf16_gemv._prefill import SMALL_GEOMETRY  # noqa: F401
++    except ImportError:
++        return False
++    return True
+ 
+ 
+ def _block32_plan(caps):
+-- 
+2.43.0
+

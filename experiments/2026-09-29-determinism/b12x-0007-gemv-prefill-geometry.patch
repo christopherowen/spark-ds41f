@@ -1,0 +1,107 @@
+--- a/b12x/gemm/bf16_gemv/_prefill.py
++++ b/b12x/gemm/bf16_gemv/_prefill.py
+@@ -74,6 +74,20 @@
+         acc.store(total)
+ 
+ 
++DEFAULT_GEOMETRY = (64, 64, 64, 2)  # tile_m, tile_n, tile_k, num_stages (production)
++GEOMETRIES = {DEFAULT_GEOMETRY, (16, 64, 128, 4), (16, 64, 64, 4), (16, 32, 128, 4), (32, 64, 128, 3),
++              (16, 64, 256, 2), (16, 16, 128, 4)}
++
++
++def small_geometry(n):
++    """Decode sizes (measured at 1-48 rows): 16-row tiles, 128-deep K tiles, four stages; 16 output
++    columns per CTA for the 384-wide router gate, 32 for the wider compressor projections."""
++    return (16, 16 if n <= 384 else 32, 128, 4)
++
++
++SMALL_GEOMETRY = small_geometry
++
++
+ class Bf16PrefillKernel:
+     """TMA-fed BF16 matrix product with FP32 accumulators and runtime rows."""
+ 
+@@ -89,10 +103,16 @@
+     unroll_k = False
+     buffer_align_bytes = 1024
+ 
+-    def __init__(self, n: int, k: int):
++    def __init__(self, n: int, k: int, geometry: tuple = DEFAULT_GEOMETRY):
+         self.n, self.k = int(n), int(k)
++        if tuple(geometry) not in GEOMETRIES:
++            raise ValueError(f"unsupported BF16 prefill geometry {geometry}")
++        self.tile_m, self.tile_n, self.tile_k, self.num_stages = (int(v) for v in geometry)
++        self.num_compute_warps = self.tile_m // 16
++        self.producer_warp = self.num_compute_warps
++        self.num_threads = 32 * (self.num_compute_warps + 1)
+         if self.n <= 0 or self.k <= 0 or self.k % self.tile_k:
+-            raise ValueError("BF16 prefill needs positive N and K divisible by 64")
++            raise ValueError("BF16 prefill needs positive N and K divisible by the K tile")
+         self.k_tiles = self.k // self.tile_k
+         self.n_tiles = (self.n + self.tile_n - 1) // self.tile_n
+ 
+@@ -361,8 +381,14 @@
+ 
+ 
+ @cache
+-def _kernel(n, k):
+-    return Bf16PrefillKernel(n, k)
++def _kernel(n, k, geometry=DEFAULT_GEOMETRY):
++    return Bf16PrefillKernel(n, k, geometry)
++
++
++def _spec_name(geometry):
++    if tuple(geometry) == DEFAULT_GEOMETRY:
++        return "gemm.bf16_prefill"
++    return "gemm.bf16_prefill.m{}n{}k{}s{}".format(*geometry)
+ 
+ 
+ def supports_prefill(x, weight, out, bias) -> bool:
+@@ -430,7 +456,7 @@
+ 
+ 
+ @program_cache
+-def compile_prefill(ordinal, max_rows, n, k, output_dtype):
++def compile_prefill(ordinal, max_rows, n, k, output_dtype, geometry=DEFAULT_GEOMETRY):
+     """Retain the native TMA prefill launcher without allocating CUDA operands."""
+     from torch._subclasses.fake_tensor import FakeTensorMode
+ 
+@@ -448,8 +474,8 @@
+             for name, t in (("source", x), ("weight", weight), ("output", out))
+         )
+         raw = b12x_compile(
+-            _kernel(n, k), *args,
+-            compile_spec=KernelCompileSpec.from_key("gemm.bf16_prefill", 3, key),
++            _kernel(n, k, tuple(geometry)), *args,
++            compile_spec=KernelCompileSpec.from_key(_spec_name(geometry), 3, key),
+         )
+ 
+     def run(x, weight, out, bias=None):
+--- a/b12x/gemm/bf16_gemv/_tuning.py
++++ b/b12x/gemm/bf16_gemv/_tuning.py
+@@ -118,7 +118,7 @@
+         return
+     if config.backend == "torch" and _torch_eligible(query):
+         return
+-    if config.backend == "prefill" and _prefill_eligible(query):
++    if config.backend in ("prefill", "prefill_small") and _prefill_eligible(query):
+         return
+     raise ValueError(f"projection backend {config.backend!r} is ineligible for this query")
+ 
+--- a/b12x/gemm/bf16_gemv/_preparation.py
++++ b/b12x/gemm/bf16_gemv/_preparation.py
+@@ -52,10 +52,11 @@
+     TUNING.validate_config(query, config, None)
+     if config.backend == "torch":
+         return {}
+-    if config.backend == "prefill":
+-        from ._prefill import compile_prefill
++    if config.backend in ("prefill", "prefill_small"):
++        from ._prefill import SMALL_GEOMETRY, DEFAULT_GEOMETRY, compile_prefill
+         launcher = compile_prefill(ordinal, query.max_rows, query.out_features,
+-                                   query.in_features, query.output_dtype)
++                                   query.in_features, query.output_dtype,
++                                   SMALL_GEOMETRY(query.out_features) if config.backend == "prefill_small" else DEFAULT_GEOMETRY)
+     else:
+         from ._kernel import compile_projection
+         launcher = compile_projection(
