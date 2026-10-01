@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: run63.sh   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
 #                    ref3m2 overlay on dgx1)
-# Cluster stopped: mhc_capture_replay.py on the run56 captures with overlay mhc-mt (B12X 0008: several tokens
+# Cluster stopped: mhc_capture_replay.py on the run56 captures with overlay mhc-mt2 (B12X 0008: several tokens
 # per CTA in the lagged native partial kernels) and the vLLM clone's b12x_layers.py: candidate-t4/t8/t16 must equal
 # the one-token candidate bit for bit (and production at decode sizes); timings. Restores r5o.
 set -uo pipefail
@@ -24,7 +24,7 @@ for n in dgx2 dgx3; do
   [ "$(ssh -n $n git -C projects/spark3-vllm-ds41f rev-parse HEAD)" = "$(git rev-parse HEAD)" ] \
     || { log "$n checkout differs from dgx1; not stopping"; exit 1; }
 done
-sha256sum $HOME/spark3-overlay/mhc-mt/b12x/norm/mhc/*.py $HOME/work/vllm-gemv/vllm/models/deepseek_v4_1/b12x_layers.py > "$out/overlay-bytes-run63.txt"
+sha256sum $HOME/spark3-overlay/mhc-mt2/b12x/norm/mhc/*.py $HOME/work/vllm-gemv/vllm/models/deepseek_v4_1/b12x_layers.py > "$out/overlay-bytes-run63.txt"
 curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
 stop_all
 mkdir -p /tmp/lookup/cache && cp $E/transition_map.py $E/mhc_capture_replay.py $E/gemv_capture_replay.py /tmp/lookup/
@@ -34,7 +34,7 @@ COMMON="-e CUTE_DSL_ARCH=sm_121a -e B12X_DENSE_SPLITK_TURBO=0 -e B12X_W4A8_TINY_
 for script in mhc_capture_replay; do
   log "$script"
   docker run --rm --gpus all --ipc=host $COMMON \
-    -v $HOME/work/vllm-gemv/vllm/models/deepseek_v4_1/b12x_layers.py:$V/vllm/models/deepseek_v4_1/b12x_layers.py:ro -v $HOME/spark3-overlay/mhc-mt/b12x/norm/mhc/_kernels.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_kernels.py:ro -v $HOME/spark3-overlay/mhc-mt/b12x/norm/mhc/_preparation.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_preparation.py:ro -v $HOME/spark3-overlay/mhc-mt/b12x/norm/mhc/_tuning.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_tuning.py:ro \
+    -v $HOME/work/vllm-gemv/vllm/models/deepseek_v4_1/b12x_layers.py:$V/vllm/models/deepseek_v4_1/b12x_layers.py:ro -v $HOME/spark3-overlay/mhc-mt2/b12x/norm/mhc/_kernels.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_kernels.py:ro -v $HOME/spark3-overlay/mhc-mt2/b12x/norm/mhc/_preparation.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_preparation.py:ro -v $HOME/spark3-overlay/mhc-mt2/b12x/norm/mhc/_tuning.py:/opt/spark3/candidate/b12x/b12x/norm/mhc/_tuning.py:ro \
     -v $S/snapshots/dba1be0a40aa45a94ad051997016db3960a90277:/models:ro -v $S/blobs:/blobs:ro \
     -v /tmp/lookup:/r:ro -v /tmp/lookup/cache:/c -v $PWD/results/private/determinism/mhc/captures:/cap:ro \
     -w /opt/spark3/candidate/b12x --entrypoint python3 $IMAGE /r/$script.py /cap > "$out/$script.txt" 2>&1

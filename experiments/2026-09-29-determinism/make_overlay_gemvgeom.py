@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Build overlay gemv-geom: B12X's TMA prefill GEMV with a configurable launch geometry.
 
-usage: make_overlay_gemvgeom.py BUILD_B12X_DIR   (writes ~/spark3-overlay/gemv-geom/b12x/gemm/bf16_gemv/)
+usage: make_overlay_gemvgeom.py BUILD_B12X_DIR   (writes ~/spark3-overlay/gemv-geom2/b12x/gemm/bf16_gemv/)
+
+BUILD_B12X_DIR must be the serving image's b12x package (r5o: /opt/spark3/candidate/b12x/b12x).
+Overlay gemv-geom (run61, run62) was built from a pre-r5o tree and lacks r5o's proxy fence before
+the TMA refill; gemv-geom2 is built from the r5o image.
 
 Bf16PrefillKernel accumulates every output over the whole K in one CTA: per 16-wide K segment one
 tensor-core product, then a compensated FP32 addition, segments in K order. The row tile (16 per
@@ -17,7 +21,7 @@ import re
 import sys
 
 SRC = os.path.join(sys.argv[1], "gemm", "bf16_gemv")
-OUT = os.path.expanduser("~/spark3-overlay/gemv-geom/b12x/gemm/bf16_gemv")
+OUT = os.environ.get("GEMVGEOM_OUT", os.path.expanduser("~/spark3-overlay/gemv-geom2/b12x/gemm/bf16_gemv"))
 os.makedirs(OUT, exist_ok=True)
 
 p = open(os.path.join(SRC, "_prefill.py")).read()

@@ -332,7 +332,7 @@
  class MHCPostPreDecodeSplitNPartialKernel:
      """Fused decode partial using split hidden slices and narrow output tiles."""
  
-@@ -4107,8 +4432,9 @@
+@@ -4115,8 +4440,9 @@
      post_only: bool = False,
      lagged_mix: bool = False,
      partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
@@ -343,7 +343,7 @@
          hidden_size=hidden_size,
          split_k=split_k,
          compute_gram=compute_gram,
-@@ -4117,6 +4443,9 @@
+@@ -4125,6 +4451,9 @@
          lagged_mix=lagged_mix,
          partials_per_cta=partials_per_cta,
      )
@@ -353,7 +353,7 @@
  
  
  @lru_cache(maxsize=32)
-@@ -4292,6 +4621,7 @@
+@@ -4300,6 +4629,7 @@
      decode_source_splits, decode_tile_n = native.source_splits, native.decode_tile_n
      decode_bf16x2 = native.decode_bf16x2
      partials_per_cta = native.partials_per_cta
@@ -361,7 +361,7 @@
      _validate_tensor_shape("x", x, (tokens, hidden_size))
      _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
      _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
-@@ -4435,9 +4765,11 @@
+@@ -4443,9 +4773,11 @@
          compile_name = (
              "integration.residual.mhc_post_pre_partial_hidden4096_hctile128"
              f"_all{partials_per_cta}"
@@ -373,7 +373,7 @@
              ("threads", _THREADS),
              ("compute_gram", compute_gram),
              ("lagged_mix", lagged_mix),
-@@ -4452,17 +4784,20 @@
+@@ -4460,17 +4792,20 @@
              False,
              lagged_mix,
              partials_per_cta,
@@ -394,7 +394,7 @@
              ("threads", _THREADS),
              ("compute_gram", compute_gram),
              ("lagged_mix", lagged_mix),
-@@ -4477,6 +4812,7 @@
+@@ -4485,6 +4820,7 @@
              False,
              lagged_mix,
              partials_per_cta,
@@ -402,7 +402,7 @@
          )
      return _compile_mhc_entry(
          kernel,
-@@ -5337,8 +5673,10 @@
+@@ -5345,8 +5681,10 @@
      pre_mix: torch.Tensor | None = None,
      y: torch.Tensor | None = None,
      partials_per_cta: int,
@@ -413,7 +413,7 @@
      if (pre_mix is None) != (y is None):
          raise ValueError("pre_mix and y must be supplied together")
      lagged_mix = pre_mix is not None
-@@ -5440,9 +5778,11 @@
+@@ -5448,9 +5786,11 @@
          compile_name = (
              "integration.residual.mhc_pre_partial_hidden4096_hctile128"
              f"_all{partials_per_cta}"
@@ -425,7 +425,7 @@
              ("threads", _THREADS),
              ("compute_gram", compute_gram),
              ("pre_only", True),
-@@ -5453,12 +5793,14 @@
+@@ -5461,12 +5801,14 @@
          compile_name = (
              "integration.residual.mhc_pre_partial_"
              f"{hidden_specialization}_hctile128_all{partials_per_cta}"
@@ -440,7 +440,7 @@
              ("threads", _THREADS),
              ("compute_gram", compute_gram),
              ("pre_only", True),
-@@ -5473,6 +5815,7 @@
+@@ -5481,6 +5823,7 @@
              pre_only=True,
              lagged_mix=lagged_mix,
              partials_per_cta=partials_per_cta,
@@ -512,7 +512,7 @@
              "projection_k_splits": self.projection_k_splits,
              "lagged_prepare": self.lagged_prepare,
              "partials_per_cta": self.partials_per_cta,
-+            **({"tokens_per_cta": self.tokens_per_cta} if self.tokens_per_cta != 1 else {}),
++            "tokens_per_cta": self.tokens_per_cta,
          }
  
  
@@ -527,3 +527,12 @@
      if config.backend == "native":
          return
      if not _tf32_eligible(query):
+@@ -498,7 +505,7 @@
+ TUNING = TuningContract(
+     component_id="norm.mhc",
+     query_schema_version=8,
+-    config_schema_version=4,
++    config_schema_version=5,
+     query_fields=frozenset(MhcQuery.__dataclass_fields__),
+     config_fields=frozenset(MhcConfig.__dataclass_fields__),
+     encode_query=_encode,

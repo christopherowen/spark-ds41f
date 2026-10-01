@@ -20,14 +20,16 @@ named "0-..." to sort first) and links to the shared logs.
   KV and computes only its tail), and a request sharing a 2000-token prefix
   with a different question.
 - identical: eight copies of one prompt arriving 0-350 ms apart.
-- chunked_end: a prompt a little over one batch budget (its second chunk ends
-  within the 128-token CED window of the first), alone and beside decoding
-  requests that move the first chunk's end.
+- chunked_end: a prompt a little over one chunk (--chunk, default 4000: the
+  arm's long-prefill threshold; its second chunk ends within the 128-token CED
+  window of the first), alone and beside decoding requests that move the first
+  chunk's end.
 - distinct: eight different prompts (c8_distinct.py's), each alone, then all
   eight at once (different routing in every row of the shared steps).
 - cache_long: a 9000-token prompt cold, against the same prompt after a
   6000-token prefix of it was served (the cached prefix ends inside a chunk,
-  so the warm request's first chunk starts mid-chunk and ends at 8000).
+  so the warm request's first chunk starts mid-chunk and ends at twice the
+  chunk).
 
 --suffix S appends S to every run name (and request tag), so a second boot's runs
 join the first boot's groups: the analysis then compares rows across restarts.
@@ -51,6 +53,7 @@ def arg(name, default):
 SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end,distinct,cache_long").split(",")
 SUFFIX = arg("--suffix", "")
 REPEATS = int(arg("--repeats", "1"))
+CHUNK = int(arg("--chunk", "4000"))
 NODES = ("dgx1", "dgx2", "dgx3")
 LOGDIR = "/cache/kkref/moe-checksums"
 with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
@@ -71,7 +74,9 @@ def notes(count, seed=0):
 SHORT = "Return a JSON object describing three fictional planets with name, mass and moons."
 LONG3K = "Here are lighthouse notes. " + notes(110, 1) + " Which fuel appears most often?"
 LONG9K = "Here are lighthouse notes. " + notes(330, 2) + " Summarize when the lighthouses were built."
-LONG4K = "Here are lighthouse notes. " + notes(166, 5) + " Summarize when the lighthouses were built."
+# 166 notes = 4082 prompt tokens (about 24.4 per note): 82 past a 4000-token chunk.
+LONG4K = ("Here are lighthouse notes. " + notes(166 + round((CHUNK - 4000) / 24.4), 5)
+          + " Summarize when the lighthouses were built.")
 PREFIX6K = "Here are lighthouse notes. " + notes(245, 6)
 LONG9K_CACHED = PREFIX6K + " " + notes(122, 7) + " Which fuel appears most often?"
 OTHER3K = "Here are lighthouse notes. " + notes(110, 3) + " Which place appears most often?"

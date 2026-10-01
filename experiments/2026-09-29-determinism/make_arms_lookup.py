@@ -96,7 +96,14 @@ ref4c is ref4b with vllm-0042 corrected (run62: CED layers ran a mixed step's
 decode rows single-pass but a decode-only step's on the decode kernel; they now
 split decode rows like every other layer, and CED decoder metadata takes the
 full-row step kind): detm-r5o-ref4c-pin and detm-r5o-ref4c-trace8 (attn-exact8:
-attn-exact7 with the same correction).
+attn-exact7 with the same correction). The ref4c arms mount gemv-geom2, built
+from the r5o image: gemv-geom (ref4b) came from a pre-r5o tree and lacks r5o's
+proxy fence in the TMA prefill GEMV.
+
+detm-r5o-ref4c-b4144-pin aligns chunks to 4096 tokens with a 4144-token budget
+(4096 plus the largest decode batch, 8 x 6), so a prompt splits where r5o splits
+it when alone (the 4000-token alignment adds a short chunk to most prompts);
+detm-r5o-ref4c-b4144-trace8 traces it (wide logs of 4160 rows hold 4144).
 
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
@@ -281,11 +288,20 @@ mhc_capture["environment"]["SPARK3_DEBUG_MHC_CAPTURE"] = "/cache/kkref/mhc-captu
 GEMV_GEOMETRY_FILES = ("gemm/bf16_gemv/_prefill.py", "gemm/bf16_gemv/_tuning.py", "gemm/bf16_gemv/_preparation.py")
 
 
-def with_gemv_geometry(arm):
-    """arm with B12X's TMA prefill GEMV launch geometries (overlay gemv-geom, B12X patch 0007)."""
+def with_budget(arm, threshold=4096, budget=4144):
+    """arm with chunks aligned to threshold and a batch budget leaving room for every decode row."""
+    arm = copy.deepcopy(arm)
+    args = arm["serve_args"]
+    args[args.index("--long-prefill-token-threshold") + 1] = str(threshold)
+    args[args.index("--max-num-batched-tokens") + 1] = str(budget)
+    return arm
+
+
+def with_gemv_geometry(arm, overlay="gemv-geom"):
+    """arm with B12X's TMA prefill GEMV launch geometries (B12X patch 0007; gemv-geom2 on r5o's tree)."""
     arm = copy.deepcopy(arm)
     for f in GEMV_GEOMETRY_FILES:
-        mount(arm, f"gemv-geom/b12x/{f}", f"{B12X}/{f}")
+        mount(arm, f"{overlay}/b12x/{f}", f"{B12X}/{f}")
     return arm
 
 
@@ -331,8 +347,13 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       with_reference(detm_variant2_pin, attention=True, ref="ref4b"))),
                   ("detm-r5o-ref4b-trace7", with_gemv_geometry(reference_trace("attn-exact7", ref="ref4b"))),
                   ("detm-r5o-ref4c-pin", with_gemv_geometry(
-                      with_reference(detm_variant2_pin, attention=True, ref="ref4c"))),
-                  ("detm-r5o-ref4c-trace8", with_gemv_geometry(reference_trace("attn-exact8", ref="ref4c"))),
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4c"), "gemv-geom2")),
+                  ("detm-r5o-ref4c-trace8", with_gemv_geometry(reference_trace("attn-exact8", ref="ref4c"),
+                                                               "gemv-geom2")),
+                  ("detm-r5o-ref4c-b4144-pin", with_budget(with_gemv_geometry(
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4c"), "gemv-geom2"))),
+                  ("detm-r5o-ref4c-b4144-trace8", with_budget(with_gemv_geometry(
+                      reference_trace("attn-exact8", ref="ref4c"), "gemv-geom2"))),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),

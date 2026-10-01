@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 """Build overlay mhc-mt: B12X mHC lagged partial kernels with several tokens per CTA.
 
-usage: make_overlay_mhcmt.py BUILD_B12X_DIR   (writes ~/spark3-overlay/mhc-mt/b12x/norm/mhc/)
+usage: make_overlay_mhcmt.py BUILD_B12X_DIR   (writes ~/spark3-overlay/mhc-mt2/b12x/norm/mhc/)
+
+BUILD_B12X_DIR must be the serving image's b12x package (r5o: /opt/spark3/candidate/b12x/b12x).
+Overlay mhc-mt was built from a pre-r5o tree (no TF32 projection proxy fences) and with a config
+codec the tuning contract rejects (run63 try 1); mhc-mt2 is built from the r5o image.
 
 The native lagged partial kernel launches one CTA per (hidden tile, partial group, token); every
 CTA reloads its slice of the layer's 24x4H FP32 mixing weights, about 2.8 GB of L2 reads per call
 at 1334 rows. MHCPostPrePartialMultiTokenKernel loads that slice into registers once and then
 computes tokens_per_cta tokens in turn, each exactly as the one-token kernel does (the same FMA
 expression per thread, the same warp reduction, warps summed in the same order), with a barrier
-between tokens for the shared warp sums. MhcConfig gains tokens_per_cta (default 1, encoded only
-when larger); the one-token kernels, their compile keys and every default plan are unchanged.
+between tokens for the shared warp sums. MhcConfig gains tokens_per_cta (default 1; every config
+payload carries it, under config schema version 5, as the tuning contract requires one field set);
+the one-token kernels, their compile keys and every default plan are otherwise unchanged.
 """
 import os
 import re
 import sys
 
 SRC = os.path.join(sys.argv[1], "norm", "mhc")
-OUT = os.environ.get("MHCMT_OUT", os.path.expanduser("~/spark3-overlay/mhc-mt/b12x/norm/mhc"))
+OUT = os.environ.get("MHCMT_OUT", os.path.expanduser("~/spark3-overlay/mhc-mt2/b12x/norm/mhc"))
 os.makedirs(OUT, exist_ok=True)
 k = open(os.path.join(SRC, "_kernels.py")).read()
 
@@ -223,8 +228,11 @@ old = """            "partials_per_cta": self.partials_per_cta,
         }"""
 assert old in t
 t = t.replace(old, """            "partials_per_cta": self.partials_per_cta,
-            **({"tokens_per_cta": self.tokens_per_cta} if self.tokens_per_cta != 1 else {}),
+            "tokens_per_cta": self.tokens_per_cta,
         }""")
+old = "    config_schema_version=4,\n"
+assert t.count(old) == 1
+t = t.replace(old, "    config_schema_version=5,\n")
 old = """    if not config.lagged_prepare and config.partials_per_cta != 4:
         raise ValueError("partial grouping requires the fused lagged producer")"""
 assert old in t
