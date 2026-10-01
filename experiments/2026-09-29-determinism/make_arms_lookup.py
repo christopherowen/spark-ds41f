@@ -397,6 +397,12 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),
+                  ("detm-r5o-ref4d-b4144-pin-prof", profiled(with_budget(with_mhc_multi_token(with_gemv_geometry(
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4d"), "gemv-geom2"))),
+                      "detm-r5o-ref4d-b4144-pin-prof")),
+                  ("detm-r5o-ref4e-s40-b4144-pin-prof", profiled(with_env(with_budget(with_mhc_multi_token(
+                      with_gemv_geometry(with_reference(detm_variant2_pin, attention=True, ref="ref4e"), "gemv-geom2"))),
+                      VLLM_DS41_MHC_TF32_SPLITS="40"), "detm-r5o-ref4e-s40-b4144-pin-prof")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),

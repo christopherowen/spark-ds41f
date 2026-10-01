@@ -1,0 +1,116 @@
+From 9d12394647757c8dc673947a16e50968f3f4c8a3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 19:06:46 +0200
+Subject: [PATCH] perf(deepseek-v4.1): TF32 mHC projection with 40 K slices in
+ batch-invariant mode
+
+Upstream base: vllm-0044 (this series on r5o's tree). Alternative to the
+lagged native route of vllm-0039/0044 for the operations it covers.
+
+Batch-invariant mode needs one mHC arithmetic per operation at every
+capacity. The lagged native route (0039) rounds like production's decode
+plans but is about 40% slower per call than the default TF32 capacity plan
+at prefill sizes, even with 16 rows per CTA (0044). The TF32 TMA
+projection with a fixed K split is also one arithmetic at every count
+(run58b: one group at 1-4000 rows) and stays near the default plan's speed
+at prefill sizes; at decode sizes it costs about 25 us per call against
+11-17 us on the lagged route.
+
+post_pre, and pre on the expanded residual (the operations B12X serves
+with TF32), now take 16-row tiles, all 24 mixes per tile and 40 K slices
+at every capacity; the other pre plans keep the lagged native route.
+
+Quality: TF32 rounds the mixing weights' inputs to 10-bit mantissas, as
+production's capacity plan already does at prefill; decode rows now get
+that rounding too (different bits from production decode, same at every
+batch size). Measured against r5o (run65b): prefill -0.9..-2.0%, mixed
+traffic short TTFT -4.0%, long TTFT +0.6%, p99 stream gap +2.4%, eight
+distinct streams +1.6%, single-stream decode step +3.3% (prose) / +4.3%
+(JSON). Launch geometries other than 16x24x64x2 are bit-identical but at
+most 2 us faster per call (run66).
+
+Tests: tests/models/test_deepseek_v4_1_mhc_batch_invariant.py.
+Upstream status: local.
+---
+ .../test_deepseek_v4_1_mhc_batch_invariant.py |  8 ++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 26 +++++++++++++++++--
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+index e79dd64e1..edbacfc7b 100644
+--- a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
++++ b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+@@ -27,6 +27,14 @@ def test_batch_invariant_mode_pins_the_lagged_native_route(monkeypatch):
+     assert (decode.tokens_per_cta, capacity.tokens_per_cta) == (1, 16)
+ 
+ 
++def test_batch_invariant_mode_takes_tf32_where_b12x_serves_it(monkeypatch):
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
++    decode, capacity = (b12x_layers._mhc_batch_invariant_config(n, tf32_eligible=True) for n in (6, 4096))
++    assert decode == capacity
++    assert decode.backend == "tf32_tma" and not decode.lagged_prepare
++    assert (decode.projection_tile_m, decode.projection_tile_n, decode.projection_k_splits) == (16, 24, 40)
++
++
+ def _query(out_features, in_features, out_dtype="float32"):
+     from b12x.gemm import bf16_gemv
+ 
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 82e2f6e79..afe7ba07f 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -752,7 +752,7 @@ def _mhc_post_fake(x, residual, post, comb, out, layer_name):
+     return None
+ 
+ 
+-def _mhc_batch_invariant_config(tokens: int):
++def _mhc_batch_invariant_config(tokens: int, tf32_eligible: bool = False):
+     """Batch-invariant mode: pre and post_pre on the lagged native route at every capacity.
+ 
+     The graph-size plans already take this route; the capacity plan defaults to
+@@ -768,11 +768,29 @@ def _mhc_batch_invariant_config(tokens: int):
+     kernel), which loads the CTA's slice of the mixing weights once for all 16
+     rather than once per row. Each row still computes exactly the one-row
+     sequence, so neither grouping changes a bit.
++
++    Operations B12X serves with the TF32 TMA projection (post_pre, and pre on
++    the expanded residual) take it instead at every capacity: 16-row tiles,
++    all 24 mixes per tile and 40 K slices summed in a fixed order, one
++    arithmetic at every count and near the default capacity plan's speed at
++    prefill sizes, at about 8 us more per call than the lagged route at decode
++    sizes.
+     """
+     if not _BATCH_INVARIANT:
+         return None
+     from b12x.norm.mhc._tuning import MhcConfig
+ 
++    if tf32_eligible:
++        return MhcConfig(
++            backend="tf32_tma",
++            projection_tile_m=16,
++            projection_tile_n=24,
++            projection_tile_k=64,
++            projection_num_stages=2,
++            projection_num_m_warps=1,
++            projection_num_n_warps=1,
++            projection_k_splits=40,
++        )
+     return MhcConfig(
+         backend="native",
+         projection_tile_m=16,
+@@ -880,7 +898,11 @@ class B12xMHC(nn.Module):
+                 self._plans[(operation, tokens)] = mhc.plan(
+                     _mhc_caps(layer.hc_attn_fn.device, tokens, self.hidden_size),
+                     invocation=invocation,
+-                    override=_mhc_batch_invariant_config(tokens),
++                    override=_mhc_batch_invariant_config(
++                        tokens,
++                        tf32_eligible=operation == "post_pre"
++                        or bool(invocation["expanded_residual"]),
++                    ),
+                 )
+         for tokens in key:
+             if ("post", tokens) not in self._plans:
+-- 
+2.43.0
+
