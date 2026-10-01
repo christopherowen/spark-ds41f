@@ -1,0 +1,42 @@
+commit 0b1bccb858f7ccaf6cea039623f28e0579fca21d
+Author: Martin Vit <martin@voipmonitor.org>
+Date:   Tue Sep 29 19:45:54 2026 +0000
+
+    fix(scheduler): let decodes preempt in a prefill turn that scheduled nothing
+    
+    With prefill compute sharing, any waiting request counts as runnable
+    prefill. While those requests cannot be admitted (every running slot is
+    taken, or restores are waiting for GPU capacity), each contended step is
+    a prefill turn, and running decodes get only the leftover pass, which
+    may not preempt. When a decode needed a KV block from a full pool, that
+    pass stopped without scheduling or preempting anything. The empty step
+    left the fairness controller unchanged, so every later step was the same.
+    Generation stopped with idle GPUs and no log lines until clients aborted
+    the running requests (mrweiner: GLM-5.3-Flash TP2 with LMCache restore
+    admission, four slots, KV cache at 98%).
+    
+    A prefill turn that scheduled nothing has no admitted work to protect,
+    so its decode pass may now preempt, as in a decode turn.
+    
+    Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 66bd89742..e9feff11a 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2033,11 +2033,13 @@ class Scheduler(SchedulerInterface):
+         # A prefill turn gives prefills first use of the model-step capacity.
+         # Existing decodes then consume only capacity genuinely left over. New
+         # requests admitted above are excluded by running_req_ids_at_step_start,
+-        # so no request can be scheduled twice in one step.
++        # so no request can be scheduled twice in one step. A turn that
++        # scheduled nothing has no admitted work to protect; its decodes preempt
++        # as in a decode turn, or a full pool would leave every step empty.
+         if adaptive_prefill_turn and token_budget > 0:
+             schedule_running_requests(
+                 "decode",
+-                allow_preemption=False,
++                allow_preemption=not num_scheduled_tokens,
+                 enforce_lora_limit=True,
+             )
+ 

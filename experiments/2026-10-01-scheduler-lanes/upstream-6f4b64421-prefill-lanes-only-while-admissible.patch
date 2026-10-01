@@ -1,0 +1,48 @@
+commit 6f4b64421721e8c891d1597b949f9a7439a30e85
+Author: Martin Vit <martin@voipmonitor.org>
+Date:   Thu Oct 1 10:48:20 2026 +0000
+
+    fix(scheduler): give prefill lanes to queued requests only while admissible
+    
+    PrefillInterleaveController ranks running and queued requests together,
+    and never-scheduled requests rank first. While every running slot was
+    taken, or new requests were paused, queued requests that the waiting
+    pass cannot admit took the prefill lanes. The running chunked prefills
+    then had none, and every step scheduled nothing: generation stopped for
+    good with idle GPUs.
+    
+    Queued requests now compete for lanes only while the waiting pass can
+    admit one, the same condition it applies itself.
+    
+    Reported, with the root cause and this fix, by netwalker4370 on Discord
+    (DeepSeek-V4.1-Flash TP4, --max-parallel-prefills 2, 40 concurrent
+    150K-token prompts at --max-num-seqs 32).
+    
+    Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index e9feff11a..dced44674 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -924,11 +924,19 @@ class Scheduler(SchedulerInterface):
+             and step_token_cap < input_budget
+         ):
+             step_token_cap = token_budget = input_budget
++        # Queued requests compete for prefill lanes only while the waiting pass
++        # can admit one. Otherwise lanes given to them would idle while running
++        # chunked prefills wait for a lane, and the step would schedule nothing.
++        admission_open = (
++            self._pause_state == PauseState.UNPAUSED
++            and len(self.running) + self.num_waiting_for_streaming_input
++            < self.max_num_running_reqs
++        )
+         prefill_interleave_step = (
+             self.prefill_interleave_controller.begin_step(
+                 running=self.running,
+-                waiting=self.waiting,
+-                skipped_waiting=self.skipped_waiting,
++                waiting=self.waiting if admission_open else (),
++                skipped_waiting=self.skipped_waiting if admission_open else (),
+                 request_lookup=self.requests,
+                 is_local_prefill=self._request_has_local_prefill,
+                 max_parallel_prefills=self.max_parallel_prefills,

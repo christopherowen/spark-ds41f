@@ -414,7 +414,9 @@ def arm_config_path(experiment: str, config: str) -> str:
 
 def measure_steps(spec: dict, job: dict) -> list[dict]:
     experiment, run = spec["experiment"], spec["run"]
-    profile = PROFILES[job.get("profile", "lean")]
+    profile = dict(PROFILES[job.get("profile", "lean")])
+    if "extras" in job:  # [[script, [args...], stem], ...]: the job's own workloads
+        profile["extras"] = [tuple(extra) for extra in job["extras"]]
     arms = list(job["arms"])
     if job.get("bracket") and len(arms) > 1:
         first = dict(arms[0])
@@ -426,16 +428,19 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
         out = f"results/private/determinism/{run}"
         steps.append({"kind": "boot", "config": config, "label": label})
         steps.append({"kind": "curves", "label": label, "out": f"{out}/curves-{label}.json"})
-        steps.append({"kind": "cli", "label": label,
-                      "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
-                               "--output", f"results/private/bench/{run}-{label}"]})
+        if job.get("bench", True):
+            steps.append({"kind": "cli", "label": label,
+                          "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
+                                   "--output", f"results/private/bench/{run}-{label}"]})
         for script, extra, stem in profile["extras"]:
             steps.append({"kind": "script", "label": label,
                           "argv": [f"{experiment}/{script}", head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
     steps.append({"kind": "table", "argv": [f"{experiment}/tables_arms.py", run, *[a["label"] for a in arms]],
                   "out": f"results/private/lab/{run}-table.txt",
-                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms]})
+                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms],
+                  "summaries": [f"results/private/determinism/{run}/{stem}-{a['label']}.jsonl"
+                                for _, _, stem in profile["extras"] for a in arms]})
     return steps
 
 
@@ -698,6 +703,18 @@ def sync_checkouts() -> bool:
     return ok
 
 
+def summary_lines(paths: list[str]) -> str:
+    """The last JSON line carrying a "summary" key of each workload output, grouped by workload."""
+    lines = []
+    for path in paths:
+        file = ROOT / path
+        if not file.exists():
+            continue
+        records = [l for l in file.read_text().splitlines() if l.startswith("{") and '"summary"' in l]
+        lines.append(f"{file.stem}: {records[-1] if records else '(no summary)'}")
+    return "\n".join(lines) + "\n"
+
+
 CURVE_POINTS = (1, 6, 12, 24, 48, 256, 1024, 2048, 4096)
 
 
@@ -892,8 +909,13 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
         elif step["kind"] == "curves":
             save_curves(step)
         elif step["kind"] == "table":
-            run_script(step)
-            table = (ROOT / step["out"]).read_text()
+            if (ROOT / step["argv"][0]).exists():
+                run_script(step)
+                table = (ROOT / step["out"]).read_text()
+            else:  # an experiment without tables_arms.py: each workload's summary line per arm
+                table = summary_lines(step.get("summaries", []))
+                (ROOT / step["out"]).parent.mkdir(parents=True, exist_ok=True)
+                (ROOT / step["out"]).write_text(table)
             curves = curves_table(step.get("curves", []))
             if curves:
                 table += "\n" + curves + "\n"
@@ -947,6 +969,8 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
     window_open(minutes, "queue")
     if not hold_is_ours(read_hold()):
         return 1
+    me = Path(__file__).resolve()
+    code_at_start = hashlib.sha256(me.read_bytes()).hexdigest()
     for state in ("running", "done", "failed"):
         (QUEUE / state).mkdir(parents=True, exist_ok=True)
     idle_since = None
@@ -983,6 +1007,11 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
         if code:
             log("QUEUE closed (job failed; the window was closed by the run)")
             return code
+        if hashlib.sha256(me.read_bytes()).hexdigest() != code_at_start:
+            # A sync job brought new runner code: continue the same window on it.
+            log("QUEUE restarting on the synced runner (window stays open)")
+            os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
+                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes)])
 
 
 def queue_status() -> None:

@@ -149,6 +149,18 @@ class QueueTest(unittest.TestCase):
         self.assertEqual([s["kind"] for s in steps], ["sync"])
 
 
+class CustomWorkloadTest(unittest.TestCase):
+    def test_a_job_may_skip_the_bench_and_name_its_own_workloads(self) -> None:
+        spec = {"experiment": "experiments/x", "run": "s1", "jobs": [{
+            "kind": "measure", "bench": False,
+            "extras": [["hol_latency.py", ["--rounds", "2"], "hol"]],
+            "arms": [{"config": "cluster-a.json", "label": "a"}]}]}
+        steps = lab.plan(spec)
+        self.assertEqual([s["kind"] for s in steps], ["boot", "curves", "script", "table"])
+        self.assertEqual(steps[2]["out"], "results/private/determinism/s1/hol-a.jsonl")
+        self.assertEqual(steps[3]["summaries"], ["results/private/determinism/s1/hol-a.jsonl"])
+
+
 class CurvesTest(unittest.TestCase):
     def test_curve_table_compares_arms_at_fixed_token_counts(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):
