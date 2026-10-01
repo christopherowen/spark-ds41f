@@ -68,7 +68,8 @@ leave room for the largest decode batch (4000 < 4096 - 48): detm-r5o-ref-pin
 (performance, the deterministic MoE of det-variant2) and detm-r5o-ref-trace
 (attn-exact5: attn-exact4 with vllm-0035 in its attention copy);
 detm-r5o-ref-trace6 also records the LM head's input rows and logits
-(attn-exact6).
+(attn-exact6). Cost attribution: detm-r5o-ref-no{moe,attn,head,mhc,gemv}-pin
+each leave one reference change out (vllm-0034, 0035, 0037, 0033, 0032).
 """
 import copy
 import json
@@ -195,6 +196,26 @@ def with_reference(arm, *, attention):
 
 
 ref_pin = with_reference(detm_variant2_pin, attention=True)
+
+
+def reference_without(drop=None, layers=None):
+    arm = with_reference(detm_variant2_pin, attention=drop != "models/deepseek_v4_1/attention.py")
+    if drop:
+        arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != f"{VLLM}/{drop}"]
+    if layers:
+        target = f"{VLLM}/models/deepseek_v4_1/b12x_layers.py"
+        arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
+        mount(arm, f"ref1-var/{layers}/vllm/models/deepseek_v4_1/b12x_layers.py", target)
+    return arm
+
+
+attribution = {
+    "nomoe": reference_without(drop="model_executor/layers/fused_moe/b12x.py"),
+    "noattn": reference_without(drop="models/deepseek_v4_1/attention.py"),
+    "nohead": reference_without(drop="model_executor/kernels/linear/b12x_blockscaled.py"),
+    "nomhc": reference_without(layers="nomhc"),
+    "nogemv": reference_without(layers="nogemv"),
+}
 def reference_trace(overlay):
     arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup="ref1"), attention=False)
     mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
@@ -224,6 +245,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-rs2-exact4-trace", final_wide4),
                   ("detm-r5o-ref-pin", ref_pin), ("detm-r5o-ref-trace", ref_trace),
                   ("detm-r5o-ref-trace6", reference_trace("attn-exact6")),
+                  *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
