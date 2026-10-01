@@ -6,7 +6,7 @@
 # logs of 4160 rows). c8_trace.py (one round: sequence-parallel WO and index records at their
 # offsets on every rank), then scenario_trace.py (mixed prefill/decode, chunked 9000-token prompts,
 # prefix-cache reuse, staggered identical requests; one repeat). The first dump writes each rank's
-# plan inventory. Restores r5o, then analyze_trace4.py on every rank.
+# plan inventory. analyze_trace4.py on every rank while the cluster is stopped, then restores r5o.
 set -uo pipefail
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-29-determinism
@@ -36,13 +36,16 @@ log "c8 exit ${PIPESTATUS[0]}"
 python3 $E/scenario_trace.py http://10.0.1.71:8000 "$out/scenarios" --repeats 1 | tee "$out/scenario-runs.jsonl"
 log "scenarios exit ${PIPESTATUS[0]}"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+# Analyses before production returns: the cluster is stopped, so they cannot press dgx1's
+# steady memory guard (one container at a time, capped).
 for node in dgx1 dgx2 dgx3; do
   for d in c8 scenarios; do
-    docker run --rm -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_trace4.py:/a.py:ro -v $PWD/$out/$d:/t:ro \
-      --entrypoint python3 $IMAGE /a.py /t --node $node --chain 12 2>&1 | grep -v Warn \
+    docker run --rm --memory=16g -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_trace4.py:/a.py:ro \
+      -v $PWD/$out/$d:/t:ro --entrypoint python3 $IMAGE /a.py /t --node $node --chain 12 2>&1 | grep -v Warn \
       > "$out/analysis4-$d-$node.jsonl"
   done
 done
+log "analysed"
+bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark3 doctor --live 2>&1 | tail -3
 log "done"
