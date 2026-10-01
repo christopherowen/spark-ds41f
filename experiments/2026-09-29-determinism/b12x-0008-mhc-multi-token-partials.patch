@@ -1,0 +1,529 @@
+--- a/b12x/norm/mhc/_kernels.py
++++ b/b12x/norm/mhc/_kernels.py
+@@ -1051,6 +1051,331 @@
+             cute.arch.griddepcontrol_launch_dependents()
+ 
+ 
++class MHCPostPrePartialMultiTokenKernel(MHCPostPrePartialKernel):
++    """MHCPostPrePartialKernel computing tokens_per_cta tokens per CTA.
++
++    Each thread loads its slice of the mixing weights once and computes every
++    token of its CTA exactly as the one-token kernel does: the same per-thread
++    expression, warp reduction and in-order warp sum, so a row's partial sums
++    are bit-identical. Large capacities read the weights once per CTA instead
++    of once per token.
++    """
++
++    def __init__(self, *, tokens_per_cta: int, **kwargs):
++        super().__init__(**kwargs)
++        tokens_per_cta = int(tokens_per_cta)
++        if not 1 < tokens_per_cta <= 16:
++            raise ValueError(f"tokens_per_cta must be in [2, 16], got {tokens_per_cta}")
++        if self.post_only:
++            raise ValueError("the multi-token partial kernel computes partial sums")
++        self.tokens_per_cta = tokens_per_cta
++
++    @cute.jit
++    def __call__(
++        self,
++        x: cute.Tensor,
++        residual: cute.Tensor,
++        prev_post: cute.Tensor,
++        prev_comb: cute.Tensor,
++        fn: cute.Tensor,
++        partials: cute.Tensor,
++        out: cute.Tensor,
++        pre_mix: cute.Tensor,
++        y: cute.Tensor,
++        num_tokens: Int32,
++        stream: cuda.CUstream,
++    ):
++        if const_expr((not self.pre_only) and x.element_type != cutlass.BFloat16):
++            raise TypeError("x must be BFloat16")
++        if const_expr(residual.element_type != cutlass.BFloat16):
++            raise TypeError("residual must be BFloat16")
++        if const_expr(
++            (not self.pre_only) and prev_post.element_type != cutlass.Float32
++        ):
++            raise TypeError("prev_post must be Float32")
++        if const_expr(
++            (not self.pre_only) and prev_comb.element_type != cutlass.Float32
++        ):
++            raise TypeError("prev_comb must be Float32")
++        if const_expr((not self.post_only) and fn.element_type != cutlass.Float32):
++            raise TypeError("fn must be Float32")
++        if const_expr(
++            (not self.post_only) and partials.element_type != cutlass.Float32
++        ):
++            raise TypeError("partials must be Float32")
++        if const_expr(out.element_type != cutlass.BFloat16):
++            raise TypeError("out must be BFloat16")
++        if const_expr(self.lagged_mix and pre_mix.element_type != cutlass.Float32):
++            raise TypeError("pre_mix must be Float32")
++        if const_expr(self.lagged_mix and y.element_type != cutlass.BFloat16):
++            raise TypeError("y must be BFloat16")
++        partial_groups = (
++            1
++            if self.post_only
++            else (self.partials + self.partials_per_cta - 1) // self.partials_per_cta
++        )
++        self.kernel(
++            x, residual, prev_post, prev_comb, fn, partials, out, pre_mix, y,
++            num_tokens,
++        ).launch(
++            grid=(
++                self.source_tiles,
++                partial_groups,
++                (num_tokens + Int32(self.tokens_per_cta - 1))
++                // Int32(self.tokens_per_cta),
++            ),
++            block=[self.num_threads, 1, 1],
++            stream=stream,
++            use_pdl=_MHC_PDL,
++        )
++
++
++    @cute.kernel
++    def kernel(
++        self,
++        x: cute.Tensor,
++        residual: cute.Tensor,
++        prev_post: cute.Tensor,
++        prev_comb: cute.Tensor,
++        fn: cute.Tensor,
++        partials: cute.Tensor,
++        out: cute.Tensor,
++        pre_mix: cute.Tensor,
++        y: cute.Tensor,
++        num_tokens: Int32,
++    ):
++        # Launched early behind the one-shot all-reduce that produces x; wait
++        # for it to complete before any global read.
++        if const_expr(_MHC_PDL):
++            cute.arch.griddepcontrol_wait()
++        hidden_tile, partial_group, token_block = cute.arch.block_idx()
++        tidx = cute.arch.thread_idx()[0]
++        lane = tidx % Int32(32)
++        warp = tidx // Int32(32)
++        nwarps = self.num_threads // 32
++        smem = cutlass_utils.SmemAllocator()
++        storage = smem.allocate(
++            _post_pre_partial_group_storage_cls(
++                self.partials_per_cta,
++                self.compute_gram,
++                self.lagged_mix,
++            )
++        )
++        warp_sums = storage.warp_sums.get_tensor(
++            cute.make_layout(
++                (self.partials_per_cta, self.num_threads // 32),
++                stride=(self.num_threads // 32, 1),
++            )
++        )
++        if const_expr(self.compute_gram):
++            gram_sums = storage.gram_sums.get_tensor(
++                cute.make_layout((_GRAM_PAIRS, nwarps), stride=(nwarps, 1))
++            )
++        if const_expr(self.lagged_mix):
++            lagged_sums = storage.lagged_sums.get_tensor(
++                cute.make_layout((nwarps,), stride=(1,))
++            )
++
++        partial0 = partial_group * Int32(self.partials_per_cta)
++        h = Int64(hidden_tile) * Int64(self.source_tile_h) + Int64(tidx)
++        # This thread's slice of the mixing weights, loaded once for every token.
++        fn_cache = cute.make_rmem_tensor(
++            cute.make_layout((self.partials_per_cta * 4,), stride=(1,)), Float32
++        )
++        for slot in cutlass.range_constexpr(self.partials_per_cta * 4):
++            fn_cache[slot] = Float32(0.0)
++        if const_expr(not self.post_only):
++            for slot in cutlass.range_constexpr(self.partials_per_cta):
++                partial = partial0 + Int32(slot)
++                if partial > Int32(0):
++                    if partial < Int32(self.partials):
++                        mix = partial - Int32(1)
++                        if const_expr(self.pre_only and cute.rank(residual) == 2):
++                            fn_cache[slot * 4] = Float32(fn[mix, h])
++                        else:
++                            fn_cache[slot * 4] = Float32(fn[mix, h])
++                            fn_cache[slot * 4 + 1] = Float32(
++                                fn[mix, Int64(self.hidden_size) + h]
++                            )
++                            fn_cache[slot * 4 + 2] = Float32(
++                                fn[mix, Int64(2 * self.hidden_size) + h]
++                            )
++                            fn_cache[slot * 4 + 3] = Float32(
++                                fn[mix, Int64(3 * self.hidden_size) + h]
++                            )
++        for step in cutlass.range(self.tokens_per_cta, unroll=1):
++            token = Int64(token_block) * Int64(self.tokens_per_cta) + Int64(step)
++            if token < Int64(num_tokens):
++                if const_expr(self.pre_only):
++                    if const_expr(cute.rank(residual) == 2):
++                        r0 = Float32(residual[token, h])
++                        r1 = r0
++                        r2 = r0
++                        r3 = r0
++                    else:
++                        r0 = Float32(residual[token, Int32(0), h])
++                        r1 = Float32(residual[token, Int32(1), h])
++                        r2 = Float32(residual[token, Int32(2), h])
++                        r3 = Float32(residual[token, Int32(3), h])
++                    if partial_group == Int32(0):
++                        out[token, Int32(0), h] = r0.to(cutlass.BFloat16)
++                        out[token, Int32(1), h] = r1.to(cutlass.BFloat16)
++                        out[token, Int32(2), h] = r2.to(cutlass.BFloat16)
++                        out[token, Int32(3), h] = r3.to(cutlass.BFloat16)
++                else:
++                    r0 = Float32(residual[token, Int32(0), h])
++                    r1 = Float32(residual[token, Int32(1), h])
++                    r2 = Float32(residual[token, Int32(2), h])
++                    r3 = Float32(residual[token, Int32(3), h])
++
++                if const_expr(not self.pre_only):
++                    xh = Float32(x[token, h])
++                    o0 = (
++                        Float32(prev_post[token, Int32(0)]) * xh
++                        + Float32(prev_comb[token, Int32(0), Int32(0)]) * r0
++                        + Float32(prev_comb[token, Int32(1), Int32(0)]) * r1
++                        + Float32(prev_comb[token, Int32(2), Int32(0)]) * r2
++                        + Float32(prev_comb[token, Int32(3), Int32(0)]) * r3
++                    ).to(cutlass.BFloat16)
++                    o1 = (
++                        Float32(prev_post[token, Int32(1)]) * xh
++                        + Float32(prev_comb[token, Int32(0), Int32(1)]) * r0
++                        + Float32(prev_comb[token, Int32(1), Int32(1)]) * r1
++                        + Float32(prev_comb[token, Int32(2), Int32(1)]) * r2
++                        + Float32(prev_comb[token, Int32(3), Int32(1)]) * r3
++                    ).to(cutlass.BFloat16)
++                    o2 = (
++                        Float32(prev_post[token, Int32(2)]) * xh
++                        + Float32(prev_comb[token, Int32(0), Int32(2)]) * r0
++                        + Float32(prev_comb[token, Int32(1), Int32(2)]) * r1
++                        + Float32(prev_comb[token, Int32(2), Int32(2)]) * r2
++                        + Float32(prev_comb[token, Int32(3), Int32(2)]) * r3
++                    ).to(cutlass.BFloat16)
++                    o3 = (
++                        Float32(prev_post[token, Int32(3)]) * xh
++                        + Float32(prev_comb[token, Int32(0), Int32(3)]) * r0
++                        + Float32(prev_comb[token, Int32(1), Int32(3)]) * r1
++                        + Float32(prev_comb[token, Int32(2), Int32(3)]) * r2
++                        + Float32(prev_comb[token, Int32(3), Int32(3)]) * r3
++                    ).to(cutlass.BFloat16)
++                    if partial_group == Int32(0):
++                        out[token, Int32(0), h] = o0
++                        out[token, Int32(1), h] = o1
++                        out[token, Int32(2), h] = o2
++                        out[token, Int32(3), h] = o3
++                    r0 = Float32(o0)
++                    r1 = Float32(o1)
++                    r2 = Float32(o2)
++                    r3 = Float32(o3)
++
++                if const_expr(self.lagged_mix):
++                    if partial_group == Int32(0):
++                        p0 = Float32(pre_mix[token, Int32(0)])
++                        p1 = Float32(pre_mix[token, Int32(1)])
++                        p2 = Float32(pre_mix[token, Int32(2)])
++                        p3 = Float32(pre_mix[token, Int32(3)])
++                        y_bf16 = _contract_four(p0, p1, p2, p3, r0, r1, r2, r3).to(
++                            cutlass.BFloat16
++                        )
++                        y[token, h] = y_bf16
++                        lagged_sum = _warp_allreduce_sum(
++                            Float32(y_bf16) * Float32(y_bf16)
++                        )
++                        if lane == Int32(0):
++                            lagged_sums[warp] = lagged_sum
++
++                if const_expr(not self.post_only):
++                    if const_expr(self.compute_gram):
++                        if partial_group == Int32(0):
++                            gvals = cute.make_rmem_tensor(
++                                cute.make_layout((_GRAM_PAIRS,), stride=(1,)),
++                                Float32,
++                            )
++                            gvals[0] = r0 * r0
++                            gvals[1] = r1 * r1
++                            gvals[2] = r2 * r2
++                            gvals[3] = r3 * r3
++                            gvals[4] = r0 * r1
++                            gvals[5] = r0 * r2
++                            gvals[6] = r0 * r3
++                            gvals[7] = r1 * r2
++                            gvals[8] = r1 * r3
++                            gvals[9] = r2 * r3
++                            for gp in cutlass.range_constexpr(_GRAM_PAIRS):
++                                gvals[gp] = _warp_allreduce_sum(gvals[gp])
++                            if lane == Int32(0):
++                                for gp in cutlass.range_constexpr(_GRAM_PAIRS):
++                                    gram_sums[gp, warp] = gvals[gp]
++
++                    values = cute.make_rmem_tensor(
++                        cute.make_layout((self.partials_per_cta,), stride=(1,)),
++                        Float32,
++                    )
++                    for slot in cutlass.range_constexpr(self.partials_per_cta):
++                        partial = partial0 + Int32(slot)
++                        value = Float32(0.0)
++                        if partial == Int32(0):
++                            value = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3
++                        elif const_expr(self.pre_only and cute.rank(residual) == 2):
++                            if partial < Int32(self.partials):
++                                mix = partial - Int32(1)
++                                value = fn_cache[slot * 4] * r0
++                        elif partial < Int32(self.partials):
++                            mix = partial - Int32(1)
++                            value = (
++                                fn_cache[slot * 4] * r0
++                                + fn_cache[slot * 4 + 1] * r1
++                                + fn_cache[slot * 4 + 2] * r2
++                                + fn_cache[slot * 4 + 3] * r3
++                            )
++                        values[slot] = _warp_allreduce_sum(value)
++                    if lane == Int32(0):
++                        for slot in cutlass.range_constexpr(self.partials_per_cta):
++                            warp_sums[slot, warp] = values[slot]
++                    cute.arch.sync_threads()
++
++                    if tidx == Int32(0):
++                        for slot in cutlass.range_constexpr(self.partials_per_cta):
++                            total = Float32(0.0)
++                            src_warp = Int32(0)
++                            while src_warp < Int32(nwarps):
++                                total += Float32(warp_sums[slot, src_warp])
++                                src_warp += Int32(1)
++                            partial = partial0 + Int32(slot)
++                            if partial < Int32(self.partials):
++                                partials[token, hidden_tile, partial] = total
++                        if const_expr(self.lagged_mix):
++                            if partial_group == Int32(0):
++                                lagged_total = Float32(0.0)
++                                src_warp = Int32(0)
++                                while src_warp < Int32(nwarps):
++                                    lagged_total += Float32(lagged_sums[src_warp])
++                                    src_warp += Int32(1)
++                                partials[
++                                    token, Int32(self.gram_row0) + hidden_tile, Int32(0)
++                                ] = lagged_total
++
++                    if const_expr(self.compute_gram):
++                        if partial_group == Int32(0):
++                            if tidx == Int32(0):
++                                for gp in cutlass.range_constexpr(_GRAM_PAIRS):
++                                    gtotal = Float32(0.0)
++                                    src_warp = Int32(0)
++                                    while src_warp < Int32(nwarps):
++                                        gtotal += Float32(gram_sums[gp, src_warp])
++                                        src_warp += Int32(1)
++                                    partials[token, Int32(self.gram_row0) + hidden_tile, gp] = (
++                                        gtotal
++                                    )
++
++            # The next token reuses the shared warp sums.
++            cute.arch.sync_threads()
++
++        if const_expr(_MHC_PDL):
++            cute.arch.sync_threads()
++            cute.arch.griddepcontrol_launch_dependents()
++
++
+ class MHCPostPreDecodeSplitNPartialKernel:
+     """Fused decode partial using split hidden slices and narrow output tiles."""
+ 
+@@ -4107,8 +4432,9 @@
+     post_only: bool = False,
+     lagged_mix: bool = False,
+     partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
++    tokens_per_cta: int = 1,
+ ) -> MHCPostPrePartialKernel:
+-    return MHCPostPrePartialKernel(
++    kwargs = dict(
+         hidden_size=hidden_size,
+         split_k=split_k,
+         compute_gram=compute_gram,
+@@ -4117,6 +4443,9 @@
+         lagged_mix=lagged_mix,
+         partials_per_cta=partials_per_cta,
+     )
++    if int(tokens_per_cta) > 1:
++        return MHCPostPrePartialMultiTokenKernel(tokens_per_cta=int(tokens_per_cta), **kwargs)
++    return MHCPostPrePartialKernel(**kwargs)
+ 
+ 
+ @lru_cache(maxsize=32)
+@@ -4292,6 +4621,7 @@
+     decode_source_splits, decode_tile_n = native.source_splits, native.decode_tile_n
+     decode_bf16x2 = native.decode_bf16x2
+     partials_per_cta = native.partials_per_cta
++    tokens_per_cta = int(getattr(native, "tokens_per_cta", 1))
+     _validate_tensor_shape("x", x, (tokens, hidden_size))
+     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+     _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
+@@ -4435,9 +4765,11 @@
+         compile_name = (
+             "integration.residual.mhc_post_pre_partial_hidden4096_hctile128"
+             f"_all{partials_per_cta}"
++            + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
+         )
+         compile_key = (
+             ("partials_per_cta", partials_per_cta),
++            *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("lagged_mix", lagged_mix),
+@@ -4452,17 +4784,20 @@
+             False,
+             lagged_mix,
+             partials_per_cta,
++            tokens_per_cta,
+         )
+     else:
+         compile_name = (
+             "integration.residual.mhc_post_pre_partial_"
+             f"{hidden_specialization}_hctile128_all{partials_per_cta}"
++            + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
+         )
+         compile_key = (
+             ("hidden_size", hidden_size),
+             ("split_k", split_k),
+             ("source_tiles", hidden_size // _SOURCE_TILE_H),
+             ("partials_per_cta", partials_per_cta),
++            *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("lagged_mix", lagged_mix),
+@@ -4477,6 +4812,7 @@
+             False,
+             lagged_mix,
+             partials_per_cta,
++            tokens_per_cta,
+         )
+     return _compile_mhc_entry(
+         kernel,
+@@ -5337,8 +5673,10 @@
+     pre_mix: torch.Tensor | None = None,
+     y: torch.Tensor | None = None,
+     partials_per_cta: int,
++    tokens_per_cta: int = 1,
+     _prepared=None,
+ ) -> None:
++    tokens_per_cta = int(tokens_per_cta)
+     if (pre_mix is None) != (y is None):
+         raise ValueError("pre_mix and y must be supplied together")
+     lagged_mix = pre_mix is not None
+@@ -5440,9 +5778,11 @@
+         compile_name = (
+             "integration.residual.mhc_pre_partial_hidden4096_hctile128"
+             f"_all{partials_per_cta}"
++            + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
+         )
+         compile_key = (
+             ("partials_per_cta", partials_per_cta),
++            *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("pre_only", True),
+@@ -5453,12 +5793,14 @@
+         compile_name = (
+             "integration.residual.mhc_pre_partial_"
+             f"{hidden_specialization}_hctile128_all{partials_per_cta}"
++            + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
+         )
+         compile_key = (
+             ("hidden_size", hidden_size),
+             ("split_k", split_k),
+             ("source_tiles", hidden_size // _SOURCE_TILE_H),
+             ("partials_per_cta", partials_per_cta),
++            *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("pre_only", True),
+@@ -5473,6 +5815,7 @@
+             pre_only=True,
+             lagged_mix=lagged_mix,
+             partials_per_cta=partials_per_cta,
++            tokens_per_cta=tokens_per_cta,
+         ),
+         compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
+         compile_args=args,
+--- a/b12x/norm/mhc/_preparation.py
++++ b/b12x/norm/mhc/_preparation.py
+@@ -52,6 +52,7 @@
+     finalize_groups: int = 1
+     block_m: int = 2
+     tile_n: int = 24
++    tokens_per_cta: int = 1
+ 
+ 
+ def _lower_native(query, config, device):
+@@ -122,6 +123,7 @@
+         route, source_splits, tile_n, bf16x2, partials, threads, groups,
+         int(controls.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2")),
+         int(controls.get("B12X_MHC_PREFILL_TILE_N", "12" if hidden == 7168 else "24")),
++        config.tokens_per_cta if config.lagged_prepare and route in ("pre", "post_pre") else 1,
+     )
+ 
+ 
+@@ -217,6 +219,7 @@
+                     residual=residual if query.expanded_residual else x, fn=fn, partials=partials, out=out,
+                     compute_gram=False, pre_mix=mix if config.lagged_prepare else None,
+                     y=y if config.lagged_prepare else None, partials_per_cta=native.partials_per_cta,
++                    tokens_per_cta=native.tokens_per_cta,
+                 )
+             else:
+                 post_pre_programs(mix if config.lagged_prepare else None, y if config.lagged_prepare else None)
+@@ -329,7 +332,8 @@
+                     entry(**args)
+         else:
+             entry = partial(kernels._run_mhc_pre_partial_launch,
+-                            partials_per_cta=native.partials_per_cta)
++                            partials_per_cta=native.partials_per_cta,
++                            tokens_per_cta=native.tokens_per_cta)
+             if config.lagged_prepare:
+                 primary = partial(entry, _prepared=programs["partial"], compute_gram=False)
+             else:
+--- a/b12x/norm/mhc/_tuning.py
++++ b/b12x/norm/mhc/_tuning.py
+@@ -55,11 +55,12 @@
+     projection_k_splits: int
+     lagged_prepare: bool = False
+     partials_per_cta: int = 4
++    tokens_per_cta: int = 1
+ 
+     @classmethod
+     def from_config(cls, payload: FrozenMapping) -> "MhcConfig":
+         expected = frozenset(cls.__dataclass_fields__)
+-        if frozenset(payload) != expected:
++        if frozenset(payload) | {"tokens_per_cta"} != expected:
+             raise ValueError(f"mHC config fields must be {sorted(expected)}")
+         return cls(
+             backend=str(payload["backend"]),
+@@ -72,6 +73,7 @@
+             projection_k_splits=int(payload["projection_k_splits"]),
+             lagged_prepare=payload["lagged_prepare"],
+             partials_per_cta=int(payload["partials_per_cta"]),
++            tokens_per_cta=int(payload.get("tokens_per_cta", 1)),
+         )
+ 
+     def to_dict(self) -> dict[str, object]:
+@@ -86,6 +88,7 @@
+             "projection_k_splits": self.projection_k_splits,
+             "lagged_prepare": self.lagged_prepare,
+             "partials_per_cta": self.partials_per_cta,
++            **({"tokens_per_cta": self.tokens_per_cta} if self.tokens_per_cta != 1 else {}),
+         }
+ 
+ 
+@@ -242,6 +245,10 @@
+         raise ValueError("partials_per_cta must be in [1, 25]")
+     if not config.lagged_prepare and config.partials_per_cta != 4:
+         raise ValueError("partial grouping requires the fused lagged producer")
++    if type(config.tokens_per_cta) is not int or not 1 <= config.tokens_per_cta <= 16:
++        raise ValueError("tokens_per_cta must be an integer in [1, 16]")
++    if config.tokens_per_cta != 1 and not config.lagged_prepare:
++        raise ValueError("several tokens per CTA require the fused lagged producer")
+     if config.backend == "native":
+         return
+     if not _tf32_eligible(query):

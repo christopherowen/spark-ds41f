@@ -12,8 +12,10 @@ three layers. Configurations:
 - candidate (vllm-0039): every capacity on the lagged native route (the graph-size plans' own),
   the 4096-row plan computing 13 partial sums per CTA; candidate-p4 groups them by 4 (same
   arithmetic: they must agree bit for bit);
-- tf32-sN: every capacity on the TF32 TMA projection with N K slices (16-row tiles), one
-  arithmetic at every count if the slices are summed in a fixed order.
+- candidate-tN (B12X 0008, overlay mhc-mt): the capacity plan computes N tokens per CTA (13 partial
+  sums each), which must agree bit for bit with the candidate;
+- tf32-sN (MHC_REPLAY_TF32=1): every capacity on the TF32 TMA projection with N K slices (16-row
+  tiles), one arithmetic at every count if the slices are summed in a fixed order.
 For each: rows grouped by exact bits as the last or first row of 1..N-row batches (N the
 captured rows); the candidate against production at decode sizes (bit equality) and against
 production and ref2 at 1024 rows (largest relative difference per output); timings (median
@@ -52,7 +54,9 @@ print(json.dumps({"captures": {f"{k[0]} {k[1]}": v["residual"].shape[0] for k, v
 # name: (batch-invariant mode, fixed graph-size plans, capacity-plan partial sums per CTA, or a TF32 split count)
 CONFIGS = {"production": (False, GRAPH, None), "ref2": (False, (), None), "candidate": (True, GRAPH, 13),
            "candidate-p4": (True, GRAPH, 4),
-           **{f"tf32-s{n}": (True, GRAPH, f"tf32:{n}") for n in (8, 16, 32, 40, 64)}}
+           **{f"candidate-t{n}": (True, GRAPH, f"mt:{n}") for n in (4, 8, 16)}}
+if os.environ.get("MHC_REPLAY_TF32"):
+    CONFIGS.update({f"tf32-s{n}": (True, GRAPH, f"tf32:{n}") for n in (8, 16, 32, 40, 64)})
 real_config = b12x_layers._mhc_batch_invariant_config
 
 
@@ -69,6 +73,12 @@ def build(name):
     b12x_layers._BATCH_INVARIANT = invariant
 
     def config(tokens, partials=partials):
+        if isinstance(partials, str) and partials.startswith("mt:"):
+            chosen = real_config(tokens)
+            if chosen is not None and tokens >= 96:  # B12X 0008: several tokens per CTA at capacity
+                chosen = type(chosen)(**{**chosen.to_dict(), "partials_per_cta": 13,
+                                         "tokens_per_cta": int(partials.split(":")[1])})
+            return chosen
         if isinstance(partials, str):
             return tf32(int(partials.split(":")[1]))
         chosen = real_config(tokens)
@@ -180,7 +190,7 @@ for (layer, op) in captures:
                    for x, y in zip(a, b))
     same = {other: all(torch.equal(a, b) for a, b in zip(outputs[(other, layer, op, 1024)],
                                                          outputs[("candidate", layer, op, 1024)]))
-            for other in ("candidate-p4",)
+            for other in ("candidate-p4", "candidate-t4", "candidate-t8", "candidate-t16")
             if (other, layer, op, 1024) in outputs}
     big = {}
     for other in ("production", "ref2"):
