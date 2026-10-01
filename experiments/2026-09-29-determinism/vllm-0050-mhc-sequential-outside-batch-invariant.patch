@@ -1,0 +1,95 @@
+From 9cec2686b271b55d06389ff5f3d8292a83d24ca7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 00:42:34 +0200
+Subject: [PATCH] perf(ds41): opt-in sequential mHC kernel outside
+ batch-invariant mode
+
+With VLLM_DS41_MHC_SEQUENTIAL=1 and batch invariance off, mHC pre and
+post_pre capacities of VLLM_DS41_MHC_SEQUENTIAL_MIN_TOKENS rows or more
+(default 8) take B12X's sequential partial kernel; smaller capacities keep
+the tuned plans, which are faster at one to four rows.
+---
+ vllm/models/deepseek_v4_1/b12x_layers.py | 49 +++++++++++++++---------
+ 1 file changed, 30 insertions(+), 19 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 43be43776..dc8ffcb87 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -220,8 +220,11 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
+ # count (cuBLAS through the torch backend) on the SIMT GEMV instead, so a row
+ # rounds the same whatever it is batched with. Off unless set.
+ _BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+-# Batch-invariant mHC on B12X's sequential partial kernel (sequential_partials).
++# mHC pre and post_pre on B12X's sequential partial kernel (sequential_partials): at every
++# capacity in batch-invariant mode, otherwise from VLLM_DS41_MHC_SEQUENTIAL_MIN_TOKENS rows
++# up (B12X's tuned plans stay faster at one to four rows).
+ _MHC_SEQUENTIAL = os.environ.get("VLLM_DS41_MHC_SEQUENTIAL") == "1"
++_MHC_SEQUENTIAL_MIN_TOKENS = int(os.environ.get("VLLM_DS41_MHC_SEQUENTIAL_MIN_TOKENS", "8"))
+ 
+ 
+ def _gemv_override(query):
+@@ -754,6 +757,28 @@ def _mhc_post_fake(x, residual, post, comb, out, layer_name):
+     return None
+ 
+ 
++def _mhc_sequential_config(tokens: int):
++    """B12X's sequential partial kernel: each partial sum is one thread's FP32 chain over a
++    128-wide hidden tile, with the four residual streams added in order. Up to eight rows
++    per CTA only share the mixing-weight reads, so they leave every bit unchanged."""
++    from b12x.norm.mhc._tuning import MhcConfig
++
++    return MhcConfig(
++        backend="native",
++        projection_tile_m=16,
++        projection_tile_n=8,
++        projection_tile_k=256,
++        projection_num_stages=1,
++        projection_num_m_warps=1,
++        projection_num_n_warps=1,
++        projection_k_splits=1,
++        lagged_prepare=True,
++        partials_per_cta=4,
++        tokens_per_cta=min(8, int(tokens)),
++        sequential_partials=True,
++    )
++
++
+ def _mhc_batch_invariant_config(tokens: int):
+     """Batch-invariant mode: pre and post_pre on the lagged native route at every capacity.
+ 
+@@ -772,27 +797,13 @@ def _mhc_batch_invariant_config(tokens: int):
+     sequence, so neither grouping changes a bit.
+     """
+     if not _BATCH_INVARIANT:
++        if _MHC_SEQUENTIAL and tokens >= _MHC_SEQUENTIAL_MIN_TOKENS:
++            return _mhc_sequential_config(tokens)
+         return None
++    if _MHC_SEQUENTIAL:
++        return _mhc_sequential_config(tokens)
+     from b12x.norm.mhc._tuning import MhcConfig
+ 
+-    if _MHC_SEQUENTIAL:
+-        # Each partial sum is one thread's FP32 chain over a 128-wide hidden tile, with
+-        # the four residual streams added in order, at every capacity. Up to eight rows
+-        # per CTA only share the mixing-weight reads, so they leave every bit unchanged.
+-        return MhcConfig(
+-            backend="native",
+-            projection_tile_m=16,
+-            projection_tile_n=8,
+-            projection_tile_k=256,
+-            projection_num_stages=1,
+-            projection_num_m_warps=1,
+-            projection_num_n_warps=1,
+-            projection_k_splits=1,
+-            lagged_prepare=True,
+-            partials_per_cta=4,
+-            tokens_per_cta=min(8, int(tokens)),
+-            sequential_partials=True,
+-        )
+     return MhcConfig(
+         backend="native",
+         projection_tile_m=16,
+-- 
+2.43.0
+
