@@ -16,6 +16,11 @@ three layers. Configurations:
   sums each), which must agree bit for bit with the candidate;
 - tf32-sN (MHC_REPLAY_TF32=1): every capacity on the TF32 TMA projection with N K slices (16-row
   tiles), one arithmetic at every count if the slices are summed in a fixed order.
+MHC_REPLAY_SET=sweep replaces the set with production, the candidate, candidate-t16 and its 9- and
+25-partial groupings (candidate-t16-pP, which must equal the candidate bit for bit), tf32-s40, and
+tf32x-* variants: 40 K slices with one launch geometry (tile_m.tile_n.n_warps.tile_k.stages) for the
+graph-size plans and another for the capacity plan, which must equal tf32-s40 bit for bit if the
+geometry only partitions the work.
 For each: rows grouped by exact bits as the last or first row of 1..N-row batches (N the
 captured rows); the candidate against production at decode sizes (bit equality) and against
 production and ref2 at 1024 rows (largest relative difference per output); timings (median
@@ -57,14 +62,24 @@ CONFIGS = {"production": (False, GRAPH, None), "ref2": (False, (), None), "candi
            **{f"candidate-t{n}": (True, GRAPH, f"mt:{n}") for n in (4, 8, 16)}}
 if os.environ.get("MHC_REPLAY_TF32"):
     CONFIGS.update({f"tf32-s{n}": (True, GRAPH, f"tf32:{n}") for n in (8, 16, 32, 40, 64)})
+SWEEP_TF32 = {"a": ("16.8.1.64.2", "64.24.1.64.2"), "b": ("16.24.3.64.2", "32.24.1.64.2"),
+              "c": ("16.8.1.128.2", "64.24.3.64.2"), "d": ("16.24.3.128.3", "64.24.1.128.2"),
+              "e": ("16.8.1.32.4", "32.8.1.64.2")}
+if os.environ.get("MHC_REPLAY_SET") == "sweep":
+    CONFIGS = {"production": (False, GRAPH, None), "candidate": (True, GRAPH, 13),
+               "candidate-t16": (True, GRAPH, "mt:16"),
+               **{f"candidate-t16-p{p}": (True, GRAPH, f"mt:16:{p}") for p in (9, 25)},
+               "tf32-s40": (True, GRAPH, "tf32:40"),
+               **{f"tf32x-{k}": (True, GRAPH, f"tf32x:40:{d}/{c}") for k, (d, c) in SWEEP_TF32.items()}}
 real_config = b12x_layers._mhc_batch_invariant_config
 
 
-def tf32(splits):
-    """TF32 TMA projection at every capacity: 16-row tiles, all 24 mixes per tile, `splits` K slices."""
+def tf32(splits, geometry="16.24.1.64.2"):
+    """TF32 TMA projection: `splits` K slices; by default 16-row tiles, all 24 mixes per tile."""
     from b12x.norm.mhc._tuning import MhcConfig
-    return MhcConfig(backend="tf32_tma", projection_tile_m=16, projection_tile_n=24, projection_tile_k=64,
-                     projection_num_stages=2, projection_num_m_warps=1, projection_num_n_warps=1,
+    tm_, tn, nn, tk, st = (int(v) for v in geometry.split("."))
+    return MhcConfig(backend="tf32_tma", projection_tile_m=tm_, projection_tile_n=tn, projection_tile_k=tk,
+                     projection_num_stages=st, projection_num_m_warps=tm_ // 16, projection_num_n_warps=nn,
                      projection_k_splits=splits)
 
 
@@ -75,10 +90,15 @@ def build(name):
     def config(tokens, partials=partials):
         if isinstance(partials, str) and partials.startswith("mt:"):
             chosen = real_config(tokens)
+            parts = partials.split(":")
             if chosen is not None and tokens >= 96:  # B12X 0008: several tokens per CTA at capacity
-                chosen = type(chosen)(**{**chosen.to_dict(), "partials_per_cta": 13,
-                                         "tokens_per_cta": int(partials.split(":")[1])})
+                chosen = type(chosen)(**{**chosen.to_dict(), "partials_per_cta": int(parts[2]) if len(parts) > 2 else 13,
+                                         "tokens_per_cta": int(parts[1])})
             return chosen
+        if isinstance(partials, str) and partials.startswith("tf32x:"):
+            _, splits, geometries = partials.split(":")
+            decode, capacity = geometries.split("/")
+            return tf32(int(splits), decode if tokens <= 48 else capacity)
         if isinstance(partials, str):
             return tf32(int(partials.split(":")[1]))
         chosen = real_config(tokens)
@@ -160,7 +180,11 @@ outputs = {}
 for name in CONFIGS:
     modules, requests = build(name)
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare(tuple(requests))
+        try:
+            session.prepare(tuple(requests))
+        except Exception as error:  # a configuration B12X rejects: report it, keep the others
+            print(json.dumps({"config": name, "error": f"{type(error).__name__}: {error}"[:300]}), flush=True)
+            continue
         (layer0, op0), (owner0, module0) = next(iter(modules.items()))
         print(json.dumps({"config": name, "plans": {f"{op} {cap}": str(p.selection.config)[:160]
                                                     for (op, cap), p in sorted(module0._plans.items())
@@ -200,4 +224,14 @@ for (layer, op) in captures:
                       "differs_at": sorted(r for r, e in equal.items() if not e),
                       "max_rel_diff_at_1024": {k: f"{v:.2e}" for k, v in big.items()},
                       "candidate_bit_equal_at_1024": same}), flush=True)
+for (layer, op) in captures:
+    for name in CONFIGS:
+        base = "tf32-s40" if name.startswith("tf32x-") else "candidate" if name.startswith("candidate-t16") else None
+        if base is None or base not in CONFIGS:
+            continue
+        rows = [r for r in (*GRAPH, 1024) if (name, layer, op, r) in outputs and (base, layer, op, r) in outputs]
+        equal = [r for r in rows if all(torch.equal(a, b) for a, b in zip(outputs[(name, layer, op, r)],
+                                                                         outputs[(base, layer, op, r)]))]
+        print(json.dumps({"bits": f"{name} vs {base} layer {layer} {op}", "equal_at": equal,
+                          "differs_at": [r for r in rows if r not in equal]}), flush=True)
 print("mhc replay done", flush=True)
