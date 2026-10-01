@@ -1,0 +1,55 @@
+--- a/checksum_debug.py
++++ b/checksum_debug.py
+@@ -486,6 +486,18 @@
+         json.dump(out, f, indent=1, default=str)
+ 
+ 
++def record_logit_rows(indices: torch.Tensor) -> None:
++    """Record the batch rows whose logits the step computes (the LM head's rows)."""
++    n = min(int(indices.numel()), _ROWS)
++    log = _log("logit", indices.device, 2 + _ROWS, _SCHEDULE_CAPACITY, _ROWS)
++    stage = log.stage[0]
++    stage.zero_()
++    stage[0].fill_(_step[0] - 1)
++    stage[1].fill_(int(indices.numel()))
++    stage[2 : 2 + n].copy_(indices.reshape(-1)[:n])
++    log.append(0)
++
++
+ def record_ced(indices: torch.Tensor) -> None:
+     """Record the step's CED decoder rows (their batch indices); eager steps only.
+ 
+--- a/model_runner.py
++++ b/model_runner.py
+@@ -1668,6 +1668,7 @@
+                 num_reqs, self.input_buffers.is_padding,
+                 self.input_buffers.positions, self.input_buffers.input_ids,
+             )
++            checksum_debug.record_logit_rows(logits_indices)
+ 
+         fast_prefill = None
+         if self.fast_prefill is not None:
+--- a/model41.py
++++ b/model41.py
+@@ -1177,3 +1177,21 @@
+                 module.setup_wo_projection()
+             if isinstance(module, Engram):
+                 module.process_weights_after_loading()
++
++
++# Debug (SPARK3_MOE_CHECKSUM_DIR): the LM head's input rows and logits, as layer 41.
++_LM_HEAD_OWNER = type("LmHead", (), {"prefix": "language_model.model.layers.41.lm_head"})()
++_upstream_compute_logits = DeepseekV41LLMForCausalLM.compute_logits
++
++
++def _traced_compute_logits(self, hidden_states):
++    from vllm.model_executor.layers.fused_moe.runner import checksum_debug
++
++    logits = _upstream_compute_logits(self, hidden_states)
++    if checksum_debug.ENABLED and logits is not None:
++        checksum_debug.record_attn(_LM_HEAD_OWNER, 33, hidden_states)
++        checksum_debug.record_attn(_LM_HEAD_OWNER, 34, logits)
++    return logits
++
++
++DeepseekV41LLMForCausalLM.compute_logits = _traced_compute_logits

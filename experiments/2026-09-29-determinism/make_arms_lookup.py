@@ -66,7 +66,9 @@ gives every operation one arithmetic for every row count in batch-invariant
 mode, and aligns prefill chunks to the long-prefill threshold, which must
 leave room for the largest decode batch (4000 < 4096 - 48): detm-r5o-ref-pin
 (performance, the deterministic MoE of det-variant2) and detm-r5o-ref-trace
-(attn-exact5: attn-exact4 with vllm-0035 in its attention copy).
+(attn-exact5: attn-exact4 with vllm-0035 in its attention copy);
+detm-r5o-ref-trace6 also records the LM head's input rows and logits
+(attn-exact6).
 """
 import copy
 import json
@@ -193,12 +195,17 @@ def with_reference(arm, *, attention):
 
 
 ref_pin = with_reference(detm_variant2_pin, attention=True)
-ref_trace = with_reference(traced(detm_variant2_pin, 1790, overlay="attn-exact5", lookup="ref1"), attention=False)
-mount(ref_trace, "attn-exact5/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
-ref_trace["environment"].update(
-    SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072",
-    SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="512", SPARK3_DEBUG_INDEX_CAPTURE="2,8,14:1530:1545",
-)
+def reference_trace(overlay):
+    arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup="ref1"), attention=False)
+    mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
+    arm["environment"].update(
+        SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072",
+        SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="512", SPARK3_DEBUG_INDEX_CAPTURE="2,8,14:1530:1545",
+    )
+    return arm
+
+
+ref_trace = reference_trace("attn-exact5")
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),
@@ -216,6 +223,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-bi-rs2-pin", with_rs(bi_full_pin, "gemv-lookup-mhc-bi-fp8-rs2")),
                   ("detm-r5o-rs2-exact4-trace", final_wide4),
                   ("detm-r5o-ref-pin", ref_pin), ("detm-r5o-ref-trace", ref_trace),
+                  ("detm-r5o-ref-trace6", reference_trace("attn-exact6")),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),

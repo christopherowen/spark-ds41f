@@ -49,8 +49,8 @@ SHARED = {0: "mlp_input", 1: "gate_up", 2: "act", 3: "down"}
 ATTN = {10: "attn_input", 11: "q_latent", 12: "kv_latent", 13: "q_rotated", 14: "compressor_latent",
         15: "index_key", 16: "index_weights", 17: "selected_sum", 18: "selected_order", 19: "selected_len",
         20: "window_len", 21: "attn_output", 22: "o_proj", 24: "q_proj", 28: "q_raw", 29: "kv_raw",
-        30: "router_logits"}
-ORDER = (10, 28, 29, 11, 12, 24, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
+        30: "router_logits", 33: "lm_head_input", 34: "logits"}
+ORDER = (10, 28, 29, 11, 12, 24, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 33, 34)
 MODES = {0: "decode", 1: "prefill", 2: "prefill_short"}
 PRIME = 16777213
 
@@ -141,6 +141,12 @@ class NodeLogs:
             for r in chronological(ced):
                 n = int(r[1].item())
                 self.ced[int(r[0].item())] = [int(v) for v in r[2: 2 + min(n, ced["max_rows"])].tolist()]
+        self.logit_rows = {}  # step -> batch rows whose logits the step computes (attn-exact6)
+        logit = latest(node_dir, "logit")
+        if logit is not None:
+            for r in chronological(logit):
+                n = int(r[1].item())
+                self.logit_rows[int(r[0].item())] = [int(v) for v in r[2: 2 + min(n, logit["max_rows"])].tolist()]
         self.sources = []  # (kind, log, steps)
         for kind in ("runner", "tags", "attn"):
             for suffix in ("", "_wide"):
@@ -194,6 +200,8 @@ def load_request(run_dir, target, node, ced_start=20):
         num_tokens, padded = h["num_tokens"], h["padded"]
         label = dict(logs.labels.get(step, {"mode": "graph", "sp": None}), rows=num_tokens, padded=padded)
         local_rows = label.pop("local_rows", None)  # rank 0's SP-local records start at offset 0
+        logit_rows = logs.logit_rows.get(step)
+        logit_row = {batch: j for j, batch in enumerate(logit_rows)} if logit_rows else {}
         decoder = logs.ced.get(step)
         compacted = decoder is not None and decoder != list(range(num_tokens))
         decoder_row = {batch: j for j, batch in enumerate(decoder)} if compacted else {}
@@ -216,6 +224,14 @@ def load_request(run_dir, target, node, ced_start=20):
                     if tag not in SHARED:
                         continue
                     keys, names = [(layer, 2, tag)], [SHARED[tag]]
+                if kind == "attn" and tag in (33, 34) and logit_rows is not None and n == len(logit_rows):
+                    stats["logit_records"] += 1  # the LM head: record row j is batch row logit_rows[j]
+                    for i in range(b - a):
+                        j = logit_row.get(a + i)
+                        if j is not None:
+                            for c, (key, name) in enumerate(zip(keys, names)):
+                                records[i][(key, name)] = float(values[j, c])
+                    continue
                 if (compacted and layer >= ced_start and offset == 0 and n == len(decoder)
                         and n not in (num_tokens, padded)):
                     stats["ced_records"] += 1  # a decoder layer: record row j is batch row decoder[j]

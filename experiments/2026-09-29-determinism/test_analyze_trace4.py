@@ -9,7 +9,9 @@ recorded as a sequence-parallel rank would (rows 4-7 of the step, offset 4),
 the index weights as rank 0 would (the step's first 4 rows, offset 0),
 one record whose rows do not match the step (must be counted, not compared),
 a CED step whose last layer computes only some rows (decoder records mapped
-through the recorded indices; a second planted difference there),
+through the recorded indices; a second planted difference there), LM-head
+records for each step's logit rows (a third planted difference, in one
+row's logits),
 a dead verification row (must be excluded) and one planted difference
 (layer 1's router logits at prompt position 4). Every other row is built from
 its (layer, tag, position, token) alone, so equal rows have equal fingerprints.
@@ -51,7 +53,8 @@ def values(layer, tag, positions, tokens, plant=None):
     return torch.stack(out)
 
 
-def run(directory, steps, plant=None, sp_local=None, unaligned=False, ced=None, plant2=None):
+def run(directory, steps, plant=None, sp_local=None, unaligned=False, ced=None, plant2=None, logits=None,
+        plant3=None):
     os.environ.update(SPARK3_MOE_CHECKSUM_DIR=directory, SPARK3_MOE_CHECKSUM_ROWS="4",
                       SPARK3_MOE_CHECKSUM_WIDE_ROWS="16", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="256",
                       SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="16")
@@ -62,6 +65,7 @@ def run(directory, steps, plant=None, sp_local=None, unaligned=False, ced=None, 
     attn = [Owner(f"language_model.model.layers.{L}.self_attn") for L in range(LAYERS)]
     moe = [Owner(f"language_model.model.layers.{L}.mlp.experts") for L in range(LAYERS)]
     shared = [Owner(f"language_model.model.layers.{L}.mlp.shared_experts") for L in range(LAYERS)]
+    head = Owner("language_model.model.layers.41.lm_head")
     for step, requests in enumerate(steps):
         req_ids = [r for r, _, _, _ in requests]
         positions = [p for _, ps, _, _ in requests for p in ps]
@@ -73,6 +77,13 @@ def run(directory, steps, plant=None, sp_local=None, unaligned=False, ced=None, 
         n = len(positions)
         cd.record_schedule(req_ids, n, n, torch.tensor(qsl), len(requests), torch.tensor(dead, dtype=torch.float32),
                            torch.tensor(positions), torch.tensor(tokens))
+        rows = (logits or {}).get(step)  # the batch rows whose logits the step computes
+        if rows is not None and hasattr(cd, "record_logit_rows"):
+            cd.record_logit_rows(torch.tensor(rows))
+            hp = [positions[i] for i in rows]
+            ht = [tokens[i] for i in rows]
+            cd.record_attn(head, 33, values(41, 33, hp, ht))
+            cd.record_attn(head, 34, values(41, 34, hp, ht, plant3))
         decoder = (ced or {}).get(step)  # CED: the last layer computes only these batch rows
         if decoder is not None:
             cd.record_ced(torch.tensor(decoder))
@@ -124,11 +135,13 @@ def main():
         prompt_rows = (list(range(6)), PROMPT, [0] * 6)
         verify = ([6, 7, 8], [100, 101, 999], [0, 0, 0])
         run(os.path.join(out, "t-m0-r0", "dgx1"),
-            [[(target.format(0), *prompt_rows)], [(target.format(0), *verify)]], ced={0: [3, 4, 5]})
+            [[(target.format(0), *prompt_rows)], [(target.format(0), *verify)]], ced={0: [3, 4, 5]},
+            logits={0: [3, 5], 1: [0, 1, 2]})
         run(os.path.join(out, "t-m1-r0", "dgx1"),
             [[("bg", [50, 51], [7, 8], [0, 0]), (target.format(1), *prompt_rows)],
              [("bg", [52], [9], [0]), (target.format(1), [6, 7, 8], [100, 101, 999], [0, 1, 0])]],
-            plant=(1, 30, 4), sp_local=(4, 4), unaligned=True, ced={0: [0, 1, 6, 7]}, plant2=(2, 21, 5))
+            plant=(1, 30, 4), sp_local=(4, 4), unaligned=True, ced={0: [0, 1, 6, 7]}, plant2=(2, 21, 5),
+            logits={0: [0, 1, 5, 7], 1: [0, 1, 2, 3]}, plant3=(41, 34, 3))
         for m in (0, 1):
             json.dump({"tag": f"trace-t-m{m}-r0", "prompt_tokens": 6, "tokens_ids": GENERATED,
                        "tokens": [f"token_id:{t}" for t in GENERATED]},
@@ -142,15 +155,17 @@ def main():
         "B: misaligned record counted, rank-0 local rows accepted": b.get("unaligned_records") == 1,
         "B: offset records used": b.get("offset_records") == LAYERS - 1,
         "8 rows compared": pair["rows_compared"] == 8,
-        "exactly the two planted rows differ": pair["rows_differing"] == 2,
+        "exactly the three planted rows differ": pair["rows_differing"] == 3,
         "CED decoder records mapped (position 5 first differs at L2 attention output)":
-            pair["first_records"] == {"L1:router_logits": 1, "L2:attn_output": 1}
-            and b.get("ced_records") == 5,
-        "first difference at position 4, L1 router logits": pair["first_difference"] is not None
-        and pair["first_difference"]["position"] == 4 and pair["first_difference"]["record"] == "L1:router_logits"
+            pair["first_records"].get("L2:attn_output") == 1 and b.get("ced_records") == 5,
+        "logit rows mapped (position 3 differs only in its logits)":
+            pair["first_records"] == {"L41:logits": 1, "L1:router_logits": 1, "L2:attn_output": 1}
+            and b.get("logit_records") == 4,
+        "first difference at position 3, the logits": pair["first_difference"] is not None
+        and pair["first_difference"]["position"] == 3 and pair["first_difference"]["record"] == "L41:logits"
         and pair["first_difference"]["records_differing"] == 1,
         "WO compared at its offset rows without a false difference":
-            pair["first_difference"]["chain"] == ["L1:router_logits"],
+            pair["first_difference"]["chain"] == ["L41:logits"],
         "step labels (prefill alone against SP prefill)":
             pair["first_difference"]["label"] == "6 rows (padded 6, prefill)"
             and pair["first_difference"]["label_other"] == "8 rows (padded 8 SP, prefill)",
