@@ -21,21 +21,25 @@ hook = '''
 _MHC_CAPTURE = os.environ.get("SPARK3_DEBUG_MHC_CAPTURE")
 _MHC_CAPTURED: set = set()
 _MHC_PROBES = 0
+_MHC_ORDER: dict = {}
 
 
 def _capture_mhc_inputs(layer_name, residual, fn, scale, base, norm, pre,
                         previous_output, previous_post, previous_comb):
-    import re
-
     global _MHC_PROBES
     directory, min_rows, max_rows = _MHC_CAPTURE.split(":")
     rows = int(residual.shape[0])
+    # Decoder layers are named by object id; every forward calls them in order,
+    # so the order of first calls is the layer index.
+    name = str(_resolve_layer_name(layer_name))
+    if name.startswith("DeepseekV4DecoderLayer") and name not in _MHC_ORDER:
+        _MHC_ORDER[name] = len(_MHC_ORDER)
     if rows >= 64 and _MHC_PROBES < 6:  # what the hook sees, in the container log
         _MHC_PROBES += 1
         import sys
         import torch.distributed as dist
 
-        print(f"SPARK3 mhc capture probe: name={_resolve_layer_name(layer_name)!r} rows={rows} "
+        print(f"SPARK3 mhc capture probe: name={name!r} index={_MHC_ORDER.get(name)} rows={rows} "
               f"capturing={torch.cuda.is_current_stream_capturing()} "
               f"arm={os.path.exists(os.path.join(directory, 'arm'))} "
               f"rank={dist.get_rank() if dist.is_initialized() else None}", file=sys.stderr, flush=True)
@@ -47,27 +51,26 @@ def _capture_mhc_inputs(layer_name, residual, fn, scale, base, norm, pre,
 
     if dist.is_initialized() and dist.get_rank() != 0:
         return
-    name = str(_resolve_layer_name(layer_name))
-    found = re.findall(r"layers\\.(\\d+)", name)
     layers = os.environ.get("SPARK3_DEBUG_MHC_CAPTURE_LAYERS", "1,20,39").split(",")
-    if not found or found[-1] not in layers:
+    index = str(_MHC_ORDER.get(name, -1))
+    if index not in layers:
         return
     operation = "pre" if previous_output is None else "post_pre"
-    if (found[-1], operation) in _MHC_CAPTURED:
+    if (index, operation) in _MHC_CAPTURED:
         return
-    _MHC_CAPTURED.add((found[-1], operation))
+    _MHC_CAPTURED.add((index, operation))
     keep = min(rows, int(max_rows))
 
     def take(t):
         return None if t is None else t[:keep].detach().to("cpu", copy=True)
 
     torch.save(
-        {"layer": name, "operation": operation, "rows": rows, "residual": take(residual),
+        {"layer": f"{name}.{index}", "operation": operation, "rows": rows, "residual": take(residual),
          "pre": take(pre), "previous_output": take(previous_output),
          "previous_post": take(previous_post), "previous_comb": take(previous_comb),
          "fn": fn.detach().cpu(), "scale": scale.detach().cpu(), "base": base.detach().cpu(),
          "norm": norm.detach().cpu()},
-        os.path.join(directory, f"mhc-{found[-1]}-{operation}.pt"),
+        os.path.join(directory, f"mhc-{index}-{operation}.pt"),
     )
 '''
 anchor = '''@torch.library.custom_op(
