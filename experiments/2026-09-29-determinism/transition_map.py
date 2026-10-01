@@ -382,10 +382,14 @@ def family_moe():
                                              route_num_experts=0),
         routing=fused_moe.RoutingSpec(apply_router_weight_on_input=False),
         invocation=FrozenMapping({"tuning_route_pattern": TUNING_WORKLOAD_VERSION}))
-    calls = {c: _prepared_moe_call_factory(tokens=c, topk=TOPK, prepared=experts, output_dtype=torch.bfloat16)
-             for c in plan.token_counts}
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
-        session.prepare((plan.request(name="moe-map", prepare_calls=calls, benchmark_calls=calls),))
+        if hasattr(plan, "token_counts"):  # a composite: one variant per warm count
+            calls = {c: _prepared_moe_call_factory(tokens=c, topk=TOPK, prepared=experts,
+                                                   output_dtype=torch.bfloat16) for c in plan.token_counts}
+            session.prepare((plan.request(name="moe-map", prepare_calls=calls, benchmark_calls=calls),))
+        else:  # one warm count: a plain plan
+            call = _prepared_moe_call_factory(tokens=LIMIT, topk=TOPK, prepared=experts, output_dtype=torch.bfloat16)
+            session.prepare((plan.request(name="moe-map", prepare_call=call, benchmark_call=call),))
         variants = getattr(plan, "variants", None) or getattr(getattr(plan, "prepared", None), "variants", None)
         if variants is not None and hasattr(variants, "items"):
             print(json.dumps({"op": "moe", "variants": {str(k): str(getattr(getattr(v, "selection", None), "config", v))[:240]
@@ -523,7 +527,7 @@ def family_wo():
 
 REFERENCE_MHC = ("MhcConfig(backend='native', projection_tile_m=16, projection_tile_n=8, projection_tile_k=256, "
                  "projection_num_stages=1, projection_num_m_warps=1, projection_num_n_warps=1, "
-                 "projection_k_splits=1, lagged_prepare=False, partials_per_cta=4)")
+                 "projection_k_splits=1, lagged_prepare={lagged}, partials_per_cta=4)")
 
 
 def family_reference():
@@ -541,23 +545,29 @@ def family_reference():
     from vllm.models.deepseek_v4_1 import b12x_layers
 
     real = b12x_layers.mhc
-    reference = eval(REFERENCE_MHC, {"MhcConfig": MhcConfig})  # noqa: S307 - a literal from the inventory
 
     class Forced:
+        reference = None
+
         def __getattr__(self, name):
             return getattr(real, name)
 
         def plan(self, caps, *, invocation=None, override=None):
-            return real.plan(caps, invocation=invocation, override=reference)
+            return real.plan(caps, invocation=invocation, override=self.reference)
 
     saved = GEMV_CAPS
     GEMV_CAPS = (*GRAPH, LIMIT)  # family_mhc warms GEMV_CAPS minus the limit: serving's set
     try:
         print(json.dumps({"family": "mhc as served (graph sizes + 4096 warm)"}), flush=True)
         family_mhc()
-        b12x_layers.mhc = Forced()
-        print(json.dumps({"family": "mhc reference (native, one K slice, no lagged prepare)"}), flush=True)
-        family_mhc()
+        for lagged in (False, True):
+            forced = Forced()
+            forced.reference = eval(REFERENCE_MHC.format(lagged=lagged), {"MhcConfig": MhcConfig})  # noqa: S307
+            b12x_layers.mhc = forced
+            print(json.dumps({"family": f"mhc reference (native, one K slice, lagged_prepare={lagged})"}),
+                  flush=True)
+            family_mhc()
+            b12x_layers.mhc = real
     finally:
         b12x_layers.mhc = real
         GEMV_CAPS = saved
@@ -597,6 +607,8 @@ def family_reference():
                               for c, p in plans.items()))
         saved_sizes = SIZES
         SIZES = [m for m in SIZES if m <= 512]
+        transitions("lm head as served (F.linear at every row count)",
+                    lambda x: torch.nn.functional.linear(x, weight), weight.shape[1])
         transitions("lm head reference (SIMT plans to 512 rows)", lambda x: bf16_gemv.mm(
             x.contiguous(), weight, plan=plans[smallest(caps, x.shape[0])], output_dtype=torch.bfloat16),
             weight.shape[1])
