@@ -16,6 +16,13 @@ stop_all() {
   done
 }
 mkdir -p "$out"
+# Production restarts from this checkout: refuse to stop unless every node runs the same published commit.
+git fetch -q origin
+git merge-base --is-ancestor HEAD origin/main || { log "deployment commit not on origin/main; not stopping"; exit 1; }
+for n in dgx2 dgx3; do
+  [ "$(ssh -n $n git -C projects/spark3-vllm-ds41f rev-parse HEAD)" = "$(git rev-parse HEAD)" ] \
+    || { log "$n checkout differs from dgx1; not stopping"; exit 1; }
+done
 curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
 stop_all
 B=/opt/spark3/candidate/b12x

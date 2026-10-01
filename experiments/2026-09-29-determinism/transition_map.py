@@ -643,6 +643,7 @@ def family_head_served():
     from b12x.gemm.blockscaled._tuning import BlockscaledConfig
     from b12x.preparation import PreparationSession, PreparedCall
     from b12x.preparation.types import require_prepared
+    from dataclasses import replace
 
     head = bf16("head.weight")
     vocab = head.shape[0]
@@ -666,10 +667,12 @@ def family_head_served():
 
     served = BlockscaledConfig(mode="a16", tile_m=None, tile_n=64, tile_k=64, split_k=1)
     sliced = BlockscaledConfig(mode="a16", tile_m=None, tile_n=128, tile_k=64, split_k=4)
-    plans = {
-        "capacity": api.plan_regimes(query(), exact_m=(), override=served),
-        "exact four slices": api.plan_regimes(query(), exact_m=tuple(c for c in GRAPH if c <= 8), override=sliced),
-    }
+    # Production's exact regimes are fixed-M children (expected_m = M); declared one by one here,
+    # since one override would also give the capacity child four slices (a 2.8 GB split-K workspace).
+    exact = tuple(c for c in GRAPH if c <= 8)
+    plans = {"capacity": api.plan_regimes(query(), exact_m=(), override=served)}
+    plans.update({f"exact {m}": api.plan(replace(query(), num_tokens=m, expected_m=m), override=sliced)
+                  for m in exact})
 
     def factory(rows):
         def prepare(state):
@@ -683,15 +686,17 @@ def family_head_served():
         return prepare
 
     requests = [p.request(name=f"head-{name}", prepare_calls={r: factory(r) for r in p.token_counts},
-                          benchmark_calls={r: factory(r) for r in p.token_counts}) for name, p in plans.items()]
+                          benchmark_calls={r: factory(r) for r in p.token_counts}) if name == "capacity" else
+                p.request(name=f"head-{name}", prepare_call=factory(p.query.num_tokens),
+                          benchmark_call=factory(p.query.num_tokens)) for name, p in plans.items()]
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         session.prepare(tuple(requests))
         workspaces = {}
         for name, p in plans.items():
             state = require_prepared(p, "gemm.blockscaled_precision", device)
+            config = getattr(getattr(state, "capacity", state), "config", None)
             print(json.dumps({"op": f"lm head nvfp4 {name}", "required_workspace": state.required_workspace,
-                              "capacity": str(state.capacity.config) if hasattr(state.capacity, "config") else None}),
-                  flush=True)
+                              "config": str(config)}), flush=True)
             workspaces[name] = (torch.empty(state.required_workspace, dtype=torch.uint8, device=device)
                                 if state.required_workspace else None)
 
@@ -700,7 +705,8 @@ def family_head_served():
                 rows = x.shape[0]
                 if rows < minimum:
                     x = torch.cat([x, x[-1:].expand(minimum - rows, -1)])
-                out = api.mm(x.contiguous(), packed, plan=plans[name], workspace=workspaces[name],
+                chosen = f"exact {x.shape[0]}" if name == "production" and x.shape[0] in exact else "capacity"
+                out = api.mm(x.contiguous(), packed, plan=plans[chosen], workspace=workspaces[chosen],
                              activation_global_scale=activation)
                 return out[:rows]
             return run
@@ -711,7 +717,7 @@ def family_head_served():
         transitions(f"lm head nvfp4 r0 {n}x{k} capacity regime (vllm-0037)", call("capacity"), k)
         transitions(f"lm head nvfp4 r0 {n}x{k} capacity, one row padded to 2", call("capacity", 2), k)
         transitions(f"lm head nvfp4 r0 {n}x{k} capacity, under 16 rows padded to 16", call("capacity", 16), k)
-        transitions(f"lm head nvfp4 r0 {n}x{k} production exact regimes to 8 rows", call("exact four slices"), k)
+        transitions(f"lm head nvfp4 r0 {n}x{k} production exact regimes to 8 rows", call("production"), k)
         SIZES = saved
 
 
