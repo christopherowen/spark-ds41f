@@ -7,7 +7,8 @@ INVENTORY = """def _describe_plan(plan, depth: int = 0):
     selection = getattr(plan, "selection", None)
     config = getattr(selection, "config", None) if selection is not None else None
     if config is not None:
-        return str(config)[:400]
+        query = getattr(plan, "query", None) or getattr(plan, "caps", None)
+        return f"{str(config)[:400]} | {str(query)[:400]}" if query is not None else str(config)[:400]
     variants = getattr(plan, "variants", None)
     if isinstance(variants, dict) and depth < 2:
         return {str(k): _describe_plan(v, depth + 1) for k, v in sorted(variants.items(), key=lambda kv: str(kv[0]))}
@@ -29,7 +30,17 @@ def _dump_inventory(rank: int) -> None:
     import json
 
     out = {}
-    for o in gc.get_objects():
+    # vLLM freezes the heap after startup; frozen objects are invisible to
+    # gc.get_objects(), so thaw them for this one walk and freeze them again.
+    frozen = gc.get_freeze_count()
+    if frozen:
+        gc.unfreeze()
+    try:
+        objects = gc.get_objects()
+    finally:
+        if frozen:
+            gc.freeze()
+    for o in objects:
         try:
             state = o.__dict__ if not isinstance(o, type) else None
         except Exception:
@@ -188,6 +199,18 @@ edit(f"{src}/checksum_debug.py", f"{dst}/checksum_debug.py", [
      '    log.append(slot)\n'),
     ('_schedule_host: list[dict] = []\n',
      INVENTORY + '_schedule_host: list[dict] = []\n'),
+    ('    moe, mhc = set(), set()\n'
+     '    for o in gc.get_objects():\n',
+     '    moe, mhc = set(), set()\n'
+     '    frozen = gc.get_freeze_count()  # frozen objects are invisible to get_objects()\n'
+     '    if frozen:\n'
+     '        gc.unfreeze()\n'
+     '    try:\n'
+     '        objects = gc.get_objects()\n'
+     '    finally:\n'
+     '        if frozen:\n'
+     '            gc.freeze()\n'
+     '    for o in objects:\n'),
     ('                if kind == "dump":\n'
      '                    try:\n'
      '                        _dump_plans(rank)\n'

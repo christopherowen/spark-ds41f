@@ -6,6 +6,7 @@ usage: CHECKSUM_DEBUG=/path/attn-exact4/checksum_debug.py python3 test_analyze_t
 Two runs of one request (6 prompt tokens, then a three-row verify block):
 run A alone; run B behind a background request's two rows, with WO's output
 recorded as a sequence-parallel rank would (rows 4-7 of the step, offset 4),
+the index weights as rank 0 would (the step's first 4 rows, offset 0),
 one record whose rows do not match the step (must be counted, not compared),
 a dead verification row (must be excluded) and one planted difference
 (layer 1's router logits at prompt position 4). Every other row is built from
@@ -82,7 +83,12 @@ def run(directory, steps, plant=None, sp_local=None, unaligned=False):
                 cd.record_attn(attn[L], 11, values(L, 11, positions[:-1], tokens[:-1]))
             if step == 0 and L == 0:  # step labels: prefill index mode; SP in run B
                 cd.record_attn_values(attn[L], 23, torch.tensor([-1.0, 1.0, 256.0]))
-                cd.record_attn_values(attn[L], 32, torch.tensor([float(bool(sp_local)), 0.0, 0.0]))
+                cd.record_attn_values(attn[L], 32, torch.tensor([float(bool(sp_local)), 0.0,
+                                                                 float(sp_local[1]) if sp_local else 0.0]))
+            if sp_local and step == 0:  # rank 0's split rows: offset 0, the step's local row count
+                cd.record_attn(attn[L], 16, values(L, 16, positions[: sp_local[1]], tokens[: sp_local[1]]))
+            else:
+                cd.record_attn(attn[L], 16, values(L, 16, positions, tokens))
             x = values(L, 40, positions, tokens)
             cd.record(moe[L], x, values(L, 41, positions, tokens), values(L, 42, positions, tokens))
             cd.record_tag(shared[L], 0, values(L, 43, positions, tokens))
@@ -119,7 +125,7 @@ def main():
     checks = {
         "A: 9 comparable rows": a["comparable"] == 9,
         "B: dead row excluded (8 comparable)": b["comparable"] == 8 and b["dead_rows"] == 1,
-        "B: misaligned record counted": b.get("unaligned_records") == 1,
+        "B: misaligned record counted, rank-0 local rows accepted": b.get("unaligned_records") == 1,
         "B: offset records used": b.get("offset_records") == LAYERS,
         "8 rows compared": pair["rows_compared"] == 8,
         "exactly the planted row differs": pair["rows_differing"] == 1,

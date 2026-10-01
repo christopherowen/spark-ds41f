@@ -147,6 +147,8 @@ class NodeLogs:
                         label["mode"] = MODES.get(int(decode(float(values[1, 0]))), "?")
                     if tag == 32 and n == 3 and label["sp"] is None:
                         label["sp"] = int(decode(float(values[0, 0]))) == 1
+                        if raw and label["sp"]:
+                            label["local_rows"] = int(values[2, 0])
         for step, h in self.host.items():  # no SP record (attn-exact2/3): infer it from the rows
             label = self.labels.setdefault(step, {"mode": "graph", "sp": None})
             if label["sp"] is None and label["mode"] != "graph":
@@ -177,6 +179,7 @@ def load_request(run_dir, target, node):
         dead = [bool(v) for v in row[3 + reqs + a: 3 + reqs + b].tolist()]
         num_tokens, padded = h["num_tokens"], h["padded"]
         label = dict(logs.labels.get(step, {"mode": "graph", "sp": None}), rows=num_tokens, padded=padded)
+        local_rows = label.pop("local_rows", None)  # rank 0's SP-local records start at offset 0
         records = [{} for _ in range(b - a)]
         for kind, log, steps in logs.sources:
             for slot, tag, n, offset, values in steps.get(step, []):
@@ -196,7 +199,7 @@ def load_request(run_dir, target, node):
                     if tag not in SHARED:
                         continue
                     keys, names = [(layer, 2, tag)], [SHARED[tag]]
-                if offset == 0 and n not in (num_tokens, padded):
+                if offset == 0 and n not in (num_tokens, padded, local_rows):
                     stats["unaligned_records"] += 1
                     continue
                 if offset > 0 and offset + n > max(padded, -(-num_tokens // 3) * 3):

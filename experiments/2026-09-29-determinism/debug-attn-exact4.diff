@@ -95,7 +95,24 @@
  
  
  def record_indices(owner, indices: torch.Tensor, lengths: torch.Tensor) -> None:
-@@ -369,6 +393,80 @@
+@@ -350,7 +374,15 @@
+     # The routed MoE's planned variants and mHC's per-operation plan counts,
+     # once per distinct set (matched on instance attributes, not class names).
+     moe, mhc = set(), set()
+-    for o in gc.get_objects():
++    frozen = gc.get_freeze_count()  # frozen objects are invisible to get_objects()
++    if frozen:
++        gc.unfreeze()
++    try:
++        objects = gc.get_objects()
++    finally:
++        if frozen:
++            gc.freeze()
++    for o in objects:
+         try:  # weak proxies to collected objects raise on any access
+             state = o.__dict__ if not isinstance(o, type) else None
+         except Exception:
+@@ -369,6 +401,91 @@
          json.dump(out, f, indent=1)
  
  
@@ -104,7 +121,8 @@
 +    selection = getattr(plan, "selection", None)
 +    config = getattr(selection, "config", None) if selection is not None else None
 +    if config is not None:
-+        return str(config)[:400]
++        query = getattr(plan, "query", None) or getattr(plan, "caps", None)
++        return f"{str(config)[:400]} | {str(query)[:400]}" if query is not None else str(config)[:400]
 +    variants = getattr(plan, "variants", None)
 +    if isinstance(variants, dict) and depth < 2:
 +        return {str(k): _describe_plan(v, depth + 1) for k, v in sorted(variants.items(), key=lambda kv: str(kv[0]))}
@@ -126,7 +144,17 @@
 +    import json
 +
 +    out = {}
-+    for o in gc.get_objects():
++    # vLLM freezes the heap after startup; frozen objects are invisible to
++    # gc.get_objects(), so thaw them for this one walk and freeze them again.
++    frozen = gc.get_freeze_count()
++    if frozen:
++        gc.unfreeze()
++    try:
++        objects = gc.get_objects()
++    finally:
++        if frozen:
++            gc.freeze()
++    for o in objects:
 +        try:
 +            state = o.__dict__ if not isinstance(o, type) else None
 +        except Exception:
@@ -176,7 +204,7 @@
  _schedule_host: list[dict] = []
  _step = [0]
  
-@@ -410,14 +508,13 @@
+@@ -410,14 +527,13 @@
      log.append(0)
      sizes = (_MAX_ROWS, _WIDE_ROWS) if _WIDE_ROWS > _MAX_ROWS else (_MAX_ROWS,)
      for name, rows in ((n, r) for r in sizes for n in ("runner", "tags", "attn")):
@@ -193,7 +221,7 @@
          mark[step_col].fill_(step)
          marker_log.append(_SLOTS - 1)
      _schedule_host.append({"step": step, "req_ids": [str(r) for r in req_ids],
-@@ -521,7 +618,7 @@
+@@ -521,7 +637,7 @@
                          rows = log.rows[: min(count, log.capacity)].cpu()
                          torch.save(
                              {"count": count, "capacity": log.capacity, "rows": rows,
@@ -202,7 +230,7 @@
                               "schedule_reqs": _SCHEDULE_REQS},
                              os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
                          )
-@@ -534,6 +631,10 @@
+@@ -534,6 +650,10 @@
                          _dump_plans(rank)
                      except Exception as error:  # never block the schedule dump
                          print(f"checksum_debug plan dump failed: {error!r}", flush=True)
