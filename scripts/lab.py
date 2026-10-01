@@ -35,6 +35,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -218,7 +219,7 @@ def published_problems() -> list[str]:
 
 # ---------------------------------------------------------------- cluster actions
 
-def spark3_cli(*arguments: str, dry: bool = False) -> int:
+def spark3_cli(*arguments: str, dry: bool = False, capture: list | None = None) -> int:
     command = [sys.executable, str(ROOT / "bin" / "spark3"), *arguments]
     if dry:
         print("  $ " + shlex.join(command[1:]))
@@ -227,12 +228,29 @@ def spark3_cli(*arguments: str, dry: bool = False) -> int:
     for line in process.stdout.splitlines():
         if "docker run" not in line:
             print(line, flush=True)
+    if capture is not None:
+        capture.extend(process.stdout.splitlines())
     return process.returncode
+
+
+def ready_seconds(lines: list[str]) -> float | None:
+    """Seconds from launch to ready, from bin/spark3's 'cluster ready ... (+N.Ns)' line."""
+    for line in lines:
+        found = re.search(r"cluster ready.*\(\+([0-9.]+)s\)", line)
+        if found:
+            return float(found.group(1))
+    return None
 
 
 def boot(config: str, dry: bool = False) -> bool:
     log(f"start {config}")
-    return spark3_cli("--cluster-config", config, "cluster", "start", "--replace", "--apply", dry=dry) == 0
+    started, lines = time.time(), []
+    ok = spark3_cli("--cluster-config", config, "cluster", "start", "--replace", "--apply", dry=dry,
+                    capture=lines) == 0
+    if not dry:
+        log(f"boot {Path(config).name}: ready +{ready_seconds(lines)} s, command {time.time() - started:.0f} s"
+            f"{'' if ok else ' FAILED'}")
+    return ok
 
 
 def stop_cluster(dry: bool = False) -> bool:

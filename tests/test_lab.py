@@ -106,6 +106,13 @@ class PlanTest(unittest.TestCase):
             lab.plan(dict(SPEC, jobs=[{"kind": "mystery"}]))
 
 
+class BootTimeTest(unittest.TestCase):
+    def test_ready_seconds_come_from_the_cluster_ready_line(self) -> None:
+        lines = ["dgx1: steady memguard active", "cluster ready; memory guards are active on all nodes (+116.9s)"]
+        self.assertEqual(lab.ready_seconds(lines), 116.9)
+        self.assertIsNone(lab.ready_seconds(["boot failed"]))
+
+
 class OverlayTest(unittest.TestCase):
     def test_fewer_fences_than_the_image_is_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
