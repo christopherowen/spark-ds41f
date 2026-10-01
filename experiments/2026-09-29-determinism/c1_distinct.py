@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-stream decode over twelve distinct prompts, one at a time: speed averaged over texts.
+"""Single-stream decode over twenty-four distinct prompts, one at a time: speed averaged over texts.
 
 usage: c1_distinct.py BASE_URL [--tokens T] [--rounds R]   (prints one JSON line per request and a summary)
 
@@ -37,6 +37,18 @@ PROMPTS = [
     "Write a SQL query that finds the top three customers by revenue per region, and explain it.",
     "List the planets of the solar system with one interesting fact about each.",
     "Draft a polite email asking a landlord to fix a leaking kitchen tap.",
+    "Explain how public-key cryptography lets two strangers agree on a secret.",
+    "Describe the life cycle of a star from nebula to remnant.",
+    "Write a Python function that merges overlapping intervals, with tests.",
+    "Give advice for a first-time manager running their first one-on-one meetings.",
+    "Summarize the plot of a heist film you invent, in five acts.",
+    "Explain why the sky is blue and sunsets are red.",
+    "Return a JSON array of six books with title, author, year and genre.",
+    "Compare electric and petrol cars on cost, emissions and maintenance.",
+    "Write a limerick about a cat who learns to code, then explain the meter.",
+    "Explain how a bill becomes a law in a parliamentary system.",
+    "Describe how to train for a first half marathon over twelve weeks.",
+    "Explain gradient descent with a worked numerical example.",
 ]
 with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     MODEL = json.load(response)["data"][0]["id"]

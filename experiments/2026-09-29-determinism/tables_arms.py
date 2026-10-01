@@ -50,7 +50,7 @@ for point in ("prose-c1", "json-nothink-c1"):
               f"   distinct outputs {p.get('distinct_outputs', '?')}")
         if base_tps is None:
             base_tps, base_step = tps, step
-print("single stream, twelve distinct prompts (tok/s ±95%)")
+print("single stream, distinct prompts one at a time (tok/s ±95%)")
 b = None
 for a in ARMS:
     s1 = [x for x in lines("c1-distinct", a) if "summary" in x]
