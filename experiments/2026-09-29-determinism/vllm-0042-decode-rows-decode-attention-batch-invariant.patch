@@ -1,4 +1,4 @@
-From bd70ed3756c80fe0b2a9ae1c0cbb57f7e2861b20 Mon Sep 17 00:00:00 2001
+From cade893ffe30ababede364f294a90347424daadb Mon Sep 17 00:00:00 2001
 From: Christopher Owen <christopherowen@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 14:38:08 +0200
 Subject: [PATCH] feat(deepseek-v4.1): decode rows keep the decode attention
@@ -13,19 +13,19 @@ kernel, which rounds differently; forcing single-pass everywhere cost about
 - the step kind comes from request state (CommonAttentionMetadata.is_prefilling):
   a step holding prompt rows is never a decode step, even when its queries are
   as short as a decode step's (the last token of a fully cached prompt);
-- such a step reports its leading decode rows, and the non-CED layers run them
-  on the decode plan and the remaining rows single-pass, from one metadata
-  write, so a decode row gets the decode kernel whatever shares its step;
-- CED layers run every row single-pass, the path decode steps with drafts
-  already take.
+- such a step reports its leading decode rows, and every layer runs them on
+  the decode plan and the remaining rows single-pass, from one metadata write,
+  so a decode row gets the decode kernel whatever shares its step; CED decoder
+  metadata takes the step kind and decode rows of the full-row metadata (the
+  decode rows lead the decoder rows).
 
 Decode-only steps are unchanged from the default path.
 ---
  ...deepseek_v4_1_attention_batch_invariant.py | 43 +++++++++++
  vllm/models/deepseek_v4_1/attention.py        | 75 ++++++++++++++++++-
- vllm/models/deepseek_v4_1/ced.py              | 11 ++-
+ vllm/models/deepseek_v4_1/ced.py              | 12 ++-
  vllm/models/deepseek_v4_1/sparse_mla.py       | 44 ++++++++++-
- 4 files changed, 168 insertions(+), 5 deletions(-)
+ 4 files changed, 169 insertions(+), 5 deletions(-)
  create mode 100644 tests/models/test_deepseek_v4_1_attention_batch_invariant.py
 
 diff --git a/tests/models/test_deepseek_v4_1_attention_batch_invariant.py b/tests/models/test_deepseek_v4_1_attention_batch_invariant.py
@@ -78,7 +78,7 @@ index 000000000..b6723f14b
 +    cm.is_prefilling = None
 +    assert _batch_invariant_decode_rows(cm, 6, True) == (True, 0)
 diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
-index 716b07d48..f3525e6e9 100644
+index 716b07d48..ffe6f20fb 100644
 --- a/vllm/models/deepseek_v4_1/attention.py
 +++ b/vllm/models/deepseek_v4_1/attention.py
 @@ -694,8 +694,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
@@ -97,12 +97,12 @@ index 716b07d48..f3525e6e9 100644
                  self.topk_indices_buffer[:rows].copy_(split.gather(selected))
  
 +        # Batch-invariant mode: a step that holds prompt rows still gives its
-+        # decode rows (the leading decode_rows, by request state) the decode
-+        # kernel, as a decode-only step does, so a generated row rounds the same
-+        # whatever shares its step. CED layers run every row single-pass.
++        # decode rows (the leading decode_rows, by request state; CED decoder
++        # rows keep them first) the decode kernel, as a decode-only step does,
++        # so a generated row rounds the same whatever shares its step.
 +        decode_rows = (
 +            int(getattr(swa, "decode_rows", 0))
-+            if _BATCH_INVARIANT and mode == "extend" and not self.is_ced_decoder
++            if _BATCH_INVARIANT and mode == "extend"
 +            else 0
 +        )
 +        if decode_rows:
@@ -178,7 +178,7 @@ index 716b07d48..f3525e6e9 100644
          swa_indices, swa_lengths, top_lengths = buffers[:3]
          visible = main.cache_lengths if main is not None else swa.cache_lengths
 diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
-index 0be406b16..dceb030a7 100644
+index 0be406b16..76b79a570 100644
 --- a/vllm/models/deepseek_v4_1/ced.py
 +++ b/vllm/models/deepseek_v4_1/ced.py
 @@ -4,19 +4,24 @@
@@ -206,16 +206,17 @@ index 0be406b16..dceb030a7 100644
  
  
  def ced_decoder_start(hf_config: Any) -> int | None:
-@@ -328,7 +333,11 @@ class CEDState:
+@@ -328,7 +333,12 @@ class CEDState:
              req_id_per_token=gather(metadata.req_id_per_token, -1),
              slot_mapping=gather(metadata.slot_mapping, -1),
              cache_lengths=gather(metadata.cache_lengths),
 -            is_decode=plan.max_query_len <= 1,
-+            # Batch-invariant mode: CED layers run every row single-pass (the
-+            # path decode steps with drafts already take), so a decode row
-+            # rounds the same whether or not its step's queries are one token.
-+            is_decode=plan.max_query_len <= 1 and not _BATCH_INVARIANT,
-+            decode_rows=0,
++            # Batch-invariant mode: the step kind of the full-row metadata (from
++            # request state), and its decode rows, which lead the decoder rows,
++            # so CED layers give a decode row the kernel a decode-only step
++            # gives it.
++            is_decode=metadata.is_decode if _BATCH_INVARIANT else plan.max_query_len <= 1,
++            decode_rows=metadata.decode_rows if _BATCH_INVARIANT else 0,
              decoder=None,
              swa_replay_start=self.replay_start,
          )

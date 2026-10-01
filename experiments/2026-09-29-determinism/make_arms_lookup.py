@@ -92,6 +92,12 @@ ref4b adds vllm-0043 and B12X patch 0007 (overlay gemv-geom: the small-row
 TMA prefill GEMV geometry for decode-sized plans): detm-r5o-ref4b-pin and
 detm-r5o-ref4b-trace7.
 
+ref4c is ref4b with vllm-0042 corrected (run62: CED layers ran a mixed step's
+decode rows single-pass but a decode-only step's on the decode kernel; they now
+split decode rows like every other layer, and CED decoder metadata takes the
+full-row step kind): detm-r5o-ref4c-pin and detm-r5o-ref4c-trace8 (attn-exact8:
+attn-exact7 with the same correction).
+
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
 ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
@@ -324,6 +330,9 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-ref4b-pin", with_gemv_geometry(
                       with_reference(detm_variant2_pin, attention=True, ref="ref4b"))),
                   ("detm-r5o-ref4b-trace7", with_gemv_geometry(reference_trace("attn-exact7", ref="ref4b"))),
+                  ("detm-r5o-ref4c-pin", with_gemv_geometry(
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4c"))),
+                  ("detm-r5o-ref4c-trace8", with_gemv_geometry(reference_trace("attn-exact8", ref="ref4c"))),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),
