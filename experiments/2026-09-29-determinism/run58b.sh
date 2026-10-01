@@ -1,0 +1,46 @@
+#!/bin/bash
+# usage: run58b.sh   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
+#                    ref3m2 overlay on dgx1)
+# Cluster stopped: mhc_capture_replay.py on the run56 captures with TF32 split-count variants (every
+# capacity on the TF32 TMA projection with 8-64 K slices) beside production, ref2 and vllm-0039 (13 partial
+# sums per CTA at capacity): bits across batch sizes and timings. Restores r5o.
+set -uo pipefail
+cd ~/projects/spark3-vllm-ds41f
+E=experiments/2026-09-29-determinism
+out=results/private/determinism/mhc4
+IMAGE=vllm-ds41f-kkref:04c30fa98e79-r5o
+V=/opt/spark3/candidate/vllm
+log() { echo "$(date -u +%FT%TZ) $*"; }
+stop_all() {
+  for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
+    experiments/2026-09-30-r5n/cluster-*.json; do
+    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  done
+}
+mkdir -p "$out"
+git fetch -q origin
+git merge-base --is-ancestor HEAD origin/main || { log "deployment commit not on origin/main; not stopping"; exit 1; }
+for n in dgx2 dgx3; do
+  [ "$(ssh -n $n git -C projects/spark3-vllm-ds41f rev-parse HEAD)" = "$(git rev-parse HEAD)" ] \
+    || { log "$n checkout differs from dgx1; not stopping"; exit 1; }
+done
+sha256sum $HOME/spark3-overlay/ref3m2/vllm/models/deepseek_v4_1/b12x_layers.py > "$out/overlay-bytes-run58b.txt"
+curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
+stop_all
+mkdir -p /tmp/lookup/cache && cp $E/transition_map.py $E/mhc_capture_replay.py $E/gemv_capture_replay.py /tmp/lookup/
+S=$HOME/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash
+COMMON="-e CUTE_DSL_ARCH=sm_121a -e B12X_DENSE_SPLITK_TURBO=0 -e B12X_W4A8_TINY_DECODE=0 -e B12X_AUTOTUNE=0
+  -e B12X_CUTE_COMPILE_CACHE_DIR=/c/cute -e CUTE_DSL_CACHE_DIR=/c/cutedsl -e B12X_COMPILE_CACHE_DIR=/c/b12x"
+for script in mhc_capture_replay; do
+  log "$script"
+  docker run --rm --gpus all --ipc=host $COMMON \
+    -v $HOME/spark3-overlay/ref3m2/vllm/models/deepseek_v4_1/b12x_layers.py:$V/vllm/models/deepseek_v4_1/b12x_layers.py:ro \
+    -v $S/snapshots/dba1be0a40aa45a94ad051997016db3960a90277:/models:ro -v $S/blobs:/blobs:ro \
+    -v /tmp/lookup:/r:ro -v /tmp/lookup/cache:/c -v $PWD/results/private/determinism/mhc/captures:/cap:ro \
+    -w /opt/spark3/candidate/b12x --entrypoint python3 $IMAGE /r/$script.py /cap > "$out/$script.txt" 2>&1
+  log "$script exit $?"
+  grep -hE '"groups"|"agreement"|done|Error|Traceback' "$out/$script.txt" | cut -c1-260 | head -40
+done
+bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark3 doctor --live 2>&1 | tail -3
+log "done"

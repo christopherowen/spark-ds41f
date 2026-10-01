@@ -10,9 +10,10 @@ three layers. Configurations:
 - production: graph-size plans and the 4096-row plan, b12x defaults (the 4096 plan is TF32 TMA);
 - ref2 (vllm-0033): only the 4096-row plan, its default TF32 TMA configuration;
 - candidate (vllm-0039): every capacity on the lagged native route (the graph-size plans' own),
-  the 4096-row plan computing all 25 partial sums per CTA; candidate-p4 and -p13 group them by 4
-  and 13 (same arithmetic: they must agree bit for bit);
-- candidate-capacity: only the 4096-row plan, on the lagged native route.
+  the 4096-row plan computing 13 partial sums per CTA; candidate-p4 groups them by 4 (same
+  arithmetic: they must agree bit for bit);
+- tf32-sN: every capacity on the TF32 TMA projection with N K slices (16-row tiles), one
+  arithmetic at every count if the slices are summed in a fixed order.
 For each: rows grouped by exact bits as the last or first row of 1..N-row batches (N the
 captured rows); the candidate against production at decode sizes (bit equality) and against
 production and ref2 at 1024 rows (largest relative difference per output); timings (median
@@ -48,11 +49,19 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "mhc-*.pt"))):
     captures[(c["layer"].rsplit(".", 1)[-1], c["operation"])] = {
         k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
 print(json.dumps({"captures": {f"{k[0]} {k[1]}": v["residual"].shape[0] for k, v in captures.items()}}), flush=True)
-# name: (batch-invariant mode, fixed graph-size plans, partial sums per CTA in the capacity plan)
-CONFIGS = {"production": (False, GRAPH, None), "ref2": (False, (), None), "candidate": (True, GRAPH, 25),
-           "candidate-p4": (True, GRAPH, 4), "candidate-p13": (True, GRAPH, 13),
-           "candidate-capacity": (True, (), 25)}
+# name: (batch-invariant mode, fixed graph-size plans, capacity-plan partial sums per CTA, or a TF32 split count)
+CONFIGS = {"production": (False, GRAPH, None), "ref2": (False, (), None), "candidate": (True, GRAPH, 13),
+           "candidate-p4": (True, GRAPH, 4),
+           **{f"tf32-s{n}": (True, GRAPH, f"tf32:{n}") for n in (8, 16, 32, 40, 64)}}
 real_config = b12x_layers._mhc_batch_invariant_config
+
+
+def tf32(splits):
+    """TF32 TMA projection at every capacity: 16-row tiles, all 24 mixes per tile, `splits` K slices."""
+    from b12x.norm.mhc._tuning import MhcConfig
+    return MhcConfig(backend="tf32_tma", projection_tile_m=16, projection_tile_n=24, projection_tile_k=64,
+                     projection_num_stages=2, projection_num_m_warps=1, projection_num_n_warps=1,
+                     projection_k_splits=splits)
 
 
 def build(name):
@@ -60,6 +69,8 @@ def build(name):
     b12x_layers._BATCH_INVARIANT = invariant
 
     def config(tokens, partials=partials):
+        if isinstance(partials, str):
+            return tf32(int(partials.split(":")[1]))
         chosen = real_config(tokens)
         if chosen is not None and tokens >= 96:
             chosen = type(chosen)(**{**chosen.to_dict(), "partials_per_cta": partials})
@@ -169,7 +180,7 @@ for (layer, op) in captures:
                    for x, y in zip(a, b))
     same = {other: all(torch.equal(a, b) for a, b in zip(outputs[(other, layer, op, 1024)],
                                                          outputs[("candidate", layer, op, 1024)]))
-            for other in ("candidate-p4", "candidate-p13", "candidate-capacity")
+            for other in ("candidate-p4",)
             if (other, layer, op, 1024) in outputs}
     big = {}
     for other in ("production", "ref2"):
