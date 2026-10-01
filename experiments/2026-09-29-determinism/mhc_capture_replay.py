@@ -9,7 +9,9 @@ streams, previous output and mixes, and the layer's own mHC weights, for pre and
 three layers. Configurations:
 - production: graph-size plans and the 4096-row plan, b12x defaults (the 4096 plan is TF32 TMA);
 - ref2 (vllm-0033): only the 4096-row plan, its default TF32 TMA configuration;
-- candidate (vllm-0039): every capacity on the lagged native route (the graph-size plans' own);
+- candidate (vllm-0039): every capacity on the lagged native route (the graph-size plans' own),
+  the 4096-row plan computing all 25 partial sums per CTA; candidate-p4 and -p13 group them by 4
+  and 13 (same arithmetic: they must agree bit for bit);
 - candidate-capacity: only the 4096-row plan, on the lagged native route.
 For each: rows grouped by exact bits as the last or first row of 1..N-row batches (N the
 captured rows); the candidate against production at decode sizes (bit equality) and against
@@ -46,13 +48,23 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "mhc-*.pt"))):
     captures[(c["layer"].rsplit(".", 1)[-1], c["operation"])] = {
         k: (v.to(device) if torch.is_tensor(v) else v) for k, v in c.items()}
 print(json.dumps({"captures": {f"{k[0]} {k[1]}": v["residual"].shape[0] for k, v in captures.items()}}), flush=True)
-CONFIGS = {"production": (False, GRAPH), "ref2": (False, ()), "candidate": (True, GRAPH),
-           "candidate-capacity": (True, ())}
+# name: (batch-invariant mode, fixed graph-size plans, partial sums per CTA in the capacity plan)
+CONFIGS = {"production": (False, GRAPH, None), "ref2": (False, (), None), "candidate": (True, GRAPH, 25),
+           "candidate-p4": (True, GRAPH, 4), "candidate-p13": (True, GRAPH, 13),
+           "candidate-capacity": (True, (), 25)}
+real_config = b12x_layers._mhc_batch_invariant_config
 
 
 def build(name):
-    invariant, fixed = CONFIGS[name]
+    invariant, fixed, partials = CONFIGS[name]
     b12x_layers._BATCH_INVARIANT = invariant
+
+    def config(tokens, partials=partials):
+        chosen = real_config(tokens)
+        if chosen is not None and tokens >= 96:
+            chosen = type(chosen)(**{**chosen.to_dict(), "partials_per_cta": partials})
+        return chosen
+    b12x_layers._mhc_batch_invariant_config = config
     modules, requests = {}, []
     for (layer, op), c in captures.items():
         owner = torch.nn.Module()
@@ -155,11 +167,16 @@ for (layer, op) in captures:
     def rel(a, b):
         return max(float(((x.float() - y.float()).abs().max() / y.float().abs().max().clamp(min=1e-30)))
                    for x, y in zip(a, b))
+    same = {other: all(torch.equal(a, b) for a, b in zip(outputs[(other, layer, op, 1024)],
+                                                         outputs[("candidate", layer, op, 1024)]))
+            for other in ("candidate-p4", "candidate-p13", "candidate-capacity")
+            if (other, layer, op, 1024) in outputs}
     big = {}
     for other in ("production", "ref2"):
         if ("candidate", layer, op, 1024) in outputs and (other, layer, op, 1024) in outputs:
             big[other] = rel(outputs[("candidate", layer, op, 1024)], outputs[(other, layer, op, 1024)])
     print(json.dumps({"agreement": f"layer {layer} {op}", "candidate_equals_production_at": sorted(r for r, e in equal.items() if e),
                       "differs_at": sorted(r for r, e in equal.items() if not e),
-                      "max_rel_diff_at_1024": {k: f"{v:.2e}" for k, v in big.items()}}), flush=True)
+                      "max_rel_diff_at_1024": {k: f"{v:.2e}" for k, v in big.items()},
+                      "candidate_bit_equal_at_1024": same}), flush=True)
 print("mhc replay done", flush=True)
