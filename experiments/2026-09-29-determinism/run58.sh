@@ -7,6 +7,8 @@
 #    must agree bit for bit and equal production at decode sizes; timings.
 # 2. gemv_capture_replay.py: router gate and compressors on real rows under production, ref2 (SIMT),
 #    the TMA prefill kernel and the MMA kernel at every capacity: bits and timings.
+# 3. The vllm-0038 GPU regression test, the vllm-0039 unit tests and the vllm-0041 fused-sum GPU test
+#    (fresh container, the patched files from the vLLM clone).
 # Restores r5o.
 set -uo pipefail
 cd ~/projects/spark3-vllm-ds41f
@@ -45,6 +47,20 @@ for script in mhc_capture_replay gemv_capture_replay; do
   log "$script exit $?"
   grep -hE '"groups"|"agreement"|done|Error|Traceback' "$out/$script.txt" | cut -c1-260 | head -40
 done
+log "tests"
+W=$HOME/work/vllm-gemv
+docker run --rm --gpus all --ipc=host $COMMON -v /tmp/lookup/cache:/c \
+  -v $W/vllm/model_executor/layers/logits_processor.py:$V/vllm/model_executor/layers/logits_processor.py:ro \
+  -v $W/vllm/models/deepseek_v4_1/b12x_layers.py:$V/vllm/models/deepseek_v4_1/b12x_layers.py:ro \
+  -v $W/vllm/distributed/device_communicators/cuda_communicator.py:$V/vllm/distributed/device_communicators/cuda_communicator.py:ro \
+  -v $W/tests/v1/sample/test_batch_invariant_vocab_projection.py:/t/test_bi_vocab.py:ro \
+  -v $W/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py:/t/test_bi_mhc.py:ro \
+  -v $W/tests/distributed/test_reduce_scatter_rank_order.py:/t/test_bi_rs.py:ro \
+  -v $HOME/projects/spark3-r5/$E/test_conftest.py:/t/conftest.py:ro -w /t \
+  --entrypoint python3 $IMAGE -m pytest -q -p no:cacheprovider /t/test_bi_vocab.py /t/test_bi_mhc.py /t/test_bi_rs.py \
+  > "$out/tests.txt" 2>&1
+log "tests exit $?"
+tail -3 "$out/tests.txt"
 bin/spark3 cluster start --replace --apply | grep -v 'docker run'
 bin/spark3 doctor --live 2>&1 | tail -3
 log "done"
