@@ -60,6 +60,13 @@ trace arm with attn-exact4 (debug-attn-exact4.diff on attn-exact3: an explicit
 row offset in every record, sequence-parallel WO output and index weights at
 their rows, raw step labels, a one-time plan inventory) and wide logs of up to
 4160 rows, a full 4096-token chunk with its decode rows.
+
+The reference configuration (overlay ref1: vllm-0027 to 0037 on r5o's tree)
+gives every operation one arithmetic for every row count in batch-invariant
+mode, and aligns prefill chunks to the long-prefill threshold, which must
+leave room for the largest decode batch (4000 < 4096 - 48): detm-r5o-ref-pin
+(performance, the deterministic MoE of det-variant2) and detm-r5o-ref-trace
+(attn-exact5: attn-exact4 with vllm-0035 in its attention copy).
 """
 import copy
 import json
@@ -166,6 +173,32 @@ final_wide4["environment"].update(
 # attn-exact4 also hooks DS4.1's model forward (CED decoder rows) and captures index selections.
 mount(final_wide4, "attn-exact4/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
 final_wide4["environment"]["SPARK3_DEBUG_INDEX_CAPTURE"] = "2,8,14:1530:1545"
+REF_FILES = ("models/deepseek_v4_1/b12x_layers.py", "models/deepseek_v4_1/compressor.py",
+             "distributed/device_communicators/cuda_communicator.py",
+             "model_executor/layers/fused_moe/b12x.py", "model_executor/kernels/linear/b12x_blockscaled.py",
+             "v1/core/sched/scheduler.py")
+
+
+def with_reference(arm, *, attention):
+    arm = copy.deepcopy(arm)
+    mounted = {m[1] for m in arm["container"]["mounts"]}
+    for f in REF_FILES + (("models/deepseek_v4_1/attention.py",) if attention else ()):
+        target = f"{VLLM}/{f}"
+        arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
+        mount(arm, f"ref1/vllm/{f}", target)
+    arm["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
+    args = arm["serve_args"]
+    args[args.index("--long-prefill-token-threshold") + 1] = "4000"
+    return arm
+
+
+ref_pin = with_reference(detm_variant2_pin, attention=True)
+ref_trace = with_reference(traced(detm_variant2_pin, 1790, overlay="attn-exact5", lookup="ref1"), attention=False)
+mount(ref_trace, "attn-exact5/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
+ref_trace["environment"].update(
+    SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072",
+    SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="512", SPARK3_DEBUG_INDEX_CAPTURE="2,8,14:1530:1545",
+)
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),
@@ -182,6 +215,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-rs2-trace", with_rs(final_wide, "gemv-lookup-mhc-bi-fp8-rs2")),
                   ("detm-r5o-bi-rs2-pin", with_rs(bi_full_pin, "gemv-lookup-mhc-bi-fp8-rs2")),
                   ("detm-r5o-rs2-exact4-trace", final_wide4),
+                  ("detm-r5o-ref-pin", ref_pin), ("detm-r5o-ref-trace", ref_trace),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),

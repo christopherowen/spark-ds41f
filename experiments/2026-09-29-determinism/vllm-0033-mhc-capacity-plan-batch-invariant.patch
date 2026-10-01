@@ -1,0 +1,34 @@
+From debcaf1d52f80de42b5b8423f09ed23a01422539 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:47:13 +0200
+Subject: [PATCH] feat(deepseek-v4.1): one mHC plan per operation in
+ batch-invariant mode
+
+mHC prepares lagged native plans for the graph sizes and a capacity plan
+for larger counts; they round a row differently, and forcing one kernel
+configuration on every capacity does not make post_pre agree. The
+capacity plan itself rounds a row the same at every live count, so with
+VLLM_DS41_BATCH_INVARIANT=1 only it is prepared and used.
+---
+ vllm/models/deepseek_v4_1/b12x_layers.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index a77838d1b..7a598ef93 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -788,6 +788,11 @@ class B12xMHC(nn.Module):
+         ):
+             return ()
+         key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
++        if _BATCH_INVARIANT:
++            # Batch-invariant mode: only the capacity plan. The graph-size plans
++            # (lagged native) round a row differently from the capacity plan;
++            # one plan rounds a row the same at every live count.
++            key = (workload.max_tokens,)
+         common = FrozenMapping(
+             {
+                 "lagged_mix": True,
+-- 
+2.43.0
+

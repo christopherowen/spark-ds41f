@@ -1,0 +1,188 @@
+From 2a0ed4c0bbaea559a79fcd908fbfba2acf0f8a8e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:46:16 +0200
+Subject: [PATCH] feat(scheduler): threshold-aligned prefill chunks in
+ batch-invariant mode
+
+A prefill chunk takes whatever token budget the step's other requests
+leave, so where a prompt splits, and with it which rows each step
+computes (and DeepSeek V4.1's CED decoder windows at a chunk end),
+depends on the other requests. With VLLM_DS41_BATCH_INVARIANT=1 and a
+long-prefill threshold, a chunk ends at the next absolute multiple of
+the threshold (prefix-cache hits counted), and a chunk that does not fit
+waits for a step that has room for all of it.
+---
+ tests/v1/core/test_batch_invariant_chunks.py | 64 ++++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py              | 43 +++++++++++++
+ 2 files changed, 107 insertions(+)
+ create mode 100644 tests/v1/core/test_batch_invariant_chunks.py
+
+diff --git a/tests/v1/core/test_batch_invariant_chunks.py b/tests/v1/core/test_batch_invariant_chunks.py
+new file mode 100644
+index 000000000..dbf9226a9
+--- /dev/null
++++ b/tests/v1/core/test_batch_invariant_chunks.py
+@@ -0,0 +1,64 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch-invariant mode: prefill chunks end at absolute multiples of the threshold."""
++
++from types import SimpleNamespace
++
++from vllm.v1.core.sched import scheduler as scheduler_module
++
++
++def _chunk(threshold, computed, remaining):
++    owner = SimpleNamespace(
++        scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold)
++    )
++    return scheduler_module.Scheduler._aligned_prefill_chunk(owner, computed, remaining)
++
++
++def test_chunks_end_at_multiples_of_the_threshold(monkeypatch):
++    monkeypatch.setattr(scheduler_module, "_BATCH_INVARIANT", True)
++    assert _chunk(400, 0, 800) == 400
++    assert _chunk(400, 400, 400) == 400
++    assert _chunk(400, 0, 150) == 150  # the prompt ends first
++    # A prefix-cache hit of 1536 tokens: the first chunk ends at 4000, as in a
++    # cold run, not 4000 tokens later.
++    assert _chunk(4000, 1536, 5000) == 2464
++    assert _chunk(0, 1536, 5000) == 5000  # no threshold: unchanged
++
++
++def test_off_by_default(monkeypatch):
++    monkeypatch.setattr(scheduler_module, "_BATCH_INVARIANT", False)
++    assert _chunk(400, 100, 800) == 800
++
++
++# A minimal OPT-125m configuration, so the scheduler builds without the hub.
++_OPT_CONFIG = {
++    "architectures": ["OPTForCausalLM"], "model_type": "opt", "hidden_size": 768,
++    "num_attention_heads": 12, "num_hidden_layers": 12, "ffn_dim": 3072,
++    "max_position_embeddings": 2048, "vocab_size": 50272, "word_embed_proj_dim": 768,
++    "torch_dtype": "float16", "do_layer_norm_before": True, "pad_token_id": 1,
++    "bos_token_id": 2, "eos_token_id": 2,
++}
++
++
++def test_no_partial_chunk_when_the_budget_is_short(monkeypatch, tmp_path):
++    import json
++
++    from tests.v1.core.utils import create_requests, create_scheduler
++
++    monkeypatch.setattr(scheduler_module, "_BATCH_INVARIANT", True)
++    (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
++    scheduler = create_scheduler(
++        model=str(tmp_path),
++        max_num_batched_tokens=1024,
++        long_prefill_token_threshold=400,
++        skip_tokenizer_init=True,
++        device="cpu",
++    )
++    requests = create_requests(num_requests=3, num_tokens=800)
++    for request in requests:
++        scheduler.add_request(request)
++    output = scheduler.schedule()
++    # Without batch invariance the third request takes the 224 tokens left.
++    assert output.num_scheduled_tokens[requests[0].request_id] == 400
++    assert output.num_scheduled_tokens[requests[1].request_id] == 400
++    assert requests[2].request_id not in output.num_scheduled_tokens
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index f2150fd9b..b9d9d74c9 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
+ import math
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -119,6 +120,11 @@ def _build_kv_connector_block_state(
+     )
+ 
+ 
++
++# Opt-in batch-invariant mode (DeepSeek V4.1): prefill chunks end at absolute
++# multiples of long_prefill_token_threshold, whatever else the step holds.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -792,6 +798,23 @@ class Scheduler(SchedulerInterface):
+             and (request.num_stale_output_tokens == 0 or request.drop_stale_output)
+         )
+ 
++    def _aligned_prefill_chunk(
++        self, num_computed_tokens: int, num_new_tokens: int
++    ) -> int:
++        """Batch-invariant mode: the prefill chunk that ends at the next multiple of
++        the long-prefill threshold (or the prompt end).
++
++        Otherwise a chunk takes whatever budget the step's other requests leave,
++        so where a prompt splits, and with it which rows a step computes and the
++        CED decoder windows, would depend on the other requests. Counting from
++        the computed tokens (prefix-cache hits included) keeps the boundaries
++        absolute.
++        """
++        threshold = self.scheduler_config.long_prefill_token_threshold
++        if not _BATCH_INVARIANT or threshold <= 0:
++            return num_new_tokens
++        return min(num_new_tokens, threshold - num_computed_tokens % threshold)
++
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+@@ -1052,6 +1075,12 @@ class Scheduler(SchedulerInterface):
+                     < num_new_tokens
+                 ):
+                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
++                aligned_chunk = None
++                if _BATCH_INVARIANT and request.is_prefill_chunk:
++                    aligned_chunk = self._aligned_prefill_chunk(
++                        request.num_computed_tokens, num_new_tokens
++                    )
++                    num_new_tokens = aligned_chunk
+                 if request.is_prefill_chunk and prefill_interleave_step is not None:
+                     num_new_tokens = min(
+                         num_new_tokens,
+@@ -1062,6 +1091,11 @@ class Scheduler(SchedulerInterface):
+                 num_new_tokens = min(
+                     num_new_tokens, token_budget, input_budget - draft_slots
+                 )
++                if aligned_chunk is not None and num_new_tokens < aligned_chunk:
++                    # Batch-invariant mode: no partial chunk; wait for a step
++                    # with room for the whole aligned one.
++                    req_index += 1
++                    continue
+                 # Make sure the input position does not exceed the max model len.
+                 # This is necessary when using spec decoding.
+                 num_new_tokens = min(
+@@ -1604,6 +1638,12 @@ class Scheduler(SchedulerInterface):
+                     threshold = self.scheduler_config.long_prefill_token_threshold
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
++                    aligned_chunk = None
++                    if _BATCH_INVARIANT and num_new_tokens > 1:
++                        aligned_chunk = self._aligned_prefill_chunk(
++                            num_computed_tokens, num_new_tokens
++                        )
++                        num_new_tokens = aligned_chunk
+ 
+                     # chunked prefill has to be enabled explicitly to allow
+                     # pooling requests to be chunked
+@@ -1617,6 +1657,9 @@ class Scheduler(SchedulerInterface):
+ 
+                     num_new_tokens = min(num_new_tokens, request_token_budget)
+                     assert num_new_tokens > 0
++                    if aligned_chunk is not None and num_new_tokens < aligned_chunk:
++                        # Batch-invariant mode: no partial chunk this step.
++                        break
+ 
+                     # Apply Mamba alignment before encoder caps.
+                     if self.need_mamba_block_aligned_split:
+-- 
+2.43.0
+

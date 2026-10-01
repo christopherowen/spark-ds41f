@@ -560,14 +560,9 @@ def family_reference():
     try:
         print(json.dumps({"family": "mhc as served (graph sizes + 4096 warm)"}), flush=True)
         family_mhc()
-        for lagged in (False, True):
-            forced = Forced()
-            forced.reference = eval(REFERENCE_MHC.format(lagged=lagged), {"MhcConfig": MhcConfig})  # noqa: S307
-            b12x_layers.mhc = forced
-            print(json.dumps({"family": f"mhc reference (native, one K slice, lagged_prepare={lagged})"}),
-                  flush=True)
-            family_mhc()
-            b12x_layers.mhc = real
+        GEMV_CAPS = (LIMIT,)  # vllm-0033: only the capacity plan
+        print(json.dumps({"family": "mhc reference (capacity plan only, vllm-0033)"}), flush=True)
+        family_mhc()
     finally:
         b12x_layers.mhc = real
         GEMV_CAPS = saved

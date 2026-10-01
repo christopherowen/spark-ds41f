@@ -1,0 +1,24 @@
+--- a/attention.py
++++ b/attention.py
+@@ -62,6 +62,9 @@
+ )
+ 
+ logger = init_logger(__name__)
++# Opt-in batch-invariant mode: decode rows run the extend (single-pass) kernel,
++# so a decode row rounds the same in a decode step as beside a prefill.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+ 
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+@@ -691,8 +694,9 @@
+             ("decode", min(self.capacity, decode_rows)),
+             ("extend", self.capacity),
+         ):
+-            # "reference" gives decode rows the single-pass kernel as well.
+-            kernel_mode = "extend" if compute == "reference" else mode
++            # "reference" gives decode rows the single-pass kernel as well (and
++            # BF16 arithmetic below); batch-invariant mode keeps the arithmetic.
++            kernel_mode = "extend" if compute == "reference" or _BATCH_INVARIANT else mode
+             caps = mla.Caps(
+                 device=device,
+                 num_q_heads=self.n_local_heads,
