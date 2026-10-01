@@ -110,6 +110,11 @@ B12X patch 0008 (overlay mhc-mt2, built on the r5o image: the multi-token
 lagged partial kernel): detm-r5o-ref4d-pin, detm-r5o-ref4d-b4144-pin and their
 traces detm-r5o-ref4d-trace8, detm-r5o-ref4d-b4144-trace8.
 
+ref4e (experiment) is ref4d whose mHC override takes the TF32 TMA projection at
+every capacity with VLLM_DS41_MHC_TF32_SPLITS K slices (row-invariant in
+run58b; prefill near production's, more per decode call at one stream, less at
+eight): detm-r5o-ref4e-s{16,40}{,-b4144}-pin and -trace8.
+
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
 ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
@@ -293,6 +298,12 @@ mhc_capture["environment"]["SPARK3_DEBUG_MHC_CAPTURE"] = "/cache/kkref/mhc-captu
 GEMV_GEOMETRY_FILES = ("gemm/bf16_gemv/_prefill.py", "gemm/bf16_gemv/_tuning.py", "gemm/bf16_gemv/_preparation.py")
 
 
+def with_env(arm, **values):
+    arm = copy.deepcopy(arm)
+    arm["environment"].update(values)
+    return arm
+
+
 def with_budget(arm, threshold=4096, budget=4144):
     """arm with chunks aligned to threshold and a batch budget leaving room for every decode row."""
     arm = copy.deepcopy(arm)
@@ -374,6 +385,14 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                     for b, budget in (("", lambda a: a), ("-b4144", with_budget))
                     for kind, arm in (("pin", with_reference(detm_variant2_pin, attention=True, ref="ref4d")),
                                       ("trace8", reference_trace("attn-exact8", ref="ref4d")))),
+                  *((f"detm-r5o-ref4e-s{n}{b}-pin", with_env(budget(with_mhc_multi_token(with_gemv_geometry(
+                      with_reference(detm_variant2_pin, attention=True, ref="ref4e"), "gemv-geom2"))),
+                      VLLM_DS41_MHC_TF32_SPLITS=str(n)))
+                    for n in (16, 40) for b, budget in (("", lambda a: a), ("-b4144", with_budget))),
+                  *((f"detm-r5o-ref4e-s{n}{b}-trace8", with_env(budget(with_mhc_multi_token(with_gemv_geometry(
+                      reference_trace("attn-exact8", ref="ref4e"), "gemv-geom2"))),
+                      VLLM_DS41_MHC_TF32_SPLITS=str(n)))
+                    for n in (16, 40) for b, budget in (("", lambda a: a), ("-b4144", with_budget))),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),
