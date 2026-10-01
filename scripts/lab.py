@@ -461,13 +461,43 @@ def validate_steps(spec: dict, job: dict) -> list[dict]:
     return steps
 
 
+PROFILE_WORKLOADS = {
+    "decode": ("profile_decode.py", ["--tokens", "128"]),
+    "c8": ("profile_c8.py", ["--case", "json", "--streams", "8", "--tokens", "128"]),
+    "prefill": ("profile_prefill.py", ["--tokens", "16384"]),
+}
+
+
+def profile_steps(spec: dict, job: dict) -> list[dict]:
+    """Torch-profiled arms (run55's method): per arm and workload one rank-0 trace, then kernel
+    summaries and cost comparisons against the first arm, computed while the cluster is stopped."""
+    experiment = spec["experiment"]
+    out = f"results/private/determinism/{spec['run']}"
+    workloads = job.get("workloads", list(PROFILE_WORKLOADS))
+    steps = []
+    for arm in job["arms"]:
+        config = arm_config_path(experiment, arm["config"])
+        steps.append({"kind": "boot", "config": config, "label": arm["label"]})
+        for workload in workloads:
+            script, extra = PROFILE_WORKLOADS[workload]
+            steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
+                          "argv": [f"{experiment}/{script}", head_url(), *extra],
+                          "out": f"{out}/{arm['label']}"})
+    steps.append({"kind": "stop"})
+    steps.append({"kind": "costs", "experiment": experiment, "out": out, "workloads": workloads,
+                  "labels": [arm["label"] for arm in job["arms"]],
+                  "config": arm_config_path(experiment, job["arms"][0]["config"])})
+    return steps
+
+
 def kernel_steps(spec: dict, job: dict) -> list[dict]:
     return [{"kind": "stop"},
             {"kind": "kernel", "bundles": job["bundles"], "out": f"results/private/lab/{spec['run']}"}]
 
 
 def plan(spec: dict) -> list[dict]:
-    builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps}
+    builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
+                "profile": profile_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -483,6 +513,10 @@ def describe_step(step: dict) -> str:
         return "bin/spark3 " + shlex.join(step["argv"])
     if step["kind"] == "script":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
+    if step["kind"] == "profile":
+        return f"profile {step['label']} {step['workload']}: python3 " + shlex.join(step["argv"])
+    if step["kind"] == "costs":
+        return f"summarize kernels and compare costs against {step['labels'][0]} ({', '.join(step['workloads'])})"
     if step["kind"] == "table":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
     if step["kind"] == "analyze":
@@ -535,6 +569,76 @@ def analyze(step: dict) -> dict:
     summary = summarize_analysis(out)
     write_json_atomic(out / "analysis-summary.json", summary)
     return summary
+
+
+def profiler_dir(config_path: str) -> str:
+    """The container's torch profiler directory, from the arm's --profiler-config."""
+    args = json.loads((ROOT / config_path).read_text())["serve_args"]
+    return json.loads(args[args.index("--profiler-config") + 1])["torch_profiler_dir"]
+
+
+def profile_workload(step: dict) -> None:
+    container_dir = profiler_dir(step["config"])
+    host_dir = ROOT / container_dir.replace("/cache/", "cache/", 1)
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+    workload = step["workload"]
+    subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
+                    f"mkdir -p {container_dir} && rm -rf {container_dir}/*.json.gz {container_dir}/{workload}"],
+                   check=False)
+    with (out / f"{workload}.json").open("w") as handle:
+        code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
+                              stderr=subprocess.STDOUT).returncode
+    log(f"profile {step['label']} {workload} exit {code}")
+    before = -1
+    for _ in range(120):  # rank 0's trace is written after /stop_profile; wait until it stops growing
+        size = sum(p.stat().st_size for p in host_dir.glob("*rank0*.json.gz"))
+        if size and size == before:
+            break
+        before = size
+        time.sleep(5)
+    else:
+        log(f"trace in {host_dir} did not settle")
+    subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
+                    f"mkdir -p {container_dir}/{workload} && mv {container_dir}/*rank0*.json.gz {container_dir}/{workload}/"],
+                   check=False)
+    trace_dir = out / f"{workload}-trace"
+    trace_dir.mkdir(exist_ok=True)
+    for trace in (host_dir / workload).glob("*.json.gz"):
+        (trace_dir / trace.name).write_bytes(trace.read_bytes())
+
+
+def profile_costs(step: dict) -> None:
+    """summarize_kernels.py per arm and workload (three at a time), then analyze_costs.py of each
+    arm against the first; the cluster is stopped, so memory is free."""
+    if container_running():
+        raise SystemExit("kernel summaries need the cluster stopped")
+    image = json.loads((ROOT / step["config"]).read_text())["container"]["image"]
+    experiment, out = ROOT / step["experiment"], ROOT / step["out"]
+
+    def docker_python(script: str, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["docker", "run", "--rm", "--memory=16g", "-e", "CUDA_VISIBLE_DEVICES=",
+                               "-v", f"{experiment / script}:/s.py:ro", "-v", f"{out}:/o",
+                               "--entrypoint", "python3", image, "/s.py", *args], text=True, capture_output=True)
+
+    def summarize(item: tuple[str, str]) -> None:
+        label, workload = item
+        traces = sorted((out / label / f"{workload}-trace").glob("*.json.gz"))
+        if traces:
+            docker_python("summarize_kernels.py", f"/o/{label}/{workload}-kernels.json",
+                          f"/o/{label}/{workload}-trace/{traces[0].name}")
+
+    items = [(label, workload) for label in step["labels"] for workload in step["workloads"]]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(summarize, items))
+    base = step["labels"][0]
+    for label in step["labels"][1:]:
+        for workload in step["workloads"]:
+            extra = ["--total"] if workload == "prefill" else []
+            result = docker_python("analyze_costs.py", f"/o/{base}/{workload}-kernels.json",
+                                   f"/o/{label}/{workload}-kernels.json", *extra, "--top", "25")
+            (out / f"costs-{label}-{workload}.txt").write_text(result.stdout + result.stderr)
+            log(f"costs {label} {workload}: {out / f'costs-{label}-{workload}.txt'}")
 
 
 def summarize_analysis(out: Path) -> dict:
@@ -678,6 +782,10 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             log(f"bench {step['label']} exit {spark3_cli(*step['argv'])}")
         elif step["kind"] == "script":
             log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
+        elif step["kind"] == "profile":
+            profile_workload(step)
+        elif step["kind"] == "costs":
+            profile_costs(step)
         elif step["kind"] == "table":
             run_script(step)
             print((ROOT / step["out"]).read_text(), flush=True)

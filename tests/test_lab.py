@@ -117,6 +117,20 @@ class BootTimeTest(unittest.TestCase):
         self.assertIsNone(lab.ready_seconds(["boot failed"]))
 
 
+class ProfilePlanTest(unittest.TestCase):
+    def test_profile_job_traces_each_workload_then_compares_stopped(self) -> None:
+        spec = {"experiment": "e", "run": "costs3", "jobs": [{
+            "kind": "profile", "workloads": ["decode", "prefill"],
+            "arms": [{"config": "cluster-r5o-pin-prof.json", "label": "r5o"},
+                     {"config": "cluster-cand-prof.json", "label": "cand"}]}]}
+        steps = lab.plan(spec)
+        kinds = [s["kind"] for s in steps]
+        self.assertEqual(kinds, ["boot", "profile", "profile", "boot", "profile", "profile", "stop", "costs"])
+        self.assertEqual(steps[2]["argv"][-2:], ["--tokens", "16384"])
+        self.assertEqual(steps[-1]["labels"], ["r5o", "cand"])
+        self.assertEqual(steps[-1]["out"], "results/private/determinism/costs3")
+
+
 class OverlayTest(unittest.TestCase):
     def test_fewer_fences_than_the_image_is_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
