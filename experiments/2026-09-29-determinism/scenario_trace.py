@@ -25,6 +25,12 @@ named "0-..." to sort first) and links to the shared logs.
   requests that move the first chunk's end.
 - distinct: eight different prompts (c8_distinct.py's), each alone, then all
   eight at once (different routing in every row of the shared steps).
+- cache_long: a 9000-token prompt cold, against the same prompt after a
+  6000-token prefix of it was served (the cached prefix ends inside a chunk,
+  so the warm request's first chunk starts mid-chunk and ends at 8000).
+
+--suffix S appends S to every run name (and request tag), so a second boot's runs
+join the first boot's groups: the analysis then compares rows across restarts.
 """
 import json
 import os
@@ -42,7 +48,8 @@ def arg(name, default):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
 
-SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end,distinct").split(",")
+SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end,distinct,cache_long").split(",")
+SUFFIX = arg("--suffix", "")
 REPEATS = int(arg("--repeats", "1"))
 NODES = ("dgx1", "dgx2", "dgx3")
 LOGDIR = "/cache/kkref/moe-checksums"
@@ -65,6 +72,8 @@ SHORT = "Return a JSON object describing three fictional planets with name, mass
 LONG3K = "Here are lighthouse notes. " + notes(110, 1) + " Which fuel appears most often?"
 LONG9K = "Here are lighthouse notes. " + notes(330, 2) + " Summarize when the lighthouses were built."
 LONG4K = "Here are lighthouse notes. " + notes(166, 5) + " Summarize when the lighthouses were built."
+PREFIX6K = "Here are lighthouse notes. " + notes(245, 6)
+LONG9K_CACHED = PREFIX6K + " " + notes(122, 7) + " Which fuel appears most often?"
 OTHER3K = "Here are lighthouse notes. " + notes(110, 3) + " Which place appears most often?"
 PREFIX = "Here are lighthouse notes. " + notes(75, 4)
 DISTINCT = [
@@ -164,7 +173,7 @@ def run(scenario, run_name, requests):
 
 
 for repeat in range(REPEATS):
-    r = f"r{repeat}"
+    r = f"r{repeat}{SUFFIX}"
     if "mixed" in SCENARIOS:
         run("mixed", f"0-solo-{r}", [(0, SHORT, 96, "mixed_short", "short", None)])
         run("mixed", f"0-solo-long-{r}", [(0, LONG3K, 16, "mixed_long", "long", None)])
@@ -202,6 +211,11 @@ for repeat in range(REPEATS):
         for i, prompt in enumerate(DISTINCT):
             run("distinct", f"0-solo{i}-{r}", [(0, prompt, 32, f"distinct{i}", f"p{i}", None)])
         run("distinct", f"together-{r}", [(0, p, 32, f"distinct{i}", f"p{i}", None) for i, p in enumerate(DISTINCT)])
+    if "cache_long" in SCENARIOS:
+        salt3 = uuid.uuid4().hex
+        run("cache_long", f"0-cold-{r}", [(0, LONG9K_CACHED, 32, "cache_long", "cold", None)])
+        run("cache_long", f"prefix-{r}", [(0, PREFIX6K + " Summarize these notes.", 8, None, "prefix", salt3)])
+        run("cache_long", f"warm-{r}", [(0, LONG9K_CACHED, 32, "cache_long", "warm", salt3)])
     if "identical" in SCENARIOS:
         run("identical", f"0-solo-{r}", [(0, SHORT, 32, "identical", "solo", None)])
         run("identical", f"staggered-{r}", [(0.05 * i, SHORT, 32, "identical", f"s{i}", None) for i in range(8)])
