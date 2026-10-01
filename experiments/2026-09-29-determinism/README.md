@@ -805,3 +805,248 @@ choice trades decode or prefill speed for invariance.
   that changes speed, not text (greedy block verification accepts the
   target's own argmax), which the traces confirm.
 - Nothing here is promoted; promotion needs the owner's acceptance.
+
+## Round 15: harness repair, transition map, frozen reference, costs (`run45`-`run55`, r5o)
+
+### The comparison harness, repaired (`analyze_trace4.py`, `debug-attn-exact4.diff`, `debug-attn-exact5.diff`)
+
+`analyze_trace3.py` mapped every record's row i to the step's batch row i.
+Three things break that, and each now has an explicit mapping:
+
+- Sequence-parallel records that hold only one rank's rows (WO's output after
+  the reduce-scatter, the index head weights of an indexer split): attn-exact4
+  records every record's row offset (layout 2), and rank 0's local rows (offset
+  0) are recognised from the step's SP record (tag 32: flag, start, local rows).
+- CED compaction: from layer 20 on (`kv_source_layer_ids`; the window is 128
+  tokens) a step computes only its decoder rows (each prefill's last window and
+  every decode row). A debug hook in DS4.1's model forward records the decoder
+  rows' batch indices per step, and records of exactly that many rows in a
+  layer from the boundary on map through them. SP runs only before the boundary,
+  so a rank-local record and a decoder record never share a layer.
+- Records that fit neither are counted (`unaligned_records`) and left out
+  instead of being compared row for row; analyze_trace3 skipped some of them
+  only because the target's rows happened to exceed the record's.
+
+Also: comparisons between any requests sharing a prompt (several traced
+requests in one run, so `c8_trace.py` and `scenario_trace.py` streams compare
+with each other), every differing row counted rather than the first only,
+each row labelled with its step (rows, padded rows, SP, index mode), small
+integer records (index sums, lengths, step labels) stored raw, a one-time
+inventory of every prepared plan and its query (`inventory-rank*.json`, after
+thawing vLLM's frozen heap, which hid every object from `gc.get_objects()`),
+and a debug capture of chosen index selections with their scores and inputs.
+`test_analyze_trace4.py` builds logs with the real attn-exact4 module on CPU
+(two runs, an SP-local record at offset 4 and one at offset 0, a misaligned
+record, a dead row, a CED step, two planted differences) and checks ten
+outcomes; removing the offset mapping, the alignment guard or the CED mapping
+each fails it. On the earlier traces the new analysis reproduces round 14's
+results; it also shows that round 14's long-prompt comparisons covered
+layers 0-19 for prompt rows outside the final window (the decoder layers
+were skipped, not mismatched).
+
+### The transition map (`transition_map.py`, `run46`-`run49`, `run52`, `run53`)
+
+Each operation runs one target row alone and as the last or first row of
+batches of M random rows, M from 1 to 72 and at every prepared-capacity
+boundary up to 4096 (122 sizes), with its served kernels and plans; rows
+group by their exact bits. "1 group" means the row's bits never change with M
+or position.
+
+| Operation (rank 0 shapes) | As served (r5o) | Reference | Change |
+|---|---|---|---|
+| Router gate GEMV, 384x5120, FP32 out | SIMT to 192 rows, TMA prefill kernel from 193: 2 groups | SIMT at every count: 1 group | vllm-0032 |
+| Ratio-2 compressor GEMV, 1024x5120, FP32 out | split at 97: 2 groups | SIMT: 1 group | vllm-0032 |
+| Index head weights GEMV, 32x5120 | torch/cuBLAS: 6 groups (13/17, 2047/2049, 3071/3073, 4090) | SIMT: 1 group | vllm-0029, 0032 |
+| Ratio-1 compressor GEMV, 512x5120 | 3 groups (9, 16, 17) | SIMT: 1 group | vllm-0029 |
+| Index key GEMV, 128x512 | 1 group | 1 group | |
+| Block-FP8 projections (query a+kv, query b, index query b, shared gate/up and down, Engram wkv) | 1 group each | 1 group | vllm-0030 (the Engram projection's small-row split K) |
+| RMS norms (q, kv, index key, final) | 1 group | 1 group | |
+| mHC `pre`, `post_pre` | graph-size plans to 48 rows, the 4096 plan from 49: 2 groups (exact-or-largest lookup: alternating) | capacity plan only: 1 group | vllm-0028, 0033 |
+| mHC `post`, layer-0 `pre` | 1 group | 1 group | |
+| Routed MoE (deterministic) | graph-size variants to 48, the 4096 variant from 49: 2 groups | 4096 variant only: 1 group | vllm-0034 |
+| WO (inverse RoPE, MXFP8) | decode static plans and the prefill plan: 1 group (392 cases) | 1 group | |
+| Target LM head (BF16, b12x vocabulary projection) | Triton row kernel for 1 row, F.linear from 2: 2 groups; F.linear alone also differs at 1 | one row projected twice: 1 group | vllm-0038 |
+| DSpark drafter heads (NVFP4 a16 block-scaled) | exact regimes split K four ways to 8 rows: 2 groups | capacity regime: 1 group | vllm-0037 |
+
+Not replayed, covered by traces: attention (decode rows in a mixed step run
+the extend kernel; vllm-0035 runs every decode row on the single-pass
+kernel), the sequence-parallel reduce-scatter (vllm-0031), and prefill chunk
+boundaries (vllm-0036).
+
+Two harness gaps surfaced while the last difference was classified, both
+fixed: the plan inventory is written once per log directory, and the
+scenario runs removed `rank*` logs but not `inventory-*`, so run50 and run51
+read run47's inventory (production's plans); trace runs now clear it after
+boot. And the map's `head` family replayed a BF16 GEMV and F.linear while
+assuming the served head was the NVFP4 block-scaled one; the block-scaled
+heads belong to the DSpark drafter, and the target head is BF16 through
+LogitsProcessor's vocabulary projection (`head_served` and `vocab_served`
+replay both as served).
+
+### The last difference: logits, from the vocabulary projection (`run51`-`run53`)
+
+run51 recorded the LM head's input rows and its logits (attn-exact6, mapped
+through each step's recorded logit rows). The 8093-token chunked prompt's
+first logprob (-0.086909 alone, -0.086725 beside decoding requests) and five
+other prompt-end rows differed in the logits while every input row matched:
+the hidden states were identical, the projection was not, and the logprob
+computation only inherits it. Every differing row was a step's only logit row
+(a prompt finishing alone) against the same row in a step with more logit
+rows; decode steps of 4-6 and 16-19 logit rows matched. The target head runs
+b12x's BF16 vocabulary projection: the plan for one row is a Triton kernel
+(one FP32 dot product per vocabulary entry), every larger count is
+F.linear. Replayed on rank 0's 43136x5120 shard (`run53`): two groups as
+served, one group from 1 to 4096 rows when a single row is projected twice
+(vllm-0038, batch-invariant mode only); F.linear alone also takes a
+different kernel for one row, so the padding is needed rather than a plain
+switch to F.linear. vllm-0037 (the capacity regime for block-scaled linears)
+turned out to act on the drafter's NVFP4 heads only (`run52`: that regime is
+one group from 1 to 4096 rows), so it affects drafts and acceptance, not the
+target's text.
+
+### The frozen reference, validated (`run54`, `detm-r5o-ref2-trace6`)
+
+The reference is frozen as overlay `ref2`: vllm-0027 to 0038 and b12x-0006 on
+r5o's tree, the deterministic MoE (0004-0009, det-variant2),
+`VLLM_DS41_BATCH_INVARIANT=1`, and a 4000-token long-prefill threshold (each
+file matches the patched vLLM clone at `8ffbf4714`). One boot, a fresh plan
+inventory (mHC holds only its 4096-row plans, the drafter's heads only the
+capacity regime, the MoE one plan), then `analyze_trace4.py` on every rank:
+
+| Traces | Pairs | Rows compared per rank | Differing | Unaligned records | Outputs |
+|---|---|---|---|---|---|
+| Eight identical concurrent prompts (`c8_trace.py`) | 28 | 2,912 | 0 | 0 | equal |
+| JSON, prose and long mixes (`trace_mixes.py`, five mixes each) | 30 | 12,567 | 0 | 0 | equal |
+| Scenarios (`scenario_trace.py`) | 56 | 39,916 | 0 | 0 | equal |
+
+The same on dgx1, dgx2 and dgx3, LM-head input rows and logits included
+(1,166 logit records per rank in the scenarios). The scenarios: a short
+request decoding inside a 2706-token prefill and the long prefill beside
+decodes; an 8093-token prompt (three chunks) alone, beside decodes and
+beside another long prompt; a 4082-token prompt whose second chunk ends
+inside the CED window; full and partial prefix-cache reuse; eight copies of
+one prompt arriving 0-350 ms apart; and eight different prompts, each alone
+and all eight together. Every group's first logprob is equal across its runs
+(the 8093-token prompt now -0.0867252 alone as beside decodes).
+
+### Costs of the frozen reference (`run54`, one boot per arm, pinned cost table, no debug overlay)
+
+| Workload | r5o | ref2 | Change |
+|---|---|---|---|
+| Decode, one stream, prose: step / TPS | 42.50 ms / 50.05 | 47.50 ms / 42.65 | +5.0 ms / -14.8% |
+| Decode, one stream, JSON: step / TPS | 48.39 ms / 74.75 | 55.47 ms / 67.69 | +7.1 ms / -9.4% |
+| Eight distinct concurrent prompts (`c8_distinct.py`, 256 tokens) | 125.10 tok/s ±2.0% | 122.78 ±1.1% | -1.9% (within the intervals) |
+| Cold prefill, real text, 1K / 4K / 16K / 64K | 2096 / 3888 / 3836 / 3878 tok/s | 1935 / 3297 / 3208 / 3173 | -7.7% / -15.2% / -16.4% / -18.2% |
+| Short prompts, prefill plus one step | 152-175 ms | 159-172 ms | +7 ms at 7-10 tokens, 2-6 ms faster at 17-68 |
+
+Three one-stream samples gave r5o three different texts and ref2 one. The
+bench's eight-stream points send eight copies of one prompt, so the reference
+looks 37-53% faster there (shared experts); they are not a cost measure.
+
+### Where the cost is (`run55`: kernel timings of captured workloads)
+
+Both arms with the torch profiler, rank 0, the same three workloads: one JSON
+stream (128 tokens), eight distinct JSON prompts at once (128 tokens each) and
+one cold 16288-token prompt. `summarize_kernels.py` reduces each trace;
+`analyze_costs.py` counts target steps by the target head's projection (once
+per forward) and groups kernels by the reference change they measure;
+`gpu_idle.py` gives the busy union per step. Leave-one-out throughput is not
+used for attribution: it changes outputs, routing and acceptance.
+
+One-stream decode (39 and 42 target steps for the same 128 tokens; busy GPU
+time per step 47.6 -> 52.5 ms, idle unchanged at 3.5-3.8 ms):
+
+| Change | Kernel time per step |
+|---|---|
+| mHC on its 4096-row plan (vllm-0033): the TF32 TMA projection replaces the partial post_pre kernels | +4.3 ms |
+| Decode rows on the extend attention kernel (vllm-0035) | +1.3 ms net (+2.8 extend, -1.5 decode) |
+| RoCE one-shot collectives | +0.6 ms |
+| Routed MoE on its capacity variant (vllm-0034, the materialized W4A8 path instead of the dynamic kernel) | -0.5 ms |
+| Dense GEMMs and activation quantization (cause not isolated; r5o's GEMMs overlap the L2 prefetch stream) | -3.2 ms |
+| Drafter heads on the capacity regime (vllm-0037) | +0.03 ms |
+
+Eight distinct prompts (53 and 51 steps, the same 177 tok/s in the window):
+attention +2.9 extend / -3.2 decode, mHC +1.4, MoE +2.2, dense GEMMs -3.4 ms
+per step; busy time per step 101.7 -> 106.2 ms.
+
+16288-token prefill (whole request; four chunks of up to 4096 in r5o, five of
+up to 4000 in ref2; kernel time 3958 -> 4939 ms):
+
+| Change | Kernel time |
+|---|---|
+| SIMT GEMVs at prefill sizes (vllm-0032): router gate and the 512-output projection on SIMT instead of the TMA prefill kernel | +537 ms |
+| Routed MoE in prefill (deterministic top-k sum, capacity variant) | +199 ms |
+| Reduce-scatter's float32 rank-order sum (vllm-0031): separate float adds and conversions; NCCL time unchanged | about +190 ms |
+| Attention, mHC, dense GEMMs and the rest at 4000-token chunks (vllm-0036) | about +55 ms |
+
+### Completion criteria for batch invariance
+
+Met when all of these hold for one frozen configuration, with nothing promoted
+until the owner accepts it:
+
+1. Every difference found is classified to one operation and replayed with
+   its served kernels (done for every case through `run53`).
+2. The transition map covers every operation on the served path, with the
+   served kernels and plans, from 1 to 4096 rows in both batch positions, and
+   shows one group under the configuration (done; attention, the
+   reduce-scatter and chunk boundaries are covered by traces instead).
+3. Serving traces of every scenario family compare zero differing rows and
+   zero unaligned records on all three ranks, with equal outputs and first
+   logprobs in every group: identical and distinct concurrent prompts, mixed
+   prefill and decode, prompts of two and three chunks, a chunk ending inside
+   the CED window, full and partial prefix-cache reuse, staggered arrivals,
+   and the JSON, prose and long mixes.
+4. Production numerics and speed are unchanged with the switches off (only
+   0027, 0028 and b12x-0006 act unconditionally; they change only row counts
+   that have no prepared plan, at no measured cost).
+5. Each change's cost is measured on captured workloads (kernel timings of a
+   one-stream decode, eight distinct concurrent prompts and a cold 16K
+   prefill) and end to end (decode at one and eight streams, eight distinct
+   prompts, prefill 1K-64K, short-prompt latency), on one pinned cost table.
+6. Promotion: owner acceptance, configuration, documentation and an immutable
+   baseline in one commit.
+
+### Status against the criteria, and what remains
+
+Criteria 1-3 are met for the frozen reference. Criterion 4 holds by
+construction (every change after 0028 acts only under
+`VLLM_DS41_BATCH_INVARIANT=1`) but has no fresh production A/B at this
+commit beyond the r5o arm above. Criterion 5 is met for the reference as a
+whole; the per-change split above is by kernel family, not by switching each
+change off. Criterion 6 has not started.
+
+Remaining gaps:
+
+- Restarts: every comparison is within one boot. A boot that autotunes a
+  different plan (where a plan is not pinned) could round differently from
+  the previous boot; not yet tested.
+- Coverage: the longest traced prompt is 8093 tokens (three chunks); 64K
+  prompts are measured for speed only. Prefix-cache reuse is traced for a
+  2706-token prompt and a 2000-token shared prefix, not a cached prefix that
+  ends mid-chunk of a longer prompt. Eight concurrent requests is the
+  configured maximum, and the only one traced.
+- Drafts: the drafter is not batch-invariant (apart from its heads under
+  0037), so acceptance and the step schedule vary with batch composition;
+  the target's text does not.
+- Speed: one-stream decode +5-7 ms per step and prefill -15 to -18% from 4K
+  tokens; eight distinct streams at parity.
+
+### Cost recovery, one change at a time (proposed order)
+
+1. Prefill GEMVs (0032, about +0.5 s of 1.0 s at 16K): replay the TMA prefill
+   kernel across 1-4096 rows; if it is row-invariant at every count, use it
+   for every count instead of SIMT (round 13 measured the router gate's
+   prefill kernel 8 us slower than SIMT at 19 rows: about 0.3 ms per decode
+   step over 40 layers).
+2. mHC at small counts (0033, +4.3 ms per decode step): find a plan that is
+   fast at decode sizes and rounds like the capacity plan; the native
+   configuration made `pre` invariant but left `post_pre` changing at 49 rows
+   (`run49`).
+3. The reduce-scatter sum (0031, about +0.19 s at 16K): one fused kernel for
+   the float32 rank-order sum instead of separate adds and conversions; same
+   arithmetic, so the trace result carries over.
+4. Attention for decode rows (0035, +1.3 ms per step) and the prefill MoE
+   (+0.2 s at 16K): measure after 1-3.
+
+Each step: replay across 1-4096 rows, then the full trace validation and the
+same cost measurement as `run54`/`run55`, before the next.
