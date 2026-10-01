@@ -69,6 +69,10 @@ class PlanTest(unittest.TestCase):
                               s["kind"] == "boot" and "trace8" in s["config"])
         self.assertNotIn("stop", [s["kind"] for s in self.steps[:first_validate]])
 
+    def test_measure_ends_with_the_comparison_table(self) -> None:
+        table = next(s for s in self.steps if s["kind"] == "table")
+        self.assertEqual(table["argv"][1:], ["lab0", "r5o", "ref4d-b4144", "r5o-end"])
+
     def test_lean_profile_and_result_layout(self) -> None:
         bench = next(s for s in self.steps if s["kind"] == "cli" and s["label"] == "ref4d-b4144")
         self.assertIn("1024,16384", bench["argv"])

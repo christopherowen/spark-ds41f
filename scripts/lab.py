@@ -423,6 +423,8 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
             steps.append({"kind": "script", "label": label,
                           "argv": [f"{experiment}/{script}", head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
+    steps.append({"kind": "table", "argv": [f"{experiment}/tables_arms.py", run, *[a["label"] for a in arms]],
+                  "out": f"results/private/lab/{run}-table.txt"})
     return steps
 
 
@@ -480,6 +482,8 @@ def describe_step(step: dict) -> str:
     if step["kind"] == "cli":
         return "bin/spark3 " + shlex.join(step["argv"])
     if step["kind"] == "script":
+        return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
+    if step["kind"] == "table":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
     if step["kind"] == "analyze":
         return f"analyze {step['out']} {','.join(step['dirs'])} on every node, in parallel"
@@ -674,6 +678,9 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             log(f"bench {step['label']} exit {spark3_cli(*step['argv'])}")
         elif step["kind"] == "script":
             log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
+        elif step["kind"] == "table":
+            run_script(step)
+            print((ROOT / step["out"]).read_text(), flush=True)
         elif step["kind"] == "fresh_inventory":
             fresh_inventory()
         elif step["kind"] == "stop":
