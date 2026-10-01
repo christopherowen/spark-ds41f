@@ -1396,19 +1396,33 @@ def command_cluster_start(args: argparse.Namespace) -> int:
                     f"{node['name']}: stale memguard is still active; refusing startup"
                 )
         if args.replace:
-            for node in nodes["nodes"]:
+            def replace(node: dict) -> tuple[str | None, str | None]:
+                """Stop and keep one node's old container; return (backup, error)."""
                 exists = run_ssh(nodes, node, "docker", "inspect", name)
                 if exists.returncode:
-                    continue
+                    return None, None
                 backup = f"{name}-{backup_suffix}"
                 stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
                 if stopped.returncode:
-                    raise RuntimeError(f"{node['name']}: could not stop {name}")
+                    return None, f"{node['name']}: could not stop {name}"
                 renamed = run_ssh(nodes, node, "docker", "rename", name, backup)
                 if renamed.returncode:
                     run_ssh(nodes, node, "docker", "start", name)
-                    raise RuntimeError(f"{node['name']}: could not preserve {name}")
-                backups[node["name"]] = backup
+                    return None, f"{node['name']}: could not preserve {name}"
+                return backup, None
+
+            # The nodes stop their old containers concurrently (a vLLM shutdown takes
+            # several seconds per node); any failure rolls back every stopped node.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+                outcomes = list(pool.map(replace, nodes["nodes"]))
+            errors = []
+            for node, (backup, error) in zip(nodes["nodes"], outcomes):
+                if backup:
+                    backups[node["name"]] = backup
+                if error:
+                    errors.append(error)
+            if errors:
+                raise RuntimeError("; ".join(errors))
         for node in order:
             start_memguard(
                 cluster,
@@ -1454,12 +1468,16 @@ def command_cluster_start(args: argparse.Namespace) -> int:
                 print(f"WARN: rollback health check failed: {rollback_error}", file=sys.stderr)
         return 130 if isinstance(error, KeyboardInterrupt) else 1
 
-    for node in nodes["nodes"]:
+    def remove_backup(node: dict) -> str | None:
         backup = backups.get(node["name"])
-        if backup:
-            result = run_ssh(nodes, node, "docker", "rm", backup)
-            if result.returncode:
-                print(f"WARN: {node['name']}: retained backup container {backup}")
+        if backup and run_ssh(nodes, node, "docker", "rm", backup).returncode:
+            return f"WARN: {node['name']}: retained backup container {backup}"
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        for warning in pool.map(remove_backup, nodes["nodes"]):
+            if warning:
+                print(warning)
     print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
     return 0
 

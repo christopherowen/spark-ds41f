@@ -392,3 +392,73 @@ class MountTestScriptTest(unittest.TestCase):
                                     capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.splitlines(), [f"rw {home}/missing dir"])
+
+
+class ClusterReplaceTest(unittest.TestCase):
+    """start --replace stops every node's old container (concurrently) and rolls back on failure."""
+
+    def run_start(self, fail_rename_on=None):
+        import argparse
+        from unittest import mock
+
+        nodes = {"ssh_user": "u", "nodes": [
+            {"name": "dgx1", "head": True, "rank": 0, "management_ip": "1", "roce_peer_hcas": []},
+            {"name": "dgx2", "head": False, "rank": 1, "management_ip": "2", "roce_peer_hcas": []},
+            {"name": "dgx3", "head": False, "rank": 2, "management_ip": "3", "roce_peer_hcas": []}]}
+        cluster = {"deployment": {"launch_enabled": True}, "container": {"name": "c"}}
+        calls = []
+        guards = set()
+
+        def run_ssh(_nodes, node, *command):
+            calls.append((node["name"], command[:2]))
+            code = 0
+            if command[:2] == ("docker", "rename") and node["name"] == fail_rename_on:
+                code = 1
+            return subprocess.CompletedProcess(command, code, stdout="id\n", stderr="")
+
+        import subprocess
+        patches = [
+            mock.patch.object(spark3, "configuration", return_value=(cluster, nodes, {})),
+            mock.patch.object(spark3, "cluster_config_path", return_value=(None, "config/cluster.json")),
+            mock.patch.object(spark3, "rendered_docker_command", return_value=["docker", "run"]),
+            mock.patch.object(spark3, "require_local_deployment_state", return_value="rev"),
+            mock.patch.object(spark3, "remote_runtime_problems", return_value=[]),
+            mock.patch.object(spark3, "stop_memguard",
+                              side_effect=lambda c, n, node: guards.discard(node["name"])),
+            mock.patch.object(spark3, "start_memguard",
+                              side_effect=lambda c, n, node, *rest, **kw: guards.add(node["name"])),
+            mock.patch.object(spark3, "start_memguards"),
+            mock.patch.object(spark3, "wait_for_api"),
+            mock.patch.object(spark3, "memguard_is_active",
+                              side_effect=lambda c, n, node: node["name"] in guards),
+            mock.patch.object(spark3, "run_ssh", side_effect=run_ssh),
+            mock.patch.object(spark3, "preserve_failed_start_logs", return_value=None),
+            mock.patch.object(spark3, "restore_containers"),
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            args = argparse.Namespace(apply=True, replace=True, cluster_config="config/cluster.json")
+            with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                code = spark3.command_cluster_start(args)
+            restore = spark3.restore_containers
+            return code, calls, restore
+        finally:
+            for patch in patches:
+                patch.stop()
+
+    def test_every_old_container_is_stopped_and_its_backup_removed(self) -> None:
+        code, calls, restore = self.run_start()
+        self.assertEqual(code, 0)
+        stopped = sorted(node for node, command in calls if command == ("docker", "stop"))
+        self.assertEqual(stopped, ["dgx1", "dgx2", "dgx3"])
+        removed = sorted(node for node, command in calls if command == ("docker", "rm"))
+        self.assertEqual(removed, ["dgx1", "dgx2", "dgx3"])
+        restore.assert_not_called()
+
+    def test_a_failed_rename_rolls_back_the_stopped_nodes(self) -> None:
+        code, calls, restore = self.run_start(fail_rename_on="dgx2")
+        self.assertEqual(code, 1)
+        backups = restore.call_args.args[2]
+        self.assertEqual(sorted(backups), ["dgx1", "dgx3"])
+        self.assertNotIn(("dgx1", ("docker", "run")), calls)
