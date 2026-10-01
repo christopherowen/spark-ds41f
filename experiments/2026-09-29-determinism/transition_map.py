@@ -2,7 +2,7 @@
 """Where does each operation's arithmetic change with the batch's row count? (GPU; cluster stopped)
 
 usage: transition_map.py FAMILY [FAMILY...]   (cwd: the B12X checkout, vLLM importable, checkpoint at /models)
-       FAMILY: gemv, fp8, mhc, norm, moe, head   (moe needs the det-variant2 overlay mounted)
+       FAMILY: gemv, fp8, mhc, norm, moe, head, wo, reference   (moe and reference need det-variant2)
 
 One target row runs alone and as the last (e) or first (s) row of batches of
 M rows (random neighbours), for every M from 1 to 72, the rows on both sides
@@ -519,6 +519,88 @@ def family_wo():
                           "groups": len(groups_seen),
                           "members": {k[:16]: (v[:12] + [f"... {len(v)} total"]) if len(v) > 12 else v
                                       for k, v in groups_seen.items()}}), flush=True)
+
+
+REFERENCE_MHC = ("MhcConfig(backend='native', projection_tile_m=16, projection_tile_n=8, projection_tile_k=256, "
+                 "projection_num_stages=1, projection_num_m_warps=1, projection_num_n_warps=1, "
+                 "projection_k_splits=1, lagged_prepare=False, partials_per_cta=4)")
+
+
+def family_reference():
+    """The candidate reference configuration, against serving's actual warm sets.
+
+    - mHC with serving's warm counts (graph sizes and 4096): as served, and with
+      every pre, post_pre and post plan forced to the native configuration that
+      post already uses below 4096 rows (one K slice, no lagged prepare).
+    - The MoE with only the 4096-token variant warm, so every count binds it.
+    - The LM head with SIMT GEMV plans at every capacity up to 512 logit rows.
+    """
+    global GEMV_CAPS, GRAPH, SIZES
+    from b12x.norm.mhc._tuning import MhcConfig
+
+    from vllm.models.deepseek_v4_1 import b12x_layers
+
+    real = b12x_layers.mhc
+    reference = eval(REFERENCE_MHC, {"MhcConfig": MhcConfig})  # noqa: S307 - a literal from the inventory
+
+    class Forced:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def plan(self, caps, *, invocation=None, override=None):
+            return real.plan(caps, invocation=invocation, override=reference)
+
+    saved = GEMV_CAPS
+    GEMV_CAPS = (*GRAPH, LIMIT)  # family_mhc warms GEMV_CAPS minus the limit: serving's set
+    try:
+        print(json.dumps({"family": "mhc as served (graph sizes + 4096 warm)"}), flush=True)
+        family_mhc()
+        b12x_layers.mhc = Forced()
+        print(json.dumps({"family": "mhc reference (native, one K slice, no lagged prepare)"}), flush=True)
+        family_mhc()
+    finally:
+        b12x_layers.mhc = real
+        GEMV_CAPS = saved
+
+    graph = GRAPH
+    GRAPH = ()  # family_moe warms GRAPH plus the limit
+    try:
+        print(json.dumps({"family": "moe reference (only the 4096-token variant warm)"}), flush=True)
+        family_moe()
+    finally:
+        GRAPH = graph
+
+    from b12x.gemm import bf16_gemv
+    from b12x.gemm.bf16_gemv._tuning import GemvConfig
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    head = bf16("head.weight")
+    weight = head[: -(-head.shape[0] // 3)].contiguous()
+    del head
+    caps = (*GRAPH, 64, 128, 256, 512)
+    plans = {}
+    for cap in caps:
+        query = bf16_gemv.GemvQuery(source_dtype="bfloat16", weight_dtype="bfloat16", max_rows=cap,
+                                    in_features=weight.shape[1], out_features=weight.shape[0], source_contiguous=True,
+                                    source_aligned=True, weight_contiguous=True, weight_aligned=True)
+        plans[cap] = bf16_gemv.plan(query, override=GemvConfig(backend="simt"))
+
+    def make_call(state):
+        q = state.query
+        source = torch.empty((q.max_rows, q.in_features), device=device, dtype=torch.bfloat16)
+        out = torch.empty((q.max_rows, q.out_features), device=device, dtype=torch.bfloat16)
+        return PreparedCall(run=lambda: state.run(source, weight, out=out),
+                            produce=lambda: source.normal_(std=0.25), owners=(weight,))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(p.request(name=f"head-ref-{c}", prepare_call=make_call, benchmark_call=make_call)
+                              for c, p in plans.items()))
+        saved_sizes = SIZES
+        SIZES = [m for m in SIZES if m <= 512]
+        transitions("lm head reference (SIMT plans to 512 rows)", lambda x: bf16_gemv.mm(
+            x.contiguous(), weight, plan=plans[smallest(caps, x.shape[0])], output_dtype=torch.bfloat16),
+            weight.shape[1])
+        SIZES = saved_sizes
 
 
 if __name__ == "__main__":

@@ -132,6 +132,32 @@ def capture_indices(owner, positions: torch.Tensor, indices: torch.Tensor, lengt
                             "indices": indices[mask].cpu(), "lengths": lengths[:rows][mask].cpu()})
 
 
+def capture_wanted(owner) -> bool:
+    \"\"\"Whether this layer's index selection is captured (scores and inputs too).\"\"\"
+    if not _INDEX_CAPTURE or torch.cuda.is_current_stream_capturing():
+        return False
+    import re
+
+    match = re.search(r"layers[.]([0-9]+)", _name(owner))
+    return match is not None and int(match.group(1)) in {int(v) for v in _INDEX_CAPTURE.split(":")[0].split(",")}
+
+
+def capture_select(owner, positions, selected, scores, q_data, q_scales, weights, lengths) -> None:
+    \"\"\"Keep one rank's scored rows in the capture window: selection, top-k scores, inputs.\"\"\"
+    import re
+
+    _, lo, hi = _INDEX_CAPTURE.split(":")
+    mask = (positions >= int(lo)) & (positions < int(hi))
+    if not bool(mask.any()):
+        return
+    layer = int(re.search(r"layers[.]([0-9]+)", _name(owner)).group(1))
+    _index_captures.append({"step": _step[0] - 1, "layer": layer, "kind": "select",
+                            "positions": positions[mask].cpu(), "indices": selected[mask].cpu(),
+                            "scores": scores[mask].cpu(), "q_data": q_data[mask].cpu(),
+                            "q_scales": q_scales[mask].cpu(), "weights": weights[mask].float().cpu(),
+                            "lengths": lengths[mask].cpu()})
+
+
 """
 
 src, dst = sys.argv[1], sys.argv[2]
@@ -303,6 +329,33 @@ edit(f"{src}/attention.py", f"{dst}/attention.py", [
      '            if main is not None:\n'
      '                checksum_debug.capture_indices(self, positions, owner.topk_indices_buffer[:rows],\n'
      '                                               top_lengths[:rows])\n'),
+    ('                iq_data, iq_scale, iw = query\n'
+     '                index_rows = iq_data.shape[0]\n',
+     '                iq_data, iq_scale, iw = query\n'
+     '                index_rows = iq_data.shape[0]\n'
+     '                capture = checksum_debug.ENABLED and checksum_debug.capture_wanted(self)\n'
+     '                if capture:  # debug: this rank\'s top-k scores for the capture window\n'
+     '                    scores_out = torch.full((index_rows, 512), float("nan"), dtype=torch.float32,\n'
+     '                                            device=iq_data.device)\n'),
+    ('                        output_indices=selected[offset:end],\n'
+     '                        **candidate_args,\n'
+     '                    )\n',
+     '                        output_indices=selected[offset:end],\n'
+     '                        **candidate_args,\n'
+     '                        **({"output_scores": scores_out[offset:end]} if capture else {}),\n'
+     '                    )\n'),
+    ('                    dsa_indexer.score(binding)\n'
+     '                    dsa_indexer.select(binding)\n'
+     '\n'
+     '            if split is None:\n',
+     '                    dsa_indexer.score(binding)\n'
+     '                    dsa_indexer.select(binding)\n'
+     '                if capture:\n'
+     '                    checksum_debug.capture_select(\n'
+     '                        self, positions[first : first + index_rows], selected[:index_rows], scores_out,\n'
+     '                        iq_data, iq_scale, iw, im.cache_lengths[first : first + index_rows])\n'
+     '\n'
+     '            if split is None:\n'),
 ])
 print("ok")
 if tree:

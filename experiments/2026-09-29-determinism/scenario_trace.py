@@ -20,6 +20,9 @@ named "0-..." to sort first) and links to the shared logs.
   KV and computes only its tail), and a request sharing a 2000-token prefix
   with a different question.
 - identical: eight copies of one prompt arriving 0-350 ms apart.
+- chunked_end: a prompt a little over one batch budget (its second chunk ends
+  within the 128-token CED window of the first), alone and beside decoding
+  requests that move the first chunk's end.
 """
 import json
 import os
@@ -37,7 +40,7 @@ def arg(name, default):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
 
-SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical").split(",")
+SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end").split(",")
 REPEATS = int(arg("--repeats", "1"))
 NODES = ("dgx1", "dgx2", "dgx3")
 LOGDIR = "/cache/kkref/moe-checksums"
@@ -59,6 +62,7 @@ def notes(count, seed=0):
 SHORT = "Return a JSON object describing three fictional planets with name, mass and moons."
 LONG3K = "Here are lighthouse notes. " + notes(110, 1) + " Which fuel appears most often?"
 LONG9K = "Here are lighthouse notes. " + notes(330, 2) + " Summarize when the lighthouses were built."
+LONG4K = "Here are lighthouse notes. " + notes(166, 5) + " Summarize when the lighthouses were built."
 OTHER3K = "Here are lighthouse notes. " + notes(110, 3) + " Which place appears most often?"
 PREFIX = "Here are lighthouse notes. " + notes(75, 4)
 BACKGROUND = ["List ten prime numbers and explain why each is prime.",
@@ -176,6 +180,12 @@ for repeat in range(REPEATS):
         run("cache", f"prefix-warm-{r}", [(0, PREFIX + " Which fuel appears most often?", 32, "cache_prefix",
                                            "b", salt2),
                                           (0, PREFIX + " Which place appears most often?", 32, None, "c", salt2)])
+    if "chunked_end" in SCENARIOS:
+        run("chunked_end", f"0-solo-{r}", [(0, LONG4K, 32, "chunked_end", "long", None)])
+        run("chunked_end", f"beside-decodes-{r}", [(0, BACKGROUND[0], 200, None, "bg0", None),
+                                                   (0, BACKGROUND[1], 200, None, "bg1", None),
+                                                   (0, BACKGROUND[2], 200, None, "bg2", None),
+                                                   (0.5, LONG4K, 32, "chunked_end", "long", None)])
     if "identical" in SCENARIOS:
         run("identical", f"0-solo-{r}", [(0, SHORT, 32, "identical", "solo", None)])
         run("identical", f"staggered-{r}", [(0.05 * i, SHORT, 32, "identical", f"s{i}", None) for i in range(8)])
