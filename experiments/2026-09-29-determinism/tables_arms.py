@@ -5,7 +5,7 @@ usage: tables_arms.py RUN ARM [ARM...]   (from the deployment checkout; RUN name
        results/private/bench/RUN-<arm>/ and results/private/determinism/RUN/)
 
 One-stream decode (prose, JSON: tokens/s with its 95% interval, GPU step time, accepted drafts
-per draft event, distinct outputs), cold prefill (tokens/s and TTFT), eight distinct concurrent
+per draft event, distinct outputs; and twelve distinct prompts one at a time), cold prefill (tokens/s and TTFT), eight distinct concurrent
 prompts, short-prompt request time (median of the per-length medians) and mixed-traffic latency
 (short and long TTFT, decoding streams' chunk gaps). Changes are against the first arm; "over"
 marks a regression beyond the 3% budget that its interval does not cover.
@@ -50,6 +50,13 @@ for point in ("prose-c1", "json-nothink-c1"):
               f"   distinct outputs {p.get('distinct_outputs', '?')}")
         if base_tps is None:
             base_tps, base_step = tps, step
+print("single stream, twelve distinct prompts (tok/s ±95%)")
+b = None
+for a in ARMS:
+    s1 = [x for x in lines("c1-distinct", a) if "summary" in x]
+    if s1:
+        print(f"  {a:10s} {s1[0]['tps_mean']:7.2f} ±{s1[0]['ci95_pct']:.1f}%{change(s1[0]['tps_mean'], b, True, s1[0]['ci95_pct'])}")
+        b = b or s1[0]["tps_mean"]
 print("cold prefill: tokens/s (TTFT s)")
 base = {}
 for a in ARMS:

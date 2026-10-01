@@ -1,0 +1,124 @@
+From 809750b53a48a4a0bb385dc73880bfa24a10464e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:21:12 +0200
+Subject: [PATCH] feat(deepseek-v4.1): mHC on the lagged native route at every
+ capacity in batch-invariant mode
+
+Replaces the capacity-plan-only mode. The 4096-row plan defaults to the TF32
+TMA projection (four K slices) while the graph-size plans take the lagged
+native route, so a row rounded differently in decode and prefill steps; one
+TF32 plan for every count made each decode call about 4 times slower (62 us
+against 13-17 us at 4-6 rows). With VLLM_DS41_BATCH_INVARIANT=1 every pre and
+post_pre capacity takes the lagged native configuration: decode keeps its
+graph-size plans and their bits, and a prefill row computes its 25 partial sums
+the same way (one FMA chain per thread, a fixed warp reduction, warps summed in
+order). Larger capacities compute 13 partial sums per CTA instead of 4, which
+only regroups that work (bit-identical) and reads each row's residual streams
+twice instead of seven times. Replayed on captured serving inputs: one group
+from 1 to 2048 rows in both batch positions, equal to production at every
+graph size, about 1.9 ms per call at 1334 rows against 1.1 ms for TF32.
+---
+ .../test_deepseek_v4_1_mhc_batch_invariant.py | 27 +++++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 38 ++++++++++++++++---
+ 2 files changed, 60 insertions(+), 5 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+
+diff --git a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+new file mode 100644
+index 000000000..fd64b2e16
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+@@ -0,0 +1,27 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch-invariant mode puts every mHC pre/post_pre capacity on the lagged native route."""
++
++import pytest
++
++pytest.importorskip("b12x")
++
++from vllm.models.deepseek_v4_1 import b12x_layers  # noqa: E402
++
++
++def test_default_mode_keeps_b12x_defaults(monkeypatch):
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", False)
++    assert b12x_layers._mhc_batch_invariant_config(4096) is None
++
++
++def test_batch_invariant_mode_pins_the_lagged_native_route(monkeypatch):
++    from b12x.norm.mhc._tuning import MhcConfig
++
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
++    decode, capacity = (b12x_layers._mhc_batch_invariant_config(n) for n in (6, 4096))
++    for config in (decode, capacity):
++        assert isinstance(config, MhcConfig)
++        assert config.backend == "native" and config.lagged_prepare
++        assert config.projection_k_splits == 1
++    assert (decode.partials_per_cta, capacity.partials_per_cta) == (4, 13)
++
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 7a598ef93..7bbe3e946 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -729,6 +729,38 @@ def _mhc_post_fake(x, residual, post, comb, out, layer_name):
+     return None
+ 
+ 
++def _mhc_batch_invariant_config(tokens: int):
++    """Batch-invariant mode: pre and post_pre on the lagged native route at every capacity.
++
++    The graph-size plans already take this route; the capacity plan defaults to
++    the TF32 TMA projection (four K splits), which rounds a row differently.
++    On the lagged native route every capacity computes each of a row's 25
++    partial sums the same way (one FMA chain per thread, a fixed warp
++    reduction, warps summed in order) and finalizes them identically, so a row
++    rounds the same at every live count. How many partial sums one CTA
++    computes only groups that work: decode sizes keep the default of four
++    (more CTAs per row); larger capacities compute 13 per CTA, which reads each
++    row's residual streams twice instead of seven times (the fastest grouping
++    measured at prefill sizes).
++    """
++    if not _BATCH_INVARIANT:
++        return None
++    from b12x.norm.mhc._tuning import MhcConfig
++
++    return MhcConfig(
++        backend="native",
++        projection_tile_m=16,
++        projection_tile_n=8,
++        projection_tile_k=256,
++        projection_num_stages=1,
++        projection_num_m_warps=1,
++        projection_num_n_warps=1,
++        projection_k_splits=1,
++        lagged_prepare=True,
++        partials_per_cta=4 if tokens < 96 else 13,
++    )
++
++
+ class B12xMHC(nn.Module):
+     """Prepared V4.1 lagged mHC plans owned by their loaded decoder."""
+ 
+@@ -788,11 +820,6 @@ class B12xMHC(nn.Module):
+         ):
+             return ()
+         key = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
+-        if _BATCH_INVARIANT:
+-            # Batch-invariant mode: only the capacity plan. The graph-size plans
+-            # (lagged native) round a row differently from the capacity plan;
+-            # one plan rounds a row the same at every live count.
+-            key = (workload.max_tokens,)
+         common = FrozenMapping(
+             {
+                 "lagged_mix": True,
+@@ -826,6 +853,7 @@ class B12xMHC(nn.Module):
+                 self._plans[(operation, tokens)] = mhc.plan(
+                     _mhc_caps(layer.hc_attn_fn.device, tokens, self.hidden_size),
+                     invocation=invocation,
++                    override=_mhc_batch_invariant_config(tokens),
+                 )
+         for tokens in key:
+             if ("post", tokens) not in self._plans:
+-- 
+2.43.0
+
