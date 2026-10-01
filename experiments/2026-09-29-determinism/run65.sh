@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: run65.sh LABEL...   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
+# usage: [REC=rec4] run65.sh LABEL...   (on dgx1, deployment checkout at this experiment's commit, config = r5o, with the
 #                    det-variant2, ref4d, ref4e, gemv-geom2 and mhc-mt2 overlays on every node)
 # The mHC screen: without tracing, one boot per arm, pinned cost table, r5o-pin and then detm-r5o-LABEL-pin for
 # each label (ref4d-b4144: the native lagged route with 16 rows per CTA at capacity; ref4e-s16-b4144 and
@@ -9,7 +9,8 @@
 set -uo pipefail
 cd ~/projects/spark3-vllm-ds41f
 E=experiments/2026-09-29-determinism
-out=results/private/determinism/rec4
+REC=${REC:-rec4}
+out=results/private/determinism/$REC
 PIN=cache/kkref/dspark-costs/r5o-pin-20260930
 IMAGE=vllm-ds41f-kkref:04c30fa98e79-r5o
 V=/opt/spark3/candidate/vllm
@@ -47,7 +48,7 @@ done
 curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
 stop_all
 
-mout=results/private/determinism/rec4
+mout=results/private/determinism/$REC
 mkdir -p "$mout"
 measure() {  # arm label
   start $E/cluster-$1.json || { log "start $1 failed"; return 1; }
@@ -57,7 +58,7 @@ measure() {  # arm label
   bin/spark3 --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode,prefill \
     --decode-cases prose,json-nothink --concurrency 1 --min-samples 5 --max-samples 5 \
     --prefill-text source --prefill-sizes 1024,4096,16384,65536 --prefill-repeats 3 \
-    --output "results/private/bench/rec4-$2"
+    --output "results/private/bench/$REC-$2"
   log "bench $2 exit $?"
   python3 $E/c1_distinct.py http://10.0.1.71:8000 --tokens 256 | tee "$mout/c1-distinct-$2.jsonl"
   python3 $E/c8_distinct.py http://10.0.1.71:8000 --samples 3 --tokens 256 | tee "$mout/c8-distinct-$2.jsonl"

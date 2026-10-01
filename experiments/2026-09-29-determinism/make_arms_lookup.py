@@ -111,9 +111,10 @@ lagged partial kernel): detm-r5o-ref4d-pin, detm-r5o-ref4d-b4144-pin and their
 traces detm-r5o-ref4d-trace8, detm-r5o-ref4d-b4144-trace8.
 
 ref4e (experiment) is ref4d whose mHC override takes the TF32 TMA projection at
-every capacity with VLLM_DS41_MHC_TF32_SPLITS K slices (row-invariant in
-run58b; prefill near production's, more per decode call at one stream, less at
-eight): detm-r5o-ref4e-s{16,40}{,-b4144}-pin and -trace8.
+every capacity with VLLM_DS41_MHC_TF32_SPLITS K slices for the operations B12X
+serves with it (post_pre, pre on the expanded residual; run65 try 1 failed on the
+others, which keep the native route) (row-invariant in run58b; prefill near
+production's, more per decode call at one stream, less at eight): detm-r5o-ref4e-s{16,40}{,-b4144}-pin and -trace8.
 
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
