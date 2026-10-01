@@ -6,6 +6,9 @@ usage (on dgx1, from the deployment checkout):
   scripts/lab.py window status
   scripts/lab.py window close
   scripts/lab.py run SPEC.json [--dry-run] [--keep-open]
+  scripts/lab.py queue add SPEC.json      (queue a spec for the open or next window)
+  scripts/lab.py queue run [--idle-minutes M] [--minutes M]
+  scripts/lab.py queue status
   scripts/lab.py kernel-local BUNDLE_DIR [--out DIR] [--dry-run]   (on any node, cluster stopped)
   scripts/lab.py watchdog [--max-age SECONDS] [--once]
 
@@ -16,6 +19,12 @@ hold someone else wrote. Jobs inside a window run back to back with no restore o
 between; the window closes (r5o booted, doctor --live, hold removed) when the run ends,
 when a job fails, when someone writes ~/spark3-request.json, or at its time cap. A
 watchdog started with the window closes it if the runner stops refreshing the heartbeat.
+
+A queue runner opens one window and runs queued specs back to back (oldest first), so the
+cluster keeps working while results are read and the next spec is written; it waits up to
+--idle-minutes for a new spec before closing the window. Terminal lines for watchers:
+"QUEUE job <name> done|failed", "QUEUE idle", "QUEUE closed". A "sync" job moves the node
+checkouts to origin/main between jobs, so newly published arms can join an open window.
 
 A run spec is JSON: {"experiment": "experiments/<dir>", "run": "rec6", "jobs": [...]} with
 jobs of kind "measure" (arms booted in turn and measured; profile "lean" or "full";
@@ -495,9 +504,13 @@ def kernel_steps(spec: dict, job: dict) -> list[dict]:
             {"kind": "kernel", "bundles": job["bundles"], "out": f"results/private/lab/{spec['run']}"}]
 
 
+def sync_steps(spec: dict, job: dict) -> list[dict]:
+    return [{"kind": "sync"}]
+
+
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
-                "profile": profile_steps}
+                "profile": profile_steps, "sync": sync_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -517,6 +530,8 @@ def describe_step(step: dict) -> str:
         return f"profile {step['label']} {step['workload']}: python3 " + shlex.join(step["argv"])
     if step["kind"] == "costs":
         return f"summarize kernels and compare costs against {step['labels'][0]} ({', '.join(step['workloads'])})"
+    if step["kind"] == "sync":
+        return "sync node checkouts to origin/main"
     if step["kind"] == "table":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
     if step["kind"] == "analyze":
@@ -638,7 +653,21 @@ def profile_costs(step: dict) -> None:
             result = docker_python("analyze_costs.py", f"/o/{base}/{workload}-kernels.json",
                                    f"/o/{label}/{workload}-kernels.json", *extra, "--top", "25")
             (out / f"costs-{label}-{workload}.txt").write_text(result.stdout + result.stderr)
-            log(f"costs {label} {workload}: {out / f'costs-{label}-{workload}.txt'}")
+            log(f"costs {label} {workload} against {base}:")
+            print("\n".join(result.stdout.splitlines()[:20]), flush=True)
+
+
+def sync_checkouts() -> bool:
+    """Move every node's checkout to origin/main (between jobs: nothing runs from them)."""
+    subprocess.run(["git", "-C", str(ROOT), "fetch", "-q", "origin"], check=False)
+    moved = subprocess.run(["git", "-C", str(ROOT), "checkout", "-q", "--detach", "origin/main"])
+    if moved.returncode:
+        return False
+    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True,
+                          capture_output=True).stdout.strip()
+    ok = spark3_cli("cluster", "sync", "--apply") == 0
+    log(f"sync to {head} " + ("OK" if ok else "FAILED"))
+    return ok
 
 
 def summarize_analysis(out: Path) -> dict:
@@ -782,6 +811,10 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             log(f"bench {step['label']} exit {spark3_cli(*step['argv'])}")
         elif step["kind"] == "script":
             log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
+        elif step["kind"] == "sync":
+            if not sync_checkouts():
+                failed = "sync failed"
+                break
         elif step["kind"] == "profile":
             profile_workload(step)
         elif step["kind"] == "costs":
@@ -811,6 +844,77 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
         window_close(failed or "run complete")
     log("done")
     return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- queue
+
+QUEUE = ROOT / "results" / "private" / "lab" / "queue"
+
+
+def queue_add(spec_path: str) -> Path:
+    spec = json.loads(Path(spec_path).read_text())
+    plan(spec)  # reject a malformed spec now, not when its turn comes
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    target = QUEUE / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{Path(spec_path).name}"
+    target.write_text(json.dumps(spec, indent=2) + "\n")
+    log(f"QUEUE added {target.name}")
+    return target
+
+
+def queued() -> list[Path]:
+    return sorted(QUEUE.glob("*.json")) if QUEUE.is_dir() else []
+
+
+def queue_run(idle_minutes: int, minutes: int) -> int:
+    """Run queued specs back to back in one window; close it when the queue stays empty."""
+    window_open(minutes, "queue")
+    if not hold_is_ours(read_hold()):
+        return 1
+    for state in ("running", "done", "failed"):
+        (QUEUE / state).mkdir(parents=True, exist_ok=True)
+    idle_since = None
+    while True:
+        hold = read_hold()
+        if not hold_is_ours(hold):
+            log("QUEUE closed (hold lost)")
+            return 1
+        reason = window_should_close(hold)
+        if reason:
+            window_close(reason)
+            log(f"QUEUE closed ({reason})")
+            return 0
+        pending = queued()
+        if not pending:
+            if idle_since is None:
+                idle_since = time.time()
+                log(f"QUEUE idle (closing in {idle_minutes} min unless a spec arrives)")
+            if time.time() - idle_since > 60 * idle_minutes:
+                window_close("queue empty")
+                log("QUEUE closed (empty)")
+                return 0
+            beat("queue idle")
+            time.sleep(10)
+            continue
+        idle_since = None
+        job = pending[0]
+        running = QUEUE / "running" / job.name
+        os.replace(job, running)
+        log(f"QUEUE job {job.name} started")
+        code = execute(json.loads(running.read_text()), dry=False, keep_open=True)
+        os.replace(running, QUEUE / ("done" if code == 0 else "failed") / job.name)
+        log(f"QUEUE job {job.name} {'done' if code == 0 else 'failed'}")
+        if code:
+            log("QUEUE closed (job failed; the window was closed by the run)")
+            return code
+
+
+def queue_status() -> None:
+    hold = read_hold()
+    print("window:", (hold or {}).get("holder", "none"), (hold or {}).get("current", ""))
+    for state in ("", "running", "done", "failed"):
+        directory = QUEUE / state if state else QUEUE
+        names = sorted(p.name for p in directory.glob("*.json")) if directory.is_dir() else []
+        print(f"{state or 'pending'}: {', '.join(names) if names else '-'}")
 
 
 # ---------------------------------------------------------------- kernel lab (node-local)
@@ -949,6 +1053,11 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("spec")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--keep-open", action="store_true", help="leave the window open after the run")
+    queue = commands.add_parser("queue")
+    queue.add_argument("action", choices=("add", "run", "status"))
+    queue.add_argument("spec", nargs="?")
+    queue.add_argument("--idle-minutes", type=int, default=10)
+    queue.add_argument("--minutes", type=int, default=180)
     kernel = commands.add_parser("kernel-local")
     kernel.add_argument("bundle")
     kernel.add_argument("--out")
@@ -972,6 +1081,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         spec = json.loads(Path(args.spec).read_text())
         return execute(spec, args.dry_run, args.keep_open)
+    if args.command == "queue":
+        if args.action == "add":
+            if not args.spec:
+                raise SystemExit("queue add needs a spec")
+            queue_add(args.spec)
+            return 0
+        if args.action == "status":
+            queue_status()
+            return 0
+        return queue_run(args.idle_minutes, args.minutes)
     if args.command == "kernel-local":
         return kernel_local(args.bundle, args.out, args.dry_run)
     watchdog(args.max_age, args.once)

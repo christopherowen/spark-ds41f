@@ -131,6 +131,24 @@ class ProfilePlanTest(unittest.TestCase):
         self.assertEqual(steps[-1]["out"], "results/private/determinism/costs3")
 
 
+class QueueTest(unittest.TestCase):
+    def test_add_validates_and_orders_specs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "QUEUE", Path(directory) / "queue"):
+            good = Path(directory) / "a.json"
+            good.write_text(json.dumps(SPEC))
+            lab.queue_add(str(good))
+            bad = Path(directory) / "b.json"
+            bad.write_text(json.dumps(dict(SPEC, jobs=[{"kind": "mystery"}])))
+            with self.assertRaises(SystemExit):
+                lab.queue_add(str(bad))
+            self.assertEqual([p.name.split("-", 1)[1] for p in lab.queued()], ["a.json"])
+
+    def test_sync_is_a_job(self) -> None:
+        steps = lab.plan(dict(SPEC, jobs=[{"kind": "sync"}]))
+        self.assertEqual([s["kind"] for s in steps], ["sync"])
+
+
 class OverlayTest(unittest.TestCase):
     def test_fewer_fences_than_the_image_is_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
