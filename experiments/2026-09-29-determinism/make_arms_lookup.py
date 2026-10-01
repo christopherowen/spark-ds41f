@@ -74,6 +74,8 @@ each leave one reference change out (vllm-0034, 0035, 0037, 0033, 0032).
 The frozen reference (overlay ref2: ref1 plus vllm-0038, the target LM head's
 vocabulary projection on one F.linear kernel for every logit-row count):
 detm-r5o-ref2-pin (performance) and detm-r5o-ref2-trace6 (attn-exact6).
+r5o-pin-prof and detm-r5o-ref2-pin-prof add the torch profiler (kernel timings
+of captured workloads: profile_decode.py, profile_c8.py, profile_prefill.py).
 """
 import copy
 import json
@@ -223,6 +225,15 @@ attribution = {
     "nomhc": reference_without(layers="nomhc"),
     "nogemv": reference_without(layers="nogemv"),
 }
+def profiled(arm, name):
+    arm = copy.deepcopy(arm)
+    arm["serve_args"] += ["--profiler-config", json.dumps({
+        "profiler": "torch", "torch_profiler_dir": f"/cache/kkref/profiles/det-{name}",
+        "torch_profiler_with_stack": False, "ignore_frontend": True, "torch_profiler_use_gzip": True,
+    })]
+    return arm
+
+
 def reference_trace(overlay, ref="ref1"):
     arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup=ref), attention=False, ref=ref)
     mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
@@ -254,6 +265,9 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-ref-trace6", reference_trace("attn-exact6")),
                   ("detm-r5o-ref2-pin", with_reference(detm_variant2_pin, attention=True, ref="ref2")),
                   ("detm-r5o-ref2-trace6", reference_trace("attn-exact6", ref="ref2")),
+                  ("r5o-pin-prof", profiled(r5o_pin, "r5o-pin-prof")),
+                  ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
+                                                      "detm-r5o-ref2-pin-prof")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
