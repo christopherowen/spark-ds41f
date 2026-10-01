@@ -2,7 +2,7 @@
 """Where does each operation's arithmetic change with the batch's row count? (GPU; cluster stopped)
 
 usage: transition_map.py FAMILY [FAMILY...]   (cwd: the B12X checkout, vLLM importable, checkpoint at /models)
-       FAMILY: gemv, fp8, mhc, norm, moe, head, wo, reference   (moe and reference need det-variant2)
+       FAMILY: gemv, fp8, mhc, norm, moe, head, head_served, wo, reference   (moe and reference need det-variant2)
 
 One target row runs alone and as the last (e) or first (s) row of batches of
 M rows (random neighbours), for every M from 1 to 72, the rows on both sides
@@ -608,6 +608,111 @@ def family_reference():
             x.contiguous(), weight, plan=plans[smallest(caps, x.shape[0])], output_dtype=torch.bfloat16),
             weight.shape[1])
         SIZES = saved_sizes
+
+
+def nvfp4_quantize(weight):
+    """E2M1 values (low nibble first), K/16 E4M3 scales and an FP32 multiplier, like an NVFP4 checkpoint."""
+    n, k = weight.shape
+    grid = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=weight.device)
+    blocks = weight.float().view(n, k // 16, 16)
+    amax = blocks.abs().amax(-1)
+    global_scale = (amax.max() / (6.0 * 448.0)).clamp(min=1e-12).reshape(1)
+    scale = (amax / (6.0 * global_scale)).clamp(min=2.0 ** -9, max=448.0).to(torch.float8_e4m3fn)
+    values = torch.empty((n, k // 2), dtype=torch.uint8, device=weight.device)
+    for start in range(0, n, 2048):
+        part = blocks[start:start + 2048] / (scale[start:start + 2048].float().unsqueeze(-1) * global_scale)
+        code = (part.abs().unsqueeze(-1) - grid).abs().argmin(-1).to(torch.uint8)
+        code |= (part < 0).to(torch.uint8) << 3
+        code = code.view(code.shape[0], k)
+        values[start:start + 2048] = code[:, 0::2] | (code[:, 1::2] << 4)
+    return values, scale, global_scale.float()
+
+
+def family_head_served():
+    """The LM head as served: rank 0's NVFP4 vocabulary shard through the B12X a16 block-scaled GEMM.
+
+    vLLM serves head.weight NVFP4-quantized through B12xBlockscaledLinear (the
+    earlier head family replayed BF16 weights, which serving does not use).
+    Under vllm-0037 every logit-row count runs the capacity regime; serving
+    selected a16 with 64-column, 64-deep tiles and no split-K for it, pinned
+    here. Also: the production exact-M regimes (four K slices) and the
+    capacity regime with one-row batches padded to two and to sixteen rows.
+    """
+    from b12x._lib import intrinsics
+    from b12x.gemm import blockscaled as api
+    from b12x.gemm.blockscaled._tuning import BlockscaledConfig
+    from b12x.preparation import PreparationSession, PreparedCall
+    from b12x.preparation.types import require_prepared
+
+    head = bf16("head.weight")
+    vocab = head.shape[0]
+    shard = -(-vocab // 3 // 64) * 64  # vLLM pads the vocabulary to 64 per rank: 43136 rows
+    weight = torch.zeros((shard, head.shape[1]), dtype=torch.bfloat16, device=device)
+    weight[: min(shard, vocab)] = head[:shard]
+    del head
+    values, scale, global_scale = nvfp4_quantize(weight)
+    n, k = weight.shape
+    del weight
+    packed = api.pack_weight(values, intrinsics.swizzle_block_scale(scale), recipe="nvfp4",
+                             global_scale=global_scale)
+    activation = torch.ones(1, dtype=torch.float32, device=device)
+
+    def query():
+        return api.BlockscaledQuery(
+            recipe="nvfp4", num_tokens=LIMIT, in_features=k, padded_in_features=k, out_features=n,
+            activation_mode="a16", activation_scale_available=True, global_scale_kind="multiplier",
+            source_contiguous=True, source_aligned=True, workspace_form="provided",
+            workspace_nbytes=2_000_000_000, expected_m=None)
+
+    served = BlockscaledConfig(mode="a16", tile_m=None, tile_n=64, tile_k=64, split_k=1)
+    sliced = BlockscaledConfig(mode="a16", tile_m=None, tile_n=128, tile_k=64, split_k=4)
+    plans = {
+        "capacity": api.plan_regimes(query(), exact_m=(), override=served),
+        "exact four slices": api.plan_regimes(query(), exact_m=tuple(c for c in GRAPH if c <= 8), override=sliced),
+    }
+
+    def factory(rows):
+        def prepare(state):
+            source = torch.empty((rows, k), dtype=torch.bfloat16, device=device)
+            workspace = (torch.empty(state.required_workspace, dtype=torch.uint8, device=device)
+                         if state.required_workspace else None)
+            return PreparedCall(
+                run=lambda: state.run(source, packed.values, packed.scale_mma, packed.global_scale,
+                                      activation_scale=activation, workspace=workspace),
+                produce=lambda: source.fill_(0.125), owners=(packed.values, packed.scale_mma), capture_safe=False)
+        return prepare
+
+    requests = [p.request(name=f"head-{name}", prepare_calls={r: factory(r) for r in p.token_counts},
+                          benchmark_calls={r: factory(r) for r in p.token_counts}) for name, p in plans.items()]
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(requests))
+        workspaces = {}
+        for name, p in plans.items():
+            state = require_prepared(p, "gemm.blockscaled_precision", device)
+            print(json.dumps({"op": f"lm head nvfp4 {name}", "required_workspace": state.required_workspace,
+                              "capacity": str(state.capacity.config) if hasattr(state.capacity, "config") else None}),
+                  flush=True)
+            workspaces[name] = (torch.empty(state.required_workspace, dtype=torch.uint8, device=device)
+                                if state.required_workspace else None)
+
+        def call(name, minimum=1):
+            def run(x):
+                rows = x.shape[0]
+                if rows < minimum:
+                    x = torch.cat([x, x[-1:].expand(minimum - rows, -1)])
+                out = api.mm(x.contiguous(), packed, plan=plans[name], workspace=workspaces[name],
+                             activation_global_scale=activation)
+                return out[:rows]
+            return run
+
+        global SIZES
+        saved = SIZES
+        SIZES = [m for m in SIZES if m <= 512] + [1024, 2048, 4095, 4096]
+        transitions(f"lm head nvfp4 r0 {n}x{k} capacity regime (vllm-0037)", call("capacity"), k)
+        transitions(f"lm head nvfp4 r0 {n}x{k} capacity, one row padded to 2", call("capacity", 2), k)
+        transitions(f"lm head nvfp4 r0 {n}x{k} capacity, under 16 rows padded to 16", call("capacity", 16), k)
+        transitions(f"lm head nvfp4 r0 {n}x{k} production exact regimes to 8 rows", call("exact four slices"), k)
+        SIZES = saved
 
 
 if __name__ == "__main__":
