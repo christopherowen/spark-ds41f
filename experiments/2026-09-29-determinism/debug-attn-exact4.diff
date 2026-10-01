@@ -112,7 +112,7 @@
          try:  # weak proxies to collected objects raise on any access
              state = o.__dict__ if not isinstance(o, type) else None
          except Exception:
-@@ -369,6 +401,91 @@
+@@ -369,6 +401,134 @@
          json.dump(out, f, indent=1)
  
  
@@ -123,8 +123,8 @@
 +    if config is not None:
 +        query = getattr(plan, "query", None) or getattr(plan, "caps", None)
 +        return f"{str(config)[:400]} | {str(query)[:400]}" if query is not None else str(config)[:400]
-+    variants = getattr(plan, "variants", None)
-+    if isinstance(variants, dict) and depth < 2:
++    variants = getattr(plan, "variants", None)  # composite plans hold a read-only mapping
++    if variants is not None and hasattr(variants, "items") and depth < 2:
 +        return {str(k): _describe_plan(v, depth + 1) for k, v in sorted(variants.items(), key=lambda kv: str(kv[0]))}
 +    return type(plan).__name__
 +
@@ -201,10 +201,53 @@
 +        json.dump(out, f, indent=1, default=str)
 +
 +
++def record_ced(indices: torch.Tensor) -> None:
++    """Record the step's CED decoder rows (their batch indices); eager steps only.
++
++    From the CED boundary layer on, the model computes only the decoder rows (a
++    prefill's last window and every decode row), so those layers' records hold
++    one row per decoder row: the analysis maps them through these indices.
++    """
++    if torch.cuda.is_current_stream_capturing():
++        return
++    n = min(int(indices.numel()), _ROWS)
++    log = _log("ced", indices.device, 2 + _ROWS, _SCHEDULE_CAPACITY, _ROWS)
++    stage = log.stage[0]
++    stage.zero_()
++    stage[0].fill_(_step[0] - 1)
++    stage[1].fill_(int(indices.numel()))
++    stage[2 : 2 + n].copy_(indices.reshape(-1)[:n])
++    log.append(0)
++
++
++# SPARK3_DEBUG_INDEX_CAPTURE="2,8:1530:1545": keep the full selected index lists
++# of these layers' rows whose positions fall in [1530, 1545) (eager steps only).
++_INDEX_CAPTURE = os.environ.get("SPARK3_DEBUG_INDEX_CAPTURE", "")
++_index_captures: list[dict] = []
++
++
++def capture_indices(owner, positions: torch.Tensor, indices: torch.Tensor, lengths: torch.Tensor) -> None:
++    if not _INDEX_CAPTURE or torch.cuda.is_current_stream_capturing():
++        return
++    import re
++
++    layers, lo, hi = _INDEX_CAPTURE.split(":")
++    match = re.search(r"layers[.]([0-9]+)", _name(owner))
++    if match is None or int(match.group(1)) not in {int(v) for v in layers.split(",")}:
++        return
++    rows = indices.shape[0]
++    pos = positions[:rows]
++    mask = (pos >= int(lo)) & (pos < int(hi))
++    if not bool(mask.any()):
++        return
++    _index_captures.append({"step": _step[0] - 1, "layer": int(match.group(1)), "positions": pos[mask].cpu(),
++                            "indices": indices[mask].cpu(), "lengths": lengths[:rows][mask].cpu()})
++
++
  _schedule_host: list[dict] = []
  _step = [0]
  
-@@ -410,14 +527,13 @@
+@@ -410,14 +570,13 @@
      log.append(0)
      sizes = (_MAX_ROWS, _WIDE_ROWS) if _WIDE_ROWS > _MAX_ROWS else (_MAX_ROWS,)
      for name, rows in ((n, r) for r in sizes for n in ("runner", "tags", "attn")):
@@ -221,7 +264,7 @@
          mark[step_col].fill_(step)
          marker_log.append(_SLOTS - 1)
      _schedule_host.append({"step": step, "req_ids": [str(r) for r in req_ids],
-@@ -521,7 +637,7 @@
+@@ -521,7 +680,7 @@
                          rows = log.rows[: min(count, log.capacity)].cpu()
                          torch.save(
                              {"count": count, "capacity": log.capacity, "rows": rows,
@@ -230,7 +273,7 @@
                               "schedule_reqs": _SCHEDULE_REQS},
                              os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
                          )
-@@ -534,6 +650,10 @@
+@@ -534,6 +693,15 @@
                          _dump_plans(rank)
                      except Exception as error:  # never block the schedule dump
                          print(f"checksum_debug plan dump failed: {error!r}", flush=True)
@@ -238,6 +281,11 @@
 +                        _dump_inventory(rank)
 +                    except Exception as error:
 +                        print(f"checksum_debug inventory dump failed: {error!r}", flush=True)
++                if kind == "dump" and _index_captures:
++                    torch.save(list(_index_captures),
++                               os.path.join(DIRECTORY, f"rank{rank}-index-capture-{len(_index_captures)}.pt"))
++                if kind == "reset":
++                    _index_captures.clear()
                  if kind == "dump" and "schedule" in _logs:
                      import json
  
@@ -268,3 +316,25 @@
          return iq_data, iq_scale, iw
  
      @staticmethod
+@@ -1777,6 +1784,8 @@
+         if checksum_debug.ENABLED:
+             checksum_debug.record_attn_values(self, 20, swa_lengths[:rows])
+             if main is not None:
++                checksum_debug.capture_indices(self, positions, owner.topk_indices_buffer[:rows],
++                                               top_lengths[:rows])
+                 checksum_debug.record_indices(
+                     self, owner.topk_indices_buffer[:rows], top_lengths[:rows]
+                 )
+--- a/model.py
++++ b/model.py
+@@ -715,6 +715,10 @@
+         lookback_token_ids: torch.Tensor | None = None,
+         ced_indices: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
++        from vllm.model_executor.layers.fused_moe.runner import checksum_debug
++
++        if checksum_debug.ENABLED and ced_indices is not None:
++            checksum_debug.record_ced(ced_indices)  # debug: decoder rows per step
+         sp = None
+         # With CED the encoder layers (before ced_decoder_start) still run on
+         # every row; SP covers them and hands full rows to the boundary layer.

@@ -163,6 +163,9 @@ final_wide4["environment"].update(
     VLLM_DS41_BATCH_INVARIANT="1", SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160",
     SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072", SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="512",
 )
+# attn-exact4 also hooks DS4.1's model forward (CED decoder rows) and captures index selections.
+mount(final_wide4, "attn-exact4/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
+final_wide4["environment"]["SPARK3_DEBUG_INDEX_CAPTURE"] = "2,8,14:1530:1545"
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),

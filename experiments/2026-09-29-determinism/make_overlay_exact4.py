@@ -1,4 +1,4 @@
-"""attn-exact3 -> attn-exact4: an explicit row offset in every record (layout 2), WO's
+"""attn-exact3 -> attn-exact4 (usage: make_exact4.py SRC DST [VLLM_TREE]): an explicit row offset in every record (layout 2), WO's
 sequence-parallel local rows recorded at their offset, and a per-step SP record (tag 32)."""
 import sys
 
@@ -9,8 +9,8 @@ INVENTORY = """def _describe_plan(plan, depth: int = 0):
     if config is not None:
         query = getattr(plan, "query", None) or getattr(plan, "caps", None)
         return f"{str(config)[:400]} | {str(query)[:400]}" if query is not None else str(config)[:400]
-    variants = getattr(plan, "variants", None)
-    if isinstance(variants, dict) and depth < 2:
+    variants = getattr(plan, "variants", None)  # composite plans hold a read-only mapping
+    if variants is not None and hasattr(variants, "items") and depth < 2:
         return {str(k): _describe_plan(v, depth + 1) for k, v in sorted(variants.items(), key=lambda kv: str(kv[0]))}
     return type(plan).__name__
 
@@ -89,7 +89,53 @@ def _dump_inventory(rank: int) -> None:
 
 """
 
+CED = """def record_ced(indices: torch.Tensor) -> None:
+    \"\"\"Record the step's CED decoder rows (their batch indices); eager steps only.
+
+    From the CED boundary layer on, the model computes only the decoder rows (a
+    prefill's last window and every decode row), so those layers' records hold
+    one row per decoder row: the analysis maps them through these indices.
+    \"\"\"
+    if torch.cuda.is_current_stream_capturing():
+        return
+    n = min(int(indices.numel()), _ROWS)
+    log = _log("ced", indices.device, 2 + _ROWS, _SCHEDULE_CAPACITY, _ROWS)
+    stage = log.stage[0]
+    stage.zero_()
+    stage[0].fill_(_step[0] - 1)
+    stage[1].fill_(int(indices.numel()))
+    stage[2 : 2 + n].copy_(indices.reshape(-1)[:n])
+    log.append(0)
+
+
+# SPARK3_DEBUG_INDEX_CAPTURE="2,8:1530:1545": keep the full selected index lists
+# of these layers' rows whose positions fall in [1530, 1545) (eager steps only).
+_INDEX_CAPTURE = os.environ.get("SPARK3_DEBUG_INDEX_CAPTURE", "")
+_index_captures: list[dict] = []
+
+
+def capture_indices(owner, positions: torch.Tensor, indices: torch.Tensor, lengths: torch.Tensor) -> None:
+    if not _INDEX_CAPTURE or torch.cuda.is_current_stream_capturing():
+        return
+    import re
+
+    layers, lo, hi = _INDEX_CAPTURE.split(":")
+    match = re.search(r"layers[.]([0-9]+)", _name(owner))
+    if match is None or int(match.group(1)) not in {int(v) for v in layers.split(",")}:
+        return
+    rows = indices.shape[0]
+    pos = positions[:rows]
+    mask = (pos >= int(lo)) & (pos < int(hi))
+    if not bool(mask.any()):
+        return
+    _index_captures.append({"step": _step[0] - 1, "layer": int(match.group(1)), "positions": pos[mask].cpu(),
+                            "indices": indices[mask].cpu(), "lengths": lengths[:rows][mask].cpu()})
+
+
+"""
+
 src, dst = sys.argv[1], sys.argv[2]
+tree = sys.argv[3] if len(sys.argv) > 3 else None
 
 
 def edit(path_in, path_out, subs):
@@ -198,7 +244,7 @@ edit(f"{src}/checksum_debug.py", f"{dst}/checksum_debug.py", [
      '    stage[4 : 4 + rows].copy_(values.reshape(rows))\n'
      '    log.append(slot)\n'),
     ('_schedule_host: list[dict] = []\n',
-     INVENTORY + '_schedule_host: list[dict] = []\n'),
+     INVENTORY + CED + '_schedule_host: list[dict] = []\n'),
     ('    moe, mhc = set(), set()\n'
      '    for o in gc.get_objects():\n',
      '    moe, mhc = set(), set()\n'
@@ -224,7 +270,12 @@ edit(f"{src}/checksum_debug.py", f"{dst}/checksum_debug.py", [
      '                    try:\n'
      '                        _dump_inventory(rank)\n'
      '                    except Exception as error:\n'
-     '                        print(f"checksum_debug inventory dump failed: {error!r}", flush=True)\n'),
+     '                        print(f"checksum_debug inventory dump failed: {error!r}", flush=True)\n'
+     '                if kind == "dump" and _index_captures:\n'
+     '                    torch.save(list(_index_captures),\n'
+     '                               os.path.join(DIRECTORY, f"rank{rank}-index-capture-{len(_index_captures)}.pt"))\n'
+     '                if kind == "reset":\n'
+     '                    _index_captures.clear()\n'),
 ])
 edit(f"{src}/attention.py", f"{dst}/attention.py", [
     ('        if checksum_debug.ENABLED:\n'
@@ -244,5 +295,27 @@ edit(f"{src}/attention.py", f"{dst}/attention.py", [
      '        if checksum_debug.ENABLED:\n'
      '            # Under an SP indexer split these are this rank\'s rows [first, last).\n'
      '            checksum_debug.record_attn(self, 16, iw, first)\n'),
+    ('        if checksum_debug.ENABLED:\n'
+     '            checksum_debug.record_attn_values(self, 20, swa_lengths[:rows])\n'
+     '            if main is not None:\n',
+     '        if checksum_debug.ENABLED:\n'
+     '            checksum_debug.record_attn_values(self, 20, swa_lengths[:rows])\n'
+     '            if main is not None:\n'
+     '                checksum_debug.capture_indices(self, positions, owner.topk_indices_buffer[:rows],\n'
+     '                                               top_lengths[:rows])\n'),
 ])
 print("ok")
+if tree:
+    edit(f"{tree}/vllm/models/deepseek_v4_1/nvidia/model.py", f"{dst}/model41.py", [
+        ("    ) -> torch.Tensor | IntermediateTensors:\n"
+         "        sp = None\n"
+         "        # With CED the encoder layers",
+         "    ) -> torch.Tensor | IntermediateTensors:\n"
+         "        from vllm.model_executor.layers.fused_moe.runner import checksum_debug\n"
+         "\n"
+         "        if checksum_debug.ENABLED and ced_indices is not None:\n"
+         "            checksum_debug.record_ced(ced_indices)  # debug: decoder rows per step\n"
+         "        sp = None\n"
+         "        # With CED the encoder layers"),
+    ])
+    print("model41 ok")

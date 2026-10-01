@@ -18,12 +18,16 @@ lists the row counts where the group changes. Configurations per family:
   gate/up and down, Engram projection; rank 0's slices) at the block-FP8
   capacities: the default selection and one K slice everywhere.
 - mhc: layer 0's pre on the embedding, layer 1's pre, post and post_pre, with
-  every prepared count warm (serving's set).
+  every prepared count warm (serving's set), under vllm-0028's smallest-capacity
+  lookup and under the original exact-count-else-largest lookup.
 - norm: B12xRMSNorm at the model's widths.
 - moe: the deterministic routed MoE through serving's one plan (graph sizes and
   the 4096-token limit warm).
 - head: the LM head's rank-0 vocabulary shard as vLLM runs it under the B12X
   linear backend: GEMV plans for the graph sizes up to 8 rows, F.linear above.
+- wo: the inverse-RoPE WO projection with rank 0's three groups of layer 2's
+  checkpoint weights: decode steps' static plan for each row count up to 96
+  against prefill steps' dynamic 4096-row plan (one grouping over both).
 """
 import hashlib
 import json
@@ -297,8 +301,17 @@ def family_mhc():
 
         gen = torch.Generator(device=device).manual_seed(20261001)
         pool = make(LIMIT, gen)
-        for op in ("layer-0 pre", "pre", "post", "post_pre"):
+        def smallest_plan(self, operation, tokens):
+            capacities = sorted(rows for o, rows in self._plans if o == operation)
+            return self._plans[(operation, next(r for r in capacities if r >= int(tokens)))]
+
+        for lookup, op in ((lookup, op) for lookup in ("smallest", "exact-or-max")
+                           for op in ("layer-0 pre", "pre", "post", "post_pre")):
             owner, module = owners[0 if op.startswith("layer-0") else 1]
+            if lookup == "smallest":
+                module._plan_for = types.MethodType(smallest_plan, module)
+            else:
+                module.__dict__.pop("_plan_for", None)
 
             def call(idx, op=op, owner=owner, module=module):
                 take = lambda key: pool[key][idx].contiguous()  # noqa: E731
@@ -315,7 +328,7 @@ def family_mhc():
                                           owner.hc_ffn_scale, owner.hc_ffn_base, owner.ffn_norm.weight, take("pre"))
                 return [t for t in (out if isinstance(out, (list, tuple)) else (out,)) if torch.is_tensor(t)]
 
-            transitions(f"mhc {op}", call, 1, make=lambda n, g: torch.arange(n, device=device))
+            transitions(f"mhc {op} [{lookup}]", call, 1, make=lambda n, g: torch.arange(n, device=device))
 
 
 def family_norm():
@@ -374,7 +387,7 @@ def family_moe():
     with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
         session.prepare((plan.request(name="moe-map", prepare_calls=calls, benchmark_calls=calls),))
         variants = getattr(plan, "variants", None) or getattr(getattr(plan, "prepared", None), "variants", None)
-        if isinstance(variants, dict):
+        if variants is not None and hasattr(variants, "items"):
             print(json.dumps({"op": "moe", "variants": {str(k): str(getattr(getattr(v, "selection", None), "config", v))[:240]
                                                         for k, v in sorted(variants.items())}}))
         scratch = torch.empty(sum(s.nbytes for s in plan.scratch_specs()), dtype=torch.uint8, device=device)
@@ -434,6 +447,78 @@ def family_head():
         global SIZES
         SIZES = [m for m in SIZES if m <= 512]  # logit rows: decode verify rows and prefill last rows
         transitions("lm head r0 43094x5120 (b12x plans to 8 rows, F.linear above)", call, weight.shape[1])
+
+
+def family_wo():
+    from b12x.gemm import wo_projection
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    groups, rank, group_width, hidden, heads, nope, rope = 3, 1024, 4096, 5120, 24, 448, 64
+    wa, sa = raw("layers.2.attn.wo_a.weight"), raw("layers.2.attn.wo_a.scale").float()
+    wb, sb = raw("layers.2.attn.wo_b.weight"), raw("layers.2.attn.wo_b.scale").float()
+    weights = wo_projection.pack_weights(
+        wa[: groups * rank].contiguous(), sa[: groups * rank // 32].contiguous(),
+        wb[:, : groups * rank].contiguous(), sb[:, : groups * rank // 32].contiguous(),
+        groups=groups, group_width=group_width, rank=rank, hidden=hidden, block_size=(32, 32))
+    gen = torch.Generator(device=device).manual_seed(20261001)
+    angles = torch.rand(8192, rope // 2, generator=gen, device=device) * 6.283
+    table = torch.cat([angles.cos(), angles.sin()], dim=1).float().contiguous()
+    invocation = dict(operation="inv_rope", heads_per_group=heads // groups, nope_dim=nope, rope_dim=rope,
+                      positions_dtype="int64", cos_sin_dtype="float32")
+
+    def prepare(state):
+        rows = state.query.max_tokens
+        source = torch.empty((rows, heads, 512), dtype=torch.bfloat16, device=device)
+        positions = torch.arange(rows, dtype=torch.int64, device=device) % table.shape[0]
+        scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device)
+                        for spec in state._scratch_state.scratch_specs())
+        binding = state.bind_inv_rope(scratch=scratch, o=source, positions=positions, cos_sin_cache=table,
+                                      weights=weights, heads_per_group=heads // groups, nope_dim=nope, rope_dim=rope)
+        return PreparedCall(run=lambda: state.run_inv_rope(binding), produce=lambda: source.normal_(std=0.25),
+                            owners=(weights, table))
+
+    plans = {}
+    for key, rows, dynamic in [*((c, c, False) for c in range(1, 97)), ("prefill", LIMIT, True)]:
+        plans[key] = wo_projection.plan(
+            wo_projection.Caps(device=device, max_tokens=rows, groups=groups, group_width=group_width, rank=rank,
+                               hidden=hidden), invocation=dict(invocation, dynamic_tokens=dynamic))
+    requests = [p.request(name=f"wo-{k}", prepare_call=prepare, benchmark_call=prepare) for k, p in plans.items()]
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(requests))
+        print(json.dumps({"op": "wo", "configs": {str(k): str(p.selection.config) for k, p in
+                                                   list(plans.items())[:3] + [("prefill", plans["prefill"])]}}))
+        o_pool = (torch.randn(LIMIT, heads, 512, generator=gen, device=device) * 0.25).to(torch.bfloat16)
+        pos_pool = torch.randint(0, table.shape[0], (LIMIT,), generator=gen, device=device, dtype=torch.int64)
+
+        def call(idx, key):
+            plan = plans[key]
+            scratch = tuple(torch.empty(spec.shape, dtype=spec.dtype, device=device) for spec in plan.scratch_specs())
+            binding = wo_projection.bind_inv_rope(plan, scratch=scratch, o=o_pool[idx].contiguous(),
+                                                  positions=pos_pool[idx].contiguous(), cos_sin_cache=table,
+                                                  weights=weights, heads_per_group=heads // groups,
+                                                  nope_dim=nope, rope_dim=rope)
+            return wo_projection.run_inv_rope(binding=binding, plan=plan)
+
+        groups_seen, order, rows_out = {}, [], []
+        target = torch.tensor([LIMIT - 1], device=device)
+        for m in SIZES:
+            for pos in (POSITIONS if m > 1 else ("e",)):
+                others = torch.arange(m - 1, device=device)
+                idx = torch.cat([others, target]) if pos == "e" else torch.cat([target, others])
+                row = m - 1 if pos == "e" else 0
+                for kind in (("decode", m), ("prefill", "prefill")) if m <= 96 else (("prefill", "prefill"),):
+                    try:
+                        key = digest(call(idx, kind[1])[row: row + 1])
+                    except Exception as error:  # noqa: BLE001
+                        key = "error:" + type(error).__name__ + ":" + str(error)[:80]
+                    if key not in groups_seen:
+                        order.append(key)
+                    groups_seen.setdefault(key, []).append(f"{kind[0][0]}{m}{pos}")
+        torch.cuda.synchronize()
+        print(json.dumps({"op": "wo inverse-RoPE (d = decode static plan, p = prefill dynamic plan)",
+                          "groups": len(groups_seen),
+                          "members": {k[:16]: (v[:12] + [f"... {len(v)} total"]) if len(v) > 12 else v
+                                      for k, v in groups_seen.items()}}), flush=True)
 
 
 if __name__ == "__main__":

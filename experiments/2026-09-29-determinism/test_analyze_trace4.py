@@ -8,6 +8,8 @@ run A alone; run B behind a background request's two rows, with WO's output
 recorded as a sequence-parallel rank would (rows 4-7 of the step, offset 4),
 the index weights as rank 0 would (the step's first 4 rows, offset 0),
 one record whose rows do not match the step (must be counted, not compared),
+a CED step whose last layer computes only some rows (decoder records mapped
+through the recorded indices; a second planted difference there),
 a dead verification row (must be excluded) and one planted difference
 (layer 1's router logits at prompt position 4). Every other row is built from
 its (layer, tag, position, token) alone, so equal rows have equal fingerprints.
@@ -49,13 +51,14 @@ def values(layer, tag, positions, tokens, plant=None):
     return torch.stack(out)
 
 
-def run(directory, steps, plant=None, sp_local=None, unaligned=False):
+def run(directory, steps, plant=None, sp_local=None, unaligned=False, ced=None, plant2=None):
     os.environ.update(SPARK3_MOE_CHECKSUM_DIR=directory, SPARK3_MOE_CHECKSUM_ROWS="4",
                       SPARK3_MOE_CHECKSUM_WIDE_ROWS="16", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="256",
                       SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="16")
     cd = load("checksum_debug_test", os.environ["CHECKSUM_DEBUG"])
     cd._Log.row_sums = lambda self, x, out: cd._fingerprint_torch(x.reshape(x.shape[0], -1), out)
     cd.threading.Thread = lambda *a, **k: type("T", (), {"start": lambda self: None})()
+    cd.torch.cuda.is_current_stream_capturing = lambda: False
     attn = [Owner(f"language_model.model.layers.{L}.self_attn") for L in range(LAYERS)]
     moe = [Owner(f"language_model.model.layers.{L}.mlp.experts") for L in range(LAYERS)]
     shared = [Owner(f"language_model.model.layers.{L}.mlp.shared_experts") for L in range(LAYERS)]
@@ -70,7 +73,18 @@ def run(directory, steps, plant=None, sp_local=None, unaligned=False):
         n = len(positions)
         cd.record_schedule(req_ids, n, n, torch.tensor(qsl), len(requests), torch.tensor(dead, dtype=torch.float32),
                            torch.tensor(positions), torch.tensor(tokens))
+        decoder = (ced or {}).get(step)  # CED: the last layer computes only these batch rows
+        if decoder is not None:
+            cd.record_ced(torch.tensor(decoder))
         for L in range(LAYERS):
+            if decoder is not None and L == LAYERS - 1:
+                dp = [positions[i] for i in decoder]
+                dt = [tokens[i] for i in decoder]
+                for tag in (10, 21, 30):
+                    cd.record_attn(attn[L], tag, values(L, tag, dp, dt, plant2))
+                cd.record(moe[L], values(L, 40, dp, dt), values(L, 41, dp, dt), values(L, 42, dp, dt))
+                cd.record_tag(shared[L], 0, values(L, 43, dp, dt))
+                continue
             for tag in (10, 21, 30):
                 cd.record_attn(attn[L], tag, values(L, tag, positions, tokens, plant))
             if sp_local and step == 0:
@@ -110,25 +124,28 @@ def main():
         prompt_rows = (list(range(6)), PROMPT, [0] * 6)
         verify = ([6, 7, 8], [100, 101, 999], [0, 0, 0])
         run(os.path.join(out, "t-m0-r0", "dgx1"),
-            [[(target.format(0), *prompt_rows)], [(target.format(0), *verify)]])
+            [[(target.format(0), *prompt_rows)], [(target.format(0), *verify)]], ced={0: [3, 4, 5]})
         run(os.path.join(out, "t-m1-r0", "dgx1"),
             [[("bg", [50, 51], [7, 8], [0, 0]), (target.format(1), *prompt_rows)],
              [("bg", [52], [9], [0]), (target.format(1), [6, 7, 8], [100, 101, 999], [0, 1, 0])]],
-            plant=(1, 30, 4), sp_local=(4, 4), unaligned=True)
+            plant=(1, 30, 4), sp_local=(4, 4), unaligned=True, ced={0: [0, 1, 6, 7]}, plant2=(2, 21, 5))
         for m in (0, 1):
             json.dump({"tag": f"trace-t-m{m}-r0", "prompt_tokens": 6, "tokens_ids": GENERATED,
                        "tokens": [f"token_id:{t}" for t in GENERATED]},
                       open(os.path.join(out, f"t-m{m}-r0", "target.json"), "w"))
-        results = analyze.main(["analyze_trace4.py", out, "--node", "dgx1"])
+        results = analyze.main(["analyze_trace4.py", out, "--node", "dgx1", "--ced-start", str(LAYERS - 1)])
     by = {(r["request"], "against" in r): r for r in results}
     a, b, pair = by[("t-m0-r0", False)], by[("t-m1-r0", False)], by[("t-m1-r0", True)]
     checks = {
         "A: 9 comparable rows": a["comparable"] == 9,
         "B: dead row excluded (8 comparable)": b["comparable"] == 8 and b["dead_rows"] == 1,
         "B: misaligned record counted, rank-0 local rows accepted": b.get("unaligned_records") == 1,
-        "B: offset records used": b.get("offset_records") == LAYERS,
+        "B: offset records used": b.get("offset_records") == LAYERS - 1,
         "8 rows compared": pair["rows_compared"] == 8,
-        "exactly the planted row differs": pair["rows_differing"] == 1,
+        "exactly the two planted rows differ": pair["rows_differing"] == 2,
+        "CED decoder records mapped (position 5 first differs at L2 attention output)":
+            pair["first_records"] == {"L1:router_logits": 1, "L2:attn_output": 1}
+            and b.get("ced_records") == 5,
         "first difference at position 4, L1 router logits": pair["first_difference"] is not None
         and pair["first_difference"]["position"] == 4 and pair["first_difference"]["record"] == "L1:router_logits"
         and pair["first_difference"]["records_differing"] == 1,

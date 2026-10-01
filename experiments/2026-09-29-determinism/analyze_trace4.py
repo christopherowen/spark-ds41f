@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare traced requests row by row: same position and input token, exact fingerprints.
 
-usage: analyze_trace4.py OUT_DIR [--group G] [--node dgx1|dgx2|dgx3] [--chain N] [--all-pairs]
+usage: analyze_trace4.py OUT_DIR [--group G] [--node dgx1|dgx2|dgx3] [--chain N] [--all-pairs] [--ced-start L]
        (runs from trace_mixes.py, c8_trace.py or scenario_trace.py on an attn-exact2/3/4 arm)
 
 Every target.json under OUT_DIR is one traced request (its run directory holds
@@ -17,6 +17,14 @@ covers the step's rows [offset, offset + rows): offsets are explicit in layout
 zero before. A record whose rows match neither the step's token count nor its
 padded count, at offset zero, is not aligned with the batch: it is counted
 and left out instead of being compared row for row.
+
+From the CED boundary layer on, a step computes only its decoder rows (each
+prefill's last window and every decode row): attn-exact4 records those rows'
+batch indices per eager step, and a record with exactly that many rows in a
+layer from the boundary on (--ced-start, 20 for DS4.1: the first full-resolution
+KV source after the compressed encoder) maps through them (counted as
+ced_records). Sequence parallelism covers only the layers before it, so a
+rank-local record and a decoder record never share a layer.
 
 A row is comparable if it is not dead and every earlier row of its step block
 was fed the token the request finally generated there (prompt rows always).
@@ -127,6 +135,12 @@ class NodeLogs:
                             key=lambda f: int(f.rsplit("-", 1)[1][:-5]))
         self.host = {h["step"]: h for h in json.load(open(host_files[-1]))} if host_files else {}
         self.dev = {int(row[0].item()): row for row in chronological(self.sched)} if self.sched else {}
+        self.ced = {}  # step -> batch indices of the decoder rows (attn-exact4)
+        ced = latest(node_dir, "ced")
+        if ced is not None:
+            for r in chronological(ced):
+                n = int(r[1].item())
+                self.ced[int(r[0].item())] = [int(v) for v in r[2: 2 + min(n, ced["max_rows"])].tolist()]
         self.sources = []  # (kind, log, steps)
         for kind in ("runner", "tags", "attn"):
             for suffix in ("", "_wide"):
@@ -155,7 +169,7 @@ class NodeLogs:
                 label["sp"] = h["num_tokens"] >= sp_min_rows
 
 
-def load_request(run_dir, target, node):
+def load_request(run_dir, target, node, ced_start=20):
     """[(position, token, comparable, records, step, label)], and counters."""
     logs = NodeLogs.load(os.path.join(run_dir, node))
     m, reqs = logs.sched["max_rows"], logs.sched["schedule_reqs"]
@@ -180,6 +194,9 @@ def load_request(run_dir, target, node):
         num_tokens, padded = h["num_tokens"], h["padded"]
         label = dict(logs.labels.get(step, {"mode": "graph", "sp": None}), rows=num_tokens, padded=padded)
         local_rows = label.pop("local_rows", None)  # rank 0's SP-local records start at offset 0
+        decoder = logs.ced.get(step)
+        compacted = decoder is not None and decoder != list(range(num_tokens))
+        decoder_row = {batch: j for j, batch in enumerate(decoder)} if compacted else {}
         records = [{} for _ in range(b - a)]
         for kind, log, steps in logs.sources:
             for slot, tag, n, offset, values in steps.get(step, []):
@@ -199,6 +216,15 @@ def load_request(run_dir, target, node):
                     if tag not in SHARED:
                         continue
                     keys, names = [(layer, 2, tag)], [SHARED[tag]]
+                if (compacted and layer >= ced_start and offset == 0 and n == len(decoder)
+                        and n not in (num_tokens, padded)):
+                    stats["ced_records"] += 1  # a decoder layer: record row j is batch row decoder[j]
+                    for i in range(b - a):
+                        j = decoder_row.get(a + i)
+                        if j is not None:
+                            for c, (key, name) in enumerate(zip(keys, names)):
+                                records[i][(key, name)] = float(values[j, c])
+                    continue
                 if offset == 0 and n not in (num_tokens, padded, local_rows):
                     stats["unaligned_records"] += 1
                     continue
@@ -292,6 +318,7 @@ def discover(out):
 def main(argv):
     out = argv[1]
     node, chain = arg(argv, "--node", "dgx1"), int(arg(argv, "--chain", "8"))
+    ced_start = int(arg(argv, "--ced-start", "20"))
     only = arg(argv, "--group", None)
     results = []
     groups = {}
@@ -301,7 +328,7 @@ def main(argv):
     for group, members in groups.items():
         loaded = {}
         for name, run_dir, target in members:
-            rows, stats = load_request(run_dir, target, node)
+            rows, stats = load_request(run_dir, target, node, ced_start)
             loaded[name] = (target, rows)
             repeats, bad = self_check(rows)
             results.append({"group": group, "request": name, "rows": len(rows),
