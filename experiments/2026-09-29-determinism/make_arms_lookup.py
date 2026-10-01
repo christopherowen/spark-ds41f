@@ -83,6 +83,11 @@ lagged native route), ref3b also vllm-0040 (TMA prefill GEMV kernel), ref3c
 also vllm-0041 (fused rank-order sum): detm-r5o-ref3{a,b,c}-pin and
 detm-r5o-ref3c-trace6.
 
+ref4a is ref3c with vllm-0042 in place of 0035 (decode rows keep the decode
+attention kernel; the step kind from request state; sparse_mla.py and ced.py
+join the mounted files): detm-r5o-ref4a-pin and detm-r5o-ref4a-trace7
+(attn-exact7: attn-exact6's debug attention with 0042 instead of 0035).
+
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
 ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
@@ -200,11 +205,12 @@ REF_FILES = ("models/deepseek_v4_1/b12x_layers.py", "models/deepseek_v4_1/compre
 
 
 REF2_FILES = REF_FILES + ("model_executor/layers/logits_processor.py",)
+REF4_FILES = REF2_FILES + ("models/deepseek_v4_1/sparse_mla.py", "models/deepseek_v4_1/ced.py")
 
 
 def with_reference(arm, *, attention, ref="ref1"):
     arm = copy.deepcopy(arm)
-    files = REF_FILES if ref == "ref1" else REF2_FILES
+    files = REF_FILES if ref == "ref1" else REF4_FILES if ref.startswith("ref4") else REF2_FILES
     for f in files + (("models/deepseek_v4_1/attention.py",) if attention else ()):
         target = f"{VLLM}/{f}"
         arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
@@ -298,6 +304,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   *((f"detm-r5o-{r}-pin", with_reference(detm_variant2_pin, attention=True, ref=r))
                     for r in ("ref3a", "ref3b", "ref3c")),
                   ("detm-r5o-ref3c-trace6", reference_trace("attn-exact6", ref="ref3c")),
+                  ("detm-r5o-ref4a-pin", with_reference(detm_variant2_pin, attention=True, ref="ref4a")),
+                  ("detm-r5o-ref4a-trace7", reference_trace("attn-exact7", ref="ref4a")),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),
