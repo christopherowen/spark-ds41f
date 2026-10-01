@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: run67.sh CANDIDATE CHUNK   (on dgx1, deployment checkout at this experiment's commit, config = r5o,
+# usage: [REC=rec5] run67.sh CANDIDATE CHUNK   (on dgx1, deployment checkout at this experiment's commit, config = r5o,
 #                    with the det-variant2, ref4d, ref4e, gemv-geom2, mhc-mt2 and attn-exact8 overlays on every node)
 # The candidate detm-r5o-CANDIDATE-{pin,trace8} (for example ref4d-b4144 4096: ref4c with vllm-0044 and
 # B12X 0008, 4096-token chunks and a 4144-token budget; CHUNK is its long-prefill threshold):
@@ -79,7 +79,8 @@ log "tests exit $?"
 tail -1 "$out/tests.txt"
 
 # 2. Measurement.
-mout=results/private/determinism/rec5
+REC=${REC:-rec5}
+mout=results/private/determinism/$REC
 mkdir -p "$mout"
 measure() {  # arm label
   start $E/cluster-$1.json || { log "start $1 failed"; return 1; }
@@ -89,7 +90,7 @@ measure() {  # arm label
   bin/spark3 --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode,prefill \
     --decode-cases prose,json-nothink --concurrency 1 --min-samples 5 --max-samples 5 \
     --prefill-text source --prefill-sizes 1024,4096,16384,65536 --prefill-repeats 3 \
-    --output "results/private/bench/rec5-$2"
+    --output "results/private/bench/$REC-$2"
   log "bench $2 exit $?"
   python3 $E/c1_distinct.py http://10.0.1.71:8000 --tokens 256 | tee "$mout/c1-distinct-$2.jsonl"
   python3 $E/c8_distinct.py http://10.0.1.71:8000 --samples 3 --tokens 256 | tee "$mout/c8-distinct-$2.jsonl"
