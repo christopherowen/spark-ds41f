@@ -1,0 +1,139 @@
+From 8ffbf4714c62dc117d114044b592b5ee31cc0d6b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 11:12:54 +0200
+Subject: [PATCH] feat(logits): one vocabulary projection kernel per row count
+ in batch-invariant mode
+
+The b12x BF16 vocabulary projection (an unquantized LM head, such as the
+DeepSeek V4.1 target head) runs a Triton row kernel for one logit row and
+F.linear for two or more. The two round differently, so a sampled position's
+logits depended on how many logit rows its step computed: a prompt finishing
+alone differed from the same prompt finishing beside decoding requests.
+F.linear also takes another kernel for one row. With
+VLLM_DS41_BATCH_INVARIANT=1 a single row is projected twice and the first
+copy kept, so every count runs one F.linear kernel. Measured on the served
+43136x5120 shard: one group for 1 to 4096 rows in both batch positions.
+---
+ .../test_batch_invariant_vocab_projection.py  | 63 +++++++++++++++++++
+ .../model_executor/layers/logits_processor.py | 14 ++++-
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/sample/test_batch_invariant_vocab_projection.py
+
+diff --git a/tests/v1/sample/test_batch_invariant_vocab_projection.py b/tests/v1/sample/test_batch_invariant_vocab_projection.py
+new file mode 100644
+index 000000000..c13466c37
+--- /dev/null
++++ b/tests/v1/sample/test_batch_invariant_vocab_projection.py
+@@ -0,0 +1,63 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch-invariant mode keeps every logit-row count on one vocabulary projection kernel."""
++
++import types
++
++import pytest
++import torch
++
++from vllm.model_executor.layers import logits_processor as module
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
++
++
++class _Head:
++    def __init__(self, weight):
++        self.weight = weight
++        self.quant_method = UnquantizedEmbeddingMethod()
++        self.shard_indices = None
++        self.tp_size = 1
++
++
++def _projection(seen):
++    """A stand-in for b12x's projection: one row takes a differently rounded route."""
++
++    class Caps:
++        def __init__(self, *, device, max_tokens, in_features, out_features):
++            self.max_tokens = max_tokens
++
++    def run(binding):
++        source, weight = binding
++        seen.append(source.shape[0])
++        out = torch.nn.functional.linear(source.float(), weight.float())
++        return (out + 1.0 if source.shape[0] == 1 else out).to(torch.bfloat16)
++
++    return types.SimpleNamespace(
++        Caps=Caps,
++        plan=lambda caps: caps,
++        bind=lambda plan, *, source, weight: (source, weight),
++        run=run,
++    )
++
++
++@pytest.mark.parametrize("invariant", [False, True])
++def test_one_logit_row_projects_like_many(default_vllm_config, monkeypatch, invariant):
++    torch.manual_seed(0)
++    vocab, hidden = 64, 16
++    processor = LogitsProcessor(vocab)
++    processor._gather_logits = lambda logits: logits
++    seen = []
++    processor._b12x_vocab_projection = _projection(seen)
++    processor.use_b12x_vocab_projection = True
++    processor.head_dtype = None
++    monkeypatch.setattr(module, "_BATCH_INVARIANT", invariant)
++    head = _Head(torch.randn(vocab, hidden, dtype=torch.bfloat16))
++    rows = torch.randn(3, hidden, dtype=torch.bfloat16)
++
++    alone = processor._get_logits(rows[:1], head, None)
++    together = processor._get_logits(rows, head, None)
++
++    assert alone.shape == (1, vocab)
++    assert seen == ([2, 3] if invariant else [1, 3])
++    assert torch.equal(alone[0], together[0]) == invariant
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 05bc57e80..868836553 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A layer that compute logits from hidden_stats."""
+ 
++import os
+ from collections.abc import Callable, Sequence
+ from functools import cache
+ 
+@@ -31,6 +32,10 @@ from vllm.utils.flashinfer import has_flashinfer
+ 
+ logger = init_logger(__name__)
+ 
++# Opt-in batch invariance (DeepSeek V4.1): a sampled position's logits do not
++# depend on how many logit rows its step computes.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
+ 
+ @cache
+ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | None:
+@@ -303,6 +308,13 @@ class LogitsProcessor(PluggableLayer):
+                 # compute_logits runs outside the compiled model graph, so
+                 # this capacity lookup is plain Python, not traced.
+                 flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++                rows = int(flat.shape[0])
++                if _BATCH_INVARIANT and rows == 1:
++                    # One row runs the Triton row kernel and two or more run
++                    # F.linear, which rounds differently (and F.linear takes
++                    # yet another kernel for one row). Projecting the row
++                    # twice keeps every logit-row count on one kernel.
++                    flat = flat.expand(2, -1).contiguous()
+                 plan = self._b12x_vocab_plan_for(lm_head, int(flat.shape[0]))
+                 projection = self._b12x_vocab_projection
+                 assert projection is not None
+@@ -311,7 +323,7 @@ class LogitsProcessor(PluggableLayer):
+                     source=flat,
+                     weight=lm_head.weight,
+                 )
+-                logits = projection.run(binding)
++                logits = projection.run(binding)[:rows]
+                 return logits.reshape(*hidden_states.shape[:-1], -1)
+             return lm_head.quant_method.apply(
+                 lm_head, hidden_states, bias=embedding_bias
+-- 
+2.43.0
+

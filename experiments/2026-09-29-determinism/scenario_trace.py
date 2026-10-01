@@ -23,6 +23,8 @@ named "0-..." to sort first) and links to the shared logs.
 - chunked_end: a prompt a little over one batch budget (its second chunk ends
   within the 128-token CED window of the first), alone and beside decoding
   requests that move the first chunk's end.
+- distinct: eight different prompts (c8_distinct.py's), each alone, then all
+  eight at once (different routing in every row of the shared steps).
 """
 import json
 import os
@@ -40,7 +42,7 @@ def arg(name, default):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
 
-SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end").split(",")
+SCENARIOS = arg("--scenarios", "mixed,chunked,cache,identical,chunked_end,distinct").split(",")
 REPEATS = int(arg("--repeats", "1"))
 NODES = ("dgx1", "dgx2", "dgx3")
 LOGDIR = "/cache/kkref/moe-checksums"
@@ -65,6 +67,16 @@ LONG9K = "Here are lighthouse notes. " + notes(330, 2) + " Summarize when the li
 LONG4K = "Here are lighthouse notes. " + notes(166, 5) + " Summarize when the lighthouses were built."
 OTHER3K = "Here are lighthouse notes. " + notes(110, 3) + " Which place appears most often?"
 PREFIX = "Here are lighthouse notes. " + notes(75, 4)
+DISTINCT = [
+    "Explain how a hash map handles collisions, with an example in Python.",
+    "Describe a walk through a spice market in Marrakech in the morning.",
+    "Write a short story about a lighthouse keeper who finds a message in a bottle.",
+    "Compare TCP and UDP for real-time multiplayer games and when to use each.",
+    "Give a detailed recipe for lentil soup with timings and substitutions.",
+    "Summarize the causes and consequences of the printing press in Europe.",
+    "Explain the difference between supervised and unsupervised learning to a student.",
+    "Plan a three-day hiking trip in the Alps with packing advice.",
+]
 BACKGROUND = ["List ten prime numbers and explain why each is prime.",
               "Write a haiku about rain, then explain its imagery.",
               "Compare TCP and UDP for game networking."]
@@ -186,6 +198,10 @@ for repeat in range(REPEATS):
                                                    (0, BACKGROUND[1], 200, None, "bg1", None),
                                                    (0, BACKGROUND[2], 200, None, "bg2", None),
                                                    (0.5, LONG4K, 32, "chunked_end", "long", None)])
+    if "distinct" in SCENARIOS:
+        for i, prompt in enumerate(DISTINCT):
+            run("distinct", f"0-solo{i}-{r}", [(0, prompt, 32, f"distinct{i}", f"p{i}", None)])
+        run("distinct", f"together-{r}", [(0, p, 32, f"distinct{i}", f"p{i}", None) for i, p in enumerate(DISTINCT)])
     if "identical" in SCENARIOS:
         run("identical", f"0-solo-{r}", [(0, SHORT, 32, "identical", "solo", None)])
         run("identical", f"staggered-{r}", [(0.05 * i, SHORT, 32, "identical", f"s{i}", None) for i in range(8)])

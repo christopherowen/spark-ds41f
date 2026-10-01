@@ -70,6 +70,10 @@ leave room for the largest decode batch (4000 < 4096 - 48): detm-r5o-ref-pin
 detm-r5o-ref-trace6 also records the LM head's input rows and logits
 (attn-exact6). Cost attribution: detm-r5o-ref-no{moe,attn,head,mhc,gemv}-pin
 each leave one reference change out (vllm-0034, 0035, 0037, 0033, 0032).
+
+The frozen reference (overlay ref2: ref1 plus vllm-0038, the target LM head's
+vocabulary projection on one F.linear kernel for every logit-row count):
+detm-r5o-ref2-pin (performance) and detm-r5o-ref2-trace6 (attn-exact6).
 """
 import copy
 import json
@@ -182,13 +186,16 @@ REF_FILES = ("models/deepseek_v4_1/b12x_layers.py", "models/deepseek_v4_1/compre
              "v1/core/sched/scheduler.py")
 
 
-def with_reference(arm, *, attention):
+REF2_FILES = REF_FILES + ("model_executor/layers/logits_processor.py",)
+
+
+def with_reference(arm, *, attention, ref="ref1"):
     arm = copy.deepcopy(arm)
-    mounted = {m[1] for m in arm["container"]["mounts"]}
-    for f in REF_FILES + (("models/deepseek_v4_1/attention.py",) if attention else ()):
+    files = REF2_FILES if ref == "ref2" else REF_FILES
+    for f in files + (("models/deepseek_v4_1/attention.py",) if attention else ()):
         target = f"{VLLM}/{f}"
         arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
-        mount(arm, f"ref1/vllm/{f}", target)
+        mount(arm, f"{ref}/vllm/{f}", target)
     arm["environment"]["VLLM_DS41_BATCH_INVARIANT"] = "1"
     args = arm["serve_args"]
     args[args.index("--long-prefill-token-threshold") + 1] = "4000"
@@ -216,8 +223,8 @@ attribution = {
     "nomhc": reference_without(layers="nomhc"),
     "nogemv": reference_without(layers="nogemv"),
 }
-def reference_trace(overlay):
-    arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup="ref1"), attention=False)
+def reference_trace(overlay, ref="ref1"):
+    arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup=ref), attention=False, ref=ref)
     mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
     arm["environment"].update(
         SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160", SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072",
@@ -245,6 +252,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-rs2-exact4-trace", final_wide4),
                   ("detm-r5o-ref-pin", ref_pin), ("detm-r5o-ref-trace", ref_trace),
                   ("detm-r5o-ref-trace6", reference_trace("attn-exact6")),
+                  ("detm-r5o-ref2-pin", with_reference(detm_variant2_pin, attention=True, ref="ref2")),
+                  ("detm-r5o-ref2-trace6", reference_trace("attn-exact6", ref="ref2")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
