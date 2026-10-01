@@ -1,0 +1,311 @@
+From bd70ed3756c80fe0b2a9ae1c0cbb57f7e2861b20 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:38:08 +0200
+Subject: [PATCH] feat(deepseek-v4.1): decode rows keep the decode attention
+ kernel in batch-invariant mode
+
+Replaces running every decode row single-pass. A step's attention mode came
+from its longest query, so decode rows that shared a step with prompt rows ran
+the single-pass extend kernel while decode-only steps ran the split decode
+kernel, which rounds differently; forcing single-pass everywhere cost about
+1.3 ms per decode step. With VLLM_DS41_BATCH_INVARIANT=1:
+
+- the step kind comes from request state (CommonAttentionMetadata.is_prefilling):
+  a step holding prompt rows is never a decode step, even when its queries are
+  as short as a decode step's (the last token of a fully cached prompt);
+- such a step reports its leading decode rows, and the non-CED layers run them
+  on the decode plan and the remaining rows single-pass, from one metadata
+  write, so a decode row gets the decode kernel whatever shares its step;
+- CED layers run every row single-pass, the path decode steps with drafts
+  already take.
+
+Decode-only steps are unchanged from the default path.
+---
+ ...deepseek_v4_1_attention_batch_invariant.py | 43 +++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 75 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/ced.py              | 11 ++-
+ vllm/models/deepseek_v4_1/sparse_mla.py       | 44 ++++++++++-
+ 4 files changed, 168 insertions(+), 5 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_attention_batch_invariant.py
+
+diff --git a/tests/models/test_deepseek_v4_1_attention_batch_invariant.py b/tests/models/test_deepseek_v4_1_attention_batch_invariant.py
+new file mode 100644
+index 000000000..b6723f14b
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_attention_batch_invariant.py
+@@ -0,0 +1,43 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Batch-invariant mode: step kind and decode rows come from request state."""
++
++import types
++
++import pytest
++import torch
++
++pytest.importorskip("b12x")
++
++from vllm.models.deepseek_v4_1.sparse_mla import _batch_invariant_decode_rows  # noqa: E402
++
++
++def _cm(prefilling, query_lens):
++    starts = [0]
++    for n in query_lens:
++        starts.append(starts[-1] + n)
++    return types.SimpleNamespace(
++        is_prefilling=torch.tensor(prefilling, dtype=torch.bool),
++        num_reqs=len(query_lens),
++        query_start_loc_cpu=torch.tensor(starts, dtype=torch.int32),
++    )
++
++
++def test_decode_only_step_keeps_its_kind():
++    assert _batch_invariant_decode_rows(_cm([False, False], [6, 4]), 6, True) == (True, 0)
++
++
++def test_prompt_tail_as_short_as_a_decode_query_is_not_a_decode_step():
++    # The last token of a fully cached prompt, alone in its step.
++    assert _batch_invariant_decode_rows(_cm([True], [1]), 6, True) == (False, 0)
++
++
++def test_mixed_step_reports_its_leading_decode_rows():
++    cm = _cm([False, False, True, True], [6, 3, 2706, 1])
++    assert _batch_invariant_decode_rows(cm, 6, False) == (False, 9)
++
++
++def test_missing_request_state_keeps_the_query_length_rule():
++    cm = _cm([False], [6])
++    cm.is_prefilling = None
++    assert _batch_invariant_decode_rows(cm, 6, True) == (True, 0)
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 716b07d48..f3525e6e9 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -694,8 +694,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             ("extend", self.capacity),
+         ):
+             # "reference" gives decode rows the single-pass kernel as well (and
+-            # BF16 arithmetic below); batch-invariant mode keeps the arithmetic.
+-            single_pass = compute == "reference" or _BATCH_INVARIANT
++            # BF16 arithmetic below).
++            single_pass = compute == "reference"
+             kernel_mode = "extend" if single_pass else mode
+             caps = mla.Caps(
+                 device=device,
+@@ -1671,6 +1671,19 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
++        # Batch-invariant mode: a step that holds prompt rows still gives its
++        # decode rows (the leading decode_rows, by request state) the decode
++        # kernel, as a decode-only step does, so a generated row rounds the same
++        # whatever shares its step. CED layers run every row single-pass.
++        decode_rows = (
++            int(getattr(swa, "decode_rows", 0))
++            if _BATCH_INVARIANT and mode == "extend" and not self.is_ced_decoder
++            else 0
++        )
++        if decode_rows:
++            self._run_split_rows(q, output, swa, main, owner, plan, state, rows, decode_rows)
++            return
++
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+         metadata_specs = self._attention_workspace_specs[mode]
+@@ -1736,6 +1749,64 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             cache_format="deepseek_v41",
+         )
+ 
++    def _run_split_rows(self, q, output, swa, main, owner, plan, state, rows, decode_rows):
++        """Batch-invariant mode: decode rows on the decode plan, the rest single-pass."""
++        from b12x.preparation import require_prepared
++
++        decode_plan = self._attention_plan("decode")
++        decode_state = require_prepared(decode_plan, "attention.compressed_sparse_mla")
++        if decode_rows > decode_state.query.query_rows:
++            raise ValueError(
++                f"V4.1 decode rows {decode_rows} exceed prepared capacity "
++                f"{decode_state.query.query_rows}"
++            )
++        metadata_specs = self._attention_workspace_specs["extend"]
++        extend_specs = tuple((s.shape, s.dtype) for s in state.scratch_plan.scratch_specs())
++        decode_specs = tuple((s.shape, s.dtype) for s in decode_state.scratch_plan.scratch_specs())
++        arena = current_workspace_manager().get_simultaneous(
++            *metadata_specs, *extend_specs, *decode_specs
++        )
++        metadata_count = len(metadata_specs)
++        self._write_decode_metadata(arena, swa, main, rows)
++        swa_indices, swa_lengths, top_lengths = arena[:3]
++        scratch = {
++            "extend": arena[metadata_count : metadata_count + len(extend_specs)],
++            "decode": arena[metadata_count + len(extend_specs) :],
++        }
++        for part_plan, part, rows_slice in (
++            (decode_plan, "decode", slice(0, decode_rows)),
++            (plan, "extend", slice(decode_rows, rows)),
++        ):
++            if rows_slice.start == rows_slice.stop:
++                continue
++            kwargs = {}
++            if main is not None:
++                kwargs = dict(
++                    indexed_indices=owner.topk_indices_buffer[rows_slice],
++                    indexed_lengths=top_lengths[rows_slice],
++                    indexed_page_table=arena[3][rows_slice],
++                )
++            binding = mla.bind(
++                part_plan,
++                scratch=scratch[part],
++                q=q[rows_slice],
++                swa_indices=swa_indices[rows_slice],
++                swa_lengths=swa_lengths[rows_slice],
++                **kwargs,
++            )
++            mla.run(
++                binding=binding,
++                swa_k_cache=self.swa_cache_layer.kv_cache,
++                indexed_k_cache=self._owner().kv_cache if main is not None else None,
++                swa_page_size=self.swa_cache_layer.block_size,
++                indexed_page_size=self._main_page,
++                sm_scale=512**-0.5,
++                attn_sink=self.attn_sink,
++                out=output[rows_slice],
++                cache_format="deepseek_v41",
++            )
++        retain_cuda_graph_capture_resource(arena)
++
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+         visible = main.cache_lengths if main is not None else swa.cache_lengths
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 0be406b16..dceb030a7 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -4,19 +4,24 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from bisect import bisect_left
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Any
+ 
+ import numpy as np
++
+ import torch
+ 
++
+ from vllm.triton_utils import tl, triton
+ 
+ if TYPE_CHECKING:
+     from .sparse_mla import DeepseekV41B12xMetadata
+ 
+ CED_WINDOW = 128
++# Opt-in batch-invariant mode (DeepSeek V4.1).
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+ 
+ 
+ def ced_decoder_start(hf_config: Any) -> int | None:
+@@ -328,7 +333,11 @@ class CEDState:
+             req_id_per_token=gather(metadata.req_id_per_token, -1),
+             slot_mapping=gather(metadata.slot_mapping, -1),
+             cache_lengths=gather(metadata.cache_lengths),
+-            is_decode=plan.max_query_len <= 1,
++            # Batch-invariant mode: CED layers run every row single-pass (the
++            # path decode steps with drafts already take), so a decode row
++            # rounds the same whether or not its step's queries are one token.
++            is_decode=plan.max_query_len <= 1 and not _BATCH_INVARIANT,
++            decode_rows=0,
+             decoder=None,
+             swa_replay_start=self.replay_start,
+         )
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 9ee107171..0fa947805 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Byte-exact V4.1 cache metadata. No foreign attention scheduler is involved."""
+ 
++import os
+ from dataclasses import dataclass
+ from typing import ClassVar
+ 
+@@ -149,6 +150,9 @@ def _chunk(
+         TopLengths + row, tl.where(valid, tl.minimum(tl.maximum(visible, 0), 512), 0)
+     )
+ 
++# Opt-in batch-invariant mode (DeepSeek V4.1).
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
+ 
+ @dataclass
+ class DeepseekV41B12xMetadata:
+@@ -168,6 +172,9 @@ class DeepseekV41B12xMetadata:
+     max_seq_len: int
+     decoder: "DeepseekV41B12xMetadata | None" = None
+     swa_replay_start: torch.Tensor | None = None
++    # Batch-invariant mode: leading rows of decoding requests in a step that
++    # also holds prompt rows (0 otherwise).
++    decode_rows: int = 0
+ 
+ 
+ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+@@ -233,6 +240,15 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             128,
+             self.circular,
+         )
++        is_decode = (
++            self.reorder_batch_threshold is not None
++            and cm.max_query_len <= self.reorder_batch_threshold
++        )
++        decode_rows = 0
++        if _BATCH_INVARIANT:
++            is_decode, decode_rows = _batch_invariant_decode_rows(
++                cm, self.reorder_batch_threshold, is_decode
++            )
+         return DeepseekV41B12xMetadata(
+             cm.num_actual_tokens,
+             cm.num_reqs,
+@@ -246,12 +262,36 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             self.reqs,
+             self.slots,
+             self.lengths,
+-            self.reorder_batch_threshold is not None
+-            and cm.max_query_len <= self.reorder_batch_threshold,
++            is_decode,
+             cm.max_seq_len,
++            decode_rows=decode_rows,
+         )
+ 
+ 
++def _batch_invariant_decode_rows(cm, threshold, is_decode):
++    """Step kind from request state, not query length (batch-invariant mode).
++
++    A prompt tail no longer than a decode step's query (the last token of a
++    fully cached prompt, a short final chunk) is still prompt work: the step is
++    not a decode step. A step holding prompt rows reports how many leading
++    rows belong to decoding requests (vLLM orders decodes first), so attention
++    can give them the decode kernel a decode-only step would use.
++    """
++    prefilling = cm.is_prefilling
++    if prefilling is None or threshold is None:
++        return is_decode, 0
++    prefilling = prefilling[: cm.num_reqs].tolist()
++    if not any(prefilling):
++        return is_decode, 0
++    starts = cm.query_start_loc_cpu[: cm.num_reqs + 1].tolist()
++    decodes = 0
++    for index, is_prefill in enumerate(prefilling):
++        if is_prefill or starts[index + 1] - starts[index] > threshold:
++            break
++        decodes += 1
++    return False, int(starts[decodes])
++
++
+ class DeepseekV41B12xBackend(AttentionBackend):
+     supported_dtypes = [torch.bfloat16]
+     supported_kv_cache_dtypes = ["auto", "fp8", "fp8_ds_mla"]
+-- 
+2.43.0
+
