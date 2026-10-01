@@ -934,79 +934,104 @@ def remote_runtime_problems(
     allow_existing: bool,
     cluster_config: str,
 ) -> list[str]:
+    """Pre-launch checks of every node, the nodes concurrently; findings keep node order."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+        findings = pool.map(
+            lambda node: node_runtime_problems(
+                cluster, nodes, node, revision,
+                allow_existing=allow_existing, cluster_config=cluster_config,
+            ),
+            nodes["nodes"],
+        )
+        return [problem for node_problems in findings for problem in node_problems]
+
+
+def mount_test_script(cluster: dict) -> str:
+    """One remote script testing every mount source (writable for rw, readable for ro)."""
+    lines = []
+    for source, _, mode in cluster["container"]["mounts"]:
+        source = source.format(home=cluster["host"]["home"])
+        test = "-w" if mode == "rw" else "-r"
+        lines.append(
+            f"test {test} {shlex.quote(source)} || printf '%s %s\\n' {mode} {shlex.quote(source)}"
+        )
+    return "\n".join(lines) + "\ntrue\n"
+
+
+def node_runtime_problems(
+    cluster: dict,
+    nodes: dict,
+    node: dict,
+    revision: str,
+    *,
+    allow_existing: bool,
+    cluster_config: str,
+) -> list[str]:
     problems: list[str] = []
     repo = repository_path(cluster)
     name = cluster["container"]["name"]
-    for node in nodes["nodes"]:
-        try:
-            remote_revision, remote_origin, dirty = remote_repository_state(
-                cluster, nodes, node
-            )
-        except RuntimeError as error:
-            problems.append(str(error))
-            continue
-        if remote_revision != revision:
-            problems.append(
-                f"{node['name']}: checkout {remote_revision} differs from deployment {revision}"
-            )
-        if normalized_repository_url(remote_origin) != normalized_repository_url(
-            cluster["deployment"]["repository"]
-        ):
-            problems.append(
-                f"{node['name']}: origin {remote_origin!r} differs from deployment repository"
-            )
-        if dirty:
-            problems.append(f"{node['name']}: checkout has uncommitted files")
-        gid_index, hcas = roce_gid_setting(cluster, node)
-        gids = remote_shell(nodes, node, roce_gid_query(hcas))
-        problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
-        doctor = run_ssh(
-            nodes,
-            node,
-            f"{repo}/bin/spark3",
-            "--cluster-config",
-            cluster_config,
-            "doctor",
+    try:
+        remote_revision, remote_origin, dirty = remote_repository_state(cluster, nodes, node)
+    except RuntimeError as error:
+        return [str(error)]
+    if remote_revision != revision:
+        problems.append(
+            f"{node['name']}: checkout {remote_revision} differs from deployment {revision}"
         )
-        if doctor.returncode:
-            detail = doctor.stdout.strip() or doctor.stderr.strip()
-            problems.append(f"{node['name']}: repository doctor failed: {detail}")
-        for source, _, mode in cluster["container"]["mounts"]:
-            source = source.format(home=cluster["host"]["home"])
-            test = "-w" if mode == "rw" else "-r"
-            exists = run_ssh(nodes, node, "test", test, source)
-            if exists.returncode:
+    if normalized_repository_url(remote_origin) != normalized_repository_url(
+        cluster["deployment"]["repository"]
+    ):
+        problems.append(
+            f"{node['name']}: origin {remote_origin!r} differs from deployment repository"
+        )
+    if dirty:
+        problems.append(f"{node['name']}: checkout has uncommitted files")
+    gid_index, hcas = roce_gid_setting(cluster, node)
+    gids = remote_shell(nodes, node, roce_gid_query(hcas))
+    problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+    doctor = run_ssh(
+        nodes,
+        node,
+        f"{repo}/bin/spark3",
+        "--cluster-config",
+        cluster_config,
+        "doctor",
+    )
+    if doctor.returncode:
+        detail = doctor.stdout.strip() or doctor.stderr.strip()
+        problems.append(f"{node['name']}: repository doctor failed: {detail}")
+    mounts = run_ssh(nodes, node, "sh", "-c", mount_test_script(cluster))
+    for line in mounts.stdout.splitlines():
+        mode, _, source = line.partition(" ")
+        problems.append(f"{node['name']}: {mode} mount source is unavailable: {source}")
+    image = run_ssh(
+        nodes,
+        node,
+        "docker",
+        "image",
+        "inspect",
+        cluster["container"]["image"],
+    )
+    if image.returncode:
+        problems.append(
+            f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+        )
+    else:
+        labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"]["expected_labels"].items():
+            if labels.get(key) != wanted:
                 problems.append(
-                    f"{node['name']}: {mode} mount source is unavailable: {source}"
+                    f"{node['name']}: image label {key}={labels.get(key)!r}, "
+                    f"expected {wanted!r}"
                 )
-        image = run_ssh(
-            nodes,
-            node,
-            "docker",
-            "image",
-            "inspect",
-            cluster["container"]["image"],
+    existing = run_ssh(nodes, node, "docker", "inspect", name)
+    if existing.returncode == 0 and not allow_existing:
+        problems.append(
+            f"{node['name']}: container {name} already exists; use --replace explicitly"
         )
-        if image.returncode:
-            problems.append(
-                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
-            )
-        else:
-            labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
-            for key, wanted in cluster["container"]["expected_labels"].items():
-                if labels.get(key) != wanted:
-                    problems.append(
-                        f"{node['name']}: image label {key}={labels.get(key)!r}, "
-                        f"expected {wanted!r}"
-                    )
-        existing = run_ssh(nodes, node, "docker", "inspect", name)
-        if existing.returncode == 0 and not allow_existing:
-            problems.append(
-                f"{node['name']}: container {name} already exists; use --replace explicitly"
-            )
-        sudo = run_ssh(nodes, node, "sudo", "-n", "true")
-        if sudo.returncode:
-            problems.append(f"{node['name']}: passwordless sudo is unavailable for memguard")
+    sudo = run_ssh(nodes, node, "sudo", "-n", "true")
+    if sudo.returncode:
+        problems.append(f"{node['name']}: passwordless sudo is unavailable for memguard")
     return problems
 
 

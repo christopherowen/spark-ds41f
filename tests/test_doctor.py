@@ -374,3 +374,21 @@ class ClockLatchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MountTestScriptTest(unittest.TestCase):
+    def test_one_script_reports_exactly_the_unavailable_sources(self) -> None:
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, "ok").write_text("")
+            cluster = {"host": {"home": home}, "container": {"mounts": [
+                ["{home}/ok", "/a", "ro"],
+                ["{home}/missing dir", "/b", "rw"],
+                ["{home}/ok", "/c", "rw"],
+            ]}}
+            result = subprocess.run(["sh", "-c", spark3.mount_test_script(cluster)],
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), [f"rw {home}/missing dir"])
