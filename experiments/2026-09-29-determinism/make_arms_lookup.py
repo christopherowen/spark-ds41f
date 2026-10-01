@@ -110,6 +110,10 @@ B12X patch 0008 (overlay mhc-mt2, built on the r5o image: the multi-token
 lagged partial kernel): detm-r5o-ref4d-pin, detm-r5o-ref4d-b4144-pin and their
 traces detm-r5o-ref4d-trace8, detm-r5o-ref4d-b4144-trace8.
 
+The -b2 arms (r5o-pin-b2, detm-r5o-ref4d-b4144-pin-b2, detm-r5o-ref4e-s40-b4144-pin-b2) add
+overlay boot2 (vllm-0048: each boot logs its measured DSpark step costs, 3 timed rounds), a
+fixed-shape step-cost comparison between arms.
+
 r5o-pin-boot is r5o-pin with the boot-time patches vllm-0046 and vllm-0047 (overlay boot1):
 same serving arithmetic, about 20 s less boot (development-cycle plan, 2026-10-01).
 
@@ -422,6 +426,14 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       VLLM_DS41_MHC_TF32_SPLITS="40"), "detm-r5o-ref4e-s40-b4144-pin-prof")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
                   ("r5o-pin", r5o_pin), ("r5o-pin-boot", with_boot_patches(r5o_pin)),
+                  ("r5o-pin-b2", with_env(with_boot_patches(r5o_pin, "boot2"), SPARK3_DSPARK_PINNED_ROUNDS="3")),
+                  ("detm-r5o-ref4d-b4144-pin-b2", with_env(with_boot_patches(with_budget(with_mhc_multi_token(
+                      with_gemv_geometry(with_reference(detm_variant2_pin, attention=True, ref="ref4d"),
+                                         "gemv-geom2"))), "boot2"), SPARK3_DSPARK_PINNED_ROUNDS="3")),
+                  ("detm-r5o-ref4e-s40-b4144-pin-b2", with_env(with_boot_patches(with_budget(with_mhc_multi_token(
+                      with_gemv_geometry(with_reference(detm_variant2_pin, attention=True, ref="ref4e"),
+                                         "gemv-geom2"))), "boot2"), SPARK3_DSPARK_PINNED_ROUNDS="3",
+                      VLLM_DS41_MHC_TF32_SPLITS="40")),
                   ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),

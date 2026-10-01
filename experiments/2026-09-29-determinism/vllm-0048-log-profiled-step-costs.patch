@@ -1,0 +1,88 @@
+From fed467a165869dc93736103e0cb4f308768a4c58 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 22:57:09 +0200
+Subject: [PATCH] feat(spec-decode): log each boot's measured DSpark step costs
+
+Upstream base: vllm-0046.
+
+Rank 0 logs the cost profile it measured (verify: target step GPU time per
+token count, CUDA graphs up to the capture limit and eager beyond; draft:
+per request count) before pinned curves replace it. Between builds this is
+a step-cost comparison at fixed shapes, independent of the texts and verify
+widths a workload produces (batch-invariant arms write different texts, so
+their per-step times in a decode benchmark mix arithmetic cost with verify
+width). SPARK3_DSPARK_PINNED_ROUNDS (default 1) sets how many timed rounds
+run before the pinned-curve check, for steadier medians.
+
+Quality: none. Tests: tests/v1/spec_decode/test_adaptive_verification.py.
+Upstream status: local (experiment instrumentation).
+---
+ .../gpu/spec_decode/adaptive_verification.py  | 31 ++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 1a3c0b6c4..be0d461b0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -34,6 +34,9 @@ _PROFILE_REPLAYS = int(os.environ.get("SPARK3_DSPARK_PROFILE_REPLAYS", "5"))
+ # set and every later boot with the same shapes reuses it, so the draft
+ # budget no longer depends on one boot's startup timing noise.
+ _COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
++# Timed rounds a boot runs before checking for pinned curves (vllm-0046): they price
++# nothing when pinned curves match, but their medians are the boot's logged step costs.
++_PINNED_ROUNDS = max(1, int(os.environ.get("SPARK3_DSPARK_PINNED_ROUNDS", "1")))
+ # "ratio" maximizes each step's expected tokens per millisecond. "marginal"
+ # maximizes expected tokens minus the achieved rate times cost, the rule that
+ # maximizes long-run tokens per millisecond when step confidence varies.
+@@ -109,6 +112,31 @@ _assign_draft_token_budget_compiled = torch.compile(
+ )
+ 
+ 
++def _log_profiled_curves(
++    samples: list[StepTimingSample],
++    draft_curve: list[tuple[int, float]],
++    verify_curve: list[tuple[int, float]],
++) -> None:
++    """Rank 0 logs the boot's measured step costs, also when pinned curves replace them.
++
++    The verify curve is the target step's GPU time at each token count (CUDA graphs up to
++    the capture limit, eager beyond): a cost comparison between builds at fixed shapes,
++    independent of the texts and verify widths a workload happens to produce.
++    """
++    try:
++        rank = get_tp_group().rank_in_group
++    except Exception:  # no distributed state (unit tests)
++        rank = 0
++    if rank != 0:
++        return
++    logger.info(
++        "Profiled DSpark step costs from %d samples: verify %s draft %s",
++        len(samples),
++        json.dumps([[int(x), round(float(y), 3)] for x, y in verify_curve]),
++        json.dumps([[int(x), round(float(y), 3)] for x, y in draft_curve]),
++    )
++
++
+ def median_curve(points: Iterable[tuple[int, float]]) -> list[tuple[int, float]]:
+     grouped: defaultdict[int, list[float]] = defaultdict(list)
+     for key, value in points:
+@@ -404,7 +432,7 @@ class AdaptiveVerificationManager:
+         """
+         # With a cost directory, one timed round fixes the shape set; when rank 0
+         # holds pinned curves for it, the rest of the profile would be discarded.
+-        first = 1 if _COST_DIR is not None else _PROFILE_REPLAYS
++        first = min(_PINNED_ROUNDS, _PROFILE_REPLAYS) if _COST_DIR is not None else _PROFILE_REPLAYS
+         for batch in self.batches_to_profile(
+             capture_sizes, full_batch_shapes, replays=1
+         ):
+@@ -531,6 +559,7 @@ class AdaptiveVerificationManager:
+             (s.num_target_tokens, s.forward_ms) for s in samples
+         )
+         verify_curves_by_num_reqs = verify_curves_by_num_reqs_from(samples)
++        _log_profiled_curves(samples, draft_curve, verify_curve)
+         draft_curve, verify_curve, verify_curves_by_num_reqs = self._pin_cost_curves(
+             draft_curve, verify_curve, verify_curves_by_num_reqs
+         )
+-- 
+2.43.0
+
