@@ -1,0 +1,276 @@
+From a32ddca21dbb64799091d6fb51f40b5c708a22bc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:11:37 +0200
+Subject: [PATCH] perf(spec-decode): profile DSpark costs once when pinned
+ curves cover the shapes
+
+Upstream base: local-inference-lab/vllm integration/karmic-kraken-beta
+04c30fa9 with this deployment's patch series (independent of the
+batch-invariance patches).
+
+With SPARK3_DSPARK_COST_DIR set, rank 0 replaces the profiled cost curves
+with pinned ones whenever a file matches the profile's shape set, yet the
+boot still ran every timed round (5 by default) of both profiling phases,
+about 16 s of a ~120 s boot, only to compute that key. Now one timed round
+runs first; rank 0 checks for matching pinned curves and broadcasts the
+answer, and the remaining rounds run only when none exist. The rounds
+continue the alternating shape order, so a completed profile is the same
+as one taken in a single block, and a new shape set is still pinned from
+the full profile.
+
+Without a cost directory nothing changes. Quality: none (costs only steer
+draft budgets, and pinned curves were already used in place of profiled
+ones).
+
+Tests: tests/v1/spec_decode/test_adaptive_verification.py (one-round
+boot with pinned curves; split profile equals one block).
+Upstream status: local.
+---
+ .../spec_decode/test_adaptive_verification.py |  60 +++++++++
+ .../gpu/spec_decode/adaptive_verification.py  | 124 ++++++++++++++----
+ 2 files changed, 161 insertions(+), 23 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 364a81fd2..4e56e772e 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -746,3 +746,63 @@ def test_marginal_rate_never_falls_below_the_no_draft_rate():
+     # At the floor (1 token / 10 ms) a 0.2-survival draft costing 1 ms pays.
+     assert manager.get_num_tokens({"low": 3}, {"low": [1, 2]}) == 2
+     assert manager._rates[1] >= 0.1
++
++
++def _profiling_manager() -> AdaptiveVerificationManager:
++    manager = _pinning_manager()
++    manager.req_states = SimpleNamespace(max_num_reqs=8, max_num_batched_tokens=16)
++    manager.set_cost_curves = lambda draft, verify, **kwargs: None
++    return manager
++
++
++def test_pinned_profile_runs_one_timed_round(monkeypatch, tmp_path):
++    """With curves pinned for the shape set, the remaining rounds are skipped."""
++    monkeypatch.setattr(adaptive_module, "_COST_DIR", str(tmp_path))
++    monkeypatch.setattr(adaptive_module, "_PROFILE_REPLAYS", 5)
++    monkeypatch.setattr(
++        adaptive_module,
++        "get_tp_group",
++        lambda: SimpleNamespace(
++            rank_in_group=0, world_size=3, broadcast_object=lambda obj, src: obj
++        ),
++    )
++    timed = []
++
++    class TimingCollector:
++        samples = None
++
++        @contextmanager
++        def collect(self):
++            self.samples = []
++            try:
++                yield self.samples
++            finally:
++                self.samples = None
++
++    timing = TimingCollector()
++
++    def run_dummy(num_tokens, context_len, profile_num_reqs=2):
++        if timing.samples is not None:
++            timed.append((num_tokens, profile_num_reqs))
++            cost = float(num_tokens + profile_num_reqs)
++            timing.samples.append(
++                StepTimingSample(cost, cost, num_tokens, profile_num_reqs, num_tokens <= 8)
++            )
++
++    shapes = [(1, 1), (8, 1), (8, 2)]
++    _profiling_manager().profile_costs(run_dummy, timing, [1, 8], shapes)
++    full_profile = len(timed)
++    assert len(list(tmp_path.glob("dspark-costs-*.json"))) == 1
++    timed.clear()
++    _profiling_manager().profile_costs(run_dummy, timing, [1, 8], shapes)
++    assert len(timed) * 5 == full_profile
++
++
++def test_completed_profile_continues_the_shape_order():
++    manager = _profiling_manager()
++    manager._cudagraph_limit = 8
++    one_block = list(manager.batches_to_profile([1, 8], [(1, 1), (8, 1)], replays=5))
++    split = list(manager.batches_to_profile([1, 8], [(1, 1), (8, 1)], replays=1)) + list(
++        manager.batches_to_profile([1, 8], [(1, 1), (8, 1)], replays=4, start=1)
++    )
++    assert split == one_block
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 3e31a7049..1a3c0b6c4 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -352,6 +352,7 @@ class AdaptiveVerificationManager:
+         *,
+         replays: int = _PROFILE_REPLAYS,
+         tail: bool = True,
++        start: int = 0,
+     ) -> Iterator[dict[str, int]]:
+         """Dummy-run kwargs whose step timings seed the cost tables.
+ 
+@@ -376,7 +377,7 @@ class AdaptiveVerificationManager:
+                 (num_tokens, None)
+                 for num_tokens in preparation_tail_sizes(capture_sizes, max_num_tokens)
+             )
+-        for replay in range(replays):
++        for replay in range(start, start + replays):
+             shapes = profile_shapes if replay % 2 == 0 else reversed(profile_shapes)
+             for num_tokens, num_reqs in shapes:
+                 batch = {
+@@ -401,13 +402,21 @@ class AdaptiveVerificationManager:
+         rows, and the full graph shapes are profiled again under it to price
+         live verification rows.
+         """
++        # With a cost directory, one timed round fixes the shape set; when rank 0
++        # holds pinned curves for it, the rest of the profile would be discarded.
++        first = 1 if _COST_DIR is not None else _PROFILE_REPLAYS
+         for batch in self.batches_to_profile(
+             capture_sizes, full_batch_shapes, replays=1
+         ):
+             run_dummy(**batch)
+         with step_timing.collect() as timings:
+-            for batch in self.batches_to_profile(capture_sizes, full_batch_shapes):
++            for batch in self.batches_to_profile(
++                capture_sizes, full_batch_shapes, replays=first
++            ):
+                 run_dummy(**batch)
++        timings = self._complete_profile(
++            timings, run_dummy, step_timing, capture_sizes, full_batch_shapes, first
++        )
+         self.set_initial_cost_curves(timings)
+         if not self.dead_rows_ratio:
+             return
+@@ -419,11 +428,97 @@ class AdaptiveVerificationManager:
+                 run_dummy(**batch)
+             with step_timing.collect() as timings:
+                 for batch in self.batches_to_profile(
+-                    capture_sizes, full_batch_shapes, tail=False
++                    capture_sizes, full_batch_shapes, replays=first, tail=False
+                 ):
+                     run_dummy(**batch)
++            timings = self._complete_profile(
++                timings,
++                run_dummy,
++                step_timing,
++                capture_sizes,
++                full_batch_shapes,
++                first,
++                rows="live",
++            )
+         self.set_live_cost_curves(timings)
+ 
++    def _complete_profile(
++        self,
++        timings: list[StepTimingSample],
++        run_dummy: Callable[..., object],
++        step_timing: StepTimingCollector,
++        capture_sizes: list[int],
++        full_batch_shapes: list[tuple[int, int]],
++        done: int,
++        rows: str = "padded",
++    ) -> list[StepTimingSample]:
++        """Run the remaining timed rounds unless pinned curves cover this shape set.
++
++        Rank 0 decides and broadcasts, so every rank runs the same steps (and
++        collectives). The rounds continue the alternating shape order, so a
++        completed profile equals one taken in a single block.
++        """
++        if done >= _PROFILE_REPLAYS or self._pinned_curves_exist(timings, rows):
++            return timings
++        with step_timing.collect() as more:
++            for batch in self.batches_to_profile(
++                capture_sizes,
++                full_batch_shapes,
++                replays=_PROFILE_REPLAYS - done,
++                start=done,
++                tail=rows == "padded",
++            ):
++                run_dummy(**batch)
++        return [*timings, *more]
++
++    def _pinned_curves_exist(
++        self, samples: list[StepTimingSample], rows: str = "padded"
++    ) -> bool:
++        tp_group = get_tp_group()
++        found = None
++        if tp_group.rank_in_group == 0:
++            by_num_reqs = verify_curves_by_num_reqs_from(samples)
++            if rows == "padded":
++                draft = median_curve(
++                    (s.num_reqs, s.drafter_ms) for s in samples if s.full_cudagraph
++                )
++                verify = median_curve((s.num_target_tokens, s.forward_ms) for s in samples)
++            else:
++                draft, verify = [], []
++            key, path = self._pin_key(draft, verify, by_num_reqs, rows)
++            found = False
++            if os.path.exists(path):
++                with open(path) as f:
++                    found = json.load(f).get("key") == key
++        return bool(tp_group.broadcast_object(found, src=0))
++
++    def _pin_key(
++        self,
++        draft_curve: list[tuple[int, float]],
++        verify_curve: list[tuple[int, float]],
++        verify_curves_by_num_reqs: Mapping[int, list[tuple[int, float]]],
++        rows: str,
++    ) -> tuple[dict, str]:
++        """The shape-set key of a cost profile and the file its pinned curves live in."""
++        key = {
++            "tp": get_tp_group().world_size,
++            "num_speculative_steps": self.num_speculative_steps,
++            "max_num_reqs": self.req_states.max_num_reqs,
++            "max_num_batched_tokens": self.req_states.max_num_batched_tokens,
++            "cudagraph_limit": self._cudagraph_limit,
++            "profile_context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
++            "draft_sizes": [int(x) for x, _ in draft_curve],
++            "verify_sizes": [int(x) for x, _ in verify_curve],
++            "full_shapes": {
++                str(n): [int(x) for x, _ in curve]
++                for n, curve in sorted(verify_curves_by_num_reqs.items())
++            },
++        }
++        if rows != "padded":
++            key["rows"] = rows
++        digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
++        return key, os.path.join(_COST_DIR, f"dspark-costs-{digest}.json")
++
+     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:
+         # Draft curve: eager-target steps inflate drafter timings (the CPU is
+         # still launching kernels, opening gaps between the drafter's events),
+@@ -493,26 +588,9 @@ class AdaptiveVerificationManager:
+         verify_curves_by_num_reqs = {
+             int(n): plain(curve) for n, curve in verify_curves_by_num_reqs.items()
+         }
+-        key = {
+-            "tp": tp_group.world_size,
+-            "num_speculative_steps": self.num_speculative_steps,
+-            "max_num_reqs": self.req_states.max_num_reqs,
+-            "max_num_batched_tokens": self.req_states.max_num_batched_tokens,
+-            "cudagraph_limit": self._cudagraph_limit,
+-            "profile_context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+-            "draft_sizes": [x for x, _ in draft_curve],
+-            "verify_sizes": [x for x, _ in verify_curve],
+-            "full_shapes": {
+-                str(n): [x for x, _ in curve]
+-                for n, curve in sorted(verify_curves_by_num_reqs.items())
+-            },
+-        }
+-        if rows != "padded":
+-            key["rows"] = rows
+-        digest = hashlib.sha256(
+-            json.dumps(key, sort_keys=True).encode()
+-        ).hexdigest()[:16]
+-        path = os.path.join(_COST_DIR, f"dspark-costs-{digest}.json")
++        key, path = self._pin_key(
++            draft_curve, verify_curve, verify_curves_by_num_reqs, rows
++        )
+         if os.path.exists(path):
+             with open(path) as f:
+                 pinned = json.load(f)
+-- 
+2.43.0
+

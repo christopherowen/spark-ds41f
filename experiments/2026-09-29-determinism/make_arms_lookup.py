@@ -110,6 +110,9 @@ B12X patch 0008 (overlay mhc-mt2, built on the r5o image: the multi-token
 lagged partial kernel): detm-r5o-ref4d-pin, detm-r5o-ref4d-b4144-pin and their
 traces detm-r5o-ref4d-trace8, detm-r5o-ref4d-b4144-trace8.
 
+r5o-pin-boot is r5o-pin with the boot-time patches vllm-0046 and vllm-0047 (overlay boot1):
+same serving arithmetic, about 20 s less boot (development-cycle plan, 2026-10-01).
+
 ref4e (experiment) is ref4d whose mHC override takes the TF32 TMA projection at
 every capacity with VLLM_DS41_MHC_TF32_SPLITS K slices for the operations B12X
 serves with it (post_pre, pre on the expanded residual; run65 try 1 failed on the
@@ -299,6 +302,20 @@ mhc_capture["environment"]["SPARK3_DEBUG_MHC_CAPTURE"] = "/cache/kkref/mhc-captu
 GEMV_GEOMETRY_FILES = ("gemm/bf16_gemv/_prefill.py", "gemm/bf16_gemv/_tuning.py", "gemm/bf16_gemv/_preparation.py")
 
 
+BOOT_FILES = ("v1/worker/gpu/spec_decode/adaptive_verification.py", "v1/executor/abstract.py")
+
+
+def with_boot_patches(arm, overlay="boot1"):
+    """arm with the boot-time patches vllm-0046 (DSpark costs profiled once when pinned curves
+    match) and vllm-0047 (no temporary-pool B12X state stage without autotuning)."""
+    arm = copy.deepcopy(arm)
+    for f in BOOT_FILES:
+        target = f"{VLLM}/{f}"
+        arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
+        mount(arm, f"{overlay}/vllm/{f}", target)
+    return arm
+
+
 def with_env(arm, **values):
     arm = copy.deepcopy(arm)
     arm["environment"].update(values)
@@ -404,7 +421,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       with_gemv_geometry(with_reference(detm_variant2_pin, attention=True, ref="ref4e"), "gemv-geom2"))),
                       VLLM_DS41_MHC_TF32_SPLITS="40"), "detm-r5o-ref4e-s40-b4144-pin-prof")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
-                  ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
+                  ("r5o-pin", r5o_pin), ("r5o-pin-boot", with_boot_patches(r5o_pin)),
+                  ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
                   ("detm-r5o-lookup-variant-pin", with_lookup(detm_variant_pin))):

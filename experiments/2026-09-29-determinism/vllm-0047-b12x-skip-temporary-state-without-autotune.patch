@@ -1,0 +1,87 @@
+From 0597248f21fb8e78ec3f1aee19f1e13d6d4cf7b7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:13:03 +0200
+Subject: [PATCH] perf(b12x): skip the temporary-pool state stage when
+ autotuning is off
+
+Upstream base: local-inference-lab/vllm integration/karmic-kraken-beta
+04c30fa9 with this deployment's patch series (independent of the
+batch-invariance patches).
+
+Executor.initialize_from_config prepares B12X state on a small disposable
+KV pool so autotuning can run before the serving cache takes its memory,
+then prepares again ("bind") on the serving pool. With B12X_AUTOTUNE=0 or
+autotuning disabled in the kernel config there is nothing to tune, and the
+first pass only repeated the same obligations (616 per rank, about 3.5 s of
+boot). Without autotuning the state stage now runs once, on the serving
+pool: the path already taken when no temporary pool is available.
+
+Quality: none. Memory: the serving pool is fixed by --kv-cache-memory-bytes;
+check the boot low point (memguard) when adopting.
+
+Tests: tests/v1/executor/test_b12x_startup.py.
+Upstream status: local.
+---
+ tests/v1/executor/test_b12x_startup.py | 22 ++++++++++++++++++++++
+ vllm/v1/executor/abstract.py           | 11 ++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/tests/v1/executor/test_b12x_startup.py b/tests/v1/executor/test_b12x_startup.py
+index 5f93e2e57..b1228beae 100644
+--- a/tests/v1/executor/test_b12x_startup.py
++++ b/tests/v1/executor/test_b12x_startup.py
+@@ -67,6 +67,28 @@ def test_state_tuning_releases_temporary_pools_before_serving_allocation(
+     assert events == expected
+ 
+ 
++def test_state_stage_runs_once_on_the_serving_pool_without_autotuning(monkeypatch):
++    """With autotuning off the temporary pool would only repeat the state stage."""
++    from vllm.platforms import current_platform
++
++    monkeypatch.setenv("B12X_AUTOTUNE", "0")
++    monkeypatch.setattr("vllm.utils.b12x.has_b12x", lambda: True)
++    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
++    monkeypatch.setattr(current_platform, "is_device_capability_family", lambda _: True)
++    events: list[object] = []
++
++    def rpc(method, **kwargs):
++        events.append(method)
++        return [True, True]
++
++    executor = SimpleNamespace(
++        collective_rpc=rpc, _run_b12x_preparation=lambda *, stage: events.append(stage)
++    )
++    Executor.initialize_from_config(executor, [object(), object()])
++    assert events == ["initialize_from_config"]
++    assert not executor._b12x_state_tuned_before_allocation
++
++
+ class _Result:
+     def __init__(self, events):
+         self.events = events
+diff --git a/vllm/v1/executor/abstract.py b/vllm/v1/executor/abstract.py
+index a1f1a97e6..d3d210846 100644
+--- a/vllm/v1/executor/abstract.py
++++ b/vllm/v1/executor/abstract.py
+@@ -161,8 +161,17 @@ class Executor(ABC):
+         from vllm.utils.b12x import has_b12x
+ 
+         self._b12x_state_tuned_before_allocation = False
++        # The temporary pool exists so autotuning runs before the serving KV
++        # cache takes its memory. Without autotuning there is nothing to tune:
++        # the state stage then runs once, on the serving pool, as it does when
++        # no temporary pool is available.
++        kernel_config = getattr(getattr(self, "vllm_config", None), "kernel_config", None)
++        autotune = os.environ.get("B12X_AUTOTUNE", "1") != "0" and getattr(
++            kernel_config, "enable_b12x_autotune", True
++        )
+         if (
+-            has_b12x()
++            autotune
++            and has_b12x()
+             and current_platform.is_cuda()
+             and current_platform.is_device_capability_family(120)
+         ):
+-- 
+2.43.0
+
