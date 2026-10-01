@@ -425,6 +425,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
         config, label = arm_config_path(experiment, arm["config"]), arm["label"]
         out = f"results/private/determinism/{run}"
         steps.append({"kind": "boot", "config": config, "label": label})
+        steps.append({"kind": "curves", "label": label, "out": f"{out}/curves-{label}.json"})
         steps.append({"kind": "cli", "label": label,
                       "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
                                "--output", f"results/private/bench/{run}-{label}"]})
@@ -433,7 +434,8 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
                           "argv": [f"{experiment}/{script}", head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
     steps.append({"kind": "table", "argv": [f"{experiment}/tables_arms.py", run, *[a["label"] for a in arms]],
-                  "out": f"results/private/lab/{run}-table.txt"})
+                  "out": f"results/private/lab/{run}-table.txt",
+                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms]})
     return steps
 
 
@@ -532,6 +534,8 @@ def describe_step(step: dict) -> str:
         return f"summarize kernels and compare costs against {step['labels'][0]} ({', '.join(step['workloads'])})"
     if step["kind"] == "sync":
         return "sync node checkouts to origin/main"
+    if step["kind"] == "curves":
+        return f"save the boot's measured step costs > {step['out']}"
     if step["kind"] == "table":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
     if step["kind"] == "analyze":
@@ -593,68 +597,92 @@ def profiler_dir(config_path: str) -> str:
 
 
 def profile_workload(step: dict) -> None:
+    """One workload under the torch profiler. Every rank's trace is collected (rank r runs on
+    node r): rank 0 alone hides time the others spend computing while it waits in collectives."""
     container_dir = profiler_dir(step["config"])
-    host_dir = ROOT / container_dir.replace("/cache/", "cache/", 1)
+    host_relative = container_dir.replace("/cache/", "cache/", 1)
+    nodes = nodes_config()
+    repo = spark3.repository_path(spark3.configuration()[0])
     out = ROOT / step["out"]
     out.mkdir(parents=True, exist_ok=True)
     workload = step["workload"]
-    subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                    f"mkdir -p {container_dir} && rm -rf {container_dir}/*.json.gz {container_dir}/{workload}"],
-                   check=False)
+
+    def in_container(node: dict, script: str) -> subprocess.CompletedProcess:
+        return spark3.run_ssh(nodes, node, "docker", "exec", CONTAINER, "sh", "-c", script)
+
+    def each(function):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            return list(pool.map(function, nodes["nodes"]))
+
+    each(lambda node: in_container(node, f"mkdir -p {container_dir} && rm -rf {container_dir}/*.json.gz "
+                                         f"{container_dir}/{workload}"))
     with (out / f"{workload}.json").open("w") as handle:
         code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
     log(f"profile {step['label']} {workload} exit {code}")
-    before = -1
-    for _ in range(120):  # rank 0's trace is written after /stop_profile; wait until it stops growing
-        size = sum(p.stat().st_size for p in host_dir.glob("*rank0*.json.gz"))
-        if size and size == before:
+
+    def trace_bytes(node: dict) -> int:
+        result = spark3.run_ssh(nodes, node, "sh", "-c",
+                                f"cat {repo}/{host_relative}/*rank*.json.gz 2>/dev/null | wc -c")
+        return int(result.stdout.strip() or 0)
+
+    before = None
+    for _ in range(120):  # traces are written after /stop_profile; wait until every node's stops growing
+        sizes = each(trace_bytes)
+        if all(sizes) and sizes == before:
             break
-        before = size
+        before = sizes
         time.sleep(5)
     else:
-        log(f"trace in {host_dir} did not settle")
-    subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
-                    f"mkdir -p {container_dir}/{workload} && mv {container_dir}/*rank0*.json.gz {container_dir}/{workload}/"],
-                   check=False)
-    trace_dir = out / f"{workload}-trace"
-    trace_dir.mkdir(exist_ok=True)
-    for trace in (host_dir / workload).glob("*.json.gz"):
-        (trace_dir / trace.name).write_bytes(trace.read_bytes())
+        log(f"traces under {host_relative} did not settle: {before}")
+    each(lambda node: in_container(node, f"mkdir -p {container_dir}/{workload} && "
+                                         f"mv {container_dir}/*rank*.json.gz {container_dir}/{workload}/"))
+
+    def fetch(node: dict) -> None:
+        target = out / f"{workload}-trace" / node["name"]
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["rsync", "-a", "-e", "ssh " + " ".join(spark3.ssh_options()),
+                        f"{spark3.ssh_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
+                       check=False)
+
+    each(fetch)
 
 
 def profile_costs(step: dict) -> None:
-    """summarize_kernels.py per arm and workload (three at a time), then analyze_costs.py of each
-    arm against the first; the cluster is stopped, so memory is free."""
+    """summarize_kernels.py per arm, workload and rank (three at a time), then analyze_costs.py of
+    each arm against the first, rank by rank; the cluster is stopped, so memory is free."""
     if container_running():
         raise SystemExit("kernel summaries need the cluster stopped")
     image = json.loads((ROOT / step["config"]).read_text())["container"]["image"]
     experiment, out = ROOT / step["experiment"], ROOT / step["out"]
+    names = [node["name"] for node in nodes_config()["nodes"]]
 
     def docker_python(script: str, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run(["docker", "run", "--rm", "--memory=16g", "-e", "CUDA_VISIBLE_DEVICES=",
                                "-v", f"{experiment / script}:/s.py:ro", "-v", f"{out}:/o",
                                "--entrypoint", "python3", image, "/s.py", *args], text=True, capture_output=True)
 
-    def summarize(item: tuple[str, str]) -> None:
-        label, workload = item
-        traces = sorted((out / label / f"{workload}-trace").glob("*.json.gz"))
+    def summarize(item: tuple[str, str, str]) -> None:
+        label, workload, node = item
+        traces = sorted((out / label / f"{workload}-trace" / node).glob("*.json.gz"))
         if traces:
-            docker_python("summarize_kernels.py", f"/o/{label}/{workload}-kernels.json",
-                          f"/o/{label}/{workload}-trace/{traces[0].name}")
+            docker_python("summarize_kernels.py", f"/o/{label}/{workload}-kernels-{node}.json",
+                          f"/o/{label}/{workload}-trace/{node}/{traces[0].name}")
 
-    items = [(label, workload) for label in step["labels"] for workload in step["workloads"]]
+    items = [(label, workload, node) for label in step["labels"] for workload in step["workloads"]
+             for node in names]
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         list(pool.map(summarize, items))
     base = step["labels"][0]
     for label in step["labels"][1:]:
         for workload in step["workloads"]:
-            extra = ["--total"] if workload == "prefill" else []
-            result = docker_python("analyze_costs.py", f"/o/{base}/{workload}-kernels.json",
-                                   f"/o/{label}/{workload}-kernels.json", *extra, "--top", "25")
-            (out / f"costs-{label}-{workload}.txt").write_text(result.stdout + result.stderr)
-            log(f"costs {label} {workload} against {base}:")
-            print("\n".join(result.stdout.splitlines()[:20]), flush=True)
+            for node in names:
+                extra = ["--total"] if workload == "prefill" else []
+                result = docker_python("analyze_costs.py", f"/o/{base}/{workload}-kernels-{node}.json",
+                                       f"/o/{label}/{workload}-kernels-{node}.json", *extra, "--top", "25")
+                (out / f"costs-{label}-{workload}-{node}.txt").write_text(result.stdout + result.stderr)
+                log(f"costs {label} {workload} {node} against {base}:")
+                print("\n".join(result.stdout.splitlines()[:12]), flush=True)
 
 
 def sync_checkouts() -> bool:
@@ -668,6 +696,48 @@ def sync_checkouts() -> bool:
     ok = spark3_cli("cluster", "sync", "--apply") == 0
     log(f"sync to {head} " + ("OK" if ok else "FAILED"))
     return ok
+
+
+CURVE_POINTS = (1, 6, 12, 24, 48, 256, 1024, 2048, 4096)
+
+
+def save_curves(step: dict) -> None:
+    """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them."""
+    logs = subprocess.run(["docker", "logs", CONTAINER], text=True, capture_output=True)
+    lines = [l for l in (logs.stdout + logs.stderr).splitlines() if "Profiled DSpark step costs" in l]
+    if not lines:
+        return
+    found = re.search(r"verify (\[.*?\]\]) draft (\[.*\]\])", lines[-1])
+    if not found:
+        return
+    out = ROOT / step["out"]
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(out, {"verify": json.loads(found.group(1)), "draft": json.loads(found.group(2))})
+
+
+def curves_table(paths: list[str]) -> str:
+    """Verify step cost (ms) at fixed token counts per arm, against the first arm."""
+    rows, base = [], None
+    for path in paths:
+        file = ROOT / path
+        if not file.exists():
+            continue
+        verify = dict((int(x), float(y)) for x, y in json.loads(file.read_text())["verify"])
+        label = file.stem.removeprefix("curves-")
+        cells = []
+        for point in CURVE_POINTS:
+            nearest = min(verify, key=lambda tokens: abs(tokens - point)) if verify else None
+            value = verify.get(nearest)
+            if base is None or value is None or base.get(point) is None:
+                cells.append(f"{nearest}:{value:.2f}" if value is not None else "-")
+            else:
+                cells.append(f"{nearest}:{value:.2f} ({100 * (value / base[point] - 1):+.1f}%)")
+        if base is None:
+            base = {point: verify.get(min(verify, key=lambda t: abs(t - point))) for point in CURVE_POINTS}
+        rows.append(f"  {label:<14} " + "  ".join(cells))
+    if not rows:
+        return ""
+    return "fixed-shape target step cost, ms at tokens (boot profile, vllm-0048):\n" + "\n".join(rows)
 
 
 def summarize_analysis(out: Path) -> dict:
@@ -819,9 +889,16 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             profile_workload(step)
         elif step["kind"] == "costs":
             profile_costs(step)
+        elif step["kind"] == "curves":
+            save_curves(step)
         elif step["kind"] == "table":
             run_script(step)
-            print((ROOT / step["out"]).read_text(), flush=True)
+            table = (ROOT / step["out"]).read_text()
+            curves = curves_table(step.get("curves", []))
+            if curves:
+                table += "\n" + curves + "\n"
+                (ROOT / step["out"]).write_text(table)
+            print(table, flush=True)
         elif step["kind"] == "fresh_inventory":
             fresh_inventory()
         elif step["kind"] == "stop":

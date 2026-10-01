@@ -149,6 +149,19 @@ class QueueTest(unittest.TestCase):
         self.assertEqual([s["kind"] for s in steps], ["sync"])
 
 
+class CurvesTest(unittest.TestCase):
+    def test_curve_table_compares_arms_at_fixed_token_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):
+            base = Path(directory) / "curves-r5o.json"
+            base.write_text(json.dumps({"verify": [[1, 10.0], [6, 12.0], [48, 20.0]], "draft": [[1, 2.0]]}))
+            cand = Path(directory) / "curves-cand.json"
+            cand.write_text(json.dumps({"verify": [[1, 11.0], [6, 12.0], [48, 19.0]], "draft": [[1, 2.0]]}))
+            table = lab.curves_table(["curves-r5o.json", "curves-cand.json", "curves-missing.json"])
+        self.assertIn("1:11.00 (+10.0%)", table)
+        self.assertIn("48:19.00 (-5.0%)", table)
+        self.assertEqual(table.count("\n"), 2)
+
+
 class OverlayTest(unittest.TestCase):
     def test_fewer_fences_than_the_image_is_a_problem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
