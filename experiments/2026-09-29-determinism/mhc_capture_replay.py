@@ -13,8 +13,9 @@ three layers. Configurations:
 - candidate-capacity: only the 4096-row plan, on the lagged native route.
 For each: rows grouped by exact bits as the last or first row of 1..N-row batches (N the
 captured rows); the candidate against production at decode sizes (bit equality) and against
-production and ref2 at 1024 rows (largest relative difference per output); eager timings
-(median of 30) at 1-4000 rows.
+production and ref2 at 1024 rows (largest relative difference per output); timings (median
+of 40) on pre-gathered inputs, decode sizes replayed from a CUDA graph, prefill sizes eager
+(1334 and 1366 rows are one rank's share of a 4000- and 4096-token chunk).
 """
 import glob
 import json
@@ -36,7 +37,7 @@ device = tm.device
 H = 5120
 GRAPH = (1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48)
 LIMIT = 4096
-TIMED = (1, 2, 4, 6, 8, 16, 32, 48, 256, 1024, 2048, 4000)
+TIMED = (1, 2, 4, 6, 8, 16, 32, 48, 128, 256, 1024, 1334, 1366, 2048, 4000)
 init_workspace_manager(device)
 b12x_layers._execution_capacities = lambda: (1, 8, LIMIT)
 captures = {}
@@ -87,15 +88,35 @@ def runner(module, c, op):
     return call
 
 
-def timed(call, rows, n):
+def timed(module, c, op, rows, n):
+    """Median microseconds of one call on pre-gathered inputs; decode sizes replay a CUDA graph."""
     idx = torch.arange(rows, device=device) % n
-    for _ in range(5):
-        call(idx)
+    inputs = {k: c[k][idx].contiguous() for k in ("residual", "pre", "previous_output", "previous_post",
+                                                  "previous_comb") if c.get(k) is not None}
+
+    def once():
+        if op == "pre":
+            return module.pre(inputs["residual"], c["fn"], c["scale"], c["base"], c["norm"], inputs["pre"])
+        return module.post_pre(inputs["previous_output"], inputs["residual"], inputs["previous_post"],
+                               inputs["previous_comb"], c["fn"], c["scale"], c["base"], c["norm"], inputs["pre"])
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            once()
+    torch.cuda.current_stream().wait_stream(side)
+    run = once
+    if rows <= 48:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            once()
+        run = graph.replay
     times = []
-    for _ in range(30):
+    for _ in range(40):
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        call(idx)
+        run()
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end) * 1000)
@@ -123,7 +144,7 @@ for name in CONFIGS:
                 if rows <= n:
                     outputs[(name, layer, op, rows)] = [t.clone() for t in call(torch.arange(rows, device=device))]
             print(json.dumps({"timing_us": f"{name} layer {layer} {op}",
-                              **{str(r): timed(call, r, n) for r in TIMED}}), flush=True)
+                              **{str(r): timed(module, c, op, r, n) for r in TIMED}}), flush=True)
     torch.cuda.synchronize()
 
 for (layer, op) in captures:
