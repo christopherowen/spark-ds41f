@@ -2,7 +2,7 @@
 """Where does each operation's arithmetic change with the batch's row count? (GPU; cluster stopped)
 
 usage: transition_map.py FAMILY [FAMILY...]   (cwd: the B12X checkout, vLLM importable, checkpoint at /models)
-       FAMILY: gemv, fp8, mhc, norm, moe, head, head_served, wo, reference   (moe and reference need det-variant2)
+       FAMILY: gemv, fp8, mhc, norm, moe, head, head_served, vocab_served, wo, reference   (moe and reference need det-variant2)
 
 One target row runs alone and as the last (e) or first (s) row of batches of
 M rows (random neighbours), for every M from 1 to 72, the rows on both sides
@@ -718,6 +718,64 @@ def family_head_served():
         transitions(f"lm head nvfp4 r0 {n}x{k} capacity, one row padded to 2", call("capacity", 2), k)
         transitions(f"lm head nvfp4 r0 {n}x{k} capacity, under 16 rows padded to 16", call("capacity", 16), k)
         transitions(f"lm head nvfp4 r0 {n}x{k} production exact regimes to 8 rows", call("production"), k)
+        SIZES = saved
+
+
+VOCAB_CAPS = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 15, 16, 20, 21, 24, 25, 28, 30, 32, 35, 40, 42, 48, 49, 56,
+              72, 96, 192, 384, 768, 1536, 3072, 4091, 4096)
+
+
+def family_vocab_served():
+    """The target model's LM head as served: BF16 weights through vLLM's b12x vocabulary projection.
+
+    LogitsProcessor projects an unquantized head through
+    b12x.gemm.bf16_vocab_projection, one prepared plan per declared logit-row
+    count (serving's set, exact or next larger): a Triton row kernel for one
+    row, torch's F.linear for two or more. Also: the candidate batch-invariant
+    route (a single row padded to two, so every count takes F.linear), and
+    F.linear alone at every count.
+    """
+    from b12x.gemm import bf16_vocab_projection as projection
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    head = bf16("head.weight")
+    vocab = head.shape[0]
+    shard = -(-vocab // 3 // 64) * 64  # rank 0's padded vocabulary rows (43136)
+    weight = torch.zeros((shard, head.shape[1]), dtype=torch.bfloat16, device=device)
+    weight[: min(shard, vocab)] = head[:shard]
+    del head
+    n, k = weight.shape
+    plans = {c: projection.plan(projection.Caps(device=device, max_tokens=c, in_features=k, out_features=n))
+             for c in VOCAB_CAPS}
+
+    def make_call(state):
+        rows = state.query.max_tokens
+        source = torch.empty((rows, k), dtype=torch.bfloat16, device=device)
+        return PreparedCall(run=lambda: state.run(source, weight), produce=lambda: source.normal_(std=0.25),
+                            owners=(weight,))
+
+    with PreparationSession(device=device, autotune=False, compile_workers=2) as session:
+        session.prepare(tuple(p.request(name=f"vocab-{c}", prepare_call=make_call, benchmark_call=make_call)
+                              for c, p in plans.items()))
+        print(json.dumps({"op": "vocab projection", "configs": {str(c): str(p.selection.config)
+                                                                 for c, p in plans.items() if c <= 3}}), flush=True)
+
+        def served(minimum=1):
+            def run(x):
+                rows = x.shape[0]
+                if rows < minimum:
+                    x = torch.cat([x, x[-1:].expand(minimum - rows, -1)])
+                plan = plans[smallest(VOCAB_CAPS, x.shape[0])]
+                return projection.run(projection.bind(plan, source=x.contiguous(), weight=weight))[:rows]
+            return run
+
+        global SIZES
+        saved = SIZES
+        SIZES = [m for m in SIZES if m <= 512] + [1024, 2048, 4095, 4096]
+        transitions(f"lm head bf16 r0 {n}x{k} vocab projection as served", served(), k)
+        transitions(f"lm head bf16 r0 {n}x{k} vocab projection, one row padded to 2", served(2), k)
+        transitions(f"lm head bf16 r0 {n}x{k} F.linear at every count",
+                    lambda x: torch.nn.functional.linear(x, weight), k)
         SIZES = saved
 
 
