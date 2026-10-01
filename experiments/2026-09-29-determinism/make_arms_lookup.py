@@ -105,6 +105,11 @@ detm-r5o-ref4c-b4144-pin aligns chunks to 4096 tokens with a 4144-token budget
 it when alone (the 4000-token alignment adds a short chunk to most prompts);
 detm-r5o-ref4c-b4144-trace8 traces it (wide logs of 4160 rows hold 4144).
 
+ref4d is ref4c with vllm-0044 (16 rows per CTA for the mHC capacity plan) and
+B12X patch 0008 (overlay mhc-mt2, built on the r5o image: the multi-token
+lagged partial kernel): detm-r5o-ref4d-pin, detm-r5o-ref4d-b4144-pin and their
+traces detm-r5o-ref4d-trace8, detm-r5o-ref4d-b4144-trace8.
+
 Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
 is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
 ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
@@ -297,6 +302,17 @@ def with_budget(arm, threshold=4096, budget=4144):
     return arm
 
 
+MHC_MULTI_TOKEN_FILES = tuple(f"norm/mhc/{f}" for f in ("_kernels.py", "_preparation.py", "_tuning.py"))
+
+
+def with_mhc_multi_token(arm, overlay="mhc-mt2"):
+    """arm with B12X's multi-token mHC lagged partial kernels (B12X patch 0008)."""
+    arm = copy.deepcopy(arm)
+    for f in MHC_MULTI_TOKEN_FILES:
+        mount(arm, f"{overlay}/b12x/{f}", f"{B12X}/{f}")
+    return arm
+
+
 def with_gemv_geometry(arm, overlay="gemv-geom"):
     """arm with B12X's TMA prefill GEMV launch geometries (B12X patch 0007; gemv-geom2 on r5o's tree)."""
     arm = copy.deepcopy(arm)
@@ -354,6 +370,10 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       with_reference(detm_variant2_pin, attention=True, ref="ref4c"), "gemv-geom2"))),
                   ("detm-r5o-ref4c-b4144-trace8", with_budget(with_gemv_geometry(
                       reference_trace("attn-exact8", ref="ref4c"), "gemv-geom2"))),
+                  *((f"detm-r5o-ref4d{b}-{kind}", budget(with_mhc_multi_token(with_gemv_geometry(arm, "gemv-geom2"))))
+                    for b, budget in (("", lambda a: a), ("-b4144", with_budget))
+                    for kind, arm in (("pin", with_reference(detm_variant2_pin, attention=True, ref="ref4d")),
+                                      ("trace8", reference_trace("attn-exact8", ref="ref4d")))),
                   ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),

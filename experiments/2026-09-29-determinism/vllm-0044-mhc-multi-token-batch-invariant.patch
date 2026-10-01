@@ -1,0 +1,73 @@
+From 60e7d789a9f5251fc305e08ec4863077c83a3e58 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 16:42:21 +0200
+Subject: [PATCH] perf(deepseek-v4.1): 16 rows per CTA for the batch-invariant
+ mHC capacity plan
+
+Upstream base: vllm-0043 (this series on r5o's tree).
+
+Batch-invariant mode runs mHC pre/post_pre on the lagged native route at
+every capacity (vllm-0039). At prefill sizes that route is slower than the
+default TF32 TMA projection mainly because every CTA reloads its slice of
+the layer's 24x4H FP32 mixing weights for each row: about 2.8 GB of L2
+reads per call at 1334 rows (one rank's share of a 4000-token chunk).
+
+B12X patch 0008 adds tokens_per_cta to MhcConfig and a multi-token partial
+kernel that loads the weight slice once and computes each of its rows with
+exactly the one-row sequence (same per-thread FMA chain, warp reduction and
+in-order warp sum). The capacity plan now uses 16 rows per CTA; the
+graph-size plans keep one.
+
+Quality: none. Captured-input replay (run64, layers 1 and 20, pre and
+post_pre, 1-4000 rows): 4, 8 and 16 rows per CTA are bit-identical to one
+row per CTA and row-invariant at every count. post_pre at 1334 rows:
+1903 -> 1581 us (production TF32 TMA: 1118 us); pre: 1881 -> 1392 us.
+
+Requires B12X patch 0008 (MhcConfig.tokens_per_cta).
+
+Tests: tests/models/test_deepseek_v4_1_mhc_batch_invariant.py.
+Upstream status: local; depends on the local B12X patch.
+---
+ tests/models/test_deepseek_v4_1_mhc_batch_invariant.py | 1 +
+ vllm/models/deepseek_v4_1/b12x_layers.py               | 6 +++++-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+index 09f4e504c..e79dd64e1 100644
+--- a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
++++ b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+@@ -24,6 +24,7 @@ def test_batch_invariant_mode_pins_the_lagged_native_route(monkeypatch):
+         assert config.backend == "native" and config.lagged_prepare
+         assert config.projection_k_splits == 1
+     assert (decode.partials_per_cta, capacity.partials_per_cta) == (4, 13)
++    assert (decode.tokens_per_cta, capacity.tokens_per_cta) == (1, 16)
+ 
+ 
+ def _query(out_features, in_features, out_dtype="float32"):
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index b43ff1680..82e2f6e79 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -764,7 +764,10 @@ def _mhc_batch_invariant_config(tokens: int):
+     computes only groups that work: decode sizes keep the default of four
+     (more CTAs per row); larger capacities compute 13 per CTA, which reads each
+     row's residual streams twice instead of seven times (the fastest grouping
+-    measured at prefill sizes).
++    measured at prefill sizes), and 16 rows per CTA (B12X's multi-token partial
++    kernel), which loads the CTA's slice of the mixing weights once for all 16
++    rather than once per row. Each row still computes exactly the one-row
++    sequence, so neither grouping changes a bit.
+     """
+     if not _BATCH_INVARIANT:
+         return None
+@@ -781,6 +784,7 @@ def _mhc_batch_invariant_config(tokens: int):
+         projection_k_splits=1,
+         lagged_prepare=True,
+         partials_per_cta=4 if tokens < 96 else 13,
++        **({} if tokens < 96 else {"tokens_per_cta": 16}),
+     )
+ 
+ 
+-- 
+2.43.0
+
