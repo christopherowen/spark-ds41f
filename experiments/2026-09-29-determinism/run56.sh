@@ -42,6 +42,7 @@ python3 $E/send_prompt.py http://10.0.1.71:8000 --tokens 3900 | tee "$out/captur
 log "prompt exit $?"
 sleep 5
 docker exec dsv41-karmic-kraken sh -c "rm -f $CAP/arm; ls -la $CAP"
+docker logs dsv41-karmic-kraken 2>&1 | grep "mhc capture probe" | head -8
 rm -rf "$out/captures" && mkdir -p "$out/captures" && cp cache/kkref/mhc-capture/mhc-*.pt "$out/captures/"
 ls "$out/captures"
 stop_all

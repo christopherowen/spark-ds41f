@@ -20,16 +20,27 @@ hook = '''
 # saves one large eager step's mHC inputs and weights per layer and operation.
 _MHC_CAPTURE = os.environ.get("SPARK3_DEBUG_MHC_CAPTURE")
 _MHC_CAPTURED: set = set()
+_MHC_PROBES = 0
 
 
 def _capture_mhc_inputs(layer_name, residual, fn, scale, base, norm, pre,
                         previous_output, previous_post, previous_comb):
     import re
 
-    if torch.cuda.is_current_stream_capturing():
-        return
+    global _MHC_PROBES
     directory, min_rows, max_rows = _MHC_CAPTURE.split(":")
     rows = int(residual.shape[0])
+    if rows >= 64 and _MHC_PROBES < 6:  # what the hook sees, in the container log
+        _MHC_PROBES += 1
+        import sys
+        import torch.distributed as dist
+
+        print(f"SPARK3 mhc capture probe: name={_resolve_layer_name(layer_name)!r} rows={rows} "
+              f"capturing={torch.cuda.is_current_stream_capturing()} "
+              f"arm={os.path.exists(os.path.join(directory, 'arm'))} "
+              f"rank={dist.get_rank() if dist.is_initialized() else None}", file=sys.stderr, flush=True)
+    if torch.cuda.is_current_stream_capturing():
+        return
     if rows < int(min_rows) or not os.path.exists(os.path.join(directory, "arm")):
         return
     import torch.distributed as dist
