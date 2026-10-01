@@ -1449,28 +1449,36 @@ def command_cluster_stop(args: argparse.Namespace) -> int:
         print("plan only; pass --apply to stop the cluster")
         return 0
 
-    failed = False
-    for node in nodes["nodes"]:
+    def stop_node(node: dict) -> tuple[list[str], list[str]]:
+        """Stop one node's memguard and container; return (messages, errors)."""
         guard = stop_memguard(cluster, nodes, node)
         if memguard_is_active(cluster, nodes, node):
             detail = guard.stderr.strip() or "unit remains active"
-            print(f"ERROR: {node['name']}: could not stop memguard: {detail}", file=sys.stderr)
-            failed = True
-            continue
+            return [], [f"{node['name']}: could not stop memguard: {detail}"]
         exists = run_ssh(nodes, node, "docker", "inspect", name)
         if exists.returncode:
-            print(f"{node['name']}: {name} is already absent")
-            continue
+            return [f"{node['name']}: {name} is already absent"], []
         stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
         if stopped.returncode:
-            print(f"ERROR: {node['name']}: {stopped.stderr.strip()}", file=sys.stderr)
-            failed = True
-            continue
+            return [], [f"{node['name']}: {stopped.stderr.strip()}"]
         if args.remove:
             removed = run_ssh(nodes, node, "docker", "rm", name)
             if removed.returncode:
-                print(f"ERROR: {node['name']}: {removed.stderr.strip()}", file=sys.stderr)
-                failed = True
+                return [], [f"{node['name']}: {removed.stderr.strip()}"]
+        return [], []
+
+    if getattr(args, "parallel", False):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
+            outcomes = list(pool.map(stop_node, nodes["nodes"]))
+    else:
+        outcomes = [stop_node(node) for node in nodes["nodes"]]
+    failed = False
+    for messages, errors in outcomes:
+        for message in messages:
+            print(message)
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+            failed = True
     return int(failed)
 
 
@@ -3741,6 +3749,9 @@ def parser() -> argparse.ArgumentParser:
     )
     cluster_stop.add_argument(
         "--apply", action="store_true", help="perform the planned coordinated stop"
+    )
+    cluster_stop.add_argument(
+        "--parallel", action="store_true", help="stop the nodes concurrently instead of in turn"
     )
     cluster_stop.set_defaults(func=command_cluster_stop)
     render = commands.add_parser("render", help="render, but do not execute, one rank launch")

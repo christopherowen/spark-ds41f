@@ -48,6 +48,25 @@ working tree: publish one commit, require clean node checkouts, and detach every
 node at that exact commit. Do not bypass the coordinated start with a one-rank
 launch script.
 
+## Shared cluster windows
+
+The three Sparks serve production and host experiments, and several agents use them.
+Coordinate through `~/spark3-hold.json` on dgx1:
+
+- Before any GPU experiment, benchmark, cluster start, stop, restart or sync, read the
+  hold file. If it exists and you are not its holder, do not act. To ask for the
+  cluster, write `~/spark3-request.json` (who, why, how long); a runner holding a
+  window closes it after its current job.
+- To take the cluster, write the hold file with `holder`, `since`, `expected_end`,
+  `heartbeat` and the rule it imposes, and remove it once production is restored.
+  `scripts/lab.py window open` does this behind the publish and idle guards.
+- A holder refreshes `heartbeat` while it works. The watchdog that
+  `scripts/lab.py` starts with a window restores the promoted service and removes
+  the hold when the heartbeat is more than 15 minutes old.
+
+Inside a window, run jobs back to back without restoring the promoted service in
+between; restore it once, when the window closes. See `docs/lab.md`.
+
 ## Upstream work
 
 Never make durable changes in exported vLLM or B12X trees. Start from the commit in

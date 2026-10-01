@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Single-stream decode over twenty-four distinct prompts, one at a time: speed averaged over texts.
 
-usage: c1_distinct.py BASE_URL [--tokens T] [--rounds R]   (prints one JSON line per request and a summary)
+usage: c1_distinct.py BASE_URL [--tokens T] [--rounds R] [--prompts N]   (prints one JSON line per request and a summary)
 
 A batch-invariant arm writes one text per prompt, so its draft acceptance, and with it its
 tokens per second, is a property of that text; one or two prompts say little about speed.
 Each prompt (fresh cache salt, thinking off, temperature 0, T tokens, ignore_eos) streams alone;
 per request: decode tokens per second from the first to the last token. Summary: mean, the 95%
-interval over requests, and the mean of the per-prompt medians when R > 1.
+interval over requests, and the mean of the per-prompt medians when R > 1. --prompts N takes N of the
+prompts at an even stride (every other one for 12), keeping the mix of prose, code and JSON.
 """
 import json
 import statistics
@@ -50,6 +51,8 @@ PROMPTS = [
     "Describe how to train for a first half marathon over twelve weeks.",
     "Explain gradient descent with a worked numerical example.",
 ]
+COUNT = int(arg("--prompts", str(len(PROMPTS))))
+PROMPTS = PROMPTS[:: max(1, len(PROMPTS) // COUNT)][:COUNT]
 with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     MODEL = json.load(response)["data"][0]["id"]
 
