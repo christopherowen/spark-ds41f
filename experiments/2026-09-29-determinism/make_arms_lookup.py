@@ -55,7 +55,11 @@ arm with it) and detm-r5o-bi-rs-pin (performance). Its second version adds the
 chunks as the RoCE one-shot all-reduce does (float32, rank order, one
 rounding; the first rounded after each BF16 add), so a row matches between
 reduce-scattered and all-reduced steps: overlay gemv-lookup-mhc-bi-fp8-rs2,
-detm-r5o-rs2-trace and detm-r5o-bi-rs2-pin.
+detm-r5o-rs2-trace and detm-r5o-bi-rs2-pin. detm-r5o-rs2-exact4-trace is that
+trace arm with attn-exact4 (debug-attn-exact4.diff on attn-exact3: an explicit
+row offset in every record, sequence-parallel WO output and index weights at
+their rows, raw step labels, a one-time plan inventory) and wide logs of up to
+4160 rows, a full 4096-token chunk with its decode rows.
 """
 import copy
 import json
@@ -153,6 +157,12 @@ mount(r5o_lookup_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
 r5o_lookup_mhc_variant = with_lookup(r5o_pin, "gemv-lookup-mhc")
 mount(r5o_lookup_mhc_variant, "moe-variant/b12x/moe/fused_moe/_preparation.py",
       f"{B12X}/moe/fused_moe/_preparation.py")
+final_wide4 = with_rs(traced(detm_variant2_pin, 1790, overlay="attn-exact4", lookup="gemv-lookup-mhc-bi-fp8"),
+                      "gemv-lookup-mhc-bi-fp8-rs2")
+final_wide4["environment"].update(
+    VLLM_DS41_BATCH_INVARIANT="1", SPARK3_MOE_CHECKSUM_WIDE_ROWS="4160",
+    SPARK3_MOE_CHECKSUM_WIDE_CAPACITY="3072", SPARK3_MOE_CHECKSUM_SCHEDULE_CAPACITY="512",
+)
 for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-lookup-variant-trace", traced(detm_variant_pin, 768)),
                   ("detm-r5o-lookup-variant-probe", probe),
@@ -168,6 +178,7 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-rs-trace", with_rs(final_wide)), ("detm-r5o-bi-rs-pin", with_rs(bi_full_pin)),
                   ("detm-r5o-rs2-trace", with_rs(final_wide, "gemv-lookup-mhc-bi-fp8-rs2")),
                   ("detm-r5o-bi-rs2-pin", with_rs(bi_full_pin, "gemv-lookup-mhc-bi-fp8-rs2")),
+                  ("detm-r5o-rs2-exact4-trace", final_wide4),
                   ("r5o-pin", r5o_pin), ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),

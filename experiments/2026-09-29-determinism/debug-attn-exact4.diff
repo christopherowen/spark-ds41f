@@ -1,0 +1,242 @@
+--- a/checksum_debug.py
++++ b/checksum_debug.py
+@@ -55,7 +55,10 @@
+ _WIDE_ROWS = int(os.environ.get("SPARK3_MOE_CHECKSUM_WIDE_ROWS", "0"))
+ _WIDE_CAPACITY = int(os.environ.get("SPARK3_MOE_CHECKSUM_WIDE_CAPACITY", "4096"))
+ _ROWS = max(_MAX_ROWS, _WIDE_ROWS)  # rows per step in the schedule log
+-_WIDTH = {"runner": lambda m: 2 + 3 * m, "tags": lambda m: 3 + m, "attn": lambda m: 3 + m}
++# Layout 2: every record is (slot, rows, tag, row offset, values...); a record
++# covers the step's rows [offset, offset + rows). Runner records carry tag -2.
++_LAYOUT = 2
++_WIDTH = {"runner": lambda m: 4 + 3 * m, "tags": lambda m: 4 + m, "attn": lambda m: 4 + m}
+ _CAPACITY = {"runner": (_RUNNER_CAPACITY, max(64, _WIDE_CAPACITY // 8)),
+              "tags": (_TAGS_CAPACITY, _WIDE_CAPACITY // 2),
+              "attn": (_ATTN_CAPACITY, _WIDE_CAPACITY)}
+@@ -172,7 +175,8 @@
+     return None, 0
+ 
+ 
+-def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor) -> None:
++def record(owner, x: torch.Tensor, shared: torch.Tensor | None, routed: torch.Tensor,
++           offset: int = 0) -> None:
+     """Append one runner record; call only when ENABLED."""
+     rows = x.shape[0]
+     log, m = _log_for("runner", rows, x.device)
+@@ -183,14 +187,16 @@
+     stage.zero_()
+     stage[0].fill_(slot)
+     stage[1].fill_(rows)
+-    log.row_sums(x, stage[2 : 2 + rows])
++    stage[2].fill_(-2)
++    stage[3].fill_(offset)
++    log.row_sums(x, stage[4 : 4 + rows])
+     if shared is not None:
+-        log.row_sums(shared, stage[2 + m : 2 + m + rows])
+-    log.row_sums(routed, stage[2 + 2 * m : 2 + 2 * m + rows])
++        log.row_sums(shared, stage[4 + m : 4 + m + rows])
++    log.row_sums(routed, stage[4 + 2 * m : 4 + 2 * m + rows])
+     log.append(slot)
+ 
+ 
+-def record_tag(owner, tag: int, x: torch.Tensor) -> None:
++def record_tag(owner, tag: int, x: torch.Tensor, offset: int = 0) -> None:
+     """Append one tagged record (slot, rows, tag, per-row sums); only when ENABLED."""
+     rows = x.shape[0]
+     log, _ = _log_for("tags", rows, x.device)
+@@ -202,12 +208,13 @@
+     stage[0].fill_(slot)
+     stage[1].fill_(rows)
+     stage[2].fill_(tag)
+-    log.row_sums(x, stage[3 : 3 + rows])
++    stage[3].fill_(offset)
++    log.row_sums(x, stage[4 : 4 + rows])
+     log.append(slot)
+ 
+ 
+-def record_attn(owner, tag: int, x: torch.Tensor) -> None:
+-    """Append one attention record (slot, rows, tag, per-row sums); only when ENABLED."""
++def record_attn(owner, tag: int, x: torch.Tensor, offset: int = 0) -> None:
++    """Append one attention record (slot, rows, tag, offset, per-row fingerprints)."""
+     rows = x.shape[0]
+     log, _ = _log_for("attn", rows, x.device)
+     if log is None:
+@@ -218,13 +225,30 @@
+     stage[0].fill_(slot)
+     stage[1].fill_(rows)
+     stage[2].fill_(tag)
+-    log.row_sums(x, stage[3 : 3 + rows])
++    stage[3].fill_(offset)
++    log.row_sums(x, stage[4 : 4 + rows])
+     log.append(slot)
+ 
+ 
+-def record_attn_values(owner, tag: int, values: torch.Tensor) -> None:
+-    """Append one attention record of per-row values (one float each)."""
+-    record_attn(owner, tag, values.reshape(values.shape[0], 1).to(torch.float32))
++def record_attn_values(owner, tag: int, values: torch.Tensor, offset: int = 0) -> None:
++    """Append one attention record of per-row values, stored as they are.
++
++    The values are exact integers below 2**24 in float32 (index sums modulo the
++    prime, lengths, step labels), so they compare as exactly as fingerprints.
++    """
++    rows = values.shape[0]
++    log, _ = _log_for("attn", rows, values.device)
++    if log is None:
++        return
++    slot = log.slot(owner)
++    stage = log.stage[slot]
++    stage.zero_()
++    stage[0].fill_(slot)
++    stage[1].fill_(rows)
++    stage[2].fill_(tag)
++    stage[3].fill_(offset)
++    stage[4 : 4 + rows].copy_(values.reshape(rows))
++    log.append(slot)
+ 
+ 
+ def record_indices(owner, indices: torch.Tensor, lengths: torch.Tensor) -> None:
+@@ -369,6 +393,80 @@
+         json.dump(out, f, indent=1)
+ 
+ 
++def _describe_plan(plan, depth: int = 0):
++    """A prepared plan's selected configuration (or its variants', for the MoE)."""
++    selection = getattr(plan, "selection", None)
++    config = getattr(selection, "config", None) if selection is not None else None
++    if config is not None:
++        return str(config)[:400]
++    variants = getattr(plan, "variants", None)
++    if isinstance(variants, dict) and depth < 2:
++        return {str(k): _describe_plan(v, depth + 1) for k, v in sorted(variants.items(), key=lambda kv: str(kv[0]))}
++    return type(plan).__name__
++
++
++def _dump_inventory(rank: int) -> None:
++    """Once per process: every live object's prepared plans by capacity, with configs.
++
++    Walks the heap for objects whose attributes hold plans (anything named
++    *plan* that carries a selection or variants), so each linear, mHC, MoE,
++    WO, attention, indexer and LM-head plan set is listed with the capacities
++    it was prepared for. The transition map starts here.
++    """
++    path = os.path.join(DIRECTORY, f"inventory-rank{rank}.json")
++    if os.path.exists(path):
++        return
++    import gc
++    import json
++
++    out = {}
++    for o in gc.get_objects():
++        try:
++            state = o.__dict__ if not isinstance(o, type) else None
++        except Exception:
++            continue
++        if not isinstance(state, dict):
++            continue
++        entry = {}
++        for attr, value in list(state.items()):
++            if "plan" not in attr.lower():
++                continue
++            try:
++                if isinstance(value, dict):
++                    items = list(value.items())
++                elif isinstance(value, (list, tuple)):
++                    items = list(enumerate(value))
++                else:
++                    items = [(None, value)]
++                described = {}
++                for key, item in items:
++                    if hasattr(item, "selection") or hasattr(item, "variants"):
++                        described[str(key)] = _describe_plan(item)
++                if described:
++                    entry[attr] = described.get("None", described) if list(described) == ["None"] else described
++            except Exception:
++                continue
++        if not entry:
++            continue
++        for extra in ("b12x_capacities", "b12x_linear_capacities", "_projection_capacities"):
++            value = state.get(extra)
++            if value is not None:
++                try:
++                    entry[extra] = sorted(value) if not isinstance(value, (list, tuple)) else list(value)
++                except Exception:
++                    pass
++        try:
++            name = _name(o)
++        except Exception:
++            name = ""
++        key = f"{type(o).__name__} {name}"
++        if key in out:
++            key = f"{key} #{id(o)}"
++        out[key] = entry
++    with open(path, "w") as f:
++        json.dump(out, f, indent=1, default=str)
++
++
+ _schedule_host: list[dict] = []
+ _step = [0]
+ 
+@@ -410,14 +508,13 @@
+     log.append(0)
+     sizes = (_MAX_ROWS, _WIDE_ROWS) if _WIDE_ROWS > _MAX_ROWS else (_MAX_ROWS,)
+     for name, rows in ((n, r) for r in sizes for n in ("runner", "tags", "attn")):
+-        step_col = 2 if name == "runner" else 3
++        step_col = 3
+         marker_log, _ = _log_for(name, rows, device)
+         mark = marker_log.stage[_SLOTS - 1]
+         mark.zero_()
+         mark[0].fill_(_MARKER)
+         mark[1].fill_(padded)
+-        if name != "runner":
+-            mark[2].fill_(_MARKER)
++        mark[2].fill_(_MARKER)
+         mark[step_col].fill_(step)
+         marker_log.append(_SLOTS - 1)
+     _schedule_host.append({"step": step, "req_ids": [str(r) for r in req_ids],
+@@ -521,7 +618,7 @@
+                         rows = log.rows[: min(count, log.capacity)].cpu()
+                         torch.save(
+                             {"count": count, "capacity": log.capacity, "rows": rows,
+-                             "names": list(log.names), "max_rows": log.max_rows,
++                             "names": list(log.names), "max_rows": log.max_rows, "layout": _LAYOUT,
+                              "schedule_reqs": _SCHEDULE_REQS},
+                             os.path.join(DIRECTORY, f"rank{rank}-{log.name}-{count}.pt"),
+                         )
+@@ -534,6 +631,10 @@
+                         _dump_plans(rank)
+                     except Exception as error:  # never block the schedule dump
+                         print(f"checksum_debug plan dump failed: {error!r}", flush=True)
++                    try:
++                        _dump_inventory(rank)
++                    except Exception as error:
++                        print(f"checksum_debug inventory dump failed: {error!r}", flush=True)
+                 if kind == "dump" and "schedule" in _logs:
+                     import json
+ 
+--- a/attention.py
++++ b/attention.py
+@@ -1430,7 +1430,13 @@
+             checksum_debug.record_attn(self, 21, output)
+         out = self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
+         if checksum_debug.ENABLED:
+-            checksum_debug.record_attn(self, 22, out)
++            # Under prefill SP, WO returns this rank's rows after the reduce-scatter.
++            checksum_debug.record_attn(self, 22, out, sp_rows.start if sp_rows is not None else 0)
++            if not torch.cuda.is_current_stream_capturing():
++                checksum_debug.record_attn_values(self, 32, torch.tensor(
++                    [float(sp_rows is not None), float(sp_rows.start if sp_rows else 0),
++                     float(sp_rows.local_rows if sp_rows else 0)],
++                    dtype=torch.float32, device=out.device))
+         return out
+ 
+     def _probe_query_projection(self, qr):
+@@ -1496,7 +1502,8 @@
+             plan=self._helper_plan("index_weights"),
+         )
+         if checksum_debug.ENABLED:
+-            checksum_debug.record_attn(self, 16, iw)
++            # Under an SP indexer split these are this rank's rows [first, last).
++            checksum_debug.record_attn(self, 16, iw, first)
+         return iq_data, iq_scale, iw
+ 
+     @staticmethod
