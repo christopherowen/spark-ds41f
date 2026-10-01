@@ -1,0 +1,55 @@
+From d45fb83606c2eda94d585492f9f57327f15cea88 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 00:24:16 +0200
+Subject: [PATCH] perf(ds41): opt-in batch-invariant mHC on the sequential
+ partial kernel
+
+VLLM_DS41_MHC_SEQUENTIAL=1 selects B12X's sequential_partials route for
+every batch-invariant mHC capacity: one FP32 chain per partial sum and
+residual stream over each 128-wide hidden tile, streams added in order,
+up to eight rows per CTA sharing the mixing-weight reads.
+---
+ vllm/models/deepseek_v4_1/b12x_layers.py | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 82e2f6e79..43be43776 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -220,6 +220,8 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
+ # count (cuBLAS through the torch backend) on the SIMT GEMV instead, so a row
+ # rounds the same whatever it is batched with. Off unless set.
+ _BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++# Batch-invariant mHC on B12X's sequential partial kernel (sequential_partials).
++_MHC_SEQUENTIAL = os.environ.get("VLLM_DS41_MHC_SEQUENTIAL") == "1"
+ 
+ 
+ def _gemv_override(query):
+@@ -773,6 +775,24 @@ def _mhc_batch_invariant_config(tokens: int):
+         return None
+     from b12x.norm.mhc._tuning import MhcConfig
+ 
++    if _MHC_SEQUENTIAL:
++        # Each partial sum is one thread's FP32 chain over a 128-wide hidden tile, with
++        # the four residual streams added in order, at every capacity. Up to eight rows
++        # per CTA only share the mixing-weight reads, so they leave every bit unchanged.
++        return MhcConfig(
++            backend="native",
++            projection_tile_m=16,
++            projection_tile_n=8,
++            projection_tile_k=256,
++            projection_num_stages=1,
++            projection_num_m_warps=1,
++            projection_num_n_warps=1,
++            projection_k_splits=1,
++            lagged_prepare=True,
++            partials_per_cta=4,
++            tokens_per_cta=min(8, int(tokens)),
++            sequential_partials=True,
++        )
+     return MhcConfig(
+         backend="native",
+         projection_tile_m=16,
+-- 
+2.43.0
+

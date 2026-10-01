@@ -1,0 +1,47 @@
+{
+  "description": "Sequential mHC partial sums (overlay mhc-seq on mhc-mt2): row invariance at 1-4000 rows, every tokens-per-CTA setting bit-equal to one per CTA, numerics against production and the native candidate, timings.",
+  "image": "vllm-ds41f-kkref:04c30fa98e79-r5o",
+  "env": {
+    "CUTE_DSL_ARCH": "sm_121a",
+    "B12X_DENSE_SPLITK_TURBO": "0",
+    "B12X_W4A8_TINY_DECODE": "0",
+    "B12X_AUTOTUNE": "0",
+    "B12X_CUTE_COMPILE_CACHE_DIR": "/c/cute",
+    "CUTE_DSL_CACHE_DIR": "/c/cutedsl",
+    "B12X_COMPILE_CACHE_DIR": "/c/b12x",
+    "MHC_REPLAY_SET": "seq",
+    "MHC_REPLAY_KERNEL_ROWS": "1,2,4,8,16,24,32,48,256,1334"
+  },
+  "mounts": [
+    [
+      "experiments/2026-09-29-determinism",
+      "/r"
+    ],
+    [
+      "harness",
+      "/h"
+    ],
+    [
+      "results/private/determinism/mhc/captures",
+      "/cap"
+    ],
+    [
+      "~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+      "/models"
+    ],
+    [
+      "~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs",
+      "/blobs"
+    ]
+  ],
+  "sync": [
+    "results/private/determinism/mhc/captures"
+  ],
+  "argv": [
+    "/h/mhc_seq_replay.py",
+    "/cap"
+  ],
+  "variant_configs": [
+    "production"
+  ]
+}

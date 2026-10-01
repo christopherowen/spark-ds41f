@@ -114,6 +114,15 @@ The -b2 arms (r5o-pin-b2, detm-r5o-ref4d-b4144-pin-b2, detm-r5o-ref4e-s40-b4144-
 overlay boot2 (vllm-0048: each boot logs its measured DSpark step costs, 3 timed rounds), a
 fixed-shape step-cost comparison between arms.
 
+ref4f is ref4d whose batch-invariant mHC takes B12X's sequential partial kernel at every
+capacity (vllm-0049, overlay ref4f, with VLLM_DS41_MHC_SEQUENTIAL=1; overlay mhc-seq, built on
+mhc-mt2 by make_overlay_mhcseq.py): each partial sum is one thread's FP32 chain over a 128-wide
+hidden tile, the four residual streams added in order, up to eight rows per CTA sharing the
+weight reads; above eight rows the row's finalize runs once in one 256-thread CTA. Kernel lab
+(bundle mhc-seq, 2026-10-01): row-invariant, bit-equal at every tokens-per-CTA setting, faster
+than production's mHC from 4 rows up (2.8x at 48 rows, 12% at 1,334), 1.6 us slower at one
+row: detm-r5o-ref4f-b4144-pin-b2 and its trace detm-r5o-ref4f-b4144-trace8.
+
 r5o-pin-boot is r5o-pin with the boot-time patches vllm-0046 and vllm-0047 (overlay boot1):
 same serving arithmetic, about 20 s less boot (development-cycle plan, 2026-10-01).
 
@@ -434,6 +443,14 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       with_gemv_geometry(with_reference(detm_variant2_pin, attention=True, ref="ref4e"),
                                          "gemv-geom2"))), "boot2"), SPARK3_DSPARK_PINNED_ROUNDS="3",
                       VLLM_DS41_MHC_TF32_SPLITS="40")),
+                  ("detm-r5o-ref4f-b4144-pin-b2", with_env(with_overlay_file(with_boot_patches(with_budget(
+                      with_mhc_multi_token(with_gemv_geometry(
+                          with_reference(detm_variant2_pin, attention=True, ref="ref4d"), "gemv-geom2"), "mhc-seq")),
+                      "boot2"), "ref4f", "models/deepseek_v4_1/b12x_layers.py"),
+                      SPARK3_DSPARK_PINNED_ROUNDS="3", VLLM_DS41_MHC_SEQUENTIAL="1")),
+                  ("detm-r5o-ref4f-b4144-trace8", with_env(with_overlay_file(with_budget(with_mhc_multi_token(
+                      with_gemv_geometry(reference_trace("attn-exact8", ref="ref4d"), "gemv-geom2"), "mhc-seq")),
+                      "ref4f", "models/deepseek_v4_1/b12x_layers.py"), VLLM_DS41_MHC_SEQUENTIAL="1")),
                   ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
