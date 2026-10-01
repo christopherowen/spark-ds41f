@@ -76,6 +76,11 @@ vocabulary projection on one F.linear kernel for every logit-row count):
 detm-r5o-ref2-pin (performance) and detm-r5o-ref2-trace6 (attn-exact6).
 r5o-pin-prof and detm-r5o-ref2-pin-prof add the torch profiler (kernel timings
 of captured workloads: profile_decode.py, profile_c8.py, profile_prefill.py).
+
+Cost recovery candidates stay separate from the frozen ref2: detm-r5o-ref2-mhccap
+is ref2 with the mHC input capture (overlay mhc-capture); detm-r5o-ref3m-pin is
+ref2 with vllm-0039 in place of 0033 (overlay ref3m: every mHC pre/post_pre
+capacity on the lagged native route).
 """
 import copy
 import json
@@ -234,6 +239,23 @@ def profiled(arm, name):
     return arm
 
 
+def with_overlay_file(arm, overlay, f):
+    """arm with one vLLM file replaced by overlay/vllm/f."""
+    arm = copy.deepcopy(arm)
+    target = f"{VLLM}/{f}"
+    arm["container"]["mounts"] = [m for m in arm["container"]["mounts"] if m[1] != target]
+    mount(arm, f"{overlay}/vllm/{f}", target)
+    return arm
+
+
+ref2_pin = with_reference(detm_variant2_pin, attention=True, ref="ref2")
+mhc_capture = copy.deepcopy(ref2_pin)
+mhc_capture["container"]["mounts"] = [m for m in mhc_capture["container"]["mounts"]
+                                      if m[1] != f"{VLLM}/models/deepseek_v4_1/b12x_layers.py"]
+mount(mhc_capture, "mhc-capture/b12x_layers.py", f"{VLLM}/models/deepseek_v4_1/b12x_layers.py")
+mhc_capture["environment"]["SPARK3_DEBUG_MHC_CAPTURE"] = "/cache/kkref/mhc-capture:512:2048"
+
+
 def reference_trace(overlay, ref="ref1"):
     arm = with_reference(traced(detm_variant2_pin, 1790, overlay=overlay, lookup=ref), attention=False, ref=ref)
     mount(arm, f"{overlay}/model41.py", f"{VLLM}/models/deepseek_v4_1/nvidia/model.py")
@@ -266,6 +288,8 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                   ("detm-r5o-ref2-pin", with_reference(detm_variant2_pin, attention=True, ref="ref2")),
                   ("detm-r5o-ref2-trace6", reference_trace("attn-exact6", ref="ref2")),
                   ("r5o-pin-prof", profiled(r5o_pin, "r5o-pin-prof")),
+                  ("detm-r5o-ref2-mhccap", mhc_capture),
+                  ("detm-r5o-ref3m-pin", with_overlay_file(ref2_pin, "ref3m", "models/deepseek_v4_1/b12x_layers.py")),
                   ("detm-r5o-ref2-pin-prof", profiled(with_reference(detm_variant2_pin, attention=True, ref="ref2"),
                                                       "detm-r5o-ref2-pin-prof")),
                   *((f"detm-r5o-ref-{k}-pin", v) for k, v in attribution.items()),
