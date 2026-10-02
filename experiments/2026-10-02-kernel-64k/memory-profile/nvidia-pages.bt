@@ -23,6 +23,7 @@ kretprobe:nv_alloc_system_pages, kretprobe:nv_alloc_contig_pages /@pending[tid]/
         @live_bytes[@callstack[$at], $requested] = sum((int64)$actual);
         @live_count[@callstack[$at], $requested] = sum(1);
         @allocated_bytes = sum($actual);
+        @outstanding_bytes = sum((int64)$actual);
         @allocated_count = count();
         @rounding_bytes = sum($actual - $requested);
     } else { @allocation_failures = count(); delete(@callstack[$at]); }
@@ -33,9 +34,11 @@ kprobe:nv_free_system_pages, kprobe:nv_free_contig_pages /@bytes[arg0]/ {
     @live_bytes[@callstack[$at], @requested[$at]] = sum(-((int64)@bytes[$at]));
     @live_count[@callstack[$at], @requested[$at]] = sum(-1);
     @freed_bytes = sum(@bytes[$at]);
+    @outstanding_bytes = sum(-((int64)@bytes[$at]));
     delete(@bytes[$at]); delete(@requested[$at]); delete(@callstack[$at]);
 }
 BEGIN { printf("READY page_size=%d\n", $1); }
+interval:s:1 { printf("LIVE t=%llu bytes=%lld\n", elapsed / 1000000000, @outstanding_bytes); }
 END {
     clear(@creating); clear(@pending); clear(@bytes); clear(@requested); clear(@callstack);
 }

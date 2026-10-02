@@ -24,3 +24,9 @@ This profiling adds overhead. Never use an instrumented startup or workload as
 a throughput comparison. Timing tests must run without the probes and with the
 same pinned draft-verification cost table on each boot. No model/dtype/KV budget
 change is part of this experiment.
+
+`cluster-pinned.json` differs from r5o only by a read-only cost-table mount and
+`SPARK3_DSPARK_COST_DIR`. The two cost files are snapshotted from the existing
+r5o experiment table on dgx1; their tracked bytes are identical across arms.
+Trace NVIDIA allocations on dgx3, avoiding extra head-node memory pressure;
+collect process/kernel inventories on every node.
