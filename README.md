@@ -3,6 +3,11 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric.
 
+The deployment tools also generate and validate a
+[four-node switchless ring profile](docs/switchless-topology.md), using NCCL
+neighbour collectives. That profile awaits four-node hardware qualification;
+the promoted configuration below remains the measured three-node deployment.
+
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
 complete, files are explicit about whether they describe observed state, desired

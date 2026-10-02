@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 import kernel_readiness
+import topology
 
 
 
@@ -60,11 +61,17 @@ def configuration(
     args: argparse.Namespace | None = None,
 ) -> tuple[dict, dict, dict]:
     cluster_path, _ = cluster_config_path(args)
-    return (
-        json.loads(cluster_path.read_text(encoding="utf-8")),
-        read_json("config/nodes.json"),
-        read_json("upstreams.lock.json"),
-    )
+    cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
+    nodes_path = repository_config_path(cluster.get("nodes_config", "config/nodes.json"))
+    return cluster, json.loads(nodes_path.read_text()), read_json("upstreams.lock.json")
+
+
+def repository_config_path(raw: str) -> Path:
+    path = Path(raw)
+    resolved = (ROOT / path).resolve()
+    if path.is_absolute() or not resolved.is_relative_to(ROOT.resolve()):
+        raise SystemExit("configuration paths must remain relative to the repository root")
+    return resolved
 
 
 def node_by_name(nodes: dict, name: str) -> dict:
@@ -75,12 +82,7 @@ def node_by_name(nodes: dict, name: str) -> dict:
 
 
 def expected_environment(cluster: dict, node: dict) -> dict[str, str]:
-    env = {key: str(value) for key, value in cluster["environment"].items()}
-    env["VLLM_HOST_IP"] = node["management_ip"]
-    env["B12X_ROCE_PEER_HCAS"] = json.dumps(
-        node["roce_peer_hcas"], separators=(",", ":")
-    )
-    return env
+    return topology.node_environment(cluster, node)
 
 
 def expected_command(cluster: dict, node: dict) -> list[str]:
@@ -240,13 +242,7 @@ class Warn(str):
 
 
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
-    problems: list[str] = []
-    node_list = nodes.get("nodes", [])
-    ranks = sorted(node.get("rank") for node in node_list)
-    if ranks != [0, 1, 2]:
-        problems.append(f"node ranks must be [0, 1, 2], got {ranks}")
-    if sum(bool(node.get("head")) for node in node_list) != 1:
-        problems.append("exactly one node must be the API head")
+    problems: list[str] = topology.problems(cluster, nodes)
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
     host = cluster.get("host", {})
@@ -654,7 +650,8 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
     """The GID index B12X and NCCL are configured to use, and the node's HCAs."""
     env = expected_environment(cluster, node)
-    index = int(env.get("B12X_ROCE_GID_INDEX") or env.get("NCCL_IB_GID_INDEX") or 3)
+    key = "NCCL_IB_GID_INDEX" if topology.transport(cluster) == "nccl-ring" else "B12X_ROCE_GID_INDEX"
+    index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
     hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
     return index, hcas
 
@@ -793,6 +790,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+        problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
             problems.append(f"{node['name']}: cannot inspect {name}: {result.stderr.strip()}")
@@ -866,10 +864,60 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     cluster, nodes, upstreams = configuration(args)
     findings = local_doctor(cluster, nodes, upstreams)
-    if args.live:
+    if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
     problems, warnings = split_findings(findings)
     return report_doctor(problems, warnings, args.live)
+
+
+def command_topology_create(args: argparse.Namespace) -> int:
+    cluster, _, _ = configuration(args)
+    nodes_path = repository_config_path(args.nodes_config)
+    output = repository_config_path(args.output)
+    nodes = json.loads(nodes_path.read_text())
+    try:
+        candidate = topology.candidate(cluster, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
+    except (ValueError, StopIteration) as error:
+        raise SystemExit(f"invalid topology: {error}") from error
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # A new candidate must never overwrite the promoted config or another run.
+    with output.open("x") as handle:
+        json.dump(candidate, handle, indent=2)
+        handle.write("\n")
+    print(f"created {output.relative_to(ROOT.resolve())} ({len(nodes['nodes'])} nodes, "
+          f"{topology.transport(candidate)}, launch disabled)")
+    return 0
+
+
+def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) -> list[str]:
+    env = expected_environment(cluster, node)
+    env.update(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,GRAPH,NET")
+    command = ["docker", "run", "--rm", "--name=spark3-collective-probe",
+               "--network=host", "--gpus=all", "--memory=4g", "--memory-swap=4g",
+               "--device=/dev/infiniband:/dev/infiniband:rwm", "--cap-add=IPC_LOCK",
+               "--ulimit=memlock=-1:-1", "--shm-size=256m",
+               "--entrypoint=/usr/bin/timeout"]
+    for key, value in sorted(env.items()):
+        command.extend(["--env", f"{key}={value}"])
+    command.extend(["--volume", f"{repository_path(cluster)}/scripts/probe_collectives.py:/probe.py:ro",
+                    cluster["container"]["image"], "--signal=TERM", "--kill-after=10s", "180s",
+                    "python3", "/probe.py", "--rank", str(node["rank"]),
+                    "--world-size", str(len(nodes["nodes"])), "--master-addr",
+                    cluster["distributed"]["master_addr"], "--master-port", str(port)])
+    return command
+
+
+def command_topology_probe(args: argparse.Namespace) -> int:
+    cluster, nodes, upstreams = configuration(args)
+    errors, warnings = split_findings(local_doctor(cluster, nodes, upstreams))
+    if errors:
+        return report_doctor(errors, warnings, False)
+    if not 1 <= args.master_port <= 65535 or str(args.master_port) == str(cluster["distributed"]["master_port"]):
+        raise SystemExit("probe port must be valid and different from the serving rendezvous port")
+    node = node_by_name(nodes, args.node)
+    print("# Plan only. Run on this node during a coordinated window with serving stopped.")
+    print(shlex.join(collective_probe_command(cluster, nodes, node, args.master_port)))
+    return 0
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -1033,6 +1081,7 @@ def node_runtime_problems(
     gid_index, hcas = roce_gid_setting(cluster, node)
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
     problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+    problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
     doctor = run_ssh(
         nodes,
         node,
@@ -3527,6 +3576,9 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
     identity = {
         "cluster_config": config_name,
         "cluster_config_sha256": sha256(config_path),
+        "nodes_config": cluster.get("nodes_config", "config/nodes.json"),
+        "topology": nodes,
+        "transport": topology.transport(cluster),
         "promoted_baseline": cluster.get("promoted_baseline"),
         "image": cluster["container"]["image"],
         "client_commit": repository_revision(),
@@ -3812,10 +3864,20 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="validate repository and optional live state")
     doctor.add_argument("--live", action="store_true")
     doctor.set_defaults(func=command_doctor)
-    status = commands.add_parser("status", help="show the three live containers")
+    fabric = commands.add_parser("topology", help="prepare a three- or four-node switchless configuration")
+    fabric_commands = fabric.add_subparsers(dest="topology_command", required=True)
+    create = fabric_commands.add_parser("create", help="write a launch-disabled candidate from this profile and a node map")
+    create.add_argument("--nodes-config", required=True, help="repository-relative node map in cable/rank order")
+    create.add_argument("--output", required=True, help="new repository-relative candidate path")
+    create.set_defaults(func=command_topology_create)
+    probe = fabric_commands.add_parser("probe", help="print a bounded, model-free collective probe command for one node")
+    probe.add_argument("node")
+    probe.add_argument("--master-port", type=int, default=29999)
+    probe.set_defaults(func=command_topology_probe)
+    status = commands.add_parser("status", help="show configured live containers")
     status.set_defaults(func=command_status)
     cluster = commands.add_parser(
-        "cluster", help="plan or apply coordinated three-node operations"
+        "cluster", help="plan or apply coordinated node operations"
     )
     cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
     cluster_sync = cluster_commands.add_parser(
@@ -3850,7 +3912,7 @@ def parser() -> argparse.ArgumentParser:
     )
     cluster_stop.set_defaults(func=command_cluster_stop)
     render = commands.add_parser("render", help="render, but do not execute, one rank launch")
-    render.add_argument("node", choices=("dgx1", "dgx2", "dgx3"))
+    render.add_argument("node", help="node name from the selected profile's node map")
     render.set_defaults(func=command_render)
     upstream = commands.add_parser("upstream", help="inspect or prepare pinned upstreams")
     upstream_commands = upstream.add_subparsers(dest="upstream_command", required=True)

@@ -8,7 +8,8 @@ the open levers, measured dead ends, and the lean screening routine.
 ## Sources of truth
 
 - `config/cluster.json` is the promoted runtime configuration.
-- `config/nodes.json` is the promoted site topology.
+- `config/cluster.json` selects the promoted site topology through `nodes_config`
+  (default: `config/nodes.json`). Candidate profiles may select a separate map.
 - `upstreams.lock.json` owns every external source URL and revision.
 - `requirements/` owns hashed non-Git build inputs.
 - `patches/*/series` owns the ordered local patch stacks.
@@ -38,9 +39,11 @@ Change one causal variable at a time unless the experiment explicitly tests an
 interaction. A candidate is promoted only when the owner accepts it and the same
 commit updates configuration, documentation, and a new immutable baseline.
 
-Never start, stop, replace, or restart the three-rank service without explicit
+Never start, stop, replace, or restart the serving cluster without explicit
 authorization for that operation. A coordinated runtime change must cover all
-three nodes; mixed rank state is invalid.
+configured nodes; mixed rank state is invalid. See `docs/switchless-topology.md`
+for three-node direct-peer and four-node neighbour-ring profiles. A new topology
+needs its own hardware qualification before promotion.
 
 Use `bin/spark3 cluster sync`, `start`, and `stop` for node operations. They are
 plans unless `--apply` is supplied. Never deploy with rsync or copy a dirty
