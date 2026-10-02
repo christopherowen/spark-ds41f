@@ -33,6 +33,10 @@ differences into this repository.
 
 ## Change discipline
 
+Use neutral task names for branches, commits, pull requests and documentation.
+Do not add agent or tool attribution, including branch prefixes or commit trailers.
+Preserve required third-party license notices.
+
 Create `experiments/YYYY-MM-DD-short-name/` for performance work. Record the base
 commit, one intended variable, exact commands, workload identity, all runs, errors,
 memory observations, and a conclusion. Do not discard an unfavorable run.
