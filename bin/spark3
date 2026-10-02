@@ -3458,13 +3458,13 @@ def suite_prefix(bench: Bench, options: argparse.Namespace, rng: random.Random) 
 
 def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
     """Four concurrent long contexts must all be admitted without preemption."""
-    tokens = min(options.admission_tokens, options.max_model_len - 1024)
+    tokens = min(options.admission_tokens, options.max_model_len - options.admission_output_tokens - 1024)
     payloads = [
         chat_payload(
             options.model,
             filler(int(tokens * 0.97), rng.randrange(1 << 30))
             + "\n\nWrite a 400-word story that uses words from the document above.",
-            256,
+            options.admission_output_tokens,
             temperature=0,
             seed=42,
             chat_template_kwargs={"thinking": False},
@@ -3473,6 +3473,8 @@ def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Rando
     ]
     for _, payload in payloads:
         payload["cache_salt"] = uuid.uuid4().hex
+        if options.admission_force_length:
+            payload.update(min_tokens=options.admission_output_tokens, ignore_eos=True)
     result = bench.run("admission 4 x %d" % tokens, payloads)
     requests = result["requests"]
     ok = [request for request in requests if request["ok"]]
@@ -3484,6 +3486,8 @@ def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Rando
     print(f"  admission: {'pass' if admitted else 'FAIL'}; peak KV {result['peak']['kv_cache_usage']:.0%}", flush=True)
     return {
         "context_tokens": tokens,
+        "output_tokens": options.admission_output_tokens,
+        "force_output_length": options.admission_force_length,
         "ok": admitted,
         "preemptions": result["metrics"]["num_preemptions"],
         "peak_running": result["peak"]["running"],
@@ -3657,6 +3661,8 @@ def command_bench(args: argparse.Namespace) -> int:
         raise SystemExit(f"unknown decode cases: {', '.join(unknown_cases)}")
     if args.min_samples < 2 or args.max_samples < args.min_samples:
         raise SystemExit("--min-samples must be at least 2 and no more than --max-samples")
+    if args.admission_output_tokens < 1 or args.admission_output_tokens + 1024 >= args.max_model_len:
+        raise SystemExit("--admission-output-tokens must be positive and leave room for the prompt")
     floor_gib = float(cluster["host"]["memguard_gib"]) + 1
 
     reference_path = None
@@ -3712,6 +3718,8 @@ def command_bench(args: argparse.Namespace) -> int:
             "prefill_repeats": args.prefill_repeats,
             "prefix_tokens": args.prefix_tokens,
             "admission_tokens": args.admission_tokens,
+            "admission_output_tokens": args.admission_output_tokens,
+            "admission_force_length": args.admission_force_length,
             "memory_floor_gib": floor_gib,
             "prompts_sha256": hashlib.sha256(
                 json.dumps([DECODE_PROMPTS, SAMPLED_PROMPTS, LRU_PROMPT], sort_keys=True).encode()
@@ -3927,6 +3935,10 @@ def parser() -> argparse.ArgumentParser:
     bench.add_argument("--prefill-repeats", type=int, default=3)
     bench.add_argument("--prefix-tokens", type=int, default=32768)
     bench.add_argument("--admission-tokens", type=int, default=65536)
+    bench.add_argument("--admission-output-tokens", type=int, default=256,
+                       help="output budget per admission request; increase for overlapping long prefills")
+    bench.add_argument("--admission-force-length", action="store_true",
+                       help="force the full admission output budget to keep long contexts active together")
     bench.add_argument(
         "--tolerance",
         type=float,

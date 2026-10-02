@@ -144,6 +144,44 @@ class ParsingTest(unittest.TestCase):
         self.assertIn("signature", spark3.assess_lru(wrong))
 
 
+class AdmissionPayloadTest(unittest.TestCase):
+    def capture(self, forced):
+        class Captured(Exception):
+            pass
+
+        class Bench:
+            def run(self, label, payloads):
+                self.label, self.payloads = label, payloads
+                raise Captured
+
+        bench = Bench()
+        options = spark3.argparse.Namespace(
+            model="m", admission_tokens=4000, max_model_len=4096,
+            admission_output_tokens=1024, admission_force_length=forced,
+        )
+        with self.assertRaises(Captured):
+            spark3.suite_admission(bench, options, spark3.random.Random(42))
+        self.assertEqual(bench.label, "admission 4 x 2048")
+        self.assertEqual(len(bench.payloads), 4)
+        self.assertEqual(len({p["cache_salt"] for _, p in bench.payloads}), 4)
+        return [p for _, p in bench.payloads]
+
+    def test_sustained_admission_reserves_output_and_keeps_requests_alive(self):
+        for payload in self.capture(True):
+            self.assertEqual(payload["max_tokens"], 1024)
+            self.assertEqual(payload["min_tokens"], 1024)
+            self.assertTrue(payload["ignore_eos"])
+
+    def test_ordinary_admission_allows_natural_stop(self):
+        for payload in self.capture(False):
+            self.assertEqual(payload["max_tokens"], 1024)
+            self.assertNotIn("min_tokens", payload)
+            self.assertNotIn("ignore_eos", payload)
+        options = spark3.parser().parse_args(["bench"])
+        self.assertEqual(options.admission_output_tokens, 256)
+        self.assertFalse(options.admission_force_length)
+
+
 class StreamTest(unittest.TestCase):
     def serve(self, events: list[dict]) -> str:
         body = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"

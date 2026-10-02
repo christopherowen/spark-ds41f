@@ -14,11 +14,11 @@ NEW = POLICY["candidate"]
 
 
 def menu(uuid="node-a", default=None):
-    old_id = f"gnulinux-advanced-{uuid}>gnulinux-{OLD}-advanced-{uuid}"
+    default_id = f"gnulinux-advanced-{uuid}>gnulinux-{POLICY['default']}-advanced-{uuid}"
     return f'''if [ "${{next_entry}}" ]; then
  set default="${{next_entry}}"
 else
- set default="{old_id if default is None else default}"
+ set default="{default_id if default is None else default}"
 fi
 submenu 'Advanced options' $menuentry_id_option 'gnulinux-advanced-{uuid}' {{
  menuentry 'old' $menuentry_id_option 'gnulinux-{OLD}-advanced-{uuid}' {{

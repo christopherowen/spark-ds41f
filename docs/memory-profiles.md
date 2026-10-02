@@ -12,6 +12,13 @@ The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV
 capacity and admission are measured at startup and under load.
 
+For simultaneous long-context admission checks, use
+`bench --admission-tokens 500000 --admission-output-tokens 4096 --admission-force-length`.
+The forced output budget keeps early requests active while later requests
+prefill. With the usual 256-token replies, an early request can finish before
+all four long prompts are admitted, leaving the overlap check inconclusive.
+The report records the output budget and whether generation was forced.
+
 The 64 KiB allocation spends 1.3 GiB of the previously measured 1.78–1.86 GiB
 memory gain, retaining 0.48–0.56 GiB for additional workspace and variation.
 The checkpoint's native limit is 1,048,576 tokens. This profile increases the
