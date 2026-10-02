@@ -1,0 +1,19 @@
+from concurrent.futures import ThreadPoolExecutor,wait
+from pathlib import Path
+import subprocess,datetime,json,time
+archive=Path.home()/'spark3-lab/mesh4/waves.tar.zst'
+image='vllm-ds41f-kkref:04c30fa98e79-r5o-roce-mesh4-waves-v1'
+expected='sha256:8a70ccd331cb0e751e8e6183676de64860ccbd5dbfc10e94a7a0a3fc66f3f520'
+def work(host):
+ with archive.open('rb') as data:
+  p=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@'+host,"bash -o pipefail -c 'zstd -dc | docker load'"],stdin=data,text=False,capture_output=True,timeout=600)
+ if p.returncode:raise RuntimeError(host+': '+p.stderr.decode())
+ actual=subprocess.check_output(['ssh','-o','BatchMode=yes','swank@'+host,'docker image inspect '+image+' --format {{.Id}}'],text=True,timeout=15).strip()
+ if actual!=expected:raise RuntimeError(host+' image mismatch '+actual)
+ print(json.dumps({'host':host,'image_id':actual,'load':p.stdout.decode()}),flush=True)
+with ThreadPoolExecutor(max_workers=3) as pool:
+ futures=[pool.submit(work,h) for h in ('dgx2','dgx3','dgx4')]
+ while not all(f.done() for f in futures):
+  p=Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=='mesh4-queue-investigation';d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\n')
+  wait(futures,timeout=30)
+ for f in futures:f.result()

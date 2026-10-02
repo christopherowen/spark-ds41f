@@ -278,8 +278,12 @@ opposite-peer traffic. Identical screens through the CPU relay (14) and NCCL
 result was observed. The retransmissions are consistent with the larger-payload
 slowdown, but this session does not distinguish loss from reordering or identify
 the specific NIC queue mechanism. A zero TC drop count is insufficient to make
-that diagnosis. Increasing queue size to 8192 is **untested**, not an established
-fix.
+that diagnosis. At the end of this first session, queue size 8192 was untested.
+The subsequent
+[queue-capacity investigation](../2026-10-02-mesh4-queue-depth/README.md)
+reproduced buffer overflows, demonstrated the partial benefit of 8192, and
+rejected a direct-first send-wave variant. Its evidence supersedes this open
+loss/reordering diagnosis.
 
 Next work is bounded: separate the loss/reordering mechanism using per-port and
 queue counters, then compare one forwarding/pacing change at a time against the

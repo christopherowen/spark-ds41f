@@ -5,7 +5,8 @@ per node. The promoted configuration remains the measured three-node deployment.
 Four-node support is a candidate configuration path. NCCL ring, RoCEnante CPU
 relay and NIC forwarding pass the hardware collective probe on four connected
 Sparks. Full DS4.1 serving qualification remains open; see the
-[hardware results](../experiments/2026-10-02-rocenante-mesh4/README.md).
+[hardware results](../experiments/2026-10-02-rocenante-mesh4/README.md) and
+[queue-capacity investigation](../experiments/2026-10-02-mesh4-queue-depth/README.md).
 
 | Fabric | TP transport | Peer map |
 | --- | --- | --- |
