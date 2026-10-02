@@ -13,6 +13,18 @@ import argparse
 from datetime import timedelta
 import json
 import os
+from pathlib import Path
+
+
+def rdma_error_counters():
+    names = ('roce_adp_retrans', 'packet_seq_err', 'out_of_sequence', 'np_cnp_sent')
+    counters = {}
+    for device in Path('/sys/class/infiniband').iterdir():
+        counters[device.name] = {name: int((device / 'ports/1/hw_counters' / name).read_text())
+                                 for name in names}
+    if not counters:
+        raise RuntimeError('RDMA counter sampling requested but no devices visible')
+    return counters
 
 
 @contextmanager
@@ -59,6 +71,8 @@ def main() -> None:
     parser.add_argument("--master-port", type=int, required=True)
     parser.add_argument("--benchmark", action="store_true",
                         help="after correctness, screen steady graph collective latency")
+    parser.add_argument("--counter-samples", action="store_true",
+                        help="record RDMA error deltas around each benchmark case")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:
         parser.error("rank must be in the configured process group")
@@ -104,6 +118,10 @@ def main() -> None:
         raise RuntimeError("PyNCCL communicator is unavailable")
 
     with prepared_rocenante(adapter, device, group.cpu_group):
+        wave_setting = os.environ.get('B12X_ROCE_MESH_WAVE_BYTES')
+        if wave_setting is not None and (adapter is None or
+                adapter._runtime.stats().get('mesh_wave_bytes') != int(wave_setting)):
+            raise RuntimeError('image did not apply the requested mesh wave threshold')
         # Exercise the torch NCCL group as well as vLLM's separate PyNCCL group.
         total = args.world_size * (args.world_size + 1) // 2
         control = torch.tensor([args.rank + 1], device=device, dtype=torch.float32)
@@ -179,6 +197,7 @@ def main() -> None:
                                 outputs = [operation() for _ in range(16)]
                         for _ in range(4): graph.replay()
                         torch.cuda.synchronize()
+                        counters_before = rdma_error_counters() if args.counter_samples else None
                         samples = []
                         for _ in range(5):
                             dist.barrier(group=group.cpu_group)
@@ -197,6 +216,11 @@ def main() -> None:
                         row = {'dtype': str(dtype), 'elements_per_rank': length,
                                'operation': name, 'microseconds_per_call': samples,
                                'calls_per_graph': 16, 'replays_per_sample': 16}
+                        if counters_before is not None:
+                            counters_after = rdma_error_counters()
+                            row['rdma_error_deltas'] = {
+                                dev: {key: value - counters_before[dev][key] for key, value in values.items()}
+                                for dev, values in counters_after.items()}
                         timings.append(row)
                         print(json.dumps({'rank': args.rank, 'timing': row}), flush=True)
                         del graph, outputs

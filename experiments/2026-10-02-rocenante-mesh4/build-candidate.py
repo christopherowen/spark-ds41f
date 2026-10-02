@@ -14,8 +14,9 @@ spec=importlib.util.spec_from_loader(loader.name,loader)
 spark3=importlib.util.module_from_spec(spec);loader.exec_module(spark3)
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--base-id',required=True)
+p.add_argument('--cluster-config', default='experiments/2026-10-02-rocenante-mesh4/qualification-mesh.json')
 a=p.parse_args()
-cluster,nodes,lock=spark3.configuration(argparse.Namespace(cluster_config='experiments/2026-10-02-rocenante-mesh4/qualification-mesh.json'))
+cluster,nodes,lock=spark3.configuration(argparse.Namespace(cluster_config=a.cluster_config))
 revision=spark3.require_local_deployment_state(cluster,nodes,lock)
 base=spark3.read_json('config/cluster.json')['container']
 image=json.loads(subprocess.check_output(['docker','image','inspect',base['image']],text=True))[0]
