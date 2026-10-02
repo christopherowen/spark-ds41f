@@ -5,6 +5,11 @@ hardware forwarding enabled, no throughput measurement, no promotion. dgx4 is
 installed but its ring cable and netplan configuration are not ready. The checked-in
 site map is an example (documentation management IPs and synthetic MACs/netdevs).
 
+Site input: dgx4's management address is `10.0.1.79` (provided by the owner).
+Use that address when preparing the real four-node map; keep the example map
+synthetic. SSH from the development machine returned `No route to host` on
+2026-10-02, so its hostname and NIC inventory have not been verified.
+
 Base deployment: `a5e66d1`. The intended variable is the path taken by
 opposite-peer RoCEnante traffic: intermediate NIC forwarding instead of the
 host CPU relay. The ring4 candidate remains available as a control. Native
