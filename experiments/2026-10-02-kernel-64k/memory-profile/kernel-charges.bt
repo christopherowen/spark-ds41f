@@ -1,6 +1,12 @@
 // Linux 7.0 memcontrol.h: charge_page(page,gfp,order) returns 0 on success.
 // Track charged kernel pages, not user anonymous or file-cache memory.
 // Start before model startup. $1 = actual PAGE_SIZE.
+BEGIN {
+    // bpftrace 0.20 needs this map's type before the replacement accounting.
+    @bytes[0] = (uint64)0;
+    delete(@bytes[0]);
+    printf("READY page_size=%d\n", $1);
+}
 kprobe:__memcg_kmem_charge_page {
     @pending_page[tid] = arg0;
     @pending_bytes[tid] = ((uint64)1 << arg2) * $1;
@@ -40,7 +46,6 @@ kprobe:__memcg_kmem_uncharge_page /@bytes[arg0]/ {
     delete(@bytes[$p]); delete(@stack[$p]); delete(@name[$p]);
 }
 kprobe:phys_mem_allocate { @uvm_requested_sizes[arg1] = count(); }
-BEGIN { printf("READY page_size=%d\n", $1); }
 interval:s:1 { printf("LIVE t=%llu\n", elapsed / 1000000000); print(@outstanding_bytes); }
 END {
     clear(@pending_page); clear(@pending_bytes); clear(@pending_stack); clear(@pending_comm);
