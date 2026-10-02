@@ -57,6 +57,8 @@ def main() -> None:
     parser.add_argument("--world-size", type=int, choices=(3, 4), required=True)
     parser.add_argument("--master-addr", required=True)
     parser.add_argument("--master-port", type=int, required=True)
+    parser.add_argument("--benchmark", action="store_true",
+                        help="after correctness, screen steady graph collective latency")
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:
         parser.error("rank must be in the configured process group")
@@ -154,6 +156,52 @@ def main() -> None:
                                "eager": True, "graph_replays": 4})
                 del graph, outputs, local, scattered, pattern
 
+        timings = []
+        if args.benchmark:
+            # A graph contains 16 independent calls, replayed 16 times per
+            # sample. This amortizes Python launch overhead. Report every rank;
+            # analysis takes the slowest rank per sample, then the median.
+            for dtype in (torch.bfloat16, torch.float32):
+                for length in (5120, 30720, 245760, 1048576):
+                    local = torch.full((length,), args.rank + 1, device=device, dtype=dtype)
+                    scattered = torch.cat([local + 8 * p for p in range(args.world_size)])
+                    operations = {
+                        'all_reduce': lambda: group.all_reduce(local),
+                        'all_gather': lambda: group.all_gather(local, dim=0),
+                        'reduce_scatter': lambda: group.reduce_scatter(scattered, dim=0),
+                    }
+                    for name, operation in operations.items():
+                        operation()
+                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with graph_capture(device=device) as context:
+                            with torch.cuda.graph(graph, stream=context.stream):
+                                outputs = [operation() for _ in range(16)]
+                        for _ in range(4): graph.replay()
+                        torch.cuda.synchronize()
+                        samples = []
+                        for _ in range(5):
+                            dist.barrier(group=group.cpu_group)
+                            start = torch.cuda.Event(enable_timing=True)
+                            end = torch.cuda.Event(enable_timing=True)
+                            start.record()
+                            for _ in range(16): graph.replay()
+                            end.record(); end.synchronize()
+                            samples.append(start.elapsed_time(end) * 1000 / 256)
+                        expected = (torch.full_like(local, total) if name == 'all_reduce'
+                                    else torch.cat([torch.full_like(local, p + 1) for p in range(args.world_size)])
+                                    if name == 'all_gather' else
+                                    torch.full_like(local, total + 8 * args.rank * args.world_size))
+                        for output in outputs:
+                            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                        row = {'dtype': str(dtype), 'elements_per_rank': length,
+                               'operation': name, 'microseconds_per_call': samples,
+                               'calls_per_graph': 16, 'replays_per_sample': 16}
+                        timings.append(row)
+                        print(json.dumps({'rank': args.rank, 'timing': row}), flush=True)
+                        del graph, outputs
+                    del local, scattered
+
         if adapter:
             adapter.check_health()
             if adapter._runtime.stats()["ops_posted"] <= before:
@@ -164,7 +212,7 @@ def main() -> None:
     print(json.dumps({"rank": args.rank, "world_size": args.world_size,
                       "transport": f"rocenante-{roce_topology}" if roce_enabled else "nccl-ring",
                       "proxy": proxy_stats,
-                      "passed": True, "checks": checks}), flush=True)
+                      "passed": True, "checks": checks, "timings": timings}), flush=True)
     destroy_model_parallel()
     destroy_distributed_environment()
 

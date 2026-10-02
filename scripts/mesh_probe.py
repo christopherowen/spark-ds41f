@@ -114,6 +114,19 @@ def run(args):
                 try: marker.wait(timeout=5)
                 except subprocess.TimeoutExpired: marker.kill(); marker.wait(timeout=5)
             failures = []
+            # Read offloaded packet counters before retiring the owned rules.
+            # A telemetry failure must not prevent path cleanup.
+            if child is not None:
+                for rule in plan['rules']:
+                    try:
+                        counters = json.loads(fabric.capture([
+                            'tc', '-j', '-s', 'filter', 'show', 'dev',
+                            rule['ingress'], 'ingress']))
+                        print(json.dumps({'rank': args.rank, 'forwarding_counters':
+                            [f for f in counters if f.get('pref') == rule['pref']],
+                            'device': rule['ingress']}), flush=True)
+                    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+                        failures.append('counter read failed: ' + str(exc))
             for undo in reversed(cleanup):
                 try: execute(undo)
                 except (subprocess.SubprocessError, OSError) as e: failures.append(str(e))
