@@ -25,3 +25,17 @@ For small effects repeat the control. Promotion additionally needs long-context
 and admission checks, matching node inventories, boot-log review, docs and a
 new immutable baseline. Until then, restore the current R580 production stack
 and close the hold. Results and decision are pending.
+
+## CUDA library/compiler screen
+
+The derivative image changes cuBLAS to 13.5.1.27, CUDA runtime to 13.3.29,
+NVRTC and nvJitLink to 13.3.33, and explicitly selects the 13.3.33 assembler
+for Triton. Hashes and architecture-specific wheel URLs are recorded. PyTorch,
+vLLM, B12X, CuTe DSL and native extensions remain exactly r5o. The existing
+13.4 nvcc wheel is preserved; the Triton assembler is installed separately.
+This is an ABI-compatibility experiment, not a fully rebuilt CUDA 13.3 stack.
+The original cuda-toolkit metapackage pins older libraries, so promotion of this
+arm would also need aligned package requirements/build inputs. Record this
+metadata mismatch explicitly; do not describe a successful import as full
+support. Verify actual loaded library paths/versions and freshly compiled
+Triton artifacts before interpreting timings. B12X's CuTe compiler is unchanged.
