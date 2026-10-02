@@ -73,6 +73,8 @@ def collect(policy):
             path = f"/boot/{kind}-{release}"
             data["files"][path] = Path(path).is_file() and Path(path).stat().st_size > 0
     data["headers"] = Path(f"/lib/modules/{target}/build/Makefile").is_file()
+    data["cpu_tools"] = Path(f"/usr/lib/linux-tools/{target}/cpupower").is_file()
+    data["governors"] = sorted({p.read_text().strip() for p in Path("/sys/devices/system/cpu/cpufreq").glob("policy*/scaling_governor")})
     config = Path(f"/boot/config-{target}")
     data["config_64k"] = config.exists() and "CONFIG_ARM64_64K_PAGES=y" in config.read_text()
     for module in ("nvidia", "nvidia_uvm", "nvidia_drm", "mlx5_core", "mlx5_ib", "dgx_ec_fan_control"):
@@ -94,6 +96,10 @@ def collect(policy):
     data["grub"] = grub_inventory(grub, environment)
     data["thp"] = read("THP", "cat", "/sys/kernel/mm/transparent_hugepage/enabled")
     data["min_free_kbytes"] = read("memory reserve", "cat", "/proc/sys/vm/min_free_kbytes")
+    swaps = read("active swap", "cat", "/proc/swaps")
+    data["active_swap"] = [line.split()[0] for line in swaps.splitlines()[1:] if line.split()]
+    if data["page_size"] == 65536:
+        data["memory_service"] = read("kernel memory service", "systemctl", "is-active", "spark3-kernel-memory.service")
     return data
 
 
@@ -120,6 +126,11 @@ def findings(name, data, policy):
             issues.append(f"{name}: missing or empty {path}")
     if not data.get("headers") or not data.get("config_64k"):
         issues.append(f"{name}: candidate headers or CONFIG_ARM64_64K_PAGES=y missing")
+    if not data.get("cpu_tools"):
+        issues.append(f"{name}: candidate cpupower tool is missing; nv-cpu-governor.service cannot run on that kernel")
+    if data.get("governors") != ["performance"]:
+        issues.append(f"{name}: CPU governors differ from performance: {data.get('governors')!r}")
+        fixes.append(f"{name}: after installing matching linux-tools, sudo systemctl restart nv-cpu-governor.service")
     for module in ("nvidia", "nvidia_uvm", "nvidia_drm", "mlx5_core", "mlx5_ib", "dgx_ec_fan_control"):
         info = data.get("modules", {}).get(module, {})
         if info.get("vermagic", "").split()[:1] != [target]:
@@ -135,18 +146,26 @@ def findings(name, data, policy):
     if target not in grub.get("entries", {}).values():
         issues.append(f"{name}: candidate is missing from GRUB")
         fixes.append(f"{name}: sudo update-grub")
-    if grub.get("default_kernel") != policy["fallback"]:
-        issues.append(f"{name}: normal boot is not explicitly pinned to {policy['fallback']} (GRUB default {grub.get('default')!r})")
-        fixes.append(f"{name}: restore the fallback entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub")
+    default = policy.get("default", policy["fallback"])
+    if grub.get("default_kernel") != default:
+        issues.append(f"{name}: normal boot is not explicitly pinned to {default} (GRUB default {grub.get('default')!r})")
+        fixes.append(f"{name}: restore the configured entry in /etc/default/grub.d/zz-spark-kernel-trial.cfg, then sudo update-grub")
     if grub.get("next_entry") or grub.get("initrdfail") or grub.get("prev_entry"):
         issues.append(f"{name}: a GRUB next-boot/recovery override is armed; kernel is not merely staged")
         fixes.append(f"{name}: inspect sudo grub-editenv list; cancel an unintended one-shot with sudo grub-editenv unset next_entry (review recovery state separately)")
+    if data.get("page_size") == 65536:
+        if "[never]" not in data.get("thp", "") or data.get("min_free_kbytes") != "45166":
+            issues.append(f"{name}: 64 KiB THP/reserve policy differs from never/45166 KiB")
+        if data.get("active_swap") != ["/swap-64k.img"] or data.get("memory_service") != "active":
+            issues.append(f"{name}: 64 KiB swap or boot memory service is not active")
+        if any("64 KiB THP" in x or "64 KiB swap" in x for x in issues):
+            fixes.append(f"{name}: inspect journalctl -u spark3-kernel-memory.service; after correcting its inputs, sudo systemctl restart spark3-kernel-memory.service")
     return issues, fixes
 
 
 def alignment(inventories):
     issues = []
-    for field in ("kernel", "page_size", "driver", "thp", "min_free_kbytes", "secure_boot"):
+    for field in ("kernel", "page_size", "driver", "thp", "min_free_kbytes", "secure_boot", "governors"):
         values = {name: data.get(field) for name, data in inventories.items()}
         if any(value in (None, "") for value in values.values()) or len({str(v) for v in values.values()}) > 1:
             issues.append("nodes differ or are unreadable for " + field + ": " + ", ".join(f"{n}={v!r}" for n, v in values.items()))

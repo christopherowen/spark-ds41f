@@ -34,6 +34,7 @@ DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get -y --no-remove --no-in
   "linux-image-$target=$version" \
   "linux-modules-$target=$version" \
   "linux-headers-$target=$version" \
+  "linux-tools-$target=$version" \
   "linux-modules-nvidia-580-open-$target=$version+1"
 dkms autoinstall -k "$target"
 depmod "$target"

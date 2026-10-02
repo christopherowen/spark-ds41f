@@ -38,6 +38,7 @@ def ready(uuid="node-a"):
             "errors": [], "packages": POLICY["packages"].copy(),
             "files": {f"/boot/{kind}-{release}": True for kind in ("config", "vmlinuz", "initrd.img") for release in (OLD, NEW)},
             "headers": True, "config_64k": True,
+            "cpu_tools": True, "governors": ["performance"],
             "modules": {m: {"vermagic": NEW + " SMP", "version": POLICY["driver"]} for m in
                         ("nvidia", "nvidia_uvm", "nvidia_drm", "mlx5_core", "mlx5_ib", "dgx_ec_fan_control")},
             "fan_dkms": f"dgx-spark-fan-control/0.1.3, {NEW}, aarch64: installed",
@@ -118,6 +119,20 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(kernel.key_enrolled(1, "/root/key.der is already enrolled\n"))
         self.assertFalse(kernel.key_enrolled(0, "/root/key.der is not enrolled"))
         self.assertFalse(kernel.key_enrolled(1, "Failed to read key"))
+
+    def test_64k_boot_requires_its_swap_and_memory_policy(self):
+        data = ready()
+        data.update(kernel=NEW, page_size=65536)
+        issues, _ = kernel.findings("dgx1", data, POLICY)
+        self.assertTrue(any("64 KiB swap" in x for x in issues))
+        data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active")
+        self.assertEqual(kernel.findings("dgx1", data, POLICY), ([], []))
+
+    def test_promoted_default_is_distinct_from_retained_fallback(self):
+        data = ready()
+        new_id = next(k for k,v in data["grub"]["entries"].items() if v == NEW)
+        data["grub"] = kernel.grub_inventory(menu(default=new_id), "")
+        self.assertEqual(kernel.findings("dgx1", data, dict(POLICY, default=NEW)), ([], []))
 
 
 if __name__ == "__main__":
