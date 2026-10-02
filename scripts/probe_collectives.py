@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import argparse
+import hashlib
 from datetime import timedelta
 import json
 import os
@@ -92,7 +93,11 @@ def main() -> None:
     parser.add_argument("--port-samples", action="store_true",
                         help="sample physical NIC bytes and buffer drops around each timed case")
     parser.add_argument("--expect-paths", type=int, choices=(2, 4))
+    parser.add_argument('--lengths', type=int, nargs='+', default=[5120,30720,245760,1048576])
+    parser.add_argument('--numerics', action='store_true')
     args = parser.parse_args()
+    if any(n < 64 or n > 2097152 or n % 8 for n in args.lengths):
+        parser.error('benchmark lengths must be aligned and between 64 and 2097152')
     if not 0 <= args.rank < args.world_size:
         parser.error("rank must be in the configured process group")
 
@@ -199,13 +204,38 @@ def main() -> None:
                                "eager": True, "graph_replays": 4})
                 del graph, outputs, local, scattered, pattern
 
+        numerical_checks = []
+        if args.numerics:
+            # Identical first 64 elements at every capacity; cancellation-sensitive
+            # inputs distinguish floating reduction order from transport corruption.
+            for dtype in (torch.bfloat16, torch.float32):
+                base = torch.arange(64, dtype=torch.float32) % 8
+                inputs = [(base + 1) * 16777216, (base + 1) / 16,
+                          -(base + 1) * 16777216, (base + 1) / 32]
+                inputs = [v.to(dtype) for v in inputs]
+                reference = inputs[0].float()
+                for v in inputs[1:]: reference = reference + v.float()
+                reference = reference.to(dtype)
+                for length in args.lengths:
+                    local = inputs[args.rank].to(device).repeat((length+63)//64)[:length].contiguous()
+                    output = group.all_reduce(local)
+                    torch.cuda.synchronize()
+                    observed = output[:64].cpu()
+                    row = {'dtype':str(dtype), 'elements_per_rank':length,
+                           'prefix_sha256':hashlib.sha256(observed.view(torch.uint8).numpy().tobytes()).hexdigest(),
+                           'rank_order_fp32_prefix_sha256':hashlib.sha256(reference.view(torch.uint8).numpy().tobytes()).hexdigest(),
+                           'mismatched_reference_elements':int((observed != reference).sum()),
+                           'max_abs_reference_difference':float((observed.float()-reference.float()).abs().max())}
+                    numerical_checks.append(row)
+                    print(json.dumps({'rank':args.rank,'numerical_check':row}),flush=True)
+                    del local,output
         timings = []
         if args.benchmark:
             # A graph contains 16 independent calls, replayed 16 times per
             # sample. This amortizes Python launch overhead. Report every rank;
             # analysis takes the slowest rank per sample, then the median.
             for dtype in (torch.bfloat16, torch.float32):
-                for length in (5120, 30720, 245760, 1048576):
+                for length in args.lengths:
                     local = torch.full((length,), args.rank + 1, device=device, dtype=dtype)
                     scattered = torch.cat([local + 8 * p for p in range(args.world_size)])
                     operations = {
@@ -275,7 +305,7 @@ def main() -> None:
     print(json.dumps({"rank": args.rank, "world_size": args.world_size,
                       "transport": f"rocenante-{roce_topology}" if roce_enabled else "nccl-ring",
                       "proxy": proxy_stats,
-                      "passed": True, "checks": checks, "timings": timings}), flush=True)
+                      "passed": True, "checks": checks, "numerical_checks": numerical_checks, "timings": timings}), flush=True)
     destroy_model_parallel()
     destroy_distributed_environment()
 

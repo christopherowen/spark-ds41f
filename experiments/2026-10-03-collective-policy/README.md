@@ -149,3 +149,21 @@ qualified for dispatch. Reduce-scatter and over-limit FP32 all-reduce are pooled
 as NCCL, regardless of the enclosing arm label. The relay has only one launch
 in this matched session. No thresholds, mixed-backend correctness, end-to-end
 speedup, strict determinism, or four-path superiority between samples are inferred.
+
+## NCCL and relay screen
+
+The next published harness uses `run.py ARM RUN_ID --benchmark --counter-samples`.
+It selects the frozen image from `cluster.json` and the bounded, explicit overrides
+in `arms.json`. Those overrides apply only to model-free probe containers; the
+production ring policy is not relaxed. Fresh processes test Ring with 1/2/4
+channels and automatic (existing LL128 exclusion), Simple or LL protocol. Every launch records the complete
+command. It changes no NIC parameters. Actual initialized channels, neighbor
+ring edges and GDR status must be verified in every rank's logs.
+
+The shared collective probe now accepts optional benchmark lengths and an
+optional cancellation-sensitive numerical screen. The same first 64 elements
+are reduced at every sampled capacity, with output hashes and differences from
+a fixed rank-order FP32 accumulation. These differences characterize arithmetic;
+they are not automatically classified as transport errors or model-quality loss.
+The existing exact transport checks remain mandatory. No strict determinism
+claim follows from these synthetic inputs alone.
