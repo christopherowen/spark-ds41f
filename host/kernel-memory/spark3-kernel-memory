@@ -1,0 +1,18 @@
+#!/bin/sh
+# The two validated page-size profiles share a disk, not a swap header.
+set -eu
+case "$(getconf PAGESIZE)" in
+  4096) swap=/swap.img ;;
+  65536)
+    swap=/swap-64k.img
+    # Avoid the PMD-sized THP reserve on the 64 KiB kernel. Keep the same
+    # minimum free-memory reserve as the original 4 KiB profile.
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled
+    echo 45166 > /proc/sys/vm/min_free_kbytes
+    ;;
+  *) echo 'Unsupported base page size' >&2; exit 1 ;;
+esac
+test -f "$swap"
+if ! swapon --show --noheadings --raw --output NAME | grep -Fxq "$swap"; then
+  swapon "$swap"
+fi
