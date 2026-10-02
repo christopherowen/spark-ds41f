@@ -1,7 +1,7 @@
 """Configuration and read-only fabric checks for one GPU per Spark.
 
 Three nodes use direct-peer RoCEnante. Four nodes use NCCL's neighbour ring
-or an explicitly built RoCEnante ring4 relay, with NCCL for larger operations.
+or an explicitly built RoCEnante relay or NIC-forwarded mesh, with NCCL for larger operations.
 """
 
 from __future__ import annotations
@@ -62,19 +62,32 @@ def set_argument(cluster: dict, flag: str, value: str) -> None:
         args.extend([flag, value])
 
 
+def logical_peer_hcas(cluster: dict, node: dict) -> dict:
+    """Physical cable routes remain authoritative; add only the opposite QP path."""
+    routes = copy.deepcopy(node["roce_peer_hcas"])
+    if transport(cluster) == "rocenante-mesh4":
+        rank = node["rank"]
+        opposite = (rank + 2) % 4
+        # Both endpoints select the same intermediate on each stripe. The
+        # two stripes cross different PCI roots and opposite ring directions.
+        intermediates = ((rank + 1) % 4, (rank - 1) % 4) if rank < opposite else ((rank - 1) % 4, (rank + 1) % 4)
+        routes[str(opposite)] = [routes[str(peer)][lane] for lane, peer in enumerate(intermediates)]
+    return routes
+
+
 def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     env = {key: str(value) for key, value in cluster["environment"].items()}
     env["VLLM_HOST_IP"] = node["management_ip"]
-    if transport(cluster) in ("nccl-ring", "rocenante-ring4"):
+    if transport(cluster) in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
         if transport(cluster) == "nccl-ring":
             env.pop("B12X_ROCE_PEER_HCAS", None)
         else:
-            env["B12X_ROCE_PEER_HCAS"] = json.dumps(node["roce_peer_hcas"], separators=(",", ":"))
+            env["B12X_ROCE_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
         hcas = sorted({h for route in node["roce_peer_hcas"].values() for h in route})
         # '=' makes NCCL match device names exactly rather than by prefix.
         env["NCCL_IB_HCA"] = "=" + ",".join(hcas)
     else:
-        env["B12X_ROCE_PEER_HCAS"] = json.dumps(node["roce_peer_hcas"], separators=(",", ":"))
+        env["B12X_ROCE_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
     if "roce_gid_index" in node:
         env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
         env["B12X_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
@@ -101,14 +114,14 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     elif cluster.get("distributed", {}).get("master_addr") != heads[0].get("management_ip"):
         errors.append("distributed.master_addr must match the API head's management_ip")
     mode = transport(cluster)
-    if mode not in ("rocenante-direct", "nccl-ring", "rocenante-ring4"):
+    if mode not in ("rocenante-direct", "nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
         errors.append(f"unknown fabric transport {mode!r}")
-    if count == 4 and mode not in ("nccl-ring", "rocenante-ring4"):
-        errors.append("four-node switchless fabric requires nccl-ring or rocenante-ring4")
-    if mode == "rocenante-ring4" and count != 4:
-        errors.append("rocenante-ring4 requires exactly four nodes")
-    if mode != "rocenante-ring4" and cluster.get("environment", {}).get("B12X_ROCE_TOPOLOGY", "direct") != "direct":
-        errors.append("B12X_ROCE_TOPOLOGY=ring4 requires rocenante-ring4 transport")
+    if count == 4 and mode not in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
+        errors.append("four-node switchless fabric requires nccl-ring, rocenante-ring4 or rocenante-mesh4")
+    if mode in ("rocenante-ring4", "rocenante-mesh4") and count != 4:
+        errors.append(f"{mode} requires exactly four nodes")
+    if mode not in ("rocenante-ring4", "rocenante-mesh4") and cluster.get("environment", {}).get("B12X_ROCE_TOPOLOGY", "direct") != "direct":
+        errors.append("B12X_ROCE_TOPOLOGY must match the selected transport")
     for flag in ("--tensor-parallel-size", "--nnodes"):
         if argument(cluster, flag) != str(count):
             errors.append(f"{flag} must equal the configured node count ({count})")
@@ -120,19 +133,19 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             errors.append(f"draft_tensor_parallel_size must equal the node count ({count})")
     except (ValueError, AttributeError):
         errors.append("--speculative-config must be a JSON object")
-    if mode in ("nccl-ring", "rocenante-ring4"):
+    if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
         env = cluster.get("environment", {})
         required_env = dict(RING_ENV)
-        if mode == "rocenante-ring4":
-            required_env.update(VLLM_ENABLE_ROCE_ALLREDUCE="1", B12X_ROCE_TOPOLOGY="ring4")
+        if mode in ("rocenante-ring4", "rocenante-mesh4"):
+            required_env.update(VLLM_ENABLE_ROCE_ALLREDUCE="1", B12X_ROCE_TOPOLOGY=mode.removeprefix("rocenante-"))
         for key, value in required_env.items():
             if str(env.get(key)) != value:
                 errors.append(f"{mode} requires {key}={value}")
         disabled = "--disable-custom-all-reduce" in cluster.get("serve_args", [])
         if mode == "nccl-ring" and not disabled:
             errors.append("nccl-ring requires --disable-custom-all-reduce")
-        if mode == "rocenante-ring4" and disabled:
-            errors.append("rocenante-ring4 requires custom all-reduce enabled")
+        if mode in ("rocenante-ring4", "rocenante-mesh4") and disabled:
+            errors.append(f"{mode} requires custom all-reduce enabled")
         if "--enable-expert-parallel" in cluster.get("serve_args", []):
             errors.append(f"{mode} does not support expert-parallel all-to-all")
         for flag in ("--pipeline-parallel-size", "--data-parallel-size",
@@ -144,11 +157,13 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append(f"{mode} cannot override topology/algorithm through {key}")
     networks = {}
     for rank, node in by_rank.items():
-        expected = {(rank - 1) % count, (rank + 1) % count} if mode in ("nccl-ring", "rocenante-ring4") else set(ranks) - {rank}
+        expected = {(rank - 1) % count, (rank + 1) % count} if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4") else set(ranks) - {rank}
         routes = node.get("roce_peer_hcas")
         if not isinstance(routes, dict) or set(routes) != {str(p) for p in expected}:
             errors.append(f"{node.get('name')}: roce_peer_hcas must name peers {sorted(expected)} in cable/rank order")
             continue
+        if mode == "rocenante-mesh4" and any(len(v) != 2 for v in routes.values() if isinstance(v, list)):
+            errors.append(f"{node['name']}: rocenante-mesh4 requires two stripes per cable")
         all_hcas = []
         for peer, hcas in routes.items():
             if not isinstance(hcas, list) or len(hcas) not in (1, 2) or any(not isinstance(h, str) or not h for h in hcas):
@@ -159,7 +174,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             back = reverse.get(str(rank)) if isinstance(reverse, dict) else None
             if not isinstance(back, list) or len(back) != len(hcas):
                 errors.append(f"{node['name']}: link to rank {peer} must have reciprocal stripe counts")
-            if mode in ("nccl-ring", "rocenante-ring4"):
+            if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
                 for lane, hca in enumerate(hcas):
                     raw = node.get("roce_subnets", {}).get(hca)
                     try:
@@ -172,19 +187,19 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                     networks.setdefault(str(net), []).append((rank, int(peer), hca, lane))
         if len(set(all_hcas)) != len(all_hcas):
             errors.append(f"{node['name']}: switchless links must use distinct local HCAs")
-        if mode in ("rocenante-direct", "rocenante-ring4") and len({len(v) for v in routes.values() if isinstance(v, list)}) != 1:
+        if mode in ("rocenante-direct", "rocenante-ring4", "rocenante-mesh4") and len({len(v) for v in routes.values() if isinstance(v, list)}) != 1:
             errors.append(f"{node['name']}: RoCEnante requires equal stripe counts for every peer")
         gid = node.get("roce_gid_index", 3)
         if type(gid) is not int or gid < 0:
             errors.append(f"{node['name']}: roce_gid_index must be a nonnegative integer")
-    if mode in ("rocenante-direct", "rocenante-ring4"):
+    if mode in ("rocenante-direct", "rocenante-ring4", "rocenante-mesh4"):
         widths = {len(v) for n in entries if isinstance(n.get("roce_peer_hcas"), dict) for v in n["roce_peer_hcas"].values() if isinstance(v, list)}
         if len(widths) != 1:
             errors.append("RoCEnante requires one common stripe count across all ranks")
     for net, ends in networks.items():
         if len(ends) != 2 or ends[0][:2] != ends[1][:2][::-1]:
             errors.append(f"fabric subnet {net} must connect exactly the two declared neighbour endpoints")
-        elif mode == "rocenante-ring4" and ends[0][3] != ends[1][3]:
+        elif mode in ("rocenante-ring4", "rocenante-mesh4") and ends[0][3] != ends[1][3]:
             errors.append(f"fabric subnet {net}: RoCEnante endpoints must use the same stripe position")
     return errors
 

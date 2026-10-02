@@ -196,7 +196,7 @@ class TopologyTest(unittest.TestCase):
         cluster["container"]["expected_labels"] = self.base["container"]["expected_labels"]
         self.assertTrue(any("image tree" in p for p in spark3.local_doctor(cluster, nodes, lock)))
         old_lock = spark3.read_json("upstreams.lock.json")
-        self.assertTrue(any("relay patch" in p for p in spark3.local_doctor(cluster, nodes, old_lock)))
+        self.assertTrue(any("transport patch" in p for p in spark3.local_doctor(cluster, nodes, old_lock)))
 
     def test_rocenante_ring4_requires_matching_mode_and_backend(self):
         cluster = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")

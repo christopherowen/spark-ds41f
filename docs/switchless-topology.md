@@ -143,3 +143,14 @@ The fourth GPU reduces some per-rank weight work and adds memory, while the ring
 adds communication hops and uses NCCL for small messages. Performance is not
 assumed equal to the three-node RoCEnante baseline. Record a new baseline only
 after four-node serving and measurements pass and the owner accepts promotion.
+
+## NIC-forwarded RoCEnante candidate
+
+The isolated [mesh4 experiment](../experiments/2026-10-02-rocenante-mesh4/README.md)
+adds endpoint QPs between opposite ranks through ConnectX-7 hardware forwarding.
+It retains the physical two-neighbour map and derives the logical peer map.
+Its bounded collective runner owns temporary NIC markers, routes and TC rules;
+NIC doctor reports settings and correction commands separately. The CPU relay
+remains a comparison candidate. Cabling, the real four-node site map, hardware
+qualification and the persistent serving lifecycle are still required before
+launch or promotion.

@@ -77,7 +77,7 @@ def main() -> None:
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     roce_enabled = os.environ.get("VLLM_ENABLE_ROCE_ALLREDUCE") == "1"
-    relay = os.environ.get("B12X_ROCE_TOPOLOGY") == "ring4"
+    roce_topology = os.environ.get("B12X_ROCE_TOPOLOGY", "direct")
     set_custom_all_reduce(roce_enabled)
     init_distributed_environment(
         world_size=args.world_size, rank=args.rank, local_rank=0,
@@ -95,8 +95,8 @@ def main() -> None:
         raise RuntimeError("ring probe unexpectedly initialized a direct-peer B12X communicator")
     if roce_enabled and (adapter is None or adapter.disabled):
         raise RuntimeError("RoCEnante requested but unavailable; refusing a fallback-only pass")
-    if relay and (adapter is None or getattr(adapter._runtime, "topology", None) != "ring4"):
-        raise RuntimeError("the image does not contain the ring4 relay")
+    if roce_topology != "direct" and (adapter is None or getattr(adapter._runtime, "topology", None) != roce_topology):
+        raise RuntimeError(f"the image does not contain the requested {roce_topology} transport")
     nccl = communicator.pynccl_comm
     if nccl is None or nccl.disabled:
         raise RuntimeError("PyNCCL communicator is unavailable")
@@ -162,7 +162,7 @@ def main() -> None:
         else:
             proxy_stats = None
     print(json.dumps({"rank": args.rank, "world_size": args.world_size,
-                      "transport": ("rocenante-ring4" if relay else "rocenante-direct") if roce_enabled else "nccl-ring",
+                      "transport": f"rocenante-{roce_topology}" if roce_enabled else "nccl-ring",
                       "proxy": proxy_stats,
                       "passed": True, "checks": checks}), flush=True)
     destroy_model_parallel()
