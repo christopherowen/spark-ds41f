@@ -1252,6 +1252,55 @@ dgx1, dgx2 and dgx3, no recompute mismatches:
 | Scenarios, both boots | 270 | 233,834 | 0 |
 | of which across the restart | 156 | 147,069 | 0 |
 
+### Real-row costs and where the time goes (`lab10`, torch profiles of r5o and ref4f)
+
+Both arms booted with `SPARK3_DSPARK_PROFILE_TOKENS=random`, so their logged step
+costs come from real (routed) rows; scheduling still used the pinned padded-row
+table. Real-row step costs (ms; random tokens route more widely than text, so
+decode points are an upper bound; the 4096-token point matches measured 16K
+prefill, about 1.1 s per chunk):
+
+| Tokens | 1 | 6 | 12 | 24 | 48 | 192 | 768 | 1536 | 4096 (ref4f: 4144) |
+|---|---|---|---|---|---|---|---|---|---|
+| r5o | 23.66 | 52.77 | 79.22 | 129.22 | 184.66 | 375.47 | 561.38 | 739.46 | 1102.31 |
+| ref4f | 25.74 | 53.81 | 78.57 | 127.20 | 180.30 | 366.38 | 563.23 | 748.27 | 1124.26 |
+| ref4f vs r5o | +8.8% | +2.0% | -0.8% | -1.6% | -2.4% | -2.4% | +0.3% | +1.2% | +2.0% (48 tokens more) |
+
+With routed experts included, the sequential mHC kernel's gain at wide steps is
+about 2%, as its 4.5% share of an eight-stream step implies.
+
+GPU time per step from each rank's trace (union of kernel intervals; "compute"
+excludes the RoCE and NCCL collectives, whose kernels also spin while waiting for
+the slowest rank):
+
+| Workload, per step | r5o compute / collective wait / idle | ref4f compute / collective wait / idle |
+|---|---|---|
+| Eight streams (json, 128 tokens), dgx1 | 99.4 / 3.9 / 5.3 ms | 99.6 / 8.4 / 6.0 ms |
+| Eight streams, dgx2 | 98.9 / 3.0 / 6.7 ms | 99.0 / 3.9 / 11.1 ms |
+| Eight streams, dgx3 | 99.6 / 2.5 / 6.5 ms | 100.3 / 7.8 / 5.9 ms |
+| One stream (128 tokens), dgx1 | 47.1 / 1.0 / 3.7 ms | 48.5 / 1.5 / 3.8 ms |
+
+- GPU compute per eight-stream step is at r5o's (the sequential mHC kernel's
+  -1.5 to -2.0 ms against the deterministic MoE's +1.5 to +2.4 ms). The
+  eight-stream window's longer steps (108.6 -> 114.0 ms) come from one extra
+  eager step: ref4f admitted the eight requests in three prefill steps, r5o in
+  two (arrival timing). An eager step launches every kernel from Python (about
+  1.6 ms of host time per routed-MoE call and 2.0-2.5 ms per attention call), so
+  it takes about 180 ms whatever its few tokens; dgx2, the slowest host, shows
+  it as GPU idle time and the other ranks as collective wait.
+- In single-stream decode the deterministic MoE adds about 1.0 ms per step, the
+  largest batch-invariance cost left at decode sizes. The texts differ, so
+  ref4f's 36 steps against r5o's 38 for 128 tokens are not a speed property.
+- Routed MoE is 62% of an eight-stream step's GPU compute (67 of 108 ms) and
+  half of a single-stream step's (24 of 48 ms), in both arms: the target for
+  faster decoding in general. Pure decode steps also leave the GPU idle about
+  3.6 ms per eight-stream step on average (7.5 ms gaps in half the steps), and
+  each eager step is host-bound.
+- 16K prefill (one window): 4093 -> 4152 ms (+1.4%): routed MoE +22 ms, NCCL
+  +17 ms (the batch-invariant rank-order sum's send/receive in place of the
+  reduce-scatter), GEMV +16 ms, unclassified +35 ms; mHC -21 ms, drafter MoE
+  -21 ms.
+
 ### The same kernel outside batch invariance (vllm-0050, `r5o-mhcseq-pin-b2`, `lab8`)
 
 r5o with mHC capacities of 8 rows and more on the sequential kernel (smaller
