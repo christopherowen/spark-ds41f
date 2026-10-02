@@ -10,7 +10,16 @@ kprobe:__memcg_kmem_charge_page {
 kretprobe:__memcg_kmem_charge_page /@pending_page[tid]/ {
     $p = @pending_page[tid];
     if (retval == 0 && (((struct page *)$p)->memcg_data & 2)) {
-        if (@bytes[$p]) { @duplicate_charge = count(); }
+        if (@bytes[$p]) {
+            // Keep the latest ownership record without double counting a page.
+            // Retain the replaced attribution so incomplete uncharge coverage
+            // remains visible in the result rather than silently disappearing.
+            @duplicate_charge = count();
+            @replaced_bytes[@stack[$p], @name[$p]] = sum(@bytes[$p]);
+            @live_bytes[@stack[$p], @name[$p]] = sum(-((int64)@bytes[$p]));
+            @live_count[@stack[$p], @name[$p]] = sum(-1);
+            @outstanding_bytes = sum(-((int64)@bytes[$p]));
+        }
         @bytes[$p] = @pending_bytes[tid];
         @stack[$p] = @pending_stack[tid];
         @name[$p] = @pending_comm[tid];
