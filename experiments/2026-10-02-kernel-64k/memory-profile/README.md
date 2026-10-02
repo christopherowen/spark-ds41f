@@ -51,9 +51,12 @@ in the local trial worktree; hashes and compact results are in
 ## Performance before recovery
 
 Native reports: `bench-4k.json`, `bench-64k.json`. Five decode samples per point;
-three prefill samples. Prose/code reasoning on, concurrency 1 and 8. The actual
-source-text prefill lengths are 1,146 / 29,447 / 59,982 tokens for nominal
-1K / 32K / 64K targets. No swap growth or thermal slowdown observed.
+three prefill samples. Prose/code reasoning on, concurrency 1 and 8. Both stock
+arms used the Mac client. Actual source-text prompt lengths, read from each
+native report's samples, are 1,006 / 952 / 1,077 tokens for nominal 1K;
+29,569 / 28,442 / 28,265 for nominal 32K; and 56,157 / 59,016 / 57,537 for
+nominal 64K. They match between these two stock arms. No swap growth or thermal
+slowdown observed.
 
 | Metric | 4 KiB | 64 KiB |
 |---|---:|---:|

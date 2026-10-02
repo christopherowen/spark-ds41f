@@ -1,6 +1,7 @@
 # Experimental UVM leaf-table packing
 
-Status: candidate prepared; not validated or promoted. Disabled by default.
+Status: allocation stress, model quality and serving screen passed. A fresh
+same-client control is pending. Not promoted; disabled by default.
 
 Base: Ubuntu `nvidia-kernel-source-580-open=580.178.04-0ubuntu0.24.04.1`,
 installed source `/usr/src/nvidia-580.178.04`, corresponding upstream tag
@@ -73,6 +74,12 @@ The net gain over 4 KiB is therefore 1.82–1.86 GiB per node in this screen.
 Single-stream steps were 41.55 ms prose / 45.91 ms code, versus 41.81 / 45.83 ms
 at 4 KiB. This is a memory recovery, with no established throughput gain.
 A fresh 4 KiB repeat checks the apparent TTFT improvement before interpretation.
+The first stock controls ran the client on the Mac, whereas this candidate ran
+it on dgx1. This also changes the Python source text used by the prefill generator.
+Consequently, use the new dgx1-client 4 KiB repeat for final speed comparisons;
+the earlier cross-client figures above are descriptive only. The candidate's
+actual prefill lengths are 978 / 881 / 961; 29,623 / 30,725 / 30,573; and
+59,368 / 57,325 / 62,638 tokens at the nominal 1K / 32K / 64K targets.
 
 The first benchmark launch could not create its output directory inside the
 root-owned capture directory. It sent no benchmark requests. Creating only that
