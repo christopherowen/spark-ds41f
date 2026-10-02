@@ -25,6 +25,9 @@ def site_problems(nodes):
     if len(entries) != 4 or sorted(n.get("rank", -1) for n in entries) != list(range(4)):
         return ["mesh4 requires four ranks in cable order"]
     for n in entries:
+        queue_size = n.get('mesh_hairpin_queue_size', 8192)
+        if queue_size not in (1024, 8192):
+            errors.append(f"{n['name']}: mesh_hairpin_queue_size must select 1024 or 8192")
         ports = n.get("mesh_ports", {})
         required = {h for pair in n.get("roce_peer_hcas", {}).values() for h in pair}
         if set(ports) != required or len(ports) != 4:
@@ -161,6 +164,8 @@ def findings(node, facts):
         except (KeyError, ValueError): errors.append(label+': selected GID must be RoCE v2 for the configured cable IP')
         if actual.get('rdma_mtu') != '4096': errors.append(label+': active RDMA MTU must be 4096')
         for key, (cmode, value) in PARAMETERS.items():
+            if key == 'hairpin_queue_size':
+                value = node.get('mesh_hairpin_queue_size', value)
             if actual.get('parameters', {}).get(key) != value:
                 errors.append(f'{label}: {key} must be {value}')
                 corrections.append(shlex.join(['sudo','devlink','dev','param','set','pci/'+p['pci'], 'name',key,'value',str(value),'cmode',cmode]))

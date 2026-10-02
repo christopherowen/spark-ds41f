@@ -104,6 +104,8 @@ class MeshTest(unittest.TestCase):
         with mock.patch.object(fabric.subprocess,'run',side_effect=AssertionError('must not execute fixes')):
             errors, commands = fabric.findings(node, facts)
         self.assertEqual(len(errors),4); self.assertEqual(len(commands),4)
+        selected = dict(node, mesh_hairpin_queue_size=1024)
+        self.assertEqual(fabric.findings(selected, facts), ([], []))
         self.assertTrue(all('value 8192 cmode driverinit' in c for c in commands))
         facts['ports'].clear()
         self.assertEqual(len(fabric.findings(node,facts)[0]),4)
