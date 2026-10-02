@@ -167,3 +167,10 @@ a fixed rank-order FP32 accumulation. These differences characterize arithmetic;
 they are not automatically classified as transport errors or model-quality loss.
 The existing exact transport checks remain mandatory. No strict determinism
 claim follows from these synthetic inputs alone.
+
+
+The follow-up bounded arms change one setting from an existing four-channel
+control: `NCCL_NTHREADS=128` with LL; `NCCL_BUFFSIZE=262144` with Simple;
+and `NCCL_BUFFSIZE=4194304` with automatic protocol selection. The original
+buffer is 1 MiB. These are experimental process-local overrides, not promoted
+settings. A faster isolated result still requires a serving/overlap screen.
