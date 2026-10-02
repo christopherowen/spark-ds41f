@@ -184,3 +184,14 @@ class ReadinessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RmQualificationTest(unittest.TestCase):
+    def test_loaded_binary_identity_required_even_when_release_matches(self):
+        policy = dict(POLICY, rm_build_note="candidate-build")
+        profile = {"release": NEW, "page_size": 65536}
+        data = {"kernel": NEW, "page_size": 65536, "driver": policy["driver"]}
+        self.assertTrue(kernel.profile_problems("node", data, profile, policy))
+        data["rm_build_note"] = "stock-build"
+        self.assertTrue(kernel.profile_problems("node", data, profile, policy))
+        data["rm_build_note"] = "candidate-build"
+        self.assertEqual(kernel.profile_problems("node", data, profile, policy), [])

@@ -71,6 +71,8 @@ def collect(policy):
         module: read(module + " loaded source", "cat", f"/sys/module/{module}/srcversion")
         for module in ("nvidia", "nvidia_uvm")
     }
+    if policy.get("rm_build_note"):
+        data["rm_build_note"] = Path("/sys/module/nvidia/notes/.note.gnu.build-id").read_bytes().hex()
     packing = Path("/sys/module/nvidia_uvm/parameters/uvm_pack_sysmem_leaf_tables")
     data["uvm_leaf_packing"] = packing.read_text().strip() if packing.exists() else "stock"
     for name in policy["packages"]:
@@ -131,6 +133,8 @@ def findings(name, data, policy):
         issues.append(f"{name}: running kernel/page size is outside the prepared pair: {running!r}/{data.get('page_size')!r}")
     if data.get("driver") != policy["driver"]:
         issues.append(f"{name}: loaded driver differs from {policy['driver']}")
+    if policy.get("rm_build_note") and data.get("rm_build_note") != policy["rm_build_note"]:
+        issues.append(f"{name}: loaded NVIDIA RM build differs from the required qualification build")
     if data.get("errors"):
         issues.append(f"{name}: incomplete kernel inventory: " + "; ".join(data["errors"]))
     missing = [p for p, version in policy["packages"].items() if data.get("packages", {}).get(p) != version]
@@ -219,6 +223,8 @@ def profile_problems(name, data, profile, policy):
     if data.get("kernel") != profile["release"] or data.get("page_size") != profile["page_size"]:
         issues.append(f"{name}: serving profile requires {profile['release']} / {profile['page_size']}-byte pages; "
                       f"running {data.get('kernel')!r} / {data.get('page_size')!r}")
+    if policy.get("rm_build_note") and data.get("rm_build_note") != policy["rm_build_note"]:
+        issues.append(f"{name}: serving profile requires the qualified NVIDIA RM build")
     if profile.get("memory_saver_required"):
         if not policy.get("memory_saver"):
             issues.append(f"{name}: serving profile requires a pinned memory-saver policy")
