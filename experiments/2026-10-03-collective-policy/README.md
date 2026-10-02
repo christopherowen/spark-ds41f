@@ -174,3 +174,12 @@ control: `NCCL_NTHREADS=128` with LL; `NCCL_BUFFSIZE=262144` with Simple;
 and `NCCL_BUFFSIZE=4194304` with automatic protocol selection. The original
 buffer is 1 MiB. These are experimental process-local overrides, not promoted
 settings. A faster isolated result still requires a serving/overlap screen.
+
+The per-call plan log revealed that the 10 KiB all-reduce still uses one LL
+channel with four channels initialized. Two targeted arms lower only the Ring/LL
+thread threshold from 32 to 1 (`NCCL_THREAD_THRESHOLDS="8 8 64 1 8 64"`),
+with two/four initialized channels and automatic protocol selection. The pinned
+NCCL source reads the six values as Tree then Ring, each LL/LL128/Simple. Confirm
+the resulting per-call channel ranges in the logs; initialization count alone
+is not evidence of the channels used by a call. This internal tuning control is
+version-specific and experimental.
