@@ -94,11 +94,14 @@ CUDA graphs.
 
 ## Kernel
 
-The nodes boot GRUB's default, the newest kernel the DGX OS
-`linux-nvidia-hwe-24.04` metapackage installs: `7.0.0-1019-nvidia` since
-2026-09-25. Kernel selection is manual; nothing on the hosts overrides it.
+The nodes pin GRUB's normal default to `7.0.0-1019-nvidia-64k` in
+`/etc/default/grub.d/zz-spark-kernel-trial.cfg`. The signed memory-saver DKMS
+module is installed on every node. `config/kernel-trial.json` records the pin,
+and `doctor --live` checks both the next normal boot and the loaded kernel/module.
+The retained `7.0.0-1019-nvidia` entry uses the smaller
+[4 KiB serving profile](memory-profiles.md).
 
-That build enables Kexec HandOver by default
+The 7.0 kernel enables Kexec HandOver by default
 (`CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y`) with no CMA area
 (`CONFIG_CMA_SIZE_MBYTES=0`). Its scratch pages stay migrate-CMA without being
 counted, so long-term pins such as `ibv_reg_mr` fail with `ENOMEM` under memory

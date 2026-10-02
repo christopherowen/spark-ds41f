@@ -11,10 +11,11 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-09-30-karmic-kraken-r5o.json](manifests/baselines/2026-09-30-karmic-kraken-r5o.json):
+[manifests/baselines/2026-10-02-karmic-kraken-r5o-64k.json](manifests/baselines/2026-10-02-karmic-kraken-r5o-64k.json):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
-  kernel `7.0.0-1019-nvidia` (`kho=off`), no desktop, and
+  kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
+  0.2.0 with UVM leaf-table packing enabled, no desktop, and
   `vm.watermark_boost_factor=0`;
 - direct dual ConnectX-7 paths between every pair of nodes;
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
@@ -50,8 +51,8 @@ The active baseline is recorded in
   host at every MoE launch;
 - B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
   model's SwiGLU clamp and caused the incoherence seen in earlier images;
-- 262,144-token per-request limit, eight admitted sequences, and 1,348,708
-  KV tokens (5.1 full windows) in a 2.2 GiB-per-rank cache;
+- 524,288-token per-request limit, eight admitted sequences, and 2,845,543
+  KV tokens (5.43 full windows) in a 3.5 GiB-per-rank cache;
 - one concurrent prefill, 4,096 batched tokens, and fail-closed 5 GiB startup
   and 3 GiB steady memory guards;
 - FlashInfer autotune disabled (`--no-enable-flashinfer-autotune`): only the
@@ -61,13 +62,36 @@ One content-addressed image runs on all three nodes and passes the LRU
 coherence gate 5/5; see [Performance](#performance).
 
 The machine-readable desired configuration is [config/cluster.json](config/cluster.json).
+The named [4 KiB and 64 KiB profiles](docs/memory-profiles.md) retain the
+previous capacity as a fallback and select the larger 64 KiB profile by default.
 To reproduce the deployment on your own three Sparks, follow
 [docs/replicate.md](docs/replicate.md).
 
 ## Performance
 
-Measured on r5l (r5o differs only by the top-k tie rule and the TMA stage-release
-fences, none with a measured cost) with
+The selected 64 KiB profile passed the LRU gate 5/5 and four simultaneous
+485K-token contexts with 4,096-token replies, zero preemptions and at least
+5.83 GiB host memory available. Near-limit retrieval passed 3/3 at 519,142
+tokens. Its current screen (three samples per decode
+point, reasoning enabled) measured:
+
+| Workload | 64 KiB profile |
+| --- | ---: |
+| One-stream prose / code | 52.8 / 64.8 tok/s |
+| Eight-stream prose / code | 171.2 / 195.8 tok/s aggregate |
+| One-stream prose / code step time | 40.84 / 45.36 ms |
+| Source-text prefill, 32K / 64K / 256K | 3.77K / 3.80K / 3.68K tok/s |
+| 32K prefix replay, cold / warm | 6.55 / 0.27 s |
+
+The [native benchmark report](manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json)
+records intervals, prompts, memory and thermal results. This establishes the
+new capacity baseline. Quantifying the page-size effect on speed would require
+a paired 4 KiB run.
+See the [deployment record](experiments/2026-10-02-memory-saver-capacity/README.md)
+for the original run and the sustained-admission check.
+
+The tables below retain the historical **4 KiB r5l** reference (r5o added the
+top-k tie rule and TMA stage-release fences). These were measured with
 `bin/spark3 bench` from dgx1: prose and code
 prompts, temperature 0, 256 output tokens. With reasoning on (the server
 default) every measured token is reasoning text:

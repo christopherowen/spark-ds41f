@@ -1,0 +1,181 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20261002T113030Z",
+  "container_name": "dsv41-karmic-kraken",
+  "image_tag": "vllm-ds41f-kkref:04c30fa98e79-r5o",
+  "image_id": "sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab",
+      "role": "headless-rank-2"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "04c30fa98e7917fee0a24c739ea503ce1e22538d",
+    "vllm_patch_head": "0a6827816c677ae540e2626602aa608c47842231",
+    "vllm_tree": "c108cd6d1fe8e2d3b91c065feefe818742159020",
+    "b12x_repository": "https://github.com/local-inference-lab/b12x",
+    "b12x_ref": "integration/karmic-kraken-beta",
+    "b12x_revision": "f8069b2c0be1311df3b112591c6b8876a843f8be",
+    "b12x_patch_head": "bb40849faeede0330ed0ee4f52188a58177121cb",
+    "b12x_tree": "1a8b9401584ada0372939df49e658c3dbeae7658",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "7522cb27e30c4370ebc62b20f45826c7f0962588",
+    "nccl_tree": "47687d2a75b06fdff1b752dbf08bb87f12ca98bb",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "image_build_deployment_commit": "cb44ad8481cbb49e2c8834a9b52c01f4e5150b7f",
+    "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "image_build_recipe": "bin/spark3 build (docker/Dockerfile)"
+  },
+  "runtime_choices": {
+    "B12X_W4A8_TINY_DECODE": "0 (tiny decode omits swiglu_limit; see experiment README)",
+    "B12X_AUTOTUNE": "0 (autotune race budget is free memory // 2 on unified memory)",
+    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP 3, adaptive verification cost scale 2, dead verification rows below survival 0.2, block rejection; greedy drafts vocabulary-parallel (vLLM patch 0012) over an NVFP4 Markov projection with an NVFP4 drafter head, and a column-sharded drafter main_proj (0013)",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-48 (adds 40 and 48 for eight streams at 1 + 5 rows)",
+    "max_num_batched_tokens": 4096,
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): it saved 0 configs, and only the sampler uses FlashInfer",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "read beside the forward launch (SPARK3_ENGRAM_ASYNC=1, vLLM patch 0002 re-ported); the base's Engram overlap is off (VLLM_DS41_ENGRAM_OVERLAP=0)",
+    "compile_cache": "/cache/kkref/jit/vllm-r5o",
+    "multimodal": "vision tower loaded (no --language-model-only), up to 4 images per request; --mm-processor-cache-gb 0 (vLLM's default 4 GiB host cache would come out of dgx1's guard margin)",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+    "l2_prefetch": "on (the base's default on SM121): side-stream L2 prefetch of the next decode projections; it compiles from r5i on (quack-kernels needs CuTe DSL 4.7), so earlier baselines recorded it on while it disabled itself at startup",
+    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence) in place of the base image's wheel",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens at TP 3; vLLM patches 0014-0018, no setting): per-layer all-reduces become reduce-scatters, row-wise work runs on a third of the rows, CED encoder layers only",
+    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit) and TileLang cache on the /cache mount, beside the B12X, CuTe DSL, FlashInfer and Triton caches",
+    "jit_warmup": "the dead-row variants of the draft combine and sampled/rejected-count Triton kernels are compiled at warmup (vLLM patch 0020); no kernel compiles after readiness",
+    "display_carveout": "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 with /dev/dri/card0 passed to the container: embed_tokens and lm_head (842.5 MiB per rank) in the firmware scanout reserve; the text console keeps its 8 MiB framebuffer",
+    "attention_compute": "VLLM_DS41_ATTENTION_COMPUTE=auto (B12X's tuned arithmetic; BF16 pending a fidelity test)",
+    "indexer_split": "always under sequence-parallel prefill (patch 0025; SPARK3_DS41_INDEXER_SPLIT_CHECK=1 validates it against the full-row indexer)",
+    "display_carveout_check": "off (SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
+    "topk_ties": "lowest logical position (B12X 0003); indexer selections repeat exactly",
+    "dense_gemm_stage_release": "async-proxy fence before each TMA-refilled stage release (B12X 0004)",
+    "prefill_stage_release": "async-proxy fence before each TMA-refilled stage release in the BF16 and mHC prefill projections and contiguous attention (B12X 0005)",
+    "host_memory": "64 KiB pages; memory-saver DKMS 0.2.0, UVM leaf-table packing enabled; THP never, vm.min_free_kbytes=45166, /swap-64k.img"
+  },
+  "capacity": {
+    "kv_cache_bytes_per_rank": 3758096384,
+    "kv_cache_tokens": 2845543,
+    "max_model_len": 524288,
+    "max_num_seqs": 8,
+    "reported_full_context_concurrency": 5.43,
+    "graph_capture_gib": 0.98,
+    "vision_tower_gib": 0.9,
+    "display_carveout_weights_mib": 842.5,
+    "checkpoint_native_max_position_embeddings": 1048576
+  },
+  "change_from_previous": "64 KiB host kernel and signed memory-saver DKMS on all three nodes; KV allocation rises from 2.2 to 3.5 GiB per rank and the request limit from 262144 to 524288. Container image, weights, model arithmetic and memory guards are unchanged. The 4 KiB serving profile retains the former limits.",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-10-02-memory-saver-capacity/"
+    ],
+    "summary": "Owner-requested fleet deployment: memory-saver DKMS 0.2.0 installed and Secure Boot verified on all nodes; both CUDA checks passed on each. Missing-module doctor warnings were observed before installation and cleared afterward; actual launch rejected the 64 KiB profile on 4 KiB hosts. On 64 KiB: quality 5/5, decode 1/2/4/8 streams, real-source prefill through 262144 tokens, prefix reuse, four concurrent 485025-485026-token prompts with 4096-token outputs and 58.85 seconds of fully prefilled overlap, zero preemptions, zero swap growth, minimum MemAvailable 5.83/7.59/7.60 GiB. Near-limit retrieval passed 3/3 at 519142 tokens with prefix caching enabled. Initial short-output admission screen is retained as inconclusive on simultaneous capacity; the sustained native report is the new reference. Three decode samples per point establish a fresh baseline without a matched 4 KiB speed comparison."
+  },
+  "build": {
+    "image": "vllm-ds41f-kkref:04c30fa98e79-r5o",
+    "image_id": "sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab",
+    "elapsed_seconds": 35,
+    "min_available_gib": 115.6,
+    "built_utc": "2026-09-30T10:36:51Z",
+    "build_directory": ".work/build/vllm-04c30fa98e79-b12x-f8069b2c0be1-<input hash>"
+  },
+  "benchmark_reference": "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json",
+  "previous_baseline": "2026-09-30-karmic-kraken-r5o",
+  "capacity_benchmark_reference": "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia-64k with kho=off",
+    "nvidia_driver": "580.178.04",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0",
+    "page_size": 65536,
+    "memory_saver": {
+      "package": "dgx-spark-memory-saver",
+      "version": "0.2.0",
+      "repository": "https://github.com/christopherowen/dgx-spark-memory-saver.git",
+      "revision": "2dd6ef107616ef13f1c7f87817c07e5aabc9199e",
+      "srcversion": "34683B82C2D3339BBD2EEC9"
+    },
+    "secure_boot": "enabled; existing enrolled DGX Fleet key signs the DKMS module",
+    "uvm_leaf_packing": "Y",
+    "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
+    "memory_policy": {
+      "thp": "never",
+      "min_free_kbytes": 45166,
+      "swap": "/swap-64k.img"
+    }
+  },
+  "capacity_validation": {
+    "simultaneous_requests": 4,
+    "actual_prompt_tokens": [
+      485025,
+      485026,
+      485026,
+      485026
+    ],
+    "output_tokens_each": 4096,
+    "all_prompts_prefilled_overlap_s": 58.851,
+    "preemptions": 0,
+    "peak_kv_usage": 0.5251,
+    "memory": {
+      "dgx1": {
+        "min_available_gib": 5.83,
+        "swap_growth_gib": 0.0
+      },
+      "dgx2": {
+        "min_available_gib": 7.59,
+        "swap_growth_gib": 0.0
+      },
+      "dgx3": {
+        "min_available_gib": 7.6,
+        "swap_growth_gib": 0.0
+      }
+    }
+  },
+  "near_limit_retrieval": [
+    {
+      "event": "result",
+      "depth": 0.1,
+      "prompt_tokens": 519142,
+      "seconds": 152.8144330500004,
+      "answer": "COPPER-OTTER-0100-CEDAR",
+      "passed": true
+    },
+    {
+      "event": "result",
+      "depth": 0.5,
+      "prompt_tokens": 519142,
+      "seconds": 137.90399230400044,
+      "answer": "COPPER-OTTER-0500-CEDAR",
+      "passed": true
+    },
+    {
+      "event": "result",
+      "depth": 0.9,
+      "prompt_tokens": 519142,
+      "seconds": 81.02968860600004,
+      "answer": "COPPER-OTTER-0900-CEDAR",
+      "passed": true
+    }
+  ]
+}

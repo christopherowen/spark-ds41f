@@ -1,6 +1,6 @@
 # Replicating the promoted baseline
 
-This reproduces `manifests/baselines/2026-09-30-karmic-kraken-r5o.json`:
+This reproduces `manifests/baselines/2026-10-02-karmic-kraken-r5o-64k.json`:
 DeepSeek V4.1 Flash on three DGX Spark (GB10) nodes, tensor parallelism 3,
 direct-cabled dual ConnectX-7 ring, Local Inference Lab's
 `integration/karmic-kraken-beta` vLLM and B12X.
@@ -27,12 +27,16 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
 - The DGX Spark additive fan-floor control on every node: the signed
   `dgx-spark-fan-control` DKMS module with its `dgx_ec_fan_floor` cooling
   device, and the `dgx-fan-control` daemon. Its source and signing key live
-  outside this repository; `doctor --live` reports the first missing layer. The deployment runs on kernel `7.0.0-1019-nvidia`, which needs
-  the `kho=off` that 26.09.2 adds (see [recovery.md](recovery.md)); it also
-  runs on `6.17.0-1032-nvidia`. The NVIDIA driver is 580.178.04.
+  outside this repository; `doctor --live` reports the first missing layer.
+- Kernel `7.0.0-1019-nvidia-64k` with `kho=off`, NVIDIA 580.178.04 and
+  signed memory-saver DKMS 0.2.0 on every node. Follow
+  [memory-profiles.md](memory-profiles.md) to install, validate and select the
+  matching profile. The page-aware memory service selects `/swap-64k.img`,
+  disables THP and sets `vm.min_free_kbytes=45166`. The 4 KiB kernel/profile
+  remains available for rollback at its original context and KV allocation.
 - `vm.watermark_boost_factor=0` on every node. With the kernel default (15000)
   a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory
-  guards read, and the head node's startup margin is about 1.2 GiB:
+  guards read:
 
   ```sh
   echo "vm.watermark_boost_factor = 0" | sudo tee /etc/sysctl.d/90-watermark-boost.conf
@@ -46,7 +50,8 @@ Edit these for your site, then run `bin/spark3 doctor`:
 - `config/nodes.json`: node names, ranks, management IPs, and
   `roce_peer_hcas`, which maps each peer rank to the local RoCE devices cabled
   to it (`ibv_devices` and `rdma link` show the names).
-- `config/cluster.json`: `distributed.master_addr` (the head node's management
+- `config/cluster.json` and both named `config/cluster-4k.json` /
+  `config/cluster-64k.json` profiles: `distributed.master_addr` (the head node's management
   IP), `host.home`, `deployment.repository` if you use a fork, and the interface
   names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and
   `NCCL_IB_HCA`. Keep `distributed.master_port` below the head node's

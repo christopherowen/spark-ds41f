@@ -10,7 +10,8 @@ configuration records its required running kernel; launch refuses a mismatch.
 
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV
-capacity and admission are measured at startup and under load.
+capacity and admission are measured at startup and under load. The selected
+profile reports 2,845,543 KV tokens, or 5.43 full 524,288-token contexts.
 
 For simultaneous long-context admission checks, use
 `bench --admission-tokens 500000 --admission-output-tokens 4096 --admission-force-length`.
@@ -26,7 +27,8 @@ configured limit to 524,288 and validates that range without changing RoPE.
 
 Use `--cluster-config config/cluster-4k.json` or
 `--cluster-config config/cluster-64k.json` before the subcommand. `config/cluster.json`
-is the selected production profile. Changes to the selected profile must update
+selects the validated 64 KiB profile, also the normal GRUB boot default on
+all three nodes. Changes to the selected profile must update
 both its named file and `cluster.json` together.
 
 ## Install memory-saver
@@ -80,4 +82,5 @@ node and reboot. Verify 4,096-byte pages and stock UVM, then start using
 `--cluster-config config/cluster-4k.json`. The page-aware memory service selects
 the matching swap file and host policy. A 64 KiB DKMS installation can remain
 staged: it is excluded from the 4 KiB kernel. Permanent rollback also selects
-the 4 KiB production configuration and GRUB default through a published commit.
+the 4 KiB production configuration and `config/kernel-trial.json` default through
+a published commit, then applies that GRUB default on every node.
