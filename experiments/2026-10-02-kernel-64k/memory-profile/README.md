@@ -30,3 +30,12 @@ change is part of this experiment.
 r5o experiment table on dgx1; their tracked bytes are identical across arms.
 Trace NVIDIA allocations on dgx3, avoiding extra head-node memory pressure;
 collect process/kernel inventories on every node.
+
+The initial matched profiles localize about 3 GiB of additional 64 KiB usage to
+`memory.stat:kernel` in the serving cgroup; RM allocations differ by only about
+9 MiB. `kernel-charges.bt` follows successful `__memcg_kmem_charge_page` calls
+and their uncharges by page pointer, with stack and process name. This identifies
+the kernel allocator responsible. It tracks neither file-cache nor ordinary user
+anonymous pages. Duplicate charges, order mismatches, map errors or nonzero
+charge failures require investigation before trusting the totals. Use
+`BPFTRACE_MAX_MAP_KEYS=131072`; runtime and memory limits remain bounded.
