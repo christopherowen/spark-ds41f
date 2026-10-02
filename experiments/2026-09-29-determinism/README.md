@@ -1050,3 +1050,218 @@ Remaining gaps:
 
 Each step: replay across 1-4096 rows, then the full trace validation and the
 same cost measurement as `run54`/`run55`, before the next.
+
+## Round 16: cost recovery (`run56`-`run67`, r5o)
+
+Owner's order: mHC at decode sizes first, the prefill GEMVs second, the fused
+rank-order sum third; ref2 stays frozen and production on r5o. Target:
+temperature-0 output identical under mixed traffic and across restarts, with
+every important workload within about 3% of r5o (measurement uncertainty
+allowing), and no single-stream or prefill loss traded for aggregate
+throughput. Each change: replay captured inputs first, then measure the
+affected workload untraced, then the full validation.
+
+### Changes, each replayed before it was measured
+
+| Patch | Change | Replay |
+|---|---|---|
+| vllm-0039 | mHC pre/post_pre on the lagged native route at every capacity (the graph-size plans' route); the capacity plan computes 13 partial sums per CTA | `run56`/`run58`: one group at 1-4000 rows, bit-equal to production at 1-48 rows; groupings 4 and 13 bit-identical |
+| vllm-0040 | The TMA prefill GEMV at every capacity where it serves (router gate, compressor projections); SIMT elsewhere | `run58`: one group at 1-4000 rows for the three served shapes |
+| vllm-0041 | The batch-invariant reduce-scatter's float32 rank-order sum in one Triton kernel (fp32 adds in rank order, one round-to-nearest) | GPU unit test against the torch reference |
+| vllm-0038b | GPU regression test for 0038 (43136 x 5120 vocabulary projection, 1-48 rows, first and last position) | - |
+| vllm-0042 | Decode rows keep the decode attention kernel in steps that also hold prompt rows: such a step reports its leading decode rows (from request state) and every layer runs them on the decode plan, the prompt rows single-pass, from one metadata write; replaces 0035 | 4 CPU unit tests; traces below |
+| vllm-0043, B12X 0007 | Small-row launch geometry (16-row tiles, 16 or 32 columns, 128-deep K, four stages) for decode-sized TMA prefill GEMV plans | `run61`: every geometry bit-identical to the default at 1-4000 rows |
+| vllm-0044, B12X 0008 | The mHC capacity plan computes 16 rows per CTA (the CTA's slice of the mixing weights loaded once for all 16) | `run64`: 4, 8, 16 rows per CTA bit-identical to one; post_pre at 1334 rows 1903 -> 1581 us |
+| 4144 budget | Chunks aligned to 4096 tokens with a 4144-token batch budget (4096 plus 8 x 6 decode rows) instead of 4000-token chunks: a prompt splits where r5o splits it when alone | traces below (`--chunk 4096`) |
+
+Two corrections found on the way:
+
+- `run62` (ref4b) failed validation: 218 differing rows in c8 and 4,221 in the
+  scenarios, all first at layer 20's attention output. CED layers ran a mixed
+  step's decode rows single-pass but a decode-only step's on the decode kernel
+  (their decoder metadata exists only in steps with a CED plan). 0042 now
+  splits decode rows in CED layers too, and CED decoder metadata takes the
+  full-row step kind; decode rows lead the decoder rows (a decode query keeps
+  all of its at most 6 rows within the 128-row window).
+- The B12X overlays for 0007 and 0008 (`gemv-geom`, `mhc-mt`) had been built
+  from a pre-r5o B12X tree and dropped r5o's proxy fences (the TMA prefill
+  GEMV's, and the mHC TF32 projection's two). `gemv-geom2` and `mhc-mt2` are
+  built from the serving image's own package; every other mounted file was
+  checked against the image and differs only by its intended change. ref4b's
+  numbers used the unfenced GEMV; ref4c onwards do not.
+
+### Validation of the 4144-budget candidate (`run64`, `detm-r5o-ref4c-b4144-trace8`)
+
+ref4c (0027-0043 with 0042 corrected, B12X 0006/0007, the deterministic MoE),
+4096-token chunks, a 4144-token budget. Boot A, then a restart (boot B) that
+repeats every scenario; `analyze_trace4.py` on every rank:
+
+| Traces | Pairs | Rows compared per rank | Differing |
+|---|---|---|---|
+| Eight identical concurrent prompts | 28 | 2,912 | 0 |
+| JSON, prose and long mixes | 30 | 12,501 | 0 |
+| Scenarios, both boots | 270 | 233,675 | 0 |
+| of which across the restart | 156 | 146,980 | 0 |
+
+The same on dgx1, dgx2 and dgx3; no unaligned records, no recompute
+mismatches, outputs and first logprobs equal in every group. The scenarios now
+include a 8995-token prompt whose 6000-token prefix was served first (the
+cached prefix ends inside a chunk), and a 4178-token prompt whose second chunk
+ends inside the CED window of the first. 0044 changes only how the capacity
+plan groups rows (bit-identical in replay), so ref4d's arithmetic is the one
+validated here.
+
+### The mHC choice
+
+The lagged native route rounds like production's decode plans and costs the
+same at decode sizes, but even with 16 rows per CTA it is 1.4x the default
+TF32 capacity plan at prefill sizes (post_pre at 1334 rows: 1578 vs 1111 us).
+The TF32 TMA projection with a fixed K split is also one arithmetic at every
+count (`run58b`) and near the default at prefill sizes (40 slices: 1251 us),
+but it cannot use the lagged producer and costs 23-25 us per call at 1-16 rows
+against 11-17 us. Launch geometry does not change its bits; the best decode
+geometry saves 2 us per call (`run66`). Regrouping the native partial sums
+(9, 13 or 25 per CTA at 16 rows per CTA) changes nothing measurable.
+
+Same session, one boot per arm, pinned cost table (`run65b`, against r5o):
+
+| Workload | ref4d-b4144 (native) | ref4e-s40-b4144 (TF32, 40 slices) |
+|---|---|---|
+| Decode step, one stream, prose | -0.4% | +3.3% |
+| Decode step, one stream, JSON | +4.1% | +4.3% |
+| One stream, 24 distinct prompts (tok/s) | +2.0% | -2.3% |
+| Eight distinct concurrent prompts | +2.6% | +1.6% |
+| Cold prefill 1K / 4K / 16K / 64K | -3.8 / -4.7 / -3.3 / -3.8% | -0.9 / -2.0 / -1.5 / -1.9% |
+| Short prompts, request time | -1.6% | +0.6% |
+| Mixed traffic: short TTFT / long TTFT / p99 stream gap | -1.1 / +4.7 / +4.6% | -4.0 / +0.6 / +2.4% |
+
+JSON decode varies by about ±1% between sessions (ref4d +2.6% in `run65`,
++4.1% here; the r5o arm 48.25-48.83 ms). The bench's two fixed decode prompts
+give each batch-invariant arm one text, so their tok/s follows that text's
+draft acceptance; the GPU step time and the 24-prompt rate are the measures.
+
+### Validation of both mHC options (`run67`, `run67b`)
+
+ref4e-s40-b4144 (`run67`) and ref4d-b4144 (`run67b`) each passed the same full
+validation as `run64`: 0 differing rows in c8, the mixes, 270 scenario pairs and
+156 pairs across the restart, on every rank.
+
+
+
+## Round 17: one arithmetic per operation — the sequential mHC kernel (`lab5`-`lab9`, r5o)
+
+Round 16 left mHC as the largest prefill cost of batch invariance: the lagged
+native route was 1.4x production's TF32 capacity plan at prefill sizes, and
+the TF32 projection, the other row-invariant option, cost 23-25 us per call at
+decode sizes. Both keep a reduction whose shape is chosen for one size range.
+This round replaces the reduction rather than tuning around it: each output
+gets one fixed summation order, and only the work around it (rows per CTA,
+weight reads, the finalize's launch) is free to change with size.
+
+### The kernel (B12X 0009, overlay `mhc-seq`, `make_overlay_mhcseq.py`)
+
+`MHCPostPreSequentialPartialKernel` takes the lagged partial kernel's inputs
+and outputs, so the finalize and every caller are unchanged
+(`MhcConfig.sequential_partials`, config schema 6):
+
+- For each of a row's 25 partial sums (the residual's sum of squares and 24
+  mixes), the lagged y sum of squares, and each of the four residual streams,
+  one thread adds the 128 products of a hidden tile in hidden order, as one
+  FP32 chain. The four stream sums are then added in stream order. A row's
+  sums depend only on its own data.
+- A CTA covers one 128-wide hidden tile for up to 16 rows (a power of two).
+  Warps 0-2 hold one (mix, stream) pair per lane and stream that pair's 128
+  weights from global memory with 16-byte loads, a few vectors ahead; each
+  hidden element's rows come from shared memory as one vector, so each weight
+  serves every row of the CTA. Warp 3 sums the squares.
+- The post-mixed residual is kept in shared memory as FP32, `[stream][hidden]
+  [row]`, each stream's block padded by 16 bytes so the four streams a warp
+  reads at once start in different banks. Without the padding (and with BF16
+  scalar reads), shared-memory bank conflicts were most of the kernel's time
+  at prefill sizes.
+- Above 8 rows the finalize runs once per row in one 256-thread CTA
+  (`lagged_threads=256`). The default 1024-thread finalize repeats a row's
+  scalar work (25 two-warp reductions and the Sinkhorn iterations on one
+  thread) in each of the row's five CTAs, and one such CTA fills an SM, so the
+  SM idles through the serial part: 452 -> 160 us at 1334 rows. The finalize's
+  arithmetic is unchanged; its y pass now issues every load before any store
+  (y is updated in place, so interleaved stores serialized it).
+
+Kernel lab (`bundles/mhc-seq`, captured layer 1 and 20 inputs, dgx1):
+
+- One row group at 1-4000 rows for pre and post_pre; 8 and 16 rows per CTA
+  bit-identical to one at every compared count.
+- Graph-replay spans (partial plus finalize, CUPTI), against production:
+
+| Rows | 1 | 2 | 8 | 16 | 32 | 48 | 256 | 1334 |
+|---|---|---|---|---|---|---|---|---|
+| Production (us) | 6.8 | 8.2 | 16.8 | 30.6 | 59.6 | 86.6 | 149 | 1036 |
+| Sequential, 8 rows per CTA (us) | 8.4 | 9.0 | 11.8 | 18.0 | 25.0 | 30.6 | 155 | 917 |
+
+  Production's decode plans run one CTA per few partial sums, each a shuffle
+  tree over a quarter of the products; at 1-2 rows their latency is lower. From
+  8 rows the sequential kernel reads each weight once per CTA instead of once
+  per row and wins; at prefill sizes it replaces production's gram kernel plus
+  TF32 projection (two passes over the residual) with one pass.
+
+### Batch invariance on it (vllm-0049, `detm-r5o-ref4f-b4144-pin-b2`)
+
+ref4f is ref4d with `VLLM_DS41_MHC_SEQUENTIAL=1` (vllm-0049): every
+batch-invariant mHC capacity takes the sequential kernel, `min(8, capacity)`
+rows per CTA. Same session, one boot per arm, pinned cost table, r5o measured
+before and after (`lab6`, lean profile); percentages against the mean of the
+two r5o runs (r5o's own 16K prefill moved 5% and its mixed short TTFT 3.4% between them):
+
+| Workload | ref4d-b4144 | ref4f-b4144 |
+|---|---|---|
+| Decode step, one stream, prose / JSON | -1.5 / +1.7% | -0.2 / -0.3% |
+| One stream, 12 distinct prompts (tok/s) | +3.8% | +2.4% |
+| Eight distinct concurrent prompts | +0.4% | -1.0% |
+| Cold prefill 1K / 16K | -3.9 / -1.0% | -1.1 / +1.1% |
+| Short prompts, request time | -5.4% | -0.6% |
+| Mixed traffic: short TTFT / long TTFT / chunks per s | +10.0 / +6.6 / -2.3% | +3.8 / +0.2 / +1.4% |
+
+Fixed-shape target step costs from each boot's profile (ms; r5o / ref4d /
+ref4f): 1 token 18.12 / 18.75 / 18.74; 6 tokens 20.17 / 21.17 / 20.54; 24
+tokens 27.20 / 27.34 / 24.73; 48 tokens 35.35 / 35.29 / 30.15; 1536 tokens
+306.8 / 351.1 / 328.3. The batch-invariant arm's wide decode steps are now
+cheaper than r5o's (-14.7% at 48 tokens); the pinned cost table keeps the
+adaptive verification on r5o's choices, so the bench rates do not yet use it.
+
+Quick validation (`ref4f-b4144-quick`: boot A c8 and the mixed, chunked,
+chunked_end, cache_long and distinct scenarios; a restart repeating cache_long
+and distinct): 0 differing rows on every rank (c8: 28 pairs, 2,942 rows;
+scenarios: 64 pairs, 65,901 rows, of which 36 pairs and 21,083 rows across the
+restart).
+
+Full validation (`lab9`, `ref4f-b4144-full`: c8, the JSON, prose and long
+mixes, every scenario, then a restart repeating every scenario): the same on
+dgx1, dgx2 and dgx3, no recompute mismatches:
+
+| Traces | Pairs | Rows compared per rank | Differing |
+|---|---|---|---|
+| Eight identical concurrent prompts | 28 | 2,939 | 0 |
+| JSON, prose and long mixes | 30 | 12,558 | 0 |
+| Scenarios, both boots | 270 | 233,834 | 0 |
+| of which across the restart | 156 | 147,069 | 0 |
+
+### The same kernel outside batch invariance (vllm-0050, `r5o-mhcseq-pin-b2`, `lab8`)
+
+r5o with mHC capacities of 8 rows and more on the sequential kernel (smaller
+ones keep the tuned plans). Wide fixed-shape steps get cheaper (48 tokens: 31.7
+ms against 42.2-44.0 ms for that session's r5o boots and 35.4 ms in `lab6`'s;
+24 tokens -6 to -10%), but no lean workload moved beyond noise: decode steps
+-1.8 / -0.4%, 12 distinct prompts +0.7%, eight streams +0.6%, short prompts
+-0.5%, mixed short TTFT -2.0%. Cold prefill was +0.7% at 1K and -4.6% at 16K
+against the mean of the r5o runs; the kernel's replay timings (faster than
+production from 1024 rows) do not explain the 16K result, which needs a repeat
+before any production claim. Not a production candidate yet.
+
+### Status
+
+ref4f meets the round-16 target on the lean matrix (every workload within
+about 3% of r5o, none of them traded for another) and passed the full
+validation. Promotion still needs the full measurement matrix and the owner's
+decision. A scheduling refinement of the kernel (weights requested after the
+post-mix when a CTA holds more than two rows, which frees registers: `lab7`)
+is bit-identical and 3-4% faster at prefill sizes; it is not in `mhc-seq` yet.

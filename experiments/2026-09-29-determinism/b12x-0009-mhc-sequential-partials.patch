@@ -1,0 +1,780 @@
+--- a/b12x/norm/mhc/_kernels.py
++++ b/b12x/norm/mhc/_kernels.py
+@@ -1376,6 +1376,446 @@
+             cute.arch.griddepcontrol_launch_dependents()
+ 
+ 
++from b12x._lib.intrinsics import (
++    ld_global_nc_v4_u32,
++    ld_shared_v2_u32,
++    ld_shared_v4_u32,
++    st_shared_v4_u32,
++    u32_as_f32,
++)
++
++# Per token: prev_post (4), prev_comb (16, [from][to]) and pre_mix (4).
++_SEQ_PARAMS = 24
++# Mixing-weight vectors (4 hidden elements each) a mix thread keeps in flight: with few tokens
++# each vector is consumed quickly, so the whole row (32 vectors) is requested at once.
++def _sequential_fn_prefetch(tokens_per_cta: int) -> int:
++    return 32 if tokens_per_cta <= 2 else 16 if tokens_per_cta == 4 else 8
++
++
++@dsl_user_op
++def _ld_shared_f32(smem_addr: Int32, *, loc=None, ip=None) -> Float32:
++    """Load one FP32 value from a u32 shared-memory address."""
++    return Float32(
++        llvm.inline_asm(
++            T.f32(),
++            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
++            "ld.shared.f32 $0, [$1];",
++            "=f,r",
++            has_side_effects=True,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++def _sequential_tokens(tokens_per_cta: int) -> int:
++    """tokens_per_cta rounded up to a power of two, so a thread's tokens fill whole vectors."""
++    tokens = 1
++    while tokens < int(tokens_per_cta):
++        tokens *= 2
++    return tokens
++
++
++@lru_cache(maxsize=16)
++def _post_pre_sequential_storage_cls(tokens_per_cta: int, lagged_mix: bool):
++    class PostPreSequentialStorage:
++        pass
++
++    annotations = {
++        # Post-mixed residual in FP32, [stream][hidden][token]. A thread's tokens are
++        # contiguous (vector loads); each stream's block carries 16 bytes of padding so the
++        # four streams a warp reads at once start in different banks.
++        "r_tile": cute.struct.Align[
++            cute.struct.MemRange[
++                cutlass.Float32, _MHC_MULT * (_SOURCE_TILE_H * tokens_per_cta + 4)
++            ],
++            16,
++        ],
++        # Per-stream sums, [token][item][stream], combined in stream order.
++        "stream_sums": cute.struct.Align[
++            cute.struct.MemRange[cutlass.Float32, tokens_per_cta * (_PARTIALS + 1) * _MHC_MULT], 16
++        ],
++        # Each token's mixing scalars.
++        "params": cute.struct.Align[
++            cute.struct.MemRange[cutlass.Float32, tokens_per_cta * _SEQ_PARAMS], 16
++        ],
++    }
++    if lagged_mix:
++        annotations["y_tile"] = cute.struct.Align[
++            cute.struct.MemRange[cutlass.Float32, _SOURCE_TILE_H * tokens_per_cta], 16
++        ]
++    PostPreSequentialStorage.__annotations__ = annotations
++    return cute.struct(PostPreSequentialStorage)
++
++
++class MHCPostPreSequentialPartialKernel(MHCPostPrePartialKernel):
++    """Lagged partials summed in one fixed order per row, whatever shares the launch.
++
++    Inputs and outputs are MHCPostPrePartialKernel's (residual_out, y, partials[token, tile,
++    j] and the lagged y-squared sums), so the finalize kernel is unchanged. For each item of a
++    row (the residual's sum of squares, 24 mixes, the lagged y sum of squares) and each
++    residual stream, one thread sums the tile's 128 products in hidden order; the four stream
++    sums are then added in stream order.
++
++    A CTA covers one hidden tile for tokens_per_cta tokens (rounded up to a power of two).
++    Warps 0-2 hold one (mix, stream) pair per lane: the thread streams its own 128 mixing
++    weights from global memory with vector loads, a few vectors ahead, and reads the CTA's
++    tokens for each hidden element as one shared-memory vector, so each weight serves every
++    token. Warp 3 sums the squares (lanes 0-3, one stream each; lane 4 the lagged y). A row's
++    sums depend only on its own data, never on how many rows share a CTA or a launch.
++    """
++
++    items_per_token = _PARTIALS + 1  # 25 partials and the lagged y-squared sum
++
++    def __init__(self, *, tokens_per_cta: int, **kwargs):
++        super().__init__(**kwargs)
++        tokens_per_cta = int(tokens_per_cta)
++        if not 1 <= tokens_per_cta <= 16:
++            raise ValueError(f"tokens_per_cta must be in [1, 16], got {tokens_per_cta}")
++        if self.post_only or self.compute_gram:
++            raise ValueError("the sequential partial kernel computes lagged partial sums only")
++        if self.source_tile_h != self.num_threads:
++            raise ValueError("the sequential partial kernel needs one thread per hidden element")
++        if (_MIXES + 1) * _MHC_MULT > self.num_threads or self.num_threads % 32:
++            raise ValueError("mix threads and a squares warp must fit the CTA")
++        self.tokens_per_cta = _sequential_tokens(tokens_per_cta)
++        self.combine_per_thread = (
++            self.tokens_per_cta * self.items_per_token + self.num_threads - 1
++        ) // self.num_threads
++
++    @cute.jit
++    def __call__(
++        self,
++        x: cute.Tensor,
++        residual: cute.Tensor,
++        prev_post: cute.Tensor,
++        prev_comb: cute.Tensor,
++        fn: cute.Tensor,
++        partials: cute.Tensor,
++        out: cute.Tensor,
++        pre_mix: cute.Tensor,
++        y: cute.Tensor,
++        num_tokens: Int32,
++        stream: cuda.CUstream,
++    ):
++        if const_expr((not self.pre_only) and x.element_type != cutlass.BFloat16):
++            raise TypeError("x must be BFloat16")
++        if const_expr(residual.element_type != cutlass.BFloat16):
++            raise TypeError("residual must be BFloat16")
++        if const_expr((not self.pre_only) and prev_post.element_type != cutlass.Float32):
++            raise TypeError("prev_post must be Float32")
++        if const_expr((not self.pre_only) and prev_comb.element_type != cutlass.Float32):
++            raise TypeError("prev_comb must be Float32")
++        if const_expr(fn.element_type != cutlass.Float32):
++            raise TypeError("fn must be Float32")
++        if const_expr(partials.element_type != cutlass.Float32):
++            raise TypeError("partials must be Float32")
++        if const_expr(out.element_type != cutlass.BFloat16):
++            raise TypeError("out must be BFloat16")
++        if const_expr(self.lagged_mix and pre_mix.element_type != cutlass.Float32):
++            raise TypeError("pre_mix must be Float32")
++        if const_expr(self.lagged_mix and y.element_type != cutlass.BFloat16):
++            raise TypeError("y must be BFloat16")
++        self.kernel(
++            x, residual, prev_post, prev_comb, fn, partials, out, pre_mix, y, num_tokens,
++        ).launch(
++            grid=(
++                self.source_tiles,
++                1,
++                (num_tokens + Int32(self.tokens_per_cta - 1)) // Int32(self.tokens_per_cta),
++            ),
++            block=[self.num_threads, 1, 1],
++            stream=stream,
++            use_pdl=_MHC_PDL,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        x: cute.Tensor,
++        residual: cute.Tensor,
++        prev_post: cute.Tensor,
++        prev_comb: cute.Tensor,
++        fn: cute.Tensor,
++        partials: cute.Tensor,
++        out: cute.Tensor,
++        pre_mix: cute.Tensor,
++        y: cute.Tensor,
++        num_tokens: Int32,
++    ):
++        hidden_tile, _, token_block = cute.arch.block_idx()
++        tidx = cute.arch.thread_idx()[0]
++        T = self.tokens_per_cta
++        H = self.source_tile_h
++        RS = H * T + 4  # r_tile stream stride, in floats
++        PF = _sequential_fn_prefetch(T)
++        MIX_THREADS = _MIXES * _MHC_MULT
++        smem = cutlass_utils.SmemAllocator()
++        storage = smem.allocate(_post_pre_sequential_storage_cls(T, self.lagged_mix))
++        r_tile = storage.r_tile.get_tensor(
++            cute.make_layout((_MHC_MULT, H, T), stride=(RS, T, 1))
++        )
++        r_addr = shared_ptr_to_u32(storage.r_tile.data_ptr())
++        stream_sums = storage.stream_sums.get_tensor(
++            cute.make_layout(
++                (T, self.items_per_token, _MHC_MULT),
++                stride=(self.items_per_token * _MHC_MULT, _MHC_MULT, 1),
++            )
++        )
++        params = storage.params.get_tensor(
++            cute.make_layout((T, _SEQ_PARAMS), stride=(_SEQ_PARAMS, 1))
++        )
++        y_addr = r_addr
++        if const_expr(self.lagged_mix):
++            y_tile = storage.y_tile.get_tensor(cute.make_layout((H, T), stride=(T, 1)))
++            y_addr = shared_ptr_to_u32(storage.y_tile.data_ptr())
++        broadcast = const_expr(self.pre_only and cute.rank(residual) == 2)
++
++        # A mix thread's weights are constant, so the first vectors are requested before the
++        # wait on the previous kernel.
++        mix = tidx // Int32(_MHC_MULT)
++        s = tidx - mix * Int32(_MHC_MULT)
++        fn_addr = get_ptr_as_int64(
++            fn,
++            cute.crd2idx(
++                (mix, Int64(s) * Int64(self.hidden_size) + Int64(hidden_tile) * Int64(H)),
++                fn.layout,
++            ),
++        )
++        wbuf = cute.make_rmem_tensor(
++            cute.make_layout((4 * PF,), stride=(1,)), Float32
++        )
++        if tidx < Int32(MIX_THREADS):
++            for v in cutlass.range_constexpr(PF):
++                a0, a1, a2, a3 = ld_global_nc_v4_u32(fn_addr + Int64(16 * v))
++                wbuf[4 * v + 0] = u32_as_f32(a0)
++                wbuf[4 * v + 1] = u32_as_f32(a1)
++                wbuf[4 * v + 2] = u32_as_f32(a2)
++                wbuf[4 * v + 3] = u32_as_f32(a3)
++        if const_expr(_MHC_PDL):
++            cute.arch.griddepcontrol_wait()
++
++        h = Int64(hidden_tile) * Int64(H) + Int64(tidx)
++        token0 = Int64(token_block) * Int64(T)
++        last = Int64(num_tokens) - Int64(1)
++        valid = Int64(num_tokens) - token0
++        if valid > Int64(T):
++            valid = Int64(T)
++
++        # Every token's residual (and x) first, so all of the CTA's loads are in flight at once.
++        # Rows past the end read the last row; their sums are never written.
++        q = cute.make_rmem_tensor(cute.make_layout((T, _MHC_MULT), stride=(_MHC_MULT, 1)), Float32)
++        xs = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), Float32)
++        for t in cutlass.range_constexpr(T):
++            token = token0 + Int64(t)
++            if token > last:
++                token = last
++            if const_expr(broadcast):
++                q[t, 0] = Float32(residual[token, h])
++            else:
++                for st in cutlass.range_constexpr(_MHC_MULT):
++                    q[t, st] = Float32(residual[token, Int32(st), h])
++            if const_expr(not self.pre_only):
++                xs[t] = Float32(x[token, h])
++        # The tokens' mixing scalars, shared through shared memory.
++        for k in cutlass.range_constexpr(
++            (T * _SEQ_PARAMS + self.num_threads - 1) // self.num_threads
++        ):
++            idx = Int32(k * self.num_threads) + tidx
++            if idx < Int32(T * _SEQ_PARAMS):
++                t = idx // Int32(_SEQ_PARAMS)
++                j = idx - t * Int32(_SEQ_PARAMS)
++                token = token0 + Int64(t)
++                if token > last:
++                    token = last
++                value = Float32(0.0)
++                if j < Int32(4):
++                    if const_expr(not self.pre_only):
++                        value = Float32(prev_post[token, j])
++                elif j < Int32(20):
++                    if const_expr(not self.pre_only):
++                        value = Float32(
++                            prev_comb[token, (j - Int32(4)) // Int32(4), (j - Int32(4)) % Int32(4)]
++                        )
++                else:
++                    if const_expr(self.lagged_mix):
++                        value = Float32(pre_mix[token, j - Int32(20)])
++                params[t, j] = value
++        cute.arch.sync_threads()
++
++        # Post-mix (or plain residual for pre), exactly as the warp-reduced kernels compute and
++        # store it.
++        r = cute.make_rmem_tensor(cute.make_layout((_MHC_MULT, T), stride=(T, 1)), Float32)
++        yv = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), Float32)
++        for t in cutlass.range_constexpr(T):
++            token = token0 + Int64(t)
++            if const_expr(self.pre_only):
++                for st in cutlass.range_constexpr(_MHC_MULT):
++                    if const_expr(broadcast):
++                        r[st, t] = q[t, 0]
++                    else:
++                        r[st, t] = q[t, st]
++                if token < Int64(num_tokens):
++                    for st in cutlass.range_constexpr(_MHC_MULT):
++                        out[token, Int32(st), h] = r[st, t].to(cutlass.BFloat16)
++            else:
++                for st in cutlass.range_constexpr(_MHC_MULT):
++                    o = (
++                        params[t, st] * xs[t]
++                        + params[t, 4 + st] * q[t, 0]
++                        + params[t, 8 + st] * q[t, 1]
++                        + params[t, 12 + st] * q[t, 2]
++                        + params[t, 16 + st] * q[t, 3]
++                    ).to(cutlass.BFloat16)
++                    if token < Int64(num_tokens):
++                        out[token, Int32(st), h] = o
++                    r[st, t] = Float32(o)
++            if const_expr(self.lagged_mix):
++                y_bf16 = _contract_four(
++                    params[t, 20], params[t, 21], params[t, 22], params[t, 23],
++                    r[0, t], r[1, t], r[2, t], r[3, t],
++                ).to(cutlass.BFloat16)
++                if token < Int64(num_tokens):
++                    y[token, h] = y_bf16
++                yv[t] = Float32(y_bf16)
++        for st in cutlass.range_constexpr(_MHC_MULT):
++            if const_expr(T % 4 == 0):
++                for c in cutlass.range_constexpr(T // 4):
++                    st_shared_v4_u32(
++                        r_addr + (Int32(st * RS + 4 * c) + tidx * Int32(T)) * Int32(4),
++                        f32_to_raw_bits(r[st, 4 * c + 0]),
++                        f32_to_raw_bits(r[st, 4 * c + 1]),
++                        f32_to_raw_bits(r[st, 4 * c + 2]),
++                        f32_to_raw_bits(r[st, 4 * c + 3]),
++                    )
++            else:
++                for t in cutlass.range_constexpr(T):
++                    r_tile[st, tidx, t] = r[st, t]
++        if const_expr(self.lagged_mix):
++            if const_expr(T % 4 == 0):
++                for c in cutlass.range_constexpr(T // 4):
++                    st_shared_v4_u32(
++                        y_addr + (Int32(4 * c) + tidx * Int32(T)) * Int32(4),
++                        f32_to_raw_bits(yv[4 * c + 0]),
++                        f32_to_raw_bits(yv[4 * c + 1]),
++                        f32_to_raw_bits(yv[4 * c + 2]),
++                        f32_to_raw_bits(yv[4 * c + 3]),
++                    )
++            else:
++                for t in cutlass.range_constexpr(T):
++                    y_tile[tidx, t] = yv[t]
++        cute.arch.sync_threads()
++
++        acc = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), Float32)
++        for t in cutlass.range_constexpr(T):
++            acc[t] = Float32(0.0)
++        v = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), Float32)
++        if tidx < Int32(MIX_THREADS):
++            # Warps 0-2: one (mix, stream) pair per lane, weights a few vectors ahead.
++            row_addr = r_addr + s * Int32(RS * 4)
++            for e4 in cutlass.range_constexpr(H // 4):
++                slot = e4 % PF
++                w0 = wbuf[4 * slot + 0]
++                w1 = wbuf[4 * slot + 1]
++                w2 = wbuf[4 * slot + 2]
++                w3 = wbuf[4 * slot + 3]
++                if const_expr(e4 + PF < H // 4):
++                    a0, a1, a2, a3 = ld_global_nc_v4_u32(fn_addr + Int64(16 * (e4 + PF)))
++                    wbuf[4 * slot + 0] = u32_as_f32(a0)
++                    wbuf[4 * slot + 1] = u32_as_f32(a1)
++                    wbuf[4 * slot + 2] = u32_as_f32(a2)
++                    wbuf[4 * slot + 3] = u32_as_f32(a3)
++                for i in cutlass.range_constexpr(4):
++                    e = 4 * e4 + i
++                    if const_expr(T % 4 == 0):
++                        for c in cutlass.range_constexpr(T // 4):
++                            b0, b1, b2, b3 = ld_shared_v4_u32(
++                                row_addr + Int32((e * T + 4 * c) * 4)
++                            )
++                            v[4 * c + 0] = u32_as_f32(b0)
++                            v[4 * c + 1] = u32_as_f32(b1)
++                            v[4 * c + 2] = u32_as_f32(b2)
++                            v[4 * c + 3] = u32_as_f32(b3)
++                    elif const_expr(T == 2):
++                        b0, b1 = ld_shared_v2_u32(row_addr + Int32(e * T * 4))
++                        v[0] = u32_as_f32(b0)
++                        v[1] = u32_as_f32(b1)
++                    else:
++                        v[0] = _ld_shared_f32(row_addr + Int32(e * 4))
++                    w = w0
++                    if const_expr(i == 1):
++                        w = w1
++                    if const_expr(i == 2):
++                        w = w2
++                    if const_expr(i == 3):
++                        w = w3
++                    for t in cutlass.range_constexpr(T):
++                        acc[t] = acc[t] + w * v[t]
++            for t in cutlass.range_constexpr(T):
++                stream_sums[t, mix + Int32(1), s] = acc[t]
++        else:
++            # Warp 3: sums of squares, lanes 0-3 the residual streams, lane 4 the lagged y.
++            lane = tidx - Int32(MIX_THREADS)
++            row_addr = r_addr
++            if lane < Int32(_MHC_MULT):
++                row_addr = r_addr + lane * Int32(RS * 4)
++            if const_expr(self.lagged_mix):
++                if lane == Int32(_MHC_MULT):
++                    row_addr = y_addr
++            for e in cutlass.range_constexpr(H):
++                if const_expr(T % 4 == 0):
++                    for c in cutlass.range_constexpr(T // 4):
++                        b0, b1, b2, b3 = ld_shared_v4_u32(row_addr + Int32((e * T + 4 * c) * 4))
++                        v[4 * c + 0] = u32_as_f32(b0)
++                        v[4 * c + 1] = u32_as_f32(b1)
++                        v[4 * c + 2] = u32_as_f32(b2)
++                        v[4 * c + 3] = u32_as_f32(b3)
++                elif const_expr(T == 2):
++                    b0, b1 = ld_shared_v2_u32(row_addr + Int32(e * T * 4))
++                    v[0] = u32_as_f32(b0)
++                    v[1] = u32_as_f32(b1)
++                else:
++                    v[0] = _ld_shared_f32(row_addr + Int32(e * 4))
++                for t in cutlass.range_constexpr(T):
++                    acc[t] = acc[t] + v[t] * v[t]
++            if lane < Int32(_MHC_MULT):
++                for t in cutlass.range_constexpr(T):
++                    stream_sums[t, Int32(0), lane] = acc[t]
++            if const_expr(self.lagged_mix):
++                if lane == Int32(_MHC_MULT):
++                    for t in cutlass.range_constexpr(T):
++                        stream_sums[t, Int32(_PARTIALS), Int32(0)] = acc[t]
++        cute.arch.sync_threads()
++
++        # Stream sums added in stream order, one (token, item) per thread and slot.
++        for slot in cutlass.range_constexpr(self.combine_per_thread):
++            unit = Int32(slot * self.num_threads) + tidx
++            t = unit // Int32(self.items_per_token)
++            j = unit - t * Int32(self.items_per_token)
++            if Int64(t) < valid:
++                token = token0 + Int64(t)
++                if j < Int32(_PARTIALS):
++                    total = stream_sums[t, j, Int32(0)]
++                    single = False
++                    if const_expr(broadcast):
++                        single = j > Int32(0)
++                    if not single:
++                        total = total + stream_sums[t, j, Int32(1)]
++                        total = total + stream_sums[t, j, Int32(2)]
++                        total = total + stream_sums[t, j, Int32(3)]
++                    partials[token, hidden_tile, j] = total
++                elif const_expr(self.lagged_mix):
++                    partials[token, Int32(self.gram_row0) + hidden_tile, Int32(0)] = stream_sums[
++                        t, j, Int32(0)
++                    ]
++
++        if const_expr(_MHC_PDL):
++            cute.arch.sync_threads()
++            cute.arch.griddepcontrol_launch_dependents()
++
++
+ class MHCPostPreDecodeSplitNPartialKernel:
+     """Fused decode partial using split hidden slices and narrow output tiles."""
+ 
+@@ -3559,8 +3999,12 @@
+         active_source_splits: int = 0,
+         lagged_mix: bool = False,
+         lagged_prepared: bool = False,
++        lagged_threads: int = _GRAM_BLOCK_H,
+     ):
+         self.lagged_prepared = bool(lagged_prepared)
++        self.lagged_threads = int(lagged_threads)
++        if self.lagged_threads != _GRAM_BLOCK_H and not self.lagged_prepared:
++            raise ValueError("lagged_threads applies to the prepared lagged finalize only")
+         if self.lagged_prepared and (
+             not lagged_mix or compact_partials or single_cta or active_source_splits not in (0, _source_tiles_for_hidden(hidden_size))
+         ):
+@@ -3574,7 +4018,7 @@
+         if not self.single_cta and self.single_cta_groups != 1:
+             raise ValueError("single_cta_groups requires single_cta=True")
+         self.num_threads = (
+-            _GRAM_BLOCK_H
++            self.lagged_threads
+             if self.lagged_prepared
+             else _PREFILL_FINALIZE_THREADS
+             if lagged_mix
+@@ -3645,7 +4089,7 @@
+                 "compact_projection_splits must be less than partials split_k"
+             )
+         self.tiles_per_cta = (
+-            1
++            (1 if self.lagged_threads == _GRAM_BLOCK_H else self.hidden_tiles)
+             if self.lagged_prepared and self.lagged_norm
+             else self.hidden_tiles
+             if self.lagged_mix
+@@ -4303,10 +4747,26 @@
+                 pre_out[token, tidx] = Float32(s_pre[tidx])
+             if const_expr(self.lagged_prepared):
+                 if const_expr(self.lagged_norm):
+-                    h = Int64(tile_group) * Int64(self.num_threads) + Int64(tidx)
+-                    value = Float32(y[token, h])
+-                    value = value * Float32(s_post[0]) * Float32(norm_weight[h])
+-                    y[token, h] = value.to(cutlass.BFloat16)
++                    # Every load before any store: y is read and written in place, so
++                    # interleaved stores would order each load behind the previous store.
++                    y_values = cute.make_rmem_tensor(
++                        cute.make_layout((self.tiles_per_cta,), stride=(1,)), Float32
++                    )
++                    weights = cute.make_rmem_tensor(
++                        cute.make_layout((self.tiles_per_cta,), stride=(1,)), Float32
++                    )
++                    for tile in cutlass.range_constexpr(self.tiles_per_cta):
++                        h = (
++                            Int64(tile_group) * Int64(self.tiles_per_cta) + Int64(tile)
++                        ) * Int64(self.num_threads) + Int64(tidx)
++                        y_values[tile] = Float32(y[token, h])
++                        weights[tile] = Float32(norm_weight[h])
++                    for tile in cutlass.range_constexpr(self.tiles_per_cta):
++                        h = (
++                            Int64(tile_group) * Int64(self.tiles_per_cta) + Int64(tile)
++                        ) * Int64(self.num_threads) + Int64(tidx)
++                        value = y_values[tile] * Float32(s_post[0]) * weights[tile]
++                        y[token, h] = value.to(cutlass.BFloat16)
+             else:
+                 p0 = Float32(pre_mix[token, 0])
+                 p1 = Float32(pre_mix[token, 1])
+@@ -4441,6 +4901,7 @@
+     lagged_mix: bool = False,
+     partials_per_cta: int = _POST_PRE_PARTIALS_PER_CTA,
+     tokens_per_cta: int = 1,
++    sequential: bool = False,
+ ) -> MHCPostPrePartialKernel:
+     kwargs = dict(
+         hidden_size=hidden_size,
+@@ -4451,6 +4912,8 @@
+         lagged_mix=lagged_mix,
+         partials_per_cta=partials_per_cta,
+     )
++    if sequential:
++        return MHCPostPreSequentialPartialKernel(tokens_per_cta=int(tokens_per_cta), **kwargs)
+     if int(tokens_per_cta) > 1:
+         return MHCPostPrePartialMultiTokenKernel(tokens_per_cta=int(tokens_per_cta), **kwargs)
+     return MHCPostPrePartialKernel(**kwargs)
+@@ -4582,6 +5045,7 @@
+     active_source_splits: int = 0,
+     lagged_mix: bool = False,
+     lagged_prepared: bool = False,
++    lagged_threads: int = _GRAM_BLOCK_H,
+ ) -> MHCFinalizeGramKernel:
+     return MHCFinalizeGramKernel(
+         hidden_size=hidden_size,
+@@ -4599,6 +5063,7 @@
+         active_source_splits=active_source_splits,
+         lagged_mix=lagged_mix,
+         lagged_prepared=lagged_prepared,
++        lagged_threads=lagged_threads,
+     )
+ 
+ 
+@@ -4630,6 +5095,7 @@
+     decode_bf16x2 = native.decode_bf16x2
+     partials_per_cta = native.partials_per_cta
+     tokens_per_cta = int(getattr(native, "tokens_per_cta", 1))
++    sequential = bool(getattr(native, "sequential", False))
+     _validate_tensor_shape("x", x, (tokens, hidden_size))
+     _validate_tensor_shape("residual", residual, (tokens, _MHC_MULT, hidden_size))
+     _validate_tensor_shape("prev_post", prev_post, (tokens, _MHC_MULT))
+@@ -4774,10 +5240,12 @@
+             "integration.residual.mhc_post_pre_partial_hidden4096_hctile128"
+             f"_all{partials_per_cta}"
+             + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
++            + ("_seq" if sequential else "")
+         )
+         compile_key = (
+             ("partials_per_cta", partials_per_cta),
+             *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
++            *((("sequential", True),) if sequential else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("lagged_mix", lagged_mix),
+@@ -4793,12 +5261,14 @@
+             lagged_mix,
+             partials_per_cta,
+             tokens_per_cta,
++            sequential,
+         )
+     else:
+         compile_name = (
+             "integration.residual.mhc_post_pre_partial_"
+             f"{hidden_specialization}_hctile128_all{partials_per_cta}"
+             + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
++            + ("_seq" if sequential else "")
+         )
+         compile_key = (
+             ("hidden_size", hidden_size),
+@@ -4806,6 +5276,7 @@
+             ("source_tiles", hidden_size // _SOURCE_TILE_H),
+             ("partials_per_cta", partials_per_cta),
+             *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
++            *((("sequential", True),) if sequential else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("lagged_mix", lagged_mix),
+@@ -4821,6 +5292,7 @@
+             lagged_mix,
+             partials_per_cta,
+             tokens_per_cta,
++            sequential,
+         )
+     return _compile_mhc_entry(
+         kernel,
+@@ -5682,9 +6154,11 @@
+     y: torch.Tensor | None = None,
+     partials_per_cta: int,
+     tokens_per_cta: int = 1,
++    sequential: bool = False,
+     _prepared=None,
+ ) -> None:
+     tokens_per_cta = int(tokens_per_cta)
++    sequential = bool(sequential)
+     if (pre_mix is None) != (y is None):
+         raise ValueError("pre_mix and y must be supplied together")
+     lagged_mix = pre_mix is not None
+@@ -5787,10 +6261,12 @@
+             "integration.residual.mhc_pre_partial_hidden4096_hctile128"
+             f"_all{partials_per_cta}"
+             + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
++            + ("_seq" if sequential else "")
+         )
+         compile_key = (
+             ("partials_per_cta", partials_per_cta),
+             *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
++            *((("sequential", True),) if sequential else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("pre_only", True),
+@@ -5802,6 +6278,7 @@
+             "integration.residual.mhc_pre_partial_"
+             f"{hidden_specialization}_hctile128_all{partials_per_cta}"
+             + (f"_t{tokens_per_cta}" if tokens_per_cta > 1 else "")
++            + ("_seq" if sequential else "")
+         )
+         compile_key = (
+             ("hidden_size", hidden_size),
+@@ -5809,6 +6286,7 @@
+             ("source_tiles", hidden_size // _SOURCE_TILE_H),
+             ("partials_per_cta", partials_per_cta),
+             *((("tokens_per_cta", tokens_per_cta),) if tokens_per_cta > 1 else ()),
++            *((("sequential", True),) if sequential else ()),
+             ("threads", _THREADS),
+             ("compute_gram", compute_gram),
+             ("pre_only", True),
+@@ -5824,6 +6302,7 @@
+             lagged_mix=lagged_mix,
+             partials_per_cta=partials_per_cta,
+             tokens_per_cta=tokens_per_cta,
++            sequential=sequential,
+         ),
+         compile_spec=KernelCompileSpec.from_key(compile_name, 4, compile_key),
+         compile_args=args,
+@@ -5863,8 +6342,10 @@
+     lagged_prepared: bool = False,
+     single_cta_threads: int = 0,
+     single_cta_groups: int = 1,
++    lagged_threads: int = _GRAM_BLOCK_H,
+     _prepared=None,
+ ) -> None:
++    lagged_threads = int(lagged_threads)
+     rms_eps = float(rms_eps)
+     hc_eps = float(hc_eps)
+     sinkhorn_iters = int(sinkhorn_iters)
+@@ -5939,6 +6420,7 @@
+         fuse_norm, compact_partials, compact_projection_splits, single_cta,
+         single_cta_threads if single_cta else _PREFILL_FINALIZE_THREADS,
+         single_cta_groups, active_source_splits, lagged_mix, bool(lagged_prepared),
++        lagged_threads,
+     )
+     common_key_tail = (
+         (
+@@ -5955,6 +6437,7 @@
+         ("fuse_norm", fuse_norm),
+         ("lagged_mix", lagged_mix),
+         ("lagged_prepared", bool(lagged_prepared)),
++        *((("lagged_threads", lagged_threads),) if lagged_threads != _GRAM_BLOCK_H else ()),
+         ("compact_partials", compact_partials),
+         ("compact_projection_splits", compact_projection_splits),
+         ("single_cta", single_cta),
+--- a/b12x/norm/mhc/_preparation.py
++++ b/b12x/norm/mhc/_preparation.py
+@@ -53,6 +53,7 @@
+     block_m: int = 2
+     tile_n: int = 24
+     tokens_per_cta: int = 1
++    sequential: bool = False
+ 
+ 
+ def _lower_native(query, config, device):
+@@ -124,6 +125,7 @@
+         int(controls.get("B12X_MHC_PREFILL_BLOCK_M_SIZE", "2")),
+         int(controls.get("B12X_MHC_PREFILL_TILE_N", "12" if hidden == 7168 else "24")),
+         config.tokens_per_cta if config.lagged_prepare and route in ("pre", "post_pre") else 1,
++        bool(config.sequential_partials) and config.lagged_prepare and route in ("pre", "post_pre"),
+     )
+ 
+ 
+@@ -220,6 +222,7 @@
+                     compute_gram=False, pre_mix=mix if config.lagged_prepare else None,
+                     y=y if config.lagged_prepare else None, partials_per_cta=native.partials_per_cta,
+                     tokens_per_cta=native.tokens_per_cta,
++                    sequential=native.sequential,
+                 )
+             else:
+                 post_pre_programs(mix if config.lagged_prepare else None, y if config.lagged_prepare else None)
+@@ -271,6 +274,10 @@
+         compact_projection_splits=config.projection_k_splits if native.route in ("lagged_tf32", "tf32") else 1,
+         active_source_splits=native.source_splits if native.route == "decode" else 0,
+         lagged_prepared=config.lagged_prepare,
++        **({"lagged_threads": 256}
++           if native.sequential
++           and query.max_tokens > int(os.environ.get("B12X_MHC_SEQ_WIDE_FINALIZE_MAX", "8"))
++           else {}),
+     )
+ 
+ 
+@@ -333,7 +340,8 @@
+         else:
+             entry = partial(kernels._run_mhc_pre_partial_launch,
+                             partials_per_cta=native.partials_per_cta,
+-                            tokens_per_cta=native.tokens_per_cta)
++                            tokens_per_cta=native.tokens_per_cta,
++                            sequential=native.sequential)
+             if config.lagged_prepare:
+                 primary = partial(entry, _prepared=programs["partial"], compute_gram=False)
+             else:
+--- a/b12x/norm/mhc/_tuning.py
++++ b/b12x/norm/mhc/_tuning.py
+@@ -56,11 +56,12 @@
+     lagged_prepare: bool = False
+     partials_per_cta: int = 4
+     tokens_per_cta: int = 1
++    sequential_partials: bool = False
+ 
+     @classmethod
+     def from_config(cls, payload: FrozenMapping) -> "MhcConfig":
+         expected = frozenset(cls.__dataclass_fields__)
+-        if frozenset(payload) | {"tokens_per_cta"} != expected:
++        if frozenset(payload) | {"tokens_per_cta", "sequential_partials"} != expected:
+             raise ValueError(f"mHC config fields must be {sorted(expected)}")
+         return cls(
+             backend=str(payload["backend"]),
+@@ -74,6 +75,7 @@
+             lagged_prepare=payload["lagged_prepare"],
+             partials_per_cta=int(payload["partials_per_cta"]),
+             tokens_per_cta=int(payload.get("tokens_per_cta", 1)),
++            sequential_partials=bool(payload.get("sequential_partials", False)),
+         )
+ 
+     def to_dict(self) -> dict[str, object]:
+@@ -89,6 +91,7 @@
+             "lagged_prepare": self.lagged_prepare,
+             "partials_per_cta": self.partials_per_cta,
+             "tokens_per_cta": self.tokens_per_cta,
++            "sequential_partials": self.sequential_partials,
+         }
+ 
+ 
+@@ -233,7 +236,7 @@
+ ) -> None:
+     if not isinstance(config, MhcConfig):
+         raise TypeError("config must be MhcConfig")
+-    if any(type(getattr(config, field)) is not int for field in config.__dataclass_fields__ if field not in ("backend", "lagged_prepare")):
++    if any(type(getattr(config, field)) is not int for field in config.__dataclass_fields__ if field not in ("backend", "lagged_prepare", "sequential_partials")):
+         raise TypeError("projection geometry fields must be integers")
+     if config.backend not in {"native", "tf32_tma"}:
+         raise ValueError(f"unsupported mHC backend {config.backend!r}")
+@@ -249,6 +252,10 @@
+         raise ValueError("tokens_per_cta must be an integer in [1, 16]")
+     if config.tokens_per_cta != 1 and not config.lagged_prepare:
+         raise ValueError("several tokens per CTA require the fused lagged producer")
++    if type(config.sequential_partials) is not bool:
++        raise TypeError("sequential_partials must be a boolean")
++    if config.sequential_partials and not config.lagged_prepare:
++        raise ValueError("sequential partials require the fused lagged producer")
+     if config.backend == "native":
+         return
+     if not _tf32_eligible(query):
+@@ -505,7 +512,7 @@
+ TUNING = TuningContract(
+     component_id="norm.mhc",
+     query_schema_version=8,
+-    config_schema_version=5,
++    config_schema_version=6,
+     query_fields=frozenset(MhcQuery.__dataclass_fields__),
+     config_fields=frozenset(MhcConfig.__dataclass_fields__),
+     encode_query=_encode,
