@@ -66,7 +66,8 @@ def site_problems(nodes):
     return errors
 
 
-def build_plan(nodes):
+def build_plan(nodes, paths=2):
+    from topology import mesh_path_specs
     errors = site_problems(nodes)
     if errors:
         raise ValueError('\n'.join(errors))
@@ -74,8 +75,7 @@ def build_plan(nodes):
     result = {r: {'rank': r, 'routes': [], 'rules': [], 'markers': []} for r in range(4)}
     for rank in range(4):
         dest = (rank + 2) % 4
-        via = ((rank+1)%4, (rank-1)%4) if rank < dest else ((rank-1)%4, (rank+1)%4)
-        for lane, mid in enumerate(via):
+        for path, (lane, mid) in enumerate(mesh_path_specs(rank, paths)):
             def endpoint(r, peer):
                 h = by_rank[r]['roce_peer_hcas'][str(peer)][lane]
                 return h, by_rank[r]['mesh_ports'][h]
@@ -87,9 +87,9 @@ def build_plan(nodes):
             route = ['ip', 'route', 'add', ip(target)+'/32', 'via', ip(ingress),
                      'dev', source['netdev'], 'src', ip(source)]
             undo = route.copy(); undo[2] = 'del'
-            result[rank]['routes'].append({'add': route, 'delete': undo, 'destination': dest, 'lane': lane})
+            result[rank]['routes'].append({'add': route, 'delete': undo, 'destination': dest, 'lane': lane, 'path': path})
             # A namespace reserved for this experiment; add refuses collisions.
-            pref = str(48100 + rank*2 + lane)
+            pref = str(48100 + rank*paths + path)
             identity = ['tc', 'filter', 'add', 'dev', ingress['netdev'], 'ingress',
                         'protocol', '0x88b5', 'pref', pref, 'handle', pref]
             add = identity + ['flower', 'skip_sw', 'src_mac', source['mac'], 'dst_mac', ingress['mac'],
@@ -98,7 +98,7 @@ def build_plan(nodes):
                     'action', 'mirred', 'egress', 'redirect', 'dev', egress['netdev']]
             delete = identity.copy(); delete[2] = 'delete'; delete += ['flower']
             result[mid]['rules'].append({'add': add, 'delete': delete, 'pref': int(pref),
-                'ingress': ingress['netdev'], 'origin': rank, 'destination': dest, 'lane': lane})
+                'ingress': ingress['netdev'], 'origin': rank, 'destination': dest, 'lane': lane, 'path': path})
             result[rank]['markers'].append({'device': hca, 'source_ip': ip(source), 'destination_ip': ip(target)})
     return result
 
@@ -182,6 +182,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('action', choices=['plan','doctor','inventory'])
     parser.add_argument('--nodes', type=Path)
+    parser.add_argument('--paths', type=int, choices=(2, 4), default=2)
     parser.add_argument('--rank', type=int, choices=range(4))
     parser.add_argument('--node-json', help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -189,7 +190,7 @@ def main():
         print(json.dumps(inventory(json.loads(args.node_json)))); return 0
     if not args.nodes: parser.error('--nodes is required')
     nodes = json.loads(args.nodes.read_text())
-    plan = build_plan(nodes)
+    plan = build_plan(nodes, args.paths)
     if args.action == 'plan':
         print(json.dumps(plan if args.rank is None else plan[args.rank], indent=2)); return 0
     if args.rank is None: parser.error('--rank is required')

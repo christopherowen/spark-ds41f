@@ -37,7 +37,7 @@ def stop_requested(sig, frame):
 
 def run(args):
     nodes = json.loads(args.nodes.read_text())
-    plan = fabric.build_plan(nodes)[args.rank]
+    plan = fabric.build_plan(nodes, args.paths)[args.rank]
     node = next(n for n in nodes['nodes'] if n['rank'] == args.rank)
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if command[:3] != ['docker','run','--rm'] or f'--name={PROBE}' not in command:
@@ -143,6 +143,7 @@ def run(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--nodes', type=Path, required=True)
+    p.add_argument('--paths', type=int, choices=(2, 4), default=2)
     p.add_argument('--rank', type=int, choices=range(4), required=True)
     p.add_argument('--marker', type=Path, required=True)
     p.add_argument('--serving-container', required=True)

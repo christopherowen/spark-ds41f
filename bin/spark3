@@ -356,6 +356,8 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         if label != record["expected_tree"]:
             problems.append(f"{mode} image tree does not match its source manifest")
     if topology.transport(cluster) == "rocenante-mesh4":
+        if cluster.get("fabric", {}).get("mesh_paths", 2) == 4 and "rocenante-mesh4-fourpaths" not in source_manifest["b12x"].get("capabilities", []):
+            problems.append("four-path mesh requires its source capability")
         problems.extend(mesh_fabric.site_problems(nodes))
         if cluster.get("deployment", {}).get("launch_enabled"):
             problems.append("mesh4 is available for bounded collective qualification only; serving lifecycle is not qualified")
@@ -1013,7 +1015,8 @@ def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) 
     if topology.transport(cluster) == "rocenante-mesh4":
         command = ["sudo", "python3", f"{repository_path(cluster)}/scripts/mesh_probe.py",
                    "--nodes", f"{repository_path(cluster)}/{cluster['nodes_config']}",
-                   "--rank", str(node["rank"]), "--serving-container", cluster["container"]["name"],
+                   "--rank", str(node["rank"]), "--paths", str(cluster.get("fabric", {}).get("mesh_paths", 2)),
+                   "--serving-container", cluster["container"]["name"],
                    "--marker", "/usr/local/libexec/spark3-roce-marker", "--"] + command
     return command
 

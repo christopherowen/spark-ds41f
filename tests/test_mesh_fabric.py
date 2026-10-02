@@ -57,6 +57,38 @@ class MeshTest(unittest.TestCase):
             self.assertEqual(len(plans[rank]['rules']), 2)
         self.assertEqual(self.nodes, original)
 
+    def test_four_path_endpoints_rules_and_link_work(self):
+        from collections import defaultdict
+        self.cluster['fabric']['mesh_paths'] = 4
+        plans = fabric.build_plan(self.nodes, 4)
+        work = defaultdict(float)
+        for rank, node in self.by_rank.items():
+            peer = (rank+2)%4
+            routes = topology.logical_peer_hcas(self.cluster, node)
+            reverse = topology.logical_peer_hcas(self.cluster, self.by_rank[peer])[str(rank)]
+            self.assertEqual(len(set(routes[str(peer)])), 4)
+            self.assertEqual(len(plans[rank]['markers']), 4)
+            self.assertEqual(len(plans[rank]['rules']), 4)
+            for path, (lane, middle) in enumerate(topology.mesh_path_specs(rank, 4)):
+                target = self.by_rank[peer]['mesh_ports'][reverse[path]]
+                source = node['mesh_ports'][routes[str(peer)][path]]
+                route = plans[rank]['routes'][path]
+                self.assertEqual(route['add'][3], str(ipaddress.ip_interface(target['address']).ip)+'/32')
+                self.assertEqual(route['add'][-1], str(ipaddress.ip_interface(source['address']).ip))
+                self.assertEqual(source['pci'].split(':')[0], target['pci'].split(':')[0])
+                rules = [r for r in plans[middle]['rules'] if r['origin']==rank and r['path']==path]
+                self.assertEqual(len(rules), 1)
+                self.assertIn(target['mac'], rules[0]['add'])
+                work[lane,rank,middle] += .25
+                work[lane,middle,peer] += .25
+            for neighbor in ((rank-1)%4,(rank+1)%4):
+                self.assertEqual(routes[str(neighbor)], node['roce_peer_hcas'][str(neighbor)])
+                for lane in range(2): work[lane,rank,neighbor] += .5
+        self.assertEqual(len(work), 16)
+        self.assertEqual(set(work.values()), {1.0})
+        for invalid in (0, 1, 3, 5):
+            with self.assertRaises(ValueError): fabric.build_plan(self.nodes, invalid)
+
     def test_invalid_geometry_rejected_before_host_actions(self):
         for mutate in (
             lambda n: n['mesh_ports'].pop(next(iter(n['mesh_ports']))),
@@ -140,7 +172,7 @@ class MeshTest(unittest.TestCase):
             rules = [dict(pref=r['pref'],kind='flower',options={'in_hw':True})
                      for r in plan['rules'] if r['add'] in actions]
             return json.dumps(rules)
-        args = argparse.Namespace(nodes=ROOT/EXPERIMENT/'nodes.example.json',rank=0,
+        args = argparse.Namespace(paths=2, nodes=ROOT/EXPERIMENT/'nodes.example.json',rank=0,
             serving_container='serving',marker=Path('/marker'),
             command=['--','docker','run','--rm','--name=spark3-collective-probe'])
         with mock.patch.object(mesh_probe.os,'geteuid',return_value=0), \

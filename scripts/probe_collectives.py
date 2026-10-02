@@ -13,6 +13,7 @@ import argparse
 from datetime import timedelta
 import json
 import os
+import subprocess
 from pathlib import Path
 
 
@@ -24,6 +25,21 @@ def rdma_error_counters():
                                  for name in names}
     if not counters:
         raise RuntimeError('RDMA counter sampling requested but no devices visible')
+    return counters
+
+
+def port_counters():
+    names = ('tx_bytes_phy', 'rx_bytes_phy', 'rx_out_of_buffer')
+    counters = {}
+    for hca in Path('/sys/class/infiniband').iterdir():
+        for netdev in (hca / 'device/net').iterdir():
+            output = subprocess.check_output(['ethtool', '-S', netdev.name], text=True)
+            values = {key.strip(): int(value.strip()) for line in output.splitlines()
+                      if ':' in line for key, value in [line.split(':', 1)]
+                      if value.strip().isdigit()}
+            counters[netdev.name] = {name: values[name] for name in names}
+    if not counters:
+        raise RuntimeError('port counter sampling requested but no RDMA netdevs visible')
     return counters
 
 
@@ -73,6 +89,9 @@ def main() -> None:
                         help="after correctness, screen steady graph collective latency")
     parser.add_argument("--counter-samples", action="store_true",
                         help="record RDMA error deltas around each benchmark case")
+    parser.add_argument("--port-samples", action="store_true",
+                        help="sample physical NIC bytes and buffer drops around each timed case")
+    parser.add_argument("--expect-paths", type=int, choices=(2, 4))
     args = parser.parse_args()
     if not 0 <= args.rank < args.world_size:
         parser.error("rank must be in the configured process group")
@@ -122,6 +141,12 @@ def main() -> None:
         if wave_setting is not None and (adapter is None or
                 adapter._runtime.stats().get('mesh_wave_bytes') != int(wave_setting)):
             raise RuntimeError('image did not apply the requested mesh wave threshold')
+        if args.expect_paths is not None:
+            if adapter is None or adapter._runtime.stats().get('path_slots') != args.expect_paths:
+                raise RuntimeError('image did not apply the requested path count')
+            requested_rotate = int(os.environ.get('B12X_ROCE_MESH_ROTATE', '0'))
+            if adapter._runtime.stats().get('mesh_rotate') != requested_rotate:
+                raise RuntimeError('image did not apply the requested posting order')
         # Exercise the torch NCCL group as well as vLLM's separate PyNCCL group.
         total = args.world_size * (args.world_size + 1) // 2
         control = torch.tensor([args.rank + 1], device=device, dtype=torch.float32)
@@ -198,6 +223,7 @@ def main() -> None:
                         for _ in range(4): graph.replay()
                         torch.cuda.synchronize()
                         counters_before = rdma_error_counters() if args.counter_samples else None
+                        ports_before = port_counters() if args.port_samples else None
                         samples = []
                         for _ in range(5):
                             dist.barrier(group=group.cpu_group)
@@ -221,6 +247,11 @@ def main() -> None:
                             row['rdma_error_deltas'] = {
                                 dev: {key: value - counters_before[dev][key] for key, value in values.items()}
                                 for dev, values in counters_after.items()}
+                        if ports_before is not None:
+                            ports_after = port_counters()
+                            row['port_deltas'] = {
+                                dev: {key: value - ports_before[dev][key] for key, value in values.items()}
+                                for dev, values in ports_after.items()}
                         timings.append(row)
                         print(json.dumps({'rank': args.rank, 'timing': row}), flush=True)
                         del graph, outputs

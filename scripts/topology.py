@@ -62,16 +62,26 @@ def set_argument(cluster: dict, flag: str, value: str) -> None:
         args.extend([flag, value])
 
 
+def mesh_path_specs(rank: int, paths: int = 2) -> list[tuple[int, int]]:
+    """Return (physical lane, intermediate rank) in reciprocal QP path order."""
+    if paths not in (2, 4):
+        raise ValueError("mesh_paths must be 2 or 4")
+    opposite = (rank + 2) % 4
+    via = ((rank + 1) % 4, (rank - 1) % 4) if rank < opposite else ((rank - 1) % 4, (rank + 1) % 4)
+    specs = [(0, via[0]), (1, via[1])]
+    if paths == 4:
+        specs += [(0, via[1]), (1, via[0])]
+    return specs
+
+
 def logical_peer_hcas(cluster: dict, node: dict) -> dict:
     """Physical cable routes remain authoritative; add only the opposite QP path."""
     routes = copy.deepcopy(node["roce_peer_hcas"])
     if transport(cluster) == "rocenante-mesh4":
         rank = node["rank"]
         opposite = (rank + 2) % 4
-        # Both endpoints select the same intermediate on each stripe. The
-        # two stripes cross different PCI roots and opposite ring directions.
-        intermediates = ((rank + 1) % 4, (rank - 1) % 4) if rank < opposite else ((rank - 1) % 4, (rank + 1) % 4)
-        routes[str(opposite)] = [routes[str(peer)][lane] for lane, peer in enumerate(intermediates)]
+        specs = mesh_path_specs(rank, cluster.get("fabric", {}).get("mesh_paths", 2))
+        routes[str(opposite)] = [routes[str(peer)][lane] for lane, peer in specs]
     return routes
 
 
@@ -114,6 +124,9 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     elif cluster.get("distributed", {}).get("master_addr") != heads[0].get("management_ip"):
         errors.append("distributed.master_addr must match the API head's management_ip")
     mode = transport(cluster)
+    paths = cluster.get("fabric", {}).get("mesh_paths", 2)
+    if paths not in (2, 4) or (paths == 4 and mode != "rocenante-mesh4"):
+        errors.append("mesh_paths must be 2, or 4 for rocenante-mesh4")
     if mode not in ("rocenante-direct", "nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
         errors.append(f"unknown fabric transport {mode!r}")
     if count == 4 and mode not in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
