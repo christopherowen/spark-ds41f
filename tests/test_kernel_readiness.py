@@ -195,3 +195,11 @@ class RmQualificationTest(unittest.TestCase):
         self.assertTrue(kernel.profile_problems("node", data, profile, policy))
         data["rm_build_note"] = "candidate-build"
         self.assertEqual(kernel.profile_problems("node", data, profile, policy), [])
+
+    def test_system_pool_policy_required(self):
+        policy = dict(POLICY, rm_system_memory_pools="0")
+        profile = {"release": NEW, "page_size": 65536}
+        data = {"kernel": NEW, "page_size": 65536, "rm_system_memory_pools": "529"}
+        self.assertTrue(kernel.profile_problems("node", data, profile, policy))
+        data["rm_system_memory_pools"] = "0"
+        self.assertEqual(kernel.profile_problems("node", data, profile, policy), [])

@@ -73,6 +73,10 @@ def collect(policy):
     }
     if policy.get("rm_build_note"):
         data["rm_build_note"] = Path("/sys/module/nvidia/notes/.note.gnu.build-id").read_bytes().hex()
+    if policy.get("rm_system_memory_pools") is not None:
+        params = read("NVIDIA parameters", "cat", "/proc/driver/nvidia/params")
+        data["rm_system_memory_pools"] = next((line.split(":", 1)[1].strip() for line in params.splitlines()
+                                               if line.startswith("EnableSystemMemoryPools:")), None)
     packing = Path("/sys/module/nvidia_uvm/parameters/uvm_pack_sysmem_leaf_tables")
     data["uvm_leaf_packing"] = packing.read_text().strip() if packing.exists() else "stock"
     for name in policy["packages"]:
@@ -225,6 +229,8 @@ def profile_problems(name, data, profile, policy):
                       f"running {data.get('kernel')!r} / {data.get('page_size')!r}")
     if policy.get("rm_build_note") and data.get("rm_build_note") != policy["rm_build_note"]:
         issues.append(f"{name}: serving profile requires the qualified NVIDIA RM build")
+    if policy.get("rm_system_memory_pools") is not None and data.get("rm_system_memory_pools") != str(policy["rm_system_memory_pools"]):
+        issues.append(f"{name}: NVIDIA system memory pool setting differs from the serving profile")
     if profile.get("memory_saver_required"):
         if not policy.get("memory_saver"):
             issues.append(f"{name}: serving profile requires a pinned memory-saver policy")

@@ -57,3 +57,16 @@ The local source hash and exact patch are pinned. This changes RM, so it is
 outside memory-saver's UVM-only scope and is installed as a separate temporary
 signed module override. The restoration script removes it before R580 returns.
 Testing this corrected driver is a new arm, not evidence that stock R610 works.
+
+The corrected RM passes 3,584 allocation/readbacks, the 4.5 GiB transfer,
+BF16 matmul/graph replay and 60 probes around 15 separate DMA boundaries in
+a 64 GiB allocation on all nodes. Its ELF build ID is pinned; NVIDIA's module
+source-version string does not distinguish this header-only correction.
+
+The first corrected-driver model start failed before weight loading: CUDA
+reported only 50–51 GiB free. R610's `NVreg_EnableSystemMemoryPools=529`
+default retained the 64 GiB test allocation after process exit. Its source
+`nvidia/nv-reg.h` documents that caching behavior. The experimental host config
+sets this option to zero, restores returned pages to ordinary host accounting,
+and checks the loaded setting before serving. This setting is removed during
+restoration. The original failed-start logs are retained.

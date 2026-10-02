@@ -16,6 +16,7 @@ for name,h in files: assert hashlib.sha256((p/name).read_bytes()).hexdigest()==h
 PY
 # Remove the separately qualified RM experiment before restoring vendor packages.
 if [ "$arm" = old ]; then
+  sudo rm -f -- /etc/modprobe.d/zz-spark3-driver-cuda-refresh.conf
   override=/lib/modules/7.0.0-1019-nvidia-64k/updates/driver-cuda-refresh/nvidia.ko
   if [ -f "$override" ]; then
     sudo rm -- "$override"
