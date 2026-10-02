@@ -47,6 +47,22 @@ per hour, prompt and output lengths, prefix-cache share, draft acceptance by
 position, the share of engine steps carrying prefill, latency quantiles, and
 peak load. Findings per hour come from the agent's own report.
 
+Every benchmark starts from the same thermal baseline: each node's hottest
+thermal zone below 55 °C.
+- `bin/spark3 bench` checks every node before measuring.
+- A node above the threshold is pre-cooled at the maximum floor of
+  dgx-spark-fan-control (`dgx-fan-control set-state 12`), with its
+  `dgx-fan-control` service paused.
+- Once it is below 55 °C, its usual fan control returns: the service's curve,
+  or firmware automatic where the service is not running. Measurement then
+  starts.
+- The bench report's `cooling` section records each node's start and final
+  temperature, whether it was cooled, and for how long.
+- `--cool-below` changes the threshold (0 skips the check). `--cool-timeout`
+  (default 600 s) bounds the wait; a node that cannot cool aborts the bench.
+- `scripts/lab.py` kernel jobs apply the same check to their nodes before
+  replaying.
+
 Report TTFT, per-stream and aggregate TPS, total wall time, prompt/decode token
 counts, and variability across complete runs. Performance is not accepted at the
 expense of model quality or silent request rejection.

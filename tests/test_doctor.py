@@ -423,6 +423,80 @@ class SiteNodesTest(unittest.TestCase):
         for node in example["nodes"]:
             self.assertEqual(set(node), {"name", "rank", "management_ip", "head", "roce_peer_hcas"})
 
+
+class CoolingTest(unittest.TestCase):
+    """Benchmarks start with every node below the cooling threshold."""
+
+    def run_cooling(self, temps: dict[str, list[float]], service_active: bool = True,
+                    timeout: float = 600.0) -> tuple[list[dict], list[tuple[str, ...]]]:
+        import threading
+        calls: list[tuple[str, ...]] = []
+        readings = {name: list(values) for name, values in temps.items()}
+
+        def fake_ssh(nodes, node, *command):
+            calls.append((node["name"], *command))
+            if command[:2] == ("sh", "-c"):
+                values = readings[node["name"]]
+                value = values.pop(0) if len(values) > 1 else values[0]
+                return spark3.subprocess.CompletedProcess(command, 0, f"{int(value * 1000)}\n", "")
+            if command[:3] == ("systemctl", "is-active", "--quiet"):
+                return spark3.subprocess.CompletedProcess(command, 0 if service_active else 3, "", "")
+            return spark3.subprocess.CompletedProcess(command, 0, "", "")
+
+        original = spark3.run_ssh
+        spark3.run_ssh = fake_ssh
+        try:
+            nodes = {"ssh_user": "u", "nodes": [{"name": n} for n in temps]}
+            records = [spark3.cool_node(nodes, node, 55.0, timeout, threading.Event(), poll_s=0)
+                       for node in nodes["nodes"]]
+        finally:
+            spark3.run_ssh = original
+        return records, calls
+
+    def test_cool_nodes_are_left_alone(self) -> None:
+        records, calls = self.run_cooling({"dgx1": [48.0]})
+        self.assertFalse(records[0]["cooled"])
+        self.assertFalse(any("dgx-fan-control" in call for call in calls))
+
+    def test_hot_node_is_cooled_then_its_service_restored(self) -> None:
+        records, calls = self.run_cooling({"dgx2": [58.5, 57.0, 54.9]})
+        commands = [call[1:] for call in calls if call[1] == "sudo"]
+        self.assertEqual(commands, [
+            ("sudo", "-n", "systemctl", "stop", "dgx-fan-control.service"),
+            ("sudo", "-n", "dgx-fan-control", "set-state", "12"),
+            ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"),
+        ])
+        self.assertTrue(records[0]["cooled"])
+        self.assertEqual(records[0]["final_c"], 54.9)
+        self.assertEqual(records[0]["restored"], "dgx-fan-control.service")
+
+    def test_without_the_service_fans_return_to_firmware_automatic(self) -> None:
+        records, calls = self.run_cooling({"dgx3": [60.0, 50.0]}, service_active=False)
+        self.assertIn(("dgx3", "sudo", "-n", "dgx-fan-control", "automatic"), calls)
+        self.assertEqual(records[0]["restored"], "automatic")
+
+    def test_timeout_still_restores_the_fans(self) -> None:
+        with self.assertRaises(RuntimeError):
+            self.run_cooling({"dgx4": [70.0]}, timeout=0.0)
+
+    def test_restore_runs_after_a_timeout(self) -> None:
+        import threading
+        calls = []
+
+        def fake_ssh(nodes, node, *command):
+            calls.append(command)
+            out = "70000\n" if command[:2] == ("sh", "-c") else ""
+            return spark3.subprocess.CompletedProcess(command, 0, out, "")
+
+        original = spark3.run_ssh
+        spark3.run_ssh = fake_ssh
+        try:
+            with self.assertRaises(RuntimeError):
+                spark3.cool_node({"ssh_user": "u"}, {"name": "dgx4"}, 55.0, 0.0, threading.Event(), poll_s=0)
+        finally:
+            spark3.run_ssh = original
+        self.assertEqual(calls[-1], ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"))
+
 if __name__ == "__main__":
     unittest.main()
 

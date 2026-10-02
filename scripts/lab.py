@@ -841,6 +841,10 @@ def run_kernel_bundles(step: dict) -> list[dict]:
             verdict.update({"passed": False, "errors": [process.stdout[-2000:], process.stderr[-2000:]]})
         return verdict
 
+    # Same thermal starting point as a bench: every node below the cooling threshold.
+    names = sorted({entry["node"] for entry in step["bundles"]})
+    spark3.cool_nodes(nodes, [spark3.node_by_name(nodes, name) for name in names],
+                      spark3.COOL_BELOW_C, spark3.COOL_TIMEOUT_S)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(step["bundles"])) as pool:
         verdicts = list(pool.map(one, step["bundles"]))
     local = ROOT / step["out"]

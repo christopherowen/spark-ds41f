@@ -28,6 +28,9 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
   `dgx-spark-fan-control` DKMS module with its `dgx_ec_fan_floor` cooling
   device, and the `dgx-fan-control` daemon. Its source and signing key live
   outside this repository; `doctor --live` reports the first missing layer.
+  `bin/spark3 bench` and kernel-lab jobs use it to pre-cool every node below
+  55 °C before measuring. Without it they wait for the node to cool under
+  NVIDIA's curve.
 - NVMe interrupt coalescing off on every node. DGX OS's
   `nvidia-nvme-interrupt-coalescing.service` sets feature 0x08 to 0x107 at
   every boot (one interrupt per 8 completions or 100 µs). The drives default to
