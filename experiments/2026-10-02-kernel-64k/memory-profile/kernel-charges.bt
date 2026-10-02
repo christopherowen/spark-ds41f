@@ -9,7 +9,7 @@ kprobe:__memcg_kmem_charge_page {
 }
 kretprobe:__memcg_kmem_charge_page /@pending_page[tid]/ {
     $p = @pending_page[tid];
-    if (retval == 0) {
+    if (retval == 0 && (((struct page *)$p)->memcg_data & 2)) {
         if (@bytes[$p]) { @duplicate_charge = count(); }
         @bytes[$p] = @pending_bytes[tid];
         @stack[$p] = @pending_stack[tid];
@@ -18,7 +18,7 @@ kretprobe:__memcg_kmem_charge_page /@pending_page[tid]/ {
         @live_count[@stack[$p], @name[$p]] = sum(1);
         @outstanding_bytes = sum((int64)@bytes[$p]);
         @total_charged_bytes = sum(@bytes[$p]);
-    } else { @charge_failures = count(); }
+    } else if (retval != 0) { @charge_failures = count(); }
     delete(@pending_page[tid]); delete(@pending_bytes[tid]);
     delete(@pending_stack[tid]); delete(@pending_comm[tid]);
 }
@@ -30,6 +30,7 @@ kprobe:__memcg_kmem_uncharge_page /@bytes[arg0]/ {
     @outstanding_bytes = sum(-((int64)@bytes[$p]));
     delete(@bytes[$p]); delete(@stack[$p]); delete(@name[$p]);
 }
+kprobe:phys_mem_allocate { @uvm_requested_sizes[arg1] = count(); }
 BEGIN { printf("READY page_size=%d\n", $1); }
 interval:s:1 { printf("LIVE t=%llu\n", elapsed / 1000000000); print(@outstanding_bytes); }
 END {

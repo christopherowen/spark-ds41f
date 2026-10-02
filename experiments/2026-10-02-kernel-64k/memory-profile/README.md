@@ -39,3 +39,20 @@ the kernel allocator responsible. It tracks neither file-cache nor ordinary user
 anonymous pages. Duplicate charges, order mismatches, map errors or nonzero
 charge failures require investigation before trusting the totals. Use
 `BPFTRACE_MAX_MAP_KEYS=131072`; runtime and memory limits remain bounded.
+
+The kernel-charge trace identifies UVM `phys_mem_allocate` / `allocate_directory`
+under `uvm_map_external_allocation_on_gpu` as the source: roughly 53K kernel
+pages, about 3.25 GiB at 64 KiB. The first all-host trace includes eight duplicate
+root-page events: successful charge calls can return without charging root
+pages. The corrected probe requires MEMCG_DATA_KMEM (bit 1) after success and
+also records UVM's requested-size histogram. The first trace is retained and
+is attribution evidence, not a byte-exact final accounting.
+
+`cluster-native-allocator.json` changes only `expandable_segments:True` to
+`False` from the pinned arm. Hypothesis: avoiding PyTorch's CUDA VMM path
+reduces UVM page-table allocations. The installed driver uses
+`alloc_pages(flags, get_order(size))` for each system-memory GPU page table;
+Blackwell inherits Hopper's 256-byte/4096-byte table sizes. A 64 KiB CPU
+page is therefore much larger than the logical table. The `vid` module option
+is not a valid shortcut: this integrated GPU requires system-memory tables.
+No module parameter or NVIDIA module has been modified.
