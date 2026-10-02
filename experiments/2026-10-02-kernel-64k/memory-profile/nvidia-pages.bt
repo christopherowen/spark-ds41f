@@ -1,0 +1,41 @@
+// NVIDIA 580.178.04: nv_alloc_s num_pages/order at offsets 32/36.
+// Validate num_pages against nvos_create_alloc's argument before trusting it.
+// $1 is the running kernel's PAGE_SIZE. Start before the serving container.
+kprobe:nvos_create_alloc { @creating[tid] = arg1; }
+kretprobe:nvos_create_alloc /@creating[tid]/ {
+    if (retval != 0 && *(uint32 *)(retval + 32) != @creating[tid]) { @bad_layout = count(); }
+    delete(@creating[tid]);
+}
+kprobe:nv_alloc_system_pages, kprobe:nv_alloc_contig_pages {
+    @pending[tid] = arg1;
+    @callstack[arg1] = kstack(16);
+}
+kretprobe:nv_alloc_system_pages, kretprobe:nv_alloc_contig_pages /@pending[tid]/ {
+    $at = @pending[tid];
+    if (retval == 0) {
+        $pages = *(uint32 *)($at + 32);
+        $order = *(uint32 *)($at + 36);
+        $block = (uint64)1 << $order;
+        $actual = (($pages + $block - 1) / $block) * $block * $1;
+        $requested = $pages * $1;
+        @bytes[$at] = $actual;
+        @requested[$at] = $requested;
+        @live_bytes[@callstack[$at], $requested] = sum((int64)$actual);
+        @live_count[@callstack[$at], $requested] = sum(1);
+        @allocated_bytes = sum($actual);
+        @allocated_count = count();
+        @rounding_bytes = sum($actual - $requested);
+    } else { @allocation_failures = count(); delete(@callstack[$at]); }
+    delete(@pending[tid]);
+}
+kprobe:nv_free_system_pages, kprobe:nv_free_contig_pages /@bytes[arg0]/ {
+    $at = arg0;
+    @live_bytes[@callstack[$at], @requested[$at]] = sum(-((int64)@bytes[$at]));
+    @live_count[@callstack[$at], @requested[$at]] = sum(-1);
+    @freed_bytes = sum(@bytes[$at]);
+    delete(@bytes[$at]); delete(@requested[$at]); delete(@callstack[$at]);
+}
+BEGIN { printf("READY page_size=%d\n", $1); }
+END {
+    clear(@creating); clear(@pending); clear(@bytes); clear(@requested); clear(@callstack);
+}

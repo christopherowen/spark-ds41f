@@ -1,0 +1,11 @@
+Owner request: boot test, probably set 64kb as the default kernel.
+Authorized coordinated trial starts 2026-10-02 05:26 UTC. Hold: codex-64k-boot-test.
+Base r5o image sha256:288fc5bd909eb7e5fa51bd5abd94286140a0f07c40b92d763f8be4970309e5ab.
+First 4K screen preceded reboot (long-lived hosts).
+Installed separate 16 GiB 64K swap and page-aware boot service; 64K THP never, min_free_kbytes=45166.
+Booted dgx3 first, then dgx1/dgx2. All large pinned copies (4.5 GiB), BF16 matmul and CUDA graph checks passed.
+dgx3 initially failed nv-cpu-governor.service due missing linux-tools package for 64K. Installed exact matching package on all three. Doctor now verifies this package/tool and performance governors. All failed services cleared.
+All-node 64K model startup API ready in 121 sec; steady memory guards active in 122 sec.
+64K screen: quality, 1/2/4/8-stream prose/code, short/32K/64K source prefill, 32K prefix reuse, 4 x 64K admission all passed. No swap growth, no thermal throttle.
+MemTotal rose by about 2.098 GiB/node but loaded-model MemAvailable was lower than historical-uptime control. Rebooted all nodes back to 4K at about 05:45 UTC for fresh control. All booted with original swap and no failed units. No 64K default promotion yet.
+Production adaptive verification costs reprofiled per startup; this is a compatibility/host-policy screen, not a pinned-policy kernel speed comparison. Decode n=2 and prefill n=1 are insufficient to establish small throughput improvements.

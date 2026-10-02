@@ -84,3 +84,10 @@ new collector reports no preparation findings or cross-node alignment issues;
 the complete `doctor --live` passes. Host-independent validation: 49 existing
 doctor tests and 14 kernel-readiness tests pass. No upstream patch or serving
 image changed. Raw inventories, installation logs and receipts are in `runs/`.
+
+## Subsequent authorized boot trial
+
+The owner subsequently requested a boot test and conditional default change.
+The [boot-test record](boot-test/README.md) records that separate operation,
+including the CPU-tools repair, serving screens, rollback and default decision.
+The preparation results above describe their original point in time.
