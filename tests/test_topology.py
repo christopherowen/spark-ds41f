@@ -91,6 +91,21 @@ class TopologyTest(unittest.TestCase):
         topology.set_argument(self.ring, "--speculative-config", '{"draft_tensor_parallel_size":3}')
         self.assertTrue(any("draft_tensor" in p for p in topology.problems(self.ring, self.four)))
 
+    def test_qualified_ring_channels_preserve_neighbor_constraints(self):
+        for channels in ("1", "2", "4"):
+            candidate = copy.deepcopy(self.ring)
+            for key in ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS"):
+                candidate["environment"][key] = channels
+            self.assertEqual(topology.problems(candidate, self.four), [])
+            env = topology.node_environment(candidate, self.four["nodes"][0])
+            self.assertEqual(env["NCCL_MAX_NCHANNELS"], channels)
+            candidate["environment"]["NCCL_ALGO"] = "Tree"
+            self.assertTrue(any("NCCL_ALGO" in p for p in topology.problems(candidate, self.four)))
+        for lower, upper in (("1", "4"), ("3", "3"), ("0", "0"), ("8", "8")):
+            candidate = copy.deepcopy(self.ring)
+            candidate["environment"].update(NCCL_MIN_NCHANNELS=lower, NCCL_MAX_NCHANNELS=upper)
+            self.assertTrue(any("NCCL_MIN_NCHANNELS" in p for p in topology.problems(candidate, self.four)))
+
     def test_ep_and_multiple_parallel_groups_rejected(self):
         self.ring["serve_args"].append("--enable-expert-parallel")
         topology.set_argument(self.ring, "--pipeline-parallel-size", "2")

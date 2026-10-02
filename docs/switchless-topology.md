@@ -85,8 +85,13 @@ cable actually delivers RDMA packets. The collective probe checks communication.
 The pinned NCCL source is
 [`73cf1122`](https://github.com/NVIDIA/nccl/tree/73cf112295c33aee2b895f329f592f2a9b4b0f97).
 
-- `NCCL_ALGO=Ring`, one channel and ranks in cable order keep collective
-  communication on neighbour edges. See `src/graph/connect.cc:connectRings`.
+- `NCCL_ALGO=Ring` and ranks in cable order keep collective communication on
+  neighbour edges. See `src/graph/connect.cc:connectRings`. The generated profile
+  defaults to one channel. Four-node validation also accepts equal
+  `NCCL_MIN_NCHANNELS`/`NCCL_MAX_NCHANNELS` settings of 2 or 4, qualified by the
+  [NCCL tuning screen](../experiments/2026-10-03-collective-policy/README.md).
+  Per-call channel use can be lower; keep the actual plan/ring logs. Serving
+  performance still requires a matched candidate screen.
 - `NCCL_RUNTIME_CONNECT=1` postpones connections until their algorithm is used.
   In `src/init.cc`, runtime connection requires **cuMem support**, so this profile
   sets `NCCL_CUMEM_ENABLE=1`. Keeping the three-node profile's `0` would eagerly

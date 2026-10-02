@@ -149,6 +149,19 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
         env = cluster.get("environment", {})
         required_env = dict(RING_ENV)
+        # Four-node qualification covers these initialized channel counts on
+        # neighbour rings. NCCL may use fewer channels for an individual call.
+        # Keep one source of truth: the native NCCL environment settings.
+        channel_keys = ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS")
+        allowed_channels = ("1", "2", "4") if count == 4 else ("1",)
+        channel_values = [str(env.get(key)) for key in channel_keys]
+        if channel_values[0] not in allowed_channels or channel_values[0] != channel_values[1]:
+            errors.append(
+                f"{mode} requires matching NCCL_MIN_NCHANNELS and NCCL_MAX_NCHANNELS "
+                f"in {', '.join(allowed_channels)}"
+            )
+        for key in channel_keys:
+            required_env.pop(key)
         if mode in ("rocenante-ring4", "rocenante-mesh4"):
             required_env.update(VLLM_ENABLE_ROCE_ALLREDUCE="1", B12X_ROCE_TOPOLOGY=mode.removeprefix("rocenante-"))
         for key, value in required_env.items():

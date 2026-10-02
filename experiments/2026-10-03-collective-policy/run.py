@@ -2,12 +2,23 @@ from pathlib import Path
 import argparse,importlib.machinery,importlib.util,json,subprocess,shlex,time,sys
 root=Path(__file__).resolve().parents[2]
 l=importlib.machinery.SourceFileLoader('spark3_probe_runner',str(root/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
-kind=sys.argv[1];runid=sys.argv[2]
-profile = 'experiments/2026-10-03-collective-policy/cluster.json'
+parser=argparse.ArgumentParser(description='Bounded four-rank collective screen')
+parser.add_argument('arm')
+parser.add_argument('run_id')
+parser.add_argument('--benchmark',action='store_true')
+parser.add_argument('--counter-samples',action='store_true')
+parser.add_argument('--lengths',type=int,nargs='+')
+parser.add_argument('--cluster-config',default='experiments/2026-10-03-collective-policy/cluster.json')
+parser.add_argument('--output-root',default='.work/collective-policy')
+parser.add_argument('--holder',default='collective-policy-tuning')
+options=parser.parse_args()
+kind=options.arm;runid=options.run_id
+profile = options.cluster_config
 overrides=json.loads((root/'experiments/2026-10-03-collective-policy/arms.json').read_text())[kind]
 c,n,_=m.configuration(argparse.Namespace(cluster_config=profile))
-hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']=='collective-policy-tuning'
-out=root/'.work/collective-policy'/runid;out.mkdir(parents=True,exist_ok=False)
+hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']==options.holder
+out=root/options.output_root/runid;out.mkdir(parents=True,exist_ok=False)
+(out/'invocation.json').write_text(json.dumps(vars(options),indent=2)+'\n')
 def hardware_snapshot(suffix):
  code="import pathlib,json,subprocess;root=pathlib.Path('/sys/class/infiniband');d={p.name:{f.name:int(f.read_text()) for f in (p/'ports/1/hw_counters').glob('*')} for p in root.iterdir()};print(json.dumps(d))"
  for node in n['nodes']:
@@ -31,8 +42,9 @@ for node in n['nodes']:
   if v.startswith('NCCL_DEBUG_SUBSYS='):cmd[i]='NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,TUNING' 
  idx=cmd.index(c['container']['image'])
  cmd[idx:idx]=['--volume','/usr/sbin/ethtool:/usr/local/sbin/ethtool:ro','--volume','/lib/aarch64-linux-gnu/libmnl.so.0:/usr/lib/aarch64-linux-gnu/libmnl.so.0:ro']
- if '--benchmark' in sys.argv[3:]: cmd.append('--benchmark')
- if '--counter-samples' in sys.argv[3:]: cmd.append('--counter-samples')
+ if options.benchmark: cmd.append('--benchmark')
+ if options.counter_samples: cmd.append('--counter-samples')
+ if options.lengths: cmd += ['--lengths', *map(str,options.lengths)]
  cmd += ['--port-samples','--numerics']
  if kind == 'relay': cmd += ['--expect-paths','2']
 
@@ -43,7 +55,7 @@ for node in n['nodes']:
 start=time.monotonic();lastbeat=0
 while any(p.poll() is None for _,p,_ in processes):
  if time.monotonic()-lastbeat>30:
-  beat="import json,pathlib,datetime;p=pathlib.Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=='collective-policy-tuning';d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\\n')"
+  beat=f"import json,pathlib,datetime;p=pathlib.Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=={options.holder!r};d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\\n')"
   subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@dgx1',shlex.join(['python3','-c',beat])],timeout=15,check=True)
   lastbeat=time.monotonic()
  if any(p.poll() not in (None,0) for _,p,_ in processes) or time.monotonic()-start>690:
