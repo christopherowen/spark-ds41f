@@ -372,6 +372,27 @@ class ClockLatchTest(unittest.TestCase):
         )
 
 
+
+class SiteNodesTest(unittest.TestCase):
+    def test_missing_site_file_points_at_the_example(self) -> None:
+        import tempfile
+
+        original = spark3.ROOT
+        with tempfile.TemporaryDirectory() as directory:
+            spark3.ROOT = Path(directory)
+            try:
+                with self.assertRaises(SystemExit) as raised:
+                    spark3.site_nodes()
+            finally:
+                spark3.ROOT = original
+        self.assertIn("config/nodes.example.json", str(raised.exception))
+
+    def test_example_is_a_complete_site_file(self) -> None:
+        example = spark3.json.loads((ROOT / "config" / "nodes.example.json").read_text())
+        self.assertEqual(sum(node["head"] for node in example["nodes"]), 1)
+        for node in example["nodes"]:
+            self.assertEqual(set(node), {"name", "rank", "management_ip", "head", "roce_peer_hcas"})
+
 if __name__ == "__main__":
     unittest.main()
 

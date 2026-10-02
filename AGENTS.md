@@ -9,7 +9,9 @@ the open levers, measured dead ends, and the lean screening routine.
 
 - `config/cluster.json` is the promoted runtime configuration.
 - `config/cluster.json` selects the promoted site topology through `nodes_config`
-  (default: `config/nodes.json`). Candidate profiles may select a separate map.
+  (default: `config/nodes.json`). The default is git-ignored and initialized
+  from `config/nodes.example.json`. Candidate profiles may select a separate map;
+  `cluster sync` preserves and copies the selected site map.
 - `upstreams.lock.json` owns the promoted external source URLs and revisions.
   Experimental cluster profiles may select a repository-relative
   `upstreams_config` lock with their own source manifest and patch series.

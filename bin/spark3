@@ -58,6 +58,21 @@ def cluster_config_path(args: argparse.Namespace | None = None) -> tuple[Path, s
     return resolved, canonical
 
 
+# The site's nodes: names, ranks, management IPs and RoCE cabling. Each site
+# keeps its own copy (git-ignored), started from config/nodes.example.json;
+# cluster sync copies the head node's file to every node.
+NODES_FILE = "config/nodes.json"
+
+
+def site_nodes() -> dict:
+    if not (ROOT / NODES_FILE).is_file():
+        raise SystemExit(
+            f"{NODES_FILE} is missing: copy config/nodes.example.json to it and edit "
+            "it for your site (docs/replicate.md, Site configuration)"
+        )
+    return read_json(NODES_FILE)
+
+
 def configuration(
     args: argparse.Namespace | None = None,
 ) -> tuple[dict, dict, dict]:
@@ -65,7 +80,7 @@ def configuration(
     cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
     nodes_path = repository_config_path(cluster.get("nodes_config", "config/nodes.json"))
     upstreams_path = repository_config_path(cluster.get("upstreams_config", "upstreams.lock.json"))
-    return cluster, json.loads(nodes_path.read_text()), json.loads(upstreams_path.read_text())
+    return cluster, (site_nodes() if nodes_path == ROOT / NODES_FILE else json.loads(nodes_path.read_text())), json.loads(upstreams_path.read_text())
 
 
 def repository_config_path(raw: str) -> Path:
@@ -159,6 +174,20 @@ def run_ssh(nodes: dict, node: dict, *command: str) -> subprocess.CompletedProce
 
 def remote_shell(nodes: dict, node: dict, script: str) -> subprocess.CompletedProcess[str]:
     return run_ssh(nodes, node, "bash", "-lc", script)
+
+
+def write_remote_file(nodes: dict, node: dict, path: str, text: str) -> subprocess.CompletedProcess[str]:
+    """Replace a file on a node atomically with the given text."""
+    quoted = shlex.quote(path)
+    script = f"cat > {quoted}.tmp && mv {quoted}.tmp {quoted}"
+    return subprocess.run(
+        ["ssh", *ssh_options(), ssh_target(nodes, node), shlex.join(["bash", "-c", script])],
+        input=text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
 
 
 def repository_path(cluster: dict) -> str:
@@ -1220,6 +1249,10 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
             )
         previous[node["name"]] = old_revision
 
+    # Read before any checkout: on the head node the checkout can be ROOT, and
+    # moving it off a commit that still tracked the file removes it.
+    site_paths = {NODES_FILE, cluster.get("nodes_config", NODES_FILE)}
+    site_texts = {relative: repository_config_path(relative).read_text(encoding="utf-8") for relative in site_paths}
     quoted_path = shlex.quote(path)
     fetch_script = (
         f"cd {quoted_path} && git fetch --quiet --prune origin && "
@@ -1243,6 +1276,11 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
                 detail = checkout.stderr.strip() or checkout.stdout.strip()
                 raise RuntimeError(f"{node['name']}: checkout failed: {detail}")
             changed.append(node)
+            for relative, site_text in site_texts.items():
+                copied = write_remote_file(nodes, node, f"{path}/{relative}", site_text)
+                if copied.returncode:
+                    detail = copied.stderr.strip() or copied.stdout.strip()
+                    raise RuntimeError(f"{node['name']}: cannot copy {relative}: {detail}")
             doctor = run_ssh(
                 nodes,
                 node,

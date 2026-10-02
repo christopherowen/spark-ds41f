@@ -12,6 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Use the example site configuration
+        run: |
+          cp config/nodes.example.json config/nodes.json
+          python3 - <<'PYCONFIG'
+          import json
+          from pathlib import Path
+          p = Path('config/cluster.json')
+          c = json.loads(p.read_text())
+          c['distributed']['master_addr'] = json.loads(Path('config/nodes.json').read_text())['nodes'][0]['management_ip']
+          p.write_text(json.dumps(c, indent=2) + '\n')
+          PYCONFIG
       - name: Validate configuration
         run: bin/spark3 doctor
       - name: Compile helper
@@ -56,6 +67,17 @@ jobs:
         source: [vllm, b12x]
     steps:
       - uses: actions/checkout@v5
+      - name: Use the example site configuration
+        run: |
+          cp config/nodes.example.json config/nodes.json
+          python3 - <<'PYCONFIG'
+          import json
+          from pathlib import Path
+          p = Path('config/cluster.json')
+          c = json.loads(p.read_text())
+          c['distributed']['master_addr'] = json.loads(Path('config/nodes.json').read_text())['nodes'][0]['management_ip']
+          p.write_text(json.dumps(c, indent=2) + '\n')
+          PYCONFIG
       - name: Apply the local series and check the recorded patch head and tree
         run: bin/spark3 build prepare --only "${{ matrix.source }}"
 
