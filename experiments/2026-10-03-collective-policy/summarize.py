@@ -10,6 +10,7 @@ def objects(text):
   try:value,end=dec.raw_decode(text[i:]);offset=i+end;yield value
   except ValueError:offset=i+1
 summary={}
+notes=json.loads((root/'run-notes.json').read_text()) if (root/'run-notes.json').exists() else {}
 for run in sorted(root.glob('run*')):
  if not run.is_dir() or not (run/'results.json').exists():continue
  rows=[];forwards=[];graphs={}
@@ -44,6 +45,17 @@ for run in sorted(root.glob('run*')):
    samples=[max(r['timings'][idx]['microseconds_per_call'][j] for r in rows) for j in range(5)]
    result['latency'].append({k:t[k] for k in ('dtype','elements_per_rank','operation')}|{'slowest_rank_samples_us':samples,'median_us':statistics.median(samples),'rdma_error_deltas':{k:sum(v.get(k,0) for r in rows for v in r['timings'][idx].get('rdma_error_deltas',{}).values()) for k in ('roce_adp_retrans','packet_seq_err','out_of_sequence')} if all('rdma_error_deltas' in r['timings'][idx] for r in rows) else None})
  for idx, row in enumerate(result['latency']):
+  shard_bytes=row['elements_per_rank']*(2 if row['dtype']=='torch.bfloat16' else 4)
+  row['input_bytes_per_rank']=shard_bytes*(4 if row['operation']=='reduce_scatter' else 1)
+  row['output_bytes_per_rank']=shard_bytes*(4 if row['operation']=='all_gather' else 1)
+  custom=rows[0]['transport']=='rocenante-ring4'
+  if custom:
+   env=graphs['dgx1']['environment']
+   assert env['VLLM_ROCE_ALLREDUCE_MAX_SIZE']=='2MB' and env['VLLM_ROCE_ALLGATHER_MAX_SIZE']=='4MB'
+  row['backend']='rocenante-ring4' if custom and (
+    (row['operation']=='all_reduce' and shard_bytes<=2*1024*1024) or
+    (row['operation']=='all_gather' and shard_bytes<=4*1024*1024)) else 'nccl-ring'
+  row['dispatch_qualified']=False
   ports={f"rank{r['rank']}/{dev}":d for r in rows for dev,d in r['timings'][idx].get('port_deltas',{}).items()}
   row['port_deltas']=ports
   tx=[d['tx_bytes_phy'] for d in ports.values()]
@@ -51,6 +63,7 @@ for run in sorted(root.glob('run*')):
   row['rx_out_of_buffer']=sum(d['rx_out_of_buffer'] for d in ports.values())
  result['graph_checks']=graphs
  result['numerical_checks']={str(r['rank']):r.get('numerical_checks',[]) for r in rows}
+ result['annotation']=notes.get(run.name,{})
  summary[run.name]=result
  print(run.name,result['totals'],'passed',len(rows))
  for row in result['latency']:
