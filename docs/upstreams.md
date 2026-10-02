@@ -1,6 +1,10 @@
 # Upstreams and contribution flow
 
-`upstreams.lock.json` is the machine-readable authority. The current chain is:
+`upstreams.lock.json` is the promoted machine-readable authority. An experimental
+cluster profile may select a separate repository-relative lock through
+`upstreams_config`; build preparation, doctor and image builds use that lock.
+This lets candidates add patches without changing the promoted image identity.
+The current production chain is:
 
 ```text
 local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9

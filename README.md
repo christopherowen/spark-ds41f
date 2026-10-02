@@ -5,7 +5,9 @@ Flash on a switchless three-node DGX Spark fabric.
 
 The deployment tools also generate and validate a
 [four-node switchless ring profile](docs/switchless-topology.md), using NCCL
-neighbour collectives. That profile awaits four-node hardware qualification;
+neighbour collectives, plus an experimental
+[RoCEnante neighbour relay](experiments/2026-10-02-rocenante-ring4/README.md).
+Both four-node paths await hardware qualification;
 the promoted configuration below remains the measured three-node deployment.
 
 This repository is being promoted from a forensic capture of the running cluster

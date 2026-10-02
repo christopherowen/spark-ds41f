@@ -10,7 +10,9 @@ the open levers, measured dead ends, and the lean screening routine.
 - `config/cluster.json` is the promoted runtime configuration.
 - `config/cluster.json` selects the promoted site topology through `nodes_config`
   (default: `config/nodes.json`). Candidate profiles may select a separate map.
-- `upstreams.lock.json` owns every external source URL and revision.
+- `upstreams.lock.json` owns the promoted external source URLs and revisions.
+  Experimental cluster profiles may select a repository-relative
+  `upstreams_config` lock with their own source manifest and patch series.
 - `requirements/` owns hashed non-Git build inputs.
 - `patches/*/series` owns the ordered local patch stacks.
 - `manifests/baselines/` is immutable evidence. Never rewrite a published baseline.

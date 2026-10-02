@@ -63,7 +63,8 @@ def configuration(
     cluster_path, _ = cluster_config_path(args)
     cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
     nodes_path = repository_config_path(cluster.get("nodes_config", "config/nodes.json"))
-    return cluster, json.loads(nodes_path.read_text()), read_json("upstreams.lock.json")
+    upstreams_path = repository_config_path(cluster.get("upstreams_config", "upstreams.lock.json"))
+    return cluster, json.loads(nodes_path.read_text()), json.loads(upstreams_path.read_text())
 
 
 def repository_config_path(raw: str) -> Path:
@@ -316,6 +317,13 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     source_manifest = read_json(
         upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
     )
+    if topology.transport(cluster) == "rocenante-ring4":
+        record = source_manifest["b12x"]
+        if "rocenante-ring4" not in record.get("capabilities", []):
+            problems.append("rocenante-ring4 requires a source manifest with the relay patch")
+        label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.b12x.tree")
+        if label != record["expected_tree"]:
+            problems.append("rocenante-ring4 image tree does not match its source manifest")
     for name in BUILD_PROJECTS:
         wanted = source_manifest[name].get("patchset_sha256")
         actual = patchset_sha256(upstreams["sources"][name])
@@ -893,14 +901,14 @@ def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) 
     env = expected_environment(cluster, node)
     env.update(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,GRAPH,NET")
     command = ["docker", "run", "--rm", "--name=spark3-collective-probe",
-               "--network=host", "--gpus=all", "--memory=4g", "--memory-swap=4g",
+               "--network=host", "--gpus=all", "--memory=12g", "--memory-swap=12g",
                "--device=/dev/infiniband:/dev/infiniband:rwm", "--cap-add=IPC_LOCK",
                "--ulimit=memlock=-1:-1", "--shm-size=256m",
                "--entrypoint=/usr/bin/timeout"]
     for key, value in sorted(env.items()):
         command.extend(["--env", f"{key}={value}"])
     command.extend(["--volume", f"{repository_path(cluster)}/scripts/probe_collectives.py:/probe.py:ro",
-                    cluster["container"]["image"], "--signal=TERM", "--kill-after=10s", "180s",
+                    cluster["container"]["image"], "--signal=TERM", "--kill-after=10s", "600s",
                     "python3", "/probe.py", "--rank", str(node["rank"]),
                     "--world-size", str(len(nodes["nodes"])), "--master-addr",
                     cluster["distributed"]["master_addr"], "--master-port", str(port)])

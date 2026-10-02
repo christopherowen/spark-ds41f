@@ -10,12 +10,16 @@ serving qualification still need four physically connected Sparks.
 | --- | --- | --- |
 | Three-node triangle | Existing RoCEnante small collectives plus NCCL | Both other ranks |
 | Four-node ring | NCCL ring for TP collectives | Previous and next ranks only |
+| Four-node ring, experimental relay image | RoCEnante ring4 small collectives plus NCCL ring | Previous and next ranks only |
 
 Ranks follow cable order: `0—1—2—3—0`. The three-node triangle already connects
 every pair. A four-node ring has no direct link to the opposite rank. The B12X
 peer-HCA map chooses an interface; it does not relay through another host.
-Consequently this implementation disables RoCEnante for the four-node profile.
-It does not add a forwarding path to RoCEnante or change its allocator/kernels.
+The generated NCCL profile therefore disables RoCEnante. The separate
+[RoCEnante ring4 candidate](../experiments/2026-10-02-rocenante-ring4/README.md)
+adds host forwarding and requires its own image. It preserves the GPU allocator
+and kernels. This candidate selects its isolated build lock with
+`upstreams_config`; omitting that key preserves `upstreams.lock.json`.
 
 ## Configuration
 
@@ -83,7 +87,8 @@ The pinned NCCL source is
   must be verified on-device; setting the variable cannot create missing CUDA
   virtual-memory capability.
 - PAT, NVLS, CollNet, MNNVL, RMA and GIN are disabled. Custom vLLM all-reduce is
-  disabled so the direct-peer B12X path is never initialized.
+  disabled in the NCCL-only profile. The RoCEnante relay profile enables it
+  with `B12X_ROCE_TOPOLOGY=ring4` and requires the patched image.
 - NIC merging and subnet-aware routing are enabled. NCCL can select the local
   interface matching the neighbour's advertised subnet. The renderer supplies
   an exact per-node HCA list from the cable map.
@@ -116,7 +121,8 @@ bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json
 
 These commands **print plans** and do not start containers. Each printed command
 uses the selected serving image, a separate container and IPC namespace, a
-4 GiB memory limit, a different rendezvous port and a 180-second timeout. It
+12 GiB memory limit, a different rendezvous port and a 600-second timeout.
+The limit covers both NCCL communicators and cold RoCEnante compilation. It
 mounts only the probe script, loads no weights and does not use serving caches.
 
 The probe initializes vLLM's distributed groups and tests torch NCCL plus the

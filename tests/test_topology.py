@@ -138,8 +138,8 @@ class TopologyTest(unittest.TestCase):
 
     def test_probe_is_bounded_and_does_not_share_serving_ipc(self):
         command = spark3.collective_probe_command(self.ring, self.four, self.four["nodes"][3], 29999)
-        self.assertIn("180s", command)
-        self.assertIn("--memory=4g", command)
+        self.assertIn("600s", command)
+        self.assertIn("--memory=12g", command)
         self.assertNotIn("--ipc=host", command)
         self.assertIn("--entrypoint=/usr/bin/timeout", command)
         self.assertEqual(command[command.index("--world-size") + 1], "4")
@@ -158,6 +158,49 @@ class TopologyTest(unittest.TestCase):
                 for path in ("../escape.json", "/tmp/escape.json"):
                     with self.assertRaises(SystemExit):
                         spark3.repository_config_path(path)
+
+    def test_rocenante_ring4_candidate_and_source_lock(self):
+        args = argparse.Namespace(cluster_config="experiments/2026-10-02-rocenante-ring4/cluster.json")
+        cluster, nodes, lock = spark3.configuration(args)
+        self.assertEqual(topology.problems(cluster, nodes), [])
+        self.assertEqual(spark3.local_doctor(cluster, nodes, lock), [])
+        self.assertIn("2026-10-02-rocenante-ring4", lock["source_manifest"])
+        self.assertFalse(cluster["deployment"]["launch_enabled"])
+        self.assertNotEqual(cluster["container"]["image"], self.base["container"]["image"])
+        for node in nodes["nodes"]:
+            env = spark3.expected_environment(cluster, node)
+            self.assertEqual(env["VLLM_ENABLE_ROCE_ALLREDUCE"], "1")
+            self.assertEqual(env["B12X_ROCE_TOPOLOGY"], "ring4")
+            self.assertEqual(set(json.loads(env["B12X_ROCE_PEER_HCAS"])),
+                             {str((node["rank"]-1)%4), str((node["rank"]+1)%4)})
+            self.assertNotIn("--disable-custom-all-reduce", spark3.expected_command(cluster, node))
+
+    def test_relay_base_can_generate_nccl_control(self):
+        relay = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
+        control = topology.candidate(relay, self.four, "config/examples/nodes-ring4.json")
+        self.assertEqual(topology.problems(control, self.four), [])
+        self.assertEqual(control["container"], relay["container"])
+        self.assertEqual(topology.transport(control), "nccl-ring")
+        self.assertNotIn("B12X_ROCE_TOPOLOGY", control["environment"])
+
+    def test_rocenante_ring4_rejects_old_image_or_lock(self):
+        args = argparse.Namespace(cluster_config="experiments/2026-10-02-rocenante-ring4/cluster.json")
+        cluster, nodes, lock = spark3.configuration(args)
+        cluster["container"]["expected_labels"] = self.base["container"]["expected_labels"]
+        self.assertTrue(any("image tree" in p for p in spark3.local_doctor(cluster, nodes, lock)))
+        old_lock = spark3.read_json("upstreams.lock.json")
+        self.assertTrue(any("relay patch" in p for p in spark3.local_doctor(cluster, nodes, old_lock)))
+
+    def test_rocenante_ring4_requires_matching_mode_and_backend(self):
+        cluster = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
+        for key in ("VLLM_ENABLE_ROCE_ALLREDUCE", "B12X_ROCE_TOPOLOGY"):
+            changed = copy.deepcopy(cluster)
+            changed["environment"][key] = "invalid"
+            self.assertTrue(any(key in p for p in topology.problems(changed, self.four)))
+        cluster["serve_args"].append("--disable-custom-all-reduce")
+        self.assertTrue(any("custom all-reduce enabled" in p for p in topology.problems(cluster, self.four)))
+        self.base["environment"]["B12X_ROCE_TOPOLOGY"] = "ring4"
+        self.assertTrue(any("B12X_ROCE_TOPOLOGY" in p for p in topology.problems(self.base, self.three)))
 
     def test_create_never_overwrites_an_existing_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
