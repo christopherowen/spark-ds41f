@@ -1,10 +1,12 @@
 # 64 KiB boot and serving trial — 2026-10-02
 
-Status: compatibility checks and a fresh 4 KiB rollback control passed. The
-owner requested allocation-level profiling on both kernels to identify the
-64 KiB memory overhead and recover the expected savings. That investigation
-is in progress. Keep the normal default at 4 KiB while profiling; no final
-promotion decision has been made. Production image remains r5o.
+Status: compatibility checks and the fresh 4 KiB rollback control passed.
+The subsequent [allocation profile and UVM recovery trial](../uvm-pool/README.md)
+identified the overhead and recovered 1.78–1.86 GiB/node over 4 KiB, without a
+substantial measured speed gain. This requires an experimental driver patch;
+the normal default remains stock 4 KiB pending driver promotion. Production
+image remains r5o. The observations below describe the original stock-driver
+boot screen, before that investigation.
 
 ## Authority and identity
 

@@ -1,8 +1,9 @@
 # Matched page-size profiling
 
-Status: the approximately 3 GiB loaded-model overhead is attributed. An opt-in
-UVM recovery candidate is being tested in [uvm-pool](../uvm-pool/README.md).
-No default or production serving configuration has changed.
+Status: attribution and the recovery trial are complete. The opt-in
+[UVM patch](../uvm-pool/README.md) recovers 1.78–1.86 GiB of usable memory per
+node versus 4 KiB in a matched-client screen. No substantial speed gain was
+demonstrated. No default or production serving configuration has changed.
 
 All runs use r5o, unchanged TP3/model/KV/graph budgets and driver 580.178.04.
 `cluster-pinned.json` adds the same read-only draft-cost tables to both arms.
