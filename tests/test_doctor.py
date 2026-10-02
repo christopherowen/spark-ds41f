@@ -462,3 +462,15 @@ class ClusterReplaceTest(unittest.TestCase):
         backups = restore.call_args.args[2]
         self.assertEqual(sorted(backups), ["dgx1", "dgx3"])
         self.assertNotIn(("dgx1", ("docker", "run")), calls)
+
+
+class KernelPolicyPathTest(unittest.TestCase):
+    def test_default_and_experiment(self):
+        self.assertEqual(spark3.kernel_policy_path({}), ROOT / "config/kernel-trial.json")
+        self.assertEqual(spark3.kernel_policy_path({"host": {"kernel_policy": "experiments/policy.json"}}),
+                         ROOT / "experiments/policy.json")
+
+    def test_outside_repository_rejected(self):
+        for path in ("../policy.json", "/tmp/policy.json"):
+            with self.assertRaises(ValueError):
+                spark3.kernel_policy_path({"host": {"kernel_policy": path}})

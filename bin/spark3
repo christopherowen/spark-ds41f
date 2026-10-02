@@ -752,10 +752,18 @@ def node_kernel_inventory(nodes: dict, node: dict, policy: dict) -> dict:
         return {"errors": [str(error)]}
 
 
+def kernel_policy_path(cluster: dict) -> Path:
+    relative = Path(cluster.get("host", {}).get("kernel_policy", "config/kernel-trial.json"))
+    path = (ROOT / relative).resolve()
+    if relative.is_absolute() or not path.is_relative_to(ROOT.resolve()):
+        raise ValueError("host.kernel_policy must remain inside the repository")
+    return path
+
+
 def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     """Findings about the live cluster: errors, and Warn for the minor ones."""
     problems: list[str] = []
-    trial_path = ROOT / "config/kernel-trial.json"
+    trial_path = kernel_policy_path(cluster)
     trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
     kernel_inventories = {}
     corrections = []
@@ -1018,7 +1026,7 @@ def node_runtime_problems(
     if dirty:
         problems.append(f"{node['name']}: checkout has uncommitted files")
     if cluster["host"].get("kernel"):
-        policy = read_json("config/kernel-trial.json")
+        policy = json.loads(kernel_policy_path(cluster).read_text())
         inventory = node_kernel_inventory(nodes, node, policy)
         problems.extend(kernel_readiness.profile_problems(
             node["name"], inventory, cluster["host"]["kernel"], policy))
