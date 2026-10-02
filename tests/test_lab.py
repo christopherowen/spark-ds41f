@@ -125,7 +125,7 @@ class ProfilePlanTest(unittest.TestCase):
                      {"config": "cluster-cand-prof.json", "label": "cand"}]}]}
         steps = lab.plan(spec)
         kinds = [s["kind"] for s in steps]
-        self.assertEqual(kinds, ["boot", "profile", "profile", "boot", "profile", "profile", "stop", "costs"])
+        self.assertEqual(kinds, ["boot", "curves", "profile", "profile", "boot", "curves", "profile", "profile", "stop", "costs"])
         self.assertEqual(steps[2]["argv"][-2:], ["--tokens", "16384"])
         self.assertEqual(steps[-1]["labels"], ["r5o", "cand"])
         self.assertEqual(steps[-1]["out"], "results/private/determinism/costs3")
@@ -172,6 +172,18 @@ class CurvesTest(unittest.TestCase):
         self.assertIn("1:11.00 (+10.0%)", table)
         self.assertIn("48:19.00 (-5.0%)", table)
         self.assertEqual(table.count("\n"), 2)
+
+    def test_padded_and_real_row_curves_never_compare(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):
+            (Path(directory) / "curves-a.json").write_text(json.dumps({"verify": [[1, 10.0]], "draft": []}))
+            (Path(directory) / "curves-b.json").write_text(
+                json.dumps({"rows": "real", "verify": [[1, 15.0]], "draft": []}))
+            (Path(directory) / "curves-c.json").write_text(
+                json.dumps({"rows": "real", "verify": [[1, 16.5]], "draft": []}))
+            table = lab.curves_table(["curves-a.json", "curves-b.json", "curves-c.json"])
+        self.assertIn("b              real   1:15.00", table)
+        self.assertNotIn("+50.0%", table)
+        self.assertIn("1:16.50 (+10.0%)", table)
 
 
 class OverlayTest(unittest.TestCase):

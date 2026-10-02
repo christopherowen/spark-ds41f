@@ -1221,12 +1221,19 @@ two r5o runs (r5o's own 16K prefill moved 5% and its mixed short TTFT 3.4% betwe
 | Short prompts, request time | -5.4% | -0.6% |
 | Mixed traffic: short TTFT / long TTFT / chunks per s | +10.0 / +6.6 / -2.3% | +3.8 / +0.2 / +1.4% |
 
-Fixed-shape target step costs from each boot's profile (ms; r5o / ref4d /
-ref4f): 1 token 18.12 / 18.75 / 18.74; 6 tokens 20.17 / 21.17 / 20.54; 24
-tokens 27.20 / 27.34 / 24.73; 48 tokens 35.35 / 35.29 / 30.15; 1536 tokens
-306.8 / 351.1 / 328.3. The batch-invariant arm's wide decode steps are now
-cheaper than r5o's (-14.7% at 48 tokens); the pinned cost table keeps the
-adaptive verification on r5o's choices, so the bench rates do not yet use it.
+Padded-row step costs from each boot's profile (ms; r5o / ref4d / ref4f): 1
+token 18.12 / 18.75 / 18.74; 6 tokens 20.17 / 21.17 / 20.54; 24 tokens 27.20 /
+27.34 / 24.73; 48 tokens 35.35 / 35.29 / 30.15; 1536 tokens 306.8 / 351.1 /
+328.3. These are not step costs of real inference. The profile feeds token 0 and
+marks every row as padding, which the MoE routers skip
+(`SPARK3_DSPARK_PROFILE_TOKENS` defaults to zeros; the real-row profile runs only
+with ratio dead rows, and these arms use tau dead rows), so the curves leave out
+routed-expert work, the largest part of a real step: in r5o's eight-stream
+torch profile (`costs2`, run68), routed MoE is 62.1 of 111.6 summed kernel ms per
+step (56%) and mHC 5.0 (4.5%), with verification widths of 20-40 rows. The
+-14.7% at 48 tokens is the padded path only; in the workloads above, ref4f's
+eight streams are at r5o's rate. The pinned cost table also keeps the adaptive
+verification on r5o's choices, as intended for a kernel comparison.
 
 Quick validation (`ref4f-b4144-quick`: boot A c8 and the mixed, chunked,
 chunked_end, cache_long and distinct scenarios; a restart repeating cache_long
@@ -1248,9 +1255,9 @@ dgx1, dgx2 and dgx3, no recompute mismatches:
 ### The same kernel outside batch invariance (vllm-0050, `r5o-mhcseq-pin-b2`, `lab8`)
 
 r5o with mHC capacities of 8 rows and more on the sequential kernel (smaller
-ones keep the tuned plans). Wide fixed-shape steps get cheaper (48 tokens: 31.7
-ms against 42.2-44.0 ms for that session's r5o boots and 35.4 ms in `lab6`'s;
-24 tokens -6 to -10%), but no lean workload moved beyond noise: decode steps
+ones keep the tuned plans). Wide padded-row steps (routed MoE skipped, see above)
+get cheaper (48 tokens: 31.7 ms against 42.2-44.0 ms for that session's r5o boots
+and 35.4 ms in `lab6`'s), but no lean workload moved beyond noise: decode steps
 -1.8 / -0.4%, 12 distinct prompts +0.7%, eight streams +0.6%, short prompts
 -0.5%, mixed short TTFT -2.0%. Cold prefill was +0.7% at 1K and -4.6% at 16K
 against the mean of the r5o runs; the kernel's replay timings (faster than

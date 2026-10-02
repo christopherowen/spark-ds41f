@@ -427,7 +427,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
         config, label = arm_config_path(experiment, arm["config"]), arm["label"]
         out = f"results/private/determinism/{run}"
         steps.append({"kind": "boot", "config": config, "label": label})
-        steps.append({"kind": "curves", "label": label, "out": f"{out}/curves-{label}.json"})
+        steps.append({"kind": "curves", "label": label, "config": config, "out": f"{out}/curves-{label}.json"})
         if job.get("bench", True):
             steps.append({"kind": "cli", "label": label,
                           "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
@@ -494,6 +494,8 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
     for arm in job["arms"]:
         config = arm_config_path(experiment, arm["config"])
         steps.append({"kind": "boot", "config": config, "label": arm["label"]})
+        steps.append({"kind": "curves", "label": arm["label"], "config": config,
+                      "out": f"{out}/curves-{arm['label']}.json"})
         for workload in workloads:
             script, extra = PROFILE_WORKLOADS[workload]
             steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
@@ -719,7 +721,11 @@ CURVE_POINTS = (1, 6, 12, 24, 48, 256, 1024, 2048, 4096)
 
 
 def save_curves(step: dict) -> None:
-    """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them."""
+    """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them.
+
+    The profile runs on padding rows, which the MoE routers skip, unless the arm sets
+    SPARK3_DSPARK_PROFILE_TOKENS=random (real rows, routed experts included); the file
+    records which, since padded-row costs leave out a real step's largest part."""
     logs = subprocess.run(["docker", "logs", CONTAINER], text=True, capture_output=True)
     lines = [l for l in (logs.stdout + logs.stderr).splitlines() if "Profiled DSpark step costs" in l]
     if not lines:
@@ -729,18 +735,28 @@ def save_curves(step: dict) -> None:
         return
     out = ROOT / step["out"]
     out.parent.mkdir(parents=True, exist_ok=True)
-    write_json_atomic(out, {"verify": json.loads(found.group(1)), "draft": json.loads(found.group(2))})
+    rows = "padded"
+    if step.get("config"):
+        environment = json.loads((ROOT / step["config"]).read_text()).get("environment", {})
+        if environment.get("SPARK3_DSPARK_PROFILE_TOKENS") == "random":
+            rows = "real"
+    write_json_atomic(out, {"rows": rows, "verify": json.loads(found.group(1)),
+                            "draft": json.loads(found.group(2))})
 
 
 def curves_table(paths: list[str]) -> str:
-    """Verify step cost (ms) at fixed token counts per arm, against the first arm."""
-    rows, base = [], None
+    """Verify step cost (ms) at fixed token counts per arm, against the first arm with the
+    same row kind (padded rows skip routed MoE, so they never compare with real rows)."""
+    rows, bases = [], {}
     for path in paths:
         file = ROOT / path
         if not file.exists():
             continue
-        verify = dict((int(x), float(y)) for x, y in json.loads(file.read_text())["verify"])
+        data = json.loads(file.read_text())
+        kind = data.get("rows", "padded")
+        verify = dict((int(x), float(y)) for x, y in data["verify"])
         label = file.stem.removeprefix("curves-")
+        base = bases.get(kind)
         cells = []
         for point in CURVE_POINTS:
             nearest = min(verify, key=lambda tokens: abs(tokens - point)) if verify else None
@@ -750,11 +766,12 @@ def curves_table(paths: list[str]) -> str:
             else:
                 cells.append(f"{nearest}:{value:.2f} ({100 * (value / base[point] - 1):+.1f}%)")
         if base is None:
-            base = {point: verify.get(min(verify, key=lambda t: abs(t - point))) for point in CURVE_POINTS}
-        rows.append(f"  {label:<14} " + "  ".join(cells))
+            bases[kind] = {point: verify.get(min(verify, key=lambda t: abs(t - point))) for point in CURVE_POINTS}
+        rows.append(f"  {label:<14} {kind:<6} " + "  ".join(cells))
     if not rows:
         return ""
-    return "fixed-shape target step cost, ms at tokens (boot profile, vllm-0048):\n" + "\n".join(rows)
+    return ("target step cost at fixed token counts, ms (boot profile, vllm-0048; padded rows skip "
+            "routed MoE, real rows include it):\n" + "\n".join(rows))
 
 
 def summarize_analysis(out: Path) -> dict:

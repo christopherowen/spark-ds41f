@@ -123,6 +123,11 @@ weight reads; above eight rows the row's finalize runs once in one 256-thread CT
 than production's mHC from 4 rows up (2.8x at 48 rows, 12% at 1,334), 1.6 us slower at one
 row: detm-r5o-ref4f-b4144-pin-b2 and its trace detm-r5o-ref4f-b4144-trace8.
 
+The -rr-prof arms (r5o-pin-b2-rr-prof, detm-r5o-ref4f-b4144-pin-b2-rr-prof) add the torch
+profiler and SPARK3_DSPARK_PROFILE_TOKENS=random: the boot's logged step costs then come from
+real (routed) rows instead of padding rows, which the MoE routers skip; scheduling still uses
+the pinned (padded-row) table.
+
 r5o-mhcseq-pin-b2 (experiment, not batch-invariant) is r5o-pin-b2 with the same kernel for mHC
 capacities of 8 rows and more (vllm-0050, overlay mhcseq-prod, VLLM_DS41_MHC_SEQUENTIAL=1;
 smaller capacities keep the tuned plans): a production speed candidate.
@@ -459,6 +464,15 @@ for name, arm in (("detm-r5o-lookup-trace", traced(detm_pin, 256)),
                       with_boot_patches(r5o_pin, "boot2"), "mhc-seq"), "mhcseq-prod",
                       "models/deepseek_v4_1/b12x_layers.py"),
                       SPARK3_DSPARK_PINNED_ROUNDS="3", VLLM_DS41_MHC_SEQUENTIAL="1")),
+                  *((f"{name}-rr-prof", profiled(with_env(arm, SPARK3_DSPARK_PROFILE_TOKENS="random"),
+                                                  f"{name}-rr-prof"))
+                    for name, arm in (
+                        ("r5o-pin-b2", with_env(with_boot_patches(r5o_pin, "boot2"), SPARK3_DSPARK_PINNED_ROUNDS="3")),
+                        ("detm-r5o-ref4f-b4144-pin-b2", with_env(with_overlay_file(with_boot_patches(with_budget(
+                            with_mhc_multi_token(with_gemv_geometry(
+                                with_reference(detm_variant2_pin, attention=True, ref="ref4d"), "gemv-geom2"),
+                                "mhc-seq")), "boot2"), "ref4f", "models/deepseek_v4_1/b12x_layers.py"),
+                            SPARK3_DSPARK_PINNED_ROUNDS="3", VLLM_DS41_MHC_SEQUENTIAL="1")))),
                   ("r5o-lookup-pin", with_lookup(r5o_pin)),
                   ("r5o-lookup-variant-pin", r5o_lookup_variant), ("detm-r5o-pin", detm_pin),
                   ("detm-r5o-lookup-pin", with_lookup(detm_pin)),
