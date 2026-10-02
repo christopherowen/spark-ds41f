@@ -1,7 +1,7 @@
 # Experimental UVM leaf-table packing
 
-Status: allocation stress, model quality and serving screen passed. A fresh
-same-client control is pending. Not promoted; disabled by default.
+Status: allocation stress, model quality and matched-client serving comparison
+passed; stock 4 KiB rollback verified. Not promoted; disabled by default.
 
 Base: Ubuntu `nvidia-kernel-source-580-open=580.178.04-0ubuntu0.24.04.1`,
 installed source `/usr/src/nvidia-580.178.04`, corresponding upstream tag
@@ -95,3 +95,41 @@ unmodified 4 KiB fallback. A global modprobe option is insufficient: the stock
 4 KiB UVM module does not recognize the added parameter. No such option was
 installed. Driver/kernel upgrades must not silently remove the fix or load an
 incompatible module. Prefer an upstream allocator fix over maintaining a fork.
+
+
+## Final same-client comparison
+
+`bench-4k-repeat.json` is the fresh stock 4 KiB control after the candidate.
+Both reports use the dgx1 client, identical workload options, quality warmup,
+Python source text and all nine prompt token counts. Each has five decode
+samples per point and three prefill samples per length. No profiler was active.
+Both pass quality with no request failures, swap growth or thermal slowdown.
+
+| Measure | Stock 4 KiB repeat | Packed 64 KiB |
+|---|---:|---:|
+| Prose c1, tokens/s | 51.87 | 53.85 |
+| Prose c8, tokens/s | 170.30 | 167.53 |
+| Code c1, tokens/s | 63.81 | 62.98 |
+| Code c8, tokens/s | 191.82 | 189.98 |
+| Prose c1 step, ms | 41.05 | 41.55 |
+| Code c1 step, ms | 45.68 | 45.91 |
+| Prose c1 TTFT, ms | 202 | 198 |
+| Code c1 TTFT, ms | 213 | 215 |
+| Nominal 32K prefill, tokens/s | 3,812.3 | 3,808.7 |
+| Nominal 64K prefill, tokens/s | 3,820.9 | 3,817.2 |
+| Minimum available GiB, dgx1 | 6.69 | 8.55 |
+| Minimum available GiB, dgx2 | 7.77 | 9.56 |
+| Minimum available GiB, dgx3 | 7.77 | 9.55 |
+
+Conclusion: the tested patch recovers the missing 64 KiB memory benefit:
+1.78–1.86 GiB more usable memory per node than stock 4 KiB under this workload.
+It does not establish a substantial throughput or TTFT gain. The earlier apparent
+10% prose TTFT improvement was a cross-client comparison and is not evidence of
+a kernel improvement. Throughput varies with speculative acceptance; c1 step
+means differ by only 0.5–1.2%, within the screens' uncertainty. Do not interpret
+the individual request confidence intervals at c8 as forty independent boots.
+The new driver path has passed these bounded tests, not a long production soak.
+
+The normal boot default remains 4 KiB. The persistent-driver integration described
+above is still a separate promotion step; the experimental module was loaded only
+in memory and the stock driver was verified after reboot on all three nodes.
