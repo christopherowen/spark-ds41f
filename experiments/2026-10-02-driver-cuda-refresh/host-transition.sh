@@ -14,6 +14,15 @@ files=[(n,h) for n,h in d['sha256'].items() if n.startswith(sys.argv[2]+'/')]
 assert len(files)==len(d[sys.argv[2]])
 for name,h in files: assert hashlib.sha256((p/name).read_bytes()).hexdigest()==h,name
 PY
+# Remove the separately qualified RM experiment before restoring vendor packages.
+if [ "$arm" = old ]; then
+  override=/lib/modules/7.0.0-1019-nvidia-64k/updates/driver-cuda-refresh/nvidia.ko
+  if [ -f "$override" ]; then
+    sudo rm -- "$override"
+    sudo depmod 7.0.0-1019-nvidia-64k
+    sudo update-initramfs -u -k 7.0.0-1019-nvidia-64k
+  fi
+fi
 # Remove the old DKMS override before replacing its packaged stock provider.
 if dkms status -m dgx-spark-memory-saver | grep -q .; then
   for version in 0.2.0 0.3.0; do

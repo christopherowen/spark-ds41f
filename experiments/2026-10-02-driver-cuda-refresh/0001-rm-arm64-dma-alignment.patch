@@ -1,0 +1,24 @@
+--- a/common/inc/nv-linux.h
++++ b/common/inc/nv-linux.h
+@@ -1079,7 +1079,7 @@
+          i++, sm = &dm->mapping.discontig.submaps[i])
+ 
+ /*
+- * On 4K ARM kernels, use max submap size a multiple of 2M to avoid breaking up 2M page size
++ * On ARM kernels, use max submap size a multiple of 2M to avoid breaking up 2M page size
+  *  sysmem allocations. 
+  *
+  * Instead of using (4G-4K), use max submap size as (4G-2M) since the mapped IOVA range
+@@ -1088,9 +1088,9 @@
+  * Bug 5401803: Tracks migrating away from making IOMMU mappings using submaps in favor of
+  * using sg_chain() to chain a single large scatterlist.
+  */
+-#if defined(CONFIG_ARM64_4K_PAGES)
+-#define NV_DMA_U32_MAX_4K_PAGES           ((NvU32)((NV_U32_MAX >> PAGE_SHIFT) + 1))
+-#define NV_DMA_SUBMAP_MAX_PAGES           ((NvU32)(NV_DMA_U32_MAX_4K_PAGES - 512))
++#if defined(CONFIG_ARM64)
++#define NV_DMA_SUBMAP_2M_PAGES           ((NvU32)(0x200000 >> PAGE_SHIFT))
++#define NV_DMA_SUBMAP_MAX_PAGES          ((NvU32)(((NV_U32_MAX >> PAGE_SHIFT) + 1) - NV_DMA_SUBMAP_2M_PAGES))
+ #else
+ #define NV_DMA_SUBMAP_MAX_PAGES           ((NvU32)(NV_U32_MAX >> PAGE_SHIFT))
+ #endif

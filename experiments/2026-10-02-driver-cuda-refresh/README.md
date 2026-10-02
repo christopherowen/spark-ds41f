@@ -39,3 +39,21 @@ arm would also need aligned package requirements/build inputs. Record this
 metadata mismatch explicitly; do not describe a successful import as full
 support. Verify actual loaded library paths/versions and freshly compiled
 Triton artifacts before interpreting timings. B12X's CuTe compiler is unchanged.
+
+## R610 compatibility failure and separate RM correction
+
+All three nodes passed 3,584 small allocations/readback after reboot, but failed
+the 4.5 GiB copy with Xid 31 / FAULT_PTE. Repeating with unlimited memlock
+also failed. dgx3 reproduced with the Ubuntu stock UVM after removing the saver
+and rebooting (stock source version `625DCD62A2DB1AC8DCCA0FF`). No model was
+started on these builds.
+
+This matches [NVIDIA issue 1269](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1269),
+reported by Max Spevack: the newer RM requires 2 MiB-aligned DMA submaps, but
+its 64 KiB branch selects 4 GiB minus 64 KiB. The separate experimental patch
+extends its existing ARM64 alignment rule to all ARM64 page sizes. The 4 KiB
+value remains unchanged; 64 KiB uses 65,504 pages, exactly 4 GiB minus 2 MiB.
+The local source hash and exact patch are pinned. This changes RM, so it is
+outside memory-saver's UVM-only scope and is installed as a separate temporary
+signed module override. The restoration script removes it before R580 returns.
+Testing this corrected driver is a new arm, not evidence that stock R610 works.
