@@ -3209,6 +3209,105 @@ class PeakWatch:
         return self.peak
 
 
+# Every benchmark or kernel run starts with each node's hottest thermal zone
+# below COOL_BELOW_C. If any node is above it, all of them run at the maximum
+# fan floor of dgx-spark-fan-control until the last one is below it, then
+# their fans return to their usual control (the dgx-fan-control service's
+# curve, or firmware automatic) before measuring.
+COOL_BELOW_C = 55.0
+COOL_TIMEOUT_S = 600.0
+COOL_POLL_S = 5.0
+FAN_SERVICE = "dgx-fan-control.service"
+HOTTEST_ZONE_QUERY = "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1"
+
+
+def hottest_zone_c(nodes: dict, node: dict) -> float | None:
+    result = run_ssh(nodes, node, "sh", "-c", HOTTEST_ZONE_QUERY)
+    try:
+        return int(result.stdout.strip()) / 1000
+    except ValueError:
+        return None
+
+
+def take_fan_control(nodes: dict, node: dict) -> dict:
+    """Pause the dgx-fan-control service and select the maximum fan floor."""
+    service = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
+    if service:
+        run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+    floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0
+    return {"service": service, "floor": floor}
+
+
+def restore_fan_control(nodes: dict, node: dict, control: dict) -> str | None:
+    """Return the node to the fan control it had before take_fan_control."""
+    if control["service"]:
+        restored = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
+        return FAN_SERVICE if restored.returncode == 0 else f"FAILED: {FAN_SERVICE}"
+    if control["floor"]:
+        restored = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "automatic")
+        return "automatic" if restored.returncode == 0 else "FAILED: automatic"
+    return None
+
+
+def cool_nodes(
+    nodes: dict,
+    targets: list[dict],
+    below_c: float,
+    timeout_s: float,
+    poll_s: float = COOL_POLL_S,
+) -> list[dict]:
+    """Bring every target node's hottest zone below below_c, cooling them together.
+
+    When any node is at or above the threshold, every target gets the maximum
+    fan floor until the last one is below it, so the wait cools them all. Each
+    node's usual fan control then returns. Raises RuntimeError when a node
+    cannot be read or does not cool within timeout_s; the fans are restored on
+    every path.
+    """
+    if below_c <= 0 or not targets:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        def readings() -> list[float | None]:
+            return list(pool.map(lambda node: hottest_zone_c(nodes, node), targets))
+
+        temperatures = readings()
+        unreadable = [node["name"] for node, value in zip(targets, temperatures) if value is None]
+        if unreadable:
+            raise RuntimeError(f"cannot read the thermal zones of {', '.join(unreadable)}")
+        records = [
+            {"node": node["name"], "start_c": value, "cooled": False, "seconds": 0.0, "final_c": value}
+            for node, value in zip(targets, temperatures)
+        ]
+        if all(value < below_c for value in temperatures):
+            return records
+        hot = ", ".join(f"{r['node']} {r['start_c']:.1f} C" for r in records if r["start_c"] >= below_c)
+        print(f"cooling: {hot}; every node at fan floor 12 until all are below {below_c:g} C", flush=True)
+        controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
+        began = time.monotonic()
+        try:
+            while not all(value is not None and value < below_c for value in temperatures):
+                if time.monotonic() - began > timeout_s:
+                    still = ", ".join(
+                        f"{node['name']} {value} C"
+                        for node, value in zip(targets, temperatures)
+                        if value is None or value >= below_c
+                    )
+                    raise RuntimeError(f"still at or above {below_c:g} C after {timeout_s:g} s: {still}")
+                time.sleep(poll_s)
+                temperatures = readings()
+        finally:
+            restored = list(pool.map(
+                lambda pair: restore_fan_control(nodes, pair[0], pair[1]), zip(targets, controls)
+            ))
+            seconds = round(time.monotonic() - began, 1)
+            for record, value, control, result in zip(records, temperatures, controls, restored):
+                record.update(cooled=True, seconds=seconds, final_c=value,
+                              fan_floor=12 if control["floor"] else None, restored=result)
+    print("cooling: " + ", ".join(f"{r['node']} {r['final_c']:.1f} C" for r in records)
+          + f" after {seconds:g} s; fans restored", flush=True)
+    return records
+
+
 class Bench:
     def __init__(self, base: str, nodes: dict, floor_gib: float) -> None:
         self.base = base
@@ -3916,6 +4015,11 @@ def command_bench(args: argparse.Namespace) -> int:
     rng = random.Random(args.seed)
     bench = Bench(base, nodes, floor_gib)
     try:
+        try:
+            report["cooling"] = cool_nodes(nodes, nodes["nodes"], args.cool_below, args.cool_timeout)
+        except RuntimeError as error:
+            raise BenchAbort(f"cooling failed: {error}") from error
+        save()
         bench.memory.wait_ready()
         for suite in BENCH_SUITES:
             if suite not in suites:
@@ -4099,6 +4203,20 @@ def parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="sample each decode point until its 95%% CI is within this percent of the mean",
+    )
+    bench.add_argument(
+        "--cool-below",
+        type=float,
+        default=COOL_BELOW_C,
+        help=f"before measuring, bring every node's hottest thermal zone below this many C "
+        f"(default {COOL_BELOW_C:g}), at the maximum dgx-fan-control floor when needed, then "
+        "restore its usual fan control; 0 skips",
+    )
+    bench.add_argument(
+        "--cool-timeout",
+        type=float,
+        default=COOL_TIMEOUT_S,
+        help=f"seconds a node may take to cool before the bench aborts (default {COOL_TIMEOUT_S:g})",
     )
     bench.add_argument("--min-samples", type=int, help="default 3, or 6 with --full")
     bench.add_argument("--max-samples", type=int, help="default 4, or 40 with --full")

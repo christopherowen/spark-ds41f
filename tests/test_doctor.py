@@ -423,9 +423,93 @@ class SiteNodesTest(unittest.TestCase):
         for node in example["nodes"]:
             self.assertEqual(set(node), {"name", "rank", "management_ip", "head", "roce_peer_hcas"})
 
-if __name__ == "__main__":
-    unittest.main()
 
+class CoolingTest(unittest.TestCase):
+    """Benchmarks start with every node below the cooling threshold."""
+
+    def run_cooling(self, temps: dict[str, list[float]], service_active: bool = True,
+                    timeout: float = 600.0):
+        calls: list[tuple[str, ...]] = []
+        readings = {name: list(values) for name, values in temps.items()}
+
+        def fake_ssh(nodes, node, *command):
+            calls.append((node["name"], *command))
+            if command[:2] == ("sh", "-c"):
+                values = readings[node["name"]]
+                value = values.pop(0) if len(values) > 1 else values[0]
+                return spark3.subprocess.CompletedProcess(command, 0, f"{int(value * 1000)}\n", "")
+            if command[:3] == ("systemctl", "is-active", "--quiet"):
+                return spark3.subprocess.CompletedProcess(command, 0 if service_active else 3, "", "")
+            return spark3.subprocess.CompletedProcess(command, 0, "", "")
+
+        original = spark3.run_ssh
+        spark3.run_ssh = fake_ssh
+        try:
+            nodes = {"ssh_user": "u", "nodes": [{"name": n} for n in temps]}
+            records = spark3.cool_nodes(nodes, nodes["nodes"], 55.0, timeout, poll_s=0)
+        finally:
+            spark3.run_ssh = original
+        return records, calls
+
+    @staticmethod
+    def fan_commands(calls, node: str) -> list[tuple[str, ...]]:
+        return [call[1:] for call in calls if call[0] == node and call[1] == "sudo"]
+
+    def test_all_cool_nodes_are_left_alone(self) -> None:
+        records, calls = self.run_cooling({"dgx1": [48.0], "dgx2": [54.9]})
+        self.assertEqual([r["cooled"] for r in records], [False, False])
+        self.assertFalse(any(call[1] == "sudo" for call in calls))
+
+    def test_one_hot_node_cools_every_node_until_all_are_below(self) -> None:
+        records, calls = self.run_cooling({"dgx1": [58.0, 56.0, 54.5], "dgx2": [50.0]})
+        expected = [
+            ("sudo", "-n", "systemctl", "stop", "dgx-fan-control.service"),
+            ("sudo", "-n", "dgx-fan-control", "set-state", "12"),
+            ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"),
+        ]
+        self.assertEqual(self.fan_commands(calls, "dgx1"), expected)
+        self.assertEqual(self.fan_commands(calls, "dgx2"), expected)
+        self.assertEqual([r["cooled"] for r in records], [True, True])
+        self.assertEqual(records[0]["final_c"], 54.5)
+        self.assertEqual(records[0]["restored"], "dgx-fan-control.service")
+
+    def test_without_the_service_fans_return_to_firmware_automatic(self) -> None:
+        records, calls = self.run_cooling({"dgx3": [60.0, 50.0]}, service_active=False)
+        self.assertIn(("sudo", "-n", "dgx-fan-control", "automatic"), self.fan_commands(calls, "dgx3"))
+        self.assertEqual(records[0]["restored"], "automatic")
+
+    def test_timeout_still_restores_every_node(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def fake_ssh(nodes, node, *command):
+            calls.append((node["name"], *command))
+            out = "70000\n" if command[:2] == ("sh", "-c") else ""
+            return spark3.subprocess.CompletedProcess(command, 0, out, "")
+
+        original = spark3.run_ssh
+        spark3.run_ssh = fake_ssh
+        try:
+            nodes = {"ssh_user": "u", "nodes": [{"name": "dgx1"}, {"name": "dgx4"}]}
+            with self.assertRaises(RuntimeError):
+                spark3.cool_nodes(nodes, nodes["nodes"], 55.0, 0.0, poll_s=0)
+        finally:
+            spark3.run_ssh = original
+        for node in ("dgx1", "dgx4"):
+            self.assertEqual(self.fan_commands(calls, node)[-1],
+                             ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"))
+
+    def test_unreadable_node_stops_before_touching_fans(self) -> None:
+        def fake_ssh(nodes, node, *command):
+            return spark3.subprocess.CompletedProcess(command, 0, "", "")
+
+        original = spark3.run_ssh
+        spark3.run_ssh = fake_ssh
+        try:
+            nodes = {"ssh_user": "u", "nodes": [{"name": "dgx2"}]}
+            with self.assertRaises(RuntimeError):
+                spark3.cool_nodes(nodes, nodes["nodes"], 55.0, 600.0, poll_s=0)
+        finally:
+            spark3.run_ssh = original
 
 class MountTestScriptTest(unittest.TestCase):
     def test_one_script_reports_exactly_the_unavailable_sources(self) -> None:
