@@ -496,6 +496,12 @@ HOST_FACTS_QUERY += (
 done | paste -sd, -)"
 """
 )
+HOST_FACTS_QUERY += r"""printf 'nvme_coalescing=%s\n' "$(for c in /dev/nvme[0-9]*; do
+  [ -c "$c" ] || continue
+  printf '%s:%s\n' "${c#/dev/}" "$(sudo -n nvme get-feature "$c" -f 8 2>/dev/null | awk -F'value:' 'NF > 1 {print $2}')"
+done | paste -sd, -)"
+printf 'nvme_coalescing_service=%s\n' "$(systemctl is-enabled nvidia-nvme-interrupt-coalescing.service 2>/dev/null)"
+"""
 
 
 def host_facts(output: str) -> dict[str, str]:
@@ -656,6 +662,50 @@ def idle_service_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
             f"{' '.join(units)} (scripts/host-recovery apply does the same)"
         )
     ]
+
+
+NVME_COALESCING_FIX = (
+    "sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && "
+    "sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable"
+)
+
+
+def nvme_coalescing_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
+    """NVMe interrupt coalescing (feature 0x08), which this site keeps off.
+
+    DGX OS's nvidia-nvme-interrupt-coalescing.service sets it to 0x107 at every
+    boot: one interrupt per 8 completions or 100 us. Engram's disk rows are
+    small direct reads, and a lone read then waits for the timer. The drives
+    default to 0 (off) and cannot save the feature, so masking the service and
+    running its disable action keeps it off across boots. These are warnings:
+    coalescing costs read latency, not correctness.
+    """
+    values = {}
+    for entry in filter(None, facts.get("nvme_coalescing", "").split(",")):
+        controller, _, value = entry.partition(":")
+        values[controller] = value.strip()
+    if not values:
+        return []
+    warnings = []
+    unreadable = sorted(c for c, v in values.items() if not v)
+    if unreadable:
+        warnings.append(Warn(
+            f"{node_name}: cannot read NVMe interrupt coalescing on {', '.join(unreadable)} "
+            "(nvme get-feature -f 8 needs passwordless sudo and nvme-cli)"
+        ))
+    enabled = sorted(f"{c}={v}" for c, v in values.items() if v and int(v, 16) != 0)
+    if enabled:
+        warnings.append(Warn(
+            f"{node_name}: NVMe interrupt coalescing is on ({', '.join(enabled)}), "
+            f"but this site keeps it off; run {NVME_COALESCING_FIX}"
+        ))
+    service = facts.get("nvme_coalescing_service", "")
+    if service not in ("masked", "masked-runtime", "not-found", ""):
+        warnings.append(Warn(
+            f"{node_name}: nvidia-nvme-interrupt-coalescing.service is {service} and turns "
+            f"coalescing back on at the next boot; run {NVME_COALESCING_FIX}"
+        ))
+    return warnings
 
 
 def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
@@ -841,6 +891,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(console_mode_problems(node["name"], facts))
         problems.extend(splash_problems(node["name"], facts))
         problems.extend(idle_service_warnings(node["name"], facts))
+        problems.extend(nvme_coalescing_warnings(node["name"], facts))
         problems.extend(fan_control_problems(node["name"], facts))
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))

@@ -28,6 +28,19 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
   `dgx-spark-fan-control` DKMS module with its `dgx_ec_fan_floor` cooling
   device, and the `dgx-fan-control` daemon. Its source and signing key live
   outside this repository; `doctor --live` reports the first missing layer.
+- NVMe interrupt coalescing off on every node. DGX OS's
+  `nvidia-nvme-interrupt-coalescing.service` sets feature 0x08 to 0x107 at
+  every boot (one interrupt per 8 completions or 100 µs). The drives default to
+  0 and cannot save the feature, so masking the service keeps it off:
+
+  ```sh
+  sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service
+  sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable
+  ```
+
+  `doctor --live` warns when coalescing is on or the service can turn it back
+  on. The measured trade-off is in
+  [experiments/2026-10-02-nvme-coalescing](../experiments/2026-10-02-nvme-coalescing/README.md).
 - Kernel `7.0.0-1019-nvidia-64k` with `kho=off`, NVIDIA 580.178.04 and
   signed memory-saver DKMS 0.2.0 on every node. Follow
   [memory-profiles.md](memory-profiles.md) to install, validate and select the

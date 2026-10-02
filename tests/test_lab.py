@@ -15,6 +15,8 @@ loader = importlib.machinery.SourceFileLoader("lab", str(ROOT / "scripts" / "lab
 spec = importlib.util.spec_from_loader("lab", loader)
 lab = importlib.util.module_from_spec(spec)
 loader.exec_module(lab)
+# Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
+lab.spark3.site_nodes = lambda: lab.spark3.read_json("config/nodes.example.json")
 
 SPEC = {
     "experiment": "experiments/2026-09-29-determinism",

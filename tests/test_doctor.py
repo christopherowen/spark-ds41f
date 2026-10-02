@@ -183,6 +183,36 @@ class ConsoleTest(unittest.TestCase):
         self.assertIn("display carve-out cannot be allocated", problems[0])
 
 
+class NvmeCoalescingTest(unittest.TestCase):
+    def test_coalescing_off_and_service_masked_passes(self) -> None:
+        self.assertEqual(spark3.nvme_coalescing_warnings(
+            "dgx1", facts(nvme_coalescing="nvme0:00000000", nvme_coalescing_service="masked")), [])
+
+    def test_missing_facts_pass(self) -> None:
+        self.assertEqual(spark3.nvme_coalescing_warnings("dgx1", facts()), [])
+
+    def test_coalescing_on_is_reported_with_its_fix(self) -> None:
+        warnings = spark3.nvme_coalescing_warnings(
+            "dgx2", facts(nvme_coalescing="nvme0:0x00000107", nvme_coalescing_service="enabled"))
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("nvme0=0x00000107", warnings[0])
+        self.assertIn("systemctl mask --now nvidia-nvme-interrupt-coalescing.service", warnings[0])
+        self.assertIn("next boot", warnings[1])
+        self.assertTrue(all(isinstance(w, spark3.Warn) for w in warnings))
+
+    def test_enabled_service_alone_is_reported(self) -> None:
+        warnings = spark3.nvme_coalescing_warnings(
+            "dgx3", facts(nvme_coalescing="nvme0:00000000", nvme_coalescing_service="enabled"))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("next boot", warnings[0])
+
+    def test_unreadable_controller_is_reported(self) -> None:
+        warnings = spark3.nvme_coalescing_warnings(
+            "dgx4", facts(nvme_coalescing="nvme0:", nvme_coalescing_service="masked"))
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("cannot read", warnings[0])
+
+
 class IdleServicesTest(unittest.TestCase):
     def test_idle_services_are_reported_with_their_fix(self) -> None:
         problems = spark3.idle_service_warnings(
