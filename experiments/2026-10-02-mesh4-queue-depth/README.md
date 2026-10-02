@@ -110,20 +110,26 @@ waves on. The 480 KiB BF16 cases have no sampled retransmission or sequence-erro
 increments in runs 05–08, despite remaining slower than relay. Packet loss
 therefore does not explain the whole residual latency gap.
 
-The current route map also distributes link work unevenly. `link-load.py`
-derives payload work from the actual forwarding plan: for an equal all-to-all
-payload of N bytes, directed links carry between 0.5N and 1.5N, with an average
-of N. Four directed links carry two forwarded half-payloads plus a direct
-half-payload; four carry only the direct half. This is a 3:1 work imbalance,
-not a measurement of utilization. Local direct-send completion does not ensure
-that every other rank has stopped direct traffic, and forwarded traffic also
-competes for links with other forwarded traffic. The measured send-wave
-regression rejects that specific remedy; it does not identify the exact share
-of latency due to skew, link imbalance, or NIC scheduling.
+The route map distributes work unevenly across PCIe-root interface paths.
+`link-load.py` derives payload work from the forwarding plan: for an equal
+all-to-all payload of N bytes, the 16 directed interface paths carry between
+0.5N and 1.5N, averaging N. Four carry two forwarded half-payloads plus a direct
+half-payload; four carry only the direct half. This is a 3:1 **interface-path**
+imbalance, not a measurement of utilization.
+
+Correction from the subsequent [four-path experiment](../2026-10-02-mesh4-fourpaths/):
+the two PCIe-root interfaces share a physical cable. Summing both interfaces
+on each directed cable gives 2N for every cable already in this control.
+Physical-port byte counters confirm balanced cable traffic. The model therefore
+identifies uneven interface/forwarding-queue work, not unused cable bandwidth.
+Local direct-send completion does not ensure that every other rank has stopped
+direct traffic. The measured send-wave regression rejects that specific remedy;
+it does not identify the exact latency share due to burst timing, interface
+imbalance or NIC scheduling.
 
 Decision: retain 8192 as the queue-capacity candidate; do not enable this
 send-wave patch in production. The next transport experiment should balance
-opposite-peer traffic across the available physical paths, with per-link byte
+opposite-peer traffic across the available interface paths, with physical-port byte
 and drop counters, before another model-serving benchmark. Keep the CPU relay
 as the measured large-payload control. A hybrid dispatcher, new thresholds,
 persistent NIC setup, reboot qualification and full TP4 serving remain separate

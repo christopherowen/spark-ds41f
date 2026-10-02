@@ -63,7 +63,7 @@ def set_argument(cluster: dict, flag: str, value: str) -> None:
 
 
 def mesh_path_specs(rank: int, paths: int = 2) -> list[tuple[int, int]]:
-    """Return (physical lane, intermediate rank) in reciprocal QP path order."""
+    """Return (interface stripe, intermediate rank) in reciprocal QP path order."""
     if paths not in (2, 4):
         raise ValueError("mesh_paths must be 2 or 4")
     opposite = (rank + 2) % 4

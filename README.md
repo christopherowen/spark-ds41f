@@ -8,7 +8,8 @@ The deployment tools also generate and validate a
 neighbour collectives, plus an experimental
 [RoCEnante neighbour relay](experiments/2026-10-02-rocenante-ring4/README.md).
 Four-node collective correctness is qualified; full model-serving qualification
-remains open. See the [hardware results](experiments/2026-10-02-rocenante-mesh4/README.md).
+remains open. See the [hardware results](experiments/2026-10-02-rocenante-mesh4/README.md) and
+[four-path transport comparison](experiments/2026-10-02-mesh4-fourpaths/README.md).
 The promoted configuration below remains the measured three-node deployment.
 
 This repository is being promoted from a forensic capture of the running cluster
