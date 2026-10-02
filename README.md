@@ -150,6 +150,13 @@ scripts/host-recovery apply
 
 `doctor`, `status`, `render`, and every cluster command without `--apply` are
 read-only. `bench` only sends API requests; see [Benchmarking](#benchmarking).
+
+`doctor --live` also compares the nodes' running kernel, base page size, driver
+and memory policy, and verifies the staged 64 KiB kernel against
+[`config/kernel-trial.json`](config/kernel-trial.json). It checks candidate
+modules, headers, initramfs presence and the retained GRUB fallback; it never
+selects a boot entry or applies corrections. Preparation is distinct from a
+successful trial boot. See [the preparation record](experiments/2026-10-02-kernel-64k/README.md).
 `build prepare` writes only under ignored `.work/build/`; see
 [docker/README.md](docker/README.md). `cluster sync` fetches a published commit and detaches every clean node
 checkout at that exact revision; it never copies a working tree or ignored files.

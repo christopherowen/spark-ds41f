@@ -31,6 +31,8 @@ from typing import NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
+sys.path.insert(0, str(ROOT / "scripts"))
+import kernel_readiness
 
 
 
@@ -740,8 +742,27 @@ def clock_latch_problems(node_name: str, facts: dict[str, str], serving: bool) -
 def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     """Findings about the live cluster: errors, and Warn for the minor ones."""
     problems: list[str] = []
+    trial_path = ROOT / "config/kernel-trial.json"
+    trial = json.loads(trial_path.read_text()) if trial_path.exists() else None
+    kernel_inventories = {}
+    corrections = []
     name = cluster["container"]["name"]
     for node in nodes["nodes"]:
+        if trial:
+            query = shlex.join(["sudo", "-n", "python3", "-c",
+                                (ROOT / "scripts/kernel_readiness.py").read_text(),
+                                json.dumps(trial)])
+            result = remote_shell(nodes, node, query)
+            try:
+                inventory = json.loads(result.stdout)
+                if result.returncode or not isinstance(inventory, dict):
+                    raise ValueError(result.stderr.strip() or "kernel inventory failed")
+            except (ValueError, TypeError) as error:
+                inventory = {"errors": [str(error)]}
+            kernel_inventories[node["name"]] = inventory
+            warnings, fixes = kernel_readiness.findings(node["name"], inventory, trial)
+            problems.extend(Warn(warning) for warning in warnings)
+            corrections.extend(fixes)
         desktop = remote_shell(nodes, node, DESKTOP_QUERY)
         problems.extend(desktop_problems(node["name"], desktop.stdout))
         boot = run_ssh(nodes, node, "efibootmgr")
@@ -799,6 +820,10 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
                 problems.append(
                     f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
                 )
+    if trial:
+        problems.extend(kernel_readiness.alignment(kernel_inventories))
+        if corrections:
+            problems.append(Warn("Kernel corrections (not executed):\n  " + "\n  ".join(dict.fromkeys(corrections))))
     return problems
 
 
