@@ -35,6 +35,8 @@ def check(rc):
 
 check(init(0))
 torch.cuda.init()
+# Runtime initialization alone can leave the primary context lazily unbound.
+context_anchor = torch.empty(1, device='cuda')
 ctx = P()
 check(getctx(C.byref(ctx)))
 assert ctx.value
