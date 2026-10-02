@@ -126,7 +126,8 @@ class ProfilePlanTest(unittest.TestCase):
         steps = lab.plan(spec)
         kinds = [s["kind"] for s in steps]
         self.assertEqual(kinds, ["boot", "curves", "profile", "profile", "boot", "curves", "profile", "profile", "stop", "costs"])
-        self.assertEqual(steps[2]["argv"][-2:], ["--tokens", "16384"])
+        self.assertEqual(steps[3]["argv"][-2:], ["--tokens", "16384"])
+        self.assertEqual(steps[1]["out"], "results/private/determinism/costs3/curves-r5o.json")
         self.assertEqual(steps[-1]["labels"], ["r5o", "cand"])
         self.assertEqual(steps[-1]["out"], "results/private/determinism/costs3")
 
