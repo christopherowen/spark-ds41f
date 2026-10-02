@@ -96,8 +96,11 @@ def main() -> None:
     parser.add_argument('--lengths', type=int, nargs='+', default=[5120,30720,245760,1048576])
     parser.add_argument('--numerics', action='store_true')
     args = parser.parse_args()
-    if any(n < 64 or n > 2097152 or n % 8 for n in args.lengths):
-        parser.error('benchmark lengths must be aligned and between 64 and 2097152')
+    # A full 4096-row, 5120-wide TP4 prefill has 5,242,880 elements
+    # per shard (10 MiB BF16). Sixteen FP32 all-gather outputs at this
+    # bound occupy 1.25 GiB; retain the runner's 12 GiB container limit.
+    if any(n < 64 or n > 5242880 or n % 8 for n in args.lengths):
+        parser.error('benchmark lengths must be aligned and between 64 and 5242880')
     if not 0 <= args.rank < args.world_size:
         parser.error("rank must be in the configured process group")
 

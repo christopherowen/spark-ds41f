@@ -36,6 +36,13 @@ would confound transport choice with a different model execution plan.
    640/768 KiB, 1/1.25/1.5/1.75/2 MiB BF16 inputs. Retain corresponding FP32
    cells and label actual NCCL fallbacks. Compare relay and automatic NCCL
    with four channels, in both orders, without overlapping host transfers.
+   Separately check 5/10 MiB BF16 shards (2,621,440/5,242,880 elements) with
+   one and four NCCL channels. These represent 2048/4096-row, 5120-wide TP4
+   hidden-state gather/scatter shapes; reduce-scatter inputs are four times
+   the shard size. Keep FP32 results separately labelled. The largest graph's
+   sixteen FP32 all-gather outputs occupy 1.25 GiB inside the existing 12 GiB
+   probe limit. These points are bulk NCCL tests, not a proposed RoCEnante
+   capacity increase.
 2. Qualify coordinated TP4 model startup with the existing memory guards,
    identical source/image, readable complete checkpoint metadata and live doctor.
    Keep the entry idle state recoverable; do not start the old triangle profile
