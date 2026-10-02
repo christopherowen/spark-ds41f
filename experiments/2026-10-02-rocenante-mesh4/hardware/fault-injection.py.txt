@@ -1,0 +1,16 @@
+import subprocess,pathlib,time,json,shlex
+root=pathlib.Path('/Users/christopherowen/projects/spark3-kernel-64k')
+out=root/'.work/mesh4-qualification/run16-marker-failure';out.mkdir(parents=True,exist_ok=True)
+log=open(out/'orchestrator.txt','w')
+p=subprocess.Popen(['python3','/tmp/run-ring4-collectives.py','mesh','run16-marker-failure','--benchmark'],stdout=log,stderr=subprocess.STDOUT)
+start=time.monotonic();injected=False
+while p.poll() is None and time.monotonic()-start<150:
+ source=out/'dgx1.txt'
+ if source.exists() and '"timing":' in source.read_text():
+  code="import pathlib,os,signal,json;matches=[]\nfor p in pathlib.Path('/proc').iterdir():\n if p.name.isdigit():\n  try:a=(p/'cmdline').read_bytes().split(b'\\0')\n  except (OSError,PermissionError):continue\n  if a and a[0]==b'/home/swank/spark3-lab/mesh4/marker':matches.append(int(p.name))\nassert len(matches)==2,matches\npid=min(matches);os.kill(pid,signal.SIGTERM);print(json.dumps({'terminated_marker_pid':pid}))"
+  cmd=['ssh','swank@dgx1',shlex.join(['sudo','python3','-c',code])]
+  r=subprocess.run(cmd,capture_output=True,text=True,timeout=15);injected=r.returncode==0
+  (out/'injection.json').write_text(json.dumps({'command':cmd,'elapsed_seconds':time.monotonic()-start,'exit':r.returncode,'stdout':r.stdout,'stderr':r.stderr},indent=2)+'\n');break
+ time.sleep(.1)
+p.wait(timeout=710);log.close()
+print('injected',injected,'orchestrator exit',p.returncode,'elapsed',time.monotonic()-start)

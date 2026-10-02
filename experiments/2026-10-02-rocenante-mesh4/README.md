@@ -1,14 +1,17 @@
 # RoCEnante over a NIC-forwarded four-node fabric
 
-Status: implemented for bounded collective qualification; no image built, no
-hardware forwarding enabled, no throughput measurement, no promotion. dgx4 is
-installed but its ring cable and netplan configuration are not ready. The checked-in
-site map is an example (documentation management IPs and synthetic MACs/netdevs).
+Status: hardware collective correctness passes on all four Sparks for NCCL ring,
+CPU relay and NIC forwarding. One transport-only candidate image has been built
+and distributed with the same digest to every rank. Latency screening is recorded
+below. Model serving and persistent fabric lifecycle remain unqualified; no
+promotion has occurred.
 
-Site input: dgx4's management address is `10.0.1.79` (provided by the owner).
-Use that address when preparing the real four-node map; keep the example map
-synthetic. SSH from the development machine returned `No route to host` on
-2026-10-02, so its hostname and NIC inventory have not been verified.
+The current site has four connected nodes. Real addresses, MACs and HCA mappings
+live in the git-ignored `config/nodes-ring4.local.json`, selected by the three
+`qualification-*.json` profiles. The tracked example stays synthetic. The live
+inventory supersedes the earlier provisional dgx4 address. Qualification uses
+separate clean checkouts at `{home}/projects/spark3-ring4-qualification` so host
+maintenance cannot replace a running test's code.
 
 Base deployment: `a5e66d1`. The intended variable is the path taken by
 opposite-peer RoCEnante traffic: intermediate NIC forwarding instead of the
@@ -70,8 +73,9 @@ python3 scripts/mesh_fabric.py plan --nodes experiments/2026-10-02-rocenante-mes
 Prepare a real site map after cabling ranks 0–1–2–3–0. Every HCA needs its
 actual netdev, PCI address, MAC, IPv4 /24 and selected IPv4 RoCE-v2 GID. Use two
 stripes per cable, in matching order at both ends. Update the candidate's
-`nodes_config` and rendezvous address, publish the site/config commit, and
-synchronize clean checkouts with `bin/spark3 cluster sync`. Keep
+`nodes_config` and rendezvous address, publish the profile commit, and
+synchronize clean checkouts with `bin/spark3 cluster sync`. The selected site map
+stays git-ignored and is copied by sync under the new nodes standard. Keep
 `deployment.launch_enabled` false while qualifying.
 
 On each host, the following is read-only (substitute the published real map and
@@ -88,7 +92,9 @@ NIC doctor for network readiness alone.
 
 Required settings are legacy eswitch / inline none / encap basic, hmfs steering,
 hardware TC offload, MTU 9000, active RDMA MTU 4096, four hairpin queues and queue
-size 8192. Doctor reports deviations and separate correction commands; it does
+size selected by `mesh_hairpin_queue_size` (1024 or 8192; default 8192). This
+qualification explicitly selects the existing 1024 setting and changes no NIC
+parameters. Doctor reports deviations and separate correction commands; it does
 not execute them. Driver-init changes require stopping all RDMA users and a
 coordinated reload or reboot. A readback of driver-init values alone does not
 prove that the running driver has applied them; the hardware probe is the gate.
@@ -106,7 +112,9 @@ sudo install -D -m 0755 /tmp/spark3-roce-marker /usr/local/libexec/spark3-roce-m
 
 Record the helper's source/binary hash and compiler version in hardware results.
 Build and distribute one candidate image digest through the normal build flow.
-The image tag in `cluster.json` is reserved, not an existing qualified image.
+The candidate image is now built; its exact digest and source identity are
+recorded with the hardware results. `build-candidate.py` creates the transport-only
+overlay after checking the installed base image ID and all source-tree labels.
 
 ## Hardware qualification
 
@@ -140,8 +148,9 @@ limits. This is not yet a cluster-wide serving supervisor.
 After correctness, compare NCCL ring, CPU relay and NIC forwarding with the same
 payloads/stripes. Then add and qualify the persistent serving lifecycle before
 model benchmarks: c1/c8 decode, 4K/16K/64K prefill, TTFT, memory, and repeatability
-on the same pinned cost table. Keep failed runs. Restore the promoted topology
-and service before releasing the window.
+on the same pinned cost table. Keep failed runs. Restore the agreed entry state before releasing the window. This qualification
+started with all four nodes idle; it does not restore an obsolete three-node
+physical topology or start an unqualified four-node serving profile.
 
 ## Evidence so far
 
@@ -153,11 +162,135 @@ and service before releasing the window.
   one/two stripes, changing sizes, delayed DMA, sequence wrap and error paths.
   The fake verbs layer checks opposite-only flow labels. This does not emulate
   NIC packet rewriting, reliable hardware delivery or CUDA kernels.
-- The native marker passes strict C syntax/type checking against dgx1's installed RDMA
-  headers; it has not attached a flow. A subsequent link-build attempt could
-  not complete because SSH to dgx1 timed out; linking remains to be verified.
-- Read-only inventory on dgx1, dgx2 and dgx3 succeeds for all twelve functions.
-  The only candidate-contract differences found were queue size 1024 instead
-  of 8192. No host setting changed. dgx4 and the recabled fabric are untested.
-- No serving image was built or deployed. TPS, TTFT and hardware memory impact
-  remain unmeasured; no performance gain is claimed.
+- The native marker compiles and links with strict warnings on all four hosts;
+  its exact RDMA flow attaches successfully. Hardware TC rules attach with the
+  existing 1024 queue size. No driver reload or host configuration change was needed.
+- Hardware results and remaining limits follow below.
+
+## Four-node hardware session, 2026-10-02
+
+The session ran 20:23–20:55 UTC. Entry and exit state: four idle nodes, no model
+service running. No driver, kernel, netplan, NIC queue, NVMe or sysctl setting was
+changed. The shared deployment checkouts finish clean at `4449d6e`; isolated
+qualification checkouts finish at `38cfe04`. The owned hold was removed at 20:55.
+Unrelated stopped containers were preserved.
+
+Identity:
+
+- Linux `7.0.0-1019-nvidia-64k`, driver `580.178.04` on all four hosts.
+- Same physical two-lane neighbour ring, MTU 9000 / RDMA MTU 4096, IPv4 RoCE v2
+  GID 3, hmfs steering, four hairpin queues of size **1024** on all 16 functions.
+- Base r5o image ID:
+  `sha256:aad8a74089ff379f5bc7905e86f9c7e2c053396d0a4027039e869c505ca7621b`.
+- Candidate image `vllm-ds41f-kkref:04c30fa98e79-r5o-roce-mesh4-v1`, same ID on all
+  four hosts:
+  `sha256:488fed96fecec12e60a32a75f387e057bbf56da384098ca6efb6757869734c2d`.
+- Candidate B12X head `f7639617b6ba677cc2996b7351b99baa35f45b4f`, tree
+  `f5b9429596f789ed88952860b43c97823bc44679`. vLLM and NCCL trees match r5o.
+- Marker binary SHA-256 on every host:
+  `239ed684d3ab4fc3bf02d5a5b44c7a3aaed03e4788c675b950ce99d8401fc563`.
+  Built and run from `~/spark3-lab/mesh4/marker`; no system-wide installation.
+
+### Run ledger
+
+[Raw evidence](hardware/runs.tar.gz) contains every run's exact command arrays,
+rank logs, result codes, inventory and cleanup evidence. The JSON
+[summary](hardware/summary.json) includes every successful correctness result,
+per-rank samples and forwarding counters. [Checksums](hardware/sha256.json)
+cover the archive and session orchestration sources, retained as `.py.txt`
+provenance rather than a supported deployment API.
+
+| Run | Result |
+| --- | --- |
+| 00 inventory | Four nodes reachable by SSH aliases; every physical HCA/GID verified. The default 8192 queue contract differed from the installed 1024, so the explicit site contract selected 1024. |
+| 01 direct links | Jumbo ping and bidirectional RDMA write passed on all eight neighbour lanes; 212.39–213.26 Gbit/s aggregate bidirectional throughput. Serial short screens, not a simultaneous saturation test. |
+| 02 NCCL | Exact GPU collective results on all four ranks, eager and graph replay. |
+| 03–06 build, attachment, distribution | Built one candidate image, distributed the same ID, compiled identical markers, attached hardware rules and cleaned them up on all four nodes. |
+| 07 mesh | Stopped before GPU work: another session moved the shared checkout to newer main during the hold, removing the runner. No transport failure. |
+| 08 mesh | Repeated from isolated checkouts; all four ranks passed, 114 RoCEnante operations each. |
+| 09 CPU relay | Same correctness matrix passed, 114 RoCEnante operations per rank. |
+| 10–12 latency | Mesh, NCCL, CPU relay respectively; all correctness checks passed. |
+| 13–15 repeat latency | Mesh, CPU relay, NCCL respectively, with before/after RDMA counters; all correctness checks passed. |
+| 16 marker failure | Terminated one dgx1 marker during active GPU benchmarking. Local runner detected its death and stopped the probe; coordinator stopped the other ranks. Expected rank exits 1/137/137/137. All processes finished about 6.4 seconds after injection. |
+| 17 cleanup | No test containers, GPU processes, markers, owned routes or TC filters remain; all four NIC inventories exactly match run 00. NIC doctor passes. |
+
+Two harness issues are retained in the interpretation: the first local sync
+attempt hit macOS's SSH control-path length limit and changed no checkout;
+subsequent syncs used `TMPDIR=/tmp`. The initial cleanup assertion incorrectly
+required *all* containers to be absent; unrelated containers were in Created
+state. The corrected audit requires no running or owned probe container and
+preserves those unrelated containers.
+
+The correctness matrix uses BF16/FP32, tiny and large payloads, both sides of
+RoCEnante's 2 MiB all-reduce and 4 MiB all-gather dispatch limits, and four graph
+replays with changing input on each size. Small uniform all-reduce/all-gather
+use RoCEnante; **reduce-scatter uses NCCL in every arm**, as do over-limit calls.
+The 19 size/dtype cases in each custom arm each check three collectives in eager
+execution and four graph replays: 285 output checks per rank. This qualifies
+these collectives, not arbitrary point-to-point traffic, expert all-to-all,
+model quality, or batch-invariant inference.
+
+### Latency screen
+
+Identical inputs on four ranks; BF16 and FP32; 5,120 / 30,720 / 245,760 / 1,048,576
+input elements per rank. For reduce-scatter this is the output shard length; the
+input has four shards. Each graph contains 16 calls; each sample replays it 16
+times, with a CPU-group barrier before the timer. Five CUDA-event samples per
+case, two fresh container launches per arm. Take the slowest rank per sample,
+then the median. The table gives the range of the two launch medians, not a
+confidence interval. Compilation, connection setup and graph capture are outside
+the timer. Final output checks also pass after the timing loops.
+
+BF16 all-reduce, microseconds per call (lower is better):
+
+| Per-rank input | NCCL ring | CPU relay | NIC forwarding |
+| --- | ---: | ---: | ---: |
+| 10 KiB | 90.6–92.4 | 18.2 | **16.2–16.9** |
+| 60 KiB | 111.5–114.2 | 29.6–30.0 | **28.1–28.5** |
+| 480 KiB | 168.9–174.1 | **96.3–98.4** | 286.3–326.6 |
+| 2 MiB | 359.5–362.1 | **316.3–319.1** | 796.2–961.2 |
+
+The first three lengths correspond to 1/6/48 rows of 5,120 BF16 elements, but
+this is a collective microbenchmark without model computation or contention.
+It does not measure end-to-end TPS, TTFT or prefill. No performance promotion or
+new dispatch threshold follows from two screening launches alone. Container
+memory was bounded at 12 GiB; peak memory was not measured, and no model weights
+or KV cache were allocated.
+
+### Forwarding works; large-payload reliability needs investigation
+
+All eight owned forwarding rules report hardware offload and advancing packet
+counters. Run 10 records **22,217,536 hardware-forwarded packets**, zero software
+packets and zero TC-action drops; run 13 records 23,962,190 hardware packets.
+These delayed counters prove both forwarding lanes carry traffic. They do not
+measure every NIC queue or prove the absence of packet loss.
+
+Run 13's RDMA counter deltas across the 16 HCAs are:
+
+- `roce_adp_retrans`: **18,316**;
+- `packet_seq_err`: **70,450**;
+- `out_of_sequence`: **83,905**;
+- `np_cnp_sent`: **167,810**.
+
+The retransmission and sequence-error increments occur on the HCAs selected for
+opposite-peer traffic. Identical screens through the CPU relay (14) and NCCL
+(15) add **zero** to those counters. No unrecovered transport error or incorrect
+result was observed. The retransmissions are consistent with the larger-payload
+slowdown, but this session does not distinguish loss from reordering or identify
+the specific NIC queue mechanism. A zero TC drop count is insufficient to make
+that diagnosis. Increasing queue size to 8192 is **untested**, not an established
+fix.
+
+Next work is bounded: separate the loss/reordering mechanism using per-port and
+queue counters, then compare one forwarding/pacing change at a time against the
+same CPU-relay control. Retain the measured CPU relay as a candidate alternative.
+Before any serving promotion, qualify restart/reboot and persistent fabric
+supervision, select thresholds from a denser size sweep, then run full TP4 model
+startup and c1/c8 decode plus 4K/16K/64K prefill. None of those serving tests ran
+in this session.
+
+Repository validation: 165 tests pass; promoted and qualification doctor checks
+pass; `git diff --check` is clean. A full local `build check` reports that the
+complete promoted tree is not prepared. The transport-only image build and
+its source-label verification succeeded on dgx1; this is distinct from a full
+base-image rebuild. Both logs are retained in `hardware/`.

@@ -1,9 +1,11 @@
 # RoCEnante on a four-node switchless ring
 
-Status: implemented experimental transport, CPU protocol tests passed; image
-build, real RDMA/GPU correctness, CUDA graph qualification and performance are
-pending. Production remains the three-node r5o configuration. This experiment
-has not used Docker, contacted the nodes or changed the serving cluster.
+Status: CPU relay now passes exact hardware GPU collective and CUDA graph checks
+on all four Sparks, with two latency-screen launches. The built mesh candidate
+includes this relay mode unchanged and supplies the common image for both arms.
+See the [hardware session](../2026-10-02-rocenante-mesh4/README.md#four-node-hardware-session-2026-10-02)
+for image identity, raw evidence and remaining serving gates. The promoted
+configuration remains TP3; full TP4 model serving is still unqualified.
 
 Deployment base: `b643f1654916eb2ad69892b5f4e75cdd45227b4d`.
 B12X base: `f8069b2c0be1311df3b112591c6b8876a843f8be` plus the production
@@ -33,7 +35,8 @@ This preserves all-reduce and all-gather buffer layouts and their GPU reduction
 order. It does not imply identical model outputs between TP3 and TP4. Existing
 size/dtype eligibility and NCCL fallbacks remain; reduce-scatter uses NCCL.
 The relay adds a second network hop for the opposite rank and CPU polling.
-Its latency and throughput have not been measured. Clockwise traffic carries
+Its collective latency is now screened; model throughput remains unmeasured.
+Clockwise traffic carries
 two payloads per operation, counterclockwise traffic one; balancing that load
 is a possible later optimization, not part of this candidate.
 
@@ -128,11 +131,12 @@ its recorded head and tree. It covers 10,000 logical collective rounds:
 
 The fake verbs layer validates host protocol logic. It does not emulate NIC
 coherence, GPU memory ordering, actual registration, GID addressing or compiler
-code generation. No transport benchmark or serving-quality result exists yet.
-The complete image inputs are absent locally, so a complete build check is
-also pending.
+code generation. The later hardware session supplies collective correctness and
+latency evidence; serving quality is still unmeasured. A complete model image
+rebuild remains separate from the verified transport-only overlay used there.
 
-Hardware qualification, in order:
+Hardware qualification sequence (the linked session completes the address,
+image and collective screens; sustained stress and model serving remain):
 
 1. Verify addresses/GIDs and build/image identity on all four nodes.
 2. Render `topology probe dgx1` through `dgx4` with this cluster config, then

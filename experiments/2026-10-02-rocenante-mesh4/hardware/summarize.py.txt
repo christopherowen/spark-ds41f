@@ -1,0 +1,31 @@
+import json,pathlib,statistics
+root=pathlib.Path('/Users/christopherowen/projects/spark3-kernel-64k/.work/mesh4-qualification')
+def objects(t):
+ dec=json.JSONDecoder();offset=0
+ while (i:=t.find('{"rank":',offset))>=0:
+  try:v,end=dec.raw_decode(t[i:]);offset=i+end;yield v
+  except ValueError:offset=i+1
+allruns={}
+for run in sorted(root.glob('run*')):
+ if not run.is_dir():continue
+ ranks=[];counters=[]
+ for p in sorted(run.glob('dgx?.txt')):
+  for o in objects(p.read_text()):
+   if o.get('passed'):ranks.append(o)
+   if 'forwarding_counters' in o:
+    for f in o['forwarding_counters']:
+     if 'options' not in f:continue
+     counters.append({'rank':o['rank'],'device':o['device'],'in_hw':f['options']['in_hw'],'stats':f['options']['actions'][-1]['stats']})
+ if not ranks:continue
+ summary={'ranks':ranks,'forwarding_counters':counters,'latency':[]}
+ if all('timings' in r and r['timings'] for r in ranks) and len(ranks)==4:
+  for idx,t in enumerate(ranks[0]['timings']):
+   samples=[max(r['timings'][idx]['microseconds_per_call'][j] for r in ranks) for j in range(5)]
+   summary['latency'].append({k:t[k] for k in ('dtype','elements_per_rank','operation')}|{'slowest_rank_samples_us':samples,'median_us':statistics.median(samples)})
+ allruns[run.name]=summary
+ if summary['latency']:
+  print(run.name)
+  for t in summary['latency']:
+   if t['dtype']=='torch.bfloat16':print(t['elements_per_rank'],t['operation'],round(t['median_us'],1))
+ if counters:print('hw packets',sum(c['stats']['hw_packets'] for c in counters),'software packets',sum(c['stats']['sw_packets'] for c in counters),'drops',sum(c['stats']['drops'] for c in counters))
+(root/'summary.json').write_text(json.dumps(allruns,indent=2)+'\n')

@@ -2,15 +2,17 @@
 
 The deployment tools accept three or four Sparks, with one GPU and one TP rank
 per node. The promoted configuration remains the measured three-node deployment.
-Four-node support is a candidate configuration path: its topology checks and
-launch rendering are tested locally; its communication probe and full DS4.1
-serving qualification still need four physically connected Sparks.
+Four-node support is a candidate configuration path. NCCL ring, RoCEnante CPU
+relay and NIC forwarding pass the hardware collective probe on four connected
+Sparks. Full DS4.1 serving qualification remains open; see the
+[hardware results](../experiments/2026-10-02-rocenante-mesh4/README.md).
 
 | Fabric | TP transport | Peer map |
 | --- | --- | --- |
 | Three-node triangle | Existing RoCEnante small collectives plus NCCL | Both other ranks |
 | Four-node ring | NCCL ring for TP collectives | Previous and next ranks only |
 | Four-node ring, experimental relay image | RoCEnante ring4 small collectives plus NCCL ring | Previous and next ranks only |
+| Four-node ring, experimental NIC forwarding | RoCEnante mesh4 small collectives plus NCCL ring | Physical neighbours; opposite paths derived |
 
 Ranks follow cable order: `0—1—2—3—0`. The three-node triangle already connects
 every pair. A four-node ring has no direct link to the opposite rank. The B12X
@@ -24,7 +26,10 @@ and kernels. This candidate selects its isolated build lock with
 ## Configuration
 
 Each cluster profile can select a repository-relative `nodes_config` file.
-Omitting it preserves `config/nodes.json`. All cluster operations, rendering,
+Omitting it uses the git-ignored site file `config/nodes.json`, initialized from
+`config/nodes.example.json`. Keep real candidate maps in ignored
+`config/*.local.json` files. `cluster sync` copies the selected map atomically
+to each checkout alongside the default site file. All cluster operations, rendering,
 live checks and benchmarks resolve the same selected node map. No separate
 node-map command-line option needs forwarding to remote helpers.
 
@@ -48,10 +53,10 @@ Create a complete candidate from a base profile:
 
 ```sh
 mkdir -p experiments/2026-10-02-switchless-ring4
-cp config/examples/nodes-ring4.json experiments/2026-10-02-switchless-ring4/nodes.json
-# Edit nodes.json for the actual hosts and cable subnets before proceeding.
+cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+# Edit config/nodes-ring4.local.json for the actual hosts and cable subnets.
 bin/spark3 topology create \
-  --nodes-config experiments/2026-10-02-switchless-ring4/nodes.json \
+  --nodes-config config/nodes-ring4.local.json \
   --output experiments/2026-10-02-switchless-ring4/cluster.json
 bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json doctor
 bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json render dgx4
@@ -151,6 +156,7 @@ adds endpoint QPs between opposite ranks through ConnectX-7 hardware forwarding.
 It retains the physical two-neighbour map and derives the logical peer map.
 Its bounded collective runner owns temporary NIC markers, routes and TC rules;
 NIC doctor reports settings and correction commands separately. The CPU relay
-remains a comparison candidate. Cabling, the real four-node site map, hardware
-qualification and the persistent serving lifecycle are still required before
+remains a comparison candidate. Hardware collective correctness now passes.
+Larger forwarded payloads show retransmissions and poorer latency than the CPU
+relay; resolve that behavior and qualify persistent serving supervision before
 launch or promotion.

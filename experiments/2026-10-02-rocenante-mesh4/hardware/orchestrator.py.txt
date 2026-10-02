@@ -1,0 +1,42 @@
+from pathlib import Path
+import argparse,importlib.machinery,importlib.util,json,subprocess,shlex,time,sys
+root=Path('/Users/christopherowen/projects/spark3-kernel-64k')
+l=importlib.machinery.SourceFileLoader('spark3_probe_runner',str(root/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
+kind=sys.argv[1];runid=sys.argv[2]
+profile='experiments/2026-10-02-rocenante-mesh4/qualification-'+kind+'.json'
+c,n,_=m.configuration(argparse.Namespace(cluster_config=profile))
+out=root/'.work/mesh4-qualification'/runid;out.mkdir(parents=True,exist_ok=True)
+def hardware_snapshot(suffix):
+ code="import pathlib,json,subprocess;root=pathlib.Path('/sys/class/infiniband');d={p.name:{f.name:int(f.read_text()) for f in (p/'ports/1/hw_counters').glob('*')} for p in root.iterdir()};print(json.dumps(d))"
+ for node in n['nodes']:
+  result=subprocess.run(['ssh','-o','BatchMode=yes','swank@'+node['name'],shlex.join(['python3','-c',code])],capture_output=True,text=True,timeout=15,check=True)
+  (out/(node['name']+'-hardware-'+suffix+'.json')).write_text(result.stdout)
+hardware_snapshot('before')
+processes=[]
+for node in n['nodes']:
+ cmd=m.collective_probe_command(c,n,node,29581)
+ if '--benchmark' in sys.argv[3:]: cmd.append('--benchmark')
+ if kind == 'mesh': cmd[cmd.index('--marker')+1]='/home/swank/spark3-lab/mesh4/marker'
+ full=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@'+node['name'],shlex.join(cmd)]
+ log=open(out/(node['name']+'.txt'),'w')
+ p=subprocess.Popen(full,stdout=log,stderr=subprocess.STDOUT)
+ processes.append((node,p,log));(out/(node['name']+'-command.json')).write_text(json.dumps(cmd,indent=2)+'\n')
+start=time.monotonic();lastbeat=0
+while any(p.poll() is None for _,p,_ in processes):
+ if time.monotonic()-lastbeat>30:
+  beat="import json,pathlib,datetime;p=pathlib.Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=='mesh4-qualification';d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\\n')"
+  subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@dgx1',shlex.join(['python3','-c',beat])],timeout=15,check=True)
+  lastbeat=time.monotonic()
+ if any(p.poll() not in (None,0) for _,p,_ in processes) or time.monotonic()-start>690:
+  for node,p,log in processes:
+   subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@'+node['name'],'docker rm -f spark3-collective-probe'],capture_output=True,timeout=30)
+  break
+ time.sleep(1)
+results=[]
+for node,p,log in processes:
+ try:p.wait(timeout=30)
+ except subprocess.TimeoutExpired:p.terminate();p.wait(timeout=10)
+ log.close();results.append({'node':node['name'],'exit':p.returncode})
+ print(node['name'],p.returncode,(out/(node['name']+'.txt')).read_text()[-1600:],flush=True)
+hardware_snapshot('after')
+(out/'results.json').write_text(json.dumps(results,indent=2)+'\n')

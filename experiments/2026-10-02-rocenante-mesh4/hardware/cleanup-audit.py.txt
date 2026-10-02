@@ -1,0 +1,22 @@
+import pathlib,subprocess,json,concurrent.futures,shlex
+root=pathlib.Path('/Users/christopherowen/projects/spark3-kernel-64k');out=root/'.work/mesh4-qualification/run17-cleanup';out.mkdir(parents=True,exist_ok=True)
+code=r'''import sys,pathlib,json,subprocess
+root=pathlib.Path.home()/'projects/spark3-ring4-qualification';sys.path.insert(0,str(root/'scripts'));import mesh_fabric as f
+nodes=json.loads((root/'config/nodes-ring4.local.json').read_text());name=subprocess.check_output(['hostname','-s'],text=True).strip();node=next(n for n in nodes['nodes'] if n['name']==name)
+inv=f.inventory(node);errors,fixes=f.findings(node,inv)
+def cmd(c):return subprocess.check_output(c,text=True).strip()
+filters={p['netdev']:json.loads(cmd(['sudo','tc','-j','filter','show','dev',p['netdev'],'ingress'])) for p in node['mesh_ports'].values()}
+routes=json.loads(cmd(['ip','-j','route','show']))
+plan=f.build_plan(nodes)[node['rank']]
+owned_destinations=[r['add'][3] for r in plan['routes']]
+markers=[]
+for p in pathlib.Path('/proc').iterdir():
+ if p.name.isdigit():
+  try:a=(p/'cmdline').read_bytes().split(b'\0')
+  except OSError:continue
+  if a and a[0]==b'/home/swank/spark3-lab/mesh4/marker':markers.append(p.name)
+print(json.dumps({'node':name,'inventory':inv,'doctor_errors':errors,'filters':filters,'owned_destinations':owned_destinations,'routes':routes,'markers':markers,'containers':cmd(['docker','ps','-a','--format','{{.Names}} {{.Status}}']),'running_containers':cmd(['docker','ps','--format','{{.Names}}']),'gpu_processes':cmd(['nvidia-smi','--query-compute-apps=pid,process_name,used_memory','--format=csv,noheader']),'shared_commit':cmd(['git','-C',str(pathlib.Path.home()/'projects/spark3-vllm-ds41f'),'rev-parse','HEAD']),'shared_dirty':cmd(['git','-C',str(pathlib.Path.home()/'projects/spark3-vllm-ds41f'),'status','--porcelain']),'qualification_commit':cmd(['git','-C',str(root),'rev-parse','HEAD']),'kernel':cmd(['uname','-r']),'driver':cmd(['nvidia-smi','--query-gpu=driver_version','--format=csv,noheader'])}))'''
+def one(n):
+ r=subprocess.run(['ssh','swank@dgx'+str(n),shlex.join(['python3','-c',code])],capture_output=True,text=True,timeout=45,check=True);d=json.loads(r.stdout);(out/f'dgx{n}.json').write_text(json.dumps(d,indent=2)+'\n');old=json.loads((root/f'.work/mesh4-qualification/run00/dgx{n}.json').read_text())['inventory'];assert d['inventory']==old,(n,'inventory changed');assert not d['doctor_errors'];assert not d['markers'];assert not d['running_containers'];assert 'spark3-collective-probe' not in d['containers'];assert not d['gpu_processes'];assert not d['shared_dirty'];assert not any(d['filters'].values());assert not any(r.get('dst') in d['owned_destinations'] for r in d['routes']);return n,'clean',d['shared_commit']
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+ for result in pool.map(one,range(1,5)):print(result)
