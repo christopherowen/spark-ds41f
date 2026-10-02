@@ -1,5 +1,11 @@
 # NVMe interrupt coalescing A/B (2026-10-02)
 
+**Decision (owner, 2026-10-02): coalescing is off on every node.** The service
+is masked and the feature cleared, `docs/replicate.md` describes the host
+setting, and `doctor --live` warns when it comes back. The measurements below
+still stand. A lone 4 KiB read completes about 4× sooner with coalescing off,
+but serving showed no gain, and prefill was 0.7–1.6% slower.
+
 **Result: keep NVIDIA's default (coalescing on).** With coalescing off, a 4 KiB read
 at queue depth 1 completes 3.6–4.4× sooner, but serving gains nothing. Decode step
 times are unchanged, prefill is 0.7–1.6% slower, and the drive raises 4.5× more
