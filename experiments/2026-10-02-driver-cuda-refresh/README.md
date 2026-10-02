@@ -29,7 +29,7 @@ and close the hold. Results and decision are pending.
 ## CUDA library/compiler screen
 
 The derivative image changes cuBLAS to 13.5.1.27, CUDA runtime to 13.3.29,
-NVRTC and nvJitLink to 13.3.33, and explicitly selects the 13.3.33 assembler
+NVRTC to 13.3.33, preserves the existing nvJitLink 13.4.52, and explicitly selects the 13.3.33 assembler
 for Triton. Hashes and architecture-specific wheel URLs are recorded. PyTorch,
 vLLM, B12X, CuTe DSL and native extensions remain exactly r5o. The existing
 13.4 nvcc wheel is preserved; the Triton assembler is installed separately.
@@ -70,3 +70,10 @@ default retained the 64 GiB test allocation after process exit. Its source
 sets this option to zero, restores returned pages to ordinary host accounting,
 and checks the loaded setting before serving. This setting is removed during
 restoration. The original failed-start logs are retained.
+
+The first derivative image (`exp1`, `sha256:f81aca445450fafe595751f9c60b8f39eb42998583855ebeaf7a70e71b4b9d38`)
+passed the bounded CUDA tests but was discarded before serving: the package audit
+showed r5o already has nvJitLink 13.4.52, whereas that image installed 13.3.33.
+The corrected `exp2` keeps 13.4.52. Shared runtime packages move forward only;
+this is why the audit records actual libraries instead of assuming the image's
+CUDA label describes every installed component.
