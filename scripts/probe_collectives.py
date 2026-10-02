@@ -33,7 +33,7 @@ def port_counters():
     counters = {}
     for hca in Path('/sys/class/infiniband').iterdir():
         for netdev in (hca / 'device/net').iterdir():
-            output = subprocess.check_output(['ethtool', '-S', netdev.name], text=True)
+            output = subprocess.check_output(['ethtool', '-S', netdev.name], text=True, timeout=10)
             values = {key.strip(): int(value.strip()) for line in output.splitlines()
                       if ':' in line for key, value in [line.split(':', 1)]
                       if value.strip().isdigit()}
@@ -222,6 +222,8 @@ def main() -> None:
                                 outputs = [operation() for _ in range(16)]
                         for _ in range(4): graph.replay()
                         torch.cuda.synchronize()
+                        if args.counter_samples or args.port_samples:
+                            dist.barrier(group=group.cpu_group)
                         counters_before = rdma_error_counters() if args.counter_samples else None
                         ports_before = port_counters() if args.port_samples else None
                         samples = []
@@ -242,6 +244,8 @@ def main() -> None:
                         row = {'dtype': str(dtype), 'elements_per_rank': length,
                                'operation': name, 'microseconds_per_call': samples,
                                'calls_per_graph': 16, 'replays_per_sample': 16}
+                        if args.counter_samples or args.port_samples:
+                            dist.barrier(group=group.cpu_group)
                         if counters_before is not None:
                             counters_after = rdma_error_counters()
                             row['rdma_error_deltas'] = {
@@ -252,6 +256,10 @@ def main() -> None:
                             row['port_deltas'] = {
                                 dev: {key: value - ports_before[dev][key] for key, value in values.items()}
                                 for dev, values in ports_after.items()}
+                        if args.counter_samples or args.port_samples:
+                            # No rank starts the next case while another rank
+                            # is still reading its counters for this case.
+                            dist.barrier(group=group.cpu_group)
                         timings.append(row)
                         print(json.dumps({'rank': args.rank, 'timing': row}), flush=True)
                         del graph, outputs

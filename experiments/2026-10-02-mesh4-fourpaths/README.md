@@ -35,7 +35,8 @@ using the shared cooling routine, restoring their usual fan control before
 measurement. Run exact eager/graph collective checks and the same BF16/FP32
 latency matrix for control, four paths and rotation, then repeat in reverse
 order. Retain relay as the large-payload control. Capture physical TX/RX bytes,
-buffer-overflow and RDMA counters around each timed case. Keep all raw attempts,
+buffer-overflow and RDMA counters around each timed case, with CPU barriers
+outside the timer to keep adjacent cases out of the counter windows. Keep all raw attempts,
 including failures. Restore entry queues and verify cleanup before releasing.
 
 Status: local correctness tests pass; hardware testing awaits the window held
