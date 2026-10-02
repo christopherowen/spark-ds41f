@@ -1,4 +1,4 @@
-"""Read-only kernel trial inventory, sent over SSH by doctor (no GPU work).
+"""Read-only kernel and memory-saver inventory, sent over SSH (no GPU work).
 
 Installed artifacts establish preparation only, never successful boot or CUDA
 qualification. GRUB identifiers contain node-local filesystem UUIDs; compare
@@ -91,6 +91,15 @@ def collect(policy):
             "version": read(module, "modinfo", "-k", target, "-F", "version", module),
         }
     data["fan_dkms"] = read("fan DKMS", "dkms", "status", "-m", "dgx-spark-fan-control", "-k", target)
+    if policy.get("memory_saver"):
+        saver = policy["memory_saver"]
+        data["memory_saver_dkms"] = read("memory-saver DKMS", "dkms", "status",
+                                        "-m", saver["package"], "-k", target)
+        data["memory_saver_disk"] = {
+            field: read("memory-saver " + field, "modinfo", "-k", target,
+                        "-F", field, "nvidia_uvm")
+            for field in ("filename", "srcversion", "signer")
+        }
     data["secure_boot"] = read("Secure Boot", "mokutil", "--sb-state")
     data["fan_signer"] = read("fan signature", "modinfo", "-k", target, "-F", "signer", "dgx_ec_fan_control")
     if data["secure_boot"] == "SecureBoot enabled":
@@ -168,7 +177,56 @@ def findings(name, data, policy):
             issues.append(f"{name}: 64 KiB swap or boot memory service is not active")
         if any("64 KiB THP" in x or "64 KiB swap" in x for x in issues):
             fixes.append(f"{name}: inspect journalctl -u spark3-kernel-memory.service; after correcting its inputs, sudo systemctl restart spark3-kernel-memory.service")
+    saver_issues = memory_saver_problems(name, data, policy)
+    issues.extend(saver_issues)
+    if saver_issues:
+        saver = policy["memory_saver"]
+        fixes.append(f"{name}: register the pinned source using docs/memory-profiles.md#install-memory-saver; "
+                     f"then sudo dkms install -m {saver['package']} -v {saver['version']} -k {target}. "
+                     "For a loaded-module mismatch, stop GPU clients and reboot into the configured kernel.")
     return issues, fixes
+
+
+def memory_saver_problems(name, data, policy):
+    """Preparation warnings apply to both profiles; loaded checks apply at 64 KiB."""
+    saver = policy.get("memory_saver")
+    if not saver:
+        return []
+    issues = []
+    expected = f"{saver['package']}/{saver['version']}, {policy['candidate']}, aarch64: installed"
+    if not any(line == expected or line.startswith(expected + " (")
+               for line in data.get("memory_saver_dkms", "").splitlines()):
+        issues.append(f"{name}: memory-saver DKMS {saver['version']} is missing or not installed for {policy['candidate']}")
+    disk = data.get("memory_saver_disk", {})
+    if (disk.get("srcversion") != saver["srcversion"] or
+            "/updates/dkms/" not in disk.get("filename", "")):
+        issues.append(f"{name}: candidate UVM does not select the expected memory-saver DKMS module")
+    if data.get("secure_boot") == "SecureBoot enabled" and not disk.get("signer"):
+        issues.append(f"{name}: memory-saver module has no readable Secure Boot signer")
+    if data.get("page_size") == 65536:
+        if data.get("uvm_leaf_packing") != "Y":
+            issues.append(f"{name}: memory-saver packing is not enabled in the loaded UVM module")
+        if data.get("loaded_nvidia_sources", {}).get("nvidia_uvm") != saver["srcversion"]:
+            issues.append(f"{name}: loaded UVM is not the expected memory-saver build; disk installation alone is insufficient")
+    return issues
+
+
+def profile_problems(name, data, profile, policy):
+    """Hard launch requirements for a memory budget tied to a particular kernel."""
+    if not profile:
+        return []
+    issues = []
+    if data.get("kernel") != profile["release"] or data.get("page_size") != profile["page_size"]:
+        issues.append(f"{name}: serving profile requires {profile['release']} / {profile['page_size']}-byte pages; "
+                      f"running {data.get('kernel')!r} / {data.get('page_size')!r}")
+    if profile.get("memory_saver_required"):
+        if not policy.get("memory_saver"):
+            issues.append(f"{name}: serving profile requires a pinned memory-saver policy")
+        else:
+            issues.extend(memory_saver_problems(name, data, policy))
+        if data.get("driver") != policy["driver"]:
+            issues.append(f"{name}: serving profile requires NVIDIA {policy['driver']}")
+    return issues
 
 
 def alignment(inventories):

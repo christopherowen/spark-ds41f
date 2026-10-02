@@ -35,6 +35,9 @@ def ready(uuid="node-a"):
     return {"kernel": OLD, "page_size": 4096, "driver": POLICY["driver"],
             "loaded_nvidia_sources": {"nvidia": "stock-rm", "nvidia_uvm": "stock-uvm"},
             "uvm_leaf_packing": "stock",
+            "memory_saver_dkms": f"dgx-spark-memory-saver/0.2.0, {NEW}, aarch64: installed (Original modules exist)",
+            "memory_saver_disk": {"srcversion": POLICY['memory_saver']['srcversion'],
+                                  "filename": f"/lib/modules/{NEW}/updates/dkms/nvidia-uvm.ko.zst", "signer": "Fleet key"},
             "thp": "always [madvise] never", "min_free_kbytes": "45166",
             "secure_boot": "SecureBoot enabled", "fan_signer": "Fleet key", "fan_key_enrolled": True,
             "errors": [], "packages": POLICY["packages"].copy(),
@@ -137,7 +140,40 @@ class ReadinessTest(unittest.TestCase):
         issues, _ = kernel.findings("dgx1", data, POLICY)
         self.assertTrue(any("64 KiB swap" in x for x in issues))
         data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active")
+        data["uvm_leaf_packing"] = "Y"
+        data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
         self.assertEqual(kernel.findings("dgx1", data, POLICY), ([], []))
+
+    def test_missing_memory_saver_warns_even_on_stock_kernel(self):
+        data = ready()
+        data["memory_saver_dkms"] = ""
+        data["memory_saver_disk"]["srcversion"] = "stock"
+        issues, fixes = kernel.findings("dgx1", data, POLICY)
+        self.assertTrue(any("memory-saver DKMS" in x and "missing" in x for x in issues))
+        self.assertTrue(any("dkms install" in x for x in fixes))
+        profile = {"release": OLD, "page_size": 4096, "memory_saver_required": False}
+        self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
+
+    def test_large_profile_refuses_stock_kernel_even_with_installed_module(self):
+        profile = {"release": NEW, "page_size": 65536, "memory_saver_required": True}
+        self.assertTrue(kernel.profile_problems("dgx1", ready(), profile, POLICY))
+
+    def test_disk_install_does_not_hide_unloaded_or_disabled_packing(self):
+        profile = {"release": NEW, "page_size": 65536, "memory_saver_required": True}
+        data = ready()
+        data.update(kernel=NEW, page_size=65536)
+        self.assertEqual(len(kernel.profile_problems("dgx1", data, profile, POLICY)), 2)
+        data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]
+        data["uvm_leaf_packing"] = "N"
+        self.assertTrue(kernel.profile_problems("dgx1", data, profile, POLICY))
+        data["uvm_leaf_packing"] = "Y"
+        self.assertEqual(kernel.profile_problems("dgx1", data, profile, POLICY), [])
+
+    def test_wrong_dkms_version_or_unsigned_module_is_reported(self):
+        data = ready()
+        data["memory_saver_dkms"] = data["memory_saver_dkms"].replace("0.2.0", "0.1.0")
+        data["memory_saver_disk"]["signer"] = ""
+        self.assertEqual(len(kernel.memory_saver_problems("dgx1", data, POLICY)), 2)
 
     def test_promoted_default_is_distinct_from_retained_fallback(self):
         data = ready()
