@@ -65,6 +65,14 @@ def collect(policy):
             data["errors"].append(f"{label}: {error}")
             return ""
     data["driver"] = read("loaded driver", "cat", "/sys/module/nvidia/version")
+    # A locally built UVM module can report the same release as the packaged
+    # driver. Compare the loaded binaries' source identities across nodes too.
+    data["loaded_nvidia_sources"] = {
+        module: read(module + " loaded source", "cat", f"/sys/module/{module}/srcversion")
+        for module in ("nvidia", "nvidia_uvm")
+    }
+    packing = Path("/sys/module/nvidia_uvm/parameters/uvm_pack_sysmem_leaf_tables")
+    data["uvm_leaf_packing"] = packing.read_text().strip() if packing.exists() else "stock"
     for name in policy["packages"]:
         value = read(name, "dpkg-query", "-W", "-f=${Status}|${Version}", name)
         data["packages"][name] = value.removeprefix("install ok installed|") if value.startswith("install ok installed|") else ""
@@ -165,7 +173,7 @@ def findings(name, data, policy):
 
 def alignment(inventories):
     issues = []
-    for field in ("kernel", "page_size", "driver", "thp", "min_free_kbytes", "secure_boot", "governors"):
+    for field in ("kernel", "page_size", "driver", "loaded_nvidia_sources", "uvm_leaf_packing", "thp", "min_free_kbytes", "secure_boot", "governors"):
         values = {name: data.get(field) for name, data in inventories.items()}
         if any(value in (None, "") for value in values.values()) or len({str(v) for v in values.values()}) > 1:
             issues.append("nodes differ or are unreadable for " + field + ": " + ", ".join(f"{n}={v!r}" for n, v in values.items()))

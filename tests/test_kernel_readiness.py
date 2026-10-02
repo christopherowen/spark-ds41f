@@ -33,6 +33,8 @@ submenu 'Advanced options' $menuentry_id_option 'gnulinux-advanced-{uuid}' {{
 
 def ready(uuid="node-a"):
     return {"kernel": OLD, "page_size": 4096, "driver": POLICY["driver"],
+            "loaded_nvidia_sources": {"nvidia": "stock-rm", "nvidia_uvm": "stock-uvm"},
+            "uvm_leaf_packing": "stock",
             "thp": "always [madvise] never", "min_free_kbytes": "45166",
             "secure_boot": "SecureBoot enabled", "fan_signer": "Fleet key", "fan_key_enrolled": True,
             "errors": [], "packages": POLICY["packages"].copy(),
@@ -94,6 +96,15 @@ class ReadinessTest(unittest.TestCase):
     def test_failed_probe_never_passes_alignment(self):
         issues = kernel.alignment({"dgx1": ready(), "dgx2": {"errors": ["SSH failed"]}})
         self.assertTrue(any("page_size" in x for x in issues))
+
+    def test_same_driver_version_does_not_hide_different_loaded_uvm(self):
+        second = ready()
+        second["loaded_nvidia_sources"]["nvidia_uvm"] = "trial-uvm"
+        second["uvm_leaf_packing"] = "Y"
+        issues = kernel.alignment({"dgx1": ready(), "dgx2": second})
+        self.assertEqual(len(issues), 2)
+        self.assertTrue(any("loaded_nvidia_sources" in x for x in issues))
+        self.assertTrue(any("uvm_leaf_packing" in x for x in issues))
 
     def test_absent_module_is_reported(self):
         data = ready()
