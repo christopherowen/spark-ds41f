@@ -48,7 +48,8 @@ The existing enrolled fleet key signs the module. Secure Boot remains enabled.
 - The coordinated start completed and live doctor passed on the larger profile.
 
 The original observations are in [runs/fleet-validation.json](runs/fleet-validation.json)
-and the individual install, CUDA, boot and doctor logs. This inventory was
+and the individual install, CUDA, boot and doctor logs. Text logs normalize
+line endings and trailing whitespace; native JSON reports are preserved. This inventory was
 captured after the one-shot boots, before changing the normal GRUB default.
 
 ## Serving screens
