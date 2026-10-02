@@ -11,7 +11,7 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
   switch), plus a management network for SSH, Gloo, and the API.
 - Docker with the NVIDIA container runtime and `buildx`, `/dev/infiniband`
   RDMA devices, and passwordless SSH from the head node to the other two as the
-  `ssh_user` in `config/nodes.json`.
+  `ssh_user` in `config/nodes.json` (see [Site configuration](#site-configuration)).
 - About 480 GiB of free disk per node for the model (the Engram tables are read
   from disk) plus caches, and 64 GiB of free memory on the build host.
 - DGX Spark 26.09.2 or later on every node, booted to `multi-user.target`
@@ -47,9 +47,13 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
 
 Edit these for your site, then run `bin/spark3 doctor`:
 
-- `config/nodes.json`: node names, ranks, management IPs, and
+- `config/nodes.json`: node names, ranks, management IPs, `ssh_user`, and
   `roce_peer_hcas`, which maps each peer rank to the local RoCE devices cabled
-  to it (`ibv_devices` and `rdma link` show the names).
+  to it (`ibv_devices` and `rdma link` show the names). The file is
+  git-ignored because it describes your site. Create it on the head node
+  with `cp config/nodes.example.json config/nodes.json` and edit it there.
+  `bin/spark3 cluster sync --apply` copies the head node's file to every node
+  after it moves their checkouts.
 - `config/cluster.json` and both named `config/cluster-4k.json` /
   `config/cluster-64k.json` profiles: `distributed.master_addr` (the head node's management
   IP), `host.home`, `deployment.repository` if you use a fork, and the interface

@@ -120,7 +120,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 def nodes_config() -> dict:
-    return spark3.read_json("config/nodes.json")
+    return spark3.site_nodes()
 
 
 def head_url() -> str:

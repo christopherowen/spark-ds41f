@@ -8,7 +8,9 @@ the open levers, measured dead ends, and the lean screening routine.
 ## Sources of truth
 
 - `config/cluster.json` is the promoted runtime configuration.
-- `config/nodes.json` is the promoted site topology.
+- `config/nodes.json` is this site's topology. It is git-ignored: each site keeps
+  its own copy, started from `config/nodes.example.json`, and `cluster sync`
+  copies the head node's file to every node.
 - `upstreams.lock.json` owns every external source URL and revision.
 - `requirements/` owns hashed non-Git build inputs.
 - `patches/*/series` owns the ordered local patch stacks.
