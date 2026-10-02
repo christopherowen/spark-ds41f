@@ -182,9 +182,6 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(kernel.findings("dgx1", data, dict(POLICY, default=NEW)), ([], []))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class RmQualificationTest(unittest.TestCase):
     def test_loaded_binary_identity_required_even_when_release_matches(self):
         policy = dict(POLICY, rm_build_note="candidate-build")
@@ -203,3 +200,7 @@ class RmQualificationTest(unittest.TestCase):
         self.assertTrue(kernel.profile_problems("node", data, profile, policy))
         data["rm_system_memory_pools"] = "0"
         self.assertEqual(kernel.profile_problems("node", data, profile, policy), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
