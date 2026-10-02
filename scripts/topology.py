@@ -160,7 +160,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             if not isinstance(back, list) or len(back) != len(hcas):
                 errors.append(f"{node['name']}: link to rank {peer} must have reciprocal stripe counts")
             if mode in ("nccl-ring", "rocenante-ring4"):
-                for hca in hcas:
+                for lane, hca in enumerate(hcas):
                     raw = node.get("roce_subnets", {}).get(hca)
                     try:
                         net = ipaddress.IPv4Network(raw, strict=True)
@@ -169,7 +169,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                     except (ValueError, TypeError, ipaddress.AddressValueError):
                         errors.append(f"{node['name']}: roce_subnets[{hca}] must name its cable's IPv4 /24 network")
                         continue
-                    networks.setdefault(str(net), []).append((rank, int(peer), hca))
+                    networks.setdefault(str(net), []).append((rank, int(peer), hca, lane))
         if len(set(all_hcas)) != len(all_hcas):
             errors.append(f"{node['name']}: switchless links must use distinct local HCAs")
         if mode in ("rocenante-direct", "rocenante-ring4") and len({len(v) for v in routes.values() if isinstance(v, list)}) != 1:
@@ -184,6 +184,8 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     for net, ends in networks.items():
         if len(ends) != 2 or ends[0][:2] != ends[1][:2][::-1]:
             errors.append(f"fabric subnet {net} must connect exactly the two declared neighbour endpoints")
+        elif mode == "rocenante-ring4" and ends[0][3] != ends[1][3]:
+            errors.append(f"fabric subnet {net}: RoCEnante endpoints must use the same stripe position")
     return errors
 
 

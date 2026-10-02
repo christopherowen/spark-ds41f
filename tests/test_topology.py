@@ -175,6 +175,13 @@ class TopologyTest(unittest.TestCase):
                              {str((node["rank"]-1)%4), str((node["rank"]+1)%4)})
             self.assertNotIn("--disable-custom-all-reduce", spark3.expected_command(cluster, node))
 
+    def test_relay_stripe_order_must_match_the_remote_cable(self):
+        relay = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
+        self.four["nodes"][0]["roce_peer_hcas"]["1"].reverse()
+        self.assertTrue(any("same stripe position" in p for p in topology.problems(relay, self.four)))
+        # NCCL selects by subnet rather than route-list position.
+        self.assertEqual(topology.problems(self.ring, self.four), [])
+
     def test_relay_base_can_generate_nccl_control(self):
         relay = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
         control = topology.candidate(relay, self.four, "config/examples/nodes-ring4.json")
