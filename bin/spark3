@@ -3128,9 +3128,10 @@ class PeakWatch:
 
 
 # Every benchmark or kernel run starts with each node's hottest thermal zone
-# below COOL_BELOW_C. A node above it is pre-cooled at the maximum fan floor of
-# dgx-spark-fan-control, then its fans return to their usual control (the
-# dgx-fan-control service's curve, or firmware automatic) before measuring.
+# below COOL_BELOW_C. If any node is above it, all of them run at the maximum
+# fan floor of dgx-spark-fan-control until the last one is below it, then
+# their fans return to their usual control (the dgx-fan-control service's
+# curve, or firmware automatic) before measuring.
 COOL_BELOW_C = 55.0
 COOL_TIMEOUT_S = 600.0
 COOL_POLL_S = 5.0
@@ -3146,74 +3147,82 @@ def hottest_zone_c(nodes: dict, node: dict) -> float | None:
         return None
 
 
-def cool_node(
+def take_fan_control(nodes: dict, node: dict) -> dict:
+    """Pause the dgx-fan-control service and select the maximum fan floor."""
+    service = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
+    if service:
+        run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+    floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0
+    return {"service": service, "floor": floor}
+
+
+def restore_fan_control(nodes: dict, node: dict, control: dict) -> str | None:
+    """Return the node to the fan control it had before take_fan_control."""
+    if control["service"]:
+        restored = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
+        return FAN_SERVICE if restored.returncode == 0 else f"FAILED: {FAN_SERVICE}"
+    if control["floor"]:
+        restored = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "automatic")
+        return "automatic" if restored.returncode == 0 else "FAILED: automatic"
+    return None
+
+
+def cool_nodes(
     nodes: dict,
-    node: dict,
+    targets: list[dict],
     below_c: float,
     timeout_s: float,
-    stop: threading.Event,
     poll_s: float = COOL_POLL_S,
-) -> dict:
-    """Bring one node's hottest zone below below_c, then restore its fan control."""
-    name = node["name"]
-    start = hottest_zone_c(nodes, node)
-    if start is None:
-        raise RuntimeError(f"{name}: cannot read its thermal zones")
-    record = {"node": name, "start_c": start, "cooled": False, "seconds": 0.0, "final_c": start}
-    if start < below_c:
-        return record
-    service_active = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
-    if service_active:
-        run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
-    floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12")
-    record["fan_floor"] = 12 if floor.returncode == 0 else None
-    print(
-        f"cooling: {name} at {start:.1f} C; waiting for < {below_c:g} C"
-        + (" at fan floor 12" if floor.returncode == 0 else " (fan floor unavailable)"),
-        flush=True,
-    )
-    began = time.monotonic()
-    current = start
-    try:
-        while current is None or current >= below_c:
-            if time.monotonic() - began > timeout_s:
-                raise RuntimeError(
-                    f"{name}: hottest zone still {current} C after {timeout_s:g} s of cooling"
-                )
-            if stop.wait(poll_s):
-                raise RuntimeError(f"{name}: cooling interrupted")
-            current = hottest_zone_c(nodes, node)
-    finally:
-        if service_active:
-            restored = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
-            record["restored"] = FAN_SERVICE if restored.returncode == 0 else f"FAILED: {FAN_SERVICE}"
-        elif floor.returncode == 0:
-            restored = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "automatic")
-            record["restored"] = "automatic" if restored.returncode == 0 else "FAILED: automatic"
-        record.update(cooled=True, seconds=round(time.monotonic() - began, 1), final_c=current)
-    print(f"cooling: {name} at {current:.1f} C after {record['seconds']:g} s; fans restored", flush=True)
-    return record
+) -> list[dict]:
+    """Bring every target node's hottest zone below below_c, cooling them together.
 
-
-def cool_nodes(nodes: dict, targets: list[dict], below_c: float, timeout_s: float) -> list[dict]:
-    """Cool every target node below below_c, concurrently; raise if any cannot."""
+    When any node is at or above the threshold, every target gets the maximum
+    fan floor until the last one is below it, so the wait cools them all. Each
+    node's usual fan control then returns. Raises RuntimeError when a node
+    cannot be read or does not cool within timeout_s; the fans are restored on
+    every path.
+    """
     if below_c <= 0 or not targets:
         return []
-    stop = threading.Event()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
-        futures = [pool.submit(cool_node, nodes, node, below_c, timeout_s, stop) for node in targets]
+        def readings() -> list[float | None]:
+            return list(pool.map(lambda node: hottest_zone_c(nodes, node), targets))
+
+        temperatures = readings()
+        unreadable = [node["name"] for node, value in zip(targets, temperatures) if value is None]
+        if unreadable:
+            raise RuntimeError(f"cannot read the thermal zones of {', '.join(unreadable)}")
+        records = [
+            {"node": node["name"], "start_c": value, "cooled": False, "seconds": 0.0, "final_c": value}
+            for node, value in zip(targets, temperatures)
+        ]
+        if all(value < below_c for value in temperatures):
+            return records
+        hot = ", ".join(f"{r['node']} {r['start_c']:.1f} C" for r in records if r["start_c"] >= below_c)
+        print(f"cooling: {hot}; every node at fan floor 12 until all are below {below_c:g} C", flush=True)
+        controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
+        began = time.monotonic()
         try:
-            records, errors = [], []
-            for future in futures:
-                try:
-                    records.append(future.result())
-                except RuntimeError as error:
-                    errors.append(str(error))
-        except KeyboardInterrupt:
-            stop.set()
-            raise
-    if errors:
-        raise RuntimeError("; ".join(errors))
+            while not all(value is not None and value < below_c for value in temperatures):
+                if time.monotonic() - began > timeout_s:
+                    still = ", ".join(
+                        f"{node['name']} {value} C"
+                        for node, value in zip(targets, temperatures)
+                        if value is None or value >= below_c
+                    )
+                    raise RuntimeError(f"still at or above {below_c:g} C after {timeout_s:g} s: {still}")
+                time.sleep(poll_s)
+                temperatures = readings()
+        finally:
+            restored = list(pool.map(
+                lambda pair: restore_fan_control(nodes, pair[0], pair[1]), zip(targets, controls)
+            ))
+            seconds = round(time.monotonic() - began, 1)
+            for record, value, control, result in zip(records, temperatures, controls, restored):
+                record.update(cooled=True, seconds=seconds, final_c=value,
+                              fan_floor=12 if control["floor"] else None, restored=result)
+    print("cooling: " + ", ".join(f"{r['node']} {r['final_c']:.1f} C" for r in records)
+          + f" after {seconds:g} s; fans restored", flush=True)
     return records
 
 

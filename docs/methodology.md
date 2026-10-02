@@ -50,12 +50,12 @@ peak load. Findings per hour come from the agent's own report.
 Every benchmark starts from the same thermal baseline: each node's hottest
 thermal zone below 55 °C.
 - `bin/spark3 bench` checks every node before measuring.
-- A node above the threshold is pre-cooled at the maximum floor of
-  dgx-spark-fan-control (`dgx-fan-control set-state 12`), with its
-  `dgx-fan-control` service paused.
-- Once it is below 55 °C, its usual fan control returns: the service's curve,
-  or firmware automatic where the service is not running. Measurement then
-  starts.
+- If any node is at or above the threshold, every node is pre-cooled at the
+  maximum floor of dgx-spark-fan-control (`dgx-fan-control set-state 12`), with
+  its `dgx-fan-control` service paused. They stay there until the last one is
+  below 55 °C, so the wait cools all of them.
+- Then each node's usual fan control returns: the service's curve, or firmware
+  automatic where the service is not running. Measurement then starts.
 - The bench report's `cooling` section records each node's start and final
   temperature, whether it was cooled, and for how long.
 - `--cool-below` changes the threshold (0 skips the check). `--cool-timeout`

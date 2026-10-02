@@ -84,8 +84,9 @@ Overlay files are mounted over `/opt/spark3/candidate/<package>/<package>/...`.
 - `sync`: inputs that are not in Git, copied to `~/spark3-lab/inputs` on the other nodes;
 - `variant_configs`: configurations allowed more than one row group, such as production.
 
-Before replaying, a kernel job brings each of its nodes below the bench's cooling
-threshold (55 °C hottest zone), then restores their usual fan control. This is the
+Before replaying, a kernel job brings its nodes below the bench's cooling threshold
+(55 °C hottest zone). If any is hotter, all of them cool together at the maximum fan
+floor until the last is below it; then their usual fan control returns. This is the
 same thermal baseline every bench starts from ([methodology](methodology.md)).
 
 Bundles, synced inputs and outputs stay under `~/spark3-lab/` on each node, outside
