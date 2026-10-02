@@ -42,4 +42,8 @@ Status: local correctness tests pass; hardware testing awaits the window held
 by another session. A first attempt to take the hold correctly refused the
 existing reservation; no host changes occurred. The first repository test run
 found a fixture missing the new `paths` argument; the fixture was corrected and
-all 171 tests passed. No hardware performance result is claimed yet.
+all 171 tests passed. The public CI profile initially inherited the private
+head address; doctor rejected it, and it now uses the example head address.
+Fresh source preparation and CI pass, including the four-path sanitizer job.
+`local-validation/` preserves the local receipts and coordination request.
+No hardware performance result is claimed yet.
