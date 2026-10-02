@@ -38,7 +38,7 @@ kprobe:nv_free_system_pages, kprobe:nv_free_contig_pages /@bytes[arg0]/ {
     delete(@bytes[$at]); delete(@requested[$at]); delete(@callstack[$at]);
 }
 BEGIN { printf("READY page_size=%d\n", $1); }
-interval:s:1 { printf("LIVE t=%llu bytes=%lld\n", elapsed / 1000000000, @outstanding_bytes); }
+interval:s:1 { printf("LIVE t=%llu\n", elapsed / 1000000000); print(@outstanding_bytes); }
 END {
     clear(@creating); clear(@pending); clear(@bytes); clear(@requested); clear(@callstack);
 }
