@@ -31,4 +31,5 @@ init=next(n for n in cls.body if isinstance(n,ast.FunctionDef) and n.name=='__in
 config=next(n.value for n in ast.walk(init) if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='config' for t in n.targets))
 assert any(isinstance(k,ast.Constant) and k.value=='dispatch_max_bytes' for k in config.keys)
 assert '#define ROCE_ABI_VERSION 10' in (tree/'b12x/comm/roce/_roce_proxy.c').read_text()
+assert 'lib.roce_abi_version() != 10' in (tree/'b12x/comm/roce/_proxy.py').read_text()
 print('PASS: actual dispatch boundary, independent capacity/priming, unchanged default, closed-runtime rejection, peer agreement field and ABI-10 mixed-version guard')
