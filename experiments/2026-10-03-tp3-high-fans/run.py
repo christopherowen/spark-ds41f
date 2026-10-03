@@ -13,6 +13,7 @@ import runpy
 import shlex
 import signal
 import subprocess
+import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,25 +104,34 @@ def main():
     deadline = time.monotonic() + max(0, 1200 - (datetime.now(timezone.utc) - start_time).total_seconds())
     result = 1
     restore_errors = []
-    launched = False
+    resume_ready = "--resume-ready" in sys.argv
+    launched = resume_ready
     try:
         heartbeat()
         for node in nodes["nodes"]:
             p = subprocess.run(ssh(node["name"], f"git -C {REMOTE} rev-parse HEAD; docker ps -q"),
                                text=True, capture_output=True, check=True, timeout=15)
-            assert p.stdout.strip() == REVISION, (node["name"], p.stdout)
-        while time.monotonic() < deadline:
+            assert p.stdout.splitlines()[0] == REVISION, (node["name"], p.stdout)
+            if not resume_ready:
+                assert p.stdout.strip() == REVISION, (node["name"], p.stdout)
+        while not resume_ready and time.monotonic() < deadline:
             heartbeat()
             snapshot = observations("cooldown")
             remaining = max(0, deadline - time.monotonic())
             print(f"cooldown: {remaining / 60:.1f} min remaining; " +
                   "; ".join(r["node"] + " " + r["output"].splitlines()[0] for r in snapshot), flush=True)
             time.sleep(min(30, remaining))
-        (RAW / "cooldown-complete.json").write_text(json.dumps({
-            "utc": now(), "elapsed_seconds": (datetime.now(timezone.utc) - start_time).total_seconds()}, indent=2))
-        launched = True
-        assert command("start", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
-                                 "cluster", "start", "--replace", "--apply"], 3600) == 0
+        if resume_ready:
+            assert json.loads((RAW / "cooldown-complete.json").read_text())["elapsed_seconds"] >= 1200
+            assert "cluster ready; memory guards are active on all nodes" in (RAW / "start.log").read_text()
+            subprocess.run(ssh("dgx1", "curl --fail --silent --max-time 5 http://127.0.0.1:8000/v1/models"),
+                           stdout=subprocess.DEVNULL, check=True, timeout=10)
+        else:
+            (RAW / "cooldown-complete.json").write_text(json.dumps({
+                "utc": now(), "elapsed_seconds": (datetime.now(timezone.utc) - start_time).total_seconds()}, indent=2))
+            launched = True
+            assert command("start", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
+                                     "cluster", "start", "--replace", "--apply"], 3600) == 0
         # Preserve maximum fans through the check. The CLI's ordinary cooling
         # routine would restore automatic control when it owns no fan service.
         cold_deadline = time.monotonic() + 600
@@ -136,16 +146,30 @@ def main():
             observations("post-start cooling")
             time.sleep(20)
         (RAW / "bench-start-temperatures.json").write_text(json.dumps({"utc": now(), "hottest_c": temperatures}))
+        # Manual maximum fans intentionally pause the normal curve daemon.
+        # Permit exactly that known doctor difference, after checking the full
+        # live configuration; every other finding must still fail the run.
+        verify = """import runpy,json
+m=runpy.run_path('bin/spark3')
+a=m['parser']().parse_args(['--cluster-config',%r,'doctor'])
+c,n,_=m['configuration'](a)
+errors,warnings=m['split_findings'](m['live_doctor'](c,n))
+expected={node['name']+': dgx-fan-control.service is enabled/inactive, expected enabled/active; run sudo systemctl enable --now dgx-fan-control.service' for node in n['nodes']}
+print(json.dumps({'errors':errors,'warnings':warnings,'expected_manual_fan_errors':sorted(expected)},indent=2))
+assert set(errors)==expected, errors
+""" % CONFIG
+        assert command("manual-fan-preflight", ["env", "TMPDIR=/tmp", "python3", "-c", verify], 180) == 0
         result = command("bench", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
             "bench", "--suites", "quality,decode,prefill,prefix", "--min-samples", "3", "--max-samples", "3",
             "--seed", "0", "--prefill-text", "source", "--prefill-sizes", "1024,32768,65536,262144",
-            "--prefill-repeats", "2", "--cool-below", "0", "--output", "results/private/tp3-high-fans/bench"], 2400)
+            "--prefill-repeats", "2", "--cool-below", "0", "--allow-mismatch",
+            "--output", "results/private/tp3-high-fans/bench"], 2400)
         subprocess.run(["scp", "-q", "swank@dgx1:" + REMOTE + "/results/private/tp3-high-fans/bench/bench.json",
                         str(RAW / "bench.json")], check=True, timeout=30)
     finally:
         if launched:
             try:
-                if command("stop", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
+                if command("stop-final" if resume_ready else "stop", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
                                     "cluster", "stop", "--apply", "--parallel"], 180):
                     restore_errors.append("coordinated stop failed")
             except BaseException as error:
@@ -157,7 +181,7 @@ def main():
                     restore_errors.append(node["name"] + ": " + message)
             except BaseException as error:
                 restore_errors.append(node["name"] + ": " + str(error))
-        (RAW / "restoration.json").write_text(json.dumps({"utc": now(), "errors": restore_errors}, indent=2))
+        (RAW / ("restoration-final.json" if resume_ready else "restoration.json")).write_text(json.dumps({"utc": now(), "errors": restore_errors}, indent=2))
         if not restore_errors:
             code = ("import pathlib,json;p=pathlib.Path.home()/'spark3-hold.json';"
                     f"assert json.loads(p.read_text())['holder']=={HOLDER!r};p.unlink()")

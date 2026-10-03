@@ -26,7 +26,6 @@ includes zero change; this small screen does not prove equivalence to a narrow b
 
 | Prompt | Streams | Previous TP3 | Fresh TP3 | Previous TP4 |
 | --- | ---: | ---: | ---: | ---: |
-
 | Prose | 1 | 52.8 | 50.9 | 65.4 |
 | Prose | 2 | 79.4 | 80.6 | 90.5 |
 | Prose | 4 | 117.9 | 117.6 | 144.7 |

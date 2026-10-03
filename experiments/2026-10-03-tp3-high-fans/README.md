@@ -20,6 +20,13 @@ every node below 55 C again after startup if necessary. The benchmark uses
 manual fan override. The runner performs that initial temperature check;
 runtime thermal, memory and request guards remain unchanged.
 
+Live doctor normally requires the fan-curve service to be active. Before using
+the benchmark's `--allow-mismatch` for this deliberate manual override, the
+runner asserts that its only three live errors are the paused fan services.
+The result summarizer checks the benchmark's own live findings against the same
+exact three messages. Image, source, memory, network and runtime requirements
+remain subject to the usual checks.
+
 Quality, decode, prefill and prefix run consecutively, without separately
 cooling between suites. This tests continuous operation over this workload,
 not just independently cooled bursts. On completion or error, the runner stops
@@ -31,4 +38,18 @@ startup cannot begin before 13:05:09 UTC (15:05 Prague). An initial setup attemp
 failed on the Mac SSH control-socket path before changing any fans; it was
 retried with the repository's required `TMPDIR=/tmp`. Both facts are recorded.
 
-Status: running; evidence and results pending.
+## Supervision incident
+
+The first supervisor needed that manual-fan preflight adjustment. Replacing it
+at the cooldown deadline left its coordinated-start child alive. The replacement
+refused an existing log, then its cleanup briefly restored automatic fans while
+the original start was still launching. The full 1,201.5-second idle cooldown
+had completed, and no model measurements had begun. The original start completed
+normally with every memory guard active. The hold and maximum fans were restored,
+and `--resume-ready` supervised that existing boot after checking readiness and
+the original cooldown receipt. It did not launch another boot. The incident,
+original logs, and brief startup fan-policy interruption are retained; maximum
+fans throughout startup cannot be claimed. Maximum fans throughout measurement
+are verified separately in the sampled fan/RPM receipts.
+
+Status: benchmark running; evidence and results pending.
