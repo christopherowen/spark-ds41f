@@ -4,8 +4,11 @@ The deployment tools accept three or four Sparks, with one GPU and one TP rank
 per node. The promoted configuration remains the measured three-node deployment.
 Four-node support is a candidate configuration path. NCCL ring, RoCEnante CPU
 relay and NIC forwarding pass the hardware collective probe on four connected
-Sparks. Full DS4.1 serving qualification remains open; see the
-[hardware results](../experiments/2026-10-02-rocenante-mesh4/README.md) and
+Sparks. The relay plus four-channel NCCL candidate passes the main DS4.1
+serving screen, with about 23% faster prefill than the one-channel TP4 control.
+Sustained-load cooling and full-context qualification remain open; see the
+[serving decision](../experiments/2026-10-03-collective-serving/decision.md),
+[hardware results](../experiments/2026-10-02-rocenante-mesh4/README.md),
 [queue-capacity investigation](../experiments/2026-10-02-mesh4-queue-depth/README.md) and
 [four-path comparison](../experiments/2026-10-02-mesh4-fourpaths/README.md).
 
@@ -88,8 +91,8 @@ The pinned NCCL source is
 - `NCCL_ALGO=Ring` and ranks in cable order keep collective communication on
   neighbour edges. See `src/graph/connect.cc:connectRings`. The generated profile
   defaults to one channel. Four-node validation also accepts equal
-  `NCCL_MIN_NCHANNELS`/`NCCL_MAX_NCHANNELS` settings of 2 or 4, qualified by the
-  [NCCL tuning screen](../experiments/2026-10-03-collective-policy/README.md).
+  `NCCL_MIN_NCHANNELS`/`NCCL_MAX_NCHANNELS` settings of 2, 4 or 8, qualified by the
+  [collective and serving screens](../experiments/2026-10-03-collective-serving/README.md).
   Per-call channel use can be lower; keep the actual plan/ring logs. Serving
   performance still requires a matched candidate screen.
 - `NCCL_RUNTIME_CONNECT=1` postpones connections until their algorithm is used.
@@ -153,7 +156,8 @@ bitwise equality with TP3 or batch-invariant output.
 
 The fourth GPU reduces some per-rank weight work and adds memory, while the ring
 adds communication hops and uses NCCL for small messages. Performance is not
-assumed equal to the three-node RoCEnante baseline. Record a new baseline only
+assumed equal to the three-node RoCEnante baseline. The measured relay candidate
+retains RoCEnante for small messages; the NCCL-only profile does not. Record a new baseline only
 after four-node serving and measurements pass and the owner accepts promotion.
 
 ## NIC-forwarded RoCEnante candidate

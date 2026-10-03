@@ -366,3 +366,11 @@ reproduced by extracting that archive and running `summarize.py` on its root.
 `hardware/sha256.json` records artifact checksums. Selected NCCL plans retain
 the library's logged byte convention; use the explicit benchmark operation and
 shape when comparing all-gather output or reduce-scatter input sizes.
+
+## Serving follow-through
+
+The [serving experiment](../2026-10-03-collective-serving/README.md) refines the
+message-size crossover, covers full prefill shards, tests up to 16 channels and
+selects relay plus four-channel NCCL after real TP4 serving measurements. The
+large-message gain survives in prefill; small-message NCCL remains slower.
+See its decision and retained failed thermal screens before promotion.
