@@ -3,6 +3,11 @@ from pathlib import Path
 import subprocess,sys,shlex,json,time
 ROOT=Path(__file__).resolve().parents[2]
 profile,runid=sys.argv[1:3]
+extra=sys.argv[3:]
+arm="relay"
+if "--nccl-only" in extra:
+ arm="nccl-c4-auto"
+ extra.remove("--nccl-only")
 output=ROOT/'.work/balanced-policy'/runid
 output.mkdir(exist_ok=False)
 code=r'''
@@ -36,7 +41,7 @@ try:
   f=(output/(host+'-telemetry.jsonl')).open('w')
   p=subprocess.Popen(['ssh','-o','BatchMode=yes','swank@'+host,shlex.join(['python3','-u','-c',code])],stdin=subprocess.PIPE,stdout=f,stderr=f)
   children.append((p,f))
- cmd=[sys.executable,'experiments/2026-10-03-collective-policy/run.py','relay',runid,'--benchmark','--counter-samples','--cluster-config',profile,'--output-root','.work/balanced-policy/probes','--holder','balanced-policy',*sys.argv[3:]]
+ cmd=[sys.executable,'experiments/2026-10-03-collective-policy/run.py',arm,runid,'--benchmark','--counter-samples','--cluster-config',profile,'--output-root','.work/balanced-policy/probes','--holder','balanced-policy',*extra]
  (output/'command.json').write_text(json.dumps(cmd,indent=2)+'\n')
  subprocess.run(cmd,cwd=ROOT,check=True)
 finally:
