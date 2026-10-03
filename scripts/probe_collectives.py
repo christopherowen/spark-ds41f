@@ -30,7 +30,8 @@ def rdma_error_counters():
 
 
 def port_counters():
-    names = ('tx_bytes_phy', 'rx_bytes_phy', 'rx_out_of_buffer')
+    names = ('tx_bytes_phy', 'rx_bytes_phy', 'rx_out_of_buffer',
+             'tx_vport_rdma_unicast_bytes', 'rx_vport_rdma_unicast_bytes')
     counters = {}
     for hca in Path('/sys/class/infiniband').iterdir():
         for netdev in (hca / 'device/net').iterdir():
@@ -259,6 +260,7 @@ def main() -> None:
                             dist.barrier(group=group.cpu_group)
                         counters_before = rdma_error_counters() if args.counter_samples else None
                         ports_before = port_counters() if args.port_samples else None
+                        proxy_before = adapter._runtime.stats() if adapter and args.port_samples else None
                         samples = []
                         for _ in range(5):
                             dist.barrier(group=group.cpu_group)
@@ -284,6 +286,11 @@ def main() -> None:
                             row['rdma_error_deltas'] = {
                                 dev: {key: value - counters_before[dev][key] for key, value in values.items()}
                                 for dev, values in counters_after.items()}
+                        if proxy_before is not None:
+                            proxy_after = adapter._runtime.stats()
+                            row['proxy_payload_bytes'] = {h: after - before for h, after, before in zip(
+                                proxy_after['hcas'], proxy_after['bytes_posted_per_hca'],
+                                proxy_before['bytes_posted_per_hca'])}
                         if ports_before is not None:
                             ports_after = port_counters()
                             row['port_deltas'] = {
