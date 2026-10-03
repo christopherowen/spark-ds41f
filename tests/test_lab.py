@@ -113,6 +113,17 @@ class PlanTest(unittest.TestCase):
 
 
 class BootTimeTest(unittest.TestCase):
+    def test_boot_rejects_a_different_physical_topology_before_launch(self) -> None:
+        from unittest import mock
+
+        promoted = {"nodes": [{"rank": 0}, {"rank": 1}, {"rank": 2}]}
+        candidate = {"nodes": [*promoted["nodes"], {"rank": 3}]}
+        with mock.patch.object(lab.spark3, "configuration", return_value=({}, candidate, {})), \
+             mock.patch.object(lab, "nodes_config", return_value=promoted), \
+             mock.patch.object(lab, "spark3_cli") as launch:
+            self.assertFalse(lab.boot("ring4.json"))
+            launch.assert_not_called()
+
     def test_ready_seconds_come_from_the_cluster_ready_line(self) -> None:
         lines = ["dgx1: steady memguard active", "cluster ready; memory guards are active on all nodes (+116.9s)"]
         self.assertEqual(lab.ready_seconds(lines), 116.9)

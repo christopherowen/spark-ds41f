@@ -1,0 +1,30 @@
+From abe4b2afd7b60e2699bf4a62ac8543ed63d1d937 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 10:12:43 +0200
+Subject: [PATCH] Match Python loader to dispatch protocol ABI
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be
+
+Keep the Python loader ABI check aligned with the version-10 native proxy.
+Quality: no numerical change. Tests: source agreement and image import smoke.
+Upstream-status: local experiment, not submitted.
+---
+ b12x/comm/roce/_proxy.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index dd8e340..f6dfb59 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 9:
++        if lib.roce_abi_version() != 10:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+-- 
+2.54.0 (Apple Git-157)
+

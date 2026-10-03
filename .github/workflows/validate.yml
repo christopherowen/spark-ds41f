@@ -13,7 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Use the example site configuration
-        run: cp config/nodes.example.json config/nodes.json
+        run: |
+          cp config/nodes.example.json config/nodes.json
+          python3 - <<'PYCONFIG'
+          import json
+          from pathlib import Path
+          p = Path('config/cluster.json')
+          c = json.loads(p.read_text())
+          c['distributed']['master_addr'] = json.loads(Path('config/nodes.json').read_text())['nodes'][0]['management_ip']
+          p.write_text(json.dumps(c, indent=2) + '\n')
+          PYCONFIG
       - name: Validate configuration
         run: bin/spark3 doctor
       - name: Compile helper
@@ -59,6 +68,110 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Use the example site configuration
-        run: cp config/nodes.example.json config/nodes.json
+        run: |
+          cp config/nodes.example.json config/nodes.json
+          python3 - <<'PYCONFIG'
+          import json
+          from pathlib import Path
+          p = Path('config/cluster.json')
+          c = json.loads(p.read_text())
+          c['distributed']['master_addr'] = json.loads(Path('config/nodes.json').read_text())['nodes'][0]['management_ip']
+          p.write_text(json.dumps(c, indent=2) + '\n')
+          PYCONFIG
       - name: Apply the local series and check the recorded patch head and tree
         run: bin/spark3 build prepare --only "${{ matrix.source }}"
+
+  rocenante-ring4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare the experimental relay series
+        run: bin/spark3 --cluster-config experiments/2026-10-02-rocenante-ring4/cluster.json build prepare --only b12x
+      - name: Stress the real C proxy with simulated DMA and sanitizers
+        run: python3 experiments/2026-10-02-rocenante-ring4/test-protocol.py
+
+  rocenante-mesh4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare the experimental NIC-forwarded series
+        run: bin/spark3 --cluster-config experiments/2026-10-02-rocenante-mesh4/cluster.json build prepare --only b12x
+      - name: Stress endpoint QPs and check opposite-only flow labels
+        run: python3 experiments/2026-10-02-rocenante-mesh4/test-protocol.py
+
+  rocenante-fourpaths:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Prepare the four-path experiment
+        run: bin/spark3 --cluster-config experiments/2026-10-02-mesh4-fourpaths/cluster.json build prepare --only b12x
+      - name: Stress mixed path counts and rotating submission order
+        run: python3 experiments/2026-10-02-mesh4-fourpaths/test-protocol.py
+
+  rocenante-bidirectional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Use the ring example on the CPU-only builder
+        run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the bidirectional relay experiment
+        run: bin/spark3 --cluster-config experiments/2026-10-03-ring4-bidirectional/cluster.json build prepare --only b12x
+      - name: Check both relay directions and receiver completion ordering
+        run: python3 experiments/2026-10-03-ring4-bidirectional/test-protocol.py
+
+  nccl-bidirectional:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Use the ring example on the CPU-only builder
+        run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the bidirectional NCCL policy
+        run: bin/spark3 --cluster-config experiments/2026-10-03-nccl-bidirectional/cluster.json build prepare --only nccl
+      - name: Verify direct reciprocal rings and unsupported geometry rejection
+        run: python3 experiments/2026-10-03-nccl-bidirectional/test-policy.py
+
+  nccl-balanced-plans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Use the ring example on the CPU-only builder
+        run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the balanced allocation experiment
+        run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/paired.json build prepare --only nccl
+      - name: Verify direction and PCIe-root coverage
+        run: python3 experiments/2026-10-03-balanced-policy/test-policy.py
+      - name: Verify fine partition boundaries preserve every element
+        run: python3 experiments/2026-10-03-balanced-policy/test-allocation.py
+
+  nccl-adaptive-plans:
+    runs-on: ubuntu-latest
+    env:
+      BALANCED_TEST_PROFILE: experiments/2026-10-03-balanced-policy/adaptive.json
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/adaptive.json build prepare --only nccl
+      - run: python3 experiments/2026-10-03-balanced-policy/test-policy.py
+      - run: python3 experiments/2026-10-03-balanced-policy/test-allocation.py
+      - run: python3 experiments/2026-10-03-balanced-policy/test-threads.py
+
+  rocenante-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/selected.json build prepare --only b12x
+      - run: python3 experiments/2026-10-03-balanced-policy/test-dispatch.py
+      - run: python3 experiments/2026-10-03-balanced-policy/test-relay.py
+
+  collective-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the explicit collective policy
+        run: bin/spark3 --cluster-config experiments/2026-10-03-collective-contract/candidate.json build prepare --only vllm,b12x
+      - name: Check dispatch limits, reporting, SP boundary and fail-stop behavior
+        run: python3 experiments/2026-10-03-collective-contract/test-contract.py
+      - name: Check TP3 and TP4 layout against pinned source helpers
+        run: python3 experiments/2026-10-03-transport-profiles/check-layout-source.py

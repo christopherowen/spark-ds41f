@@ -1,0 +1,13 @@
+import subprocess,shlex,json,pathlib,sys,datetime
+root=pathlib.Path('/Users/christopherowen/projects/spark3-kernel-64k');out=root/'.work/mesh4-queues'/sys.argv[1];out.mkdir(exist_ok=True)
+expected,size=map(int,sys.argv[2:4]);hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']=='mesh4-queue-investigation'
+# All-host preflight happens before the first mutation.
+pre="import subprocess,json;assert not subprocess.check_output(['docker','ps','-q'],text=True).strip();assert not subprocess.check_output(['nvidia-smi','--query-compute-apps=pid','--format=csv,noheader'],text=True).strip();assert not json.loads(subprocess.check_output(['sudo','rdma','-j','resource','show','ctx'],text=True));print('idle')"
+for n in range(1,5):subprocess.run(['ssh','swank@dgx'+str(n),shlex.join(['python3','-c',pre])],check=True,timeout=20)
+for n in range(1,5):
+ cmd=['sudo','python3','/home/swank/projects/spark3-ring4-qualification/experiments/2026-10-02-mesh4-queue-depth/set-queue-depth.py','--nodes','/home/swank/projects/spark3-ring4-qualification/config/nodes-ring4.local.json','--rank',str(n-1),'--expected',str(expected),'--size',str(size)]
+ log=open(out/f'dgx{n}.txt','w');p=subprocess.run(['ssh','swank@dgx'+str(n),shlex.join(cmd)],stdout=log,stderr=subprocess.STDOUT,timeout=420);log.close();print('dgx'+str(n),'exit',p.returncode,flush=True)
+ (out/f'dgx{n}-command.json').write_text(json.dumps(cmd,indent=2)+'\n')
+ p.check_returncode()
+ beat="import json,pathlib,datetime;p=pathlib.Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=='mesh4-queue-investigation';d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\\n')"
+ subprocess.run(['ssh','swank@dgx1',shlex.join(['python3','-c',beat])],check=True,timeout=20)

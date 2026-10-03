@@ -8,10 +8,13 @@ the open levers, measured dead ends, and the lean screening routine.
 ## Sources of truth
 
 - `config/cluster.json` is the promoted runtime configuration.
-- `config/nodes.json` is this site's topology. It is git-ignored: each site keeps
-  its own copy, started from `config/nodes.example.json`, and `cluster sync`
-  copies the head node's file to every node.
-- `upstreams.lock.json` owns every external source URL and revision.
+- `config/cluster.json` selects the promoted site topology through `nodes_config`
+  (default: `config/nodes.json`). The default is git-ignored and initialized
+  from `config/nodes.example.json`. Candidate profiles may select a separate map;
+  `cluster sync` preserves and copies the selected site map.
+- `upstreams.lock.json` owns the promoted external source URLs and revisions.
+  Experimental cluster profiles may select a repository-relative
+  `upstreams_config` lock with their own source manifest and patch series.
 - `requirements/` owns hashed non-Git build inputs.
 - `patches/*/series` owns the ordered local patch stacks.
 - `manifests/baselines/` is immutable evidence. Never rewrite a published baseline.
@@ -32,6 +35,10 @@ differences into this repository.
 
 ## Change discipline
 
+Use neutral task names for branches, commits, pull requests and documentation.
+Do not add agent or tool attribution, including branch prefixes or commit trailers.
+Preserve required third-party license notices.
+
 Create `experiments/YYYY-MM-DD-short-name/` for performance work. Record the base
 commit, one intended variable, exact commands, workload identity, all runs, errors,
 memory observations, and a conclusion. Do not discard an unfavorable run.
@@ -40,9 +47,11 @@ Change one causal variable at a time unless the experiment explicitly tests an
 interaction. A candidate is promoted only when the owner accepts it and the same
 commit updates configuration, documentation, and a new immutable baseline.
 
-Never start, stop, replace, or restart the three-rank service without explicit
+Never start, stop, replace, or restart the serving cluster without explicit
 authorization for that operation. A coordinated runtime change must cover all
-three nodes; mixed rank state is invalid.
+configured nodes; mixed rank state is invalid. See `docs/switchless-topology.md`
+for three-node direct-peer and four-node neighbour-ring profiles. A new topology
+needs its own hardware qualification before promotion.
 
 Use `bin/spark3 cluster sync`, `start`, and `stop` for node operations. They are
 plans unless `--apply` is supplied. Never deploy with rsync or copy a dirty

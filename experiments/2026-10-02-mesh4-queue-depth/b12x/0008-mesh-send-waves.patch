@@ -1,0 +1,253 @@
+From 621d11fdd1ff9712792771048c5131aa80baed88 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 21:20:00 +0000
+Subject: [PATCH] Separate direct and forwarded mesh sends above a payload
+ threshold
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be plus deployment patches 0001-0007.
+
+Rationale: larger simultaneous direct and forwarded sends overflow finite NIC hairpin buffers. An opt-in B12X_ROCE_MESH_WAVE_BYTES threshold drains acknowledged direct sends before posting the opposite peer. The disabled default preserves the original posting order. ABI 7 and threshold handshake reject mixed settings; counters expose activation.
+
+Quality: no GPU kernel, buffer layout, payload, reduction or numerical change. Stop, GPU poison and bounded completion waits remain fatal to the proxy.
+
+Tests: 26,000 simulated collective rounds with ASan/UBSan, one/two stripes, changing sizes, delayed DMA, sequence wrap, mixed-threshold rejection and stop/error paths. The verbs simulator asserts direct completions precede the forwarded post when enabled. Hardware qualification follows in the deployment experiment.
+
+Upstream-status: local experiment; not submitted.
+---
+ b12x/comm/roce/_proxy.py              |  4 +-
+ b12x/comm/roce/_roce_proxy.c          | 64 ++++++++++++++++++++++++++-
+ tests/comm/roce_proxy_fake/simulate.c | 21 +++++++--
+ 3 files changed, 83 insertions(+), 6 deletions(-)
+
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index a73f915..175b57a 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 6:
++        if lib.roce_abi_version() != 7:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+@@ -282,6 +282,8 @@ class Proxy:
+             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
+             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
+             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),
++            "mesh_wave_bytes": int(self._lib.roce_stat(self._ctx, 3)),
++            "mesh_waves": int(self._lib.roce_stat(self._ctx, 4)),
+             "writes_completed_per_hca": [
+                 int(self._lib.roce_hca_stat(self._ctx, hca, 0))
+                 for hca in range(len(self.hca_names))
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index 0217ad5..2441896 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -43,14 +43,14 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 6
++#define ROCE_ABI_VERSION 7
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+ #define ROCE_IDLE_SPINS 20000000
+ 
+ typedef struct {
+-    uint32_t abi, world, rank, ring4;
++    uint32_t abi, world, rank, ring4, mesh_wave_bytes;
+     uint64_t slot_bytes;
+     uint64_t region_addr;
+     uint32_t rkey[ROCE_MAX_LOCAL_HCAS];
+@@ -81,6 +81,8 @@ typedef struct {
+     int world;
+     int rank;
+     int ring4;
++    uint32_t mesh_wave_bytes;
++    atomic_uint_fast64_t mesh_waves;
+     int n_hca;
+     int n_stripes;
+     int gid_index;
+@@ -291,6 +293,20 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         snprintf(err, err_len, "out of memory");
+         return NULL;
+     }
++    const char *wave_text = getenv("B12X_ROCE_MESH_WAVE_BYTES");
++    if (wave_text && *wave_text) {
++        char *end = NULL;
++        errno = 0;
++        unsigned long long value = strtoull(wave_text, &end, 10);
++        if (errno || wave_text[0] < '0' || wave_text[0] > '9' || *end ||
++            value > slot_bytes || value > UINT32_MAX || value % 16 ||
++            (value && ring4 != 2)) {
++            snprintf(err, err_len, "invalid B12X_ROCE_MESH_WAVE_BYTES for this transport/slot");
++            free(c);
++            return NULL;
++        }
++        c->mesh_wave_bytes = (uint32_t)value;
++    }
+     c->world = world;
+     c->rank = rank;
+     c->ring4 = ring4;
+@@ -330,6 +346,7 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     blob.world = c->world;
+     blob.rank = c->rank;
+     blob.ring4 = c->ring4;
++    blob.mesh_wave_bytes = c->mesh_wave_bytes;
+     blob.slot_bytes = c->slot_bytes;
+     blob.region_addr = (uint64_t)(uintptr_t)c->region;
+     blob.n_hca = (uint8_t)c->n_hca;
+@@ -410,6 +427,7 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+     for (int p = 0; p < c->world; p++) {
+         if (all[p].abi != ROCE_ABI_VERSION || all[p].world != (uint32_t)c->world ||
+             all[p].rank != (uint32_t)p || all[p].ring4 != (uint32_t)c->ring4 ||
++            all[p].mesh_wave_bytes != c->mesh_wave_bytes ||
+             all[p].slot_bytes != c->slot_bytes ||
+             all[p].n_hca < 1 || all[p].n_hca > ROCE_MAX_LOCAL_HCAS ||
+             all[p].n_stripes != c->n_stripes) {
+@@ -602,6 +620,34 @@ static int wait_relay(roce_ctx_t *c, uint32_t seq, int origin) {
+     }
+ }
+ 
++static int wait_direct_completions(roce_ctx_t *c) {
++    struct timespec start, now;
++    clock_gettime(CLOCK_MONOTONIC, &start);
++    volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
++    int opposite = (c->rank + 2) % c->world;
++    for (unsigned spins = 0;; spins++) {
++        int pending = 0;
++        for (int h = 0; h < c->n_hca; h++) {
++            if (drain_cq(c, h) != 0) return -1;
++            for (int p = 0; p < c->world; p++)
++                if (p != c->rank && p != opposite) pending |= c->hca[h].outstanding[p] != 0;
++        }
++        if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
++            __atomic_load_n(&ctrl[2], __ATOMIC_ACQUIRE)) {
++            snprintf(c->err, sizeof(c->err), "mesh send wave stopped or GPU failed");
++            return -1;
++        }
++        if (!pending) return 0;
++        if ((spins & 4095u) == 0) {
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            if ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec >= 5000000000LL) {
++                snprintf(c->err, sizeof(c->err), "mesh direct send wave timed out");
++                return -1;
++            }
++        }
++    }
++}
++
+ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
+         snprintf(c->err, sizeof(c->err), "invalid RoCE payload size %u (slot %zu)", nbytes, c->slot_bytes);
+@@ -609,10 +655,20 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     }
+     uint32_t slot = seq & 1u;
+     uint8_t *send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
++    int wave = c->ring4 == 2 && c->mesh_wave_bytes && nbytes >= c->mesh_wave_bytes;
++    int opposite = (c->rank + 2) % c->world;
+     for (int p = 0; p < c->world; p++) {
++        if (wave && p == opposite) continue;
+         if (adjacent(c->world, c->rank, p, c->ring4) &&
+             post_peer(c, seq, nbytes, c->rank, p, send) != 0) return -1;
+     }
++    if (wave) {
++        // Drain acknowledged direct sends before adding forwarded traffic to
++        // the same links. No GPU operation, buffer or reduction order changes.
++        if (wait_direct_completions(c) != 0 ||
++            post_peer(c, seq, nbytes, c->rank, opposite, send) != 0) return -1;
++        atomic_fetch_add_explicit(&c->mesh_waves, 1, memory_order_relaxed);
++    }
+     if (c->ring4 == 1) {
+         int prev = (c->rank + c->world - 1) % c->world;
+         int next = (c->rank + 1) % c->world;
+@@ -726,6 +782,10 @@ uint64_t roce_stat(roce_ctx_t *c, int which) {
+         return c->writes_completed;
+     case 2:
+         return c->last_seq;
++    case 3:
++        return c->mesh_wave_bytes;
++    case 4:
++        return atomic_load_explicit(&c->mesh_waves, memory_order_relaxed);
+     default:
+         return 0;
+     }
+diff --git a/tests/comm/roce_proxy_fake/simulate.c b/tests/comm/roce_proxy_fake/simulate.c
+index 5ab8d6d..4be738a 100644
+--- a/tests/comm/roce_proxy_fake/simulate.c
++++ b/tests/comm/roce_proxy_fake/simulate.c
+@@ -20,11 +20,16 @@ static uint32_t rng = 1;
+ static unsigned random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; return rng ^= rng << 5; }
+ static int world, ring4, stripes;
+ static uint64_t messages;
++static uint32_t wave_bytes;
+ 
+ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
+     (void)bad;
+     assert(qp && qp->source != qp->dest);
+     if (ring4 == 1) assert((qp->source + 2) % 4 != qp->dest);
++    struct ibv_send_wr *flag_wr = wr;
++    while (flag_wr->next) flag_wr = flag_wr->next;
++    uint32_t posted_seq;
++    memcpy(&posted_seq, (void *)(uintptr_t)flag_wr->sg_list->addr, sizeof(posted_seq));
+     pthread_mutex_lock(&lock);
+     for (; wr; wr = wr->next) {
+         assert(wr->num_sge == 1 && wr->opcode == IBV_WR_RDMA_WRITE);
+@@ -33,6 +38,12 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr
+         t->dest = (uint8_t *)(uintptr_t)wr->wr.rdma.remote_addr;
+         t->bytes = wr->sg_list->length;
+         roce_ctx_t *c = ranks[qp->source], *d = ranks[qp->dest];
++        if (c->mesh_wave_bytes && qp->dest == (qp->source + 2) % world &&
++            __atomic_load_n((uint32_t *)(c->region + c->ctrl_off + 4 * (4 + (posted_seq & 1))), __ATOMIC_ACQUIRE) >= c->mesh_wave_bytes) {
++            for (int h = 0; h < c->n_hca; h++)
++                for (int peer = 0; peer < world; peer++)
++                    if (peer != c->rank && peer != qp->dest) assert(c->hca[h].outstanding[peer] == 0);
++        }
+         assert(t->dest >= d->region && t->dest + t->bytes <= d->region + d->region_bytes);
+         t->inline_data = !!(wr->send_flags & IBV_SEND_INLINE);
+         t->signaled = !!(wr->send_flags & IBV_SEND_SIGNALED);
+@@ -94,7 +105,7 @@ static void setup(uint32_t seed) {
+     assert(!roce_layout(world, 4096, layout));
+     for (int r = 0; r < world; r++) {
+         roce_ctx_t *c = ranks[r] = calloc(1, sizeof(*c));
+-        c->world = world; c->rank = r; c->ring4 = ring4; c->n_stripes = stripes; c->n_hca = 2 * stripes;
++        c->world = world; c->rank = r; c->ring4 = ring4; c->mesh_wave_bytes = wave_bytes; c->n_stripes = stripes; c->n_hca = 2 * stripes;
+         c->slot_bytes=4096; c->region_bytes=layout[4]; c->region=calloc(1, layout[4]);
+         c->recv_off=layout[0]; c->flag_off=layout[1]; c->send_off=layout[2]; c->ctrl_off=layout[3];
+         memset(c->route_hca, 255, sizeof(c->route_hca));
+@@ -123,6 +134,9 @@ static void setup(uint32_t seed) {
+     blobs[2].ring4 ^= 1;
+     assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
+     blobs[2].ring4 ^= 1;
++    blobs[2].mesh_wave_bytes ^= 16;
++    assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
++    blobs[2].mesh_wave_bytes ^= 16;
+     for(int r=0;r<world;r++) assert(!roce_connect(ranks[r],blobs,sizeof(blobs)));
+ }
+ static void cleanup(void) {
+@@ -188,7 +202,7 @@ static void failures(void) {
+     atomic_store(&c->running,0);
+     assert(!roce_start(c));
+     uint32_t *ctrl=(uint32_t *)(c->region+c->ctrl_off);
+-    __atomic_store_n(&ctrl[5],16,__ATOMIC_RELEASE);
++    __atomic_store_n(&ctrl[5],c->mesh_wave_bytes ? 4096 : 16,__ATOMIC_RELEASE);
+     __atomic_store_n(&ctrl[0],1,__ATOMIC_RELEASE);
+     usleep(10000); roce_stop(c); // predecessor never publishes: stop must unblock.
+     assert(roce_failed(c));
+@@ -207,8 +221,9 @@ int main(void) {
+         world=4;ring4=1;run(3000,0);run(1000,UINT32_MAX-100);
+         failures();
+         world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
++        wave_bytes=256;run(3000,0);run(1000,UINT32_MAX-100);failures();wave_bytes=0;
+     }
+-    printf("PASS: direct3/ring4/mesh4, 1/2 stripes, 18000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
++    printf("PASS: direct3/ring4/mesh4, 1/2 stripes, 26000 collectives, mesh send waves, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+-- 
+2.54.0 (Apple Git-157)
+

@@ -82,7 +82,7 @@ A promotion commit must:
 2. add a new immutable baseline manifest;
 3. link the accepted experiment and all native receipts;
 4. update upstream pins or patch series when source changed;
-5. prove all three ranks use the same content-addressed image;
+5. prove all configured ranks use the same content-addressed image;
 6. pass `bin/spark3 doctor --live` after coordinated deployment;
 7. add the deployed service's complete `bin/spark3 bench` report as
    `manifests/benchmarks/<baseline>.json`, the reference later runs compare with.

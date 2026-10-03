@@ -32,7 +32,11 @@ from typing import NamedTuple
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
 sys.path.insert(0, str(ROOT / "scripts"))
+import mesh_fabric
 import kernel_readiness
+import topology
+import transport_profiles
+import model_layout
 
 
 
@@ -75,11 +79,18 @@ def configuration(
     args: argparse.Namespace | None = None,
 ) -> tuple[dict, dict, dict]:
     cluster_path, _ = cluster_config_path(args)
-    return (
-        json.loads(cluster_path.read_text(encoding="utf-8")),
-        site_nodes(),
-        read_json("upstreams.lock.json"),
-    )
+    cluster = json.loads(cluster_path.read_text(encoding="utf-8"))
+    nodes_path = repository_config_path(cluster.get("nodes_config", "config/nodes.json"))
+    upstreams_path = repository_config_path(cluster.get("upstreams_config", "upstreams.lock.json"))
+    return cluster, (site_nodes() if nodes_path == ROOT / NODES_FILE else json.loads(nodes_path.read_text())), json.loads(upstreams_path.read_text())
+
+
+def repository_config_path(raw: str) -> Path:
+    path = Path(raw)
+    resolved = (ROOT / path).resolve()
+    if path.is_absolute() or not resolved.is_relative_to(ROOT.resolve()):
+        raise SystemExit("configuration paths must remain relative to the repository root")
+    return resolved
 
 
 def node_by_name(nodes: dict, name: str) -> dict:
@@ -90,12 +101,7 @@ def node_by_name(nodes: dict, name: str) -> dict:
 
 
 def expected_environment(cluster: dict, node: dict) -> dict[str, str]:
-    env = {key: str(value) for key, value in cluster["environment"].items()}
-    env["VLLM_HOST_IP"] = node["management_ip"]
-    env["B12X_ROCE_PEER_HCAS"] = json.dumps(
-        node["roce_peer_hcas"], separators=(",", ":")
-    )
-    return env
+    return topology.node_environment(cluster, node)
 
 
 def expected_command(cluster: dict, node: dict) -> list[str]:
@@ -269,13 +275,7 @@ class Warn(str):
 
 
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
-    problems: list[str] = []
-    node_list = nodes.get("nodes", [])
-    ranks = sorted(node.get("rank") for node in node_list)
-    if ranks != [0, 1, 2]:
-        problems.append(f"node ranks must be [0, 1, 2], got {ranks}")
-    if sum(bool(node.get("head")) for node in node_list) != 1:
-        problems.append("exactly one node must be the API head")
+    problems: list[str] = topology.problems(cluster, nodes)
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
     host = cluster.get("host", {})
@@ -349,6 +349,20 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     source_manifest = read_json(
         upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
     )
+    if topology.transport(cluster) in ("rocenante-ring4", "rocenante-mesh4"):
+        mode = topology.transport(cluster)
+        record = source_manifest["b12x"]
+        if mode not in record.get("capabilities", []):
+            problems.append(f"{mode} requires a source manifest with its transport patch")
+        label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.b12x.tree")
+        if label != record["expected_tree"]:
+            problems.append(f"{mode} image tree does not match its source manifest")
+    if topology.transport(cluster) == "rocenante-mesh4":
+        if cluster.get("fabric", {}).get("mesh_paths", 2) == 4 and "rocenante-mesh4-fourpaths" not in source_manifest["b12x"].get("capabilities", []):
+            problems.append("four-path mesh requires its source capability")
+        problems.extend(mesh_fabric.site_problems(nodes))
+        if cluster.get("deployment", {}).get("launch_enabled"):
+            problems.append("mesh4 is available for bounded collective qualification only; serving lifecycle is not qualified")
     for name in BUILD_PROJECTS:
         wanted = source_manifest[name].get("patchset_sha256")
         actual = patchset_sha256(upstreams["sources"][name])
@@ -733,7 +747,8 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
     """The GID index B12X and NCCL are configured to use, and the node's HCAs."""
     env = expected_environment(cluster, node)
-    index = int(env.get("B12X_ROCE_GID_INDEX") or env.get("NCCL_IB_GID_INDEX") or 3)
+    key = "NCCL_IB_GID_INDEX" if topology.transport(cluster) == "nccl-ring" else "B12X_ROCE_GID_INDEX"
+    index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
     hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
     return index, hcas
 
@@ -848,6 +863,18 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     corrections = []
     name = cluster["container"]["name"]
     for node in nodes["nodes"]:
+        if topology.transport(cluster) == "rocenante-mesh4":
+            query = shlex.join(["python3", "-c", (ROOT / "scripts/mesh_fabric.py").read_text(),
+                                "inventory", "--node-json", json.dumps(node)])
+            result = remote_shell(nodes, node, query)
+            try:
+                if result.returncode:
+                    raise ValueError(result.stderr.strip())
+                errors, fixes = mesh_fabric.findings(node, json.loads(result.stdout))
+                problems.extend(errors)
+                corrections.extend(fixes)
+            except (ValueError, TypeError) as error:
+                problems.append(f"{node['name']}: mesh NIC inventory failed: {error}")
         if trial:
             inventory = node_kernel_inventory(nodes, node, trial)
             kernel_inventories[node["name"]] = inventory
@@ -873,6 +900,7 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         gid_index, hcas = roce_gid_setting(cluster, node)
         gids = remote_shell(nodes, node, roce_gid_query(hcas))
         problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+        problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
         result = run_ssh(nodes, node, "docker", "inspect", name)
         if result.returncode:
             problems.append(f"{node['name']}: cannot inspect {name}: {result.stderr.strip()}")
@@ -946,10 +974,101 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     cluster, nodes, upstreams = configuration(args)
     findings = local_doctor(cluster, nodes, upstreams)
-    if args.live:
+    if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
     problems, warnings = split_findings(findings)
     return report_doctor(problems, warnings, args.live)
+
+
+def command_tuning(args: argparse.Namespace) -> int:
+    if args.cluster_config != DEFAULT_CLUSTER_CONFIG:
+        raise SystemExit("tuning profiles select their pinned base; omit --cluster-config")
+    try:
+        profile, resolved = transport_profiles.resolve(ROOT, args.profiles_config, args.profile)
+        layout = model_layout.describe(ROOT, resolved, transport_profiles.size_bytes(
+            resolved["environment"]["VLLM_ROCE_ALLREDUCE_MAX_SIZE"]))
+        if args.tuning_command == "show":
+            print(json.dumps({**profile, "derived_layout": layout}, indent=2))
+            return 0
+        nodes_path = repository_config_path(args.nodes_config)
+        output = repository_config_path(args.output)
+        if not output.is_relative_to((ROOT / "experiments").resolve()):
+            raise ValueError("new tuning candidates belong under experiments/")
+        nodes = json.loads(nodes_path.read_text())
+        candidate = transport_profiles.materialize(
+            profile, resolved, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
+        candidate["tuning_origin"] = {
+            "catalog": args.profiles_config,
+            "catalog_sha256": hashlib.sha256(repository_config_path(args.profiles_config).read_bytes()).hexdigest(),
+            "profile": args.profile,
+            "base_config": profile["base_config"],
+            "base_sha256": profile["base_sha256"],
+            "derived_layout": layout,
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("x") as handle:
+            json.dump(candidate, handle, indent=2)
+            handle.write("\n")
+    except (ValueError, OSError) as error:
+        raise SystemExit(f"invalid tuning profile: {error}") from error
+    print(f"created {output.relative_to(ROOT.resolve())} ({args.profile}, launch disabled)")
+    return 0
+
+
+def command_topology_create(args: argparse.Namespace) -> int:
+    cluster, _, _ = configuration(args)
+    nodes_path = repository_config_path(args.nodes_config)
+    output = repository_config_path(args.output)
+    nodes = json.loads(nodes_path.read_text())
+    try:
+        candidate = topology.candidate(cluster, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
+    except (ValueError, StopIteration) as error:
+        raise SystemExit(f"invalid topology: {error}") from error
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # A new candidate must never overwrite the promoted config or another run.
+    with output.open("x") as handle:
+        json.dump(candidate, handle, indent=2)
+        handle.write("\n")
+    print(f"created {output.relative_to(ROOT.resolve())} ({len(nodes['nodes'])} nodes, "
+          f"{topology.transport(candidate)}, launch disabled)")
+    return 0
+
+
+def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) -> list[str]:
+    env = expected_environment(cluster, node)
+    env.update(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,GRAPH,NET")
+    command = ["docker", "run", "--rm", "--name=spark3-collective-probe",
+               "--network=host", "--gpus=all", "--memory=12g", "--memory-swap=12g",
+               "--device=/dev/infiniband:/dev/infiniband:rwm", "--cap-add=IPC_LOCK",
+               "--ulimit=memlock=-1:-1", "--shm-size=256m",
+               "--entrypoint=/usr/bin/timeout"]
+    for key, value in sorted(env.items()):
+        command.extend(["--env", f"{key}={value}"])
+    command.extend(["--volume", f"{repository_path(cluster)}/scripts/probe_collectives.py:/probe.py:ro",
+                    cluster["container"]["image"], "--signal=TERM", "--kill-after=10s", "600s",
+                    "python3", "/probe.py", "--rank", str(node["rank"]),
+                    "--world-size", str(len(nodes["nodes"])), "--master-addr",
+                    cluster["distributed"]["master_addr"], "--master-port", str(port)])
+    if topology.transport(cluster) == "rocenante-mesh4":
+        command = ["sudo", "python3", f"{repository_path(cluster)}/scripts/mesh_probe.py",
+                   "--nodes", f"{repository_path(cluster)}/{cluster['nodes_config']}",
+                   "--rank", str(node["rank"]), "--paths", str(cluster.get("fabric", {}).get("mesh_paths", 2)),
+                   "--serving-container", cluster["container"]["name"],
+                   "--marker", "/usr/local/libexec/spark3-roce-marker", "--"] + command
+    return command
+
+
+def command_topology_probe(args: argparse.Namespace) -> int:
+    cluster, nodes, upstreams = configuration(args)
+    errors, warnings = split_findings(local_doctor(cluster, nodes, upstreams))
+    if errors:
+        return report_doctor(errors, warnings, False)
+    if not 1 <= args.master_port <= 65535 or str(args.master_port) == str(cluster["distributed"]["master_port"]):
+        raise SystemExit("probe port must be valid and different from the serving rendezvous port")
+    node = node_by_name(nodes, args.node)
+    print("# Plan only. Run on this node during a coordinated window with serving stopped.")
+    print(shlex.join(collective_probe_command(cluster, nodes, node, args.master_port)))
+    return 0
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -1113,6 +1232,7 @@ def node_runtime_problems(
     gid_index, hcas = roce_gid_setting(cluster, node)
     gids = remote_shell(nodes, node, roce_gid_query(hcas))
     problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+    problems.extend(topology.gid_subnet_problems(node, gid_index, gids.stdout))
     doctor = run_ssh(
         nodes,
         node,
@@ -1222,7 +1342,8 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
 
     # Read before any checkout: on the head node the checkout can be ROOT, and
     # moving it off a commit that still tracked the file removes it.
-    site_text = (ROOT / NODES_FILE).read_text(encoding="utf-8")
+    site_paths = {NODES_FILE, cluster.get("nodes_config", NODES_FILE)}
+    site_texts = {relative: repository_config_path(relative).read_text(encoding="utf-8") for relative in site_paths}
     quoted_path = shlex.quote(path)
     fetch_script = (
         f"cd {quoted_path} && git fetch --quiet --prune origin && "
@@ -1246,10 +1367,11 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
                 detail = checkout.stderr.strip() or checkout.stdout.strip()
                 raise RuntimeError(f"{node['name']}: checkout failed: {detail}")
             changed.append(node)
-            copied = write_remote_file(nodes, node, f"{path}/{NODES_FILE}", site_text)
-            if copied.returncode:
-                detail = copied.stderr.strip() or copied.stdout.strip()
-                raise RuntimeError(f"{node['name']}: cannot copy {NODES_FILE}: {detail}")
+            for relative, site_text in site_texts.items():
+                copied = write_remote_file(nodes, node, f"{path}/{relative}", site_text)
+                if copied.returncode:
+                    detail = copied.stderr.strip() or copied.stdout.strip()
+                    raise RuntimeError(f"{node['name']}: cannot copy {relative}: {detail}")
             doctor = run_ssh(
                 nodes,
                 node,
@@ -3151,7 +3273,9 @@ def take_fan_control(nodes: dict, node: dict) -> dict:
     """Pause the dgx-fan-control service and select the maximum fan floor."""
     service = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
     if service:
-        run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+        stopped = run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+        if stopped.returncode:
+            return {"service": service, "floor": False}
     floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0
     return {"service": service, "floor": floor}
 
@@ -3159,8 +3283,16 @@ def take_fan_control(nodes: dict, node: dict) -> dict:
 def restore_fan_control(nodes: dict, node: dict, control: dict) -> str | None:
     """Return the node to the fan control it had before take_fan_control."""
     if control["service"]:
+        # These intentional cooling cycles can exhaust systemd's start-rate
+        # budget even though the daemon exited successfully each time.
+        reset = run_ssh(nodes, node, "sudo", "-n", "systemctl", "reset-failed", FAN_SERVICE)
+        if reset.returncode:
+            return f"FAILED: reset start-rate limit for {FAN_SERVICE}"
         restored = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
-        return FAN_SERVICE if restored.returncode == 0 else f"FAILED: {FAN_SERVICE}"
+        if restored.returncode:
+            return f"FAILED: {FAN_SERVICE}"
+        active = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE)
+        return FAN_SERVICE if active.returncode == 0 else f"FAILED: {FAN_SERVICE} is not active"
     if control["floor"]:
         restored = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "automatic")
         return "automatic" if restored.returncode == 0 else "FAILED: automatic"
@@ -3203,6 +3335,9 @@ def cool_nodes(
         controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
         began = time.monotonic()
         try:
+            missing = [node["name"] for node, control in zip(targets, controls) if not control["floor"]]
+            if missing:
+                raise RuntimeError(f"cannot select maximum fan floor on {', '.join(missing)}")
             while not all(value is not None and value < below_c for value in temperatures):
                 if time.monotonic() - began > timeout_s:
                     still = ", ".join(
@@ -3221,6 +3356,10 @@ def cool_nodes(
             for record, value, control, result in zip(records, temperatures, controls, restored):
                 record.update(cooled=True, seconds=seconds, final_c=value,
                               fan_floor=12 if control["floor"] else None, restored=result)
+            failed = [f"{node['name']}: {result}" for node, result in zip(targets, restored)
+                      if str(result).startswith("FAILED")]
+            if failed:
+                raise RuntimeError("cannot restore fan control: " + "; ".join(failed))
     print("cooling: " + ", ".join(f"{r['node']} {r['final_c']:.1f} C" for r in records)
           + f" after {seconds:g} s; fans restored", flush=True)
     return records
@@ -3713,6 +3852,9 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
     identity = {
         "cluster_config": config_name,
         "cluster_config_sha256": sha256(config_path),
+        "nodes_config": cluster.get("nodes_config", "config/nodes.json"),
+        "topology": nodes,
+        "transport": topology.transport(cluster),
         "promoted_baseline": cluster.get("promoted_baseline"),
         "image": cluster["container"]["image"],
         "client_commit": repository_revision(),
@@ -4003,10 +4145,31 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="validate repository and optional live state")
     doctor.add_argument("--live", action="store_true")
     doctor.set_defaults(func=command_doctor)
-    status = commands.add_parser("status", help="show the three live containers")
+    tuning = commands.add_parser("tuning", help="inspect or materialize named TP3/TP4 transport settings")
+    tuning.add_argument("--profiles-config", default=transport_profiles.DEFAULT_PROFILES,
+                        help="repository-relative tuning catalog (copy it to create a new experiment)")
+    tuning_commands = tuning.add_subparsers(dest="tuning_command", required=True)
+    for operation in ("show", "create"):
+        action = tuning_commands.add_parser(operation)
+        action.add_argument("profile", help="named profile: tp3 or tp4")
+        if operation == "create":
+            action.add_argument("--nodes-config", required=True, help="site node map for this topology")
+            action.add_argument("--output", required=True, help="new resolved config under experiments/")
+        action.set_defaults(func=command_tuning)
+    fabric = commands.add_parser("topology", help="prepare a three- or four-node switchless configuration")
+    fabric_commands = fabric.add_subparsers(dest="topology_command", required=True)
+    create = fabric_commands.add_parser("create", help="write a launch-disabled candidate from this profile and a node map")
+    create.add_argument("--nodes-config", required=True, help="repository-relative node map in cable/rank order")
+    create.add_argument("--output", required=True, help="new repository-relative candidate path")
+    create.set_defaults(func=command_topology_create)
+    probe = fabric_commands.add_parser("probe", help="print a bounded, model-free collective probe command for one node")
+    probe.add_argument("node")
+    probe.add_argument("--master-port", type=int, default=29999)
+    probe.set_defaults(func=command_topology_probe)
+    status = commands.add_parser("status", help="show configured live containers")
     status.set_defaults(func=command_status)
     cluster = commands.add_parser(
-        "cluster", help="plan or apply coordinated three-node operations"
+        "cluster", help="plan or apply coordinated node operations"
     )
     cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
     cluster_sync = cluster_commands.add_parser(
@@ -4041,7 +4204,7 @@ def parser() -> argparse.ArgumentParser:
     )
     cluster_stop.set_defaults(func=command_cluster_stop)
     render = commands.add_parser("render", help="render, but do not execute, one rank launch")
-    render.add_argument("node", choices=("dgx1", "dgx2", "dgx3"))
+    render.add_argument("node", help="node name from the selected profile's node map")
     render.set_defaults(func=command_render)
     upstream = commands.add_parser("upstream", help="inspect or prepare pinned upstreams")
     upstream_commands = upstream.add_subparsers(dest="upstream_command", required=True)

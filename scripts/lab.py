@@ -120,7 +120,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 def nodes_config() -> dict:
-    return spark3.site_nodes()
+    return spark3.configuration()[1]
 
 
 def head_url() -> str:
@@ -252,6 +252,13 @@ def ready_seconds(lines: list[str]) -> float | None:
 
 
 def boot(config: str, dry: bool = False) -> bool:
+    # A lab window restores the promoted physical fabric. It cannot undo
+    # recabling or safely clean up a candidate with a different node set.
+    candidate_nodes = spark3.configuration(argparse.Namespace(cluster_config=config))[1]
+    if candidate_nodes != nodes_config():
+        log("lab windows require the promoted node topology; qualify a new fabric "
+            "with explicit cluster commands before using it in lab runs")
+        return False
     log(f"start {config}")
     started, lines = time.time(), []
     ok = spark3_cli("--cluster-config", config, "cluster", "start", "--replace", "--apply", dry=dry,

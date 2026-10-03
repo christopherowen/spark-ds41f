@@ -465,6 +465,7 @@ class CoolingTest(unittest.TestCase):
         expected = [
             ("sudo", "-n", "systemctl", "stop", "dgx-fan-control.service"),
             ("sudo", "-n", "dgx-fan-control", "set-state", "12"),
+            ("sudo", "-n", "systemctl", "reset-failed", "dgx-fan-control.service"),
             ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"),
         ]
         self.assertEqual(self.fan_commands(calls, "dgx1"), expected)
