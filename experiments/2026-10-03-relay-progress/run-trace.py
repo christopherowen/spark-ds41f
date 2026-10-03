@@ -28,6 +28,13 @@ if m.project_problems(trace_source,trace_inputs['b12x']):raise SystemExit('prepa
 relative=trace_source.relative_to(root)/'b12x/comm/roce/_roce_proxy.c'
 import hashlib
 wanted=hashlib.sha256((root/relative).read_bytes()).hexdigest()
+source_text=(root/relative).read_text()
+for enabled, symbol in ((options.chunk_bytes,'B12X_ROCE_STREAM_CHUNK_BYTES'),
+                        (options.window,'B12X_ROCE_STREAM_WINDOW')):
+ if enabled and symbol not in source_text: raise SystemExit('selected source does not implement '+symbol)
+if options.window and not options.chunk_bytes: raise SystemExit('--window requires --chunk-bytes')
+if options.early and not options.trace: raise SystemExit('--early requires --trace')
+if options.window and options.trace: raise SystemExit('serial-phase trace attribution is not supported for the shared progress loop')
 binding_relative=trace_source.relative_to(root)/'b12x/comm/roce/_proxy.py'
 for node in n['nodes']:
  for path in (relative,binding_relative):

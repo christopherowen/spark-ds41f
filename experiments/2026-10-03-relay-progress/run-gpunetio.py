@@ -12,19 +12,25 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 p = argparse.ArgumentParser()
 p.add_argument('run_id')
-p.add_argument('--server',type=int,default=0)
+p.add_argument('--server',type=int,default=0,choices=range(4))
 p.add_argument('--lane',type=int,default=0,choices=(0,1))
 p.add_argument('--handler',type=int,default=1,choices=(1,))
-p.add_argument('--source',choices=('spark','debug','syndrome','system'),default='spark')
+p.add_argument('--source',choices=('spark','debug','syndrome','system'),default='system')
 p.add_argument('--iterations',type=int,default=512)
 a=p.parse_args()
+if a.iterations <= 0: p.error('--iterations must be positive')
 l=importlib.machinery.SourceFileLoader('relay_run',str(ROOT/'bin/spark3'))
 s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 c,n,_=m.configuration(argparse.Namespace(cluster_config='experiments/2026-10-03-balanced-policy/selected.json'))
 hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']=='relay-progress'
-out=ROOT/'.work/relay-progress'/a.run_id;out.mkdir(exist_ok=False)
+def heartbeat():
+ code="import json,pathlib,datetime;p=pathlib.Path.home()/'spark3-hold.json';d=json.loads(p.read_text());assert d['holder']=='relay-progress';d['heartbeat']=datetime.datetime.now(datetime.timezone.utc).isoformat();p.write_text(json.dumps(d,indent=2)+'\\n')"
+ subprocess.run(['ssh','swank@dgx1',shlex.join(['python3','-c',code])],check=True,timeout=15)
+heartbeat()
+out=ROOT/'.work/relay-progress'/a.run_id;out.mkdir(parents=True,exist_ok=False)
 (out/'invocation.json').write_text(json.dumps(vars(a),indent=2)+'\n')
 (out/'cooling.json').write_text(json.dumps(m.cool_nodes(n,n['nodes'],55,600),indent=2)+'\n')
+heartbeat()
 server=n['nodes'][a.server];client=n['nodes'][(a.server+1)%4]
 children=[]
 try:
