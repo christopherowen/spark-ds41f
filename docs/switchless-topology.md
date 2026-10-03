@@ -12,6 +12,12 @@ Sustained-load cooling and full-context qualification remain open; see the
 [queue-capacity investigation](../experiments/2026-10-02-mesh4-queue-depth/README.md) and
 [four-path comparison](../experiments/2026-10-02-mesh4-fourpaths/README.md).
 
+The [matched TP3–TP4 workload comparison](../experiments/2026-10-03-tp3-tp4-comparison/README.md)
+measures the four-node candidate against the historical three-node control.
+Its [padding audit](../experiments/2026-10-03-tp3-tp4-comparison/padding.md)
+distinguishes the removed TP3 divisibility padding from retained graph,
+sequence-parallel and compact MoE tail handling.
+
 | Fabric | TP transport | Peer map |
 | --- | --- | --- |
 | Three-node triangle | Existing RoCEnante small collectives plus NCCL | Both other ranks |
