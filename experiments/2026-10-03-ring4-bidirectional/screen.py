@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess,sys,shlex,json,time
 ROOT=Path(__file__).resolve().parents[2]
-profile,runid=sys.argv[1:]
+profile,runid=sys.argv[1:3]
 output=ROOT/'.work/ring4-bidirectional'/runid
 output.mkdir(exist_ok=False)
 code=r'''
@@ -20,7 +20,7 @@ while not select.select([sys.stdin],[],[],0)[0]:
  d['threads']={}
  for proc in P('/proc').glob('[0-9]*'):
   cmd=read(proc/'cmdline')
-  if not cmd or not any(x.endswith('/probe_collectives.py') for x in cmd.split('\0')):continue
+  if not cmd or not any((x.endswith('/probe_collectives.py') or x == '/probe.py') for x in cmd.split('\0')):continue
   for stat in (proc/'task').glob('*/stat'):
    s=read(stat)
    if not s:continue
@@ -36,7 +36,7 @@ try:
   f=(output/(host+'-telemetry.jsonl')).open('w')
   p=subprocess.Popen(['ssh','-o','BatchMode=yes','swank@'+host,shlex.join(['python3','-u','-c',code])],stdin=subprocess.PIPE,stdout=f,stderr=f)
   children.append((p,f))
- cmd=[sys.executable,'experiments/2026-10-03-collective-policy/run.py','relay',runid,'--benchmark','--counter-samples','--cluster-config',profile,'--output-root','.work/ring4-bidirectional/probes','--holder','ring4-bidirectional']
+ cmd=[sys.executable,'experiments/2026-10-03-collective-policy/run.py','relay',runid,'--benchmark','--counter-samples','--cluster-config',profile,'--output-root','.work/ring4-bidirectional/probes','--holder','ring4-bidirectional',*sys.argv[3:]]
  (output/'command.json').write_text(json.dumps(cmd,indent=2)+'\n')
  subprocess.run(cmd,cwd=ROOT,check=True)
 finally:
