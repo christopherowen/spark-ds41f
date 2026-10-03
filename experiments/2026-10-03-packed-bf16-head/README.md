@@ -16,8 +16,13 @@ extending the candidate's series with
 [B12X 0012](b12x/0012-packed-bf16-vocab-projection.patch) and
 [vLLM 0028](vllm/0028-deepseek-v41-packed-bf16-lm-head.patch).
 
-**Status:** source-qualified on GB10 through kernel-lab overlays; image,
-kernel tests and the TP4 window follow.
+**Status:** image `vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-packedhead-v1`
+(`sha256:5e112503…`) built on dgx4 from `2ed0fd8` with the regular
+`bin/spark3 build` commands and loaded on dgx1–dgx3. Its kernel bundles pass on
+dgx4 (2026-10-03 22:16–22:18 UTC): B12X 15 passed, vLLM 2 passed, head bench
+26 checks passed. The TP4 window (22:19–22:36 UTC) measured 0.44 ms less head
+time per decode step and a 0.60 ms shorter step-end tail, with throughput
+level within the benchmark's noise; see [TP4 window](#tp4-window).
 
 ## Why
 
@@ -76,6 +81,79 @@ configurations per row count; the defaults use these winners):
 | TP3 rank 2 | 48 | 1,912 µs | — | 1,537 µs | 216 | 1.24× |
 
 At TP4 that is 0.33–0.44 ms less per head read, two reads per decode step.
+
+The built image, default prepared configuration ([head-bench](bundles/head-bench/candidate.json)):
+
+| Shard | Rows | cuBLAS BF16 | Packed | Packed GB/s | Speedup | Max error, packed / cuBLAS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TP4 rank 0 | 1 | 1,368 µs | 1,057 µs | 235 | 1.29× | 0.123 / 0.123 |
+| TP4 rank 0 | 6 | 1,392 µs | 1,051 µs | 237 | 1.33× | 0.125 / 0.125 |
+| TP4 rank 0 | 8 | 1,390 µs | 1,056 µs | 235 | 1.32× | 0.125 / 0.125 |
+| TP4 rank 0 | 16 | 1,394 µs | 1,063 µs | 234 | 1.31× | 0.125 / 0.125 |
+| TP4 rank 0 | 32 | 1,509 µs | 1,043 µs | 238 | 1.45× | 0.125 / 0.125 |
+| TP4 rank 0 | 48 | 1,525 µs | 1,104 µs | 225 | 1.38× | 0.125 / 0.125 |
+| TP3 rank 2 | 1 | 2,670 µs | 1,411 µs | 235 | 1.89× | 0.125 / 0.125 |
+| TP3 rank 2 | 6 | 1,851 µs | 1,431 µs | 232 | 1.29× | 0.125 / 0.125 |
+| TP3 rank 2 | 48 | 1,895 µs | 1,504 µs | 220 | 1.26× | 0.204 / 0.204 |
+
+Errors are against an FP32 product of the same BF16 weights; every row count
+kept row 0's logits bit-identical to a single-token run.
+
+## TP4 window
+
+Same-window A/B on the four-node ring, 2026-10-03 22:19–22:36 UTC, with the
+hardened window procedure (hold file with heartbeat, idle-entry check,
+`cluster sync`, per arm start, `bin/spark3 bench` decode and prefill, decode
+profile, stop, entry checkouts restored, hold released; all four nodes idle
+afterwards). Arms: [control.json](control.json) (the TP4 profile with native
+drafter heads, image `-r5o-roce-contract-v1`) and [packed.json](packed.json)
+(image `-r5o-roce-contract-packedhead-v1`). Summary:
+[results.json](results.json).
+
+| Case | Control | Packed | Change |
+| --- | ---: | ---: | ---: |
+| prose, 1 stream | 61.7 ± 11.0% | 61.8 ± 11.1% | +0.2% |
+| prose, 8 streams | 216.0 ± 1.0% | 216.9 ± 3.0% | +0.4% |
+| code, 1 stream | 76.9 ± 29.8% | 75.9 ± 4.5% | −1.3% |
+| code, 8 streams | 250.7 ± 8.1% | 248.7 ± 4.3% | −0.8% |
+
+Single-stream step: prose 33.60 → 33.00 ms, code 37.82 → 37.10 ms (−0.6 and
+−0.7 ms, inside the three-sample intervals). Prefill: 1K −0.2%, 32K −0.4%,
+64K −0.2%, 256K −0.2%. Quality 5/5 in both arms; no thermal slowdown. The
+control reproduces the round-2 native-heads control of the TileLang screen
+(prose 62.3 / 213.3, code 78.1 / 246.0 tok/s).
+
+Each rank logged the exact packing (exponents 112–126; 25,992 exceptions on
+rank 0, 27,034 on rank 3, as measured offline), and the display carve-out
+held 552.3 MiB instead of 631.2 MiB. The decode profiles (median over
+six-row steps, main stream) show the effect directly:
+
+| | Control | Packed |
+| --- | ---: | ---: |
+| Vocabulary head kernel, per read (rank 0 / rank 3) | 1.311 / 1.336 ms (cuBLAS BF16) | 1.075 / 1.095 ms (packed) |
+| Head reads per step | 2 | 2 |
+| Step-end tail after the last layer | 6.09 ms | 5.49 ms |
+
+Under serving the packed read saves 18% rather than the 24% of the offline
+bench, because the L2 prefetch and collectives share the bandwidth.
+
+Open item: host MemAvailable minima during the benches were 0.5–0.8 GiB lower
+in the packed arm on every node (packed 30.09 / 31.14 / 31.09 / 30.64 GiB,
+control 30.63 / 31.93 / 31.91 / 31.39). vLLM's own accounting does not show
+it: model loading took 73.34 GiB against 73.33, the KV cache is fixed at
+3.5 GiB, and the packed arm had 0.24 GiB more free memory when the KV cache
+was allocated. The next window should compare per-process memory after boot
+before any promotion.
+
+## Conclusion
+
+The packed head is lossless and does what it was built for: 0.44 ms less
+vocabulary-head time per decode step at TP4, with logits that are the
+checkpoint's weights accumulated in a fixed order. At 33–38 ms per step that
+is about 1.5%, below what three-sample decode benches resolve, so it shows in
+the profiles and step times rather than in tok/s. It recovers part of the
+eight-stream cost of native drafter heads (3.5–3.8%); the rest is the
+Markov head, which this change does not pack.
 
 ## Changes
 
