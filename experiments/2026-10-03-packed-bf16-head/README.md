@@ -151,9 +151,15 @@ The packed head is lossless and does what it was built for: 0.44 ms less
 vocabulary-head time per decode step at TP4, with logits that are the
 checkpoint's weights accumulated in a fixed order. At 33–38 ms per step that
 is about 1.5%, below what three-sample decode benches resolve, so it shows in
-the profiles and step times rather than in tok/s. It recovers part of the
-eight-stream cost of native drafter heads (3.5–3.8%); the rest is the
-Markov head, which this change does not pack.
+the profiles and step times rather than in tok/s.
+
+Per TP4 rank and decode step, the vocabulary reads were 443 MB with the old
+NVFP4 drafter heads (BF16 target head 331 MB, NVFP4 draft copy 93 MB, NVFP4
+Markov head 4 × 4.7 MB) and 728 MB with native heads (the shared BF16 head
+twice, BF16 Markov head 4 × 16.5 MB). Packing brings it to 563 MB, recovering
+58% of the extra bytes without changing a weight. The rest is the packed head
+still being larger than the NVFP4 copy, and the BF16 Markov head, which this
+change does not pack because it gathers individual rows.
 
 ## Changes
 
