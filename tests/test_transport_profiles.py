@@ -54,12 +54,53 @@ class TransportProfilesTest(unittest.TestCase):
                 self.assertEqual(cluster, original)
                 self.assertEqual(report["scheduled_rows"]["prefill_sp_min_live_rows"], 205)
                 rows = {r["live_rows"]: r for r in report["scheduled_rows"]["examples"]}
-                self.assertEqual(rows[19]["next_decode_graph_capacity_if_eligible"], 20)
+                self.assertEqual(rows[19]["next_configured_graph_capacity"], 20)
+                self.assertEqual(rows[19]["next_draft_context_graph_capacity"], 32)
                 self.assertIsNone(rows[19]["prefill_sp_collective_rows_if_eligible"])
                 self.assertEqual(rows[205]["prefill_sp_collective_rows_if_eligible"], 207 if name == "tp3" else 208)
                 self.assertEqual(rows[4096]["prefill_sp_collective_rows_if_eligible"], 4098 if name == "tp3" else 4096)
                 self.assertEqual(report["kernel_scratch"]["compact_moe_intermediate_width_when_selected"],
                                  None if name == "tp3" else 640)
+
+    def test_draft_storage_and_graph_alignment(self):
+        for name in ("tp3", "tp4"):
+            _, cluster = self.resolve(name)
+            report = spark3.model_layout.describe(ROOT, cluster, 2097152)
+            draft = report["drafter"]
+            tp3 = name == "tp3"
+            self.assertEqual([r["real_rows"] for r in draft["vocabulary_shards"]],
+                             [43136, 43136, 43008] if tp3 else [32320] * 4)
+            self.assertEqual([r["padding_rows"] for r in draft["vocabulary_shards"]],
+                             [0, 0, 128] if tp3 else [0] * 4)
+            self.assertEqual(draft["lm_head_nvfp4"]["packed_values_uint8_shape"],
+                             [43136 if tp3 else 32320, 2560])
+            self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"],
+                             [43136 if tp3 else 32384, 320])
+            self.assertEqual(draft["lm_head_nvfp4"]["scale_alignment_extra_bytes"], 0 if tp3 else 20480)
+            self.assertEqual(draft["markov_output_nvfp4"]["scale_alignment_extra_bytes"], 0 if tp3 else 1024)
+            self.assertEqual(draft["aux_context_bf16_buffer_shape"], [48, 15360])
+            self.assertEqual(report["model_dimensions"]["draft_aux_projection_output"]["allocated_per_rank"],
+                             1728 if tp3 else 1280)
+            graphs = report["scheduled_rows"]
+            self.assertEqual(graphs["draft_context_graph_capacities_if_full_supported"], [1, 2, 4, 8, 16, 32, 48])
+            self.assertEqual(graphs["draft_query_graph_capacities_if_full_supported"], [6, 12, 18, 24, 30, 36, 42, 48])
+            self.assertIn({"requests": 1, "rows": 5}, graphs["target_exact_low_concurrency_graphs"])
+
+    def test_layout_rejects_incompatible_execution_flags(self):
+        _, base = self.resolve("tp4")
+        for key, value in (("VLLM_DS41_DRAFT_NVFP4_HEAD", "0"),
+                           ("SPARK3_DSPARK_MAIN_PROJ_TP", "0"),
+                           ("VLLM_USE_V2_MODEL_RUNNER", "0"),
+                           ("VLLM_ENABLE_ROCE_ALLREDUCE", "0"),
+                           ("VLLM_DS41_BATCH_INVARIANT", "1")):
+            cluster = copy.deepcopy(base)
+            cluster["environment"][key] = value
+            with self.assertRaises(ValueError):
+                spark3.model_layout.describe(ROOT, cluster, 2097152)
+        cluster = copy.deepcopy(base)
+        spark3.topology.set_argument(cluster, "--engram-config", '{"projection_tp":false}')
+        with self.assertRaisesRegex(ValueError, "Engram"):
+            spark3.model_layout.describe(ROOT, cluster, 2097152)
 
     def test_layout_rejects_unaudited_sources_and_checkpoint(self):
         _, base = self.resolve("tp4")
