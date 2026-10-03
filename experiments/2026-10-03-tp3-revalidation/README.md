@@ -35,7 +35,7 @@ includes zero change; this small screen does not prove equivalence to a narrow b
 | Code | 4 | 135.6 | 139.7 | 170.6 |
 | Code | 8 | 195.8 | 193.9 | 243.5 |
 
-Single-stream step times are 41.108 ms prose and 45.822 ms code, versus the old
+Derived single-stream step times are 41.108 ms prose and 45.822 ms code, versus the old
 40.845/45.356 ms. These are acceptance-adjusted estimates, not fixed-work kernel
 timings: adaptive verification work also changes. The new single-stream accepted
 and verified draft counts are 1.172/3.259 (prose) and 1.874/3.857 (code).

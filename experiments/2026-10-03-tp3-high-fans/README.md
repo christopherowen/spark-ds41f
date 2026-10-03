@@ -76,12 +76,17 @@ Aggregate decode tokens/s, three samples per point:
 | prose-c8 | 171.2 | 170.4 | 170.1 |
 | code-c8 | 195.8 | 193.9 | 193.4 |
 
-Single-stream step times were **40.744 ms prose / 45.765 ms code**, versus
+Derived single-stream step times were **40.744 ms prose / 45.765 ms code**, versus
 40.845/45.356 ms on published main and 41.108/45.822 ms in the preceding
 ordinary-fan screen. There is no statistically resolved decode regression
 against main. The apparent code-c1 TPS recovery from 60.0 to 65.0 comes with
 higher draft acceptance (1.874 to 2.132), while step time is nearly unchanged;
 it is not evidence of an 8% kernel speedup from cooling.
+
+The benchmark derives this step estimate from throughput and accepted drafts;
+it is not an independent GPU timing. The [focused speculation check](../2026-10-03-prose-speculation/README.md)
+adds server duration and iteration counters and repeats boots with one saved
+verification-cost table.
 
 | Nominal prefill length | Published main tok/s | High-fan tok/s |
 | --- | ---: | ---: |

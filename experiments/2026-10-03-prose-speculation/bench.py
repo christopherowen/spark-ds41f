@@ -1,4 +1,4 @@
-"""Run the native benchmark while preserving full replies and metric snapshots."""
+"""Preserve answer content, output hashes and metric snapshots from native bench."""
 import json
 from pathlib import Path
 import runpy
