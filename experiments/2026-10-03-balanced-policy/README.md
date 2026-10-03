@@ -23,3 +23,19 @@ After transport screening, qualify the selected profile with matched serving
 work, pinned verification costs and unchanged thermal/memory guards. A global
 optimum cannot be established by a finite screen; report the tested choice and
 remaining limits. No promotion without the owner's acceptance.
+
+## Planner candidate
+
+An independent source patch adds a second bidirectional channel ordering:
+CW/root0, CCW/root1, CCW/root0, CW/root1. Every pair starts with opposite
+directions; a complete group of four covers both roots in both directions.
+Mode 1 retains the previous half-reversal, mode 0 the upstream rings.
+`NCCL_MIN_TRAFFIC_PER_CHANNEL` exposes the existing 32 KiB allocation floor,
+with that default unchanged. The fine arm tests 512 bytes plus the previously
+screened Ring thread thresholds. Actual low/middle/high channel element counts
+are logged with TUNING enabled; production WARN logging emits none.
+
+The paired, fine and paired-fine arms separate ordering from finer allocation.
+No collective arithmetic implementation is replaced, but partitioning and ring
+order can change floating-point rounding. The existing CUDA graph, exact-data,
+non-aligned fallback and cancellation checks remain mandatory.
