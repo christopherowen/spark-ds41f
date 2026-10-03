@@ -129,3 +129,16 @@ jobs:
         run: bin/spark3 --cluster-config experiments/2026-10-03-nccl-bidirectional/cluster.json build prepare --only nccl
       - name: Verify direct reciprocal rings and unsupported geometry rejection
         run: python3 experiments/2026-10-03-nccl-bidirectional/test-policy.py
+
+  nccl-balanced-plans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Use the ring example on the CPU-only builder
+        run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the balanced allocation experiment
+        run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/paired.json build prepare --only nccl
+      - name: Verify direction and PCIe-root coverage
+        run: python3 experiments/2026-10-03-balanced-policy/test-policy.py
+      - name: Verify fine partition boundaries preserve every element
+        run: python3 experiments/2026-10-03-balanced-policy/test-allocation.py
