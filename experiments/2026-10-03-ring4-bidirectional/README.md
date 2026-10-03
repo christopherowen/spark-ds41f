@@ -80,3 +80,52 @@ Then compare decode at one/eight streams and prefill with temperature,
 actual fan RPM, proxy CPU time, GPU clocks/power and NIC bytes recorded on
 every node. Directional balance alone is insufficient thermal evidence.
 Keep all failed runs. No production changes or promotion are implied.
+
+## Hardware result, 2026-10-03
+
+Three launches (control / candidate / control) passed on all four ranks:
+exact-data checks, changing CUDA-graph inputs, dispatch boundaries and zero
+tracked RDMA errors. Candidate image:
+`sha256:08b001f19414fbcebb4bcdd8b4d449569977108e70daa5a7adfb8990ebc923ec`,
+built from deployment `abcfda0`, with the same digest verified on all nodes.
+The GPU preparation suite passed all four tests. The native protocol suite
+also passed on a Spark's ARM CPU. CI passes after initializing its example
+ring map; the first CI job lacked that intentionally ignored site file.
+
+Each node's proxy counters changed from approximately 32.04/16.02 GB
+clockwise/counterclockwise to 24.03/24.03 GB, with equal aggregate payload
+work. Both HCA lanes and both directions contribute; payloads are split,
+not duplicated.
+
+BF16 all-reduce microseconds per call (median of the slowest rank in each of
+five samples; each sample contains 256 calls):
+
+| Input per rank | Control before | Bidirectional | Control after |
+|---|---:|---:|---:|
+| 10 KiB | 17.42 | 16.90 | 17.05 |
+| 60 KiB | 28.07 | 28.04 | 28.84 |
+| 480 KiB | 95.07 | 93.99 | 95.06 |
+| 2 MiB | 314.81 | 307.74 | 315.31 |
+
+This establishes working bidirectional delivery at near-baseline latency,
+not a serving TPS improvement. The broader all-gather results are retained
+in `results.json`; some are slightly slower. The short probes did not
+reproduce the serving thermal failure. Their GPU temperature/power pattern
+does not establish a thermal benefit.
+
+The first telemetry wrapper matched the host filename rather than its
+container name `/probe.py`, so these three launches have GPU/fan/system CPU
+samples but no per-thread samples. The corrected wrapper records threads in
+the subsequent NCCL experiment. Do not infer proxy CPU savings from this arm.
+
+Native receipts are in `hardware/runs.tar.gz`, with every member hash in
+`hardware/sha256.json`. Extract into a directory and reproduce the summary:
+
+```sh
+python3 experiments/2026-10-03-ring4-bidirectional/summarize.py EXTRACTED_DIR control1 candidate1 control2
+```
+
+NCCL bulk rings were independently found to use only clockwise channels;
+their separate candidate and results are in `../2026-10-03-nccl-bidirectional`.
+Neither candidate is promoted. The window ended at 06:56:41 UTC with all
+nodes idle, fan controllers active and shared production checkouts unchanged.

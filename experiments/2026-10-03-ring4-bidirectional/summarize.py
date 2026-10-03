@@ -21,7 +21,7 @@ for run in args.runs:
    for h,counters in t.get('rdma_error_deltas',{}).items():
     for name,count in counters.items():
      if count:errors[h+':'+name]=count
-   r['timings'].append({'dtype':t['dtype'],'operation':t['operation'],'elements_per_rank':t['elements_per_rank'],'samples_us':t['microseconds_per_call'],'median_us':statistics.median(t['microseconds_per_call']),'physical_tx_bytes':tx,'rdma_errors':errors})
+   r['timings'].append({'dtype':t['dtype'],'operation':t['operation'],'elements_per_rank':t['elements_per_rank'],'samples_us':t['microseconds_per_call'],'median_us':statistics.median(t['microseconds_per_call']),'directional_tx_counter_sums':tx,'rdma_errors':errors})
   tele=args.root/run/(node+'-telemetry.jsonl')
   if tele.exists():
    samples=[json.loads(l) for l in tele.read_text().splitlines() if l.startswith('{')]
