@@ -36,13 +36,6 @@ for run in a.runs:
         clean = re.sub(trace_pattern, '', raw)
         for match in re.finditer(r'\{"rank": [0-9]+, "world_size"', clean):
             final = json.JSONDecoder().raw_decode(clean[match.start():])[0]
-        for line in []:
-            if line.startswith('ROCE_TRACE,'):
-                traces.append(dict(zip(fields, map(int, line.split(',')[1:]))))
-            elif line.startswith('{'):
-                obj = json.loads(line)
-                if 'passed' in obj:
-                    final = obj
         if final is None or not final['passed']:
             raise ValueError(f'{run}: rank {rank} did not pass')
         ranks.append({'rank': rank, 'trace_count': len(traces), 'proxy': final['proxy']})
@@ -50,11 +43,20 @@ for run in a.runs:
             key = f"{row['operation']}/{row['dtype']}/{row['elements_per_rank']}"
             case = cases.setdefault(key, {'rank_samples_us': [], 'traces': []})
             case['rank_samples_us'].append(row['microseconds_per_call'])
+            case.setdefault('node_counters', {})[str(rank)] = {
+                'proxy_payload_bytes': row['proxy_payload_bytes'],
+                'rdma_errors': {dev: {k:v for k,v in vals.items() if v}
+                    for dev, vals in row['rdma_error_deltas'].items() if any(vals.values())},
+                'port_tx_rdma_bytes': {dev: vals['tx_vport_rdma_unicast_bytes']
+                    for dev, vals in row['port_deltas'].items()}}
+
             if traces and row['expected_backend'] == 'rocenante':
                 window = row['proxy_sequence_window']
                 chosen = [t for t in traces if window['before'] < t['seq'] <= window['after']]
                 if len(chosen) != 1280:
                     raise ValueError(f'{run} {rank} {key}: expected 1280 calls, got {len(chosen)}')
+                for t in chosen:
+                    t['sample_boundary'] = (t['seq']-window['before']-1) % 256 == 0
                 case['traces'].extend(chosen)
     for key, case in cases.items():
         samples = case.pop('rank_samples_us')
@@ -71,6 +73,9 @@ for run in a.runs:
             for name in ('post_ns','queue_ns'):
                 case[name.replace('_ns','_us')] = summary([t[name]/1000 for t in traces])
             early = [t for t in traces if t['early_ns'] and t['begin'] >= t['early_ns']]
+            within = [t for t in early if not t['sample_boundary']]
+            case['early_nonboundary_count'] = len(within)
+            case['early_nonboundary_delay_us'] = summary([(t['begin']-t['early_ns'])/1000 for t in within])
             case['early_fraction'] = len(early)/len(traces)
             case['early_delay_us'] = summary([(t['begin']-t['early_ns'])/1000 for t in early])
             case['ready_at_begin_fraction'] = sum(t['ready_mask'] != 0 for t in traces)/len(traces)
