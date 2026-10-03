@@ -11,6 +11,8 @@ parser.add_argument('--lengths',type=int,nargs='+')
 parser.add_argument('--cluster-config',default='experiments/2026-10-03-balanced-policy/selected.json')
 parser.add_argument('--output-root',default='.work/relay-progress')
 parser.add_argument('--holder',default='relay-progress')
+parser.add_argument('--source-profile',default='experiments/2026-10-03-relay-progress/source-only.json')
+parser.add_argument('--chunk-bytes',type=int,default=0)
 parser.add_argument('--trace',action='store_true')
 parser.add_argument('--early',action='store_true')
 options=parser.parse_args()
@@ -18,20 +20,22 @@ kind=options.arm;runid=options.run_id
 profile = options.cluster_config
 overrides=json.loads((root/'experiments/2026-10-03-collective-policy/arms.json').read_text())[kind]
 c,n,_=m.configuration(argparse.Namespace(cluster_config=profile))
-_,_,trace_lock=m.configuration(argparse.Namespace(cluster_config='experiments/2026-10-03-relay-progress/source-only.json'))
+_,_,trace_lock=m.configuration(argparse.Namespace(cluster_config=options.source_profile))
 trace_inputs=m.build_inputs(trace_lock)
 trace_source=m.build_directory(trace_inputs)/'src/b12x'
 if m.project_problems(trace_source,trace_inputs['b12x']):raise SystemExit('prepare trace source first')
 relative=trace_source.relative_to(root)/'b12x/comm/roce/_roce_proxy.c'
 import hashlib
 wanted=hashlib.sha256((root/relative).read_bytes()).hexdigest()
+binding_relative=trace_source.relative_to(root)/'b12x/comm/roce/_proxy.py'
 for node in n['nodes']:
- remote=m.repository_path(c)+'/'+str(relative)
- got=subprocess.check_output(['ssh','swank@'+node['name'],shlex.join(['sha256sum',remote])],text=True).split()[0]
- if got!=wanted:raise SystemExit('proxy source mismatch on '+node['name'])
+ for path in (relative,binding_relative):
+  remote=m.repository_path(c)+'/'+str(path)
+  got=subprocess.check_output(['ssh','swank@'+node['name'],shlex.join(['sha256sum',remote])],text=True).split()[0]
+  if got!=hashlib.sha256((root/path).read_bytes()).hexdigest():raise SystemExit('proxy source mismatch on '+node['name'])
 hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']==options.holder
 out=root/options.output_root/runid;out.mkdir(parents=True,exist_ok=False)
-(out/'invocation.json').write_text(json.dumps(dict(vars(options),proxy_sha256=wanted,source_manifest='experiments/2026-10-03-relay-progress/source.json'),indent=2)+'\n')
+(out/'invocation.json').write_text(json.dumps(dict(vars(options),proxy_sha256=wanted,source_profile=options.source_profile),indent=2)+'\n')
 def hardware_snapshot(suffix):
  code="import pathlib,json,subprocess;root=pathlib.Path('/sys/class/infiniband');d={p.name:{f.name:int(f.read_text()) for f in (p/'ports/1/hw_counters').glob('*')} for p in root.iterdir()};print(json.dumps(d))"
  for node in n['nodes']:
@@ -55,6 +59,8 @@ for node in n['nodes']:
   if v.startswith('NCCL_DEBUG_SUBSYS='):cmd[i]='NCCL_DEBUG_SUBSYS=INIT,GRAPH,NET,TUNING'
  idx=cmd.index(c['container']['image'])
  cmd[idx:idx]=['--volume',m.repository_path(c)+'/'+str(relative)+':/opt/spark3/candidate/b12x/b12x/comm/roce/_roce_proxy.c:ro',
+                '--volume',m.repository_path(c)+'/'+str(binding_relative)+':/opt/spark3/candidate/b12x/b12x/comm/roce/_proxy.py:ro',
+                '--env','B12X_ROCE_STREAM_CHUNK_BYTES='+str(options.chunk_bytes),
                 '--env','B12X_ROCE_TRACE='+('1' if options.trace else '0'),
                 '--env','B12X_ROCE_TRACE_EARLY='+('1' if options.early else '0')]
  idx=cmd.index(c['container']['image'])

@@ -1,0 +1,323 @@
+From 5bc094bd639b3982c6f68e92256a943ffc6d8e5f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <root@your.mom>
+Date: Sat, 3 Oct 2026 12:16:09 +0200
+Subject: [PATCH] Stream ring relay chunks with independent epoch readiness
+
+Base: f8069b2 plus the balanced TP4 and diagnostic patch series. Retains full-fragment GPU flags and the two-slot lifetime. Chunk flags use reserved flag-line words, RC write ordering, and the existing device-to-CPU barrier. Changes transfer timing only, preserving reduction order. Opt-in experiment, not proposed for upstream or production yet. ASAN/UBSAN protocol simulations pass 32000 collectives including delayed DMA, wrap, mismatched chunk geometry, stop, and partial readiness in both directions; hardware screen pending.
+---
+ b12x/comm/roce/_proxy.py              |  2 +-
+ b12x/comm/roce/_roce_proxy.c          | 94 ++++++++++++++++++++++-----
+ tests/comm/roce_proxy_fake/simulate.c | 53 +++++++++++++--
+ 3 files changed, 127 insertions(+), 22 deletions(-)
+
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index f6dfb59..f316a1f 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 10:
++        if lib.roce_abi_version() != 11:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index 2e9299f..628e939 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -44,14 +44,14 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 10
++#define ROCE_ABI_VERSION 11
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+ #define ROCE_IDLE_SPINS 20000000
+ 
+ typedef struct {
+-    uint32_t abi, world, rank, ring4, mesh_rotate;
++    uint32_t abi, world, rank, ring4, mesh_rotate, stream_chunk_bytes;
+     uint64_t slot_bytes;
+     uint64_t region_addr;
+     uint32_t rkey[ROCE_MAX_LOCAL_HCAS];
+@@ -90,6 +90,7 @@ typedef struct {
+     int rank;
+     int ring4;
+     int mesh_rotate;
++    uint32_t stream_chunk_bytes;
+     int n_hca;
+     int n_stripes;
+     int gid_index;
+@@ -350,6 +351,16 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         snprintf(err, err_len, "rotating posts require four mesh paths");
+         free(c); return NULL;
+     }
++    const char *chunk = getenv("B12X_ROCE_STREAM_CHUNK_BYTES");
++    if (chunk && *chunk) {
++        char *end = NULL;
++        unsigned long value = strtoul(chunk, &end, 10);
++        if (*end || value > 1048576 || value % 16 || (value && ring4 != 1)) {
++            snprintf(err, err_len, "stream chunks require ring4 and a multiple of 16 up to 1 MiB");
++            free(c->trace); free(c); return NULL;
++        }
++        c->stream_chunk_bytes = (uint32_t)value;
++    }
+     c->world = world;
+     c->rank = rank;
+     c->ring4 = ring4;
+@@ -390,6 +401,7 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     blob.rank = c->rank;
+     blob.ring4 = c->ring4;
+     blob.mesh_rotate = c->mesh_rotate;
++    blob.stream_chunk_bytes = c->stream_chunk_bytes;
+     blob.slot_bytes = c->slot_bytes;
+     blob.region_addr = (uint64_t)(uintptr_t)c->region;
+     blob.n_hca = (uint8_t)c->n_hca;
+@@ -471,6 +483,7 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+         if (all[p].abi != ROCE_ABI_VERSION || all[p].world != (uint32_t)c->world ||
+             all[p].rank != (uint32_t)p || all[p].ring4 != (uint32_t)c->ring4 ||
+             all[p].slot_bytes != c->slot_bytes ||
++            all[p].stream_chunk_bytes != c->stream_chunk_bytes ||
+             all[p].n_hca < 1 || all[p].n_hca > ROCE_MAX_LOCAL_HCAS ||
+             all[p].n_stripes != c->n_stripes ||
+             all[p].mesh_rotate != (uint32_t)c->mesh_rotate) {
+@@ -559,9 +572,9 @@ static int flag_lanes(const roce_ctx_t *c) {
+     return c->n_stripes * (c->ring4 == 1 ? 2 : 1);
+ }
+ 
+-static int post_fragment(roce_ctx_t *c, uint32_t seq,
++static int post_fragment_word(roce_ctx_t *c, uint32_t seq,
+                          int origin, int p, uint8_t *send, int lane,
+-                         uint64_t byte_offset, uint32_t stripe_bytes, int flag_lane) {
++                         uint64_t byte_offset, uint32_t stripe_bytes, int flag_lane, unsigned flag_word) {
+     uint32_t slot = seq & 1u;
+     uint32_t seq_copy = seq;
+     {
+@@ -601,7 +614,7 @@ static int post_fragment(roce_ctx_t *c, uint32_t seq,
+         flag_wr.wr.rdma.remote_addr =
+             remote + c->flag_off +
+             (((uint64_t)origin * ROCE_SLOTS + slot) * (uint64_t)flag_lanes(c) +
+-             (uint64_t)flag_lane) * ROCE_FLAG_STRIDE;
++             (uint64_t)flag_lane) * ROCE_FLAG_STRIDE + 4 * flag_word;
+         flag_wr.wr.rdma.rkey = c->peer_rkey[lane][p];
+ 
+         struct ibv_send_wr data_wr;
+@@ -640,6 +653,20 @@ static int post_fragment(roce_ctx_t *c, uint32_t seq,
+     return 0;
+ }
+ 
++static int post_fragment(roce_ctx_t *c, uint32_t seq, int origin, int p,
++                         uint8_t *send, int lane, uint64_t byte_offset,
++                         uint32_t stripe_bytes, int flag_lane) {
++    return post_fragment_word(c, seq, origin, p, send, lane, byte_offset,
++                              stripe_bytes, flag_lane, 0);
++}
++
++// Word zero retains the GPU's whole-fragment contract. Words 1..31 are
++// independent epoch flags for ordered chunks; no torn multiword progress record.
++static uint32_t stream_chunk_size(roce_ctx_t *c, uint32_t stripe_bytes) {
++    uint32_t minimum = (stripe_bytes / 31 + (stripe_bytes % 31 != 0) + 15) & ~15u;
++    return c->stream_chunk_bytes > minimum ? c->stream_chunk_bytes : minimum;
++}
++
+ static void stripe_range(uint32_t nbytes, int width, int lane,
+                          uint32_t *offset, uint32_t *packs) {
+     uint32_t total = nbytes / 16, remainder = total % (uint32_t)width;
+@@ -653,8 +680,26 @@ static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+     uint32_t offset, packs;
+     stripe_range(nbytes, peer_width(c->world, c->rank, p, c->n_stripes),
+                  lane, &offset, &packs);
+-    return post_fragment(c, seq, origin, p, send, lane,
+-                         (uint64_t)offset * 16, packs * 16, lane);
++    uint32_t bytes = packs * 16;
++    if (!c->stream_chunk_bytes || bytes <= c->stream_chunk_bytes)
++        return post_fragment(c, seq, origin, p, send, lane,
++                             (uint64_t)offset * 16, bytes, lane);
++    uint32_t chunk = stream_chunk_size(c, bytes);
++    uint32_t count = (bytes + chunk - 1) / chunk;
++    // Send the half this neighbour relays first. Both directions can begin
++    // forwarding before their unrelated half arrives at the same neighbour.
++    uint32_t first_pack = (packs + ((seq + (uint32_t)lane) & 1u)) / 2;
++    uint32_t first_chunk = p == (c->rank + c->world - 1) % c->world
++        ? (first_pack * 16) / chunk : 0;
++    for (uint32_t i = 0; i < count; i++) {
++        uint32_t index = (first_chunk + i) % count;
++        uint32_t begin = index * chunk;
++        uint32_t length = bytes - begin < chunk ? bytes - begin : chunk;
++        if (post_fragment_word(c, seq, origin, p, send, lane,
++                (uint64_t)offset * 16 + begin, length, lane, index + 1)) return -1;
++    }
++    // RC ordering makes this flag cover every chunk, regardless of send order.
++    return post_fragment(c, seq, origin, p, send, lane, 0, 0, lane);
+ }
+ 
+ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+@@ -669,6 +714,7 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     clock_gettime(CLOCK_MONOTONIC, &start);
+     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
+     unsigned pending = (1u << (2 * c->n_stripes)) - 1u;
++    uint32_t forwarded[2 * ROCE_MAX_STRIPES] = {0};
+     for (unsigned spins = 0;; spins++) {
+         if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
+             __atomic_load_n(&ctrl[2], __ATOMIC_ACQUIRE)) {
+@@ -687,7 +733,27 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             int destination = direction == 0 ? next : prev;
+             uint32_t *flag = (uint32_t *)(c->region + c->flag_off +
+                 (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * flag_lanes(c) + lane) * ROCE_FLAG_STRIDE);
++            uint32_t offset, packs;
++            stripe_range(nbytes, c->n_stripes, lane, &offset, &packs);
++            uint32_t stripe_bytes = packs * 16;
++            uint32_t first = (packs + ((seq + (uint32_t)lane) & 1u)) / 2;
++            uint32_t half_begin = direction == 0 ? 0 : first * 16;
++            uint32_t half_end = direction == 0 ? first * 16 : stripe_bytes;
++            uint32_t cursor = half_begin + forwarded[fragment];
++            uint32_t length = half_end - cursor;
++            unsigned out_word = 0;
+             uint32_t observed = __atomic_load_n(flag, __ATOMIC_ACQUIRE);
++            if (c->stream_chunk_bytes && stripe_bytes > c->stream_chunk_bytes && length) {
++                uint32_t chunk = stream_chunk_size(c, stripe_bytes);
++                uint32_t index = cursor / chunk;
++                uint32_t available = (index + 1) * chunk - cursor;
++                if (length > available) length = available;
++                // The whole-lane flag also covers this chunk. Otherwise the
++                // per-chunk flag only becomes visible after that chunk's DMA.
++                if (observed != seq)
++                    observed = __atomic_load_n(&flag[index + 1], __ATOMIC_ACQUIRE);
++                if (cursor + length < half_end) out_word = index + 1;
++            }
+             if ((int32_t)(observed - seq) > 0) {
+                 snprintf(c->err, sizeof(c->err), "relay slot overwritten: rank %d seq %u saw %u", origin, seq, observed);
+                 return -1;
+@@ -702,22 +768,16 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+ #else
+             __sync_synchronize();
+ #endif
+-            uint32_t offset, packs;
+-            stripe_range(nbytes, c->n_stripes, lane, &offset, &packs);
+-            // Split each physical stripe into disjoint 16-byte packs. Rotate
+-            // the odd pack across epochs and lanes instead of biasing one path.
+-            uint32_t first = (packs + ((seq + (uint32_t)lane) & 1u)) / 2;
+-            if (direction == 0) packs = first;
+-            else { offset += first; packs -= first; }
+             uint8_t *received = c->region + c->recv_off +
+                 ((size_t)origin * ROCE_SLOTS + (seq & 1u)) * c->slot_bytes;
+             // Preserve the original source's slot. Its N+2 cannot begin until
+             // the opposite GPU has consumed BOTH fragments of N. Zero-length
+             // fragments still publish a flag, including the 16-byte case.
+-            if (post_fragment(c, seq, origin, destination, received, lane,
+-                              (uint64_t)offset * 16, packs * 16, fragment) != 0)
++            if (post_fragment_word(c, seq, origin, destination, received, lane,
++                    (uint64_t)offset * 16 + cursor, length, fragment, out_word) != 0)
+                 return -1;
+-            pending &= ~bit;
++            forwarded[fragment] += length;
++            if (half_begin + forwarded[fragment] == half_end) pending &= ~bit;
+         }
+         if (!pending) return 0;
+         if ((spins & 63u) == 0) {
+diff --git a/tests/comm/roce_proxy_fake/simulate.c b/tests/comm/roce_proxy_fake/simulate.c
+index 5337c58..f806443 100644
+--- a/tests/comm/roce_proxy_fake/simulate.c
++++ b/tests/comm/roce_proxy_fake/simulate.c
+@@ -18,7 +18,7 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+ static roce_ctx_t *ranks[4];
+ static uint32_t rng = 1;
+ static unsigned random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; return rng ^= rng << 5; }
+-static int world, ring4, stripes, rotate;
++static int world, ring4, stripes, rotate, stream_chunk;
+ static uint64_t messages;
+ static unsigned posted_in_round[4];
+ static uint32_t posted_seq[4];
+@@ -150,7 +150,7 @@ static void setup(uint32_t seed) {
+     for (int r = 0; r < world; r++) {
+         roce_ctx_t *c = ranks[r] = calloc(1, sizeof(*c));
+         c->world = world; c->rank = r; c->ring4 = ring4; c->n_stripes = stripes; c->mesh_rotate = rotate; c->n_hca = stripes == 4 ? 4 : 2 * stripes;
+-        c->slot_bytes=4096; c->region_bytes=layout[4]; c->region=calloc(1, layout[4]);
++        c->stream_chunk_bytes=stream_chunk; c->slot_bytes=4096; c->region_bytes=layout[4]; c->region=calloc(1, layout[4]);
+         c->recv_off=layout[0]; c->flag_off=layout[1]; c->send_off=layout[2]; c->ctrl_off=layout[3];
+         memset(c->route_hca, 255, sizeof(c->route_hca));
+         for (int h = 0; h < c->n_hca; h++) {
+@@ -161,7 +161,8 @@ static void setup(uint32_t seed) {
+         int edge=0;
+         for (int p=0; p<world; p++) {
+             for (int lane=0; lane<flag_lanes(c); lane++)
+-                for (int slot=0; slot<2; slot++) *flag(c,p,slot,lane)=seed;
++                for (int slot=0; slot<2; slot++)
++                    for (int word=0;word<ROCE_FLAG_STRIDE/4;word++) flag(c,p,slot,lane)[word]=seed;
+             for (int lane=0; lane<stripes; lane++) {
+                 if (p==r || (ring4 == 1 && p==(r+2)%4) ||
+                     lane >= peer_width(world, r, p, stripes)) continue;
+@@ -187,6 +188,9 @@ static void setup(uint32_t seed) {
+     blobs[2].mesh_rotate ^= 1;
+     assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
+     blobs[2].mesh_rotate ^= 1;
++    blobs[2].stream_chunk_bytes ^= 16;
++    assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
++    blobs[2].stream_chunk_bytes ^= 16;
+     for(int r=0;r<world;r++) assert(!roce_connect(ranks[r],blobs,sizeof(blobs)));
+ }
+ static void cleanup(void) {
+@@ -311,6 +315,42 @@ static void independent_directions(void) {
+     }
+ }
+ 
++static void partial_streaming(void) {
++    stream_chunk=64;
++    for (int ready_peer=1;ready_peer<=3;ready_peer+=2) {
++        setup(0);
++        roce_ctx_t *c=ranks[0];
++        const uint32_t seq=1, bytes=4096;
++        const int lane=0, direction=ready_peer==3?0:1, dest=(ready_peer+2)%4;
++        uint32_t stripe_offset,packs;
++        stripe_range(bytes,stripes,lane,&stripe_offset,&packs);
++        uint32_t chunk=stream_chunk_size(c,packs*16);
++        uint32_t first=(packs+((seq+lane)&1u))/2;
++        uint32_t begin=direction==0?0:first*16;
++        uint32_t index=begin/chunk, length=(index+1)*chunk-begin;
++        uint8_t *recv=c->region+c->recv_off+((size_t)ready_peer*2+1)*c->slot_bytes;
++        for (unsigned i=0;i<bytes;i++) recv[i]=pattern(ready_peer,seq,i);
++        // Publish ONE chunk only. The full-lane flag and every other chunk
++        // remain absent; forwarding must start without either becoming ready.
++        __atomic_store_n(&flag(c,ready_peer,seq,lane)[index+1],seq,__ATOMIC_RELEASE);
++        uint32_t *ctrl=(uint32_t *)(c->region+c->ctrl_off);
++        assert(!roce_start(c));
++        __atomic_store_n(&ctrl[5],bytes,__ATOMIC_RELEASE);
++        __atomic_store_n(ctrl,seq,__ATOMIC_RELEASE);
++        uint32_t *seen=&flag(ranks[dest],ready_peer,seq,2*lane+direction)[index+1];
++        for(int i=0;i<10000 && __atomic_load_n(seen,__ATOMIC_ACQUIRE)!=seq;i++) {
++            progress();usleep(10);
++        }
++        assert(__atomic_load_n(seen,__ATOMIC_ACQUIRE)==seq);
++        assert(__atomic_load_n(flag(ranks[dest],ready_peer,seq,2*lane+direction),__ATOMIC_ACQUIRE)==0);
++        uint8_t *received=ranks[dest]->region+ranks[dest]->recv_off+
++            ((size_t)ready_peer*2+1)*c->slot_bytes;
++        for(unsigned i=begin;i<begin+length;i++) assert(received[i]==pattern(ready_peer,seq,i));
++        roce_stop(c);assert(roce_failed(c));cleanup();
++    }
++    stream_chunk=0;
++}
++
+ int main(void) {
+     for(stripes=1;stripes<=2;stripes++) {
+         world=3;ring4=0;run(1000,0);
+@@ -320,7 +360,12 @@ int main(void) {
+     }
+     stripes=4;world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+     rotate=1;run(3000,0);run(1000,UINT32_MAX-100);rotate=0;
+-    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, 26000 collectives, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
++    stripes=2;world=4;ring4=1;
++    for(stream_chunk=16;stream_chunk<=256;stream_chunk*=4) {
++        run(1000,0);run(1000,UINT32_MAX-100);failures();independent_directions();
++    }
++    stream_chunk=0;partial_streaming();
++    printf("PASS: streaming plus direct3/ring4/mesh4, 1/2/4 paths, 32000 collectives, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+-- 
+2.54.0 (Apple Git-157)
+
