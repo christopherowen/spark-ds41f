@@ -39,3 +39,14 @@ The paired, fine and paired-fine arms separate ordering from finer allocation.
 No collective arithmetic implementation is replaced, but partitioning and ring
 order can change floating-point rounding. The existing CUDA graph, exact-data,
 non-aligned fallback and cancellation checks remain mandatory.
+
+## Adaptive tiny-message threads
+
+The global 128-thread screen fills all four lanes at 128 bytes/rank but costs
+latency at larger shapes. The adaptive source adds a mode-2-only Ring rule:
+reduce threads down to 128 before dropping channels when a message is too
+small for the current four-or-more-channel budget. Large calls retain the
+original thread count, and mode 0/1 and non-Ring algorithms are unchanged.
+The adaptive profile combines this with the measured 4 MiB buffer, 512-byte
+allocation floor and Ring retention thresholds. Its own image and manifests
+preserve the earlier source and every unsuccessful screen for comparison.

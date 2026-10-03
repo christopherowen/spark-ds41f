@@ -9,8 +9,8 @@ for line in a.log.read_text().splitlines():
   ch,prev,rank,nxt=map(int,m.groups());rings[ch]={'previous':prev,'rank':rank,'next':nxt}
  m=re.search(r'Channel (\d+)/\d+ : .*\[send\] via NET/IB/(\d+)',line)
  if m:roots[int(m[1])]=int(m[2])
- m=re.search(r'Channel partition: elementBytes=(\d+) countLo=(\d+) countMid=(\d+) countHi=(\d+)',line)
- if m:parts=list(map(int,m.groups()))
+ m=re.search(r'Channel partition: elementBytes=(\d+) countLo=(\d+) countMid=(\d+) countHi=(\d+)$',line)
+ if 'Channel partition:' in line:parts=list(map(int,m.groups())) if m else None
  m=re.search(r'(AllReduce|AllGather|ReduceScatter|Broadcast): (\d+) Bytes -> Algo (\w+) proto (\w+) channel\{Lo..Hi\}=\{(\d+)..(\d+)\}',line)
  if not m:continue
  op,bs,algo,proto,lo,hi=m.groups();bs,lo,hi=map(int,[bs,lo,hi])

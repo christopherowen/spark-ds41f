@@ -1,11 +1,11 @@
 from pathlib import Path
-import subprocess,tempfile
+import subprocess,tempfile,os
 import importlib.machinery,importlib.util,argparse
 ROOT=Path(__file__).resolve().parents[2]
 loader=importlib.machinery.SourceFileLoader("spark3_nccl_rings",str(ROOT/"bin/spark3"))
 spec=importlib.util.spec_from_loader(loader.name,loader)
 spark3=importlib.util.module_from_spec(spec);loader.exec_module(spark3)
-_,_,lock=spark3.configuration(argparse.Namespace(cluster_config="experiments/2026-10-03-balanced-policy/paired.json"))
+_,_,lock=spark3.configuration(argparse.Namespace(cluster_config=os.environ.get("BALANCED_TEST_PROFILE","experiments/2026-10-03-balanced-policy/paired.json")))
 inputs=spark3.build_inputs(lock)
 prepared=spark3.build_directory(inputs)/"src/nccl"
 errors=spark3.project_problems(prepared,inputs["nccl"])

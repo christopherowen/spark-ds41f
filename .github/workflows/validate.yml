@@ -142,3 +142,15 @@ jobs:
         run: python3 experiments/2026-10-03-balanced-policy/test-policy.py
       - name: Verify fine partition boundaries preserve every element
         run: python3 experiments/2026-10-03-balanced-policy/test-allocation.py
+
+  nccl-adaptive-plans:
+    runs-on: ubuntu-latest
+    env:
+      BALANCED_TEST_PROFILE: experiments/2026-10-03-balanced-policy/adaptive.json
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/adaptive.json build prepare --only nccl
+      - run: python3 experiments/2026-10-03-balanced-policy/test-policy.py
+      - run: python3 experiments/2026-10-03-balanced-policy/test-allocation.py
+      - run: python3 experiments/2026-10-03-balanced-policy/test-threads.py
