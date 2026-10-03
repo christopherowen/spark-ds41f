@@ -3236,7 +3236,9 @@ def take_fan_control(nodes: dict, node: dict) -> dict:
     """Pause the dgx-fan-control service and select the maximum fan floor."""
     service = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0
     if service:
-        run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+        stopped = run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+        if stopped.returncode:
+            return {"service": service, "floor": False}
     floor = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "set-state", "12").returncode == 0
     return {"service": service, "floor": floor}
 
@@ -3244,8 +3246,16 @@ def take_fan_control(nodes: dict, node: dict) -> dict:
 def restore_fan_control(nodes: dict, node: dict, control: dict) -> str | None:
     """Return the node to the fan control it had before take_fan_control."""
     if control["service"]:
+        # These intentional cooling cycles can exhaust systemd's start-rate
+        # budget even though the daemon exited successfully each time.
+        reset = run_ssh(nodes, node, "sudo", "-n", "systemctl", "reset-failed", FAN_SERVICE)
+        if reset.returncode:
+            return f"FAILED: reset start-rate limit for {FAN_SERVICE}"
         restored = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
-        return FAN_SERVICE if restored.returncode == 0 else f"FAILED: {FAN_SERVICE}"
+        if restored.returncode:
+            return f"FAILED: {FAN_SERVICE}"
+        active = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE)
+        return FAN_SERVICE if active.returncode == 0 else f"FAILED: {FAN_SERVICE} is not active"
     if control["floor"]:
         restored = run_ssh(nodes, node, "sudo", "-n", "dgx-fan-control", "automatic")
         return "automatic" if restored.returncode == 0 else "FAILED: automatic"
@@ -3288,6 +3298,9 @@ def cool_nodes(
         controls = list(pool.map(lambda node: take_fan_control(nodes, node), targets))
         began = time.monotonic()
         try:
+            missing = [node["name"] for node, control in zip(targets, controls) if not control["floor"]]
+            if missing:
+                raise RuntimeError(f"cannot select maximum fan floor on {', '.join(missing)}")
             while not all(value is not None and value < below_c for value in temperatures):
                 if time.monotonic() - began > timeout_s:
                     still = ", ".join(
@@ -3306,6 +3319,10 @@ def cool_nodes(
             for record, value, control, result in zip(records, temperatures, controls, restored):
                 record.update(cooled=True, seconds=seconds, final_c=value,
                               fan_floor=12 if control["floor"] else None, restored=result)
+            failed = [f"{node['name']}: {result}" for node, result in zip(targets, restored)
+                      if str(result).startswith("FAILED")]
+            if failed:
+                raise RuntimeError("cannot restore fan control: " + "; ".join(failed))
     print("cooling: " + ", ".join(f"{r['node']} {r['final_c']:.1f} C" for r in records)
           + f" after {seconds:g} s; fans restored", flush=True)
     return records
