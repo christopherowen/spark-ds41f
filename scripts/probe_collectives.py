@@ -296,6 +296,8 @@ def main() -> None:
                                 name == 'all_gather' and adapter.should_all_gather(local, 0))
                             row['expected_backend'] = 'rocenante' if expected_custom else 'nccl'
                             proxy_after = adapter._runtime.stats()
+                            row['proxy_sequence_window'] = {
+                                'before': proxy_before['last_seq'], 'after': proxy_after['last_seq']}
                             row['proxy_payload_bytes'] = {h: after - before for h, after, before in zip(
                                 proxy_after['hcas'], proxy_after['bytes_posted_per_hca'],
                                 proxy_before['bytes_posted_per_hca'])}
