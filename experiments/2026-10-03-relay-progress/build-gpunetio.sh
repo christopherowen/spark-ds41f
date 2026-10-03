@@ -7,7 +7,12 @@ revision=586453728bcab2d4c50574924dc6cf43543c9ed4
 if [[ ! -d "$source_dir/.git" ]]; then
   git clone https://github.com/NVIDIA-DOCA/gpunetio.git "$source_dir"
 fi
-[[ -z $(git -C "$source_dir" status --porcelain --untracked-files=no) ]]
+# configure rewrites this tracked generated header. Preserve its diff in the
+# build log and reset only that reproducible build output before reapplying.
+git -C "$source_dir" diff --quiet -- . ':!include/doca_gpunetio_config.h'
+git -C "$source_dir" diff --cached --quiet
+git -C "$source_dir" diff -- include/doca_gpunetio_config.h
+git -C "$source_dir" restore --source=HEAD -- include/doca_gpunetio_config.h
 git -C "$source_dir" checkout --detach "$revision"
 [[ $(git -C "$source_dir" rev-parse HEAD) == "$revision" ]]
 # The upstream all target can link examples before the library under -j.
