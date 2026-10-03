@@ -3,7 +3,9 @@
 CPU-read the checkpoint's head.weight rows for one TP4 and one TP3 rank, pack
 them with the image's B12X, check the exact round trip, then time each row
 count under CUDA graphs with the default configuration and check accuracy
-and batch invariance. Exits non-zero on any failed check.
+and batch invariance. Reports its checks like a test suite (a FAILED line per
+failed check, then "N passed"), so the bundle uses the suite verdict, and exits
+non-zero on any failed check.
 """
 import json
 import sys
@@ -106,6 +108,11 @@ def main():
         del weight, packed
         torch.cuda.empty_cache()
     print(json.dumps({"report": report, "failures": failures}))
+    checks = sum(1 + 2 * len(entry["rows"]) for entry in report.values())  # round trip; accuracy, invariance per row count
+    for failure in failures:
+        print(f"FAILED {failure.replace(' ', '_')} - check failed")
+    summary = f"{checks - len(failures)} passed" + (f", {len(failures)} failed" if failures else "")
+    print(f"===== {summary} =====")
     sys.exit(1 if failures else 0)
 
 
