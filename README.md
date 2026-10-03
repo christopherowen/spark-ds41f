@@ -15,6 +15,11 @@ Sustained-load cooling and full-context qualification remain open. See the
 [four-path transport comparison](experiments/2026-10-02-mesh4-fourpaths/README.md).
 The promoted configuration below remains the measured three-node deployment.
 
+Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profiles/README.md)
+keep the measured limits and NCCL settings together. `bin/spark3 tuning show tp4`
+shows the candidate settings; `tuning create` generates a complete configuration
+for a site node map. The generated configuration starts with launch disabled.
+
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
 complete, files are explicit about whether they describe observed state, desired

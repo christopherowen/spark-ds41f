@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import mesh_fabric
 import kernel_readiness
 import topology
+import transport_profiles
 
 
 
@@ -976,6 +977,38 @@ def command_doctor(args: argparse.Namespace) -> int:
         findings.extend(live_doctor(cluster, nodes))
     problems, warnings = split_findings(findings)
     return report_doctor(problems, warnings, args.live)
+
+
+def command_tuning(args: argparse.Namespace) -> int:
+    if args.cluster_config != DEFAULT_CLUSTER_CONFIG:
+        raise SystemExit("tuning profiles select their pinned base; omit --cluster-config")
+    try:
+        profile, resolved = transport_profiles.resolve(ROOT, args.profiles_config, args.profile)
+        if args.tuning_command == "show":
+            print(json.dumps(profile, indent=2))
+            return 0
+        nodes_path = repository_config_path(args.nodes_config)
+        output = repository_config_path(args.output)
+        if not output.is_relative_to((ROOT / "experiments").resolve()):
+            raise ValueError("new tuning candidates belong under experiments/")
+        nodes = json.loads(nodes_path.read_text())
+        candidate = transport_profiles.materialize(
+            profile, resolved, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
+        candidate["tuning_origin"] = {
+            "catalog": args.profiles_config,
+            "catalog_sha256": hashlib.sha256(repository_config_path(args.profiles_config).read_bytes()).hexdigest(),
+            "profile": args.profile,
+            "base_config": profile["base_config"],
+            "base_sha256": profile["base_sha256"],
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("x") as handle:
+            json.dump(candidate, handle, indent=2)
+            handle.write("\n")
+    except (ValueError, OSError) as error:
+        raise SystemExit(f"invalid tuning profile: {error}") from error
+    print(f"created {output.relative_to(ROOT.resolve())} ({args.profile}, launch disabled)")
+    return 0
 
 
 def command_topology_create(args: argparse.Namespace) -> int:
@@ -4108,6 +4141,17 @@ def parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="validate repository and optional live state")
     doctor.add_argument("--live", action="store_true")
     doctor.set_defaults(func=command_doctor)
+    tuning = commands.add_parser("tuning", help="inspect or materialize named TP3/TP4 transport settings")
+    tuning.add_argument("--profiles-config", default=transport_profiles.DEFAULT_PROFILES,
+                        help="repository-relative tuning catalog (copy it to create a new experiment)")
+    tuning_commands = tuning.add_subparsers(dest="tuning_command", required=True)
+    for operation in ("show", "create"):
+        action = tuning_commands.add_parser(operation)
+        action.add_argument("profile", help="named profile: tp3 or tp4")
+        if operation == "create":
+            action.add_argument("--nodes-config", required=True, help="site node map for this topology")
+            action.add_argument("--output", required=True, help="new resolved config under experiments/")
+        action.set_defaults(func=command_tuning)
     fabric = commands.add_parser("topology", help="prepare a three- or four-node switchless configuration")
     fabric_commands = fabric.add_subparsers(dest="topology_command", required=True)
     create = fabric_commands.add_parser("create", help="write a launch-disabled candidate from this profile and a node map")
