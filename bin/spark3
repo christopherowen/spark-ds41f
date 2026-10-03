@@ -36,6 +36,7 @@ import mesh_fabric
 import kernel_readiness
 import topology
 import transport_profiles
+import model_layout
 
 
 
@@ -984,8 +985,10 @@ def command_tuning(args: argparse.Namespace) -> int:
         raise SystemExit("tuning profiles select their pinned base; omit --cluster-config")
     try:
         profile, resolved = transport_profiles.resolve(ROOT, args.profiles_config, args.profile)
+        layout = model_layout.describe(ROOT, resolved, transport_profiles.size_bytes(
+            resolved["environment"]["VLLM_ROCE_ALLREDUCE_MAX_SIZE"]))
         if args.tuning_command == "show":
-            print(json.dumps(profile, indent=2))
+            print(json.dumps({**profile, "derived_layout": layout}, indent=2))
             return 0
         nodes_path = repository_config_path(args.nodes_config)
         output = repository_config_path(args.output)
@@ -1000,6 +1003,7 @@ def command_tuning(args: argparse.Namespace) -> int:
             "profile": args.profile,
             "base_config": profile["base_config"],
             "base_sha256": profile["base_sha256"],
+            "derived_layout": layout,
         }
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("x") as handle:

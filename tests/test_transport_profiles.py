@@ -39,6 +39,39 @@ class TransportProfilesTest(unittest.TestCase):
                 self.assertNotIn("branch", result["deployment"])
                 self.assertEqual(resolved, base)
 
+    def test_derived_padding_matches_audited_layouts(self):
+        for name, expected in (("tp3", (72, 9, 25632, 129408, 768)),
+                               ("tp4", (64, 8, 25600, 129280, 576))):
+            with self.subTest(name=name):
+                _, cluster = self.resolve(name)
+                original = copy.deepcopy(cluster)
+                report = spark3.model_layout.describe(ROOT, cluster, 2097152)
+                dims = report["model_dimensions"]
+                actual = tuple(dims[key]["padded_global"] for key in (
+                    "attention_heads", "attention_output_groups", "engram_wkv_width", "target_vocabulary_rows"))
+                actual += (dims["routed_expert_intermediate_width"]["allocated_per_rank"],)
+                self.assertEqual(actual, expected)
+                self.assertEqual(cluster, original)
+                self.assertEqual(report["scheduled_rows"]["prefill_sp_min_live_rows"], 205)
+                rows = {r["live_rows"]: r for r in report["scheduled_rows"]["examples"]}
+                self.assertEqual(rows[19]["next_decode_graph_capacity_if_eligible"], 20)
+                self.assertIsNone(rows[19]["prefill_sp_collective_rows_if_eligible"])
+                self.assertEqual(rows[205]["prefill_sp_collective_rows_if_eligible"], 207 if name == "tp3" else 208)
+                self.assertEqual(rows[4096]["prefill_sp_collective_rows_if_eligible"], 4098 if name == "tp3" else 4096)
+                self.assertEqual(report["kernel_scratch"]["compact_moe_intermediate_width_when_selected"],
+                                 None if name == "tp3" else 640)
+
+    def test_layout_rejects_unaudited_sources_and_checkpoint(self):
+        _, base = self.resolve("tp4")
+        for field in ("source", "model"):
+            cluster = copy.deepcopy(base)
+            if field == "source":
+                cluster["container"]["expected_labels"]["local.spark3.b12x.tree"] = "unknown"
+            else:
+                cluster["container"]["mounts"][0][0] = "/some/other/checkpoint"
+            with self.assertRaises(ValueError):
+                spark3.model_layout.describe(ROOT, cluster, 2097152)
+
     def test_wrong_topology_rejected(self):
         profile, base = self.resolve("tp3")
         with self.assertRaisesRegex(ValueError, "does not match"):
@@ -82,6 +115,7 @@ class TransportProfilesTest(unittest.TestCase):
                 self.assertEqual(args.func(args), 0)
             generated = spark3.read_json(output)
             self.assertEqual(generated["tuning_origin"]["profile"], "tp4")
+            self.assertEqual(generated["tuning_origin"]["derived_layout"]["tensor_parallel_size"], 4)
             self.assertFalse(generated["deployment"]["launch_enabled"])
             with self.assertRaises(SystemExit):
                 args.func(args)

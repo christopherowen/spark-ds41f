@@ -33,6 +33,41 @@ The table describes policy for eligible inputs. Tensor shape, dtype, alignment
 and tiny indivisible payloads retain the documented eligibility boundaries.
 Four initialized NCCL channels do not mean every call uses all four.
 
+## Derived model layout
+
+`tuning show` also reports `derived_layout`, calculated from the pinned
+checkpoint dimensions in [model-layout.json](model-layout.json), TP size and
+the resolved graph/transport settings. Generated configs retain this report
+inside `tuning_origin`. It is documentation/provenance; serving does not read
+it as a second set of padding controls. The source audit is checked against
+the selected vLLM/B12X tree pair and mounted model snapshot before reporting.
+
+| Model dimension | TP3 | TP4 |
+| --- | --- | --- |
+| Attention heads, global | 64 → 72 | 64 |
+| Attention output groups, global | 8 → 9 | 8 |
+| Engram WKV width, global | 25,600 → 25,632 | 25,600 |
+| Target vocabulary rows, global | 129,280 → 129,408 | 129,280 |
+| Expert intermediate width, per rank | 768, exact | 576, exact |
+| Compact MoE intermediate scratch when selected | This tail path is inactive | 576 → 640 |
+
+The report separates model dimensions, kernel scratch, scheduled rows and
+transport layout. TP4 removes the listed model-dimension padding while still
+using graph-capacity, sequence-parallel and tile alignment. For example, a
+4,096-row SP prefill uses 4,098 collective rows at TP3 and 4,096 at TP4;
+205 rows become 207 and 208 respectively. Nineteen eligible decode rows map
+to a 20-row target graph in both profiles. These are rows in one forward,
+not total prompt length. Whole prompts are scheduled into prefill chunks,
+and CED compaction changes which layers process which rows.
+
+Vision weights remain replicated in both served implementations. The draft
+head shares the vocabulary partition rule, but its NVFP4 packing and auxiliary
+graph workspaces are not fully enumerated here. Experimental batch-invariant
+LM-head row duplication is not enabled. See the
+[source-level padding audit](../2026-10-03-tp3-tp4-comparison/padding.md) for
+implementation locations. Changing source trees or the checkpoint requires
+rechecking this audit; the numbers are not live kernel measurements.
+
 ## Inspect and generate
 
 ```sh
@@ -136,7 +171,7 @@ git diff --check
 These checks qualify the generator. They add no new performance or hardware
 claim to the linked experiment results.
 
-Completed locally: all **182 repository tests**, default doctor, generated TP4
+Completed locally: all **184 repository tests**, default doctor, generated TP4
 doctor using the four-node example map, verified prepared build inputs, and
 `git diff --check`. Source preparation reused the already verified
 vLLM/B12X/NCCL trees; no upstream patch changed in this task. No cluster window,
