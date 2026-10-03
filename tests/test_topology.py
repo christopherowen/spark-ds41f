@@ -92,7 +92,7 @@ class TopologyTest(unittest.TestCase):
         self.assertTrue(any("draft_tensor" in p for p in topology.problems(self.ring, self.four)))
 
     def test_qualified_ring_channels_preserve_neighbor_constraints(self):
-        for channels in ("1", "2", "4"):
+        for channels in ("1", "2", "4", "8"):
             candidate = copy.deepcopy(self.ring)
             for key in ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS"):
                 candidate["environment"][key] = channels
@@ -101,7 +101,7 @@ class TopologyTest(unittest.TestCase):
             self.assertEqual(env["NCCL_MAX_NCHANNELS"], channels)
             candidate["environment"]["NCCL_ALGO"] = "Tree"
             self.assertTrue(any("NCCL_ALGO" in p for p in topology.problems(candidate, self.four)))
-        for lower, upper in (("1", "4"), ("3", "3"), ("0", "0"), ("8", "8")):
+        for lower, upper in (("1", "4"), ("3", "3"), ("0", "0"), ("16", "16")):
             candidate = copy.deepcopy(self.ring)
             candidate["environment"].update(NCCL_MIN_NCHANNELS=lower, NCCL_MAX_NCHANNELS=upper)
             self.assertTrue(any("NCCL_MIN_NCHANNELS" in p for p in topology.problems(candidate, self.four)))

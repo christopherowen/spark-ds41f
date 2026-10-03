@@ -19,10 +19,11 @@ profiler endpoint.
 | --- | ---: | ---: | --- |
 | `cluster-relay-c1.json` | 1 | 1 MiB | Four-node serving control |
 | `cluster-relay-c4.json` | 4 | 1 MiB | Channel count only |
+| `cluster-relay-c8.json` | 8 | 1 MiB | Channel count only, after bulk qualification |
 | `cluster-relay-c4-buffer4m.json` | 4 | 4 MiB | Buffer size only, if useful |
 
-The topology validator accepts equal native min/max channel settings of 1, 2 or
-4 on four nodes. It retains all neighbor, algorithm and reachability constraints.
+The topology validator accepts equal native min/max channel settings of 1, 2, 4 or
+8 on four nodes. It retains all neighbor, algorithm and reachability constraints.
 The default generator still chooses one channel. There is no duplicate custom
 channel setting and no production environment change.
 

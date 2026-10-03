@@ -153,7 +153,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
         # neighbour rings. NCCL may use fewer channels for an individual call.
         # Keep one source of truth: the native NCCL environment settings.
         channel_keys = ("NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS")
-        allowed_channels = ("1", "2", "4") if count == 4 else ("1",)
+        allowed_channels = ("1", "2", "4", "8") if count == 4 else ("1",)
         channel_values = [str(env.get(key)) for key in channel_keys]
         if channel_values[0] not in allowed_channels or channel_values[0] != channel_values[1]:
             errors.append(
