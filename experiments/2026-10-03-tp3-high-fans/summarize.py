@@ -50,9 +50,12 @@ def main():
     for host in ("dgx1", "dgx2", "dgx3"):
         readings = [node["output"].splitlines() for sample in fan_samples
                     for node in sample["nodes"] if node["node"] == host]
+        pairs = [[int(value) for value in lines[2:-1] if value.isdecimal()] for lines in readings]
+        complete_pairs = [pair for pair in pairs if len(pair) == 2]
         result["fan_observations"]["nodes"][host] = {
             "maximum_state_every_sample": all("state=12/12" in lines[0] for lines in readings),
-            "minimum_recorded_rpm": [min(int(lines[i]) for lines in readings) for i in (2, 3)],
+            "samples_with_incomplete_rpm": len(pairs) - len(complete_pairs),
+            "minimum_recorded_rpm_from_complete_pairs": [min(pair[i] for pair in complete_pairs) for i in (0, 1)],
         }
 
     def compare(current, baseline):

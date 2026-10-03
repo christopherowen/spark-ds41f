@@ -52,4 +52,84 @@ original logs, and brief startup fan-policy interruption are retained; maximum
 fans throughout startup cannot be claimed. Maximum fans throughout measurement
 are verified separately in the sampled fan/RPM receipts.
 
-Status: benchmark running; evidence and results pending.
+## Result
+
+The combined quality/decode/prefill/prefix screen **passed**, including both
+nominal 256K requests that the earlier run could not finish. The normal runtime
+thermal guard remained enabled. No thermal slowdown, power-cap time or swap
+growth was recorded. Minimum available host memory was 6.88 GiB.
+
+Recorded peak GPU temperatures were **69 / 67 / 65 C** on dgx1/dgx2/dgx3;
+minimum thermal headroom was **22 / 21 / 27 C**. The earlier ordinary-fan
+prefill run stopped on dgx2 at 83 C with 3 C headroom. Maximum board readings
+were 77.7 / 75.7 / 71.8 C. The benchmark started with hottest-zone readings
+39.8 / 38.8 / 39.7 C after the completed 20-minute idle cooldown and startup.
+
+### Performance
+
+Aggregate decode tokens/s, three samples per point:
+
+| Workload | Published main | Previous ordinary fans | High-fan rerun |
+| --- | ---: | ---: | ---: |
+| prose-c1 | 52.8 | 50.9 | 51.4 |
+| code-c1 | 64.8 | 60.0 | 65.0 |
+| prose-c8 | 171.2 | 170.4 | 170.1 |
+| code-c8 | 195.8 | 193.9 | 193.4 |
+
+Single-stream step times were **40.744 ms prose / 45.765 ms code**, versus
+40.845/45.356 ms on published main and 41.108/45.822 ms in the preceding
+ordinary-fan screen. There is no statistically resolved decode regression
+against main. The apparent code-c1 TPS recovery from 60.0 to 65.0 comes with
+higher draft acceptance (1.874 to 2.132), while step time is nearly unchanged;
+it is not evidence of an 8% kernel speedup from cooling.
+
+| Nominal prefill length | Published main tok/s | High-fan tok/s |
+| --- | ---: | ---: |
+| 1024 | 2181.3 | 2182.9 |
+| 32768 | 3768.1 | 3794.6 |
+| 65536 | 3796.4 | 3819.2 |
+| 262144 | 3684.1 | 3703.2 |
+
+Both repetitions completed at every length. Actual input lengths match the
+published baseline, as checked by the summarizer. Prefill changes are +0.1% to
++0.7%, with all comparison intervals including zero. Prefix reuse passed:
+6.524 s cold, 0.268 s warm and 99% hit rate. Quality passed 5/5.
+
+This demonstrates successful continuous operation for this combined workload
+under the requested cooling policy. It does not establish indefinite sustained
+capacity or qualify the unbuilt explicit-policy image. The experiment bundles
+a longer idle cooldown with maximum fans throughout measurement; it cannot
+separate their effects. The previous daemon log already reported state 12 during
+its failing prefill, so the effective fan behavior and accumulated heat remain
+worth distinguishing before changing the normal fan policy. No kernel/transport
+speedup or permanent cooling change is claimed.
+
+### Evidence and restoration
+
+The 20-minute interval was 1,201.5 seconds. Every sampled fan state was 12/12.
+Available paired RPM readings stayed near maximum; see `results.json` for each
+node's minimum. One dgx2 sample at 13:09:50 UTC lacked both RPM reads; the raw
+sample is retained and the summarizer counts it as incomplete rather than
+filling it in. The pre-benchmark supervision incident above remains part of the
+record and prevents claiming uninterrupted maximum fans throughout startup.
+
+The benchmark client and all serving checkouts stayed on `6f71c3c`, with the
+same configuration hash and image as the preceding TP3 screen. Only the three
+intentional paused fan-service findings were allowed by live validation; the
+preflight and report summarizer both check that exact error set. Native thermal,
+memory and request checks were unchanged. The corrected local supervisor and
+reporting sources are retained here; no remote source edits or overlays were used.
+
+`hardware/runs.tar.gz` preserves the reports, command receipts, cooldown and
+fan/RPM samples, startup and supervision failure, host journals, and restoration.
+`hardware/sha256.json` records every file hash and the archive hash. Extract and
+reproduce the comparison with:
+
+```sh
+TMPDIR=/tmp python3 experiments/2026-10-03-tp3-high-fans/summarize.py \
+  RAW_DIRECTORY experiments/2026-10-03-tp3-high-fans/results.json
+```
+
+The cluster is stopped again, all three normal fan controllers are active, GPUs
+are idle, and the exclusive hold is released. Triangle addressing remains.
+
