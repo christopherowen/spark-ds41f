@@ -12,6 +12,7 @@ parser.add_argument('--cluster-config',default='experiments/2026-10-03-balanced-
 parser.add_argument('--output-root',default='.work/relay-progress')
 parser.add_argument('--holder',default='relay-progress')
 parser.add_argument('--source-profile',default='experiments/2026-10-03-relay-progress/source-only.json')
+parser.add_argument('--window',type=int,default=0)
 parser.add_argument('--chunk-bytes',type=int,default=0)
 parser.add_argument('--trace',action='store_true')
 parser.add_argument('--early',action='store_true')
@@ -61,6 +62,7 @@ for node in n['nodes']:
  cmd[idx:idx]=['--volume',m.repository_path(c)+'/'+str(relative)+':/opt/spark3/candidate/b12x/b12x/comm/roce/_roce_proxy.c:ro',
                 '--volume',m.repository_path(c)+'/'+str(binding_relative)+':/opt/spark3/candidate/b12x/b12x/comm/roce/_proxy.py:ro',
                 '--env','B12X_ROCE_STREAM_CHUNK_BYTES='+str(options.chunk_bytes),
+                '--env','B12X_ROCE_STREAM_WINDOW='+str(options.window),
                 '--env','B12X_ROCE_TRACE='+('1' if options.trace else '0'),
                 '--env','B12X_ROCE_TRACE_EARLY='+('1' if options.early else '0')]
  idx=cmd.index(c['container']['image'])
