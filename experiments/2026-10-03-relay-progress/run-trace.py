@@ -67,7 +67,9 @@ for node in n['nodes']:
 
  full=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8','swank@'+node['name'],shlex.join(cmd)]
  log=open(out/(node['name']+'.txt'),'w')
- p=subprocess.Popen(full,stdout=log,stderr=subprocess.STDOUT)
+ errlog=open(out/(node['name']+'-stderr.txt'),'w')
+ p=subprocess.Popen(full,stdout=log,stderr=errlog)
+ errlog.close()
  processes.append((node,p,log));(out/(node['name']+'-command.json')).write_text(json.dumps(cmd,indent=2)+'\n')
 start=time.monotonic();lastbeat=0
 while any(p.poll() is None for _,p,_ in processes):

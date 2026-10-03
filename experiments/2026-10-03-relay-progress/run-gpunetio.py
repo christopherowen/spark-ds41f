@@ -15,7 +15,7 @@ p.add_argument('run_id')
 p.add_argument('--server',type=int,default=0)
 p.add_argument('--lane',type=int,default=0,choices=(0,1))
 p.add_argument('--handler',type=int,default=1,choices=(1,2))
-p.add_argument('--source',choices=('spark','debug'),default='spark')
+p.add_argument('--source',choices=('spark','debug','syndrome','system'),default='spark')
 p.add_argument('--iterations',type=int,default=512)
 a=p.parse_args()
 l=importlib.machinery.SourceFileLoader('relay_run',str(ROOT/'bin/spark3'))
@@ -37,7 +37,7 @@ try:
   source=m.repository_path(c)+'/.work/gpunetio-586453728bca'
   hca=node['roce_peer_hcas'][str(peer['rank'])][a.lane]
   command=['env','DOCA_GPUNETIO_LOG=6','LD_LIBRARY_PATH='+source+'/lib:/usr/local/cuda-13.0/lib64','timeout','--signal=TERM','--kill-after=3','40','stdbuf','-oL',source+'/examples/gpunetio_verbs_write_lat/gpunetio_verbs_write_lat','-g','000f:01:00.0','-d',hca,'-l','3','-p',str(a.handler),'-i',str(a.iterations)]
-  if a.source=='debug':command.insert(1,'GPUNETIO_TRACE_PROGRESS=1')
+  if a.source in ('debug','syndrome','system'):command.insert(1,'GPUNETIO_TRACE_PROGRESS=1')
   if role=='client':command+=['-c',server['management_ip']]
   identity=subprocess.check_output(['ssh','swank@'+node['name'],shlex.join(['git','-C',source,'rev-parse','HEAD'])],text=True).strip()
   if identity!=json.loads((Path(__file__).parent/'gpunetio-sources.json').read_text())[a.source]:raise RuntimeError('source identity mismatch')
