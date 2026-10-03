@@ -142,8 +142,12 @@ in the packed arm on every node (packed 30.09 / 31.14 / 31.09 / 30.64 GiB,
 control 30.63 / 31.93 / 31.91 / 31.39). vLLM's own accounting does not show
 it: model loading took 73.34 GiB against 73.33, the KV cache is fixed at
 3.5 GiB, and the packed arm had 0.24 GiB more free memory when the KV cache
-was allocated. The next window should compare per-process memory after boot
-before any promotion.
+was allocated. The arms differ in one more way: the control loaded DSpark
+cost curves pinned earlier, while the packed arm, with its own new cost
+directory, profiled and pinned them at this boot. A TileLang window of the
+same change shows the same pattern. Rebooting the packed arm with its now-pinned curves,
+and comparing per-process memory after boot, separates the two before any
+promotion.
 
 ## Conclusion
 
