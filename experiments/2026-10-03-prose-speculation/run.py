@@ -83,7 +83,7 @@ def command(name, argv, timeout=900, fans=True):
 
 
 def cluster(action):
-    return ['bin/spark3', '--cluster-config', CONFIG, 'cluster', action, '--apply']
+    return ['bin/spark3', '--cluster-config', CONFIG, 'cluster', action, '--apply'] + (['--replace'] if action == 'start' else [])
 
 
 def cool(name):
