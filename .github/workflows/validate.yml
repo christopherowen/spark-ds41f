@@ -163,3 +163,13 @@ jobs:
       - run: bin/spark3 --cluster-config experiments/2026-10-03-balanced-policy/selected.json build prepare --only b12x
       - run: python3 experiments/2026-10-03-balanced-policy/test-dispatch.py
       - run: python3 experiments/2026-10-03-balanced-policy/test-relay.py
+
+  collective-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
+      - name: Prepare the explicit collective policy
+        run: bin/spark3 --cluster-config experiments/2026-10-03-collective-contract/candidate.json build prepare --only vllm,b12x
+      - name: Check dispatch limits, reporting, SP boundary and fail-stop behavior
+        run: python3 experiments/2026-10-03-collective-contract/test-contract.py

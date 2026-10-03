@@ -32,7 +32,11 @@ prepared operations may use the full registered capacity. The dispatch limit
 is validated collectively and included in peer agreement; ABI 10 rejects mixed
 implementations even when an older rank zero would ignore the new field.
 
-The legacy vLLM startup message still reports the registered all-reduce capacity.
+A source-qualified [successor contract](../2026-10-03-collective-contract/README.md)
+corrects the reporting/API and makes the selected collective policy fail-stop.
+It is not built or deployed, and does not replace this measured image.
+
+The legacy vLLM startup message in this measured image still reports the registered all-reduce capacity.
 Use `B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES` and B12X's `dispatch_max_bytes`
 statistics for the dispatch ceiling. The hardware probe asserts that observed
 RoCEnante payload counters agree with the actual backend predicate.
