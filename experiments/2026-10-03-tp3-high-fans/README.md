@@ -132,4 +132,3 @@ TMPDIR=/tmp python3 experiments/2026-10-03-tp3-high-fans/summarize.py \
 
 The cluster is stopped again, all three normal fan controllers are active, GPUs
 are idle, and the exclusive hold is released. Triangle addressing remains.
-
