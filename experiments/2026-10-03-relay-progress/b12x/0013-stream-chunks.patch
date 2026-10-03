@@ -1,4 +1,4 @@
-From 5bc094bd639b3982c6f68e92256a943ffc6d8e5f Mon Sep 17 00:00:00 2001
+From 39ec776c6d51237a3a4299d2b0e5b3840c0232e1 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <root@your.mom>
 Date: Sat, 3 Oct 2026 12:16:09 +0200
 Subject: [PATCH] Stream ring relay chunks with independent epoch readiness
@@ -6,9 +6,9 @@ Subject: [PATCH] Stream ring relay chunks with independent epoch readiness
 Base: f8069b2 plus the balanced TP4 and diagnostic patch series. Retains full-fragment GPU flags and the two-slot lifetime. Chunk flags use reserved flag-line words, RC write ordering, and the existing device-to-CPU barrier. Changes transfer timing only, preserving reduction order. Opt-in experiment, not proposed for upstream or production yet. ASAN/UBSAN protocol simulations pass 32000 collectives including delayed DMA, wrap, mismatched chunk geometry, stop, and partial readiness in both directions; hardware screen pending.
 ---
  b12x/comm/roce/_proxy.py              |  2 +-
- b12x/comm/roce/_roce_proxy.c          | 94 ++++++++++++++++++++++-----
+ b12x/comm/roce/_roce_proxy.c          | 98 ++++++++++++++++++++++-----
  tests/comm/roce_proxy_fake/simulate.c | 53 +++++++++++++--
- 3 files changed, 127 insertions(+), 22 deletions(-)
+ 3 files changed, 131 insertions(+), 22 deletions(-)
 
 diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
 index f6dfb59..f316a1f 100644
@@ -24,7 +24,7 @@ index f6dfb59..f316a1f 100644
          _LIB = lib
          return lib
 diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
-index 2e9299f..628e939 100644
+index 2e9299f..ede635e 100644
 --- a/b12x/comm/roce/_roce_proxy.c
 +++ b/b12x/comm/roce/_roce_proxy.c
 @@ -44,14 +44,14 @@
@@ -164,7 +164,7 @@ index 2e9299f..628e939 100644
      for (unsigned spins = 0;; spins++) {
          if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
              __atomic_load_n(&ctrl[2], __ATOMIC_ACQUIRE)) {
-@@ -687,7 +733,27 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+@@ -687,7 +733,31 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
              int destination = direction == 0 ? next : prev;
              uint32_t *flag = (uint32_t *)(c->region + c->flag_off +
                  (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * flag_lanes(c) + lane) * ROCE_FLAG_STRIDE);
@@ -178,6 +178,10 @@ index 2e9299f..628e939 100644
 +            uint32_t length = half_end - cursor;
 +            unsigned out_word = 0;
              uint32_t observed = __atomic_load_n(flag, __ATOMIC_ACQUIRE);
++            if ((int32_t)(observed - seq) > 0) {
++                snprintf(c->err, sizeof(c->err), "relay whole slot overwritten at seq %u", seq);
++                return -1;
++            }
 +            if (c->stream_chunk_bytes && stripe_bytes > c->stream_chunk_bytes && length) {
 +                uint32_t chunk = stream_chunk_size(c, stripe_bytes);
 +                uint32_t index = cursor / chunk;
@@ -192,7 +196,7 @@ index 2e9299f..628e939 100644
              if ((int32_t)(observed - seq) > 0) {
                  snprintf(c->err, sizeof(c->err), "relay slot overwritten: rank %d seq %u saw %u", origin, seq, observed);
                  return -1;
-@@ -702,22 +768,16 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+@@ -702,22 +772,16 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
  #else
              __sync_synchronize();
  #endif
