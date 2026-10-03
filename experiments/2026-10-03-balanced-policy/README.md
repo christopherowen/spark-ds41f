@@ -50,3 +50,18 @@ original thread count, and mode 0/1 and non-Ring algorithms are unchanged.
 The adaptive profile combines this with the measured 4 MiB buffer, 512-byte
 allocation floor and Ring retention thresholds. Its own image and manifests
 preserve the earlier source and every unsuccessful screen for comparison.
+
+## Transport handoffs
+
+Matched NCCL-only and mixed-backend screens cover 480 KiB–4 MiB BF16 and
+960 KiB–8 MiB FP32. All-reduce is tied near 1 MiB; at 2 MiB NCCL is about
+235/243 us versus RoCEnante 314/324 us (BF16/FP32). All-gather stays on
+RoCEnante through 2 MiB and benefits from NCCL above it.
+
+The selected profile tests a 1 MiB all-reduce dispatch limit and a 2 MiB
+all-gather input-shard limit. A B12X patch separates dispatch from registered
+capacity, keeping `max_size=2 MiB`, preparation capacity and vLLM's existing
+sequence-parallel threshold unchanged. The dispatch limit participates in
+collective configuration agreement; ABI 10 rejects older implementations even
+when rank 0 has the older configuration schema. Explicit prepared/priming calls
+retain the full capacity. Defaults retain the previous dispatch behavior.

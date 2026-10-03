@@ -146,6 +146,10 @@ def main() -> None:
         raise RuntimeError("PyNCCL communicator is unavailable")
 
     with prepared_rocenante(adapter, device, group.cpu_group):
+        dispatch_setting = os.environ.get('B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES')
+        if dispatch_setting is not None and (adapter is None or
+                adapter._runtime.stats().get('dispatch_max_bytes') != int(dispatch_setting)):
+            raise RuntimeError('image did not apply the requested independent dispatch limit')
         wave_setting = os.environ.get('B12X_ROCE_MESH_WAVE_BYTES')
         if wave_setting is not None and (adapter is None or
                 adapter._runtime.stats().get('mesh_wave_bytes') != int(wave_setting)):
@@ -169,7 +173,8 @@ def main() -> None:
         for dtype in (torch.bfloat16, torch.float32):
             lengths = {1, 17, 1024, 2 * 1024 * 1024}
             if adapter:
-                for limit in (adapter._runtime.max_size, adapter._runtime.max_gather_bytes):
+                for limit in (adapter._runtime.max_size, adapter._runtime.max_gather_bytes,
+                              getattr(adapter._runtime, "dispatch_max_bytes", adapter._runtime.max_size)):
                     # Exercise the exact dispatch boundary and both adjacent
                     # 16-byte packs for each operation/dtype.
                     lengths.update((limit // dtype.itemsize + offset) for offset in
@@ -287,10 +292,15 @@ def main() -> None:
                                 dev: {key: value - counters_before[dev][key] for key, value in values.items()}
                                 for dev, values in counters_after.items()}
                         if proxy_before is not None:
+                            expected_custom = (name == 'all_reduce' and adapter.should_custom_ar(local)) or (
+                                name == 'all_gather' and adapter.should_all_gather(local, 0))
+                            row['expected_backend'] = 'rocenante' if expected_custom else 'nccl'
                             proxy_after = adapter._runtime.stats()
                             row['proxy_payload_bytes'] = {h: after - before for h, after, before in zip(
                                 proxy_after['hcas'], proxy_after['bytes_posted_per_hca'],
                                 proxy_before['bytes_posted_per_hca'])}
+                            if bool(sum(row['proxy_payload_bytes'].values())) != expected_custom:
+                                raise RuntimeError(f'{name}: actual transport counters disagree with dispatch policy')
                         if ports_before is not None:
                             ports_after = port_counters()
                             row['port_deltas'] = {
