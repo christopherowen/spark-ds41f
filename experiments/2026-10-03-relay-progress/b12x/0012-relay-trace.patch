@@ -1,0 +1,192 @@
+From 608472e4d8c3f67d8dee920348d4962e78f1fc5e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 09:55:35 +0000
+Subject: [PATCH] Instrument relay progress without changing the wire protocol
+
+Base: f8069b2c0be1311df3b112591c6b8876a843f8be plus balanced-policy series through abe4b2a.
+Opt-in bounded CPU timestamps split local posts, relay, completions,
+posting cost and SQ backpressure. Optional early-flag observer measures
+readiness seen before the local GPU doorbell. No forwarding/order change.
+Quality: diagnostics perturb timings and are not serving configuration.
+Tests: 26000 simulated collectives under address/undefined sanitizers.
+Upstream status: local diagnostic experiment.
+---
+ b12x/comm/roce/_roce_proxy.c | 76 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index ef501ae..2e9299f 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -78,6 +78,13 @@ typedef struct {
+     enum ibv_mtu mtu;
+ } roce_hca_t;
+ 
++// Diagnostic-only, bounded CPU timestamps. Never enabled in serving profiles.
++#define ROCE_TRACE_CAPACITY 131072
++typedef struct {
++    uint32_t seq, nbytes, ready_mask;
++    uint64_t begin, local_end, relay_end, end, early_ns, post_ns, queue_ns;
++} roce_trace_t;
++
+ typedef struct {
+     int world;
+     int rank;
+@@ -105,6 +112,13 @@ typedef struct {
+     uint32_t last_seq;
+     uint64_t ops_posted;
+     uint64_t writes_completed;
++    roce_trace_t *trace;
++    uint32_t trace_count;
++    uint64_t trace_dropped;
++    int trace_early;
++    uint32_t early_seq;
++    uint64_t early_ns;
++    roce_trace_t *active_trace;
+     char err[512];
+ } roce_ctx_t;
+ 
+@@ -319,6 +333,13 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         snprintf(err, err_len, "out of memory");
+         return NULL;
+     }
++    const char *trace = getenv("B12X_ROCE_TRACE");
++    if (trace && !strcmp(trace, "1")) {
++        c->trace = calloc(ROCE_TRACE_CAPACITY, sizeof(*c->trace));
++        if (!c->trace) { free(c); snprintf(err,err_len,"trace allocation failed"); return NULL; }
++        const char *early = getenv("B12X_ROCE_TRACE_EARLY");
++        c->trace_early = early && !strcmp(early,"1");
++    }
+     const char *rotate = getenv("B12X_ROCE_MESH_ROTATE");
+     if (rotate && strcmp(rotate, "0") && strcmp(rotate, "1")) {
+         snprintf(err, err_len, "B12X_ROCE_MESH_ROTATE must be 0 or 1");
+@@ -489,6 +510,27 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+     return 0;
+ }
+ 
++static uint64_t trace_clock(void) {
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
++}
++
++static unsigned trace_ready(roce_ctx_t *c, uint32_t seq) {
++    unsigned mask = 0;
++    if (c->ring4 != 1) return 0;
++    for (int lane = 0; lane < c->n_stripes; lane++) {
++        for (int direction = 0; direction < 2; direction++) {
++            int origin = (c->rank + (direction ? 1 : c->world - 1)) % c->world;
++            uint32_t *flag = (uint32_t *)(c->region + c->flag_off +
++                (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * (2 * c->n_stripes) + lane) * ROCE_FLAG_STRIDE);
++            if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) == seq)
++                mask |= 1u << (lane * 2 + direction);
++        }
++    }
++    return mask;
++}
++
+ static int drain_cq(roce_ctx_t *c, int h) {
+     struct ibv_wc wc[32];
+     int n = ibv_poll_cq(c->hca[h].cq, 32, wc);
+@@ -527,6 +569,7 @@ static int post_fragment(roce_ctx_t *c, uint32_t seq,
+         roce_hca_t *hca = &c->hca[h];
+         // Two work requests per stripe; keep the queue at most a quarter
+         // full so a provider that needs extra entries can never fail a post.
++        uint64_t queue_start = c->active_trace && hca->outstanding[p] >= ROCE_SEND_DEPTH / 4 ? trace_clock() : 0;
+         while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
+             if (drain_cq(c, h) != 0) {
+                 return -1;
+@@ -541,6 +584,7 @@ static int post_fragment(roce_ctx_t *c, uint32_t seq,
+                 return -1;
+             }
+         }
++        if (queue_start) c->active_trace->queue_ns += trace_clock() - queue_start;
+         uint64_t remote = c->peer_addr[p];
+         struct ibv_sge flag_sge = {
+             .addr = (uint64_t)(uintptr_t)&seq_copy,
+@@ -583,7 +627,9 @@ static int post_fragment(roce_ctx_t *c, uint32_t seq,
+             first_wr = &data_wr;
+         }
+         struct ibv_send_wr *bad = NULL;
++        uint64_t post_start = c->active_trace ? trace_clock() : 0;
+         int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
++        if (post_start) c->active_trace->post_ns += trace_clock() - post_start;
+         if (rc != 0) {
+             set_err(c, "ibv_post_send", rc);
+             return -1;
+@@ -689,6 +735,15 @@ static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+ }
+ 
+ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
++    c->active_trace = NULL;
++    if (c->trace) {
++        if (c->trace_count < ROCE_TRACE_CAPACITY) {
++            c->active_trace = &c->trace[c->trace_count++];
++            *c->active_trace = (roce_trace_t){.seq=seq, .nbytes=nbytes,
++                .begin=trace_clock(), .ready_mask=trace_ready(c,seq),
++                .early_ns=c->early_seq == seq ? c->early_ns : 0};
++        } else c->trace_dropped++;
++    }
+     if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->slot_bytes) {
+         snprintf(c->err, sizeof(c->err), "invalid RoCE payload size %u (slot %zu)", nbytes, c->slot_bytes);
+         return -1;
+@@ -718,15 +773,19 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+             post_peer(c, seq, nbytes, c->rank, p, send) != 0) return -1;
+     }
+     }
++    if (c->active_trace) c->active_trace->local_end = trace_clock();
+     if (c->ring4 == 1) {
+         if (relay_both_directions(c, seq, nbytes) != 0) return -1;
+     }
++    if (c->active_trace) c->active_trace->relay_end = trace_clock();
+     c->ops_posted += 1;
+     for (int h = 0; h < c->n_hca; h++) {
+         if (drain_cq(c, h) != 0) {
+             return -1;
+         }
+     }
++    if (c->active_trace) c->active_trace->end = trace_clock();
++    c->active_trace = NULL;
+     return 0;
+ }
+ 
+@@ -745,6 +804,11 @@ static void *proxy_main(void *arg) {
+         if (seq == c->last_seq) {
+             idle++;
+             if (idle % 64 == 0) {
++                uint32_t next = c->last_seq + 1;
++                if (c->trace_early && c->early_seq != next && trace_ready(c, next)) {
++                    c->early_ns = trace_clock();
++                    c->early_seq = next;
++                }
+                 for (int h = 0; h < c->n_hca; h++) {
+                     if (drain_cq(c, h) != 0) {
+                         atomic_store(&c->failed, 1);
+@@ -808,6 +872,17 @@ int roce_start(roce_ctx_t *c) {
+ void roce_stop(roce_ctx_t *c) {
+     if (atomic_exchange(&c->running, 0)) {
+         pthread_join(c->thread, NULL);
++        for (uint32_t i=0;i<c->trace_count;i++) {
++            roce_trace_t *t=&c->trace[i];
++            fprintf(stderr,"ROCE_TRACE,%d,%u,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
++                c->rank,t->seq,t->nbytes,t->ready_mask,
++                (unsigned long long)t->begin,(unsigned long long)t->local_end,
++                (unsigned long long)t->relay_end,(unsigned long long)t->end,
++                (unsigned long long)t->early_ns,(unsigned long long)t->post_ns,
++                (unsigned long long)t->queue_ns);
++        }
++        if (c->trace) fprintf(stderr,"ROCE_TRACE_DROPPED,%d,%llu\n",c->rank,(unsigned long long)c->trace_dropped);
++        c->trace_count=0;
+     }
+ }
+ 
+@@ -871,5 +946,6 @@ void roce_destroy(roce_ctx_t *c) {
+             ibv_close_device(hca->ctx);
+         }
+     }
++    free(c->trace);
+     free(c);
+ }
+-- 
+2.54.0 (Apple Git-157)
+
