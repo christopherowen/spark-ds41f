@@ -28,7 +28,10 @@ jobs:
       - name: Compile helper
         run: python3 -m py_compile bin/spark3
       - name: Unit tests
-        run: python3 -m unittest discover -s tests
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --quiet --require-hashes -r requirements/bench-client.txt
+          .venv/bin/python -m unittest discover -s tests
       - name: Validate helpers
         run: |
           # scripts/ holds shell and Python helpers and JSON lab specs; check each by

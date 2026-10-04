@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import http.server
+import random
+import tempfile
 import importlib.machinery
 import importlib.util
 import json
@@ -142,6 +145,241 @@ class ParsingTest(unittest.TestCase):
         self.assertIn("syntax error", spark3.assess_lru("```python\nclass (:\n```"))
         wrong = good.replace("key, value", "k, v")
         self.assertIn("signature", spark3.assess_lru(wrong))
+
+
+HAS_JSONSCHEMA = importlib.util.find_spec("jsonschema") is not None
+needs_jsonschema = unittest.skipUnless(HAS_JSONSCHEMA, "python-jsonschema is not installed")
+
+
+class PrecisionSetTest(unittest.TestCase):
+    def test_precision_cases_use_the_1k_budget_without_forcing_length(self) -> None:
+        self.assertEqual(spark3.DECODE_CASE_GROUPS["precision"], ["prose-1k", "code-1k", "json-1k"])
+        for case in spark3.DECODE_CASE_GROUPS["precision"]:
+            spec = spark3.DECODE_CASES[case]
+            self.assertEqual(
+                (spec.max_tokens, spec.min_samples, spec.max_samples, spec.converge_on, spec.fixed_length),
+                (1024, 5, 12, "step_ms", False), case,
+            )
+            payloads = [payload for _, payload in spark3.decode_payloads("m", case, 8)]
+            self.assertEqual(len({payload["messages"][0]["content"] for payload in payloads}), 8, case)
+            for payload in payloads:
+                self.assertEqual(payload["max_tokens"], 1024)
+                self.assertNotIn("min_tokens", payload)
+                self.assertNotIn("ignore_eos", payload)
+                self.assertEqual(payload["temperature"], 0)
+                self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
+        self.assertEqual(len(spark3.DECODE_CASES["json-1k"].json_schema), 8)
+        self.assertEqual(len(set(spark3.PRECISION_JSON_PROMPTS)), 8)
+        # Every prompt names every key of its own schema, so prompt and check cannot drift.
+        for prompt, schema in zip(spark3.PRECISION_JSON_PROMPTS, spark3.PRECISION_JSON_SCHEMAS):
+            for key in schema["properties"]:
+                self.assertIn(f"{key} (", prompt)
+        self.assertEqual(spark3.json_schema_for(spark3.DECODE_CASES["json-1k"], 9), spark3.PRECISION_JSON_SCHEMAS[1])
+        # The portable protocol and the reference prompts are untouched.
+        rows = spark3.decode_payloads("m", "rows", 1)[0][1]
+        self.assertEqual((rows["max_tokens"], rows["min_tokens"]), (256, 256))
+        self.assertEqual(spark3.DECODE_CASES["prose"], spark3.DecodeCase(spark3.DECODE_PROMPTS["prose"]))
+
+    def test_structured_output_case_is_opt_in(self) -> None:
+        self.assertNotIn("json-schema-1k", spark3.DECODE_CASE_GROUPS["precision"])
+        payload = spark3.decode_payloads("m", "json-schema-1k", 1)[0][1]
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"]["type"], "array")
+        self.assertEqual(spark3.DECODE_CASES["json-schema-1k"].json_schema, payload["response_format"]["json_schema"]["schema"]["items"])
+        self.assertIn("tags (an array of two strings)", payload["messages"][0]["content"])
+        self.assertNotIn("response_format", spark3.decode_payloads("m", "json-1k", 1)[0][1])
+
+    def test_schema_key_text_describes_types_counts_and_ranges(self) -> None:
+        schema = spark3.record_schema(
+            a={"type": "string"}, b={"type": "integer"}, c=spark3.percent(), d=spark3.strings(3),
+            e={"type": "array", "items": spark3.record_schema(x={"type": "boolean"})},
+        )
+        self.assertEqual(
+            spark3.schema_key_text(schema),
+            "a (a string), b (an integer), c (a number from 0 to 100), d (an array of three strings) "
+            "and e (an array of objects with x (a boolean))",
+        )
+
+    @needs_jsonschema
+    def test_json_schema_violations_cover_the_record_shapes(self) -> None:
+        books = spark3.PRECISION_JSON_SCHEMAS[0]
+        good = {"title": "T", "author": "A", "year": 1999, "genres": ["x", "y"], "isbn": "1", "pages": 10,
+                "available": True, "rating": 4.5}
+        self.assertEqual(spark3.json_schema_violations(good, books), [])
+        bad = dict(good, year="1999", genres=["x"], rating=7, available=1, extra=None)
+        del bad["pages"]
+        found = spark3.json_schema_violations(bad, books)
+        self.assertEqual(len(found), 6)
+        # Root-level findings come first; their mutual order varies by jsonschema version.
+        self.assertEqual(set(found[:2]), {"$: Additional properties are not allowed ('extra' was unexpected)",
+                                          "$: 'pages' is a required property"})
+        self.assertIn("$.available: 1 is not of type 'boolean'", found)
+        self.assertIn("$.genres: ['x'] is too short", found)
+        self.assertIn("$.rating: 7 is greater than the maximum of 5", found)
+        self.assertIn("$.year: '1999' is not of type 'integer'", found)
+        # Booleans are not integers; integers are numbers.
+        self.assertEqual(spark3.json_schema_violations(True, {"type": "integer"}), ["$: True is not of type 'integer'"])
+        self.assertEqual(spark3.json_schema_violations(3, {"type": "number"}), [])
+        invoice = {"invoiceId": "i", "customer": "c", "issuedOn": "d", "dueOn": "d", "paid": False,
+                   "lineItems": [{"description": "x", "amountCents": 5}, {"description": "y", "amountCents": "5"}]}
+        self.assertEqual(spark3.json_schema_violations(invoice, spark3.PRECISION_JSON_SCHEMAS[6]),
+                         ["$.lineItems[1].amountCents: '5' is not of type 'integer'"])
+        # Every benchmark schema is itself a valid Draft 2020-12 schema.
+        for schema in (*spark3.PRECISION_JSON_SCHEMAS, spark3.PRECISION_JSON_SCHEMA["schema"]):
+            spark3.schema_validator(schema)
+
+    @needs_jsonschema
+    def test_json_progress_scores_objects_against_the_schema_and_saves_outputs(self) -> None:
+        schema = spark3.record_schema(a={"type": "integer"})
+        text = '[{"a": 1}, {"a": "two"}, {"a": 3'
+        scored = spark3.json_array_progress(text, schema)
+        self.assertEqual(
+            {key: scored[key] for key in ("json_objects", "json_prefix_valid", "json_valid_objects", "json_violation")},
+            {"json_objects": 2, "json_prefix_valid": True, "json_valid_objects": 1,
+             "json_violation": "$[1].a: 'two' is not of type 'integer'"},
+        )
+        self.assertEqual(json.loads(scored["json_prefix"]), [{"a": 1}, {"a": "two"}])
+        broken = spark3.json_array_progress('[{"a": }', schema)
+        self.assertEqual((broken["json_objects"], broken["json_prefix_valid"], broken["json_valid_objects"]), (0, False, 0))
+        self.assertNotIn("json_prefix", broken)
+        with tempfile.TemporaryDirectory() as tmp:
+            request = {"content": text, **scored}
+            spark3.save_output(Path(tmp), "json-1k-c2", "sample03", 1, request)
+            folder = Path(tmp) / "outputs" / "json-1k-c2"
+            self.assertEqual((folder / "sample03-stream2.txt").read_text(), text)
+            self.assertEqual(json.loads((folder / "sample03-stream2.json").read_text()), [{"a": 1}, {"a": "two"}])
+            spark3.save_output(Path(tmp), "json-1k-c2", "warmup", 0, {"content": "no json", **spark3.json_array_progress("no json", schema)})
+            self.assertFalse((folder / "warmup-stream1.json").exists())
+            spark3.save_output(None, "json-1k-c2", "sample01", 0, request)
+
+    def test_json_array_progress_scores_truncated_arrays(self) -> None:
+        text = '[{"a": 1, "t": ["x", "y]"]}, {"a": "}", "n": {"k": 2}}, {"a": 3'
+        scored = spark3.json_array_progress(text)
+        self.assertEqual((scored["json_objects"], scored["json_prefix_valid"]), (2, True))
+        self.assertEqual(scored["json_prefix"], '[{"a": 1, "t": ["x", "y]"]}, {"a": "}", "n": {"k": 2}}]')
+        self.assertEqual(spark3.json_array_progress("Sure! Here is"), {"json_objects": 0, "json_prefix_valid": False})
+        # The decoder stops at the first element that is not JSON; what came before still counts.
+        partial = spark3.json_array_progress('[{"a": 1}, {"b": }]')
+        self.assertEqual((partial["json_objects"], partial["json_prefix_valid"], partial["json_prefix"]), (1, True, '[{"a": 1}]'))
+        nothing = spark3.json_array_progress('[{"a": }')
+        self.assertEqual((nothing["json_objects"], nothing["json_prefix_valid"]), (0, False))
+        self.assertNotIn("json_prefix", nothing)
+        mixed = spark3.json_array_progress('["s", 1, {"a": 1}]')
+        self.assertEqual((mixed["json_objects"], mixed["json_prefix_valid"]), (1, True))
+        escaped = spark3.json_array_progress('[{"q": "\\\\"}, {"r": "\\"}"}')
+        self.assertEqual((escaped["json_objects"], escaped["json_prefix_valid"]), (2, True))
+
+    def test_sample_metrics_reports_primaries_and_both_throughputs(self) -> None:
+        requests = [
+            {"ok": True, "first_s": 0.5, "last_s": 10.5, "completion_tokens": 1024, "decode_tps": 102.3,
+             "ttft_s": 0.5, "output_sha256": "a", "content": '[{"a": 1}'},
+            {"ok": True, "first_s": 0.6, "last_s": 10.5, "completion_tokens": 1024, "decode_tps": 103.3,
+             "ttft_s": 0.6, "output_sha256": "b"},
+        ]
+        metrics = {"spec_decode_num_drafts": 500, "spec_decode_num_draft_tokens": 2000,
+                   "spec_decode_num_accepted_tokens": 1548}
+        entry = spark3.sample_metrics({"wall_s": 11.0, "requests": requests, "metrics": metrics}, 2)
+        self.assertEqual(entry["accepted_per_draft"], 3.096)
+        self.assertEqual(entry["accepted_per_verified"], 0.774)
+        self.assertEqual(entry["tokens_per_step"], 4.096)
+        self.assertEqual(entry["verified_per_draft"], 4.0)
+        # Two streams, 2046 tokens after their first tokens, over a 10 s window.
+        self.assertEqual(entry["decode_window_tps"], 204.6)
+        self.assertAlmostEqual(entry["step_ms"], 1000 * 4.096 * 2 / 204.6, places=2)
+        self.assertAlmostEqual(entry["derived_tps"], 204.6, places=1)
+        self.assertEqual(entry["tps"], round(2048 / 11.0, 3))
+        self.assertNotIn("content", entry["requests"][0])
+        single = spark3.sample_metrics({"wall_s": 11.0, "requests": requests[:1], "metrics": metrics}, 1)
+        self.assertAlmostEqual(single["step_ms"], 1000 * 4.096 / 102.3, places=2)
+        self.assertEqual(spark3.convergence_values([entry, single], "step_ms"), [entry["step_ms"], single["step_ms"]])
+        self.assertEqual(spark3.convergence_values([entry, single], "tps"), [entry["tps"], single["tps"]])
+        # A failed stream leaves the step time undefined rather than wrong.
+        broken = [dict(requests[0]), dict(requests[1], ok=False)]
+        self.assertIsNone(spark3.sample_metrics({"wall_s": 11.0, "requests": broken, "metrics": metrics}, 2)["step_ms"])
+        # Older reports kept only single-stream requests; their step times still derive.
+        legacy = [{"accepted_per_draft": 3.0, "requests": [{"ok": True, "decode_tps": 100.0}]}]
+        self.assertEqual(spark3.sample_step_times(legacy), [40.0])
+
+    def test_decode_plan_applies_case_floors_and_cli_override(self) -> None:
+        options = argparse.Namespace(min_samples=3, max_samples=4, converge_on=None)
+        spec, concurrency, metric, minimum, maximum = spark3.decode_plan(options, "json-1k-c8")
+        self.assertEqual((spec, concurrency, metric, minimum, maximum), (spark3.DECODE_CASES["json-1k"], 8, "step_ms", 5, 12))
+        self.assertEqual(spark3.decode_plan(options, "prose-c1")[2:], ("tps", 3, 4))
+        options.converge_on = "accepted_per_verified"
+        self.assertEqual(spark3.decode_plan(options, "json-1k-c1")[2], "accepted_per_verified")
+        options.min_samples, options.max_samples = 8, 20
+        self.assertEqual(spark3.decode_plan(options, "json-1k-c1")[3:], (8, 20))
+
+    @needs_jsonschema
+    def test_suite_decode_applies_case_floors_and_scores_json(self) -> None:
+        class StubBench:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, bool]] = []
+
+            def run(self, label, payloads, concurrency=None, keep_content=False, retries=3):
+                self.calls.append((label, keep_content))
+                streams = len(payloads)
+                requests = [
+                    {"ok": True, "ttft_s": 0.3, "first_s": 0.3, "last_s": 10.3, "prompt_tokens": 50,
+                     "completion_tokens": 1024, "decode_tps": 100.0, "output_sha256": f"{len(self.calls)}-{index}",
+                     "reasoning_chars": 0, "content_chars": 20, "error": None,
+                     "content": '[{"a": 1}, {"b": 2}, {"c": '}
+                    for index in range(streams)
+                ]
+                metrics = {"spec_decode_num_drafts": 250 * streams, "spec_decode_num_draft_tokens": 1000 * streams,
+                           "spec_decode_num_accepted_tokens": 774 * streams}
+                return {"wall_s": 10.6, "requests": requests, "metrics": metrics, "peak": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            options = argparse.Namespace(decode_cases=["json-1k"], concurrency=[1, 2], model="m",
+                                         min_samples=3, max_samples=4, precision=2.0, converge_on=None,
+                                         output_dir=Path(tmp))
+            bench = StubBench()
+            report = spark3.suite_decode(bench, options, random.Random(0))
+            saved = sorted(path.name for path in (Path(tmp) / "outputs" / "json-1k-c2").iterdir())
+        self.assertIn("warmup-stream2.txt", saved)
+        self.assertIn("sample05-stream1.json", saved)
+        self.assertEqual(len(saved), 2 * 2 * 6)
+        point = report["points"]["json-1k-c2"]
+        # The stub's objects lack the books keys, so none conform.
+        self.assertEqual(point["json_schema_valid"], 0.0)
+        self.assertRegex(point["json_violation_example"], r"^\$\[0\]: .*(required property|Additional properties)")
+        # Constant samples converge at once, so the case floor of five decides.
+        self.assertEqual(point["step_ms"]["n"], 5)
+        self.assertEqual(point["converge_on"], "step_ms")
+        self.assertEqual(point["accepted_per_verified"]["mean"], 0.774)
+        self.assertEqual(point["tokens_per_step"]["mean"], 4.096)
+        self.assertEqual(point["derived_tps"]["n"], 5)
+        self.assertEqual(point["json_objects"]["mean"], 2.0)
+        self.assertEqual(point["json_prefix_valid"], 1.0)
+        self.assertEqual(point["full_length_outputs"], 10)
+        self.assertEqual(point["max_tokens"], 1024)
+        self.assertTrue(all(keep for _, keep in bench.calls))
+        self.assertNotIn("content", report["samples"]["json-1k-c2"][0]["requests"][0])
+        self.assertEqual(len(bench.calls), 2 + 5 * 2)
+
+    def test_primary_rows_show_both_throughputs_and_warn_on_short_outputs(self) -> None:
+        stat = lambda mean: {"n": 5, "mean": mean, "ci95_pct": 1.5}
+        points = {
+            "json-1k-c2": {
+                "step_ms": stat(40.0), "accepted_per_verified": stat(0.77), "tokens_per_step": stat(4.1),
+                "tps": stat(190.0), "decode_window_tps": stat(204.6), "derived_tps": stat(205.0),
+                "max_tokens": 1024, "full_length_outputs": 9, "failed_requests": 0,
+                "json_objects": stat(22.4), "json_prefix_valid": 0.9, "json_schema_valid": 0.98,
+                "json_violation_example": "$[3].year: expected integer, got str",
+            },
+            "prose-c1": {"tps": stat(57.0)},
+        }
+        lines = spark3.decode_primary_rows(points)
+        self.assertTrue(lines[0].startswith("decode primaries"))
+        self.assertIn("40.00 ±1.5%", lines[1])
+        self.assertIn("190.0 ±1.5% /", lines[1])
+        self.assertIn("205.0 ±1.5%", lines[1])
+        self.assertIn("WARN json-1k-c2: 1 of 10 outputs stopped before 1024 tokens", lines[2])
+        self.assertIn("JSON: 22.4 ±1.5% completed objects per output, prefix parses 0.9, objects conform 0.98", lines[3])
+        self.assertIn("first violation: $[3].year: expected integer, got str", lines[4])
+        self.assertIn("WARN json-1k-c2: some outputs are not JSON arrays", lines[5])
+        self.assertEqual(len(lines), 6)
 
 
 class AdmissionPayloadTest(unittest.TestCase):
