@@ -224,6 +224,53 @@ class TopologyTest(unittest.TestCase):
         self.base["environment"]["B12X_ROCE_TOPOLOGY"] = "ring4"
         self.assertTrue(any("B12X_ROCE_TOPOLOGY" in p for p in topology.problems(self.base, self.three)))
 
+    def sparknet(self):
+        """The sparknet candidate on the example ring map, with its lock."""
+        experiment = "experiments/2026-10-04-tilelang-sparknet"
+        cluster = spark3.read_json(f"{experiment}/candidate.json")
+        cluster["distributed"]["master_addr"] = next(n for n in self.four["nodes"] if n.get("head"))["management_ip"]
+        return cluster, spark3.read_json(f"{experiment}/upstreams.lock.json")
+
+    def test_oneshot_ring4_runs_sparknet_under_its_own_names(self):
+        cluster, lock = self.sparknet()
+        self.assertEqual(topology.transport(cluster), "oneshot-ring4")
+        self.assertEqual(topology.problems(cluster, self.four), [])
+        self.assertEqual([p for p in spark3.local_doctor(cluster, self.four, lock) if not isinstance(p, spark3.Warn)], [])
+        for node in self.four["nodes"]:
+            env = spark3.expected_environment(cluster, node)
+            self.assertEqual(env["SPARKNET_ROCE_TOPOLOGY"], "ring4")
+            self.assertEqual(set(json.loads(env["SPARKNET_ROCE_PEER_HCAS"])),
+                             {str((node["rank"] - 1) % 4), str((node["rank"] + 1) % 4)})
+            self.assertEqual(env["SPARKNET_ROCE_GID_INDEX"], str(node.get("roce_gid_index", 3)))
+            self.assertFalse([k for k in env if k.startswith("B12X_ROCE_") or k in topology.B12X_VLLM_SETTINGS])
+            self.assertNotIn("--disable-custom-all-reduce", spark3.expected_command(cluster, node))
+        self.assertEqual(spark3.roce_gid_setting(cluster, self.four["nodes"][1])[0],
+                         self.four["nodes"][1].get("roce_gid_index", 3))
+
+    def test_oneshot_refuses_b12x_settings_and_mismatched_images(self):
+        cluster, lock = self.sparknet()
+        for key, value in (("VLLM_ENABLE_ROCE_ALLREDUCE", "1"), ("B12X_ROCE_TOPOLOGY", "ring4"),
+                           ("VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB")):
+            changed = copy.deepcopy(cluster)
+            changed["environment"][key] = value
+            self.assertTrue(any(key in p for p in topology.problems(changed, self.four)), key)
+        changed = copy.deepcopy(cluster)
+        changed["environment"]["SPARKNET_ROCE_TOPOLOGY"] = "direct"
+        self.assertTrue(any("SPARKNET_ROCE_TOPOLOGY" in p for p in topology.problems(changed, self.four)))
+        changed = copy.deepcopy(cluster)
+        changed["serve_args"].append("--disable-custom-all-reduce")
+        self.assertTrue(any("custom all-reduce enabled" in p for p in topology.problems(changed, self.four)))
+        relay = spark3.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
+        relay["environment"]["SPARKNET_ROCE_SPIN_LIMIT"] = "1"
+        self.assertTrue(any("does not run sparknet" in p for p in topology.problems(relay, self.four)))
+        # A sparknet image serves only oneshot-*; oneshot-* needs that image.
+        b12x = copy.deepcopy(cluster)
+        b12x["fabric"]["transport"] = "rocenante-ring4"
+        self.assertTrue(any("serves sparknet's oneshot-* transports" in str(p)
+                            for p in spark3.local_doctor(b12x, self.four, lock)))
+        older = spark3.read_json("experiments/2026-10-04-tilelang-mhc/upstreams.lock.json")
+        self.assertTrue(any("requires an image with" in str(p) for p in spark3.local_doctor(cluster, self.four, older)))
+
     def test_create_never_overwrites_an_existing_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

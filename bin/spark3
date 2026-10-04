@@ -366,6 +366,18 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.b12x.tree")
         if label != record["expected_tree"]:
             problems.append(f"{mode} image tree does not match its source manifest")
+    # sparknet's transports run only on an image built with sparknet's
+    # collectives, and such an image serves only sparknet's transports.
+    sparknet_image = SPARKNET_CAPABILITY in source_manifest.get("vllm", {}).get("capabilities", [])
+    if topology.is_sparknet(topology.transport(cluster)):
+        if not sparknet_image or "sparknet" not in upstreams["sources"] or "sparknet" not in source_manifest:
+            problems.append(f"{topology.transport(cluster)} requires an image with {SPARKNET_CAPABILITY} and the lock's sparknet source")
+        else:
+            label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.sparknet.tree")
+            if label != source_manifest["sparknet"]["expected_tree"]:
+                problems.append("sparknet image tree does not match its source manifest")
+    elif sparknet_image and topology.one_shot_topology(topology.transport(cluster)) is not None:
+        problems.append(f"an image with {SPARKNET_CAPABILITY} serves sparknet's oneshot-* transports, not {topology.transport(cluster)}")
     if topology.transport(cluster) == "rocenante-mesh4":
         if cluster.get("fabric", {}).get("mesh_paths", 2) == 4 and "rocenante-mesh4-fourpaths" not in source_manifest["b12x"].get("capabilities", []):
             problems.append("four-path mesh requires its source capability")
@@ -763,7 +775,8 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
     """The GID index B12X and NCCL are configured to use, and the node's HCAs."""
     env = expected_environment(cluster, node)
-    key = "NCCL_IB_GID_INDEX" if topology.transport(cluster) == "nccl-ring" else "B12X_ROCE_GID_INDEX"
+    mode = topology.transport(cluster)
+    key = f"{topology.ONE_SHOT[mode][0]}_GID_INDEX" if mode in topology.ONE_SHOT else "NCCL_IB_GID_INDEX"
     index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
     hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
     return index, hcas
@@ -1939,6 +1952,8 @@ OPTIONAL_BUILD_PROJECTS = ("tilelang", "tile_kernels")
 # Built when the lock lists it, independently: sparknet's one-shot RoCE
 # collectives, installed on the TileLang runtime.
 INDEPENDENT_BUILD_PROJECTS = ("sparknet",)
+# The vLLM capability of images whose TileLang family runs sparknet's collectives.
+SPARKNET_CAPABILITY = "tilelang-sparknet-collectives"
 BUILD_PARTS = ("vllm", "b12x", "nccl", "cutlass", "wheels")
 BUILD_CONTEXTS = (
     "vllm-source", "b12x-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions"

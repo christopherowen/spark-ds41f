@@ -339,7 +339,7 @@ class KernelBackendTest(unittest.TestCase):
         cluster["distributed"]["master_addr"] = self.nodes["nodes"][0]["management_ip"]
         inputs = spark3.build_inputs(lock)
         self.assertEqual(spark3.build_projects(inputs)[-1], "sparknet")
-        self.assertEqual(inputs["sparknet"]["version"], "0.1.0")
+        self.assertEqual(inputs["sparknet"]["version"], "0.2.0")
         self.assertEqual(spark3.build_contexts(inputs)[-1], "sparknet-source")
         self.assertEqual(spark3.runtime_stage(inputs), "runtime-tilelang-sparknet")
         without_tilelang = {name: value for name, value in inputs.items() if name not in kernel_backend.SOURCES}
@@ -352,14 +352,14 @@ class KernelBackendTest(unittest.TestCase):
                 mock.patch.object(spark3, "repository_revision", return_value="0" * 40), \
                 contextlib.redirect_stdout(output):
             spark3.command_build_image(argparse.Namespace(cluster_config="c.json", tag=None, apply=False))
-        for expected in ("RUNTIME_STAGE=runtime-tilelang-sparknet", "SPARKNET_VERSION=0.1.0",
-                         "SPARKNET_TREE=6b215155e033607ee02c7bbce726e483853537ae",
+        for expected in ("RUNTIME_STAGE=runtime-tilelang-sparknet", "SPARKNET_VERSION=0.2.0",
+                         "SPARKNET_TREE=bd4191b3241383e8ecb705ad291f2da5b064370f",
                          "--build-context sparknet-source=", "--build-context tilelang-source="):
             self.assertIn(expected, output.getvalue())
         script = spark3.smoke_script(lock)
         compile(script, "smoke", "exec")
         for expected in ("from sparknet.integration.vllm import SparknetOneShotAllReduce",
-                         "version(\"dgx-spark-networking\") == '0.1.0'", "roce_abi_version()"):
+                         "version(\"dgx-spark-networking\") == '0.2.0'", "roce_abi_version()"):
             self.assertIn(expected, script)
 
     def test_smoke_imports_tilelang_and_the_capability_module(self):
