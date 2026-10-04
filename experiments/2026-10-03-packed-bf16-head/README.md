@@ -16,13 +16,17 @@ extending the candidate's series with
 [B12X 0012](b12x/0012-packed-bf16-vocab-projection.patch) and
 [vLLM 0028](vllm/0028-deepseek-v41-packed-bf16-lm-head.patch).
 
-**Status:** image `vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-packedhead-v1`
-(`sha256:5e112503…`) built on dgx4 from `2ed0fd8` with the regular
-`bin/spark3 build` commands and loaded on dgx1–dgx3. Its kernel bundles pass on
-dgx4 (2026-10-03 22:16–22:18 UTC): B12X 15 passed, vLLM 2 passed, head bench
-26 checks passed. The TP4 window (22:19–22:36 UTC) measured 0.44 ms less head
-time per decode step and a 0.60 ms shorter step-end tail, with throughput
-level within the benchmark's noise; see [TP4 window](#tp4-window).
+**Status:** the candidate runs image `-packedhead-v3` (`sha256:97373157…`, built on dgx4
+from `3525568`), which packs the head in its own storage. Its bundles pass
+(B12X 17, vLLM 2, head bench 26). Serving saves 0.44 ms of vocabulary-head time
+per decode step with throughput level within the benchmark's noise
+([TP4 window](#tp4-window)), and uses 200–550 MiB less host memory per node
+than the BF16 head ([host memory](#host-memory-pack-in-place)).
+
+History: image `-packedhead-v1` (`sha256:5e112503…`, from `2ed0fd8`) carried
+the first, out-of-place packer and ran the first TP4 window
+(2026-10-03 22:19–22:36 UTC); `-packedhead-v2` (`sha256:0b838fdd…`, from
+`c62f9b2`) carried the fused out-of-place packer.
 
 ## Why
 
@@ -140,7 +144,7 @@ six-row steps, main stream) show the effect directly:
 Under serving the packed read saves 18% rather than the 24% of the offline
 bench, because the L2 prefetch and collectives share the bandwidth.
 
-### Host memory: the first packer leaked, the fused packer saves
+### Host memory: pack in place
 
 The first packer (image `-packedhead-v1`, used in the window above) built the
 format with generic tensor operations over 4,096-row slices: it widened the
@@ -208,8 +212,19 @@ carve-out move (a copy, after which the original storage is freed):
 | Out-of-place packer (v2) | +778 MiB | 249 MiB |
 | In-place packer (v3) | +373 MiB | 249 MiB |
 
-[packed-v3.json](packed-v3.json) is the v3 window arm. Until a serving window confirms the
-result, the item stays open and blocks promotion.
+[packed-v3.json](packed-v3.json) is the v3 window arm. Serving confirmed it as the base arm
+of the TP4 memory screen (2026-10-04 07:14–07:22 UTC, `experiments/2026-10-04-tp4-memory-tuning`
+on branch `tp4-memory-tuning`): decode 61.7 / 215.3 tok/s prose and 80.5 /
+250.2 code, quality 5/5, and host memory used at the end of the arm
+
+| dgx1–dgx4 (MiB) | dgx1 | dgx2 | dgx3 | dgx4 |
+| --- | ---: | ---: | ---: | ---: |
+| BF16-head boots (range) | 96,020–96,351 | 94,850–95,098 | 94,840–94,900 | 95,480–95,563 |
+| Packed v1 / v2 | 96,790 / 96,800 | 95,609 / 95,524 | 95,611 / 95,538 | 96,221 / 96,173 |
+| Packed v3, in place | 95,802 | 94,648 | 94,529 | 95,195 |
+
+v3 uses 200–550 MiB less than any BF16-head boot on every node. The memory
+item is resolved.
 
 ## Conclusion
 
