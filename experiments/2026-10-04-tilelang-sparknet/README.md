@@ -45,14 +45,46 @@ the measured fabric profiles. This experiment serves them from sparknet.
 `-tilelang-sparknet-v2` image and the `oneshot-ring4` transport. (`-v1`
 carried sparknet 0.1.0 with its aliases; it was not served.)
 
+## Results
+
+**Collective probe.** `bin/spark3 topology probe` ran on all four nodes at
+once with the candidate (numerics and benchmark), in vLLM's own TP
+communicator, which logged `SPARKNET_ONESHOT` as its collective policy:
+
+- every rank passed 20 checks and 8 exact BF16/FP32 numerical checks on
+  transport `oneshot-ring4`;
+- the runtime applied the requested settings: topology `ring4`, two stripes,
+  2 MiB capacity and all-gather limit, 1 MiB dispatch limit, spin limit
+  5,000,000;
+- each rank posted 17,601 operations;
+- a 5,120-element BF16 all-reduce took about 15 µs.
+
+**Serving**, against the mHC candidate (the same image line on B12X's
+collectives):
+
+| | Control (B12X collectives) | sparknet | Change |
+| --- | ---: | ---: | --- |
+| Step time, prose c1 | 33.20 ms | 33.12 ms | −0.2% [−0.6, +0.1], same |
+| Step time, code c1 | 36.65 ms | 36.46 ms | −0.5% [−1.1, +0.1], same |
+| Decode, prose c8 | 215.8 tok/s | 218.3 tok/s | +1.1% [−2.6, +4.9], same |
+| Decode, code c8 | 252.6 tok/s | 251.6 tok/s | −0.4% [−3.2, +2.5], same |
+| Prefill, 32,768 tokens | 4,881 tok/s | 4,919 tok/s | +0.8% [−7.8, +9.3], same |
+| Prefill, 262,144 tokens | 4,631 tok/s | 4,678 tok/s | +1.0% [−1.5, +3.6], same |
+
+Quality passed 5 of 5. The serving log names `SPARKNET_ONESHOT`. In the
+single-stream decode profile, sparknet's one-shot kernels replace B12X's one
+for one, at the same launch counts:
+
+- the all-reduce goes from 5.28 to 4.99 ms per scheduler step, much of it
+  waiting on peers;
+- the all-gather goes from 0.35 to 0.31 ms.
+
+B12X's share of decode GPU time falls to 6.1%: its dense GEMM, attention
+rotary, BF16 GEMV and KV-cache kernels.
+
 ## Procedure
 
-sparknet had not run on the Sparks as a package, so the fabric is qualified
-before serving, inside one window with serving stopped:
-
-1. Build `-tilelang-sparknet-v1`; run the [tests](bundles/tests/candidate.json)
-   bundle.
-2. Run `bin/spark3 topology probe` on all four nodes with the candidate.
-   This exercises vLLM's TP communicator, now sparknet's, with CUDA graphs.
-3. Boot the mHC candidate (the control) and this arm in turn: decode at one
-   and eight streams, prefill, and the single-stream decode profile for each.
+`-tilelang-sparknet-v2` passed the tests bundle (97 of 97). One window ran
+the collective probe on all four nodes, then booted the mHC candidate (the
+control) and this arm in turn: decode at one and eight streams, prefill, and
+the single-stream decode profile for each.
