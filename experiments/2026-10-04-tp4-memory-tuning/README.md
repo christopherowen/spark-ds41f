@@ -237,7 +237,8 @@ way oldest first as long sequences run.
 
 [candidate.json](candidate.json) is the recipe, launch disabled. It runs the
 [streamed vocabulary weights](../2026-10-04-streamed-embeddings/README.md)
-image (`-r5o-roce-contract-streamed-v1`), with:
+series plus [0039](vllm/0039-dummy-context-disjoint-blocks.patch) (image
+`-r5o-roce-contract-tp4-1m-v1`, not built yet), with:
 
 - `--max-model-len` 1,048,576;
 - `--max-num-seqs` 16, with CUDA graphs up to 96 rows;
@@ -253,6 +254,29 @@ packed target head, and the audit lists this image's vLLM and B12X trees.
 Their changes from the audited TP4 trees are the packed head, its B12X
 kernel, and the carve-out. None of them pads or partitions anything
 differently.
+
+## Fabricated profiling context (vLLM 0039)
+
+DSpark's startup cost profile fabricates 8,192 tokens of context per dummy
+request, and `set_dummy_context` gave every KV cache group the same block
+ids, request after request from block 0. The 17 groups draw from one pool
+and overlay the same memory; the allocator gives a block to one group and
+request at a time, and block 0 is the null block. At 16 sequences the
+drafter's sliding window read bytes another group had written in its own
+format, and its first attention layer returned non-finite rows for one
+dummy request. B12X's router routes them without complaint, so this recipe
+started and pinned cost curves from that profile; TileKernels' gate refuses
+them, which is how the [TileLang 1M](../2026-10-04-tilelang-1m/README.md)
+experiment found it. Serving never shares a block.
+
+[0039](vllm/0039-dummy-context-disjoint-blocks.patch) gives each request of
+each group its own whole blocks after the null block. The recipe now has its
+own [series](vllm/series), [lock](upstreams.lock.json) and
+[source manifest](source.json): the streamed-embeddings series plus 0039. It
+profiles into a fresh cost directory (`ring4-tp4-1m-20261005`), so the
+pinned curves come from valid reads. The model layout audit lists the new
+vLLM tree with the recipe's B12X tree. The image is not built or measured
+yet.
 
 ## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
