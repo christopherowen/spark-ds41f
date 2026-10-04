@@ -43,8 +43,11 @@ Values whose exponent falls outside the window are exceptions: their slot holds
 after the main dot product. A row is `K` sign-and-mantissa bytes followed by
 `K/2` code bytes, 7,680 bytes for K = 5,120.
 
-Packing runs once after loading and refuses to start unless unpacking
-reproduces every input bit. The checkpoint (`dba1be0a…`) has no zero or
+Packing runs once after loading as three fused GPU passes over the BF16
+weight (exponent histogram, per-row exception counts, then the packed bytes
+and exceptions), allocating nothing large but its result. The write pass
+decodes every value it encodes and packing refuses to start unless all of
+them match the source bits. The checkpoint (`dba1be0a…`) has no zero or
 subnormal values in `head.weight` and uses 31 exponents (97–127); the best
 window, 112–126, leaves about 1.6 values in 10,000 as exceptions:
 
@@ -137,27 +140,34 @@ six-row steps, main stream) show the effect directly:
 Under serving the packed read saves 18% rather than the 24% of the offline
 bench, because the L2 prefetch and collectives share the bandwidth.
 
-Open item, blocking promotion: the packed head costs host memory instead of
-saving it. At the end of each arm (`free -m` on every node, after the bench
-and profile), the B12X packed arm used 96,790 / 95,609 / 95,611 / 96,221 MiB
-on dgx1–dgx4, 570–760 MiB more than any of three B12X boots without it
-(96,020–96,220 / 94,850–94,931 / 94,840–94,900 / 95,480–95,563 MiB across
-rounds 2 and 3 of the TileLang screen and this control). The TileLang packed
-arm was likewise above every other TileLang boot, by 64–573 MiB. The format
-alone should save 79 MiB. Ruled out so far:
+### Host memory: the first packer leaked, the fused packer saves
 
-- vLLM's model and KV accounting: loading took 73.34 GiB against 73.33, the
-  KV cache is fixed at 3.5 GiB, and free memory at KV allocation was 0.24 GiB
-  higher in the packed arm.
-- Fresh DSpark cost-curve profiling at boot: round 2's B12X boot also
-  profiled fresh curves and used normal memory.
-- Compiler residency: on dgx4, preparing the packed projection with a cold
-  Triton cache leaves 56 MiB resident in the process, 5 MiB with a warm one.
-- CUDA contexts in compile workers: B12X's compile pool hides the GPU from
-  its workers.
+The first packer (image `-packedhead-v1`, used in the window above) built the
+format with generic tensor operations over 4,096-row slices: it widened the
+16-bit weights to 32-bit integers, built full-size exponent, code, mask and
+low-byte arrays, and unpacked each slice again to verify. That peaked at about
+1.2 GiB of temporaries per shard, and on GB10's unified memory most of what
+they touched was not handed back to the system after torch released it. At the
+end of each arm the packed arm used 570–760 MiB more host memory than any of
+three B12X boots without it (TileLang: 64–573 MiB more than any other TileLang
+boot), although vLLM's model and KV accounting were equal and the old BF16
+tensor was freed.
 
-vLLM's "graph capturing took" figure is not usable here; it ranged from 0.07
-to 1.26 GiB across identical B12X configurations.
+A stage-by-stage test on dgx4 (TP4-sized head through vLLM's own path, packed
+and BF16 each in a fresh process, host memory used relative to a CUDA context)
+located and confirmed it:
+
+| Stage | BF16 head | First packer | Fused packer |
+| --- | ---: | ---: | ---: |
+| Head loaded | +326 MiB | +312 MiB | +319 MiB |
+| After packing | +326 MiB | +1,589 MiB | +617 MiB |
+| After releasing the allocator cache | +326 MiB | +1,408 MiB | +298 MiB |
+| After B12X preparation and 10 graph captures | +829 MiB | +1,555 MiB | +520 MiB |
+
+The fused packer (image `-packedhead-v2`) peaks at the old weight plus its
+result and ends below the BF16 head. With the display carve-out holding the
+head in serving, the expected difference there is the format's own 79 MiB per
+TP4 rank; the v2 window checks it.
 
 ## Conclusion
 

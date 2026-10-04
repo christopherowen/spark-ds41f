@@ -1,4 +1,4 @@
-From a50af346ab7dfa66fe1bfd063078f4cd6775de8f Mon Sep 17 00:00:00 2001
+From aec30ab24bf31db45b751488f04526042bc8571f Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 23:43:45 +0200
 Subject: [PATCH] feat(gemm): vocabulary projection over exact 12-bit packed
@@ -11,9 +11,14 @@ bytes. Each value keeps its sign and mantissa in one byte and its exponent
 in a 4-bit code over a 15-exponent window chosen per tensor; code 0 keeps
 exponent 0, so zeros and subnormals are exact. Values outside the window
 are stored exactly in a per-row exception list and added after the main
-dot product. pack() verifies that every bit round-trips and refuses
-otherwise, so the packed tensor is the checkpoint tensor in 75% of the
-bytes.
+dot product. pack() runs three fused passes over the BF16 weight
+(exponent histogram, per-row exception counts, then the packed bytes and
+exceptions) and allocates nothing large but its result; the write pass
+decodes every value it encodes and pack() refuses unless all of them match
+the source bits, so the packed tensor is the checkpoint tensor in 75% of
+the bytes. Packing with generic tensor operations instead needed about
+1 GiB of transient intermediates per 32,320-row shard, which a GB10's
+unified memory did not hand back to the system.
 
 The Triton projection decodes in registers and accumulates in FP32 on
 tensor cores. Each output sums its row's 128-column groups in order and
@@ -27,22 +32,23 @@ row.
 
 Quality: lossless storage; logits differ from cuBLAS BF16 only by FP32
 accumulation order. Tests: exact round trip including zeros, subnormals,
-infinities and out-of-window values; reference match; bit-identical
-logits across batch sizes and every tile configuration; CUDA graph
-replay; shared-memory model against compiler limits; registry contract.
+infinities and out-of-window values; packing allocates within 64 KiB of
+its result; reference match; bit-identical logits across batch sizes and
+every tile configuration; CUDA graph replay; shared-memory model against
+compiler limits; registry contract.
 Upstream-status: local experiment, not submitted.
 ---
  b12x/__init__.py                              |   1 +
  b12x/gemm/__init__.py                         |   3 +
- .../packed_bf16_vocab_projection/__init__.py  |  60 +++++++
- .../_contracts.py                             |  97 +++++++++++
- .../packed_bf16_vocab_projection/_format.py   | 138 +++++++++++++++
- .../packed_bf16_vocab_projection/_kernel.py   | 114 ++++++++++++
- .../_preparation.py                           |  99 +++++++++++
- .../packed_bf16_vocab_projection/_tuning.py   | 160 +++++++++++++++++
- b12x/gemm/packed_bf16_vocab_projection/api.py |  31 ++++
- .../gemm/test_packed_bf16_vocab_projection.py | 164 ++++++++++++++++++
- 10 files changed, 867 insertions(+)
+ .../packed_bf16_vocab_projection/__init__.py  |  60 ++++++
+ .../_contracts.py                             |  97 ++++++++++
+ .../packed_bf16_vocab_projection/_format.py   | 177 +++++++++++++++++
+ .../packed_bf16_vocab_projection/_kernel.py   | 114 +++++++++++
+ .../_preparation.py                           |  99 ++++++++++
+ .../packed_bf16_vocab_projection/_tuning.py   | 160 ++++++++++++++++
+ b12x/gemm/packed_bf16_vocab_projection/api.py |  31 +++
+ .../gemm/test_packed_bf16_vocab_projection.py | 181 ++++++++++++++++++
+ 10 files changed, 923 insertions(+)
  create mode 100644 b12x/gemm/packed_bf16_vocab_projection/__init__.py
  create mode 100644 b12x/gemm/packed_bf16_vocab_projection/_contracts.py
  create mode 100644 b12x/gemm/packed_bf16_vocab_projection/_format.py
@@ -256,10 +262,10 @@ index 00000000..c2e26108
 +__all__ = ["Binding", "Caps", "Plan", "bind", "plan", "run"]
 diff --git a/b12x/gemm/packed_bf16_vocab_projection/_format.py b/b12x/gemm/packed_bf16_vocab_projection/_format.py
 new file mode 100644
-index 00000000..4c01b8a5
+index 00000000..7f04cb3a
 --- /dev/null
 +++ b/b12x/gemm/packed_bf16_vocab_projection/_format.py
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,177 @@
 +"""Exact 12-bit storage for BF16 vocabulary weights.
 +
 +A BF16 value is a sign bit, an 8-bit exponent and a 7-bit mantissa. Each value
@@ -274,18 +280,24 @@ index 00000000..4c01b8a5
 +codes. Byte ``j`` of each 128-column group's 64 code bytes holds the code of
 +column ``j`` in its low nibble and of column ``j + 64`` in its high nibble.
 +
-+``pack`` checks that unpacking reproduces every input bit and refuses
-+otherwise, so a packed tensor is the checkpoint tensor, not an approximation.
++``pack`` streams the BF16 weight through three fused GPU passes (exponent
++histogram, per-row exception counts, then the packed bytes and exceptions) and
++allocates nothing large but its result. The write pass decodes every value it
++encodes and compares it with the source bits; ``pack`` refuses unless all of
++them match, so a packed tensor is the checkpoint tensor, not an approximation.
 +"""
 +from __future__ import annotations
 +
 +from dataclasses import dataclass
 +
 +import torch
++import triton
++import triton.language as tl
 +
 +GROUP = 128
 +WINDOW = 15
-+_CHUNK_ROWS = 4_096
++_GROUP = tl.constexpr(GROUP)
++_WINDOW = tl.constexpr(WINDOW)
 +
 +
 +@dataclass(frozen=True)
@@ -308,6 +320,72 @@ index 00000000..4c01b8a5
 +        return int(self.values.shape[1]) * 2 // 3
 +
 +
++@triton.jit
++def _exponent_histogram_kernel(weight, histogram, K: tl.constexpr):
++    row = weight + tl.program_id(0).to(tl.int64) * K
++    lane = tl.arange(0, _GROUP)
++    counts = tl.zeros((256,), tl.int32)
++    for column in range(0, K, _GROUP):
++        bits = tl.load(row + column + lane).to(tl.int32) & 0xFFFF
++        counts += tl.histogram((bits >> 7) & 0xFF, 256)
++    tl.atomic_add(histogram + tl.arange(0, 256), counts)
++
++
++@triton.jit
++def _outside(bits, base):
++    exponent = (bits >> 7) & 0xFF
++    return (exponent != 0) & ((exponent < base) | (exponent >= base + _WINDOW))
++
++
++@triton.jit
++def _exception_count_kernel(weight, counts, base, K: tl.constexpr):
++    row = weight + tl.program_id(0).to(tl.int64) * K
++    lane = tl.arange(0, _GROUP)
++    total = tl.full((), 0, tl.int32)
++    for column in range(0, K, _GROUP):
++        bits = tl.load(row + column + lane).to(tl.int32) & 0xFFFF
++        total += tl.sum(_outside(bits, base).to(tl.int32), 0)
++    tl.store(counts + tl.program_id(0), total)
++
++
++@triton.jit
++def _encode_half(source, columns, row_index, base, rows, entries, written):
++    """Low bytes, codes and exceptions of 64 columns; returns codes, new count, mismatches."""
++    bits = tl.load(source + columns).to(tl.int32) & 0xFFFF
++    exponent = (bits >> 7) & 0xFF
++    outside = _outside(bits, base)
++    code = tl.where((exponent != 0) & ~outside, exponent - base + 1, 0)
++    low = tl.where(outside, 0, ((bits >> 8) & 0x80) | (bits & 0x7F))
++    decoded = ((low & 0x80) << 8) | (tl.where(code == 0, 0, code + base - 1) << 7) | (low & 0x7F)
++    mismatches = tl.sum((~outside & (decoded != bits)).to(tl.int32), 0)
++    flag = outside.to(tl.int32)
++    position = written + tl.cumsum(flag, 0) - flag
++    tl.store(rows + position, row_index + tl.zeros_like(flag), mask=outside)
++    tl.store(entries + position, (columns << 16) | bits, mask=outside)
++    return low, code, written + tl.sum(flag, 0), mismatches
++
++
++@triton.jit
++def _pack_rows_kernel(weight, values, offsets, rows, entries, mismatches, base, K: tl.constexpr):
++    row_index = tl.program_id(0)
++    source = weight + row_index.to(tl.int64) * K
++    out = values + row_index.to(tl.int64) * (K + K // 2)
++    lane = tl.arange(0, _GROUP // 2)
++    written = tl.load(offsets + row_index)
++    bad = tl.full((), 0, tl.int32)
++    for group in range(0, K // _GROUP):
++        column = group * _GROUP
++        low_a, code_a, written, bad_a = _encode_half(source, column + lane, row_index, base, rows, entries, written)
++        low_b, code_b, written, bad_b = _encode_half(source, column + _GROUP // 2 + lane, row_index, base, rows,
++                                                     entries, written)
++        tl.store(out + column + lane, low_a.to(tl.uint8))
++        tl.store(out + column + _GROUP // 2 + lane, low_b.to(tl.uint8))
++        tl.store(out + K + group * (_GROUP // 2) + lane, (code_a | (code_b << 4)).to(tl.uint8))
++        bad += bad_a + bad_b
++    bad += (written != tl.load(offsets + row_index + 1)).to(tl.int32)
++    tl.atomic_add(mismatches, bad)
++
++
 +def _check_weight(weight: torch.Tensor) -> None:
 +    if weight.ndim != 2 or weight.dtype != torch.bfloat16:
 +        raise TypeError("packing needs a 2-D torch.bfloat16 weight")
@@ -317,84 +395,51 @@ index 00000000..4c01b8a5
 +        raise ValueError(f"packing needs rows and K divisible by {GROUP}, got {tuple(weight.shape)}")
 +
 +
-+def _bits(weight: torch.Tensor) -> torch.Tensor:
-+    return weight.view(torch.int16).to(torch.int32) & 0xFFFF
++def pack(weight: torch.Tensor) -> PackedBf16Weight:
++    """Pack ``weight`` exactly; raise if any value would not round-trip.
 +
-+
-+def _choose_base(weight: torch.Tensor) -> int:
-+    """The window start covering the most nonzero exponents, the lowest on ties."""
-+    hist = torch.zeros(256, dtype=torch.int64, device=weight.device)
-+    for start in range(0, weight.shape[0], _CHUNK_ROWS):
-+        exponent = (_bits(weight[start:start + _CHUNK_ROWS]) >> 7) & 0xFF
-+        hist += torch.bincount(exponent.flatten(), minlength=256)
++    Besides the result, it allocates only the 256-bin histogram, the
++    mismatch counter and a row-count prefix sum.
++    """
++    _check_weight(weight)
++    out_features, in_features = map(int, weight.shape)
++    device = weight.device
++    bits = weight.view(torch.int16)
++    histogram = torch.zeros(256, dtype=torch.int32, device=device)
++    _exponent_histogram_kernel[(out_features,)](bits, histogram, K=in_features)
++    hist = histogram.to(torch.int64).cpu()
 +    hist[0] = 0
 +    windows = hist.unfold(0, WINDOW, 1).sum(1)
 +    windows[0] = -1
-+    return int(windows.argmax())
-+
-+
-+def _pack_rows(bits: torch.Tensor, base: int):
-+    rows, k = bits.shape
-+    exponent = (bits >> 7) & 0xFF
-+    inside = (exponent >= base) & (exponent < base + WINDOW)
-+    exception = (exponent != 0) & ~inside
-+    code = torch.where(inside, exponent - base + 1, 0)
-+    low = torch.where(exception, 0, ((bits >> 8) & 0x80) | (bits & 0x7F))
-+    code = code.view(rows, k // GROUP, 2, GROUP // 2)
-+    codes = (code[:, :, 0] | (code[:, :, 1] << 4)).reshape(rows, k // 2)
-+    values = torch.cat((low.to(torch.uint8), codes.to(torch.uint8)), dim=1)
-+    row, column = exception.nonzero(as_tuple=True)
-+    entries = ((column << 16) | bits[row, column]).to(torch.int32)
-+    return values, row.to(torch.int32), entries
-+
-+
-+def _unpack_rows(values: torch.Tensor, base: int, rows: torch.Tensor, entries: torch.Tensor) -> torch.Tensor:
-+    count, width = values.shape
-+    k = width * 2 // 3
-+    low = values[:, :k].to(torch.int32)
-+    codes = values[:, k:].to(torch.int32).view(count, k // GROUP, 1, GROUP // 2)
-+    code = torch.cat((codes & 0xF, codes >> 4), dim=2).reshape(count, k)
-+    exponent = torch.where(code == 0, 0, code + base - 1)
-+    bits = ((low & 0x80) << 8) | (exponent << 7) | (low & 0x7F)
-+    if entries.numel():
-+        bits[rows.long(), (entries >> 16).long()] = entries & 0xFFFF
-+    return bits.to(torch.int16).view(torch.bfloat16)
-+
-+
-+def pack(weight: torch.Tensor) -> PackedBf16Weight:
-+    """Pack ``weight`` exactly; raise if any value would not round-trip."""
-+    _check_weight(weight)
-+    out_features, in_features = map(int, weight.shape)
-+    base = _choose_base(weight)
-+    values = torch.empty((out_features, in_features + in_features // 2), dtype=torch.uint8, device=weight.device)
-+    exception_rows, exception_entries = [], []
-+    counts = torch.zeros(out_features, dtype=torch.int32, device=weight.device)
-+    for start in range(0, out_features, _CHUNK_ROWS):
-+        source = weight[start:start + _CHUNK_ROWS]
-+        chunk, rows, entries = _pack_rows(_bits(source), base)
-+        if not torch.equal(_unpack_rows(chunk, base, rows, entries).view(torch.int16), source.view(torch.int16)):
-+            raise ValueError(f"packed BF16 rows {start}..{start + len(source)} do not round-trip")
-+        values[start:start + len(source)] = chunk
-+        counts[start:start + len(source)] = torch.bincount(rows, minlength=len(source)).to(torch.int32)
-+        exception_rows.append(rows + start)
-+        exception_entries.append(entries)
-+    row_offsets = torch.zeros(out_features + 1, dtype=torch.int32, device=weight.device)
-+    row_offsets[1:] = torch.cumsum(counts, 0)
-+    rows = torch.cat(exception_rows)
-+    entries = torch.cat(exception_entries)
-+    exceptions = int(rows.numel())
-+    if exceptions == 0:
-+        # Kernels take a valid pointer even when the row offsets select nothing.
-+        rows = torch.zeros(1, dtype=torch.int32, device=weight.device)
-+        entries = torch.zeros(1, dtype=torch.int32, device=weight.device)
-+    return PackedBf16Weight(values, base, rows.contiguous(), entries.contiguous(), row_offsets, exceptions)
++    base = int(windows.argmax())  # the lowest of equally good windows
++    row_offsets = torch.zeros(out_features + 1, dtype=torch.int32, device=device)
++    _exception_count_kernel[(out_features,)](bits, row_offsets[1:], base, K=in_features)
++    row_offsets[1:] = torch.cumsum(row_offsets[1:], 0, dtype=torch.int32)
++    exceptions = int(row_offsets[-1])
++    values = torch.empty((out_features, in_features + in_features // 2), dtype=torch.uint8, device=device)
++    # Kernels take a valid pointer even when the row offsets select nothing.
++    rows = torch.zeros(max(exceptions, 1), dtype=torch.int32, device=device)
++    entries = torch.zeros_like(rows)
++    mismatches = torch.zeros(1, dtype=torch.int32, device=device)
++    _pack_rows_kernel[(out_features,)](bits, values, row_offsets, rows, entries, mismatches, base, K=in_features)
++    if int(mismatches) != 0:
++        raise ValueError(f"packed BF16 weight does not round-trip ({int(mismatches)} mismatches)")
++    return PackedBf16Weight(values, base, rows, entries, row_offsets, exceptions)
 +
 +
 +def unpack(packed: PackedBf16Weight) -> torch.Tensor:
-+    """The exact BF16 weight that ``packed`` stores."""
-+    count = packed.exceptions
-+    return _unpack_rows(packed.values, packed.exponent_base,
-+                        packed.exception_rows[:count], packed.exception_entries[:count])
++    """The exact BF16 weight that ``packed`` stores (for tests and inspection; allocates freely)."""
++    count, width = packed.values.shape
++    k = width * 2 // 3
++    low = packed.values[:, :k].to(torch.int32)
++    codes = packed.values[:, k:].to(torch.int32).view(count, k // GROUP, 1, GROUP // 2)
++    code = torch.cat((codes & 0xF, codes >> 4), dim=2).reshape(count, k)
++    exponent = torch.where(code == 0, 0, code + packed.exponent_base - 1)
++    bits = ((low & 0x80) << 8) | (exponent << 7) | (low & 0x7F)
++    if packed.exceptions:
++        entries = packed.exception_entries[: packed.exceptions]
++        bits[packed.exception_rows[: packed.exceptions].long(), (entries >> 16).long()] = entries & 0xFFFF
++    return bits.to(torch.int16).view(torch.bfloat16)
 +
 +
 +__all__ = ["GROUP", "PackedBf16Weight", "WINDOW", "pack", "unpack"]
@@ -828,10 +873,10 @@ index 00000000..b9a71f9a
 +]
 diff --git a/tests/gemm/test_packed_bf16_vocab_projection.py b/tests/gemm/test_packed_bf16_vocab_projection.py
 new file mode 100644
-index 00000000..9a5ba038
+index 00000000..7a04ffa1
 --- /dev/null
 +++ b/tests/gemm/test_packed_bf16_vocab_projection.py
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,181 @@
 +from __future__ import annotations
 +
 +import itertools
@@ -924,6 +969,23 @@ index 00000000..9a5ba038
 +    offsets = packed.row_offsets.cpu()
 +    assert offsets[0] == 0 and offsets[-1] == packed.exceptions
 +    assert torch.all(offsets[1:] >= offsets[:-1])
++
++
++@cuda_required
++def test_pack_allocates_only_its_result() -> None:
++    # Packing runs at load, beside the whole model: it must not need transient
++    # copies of the weight, which unified-memory GPUs do not hand back cleanly.
++    weight = _weight(4096, 5120, seed=11)
++    torch.cuda.synchronize()
++    torch.cuda.reset_peak_memory_stats()
++    before = torch.cuda.memory_allocated()
++    packed = projection.pack(weight)
++    torch.cuda.synchronize()
++    peak = torch.cuda.max_memory_allocated() - before
++    result = sum(t.numel() * t.element_size() for t in (
++        packed.values, packed.exception_rows, packed.exception_entries, packed.row_offsets))
++    assert peak <= result + 64 * 1024, (peak, result)
++    assert torch.equal(projection.unpack(packed).view(torch.int16), weight.view(torch.int16))
 +
 +
 +@cuda_required
