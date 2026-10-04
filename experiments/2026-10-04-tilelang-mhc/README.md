@@ -74,10 +74,36 @@ The tests pass 14 of 14 against V4.1's FP32 lagged reference:
 - the projection partials;
 - every result bit-identical across batch sizes.
 
+## Serving results
+
+One window against the vocabulary heads candidate:
+
+| | Control (B12X mHC) | TileKernels mHC | Change |
+| --- | ---: | ---: | --- |
+| Step time, prose c1 | 32.67 ms | 33.19 ms | +1.6% [+1.1, +2.1], slower |
+| Step time, code c1 | 35.75 ms | 36.58 ms | +2.3% [+1.7, +2.9], slower |
+| Decode, prose c8 | 215.4 tok/s | 217.8 tok/s | +1.1% [+0.9, +1.3], faster |
+| Decode, code c8 | 248.3 tok/s | 252.5 tok/s | +1.7% [−0.8, +4.2], same |
+| Prefill, 32,768 tokens | 4,889 tok/s | 4,907 tok/s | +0.4% [−11.8, +12.5], same |
+| Prefill, 262,144 tokens | 4,646 tok/s | 4,656 tok/s | +0.2% [−3.9, +4.3], same |
+
+Quality passed 5 of 5. Not promotable as it stands: single-stream decode is
+slower. The single-stream profile, per scheduler step:
+
+- B12X's mHC kernels took 2.10 ms;
+- the TileKernels path takes 2.79 ms over the same number of launches:
+  - `project_streams` and `finalize`: 2.69 ms;
+  - TileKernels' standalone post and collapse: 0.10 ms.
+
+That is about 31 µs per sublayer against B12X's 22 µs. Single-stream
+sublayers run a few rows, where B12X's kernels are faster (6.7 µs against
+13.3 µs at one row in the bench). Prefill shows none of the bench's gain:
+B12X prepares its prefill path for the real workload, which the bench's plan
+did not. The next step is the few-row latency of `project_streams`.
+
 ## Procedure
 
-Build `-tilelang-mhc-v1` and run both bundles: [tests](bundles/tests/candidate.json)
-and the [mHC bench](bundles/mhc-bench/candidate.json), which also measures
-B12X. Then one window boots the vocabulary heads candidate (the control) and
-this arm in turn: decode at one and eight streams, prefill, and the
-single-stream decode profile for each.
+`-tilelang-mhc-v1` passes both bundles (97 of 97 tests, 7 bench points each
+side). One window booted the vocabulary heads candidate (the control) and this
+arm in turn: decode at one and eight streams, prefill, and the single-stream
+decode profile for each.
