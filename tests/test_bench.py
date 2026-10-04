@@ -169,6 +169,12 @@ class PrecisionSetTest(unittest.TestCase):
                 self.assertEqual(payload["temperature"], 0)
                 self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
         self.assertEqual(len(spark3.DECODE_CASES["json-1k"].json_schema), 8)
+        # Code tasks are sized past the budget: implementation, tests and a CLI each.
+        self.assertEqual(len(set(spark3.PRECISION_CODE_TASKS)), 8)
+        self.assertNotEqual(spark3.DECODE_CASES["code-1k"].prompt, spark3.PORTABLE_CODE_TASKS)
+        for task in spark3.PRECISION_CODE_TASKS:
+            self.assertIn("unittest suite", task)
+            self.assertIn("argparse", task)
         self.assertEqual(len(set(spark3.PRECISION_JSON_PROMPTS)), 8)
         # Every prompt names every key of its own schema, so prompt and check cannot drift.
         for prompt, schema in zip(spark3.PRECISION_JSON_PROMPTS, spark3.PRECISION_JSON_SCHEMAS):

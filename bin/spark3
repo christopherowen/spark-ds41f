@@ -2727,6 +2727,35 @@ def json_records_prompt(subject: str, schema: dict, count: int = 80) -> str:
 
 
 PRECISION_JSON_PROMPTS = tuple(json_records_prompt(subject, schema) for subject, schema in PRECISION_JSON_RECORDS)
+# Code tasks whose natural answer runs well past the budget: an implementation,
+# a complete test suite and a command-line interface for each. The portable
+# tasks are single functions and can stop early.
+PRECISION_CODE_TAIL = (
+    "Reply with Python source only: no comments, no docstrings, no Markdown fences. Write the full "
+    "implementation, then a complete unittest suite covering every public method and edge case, then "
+    "an argparse command-line interface for it. Keep writing code until all three parts are complete."
+)
+PRECISION_CODE_TASKS = tuple(
+    f"{name}\n{spec}\n{PRECISION_CODE_TAIL}"
+    for name, spec in (
+        ("library", "A library system: Book, Member and Library classes with borrowing limits, due dates, "
+                    "late fees, reservations and title/author search."),
+        ("inventory", "An inventory manager: products with SKUs, stock levels, reorder thresholds, suppliers, "
+                      "CSV import/export and a low-stock report."),
+        ("scheduler", "A task scheduler: tasks with dependencies, priorities and durations, topological ordering, "
+                      "cycle detection and a critical-path calculation."),
+        ("ledger", "A bank ledger: accounts, deposits, withdrawals, transfers with overdraft rules, monthly "
+                   "interest and statement generation."),
+        ("expressions", "An arithmetic expression engine: tokenizer, recursive-descent parser to an AST, "
+                        "evaluator with variables and functions, and a pretty printer."),
+        ("matrix", "A matrix library over lists of lists: construction, addition, multiplication, transpose, "
+                   "determinant, inverse and solving linear systems, with shape checking."),
+        ("cache", "A caching package: LRU, LFU and TTL caches behind one interface, with statistics, "
+                  "eviction callbacks and a decorator for memoizing functions."),
+        ("adventure", "A text-adventure engine: rooms, exits, items, inventory, a command parser, save and "
+                      "load of game state, and a scripted sample world."),
+    )
+)
 PRECISION_JSON_SCHEMAS = tuple(schema for _, schema in PRECISION_JSON_RECORDS)
 PRECISION_JSON_SCHEMA = {
     "name": "records",
@@ -2744,7 +2773,7 @@ PRECISION_CASES = {
         min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
     ),
     "code-1k": DecodeCase(
-        PORTABLE_CODE_TASKS, {"thinking": False}, max_tokens=PRECISION_TOKENS,
+        PRECISION_CODE_TASKS, {"thinking": False}, max_tokens=PRECISION_TOKENS,
         min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
     ),
     "json-1k": DecodeCase(
