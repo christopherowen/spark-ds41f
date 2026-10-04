@@ -382,6 +382,88 @@ class PrecisionSetTest(unittest.TestCase):
         self.assertEqual(len(lines), 6)
 
 
+class ComplianceSuiteTest(unittest.TestCase):
+    def test_compliance_is_explicit_and_full_excludes_it(self) -> None:
+        self.assertIn("compliance", spark3.BENCH_SUITES)
+        self.assertNotIn("compliance", spark3.FULL_SUITES)
+        self.assertEqual(spark3.BENCH_SUITE_FUNCTIONS["compliance"], spark3.suite_compliance)
+
+    def test_compliance_payloads_ask_for_a_complete_array_with_room(self) -> None:
+        plain = [payload for _, payload in spark3.compliance_payloads("m", False)]
+        strict = [payload for _, payload in spark3.compliance_payloads("m", True)]
+        self.assertEqual(len(plain), len(spark3.PRECISION_JSON_RECORDS))
+        for payload in plain:
+            self.assertEqual(payload["max_tokens"], 4096)
+            self.assertNotIn("min_tokens", payload)
+            self.assertNotIn("response_format", payload)
+            self.assertIn("array of 12 invented", payload["messages"][0]["content"])
+            self.assertEqual(payload["chat_template_kwargs"], {"thinking": False})
+        schema = strict[0]["response_format"]["json_schema"]["schema"]
+        self.assertEqual((schema["type"], schema["minItems"], schema["maxItems"]), ("array", 12, 12))
+        self.assertEqual(schema["items"], spark3.PRECISION_JSON_SCHEMAS[0])
+
+    def test_used_whole_budget_prefers_the_finish_reason(self) -> None:
+        self.assertTrue(spark3.used_whole_budget({"finish_reason": "length", "completion_tokens": 10}, 1024))
+        self.assertFalse(spark3.used_whole_budget({"finish_reason": "stop", "completion_tokens": 1024}, 1024))
+        self.assertTrue(spark3.used_whole_budget({"completion_tokens": 1024}, 1024))
+        self.assertFalse(spark3.used_whole_budget({"completion_tokens": 900}, 1024))
+
+    @needs_jsonschema
+    def test_assess_json_records_requires_a_clean_complete_conforming_array(self) -> None:
+        schema = spark3.record_schema(a={"type": "integer"})
+        good = json.dumps([{"a": index} for index in range(3)])
+        self.assertEqual(spark3.assess_json_records(good, schema, 3)["ok"], True)
+        short = spark3.assess_json_records(json.dumps([{"a": 1}]), schema, 3)
+        self.assertEqual((short["ok"], short["objects"], short["violation"]), (False, 1, "1 objects, 3 requested"))
+        fenced = spark3.assess_json_records(f"```json\n{good}\n```", schema, 3)
+        self.assertEqual((fenced["ok"], fenced["fenced"], fenced["conforming"]), (False, True, 3))
+        bad = spark3.assess_json_records(json.dumps([{"a": 1}, {"a": "x"}, {"a": 3}]), schema, 3)
+        self.assertEqual((bad["ok"], bad["conforming"], bad["violation"]), (False, 2, "$[1].a: 'x' is not of type 'integer'"))
+        self.assertFalse(spark3.assess_json_records("Sure thing", schema, 3)["parsed"])
+        self.assertEqual(spark3.assess_json_records('{"a": 1}', schema, 1)["violation"], "top level is not an array")
+
+    @needs_jsonschema
+    def test_suite_compliance_reports_both_arms_and_saves_outputs(self) -> None:
+        class StubBench:
+            def __init__(self) -> None:
+                self.labels: list[str] = []
+
+            def run(self, label, payloads, concurrency=None, keep_content=False, retries=3):
+                self.labels.append(label)
+                requests = []
+                for index, (subject, schema) in enumerate(spark3.PRECISION_JSON_RECORDS):
+                    content = json.dumps([
+                        {key: ({"string": "s", "integer": 1, "number": 2.5, "boolean": True}.get(prop.get("type"))
+                               if prop.get("type") != "array" else
+                               (["x", "y", "z"][: prop["minItems"]] if prop["items"].get("type") == "string"
+                                else [{"description": "d", "amountCents": 1}] * prop["minItems"]))
+                         for key, prop in schema["properties"].items()}
+                        for _ in range(spark3.COMPLIANCE_OBJECTS)
+                    ])
+                    finish = "length" if (index == 0 and "constrained" not in label) else "stop"
+                    requests.append({"ok": True, "content": content, "finish_reason": finish, "completion_tokens": 700,
+                                     "elapsed_s": 9.5 + index, "error": None})
+                metrics = {"spec_decode_num_drafts": 100, "spec_decode_num_draft_tokens": 400,
+                           "spec_decode_num_accepted_tokens": 300}
+                return {"wall_s": 30.0, "requests": requests, "metrics": metrics, "peak": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            options = argparse.Namespace(model="m", output_dir=Path(tmp))
+            bench = StubBench()
+            report = spark3.suite_compliance(bench, options, random.Random(0))
+            saved = sorted(p.name for p in (Path(tmp) / "outputs" / "compliance-constrained").iterdir())
+        self.assertEqual(bench.labels, ["compliance prompt_only", "compliance constrained"])
+        self.assertEqual(report["arms"]["prompt_only"]["passed"], len(spark3.PRECISION_JSON_RECORDS) - 1)
+        self.assertEqual(report["arms"]["prompt_only"]["requests"][0]["violation"], "hit the token budget")
+        self.assertEqual(report["arms"]["constrained"]["passed"], len(spark3.PRECISION_JSON_RECORDS))
+        self.assertEqual(report["arms"]["constrained"]["accepted_per_verified"], 0.75)
+        self.assertFalse(report["ok"])
+        self.assertIn("library-books.txt", saved)
+        lines, _ = spark3.bench_rows({"suites": {"compliance": report}}, None, 3.0)
+        self.assertTrue(lines[0].startswith("compliance prompt_only: 7/8 complete and conforming"))
+        self.assertIn("  library books: hit the token budget", lines)
+
+
 class AdmissionPayloadTest(unittest.TestCase):
     def capture(self, forced):
         class Captured(Exception):
@@ -447,11 +529,14 @@ class StreamTest(unittest.TestCase):
                 {"choices": [{"delta": {"role": "assistant", "content": ""}}]},
                 {"choices": [{"delta": {"reasoning_content": "think "}}]},
                 {"choices": [{"delta": {"content": "hello"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                 {"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3}},
             ]
         )
         result = spark3.stream_request(url, {"model": "m"}, threading.Event(), keep_content=True)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["finish_reason"], "stop")
+        self.assertIn("finish_reason", spark3.compact([result])[0])
         self.assertEqual(result["content"], "hello")
         self.assertEqual(result["completion_tokens"], 3)
         self.assertEqual(result["prompt_tokens"], 5)
@@ -471,6 +556,7 @@ class StreamTest(unittest.TestCase):
         result = spark3.stream_request(url, {"model": "m"}, threading.Event())
         self.assertTrue(result["ok"])
         self.assertIsNotNone(result["ttft_s"])
+        self.assertIsNone(result["finish_reason"])
 
     def test_failed_request_is_recorded(self) -> None:
         result = spark3.stream_request("http://127.0.0.1:9", {"model": "m"}, threading.Event())

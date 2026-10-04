@@ -2463,7 +2463,10 @@ def command_build_smoke(args: argparse.Namespace) -> int:
 
 
 BENCH_SCHEMA = 1
-BENCH_SUITES = ("quality", "decode", "sampled", "prefill", "prefix", "admission")
+BENCH_SUITES = ("quality", "compliance", "decode", "sampled", "prefill", "prefix", "admission")
+# --full runs the promotion report; compliance is selected explicitly with --suites
+# until constrained decoding beside DSpark has been qualified on the cluster.
+FULL_SUITES = tuple(suite for suite in BENCH_SUITES if suite != "compliance")
 BENCH_TIMEOUT_SECONDS = 1800
 # These prompts and settings match the client behind every baseline manifest
 # since 2026-09-20, so decode means stay comparable with published figures.
@@ -3134,6 +3137,7 @@ def stream_request(
     last: float | None = None
     status: int | None = None
     usage: dict = {}
+    finish: str | None = None
     content: list[str] = []
     reasoning_chars = 0
     content_chars = 0
@@ -3154,6 +3158,7 @@ def stream_request(
                 event = json.loads(line[6:])
                 usage = event.get("usage") or usage
                 for choice in event.get("choices") or []:
+                    finish = choice.get("finish_reason") or finish
                     delta = choice.get("delta") or {}
                     pieces = (
                         delta.get("reasoning_content"),
@@ -3189,6 +3194,8 @@ def stream_request(
         "elapsed_s": round(ended - started, 4),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": tokens,
+        # "stop" is a natural end, "length" the budget; None when the server sent neither.
+        "finish_reason": finish,
         "decode_tps": None if decode is None else round(decode, 2),
         "output_sha256": digest.hexdigest()[:16],
         "reasoning_chars": reasoning_chars,
@@ -3779,6 +3786,15 @@ def step_time_ms(requests: list[dict], accepted: float | None, concurrency: int)
     return round(1000 * (1 + accepted) * concurrency / window, 3) if window else None
 
 
+def used_whole_budget(request: dict, max_tokens: int) -> bool:
+    """Whether a request ran to its token budget: the server's finish reason
+    when it sent one, otherwise the token count."""
+    finish = request.get("finish_reason")
+    if finish is not None:
+        return finish == "length"
+    return (request.get("completion_tokens") or 0) >= max_tokens
+
+
 def sample_step_times(entries: list[dict]) -> list[float]:
     """Step times stored with each sample, or derived from older reports that
     kept only single-stream requests."""
@@ -3918,8 +3934,8 @@ def save_output(directory: Path | None, point: str, tag: str, index: int, reques
 
 def compact(results: list[dict]) -> list[dict]:
     keys = ("ok", "ttft_s", "first_s", "last_s", "prompt_tokens", "completion_tokens", "decode_tps",
-            "output_sha256", "reasoning_chars", "content_chars", "error", "json_objects", "json_prefix_valid",
-            "json_valid_objects", "json_violation")
+            "output_sha256", "reasoning_chars", "content_chars", "error", "finish_reason", "json_objects",
+            "json_prefix_valid", "json_valid_objects", "json_violation")
     return [{key: result[key] for key in keys if key in result} for result in results]
 
 
@@ -3959,6 +3975,105 @@ def suite_quality(bench: Bench, options: argparse.Namespace, rng: random.Random)
         print(f"  quality {index + 1}/5: {verdict}", flush=True)
     passed = sum(run["verdict"] == "pass" for run in runs)
     return {"passed": passed, "runs": runs, "ok": passed == len(runs)}
+
+
+COMPLIANCE_OBJECTS = 12
+COMPLIANCE_MAX_TOKENS = 4096
+COMPLIANCE_CONCURRENCY = 4
+
+
+def compliance_payloads(model: str, constrained: bool) -> list[tuple[str, dict]]:
+    """One request per record type, asking for a complete array of
+    COMPLIANCE_OBJECTS objects, with room to finish naturally. The constrained
+    arm sends the same prompt with the array schema as response_format."""
+    payloads = []
+    for subject, schema in PRECISION_JSON_RECORDS:
+        extra: dict = {"chat_template_kwargs": {"thinking": False}}
+        if constrained:
+            extra["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "records",
+                    "schema": {"type": "array", "items": schema,
+                               "minItems": COMPLIANCE_OBJECTS, "maxItems": COMPLIANCE_OBJECTS},
+                },
+            }
+        payloads.append(chat_payload(
+            model, json_records_prompt(subject, schema, COMPLIANCE_OBJECTS), COMPLIANCE_MAX_TOKENS,
+            temperature=0, seed=42, **extra,
+        ))
+    return payloads
+
+
+def assess_json_records(content: str, schema: dict, count: int) -> dict:
+    """Whole-output compliance: exactly a JSON array of ``count`` objects, each
+    conforming to ``schema``, with no fence or commentary around it."""
+    text = content.strip()
+    fenced = text.startswith("```")
+    if fenced:
+        text = re.sub(r"^```[A-Za-z]*\s*|\s*```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError as error:
+        return {"parsed": False, "fenced": fenced, "objects": 0, "conforming": 0,
+                "violation": f"not JSON: {error}", "ok": False}
+    if not isinstance(parsed, list):
+        return {"parsed": True, "fenced": fenced, "objects": 0, "conforming": 0,
+                "violation": "top level is not an array", "ok": False}
+    violations = [json_schema_violations(item, schema) for item in parsed]
+    conforming = sum(1 for found in violations if not found)
+    violation = next((f"$[{index}]{found[0][1:]}" for index, found in enumerate(violations) if found), None)
+    if violation is None and len(parsed) != count:
+        violation = f"{len(parsed)} objects, {count} requested"
+    return {"parsed": True, "fenced": fenced, "objects": len(parsed), "conforming": conforming,
+            "violation": violation, "ok": not fenced and violation is None}
+
+
+def suite_compliance(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Structured-output compliance on natural completion.
+
+    Two arms over the same eight record prompts: prompt-only, then the same
+    requests constrained by the array schema through response_format. A
+    request passes when it stopped on its own, parsed as exactly the requested
+    number of objects, and every object conforms. This measures correctness,
+    not speed; the decode suite's json cases measure speed.
+    """
+    output_dir = getattr(options, "output_dir", None)
+    arms = {}
+    for arm, constrained in (("prompt_only", False), ("constrained", True)):
+        result = bench.run(f"compliance {arm}", compliance_payloads(options.model, constrained),
+                           concurrency=COMPLIANCE_CONCURRENCY, keep_content=True)
+        rows = []
+        for (subject, schema), request in zip(PRECISION_JSON_RECORDS, result["requests"]):
+            row = {"subject": subject, "ok": False, "finish_reason": request.get("finish_reason"),
+                   "completion_tokens": request.get("completion_tokens"), "elapsed_s": request.get("elapsed_s")}
+            if request["ok"]:
+                row.update(assess_json_records(request.get("content") or "", schema, COMPLIANCE_OBJECTS))
+                if request.get("finish_reason") == "length":
+                    row["ok"] = False
+                    row["violation"] = row["violation"] or "hit the token budget"
+            else:
+                row["error"] = request.get("error")
+            rows.append(row)
+            if output_dir is not None:
+                folder = output_dir / "outputs" / f"compliance-{arm}"
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{subject.replace(' ', '-')}.txt").write_text(request.get("content") or "", encoding="utf-8")
+            print(f"  compliance {arm} {subject}: {'pass' if row['ok'] else row.get('violation') or row.get('error')}", flush=True)
+        metrics = result["metrics"]
+        draft_tokens = metrics["spec_decode_num_draft_tokens"]
+        arms[arm] = {
+            "requests": rows,
+            "passed": sum(row["ok"] for row in rows),
+            "failed_requests": sum(1 for request in result["requests"] if not request["ok"]),
+            "accepted_per_draft": acceptance(metrics),
+            "accepted_per_verified": (
+                round(metrics["spec_decode_num_accepted_tokens"] / draft_tokens, 4) if draft_tokens else None
+            ),
+            "elapsed_s": describe([row["elapsed_s"] for row in rows if row.get("elapsed_s")]),
+        }
+    return {"arms": arms, "objects_requested": COMPLIANCE_OBJECTS, "max_tokens": COMPLIANCE_MAX_TOKENS,
+            "ok": all(arm["passed"] == len(arm["requests"]) for arm in arms.values())}
 
 
 def decode_plan(options: argparse.Namespace, point: str) -> tuple[DecodeCase, int, str, int, int]:
@@ -4048,9 +4163,7 @@ def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) 
             "max_tokens": spec.max_tokens,
             # Outputs that used the whole budget. A precision case wants every
             # one: a prompt that stops early measures a shorter workload.
-            "full_length_outputs": sum(
-                1 for request in ok if (request.get("completion_tokens") or 0) >= spec.max_tokens
-            ),
+            "full_length_outputs": sum(1 for request in ok if used_whole_budget(request, spec.max_tokens)),
             "failed_requests": len(requests) - len(ok),
             "distinct_outputs": len({request["output_sha256"] for request in ok}),
             "reasoning_share": reasoning_share(ok),
@@ -4214,6 +4327,7 @@ def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Rando
 
 BENCH_SUITE_FUNCTIONS = {
     "quality": suite_quality,
+    "compliance": suite_compliance,
     "decode": suite_decode,
     "sampled": suite_sampled,
     "prefill": suite_prefill,
@@ -4320,6 +4434,17 @@ def bench_rows(report: dict, reference: dict | None, tolerance: float) -> tuple[
     if "quality" in suites:
         quality = suites["quality"]
         lines.append(f"quality: LRU {quality['passed']}/{len(quality['runs'])}")
+    if "compliance" in suites:
+        compliance = suites["compliance"]
+        for arm, summary in compliance["arms"].items():
+            lines.append(
+                f"compliance {arm}: {summary['passed']}/{len(summary['requests'])} complete and conforming, "
+                f"accepted/verified {summary.get('accepted_per_verified')}, "
+                f"completion p-max {summary['elapsed_s'].get('max')} s"
+            )
+            for row in summary["requests"]:
+                if not row["ok"]:
+                    lines.append(f"  {row['subject']}: {row.get('violation') or row.get('error')}")
     if "decode" in suites:
         lines.append("decode (aggregate tok/s, 95% CI):")
         ref_points = ref_suites.get("decode", {}).get("points", {})
@@ -4397,7 +4522,7 @@ def command_bench(args: argparse.Namespace) -> int:
     cluster, nodes, _ = configuration(args)
     config_path, config_name = cluster_config_path(args)
     if args.suites is None:
-        args.suites = ",".join(BENCH_SUITES) if args.full else "quality,decode"
+        args.suites = ",".join(FULL_SUITES) if args.full else "quality,decode"
     if args.min_samples is None:
         args.min_samples = 6 if args.full else 3
     if args.max_samples is None:
@@ -4419,7 +4544,7 @@ def command_bench(args: argparse.Namespace) -> int:
     unknown_cases = sorted(set(args.decode_cases) - set(DECODE_CASES))
     if unknown_cases:
         raise SystemExit(f"unknown decode cases: {', '.join(unknown_cases)}")
-    if any(DECODE_CASES[case].json_schema is not None for case in args.decode_cases):
+    if "compliance" in suites or any(DECODE_CASES[case].json_schema is not None for case in args.decode_cases):
         schema_validator({"type": "object"})
     if args.min_samples < 2 or args.max_samples < args.min_samples:
         raise SystemExit("--min-samples must be at least 2 and no more than --max-samples")
@@ -4544,10 +4669,16 @@ def command_bench(args: argparse.Namespace) -> int:
         failures.append("quality gate failed")
     if "admission" in report["suites"] and not report["suites"]["admission"]["ok"]:
         failures.append("admission failed")
+    if "compliance" in report["suites"] and not report["suites"]["compliance"]["ok"]:
+        failures.append("compliance failed")
     failed_requests = sum(
         point.get("failed_requests", 0)
         for suite in ("decode", "sampled", "prefill")
         for point in report["suites"].get(suite, {}).get("points", {}).values()
+    )
+    failed_requests += sum(
+        arm.get("failed_requests", 0)
+        for arm in report["suites"].get("compliance", {}).get("arms", {}).values()
     )
     if failed_requests:
         failures.append(f"{failed_requests} requests failed")

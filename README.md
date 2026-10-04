@@ -246,6 +246,16 @@ Suites of the full run, in order (`--suites` selects a subset):
 
 - `quality`: the fixed LRU request five times at temperature 0; all five must
   pass, or the run stops before measuring anything.
+- `compliance` (explicit `--suites compliance`; not part of `--full` until
+  constrained decoding beside DSpark is qualified): structured-output
+  correctness on natural completion. Eight record prompts, each asking for a
+  complete array of twelve objects with 4,096 tokens of room, run prompt-only
+  and then constrained by the same array schema through `response_format`. A
+  request passes when it stopped on its own (`finish_reason`), parsed as
+  exactly twelve objects with no fence or commentary, and every object
+  conforms to its schema (python-jsonschema). Outputs are saved under
+  `outputs/compliance-<arm>/`. Every request receipt in every suite now
+  records `finish_reason`.
 - `decode`: prose and code prompts at concurrency 1, 2, 4, and 8, 256 output
   tokens, reasoning on, temperature 0, and the same prompts and metric
   (aggregate completion tokens per wall second) as every published baseline.
