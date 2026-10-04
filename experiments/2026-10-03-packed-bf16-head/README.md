@@ -185,7 +185,8 @@ serving gap:
 Prefill level (−0.8% to +0.5%), quality 5/5. Speed reproduces the first
 window. Host memory is the same as with the first packer (dgx1 96,800 against
 96,790 MiB), so serving holds something the stage test does not reproduce. The
-[TP4 memory screen](../2026-10-04-tp4-memory-tuning/README.md) adds a
+TP4 memory screen (`experiments/2026-10-04-tp4-memory-tuning` on branch
+`tp4-memory-tuning`) adds a
 same-image arm without the packed head and per-process captures to locate it.
 This remains open and blocks promotion.
 
