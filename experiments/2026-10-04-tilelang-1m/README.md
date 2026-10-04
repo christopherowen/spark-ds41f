@@ -26,6 +26,7 @@ followed by the TileLang patches, rebased onto it:
 | [0036](vllm/0036-tilelang-vocab-heads.patch) | vocabulary heads |
 | [0037](vllm/0037-tilelang-tilekernels-mhc.patch) | TileKernels mHC |
 | [0038](vllm/0038-tilelang-sparknet-collectives.patch) | sparknet collectives |
+| [0039](vllm/0039-dummy-context-disjoint-blocks.patch) | fabricated profiling context with its own blocks per group and request |
 
 Every TileLang commit applied without conflict. The packed head is packed
 in place in the carve-out, and the TileLang projection reads it there. The
@@ -57,9 +58,46 @@ mHC. The profile disagrees:
 0037 (B12X's mHC). An A/B/A window measures the difference against the boot
 noise.
 
+## Startup failure in the cost profile (0039)
+
+The v1 images did not start. In DSpark's startup cost profile, TileKernels'
+gate refused non-finite logits on five rows, in every arm, B12X's mHC
+included. The [diagnostics](diagnostics/) narrowed it down:
+
+| Arm | Change from the candidate | Start |
+| --- | --- | --- |
+| shapes8 | 8 sequences, 4,096 batched tokens, graphs to 48 rows | passes, quality 5/5 |
+| seqs16-4k | 4,096 batched tokens | fails, same rows |
+| ctx0 | profile without fabricated context | passes; quality 5/5, decode at 1, 8 and 16 streams finite |
+| seqs12 | 12 sequences | passes |
+
+The router-debug build (debug patch, non-finite counts per check and the
+first sequence number at which each saw one) located the origin. All 40
+target gates were finite. The rows were one dummy request's DSpark query
+block (five rows of an 80-row drafter batch), in one profiled shape. The
+first non-finite value was the drafter's first attention output, while its
+query, KV and input were finite: the attention read non-finite cache bytes.
+
+The profile fabricates 8,192 tokens of context per dummy request, and
+`set_dummy_context` gave every KV cache group the same block ids, request
+after request from block 0. The 17 groups draw from one pool and overlay
+the same memory; the allocator gives a block to one group and request at
+a time, and block 0 is the null block. Fabricated spans broke both rules,
+so the drafter's sliding window read bytes another group had written in
+its own format. Serving never shares a block. B12X's router routes
+non-finite logits without complaint, so the B12X recipe starts with the
+same reads in its profile.
+
+0039 gives each request of each group its own whole blocks after the null
+block (spans wrap only when the pool runs out). The
+[poisoned-scratch](diagnostics/bundles/poisoned-scratch/candidate.json)
+bundle also showed the TileLang projections and routed experts ignore
+their scratch at TP4 shapes on both sides of the 64-row decode tile.
+
 ## Procedure
 
-Build `-tilelang-1m-v1` and `-tilelang-1m-b12xmhc-v1`, and run the
-[tests](bundles/tests/candidate.json) bundle. One window then boots the
+Build `-tilelang-1m-v2` and `-tilelang-1m-b12xmhc-v2` (0039 added; the v1
+images do not start), and run the [tests](bundles/tests/candidate.json)
+bundle. One window then boots the
 TileKernels arm, the B12X-mHC arm and the TileKernels arm again: decode at one
 and eight streams, prefill, and the memory log on every node for each.
