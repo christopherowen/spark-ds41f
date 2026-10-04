@@ -27,6 +27,7 @@ followed by the TileLang patches, rebased onto it:
 | [0037](vllm/0037-tilelang-tilekernels-mhc.patch) | TileKernels mHC |
 | [0038](vllm/0038-tilelang-sparknet-collectives.patch) | sparknet collectives |
 | [0039](vllm/0039-dummy-context-disjoint-blocks.patch) | fabricated profiling context with its own blocks per group and request |
+| [0040](vllm/0040-tilelang-mhc-register-fold.patch) | mHC streams folded in registers |
 
 Every TileLang commit applied without conflict. The packed head is packed
 in place in the carve-out, and the TileLang projection reads it there. The
@@ -98,7 +99,7 @@ their scratch at TP4 shapes on both sides of the 64-row decode tile.
 
 Build `-tilelang-1m-v2` and `-tilelang-1m-b12xmhc-v2` (0039 added; the v1
 images do not start), and run the [tests](bundles/tests/candidate.json)
-bundle. One window then boots the
+bundle. (The candidate has since moved to `-tilelang-1m-v3`, with 0040.) One window then boots the
 TileKernels arm, the B12X-mHC arm and the TileKernels arm again: decode at one
 and eight streams, prefill, and the memory log on every node for each.
 
@@ -164,6 +165,26 @@ Sublayer entry (projection and finalize), µs per call, fn cold:
 | 0037 | 18.5 | 20.9 | 31.1 | 49.8 | 67.3 |
 | 0040 | 14.4 | 17.4 | 23.3 | 35.7 | 44.4 |
 
-[register-fold/candidate.json](register-fold/candidate.json) is the
-candidate with 0040 (image `-tilelang-1m-v3`), with the same pinned DSpark
-cost curves, for an A/B against the v2 candidate in one window.
+The [mhc-cold](bundles/mhc-cold/candidate.json) bundle reproduces the table.
+
+**A/B in serving** (window 2026-10-04 23:10–23:27 UTC, v2 then v3, the same
+pinned DSpark cost curves; quality 5/5 in both):
+
+| v3 against v2 | prose | code |
+| --- | --- | --- |
+| single-stream step time | −1.0% (32.98 ms) | −2.2% (35.83 ms) |
+| c1 tok/s | −1.8% | −6.3% |
+| c8 tok/s | same | same |
+| c16 tok/s | +0.9% (same) | +2.3% |
+| prefill, 1K to 262K | level | level |
+
+In the decode profiles the projection kernel takes 12.9 µs per call against
+19.5 (0.95 ms per step against 1.35). The c1 throughput difference is
+acceptance, not speed: code averaged 2.65 tokens per step against 2.89. The
+sums of squares now add in another order, which moves some results by an
+ulp; at temperature 0 that changes the generated text, and the bench's
+single-stream code acceptance follows the text. The step time and the
+many-stream points are the measures to judge the kernel by.
+
+0040 is now in the candidate (image `-tilelang-1m-v3`; the tests bundle
+passes 99 on it).
