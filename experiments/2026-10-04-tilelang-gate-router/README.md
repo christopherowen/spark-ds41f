@@ -90,9 +90,25 @@ running longer: the padding rows of each captured batch were routed and
 dispatched as real tokens. 0035 fixes that, and its tests check both routers on
 a padded step.
 
+Window 2 (`-tilelang-gate-router-v2`, with 0035) against the same control:
+
+| | Control | Fused (0033–0035) | Change |
+| --- | ---: | ---: | --- |
+| Step time, prose c1 | 33.83 ms | 33.41 ms | −1.2% [−2.3, −0.2], faster |
+| Step time, code c1 | 36.79 ms | 36.42 ms | −1.0% [−2.0, +0.0], same |
+| Decode, prose c8 | 212.6 tok/s | 215.1 tok/s | +1.2% [+0.6, +1.8] |
+| Decode, code c8 | 247.4 tok/s | 247.9 tok/s | +0.2% [−3.3, +3.8], same |
+| Prefill, 32,768 tokens | 4,902 tok/s | 4,869 tok/s | −0.7% [−10.6, +9.2], same |
+| Prefill, 262,144 tokens | 4,655 tok/s | 4,633 tok/s | −0.5% [−3.1, +2.2], same |
+
+Quality passed 5 of 5. In the single-stream profile, GPU time per step equals
+the control's: the TileLang route kernel takes the place of `splitk_reduce`
+and the Triton `dsv4_topk`, which no longer runs. The step-time saving
+matches the kernel results: about 4 µs per target MoE layer.
+
 ## Procedure
 
-Build `-tilelang-gate-router-v2` and run both bundles. Then one window boots
-the control (`packed-v2.json`) and this arm in turn. Each gets the
-single-stream decode bench against the control and the single-stream decode
-profile; the fused arm then gets the eight-stream bench and the prefill bench.
+`-tilelang-gate-router-v2` passes both bundles (60 of 60 tests). One window
+booted the control (`packed-v2.json`) and this arm in turn: decode at one and
+eight streams against the control, prefill, and the single-stream decode
+profile for each.
