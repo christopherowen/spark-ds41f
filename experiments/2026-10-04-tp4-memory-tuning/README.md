@@ -78,12 +78,26 @@ only at the end of a stage, so the window stopped the arm; no selection file
 was written. A one-boot autotune of everything does not fit; tuning has to be
 staged with bounded memory, and the selections pinned (see below).
 
-## Next
+## Combined
 
-- [combined.json](combined.json): batched8k + seqs16 + kv12g together, run
-  against the base in one window with decode at 1, 8 and 16 streams and the
-  prefill lengths, to check that the settings compose and that every node
-  keeps at least 8 GiB.
+[combined.json](combined.json) runs batched8k + seqs16 + kv12g together,
+against the base in one window (2026-10-04 07:54–08:10 UTC):
+
+| | Base | Combined | Change |
+| --- | ---: | ---: | ---: |
+| prose, 1 / 8 streams (tok/s) | 62.8 / 217.1 | 63.0 / 213.2 | +0.3% / −1.8% |
+| code, 1 / 8 streams | 82.3 / 246.4 | 77.4 / 247.2 | −6.0% / +0.4% (within noise) |
+| prose / code, 16 streams | — (eight sequences) | 303.3 / 325.3 | |
+| Prefill 32K / 64K / 256K | 4,678 / 4,734 / 4,526 | 5,137 / 5,114 / 4,904 | **+9.8% / +8.0% / +8.3%** |
+| KV cache tokens per node | 2,845,543 | 9,756,345 | ×3.4 |
+| Lowest MemAvailable over startup, decode and prefill, dgx1–dgx4 (GiB) | 30.6 / 31.7 / 31.8 / 31.0 | 20.4 / 21.6 / 21.6 / 21.0 | |
+| Host memory used at the end, dgx1 (MiB) | 95,187 | 105,856 | +10.4 GiB |
+
+Quality 5/5 in both. The settings compose: the combined arm keeps each one's
+gain and its memory is their sum, leaving the tightest node 20.4 GiB above
+zero, far outside the 8 GiB margin and the 3 GiB steady guard.
+
+## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
   the selections for each TP size to the repository, prove them stable with a
   second run, and serve from them read-only with autotune off.
