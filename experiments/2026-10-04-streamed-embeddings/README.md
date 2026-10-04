@@ -13,8 +13,9 @@ which the target's replace after loading. Every packed-head boot logged
 On GB10, freed GPU memory stays charged to the process: of each GiB freed,
 355–753 MiB stays counted as used, and only the same process can reuse it
 (found while packing the head in place). So the copy and the dropped
-placeholders cost host memory for the life of the server, while the weights
-they served from were already in the carve-out.
+placeholders could cost host memory for the life of the server, while the
+weights they served from were already in the carve-out. The window below
+measures how much they did.
 
 ## Change
 
@@ -57,6 +58,31 @@ way.
    samples), against the first control. Record the boot's carve-out log line,
    MemAvailable once a second on every node, and `free -m` at the end.
 
-Expected: the boot frees about nothing at load. End-of-arm host memory used
-falls by the charged part of the 1.0–1.6 GiB each rank used to free, with
-decode and quality unchanged.
+## Results
+
+Both bundles passed on dgx4 with the new image. The carve-out tests passed
+14 of 14 with none skipped; the in-place load test saw the two 64 MiB tables
+take no ordinary memory. The logits-head tests passed 2 of 2.
+
+Window 2026-10-04 08:57–09:15 UTC, four boots alternating control and
+streamed. Every streamed rank logged both weights "in 2 buffers, loaded in
+place". The control ranks freed 941–1,727 MiB of ordinary memory at that point.
+
+| Node | Used at the end, control (MiB) | Used at the end, streamed (MiB) | Change | Lowest MemAvailable, control → streamed (GiB) |
+| --- | --- | --- | ---: | --- |
+| dgx1 | 95,082 / 95,030 | 94,924 / 94,901 | −143 | 30.39–30.41 → 30.58–30.59 |
+| dgx2 | 93,938 / 93,952 | 93,851 / 93,843 | −98 | 31.55–31.57 → 31.76–31.95 |
+| dgx3 | 93,928 / 93,909 | 93,817 / 93,841 | −90 | 31.81–31.85 → 31.97–31.98 |
+| dgx4 | 94,547 / 94,527 | 94,492 / 94,491 | −45 | 31.43–31.46 → 31.49–31.50 |
+
+Repeat boots of one arm agree within 52 MiB, so the saving is real: 45–143 MiB
+of host memory per node, with the floors 0.05–0.3 GiB higher. Decode is level
+in both pairs (every point within its interval, against the first control),
+and quality passed 5/5 in all four boots.
+
+The saving is a tenth of what was freed, not the third to three quarters the
+packed-head stage test predicted. The serving process reuses the memory it
+freed at load for its KV cache, graph capture and preparation, so most of the
+old copy's cost was recovered later in the same process. What remains is
+the copy's share that nothing reused. The change stays: it moves no weights
+after loading, never allocates the drafter's dropped tables, and costs no speed.
