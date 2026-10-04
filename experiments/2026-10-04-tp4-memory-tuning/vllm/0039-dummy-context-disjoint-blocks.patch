@@ -1,0 +1,128 @@
+From 8632697fc61a32139c6e96592cafc954fded1b14 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 23:16:26 +0200
+Subject: [PATCH] Give fabricated profiling context its own blocks per group
+ and request
+
+DSpark's cost profile fabricates context_len tokens of context for each
+dummy request. Every KV cache group got the same block ids, request after
+request from block 0. The groups draw from one pool and overlay the same
+memory, and the allocator gives a block to one group and request at a
+time, with block 0 reserved as the null block. With 16 requests the
+drafter's sliding window read bytes another group had written in its own
+format, and its first attention layer returned non-finite rows, which
+TileKernels' gate refuses.
+
+Each request of each group now gets its own whole blocks after the null
+block; spans wrap and share only when the pool runs out.
+---
+ tests/v1/worker/test_gpu_pcp_manager.py | 44 ++++++++++++++++++++++++-
+ vllm/v1/worker/gpu/input_batch.py       | 27 +++++++++++----
+ 2 files changed, 64 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_pcp_manager.py b/tests/v1/worker/test_gpu_pcp_manager.py
+index 2bd7be2cf..dcff3ff3a 100644
+--- a/tests/v1/worker/test_gpu_pcp_manager.py
++++ b/tests/v1/worker/test_gpu_pcp_manager.py
+@@ -248,11 +248,53 @@ def test_dummy_context_updates_pcp_local_block_tables():
+ 
+     torch.testing.assert_close(
+         local_block_tables[0][:2, :2],
+-        torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
++        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+     )
+     assert torch.all(global_block_table == -1)
+ 
+ 
++def test_dummy_context_gives_each_group_and_request_its_own_blocks():
++    # Two KV cache groups over one pool: 4-token kernel blocks two to a KV
++    # block, and 2-token blocks one to a KV block.
++    tables = (
++        torch.full((3, 8), -1, dtype=torch.int32),
++        torch.full((3, 8), -1, dtype=torch.int32),
++    )
++    block_tables = SimpleNamespace(
++        input_block_tables=tables,
++        kernel_block_sizes=(4, 2),
++        blocks_per_kv_block=(2, 1),
++    )
++    input_batch = InputBatch.make_dummy(
++        num_reqs=3,
++        num_tokens=3,
++        input_buffers=InputBuffers(3, 8, torch.device("cpu")),
++        max_query_len=1,
++    )
++
++    set_dummy_context(
++        input_batch,
++        block_tables,
++        context_len=10,
++        num_kv_blocks=64,
++        max_model_len=32,
++    )
++
++    owners = {}
++    for group, (table, bpk) in enumerate(zip(tables, (2, 1))):
++        num_blocks = 3 if group == 0 else 6  # 11 tokens of context and query
++        spans = table[:3, :num_blocks]
++        assert torch.all(spans > 0), "the null block is never handed out"
++        assert torch.all(table[:3, num_blocks:] == -1)
++        for request in range(3):
++            row = spans[request]
++            # Each request's kernel blocks run on through whole KV blocks.
++            assert torch.equal(row, row[0] + torch.arange(num_blocks, dtype=row.dtype))
++            assert int(row[0]) % bpk == 0
++            for kv_block in set((row // bpk).tolist()):
++                assert owners.setdefault(kv_block, (group, request)) == (group, request)
++
++
+ def _rank_rows(
+     pcp_rank: int,
+     pcp_world_size: int,
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 7e7ca789c..f72e209cb 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -270,18 +270,33 @@ def set_dummy_context(
+     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+ 
+     seq_len = context_len + query_len
++    # Every KV cache group draws from one block pool and the groups overlay the
++    # same memory, so the allocator gives each block to one group and request
++    # at a time, and block 0 is the reserved null block. Fabricated spans keep
++    # that: each request of each group gets its own whole blocks, after the
++    # null block, so no span reads bytes another group wrote in its own
++    # format. They wrap and share only when the pool runs out.
++    usable = num_kv_blocks - 1
++    next_block = 0
+     for block_table, block_size, bpk in zip(
+         input_block_tables,
+         block_tables.kernel_block_sizes,
+         block_tables.blocks_per_kv_block,
+     ):
+         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
+-        # Spans are disjoint until the pool runs out, then they wrap and share
+-        # blocks: profiling only needs the reads to be realistic, not distinct.
+-        block_ids = torch.arange(
+-            num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
+-        ) % (num_kv_blocks * bpk)
+-        block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
++        kv_blocks = cdiv(num_blocks, bpk)
++        device = block_table.device
++        kv_ids = (
++            next_block
++            + torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
++        ) % usable + 1
++        next_block = (next_block + num_reqs * kv_blocks) % usable
++        kernel_ids = kv_ids.view(num_reqs, kv_blocks, 1) * bpk + torch.arange(
++            bpk, dtype=torch.int64, device=device
++        )
++        block_table[:num_reqs, :num_blocks] = kernel_ids.view(num_reqs, -1)[
++            :, :num_blocks
++        ].to(block_table.dtype)
+ 
+ 
+ @triton.jit
+-- 
+2.54.0 (Apple Git-157)
+
