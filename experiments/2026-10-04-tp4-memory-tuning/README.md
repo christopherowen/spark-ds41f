@@ -115,8 +115,63 @@ asks of the rest of the configuration:
   retrieval at depth, the full-length prefill time and the decode rate with
   the whole context resident.
 
-The KV cache (12 GiB, 9.3 full windows for up to 16 sequences) is then sized
-from the measured floors.
+Window 2026-10-04 08:21–08:45 UTC, against the combined arm's reports:
+
+| | 1M | 512K (combined) |
+| --- | ---: | ---: |
+| prose, 1 / 8 / 16 streams (tok/s) | 64.1 / 212.3 / 297.1 | 63.0 / 213.2 / 303.3 |
+| code, 1 / 8 / 16 streams | 76.9 / 246.6 / 324.1 | 77.4 / 247.2 / 325.3 |
+| Prefill 32K / 256K | 5,075 / 4,875 | 5,137 / 4,903 |
+| Prefill, 1,000,000 tokens | 4,013 tok/s (249 s) | — |
+| Lowest MemAvailable over startup, decode and prefill, dgx1–dgx4 (GiB) | 19.05 / 20.72 / 20.75 / 20.08 | 20.4 / 21.6 / 21.6 / 21.0 |
+
+Decode and prefill are level within noise, and quality passed 5/5. The
+~1M-token prefill moves the floor only 0.6 GiB below decode. Retrieval at
+depth passed: a code word planted at 10% and at 90% of ~900K-token prompts
+(902,794 and 892,797 tokens) was answered correctly. The time to first token
+was 224 s and 221 s, and decode ran at 131 tok/s with the whole context
+resident.
+
+## KV cache and prompt cache at 1M
+
+With 12 GiB of KV per rank, vLLM reports a maximum concurrency of 9.35 for
+1,048,576-token requests (9,806,361 tokens, 56,552 blocks), about 1.28 GiB per
+full window. The owner set the rule for sizing: of the 16 sequences, keep room
+for about 8 at full length, and tune the prompt cache to stay reasonable.
+
+The prompt (prefix) cache shares the same pool. Each of the 40 layers, and
+the drafter's, keeps a 128-token sliding-window cache.
+`--prefix-cache-retention-interval` retains a checkpoint of those windows
+every interval along a cached prompt, about 16 blocks per checkpoint, so a
+later prompt that diverges mid-way can resume there. At 512, checkpoints keep
+a quarter of every cached prompt's sliding-window blocks: about 32,800 blocks
+for one cached 1M prompt, against about 5,000 for its compressed KV and
+56,552 in the pool. Multi-turn continuations do not need periodic
+checkpoints: the end of the previous turn is always retained.
+
+Three arms, one per retention interval. Each is the 1M arm with 10.5 GiB of
+KV per rank (8.2 full windows). They keep its DSpark cost directory, since
+neither setting changes a shape:
+
+| Arm | Retention interval | Checkpoint blocks per cached 1M prompt (estimate) | Most tokens recomputed after a mid-prompt divergence |
+| --- | ---: | ---: | ---: |
+| [kv8-r512](kv8-r512.json) | 512 | ~32,800 | 512 |
+| [kv8-r8k](kv8-r8k.json) | 8,192 | ~2,050 | 8,192 (one prefill chunk) |
+| [kv8-r32k](kv8-r32k.json) | 32,768 | ~510 | 32,768 |
+
+Each arm runs lean decode (prose and code at 1 and 8 streams, three samples,
+against the 1M arm) and [prefix_cache.py](prefix_cache.py). The probe sends
+~200K-token real-text prompts one at a time and reads each request's cached
+tokens from the server's counters:
+
+- a cold prompt and its exact repeat;
+- the prompt with a new tail from 75%, where the hit is the last retained
+  checkpoint;
+- a multi-turn continuation;
+- ten other prompts, then the first again, which shows whether the cache
+  still holds it.
+
+The per-second memory logs give each arm's floors.
 
 ## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
