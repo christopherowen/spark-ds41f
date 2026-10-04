@@ -133,3 +133,37 @@ the others), so the 10.5 GiB KV pool qualifies against the 8 GiB floor.
 **mHC recommendation:** keep TileKernels' mHC (0037). It follows DeepSeek's
 reference arithmetic, and its acceptance more than pays for B12X's
 per-step lead.
+
+## mHC register fold (0040)
+
+The decode profiles put TileKernels' mHC entry at about 20 µs per call in
+serving, in its projection kernel. With fn cold in L2, as in serving (40
+distinct fn and residual sets cycled inside one CUDA graph), timing the
+kernel with parts removed showed where the time went. The post fold was
+half of it: per stream, scalar shared loads of the staged streams, a staged
+BF16 tile, a TMA store that waited for the write, and a reload into the GEMM
+tile, with barriers between. The collapse's sum of squares then took sixteen
+block-wide reductions. The GEMMs themselves were about 1 µs. Staging fn
+asynchronously did not help: the projection already reads fn near the
+memory bandwidth, and the earlier "fn prefetch had no effect" benchmark had
+fn warm in L2.
+
+[0040](vllm/0040-tilelang-mhc-register-fold.patch) gives each thread one
+token's 16 contiguous columns. It folds the previous output into the
+streams in registers (same expression and order), stores the updated
+stream directly and writes the GEMM tile; both sums of squares reduce
+across the token's eight lanes. The updated streams, GEMM partials and
+collapse are unchanged bit for bit; the two sums of squares add in a
+different fixed order, so the mixes move by about 1e-7 and y by at most one
+BF16 ulp. The tests bundle passes (99).
+
+Sublayer entry (projection and finalize), µs per call, fn cold:
+
+| Tokens | 1 | 16 | 32 | 64 | 96 |
+| --- | --- | --- | --- | --- | --- |
+| 0037 | 18.5 | 20.9 | 31.1 | 49.8 | 67.3 |
+| 0040 | 14.4 | 17.4 | 23.3 | 35.7 | 44.4 |
+
+[register-fold/candidate.json](register-fold/candidate.json) is the
+candidate with 0040 (image `-tilelang-1m-v3`), with the same pinned DSpark
+cost curves, for an A/B against the v2 candidate in one window.
