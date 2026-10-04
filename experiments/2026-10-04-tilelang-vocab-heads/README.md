@@ -63,11 +63,27 @@ The Markov head, with weights cold in L2:
 
 The [tests](bundles/tests/candidate.json) pass 23 of 23 for the heads.
 
+## Serving results
+
+One window against the gate router candidate (`-tilelang-gate-router-v2`):
+
+| | Control | Heads | Change |
+| --- | ---: | ---: | --- |
+| Step time, prose c1 | 33.31 ms | 32.70 ms | −1.8% [−3.6, −0.0], faster |
+| Step time, code c1 | 36.39 ms | 35.77 ms | −1.7% [−3.2, −0.2], faster |
+| Decode, prose c8 | 215.9 tok/s | 213.2 tok/s | −1.2% [−6.3, +3.8], same |
+| Decode, code c8 | 250.0 tok/s | 249.8 tok/s | −0.1% [−0.9, +0.8], same |
+| Prefill, 32,768 tokens | 4,900 tok/s | 4,879 tok/s | −0.4% [−15.9, +15.0], same |
+| Prefill, 262,144 tokens | 4,649 tok/s | 4,647 tok/s | −0.0% [−2.5, +2.4], same |
+
+Quality passed 5 of 5. In the single-stream decode profile, each scheduler
+step loses B12X's two packed head projections (2.24 ms) and five Markov row
+kernels (0.41 ms), and gains 2.22 ms of TileLang kernels. Triton kernels fell
+from 6.6% to 1.3% of GPU time.
+
 ## Procedure
 
-Build `-tilelang-vocab-heads-v1` and run both bundles:
-[tests](bundles/tests/candidate.json) and the
-[head bench](bundles/head-bench/candidate.json), which measures the prepared
-heads. Then one window boots the gate router candidate (the control) and this
+`-tilelang-vocab-heads-v1` passes both bundles (83 of 83 tests, 20 bench
+points). One window booted the gate router candidate (the control) and this
 arm in turn: decode at one and eight streams, prefill, and the single-stream
 decode profile for each.
