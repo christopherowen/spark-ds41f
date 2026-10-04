@@ -10,7 +10,7 @@ launches:
 2. `splitk_reduce`, writing FP32 logits;
 3. the router reading them back.
 
-Two vLLM patches shorten that.
+Two vLLM patches shorten that, and a third keeps both routers off padding rows.
 
 **[0033](vllm/0033-tilelang-splitk-row-tiles.patch): row tiles sized to the
 rows.** The split-K partials kernel always used 64-row tiles. At one to six
@@ -33,6 +33,16 @@ launch with TileKernels' arithmetic:
 
 The logits never reach memory, and each MoE layer runs one launch fewer.
 Above 64 rows the gate runs its GEMM and TileKernels routes the logits.
+
+**[0035](vllm/0035-tilelang-routing-skips-padding.patch): padding rows left
+unrouted.** A CUDA graph runs its captured batch size, so a step with one
+decode row (one token plus its drafts) can carry padding rows. vLLM's own
+routers give those rows id −1 and weight 0 when `VLLM_MOE_SKIP_PADDING` is on
+(the default), and the MoE dispatch then skips them. Neither TileLang router
+did, so every padding row dispatched six experts of work. Both routers now
+take the step's padding mask. It is computed once per step and cached on the
+forward context, like the image mask, and masked rows write −1 and 0 without
+reading their logits.
 
 [fused.json](fused.json) is the candidate, launchable, with the router arm's
 cost directory.
@@ -61,10 +71,28 @@ step-one image:
 At single-stream decode, each target MoE layer's gate and routing take
 8.0 µs, down from 12.0 µs before 0032.
 
+## Serving results
+
+Window 1 (`-tilelang-gate-router-v1`, before 0035) and a second window with a
+rebuilt control (`-tilelang-packedhead-v2`, [packed-v2.json](../2026-10-04-tilelang-router/packed-v2.json)):
+
+| Single-stream step time | prose c1 | code c1 |
+| --- | ---: | ---: |
+| Control | 33.70 ms | 36.87 ms |
+| Router (0032) | 37.75 ms (+12.0%) | 39.20 ms (+6.3%) |
+| Fused (0033–0034) | 37.60 ms (+12.0%) | 39.05 ms (+6.3%) |
+
+The router arm's eight-stream throughput was unchanged, and both router arms
+carried the same fixed loss at one stream. In the single-stream profiles,
+routing itself costs only 45 µs per step more than the Triton kernel. The rest,
+1.3 ms per step, is TileLang kernels launched as often as in the control but
+running longer: the padding rows of each captured batch were routed and
+dispatched as real tokens. 0035 fixes that, and its tests check both routers on
+a padded step.
+
 ## Procedure
 
-Build `-tilelang-gate-router-v1` and run both bundles. Then one window
-boots the TileLang packed arm, the router arm and this arm in turn. Each
-gets the single-stream decode bench (against the packed arm of the same
-window) and the single-stream decode profile, so the router arm's
-single-stream slowdown can be traced to its kernels or gaps.
+Build `-tilelang-gate-router-v2` and run both bundles. Then one window boots
+the control (`packed-v2.json`) and this arm in turn. Each gets the
+single-stream decode bench against the control and the single-stream decode
+profile; the fused arm then gets the eight-stream bench and the prefill bench.
