@@ -61,6 +61,25 @@ shuffles per round. The next step folds the gate projection's split-K reduce
 into the router, which removes one launch and the FP32 logits round trip
 from every MoE layer.
 
+## Serving results
+
+Window 2026-10-04 12:58–13:06 UTC, against the packed arm's reports:
+
+| | Router | Packed arm | Change |
+| --- | ---: | ---: | --- |
+| prose, 1 / 8 streams (tok/s) | 57.5 / 213.1 | 62.3 / 213.6 | −7.6% / −0.2% |
+| code, 1 / 8 streams | 74.7 / 248.4 | 80.8 / 247.5 | −7.6% / +0.3% |
+| Single-stream step time, prose / code (ms) | 37.79 / 39.29 | 33.58 / 36.73 | +12.6% / +6.9% |
+| Prefill 1K / 32K / 64K / 256K (tok/s) | 2,586 / 4,895 / 4,906 / 4,652 | 2,575 / 4,885 / 4,908 / 4,651 | level |
+
+Quality passed 5/5, and every node kept at least 29.9 GiB available.
+Eight-stream decode and prefill are level. Single-stream step time is
+4.2 ms longer, far more than the router's 2 µs per call (about 0.1 ms per
+step). The packed arm's reports come from another day's boot, and the
+TileLang family's routed experts have varied 16.15–18.86 ms across boots.
+The [gate router](../2026-10-04-tilelang-gate-router/README.md) window
+reruns the packed arm beside this one, with a decode profile of each.
+
 ## Procedure
 
 Build `-tilelang-router-v1`, run both bundles, then one window with the

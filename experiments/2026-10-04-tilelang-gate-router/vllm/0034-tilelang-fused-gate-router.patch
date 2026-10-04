@@ -1,0 +1,411 @@
+From dae520b10a049183672981de7a911f1be154ab33 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:09:52 +0200
+Subject: [PATCH] Fuse the TileLang gate's split-K reduction into the router
+
+At decode the 384-expert gate ran as split-K partials, a reduction
+kernel writing FP32 logits, and then TileKernels' router reading them.
+TileLangGateRouter now owns the gate. route_partials adds the partials
+in shard order, which reproduces splitk_reduce's logits bit for bit, and
+routes them in the same launch with TileKernels' arithmetic. Each
+round's warp winner takes two integer reductions instead of ten
+shuffles, and non-finite logits are checked once per lane. The logits
+never reach memory, and each MoE layer runs one launch fewer.
+
+Ids and weights are bit-identical to running the gate, then TileKernels'
+router, at 1-64 rows for the target and the drafter, image tokens
+included. Above 64 rows the gate runs its GEMM and TileKernels routes
+the logits.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  |  92 ++++++++
+ vllm/models/deepseek_v4/nvidia/model.py       |   9 +-
+ vllm/models/deepseek_v4_1/kernels.py          |   4 +-
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 217 ++++++++++++++++++
+ 4 files changed, 319 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 45253de6b..0b24695b1 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -128,3 +128,95 @@ def test_matches_the_triton_router_it_replaces():
+     triton_weights, triton_ids = dsv4_topk(logits, bias, torch.int64, SCALE)
+     torch.testing.assert_close(ids, triton_ids, rtol=0, atol=0)
+     torch.testing.assert_close(weights, triton_weights, rtol=1e-5, atol=0)
++
++
++class _Gate(torch.nn.Module):
++    """A V4.1 router gate on the TileLang BF16 projection, FP32 out."""
++
++    def __init__(self, experts, hidden=5120, seed=0):
++        from vllm.models.deepseek_v4_1.tilelang.linear import TileLangLinearMethod
++
++        super().__init__()
++        generator = torch.Generator(device="cuda").manual_seed(seed)
++        weight = torch.randn(experts, hidden, device="cuda", generator=generator) * 0.02
++        self.weight = torch.nn.Parameter(weight.to(torch.bfloat16), requires_grad=False)
++        self.out_dtype = torch.float32
++        self.quant_method = TileLangLinearMethod()
++        self.quant_method.process_weights_after_loading(self)
++
++    def forward(self, x):
++        return self.quant_method.apply(self, x), None
++
++
++@pytest.fixture
++def plain_scratch(monkeypatch):
++    from vllm.models.deepseek_v4_1.tilelang import linear
++
++    monkeypatch.setattr(
++        linear,
++        "_scratch",
++        lambda specs, scratch: [
++            torch.empty(s, dtype=d, device="cuda") for s, d in specs
++        ],
++    )
++
++
++@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
++@pytest.mark.parametrize("rows", [1, 6, 17, 64, 65, 512])
++def test_gate_router_matches_the_gate_then_the_router(
++    plain_scratch, experts, topk, rows
++):
++    """Decode rows fuse the gate's split-K reduction into the router, bit for bit."""
++    gate = _Gate(experts, seed=experts)
++    assert gate.tilelang_shards > 1
++    generator = torch.Generator(device="cuda").manual_seed(rows)
++    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
++    bias = torch.randn(experts, device="cuda", generator=generator) * 0.1
++    kwargs = dict(
++        top_k=topk,
++        global_num_experts=experts,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    weights, ids = fused._compute_routing(None, x, None)
++    logits, _ = gate(x)
++    expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
++        None, logits, None
++    )
++    assert torch.equal(ids, expected[1])
++    assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
++
++
++def test_gate_router_routes_image_tokens(plain_scratch):
++    gate = _Gate(384, seed=3)
++    generator = torch.Generator(device="cuda").manual_seed(5)
++    x = torch.randn(48, 5120, device="cuda", generator=generator).to(torch.bfloat16)
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    bias_vl = torch.nn.Parameter(
++        torch.randn(384, device="cuda", generator=generator) * 0.1, requires_grad=False
++    )
++    input_ids = torch.randint(0, 1000, (48,), device="cuda", generator=generator)
++    input_ids[1::4] = LO
++    kwargs = dict(
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++        bias_vl=bias_vl,
++        image_sentinel_lo=LO,
++        image_sentinel_count=1,
++    )
++    weights, ids = tilelang_router.TileLangGateRouter(
++        gate=gate, **kwargs
++    )._compute_routing(None, x, None, input_ids=input_ids)
++    logits, _ = gate(x)
++    expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
++        None, logits, None, input_ids=input_ids
++    )
++    assert torch.equal(ids, expected[1])
++    assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 721b4eafd..a5a36f12a 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -1015,9 +1015,15 @@ class DeepseekV4MoE(nn.Module):
+         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+ 
+         router = None
++        runner_gate = self.gate
+         if self.router_cls is not None:
+             if parallel_config.enable_eplb:
+                 raise ValueError(f"{self.router_cls.__name__} does not support EPLB")
++            extra = {}
++            if getattr(self.router_cls, "routes_hidden_states", False):
++                # The router runs the gate itself; the runner passes it the
++                # hidden states in place of logits.
++                extra["gate"], runner_gate = self.gate, None
+             router = self.router_cls(
+                 top_k=self.n_activated_experts,
+                 global_num_experts=self.n_routed_experts,
+@@ -1029,10 +1035,11 @@ class DeepseekV4MoE(nn.Module):
+                 bias_vl=getattr(self.gate, "bias_vl", None),
+                 image_sentinel_lo=self.image_sentinel_lo,
+                 image_sentinel_count=self.image_sentinel_count,
++                **extra,
+             )
+         self.experts = FusedMoEFactory(
+             shared_experts=self.shared_experts,
+-            gate=self.gate,
++            gate=runner_gate,
+             router=router,
+             num_experts=self.n_routed_experts,
+             top_k=self.n_activated_experts,
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 1db635571..55e95bff3 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -54,9 +54,9 @@ def embedding_method():
+ def moe_router_class():
+     """Router class for the MoE layers; None keeps vLLM's for the config."""
+     if uses_tilelang():
+-        from .tilelang.router import TileKernelsRouter
++        from .tilelang.router import TileLangGateRouter
+ 
+-        return TileKernelsRouter
++        return TileLangGateRouter
+     return None
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 9cc62e875..b4a9c77a2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -16,8 +16,17 @@ routing:
+ 
+ One warp routes one token. The kernel refuses NaN or infinite logits instead
+ of routing on them. V4.1 has no hash-routed layers.
++
++``TileLangGateRouter`` also owns the gate projection. At decode the gate runs
++as split-K FP32 partials, and ``route_partials`` adds them in shard order,
++which reproduces ``splitk_reduce``'s logits bit for bit. It then routes them
++with TileKernels' arithmetic in the same launch, so the logits never reach
++memory and each MoE layer runs one launch fewer. At prefill the gate runs its
++own GEMM and TileKernels routes the logits.
+ """
+ 
++import tilelang
++import tilelang.language as T
+ import torch
+ 
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+@@ -89,3 +98,211 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+                 f"TileKernels routing writes int64 expert ids, not {indices_type}"
+             )
+         return topk_weights, topk_ids
++
++
++_WARP = 32
++_VECTOR = 4
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_OUT_OF_BOUND_WARNING: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++    },
++)
++def route_partials(
++    num_topk: int, num_experts: int, shards: int, image_mask: bool, warps: int = 2
++):
++    """Sum a gate's split-K partials in shard order and route each token.
++
++    The routing is TileKernels' ``moe_topk_gate_forward`` for sqrtsoftplus
++    with a correction bias: the same scores, selection order and weights. Its
++    inputs are the partials ``P[shards, rows, experts]``, added from shard 0
++    as ``splitk_reduce`` adds them. Each round's warp-wide winner takes two
++    integer reductions instead of TileKernels' ten shuffles. Non-finite
++    logits are refused once per lane, not once per logit.
++    """
++    assert num_topk <= _WARP and num_experts % _VECTOR == 0
++    per_lane = tilelang.cdiv(tilelang.cdiv(num_experts, _WARP), _VECTOR) * _VECTOR
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def main(
++        P: T.Tensor((shards, rows, num_experts), T.float32),
++        bias: T.Tensor((num_experts,), T.float32),
++        image_bias: T.Tensor((num_experts,), T.float32),
++        image_token_mask: T.Tensor((rows,), T.bool),
++        topk_idx: T.Tensor((rows, num_topk), T.int64),
++        topk_weights: T.Tensor((rows, num_topk), T.float32),
++        routed_scaling_factor: T.float32,
++    ):
++        with T.Kernel(T.ceildiv(rows, warps), threads=warps * _WARP) as pid:
++            thread = T.get_thread_binding()
++            token = thread // _WARP
++            row = token + pid * warps
++            lane = thread % _WARP
++            if row >= rows:
++                T.thread_return()
++
++            unbiased = T.alloc_shared((warps, num_experts), T.float32)
++            bias_local = T.alloc_local((per_lane,), T.float32)
++            scores = T.alloc_local((per_lane,), T.float32)
++            ids = T.alloc_local((per_lane,), T.int32)
++            finite = T.alloc_var(T.bool, init=True)
++            best_score = T.alloc_var(T.float32)
++            best_idx = T.alloc_var(T.int32, init=-1)
++            previous = T.alloc_var(T.int32, init=-1)
++            chosen_idx = T.alloc_var(T.int64)
++            chosen_score = T.alloc_var(T.float32)
++            total = T.alloc_var(T.float32)
++            is_image = T.alloc_var(T.bool)
++            is_image = image_token_mask[row] if image_mask else False
++
++            T.fill(ids, -1)
++            T.fill(scores, -T.infinity(T.float32))
++            T.fill(bias_local, 0.0)
++            for i in T.unroll(0, per_lane // _VECTOR):
++                start = i * _VECTOR * _WARP + lane * _VECTOR
++                if start < num_experts:
++                    for j in T.vectorized(_VECTOR):
++                        scores[i * _VECTOR + j] = P[0, row, start + j]
++                        bias_local[i * _VECTOR + j] = (
++                            image_bias[start + j] if is_image else bias[start + j]
++                        )
++                    for s in T.serial(1, shards):
++                        for j in T.vectorized(_VECTOR):
++                            scores[i * _VECTOR + j] += P[s, row, start + j]
++                    for j in T.unroll(_VECTOR):
++                        if not T.isfinite(scores[i * _VECTOR + j]):
++                            finite = False
++            T.device_assert(
++                finite, msg="route_partials: gate logits contain nan or inf"
++            )
++
++            for i in T.unroll(0, T.ceildiv(num_experts, _VECTOR * _WARP)):
++                start = i * _VECTOR * _WARP + lane * _VECTOR
++                if start < num_experts:
++                    for j in T.unroll(_VECTOR):
++                        x = scores[i * _VECTOR + j]
++                        scores[i * _VECTOR + j] = T.sqrt(
++                            T.Select(x > 20.0, x, T.log1p(T.exp(x)))
++                        )
++                    for j in T.vectorized(_VECTOR):
++                        unbiased[token, start + j] = scores[i * _VECTOR + j]
++                        scores[i * _VECTOR + j] += bias_local[i * _VECTOR + j]
++                        ids[i * _VECTOR + j] = start + j
++            T.sync_warp()
++
++            for k in T.unroll(num_topk):
++                best_score = -T.infinity(T.float32)
++                best_idx = -1
++                for i in T.unroll(0, per_lane):
++                    if k != 0 and previous == ids[i]:
++                        scores[i] = -T.infinity(T.float32)
++                    elif scores[i] > best_score:
++                        best_score = scores[i]
++                        best_idx = ids[i]
++                # The winner across the warp in two hardware reductions: the
++                # largest score as an integer that orders like the float, then
++                # the lowest expert id among the lanes holding it.
++                bits = T.reinterpret(best_score, T.int32)
++                key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
++                top = T.warp_reduce_max(key)
++                best_idx = T.warp_reduce_min(
++                    T.if_then_else(key == top, best_idx, 0x7FFFFFFF)
++                )
++                previous = best_idx
++                if lane == k:
++                    chosen_idx = best_idx
++
++            chosen_score = 0.0
++            if lane < num_topk:
++                chosen_score = unbiased[token, chosen_idx]
++            total = chosen_score
++            for i in T.unroll(0, 5):
++                total += T.shfl_xor(total, 1 << (4 - i))
++            total += 1e-20
++            if lane < num_topk:
++                topk_idx[row, lane] = chosen_idx
++                topk_weights[row, lane] = chosen_score / total * routed_scaling_factor
++
++    return main
++
++
++class TileLangGateRouter(TileKernelsRouter):
++    """TileKernelsRouter that also runs the gate, fusing its decode reduction.
++
++    The fused-MoE runner hands it the hidden states in place of router
++    logits (the MoE layer gives it the gate instead of the runner).
++    """
++
++    routes_hidden_states = True
++
++    def __init__(self, *args, gate: torch.nn.Module, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.gate = gate
++        self._kernels: dict[bool, object] = {}
++        # Text-only layers pass no image tokens; one all-false mask serves them.
++        self._no_image = None
++
++    def _compute_routing(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        indices_type: torch.dtype | None,
++        *,
++        input_ids: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        from .linear import _partial_specs, _scratch, partials_kernel
++
++        gate = self.gate
++        x = router_logits.reshape(-1, gate.weight.shape[1])
++        specs = _partial_specs(gate, x.shape[0])
++        if not specs:
++            logits, _ = gate(x)
++            return super()._compute_routing(
++                hidden_states, logits, indices_type, input_ids=input_ids
++            )
++        if indices_type not in (None, torch.int64):
++            raise ValueError(
++                f"TileLang routing writes int64 expert ids, not {indices_type}"
++            )
++        (partials,) = _scratch(specs, None)
++        partials_kernel(gate, x.shape[0])(x, gate.weight, partials)
++        image = self.bias_vl is not None and self.image_sentinel_lo > 0
++        if image and input_ids is None:
++            raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
++        if image not in self._kernels:
++            self._kernels[image] = route_partials(
++                self.top_k, gate.weight.shape[0], gate.tilelang_shards, image
++            )
++        rows = x.shape[0]
++        topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
++        topk_weights = torch.empty(
++            rows, self.top_k, dtype=torch.float32, device=x.device
++        )
++        bias = self.e_score_correction_bias.data
++        if image:
++            image_bias = self.bias_vl.data
++            mask = _image_token_mask(
++                input_ids, self.image_sentinel_lo, self.image_sentinel_count
++            )
++        else:
++            if self._no_image is None or self._no_image.device != x.device:
++                from .linear import DECODE_ROWS
++
++                self._no_image = torch.zeros(
++                    DECODE_ROWS, dtype=torch.bool, device=x.device
++                )
++            image_bias, mask = bias, self._no_image[:rows]
++        self._kernels[image](
++            partials,
++            bias,
++            image_bias,
++            mask,
++            topk_ids,
++            topk_weights,
++            self.routed_scaling_factor,
++        )
++        return topk_weights, topk_ids
+-- 
+2.54.0 (Apple Git-157)
+

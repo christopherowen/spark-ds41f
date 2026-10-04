@@ -1,0 +1,105 @@
+From b0cc60c5e4637e1d3bf8d488d769227a36eb2e57 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:09:51 +0200
+Subject: [PATCH] Size the TileLang split-K row tile to the decode rows
+
+The BF16 projection's split-K partials kernel always used 64-row tiles.
+At one to six decode rows a 64-row tile takes twice as long as a 16-row
+one: the 384-expert gate's partials took 9.2 us against 4.3 us. Every
+tile height gives the same partials bit for bit, so each call now takes
+the smallest of 16, 32 and 64 rows that fits. The test checks that every
+height matches the full batch.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 22 ++++++++++++++-----
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 21 ++++++++++++++++--
+ 2 files changed, 36 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 78715b286..6ab9abf7d 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -110,18 +110,30 @@ def test_bf16_gemm(n, k, out_dtype):
+         full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+     )
+     if shards > 1:
+-        partials = bf16_gemm_partials(n, k, shards)
++        from vllm.models.deepseek_v4_1.tilelang.linear import PARTIAL_ROW_TILES
++
++        partials = {
++            block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
++            for block_M in PARTIAL_ROW_TILES
++        }
+         reduce = splitk_reduce(n, shards, out_dtype=tl_dtype)
+     for rows in ROWS:
+         out = torch.empty((rows, n), dtype=out_dtype, device=DEVICE)
+         if shards > 1 and rows <= DECODE_ROWS:
+-            # Decode rows: split-K partials, reduced in shard order.
++            # Decode rows: split-K partials, reduced in shard order. Every row
++            # tile height gives the full batch's result bit for bit.
+             p = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
+-            partials(x[:rows], weight, p)
+-            reduce(p, out)
++            for block_M, kernel in partials.items():
++                kernel(x[:rows], weight, p)
++                reduce(p, out)
++                assert torch.equal(out, full[:rows]), (
++                    f"rows={rows} with {block_M}-row tiles differs from the full batch"
++                )
+         else:
+             gemm(x[:rows], weight, out)
+-        assert torch.equal(out, full[:rows]), f"rows={rows} differs from the full batch"
++            assert torch.equal(out, full[:rows]), (
++                f"rows={rows} differs from the full batch"
++            )
+ 
+ 
+ @pytest.mark.parametrize("hidden", [128, 512, 4096])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index a064e5f77..eead5a2fc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -63,6 +63,20 @@ def _activation_specs(rows: int, k: int):
+     )
+ 
+ 
++# Row tiles of the split-K partials kernel. A 64-row tile computes one decode
++# row in twice the time of a 16-row tile; every height gives the same
++# partials bit for bit, so each row count takes the smallest tile that fits.
++PARTIAL_ROW_TILES = (16, 32, 64)
++
++
++def partials_kernel(layer: nn.Module, rows: int):
++    """The layer's split-K partials kernel with the smallest row tile for ``rows``."""
++    for block_M in PARTIAL_ROW_TILES:
++        if rows <= block_M:
++            return layer.tilelang_partials[block_M]
++    return layer.tilelang_partials[PARTIAL_ROW_TILES[-1]]
++
++
+ def _partial_specs(layer: nn.Module, rows: int):
+     """FP32 split-K partials of a BF16 projection's decode rows, if it splits."""
+     shards = layer.tilelang_shards
+@@ -151,7 +165,7 @@ def _bf16_linear(
+     specs = _partial_specs(layer, rows)
+     if specs:
+         (partials,) = _scratch(specs, scratch)
+-        layer.tilelang_partials(x, layer.weight, partials)
++        partials_kernel(layer, rows)(x, layer.weight, partials)
+         layer.tilelang_reduce(partials, out)
+     else:
+         layer.tilelang_gemm(x, layer.weight, out)
+@@ -205,7 +219,10 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         shards = layer.tilelang_shards = bf16_shards(n, k)
+         layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
+         if shards > 1:
+-            layer.tilelang_partials = bf16_gemm_partials(n, k, shards)
++            layer.tilelang_partials = {
++                block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
++                for block_M in PARTIAL_ROW_TILES
++            }
+             layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
+         layer.tilelang_key = id(layer)
+         _LAYERS[layer.tilelang_key] = layer
+-- 
+2.54.0 (Apple Git-157)
+
