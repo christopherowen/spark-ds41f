@@ -1,4 +1,4 @@
-From aa9b98f23419b7a5789d0fd3e1a56df458c4767e Mon Sep 17 00:00:00 2001
+From e31aeac9e550e289fa3252220d2bc6579beeaa46 Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 23:50:32 +0200
 Subject: [PATCH] Serve the DeepSeek V4.1 target head from exact 12-bit packed
@@ -12,10 +12,12 @@ The BF16 vocabulary head is read in full for every target verification and
 every first draft position, so its cost is its bytes. With
 VLLM_DS41_PACKED_BF16_LM_HEAD=1 the DS4.1 target head (which a DSpark
 drafter without its own head shares) loads its checkpoint BF16 tensor
-unchanged and then packs it with B12X: one sign-and-mantissa byte plus a
-4-bit exponent code per value, with out-of-window values kept exactly in a
-per-row exception list. The packed bytes replace the BF16 tensor, so the
-display carve-out moves them like any streamed weight. The logits
+unchanged and then packs it with B12X, in the head's own storage: one
+sign-and-mantissa byte plus a 4-bit exponent code per value, with
+out-of-window values kept exactly in a per-row exception list. Packing in
+place frees nothing the BF16 head would not; on a GB10, memory freed during
+loading stays charged to the process. The packed bytes replace the BF16
+tensor, so the display carve-out moves them like any streamed weight. The logits
 processor declares, prepares and runs B12X's packed projection per token
 capacity, as it does the BF16 one.
 
@@ -29,14 +31,14 @@ drafter's logits processor and replays in a CUDA graph; the existing
 shared and Markov logits-head preparation test still passes.
 Upstream status: local experimental patch, not submitted.
 ---
- ...test_deepseek_v4_1_prepared_projections.py |  79 +++++++++++++
+ ...test_deepseek_v4_1_prepared_projections.py |  79 ++++++++++++
  vllm/envs.py                                  |   7 ++
  .../model_executor/layers/logits_processor.py |  76 +++++++++++-
- .../layers/quantization/online/packed_bf16.py | 111 ++++++++++++++++++
+ .../layers/quantization/online/packed_bf16.py | 117 ++++++++++++++++++
  .../layers/vocab_parallel_embedding.py        |  42 ++++++-
  vllm/models/deepseek_v41/nvidia/model.py      |   3 +
  vllm/utils/b12x.py                            |   5 +
- 7 files changed, 318 insertions(+), 5 deletions(-)
+ 7 files changed, 324 insertions(+), 5 deletions(-)
  create mode 100644 vllm/model_executor/layers/quantization/online/packed_bf16.py
 
 diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
@@ -289,17 +291,18 @@ index 05bc57e80..2042b8ee2 100644
                  and embedding_bias is None
 diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
 new file mode 100644
-index 000000000..d642a0037
+index 000000000..181c57420
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,117 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Vocabulary heads stored in B12X's exact 12-bit packed BF16 form.
 +
-+The checkpoint's BF16 head loads unchanged; after loading it is packed into
-+one sign-and-mantissa byte plus a 4-bit exponent code per value, with the
-+rare out-of-window values kept exactly in a per-row exception list. Packing
++The checkpoint's BF16 head loads unchanged; after loading it is packed, in
++its own storage, into one sign-and-mantissa byte plus a 4-bit exponent code
++per value, with the rare out-of-window values kept exactly in a per-row
++exception list. Packing
 +verifies that every bit round-trips and refuses otherwise, so the served head
 +is the checkpoint tensor in 75% of the bytes, not an approximation.
 +
@@ -359,8 +362,13 @@ index 000000000..d642a0037
 +        projection = get_b12x_packed_bf16_vocab_projection()
 +        assert projection is not None
 +        weight = layer.weight.data
-+        packed = projection.pack(weight.contiguous())
 +        in_features = int(weight.shape[1])
++        # In place: the packed rows take the first three quarters of the BF16
++        # head's own storage, so loading frees nothing the BF16 head would not.
++        # On GB10 freed memory stays charged to the process, so an extra
++        # allocation and free here would cost host memory for good.
++        packed = projection.pack(weight, in_place=True)
++        del weight
 +        replace_parameter(layer, "weight", packed.values)
 +        replace_parameter(layer, "weight_exception_rows", packed.exception_rows)
 +        replace_parameter(layer, "weight_exception_entries", packed.exception_entries)

@@ -188,7 +188,28 @@ window. Host memory is the same as with the first packer (dgx1 96,800 against
 TP4 memory screen (`experiments/2026-10-04-tp4-memory-tuning` on branch
 `tp4-memory-tuning`) adds a
 same-image arm without the packed head and per-process captures to locate it.
-This remains open and blocks promotion.
+
+On GB10, memory freed during loading stays charged to the process: freeing a
+1 GiB allocation left 355–753 MiB counted as used, and a second 1 GiB
+allocation in the same process grew the count by only 255–340 MiB, so the
+process reuses it but the system, and the memory guard, cannot. A
+virtual-memory release (expandable segments) returned no more. Both packers
+so far freed more than the BF16 path does: the first its temporaries and both
+their separate result buffer, after the carve-out move.
+
+The in-place packer (image `-packedhead-v3`) writes the packed rows into the
+BF16 head's own storage through one 1,024-row staging block, so loading frees
+nothing the BF16 head would not. The stage test, now with a stand-in for the
+carve-out move (a copy, after which the original storage is freed):
+
+| End of preparation and 10 graph captures | Host memory used | Torch allocated |
+| --- | ---: | ---: |
+| BF16 head | +1,164 MiB | 392 MiB |
+| Out-of-place packer (v2) | +778 MiB | 249 MiB |
+| In-place packer (v3) | +373 MiB | 249 MiB |
+
+[packed-v3.json](packed-v3.json) is the v3 window arm. Until a serving window confirms the
+result, the item stays open and blocks promotion.
 
 ## Conclusion
 
