@@ -111,6 +111,19 @@ class TransportProfilesTest(unittest.TestCase):
         self.assertEqual([sorted(e) for e in draft["quantized_activation_examples"]],
                          [["lm_head", "rows_passed_to_head"]] * 3)
 
+    def test_layout_describes_the_packed_target_head(self):
+        cluster = json.loads((ROOT / "experiments/2026-10-04-tp4-memory-tuning/candidate.json").read_text())
+        draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
+        self.assertEqual(draft["head_formats"], {"lm_head": "packed_bf16", "markov_output": "bf16"})
+        head = draft["lm_head_packed_bf16"]
+        self.assertEqual(head["packed_values_uint8_shape"], [32320, 7680])
+        self.assertEqual(head["packed_values_bytes"] * 4, head["bf16_bytes"] * 3)
+        self.assertTrue(head["shared_with_target_head"])
+        # The packed head is audited only when the drafter shares it.
+        cluster["environment"]["VLLM_DS41_DRAFT_NVFP4_HEAD"] = "1"
+        with self.assertRaisesRegex(ValueError, "packed BF16 target head"):
+            spark3.model_layout.describe(ROOT, cluster, 2097152)
+
     def test_layout_rejects_incompatible_execution_flags(self):
         _, base = self.resolve("tp4")
         for key, value in (("VLLM_DS41_DRAFT_NVFP4_HEAD", "2"),

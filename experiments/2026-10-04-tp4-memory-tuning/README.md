@@ -211,6 +211,49 @@ misses. The number of hits is how many prompts the cache held at that
 interval. A recall hit adds no blocks, so recalling never evicts an older
 prompt.
 
+Window 2026-10-04 09:54–10:34 UTC:
+
+| Interval | Prompts held, of 30 | Cached tokens held | Blocks per 1,000 cached tokens | Checkpoints' share of cache space |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 8 | ~745K | 15.9 | ~75% |
+| 8,192 | 27 | 2,526,188 | 4.7 | ~16% |
+| 32,768 | 30 (did not fill) | ≥2,809,801 | ≤4.2 | ~5% (fit) |
+
+A prompt being computed held about 2,300 of the 3 GiB pool's ~14,100 blocks;
+the rest held the cache. Hits took 0.4 s and a miss recomputed in about 19 s.
+The two saturated points fit a constant 3.9 blocks per 1,000 tokens of
+compressed KV plus about 6,100 / interval of checkpoints, which predicts the
+32K arm's fill exactly at the edge.
+
+## TP4 recipe at 1M
+
+Interval 8,192, one checkpoint per prefill chunk. It holds 3.4 times the
+prompt cache of 512 in the same memory, and a mid-prompt divergence resumes
+at most one chunk (≤1.6 s) back. 32,768 would add about 14% more cache and
+quadruple the worst-case recompute. The KV pool stays at 10.5 GiB per rank,
+8.18 full 1,048,576-token windows by vLLM's own accounting. An idle server
+holds about 10M cached prompt tokens, about ten full 1M prompts, which give
+way oldest first as long sequences run.
+
+[candidate.json](candidate.json) is the recipe, launch disabled. It runs the
+[streamed vocabulary weights](../2026-10-04-streamed-embeddings/README.md)
+image (`-r5o-roce-contract-streamed-v1`), with:
+
+- `--max-model-len` 1,048,576;
+- `--max-num-seqs` 16, with CUDA graphs up to 96 rows;
+- `--max-num-batched-tokens` and `--long-prefill-token-threshold` 8,192;
+- `--kv-cache-memory-bytes` 11,274,289,152 (10.5 GiB);
+- `--prefix-cache-retention-interval` 8,192;
+- the 1M arm's DSpark cost directory.
+
+Against the streamed candidate nothing else changes.
+[profiles.json](profiles.json) is the tuning catalog with `tp4` pinned to
+it. TP3 is unchanged. The catalog's model layout report now describes the
+packed target head, and the audit lists this image's vLLM and B12X trees.
+Their changes from the audited TP4 trees are the packed head, its B12X
+kernel, and the carve-out. None of them pads or partitions anything
+differently.
+
 ## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
   the selections for each TP size to the repository, prove them stable with a

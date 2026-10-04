@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "tp3": {
+      "base_config": "config/cluster-64k.json",
+      "base_sha256": "f7ff055b980eaea95301d9f14facdc89f1466154b6a3a922e5c2d9c628d3f95f",
+      "status": "Promoted TP3 settings; physical triangle required.",
+      "node_count": 3,
+      "transport": "rocenante-direct",
+      "rocenante": {
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE": "2MB",
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE": "4MB",
+        "B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": null,
+        "B12X_ROCE_SPIN_LIMIT": "5000000"
+      },
+      "nccl": {
+        "NCCL_MIN_NCHANNELS": null,
+        "NCCL_MAX_NCHANNELS": "8",
+        "NCCL_BUFFSIZE": "1048576",
+        "NCCL_LL128_BUFFSIZE": "262144",
+        "NCCL_PROTO": "^LL128",
+        "NCCL_SWITCHLESS_BIDIRECTIONAL": null,
+        "NCCL_MIN_TRAFFIC_PER_CHANNEL": null,
+        "NCCL_THREAD_THRESHOLDS": null
+      }
+    },
+    "tp4": {
+      "base_config": "experiments/2026-10-04-tp4-memory-tuning/candidate.json",
+      "base_sha256": "ae233f99046c3d40309dec6db9dfa336e401e4074536c3eb7859b2528216ceb1",
+      "status": "Candidate: the balanced ring transport on the streamed-vocabulary image, at the full 1,048,576-token context with 16 sequences, 8,192-token batches, 10.5 GiB of KV per rank (8.18 full windows) and prefix-cache checkpoints every 8,192 tokens; qualification pending.",
+      "node_count": 4,
+      "transport": "rocenante-ring4",
+      "rocenante": {
+        "VLLM_ROCE_ALLREDUCE_MAX_SIZE": "2MB",
+        "VLLM_ROCE_ALLGATHER_MAX_SIZE": "2MB",
+        "B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "1048576",
+        "B12X_ROCE_SPIN_LIMIT": "5000000"
+      },
+      "nccl": {
+        "NCCL_MIN_NCHANNELS": "4",
+        "NCCL_MAX_NCHANNELS": "4",
+        "NCCL_BUFFSIZE": "4194304",
+        "NCCL_LL128_BUFFSIZE": "262144",
+        "NCCL_PROTO": "^LL128",
+        "NCCL_SWITCHLESS_BIDIRECTIONAL": "2",
+        "NCCL_MIN_TRAFFIC_PER_CHANNEL": "512",
+        "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1"
+      }
+    }
+  }
+}

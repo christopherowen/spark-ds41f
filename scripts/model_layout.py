@@ -37,6 +37,20 @@ def bf16_storage(rows: int, columns: int) -> dict:
     return {"logical_shape": [rows, columns], "bf16_bytes": rows * columns * 2}
 
 
+def packed_bf16_storage(rows: int, columns: int) -> dict:
+    """The checkpoint's BF16 head packed exactly into 12 bits per value (vLLM patch 0028).
+
+    One sign-and-mantissa byte per value plus a 4-bit exponent code per value
+    over a 15-exponent window; values outside the window are kept exactly in a
+    per-row exception list whose size depends on the weights.
+    """
+    if rows <= 0 or columns <= 0 or columns % 128:
+        raise ValueError("packed BF16 heads need positive dimensions with K divisible by 128")
+    return {"logical_shape": [rows, columns], "packed_values_uint8_shape": [rows, columns * 3 // 2],
+            "packed_values_bytes": rows * columns * 3 // 2, "bf16_bytes": rows * columns * 2,
+            "exceptions": "per-row list of out-of-window values, kept exactly; size depends on the weights"}
+
+
 def describe(root: Path, cluster: dict, capacity_bytes: int) -> dict:
     raw = (root / LAYOUT_PATH).read_bytes()
     audit = json.loads(raw)
@@ -60,6 +74,12 @@ def describe(root: Path, cluster: dict, capacity_bytes: int) -> dict:
             raise ValueError(f"model layout audit needs {key} set to 0 (native BF16) or 1 (NVFP4)")
         head_flags[key] = value == "1"
     nvfp4_head, nvfp4_markov = head_flags.values()
+    packed_flag = cluster["environment"].get("VLLM_DS41_PACKED_BF16_LM_HEAD", "0")
+    if packed_flag not in ("0", "1"):
+        raise ValueError("model layout audit needs VLLM_DS41_PACKED_BF16_LM_HEAD set to 0 or 1")
+    packed_head = packed_flag == "1"
+    if packed_head and nvfp4_head:
+        raise ValueError("a packed BF16 target head is audited only with the drafter sharing it (native heads)")
     if cluster["environment"].get("VLLM_DS41_BATCH_INVARIANT", "0") != "0":
         raise ValueError("batch-invariant execution needs its own model layout audit")
     tp = int(topology.argument(cluster, "--tensor-parallel-size"))
@@ -154,9 +174,11 @@ def describe(root: Path, cluster: dict, capacity_bytes: int) -> dict:
         "drafter": {
             "vocabulary_shards": vocabulary_shards,
             "vocabulary_note": "Target head, draft head and Markov output share these token partitions. Padded token logits are masked; scale-only rows are not token IDs.",
-            "head_formats": {"lm_head": "nvfp4" if nvfp4_head else "bf16",
+            "head_formats": {"lm_head": "nvfp4" if nvfp4_head else "packed_bf16" if packed_head else "bf16",
                              "markov_output": "nvfp4" if nvfp4_markov else "bf16"},
             **({"lm_head_nvfp4": nvfp4_storage(shard_rows, dims["hidden_size"], alignment)} if nvfp4_head
+               else {"lm_head_packed_bf16": {**packed_bf16_storage(shard_rows, dims["hidden_size"]),
+                                             "shared_with_target_head": True}} if packed_head
                else {"lm_head_bf16": {**bf16_storage(shard_rows, dims["hidden_size"]),
                                       "shared_with_target_head": True}}),
             **({"markov_output_nvfp4": nvfp4_storage(shard_rows, dims["dspark_markov_rank"], alignment)}
