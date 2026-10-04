@@ -11,7 +11,8 @@ profiler directories, and sources that add B12X 0012 and vLLM 0028.
   replays on top; besides the replay, it lets the packed head's backend check
   accept `tilelang`, as it already does for B12X's BF16 projection. Tree
   `6415d579`, head `54013620`.
-- B12X: the packed head's series ([../b12x/series](../b12x/series)), tree `bd2d95c4`.
+- B12X: the packed head's series ([../b12x/series](../b12x/series)), tree `2a503d9f` with the
+  fused packer (`bd2d95c4` for the v1 image measured below).
 - Candidate: [candidate.json](candidate.json). Window arms:
   [control.json](control.json), identical to the TileLang TP4 round 3 arm
   (image `-r5o-roce-contract-tilelang-v5`), and [packed.json](packed.json)
@@ -20,7 +21,10 @@ profiler directories, and sources that add B12X 0012 and vLLM 0028.
   [vllm-tests](bundles/vllm-tests/candidate.json) and
   [b12x-tests](bundles/b12x-tests/candidate.json) against the new image.
 
-**Status:** image `vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tilelang-packedhead-v1`
+**Status:** the candidate now names image `-tilelang-packedhead-v2`, with the fused
+packer (see [Host memory](../README.md#host-memory-the-first-packer-leaked-the-fused-packer-saves)),
+and [packed-v2.json](packed-v2.json) is its window arm. The window below ran
+image `vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tilelang-packedhead-v1`
 (`sha256:5bcbc860…`) built on dgx4 from `0c0149f` with the regular
 `bin/spark3 build` commands and loaded on dgx1–dgx3. Its bundles pass on dgx4
 (2026-10-03 22:52–22:53 UTC): TileLang 51 passed, vLLM 2 passed, B12X 15
