@@ -448,6 +448,36 @@ acceptance unchanged. It needs no model-dimension padding (16 heads per rank).
 - **Not selected, kept as experiments:** NIC-forwarded mesh4 and four fixed
   paths (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
 
+## TileLang kernel family
+
+The TileLang family (TileLang attention, projections and MoE, TileKernels
+routing and mHC, TileLang vocabulary heads, sparknet collectives) is a
+candidate on the TP4 1M recipe, on branch `tilelang-1m`
+(`experiments/2026-10-04-tilelang-1m`). The default is expected to move to it
+once the comparison below is done.
+
+1. **End-to-end validation and benchmark, TP4.** Run the full validation and
+   bench matrix for the TileLang candidate and for the B12X TP4 1M recipe
+   (branch `tp4-memory-tuning`, image `-tp4-1m-v1`, not built yet), in the same
+   windows. The B12X recipe now carries the fabricated-context fix (vLLM 0039),
+   so its DSpark cost curves must be profiled again.
+2. **Then the same on TP3.** The TileLang family's TP3 configurations
+   (`experiments/2026-10-03-tilelang-kernels/tp3`, on branches
+   `tilelang-kernel-policy` and `tilelang-1m`) predate the current kernels;
+   bring them onto the current TP3 recipe first.
+3. **mHC: fold `finalize` into `project_streams`.** After vLLM 0040 the
+   sublayer entry is two launches: the projection (about 10.5 µs at one token
+   with fn cold) and the per-token finalize (about 4 µs). Let the last CTA of
+   each token tile reduce the split partials in fixed split order and run the
+   mix, Sinkhorn and RMSNorm, so each sublayer is one launch. The order must
+   not depend on which CTA finishes last.
+4. **mHC: fn in three bytes.** The projection reads fn (24 x 20,480 FP32, 2 MB
+   per sublayer) near the memory bandwidth, and a TF32 MMA reads only the top
+   19 bits of each value. Storing the top 24 bits would cut that traffic by a
+   quarter with identical results, but only if SM121's TF32 MMA truncates its
+   inputs rather than rounding them; verify that on the hardware first. Native
+   weights stay unless the result is bit-identical.
+
 ## Upstream and hygiene
 
 - The one-read `fill_defaults` fix (0019) is still needed on PyTorch main.
