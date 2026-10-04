@@ -137,17 +137,27 @@ six-row steps, main stream) show the effect directly:
 Under serving the packed read saves 18% rather than the 24% of the offline
 bench, because the L2 prefetch and collectives share the bandwidth.
 
-Open item: host MemAvailable minima during the benches were 0.5–0.8 GiB lower
-in the packed arm on every node (packed 30.09 / 31.14 / 31.09 / 30.64 GiB,
-control 30.63 / 31.93 / 31.91 / 31.39). vLLM's own accounting does not show
-it: model loading took 73.34 GiB against 73.33, the KV cache is fixed at
-3.5 GiB, and the packed arm had 0.24 GiB more free memory when the KV cache
-was allocated. The arms differ in one more way: the control loaded DSpark
-cost curves pinned earlier, while the packed arm, with its own new cost
-directory, profiled and pinned them at this boot. A TileLang window of the
-same change shows the same pattern. Rebooting the packed arm with its now-pinned curves,
-and comparing per-process memory after boot, separates the two before any
-promotion.
+Open item, blocking promotion: the packed head costs host memory instead of
+saving it. At the end of each arm (`free -m` on every node, after the bench
+and profile), the B12X packed arm used 96,790 / 95,609 / 95,611 / 96,221 MiB
+on dgx1–dgx4, 570–760 MiB more than any of three B12X boots without it
+(96,020–96,220 / 94,850–94,931 / 94,840–94,900 / 95,480–95,563 MiB across
+rounds 2 and 3 of the TileLang screen and this control). The TileLang packed
+arm was likewise above every other TileLang boot, by 64–573 MiB. The format
+alone should save 79 MiB. Ruled out so far:
+
+- vLLM's model and KV accounting: loading took 73.34 GiB against 73.33, the
+  KV cache is fixed at 3.5 GiB, and free memory at KV allocation was 0.24 GiB
+  higher in the packed arm.
+- Fresh DSpark cost-curve profiling at boot: round 2's B12X boot also
+  profiled fresh curves and used normal memory.
+- Compiler residency: on dgx4, preparing the packed projection with a cold
+  Triton cache leaves 56 MiB resident in the process, 5 MiB with a warm one.
+- CUDA contexts in compile workers: B12X's compile pool hides the GPU from
+  its workers.
+
+vLLM's "graph capturing took" figure is not usable here; it ranged from 0.07
+to 1.26 GiB across identical B12X configurations.
 
 ## Conclusion
 
