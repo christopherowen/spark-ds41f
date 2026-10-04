@@ -25,7 +25,8 @@ CANDIDATE = "experiments/2026-10-03-tilelang-kernels"
 # Experiments that run the TileLang family and may therefore build its sources.
 TILELANG_EXPERIMENTS = (CANDIDATE, "experiments/2026-10-03-packed-bf16-head/tilelang-tp4",
                         "experiments/2026-10-04-tilelang-router",
-                        "experiments/2026-10-04-tilelang-gate-router")
+                        "experiments/2026-10-04-tilelang-gate-router",
+                        "experiments/2026-10-04-tilelang-vocab-heads")
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
 # configuration's lock and an example node map of its topology.
