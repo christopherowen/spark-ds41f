@@ -22,6 +22,8 @@ loader.exec_module(spark3)
 kernel_backend = spark3.kernel_backend
 
 CANDIDATE = "experiments/2026-10-03-tilelang-kernels"
+# Experiments that run the TileLang family and may therefore build its sources.
+TILELANG_EXPERIMENTS = (CANDIDATE, "experiments/2026-10-03-packed-bf16-head/tilelang-tp4")
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
 # configuration's lock and an example node map of its topology.
@@ -340,7 +342,7 @@ class KernelBackendTest(unittest.TestCase):
     def test_existing_profiles_and_locks_are_unaffected(self):
         for path in sorted(glob.glob(str(ROOT / "experiments/**/*.json"), recursive=True)):
             relative = Path(path).relative_to(ROOT).as_posix()
-            if relative.startswith(CANDIDATE):
+            if relative.startswith(TILELANG_EXPERIMENTS):
                 continue
             data = json.loads(Path(path).read_text())
             if not isinstance(data, dict):
