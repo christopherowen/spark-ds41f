@@ -58,7 +58,7 @@ mHC. The profile disagrees:
 0037 (B12X's mHC). An A/B/A window measures the difference against the boot
 noise.
 
-## Startup failure in the cost profile (0039)
+## Startup failure in the cost profile (fixed by 0039)
 
 The v1 images did not start. In DSpark's startup cost profile, TileKernels'
 gate refused non-finite logits on five rows, in every arm, B12X's mHC
@@ -101,3 +101,35 @@ images do not start), and run the [tests](bundles/tests/candidate.json)
 bundle. One window then boots the
 TileKernels arm, the B12X-mHC arm and the TileKernels arm again: decode at one
 and eight streams, prefill, and the memory log on every node for each.
+
+## Results (window 2026-10-04 21:45–22:08 UTC)
+
+The v2 images built, the tests bundle passed (99 tests), and every arm
+started the full 1M recipe with the profile's fabricated context. All
+three arms passed quality 5/5. The arms share one pinned DSpark cost
+directory, as the first arm profiled it.
+
+| Arm | prose c1 tok/s | code c1 | prose c8 | code c8 | prose c1 step ms | code c1 step ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| TileKernels mHC | 63.2 | 78.8 | 219.3 | 254.8 | 33.36 | 36.66 |
+| B12X mHC | 62.9 | 75.5 | 208.9 | 241.0 | 32.97 | 36.10 |
+| TileKernels mHC again | 63.2 | 78.8 | 219.4 | 254.5 | 33.35 | 36.63 |
+
+The two TileKernels boots agree within 0.1% on every point, so boot noise
+is out of the comparison. B12X's mHC is 1.2–1.5% faster per single-stream
+step, as the microbenchmarks predicted at small row counts. TileKernels'
+mHC gets more tokens per step, though: 2.11 against 2.07 on prose and 2.89
+against 2.73 on code. In aggregate it is ahead by 0.6% (prose c1, within
+noise) to 5.4% (code c8). Prefill is level within noise.
+
+At 16 streams the TileKernels arm decodes 316.5 tok/s of prose and 342.9 of
+code. Against the TileLang packed-head arm on the 512K recipe, single-stream
+step time is the same, eight streams are 2.7–3.0% faster, and prefill is
+15–17% faster from 32K to 262K tokens, with 8,192-token batches.
+
+MemAvailable never fell below 19.8 GiB on any node (dgx1; 20.0–21.3 GiB on
+the others), so the 10.5 GiB KV pool qualifies against the 8 GiB floor.
+
+**mHC recommendation:** keep TileKernels' mHC (0037). It follows DeepSeek's
+reference arithmetic, and its acceptance more than pays for B12X's
+per-step lead.
