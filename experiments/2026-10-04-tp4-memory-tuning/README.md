@@ -97,6 +97,27 @@ Quality 5/5 in both. The settings compose: the combined arm keeps each one's
 gain and its memory is their sum, leaving the tightest node 20.4 GiB above
 zero, far outside the 8 GiB margin and the 3 GiB steady guard.
 
+## Full context length
+
+DS4.1 Flash supports 1,048,576 tokens (`max_position_embeddings`, YaRN factor
+16 over 65,536); every TP4 recipe stopped at 524,288. The owner set the TP4
+recipes to the full length and asked for the settings to be tuned for it.
+[ctx1m.json](ctx1m.json) is the combined arm with `--max-model-len 1048576`
+and its own DSpark cost directory. One window measures what the full length
+asks of the rest of the configuration:
+
+- memory over startup, decode and a ~970K-token prefill (each 8,192-token
+  chunk attends to everything before it), from the per-second logs;
+- decode at 1, 8 and 16 streams and prefill at 32K, 256K and ~970K, against
+  the 512K combined arm's reports;
+- [long_context.py](long_context.py): ~960K-token real-text prompts with a
+  code word planted at 10% and 90% depth, answered greedily and streamed, for
+  retrieval at depth, the full-length prefill time and the decode rate with
+  the whole context resident.
+
+The KV cache (12 GiB, 9.3 full windows for up to 16 sequences) is then sized
+from the measured floors.
+
 ## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
   the selections for each TP size to the repository, prove them stable with a
