@@ -188,6 +188,15 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
    every step. Fifteen exponent values cover 99.984% of its weights, so an
    exact coded form would be ~331 MB, worth ~0.45 ms per step (~1%). It needs
    a custom exact GEMV for M ≤ 48 that is safe inside CUDA graphs. Low priority.
+6. **Decode collectives over both link halves.** Check whether the 81 RoCE
+   one-shot all-reduces per step use one path of each cable or both. If one,
+   try a one-hop RDMA write that splits each payload across both halves and
+   compare per-step collective time.
+7. **A second stream inside the decode graph.** Overlap the shared expert with
+   the routed MoE, and the attention key path (cache and indexer-key writes)
+   with the query path, on a second CUDA stream captured into the graph. First
+   measure how much of the ~6 ms latency-bound bucket is serial dependency
+   rather than kernel time.
 
 ## Speculative decoding
 
@@ -205,7 +214,13 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
   attention work on the rows still verified. Screen depth schedules (for
   example 5 drafts at one or two streams and 3 above) against recorded agent
   traffic as well as the bench. A per-request depth from recent acceptance is
-  the content-aware alternative.
+  the content-aware alternative. Include a deeper arm (7 drafts) for code at
+  one stream.
+- **Drafter reuse of the target's token selection.** Check whether the DSpark
+  draft layers run their own indexer scoring and top-k every step. If they do,
+  try reusing the target's selection from the anchor position instead. It
+  changes only the drafts, so output stays exact; measure drafter time and
+  acceptance with the replay trace.
 - **Verification objective.** The current rule picks the verify length that
   maximizes expected accepted tokens per unit of profiled cost at each step.
   Maximizing expected tokens minus a running-rate-weighted cost may be closer
@@ -223,6 +238,8 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
   0008 (masked top-k sum, no dead-route clearing) matches the atomic combine
   within 0.4% at fixed shapes. Before proposing it: profile against r5n with
   one pinned cost table, and check repeatability across batch compositions.
+  The acceptance gate: every reply at two, four and eight concurrent streams
+  is bit-identical to the same request run alone.
 
 ## Prefill and first token
 
@@ -245,6 +262,13 @@ The whole step is about 70% bandwidth-efficient against a ~30 ms floor.
   MXFP4 score kernel at about 64 TFLOP/s, a kernel lever. The SP collectives
   exceed the RoCE one-shot limits and run on NCCL: check whether large
   transfers use every available port and PCIe path.
+- **Indexer selection at long context.** Split the indexer's 323 ms per chunk at
+  200K into scoring and top-k selection. If selection is a measurable share,
+  try a radix top-k over bounded blocks of candidate rows.
+- **Sparse-MLA prefill occupancy with few heads per rank.** Each rank holds 24
+  query heads at TP3 (16 at TP4). Check the sparse-MLA prefill kernel's SM
+  occupancy at long context; if it is under-filled, split each sequence across
+  SMs (context parallelism inside the GPU).
 - **Prefix-cache retention:** agent prompts are 64-100K tokens and live on
   cache hits. Add a probe for retention around block boundaries and under
   eviction pressure.
@@ -273,6 +297,16 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
   a TP > 1 boot; an interrupted boot can leave corrupt CuTe cache files; warming
   the page cache takes MemFree that the GB10 allocator needs.
 
+## Context capacity
+
+- **Decode context parallelism.** DS4.1 has one shared KV head
+  (`num_key_value_heads: 1`), so under TP3 every rank stores the whole KV cache.
+  Sharding tokens across the ranks would hold up to three times as many tokens
+  per KV byte, at the cost of a per-layer exchange of attention partials. Our
+  vLLM has decode-context-parallel infrastructure, including a sparse-attention
+  indexer path, but DS4.1's attention does not use it yet. Large; scope it
+  against the 256K limit and long agent contexts first.
+
 ## dgx1 headroom
 
 - **Vision tower (926 MiB of BF16 weights on every rank).** Image input is
@@ -291,6 +325,13 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
   uncached with small pages, so only data read once per step belongs there;
   about 1.2 GiB is still free. `experiments/2026-09-29-display-carveout-kv` has
   the access-speed measurements.
+- **Uneven head split instead of TP3 padding.** TP3 pads DS4.1's 64 heads and 8
+  output groups to 72 and 9 with zero weights, so each rank holds 24 heads in 3
+  groups. A balanced uneven split (3/3/2 groups) removes the zero group's
+  weights and work from the rank that carries it; measure which rank that is
+  and what it costs. The busiest rank keeps 24 heads, so speed only improves
+  if heads can split inside a group (22/21/21), which needs an extra reduction
+  in the grouped output projection. TP4 needs neither (16 heads per rank).
 - **Do not raise `min_free_kbytes`;** it eats the margin the guards protect.
 
 ## Quality
@@ -303,6 +344,16 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 - **Temperature-0 outputs still vary between identical requests** on r5n: the
   atomic MoE combine and split-K turbo change summation order run to run
   (see the determinism item under decode).
+
+- **Reasoning loops in long, compacted agent sessions.** Untested here, and
+  reported on other DS4.1 stacks: after several context compactions, hidden
+  reasoning degrades into short repeated lines and grows each turn. The
+  DS4.1 encoder keeps reasoning for every assistant step since the last user
+  message, which is the feedback path. Replay a long compacted transcript at
+  reasoning effort 75 and 100, with DSpark on and off, and scan the reasoning
+  for short repeated lines. Add that scan as a debug-only eval check, and
+  record finish reasons in `workload` windows so a loop shows up as
+  length-capped requests.
 
 - **BF16 sparse attention** (patch 0023, off in configuration): measure its
   fidelity with a teacher-forced comparison against
