@@ -439,9 +439,12 @@ acceptance unchanged. It needs no model-dimension padding (16 heads per rank).
   (`experiments/2026-10-03-collective-serving/decision.md`). The explicit-policy
   image (`experiments/2026-10-03-collective-contract`) is source-qualified,
   unbuilt and launch-disabled.
-- **Open:** sustained-load cooling and full-context qualification. The ring
-  must be recabled first: the triangle was restored for the TP3 revalidation
-  on 2026-10-03.
+- **Open:** sustained-load cooling and full-context qualification.
+- **Cabling decides the profile.** TP3 needs the dgx1-dgx2-dgx3 triangle and
+  TP4 the four-node ring, each with a matching node map (the current site
+  `config/nodes.json` is a triangle map). The cabling has changed back and
+  forth since 2026-10-02:
+  check the live links before starting either.
 - **Not selected, kept as experiments:** NIC-forwarded mesh4 and four fixed
   paths (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
 
