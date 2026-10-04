@@ -165,9 +165,29 @@ located and confirmed it:
 | After B12X preparation and 10 graph captures | +829 MiB | +1,555 MiB | +520 MiB |
 
 The fused packer (image `-packedhead-v2`) peaks at the old weight plus its
-result and ends below the BF16 head. With the display carve-out holding the
-head in serving, the expected difference there is the format's own 79 MiB per
-TP4 rank; the v2 window checks it.
+result and ends below the BF16 head in that test.
+
+The v2 window (2026-10-04 06:09–06:26 UTC, BF16-head control against
+[packed-v2.json](packed-v2.json), same procedure as above) did not close the
+serving gap:
+
+| | Control | Packed v2 | Change |
+| --- | ---: | ---: | ---: |
+| prose, 1 stream (tok/s) | 61.3 | 59.8 | −2.5% |
+| prose, 8 streams | 212.1 | 214.7 | +1.2% |
+| code, 1 stream | 76.9 | 76.5 | −0.5% |
+| code, 8 streams | 244.4 | 241.7 | −1.1% |
+| Single-stream step, prose / code (ms) | 33.76 / 37.72 | 32.40 / 37.38 | −4.0% / −0.9% |
+| Vocabulary head per read, rank 0 (ms) | 1.314 | 1.091 | −0.22 |
+| Step-end tail (ms) | 6.15 | 5.66 | −0.49 |
+| Host memory used at the end, dgx1–dgx4 (MiB) | 96,351 / 95,098 / 94,872 / 95,531 | 96,800 / 95,524 / 95,538 / 96,173 | +449 / +426 / +666 / +642 |
+
+Prefill level (−0.8% to +0.5%), quality 5/5. Speed reproduces the first
+window. Host memory is the same as with the first packer (dgx1 96,800 against
+96,790 MiB), so serving holds something the stage test does not reproduce. The
+[TP4 memory screen](../2026-10-04-tp4-memory-tuning/README.md) adds a
+same-image arm without the packed head and per-process captures to locate it.
+This remains open and blocks promotion.
 
 ## Conclusion
 
