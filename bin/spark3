@@ -355,7 +355,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     listed = [name for name in OPTIONAL_BUILD_PROJECTS if name in upstreams["sources"]]
     if listed and len(listed) != len(OPTIONAL_BUILD_PROJECTS):
         problems.append(f"{' and '.join(OPTIONAL_BUILD_PROJECTS)} are built together; the lock lists only {listed[0]}")
-    for name in listed:
+    for name in (*listed, *(n for n in INDEPENDENT_BUILD_PROJECTS if n in upstreams["sources"])):
         if not upstreams["sources"][name].get("version"):
             problems.append(f"{name}: package version is not recorded in the lock")
     if topology.transport(cluster) in ("rocenante-ring4", "rocenante-mesh4"):
@@ -1936,6 +1936,9 @@ BUILD_PROJECTS = ("vllm", "b12x", "nccl")
 # Built only when the lock lists them (the TileLang kernel backend); each adds
 # its own <name>-source context.
 OPTIONAL_BUILD_PROJECTS = ("tilelang", "tile_kernels")
+# Built when the lock lists it, independently: sparknet's one-shot RoCE
+# collectives, installed on the TileLang runtime.
+INDEPENDENT_BUILD_PROJECTS = ("sparknet",)
 BUILD_PARTS = ("vllm", "b12x", "nccl", "cutlass", "wheels")
 BUILD_CONTEXTS = (
     "vllm-source", "b12x-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions"
@@ -1972,11 +1975,24 @@ print("GPU import smoke passed")
 
 def build_projects(sources: dict) -> tuple[str, ...]:
     """The required projects, then each optional one the lock or inputs list."""
-    return BUILD_PROJECTS + tuple(name for name in OPTIONAL_BUILD_PROJECTS if name in sources)
+    return BUILD_PROJECTS + tuple(
+        name for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in sources
+    )
 
 
 def build_contexts(inputs: dict) -> tuple[str, ...]:
-    return BUILD_CONTEXTS + tuple(f"{name}-source" for name in OPTIONAL_BUILD_PROJECTS if name in inputs)
+    return BUILD_CONTEXTS + tuple(
+        f"{name}-source" for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in inputs
+    )
+
+
+def runtime_stage(inputs: dict) -> str | None:
+    """The Dockerfile stage the image ends with; None keeps the B12X runtime."""
+    if "sparknet" in inputs:
+        if "tilelang" not in inputs:
+            raise SystemExit("sparknet is installed on the TileLang runtime; the lock must list the TileLang sources")
+        return "runtime-tilelang-sparknet"
+    return "runtime-tilelang" if "tilelang" in inputs else None
 
 
 def missing_patches(source: dict) -> list[str]:
@@ -2009,7 +2025,17 @@ def smoke_script(upstreams: dict) -> str:
     manifest = read_json(upstreams["source_manifest"])
     if kernel_backend.CAPABILITY in manifest["vllm"].get("capabilities", []):
         script += "import vllm.models.deepseek_v4_1.tilelang  # noqa: F401\n"
-    return script + "print(\"TileLang import smoke passed\")\n"
+    script += "print(\"TileLang import smoke passed\")\n"
+    if "sparknet" in upstreams["sources"]:
+        version = upstreams["sources"]["sparknet"]["version"]
+        script += (
+            "from sparknet.integration.vllm import SparknetOneShotAllReduce  # noqa: F401\n"
+            "from sparknet.oneshot._proxy import load\n\n"
+            f"assert importlib.metadata.version(\"dgx-spark-networking\") == {version!r}\n"
+            "print(\"sparknet proxy ABI\", load().roce_abi_version())\n"
+            "print(\"sparknet import smoke passed\")\n"
+        )
+    return script
 
 
 def git_output(directory: Path, *arguments: str) -> str:
@@ -2072,7 +2098,7 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
             "patch_head": record["patch_head"],
             "expected_tree": record["expected_tree"],
         }
-        if name in OPTIONAL_BUILD_PROJECTS:
+        if name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS):
             if not source.get("version"):
                 raise SystemExit(f"{name}: record its package version in the upstreams lock")
             inputs[name]["version"] = source["version"]
@@ -2316,10 +2342,11 @@ def command_build_prepare(args: argparse.Namespace) -> int:
     _, _, upstreams = configuration(args)
     parts = args.only.split(",") if args.only else None
     if parts:
-        unknown = sorted(set(parts) - set(BUILD_PARTS) - set(OPTIONAL_BUILD_PROJECTS))
+        optional = (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS)
+        unknown = sorted(set(parts) - set(BUILD_PARTS) - set(optional))
         if unknown:
             raise SystemExit(f"unknown build parts: {', '.join(unknown)}")
-        unlisted = [part for part in parts if part in OPTIONAL_BUILD_PROJECTS and part not in upstreams["sources"]]
+        unlisted = [part for part in parts if part in optional and part not in upstreams["sources"]]
         if unlisted:
             raise SystemExit(f"{', '.join(unlisted)}: not listed in the upstreams lock")
     inputs = build_inputs(upstreams, parts)
@@ -2528,8 +2555,9 @@ def command_build_image(args: argparse.Namespace) -> int:
             })
             if "version" in record:
                 build_args[f"{prefix}_VERSION"] = record["version"]
-        if "tilelang" in inputs:
-            build_args.update(RUNTIME_STAGE="runtime-tilelang", TILELANG_COMPILE_JOBS=str(jobs))
+        stage = runtime_stage(inputs)
+        if stage is not None:
+            build_args.update(RUNTIME_STAGE=stage, TILELANG_COMPILE_JOBS=str(jobs))
         for key, value in build_args.items():
             rendered += ["--build-arg", f"{key}={value}"]
         if os.environ.get("GITHUB_TOKEN"):
@@ -4351,7 +4379,8 @@ def parser() -> argparse.ArgumentParser:
     build_prepare.add_argument(
         "--only",
         metavar="PARTS",
-        help="comma-separated subset of: " + ", ".join((*BUILD_PARTS, *OPTIONAL_BUILD_PROJECTS))
+        help="comma-separated subset of: "
+        + ", ".join((*BUILD_PARTS, *OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS))
         + " (sources only, no contexts; the last two only when the lock lists them)",
     )
     build_prepare.set_defaults(func=command_build_prepare)

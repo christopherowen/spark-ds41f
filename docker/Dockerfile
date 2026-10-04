@@ -9,9 +9,10 @@
 # stable CUDA extensions are rebuilt from the overlaid source.
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf
 # The image is the `runtime` stage unless the lock lists the TileLang sources;
-# `bin/spark3 build image` then selects `runtime-tilelang`. BuildKit builds
-# only the stages the selected one needs, so a B12X-only build neither builds
-# TileLang nor needs its contexts, and its layers are unchanged.
+# `bin/spark3 build image` then selects `runtime-tilelang`, or
+# `runtime-tilelang-sparknet` when the lock also lists sparknet. BuildKit
+# builds only the stages the selected one needs, so a B12X-only build neither
+# builds TileLang nor needs its contexts, and its layers are unchanged.
 ARG RUNTIME_STAGE=runtime
 
 FROM ${BASE_IMAGE} AS vllm-native-builder
@@ -120,6 +121,15 @@ RUN set -eux; \
       python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/tilelang \
         /workspace/tile_kernels; \
     ls /opt/tilelang/tilelang-*.whl /opt/tilelang/tile_kernels-*.whl
+
+# sparknet (christopherowen/dgx-spark-networking): the one-shot RoCE
+# collectives vendored from B12X with spark3's patches 0001-0011, used by the
+# TileLang family instead of b12x.comm.roce. Pure Python plus a C proxy.
+FROM ${BASE_IMAGE} AS sparknet-builder
+
+COPY --from=sparknet-source . /workspace/sparknet/
+RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
+    ls /opt/sparknet/dgx_spark_networking-*.whl
 
 FROM ${BASE_IMAGE} AS runtime
 
@@ -388,6 +398,41 @@ for line in Path("/opt/spark3/candidate/vllm/requirements/cuda.txt").read_text()
     if line and not line.startswith("-"):
         check("vllm (requirements/cuda.txt)", line, SHARED)
 print("TileLang build checks passed")
+PY
+
+# The TileLang runtime with sparknet's collectives. The proxy is built here,
+# into SPARKNET_ROCE_CACHE_DIR, so no compiler runs when serving starts; the
+# CuTe kernels compile on a node's first prepare into the mounted DSL cache.
+FROM runtime-tilelang AS runtime-tilelang-sparknet
+
+ARG SPARKNET_UPSTREAM=unrecorded
+ARG SPARKNET_REF=unrecorded
+ARG SPARKNET_REVISION=unrecorded
+ARG SPARKNET_PATCH_HEAD=unrecorded
+ARG SPARKNET_TREE=unrecorded
+ARG SPARKNET_VERSION=unrecorded
+
+LABEL local.spark3.sparknet.upstream="${SPARKNET_UPSTREAM}" \
+      local.spark3.sparknet.ref="${SPARKNET_REF}" \
+      local.spark3.sparknet.revision="${SPARKNET_REVISION}" \
+      local.spark3.sparknet.patch-head="${SPARKNET_PATCH_HEAD}" \
+      local.spark3.sparknet.tree="${SPARKNET_TREE}"
+
+ENV SPARKNET_ROCE_CACHE_DIR=/opt/sparknet/roce
+RUN --mount=type=bind,from=sparknet-builder,source=/opt/sparknet,target=/tmp/sparknet-wheels \
+    python3 -m pip install --no-cache-dir --no-deps /tmp/sparknet-wheels/dgx_spark_networking-*.whl
+RUN SPARKNET_VERSION=${SPARKNET_VERSION} python3 - <<'PY'
+import importlib.metadata as metadata
+import os
+
+installed = metadata.version("dgx-spark-networking")
+assert installed == os.environ["SPARKNET_VERSION"], f"sparknet {installed} is installed"
+unconditional = [r for r in metadata.requires("dgx-spark-networking") or () if "extra ==" not in r]
+assert not unconditional, f"sparknet takes no runtime dependencies: {unconditional}"
+from sparknet.oneshot._proxy import load
+
+print("sparknet proxy ABI", load().roce_abi_version())
+print("sparknet build checks passed")
 PY
 
 FROM ${RUNTIME_STAGE}
