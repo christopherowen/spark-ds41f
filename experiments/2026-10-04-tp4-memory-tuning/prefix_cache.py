@@ -15,6 +15,10 @@ second while the request runs, so the peak shows the running footprint.
              of the previous turn
   capacity   --fill distinct prompts, then P again: a hit means the cache kept P
 
+With --capacity N it instead loads N distinct prompts and recalls them newest
+first until one misses, so a small KV pool shows how many prompts the cache
+holds. A recall hit adds no blocks, so recalling never evicts an older prompt.
+
 Writes one JSON line per request.
 """
 
@@ -88,7 +92,22 @@ def main():
     parser.add_argument("url")
     parser.add_argument("--tokens", type=int, default=200_000, help="approximate prompt length")
     parser.add_argument("--fill", type=int, default=10, help="distinct prompts sent before P returns")
+    parser.add_argument("--capacity", type=int, default=0,
+                        help="instead: send this many distinct prompts, then re-send them newest first "
+                             "until one misses; the hits are how many the cache held")
     args = parser.parse_args()
+    if args.capacity:
+        prompts = [spark3.source_text(args.tokens, 9500 + index) + QUESTION for index in range(args.capacity)]
+        for index, prompt in enumerate(prompts):
+            measured(args.url, f"load-{index + 1}", prompt)
+        held = 0
+        for index in reversed(range(len(prompts))):
+            _, row = measured(args.url, f"recall-{index + 1}", prompts[index])
+            if row["cached_tokens"] < row["prompt_tokens"] // 2:
+                break
+            held += 1
+        print(json.dumps({"step": "held", "prompts": held, "of": len(prompts)}), flush=True)
+        return
     body = spark3.source_text(args.tokens, 9100)
     prompt = body + QUESTION
     answer, _ = measured(args.url, "cold", prompt, max_tokens=32)

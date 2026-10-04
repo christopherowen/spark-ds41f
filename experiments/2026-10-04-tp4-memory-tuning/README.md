@@ -173,6 +173,44 @@ tokens from the server's counters:
 
 The per-second memory logs give each arm's floors.
 
+### Results
+
+Window 2026-10-04 09:15–09:53 UTC. At 10.5 GiB vLLM reports 8,580,566 KV tokens
+(49,483 blocks) and a maximum concurrency of 8.18 full windows. Every arm
+decoded level with the 12 GiB 1M arm, with every point inside its interval,
+and passed quality 5/5.
+
+| | kv8-r512 | kv8-r8k | kv8-r32k |
+| --- | --- | --- | --- |
+| Exact repeat of a 196,133-token prompt | 195,840 cached, 0.6 s | 195,840 cached, 0.6 s | 195,840 cached, 0.6 s |
+| New tail from ~151K tokens: resumed at | 151,040 (46,781 recomputed, 10.2 s) | 147,456 (50,365, 11.0 s) | 131,072 (66,749, 14.4 s) |
+| Follow-up turn | 195,840 cached | 195,840 cached | 195,840 cached |
+| The first prompt after ten more (1.9M tokens) | still cached | still cached | still cached |
+| Peak KV use of the running 196K prompt | 5.43% | 5.43% | 5.43% |
+| Lowest MemAvailable, dgx1–dgx4 (GiB) | 21.02 / 22.13 / 22.38 / 21.53 | 20.97 / 22.23 / 22.30 / 21.66 | 20.90 / 22.29 / 22.33 / 21.35 |
+| Host memory used at the end, dgx1 (MiB) | 105,214 | 105,185 | 105,299 |
+
+The interval does not change the running footprint, so it does not change
+how many full-length sequences fit. A running request holds no checkpoints;
+they become cached blocks when it ends. After a divergence the hit lands on
+the last checkpoint before it, as designed. The cost of each interval is
+cache space, and ten ~190K prompts did not fill a 10.5 GiB pool, so this
+probe could not measure it. The ~1,000 blocks a running request holds
+regardless of length are its sliding-window chunk state: 8,192 tokens plus
+the window, in every sliding-window group.
+
+### Cache capacity
+
+Three measurement arms keep the 1M settings but shrink the KV pool to 3 GiB,
+so the cache fills quickly:
+[cap-r512](cap-r512.json), [cap-r8k](cap-r8k.json) and
+[cap-r32k](cap-r32k.json). The space a cached token takes does not depend on
+the pool's size. `prefix_cache.py --capacity 30 --tokens 100000` loads 30
+distinct ~100K-token prompts, then recalls them newest first until one
+misses. The number of hits is how many prompts the cache held at that
+interval. A recall hit adds no blocks, so recalling never evicts an older
+prompt.
+
 ## Next
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
   the selections for each TP size to the repository, prove them stable with a
