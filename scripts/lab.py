@@ -66,6 +66,8 @@ REQUEST = Path.home() / "spark3-request.json"
 HOLDER_PREFIX = "spark3-lab"
 CONTAINER = "dsv41-karmic-kraken"
 CANDIDATE = "/opt/spark3/candidate"
+# The GPU's DRM card by PCI path, as the serving container mounts it for the display carve-out.
+DRM_CARD = "/dev/dri/by-path/pci-000f:01:00.0-card"
 DEFAULT_MINUTES = 120
 HEARTBEAT_MAX_AGE = 900
 TRACE_LOG_DIR = "/cache/kkref/moe-checksums"
@@ -1083,6 +1085,10 @@ def bundle_command(bundle: Path, candidate: dict, out: Path) -> list[str]:
     command = ["docker", "run", "--rm", "--gpus", "all", "--ipc=host"]
     for key, value in sorted(candidate.get("env", {}).items()):
         command += ["-e", f"{key}={value}"]
+    if candidate.get("display_carveout"):
+        # Tests that allocate from the display carve-out get the serving container's DRM access.
+        command += [f"--mount=type=bind,source={DRM_CARD},target=/dev/dri/card0",
+                    "--device-cgroup-rule=c 226:* rw"]
     overlay = bundle / "overlay"
     if overlay.is_dir():
         for path in sorted(p for p in overlay.rglob("*") if p.is_file()):

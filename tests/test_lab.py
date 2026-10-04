@@ -237,6 +237,18 @@ class KernelLabTest(unittest.TestCase):
         self.assertIn("B12X_AUTOTUNE=0", command)
         self.assertEqual(command[-3:], ["img:tag", "/r/replay.py", "/cap"])
 
+    def test_display_carveout_bundles_get_the_serving_drm_access(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            plain = lab.bundle_command(bundle, self.CANDIDATE, bundle / "out")
+            carveout = lab.bundle_command(bundle, dict(self.CANDIDATE, display_carveout=True), bundle / "out")
+        self.assertFalse([arg for arg in plain if "dri" in arg or "226" in arg])
+        serving = json.loads((ROOT / "config/cluster.json").read_text())["container"]["docker_run_args"]
+        for arg in ("--mount=type=bind,source=/dev/dri/by-path/pci-000f:01:00.0-card,target=/dev/dri/card0",
+                    "--device-cgroup-rule=c 226:* rw"):
+            self.assertIn(arg, carveout)
+            self.assertIn(arg, serving)
+
     def test_verdict_passes_only_invariant_and_bit_equal(self) -> None:
         good = [json.dumps({"op": "mhc production layer 1 pre", "groups": 2}),
                 json.dumps({"op": "mhc candidate layer 1 pre", "groups": 1}),
