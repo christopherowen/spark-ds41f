@@ -80,8 +80,10 @@ staged with bounded memory, and the selections pinned (see below).
 
 ## Next
 
-- One combined arm (batched8k + seqs16 + kv12g) with the full bench, to check
-  that the settings compose and that every node keeps at least 8 GiB.
+- [combined.json](combined.json): batched8k + seqs16 + kv12g together, run
+  against the base in one window with decode at 1, 8 and 16 streams and the
+  prefill lengths, to check that the settings compose and that every node
+  keeps at least 8 GiB.
 - Autotune as a `spark3` command: tune in stages with bounded memory, write
   the selections for each TP size to the repository, prove them stable with a
   second run, and serve from them read-only with autotune off.
