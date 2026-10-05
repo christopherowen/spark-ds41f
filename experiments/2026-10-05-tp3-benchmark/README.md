@@ -45,6 +45,18 @@ one block per group. It changes no serving path. Until the next image build,
 ([overlay](overlay/vllm/v1/worker/gpu/)) over `-tilelang-1m-v3`; the dummy
 layout tests pass on that image.
 
+With 0041 the start went on to the drafter's CUDA graph capture and stopped
+there the same way. The target marks the rows that pad its batch, and every
+row of a dummy batch, as padding, and the MoE routers skip them; the DSpark
+drafter set no mask, so its routers took capture's dummy rows, which read
+the null block that dummy runs fill with other groups' records.
+[0042](../2026-10-04-tilelang-1m/vllm/0042-dspark-drafter-padding-rows.patch)
+gives the drafter a persistent padding mask: all padding during capture,
+rows past the live query rows on every step, all padding for a profiling
+batch. In serving it keeps the drafter's CUDA graph padding rows out of the
+routers too, which nothing guaranteed before. The config mounts its file
+over the image as well.
+
 ## Numerical check
 
 The TP4 benchmark showed TileLang accepting fewer drafts at most points while
