@@ -41,10 +41,13 @@ no thermal slowdown.
 | Code, B12X | 72.5 | 111.3 | 168.3 | 245.7 | 323.5 |
 | Code, TileLang | 74.3 | 105.0 | 171.5 | 261.7 | 352.2 |
 
-| Prefill, real text (tok/s) | 32K | 256K | 1M |
-| --- | ---: | ---: | ---: |
-| B12X | 5,117 | 4,873 | 4,026 |
-| TileLang | 5,730 | 5,387 | 4,312 |
+| Prefill, real text (tok/s) | 32K | 256K | 500K | 1M |
+| --- | ---: | ---: | ---: | ---: |
+| B12X | 5,117 | 4,873 | 4,645 | 4,026 |
+| TileLang | 5,730 | 5,387 | 5,006 | 4,312 |
+
+The 500K column was measured separately, in
+[2026-10-05-tp4-500k](../2026-10-05-tp4-500k/README.md).
 
 Single-stream steps: TileLang 32.59 ms on prose and 35.63 ms on code, B12X
 34.00 and 37.72 (-4.2% and -5.5%). At 16 streams TileLang decodes 7.3% more

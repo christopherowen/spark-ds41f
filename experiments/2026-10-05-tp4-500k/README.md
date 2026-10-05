@@ -23,6 +23,19 @@ gate and real-source-text prefill at 500,000 tokens, two repeats
 --prefill-sizes 500000 --prefill-repeats 2`). The B12X boot stays up as the
 serving configuration.
 
-## Results
+## Results (2026-10-05, 08:05-08:17 UTC)
 
-Pending.
+Both boots passed quality 5/5. Every node kept at least 20.97 GiB available,
+and there was no thermal slowdown. Reports: [TileLang](runs/tilelang-bench.json)
+([summary](runs/tilelang-bench.txt)), [B12X](runs/b12x-bench.json)
+([summary](runs/b12x-bench.txt)), [runner log](runs/runner.log).
+
+| Prefill, real text (tok/s) | 32K | 256K | 500K | 1M |
+| --- | ---: | ---: | ---: | ---: |
+| B12X | 5,117 | 4,873 | **4,645** (±1.7%) | 4,026 |
+| TileLang | 5,730 | 5,387 | **5,006** (±1.4%) | 4,312 |
+
+The 500K points are from this run; the others are from the
+[TP4 benchmark](../2026-10-05-tp4-validation/README.md). TileLang prefills
+500K 7.8% faster. Both points fall between the 256K and 1M rates of the same
+family. The B12X boot stayed up as the serving configuration.

@@ -105,7 +105,7 @@ the owner requires.
 | | |
 | --- | --- |
 | Single-stream step, prose / code | 34.00 / 37.72 ms |
-| Prefill, real text, 32K / 256K / 1M | 5,117 / 4,873 / 4,026 tok/s |
+| Prefill, real text, 32K / 256K / 500K / 1M | 5,117 / 4,873 / 4,645 / 4,026 tok/s (500K from [2026-10-05-tp4-500k](../2026-10-05-tp4-500k/README.md)) |
 | Lowest MemAvailable, dgx1-dgx4 | 20.4 / 22.2 / 22.2 / 21.3 GiB |
 
 Against r5o's TP3 reference, the recipe decodes 12-26% more at one to eight

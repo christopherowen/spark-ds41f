@@ -134,7 +134,7 @@ and 1M-token prefill:
 | Prose, 1 / 2 / 4 / 8 / 16 streams | 62.1 / 92.7 / 141.6 / 215.7 / 297.3 |
 | Code, 1 / 2 / 4 / 8 / 16 streams | 72.5 / 111.3 / 168.3 / 245.7 / 323.5 |
 | One-stream prose / code step time | 34.00 / 37.72 ms |
-| Source-text prefill, 32K / 256K / 1M | 5.12K / 4.87K / 4.03K tok/s |
+| Source-text prefill, 32K / 256K / 500K / 1M | 5.12K / 4.87K / 4.65K / 4.03K tok/s |
 | KV capacity | 8,580,566 tokens in 10.5 GiB per rank (8.18 full 1M windows) |
 | Lowest MemAvailable | 20.4 GiB (dgx1) |
 
