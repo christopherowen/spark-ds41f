@@ -57,4 +57,4 @@ The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
 [`2026-09-20-live`](../manifests/baselines/2026-09-20-live.json).
 
-To reproduce it elsewhere, follow [replicate.md](replicate.md).
+To reproduce it elsewhere, follow [setup.md](setup.md).

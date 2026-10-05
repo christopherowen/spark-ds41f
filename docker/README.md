@@ -117,6 +117,6 @@ ID, job count, elapsed time, and lowest MemAvailable.
 The default tag is `container.image` from the cluster configuration. The
 command refuses to overwrite an existing tag, so a node never silently holds a
 different image under the promoted name. Build once, then load the same image
-on every node and confirm all three report the same ID (`docs/replicate.md`).
+on every node and confirm every node reports the same ID ([docs/setup.md](../docs/setup.md#6-image)).
 Start the service only through `bin/spark cluster start`, with its startup and
 steady memory guards.

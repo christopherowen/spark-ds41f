@@ -35,6 +35,41 @@ into its only operational source of truth. Until the transition checklist is
 complete, files are explicit about whether they describe observed state, desired
 state, or an experiment.
 
+## Quick start
+
+You need three DGX Sparks cabled as a triangle, or four cabled as a ring, on
+DGX OS 26.09.2 or later. Each node needs about 480 GiB of free disk, Docker
+with the NVIDIA runtime, and passwordless SSH and `sudo` from the head node.
+Two Sparks are not supported. [docs/setup.md](docs/setup.md) is the full
+guide: what each stage changes on your machines, how to check it, and how to
+undo it.
+
+| Sparks | Profile | Context | Kernel | [Memory saver](https://github.com/christopherowen/dgx-spark-memory-saver) |
+| --- | --- | ---: | --- | --- |
+| 3 | [config/cluster-4k.json](config/cluster-4k.json) | 262,144 | stock 4 KiB | not needed |
+| 3 | [config/cluster.json](config/cluster.json) | 524,288 | 64 KiB | required |
+| 4 | [config/cluster-tp4.json](config/cluster-tp4.json) | 1,048,576 | 64 KiB | required |
+
+The 4 KiB profile needs no kernel change, so it is the shortest path to a
+running service.
+
+| Stage | Do | Check |
+| --- | --- | --- |
+| 1 | [Host baseline](docs/setup.md#1-host-baseline): `scripts/host-recovery apply`, headless boot, `nvidia-drm` mode setting, reboot | `scripts/host-recovery check` |
+| 2 | [64 KiB kernel and memory saver](docs/setup.md#2-kernel-64-kib-profiles) (64 KiB profiles only) | `getconf PAGESIZE` prints 65536 |
+| 3 | [Fabric](docs/setup.md#3-fabric-cabling-and-addressing): cable, then address with `sparknet topology discover` | 9000-byte pings on every cable path |
+| 4 | [Site configuration](docs/setup.md#4-site-configuration): node map, head address, interfaces | `bin/spark doctor` |
+| 5 | [Model](docs/setup.md#5-model): the pinned checkpoint on every node | |
+| 6 | [Image](docs/setup.md#6-image): `bin/spark build prepare`, `bin/spark build image --apply`, copy to every node | one image ID everywhere |
+| 7 | [First start](docs/setup.md#7-first-start): `bin/spark cluster start --apply` | `bin/spark doctor --live` |
+| 8 | [Verify](docs/setup.md#8-verify): `bin/spark bench` | quality 5/5, no regressions |
+
+Use `--cluster-config <profile>` before the subcommand for any profile other
+than `config/cluster.json`. The repository never changes a host by itself:
+`bin/spark doctor` only reports, and prints each fix as a command for you to
+run ([docs/doctor.md](docs/doctor.md)). `cluster start` refuses to launch
+until the profile's kernel, fabric and image checks pass.
+
 ## Current baseline
 
 The active baseline is recorded in
@@ -109,8 +144,8 @@ The named [4 KiB and 64 KiB profiles](docs/memory-profiles.md) retain the
 previous capacity as a fallback and select the larger 64 KiB profile by default;
 [config/cluster-tp4.json](config/cluster-tp4.json) is the four-node TP4 1M
 profile on the same image (`--cluster-config config/cluster-tp4.json`).
-To reproduce the deployment on your own three Sparks, follow
-[docs/replicate.md](docs/replicate.md).
+To reproduce the deployment on your own Sparks, follow
+[docs/setup.md](docs/setup.md).
 
 ## Performance
 
