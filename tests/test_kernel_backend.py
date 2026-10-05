@@ -23,12 +23,24 @@ kernel_backend = spark3.kernel_backend
 
 CANDIDATE = "experiments/2026-10-03-tilelang-kernels"
 # Experiments that run the TileLang family and may therefore build its sources.
-TILELANG_EXPERIMENTS = (CANDIDATE, "experiments/2026-10-04-tilelang-1m")
+TILELANG_EXPERIMENTS = (
+    CANDIDATE,
+    "experiments/2026-10-03-packed-bf16-head/tilelang-tp4",
+    "experiments/2026-10-03-tilelang-tp4-performance",
+    "experiments/2026-10-04-tilelang-1m",
+    "experiments/2026-10-04-tilelang-gate-router",
+    "experiments/2026-10-04-tilelang-mhc",
+    "experiments/2026-10-04-tilelang-router",
+    "experiments/2026-10-04-tilelang-sparknet",
+    "experiments/2026-10-04-tilelang-vocab-heads",
+)
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
-# configuration's lock and an example node map of its topology.
+# configuration's lock and an example node map of its topology. The TP3 profile
+# mirrors r5o, the configuration promoted when it was made.
+R5O = "experiments/2026-10-05-r5p-promotion/r5o"
 TWINS = {
-    "tp3": ("config/cluster.json", "upstreams.lock.json", "config/nodes.example.json"),
+    "tp3": (f"{R5O}/cluster.json", f"{R5O}/upstreams.lock.json", "config/nodes.example.json"),
     "tp4": ("experiments/2026-10-03-collective-contract/candidate.json",
             "experiments/2026-10-03-collective-contract/upstreams.lock.json",
             "config/examples/nodes-ring4.json"),
@@ -191,6 +203,8 @@ class KernelBackendTest(unittest.TestCase):
         self.assertEqual(len(images), len(TWINS))
 
     def test_tuning_catalog_mirrors_the_b12x_profiles(self):
+        # The transport settings match the promoted catalog; the model layout
+        # matches the B12X configuration each profile mirrors.
         profiles = spark3.transport_profiles
         b12x = spark3.read_json(profiles.DEFAULT_PROFILES)["profiles"]
         catalog = f"{CANDIDATE}/profiles.json"
@@ -204,7 +218,7 @@ class KernelBackendTest(unittest.TestCase):
                     self.assertEqual(profile[key], b12x[name][key])
                 layout = spark3.model_layout.describe(ROOT, resolved, profiles.size_bytes(
                     resolved["environment"]["VLLM_ROCE_ALLREDUCE_MAX_SIZE"]))
-                _, twin = profiles.resolve(ROOT, profiles.DEFAULT_PROFILES, name)
+                twin = spark3.read_json(TWINS[name][0])
                 twin_layout = spark3.model_layout.describe(ROOT, twin, profiles.size_bytes(
                     twin["environment"]["VLLM_ROCE_ALLREDUCE_MAX_SIZE"]))
                 for key in ("model_dimensions", "drafter", "scheduled_rows", "transport_layout"):
