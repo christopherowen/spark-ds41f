@@ -61,8 +61,17 @@ def main():
     no_prefetch["environment"]["VLLM_DS41_L2_PREFETCH"] = "0"
     no_prefetch["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v3-nopf-20261005"
     set_profiler(no_prefetch, "ring4-tl-decode-v3-nopf-20261005")
+    # Arm b: the candidate with every Q-B and indexer Q-B decode CTA resident
+    # (128 CTAs of 16 x 64 and 16 x 32 tiles) instead of 64 at one per SM.
+    alt = copy.deepcopy(candidate)
+    gemm = "models/deepseek_v4_1/tilelang/gemm.py"
+    alt["container"]["mounts"] = [m for m in alt["container"]["mounts"] if not m[1].endswith(gemm)]
+    alt["container"]["mounts"].append(
+        [f"{{home}}/projects/spark-ds41f/{REL}/overlay-b/vllm/{gemm}", f"{IMAGE_VLLM}/{gemm}", "ro"])
+    alt["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v3b-20261005"
+    set_profiler(alt, "ring4-tl-decode-v3b-20261005")
     for name, cluster in (("control", control), ("candidate", candidate), ("candidate-nopf", no_prefetch),
-                          ("b12x", b12x)):
+                          ("candidate-b", alt), ("b12x", b12x)):
         (HERE / f"{name}.json").write_text(json.dumps(cluster, indent=2) + "\n")
         print(f"wrote {REL}/{name}.json")
 
