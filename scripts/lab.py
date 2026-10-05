@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Experiment windows, runs and kernel-lab jobs on the three-Spark cluster.
+"""Experiment windows, runs and kernel-lab jobs on the Spark cluster.
 
 usage (on dgx1, from the deployment checkout):
-  scripts/lab.py window open [--minutes M] [--note TEXT]
+  scripts/lab.py window open [--minutes M] [--note TEXT] [--production-config PATH]
   scripts/lab.py window status
-  scripts/lab.py window close
-  scripts/lab.py run SPEC.json [--dry-run] [--keep-open]
+  scripts/lab.py window close [--production-config PATH]
+  scripts/lab.py run SPEC.json [--dry-run] [--keep-open] [--production-config PATH]
   scripts/lab.py queue add SPEC.json      (queue a spec for the open or next window)
-  scripts/lab.py queue run [--idle-minutes M] [--minutes M]
+  scripts/lab.py queue run [--idle-minutes M] [--minutes M] [--production-config PATH]
   scripts/lab.py queue status
   scripts/lab.py kernel-local BUNDLE_DIR [--out DIR] [--dry-run]   (on any node, cluster stopped)
   scripts/lab.py watchdog [--max-age SECONDS] [--once]
@@ -15,10 +15,17 @@ usage (on dgx1, from the deployment checkout):
 A window holds the cluster for one experiment session. While it is open the hold file
 (~/spark-hold.json on dgx1) names this runner as holder; other agents must not stop,
 restart, sync or benchmark the cluster, and this runner refuses to open a window over a
-hold someone else wrote. Jobs inside a window run back to back with no restore of r5o in
-between; the window closes (r5o booted, doctor --live, hold removed) when the run ends,
-when a job fails, when someone writes ~/spark-request.json, or at its time cap. A
-watchdog started with the window closes it if the runner stops refreshing the heartbeat.
+hold someone else wrote. Jobs inside a window run back to back with no restore of the
+promoted service in between; the window closes (production booted, doctor --live, hold
+removed) when the run ends, when a job fails, when someone writes ~/spark-request.json,
+or at its time cap. A watchdog started with the window closes it if the runner stops
+refreshing the heartbeat.
+
+The production profile is the cluster configuration a window restores and whose node map
+every cluster action uses (--production-config, default config/cluster.json). A window
+opens only while that profile is the live cluster, records it in the hold file as
+"production_config", and every later command in the window (close, watchdog, runs, the
+queue) follows the record.
 
 A queue runner opens one window and runs queued specs back to back (oldest first), so the
 cluster keeps working while results are read and the next spec is written; it waits up to
@@ -74,6 +81,8 @@ CANDIDATE = "/opt/spark3/candidate"
 DRM_CARD = "/dev/dri/by-path/pci-000f:01:00.0-card"
 DEFAULT_MINUTES = 120
 HEARTBEAT_MAX_AGE = 900
+# The profile a window restores; main() sets it from --production-config or the open window's hold.
+PRODUCTION_CONFIG = spark.DEFAULT_CLUSTER_CONFIG
 TRACE_LOG_DIR = "/cache/kkref/moe-checksums"
 
 # Measurement profiles: (script, extra arguments, output stem). The bench command is built apart.
@@ -125,8 +134,12 @@ def write_json_atomic(path: Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
+def production_configuration() -> tuple[dict, dict, dict]:
+    return spark.configuration(argparse.Namespace(cluster_config=PRODUCTION_CONFIG))
+
+
 def nodes_config() -> dict:
-    return spark.configuration()[1]
+    return production_configuration()[1]
 
 
 def head_url() -> str:
@@ -163,7 +176,25 @@ def new_hold(minutes: int, note: str, at: float | None = None) -> dict:
         "heartbeat": stamp,
         "rule": "no GPU experiments, restarts, cluster sync or serving changes while this file exists",
         "request": f"to ask for the cluster, write {REQUEST}; the window closes after the current job",
+        "production_config": PRODUCTION_CONFIG,
     }
+
+
+def resolve_production(explicit: str | None, hold: dict | None) -> str:
+    """The profile to restore: our open window's record, else --production-config, else the default.
+
+    A window keeps the profile it opened with; an explicit profile that differs is refused
+    rather than silently restoring something else. Holds written before the field existed
+    (and foreign holds) carry no record."""
+    recorded = hold.get("production_config") if hold_is_ours(hold) else None
+
+    def canonical(raw: str) -> str:
+        return spark.cluster_config_path(argparse.Namespace(cluster_config=raw))[1]
+
+    if recorded and explicit and canonical(explicit) != canonical(recorded):
+        raise SystemExit(f"window {hold.get('window')} restores {recorded}; "
+                         f"--production-config {explicit} differs")
+    return canonical(recorded or explicit or spark.DEFAULT_CLUSTER_CONFIG)
 
 
 def heartbeat_age(hold: dict, at: float | None = None) -> float:
@@ -224,7 +255,7 @@ def published_problems() -> list[str]:
                           capture_output=True).stdout.strip()
     if subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "origin/main"]).returncode:
         problems.append(f"deployment commit {head[:8]} is not on origin/main")
-    cluster, nodes, _ = spark.configuration()
+    cluster, nodes, _ = production_configuration()
     repo = spark.repository_path(cluster)
     for node in nodes["nodes"]:
         if node["head"]:
@@ -265,7 +296,7 @@ def boot(config: str, dry: bool = False) -> bool:
     # recabling or safely clean up a candidate with a different node set.
     candidate_nodes = spark.configuration(argparse.Namespace(cluster_config=config))[1]
     if candidate_nodes != nodes_config():
-        log("lab windows require the promoted node topology; qualify a new fabric "
+        log(f"lab windows require the promoted node topology ({PRODUCTION_CONFIG}); qualify a new fabric "
             "with explicit cluster commands before using it in lab runs")
         return False
     log(f"start {config}")
@@ -278,22 +309,30 @@ def boot(config: str, dry: bool = False) -> bool:
     return ok
 
 
-def stop_cluster(dry: bool = False) -> bool:
+def stop_arguments(remove: bool = False) -> list[str]:
+    """Stop the production profile's containers; they are kept (stopped) unless removal is asked for."""
+    return ["--cluster-config", PRODUCTION_CONFIG, "cluster", "stop", *(["--remove"] if remove else []),
+            "--apply", "--parallel"]
+
+
+def stop_cluster(dry: bool = False, remove: bool = False) -> bool:
     log("stop")
-    return spark_cli("cluster", "stop", "--remove", "--apply", "--parallel", dry=dry) == 0
+    return spark_cli(*stop_arguments(remove), dry=dry) == 0
 
 
-def production_live() -> bool:
-    process = subprocess.run([sys.executable, str(ROOT / "bin" / "spark"), "doctor", "--live"], cwd=ROOT,
-                             text=True, capture_output=True)
+def production_live(problems: list | None = None) -> bool:
+    process = subprocess.run([sys.executable, str(ROOT / "bin" / "spark"), "--cluster-config", PRODUCTION_CONFIG,
+                              "doctor", "--live"], cwd=ROOT, text=True, capture_output=True)
+    if problems is not None:
+        problems.extend(line for line in process.stdout.splitlines() if line.startswith("ERROR"))
     return process.returncode == 0 and "live cluster matches" in process.stdout
 
 
 def restore_production(dry: bool = False) -> bool:
     if not dry and production_live():
-        log("r5o already serving")
+        log(f"{PRODUCTION_CONFIG} already serving")
         return True
-    ok = boot(spark.DEFAULT_CLUSTER_CONFIG, dry=dry)
+    ok = boot(PRODUCTION_CONFIG, dry=dry)
     if not dry:
         ok = production_live() and ok
         log("doctor --live " + ("OK" if ok else "FAILED"))
@@ -319,20 +358,28 @@ def window_open(minutes: int, note: str, dry: bool = False) -> None:
         log(f"window {hold['window']} already open")
         return
     if dry:
-        print(f"  would open a {minutes}-minute window after the publish and idle guards")
+        print(f"  would open a {minutes}-minute window restoring {PRODUCTION_CONFIG} after the publish, "
+              "live and idle guards")
         return
     problems = published_problems()
     if problems:
         raise SystemExit("not opening: " + "; ".join(problems))
+    # The window restores this profile when it closes; it must be what is serving now.
+    live_problems = []
+    if not production_live(live_problems):
+        raise SystemExit(f"not opening: {PRODUCTION_CONFIG} is not the live cluster (doctor --live failed); "
+                         "pass --production-config with the profile that is serving"
+                         + "".join(f"\n  {line}" for line in live_problems))
     if not idle_for(30):
         raise SystemExit("not opening: the cluster is serving requests")
     hold = new_hold(minutes, note)
     write_json_atomic(HOLD, hold)
-    log(f"window {hold['window']} open until {hold['expected_end']}")
+    log(f"window {hold['window']} open until {hold['expected_end']}; restores {PRODUCTION_CONFIG}")
     watchdog_log = ROOT / "results" / "private" / "lab" / f"watchdog-{hold['window']}.log"
     watchdog_log.parent.mkdir(parents=True, exist_ok=True)
     with watchdog_log.open("a") as handle:
-        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watchdog"], cwd=ROOT,
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watchdog",
+                          "--production-config", PRODUCTION_CONFIG], cwd=ROOT,
                          stdout=handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                          start_new_session=True)
 
@@ -428,6 +475,11 @@ def arm_config_path(experiment: str, config: str) -> str:
     return config if "/" in config else f"{experiment}/{config}"
 
 
+def stop_step(job: dict) -> dict:
+    """Stopped containers are kept for inspection unless the job sets "remove_stopped": true."""
+    return {"kind": "stop", "remove": bool(job.get("remove_stopped", False))}
+
+
 def measure_steps(spec: dict, job: dict) -> list[dict]:
     experiment, run = spec["experiment"], spec["run"]
     profile = dict(PROFILES[job.get("profile", "lean")])
@@ -488,7 +540,7 @@ def validate_steps(spec: dict, job: dict) -> list[dict]:
             restart += ["--scenarios", tier["restart_scenarios"]]
         steps.append({"kind": "boot", "config": config, "label": f"{job['name']} boot B"})
         steps.append({"kind": "script", "argv": restart, "out": f"{out}/scenario-runs-bootB.jsonl"})
-    steps.append({"kind": "stop"})
+    steps.append(stop_step(job))
     steps.append({"kind": "analyze", "out": out, "dirs": dirs, "config": config})
     return steps
 
@@ -517,7 +569,7 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
             steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
                           "argv": [f"{experiment}/{script}", head_url(), *extra],
                           "out": f"{out}/{arm['label']}"})
-    steps.append({"kind": "stop"})
+    steps.append(stop_step(job))
     steps.append({"kind": "costs", "experiment": experiment, "out": out, "workloads": workloads,
                   "labels": [arm["label"] for arm in job["arms"]],
                   "config": arm_config_path(experiment, job["arms"][0]["config"])})
@@ -525,7 +577,7 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
 
 
 def kernel_steps(spec: dict, job: dict) -> list[dict]:
-    return [{"kind": "stop"},
+    return [stop_step(job),
             {"kind": "kernel", "bundles": job["bundles"], "out": f"results/private/lab/{spec['run']}"}]
 
 
@@ -557,6 +609,8 @@ def describe_step(step: dict) -> str:
         return f"summarize kernels and compare costs against {step['labels'][0]} ({', '.join(step['workloads'])})"
     if step["kind"] == "sync":
         return "sync node checkouts to origin/main"
+    if step["kind"] == "stop":
+        return "bin/spark " + shlex.join(stop_arguments(step.get("remove", False)))
     if step["kind"] == "curves":
         return f"save the boot's measured step costs > {step['out']}"
     if step["kind"] == "table":
@@ -625,7 +679,7 @@ def profile_workload(step: dict) -> None:
     container_dir = profiler_dir(step["config"])
     host_relative = container_dir.replace("/cache/", "cache/", 1)
     nodes = nodes_config()
-    repo = spark.repository_path(spark.configuration()[0])
+    repo = spark.repository_path(production_configuration()[0])
     out = ROOT / step["out"]
     out.mkdir(parents=True, exist_ok=True)
     workload = step["workload"]
@@ -716,7 +770,7 @@ def sync_checkouts() -> bool:
         return False
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True,
                           capture_output=True).stdout.strip()
-    ok = spark_cli("cluster", "sync", "--apply") == 0
+    ok = spark_cli("--cluster-config", PRODUCTION_CONFIG, "cluster", "sync", "--apply") == 0
     log(f"sync to {head} " + ("OK" if ok else "FAILED"))
     return ok
 
@@ -822,8 +876,7 @@ def run_kernel_bundles(step: dict) -> list[dict]:
     ignored files never enter a checkout by copy. Paths listed under "sync" (inputs such as
     captures, kept out of git) go to ~/spark-lab/inputs/<path> on the other nodes.
     """
-    nodes = nodes_config()
-    cluster, _, _ = spark.configuration()
+    cluster, nodes, _ = production_configuration()
     repo = spark.repository_path(cluster)
     run = Path(step["out"]).name
     home = cluster["host"]["home"]
@@ -883,14 +936,14 @@ def verdicts_agree(verdicts: list[dict]) -> bool:
 def execute(spec: dict, dry: bool, keep_open: bool) -> int:
     steps = plan(spec)
     if dry:
-        print(f"run {spec['run']}: {len(steps)} steps")
+        print(f"run {spec['run']}: {len(steps)} steps; production {PRODUCTION_CONFIG}")
         for index, step in enumerate(steps, 1):
             print(f"{index:3d}. {describe_step(step)}")
         return 0
     hold = read_hold()
     if not hold_is_ours(hold):
         window_open(spec.get("minutes", DEFAULT_MINUTES), f"run {spec['run']}")
-    home = spark.configuration()[0]["host"]["home"]
+    home = production_configuration()[0]["host"]["home"]
     checked = set()
     failed = None
     current = {"note": "starting"}
@@ -962,7 +1015,7 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
         elif step["kind"] == "fresh_inventory":
             fresh_inventory()
         elif step["kind"] == "stop":
-            if container_running() and not stop_cluster():
+            if container_running() and not stop_cluster(remove=step.get("remove", False)):
                 failed = "stop failed"
                 break
         elif step["kind"] == "analyze":
@@ -1049,7 +1102,8 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
             # A sync job brought new runner code: continue the same window on it.
             log("QUEUE restarting on the synced runner (window stays open)")
             os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
-                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes)])
+                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes),
+                                      "--production-config", PRODUCTION_CONFIG])
 
 
 def queue_status() -> None:
@@ -1213,18 +1267,24 @@ def kernel_local(bundle_dir: str, out_dir: str | None, dry: bool) -> int:
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
+    global PRODUCTION_CONFIG
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    production = argparse.ArgumentParser(add_help=False)
+    production.add_argument(
+        "--production-config", metavar="PATH",
+        help="repository-relative cluster config the window restores and whose node map it uses "
+             f"(default: the open window's record, else {spark.DEFAULT_CLUSTER_CONFIG})")
     commands = parser.add_subparsers(dest="command", required=True)
-    window = commands.add_parser("window")
+    window = commands.add_parser("window", parents=[production])
     window.add_argument("action", choices=("open", "status", "close"))
     window.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     window.add_argument("--note", default="")
     window.add_argument("--dry-run", action="store_true")
-    run = commands.add_parser("run")
+    run = commands.add_parser("run", parents=[production])
     run.add_argument("spec")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--keep-open", action="store_true", help="leave the window open after the run")
-    queue = commands.add_parser("queue")
+    queue = commands.add_parser("queue", parents=[production])
     queue.add_argument("action", choices=("add", "run", "status"))
     queue.add_argument("spec", nargs="?")
     queue.add_argument("--idle-minutes", type=int, default=10)
@@ -1233,10 +1293,12 @@ def main(argv: list[str] | None = None) -> int:
     kernel.add_argument("bundle")
     kernel.add_argument("--out")
     kernel.add_argument("--dry-run", action="store_true")
-    dog = commands.add_parser("watchdog")
+    dog = commands.add_parser("watchdog", parents=[production])
     dog.add_argument("--max-age", type=int, default=HEARTBEAT_MAX_AGE)
     dog.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
+    if args.command != "kernel-local":
+        PRODUCTION_CONFIG = resolve_production(args.production_config, read_hold())
 
     if args.command == "window":
         if args.action == "open":
