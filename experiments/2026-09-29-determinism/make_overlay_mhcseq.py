@@ -230,8 +230,10 @@ class MHCPostPreSequentialPartialKernel(MHCPostPrePartialKernel):
             y_addr = shared_ptr_to_u32(storage.y_tile.data_ptr())
         broadcast = const_expr(self.pre_only and cute.rank(residual) == 2)
 
-        # A mix thread's weights are constant, so the first vectors are requested before the
-        # wait on the previous kernel.
+        # A mix thread's weights are constant. With one or two rows per CTA, latency rules: the
+        # first vectors are requested before the wait on the previous kernel. With more rows
+        # they are requested after the post-mix, so they do not hold registers through the
+        # residual loads (occupancy).
         mix = tidx // Int32(_MHC_MULT)
         s = tidx - mix * Int32(_MHC_MULT)
         fn_addr = get_ptr_as_int64(
@@ -244,13 +246,14 @@ class MHCPostPreSequentialPartialKernel(MHCPostPrePartialKernel):
         wbuf = cute.make_rmem_tensor(
             cute.make_layout((4 * PF,), stride=(1,)), Float32
         )
-        if tidx < Int32(MIX_THREADS):
-            for v in cutlass.range_constexpr(PF):
-                a0, a1, a2, a3 = ld_global_nc_v4_u32(fn_addr + Int64(16 * v))
-                wbuf[4 * v + 0] = u32_as_f32(a0)
-                wbuf[4 * v + 1] = u32_as_f32(a1)
-                wbuf[4 * v + 2] = u32_as_f32(a2)
-                wbuf[4 * v + 3] = u32_as_f32(a3)
+        if const_expr(T <= 2):
+            if tidx < Int32(MIX_THREADS):
+                for v in cutlass.range_constexpr(PF):
+                    a0, a1, a2, a3 = ld_global_nc_v4_u32(fn_addr + Int64(16 * v))
+                    wbuf[4 * v + 0] = u32_as_f32(a0)
+                    wbuf[4 * v + 1] = u32_as_f32(a1)
+                    wbuf[4 * v + 2] = u32_as_f32(a2)
+                    wbuf[4 * v + 3] = u32_as_f32(a3)
         if const_expr(_MHC_PDL):
             cute.arch.griddepcontrol_wait()
 
@@ -337,6 +340,14 @@ class MHCPostPreSequentialPartialKernel(MHCPostPrePartialKernel):
                 if token < Int64(num_tokens):
                     y[token, h] = y_bf16
                 yv[t] = Float32(y_bf16)
+        if const_expr(T > 2):
+            if tidx < Int32(MIX_THREADS):
+                for v in cutlass.range_constexpr(PF):
+                    a0, a1, a2, a3 = ld_global_nc_v4_u32(fn_addr + Int64(16 * v))
+                    wbuf[4 * v + 0] = u32_as_f32(a0)
+                    wbuf[4 * v + 1] = u32_as_f32(a1)
+                    wbuf[4 * v + 2] = u32_as_f32(a2)
+                    wbuf[4 * v + 3] = u32_as_f32(a3)
         for st in cutlass.range_constexpr(_MHC_MULT):
             if const_expr(T % 4 == 0):
                 for c in cutlass.range_constexpr(T // 4):
