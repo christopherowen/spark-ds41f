@@ -1017,6 +1017,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            # The drafter's dummy rows route only when the target's do.
+            self.speculator.dummy_rows_live = self.input_buffers.dummy_input_ids is not None
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.propose(
                     input_batch=input_batch,

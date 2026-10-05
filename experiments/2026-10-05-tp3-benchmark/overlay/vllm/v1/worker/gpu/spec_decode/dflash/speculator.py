@@ -58,6 +58,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # rows. Persistent: captured graphs read it on replay.
         self._is_padding = torch.ones(self.max_num_tokens, dtype=torch.bool, device=device)
         self._row_index = torch.arange(self.max_num_tokens, device=device)
+        # Set by the model runner before a dummy step: whether its dummy rows
+        # stand in for real rows (profile token ids), as the target's do.
+        self.dummy_rows_live = False
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -162,6 +165,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        # Capture runs dummy rows only: route none of them.
+        self._is_padding.fill_(True)
         self.query_cudagraph_manager.capture(
             self._generate_draft,
             self.input_buffers,
@@ -734,10 +739,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
 
-        # Rows past the live query rows pad the batch; a profiling batch is all
-        # padding, like the target's dummy batches. Written eagerly before the
-        # graph replays, so the routers skip exactly these rows.
-        live = 0 if dummy_run and is_profile else num_query_tokens
+        # Rows past the live query rows pad the batch, and a dummy batch is all
+        # padding unless its rows stand in for real ones, like the target's.
+        # Written eagerly before the graph replays, so the routers skip
+        # exactly these rows.
+        live = 0 if dummy_run and not self.dummy_rows_live else num_query_tokens
         self._is_padding[:num_tokens_padded].copy_(
             self._row_index[:num_tokens_padded] >= live
         )

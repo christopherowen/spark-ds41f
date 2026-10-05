@@ -1,29 +1,45 @@
-From be32c2acc7efba617562d740f920de01f1ce3eae Mon Sep 17 00:00:00 2001
+From f0d2d5b51c47974eb569690fa59b360a4787199b Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 03:37:57 +0200
 Subject: [PATCH] Mark the DSpark drafter's padding rows for the MoE routers
 
 The target marks the rows that pad its batch, and every row of a dummy
-batch, as padding in the forward context, and the MoE routers skip them
-(VLLM_MOE_SKIP_PADDING). The DFlash/DSpark drafter set no mask, so its
-routers routed CUDA graph padding rows and the dummy rows of graph
-capture and the memory profiles. Those rows read the null block, which
-dummy runs fill with other cache groups' records; TileKernels' gate
-refused their non-finite logits at TP3.
+batch unless profile token ids stand in for real rows, as padding in the
+forward context, and the MoE routers skip them (VLLM_MOE_SKIP_PADDING).
+The DFlash/DSpark drafter set no mask, so its routers routed CUDA graph
+padding rows and the dummy rows of graph capture and the memory
+profiles. Those rows read the null block, which dummy runs fill with
+other cache groups' records; TileKernels' gate refused their non-finite
+logits at TP3.
 
-The drafter keeps a persistent padding mask in its forward context. It
-starts as all padding, so capture routes no dummy row; each step marks
-rows past the live query rows as padding before the graph replays, and a
-profiling batch is all padding, like the target's.
+The drafter keeps a persistent padding mask in its forward context, all
+padding while its graphs are captured. Before each step's replay it marks
+rows past the live query rows as padding, and a dummy batch's rows as
+padding unless the model runner says they stand in for real rows, as the
+target's do.
 ---
- .../worker/gpu/spec_decode/dflash/speculator.py | 17 +++++++++++++++++
- 1 file changed, 17 insertions(+)
+ vllm/v1/worker/gpu/model_runner.py            |  2 ++
+ .../gpu/spec_decode/dflash/speculator.py      | 23 +++++++++++++++++++
+ 2 files changed, 25 insertions(+)
 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index db52c6f20..867a5fa6d 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1017,6 +1017,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
+                 )
++            # The drafter's dummy rows route only when the target's do.
++            self.speculator.dummy_rows_live = self.input_buffers.dummy_input_ids is not None
+             with use_workspace_lane(self._draft_workspace_lane):
+                 self.speculator.propose(
+                     input_batch=input_batch,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index e209f6829..3e24b90d9 100644
+index e209f6829..fd3902b8d 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-@@ -52,6 +52,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -52,6 +52,15 @@ class DFlashSpeculator(DraftModelSpeculator):
          self.hidden_states = torch.zeros(
              self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
          )
@@ -33,10 +49,22 @@ index e209f6829..3e24b90d9 100644
 +        # rows. Persistent: captured graphs read it on replay.
 +        self._is_padding = torch.ones(self.max_num_tokens, dtype=torch.bool, device=device)
 +        self._row_index = torch.arange(self.max_num_tokens, device=device)
++        # Set by the model runner before a dummy step: whether its dummy rows
++        # stand in for real rows (profile token ids), as the target's do.
++        self.dummy_rows_live = False
  
          # Multimodal inputs not currently supported.
          self.supports_mm_inputs = False
-@@ -425,6 +431,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -156,6 +165,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+         self.sample_pos.zero_()
+         self.sample_idx_mapping.fill_(-1)
+         assert self.query_cudagraph_manager is not None
++        # Capture runs dummy rows only: route none of them.
++        self._is_padding.fill_(True)
+         self.query_cudagraph_manager.capture(
+             self._generate_draft,
+             self.input_buffers,
+@@ -425,6 +436,7 @@ class DFlashSpeculator(DraftModelSpeculator):
              num_tokens_across_dp=num_tokens_across_dp,
              slot_mapping=slot_mappings,
              batch_descriptor=batch_descriptor,
@@ -44,7 +72,7 @@ index e209f6829..3e24b90d9 100644
          ):
              last_hidden_states = self.model(
                  input_ids=self.input_buffers.input_ids[:num_tokens],
-@@ -593,6 +600,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -593,6 +605,8 @@ class DFlashSpeculator(DraftModelSpeculator):
              # DFlash processes all speculative tokens in one forward pass,
              # so the real token count is num_query_tokens.
              self._prepare_eplb_forward(num_query_tokens)
@@ -53,14 +81,15 @@ index e209f6829..3e24b90d9 100644
              self._generate_draft(
                  num_reqs,
                  num_query_tokens,
-@@ -725,6 +734,14 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -725,6 +739,15 @@ class DFlashSpeculator(DraftModelSpeculator):
          # so the real token count is num_query_tokens.
          self._prepare_eplb_forward(num_query_tokens)
  
-+        # Rows past the live query rows pad the batch; a profiling batch is all
-+        # padding, like the target's dummy batches. Written eagerly before the
-+        # graph replays, so the routers skip exactly these rows.
-+        live = 0 if dummy_run and is_profile else num_query_tokens
++        # Rows past the live query rows pad the batch, and a dummy batch is all
++        # padding unless its rows stand in for real ones, like the target's.
++        # Written eagerly before the graph replays, so the routers skip
++        # exactly these rows.
++        live = 0 if dummy_run and not self.dummy_rows_live else num_query_tokens
 +        self._is_padding[:num_tokens_padded].copy_(
 +            self._row_index[:num_tokens_padded] >= live
 +        )
