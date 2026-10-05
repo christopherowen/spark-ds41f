@@ -199,14 +199,14 @@ previous, two ConnectX-7 paths per cable;
    [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json) as
    `config/nodes-ring4.local.json` (git-ignored, like `config/nodes.json`):
    ranks in ring order, management IPs, and each peer's RoCE devices.
-3. Copy [experiments/2026-10-05-tilelang-r6/tp4.json](../experiments/2026-10-05-tilelang-r6/tp4.json)
-   for your site: `nodes_config`, `distributed.master_addr`, `host.home` and
-   the socket interface names, as for the three-node profile, then
-   `bin/spark --cluster-config <your tp4.json> doctor`.
+3. Edit [config/cluster-tp4.json](../config/cluster-tp4.json) for your site
+   as for the three-node profile (`distributed.master_addr`, `host.home` and
+   the socket interface names; it reads `config/nodes-ring4.local.json`),
+   then `bin/spark --cluster-config config/cluster-tp4.json doctor`.
 4. Download the model on the fourth node, copy the image to it, and start:
 
    ```sh
-   bin/spark --cluster-config <your tp4.json> cluster start --apply
+   bin/spark --cluster-config config/cluster-tp4.json cluster start --apply
    ```
 
 Its acceptance benchmark (decode at 1-16 streams, real-text prefill at 32K to

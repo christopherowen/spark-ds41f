@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Write r6's TP4 and TP3 configurations from the TileLang recipes of 2026-10-05.
+"""Write r6's benchmark configurations from the TileLang recipes of 2026-10-05.
 
-- tp4.json: the r6 image (this directory's lock: the TileLang 1M series plus
-  vLLM 0041-0044), its own DSpark cost directory, nothing mounted over the
-  image and no profiler;
-- tp4-profile.json: tp4.json with the torch profiler endpoints, for the
-  per-kernel decode profile of the benchmark window;
-- tp3.json and tp3-profile.json: the same for the TP3 recipe (8 x 512K), from
-  the 2026-10-05 TP3 TileLang benchmark's configuration.
+- tp4-profile.json: the TP4 1M recipe on the r6 image (this directory's lock:
+  the TileLang 1M series plus vLLM 0041-0044), its own DSpark cost directory,
+  nothing mounted over the image, and the torch profiler endpoints for the
+  benchmark boot's decode profile;
+- tp3-profile.json: the same for the TP3 recipe (8 x 512K), from the
+  2026-10-05 TP3 TileLang benchmark's configuration.
+
+The promoted profiles are config/cluster.json (TP3) and config/cluster-tp4.json
+(TP4): these recipes without the profiler, on the root lock.
 """
 import copy
 import json
@@ -66,8 +68,8 @@ def main():
     assert not [m for m in tp4["container"]["mounts"] if "overlay" in m[0]]
     without_profiler(tp4)
     three = tp3()
-    for name, cluster in (("tp4", tp4), ("tp4-profile", profiled(tp4, "ring4-r6-20261005")),
-                          ("tp3", three), ("tp3-profile", profiled(three, "tp3-r6-20261005"))):
+    for name, cluster in (("tp4-profile", profiled(tp4, "ring4-r6-20261005")),
+                          ("tp3-profile", profiled(three, "tp3-r6-20261005"))):
         (HERE / f"{name}.json").write_text(json.dumps(cluster, indent=2) + "\n")
         print(f"wrote {REL}/{name}.json")
 

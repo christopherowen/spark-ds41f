@@ -1,12 +1,16 @@
 # Page-size and context profiles
 
-The serving image and model arithmetic are identical in both profiles. Each
+The serving image and model arithmetic are identical in every profile. Each
 configuration records its required running kernel; launch refuses a mismatch.
+The first two are the three-node (TP3) profiles; `config/cluster-tp4.json` is
+the four-node ring's TP4 1M profile, with 16 sequences (8,580,566 KV tokens,
+8.18 full 1M windows).
 
 | Configuration | CPU pages | KV allocation per rank | Per-request token limit |
 | --- | ---: | ---: | ---: |
 | `config/cluster-4k.json` | 4 KiB | 2.2 GiB | 262,144 |
 | `config/cluster-64k.json` | 64 KiB, memory-saver enabled | 3.5 GiB | 524,288 |
+| `config/cluster-tp4.json` (four nodes) | 64 KiB, memory-saver enabled | 10.5 GiB | 1,048,576 |
 
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV

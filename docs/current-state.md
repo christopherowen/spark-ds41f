@@ -5,8 +5,8 @@ Promoted 2026-10-05 as
 for all three nodes from `config/cluster.json`
 ([promotion record](../experiments/2026-10-05-tilelang-r6/README.md)).
 The TileLang kernel family runs the model; B12X is the alternative backend in
-the same image. The same image serves the TP4 1M recipe
-([tp4.json](../experiments/2026-10-05-tilelang-r6/tp4.json)).
+the same image. The same image serves the TP4 1M profile
+([config/cluster-tp4.json](../config/cluster-tp4.json)) on the four-node ring.
 
 | Setting | Active value |
 |---|---:|

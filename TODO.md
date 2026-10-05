@@ -430,7 +430,7 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Four nodes (TP4)
 
-The TP4 1M recipe on r6 (`experiments/2026-10-05-tilelang-r6/tp4.json`) is
+The TP4 1M profile on r6 (`config/cluster-tp4.json`) is
 benchmarked at its limits: 62.4/76.0 tok/s prose/code at one stream,
 318.4/349.8 at sixteen, prefill 5.8k/5.5k/5.1k/4.4k tok/s at 32K/256K/500K/1M,
 at least 19.35 GiB available on every node. It needs no model-dimension

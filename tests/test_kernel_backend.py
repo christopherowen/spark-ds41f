@@ -108,6 +108,24 @@ class KernelBackendTest(unittest.TestCase):
                 self.assertEqual(kernel_backend.problems(cluster), [])
                 self.assertEqual(self.errors(cluster, lock), [])
 
+    def test_promoted_tp4_profile_runs_tilelang(self):
+        # config/cluster-tp4.json reads the site's git-ignored ring map; check it
+        # against the example map of the same topology.
+        lock = spark.read_json("upstreams.lock.json")
+        nodes = spark.read_json("config/examples/nodes-ring4.json")
+        cluster = spark.read_json("config/cluster-tp4.json")
+        self.assertEqual(cluster["nodes_config"], "config/nodes-ring4.local.json")
+        self.assertNotIn("upstreams_config", cluster)
+        self.assertEqual(cluster["promoted_baseline"], spark.read_json("config/cluster.json")["promoted_baseline"])
+        cluster["distributed"]["master_addr"] = next(n for n in nodes["nodes"] if n.get("head"))["management_ip"]
+        self.assertEqual(cluster["kernel_backend"], "tilelang")
+        self.assertEqual(spark.topology.argument(cluster, "--tensor-parallel-size"), "4")
+        self.assertEqual(spark.topology.argument(cluster, "--max-model-len"), "1048576")
+        self.assertEqual(spark.topology.transport(cluster), "oneshot-ring4")
+        self.assertNotIn("--profiler-config", cluster["serve_args"])
+        errors = [p for p in spark.local_doctor(cluster, nodes, lock) if not isinstance(p, spark.Warn)]
+        self.assertEqual(errors, [])
+
     def test_absent_backend_means_b12x(self):
         # Every configuration recorded before r6 omits kernel_backend.
         self.assertNotIn("kernel_backend", self.base)

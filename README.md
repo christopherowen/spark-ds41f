@@ -17,7 +17,7 @@ compares the two families kernel by kernel.
 
 The deployment tools also generate and validate a
 [four-node switchless ring profile](docs/switchless-topology.md). The
-[TP4 1M recipe](experiments/2026-10-05-tilelang-r6/tp4.json) serves the
+[TP4 1M profile](config/cluster-tp4.json) serves the
 checkpoint's full 1,048,576-token context with 16 sequences on the same image
 as the three-node deployment, and was benchmarked at those limits (see
 [Performance](#performance)). The promoted configuration below is the
@@ -27,9 +27,8 @@ Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profi
 keep B12X's measured RoCEnante limits and NCCL settings together.
 `bin/spark tuning show tp4` shows the B12X TP4 recipe; `tuning create`
 generates a complete B12X configuration for a site node map, with launch
-disabled. The TileLang recipes are the r6 configurations
-([TP3](experiments/2026-10-05-tilelang-r6/tp3.json),
-[TP4](experiments/2026-10-05-tilelang-r6/tp4.json)).
+disabled. The promoted TileLang profiles are [config/cluster.json](config/cluster.json)
+(TP3) and [config/cluster-tp4.json](config/cluster-tp4.json) (TP4).
 
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
@@ -107,7 +106,9 @@ coherence gate 5/5; see [Performance](#performance).
 
 The machine-readable desired configuration is [config/cluster.json](config/cluster.json).
 The named [4 KiB and 64 KiB profiles](docs/memory-profiles.md) retain the
-previous capacity as a fallback and select the larger 64 KiB profile by default.
+previous capacity as a fallback and select the larger 64 KiB profile by default;
+[config/cluster-tp4.json](config/cluster-tp4.json) is the four-node TP4 1M
+profile on the same image (`--cluster-config config/cluster-tp4.json`).
 To reproduce the deployment on your own three Sparks, follow
 [docs/replicate.md](docs/replicate.md).
 

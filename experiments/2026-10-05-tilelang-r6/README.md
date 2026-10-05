@@ -26,14 +26,18 @@ is `vllm-ds41f-kkref:04c30fa98e79-r6`.
 
 ## Configurations
 
-[make_configs.py](make_configs.py) derives both from the TP4 TileLang recipe
-([2026-10-05-tp4-500k/tilelang.json](../2026-10-05-tp4-500k/tilelang.json)):
+[make_configs.py](make_configs.py) writes the benchmark configurations from
+the 2026-10-05 TileLang recipes
+([TP4](../2026-10-05-tp4-500k/tilelang.json), [TP3](../2026-10-05-tp3-benchmark/tilelang.json)):
+[tp4-profile.json](tp4-profile.json) and [tp3-profile.json](tp3-profile.json),
+the r6 image with nothing mounted over it, their own DSpark cost directories
+(`ring4-r6-20261005`, `tp3-r6-20261005`) and the torch profiler endpoints for
+each boot's decode profile.
 
-- [tp4.json](tp4.json): the serving configuration, no profiler;
-- [tp4-profile.json](tp4-profile.json): the same with the torch profiler
-  endpoints, for the benchmark boot's decode profile.
-
-Each uses its own DSpark cost directory (`ring4-r6-20261005`).
+The promoted profiles are the same recipes without the profiler, on the root
+lock: [config/cluster.json](../../config/cluster.json) (TP3, with
+`cluster-64k` and `cluster-4k`) and
+[config/cluster-tp4.json](../../config/cluster-tp4.json) (TP4).
 
 ## Benchmark
 
@@ -104,6 +108,7 @@ r6 becomes the promoted baseline
 ([manifests/baselines/2026-10-05-karmic-kraken-r6.json](../../manifests/baselines/2026-10-05-karmic-kraken-r6.json)):
 the TileLang patches join `patches/vllm` (series-r5p keeps r5p's series),
 the root lock and source manifest become r6's, and `config/cluster*.json`
-become the TP3 recipe with `kernel_backend: tilelang`. [r5p/](r5p) keeps
+become the TP3 recipe with `kernel_backend: tilelang`, `config/cluster-tp4.json`
+is the TP4 1M profile, and [r5p/](r5p) keeps
 r5p's lock and TP3 configuration, which the B12X tuning profiles and the
 topology tests use.
