@@ -33,12 +33,16 @@ TILELANG_EXPERIMENTS = (
     "experiments/2026-10-04-tilelang-router",
     "experiments/2026-10-04-tilelang-sparknet",
     "experiments/2026-10-04-tilelang-vocab-heads",
+    "experiments/2026-10-05-tilelang-r6",
 )
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
 # configuration's lock and an example node map of its topology. The TP3 profile
 # mirrors r5o, the configuration promoted when it was made.
 R5O = "experiments/2026-10-05-r5p-promotion/r5o"
+# r5p's B12X TP3 configuration and lock, kept when r6 promoted the TileLang family.
+R5P_TP3 = "experiments/2026-10-05-tilelang-r6/r5p/cluster-64k.json"
+R5P_LOCK = "experiments/2026-10-05-tilelang-r6/r5p/upstreams.lock.json"
 TWINS = {
     "tp3": (f"{R5O}/cluster.json", f"{R5O}/upstreams.lock.json", "config/nodes.example.json"),
     "tp4": ("experiments/2026-10-03-collective-contract/candidate.json",
@@ -60,9 +64,9 @@ class KernelBackendTest(unittest.TestCase):
     def setUp(self):
         self.nodes = spark.read_json("config/nodes.example.json")
         head = self.nodes["nodes"][0]["management_ip"]
-        self.base = spark.read_json("config/cluster.json")
+        self.base = spark.read_json(R5P_TP3)
         self.base["distributed"]["master_addr"] = head
-        self.lock = spark.read_json("upstreams.lock.json")
+        self.lock = spark.read_json(R5P_LOCK)
         self.candidate = spark.read_json(f"{CANDIDATE}/tp3/cluster.json")
         self.candidate["distributed"]["master_addr"] = head
         self.candidate_lock = spark.read_json(f"{CANDIDATE}/tp3/upstreams.lock.json")
@@ -93,13 +97,41 @@ class KernelBackendTest(unittest.TestCase):
     def errors(self, cluster, lock):
         return [p for p in spark.local_doctor(cluster, self.nodes, lock) if not isinstance(p, spark.Warn)]
 
-    def test_promoted_profiles_default_to_b12x_unchanged(self):
+    def test_promoted_profiles_run_tilelang(self):
+        lock = spark.read_json("upstreams.lock.json")
         for name in ("config/cluster.json", "config/cluster-64k.json", "config/cluster-4k.json"):
             with self.subTest(name=name):
                 cluster = spark.read_json(name)
-                self.assertEqual(kernel_backend.backend(cluster), "b12x")
-                self.assertNotIn(kernel_backend.ENVIRONMENT, cluster["environment"])
+                cluster["distributed"]["master_addr"] = self.base["distributed"]["master_addr"]
+                self.assertEqual(cluster["kernel_backend"], "tilelang")
+                self.assertEqual(cluster["environment"][kernel_backend.ENVIRONMENT], "tilelang")
                 self.assertEqual(kernel_backend.problems(cluster), [])
+                self.assertEqual(self.errors(cluster, lock), [])
+
+    def test_promoted_tp4_profile_runs_tilelang(self):
+        # config/cluster-tp4.json reads the site's git-ignored ring map; check it
+        # against the example map of the same topology.
+        lock = spark.read_json("upstreams.lock.json")
+        nodes = spark.read_json("config/examples/nodes-ring4.json")
+        cluster = spark.read_json("config/cluster-tp4.json")
+        self.assertEqual(cluster["nodes_config"], "config/nodes-ring4.local.json")
+        self.assertNotIn("upstreams_config", cluster)
+        self.assertEqual(cluster["promoted_baseline"], spark.read_json("config/cluster.json")["promoted_baseline"])
+        cluster["distributed"]["master_addr"] = next(n for n in nodes["nodes"] if n.get("head"))["management_ip"]
+        self.assertEqual(cluster["kernel_backend"], "tilelang")
+        self.assertEqual(spark.topology.argument(cluster, "--tensor-parallel-size"), "4")
+        self.assertEqual(spark.topology.argument(cluster, "--max-model-len"), "1048576")
+        self.assertEqual(spark.topology.transport(cluster), "oneshot-ring4")
+        self.assertNotIn("--profiler-config", cluster["serve_args"])
+        errors = [p for p in spark.local_doctor(cluster, nodes, lock) if not isinstance(p, spark.Warn)]
+        self.assertEqual(errors, [])
+
+    def test_absent_backend_means_b12x(self):
+        # Every configuration recorded before r6 omits kernel_backend.
+        self.assertNotIn("kernel_backend", self.base)
+        self.assertEqual(kernel_backend.backend(self.base), "b12x")
+        self.assertNotIn(kernel_backend.ENVIRONMENT, self.base["environment"])
+        self.assertEqual(kernel_backend.problems(self.base), [])
         self.assertEqual(self.errors(self.base, self.lock), [])
         # Naming the default explicitly changes nothing that is launched.
         explicit = copy.deepcopy(self.base)

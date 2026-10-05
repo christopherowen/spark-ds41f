@@ -1,8 +1,17 @@
 # Three- and four-node switchless deployments
 
 The deployment tools accept three or four Sparks, with one GPU and one TP rank
-per node. The promoted configuration remains the measured three-node deployment.
-Four-node support is a candidate configuration path. NCCL ring, RoCEnante CPU
+per node. Both layouts have a promoted profile on the r6 image:
+[config/cluster.json](../config/cluster.json) for the three-node triangle (TP3)
+and [config/cluster-tp4.json](../config/cluster-tp4.json) for the four-node
+ring (TP4, the full 1M context with 16 sequences), each with the TileLang
+kernel family and sparknet's one-shot collectives
+([r6 record](../experiments/2026-10-05-tilelang-r6/README.md)). The four-node
+profile reads the site's ring map from the git-ignored
+`config/nodes-ring4.local.json`; start from
+[config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json).
+
+The history of the four-node path, measured with B12X: NCCL ring, RoCEnante CPU
 relay and NIC forwarding pass the hardware collective probe on four connected
 Sparks. The relay plus four-channel NCCL candidate passes the main DS4.1
 serving screen, with about 23% faster prefill than the one-channel TP4 control.
@@ -20,7 +29,9 @@ sequence-parallel and compact MoE tail handling.
 
 | Fabric | TP transport | Peer map |
 | --- | --- | --- |
-| Three-node triangle | Existing RoCEnante small collectives plus NCCL | Both other ranks |
+| Three-node triangle, promoted (TileLang) | sparknet one-shot small collectives (`oneshot-direct`) plus NCCL | Both other ranks |
+| Four-node ring, promoted (TileLang) | sparknet ring4 one-shot small collectives (`oneshot-ring4`) plus NCCL ring | Previous and next ranks only |
+| Three-node triangle, B12X | RoCEnante small collectives plus NCCL | Both other ranks |
 | Four-node ring | NCCL ring for TP collectives | Previous and next ranks only |
 | Four-node ring, experimental relay image | RoCEnante ring4 small collectives plus NCCL ring | Previous and next ranks only |
 | Four-node ring, experimental NIC forwarding | RoCEnante mesh4 small collectives plus NCCL ring | Physical neighbours; opposite paths derived |

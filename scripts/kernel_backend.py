@@ -1,9 +1,12 @@
 """Kernel backend policy: which library runs the DS4.1 model compute kernels.
 
-B12X is the default and the promoted backend. TileLang selects the TileLang
-compiler, DeepSeek's TileKernels and the DS4.1 TileLang kernels in the vLLM
-patch stack. Collectives (RoCEnante, NCCL) and the B12X checkpoint loader are
-outside this policy: both backends keep them.
+TileLang is the promoted backend (r6): it selects the TileLang compiler,
+DeepSeek's TileKernels and the DS4.1 TileLang kernels in the vLLM patch stack,
+with sparknet's one-shot collectives. The promoted configurations name it
+explicitly. B12X remains the alternative; a configuration without
+``kernel_backend`` means B12X, as every configuration recorded before r6 does.
+NCCL and the B12X checkpoint loader are outside this policy: both backends
+keep them.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import json
 from pathlib import PurePosixPath
 
 
+# The backend of a configuration that does not name one (every record before r6).
 DEFAULT = "b12x"
 # Serve arguments and the environment value each backend requires.
 BACKENDS = {

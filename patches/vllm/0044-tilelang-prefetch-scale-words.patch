@@ -1,0 +1,40 @@
+From c1b22ea93ac1a26e99b87cea939c900b7b23afc1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 12:14:07 +0200
+Subject: [PATCH] Prefetch the TileLang scale words with each projection's
+ weight
+
+The TileLang block-32 projections read per-row packed UE8M0 scale words
+beside the FP8 weight. The decode L2 prefetch streamed only the weight,
+so each projection's first K blocks waited on scale misses. The scale
+words are now a segment of the same linear.
+---
+ vllm/models/deepseek_v4_1/l2_prefetch.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index 1e3c2068f..eb759d6c1 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -110,8 +110,16 @@ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+     packed = getattr(linear, "b12x_weight", None)
+     if packed is not None:
+         return object_segments(f"{name}.b12x_weight", packed)
+-    segment = _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None))
+-    return [segment] if segment is not None else []
++    segments = [
++        _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
++        # The TileLang block-32 projections read per-row scale words beside it.
++        _l2pf.tensor_segment(
++            f"{name}.tilelang_weight_sf",
++            getattr(linear, "tilelang_weight_sf", None),
++            min_bytes=0,
++        ),
++    ]
++    return [segment for segment in segments if segment is not None]
+ 
+ 
+ def param_segments(name: str, owner: object, attrs: tuple[str, ...]) -> list[Segment]:
+-- 
+2.54.0 (Apple Git-157)
+

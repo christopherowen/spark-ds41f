@@ -1,33 +1,34 @@
 # spark-ds41f
 
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
-Flash on a switchless three-node DGX Spark fabric.
+Flash on a switchless three-node DGX Spark fabric, and the same deployment on
+a four-node ring.
+
+The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
+with DeepSeek's TileKernels and the one-shot RoCE collectives of
+[sparknet](https://github.com/christopherowen/dgx-spark-networking), in place
+of B12X's attention, linear, MoE, mHC, vocabulary and collective kernels
+(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). B12X stays in
+the image as the alternative backend; a configuration without
+`kernel_backend` means B12X. The [r6 promotion record](experiments/2026-10-05-tilelang-r6/README.md)
+has both recipes and their benchmarks, and the
+[decode-kernel experiment](experiments/2026-10-05-tilelang-decode-kernels/README.md)
+compares the two families kernel by kernel.
 
 The deployment tools also generate and validate a
-[four-node switchless ring profile](docs/switchless-topology.md) with the
-balanced [RoCEnante ring relay](experiments/2026-10-02-rocenante-ring4/README.md)
-and tuned NCCL. Its [TP4 1M recipe](experiments/2026-10-04-tp4-memory-tuning/README.md)
-serves the checkpoint's full 1,048,576-token context with 16 sequences on the
-same image as the three-node deployment, and was benchmarked at those limits
-(see [Performance](#performance)). See the
-[serving decision](experiments/2026-10-03-collective-serving/decision.md),
-[hardware results](experiments/2026-10-02-rocenante-mesh4/README.md) and
-[four-path transport comparison](experiments/2026-10-02-mesh4-fourpaths/README.md).
-The promoted configuration below is the three-node deployment.
+[four-node switchless ring profile](docs/switchless-topology.md). The
+[TP4 1M profile](config/cluster-tp4.json) serves the
+checkpoint's full 1,048,576-token context with 16 sequences on the same image
+as the three-node deployment, and was benchmarked at those limits (see
+[Performance](#performance)). The promoted configuration below is the
+three-node deployment.
 
 Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profiles/README.md)
-keep the measured limits and NCCL settings together. `bin/spark tuning show tp4`
-shows the TP4 recipe; `tuning create` generates a complete configuration
-for a site node map. The generated configuration starts with launch disabled.
-
-The TileLang kernel family (TileLang, DeepSeek's TileKernels and sparknet
-collectives in place of B12X's kernels) is an alternative kernel backend
-(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). Its TP3 and TP4
-configurations ([TP3](experiments/2026-10-05-tp3-benchmark/tilelang.json),
-[TP4](experiments/2026-10-04-tilelang-1m/candidate.json)) were benchmarked
-against r5p's in the same windows
-([TP4](experiments/2026-10-05-tp4-validation/README.md),
-[TP3](experiments/2026-10-05-tp3-benchmark/README.md)).
+keep B12X's measured RoCEnante limits and NCCL settings together.
+`bin/spark tuning show tp4` shows the B12X TP4 recipe; `tuning create`
+generates a complete B12X configuration for a site node map, with launch
+disabled. The promoted TileLang profiles are [config/cluster.json](config/cluster.json)
+(TP3) and [config/cluster-tp4.json](config/cluster-tp4.json) (TP4).
 
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
@@ -37,8 +38,8 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-10-05-karmic-kraken-r5p.json](manifests/baselines/2026-10-05-karmic-kraken-r5p.json)
-([promotion record](experiments/2026-10-05-r5p-promotion/README.md)):
+[manifests/baselines/2026-10-05-karmic-kraken-r6.json](manifests/baselines/2026-10-05-karmic-kraken-r6.json)
+([promotion record](experiments/2026-10-05-tilelang-r6/README.md)):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
@@ -47,48 +48,52 @@ The active baseline is recorded in
 - direct dual ConnectX-7 paths between every pair of nodes;
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram
   projection sharding, asynchronous Engram rows, and two tool-call and
-  image-cache fixes) and B12X (plus the switchless RoCEnante patch, and its
-  CuTe DSL pin moved to the 4.7.1 that vLLM requires; its FP4 KV writer
-  rounds like DeepSeek's reference quantizer, and its indexer top-k breaks
-  score ties by position, so selections repeat, and its dense GEMM and prefill
-  kernels fence shared-memory stage reads before the TMA refill), with B12X attention,
-  linear, MoE, and mHC kernels and L2 weight prefetch during decode (the
-  next layer's weights stream into L2 while latency-bound kernels run); the
-  image also carries B12X's four-node RoCEnante relay and mesh transports,
-  inactive on the triangle;
+  image-cache fixes) with the TileLang kernel family:
+  - TileLang 0.1.15 with three patches that enable SM120/SM121 block-scaled
+    MMAs (MXFP8, FP8 × FP4, MXFP4);
+  - DS4.1 TileLang kernels for sparse MLA, the MXFP4 indexer, the block-32 FP8
+    and BF16 projections, the FP8 × FP4 routed experts and the vocabulary
+    heads; decode rows run on 16-, 32- or 64-row tiles with TileLang's
+    unspecialized pipeline (its warp-specialized scale staging races on SM121
+    at decode tiles), and prefill rasterizes weights larger than L2 in panels;
+  - DeepSeek's TileKernels 2.0.0 for the MoE top-k gate, the SwiGLU and
+    quantization casts and mHC, with the mHC projection a TileLang kernel;
+  - sparknet's one-shot RoCE all-reduce and all-gather, explicit and
+    fail-stop;
+  - L2 weight prefetch during decode (the next layer's weights and scale
+    words stream into L2 while latency-bound kernels run);
+  - B12X's WO projection, RoPE, KV cache writers, compressor and BF16 GEMVs,
+    which the family does not replace yet, and its checkpoint loader;
+- B12X, with all its fixes, as the alternative backend in the same image: its
+  FP4 KV writer rounds like DeepSeek's reference quantizer, its indexer top-k
+  breaks score ties by position, its dense GEMM and prefill kernels fence
+  shared-memory stage reads before the TMA refill, and W4A8 tiny decode stays
+  off; its four-node RoCEnante relay and mesh transports are present too;
 - NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
   (NVIDIA/nccl#2393), which prevents a proxy-thread hang, and the four-node
   switchless ring patches (bidirectional rings, balanced channels);
 - DeepSeek V4.1 Flash native FP8/FP4/BF16 weights, every served weight bit as
   the checkpoint stores it, with the vision tower loaded (up to four images
   per request); the output head is stored in an exact 12-bit packed form of
-  its BF16 weights (a sign-and-mantissa byte and a 4-bit exponent code, with
-  out-of-window values kept in a per-row list), and the embedding and output
-  head live in the GB10 display carve-out, the firmware's scanout reserve
-  that ordinary allocations never use, loaded there directly from the
-  checkpoint while the text console keeps its framebuffer;
+  its BF16 weights, and the embedding and output head live in the GB10
+  display carve-out, loaded there directly from the checkpoint while the
+  text console keeps its framebuffer;
+- every row's result is independent of its batch: each kernel adds its
+  reduction in a fixed order, decode and prefill alike;
 - the ratio-2 compressor carries its open pair across decode steps, so
   compressed entries for generated tokens match the ones prefill builds;
 - DSpark speculative decoding with five draft tokens (the drafter's trained
   block) and block rejection, full CUDA graphs for decode batches up to 48
-  tokens; verification rows whose drafts are unlikely to survive skip the
-  routed experts, and greedy drafts stay sharded by vocabulary over the
-  checkpoint's BF16 drafter head (the target head's own tensor) and Markov
-  projection;
-- the requested RoCE collective policy is enforced: a declined or lost RoCE
-  backend fails startup rather than falling back to another path, and the
-  fabricated context of startup profiling gives each KV cache group its own
-  blocks;
+  tokens, verification-cost curves profiled for this image; verification rows
+  whose drafts are unlikely to survive skip the routed experts, the drafter
+  marks its padding rows for the MoE routers, and greedy drafts stay sharded
+  by vocabulary over the checkpoint's BF16 drafter head and Markov projection;
+- the fabricated context of startup profiling gives each KV cache group its
+  own blocks;
 - sequence-parallel prefill once a prompt chunk's reduce-scatter outgrows
-  the one-shot RoCE all-reduce (205 tokens): the encoder layers' row-wise
-  work runs on a third of the rows per rank, and so does the sparse-attention
-  indexer, whose cost grows with context depth (a 4,096-token chunk at 200K
-  of context runs 15% faster);
+  the one-shot RoCE all-reduce (205 tokens);
 - mutating custom ops read their argument schema once per call, not once per
-  argument as torch does, which keeps short prompts from waiting on the
-  host at every MoE launch;
-- B12X W4A8 tiny decode disabled (`B12X_W4A8_TINY_DECODE=0`): it omits the
-  model's SwiGLU clamp and caused the incoherence seen in earlier images;
+  argument as torch does;
 - 524,288-token per-request limit, eight admitted sequences, and 2,845,543
   KV tokens (5.43 full windows) in a 3.5 GiB-per-rank cache;
 - one concurrent prefill, 4,096 batched tokens, and fail-closed 5 GiB startup
@@ -101,45 +106,70 @@ coherence gate 5/5; see [Performance](#performance).
 
 The machine-readable desired configuration is [config/cluster.json](config/cluster.json).
 The named [4 KiB and 64 KiB profiles](docs/memory-profiles.md) retain the
-previous capacity as a fallback and select the larger 64 KiB profile by default.
+previous capacity as a fallback and select the larger 64 KiB profile by default;
+[config/cluster-tp4.json](config/cluster-tp4.json) is the four-node TP4 1M
+profile on the same image (`--cluster-config config/cluster-tp4.json`).
 To reproduce the deployment on your own three Sparks, follow
 [docs/replicate.md](docs/replicate.md).
 
 ## Performance
 
-The r5p acceptance benchmark (2026-10-05, `bin/spark bench` from dgx1:
+The r6 acceptance benchmark (2026-10-05, `bin/spark bench` from dgx1:
 quality, then prose and code prompts with reasoning on, temperature 0, 256
 output tokens, three samples per decode point, and real source text for
-prefill) measured, on the three-node deployment against r5o's 64 KiB
-reference:
+prefill, two repeats) against r5p's, one boot each at the recipe's limits.
+Each value is the mean ± its 95% confidence interval; a family is ahead only
+where the two intervals do not overlap (**bold**).
 
-| Workload | r5o | r5p |
+Three nodes (TP3, eight sequences at 512K):
+
+| Workload | B12X r5p | TileLang r6 |
 | --- | ---: | ---: |
 | Quality gate (fixed LRU task, 5 repeats) | 5/5 | 5/5 |
-| Prose, 1 / 2 / 4 / 8 streams (aggregate tok/s) | 52.8 / 79.4 / 117.9 / 171.2 | 50.4 / 75.9 / 118.8 / 173.3 |
-| Code, 1 / 2 / 4 / 8 streams | 64.8 / 90.7 / 135.6 / 195.8 | 60.1 / 90.8 / 136.3 / 192.3 |
-| One-stream prose / code step time | 40.84 / 45.36 ms | 41.92 / 46.44 ms |
-| Source-text prefill, 32K / 256K / 500K | 3.77K / 3.68K / - tok/s | 3.78K / 3.63K / 3.43K tok/s |
-| Lowest MemAvailable, dgx1 | 5.83 GiB | 5.93 GiB |
+| Prose, 1 stream (aggregate tok/s) | 50.4 ± 12.2% | 52.2 ± 0.7% |
+| Prose, 2 streams | 75.9 ± 10.6% | 84.4 ± 0.6% |
+| Prose, 4 streams | 118.8 ± 12.9% | 125.7 ± 0.5% |
+| Prose, 8 streams | 173.3 ± 8.4% | **198.6 ± 0.4%** |
+| Code, 1 stream | 60.1 ± 2.0% | **63.0 ± 0.5%** |
+| Code, 2 streams | 90.8 ± 5.0% | 97.3 ± 8.5% |
+| Code, 4 streams | 136.3 ± 6.3% | 159.2 ± 44.2% |
+| Code, 8 streams | 192.3 ± 3.2% | **240.3 ± 1.0%** |
+| One-stream prose / code step time | 41.92 / 46.44 ms | **38.21 / 42.43 ms** |
+| Source-text prefill, 32K (tok/s) | 3,778 ± 14.9% | 4,306 ± 20.9% |
+| Source-text prefill, 256K | 3,632 ± 2.2% | **4,034 ± 0.3%** |
+| Source-text prefill, 500K | 3,432 ± 0.6% | **3,743 ± 0.8%** |
+| Lowest MemAvailable, dgx1 | 5.93 GiB | 5.99 GiB |
 
-Every point is the same as r5o within its interval. Single-stream steps are
-1.1 ms longer because the drafter reads the checkpoint's BF16 heads instead
-of NVFP4 re-quantizations; the packed output head recovers part of that.
+Four nodes (TP4 1M recipe, 16 sequences at 1,048,576 tokens):
 
-The TP4 1M recipe on four Sparks, same image and protocol, up to 16 streams
-and 1M-token prefill:
+| Workload | B12X r5p | TileLang r6 |
+| --- | ---: | ---: |
+| Prose, 1 / 2 / 4 streams | 62.1 ± 3.8% / 92.7 ± 8.0% / 141.6 ± 7.9% | 62.4 ± 1.2% / 100.2 ± 2.7% / 147.1 ± 10.2% |
+| Prose, 8 / 16 streams | 215.7 ± 7.5% / 297.3 ± 1.2% | 222.1 ± 0.3% / **318.4 ± 1.6%** |
+| Code, 1 / 2 / 4 streams | 72.5 ± 7.5% / 111.3 ± 5.4% / 168.3 ± 9.6% | 76.0 ± 0.6% / 116.8 ± 18.9% / 174.9 ± 0.6% |
+| Code, 8 / 16 streams | 245.7 ± 1.3% / 323.5 ± 1.5% | **264.3 ± 0.6% / 349.8 ± 2.5%** |
+| One-stream prose / code step time | 34.00 / 37.72 ms | **31.79 / 34.75 ms** |
+| Source-text prefill, 32K / 256K (tok/s) | 5,117 ± 1.7% / 4,873 ± 2.5% | **5,836 ± 4.2% / 5,471 ± 3.1%** |
+| Source-text prefill, 500K / 1M | 4,645 ± 1.7% / 4,026 ± 0.9% | **5,072 ± 1.3% / 4,370 ± 0.6%** |
+| KV capacity | 8,580,566 tokens in 10.5 GiB per rank | same |
+| Lowest MemAvailable | 20.4 GiB (dgx1) | 19.35 GiB (dgx1) |
 
-| Workload | TP4 1M recipe |
-| --- | ---: |
-| Prose, 1 / 2 / 4 / 8 / 16 streams | 62.1 / 92.7 / 141.6 / 215.7 / 297.3 |
-| Code, 1 / 2 / 4 / 8 / 16 streams | 72.5 / 111.3 / 168.3 / 245.7 / 323.5 |
-| One-stream prose / code step time | 34.00 / 37.72 ms |
-| Source-text prefill, 32K / 256K / 500K / 1M | 5.12K / 4.87K / 4.65K / 4.03K tok/s |
-| KV capacity | 8,580,566 tokens in 10.5 GiB per rank (8.18 full 1M windows) |
-| Lowest MemAvailable | 20.4 GiB (dgx1) |
+TileLang is never behind: it is ahead on single-stream step time, at eight
+and sixteen streams and on every prefill point except TP3's 32K, and level
+elsewhere. B12X's intervals are wider because its text changes from sample to
+sample (DSpark acceptance moves with it); TileLang generates the same text
+every sample, so its intervals are tight except where two- and four-stream
+scheduling interleaves differently between samples. The intervals cover
+sample-to-sample spread on one text; across 13 texts at TP3, DSpark
+acceptance per text varied about ±5% while the two families' means were level
+([TP3 benchmark](experiments/2026-10-05-tp3-benchmark/README.md)). Step time,
+which does not depend on acceptance, is the kernel comparison. The B12X TP4
+500K point is from [its own run](experiments/2026-10-05-tp4-500k/README.md).
 
 The native benchmark reports
-([TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json),
+([TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r6.json),
+[TP4](experiments/2026-10-05-tilelang-r6/runs-tp4/bench.json), and r5p's
+[TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json) and
 [TP4](experiments/2026-10-05-r5p-promotion/runs/tp4-bench.json)) record
 intervals, prompts, memory and thermal results. The
 [64 KiB deployment record](experiments/2026-10-02-memory-saver-capacity/README.md)
@@ -434,5 +464,6 @@ but are not build inputs are kept separately in
 and one content digest runs on all three nodes.
 
 Canonical vLLM main is parked; the serving sources are Local Inference Lab's
-`integration/karmic-kraken-beta` vLLM and B12X with the local patch series
+`integration/karmic-kraken-beta` vLLM and B12X, TileLang, DeepSeek's
+TileKernels and sparknet, with the local patch series
 ([docs/upstreams.md](docs/upstreams.md)).

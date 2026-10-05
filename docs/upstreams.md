@@ -18,13 +18,23 @@ local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
                                packed BF16 output head; vocabulary
                                weights loaded into the display carve-
                                out; disjoint profiling-context blocks;
-                               other DSpark tools off by default)
+                               the TileLang kernel family: kernels,
+                               TileKernels router and mHC, vocabulary
+                               heads, sparknet collectives, race-free
+                               decode tiles; other DSpark tools off by
+                               default)
                     \
 local-inference-lab/b12x integration/karmic-kraken-beta @ f8069b2c
         + patches/b12x/series (switchless RoCEnante routing, CuTe DSL 4.7.1,
           top-k position ties, TMA stage-release fences, four-node relay
           and mesh transports, packed BF16 vocabulary projection)
-                     ---- vllm-ds41f-kkref:04c30fa98e79-r5p (sha256:4995e0d3…)
+                    |
+tile-ai/tilelang main @ b95ee4ff (0.1.15)
+        + patches/tilelang/series (SM120/SM121 block-scaled MMA:
+          MXFP8, FP8 x FP4, MXFP4)
+deepseek-ai/TileKernels main @ 66258df6 (2.0.0, unpatched)
+christopherowen/dgx-spark-networking main @ f73a3cea (sparknet 0.2.0)
+                     ---- vllm-ds41f-kkref:04c30fa98e79-r6 (sha256:b5225c98…)
                     /
 NVIDIA/nccl v2.30.7-1 @ 73cf1122
         + patches/nccl/series (IB send-path fence, bidirectional switchless
@@ -48,6 +58,9 @@ Inference Lab integration branch is the serving source.
 | `vllm_base_image` | `docker.io/vllm/vllm-openai` | not applicable | official CUDA/Torch/native-extension foundation |
 | `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`) | not created yet | DS4.1 kernels and RoCEnante transport |
 | `nccl` | `NVIDIA/nccl` (tag `v2.30.7-1`) | not created yet | the base image's NCCL version, rebuilt for SM121 with `patches/nccl` |
+| `tilelang` | `tile-ai/tilelang` (`main`) | `christopherowen/tilelang` | the promoted kernel compiler, with `patches/tilelang` for SM120/SM121 |
+| `tile_kernels` | `deepseek-ai/TileKernels` (`main`) | not created yet | DeepSeek's TileLang kernels: MoE gate, casts, mHC |
+| `sparknet` | `christopherowen/dgx-spark-networking` (`main`) | not applicable | one-shot RoCE collectives for the TileLang family |
 | `flashinfer` | `flashinfer-ai/flashinfer` | not created yet | not a promoted build input (the runtime base supplies 0.6.18.post1) |
 | `cutlass` | `NVIDIA/cutlass` | not created yet | SM121 stable-extension headers at `v4.7.1` |
 | `cutlass_dsl` | NVIDIA packages on PyPI | not applicable | SHA-256-locked ARM64 CuTe DSL wheel set |

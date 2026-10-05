@@ -19,10 +19,18 @@ loader.exec_module(spark)
 topology = spark.topology
 
 
+# The B12X TP3 configuration the topology tooling generates from: r5p's, kept
+# with r5p's lock when r6 promoted the TileLang family.
+B12X_BASE = "experiments/2026-10-05-tilelang-r6/r5p/cluster-64k.json"
+
+
 class TopologyTest(unittest.TestCase):
     def setUp(self):
-        self.base = spark.read_json("config/cluster.json")
+        self.base = spark.read_json(B12X_BASE)
         self.three = spark.read_json("config/nodes.json")
+        # The site map (or CI's example map) names the API head.
+        head = next(node for node in self.three["nodes"] if node.get("head"))
+        self.base["distributed"]["master_addr"] = head["management_ip"]
         self.four = spark.read_json("config/examples/nodes-ring4.json")
         self.ring = topology.candidate(self.base, self.four, "config/examples/nodes-ring4.json")
 
@@ -165,6 +173,7 @@ class TopologyTest(unittest.TestCase):
             (root / "nodes.json").write_text(json.dumps(self.four))
             candidate = copy.deepcopy(self.ring)
             candidate["nodes_config"] = "nodes.json"
+            candidate.pop("upstreams_config", None)  # the temporary root holds its own lock
             (root / "cluster.json").write_text(json.dumps(candidate))
             (root / "upstreams.lock.json").write_text("{}")
             with mock.patch.object(spark, "ROOT", root):
