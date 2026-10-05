@@ -60,6 +60,16 @@ scripts/lab.py run scripts/lab_specs/lab1-first-window.json --dry-run
 scripts/lab.py run scripts/lab_specs/lab1-first-window.json
 ```
 
+Over ssh, detach a long `run` or `queue run` from the session: use `setsid -f` with every
+stream redirected, or run it inside tmux. `lab.py` logs to stdout. If stdout is the session's
+pipe and the session ends, the next log line fails with a broken pipe and the runner exits.
+The heartbeat then stops and the watchdog closes the window 15 minutes later.
+
+```sh
+ssh dgx1 'cd ~/projects/spark-ds41f && setsid -f scripts/lab.py run SPEC.json \
+  --production-config config/cluster-tp4.json > results/private/lab/SPEC.log 2>&1 < /dev/null'
+```
+
 A spec names the experiment directory, a run name and a list of jobs. A run opens a
 window if none of ours is open.
 
