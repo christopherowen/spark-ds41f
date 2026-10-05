@@ -1,0 +1,23 @@
+{
+  "description": "Lagged mHC per sublayer under CUDA graphs, 1-8192 rows: patch 0037's TileKernels path (pre and post_pre, fn warm and cold, each kernel alone), then B12X's post_pre prepared as vLLM's B12xMHC prepares it.",
+  "image": "vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tilelang-mhc-v1",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; a = subprocess.call([sys.executable, '/b/bench_mhc.py']); b = subprocess.call([sys.executable, '/b/bench_b12x_mhc.py']); sys.exit(a or b)"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "bench_mhc.py",
+      "/b/bench_mhc.py"
+    ],
+    [
+      "bench_b12x_mhc.py",
+      "/b/bench_b12x_mhc.py"
+    ]
+  ]
+}
