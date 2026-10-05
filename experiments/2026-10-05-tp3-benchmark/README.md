@@ -128,10 +128,11 @@ was 5.9 GiB on dgx1 for B12X and 6.4 GiB for TileLang, with the promoted 3.5
 GiB of KV per rank; the startup guard is at 5 GiB.
 
 **Coherence (TileLang).** [coherence.py](coherence.py) answers to six prompts
-are coherent and correct: an explanation of hash-map collisions, an
-expand-around-centre palindrome function, the arrival time (12:10), a
-five-sentence story, a JSON list (FORTRAN 1957, Lisp 1958, C 1972; cut by the
-1,200-token budget after long reasoning) and a syllogism ("No"). The repeated
+([coherence-tilelang.json](coherence-tilelang.json)) are coherent and correct:
+an explanation of hash-map collisions, an expand-around-centre palindrome
+function, the arrival time (12:10), a five-sentence story, a JSON list
+(FORTRAN 1957, Lisp 1958, C 1972) and a syllogism ("No"). The explanation
+and the JSON list stopped at the 1,200-token budget after long reasoning. The repeated
 n-grams come from the reasoning drafting the final text. At ~420K tokens,
 `long_context.py` found both code words (10% and 90% depth); time to first
 token was about 112 s and decode ran at 113-119 tok/s with the context
