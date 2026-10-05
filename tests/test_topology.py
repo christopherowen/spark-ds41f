@@ -28,6 +28,9 @@ class TopologyTest(unittest.TestCase):
     def setUp(self):
         self.base = spark.read_json(B12X_BASE)
         self.three = spark.read_json("config/nodes.json")
+        # The site map (or CI's example map) names the API head.
+        head = next(node for node in self.three["nodes"] if node.get("head"))
+        self.base["distributed"]["master_addr"] = head["management_ip"]
         self.four = spark.read_json("config/examples/nodes-ring4.json")
         self.ring = topology.candidate(self.base, self.four, "config/examples/nodes-ring4.json")
 
