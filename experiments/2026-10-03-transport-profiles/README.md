@@ -8,9 +8,11 @@ remains a separate promotion task.
 
 [`profiles.json`](profiles.json) puts the transport tuning controls side by
 side. `tp3` reproduces the promoted 64 KiB triangle configuration. `tp4`
-reproduces the [explicit-policy candidate](../2026-10-03-collective-contract/README.md):
-the measured balanced transport plus its source-tested vLLM policy/reporting
-fix. That final image is **not built or hardware-qualified**. The registry
+reproduces the [TP4 1M recipe](../2026-10-04-tp4-memory-tuning/README.md),
+promoted with r5p (2026-10-05): the balanced transport and the explicit
+policy adapter of the [explicit-policy candidate](../2026-10-03-collective-contract/README.md)
+on the r5p image, at 1M context and 16 sequences, benchmarked in
+[the promotion record](../2026-10-05-r5p-promotion/README.md). The registry
 does not make either topology appropriate for different physical cabling.
 
 | Setting | TP3 | TP4 |
@@ -125,6 +127,12 @@ the recipe already identifies its base.
 Merging the branch's tooling and experiment records is distinct from selecting
 a production image. The current PR leaves `config/cluster.json` on TP3; merging
 alone neither starts serving nor promotes the experimental TP4 settings.
+
+The steps below were the plan for the explicit-policy candidate (2026-10-03).
+r5p carried them out as the TP4 1M recipe: one immutable image on every rank,
+the owner's acceptance benchmark at the recipe's limits, and the promotion
+commit. Sustained mixed load and a 1M admission and retrieval check remain
+open (see `TODO.md`).
 
 The production candidate is the balanced **whole-fragment** TP4 transport with
 the explicit policy adapter. Complete these finite steps:
