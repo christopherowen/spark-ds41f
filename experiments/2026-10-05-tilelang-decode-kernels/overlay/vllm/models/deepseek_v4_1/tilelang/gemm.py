@@ -428,9 +428,9 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
 # projection folds the same shards; the other fields only change speed.
 DECODE_FP8_CONFIGS: dict[tuple[int, int], dict] = {
     # TP4: indexer Q-B, fused Q-A/KV, DSpark main projection.
-    (4096, 1280): dict(block_N=128, num_stages=3),
-    (1792, 5120): dict(block_N=128, num_stages=2, shards=5),
-    (6400, 5120): dict(block_N=64, num_stages=4, shards=5),
+    (4096, 1280): dict(block_N=128, num_stages=2),
+    (1792, 5120): dict(block_N=128, num_stages=2, shards=2),
+    (6400, 5120): dict(block_N=64, num_stages=4),
 }
 
 

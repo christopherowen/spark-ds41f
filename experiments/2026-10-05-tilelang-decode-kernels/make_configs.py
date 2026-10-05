@@ -5,6 +5,7 @@
   (the TP3 benchmark's overlay), its own profiler directory;
 - candidate.json: control plus this experiment's kernel files (overlay/),
   with its own DSpark cost and profiler directories;
+- candidate-nopf.json: candidate without the L2 weight prefetch (diagnostic);
 - b12x.json: the r5p B12X TP4 recipe, with a profiler directory.
 """
 import copy
@@ -23,7 +24,6 @@ FIX_FILES = (  # vLLM 0041 and 0042
 KERNEL_FILES = (
     "models/deepseek_v4_1/tilelang/gemm.py",
     "models/deepseek_v4_1/tilelang/linear.py",
-    "models/deepseek_v4_1/tilelang/sparse_mla.py",
     "models/deepseek_v4_1/l2_prefetch.py",
 )
 
@@ -55,7 +55,14 @@ def main():
     set_profiler(candidate, "ring4-tl-decode-v1-20261005")
     b12x = json.loads((ROOT / "experiments/2026-10-05-tp4-500k/b12x.json").read_text())
     set_profiler(b12x, "ring4-b12x-1m-20261005")
-    for name, cluster in (("control", control), ("candidate", candidate), ("b12x", b12x)):
+    # Diagnostic: the candidate without the L2 weight prefetch, to separate kernel
+    # time from prefetch overlap in the decode profile.
+    no_prefetch = copy.deepcopy(candidate)
+    no_prefetch["environment"]["VLLM_DS41_L2_PREFETCH"] = "0"
+    no_prefetch["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v1-nopf-20261005"
+    set_profiler(no_prefetch, "ring4-tl-decode-v1-nopf-20261005")
+    for name, cluster in (("control", control), ("candidate", candidate), ("candidate-nopf", no_prefetch),
+                          ("b12x", b12x)):
         (HERE / f"{name}.json").write_text(json.dumps(cluster, indent=2) + "\n")
         print(f"wrote {REL}/{name}.json")
 
