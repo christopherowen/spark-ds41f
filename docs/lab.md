@@ -1,12 +1,12 @@
 # Experiment windows and the kernel lab
 
-`scripts/lab.py` runs experiments on the three Sparks without restoring the promoted
+`scripts/lab.py` runs experiments on the Spark cluster without restoring the promoted
 service after every run. It replaces the copy-and-edit `runNN.sh` pattern.
 
 ## Windows
 
 ```sh
-scripts/lab.py window open --minutes 90 --note "mHC screen"
+scripts/lab.py window open --minutes 90 --note "mHC screen" --production-config config/cluster-tp4.json
 scripts/lab.py window status
 scripts/lab.py window close
 ```
@@ -14,15 +14,18 @@ scripts/lab.py window close
 `open` refuses unless:
 
 - the deployment commit is on `origin/main` and every node's checkout matches;
+- `doctor --live` passes for the production profile, so the profile the window will
+  restore is the one serving;
 - the cluster has served no requests for 30 s;
 - no one else holds `~/spark-hold.json`.
 
-It then writes the hold file and starts a watchdog. The hold file records the time cap
-and a heartbeat that the runner refreshes every minute. The watchdog restores the
-promoted service and removes the hold if the heartbeat goes stale for 15 minutes.
+It then writes the hold file and starts a watchdog. The hold file records the time cap,
+the production profile (`production_config`) and a heartbeat that the runner refreshes
+every minute. The watchdog restores the production profile and removes the hold if the
+heartbeat goes stale for 15 minutes.
 
-`close` boots `config/cluster.json` (unless it is already live), checks
-`doctor --live`, and removes the hold.
+`close` boots the production profile (unless it is already live), checks
+`doctor --live` against it, and removes the hold.
 
 A window closes itself:
 
@@ -31,11 +34,40 @@ A window closes itself:
 - at its time cap;
 - when someone writes `~/spark-request.json`. The runner finishes the current job first.
 
+### Production profile
+
+The production profile is the cluster configuration that a window restores. Every
+cluster action in the window uses its node map: stop, sync, `doctor --live`, the publish
+guard and the node-map check before each boot.
+
+- `--production-config PATH` selects it on `window open`, `window close`, `run` and
+  `queue run`. The default is `config/cluster.json` (TP3 triangle). While the four-node
+  ring serves TP4, pass `config/cluster-tp4.json`.
+- `open` writes it to the hold file as `production_config`. The commands that follow
+  use that record: `close`, the watchdog, runs inside the window and a queue runner
+  restarted by a sync job.
+- A `--production-config` that differs from the open window's record is refused.
+- A window opened before the field existed has no record; it uses the option or the
+  default.
+
+The other hold fields are unchanged ([AGENTS.md](../AGENTS.md), Shared cluster windows).
+Holds written by other agents are never read for a profile.
+
 ## Runs
 
 ```sh
 scripts/lab.py run scripts/lab_specs/lab1-first-window.json --dry-run
 scripts/lab.py run scripts/lab_specs/lab1-first-window.json
+```
+
+Over ssh, detach a long `run` or `queue run` from the session: use `setsid -f` with every
+stream redirected, or run it inside tmux. `lab.py` logs to stdout. If stdout is the session's
+pipe and the session ends, the next log line fails with a broken pipe and the runner exits.
+The heartbeat then stops and the watchdog closes the window 15 minutes later.
+
+```sh
+ssh dgx1 'cd ~/projects/spark-ds41f && setsid -f scripts/lab.py run SPEC.json \
+  --production-config config/cluster-tp4.json > results/private/lab/SPEC.log 2>&1 < /dev/null'
 ```
 
 A spec names the experiment directory, a run name and a list of jobs. A run opens a
@@ -66,6 +98,15 @@ window if none of ours is open.
 - **`kernel`:** runs kernel-lab bundles on the named nodes concurrently, with the cluster
   stopped. It writes `results/private/lab/<run>/verdicts.json` and checks that the
   nodes agree.
+
+Jobs that stop the cluster (`validate`, `profile`, `kernel`) run
+`bin/spark --cluster-config <production profile> cluster stop --apply --parallel`. The
+stopped containers are kept; the next boot's `cluster start --replace` replaces them.
+Set `"remove_stopped": true` on a job to remove them as well (`cluster stop --remove`).
+`run --dry-run` prints the production profile and each stop command.
+
+Every arm must use the production profile's node map. `boot` refuses any other
+node set before launch, because a window cannot recable the fabric.
 
 Before an arm's first boot, every mounted B12X file must carry at least as many
 `fence_proxy` calls as the image's own copy. Overlays built from an older B12X tree

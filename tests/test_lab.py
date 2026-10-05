@@ -7,6 +7,7 @@ import io
 import importlib.machinery
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,12 @@ lab = importlib.util.module_from_spec(spec)
 loader.exec_module(lab)
 # Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
 lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
+# Never read or write the real hold and request files, even when the suite runs on dgx1.
+_STATE = tempfile.TemporaryDirectory()
+lab.HOLD = Path(_STATE.name) / "spark-hold.json"
+lab.LEGACY_HOLD = Path(_STATE.name) / "spark3-hold.json"
+lab.REQUEST = Path(_STATE.name) / "spark-request.json"
+lab.LEGACY_REQUEST = Path(_STATE.name) / "spark3-request.json"
 
 SPEC = {
     "experiment": "experiments/2026-09-29-determinism",
@@ -148,6 +155,209 @@ class BootTimeTest(unittest.TestCase):
         lines = ["dgx1: steady memguard active", "cluster ready; memory guards are active on all nodes (+116.9s)"]
         self.assertEqual(lab.ready_seconds(lines), 116.9)
         self.assertIsNone(lab.ready_seconds(["boot failed"]))
+
+
+TP4 = "config/cluster-tp4.json"
+RING4 = {"nodes": [{"name": f"dgx{rank + 1}", "rank": rank, "head": rank == 0,
+                    "management_ip": f"192.0.2.{71 + rank}"} for rank in range(4)]}
+
+
+def fake_configuration(args=None):
+    """The TP4 profile's node map is a site file (git-ignored); stand in for it with a ring of four."""
+    config = getattr(args, "cluster_config", lab.spark.DEFAULT_CLUSTER_CONFIG)
+    nodes = RING4 if "tp4" in config else lab.spark.site_nodes()
+    return {"host": {"home": "/home/x"}, "deployment": {"path": "{home}/projects/spark-ds41f"}}, nodes, {}
+
+
+def no_subprocesses(*args, **kwargs):
+    raise AssertionError(f"unexpected subprocess: {args}")
+
+
+class ProductionProfileTest(unittest.TestCase):
+    """The profile a window restores is selectable, recorded in the hold and used by every cluster action."""
+
+    def setUp(self) -> None:
+        # main() sets the module's profile; restore it after every test.
+        patcher = mock.patch.object(lab, "PRODUCTION_CONFIG", lab.spark.DEFAULT_CLUSTER_CONFIG)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name)
+        for name, file in (("HOLD", "spark-hold.json"), ("LEGACY_HOLD", "spark3-hold.json"),
+                           ("REQUEST", "spark-request.json"), ("LEGACY_REQUEST", "spark3-request.json")):
+            patcher = mock.patch.object(lab, name, self.state / file)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(lab.spark, "configuration", side_effect=fake_configuration)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def main(self, *argv: str) -> tuple[int, str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = lab.main(list(argv))
+        return code, out.getvalue()
+
+    def hold(self, production: str | None, heartbeat_at: float | None = None) -> dict:
+        hold = lab.new_hold(60, "test", at=heartbeat_at)
+        if production is None:
+            del hold["production_config"]  # a window opened before the field existed
+        else:
+            hold["production_config"] = production
+        lab.write_json_atomic(lab.HOLD, hold)
+        return hold
+
+    def test_the_window_record_wins_then_the_option_then_the_default(self) -> None:
+        self.assertEqual(lab.resolve_production(None, None), "config/cluster.json")
+        self.assertEqual(lab.resolve_production("./config/cluster-tp4.json", None), TP4)
+        ours = lab.new_hold(10, "", at=1_000_000.0)
+        ours["production_config"] = TP4
+        self.assertEqual(lab.resolve_production(None, ours), TP4)
+        self.assertEqual(lab.resolve_production(TP4, ours), TP4)
+        with self.assertRaises(SystemExit) as refused:
+            lab.resolve_production("config/cluster.json", ours)
+        self.assertIn("restores config/cluster-tp4.json", str(refused.exception))
+        foreign = {"holder": "codex tool-eval-bench", "production_config": TP4}
+        self.assertEqual(lab.resolve_production(None, foreign), "config/cluster.json")
+        legacy = {k: v for k, v in ours.items() if k != "production_config"}
+        self.assertEqual(lab.resolve_production(None, legacy), "config/cluster.json")
+        self.assertEqual(lab.resolve_production(TP4, legacy), TP4)
+        with self.assertRaises(SystemExit):
+            lab.resolve_production("config/no-such-profile.json", None)
+
+    def test_the_hold_records_the_profile_beside_the_shared_fields(self) -> None:
+        with mock.patch.object(lab, "PRODUCTION_CONFIG", TP4):
+            hold = lab.new_hold(30, "run lab0", at=1_000_000.0)
+        self.assertEqual(hold["production_config"], TP4)
+        for field in ("holder", "since", "expected_end", "heartbeat", "rule"):  # AGENTS.md, Shared cluster windows
+            self.assertIn(field, hold)
+
+    def test_stop_targets_the_profile_and_keeps_containers_unless_asked(self) -> None:
+        lab.PRODUCTION_CONFIG = TP4
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(lab.stop_cluster(dry=True))
+            self.assertTrue(lab.stop_cluster(dry=True, remove=True))
+        kept, removed = [line for line in out.getvalue().splitlines() if "$" in line]
+        self.assertTrue(kept.endswith("--cluster-config config/cluster-tp4.json cluster stop --apply --parallel"))
+        self.assertTrue(removed.endswith("cluster stop --remove --apply --parallel"))
+        steps = lab.plan(dict(SPEC, jobs=[SPEC["jobs"][2], dict(SPEC["jobs"][2], remove_stopped=True)]))
+        stops = [lab.describe_step(step) for step in steps if step["kind"] == "stop"]
+        self.assertEqual(stops, ["bin/spark --cluster-config config/cluster-tp4.json cluster stop --apply --parallel",
+                                 "bin/spark --cluster-config config/cluster-tp4.json cluster stop --remove "
+                                 "--apply --parallel"])
+
+    def test_doctor_live_checks_the_profile(self) -> None:
+        lab.PRODUCTION_CONFIG = TP4
+        serving = subprocess.CompletedProcess([], 0, stdout="configuration OK; live cluster matches\n")
+        with mock.patch.object(lab.subprocess, "run", return_value=serving) as run:
+            self.assertTrue(lab.production_live())
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[2:], ["--cluster-config", TP4, "doctor", "--live"])
+        down = subprocess.CompletedProcess([], 1, stdout="ERROR: dgx4: container is not running\n")
+        problems = []
+        with mock.patch.object(lab.subprocess, "run", return_value=down):
+            self.assertFalse(lab.production_live(problems))
+        self.assertEqual(problems, ["ERROR: dgx4: container is not running"])
+
+    def test_boot_compares_candidates_with_the_profile_node_map(self) -> None:
+        lab.PRODUCTION_CONFIG = TP4
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(lab.boot("experiments/x/cluster-tp4-candidate.json", dry=True))
+            self.assertFalse(lab.boot("config/cluster.json", dry=True))
+        self.assertIn("--cluster-config experiments/x/cluster-tp4-candidate.json cluster start --replace --apply",
+                      out.getvalue())
+        self.assertIn("lab windows require the promoted node topology (config/cluster-tp4.json)", out.getvalue())
+        self.assertEqual(out.getvalue().count("cluster start"), 1)
+
+    def test_dry_run_shows_the_profile_for_every_cluster_action(self) -> None:
+        spec = self.state / "spec.json"
+        spec.write_text(json.dumps(SPEC))
+        code, out = self.main("run", str(spec), "--dry-run", "--production-config", TP4)
+        self.assertEqual(code, 0)
+        self.assertIn("steps; production config/cluster-tp4.json", out.splitlines()[0])
+        self.assertIn("bin/spark --cluster-config config/cluster-tp4.json cluster stop --apply --parallel", out)
+        self.assertNotIn("--remove", out)
+        code, out = self.main("window", "open", "--dry-run", "--production-config", TP4)
+        self.assertIn("window restoring config/cluster-tp4.json", out)
+        self.assertFalse(lab.HOLD.exists())
+
+    def test_close_restores_the_profile_the_window_recorded(self) -> None:
+        self.hold(TP4)
+        code, out = self.main("window", "close", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("--cluster-config config/cluster-tp4.json cluster start --replace --apply", out)
+        self.assertTrue(lab.HOLD.exists())
+        with self.assertRaises(SystemExit):
+            self.main("window", "close", "--dry-run", "--production-config", "config/cluster.json")
+
+    def test_a_window_opened_before_the_record_closes_on_the_option_or_default(self) -> None:
+        self.hold(None)
+        _, out = self.main("window", "close", "--dry-run")
+        self.assertIn("--cluster-config config/cluster.json cluster start", out)
+        _, out = self.main("window", "close", "--dry-run", "--production-config", TP4)
+        self.assertIn("--cluster-config config/cluster-tp4.json cluster start", out)
+
+    def test_open_refuses_unless_the_profile_is_live(self) -> None:
+        def down(problems=None):
+            problems.append("ERROR: dgx4: container is not running")
+            return False
+
+        with mock.patch.object(lab, "published_problems", return_value=[]), \
+                mock.patch.object(lab, "production_live", side_effect=down), \
+                mock.patch.object(lab, "idle_for") as idle, \
+                mock.patch.object(lab.subprocess, "Popen", side_effect=no_subprocesses), \
+                self.assertRaises(SystemExit) as refused:
+            lab.window_open(30, "test")
+        message = str(refused.exception)
+        self.assertIn("config/cluster.json is not the live cluster", message)
+        self.assertIn("--production-config", message)
+        self.assertIn("dgx4: container is not running", message)
+        idle.assert_not_called()
+        self.assertFalse(lab.HOLD.exists())
+
+    def test_open_records_the_profile_and_hands_it_to_the_watchdog(self) -> None:
+        lab.PRODUCTION_CONFIG = TP4
+        with mock.patch.object(lab, "published_problems", return_value=[]), \
+                mock.patch.object(lab, "production_live", return_value=True), \
+                mock.patch.object(lab, "idle_for", return_value=True), \
+                mock.patch.object(lab, "ROOT", self.state), \
+                mock.patch.object(lab.subprocess, "run", side_effect=no_subprocesses), \
+                mock.patch.object(lab.subprocess, "Popen") as popen, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            lab.window_open(30, "test")
+        self.assertEqual(lab.read_hold()["production_config"], TP4)
+        self.assertEqual(popen.call_args.args[0][-3:], ["watchdog", "--production-config", TP4])
+        self.assertIn("restores config/cluster-tp4.json", out.getvalue())
+
+    def test_watchdog_restores_the_recorded_profile(self) -> None:
+        self.hold(TP4, heartbeat_at=1_000_000.0)  # stale
+        with mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                mock.patch.object(lab, "production_live", side_effect=[False, True]), \
+                mock.patch.object(lab.subprocess, "run", side_effect=no_subprocesses), \
+                mock.patch.object(lab.subprocess, "Popen", side_effect=no_subprocesses):
+            code, out = self.main("watchdog", "--once")
+        self.assertEqual(code, 0)
+        self.assertEqual(cli.call_args.args, ("--cluster-config", TP4, "cluster", "start", "--replace", "--apply"))
+        self.assertFalse(lab.HOLD.exists())
+        self.assertIn("window closed; hold removed", out)
+
+    def test_publish_guard_and_sync_cover_every_profile_node(self) -> None:
+        lab.PRODUCTION_CONFIG = TP4
+        head = subprocess.CompletedProcess([], 0, stdout="abc1234\n")
+
+        def checkout(nodes, node, *command):
+            return subprocess.CompletedProcess([], 0, stdout="old5678\n" if node["name"] == "dgx4" else "abc1234\n")
+
+        with mock.patch.object(lab.subprocess, "run", return_value=head), \
+                mock.patch.object(lab.spark, "run_ssh", side_effect=checkout) as ssh:
+            problems = lab.published_problems()
+        self.assertEqual([call.args[1]["name"] for call in ssh.call_args_list], ["dgx2", "dgx3", "dgx4"])
+        self.assertEqual(problems, ["dgx4 checkout old5678 differs from abc1234"])
+        with mock.patch.object(lab.subprocess, "run", return_value=head), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(lab.sync_checkouts())
+        self.assertEqual(cli.call_args.args, ("--cluster-config", TP4, "cluster", "sync", "--apply"))
 
 
 class ProfilePlanTest(unittest.TestCase):

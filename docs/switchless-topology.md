@@ -137,9 +137,11 @@ Reserve a cluster window before recabling, GPU work or serving changes. Publish
 the candidate and use coordinated `cluster sync` so every participating node
 has the same revision and image. Physical recabling requires an explicit plan
 for restoring the original triangle; a watchdog cannot restore cables.
-The existing `scripts/lab.py` runner rejects a candidate whose node map differs
-from the promoted map, because its automatic restoration targets that map.
-Once a four-node topology is promoted, lab reads its configured node map.
+The `scripts/lab.py` runner rejects a candidate whose node map differs from
+the window's production profile, because its automatic restoration targets
+that profile. Select the promoted four-node profile with
+`--production-config config/cluster-tp4.json`; the window records it in the
+hold file ([lab windows](lab.md#production-profile)).
 
 With serving stopped and the fabric addressed, render one probe command per
 node and run each command on the node it names, concurrently:
