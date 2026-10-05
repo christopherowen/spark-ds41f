@@ -1002,9 +1002,14 @@ def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
 
 def command_doctor(args: argparse.Namespace) -> int:
     cluster, nodes, upstreams = configuration(args)
+    if getattr(args, "fragmentation_commands", False):
+        for finding in weight_fragmentation_findings(cluster, nodes, commands=True):
+            print(finding)
+        return 0
     findings = local_doctor(cluster, nodes, upstreams)
     if args.live and not split_findings(findings)[0]:
         findings.extend(live_doctor(cluster, nodes))
+        findings.extend(weight_fragmentation_findings(cluster, nodes))
     problems, warnings = split_findings(findings)
     return report_doctor(problems, warnings, args.live)
 
@@ -1098,6 +1103,67 @@ def command_topology_probe(args: argparse.Namespace) -> int:
     print("# Plan only. Run on this node during a coordinated window with serving stopped.")
     print(shlex.join(collective_probe_command(cluster, nodes, node, args.master_port)))
     return 0
+
+
+def report_weight_fragmentation(reports: dict, commands: bool = False) -> list[str]:
+    """Report every shard above ext4's best count, regardless of severity score."""
+    findings = []
+    has_fragmentation = False
+    for name, report in reports.items():
+        if report.get("error"):
+            findings.append(Warn(f"{name}: cannot check weight fragmentation: {report['error']}"))
+            continue
+        shards = report["shards"]
+        fragmented = [shard for shard in shards if shard["current"] > shard["best"]]
+        if not fragmented:
+            continue
+        has_fragmentation = True
+        current = sum(f["current"] for f in shards)
+        best = sum(f["best"] for f in shards)
+        findings.append(Warn(
+            f"{name}: {len(fragmented)}/{len(shards)} weight shards are not at ext4's best "
+            f"extent count ({current} current / {best} best across the checkpoint)"
+        ))
+        if commands:
+            findings.append(f"# On {name}, during a coordinated maintenance window:")
+            findings.extend(shlex.join(["sudo", "e4defrag", "-v", f["path"]]) for f in fragmented)
+    if has_fragmentation and not commands:
+        findings.append(Warn(
+            "weight fragmentation: use doctor --fragmentation-commands to print targeted "
+            "correction commands; no defragmentation is performed by doctor"
+        ))
+    return findings
+
+
+def weight_fragmentation_findings(cluster: dict, nodes: dict, commands: bool = False) -> list[str]:
+    """Read extent metadata and report only non-ideal layouts or unavailable checks."""
+    source = next(
+        (source for source, target, _ in cluster["container"]["mounts"] if target == "/models"),
+        None,
+    )
+    if source is None:
+        return [Warn("cannot check weight fragmentation: no /models mount")]
+    root = source.format(home=cluster["host"]["home"])
+    code = (ROOT / "scripts/weight_fragmentation.py").read_text()
+
+    def inspect(node: dict) -> dict:
+        try:
+            result = subprocess.run(
+                ["ssh", *ssh_options(), ssh_target(nodes, node),
+                 shlex.join(["python3", "-c", code, root])],
+                capture_output=True, text=True, timeout=30, check=True,
+            )
+            return json.loads(result.stdout)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            # CalledProcessError/TimeoutExpired include the entire SSH script.
+            return {"error": type(error).__name__}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        reports = dict(zip(
+            (node["name"] for node in nodes["nodes"]),
+            pool.map(inspect, nodes["nodes"]),
+        ))
+    return report_weight_fragmentation(reports, commands=commands)
 
 
 def command_status(args: argparse.Namespace) -> int:
@@ -4911,6 +4977,10 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     doctor = commands.add_parser("doctor", help="validate repository and optional live state")
     doctor.add_argument("--live", action="store_true")
+    doctor.add_argument(
+        "--fragmentation-commands", action="store_true",
+        help="check remote checkpoint fragmentation and print correction commands only; never execute them",
+    )
     doctor.set_defaults(func=command_doctor)
     tuning = commands.add_parser("tuning", help="inspect or materialize named TP3/TP4 transport settings")
     tuning.add_argument("--profiles-config", default=transport_profiles.DEFAULT_PROFILES,

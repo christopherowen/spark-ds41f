@@ -233,6 +233,20 @@ and memory policy, and verifies the staged 64 KiB kernel against
 modules, headers, initramfs presence and the retained GRUB fallback; it never
 selects a boot entry or applies corrections. Preparation is distinct from a
 successful trial boot. The [boot trial](experiments/2026-10-02-kernel-64k/boot-test/README.md) passed compatibility checks. Matched memory profiling is in progress before deciding the default; both kernels and their matching swap files remain installed.
+
+`doctor --live` checks the configured checkpoint's file fragmentation on every
+node. It reports every shard whose current extent count exceeds ext4's best
+count, even if `e4defrag` assigns it a severity score of zero; ideal layouts
+remain quiet. Large files can have a best count greater than one. Run
+`bin/spark3 doctor --fragmentation-commands` to print exact correction commands
+for affected blob files, grouped by node. This only prints commands: any actual
+defragmentation belongs in a coordinated maintenance window. The check reads
+the checkpoint index and extent metadata using `sudo -n e4defrag -c`, resolves
+shard symlinks, and neither scans tensor payloads nor flushes caches. Missing
+permissions, unsupported filesystems or incomplete reports are warnings, never
+reported as clean layouts. Fragmentation warnings do not block startup and do
+not establish a loading slowdown. Plain `doctor` remains local.
+
 `build prepare` writes only under ignored `.work/build/`; see
 [docker/README.md](docker/README.md). `cluster sync` fetches a published commit and detaches every clean node
 checkout at that exact revision; it never copies a working tree or ignored files.
