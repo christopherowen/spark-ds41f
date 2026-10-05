@@ -1,0 +1,323 @@
+From c205adf2a273b2098b75b10616454d8b2832dff9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 22:13:33 +0200
+Subject: [PATCH] Debug flag: count non-finite TileLang gate inputs instead of
+ trapping
+
+With SPARK3_DEBUG_ROUTER_NONFINITE=1 each TileLang gate router counts the
+rows whose input or gate logits are non-finite, split into routed and
+masked rows, records the first routed one and its batch size, and zeroes
+the logits so the step completes. Probes count non-finite rows at each
+decoder layer's attention input and output, FFN input and residual, inside
+attention (qr, kv, q, MQA output) and in the DSpark drafter (input
+embeddings, main_x, context KV). Every check takes the next value of one
+device counter, so the earliest first-bad sequence marks the origin. The
+model runner logs the counts after graph capture and after the DSpark
+cost profile. Off by default.
+---
+ vllm/models/deepseek_v4_1/attention.py       |   6 +
+ vllm/models/deepseek_v4_1/nvidia/dspark.py   |   7 +
+ vllm/models/deepseek_v4_1/nvidia/model.py    |  10 ++
+ vllm/models/deepseek_v4_1/tilelang/router.py | 128 +++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py           |  12 ++
+ 5 files changed, 163 insertions(+)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 2c46337b4..7ff7ef525 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1342,7 +1342,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+             qr, kv = self.q_norm(qr), self.kv_norm(kv)
++        from vllm.models.deepseek_v4_1.tilelang.router import probe
++
++        probe(f"{self.prefix}.qr", qr)
++        probe(f"{self.prefix}.kv", kv)
+         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
++        probe(f"{self.prefix}.q", q)
+         l2_prefetch.issue(self._l2pf_wo, rows)
+         q = _rotated(
+             q,
+@@ -1384,6 +1389,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+                 index_query = (*query, split, reference)
+             self.forward_mqa(q, kv, positions, output, index_query=index_query)
++        probe(f"{self.prefix}.mqa_out", output)
+         return self._o_proj(output, positions, is_prefill=is_prefill, sp_rows=sp_rows)
+ 
+     def _index_query(
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index aa232fe93..05651a4ca 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -452,7 +452,11 @@ class DSparkDeepseekV4Model(nn.Module):
+                 else context_slot_mappings[i]
+             )
+             attn = layer.attn
++            from vllm.models.deepseek_v4_1.tilelang.router import probe
++
++            probe("dspark.main_x", main_x)
+             kv = attn.kv_norm(self._context_kv_projections[i](main_x))
++            probe(f"dspark.context_kv.{i}", kv)
+             if slot_mapping is None:
+                 continue
+             _insert_context_kv(attn, kv, context_positions, slot_mapping)
+@@ -465,6 +469,9 @@ class DSparkDeepseekV4Model(nn.Module):
+     ) -> torch.Tensor:
+         if inputs_embeds is None:
+             inputs_embeds = self.embed_input_ids(input_ids)
++        from vllm.models.deepseek_v4_1.tilelang.router import probe
++
++        probe("dspark.inputs_embeds", inputs_embeds)
+         full_num_tokens = positions.shape[0]
+         if self.use_sequence_parallel:
+             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 57a864b23..4346681db 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -325,12 +325,14 @@ class DeepseekV4DecoderLayer(nn.Module):
+             positions = gather_rows(positions, ced_indices)
+             if input_ids is not None:
+                 input_ids = gather_rows(input_ids, ced_indices)
++        _probe(f"{self.attn.prefix}.attn_in", x)
+         if sp_rows is None:
+             x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+         else:
+             # SP: attention gathers every row and reduce-scatters its output.
+             with sp_prefill.activate(sp_rows):
+                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
++        _probe(f"{self.attn.prefix}.attn_out", x)
+         residual, post_mix, res_mix, x, ffn_pre = self.mhc.post_pre(
+             x,
+             residual,
+@@ -342,6 +344,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+             self.ffn_norm.weight,
+             attn_pre,
+         )
++        _probe(f"{self.attn.prefix}.ffn_in", x)
++        _probe(f"{self.attn.prefix}.residual", residual)
+         if sp_rows is None:
+             x = self.ffn(x, input_ids)
+         else:
+@@ -352,6 +356,12 @@ class DeepseekV4DecoderLayer(nn.Module):
+         return x, residual, post_mix, res_mix, ffn_pre
+ 
+ 
++def _probe(name: str, x: torch.Tensor) -> None:
++    from vllm.models.deepseek_v4_1.tilelang.router import probe
++
++    probe(name, x)
++
++
+ def build_l2_prefetch_plans(layers: list, first_layer: int = 0) -> bool:
+     """Install L2 prefetch windows on consecutive decoder layers.
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 4476b85dd..34fec077f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -27,6 +27,8 @@ memory and each MoE layer runs one launch fewer. At prefill the gate runs its
+ own GEMM and TileKernels routes the logits.
+ """
+ 
++import os
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+@@ -38,6 +40,125 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+ )
+ 
+ 
++# Debug only (SPARK3_DEBUG_ROUTER_NONFINITE=1): instead of trapping on non-finite
++# gate logits, count them per router (split into routed and masked rows), zero
++# them so the step completes, and report with ``debug_report``. ``probe`` adds
++# the same count at any other point. Every check takes the next value of one
++# device counter, so the earliest first-bad sequence marks where non-finite
++# rows begin. Off by default; the checks are tensor ops on persistent buffers,
++# so CUDA graphs keep them.
++_DEBUG_NONFINITE = os.environ.get("SPARK3_DEBUG_ROUTER_NONFINITE") == "1"
++_DEBUG_FIELDS = (
++    "calls",
++    "rows",
++    "bad_x",
++    "bad_routed",
++    "bad_masked",
++    "first_bad_row",
++    "first_bad_batch",
++    "first_bad_seq",
++)
++_DEBUG_SLOTS = 1024
++_debug_names: list[str] = []
++_debug_probes: dict[str, int] = {}
++_debug_stats: torch.Tensor | None = None
++_debug_seq: torch.Tensor | None = None
++
++
++def _debug_new_slot(name: str) -> int:
++    global _debug_stats, _debug_seq
++    if _debug_stats is None:
++        _debug_stats = torch.zeros(
++            (_DEBUG_SLOTS, len(_DEBUG_FIELDS)), dtype=torch.int64, device="cuda"
++        )
++        _debug_stats[:, 5:].fill_(-1)
++        _debug_seq = torch.zeros((), dtype=torch.int64, device="cuda")
++    _debug_names.append(name)
++    assert len(_debug_names) <= _DEBUG_SLOTS
++    return len(_debug_names) - 1
++
++
++def _debug_slot(num_experts: int) -> int:
++    kind = "router.target" if num_experts == 384 else f"router.draft{num_experts}"
++    index = sum(1 for name in _debug_names if name.startswith(kind + "."))
++    return _debug_new_slot(f"{kind}.{index}")
++
++
++def _debug_record(stats, seq, bad, bad_x, bad_routed, bad_masked) -> None:
++    rows = bad.shape[0]
++    seq += 1
++    stats[0] += 1
++    stats[1] += rows
++    stats[2] += bad_x.sum()
++    stats[3] += bad_routed.sum()
++    stats[4] += bad_masked.sum()
++    index = torch.arange(rows, device=bad.device)
++    flagged = bad_routed | bad_x
++    first = torch.where(flagged, index, rows).min()
++    new = (stats[5] < 0) & flagged.any()
++    stats[5] = torch.where(new, first, stats[5])
++    stats[6] = torch.where(new, flagged.new_full((), rows, dtype=torch.int64), stats[6])
++    stats[7] = torch.where(new, seq, stats[7])
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_debug_nonfinite_probe", mutates_args=("stats", "seq")
++)
++def _probe_op(x: torch.Tensor, stats: torch.Tensor, seq: torch.Tensor, slot: int) -> None:
++    if x.numel() == 0:
++        return
++    bad = ~torch.isfinite(x.reshape(x.shape[0], -1)).all(-1)
++    none = torch.zeros_like(bad)
++    _debug_record(stats[slot], seq, bad, bad, none, none)
++
++
++@_probe_op.register_fake
++def _probe_op_fake(x, stats, seq, slot) -> None:
++    return None
++
++
++def probe(name: str, x: torch.Tensor) -> None:
++    """Count ``x``'s non-finite rows under ``name`` (debug flag only)."""
++    if not _DEBUG_NONFINITE:
++        return
++    slot = _debug_probes.get(name)
++    if slot is None:
++        slot = _debug_probes[name] = _debug_new_slot(f"probe.{name}")
++    _probe_op(x, _debug_stats, _debug_seq, slot)
++
++
++def _debug_check(slot, x, logits, route_mask) -> None:
++    """Count non-finite rows of ``x`` and ``logits``, then zero ``logits``' non-finite values."""
++    rows = logits.shape[-2]
++    bad = ~torch.isfinite(logits).reshape(-1, rows, logits.shape[-1]).all(-1).all(0)
++    routed = route_mask if route_mask is not None else torch.ones_like(bad)
++    bad_x = ~torch.isfinite(x).all(-1)
++    _debug_record(
++        _debug_stats[slot], _debug_seq, bad, bad_x, bad & routed, bad & ~routed
++    )
++    logits.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
++
++
++def debug_report() -> list[str]:
++    """Checks that ever saw non-finite rows, earliest first, and a summary."""
++    if _debug_stats is None:
++        return []
++    stats = _debug_stats[: len(_debug_names)].tolist()
++    flagged = sorted(
++        (row[7], name, row)
++        for name, row in zip(_debug_names, stats)
++        if row[2] or row[3] or row[4]
++    )
++    lines = [
++        f"router non-finite {name}: "
++        + ", ".join(f"{field}={value}" for field, value in zip(_DEBUG_FIELDS, row))
++        for _, name, row in flagged
++    ]
++    lines.append(
++        f"router non-finite: {len(flagged)} of {len(_debug_names)} checks flagged"
++    )
++    return lines
++
+ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Tensor:
+     """Image sentinel tokens of this step, computed once and shared by every layer."""
+     context = get_forward_context() if is_forward_context_available() else None
+@@ -274,6 +395,9 @@ class TileLangGateRouter(TileKernelsRouter):
+         super().__init__(*args, **kwargs)
+         self.gate = gate
+         self._kernels: dict[tuple[bool, bool], object] = {}
++        self._debug_slot = (
++            _debug_slot(gate.weight.shape[0]) if _DEBUG_NONFINITE else None
++        )
+         # Text-only layers pass no image tokens; one all-false mask serves them.
+         self._no_image = None
+ 
+@@ -292,6 +416,8 @@ class TileLangGateRouter(TileKernelsRouter):
+         specs = _partial_specs(gate, x.shape[0])
+         if not specs:
+             logits, _ = gate(x)
++            if self._debug_slot is not None:
++                _debug_check(self._debug_slot, x, logits, _routing_mask(x.shape[0]))
+             return super()._compute_routing(
+                 hidden_states, logits, indices_type, input_ids=input_ids
+             )
+@@ -305,6 +431,8 @@ class TileLangGateRouter(TileKernelsRouter):
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+         route_mask = _routing_mask(x.shape[0])
++        if self._debug_slot is not None:
++            _debug_check(self._debug_slot, x, partials, route_mask)
+         key = (image, route_mask is not None)
+         if key not in self._kernels:
+             self._kernels[key] = route_partials(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ee4586e24..c3bbfd934 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -842,6 +842,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_blocks=self.kv_cache_config.num_blocks,
+         )
+ 
++    def _log_router_nonfinite(self, phase: str) -> None:
++        """Debug only (SPARK3_DEBUG_ROUTER_NONFINITE=1): log the routers' non-finite counts."""
++        if os.environ.get("SPARK3_DEBUG_ROUTER_NONFINITE") != "1":
++            return
++        from vllm.models.deepseek_v4_1.tilelang.router import debug_report
++
++        torch.accelerator.synchronize()
++        for line in debug_report():
++            logger.warning("%s: %s", phase, line)
++
+     @contextlib.contextmanager
+     def _profile_token_ids(self, real_rows: bool | None = None):
+         """Feed distinct token ids to the adaptive-verification cost profile.
+@@ -1280,6 +1290,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         with use_workspace_lane(self._draft_workspace_lane):
+                             self.speculator.capture()
+                     if self.adaptive_verification is not None:
++                        self._log_router_nonfinite("after capture")
+                         with self._profile_token_ids():
+                             self.adaptive_verification.profile_costs(
+                                 self._dummy_run,
+@@ -1290,6 +1301,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                                     self._profile_token_ids, True
+                                 ),
+                             )
++                        self._log_router_nonfinite("after cost profile")
+                     self.kv_connector.reset_capture_state()
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+-- 
+2.54.0 (Apple Git-157)
+

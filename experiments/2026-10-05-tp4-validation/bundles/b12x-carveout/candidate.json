@@ -1,0 +1,20 @@
+{
+  "description": "The display carve-out tests of vLLM patch 0030, run from the candidate image's own vLLM tree with the serving container's DRM access: vocabulary-sized weights are created in their own carve-out buffers and load in place without touching ordinary memory, small and non-CUDA weights stay ordinary, the post-load confirmation accepts weights loaded in place and refuses a weight outside the carve-out or a buffer left behind by a dropped layer, and the debug integrity check still baselines every carve-out weight.",
+  "image": "vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tp4-1m-v1",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "display_carveout": true,
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-m",
+    "pytest",
+    "-q",
+    "-rs",
+    "-p",
+    "no:cacheprovider",
+    "--noconftest",
+    "tests/v1/worker/test_display_carveout.py"
+  ],
+  "verdict": "exit"
+}

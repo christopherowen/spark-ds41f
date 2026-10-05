@@ -1,7 +1,10 @@
 """Configuration and read-only fabric checks for one GPU per Spark.
 
-Three nodes use direct-peer RoCEnante. Four nodes use NCCL's neighbour ring
-or an explicitly built RoCEnante relay or NIC-forwarded mesh, with NCCL for larger operations.
+Three nodes use direct-peer one-shot collectives. Four nodes use NCCL's
+neighbour ring, or one-shot collectives over a relay ring or NIC-forwarded
+mesh, with NCCL for larger operations. The one-shot collectives are B12X's
+RoCEnante (``rocenante-*``) or sparknet's (``oneshot-*``, under sparknet's own
+``SPARKNET_ROCE_*`` names).
 """
 
 from __future__ import annotations
@@ -46,6 +49,34 @@ def transport(cluster: dict) -> str:
     return cluster.get("fabric", {}).get("transport", "rocenante-direct")
 
 
+# One-shot transports: the RoCE environment prefix of their library and their
+# one-shot topology. sparknet's are always on (no enable switch) and read no
+# B12X names.
+ONE_SHOT = {
+    "rocenante-direct": ("B12X_ROCE", "direct"),
+    "rocenante-ring4": ("B12X_ROCE", "ring4"),
+    "rocenante-mesh4": ("B12X_ROCE", "mesh4"),
+    "oneshot-direct": ("SPARKNET_ROCE", "direct"),
+    "oneshot-ring4": ("SPARKNET_ROCE", "ring4"),
+}
+TRANSPORTS = (*ONE_SHOT, "nccl-ring")
+# vLLM settings of B12X's one-shot collectives, which sparknet does not read.
+B12X_VLLM_SETTINGS = ("VLLM_ENABLE_ROCE_ALLREDUCE", "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "VLLM_ROCE_ALLGATHER_MAX_SIZE")
+
+
+def one_shot_topology(mode: str) -> str | None:
+    return ONE_SHOT[mode][1] if mode in ONE_SHOT else None
+
+
+def neighbour_ring(mode: str) -> bool:
+    """The four-node cable loop: each rank reaches only its two neighbours."""
+    return mode == "nccl-ring" or one_shot_topology(mode) in ("ring4", "mesh4")
+
+
+def is_sparknet(mode: str) -> bool:
+    return mode.startswith("oneshot-")
+
+
 def argument(cluster: dict, flag: str) -> str | None:
     args = cluster.get("serve_args", [])
     if flag not in args:
@@ -77,7 +108,7 @@ def mesh_path_specs(rank: int, paths: int = 2) -> list[tuple[int, int]]:
 def logical_peer_hcas(cluster: dict, node: dict) -> dict:
     """Physical cable routes remain authoritative; add only the opposite QP path."""
     routes = copy.deepcopy(node["roce_peer_hcas"])
-    if transport(cluster) == "rocenante-mesh4":
+    if one_shot_topology(transport(cluster)) == "mesh4":
         rank = node["rank"]
         opposite = (rank + 2) % 4
         specs = mesh_path_specs(rank, cluster.get("fabric", {}).get("mesh_paths", 2))
@@ -88,19 +119,23 @@ def logical_peer_hcas(cluster: dict, node: dict) -> dict:
 def node_environment(cluster: dict, node: dict) -> dict[str, str]:
     env = {key: str(value) for key, value in cluster["environment"].items()}
     env["VLLM_HOST_IP"] = node["management_ip"]
-    if transport(cluster) in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
-        if transport(cluster) == "nccl-ring":
+    mode = transport(cluster)
+    prefix = ONE_SHOT[mode][0] if mode in ONE_SHOT else "B12X_ROCE"
+    if neighbour_ring(mode):
+        if mode == "nccl-ring":
             env.pop("B12X_ROCE_PEER_HCAS", None)
         else:
-            env["B12X_ROCE_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
+            env[f"{prefix}_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
         hcas = sorted({h for route in node["roce_peer_hcas"].values() for h in route})
         # '=' makes NCCL match device names exactly rather than by prefix.
         env["NCCL_IB_HCA"] = "=" + ",".join(hcas)
     else:
-        env["B12X_ROCE_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
+        env[f"{prefix}_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
+    if is_sparknet(mode):
+        env["SPARKNET_ROCE_TOPOLOGY"] = one_shot_topology(mode)
     if "roce_gid_index" in node:
         env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
-        env["B12X_ROCE_GID_INDEX"] = str(node["roce_gid_index"])
+        env[f"{prefix}_GID_INDEX"] = str(node["roce_gid_index"])
     return env
 
 
@@ -127,14 +162,24 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     paths = cluster.get("fabric", {}).get("mesh_paths", 2)
     if paths not in (2, 4) or (paths == 4 and mode != "rocenante-mesh4"):
         errors.append("mesh_paths must be 2, or 4 for rocenante-mesh4")
-    if mode not in ("rocenante-direct", "nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
+    if mode not in TRANSPORTS:
         errors.append(f"unknown fabric transport {mode!r}")
-    if count == 4 and mode not in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
-        errors.append("four-node switchless fabric requires nccl-ring, rocenante-ring4 or rocenante-mesh4")
-    if mode in ("rocenante-ring4", "rocenante-mesh4") and count != 4:
+    if count == 4 and not neighbour_ring(mode):
+        errors.append("four-node switchless fabric requires nccl-ring, oneshot-ring4, rocenante-ring4 or rocenante-mesh4")
+    if one_shot_topology(mode) in ("ring4", "mesh4") and count != 4:
         errors.append(f"{mode} requires exactly four nodes")
-    if mode not in ("rocenante-ring4", "rocenante-mesh4") and cluster.get("environment", {}).get("B12X_ROCE_TOPOLOGY", "direct") != "direct":
-        errors.append("B12X_ROCE_TOPOLOGY must match the selected transport")
+    settings = cluster.get("environment", {})
+    if is_sparknet(mode):
+        foreign = sorted(k for k in settings if k.startswith("B12X_ROCE_") or k in B12X_VLLM_SETTINGS)
+        if foreign:
+            errors.append(f"{mode} reads sparknet's SPARKNET_ROCE_* settings only; remove {', '.join(foreign)}")
+        if settings.get("SPARKNET_ROCE_TOPOLOGY", one_shot_topology(mode)) != one_shot_topology(mode):
+            errors.append("SPARKNET_ROCE_TOPOLOGY must match the selected transport")
+    else:
+        if any(k.startswith("SPARKNET_ROCE_") for k in settings):
+            errors.append(f"{mode} does not run sparknet; SPARKNET_ROCE_* settings do not apply")
+        if one_shot_topology(mode) not in ("ring4", "mesh4") and settings.get("B12X_ROCE_TOPOLOGY", "direct") != "direct":
+            errors.append("B12X_ROCE_TOPOLOGY must match the selected transport")
     for flag in ("--tensor-parallel-size", "--nnodes"):
         if argument(cluster, flag) != str(count):
             errors.append(f"{flag} must equal the configured node count ({count})")
@@ -146,7 +191,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             errors.append(f"draft_tensor_parallel_size must equal the node count ({count})")
     except (ValueError, AttributeError):
         errors.append("--speculative-config must be a JSON object")
-    if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
+    if neighbour_ring(mode):
         env = cluster.get("environment", {})
         required_env = dict(RING_ENV)
         # Four-node qualification covers these initialized channel counts on
@@ -164,13 +209,16 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             required_env.pop(key)
         if mode in ("rocenante-ring4", "rocenante-mesh4"):
             required_env.update(VLLM_ENABLE_ROCE_ALLREDUCE="1", B12X_ROCE_TOPOLOGY=mode.removeprefix("rocenante-"))
+        elif is_sparknet(mode):
+            # sparknet's one-shot is always on; vLLM's B12X switch must be absent.
+            required_env.pop("VLLM_ENABLE_ROCE_ALLREDUCE")
         for key, value in required_env.items():
             if str(env.get(key)) != value:
                 errors.append(f"{mode} requires {key}={value}")
         disabled = "--disable-custom-all-reduce" in cluster.get("serve_args", [])
         if mode == "nccl-ring" and not disabled:
             errors.append("nccl-ring requires --disable-custom-all-reduce")
-        if mode in ("rocenante-ring4", "rocenante-mesh4") and disabled:
+        if one_shot_topology(mode) in ("ring4", "mesh4") and disabled:
             errors.append(f"{mode} requires custom all-reduce enabled")
         if "--enable-expert-parallel" in cluster.get("serve_args", []):
             errors.append(f"{mode} does not support expert-parallel all-to-all")
@@ -183,7 +231,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append(f"{mode} cannot override topology/algorithm through {key}")
     networks = {}
     for rank, node in by_rank.items():
-        expected = {(rank - 1) % count, (rank + 1) % count} if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4") else set(ranks) - {rank}
+        expected = {(rank - 1) % count, (rank + 1) % count} if neighbour_ring(mode) else set(ranks) - {rank}
         routes = node.get("roce_peer_hcas")
         if not isinstance(routes, dict) or set(routes) != {str(p) for p in expected}:
             errors.append(f"{node.get('name')}: roce_peer_hcas must name peers {sorted(expected)} in cable/rank order")
@@ -200,7 +248,7 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
             back = reverse.get(str(rank)) if isinstance(reverse, dict) else None
             if not isinstance(back, list) or len(back) != len(hcas):
                 errors.append(f"{node['name']}: link to rank {peer} must have reciprocal stripe counts")
-            if mode in ("nccl-ring", "rocenante-ring4", "rocenante-mesh4"):
+            if neighbour_ring(mode):
                 for lane, hca in enumerate(hcas):
                     raw = node.get("roce_subnets", {}).get(hca)
                     try:
@@ -213,20 +261,20 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                     networks.setdefault(str(net), []).append((rank, int(peer), hca, lane))
         if len(set(all_hcas)) != len(all_hcas):
             errors.append(f"{node['name']}: switchless links must use distinct local HCAs")
-        if mode in ("rocenante-direct", "rocenante-ring4", "rocenante-mesh4") and len({len(v) for v in routes.values() if isinstance(v, list)}) != 1:
-            errors.append(f"{node['name']}: RoCEnante requires equal stripe counts for every peer")
+        if mode in ONE_SHOT and len({len(v) for v in routes.values() if isinstance(v, list)}) != 1:
+            errors.append(f"{node['name']}: one-shot collectives require equal stripe counts for every peer")
         gid = node.get("roce_gid_index", 3)
         if type(gid) is not int or gid < 0:
             errors.append(f"{node['name']}: roce_gid_index must be a nonnegative integer")
-    if mode in ("rocenante-direct", "rocenante-ring4", "rocenante-mesh4"):
+    if mode in ONE_SHOT:
         widths = {len(v) for n in entries if isinstance(n.get("roce_peer_hcas"), dict) for v in n["roce_peer_hcas"].values() if isinstance(v, list)}
         if len(widths) != 1:
-            errors.append("RoCEnante requires one common stripe count across all ranks")
+            errors.append("one-shot collectives require one common stripe count across all ranks")
     for net, ends in networks.items():
         if len(ends) != 2 or ends[0][:2] != ends[1][:2][::-1]:
             errors.append(f"fabric subnet {net} must connect exactly the two declared neighbour endpoints")
-        elif mode in ("rocenante-ring4", "rocenante-mesh4") and ends[0][3] != ends[1][3]:
-            errors.append(f"fabric subnet {net}: RoCEnante endpoints must use the same stripe position")
+        elif one_shot_topology(mode) in ("ring4", "mesh4") and ends[0][3] != ends[1][3]:
+            errors.append(f"fabric subnet {net}: one-shot endpoints must use the same stripe position")
     return errors
 
 

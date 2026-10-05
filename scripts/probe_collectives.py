@@ -47,8 +47,11 @@ def port_counters():
 
 @contextmanager
 def prepared_rocenante(adapter, device, cpu_group):
-    """Prepare the adapter's real serving declaration without loading a model."""
-    if adapter is None:
+    """Prepare the adapter's real serving declaration without loading a model.
+
+    sparknet's adapter prepares itself when it is constructed.
+    """
+    if adapter is None or adapter.backend_name == "SPARKNET_ONESHOT":
         yield
         return
     import torch
@@ -120,8 +123,13 @@ def main() -> None:
 
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
-    roce_enabled = os.environ.get("VLLM_ENABLE_ROCE_ALLREDUCE") == "1"
-    roce_topology = os.environ.get("B12X_ROCE_TOPOLOGY", "direct")
+    # sparknet's one-shot (oneshot-*) is always on and named SPARKNET_ROCE_*;
+    # B12X's (rocenante-*) is switched by vLLM and named B12X_ROCE_*.
+    sparknet = "SPARKNET_ROCE_TOPOLOGY" in os.environ
+    roce_enabled = sparknet or os.environ.get("VLLM_ENABLE_ROCE_ALLREDUCE") == "1"
+    prefix = "SPARKNET_ROCE" if sparknet else "B12X_ROCE"
+    roce_topology = os.environ.get(f"{prefix}_TOPOLOGY", "direct")
+    family = "oneshot" if sparknet else "rocenante"
     set_custom_all_reduce(roce_enabled)
     init_distributed_environment(
         world_size=args.world_size, rank=args.rank, local_rank=0,
@@ -138,7 +146,7 @@ def main() -> None:
     if not roce_enabled and adapter is not None:
         raise RuntimeError("ring probe unexpectedly initialized a direct-peer B12X communicator")
     if roce_enabled and (adapter is None or adapter.disabled):
-        raise RuntimeError("RoCEnante requested but unavailable; refusing a fallback-only pass")
+        raise RuntimeError(f"{family} collectives requested but unavailable; refusing a fallback-only pass")
     if roce_topology != "direct" and (adapter is None or getattr(adapter._runtime, "topology", None) != roce_topology):
         raise RuntimeError(f"the image does not contain the requested {roce_topology} transport")
     nccl = communicator.pynccl_comm
@@ -146,7 +154,7 @@ def main() -> None:
         raise RuntimeError("PyNCCL communicator is unavailable")
 
     with prepared_rocenante(adapter, device, group.cpu_group):
-        dispatch_setting = os.environ.get('B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES')
+        dispatch_setting = os.environ.get(f'{prefix}_ALLREDUCE_DISPATCH_MAX_BYTES')
         if dispatch_setting is not None and (adapter is None or
                 adapter._runtime.stats().get('dispatch_max_bytes') != int(dispatch_setting)):
             raise RuntimeError('image did not apply the requested independent dispatch limit')
@@ -157,7 +165,7 @@ def main() -> None:
         if args.expect_paths is not None:
             if adapter is None or adapter._runtime.stats().get('path_slots') != args.expect_paths:
                 raise RuntimeError('image did not apply the requested path count')
-            requested_rotate = int(os.environ.get('B12X_ROCE_MESH_ROTATE', '0'))
+            requested_rotate = int(os.environ.get(f'{prefix}_MESH_ROTATE', '0'))
             if adapter._runtime.stats().get('mesh_rotate') != requested_rotate:
                 raise RuntimeError('image did not apply the requested posting order')
         # Exercise the torch NCCL group as well as vLLM's separate PyNCCL group.
@@ -294,7 +302,7 @@ def main() -> None:
                         if proxy_before is not None:
                             expected_custom = (name == 'all_reduce' and adapter.should_custom_ar(local)) or (
                                 name == 'all_gather' and adapter.should_all_gather(local, 0))
-                            row['expected_backend'] = 'rocenante' if expected_custom else 'nccl'
+                            row['expected_backend'] = family if expected_custom else 'nccl'
                             proxy_after = adapter._runtime.stats()
                             row['proxy_sequence_window'] = {
                                 'before': proxy_before['last_seq'], 'after': proxy_after['last_seq']}
@@ -320,12 +328,12 @@ def main() -> None:
         if adapter:
             adapter.check_health()
             if adapter._runtime.stats()["ops_posted"] <= before:
-                raise RuntimeError("no probe payload used the RoCEnante proxy")
+                raise RuntimeError(f"no probe payload used the {family} proxy")
             proxy_stats = adapter._runtime.stats()
         else:
             proxy_stats = None
     print(json.dumps({"rank": args.rank, "world_size": args.world_size,
-                      "transport": f"rocenante-{roce_topology}" if roce_enabled else "nccl-ring",
+                      "transport": f"{family}-{roce_topology}" if roce_enabled else "nccl-ring",
                       "proxy": proxy_stats,
                       "passed": True, "checks": checks, "numerical_checks": numerical_checks, "timings": timings}), flush=True)
     destroy_model_parallel()
