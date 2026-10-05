@@ -1,0 +1,254 @@
+From 388522f499a9d30f481922f45fa51c4bdadb6a18 Mon Sep 17 00:00:00 2001
+From: carlosmolina0615 <carlosmolina0615@gmail.com>
+Date: Mon, 5 Oct 2026 23:27:25 +0200
+Subject: [PATCH] Route the CED decoder's MoE with its own padding mask in
+ TileLang
+
+A CED decoder layer routes the step's rows gathered by CED's indices, not
+the step's rows. The TileLang routers took the step's padding mask and
+sliced it to the decoder's row count (0035), which is only right when
+padding sits at the end and the plan is exact. Neither holds in a mixed
+step: adaptive verification marks dead verification rows inside the batch
+(0010), and the plan's CPU upper bound leaves -1 indices at its end when
+verification shortens the decode ranges. The router then routed padding
+rows, whose NaN logits stopped the engine at the TileKernels assertion,
+and skipped live ones.
+
+DeepseekV41ModelState.prepare_attn now gathers the step's mask by the CED
+indices, with the -1 indices padding, and puts it on the decoder metadata
+once per step. The decoder layers' routers are tagged at construction and
+take that mask; encoder and drafter routers keep the step's. A compact
+mask is never chosen by row count alone, since an encoder forward can have
+the same number of rows. The mask is a new tensor each step, so a CED step
+that would replay a CUDA graph is refused; CED starts above the capture
+sizes.
+
+Reproduced on three GB10 nodes with r6 (TP3, 4 KiB profile, 2.0 and
+2.2 GiB KV, with and without prefix caching): a prefill with 3,328 cached
+tokens admitted while five requests decode fails at the first mixed step.
+With this change, two rounds of six concurrent streams completed 24 of 24
+requests with prefix caching on, with no NaN or Inf.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  | 70 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  7 ++
+ .../deepseek_v4_1/nvidia/model_state.py       | 18 ++++-
+ vllm/models/deepseek_v4_1/sparse_mla.py       |  2 +
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 31 ++++++--
+ 5 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index d3fd6f4..891be45 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -273,3 +273,73 @@ def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
+         )
+         assert torch.equal(ids, unfused[1])
+         assert torch.equal(weights.view(torch.int32), unfused[0].view(torch.int32))
++
++
++@pytest.fixture
++def ced_step(monkeypatch):
++    """A mixed step whose CED decoder batch is shorter than its CPU plan.
++
++    Five decode requests are scheduled 6 rows each and a prefill 331 rows,
++    3,328 of them cached: 361 rows. Adaptive verification shortens the decode
++    ranges to 22 rows, so the decoder keeps 22 decode rows and the prefill's
++    last 128, and the plan's 158 rows end in eight -1 indices. Rows 1, 7 and
++    20 are dead verification rows inside the batch.
++    """
++    from vllm.models.deepseek_v4_1.ced import CEDState, gather_rows
++
++    state = CEDState(6, 4096, (256, 512, 1024, 2048, 4096), "cuda")
++    starts = torch.tensor(
++        [0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda"
++    )
++    seq = torch.tensor([4000] * 5 + [3659], dtype=torch.int32, device="cuda")
++    state.stage(starts, seq, [6] * 5 + [331], [False] * 6, [0] * 5 + [3328])
++    indices = state.get_indices()
++    is_padding = torch.zeros(361, dtype=torch.bool, device="cuda")
++    is_padding[[1, 7, 20]] = True
++    is_padding[353:] = True
++    # What DeepseekV41ModelState.prepare_attn puts on the decoder metadata.
++    compact = (indices >= 0) & ~gather_rows(is_padding, indices)
++    decoder = type("Decoder", (), {"routing_mask": compact})()
++    layer = type("Layer", (), {"decoder": decoder})()
++    context = type("Context", (), {})()
++    context.is_padding = is_padding
++    context.attn_metadata = {"layer": layer}
++    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
++    return context, indices, compact
++
++
++def test_ced_decoder_routes_its_gathered_rows(ced_step):
++    context, indices, compact = ced_step
++    is_padding = context.is_padding
++    assert indices.tolist() == list(range(22)) + list(range(225, 353)) + [-1] * 8
++    expected = torch.ones(158, dtype=torch.bool, device="cuda")
++    expected[[1, 7, 20]] = False
++    expected[150:] = False
++    assert torch.equal(compact, expected)
++    # Truncating the step's mask, as before, keeps the wrong rows.
++    assert not torch.equal((~is_padding)[:158], expected)
++    assert torch.equal(tilelang_router._routing_mask(158, ced_decoder=True), expected)
++    # Encoder and draft routers keep the step's layout, even at the same size.
++    assert torch.equal(tilelang_router._routing_mask(361), ~is_padding)
++    assert torch.equal(tilelang_router._routing_mask(158), (~is_padding)[:158])
++
++
++def test_ced_decoder_skips_nan_padding_rows(ced_step):
++    _, _, expected = ced_step
++    bias = torch.zeros(384, device="cuda")
++    router = tilelang_router.TileKernelsRouter(
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=1.0,
++        scoring_func="sqrtsoftplus",
++    )
++    router._ds41_is_ced_decoder = True
++    logits = torch.zeros(158, 384, device="cuda")
++    logits[~expected] = float("nan")  # what the gate leaves in padding rows
++    weights, ids = router._compute_routing(None, logits, None)
++    torch.cuda.synchronize()
++    assert (ids[~expected] == -1).all() and (weights[~expected] == 0).all()
++    assert (ids[expected] >= 0).all() and torch.isfinite(weights).all()
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 57a864b..3deb08d 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -167,6 +167,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+             router_cls=kernels.moe_router_class(),
+         )
+ 
++        # A CED decoder layer routes the compact decoder rows, whose padding
++        # mask differs from the step's. Tag its router by layer, never by the
++        # row count, which an encoder forward can share.
++        router = getattr(self.ffn.experts, "router", None)
++        if router is not None:
++            router._ds41_is_ced_decoder = self.attn.is_ced_decoder
++
+         self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+         self.ffn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+         self.hc_mult = config.hc_mult
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 1104975..38c9ac5 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -8,7 +8,9 @@ import torch.nn as nn
+ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+-from vllm.models.deepseek_v4_1.ced import CED_WINDOW, CEDState, ced_decoder_start
++from vllm.models.deepseek_v4_1.ced import (
++    CED_WINDOW, CEDState, ced_decoder_start, gather_rows,
++)
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.core.sched.output import NewRequestData
+@@ -222,6 +224,19 @@ class DeepseekV41ModelState(DefaultModelState):
+         )
+         state = self.ced_state
+         if state is not None:
++            # The decoder's rows are the step's rows gathered by CED's indices.
++            # Adaptive verification marks dead rows inside the batch, and the
++            # plan's CPU upper bound leaves -1 indices at its end, so the
++            # step's padding mask is gathered, not truncated. The mask is a new
++            # tensor each step: CED steps must not replay a CUDA graph.
++            indices = state.get_indices()
++            routing_mask = None
++            if indices is not None:
++                if cudagraph_mode != CUDAGraphMode.NONE:
++                    raise RuntimeError("CED decoder routing requires eager execution")
++                routing_mask = (indices >= 0) & ~gather_rows(
++                    input_batch.is_padding, indices
++                )
+             seen: set[int] = set()
+             for value in metadata.values():
+                 if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
+@@ -229,6 +244,7 @@ class DeepseekV41ModelState(DefaultModelState):
+                     value.swa_replay_start = state.replay_start
+                     if state.plan is not None:
+                         value.decoder = state.decoder_metadata(value)
++                        value.decoder.routing_mask = routing_mask
+         return metadata
+ 
+     def prepare_inputs(
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 9ee1071..249d376 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -168,6 +168,8 @@ class DeepseekV41B12xMetadata:
+     max_seq_len: int
+     decoder: "DeepseekV41B12xMetadata | None" = None
+     swa_replay_start: torch.Tensor | None = None
++    # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
++    routing_mask: torch.Tensor | None = None
+ 
+ 
+ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 4476b85..eedb28f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -50,11 +50,28 @@ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Ten
+     return mask
+ 
+ 
+-def _routing_mask(rows: int) -> torch.Tensor | None:
+-    """Rows to route this step (False pads a CUDA graph's batch), computed once."""
++def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | None:
++    """Rows to route this step (False pads the batch), computed once per layout."""
+     if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+         return None
+     context = get_forward_context()
++    # A CED decoder layer routes compact rows: its mask comes from the
++    # decoder metadata (gathered by the CED indices), not from the step's.
++    compact_masks = getattr(context, "_ds41_ced_routing_masks", None)
++    if compact_masks is None:
++        compact_masks = {}
++        metadata = context.attn_metadata
++        if isinstance(metadata, dict):
++            for value in metadata.values():
++                decoder = getattr(value, "decoder", None)
++                mask = getattr(decoder, "routing_mask", None)
++                if mask is not None:
++                    compact_masks[mask.numel()] = mask
++        context._ds41_ced_routing_masks = compact_masks
++    if ced_decoder and compact_masks:
++        if rows not in compact_masks:
++            raise RuntimeError("CED routing mask does not match the decoder rows")
++        return compact_masks[rows]
+     is_padding = context.is_padding
+     if is_padding is None:
+         return None
+@@ -106,7 +123,10 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+             num_shared_experts=0,
+             routed_scaling_factor=self.routed_scaling_factor,
+             ep_rank=0,
+-            mask=_routing_mask(router_logits.shape[0]),
++            mask=_routing_mask(
++                router_logits.shape[0],
++                ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
++            ),
+             bias=self.e_score_correction_bias.data,
+             image_bias=image_bias,
+             image_token_mask=image_token_mask,
+@@ -304,7 +324,10 @@ class TileLangGateRouter(TileKernelsRouter):
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+-        route_mask = _routing_mask(x.shape[0])
++        route_mask = _routing_mask(
++            x.shape[0],
++            ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
++        )
+         key = (image, route_mask is not None)
+         if key not in self._kernels:
+             self._kernels[key] = route_partials(
+-- 
+2.48.1
+
