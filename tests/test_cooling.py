@@ -1,4 +1,6 @@
 """Cooling must restore the normal fan policy before a measurement can start."""
+import contextlib
+import io
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -44,14 +46,17 @@ class CoolingTest(unittest.TestCase):
         with patch.object(spark, "hottest_zone_c", side_effect=[60.0, 50.0]), \
              patch.object(spark, "take_fan_control", return_value={"service": True, "floor": True}), \
              patch.object(spark, "restore_fan_control", return_value="FAILED: service"), \
-             patch.object(spark.time, "sleep"):
+             patch.object(spark.time, "sleep"), \
+             contextlib.redirect_stdout(io.StringIO()) as progress:
             with self.assertRaisesRegex(RuntimeError, "cannot restore fan control"):
                 spark.cool_nodes({}, [{"name": "node"}], 55, 60)
+        self.assertIn("every node at fan floor 12", progress.getvalue())
 
     def test_failed_take_still_restores_the_original_control(self):
         with patch.object(spark, "hottest_zone_c", return_value=60.0), \
              patch.object(spark, "take_fan_control", return_value={"service": True, "floor": False}), \
-             patch.object(spark, "restore_fan_control", return_value=spark.FAN_SERVICE) as restore:
+             patch.object(spark, "restore_fan_control", return_value=spark.FAN_SERVICE) as restore, \
+             contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(RuntimeError, "cannot select maximum fan floor"):
                 spark.cool_nodes({}, [{"name": "node"}], 55, 60)
         restore.assert_called_once()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import importlib.machinery
 import importlib.util
 import unittest
@@ -427,6 +429,12 @@ class SiteNodesTest(unittest.TestCase):
 class CoolingTest(unittest.TestCase):
     """Benchmarks start with every node below the cooling threshold."""
 
+    def setUp(self) -> None:
+        # cool_nodes reports each cooling step; keep it out of the test output.
+        progress = contextlib.redirect_stdout(io.StringIO())
+        self.progress = progress.__enter__()
+        self.addCleanup(progress.__exit__, None, None, None)
+
     def run_cooling(self, temps: dict[str, list[float]], service_active: bool = True,
                     timeout: float = 600.0):
         calls: list[tuple[str, ...]] = []
@@ -473,6 +481,7 @@ class CoolingTest(unittest.TestCase):
         self.assertEqual([r["cooled"] for r in records], [True, True])
         self.assertEqual(records[0]["final_c"], 54.5)
         self.assertEqual(records[0]["restored"], "dgx-fan-control.service")
+        self.assertIn("fans restored", self.progress.getvalue())
 
     def test_without_the_service_fans_return_to_firmware_automatic(self) -> None:
         records, calls = self.run_cooling({"dgx3": [60.0, 50.0]}, service_active=False)

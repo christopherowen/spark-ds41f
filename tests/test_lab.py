@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import importlib.machinery
 import importlib.util
 import json
@@ -136,9 +138,11 @@ class BootTimeTest(unittest.TestCase):
         candidate = {"nodes": [*promoted["nodes"], {"rank": 3}]}
         with mock.patch.object(lab.spark, "configuration", return_value=({}, candidate, {})), \
              mock.patch.object(lab, "nodes_config", return_value=promoted), \
-             mock.patch.object(lab, "spark_cli") as launch:
+             mock.patch.object(lab, "spark_cli") as launch, \
+             contextlib.redirect_stdout(io.StringIO()) as log:
             self.assertFalse(lab.boot("ring4.json"))
             launch.assert_not_called()
+        self.assertIn("lab windows require the promoted node topology", log.getvalue())
 
     def test_ready_seconds_come_from_the_cluster_ready_line(self) -> None:
         lines = ["dgx1: steady memguard active", "cluster ready; memory guards are active on all nodes (+116.9s)"]
@@ -167,7 +171,9 @@ class QueueTest(unittest.TestCase):
                 mock.patch.object(lab, "QUEUE", Path(directory) / "queue"):
             good = Path(directory) / "a.json"
             good.write_text(json.dumps(SPEC))
-            lab.queue_add(str(good))
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                lab.queue_add(str(good))
+            self.assertIn("QUEUE added", log.getvalue())
             bad = Path(directory) / "b.json"
             bad.write_text(json.dumps(dict(SPEC, jobs=[{"kind": "mystery"}])))
             with self.assertRaises(SystemExit):
