@@ -1,0 +1,114 @@
+From 21a4bcd4ce3a72b5e717908b6807eede7dc387e8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 08:06:00 +0000
+Subject: [PATCH] Separate collective dispatch ceiling from registered RoCE
+ capacity
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be
+
+B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES controls backend selection while
+max_size and the prepared capacity remain unchanged. This allows NCCL to
+handle intermediate payloads without moving vLLM sequence-parallel prefill.
+The default is the existing capacity. Validate the limit collectively and
+include it in peer configuration agreement. Bump the proxy ABI to reject
+mixed implementations, including when rank zero uses the older schema.
+Explicit prepared calls and priming may still use the entire capacity.
+
+Quality: choosing NCCL can alter reduction rounding; no precision change or
+bitwise-equivalence claim. Tests cover actual dispatch methods, independent
+capacity, protocol agreement and GPU mixed-backend boundaries.
+Upstream-status: local experiment, not submitted.
+---
+ b12x/comm/roce/_roce_proxy.c   |  2 +-
+ b12x/comm/roce/roce_oneshot.py | 20 +++++++++++++++++---
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index 47eb0b8..ef501ae 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -44,7 +44,7 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 9
++#define ROCE_ABI_VERSION 10
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+diff --git a/b12x/comm/roce/roce_oneshot.py b/b12x/comm/roce/roce_oneshot.py
+index 1e472b1..e417f1d 100644
+--- a/b12x/comm/roce/roce_oneshot.py
++++ b/b12x/comm/roce/roce_oneshot.py
+@@ -348,6 +348,7 @@ class RoceOneshotAllReduce:
+             # for a power-of-two block count.
+             raise ValueError("blocks must be a positive power of two")
+         self.max_size = int(max_size)
++        self.dispatch_max_bytes = self.max_size
+         self.max_gather_bytes = int(max_gather_bytes)
+         self._threads = int(threads)
+         self._blocks = int(blocks)
+@@ -414,6 +415,13 @@ class RoceOneshotAllReduce:
+ 
+         error: Optional[str] = None
+         try:
++            # Dispatch is independent of registered capacity. vLLM also uses
++            # max_size for its sequence-parallel execution threshold.
++            self.dispatch_max_bytes = _env_int(
++                "B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES", default=self.max_size
++            )
++            if not (PACK_BYTES <= self.dispatch_max_bytes <= self.max_size) or self.dispatch_max_bytes % PACK_BYTES:
++                raise ValueError("RoCE dispatch limit must be 16-byte aligned and within registered capacity")
+             self._proxy = Proxy(
+                 world_size=self.world_size,
+                 rank=self.rank,
+@@ -447,6 +455,7 @@ class RoceOneshotAllReduce:
+             "slots": self._layout.slots,
+             "flag_stride": self._layout.flag_stride,
+             "max_size": self.max_size,
++            "dispatch_max_bytes": self.dispatch_max_bytes,
+             "max_gather_bytes": self.max_gather_bytes,
+             "spin_limit": self.spin_limit,
+             "threads": self._threads,
+@@ -559,7 +568,11 @@ class RoceOneshotAllReduce:
+         return False
+ 
+     def should_allreduce(self, inp: torch.Tensor) -> bool:
+-        """Eligible: contiguous CUDA tensor of a supported dtype, 16-byte total size within ``max_size``.
++        """Select this backend below the jointly validated dispatch ceiling."""
++        return self._accepts_allreduce(inp, self.dispatch_max_bytes)
++
++    def _accepts_allreduce(self, inp: torch.Tensor, limit: int) -> bool:
++        """Eligible: contiguous CUDA tensor of a supported dtype, 16-byte total size within ``limit``.
+ 
+         The decision depends only on dtype, shape, contiguity and size, which
+         tensor-parallel ranks share, never on the pointer value; a closed runtime
+@@ -573,7 +586,7 @@ class RoceOneshotAllReduce:
+         if inp.device != self.device or not inp.is_contiguous():
+             return False
+         nbytes = inp.numel() * inp.element_size()
+-        return 0 < nbytes <= self.max_size and nbytes % PACK_BYTES == 0
++        return 0 < nbytes <= limit and nbytes % PACK_BYTES == 0
+ 
+     # -- channels / streams (single channel runtime) ---------------------------
+ 
+@@ -677,7 +690,7 @@ class RoceOneshotAllReduce:
+         """Run a materialized launcher during priming or once the plan is published."""
+         with self._lock:
+             self.check_health()
+-            if not self.should_allreduce(inp):
++            if not self._accepts_allreduce(inp, self.max_size):
+                 raise ValueError(
+                     "input is not eligible for the RoCE one-shot all-reduce"
+                 )
+@@ -1053,6 +1066,7 @@ class RoceOneshotAllReduce:
+             },
+             "stripe_count": self.stripe_count,
+             "max_size": self.max_size,
++            "dispatch_max_bytes": self.dispatch_max_bytes,
+             "max_gather_bytes": self.max_gather_bytes,
+             "slot_bytes": self._slot_bytes,
+             "epoch": int(self._counters[0].item()),
+-- 
+2.54.0 (Apple Git-157)
+

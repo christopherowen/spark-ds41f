@@ -222,6 +222,37 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   stream at that interval; a mismatch, or a check that cannot run, is logged
   and kills the worker. Upstream status: Spark-specific, not for upstream.
 
+- `0027-explicit-collective-policy.patch` makes the requested RoCE collective
+  policy fail-stop: a multi-node RoCE selection is a required RoCE/PyNCCL
+  policy, startup errors abort, and ineligible operations go directly to
+  PyNCCL instead of other accelerators or the PyTorch process-group fallback.
+  It reports dispatch and registered capacity separately (with B12X 0010).
+  From `experiments/2026-10-03-collective-contract`. Upstream status: local.
+
+- `0028-deepseek-v41-packed-bf16-lm-head.patch` serves the DeepSeek V4.1
+  target head, which the BF16 DSpark draft head shares, from B12X 0012's exact
+  12-bit packed form, packed in place after loading
+  (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`). From
+  `experiments/2026-10-03-packed-bf16-head`. Upstream status: candidate.
+
+- `0030-worker-display-carveout-streamed-weights.patch` creates the embedding
+  and packed head in their own display carve-out buffers when the model is
+  built, so the checkpoint loader writes straight into them; nothing is copied
+  from ordinary memory, and the drafter builds its placeholder embedding and
+  head on the meta device until the target's replace them. From `experiments/2026-10-04-streamed-embeddings`.
+  Upstream status: Spark-specific.
+
+- `0039-dummy-context-disjoint-blocks.patch` gives the fabricated context of
+  startup profiling and dummy runs its own blocks for each KV cache group and
+  request. The groups overlay one block pool, so shared blocks made one group
+  read another's records in its own format. From
+  `experiments/2026-10-04-tp4-memory-tuning`. Upstream status: candidate.
+
+0029 and 0031-0038 are the TileLang family's patches on the `tilelang-1m`
+branch. Applying the series (0001-0028, 0030, 0039) to the base yields patch
+head `8d1eb01e` and tree `eaa33543`, the r5p image. `series-r5o` keeps the
+r5o series (0001-0026) for the records that pinned it.
+
 Applying 0001-0026 to the base yields patch head `0a682781` and tree
 `c108cd6d`; 0001-0024, the r5k image, give patch head `59d1113b` and tree
 `9ba14ba1`.

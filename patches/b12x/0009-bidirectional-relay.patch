@@ -1,0 +1,720 @@
+From 5aa0eb92532968a7cfc0fbec2af13ea46c815ef2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 06:11:40 +0000
+Subject: [PATCH] Split ring4 opposite-rank relay traffic across both
+ directions
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be
+Patch-base: 6056b0a181a5388a7a77e4192121d89a0a42d426
+
+Keep neighbour payloads on direct QPs. Relay disjoint halves of every
+physical stripe clockwise and counterclockwise, independently as their
+first-hop flags arrive. Preserve the two-slot lifetime and fixed-rank
+reduction; add completion flags for both fragments, including empty ones.
+Bump the wire ABI so old and new peers cannot exchange incompatible flags.
+
+Quality: transport-only; payload bytes and reduction arithmetic unchanged.
+Tests: 26000 sanitizer-backed simulated collectives, directional byte
+balance, unique pack delivery, independently stalled paths, wraparound,
+stop/error paths, direct/mesh regressions, GPU launcher geometry/cache keys.
+Hardware qualification remains required; no speed or thermal claim.
+Upstream-status: local experiment, not submitted.
+---
+ b12x/comm/roce/_allgather_cute.py           |  16 ++-
+ b12x/comm/roce/_oneshot_cute.py             |  15 ++-
+ b12x/comm/roce/_preparation.py              |   3 +
+ b12x/comm/roce/_proxy.py                    |   2 +-
+ b12x/comm/roce/_roce_proxy.c                | 111 ++++++++++++--------
+ b12x/comm/roce/roce_oneshot.py              |   2 +
+ tests/comm/roce_proxy_fake/run.py           |  58 ++++++++++
+ tests/comm/roce_proxy_fake/simulate.c       |  97 +++++++++++++++--
+ tests/comm/test_roce_preparation_compile.py |   6 +-
+ 9 files changed, 252 insertions(+), 58 deletions(-)
+
+diff --git a/b12x/comm/roce/_allgather_cute.py b/b12x/comm/roce/_allgather_cute.py
+index 6be72d6..72ee330 100644
+--- a/b12x/comm/roce/_allgather_cute.py
++++ b/b12x/comm/roce/_allgather_cute.py
+@@ -61,8 +61,11 @@ class _RoceAllGatherLaunch:
+         slots: int,
+         flag_stride: int,
+         hca_count: int,
++        ring4: bool = False,
+     ) -> None:
+         """Bind one kernel specialization: world size, rank, and layout constants."""
++        neighbor_lanes = int(hca_count) if ring4 else (2 if hca_count == 4 else int(hca_count))
++        hca_count = int(hca_count) * (2 if ring4 else 1)
+         if int(threads) < int(world_size) * int(hca_count):
+             raise ValueError(
+                 "RoCE kernels need threads >= world_size * hca_count "
+@@ -75,6 +78,7 @@ class _RoceAllGatherLaunch:
+         self._slots = int(slots)
+         self._flag_stride = int(flag_stride)
+         self._hca_count = int(hca_count)
++        self._neighbor_lanes = neighbor_lanes
+ 
+     @cute.jit
+     def __call__(
+@@ -196,8 +200,8 @@ class _RoceAllGatherLaunch:
+                 peer = Int32(tidx) // Int32(self._hca_count)
+                 hca = Int32(tidx) - peer * Int32(self._hca_count)
+                 active = peer != Int32(self._rank)
+-                if cutlass.const_expr(self._hca_count == 4):
+-                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(2)))
++                if cutlass.const_expr(self._neighbor_lanes != self._hca_count):
++                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(self._neighbor_lanes)))
+                 if active:
+                     flag_addr = flag_base + (
+                         (Int64(peer) * Int64(self._slots) + slot)
+@@ -270,6 +274,7 @@ def _process_key(
+     flag_stride: int,
+     hca_count: int,
+     device_index: int,
++    ring4: bool = False,
+ ) -> tuple[object, ...]:
+     """Cache key of one compiled launcher specialization."""
+     return (
+@@ -280,6 +285,7 @@ def _process_key(
+         int(flag_stride),
+         int(hca_count),
+         int(device_index),
++        bool(ring4),
+     )
+ 
+ 
+@@ -297,14 +303,15 @@ def get_launcher(
+     flag_stride: int,
+     hca_count: int,
+     device_index: int,
++    ring4: bool = False,
+ ) -> Callable[..., None]:
+     """Compile the launcher for ``key`` once and return it."""
+     process_key = _process_key(
+-        world_size, rank, threads, slots, flag_stride, hca_count, device_index
++        world_size, rank, threads, slots, flag_stride, hca_count, device_index, ring4
+     )
+     del device_index
+     launch = _RoceAllGatherLaunch(
+-        world_size, rank, threads, slots, flag_stride, hca_count
++        world_size, rank, threads, slots, flag_stride, hca_count, ring4
+     )
+     cache_key = (
+         int(world_size),
+@@ -313,6 +320,7 @@ def get_launcher(
+         int(slots),
+         int(flag_stride),
+         int(hca_count),
++        bool(ring4),
+     )
+     raise_if_kernel_resolution_frozen(
+         "cute.compile", target=launch, cache_key=cache_key
+diff --git a/b12x/comm/roce/_oneshot_cute.py b/b12x/comm/roce/_oneshot_cute.py
+index 50a2d2e..8349671 100644
+--- a/b12x/comm/roce/_oneshot_cute.py
++++ b/b12x/comm/roce/_oneshot_cute.py
+@@ -78,10 +78,13 @@ class _RoceOneshotLaunch:
+         slots: int,
+         flag_stride: int,
+         hca_count: int,
++        ring4: bool = False,
+     ) -> None:
+         """Bind one kernel specialization: dtype, world size, rank, and layout constants."""
+         if dtype_name not in _DTYPE_PACK_ELEMS:
+             raise ValueError(f"unsupported RoCE one-shot dtype {dtype_name!r}")
++        neighbor_lanes = int(hca_count) if ring4 else (2 if hca_count == 4 else int(hca_count))
++        hca_count = int(hca_count) * (2 if ring4 else 1)
+         if int(threads) < int(world_size) * int(hca_count):
+             raise ValueError(
+                 "RoCE kernels need threads >= world_size * hca_count "
+@@ -96,6 +99,7 @@ class _RoceOneshotLaunch:
+         self._slots = int(slots)
+         self._flag_stride = int(flag_stride)
+         self._hca_count = int(hca_count)
++        self._neighbor_lanes = neighbor_lanes
+ 
+     @cute.jit
+     def _accumulate_words(
+@@ -263,8 +267,8 @@ class _RoceOneshotLaunch:
+                 peer = Int32(tidx) // Int32(self._hca_count)
+                 hca = Int32(tidx) - peer * Int32(self._hca_count)
+                 active = peer != Int32(self._rank)
+-                if cutlass.const_expr(self._hca_count == 4):
+-                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(2)))
++                if cutlass.const_expr(self._neighbor_lanes != self._hca_count):
++                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(self._neighbor_lanes)))
+                 if active:
+                     flag_addr = flag_base + (
+                         (Int64(peer) * Int64(self._slots) + slot)
+@@ -331,6 +335,7 @@ def _process_key(
+     flag_stride: int,
+     hca_count: int,
+     device_index: int,
++    ring4: bool = False,
+ ) -> tuple[object, ...]:
+     """Cache key of one compiled launcher specialization."""
+     return (
+@@ -342,6 +347,7 @@ def _process_key(
+         int(flag_stride),
+         int(hca_count),
+         int(device_index),
++        bool(ring4),
+     )
+ 
+ 
+@@ -361,6 +367,7 @@ def get_launcher(
+     flag_stride: int,
+     hca_count: int,
+     device_index: int,
++    ring4: bool = False,
+ ) -> Callable[..., None]:
+     """Compile the launcher for ``key`` once and return it."""
+     process_key = _process_key(
+@@ -372,10 +379,11 @@ def get_launcher(
+         flag_stride,
+         hca_count,
+         device_index,
++        ring4,
+     )
+     del device_index  # retained in the functools and preparation keys only
+     launch = _RoceOneshotLaunch(
+-        dtype_name, world_size, rank, threads, slots, flag_stride, hca_count
++        dtype_name, world_size, rank, threads, slots, flag_stride, hca_count, ring4
+     )
+     cache_key = (
+         str(dtype_name),
+@@ -385,6 +393,7 @@ def get_launcher(
+         int(slots),
+         int(flag_stride),
+         int(hca_count),
++        bool(ring4),
+     )
+     raise_if_kernel_resolution_frozen(
+         "cute.compile", target=launch, cache_key=cache_key
+diff --git a/b12x/comm/roce/_preparation.py b/b12x/comm/roce/_preparation.py
+index 7e216d4..a213498 100644
+--- a/b12x/comm/roce/_preparation.py
++++ b/b12x/comm/roce/_preparation.py
+@@ -34,6 +34,7 @@ def compile_roce(payload, ordinal: int):
+         int(setup["flag_stride"]),
+         int(setup["hca_count"]),
+         ordinal,
++        bool(setup.get("ring4", False)),
+     )
+     with torch.cuda.device(ordinal):
+         programs = {
+@@ -100,6 +101,7 @@ def plan(
+         query.world_size != runtime.world_size
+         or query.rank != runtime.rank
+         or tuple(query.hca_names) != tuple(runtime.hca_names)
++        or bool(query.setup.get("ring4", False)) != (runtime.topology == "ring4")
+     ):
+         raise ValueError("RoCE query differs from established runtime")
+     if invocation:
+@@ -159,6 +161,7 @@ def query_from_runtime(
+                 # per edge; compiling for four would make the kernel read flag
+                 # offsets the two-stripe proxy never writes.
+                 "hca_count": runtime.stripe_count,
++                "ring4": runtime.topology == "ring4",
+             }
+         ),
+     )
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index e158812..dd8e340 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 8:
++        if lib.roce_abi_version() != 9:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index 889341c..47eb0b8 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -18,8 +18,9 @@
+ // by its own 4-byte seq write on the same reliable QP, so its flag cannot become
+ // visible before its payload. The GPU waits for every stripe flag before
+ // consuming the receive slot. In explicit ring4 mode the host additionally
+-// forwards the predecessor's completed receive slot to the successor, retaining
+-// the original source index. GPU layout and reduction order remain unchanged.
++// forwards disjoint halves of each received stripe in both directions. The
++// opposite GPU waits on twice as many flags; source slots and rank-order sums
++// are unchanged. Neighbour traffic always uses its direct QPs.
+ //
+ // This file is compiled by b12x.comm.roce._proxy at first use with the host
+ // gcc and libibverbs; it must stay plain C with no CUDA dependency.
+@@ -43,7 +44,7 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 8
++#define ROCE_ABI_VERSION 9
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+@@ -510,15 +511,17 @@ static int drain_cq(roce_ctx_t *c, int h) {
+     return 0;
+ }
+ 
+-static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+-                     int origin, int p, uint8_t *send, int lane) {
++// Ring relays have two independently ordered fragments per physical lane.
++// Neighbours publish one flag per lane; the opposite rank waits for both halves.
++static int flag_lanes(const roce_ctx_t *c) {
++    return c->n_stripes * (c->ring4 == 1 ? 2 : 1);
++}
++
++static int post_fragment(roce_ctx_t *c, uint32_t seq,
++                         int origin, int p, uint8_t *send, int lane,
++                         uint64_t byte_offset, uint32_t stripe_bytes, int flag_lane) {
+     uint32_t slot = seq & 1u;
+     uint32_t seq_copy = seq;
+-    uint32_t total_packs = nbytes / 16;
+-    uint32_t width = (uint32_t)peer_width(c->world, c->rank, p, c->n_stripes);
+-    uint32_t remainder = total_packs % width;
+-    uint32_t pack_offset = (uint32_t)lane * (total_packs / width) +
+-        ((uint32_t)lane < remainder ? (uint32_t)lane : remainder);
+     {
+         int h = c->route_hca[p][lane];
+         roce_hca_t *hca = &c->hca[h];
+@@ -538,12 +541,6 @@ static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+                 return -1;
+             }
+         }
+-        uint32_t stripe_packs = total_packs / width;
+-        if ((uint32_t)lane < total_packs % width) {
+-            stripe_packs += 1;
+-        }
+-        uint32_t stripe_bytes = stripe_packs * 16;
+-        uint64_t byte_offset = (uint64_t)pack_offset * 16;
+         uint64_t remote = c->peer_addr[p];
+         struct ibv_sge flag_sge = {
+             .addr = (uint64_t)(uintptr_t)&seq_copy,
+@@ -559,8 +556,8 @@ static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+         flag_wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+         flag_wr.wr.rdma.remote_addr =
+             remote + c->flag_off +
+-            (((uint64_t)origin * ROCE_SLOTS + slot) * (uint64_t)c->n_stripes +
+-             (uint64_t)lane) * ROCE_FLAG_STRIDE;
++            (((uint64_t)origin * ROCE_SLOTS + slot) * (uint64_t)flag_lanes(c) +
++             (uint64_t)flag_lane) * ROCE_FLAG_STRIDE;
+         flag_wr.wr.rdma.rkey = c->peer_rkey[lane][p];
+ 
+         struct ibv_send_wr data_wr;
+@@ -597,6 +594,23 @@ static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+     return 0;
+ }
+ 
++static void stripe_range(uint32_t nbytes, int width, int lane,
++                         uint32_t *offset, uint32_t *packs) {
++    uint32_t total = nbytes / 16, remainder = total % (uint32_t)width;
++    *offset = (uint32_t)lane * (total / (uint32_t)width) +
++        ((uint32_t)lane < remainder ? (uint32_t)lane : remainder);
++    *packs = total / (uint32_t)width + ((uint32_t)lane < remainder);
++}
++
++static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
++                     int origin, int p, uint8_t *send, int lane) {
++    uint32_t offset, packs;
++    stripe_range(nbytes, peer_width(c->world, c->rank, p, c->n_stripes),
++                 lane, &offset, &packs);
++    return post_fragment(c, seq, origin, p, send, lane,
++                         (uint64_t)offset * 16, packs * 16, lane);
++}
++
+ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+                      int origin, int p, uint8_t *send) {
+     for (int lane = 0; lane < peer_width(c->world, c->rank, p, c->n_stripes); lane++)
+@@ -604,28 +618,35 @@ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+     return 0;
+ }
+ 
+-static int wait_relay(roce_ctx_t *c, uint32_t seq, int origin) {
++static int relay_both_directions(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     struct timespec start, now;
+     clock_gettime(CLOCK_MONOTONIC, &start);
+     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
++    unsigned pending = (1u << (2 * c->n_stripes)) - 1u;
+     for (unsigned spins = 0;; spins++) {
+-        int ready = 1;
+-        for (int lane = 0; lane < c->n_stripes; lane++) {
++        if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
++            __atomic_load_n(&ctrl[2], __ATOMIC_ACQUIRE)) {
++            snprintf(c->err, sizeof(c->err), "relay stopped or GPU failed at seq %u", seq);
++            return -1;
++        }
++        // Do not wait for one direction before progressing the other. Each
++        // fragment can forward as soon as its own first-hop lane has arrived.
++        for (int fragment = 0; fragment < 2 * c->n_stripes; fragment++) {
++            unsigned bit = 1u << fragment;
++            if (!(pending & bit)) continue;
++            int direction = fragment % 2, lane = fragment / 2;
++            int prev = (c->rank + c->world - 1) % c->world;
++            int next = (c->rank + 1) % c->world;
++            int origin = direction == 0 ? prev : next;
++            int destination = direction == 0 ? next : prev;
+             uint32_t *flag = (uint32_t *)(c->region + c->flag_off +
+-                (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * c->n_stripes + lane) * ROCE_FLAG_STRIDE);
++                (((size_t)origin * ROCE_SLOTS + (seq & 1u)) * flag_lanes(c) + lane) * ROCE_FLAG_STRIDE);
+             uint32_t observed = __atomic_load_n(flag, __ATOMIC_ACQUIRE);
+             if ((int32_t)(observed - seq) > 0) {
+                 snprintf(c->err, sizeof(c->err), "relay slot overwritten: rank %d seq %u saw %u", origin, seq, observed);
+                 return -1;
+             }
+-            ready &= observed == seq;
+-        }
+-        if (!atomic_load_explicit(&c->running, memory_order_relaxed) ||
+-            __atomic_load_n(&ctrl[2], __ATOMIC_ACQUIRE)) {
+-            snprintf(c->err, sizeof(c->err), "relay stopped or GPU failed at seq %u", seq);
+-            return -1;
+-        }
+-        if (ready) {
++            if (observed != seq) continue;
+             // Match rdma-core's device-to-CPU barrier after observing ordered
+             // DMA flags; normal C acquire alone need not include the NIC domain.
+ #if defined(__aarch64__)
+@@ -635,8 +656,24 @@ static int wait_relay(roce_ctx_t *c, uint32_t seq, int origin) {
+ #else
+             __sync_synchronize();
+ #endif
+-            return 0;
++            uint32_t offset, packs;
++            stripe_range(nbytes, c->n_stripes, lane, &offset, &packs);
++            // Split each physical stripe into disjoint 16-byte packs. Rotate
++            // the odd pack across epochs and lanes instead of biasing one path.
++            uint32_t first = (packs + ((seq + (uint32_t)lane) & 1u)) / 2;
++            if (direction == 0) packs = first;
++            else { offset += first; packs -= first; }
++            uint8_t *received = c->region + c->recv_off +
++                ((size_t)origin * ROCE_SLOTS + (seq & 1u)) * c->slot_bytes;
++            // Preserve the original source's slot. Its N+2 cannot begin until
++            // the opposite GPU has consumed BOTH fragments of N. Zero-length
++            // fragments still publish a flag, including the 16-byte case.
++            if (post_fragment(c, seq, origin, destination, received, lane,
++                              (uint64_t)offset * 16, packs * 16, fragment) != 0)
++                return -1;
++            pending &= ~bit;
+         }
++        if (!pending) return 0;
+         if ((spins & 63u) == 0) {
+             for (int h = 0; h < c->n_hca; h++)
+                 if (drain_cq(c, h) != 0) return -1;
+@@ -644,7 +681,7 @@ static int wait_relay(roce_ctx_t *c, uint32_t seq, int origin) {
+         if ((spins & 4095u) == 0) {
+             clock_gettime(CLOCK_MONOTONIC, &now);
+             if ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec >= 5000000000LL) {
+-                snprintf(c->err, sizeof(c->err), "relay timed out: rank %d seq %u", origin, seq);
++                snprintf(c->err, sizeof(c->err), "relay timed out: seq %u pending 0x%x", seq, pending);
+                 return -1;
+             }
+         }
+@@ -682,15 +719,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     }
+     }
+     if (c->ring4 == 1) {
+-        int prev = (c->rank + c->world - 1) % c->world;
+-        int next = (c->rank + 1) % c->world;
+-        if (wait_relay(c, seq, prev) != 0) return -1;
+-        uint8_t *received = c->region + c->recv_off +
+-            ((size_t)prev * ROCE_SLOTS + slot) * c->slot_bytes;
+-        // Keep the original source slot at the destination. The two-slot
+-        // collective protocol keeps this receive buffer live through DMA:
+-        // origin cannot publish N+2 until the opposite rank has consumed N.
+-        if (post_peer(c, seq, nbytes, prev, next, received) != 0) return -1;
++        if (relay_both_directions(c, seq, nbytes) != 0) return -1;
+     }
+     c->ops_posted += 1;
+     for (int h = 0; h < c->n_hca; h++) {
+diff --git a/b12x/comm/roce/roce_oneshot.py b/b12x/comm/roce/roce_oneshot.py
+index 0910df8..1e472b1 100644
+--- a/b12x/comm/roce/roce_oneshot.py
++++ b/b12x/comm/roce/roce_oneshot.py
+@@ -598,6 +598,7 @@ class RoceOneshotAllReduce:
+             self._layout.flag_stride,
+             self.stripe_count,
+             self.device.index,
++            self.topology == "ring4",
+         )
+ 
+     def _gather_launcher_key(self) -> tuple[object, ...]:
+@@ -610,6 +611,7 @@ class RoceOneshotAllReduce:
+             self._layout.flag_stride,
+             self.stripe_count,
+             self.device.index,
++            self.topology == "ring4",
+         )
+ 
+     def _counter_addresses(self, blocks: int) -> tuple[int, int]:
+diff --git a/tests/comm/roce_proxy_fake/run.py b/tests/comm/roce_proxy_fake/run.py
+index 7e8e781..cdc79b4 100644
+--- a/tests/comm/roce_proxy_fake/run.py
++++ b/tests/comm/roce_proxy_fake/run.py
+@@ -70,3 +70,61 @@ for rank in range(4):
+         except ValueError: pass
+         else: raise AssertionError("invalid mixed peer widths accepted")
+ print("PASS: four-path mesh keeps neighbors on two paths and rejects malformed geometry")
++
++# Exercise the actual constructor/cache-key code without importing CUDA. The
++# C simulator above represents the GPU endpoint; these checks tie its flag
++# geometry to BOTH device launchers and prevent a stale prepared kernel reuse.
++import types
++for module, class_name in (("_oneshot_cute.py", "_RoceOneshotLaunch"),
++                           ("_allgather_cute.py", "_RoceAllGatherLaunch")):
++    source = root.parents[2] / "b12x/comm/roce" / module
++    tree = ast.parse(source.read_text())
++    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
++    kernel = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "kernel")
++    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"]
++    key = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_process_key")
++    namespace = {"_DTYPE_PACK_ELEMS": {"bfloat16": 8}}
++    exec(compile(ast.Module(body=[cls, key], type_ignores=[]), str(source), "exec"), namespace)
++    prefix = ("bfloat16",) if module == "_oneshot_cute.py" else ()
++    for width in (1, 2):
++        for rank in range(4):
++            args = prefix + (4, rank, 128, 2, 64, width)
++            launch = namespace[class_name](*args, True)
++            assert launch._hca_count == 2 * width and launch._neighbor_lanes == width
++            assert namespace["_process_key"](*args, 0, True) != namespace["_process_key"](*args, 0, False)
++            # Execute the kernel's actual active-flag selection, preserving
++            # its expressions rather than duplicating them in a simulator.
++            wait = next(n for n in ast.walk(kernel) if isinstance(n, ast.If)
++                        and isinstance(n.test, ast.Compare)
++                        and "self._world_size * self._hca_count" in ast.unparse(n.test))
++            select = ast.Module(body=wait.body[:4], type_ignores=[])
++            selected = []
++            for tid in range(4 * 2 * width):
++                env = dict(self=launch, tidx=tid, Int32=int,
++                           cutlass=types.SimpleNamespace(const_expr=lambda x:x))
++                exec(compile(select, str(source), "exec"), env)
++                if env["active"]: selected.append((env["peer"], env["hca"]))
++            expected = [(p, lane) for p in range(4) if p != rank
++                        for lane in range(2 * width if p == (rank+2)%4 else width)]
++            assert selected == expected
++    for width in (1, 2, 4):
++        launch = namespace[class_name](*(prefix + (4, 0, 128, 2, 64, width)))
++        assert launch._hca_count == width
++        assert launch._neighbor_lanes == (2 if width == 4 else width)
++print("PASS: both GPU launcher flag geometries and distinct ring4 cache keys")
++
++# query.topology describes RDMA capability, not the runtime's routing mode.
++# Preserve the latter explicitly through preparation and process launch keys.
++source = root.parents[2] / "b12x/comm/roce/_preparation.py"
++tree = ast.parse(source.read_text())
++query_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "query_from_runtime")
++namespace = dict(RoceQuery=types.SimpleNamespace, FrozenMapping=dict)
++exec(compile(ast.Module(body=[query_fn], type_ignores=[]), str(source), "exec"), namespace)
++for topology in ("direct", "ring4", "mesh4"):
++    runtime = types.SimpleNamespace(world_size=4, rank=0, hca_names=("a", "b"),
++        topology=topology, stripe_count=2, _threads=128,
++        _layout=types.SimpleNamespace(slots=2, flag_stride=64))
++    query = namespace["query_from_runtime"](runtime, surface="AllReduce.all_reduce",
++        call={}, topology="roce_rdma", peer_hosts=("a", "b", "c", "d"))
++    assert query.setup["ring4"] == (topology == "ring4")
++print("PASS: preparation preserves routing mode separately from RDMA capability")
+diff --git a/tests/comm/roce_proxy_fake/simulate.c b/tests/comm/roce_proxy_fake/simulate.c
+index f26255b..5337c58 100644
+--- a/tests/comm/roce_proxy_fake/simulate.c
++++ b/tests/comm/roce_proxy_fake/simulate.c
+@@ -22,6 +22,9 @@ static int world, ring4, stripes, rotate;
+ static uint64_t messages;
+ static unsigned posted_in_round[4];
+ static uint32_t posted_seq[4];
++static uint64_t direct_bytes[4][4], relay_bytes[4][4];
++static unsigned written_seq[4][4][4096 / 16];
++static unsigned char written_valid[4][4][4096 / 16];
+ 
+ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
+     (void)bad;
+@@ -59,6 +62,29 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr
+         } else {
+             assert(t->source >= c->region && t->source + t->bytes <= c->region + c->region_bytes);
+             assert(wr->sg_list->lkey == c->hca[qp->hca].mr->lkey);
++            if (ring4 == 1) {
++                size_t offset = (size_t)(t->dest - d->region - d->recv_off);
++                int origin = (int)(offset / (2 * d->slot_bytes));
++                assert(origin >= 0 && origin < world);
++                uint32_t seq;
++                assert(wr->next && (wr->next->send_flags & IBV_SEND_INLINE));
++                memcpy(&seq, (void *)(uintptr_t)wr->next->sg_list->addr, 4);
++                if (origin == qp->source) {
++                    assert(qp->dest == (origin + 1) % 4 || qp->dest == (origin + 3) % 4);
++                    direct_bytes[origin][qp->dest] += t->bytes;
++                } else {
++                    assert(qp->dest == (origin + 2) % 4);
++                    relay_bytes[qp->source][qp->dest] += t->bytes;
++                }
++                // Every pack reaches each consumer exactly once, even when
++                // the two routes deliver flags/data at very different times.
++                size_t begin = (offset % d->slot_bytes) / 16;
++                for (size_t i = begin; i < begin + t->bytes / 16; i++) {
++                    assert(!written_valid[origin][qp->dest][i] || written_seq[origin][qp->dest][i] != seq);
++                    written_valid[origin][qp->dest][i] = 1;
++                    written_seq[origin][qp->dest][i] = seq;
++                }
++            }
+         }
+         int path = -1;
+         for (int i = 0; i < peer_width(world, qp->source, qp->dest, stripes); i++)
+@@ -103,7 +129,11 @@ static void progress(void) {
+     pthread_mutex_unlock(&lock);
+ }
+ static uint32_t *flag(roce_ctx_t *c, int src, uint32_t seq, int lane) {
+-    return (uint32_t *)(c->region + c->flag_off + (((size_t)src * 2 + (seq & 1)) * stripes + lane) * ROCE_FLAG_STRIDE);
++    return (uint32_t *)(c->region + c->flag_off + (((size_t)src * 2 + (seq & 1)) * flag_lanes(c) + lane) * ROCE_FLAG_STRIDE);
++}
++static int receive_lanes(int rank, int peer) {
++    if (ring4 == 1 && peer == (rank + 2) % world) return 2 * stripes;
++    return peer_width(world, rank, peer, stripes);
+ }
+ static uint8_t pattern(int source, uint32_t seq, size_t i) { return (uint8_t)(source * 53 + seq * 7 + i * 11); }
+ static unsigned size_at(uint32_t seq) {
+@@ -112,6 +142,9 @@ static unsigned size_at(uint32_t seq) {
+ }
+ static void setup(uint32_t seed) {
+     memset(posted_in_round, 0, sizeof(posted_in_round));
++    memset(direct_bytes, 0, sizeof(direct_bytes));
++    memset(relay_bytes, 0, sizeof(relay_bytes));
++    memset(written_valid, 0, sizeof(written_valid));
+     uint64_t layout[7];
+     assert(!roce_layout(world, 4096, layout));
+     for (int r = 0; r < world; r++) {
+@@ -127,8 +160,9 @@ static void setup(uint32_t seed) {
+         }
+         int edge=0;
+         for (int p=0; p<world; p++) {
+-            for (int lane=0; lane<stripes; lane++) {
++            for (int lane=0; lane<flag_lanes(c); lane++)
+                 for (int slot=0; slot<2; slot++) *flag(c,p,slot,lane)=seed;
++            for (int lane=0; lane<stripes; lane++) {
+                 if (p==r || (ring4 == 1 && p==(r+2)%4) ||
+                     lane >= peer_width(world, r, p, stripes)) continue;
+                 int h = stripes == 4 ? (p == (r+2)%4 ? lane :
+@@ -143,6 +177,9 @@ static void setup(uint32_t seed) {
+     }
+     roce_blob_t blobs[4];
+     for(int r=0;r<world;r++) assert(!roce_local_blob(ranks[r], &blobs[r], sizeof(blobs[r])));
++    blobs[2].abi--;
++    assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
++    blobs[2].abi++;
+     // Mixed geometry must be rejected, including the rank without a direct QP.
+     blobs[2].ring4 ^= 1;
+     assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
+@@ -191,7 +228,7 @@ static void run(unsigned count, uint32_t seed) {
+             }
+             if(active[r]) {
+                 int ready=1;
+-                for(int p=0;p<world;p++) if(p!=r) for(int l=0;l<peer_width(world,r,p,stripes);l++)
++                for(int p=0;p<world;p++) if(p!=r) for(int l=0;l<receive_lanes(r,p);l++)
+                     ready &= __atomic_load_n(flag(c,p,seq,l),__ATOMIC_ACQUIRE)==seq;
+                 if(ready) {
+                     for(int p=0;p<world;p++) if(p!=r) {
+@@ -206,6 +243,19 @@ static void run(unsigned count, uint32_t seed) {
+     // Wait for the final operation to be posted on every proxy before teardown.
+     // GPU completion alone need not mean its own host proxy has finished.
+     for(int i=0;i<1000;i++) progress();
++    if (ring4 == 1) {
++        uint64_t total = 0;
++        for (unsigned i=1;i<=count;i++) total += size_at(seed+i);
++        for (int r=0;r<4;r++) {
++            int next=(r+1)%4, prev=(r+3)%4;
++            assert(direct_bytes[r][next] == total && direct_bytes[r][prev] == total);
++            assert(relay_bytes[r][next] + relay_bytes[r][prev] == total);
++            assert(relay_bytes[r][next] && relay_bytes[r][prev]);
++            uint64_t a=relay_bytes[r][next], b=relay_bytes[r][prev];
++            // At most one 16-byte remainder per lane and collective.
++            assert((a>b?a-b:b-a) <= (uint64_t)count*stripes*16);
++        }
++    }
+     cleanup();
+ }
+ static void failures(void) {
+@@ -223,21 +273,54 @@ static void failures(void) {
+     setup(0); c=ranks[0];
+     atomic_store(&c->running,1);
+     ctrl=(uint32_t *)(c->region+c->ctrl_off); ctrl[2]=1;
+-    assert(wait_relay(c,1,3)==-1); atomic_store(&c->running,0); cleanup();
++    assert(relay_both_directions(c,1,16)==-1); atomic_store(&c->running,0); cleanup();
+     setup(0); c=ranks[0]; atomic_store(&c->running,1);
+     __atomic_store_n(flag(c,3,1,0),3,__ATOMIC_RELEASE);
+-    assert(wait_relay(c,1,3)==-1); atomic_store(&c->running,0); cleanup();
++    assert(relay_both_directions(c,1,16)==-1); atomic_store(&c->running,0); cleanup();
+ }
++
++static void independent_directions(void) {
++    // Publish only one neighbour's input. It must be forwarded while the
++    // other neighbour is still absent, in BOTH choices of delayed direction.
++    for (int ready_peer=1;ready_peer<=3;ready_peer+=2) {
++        setup(0);
++        roce_ctx_t *c=ranks[0];
++        const uint32_t seq=1, bytes=128;
++        uint8_t *recv=c->region+c->recv_off+((size_t)ready_peer*2+1)*c->slot_bytes;
++        for (unsigned i=0;i<bytes;i++) recv[i]=pattern(ready_peer,seq,i);
++        for (int lane=0;lane<stripes;lane++)
++            __atomic_store_n(flag(c,ready_peer,seq,lane),seq,__ATOMIC_RELEASE);
++        uint32_t *ctrl=(uint32_t *)(c->region+c->ctrl_off);
++        assert(!roce_start(c));
++        __atomic_store_n(&ctrl[5],bytes,__ATOMIC_RELEASE);
++        __atomic_store_n(ctrl,seq,__ATOMIC_RELEASE);
++        int dest=(ready_peer+2)%4, direction=ready_peer==3?0:1, ready=0;
++        for (int attempt=0;attempt<10000 && !ready;attempt++) {
++            progress();
++            ready=1;
++            for (int lane=0;lane<stripes;lane++)
++                ready &= __atomic_load_n(flag(ranks[dest],ready_peer,seq,2*lane+direction),__ATOMIC_ACQUIRE)==seq;
++            if (!ready) usleep(10);
++        }
++        assert(ready);
++        for (int lane=0;lane<stripes;lane++)
++            assert(__atomic_load_n(flag(ranks[dest],ready_peer,seq,2*lane+1-direction),__ATOMIC_ACQUIRE)==0);
++        roce_stop(c); // Other direction still missing; stop must unblock it.
++        assert(roce_failed(c));
++        cleanup();
++    }
++}
++
+ int main(void) {
+     for(stripes=1;stripes<=2;stripes++) {
+         world=3;ring4=0;run(1000,0);
+         world=4;ring4=1;run(3000,0);run(1000,UINT32_MAX-100);
+-        failures();
++        failures(); independent_directions();
+         world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+     }
+     stripes=4;world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+     rotate=1;run(3000,0);run(1000,UINT32_MAX-100);rotate=0;
+-    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, fixed/rotating posts, 26000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
++    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, 26000 collectives, bidirectional byte balance, independent directions, no duplicate packs, wrap, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+diff --git a/tests/comm/test_roce_preparation_compile.py b/tests/comm/test_roce_preparation_compile.py
+index 3d4ed8a..163c3d6 100644
+--- a/tests/comm/test_roce_preparation_compile.py
++++ b/tests/comm/test_roce_preparation_compile.py
+@@ -11,7 +11,8 @@ from b12x._lib.compile_plan import compiled_program_available, program_keys, loa
+ 
+ 
+ @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA compilation")
+-def test_compile_declared_dtypes():
++@pytest.mark.parametrize("ring4,width", [(False, 2), (True, 1), (True, 2)])
++def test_compile_declared_dtypes(ring4, width):
+     dtypes = (torch.float16, torch.bfloat16, torch.float32)
+     query = RoceQuery(
+         surface="AllReduce.all_reduce",
+@@ -23,7 +24,8 @@ def test_compile_declared_dtypes():
+         call=FrozenMapping({
+             "dtypes": ("float16", "bfloat16", "float32"),
+         }),
+-        setup=FrozenMapping({"threads": 512, "slots": 2, "flag_stride": 16, "hca_count": 2}),
++        setup=FrozenMapping({"threads": 512, "slots": 2, "flag_stride": 16,
++                             "hca_count": width, "ring4": ring4}),
+     )
+     payload = TUNING.encode_query(query)
+     ordinal = torch.cuda.current_device()
+-- 
+2.54.0 (Apple Git-157)
+

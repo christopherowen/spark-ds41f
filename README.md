@@ -4,21 +4,26 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric.
 
 The deployment tools also generate and validate a
-[four-node switchless ring profile](docs/switchless-topology.md), using NCCL
-neighbour collectives, plus an experimental
-[RoCEnante neighbour relay](experiments/2026-10-02-rocenante-ring4/README.md).
-Four-node relay serving passes the main quality, decode, prefill and admission
-screen; tuned NCCL improves prefill by about 23% in a matched TP4 comparison.
-Sustained-load cooling and full-context qualification remain open. See the
+[four-node switchless ring profile](docs/switchless-topology.md) with the
+balanced [RoCEnante ring relay](experiments/2026-10-02-rocenante-ring4/README.md)
+and tuned NCCL. Its [TP4 1M recipe](experiments/2026-10-04-tp4-memory-tuning/README.md)
+serves the checkpoint's full 1,048,576-token context with 16 sequences on the
+same image as the three-node deployment, and was benchmarked at those limits
+(see [Performance](#performance)). See the
 [serving decision](experiments/2026-10-03-collective-serving/decision.md),
 [hardware results](experiments/2026-10-02-rocenante-mesh4/README.md) and
 [four-path transport comparison](experiments/2026-10-02-mesh4-fourpaths/README.md).
-The promoted configuration below remains the measured three-node deployment.
+The promoted configuration below is the three-node deployment.
 
 Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profiles/README.md)
 keep the measured limits and NCCL settings together. `bin/spark3 tuning show tp4`
-shows the candidate settings; `tuning create` generates a complete configuration
+shows the TP4 recipe; `tuning create` generates a complete configuration
 for a site node map. The generated configuration starts with launch disabled.
+
+The TileLang kernel family (TileLang, DeepSeek's TileKernels and sparknet
+collectives in place of B12X's kernels) is developed on the `tilelang-1m`
+branch; its TP3 and TP4 configurations were benchmarked against r5p's in the
+same windows.
 
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
@@ -28,7 +33,8 @@ state, or an experiment.
 ## Current baseline
 
 The active baseline is recorded in
-[manifests/baselines/2026-10-02-karmic-kraken-r5o-64k.json](manifests/baselines/2026-10-02-karmic-kraken-r5o-64k.json):
+[manifests/baselines/2026-10-05-karmic-kraken-r5p.json](manifests/baselines/2026-10-05-karmic-kraken-r5p.json)
+([promotion record](experiments/2026-10-05-r5p-promotion/README.md)):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
@@ -43,21 +49,32 @@ The active baseline is recorded in
   score ties by position, so selections repeat, and its dense GEMM and prefill
   kernels fence shared-memory stage reads before the TMA refill), with B12X attention,
   linear, MoE, and mHC kernels and L2 weight prefetch during decode (the
-  next layer's weights stream into L2 while latency-bound kernels run);
+  next layer's weights stream into L2 while latency-bound kernels run); the
+  image also carries B12X's four-node RoCEnante relay and mesh transports,
+  inactive on the triangle;
 - NCCL 2.30.7 rebuilt with the AArch64 InfiniBand send-path fence
-  (NVIDIA/nccl#2393), which prevents a proxy-thread hang;
-- DeepSeek V4.1 Flash native FP8/FP4 weights, unchanged, with the vision
-  tower loaded (up to four images per request); the embedding and output-head
-  weights (842.5 MiB per rank) live in the GB10 display carve-out, the
-  firmware's scanout reserve that ordinary allocations never use, which frees
-  that memory for the KV cache while the text console keeps its framebuffer;
+  (NVIDIA/nccl#2393), which prevents a proxy-thread hang, and the four-node
+  switchless ring patches (bidirectional rings, balanced channels);
+- DeepSeek V4.1 Flash native FP8/FP4/BF16 weights, every served weight bit as
+  the checkpoint stores it, with the vision tower loaded (up to four images
+  per request); the output head is stored in an exact 12-bit packed form of
+  its BF16 weights (a sign-and-mantissa byte and a 4-bit exponent code, with
+  out-of-window values kept in a per-row list), and the embedding and output
+  head live in the GB10 display carve-out, the firmware's scanout reserve
+  that ordinary allocations never use, loaded there directly from the
+  checkpoint while the text console keeps its framebuffer;
 - the ratio-2 compressor carries its open pair across decode steps, so
   compressed entries for generated tokens match the ones prefill builds;
 - DSpark speculative decoding with five draft tokens (the drafter's trained
   block) and block rejection, full CUDA graphs for decode batches up to 48
   tokens; verification rows whose drafts are unlikely to survive skip the
-  routed experts, and greedy drafts stay sharded by vocabulary over an NVFP4
-  drafter head and Markov projection;
+  routed experts, and greedy drafts stay sharded by vocabulary over the
+  checkpoint's BF16 drafter head (the target head's own tensor) and Markov
+  projection;
+- the requested RoCE collective policy is enforced: a declined or lost RoCE
+  backend fails startup rather than falling back to another path, and the
+  fabricated context of startup profiling gives each KV cache group its own
+  blocks;
 - sequence-parallel prefill once a prompt chunk's reduce-scatter outgrows
   the one-shot RoCE all-reduce (205 tokens): the encoder layers' row-wise
   work runs on a third of the rows per rank, and so does the sparse-attention
@@ -86,26 +103,44 @@ To reproduce the deployment on your own three Sparks, follow
 
 ## Performance
 
-The selected 64 KiB profile passed the LRU gate 5/5 and four simultaneous
-485K-token contexts with 4,096-token replies, zero preemptions and at least
-5.83 GiB host memory available. Near-limit retrieval passed 3/3 at 519,142
-tokens. Its current screen (three samples per decode
-point, reasoning enabled) measured:
+The r5p acceptance benchmark (2026-10-05, `bin/spark3 bench` from dgx1:
+quality, then prose and code prompts with reasoning on, temperature 0, 256
+output tokens, three samples per decode point, and real source text for
+prefill) measured, on the three-node deployment against r5o's 64 KiB
+reference:
 
-| Workload | 64 KiB profile |
+| Workload | r5o | r5p |
+| --- | ---: | ---: |
+| Quality gate (fixed LRU task, 5 repeats) | 5/5 | 5/5 |
+| Prose, 1 / 2 / 4 / 8 streams (aggregate tok/s) | 52.8 / 79.4 / 117.9 / 171.2 | 50.4 / 75.9 / 118.8 / 173.3 |
+| Code, 1 / 2 / 4 / 8 streams | 64.8 / 90.7 / 135.6 / 195.8 | 60.1 / 90.8 / 136.3 / 192.3 |
+| One-stream prose / code step time | 40.84 / 45.36 ms | 41.92 / 46.44 ms |
+| Source-text prefill, 32K / 256K / 500K | 3.77K / 3.68K / - tok/s | 3.78K / 3.63K / 3.43K tok/s |
+| Lowest MemAvailable, dgx1 | 5.83 GiB | 5.93 GiB |
+
+Every point is the same as r5o within its interval. Single-stream steps are
+1.1 ms longer because the drafter reads the checkpoint's BF16 heads instead
+of NVFP4 re-quantizations; the packed output head recovers part of that.
+
+The TP4 1M recipe on four Sparks, same image and protocol, up to 16 streams
+and 1M-token prefill:
+
+| Workload | TP4 1M recipe |
 | --- | ---: |
-| One-stream prose / code | 52.8 / 64.8 tok/s |
-| Eight-stream prose / code | 171.2 / 195.8 tok/s aggregate |
-| One-stream prose / code step time | 40.84 / 45.36 ms |
-| Source-text prefill, 32K / 64K / 256K | 3.77K / 3.80K / 3.68K tok/s |
-| 32K prefix replay, cold / warm | 6.55 / 0.27 s |
+| Prose, 1 / 2 / 4 / 8 / 16 streams | 62.1 / 92.7 / 141.6 / 215.7 / 297.3 |
+| Code, 1 / 2 / 4 / 8 / 16 streams | 72.5 / 111.3 / 168.3 / 245.7 / 323.5 |
+| One-stream prose / code step time | 34.00 / 37.72 ms |
+| Source-text prefill, 32K / 256K / 1M | 5.12K / 4.87K / 4.03K tok/s |
+| KV capacity | 8,580,566 tokens in 10.5 GiB per rank (8.18 full 1M windows) |
+| Lowest MemAvailable | 20.4 GiB (dgx1) |
 
-The [native benchmark report](manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json)
-records intervals, prompts, memory and thermal results. This establishes the
-new capacity baseline. Quantifying the page-size effect on speed would require
-a paired 4 KiB run.
-See the [deployment record](experiments/2026-10-02-memory-saver-capacity/README.md)
-for the original run and the sustained-admission check.
+The native benchmark reports
+([TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json),
+[TP4](experiments/2026-10-05-r5p-promotion/runs/tp4-bench.json)) record
+intervals, prompts, memory and thermal results. The
+[64 KiB deployment record](experiments/2026-10-02-memory-saver-capacity/README.md)
+covers the TP3 profile's long-context admission (four simultaneous 485K-token
+contexts) and near-limit retrieval (3/3 at 519,142 tokens), measured on r5o.
 
 The tables below retain the historical **4 KiB r5l** reference (r5o added the
 top-k tie rule and TMA stage-release fences). These were measured with

@@ -60,6 +60,31 @@ CuTe compile-cache integrity check (#418, `2fca4df8`).
   `experiments/2026-09-30-r5o`. 0001-0005 on the base yield patch head
   `bb40849f` and tree `1a8b9401`.
 
+- `0006-rocenante-ring4.patch` through `0011-loader-abi.patch` are the
+  four-node transports, inactive on the triangle's direct peers: 0006 relays
+  opposite-rank payloads over a switchless ring (neighbour QPs only), 0007
+  opens NIC-forwarded mesh QPs, 0008 stripes opposite-peer payloads over four
+  mesh paths, 0009 splits the ring relay across both directions, 0010
+  separates the collective dispatch ceiling from the registered RoCE capacity
+  (`B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES`) so NCCL takes intermediate
+  payloads, and 0011 keeps the Python loader's ABI check on the version-10
+  proxy. GPU kernels and reduction order are unchanged; each was tested with
+  the real proxy under simulated verbs and sanitizers. From
+  `experiments/2026-10-02-rocenante-ring4`, `-rocenante-mesh4`,
+  `-mesh4-fourpaths`, `experiments/2026-10-03-ring4-bidirectional` and
+  `-balanced-policy`; the TP4 recipe serves on the ring relay. Upstream
+  status: local experiments, not submitted.
+
+- `0012-packed-bf16-vocab-projection.patch` adds a vocabulary projection over
+  an exact 12-bit packed form of BF16 weights: a sign-and-mantissa byte and a
+  4-bit exponent code over a 15-exponent window per tensor, with out-of-window
+  values kept exactly in a per-row list added after the main dot product.
+  Packing refuses unless every value decodes back bit for bit. From
+  `experiments/2026-10-03-packed-bf16-head`. 0001-0012 on the base yield patch
+  head `97dc180b` and tree `7f666380`, the r5p image.
+
+`series-r5o` keeps the r5o series (0001-0005) for the records that pinned it.
+
 Not in the series: the W4A8 tiny-decode `swiglu_limit` fix
 (`experiments/2026-09-23-karmic-kraken-reference/patches/b12x/0002-tiny-decode-swiglu-limit.patch`)
 is an upstream contribution. The promoted runtime disables tiny decode instead

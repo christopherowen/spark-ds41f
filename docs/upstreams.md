@@ -14,16 +14,21 @@ local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
                                parameters, multimodal block hashes;
                                dead verification rows; sequence-
                                parallel prefill; one-read custom-op
-                               defaults; other DSpark tools off by
-                               default)
+                               defaults; explicit collective policy;
+                               packed BF16 output head; vocabulary
+                               weights loaded into the display carve-
+                               out; disjoint profiling-context blocks;
+                               other DSpark tools off by default)
                     \
 local-inference-lab/b12x integration/karmic-kraken-beta @ f8069b2c
         + patches/b12x/series (switchless RoCEnante routing, CuTe DSL 4.7.1,
-          top-k position ties, TMA stage-release fences)
-                     ---- vllm-ds41f-kkref:04c30fa98e79-r5o (sha256:288fc5bd…)
+          top-k position ties, TMA stage-release fences, four-node relay
+          and mesh transports, packed BF16 vocabulary projection)
+                     ---- vllm-ds41f-kkref:04c30fa98e79-r5p (sha256:4995e0d3…)
                     /
 NVIDIA/nccl v2.30.7-1 @ 73cf1122
-        + patches/nccl/series (IB send-path fence), replacing the base
+        + patches/nccl/series (IB send-path fence, bidirectional switchless
+          rings, balanced channels), replacing the base
           image's nvidia-nccl-cu13 libnccl.so.2
 
 deepseek-ai/DeepSeek-V4.1-Flash @ dba1be0a (unchanged; TP3 head padding is in

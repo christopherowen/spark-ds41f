@@ -1,0 +1,498 @@
+From 6056b0a181a5388a7a77e4192121d89a0a42d426 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 21:55:00 +0000
+Subject: [PATCH] Stripe opposite-peer payloads over four reciprocal mesh paths
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be plus deployment patches 0001-0007.
+
+Rationale: retain two direct neighbor paths and use four paths for the opposite peer. Mixed-width mesh geometry uses four flag slots and waits only on active paths. B12X_ROCE_MESH_ROTATE optionally rotates HCA and traffic-class posting order without changing the byte split or introducing a completion barrier. ABI 8 rejects incompatible geometry and rotation settings.
+
+Quality: payload byte offsets and fixed-rank GPU arithmetic are unchanged. The GPU completion predicate includes all four opposite-path flags and two neighbor flags; inactive neighbor slots are excluded. Malformed path counts and duplicate neighbor HCAs fail closed.
+
+Tests: 26,000 real-proxy simulated collectives under ASan/UBSan, fixed and rotating posts, delayed DMA, uneven small payloads, sequence wrap, geometry mismatch and stop/error tests. Simulator verifies posting order and every delivered byte. Hardware qualification remains required.
+
+Upstream-status: local experiment; not submitted.
+---
+ b12x/comm/roce/_allgather_cute.py     |   5 +-
+ b12x/comm/roce/_oneshot_cute.py       |   5 +-
+ b12x/comm/roce/_proxy.py              |   6 +-
+ b12x/comm/roce/_roce_proxy.c          | 100 ++++++++++++++++++++++----
+ b12x/comm/roce/roce_oneshot.py        |  10 ++-
+ tests/comm/roce_proxy_fake/run.py     |  16 +++++
+ tests/comm/roce_proxy_fake/simulate.c |  45 +++++++++---
+ 7 files changed, 159 insertions(+), 28 deletions(-)
+
+diff --git a/b12x/comm/roce/_allgather_cute.py b/b12x/comm/roce/_allgather_cute.py
+index 0c4de63..6be72d6 100644
+--- a/b12x/comm/roce/_allgather_cute.py
++++ b/b12x/comm/roce/_allgather_cute.py
+@@ -195,7 +195,10 @@ class _RoceAllGatherLaunch:
+             if Int32(tidx) < Int32(self._world_size * self._hca_count):
+                 peer = Int32(tidx) // Int32(self._hca_count)
+                 hca = Int32(tidx) - peer * Int32(self._hca_count)
+-                if peer != Int32(self._rank):
++                active = peer != Int32(self._rank)
++                if cutlass.const_expr(self._hca_count == 4):
++                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(2)))
++                if active:
+                     flag_addr = flag_base + (
+                         (Int64(peer) * Int64(self._slots) + slot)
+                         * Int64(self._hca_count)
+diff --git a/b12x/comm/roce/_oneshot_cute.py b/b12x/comm/roce/_oneshot_cute.py
+index 7b00a27..50a2d2e 100644
+--- a/b12x/comm/roce/_oneshot_cute.py
++++ b/b12x/comm/roce/_oneshot_cute.py
+@@ -262,7 +262,10 @@ class _RoceOneshotLaunch:
+             if Int32(tidx) < Int32(self._world_size * self._hca_count):
+                 peer = Int32(tidx) // Int32(self._hca_count)
+                 hca = Int32(tidx) - peer * Int32(self._hca_count)
+-                if peer != Int32(self._rank):
++                active = peer != Int32(self._rank)
++                if cutlass.const_expr(self._hca_count == 4):
++                    active = active & ((peer == Int32((self._rank + 2) % self._world_size)) | (hca < Int32(2)))
++                if active:
+                     flag_addr = flag_base + (
+                         (Int64(peer) * Int64(self._slots) + slot)
+                         * Int64(self._hca_count)
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index a73f915..e158812 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 6:
++        if lib.roce_abi_version() != 8:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+@@ -208,7 +208,7 @@ class Proxy:
+         if len(peer_hca_indices) != int(world_size):
+             raise ValueError("peer HCA routes must cover the entire process group")
+         flat_routes = [
+-            -1 if not peer_hca_indices[peer] else int(peer_hca_indices[peer][lane])
++            -1 if lane >= len(peer_hca_indices[peer]) else int(peer_hca_indices[peer][lane])
+             for peer in range(int(world_size))
+             for lane in range(int(stripe_count))
+         ]
+@@ -282,6 +282,8 @@ class Proxy:
+             "ops_posted": int(self._lib.roce_stat(self._ctx, 0)),
+             "writes_completed": int(self._lib.roce_stat(self._ctx, 1)),
+             "last_seq": int(self._lib.roce_stat(self._ctx, 2)),
++            "path_slots": int(self._lib.roce_stat(self._ctx, 3)),
++            "mesh_rotate": int(self._lib.roce_stat(self._ctx, 4)),
+             "writes_completed_per_hca": [
+                 int(self._lib.roce_hca_stat(self._ctx, hca, 0))
+                 for hca in range(len(self.hca_names))
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index 0217ad5..889341c 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -38,19 +38,19 @@
+ 
+ #define ROCE_MAX_PEERS 16
+ #define ROCE_MAX_LOCAL_HCAS 4
+-#define ROCE_MAX_STRIPES 2
++#define ROCE_MAX_STRIPES 4
+ #define ROCE_SLOTS 2
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 6
++#define ROCE_ABI_VERSION 8
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+ #define ROCE_IDLE_SPINS 20000000
+ 
+ typedef struct {
+-    uint32_t abi, world, rank, ring4;
++    uint32_t abi, world, rank, ring4, mesh_rotate;
+     uint64_t slot_bytes;
+     uint64_t region_addr;
+     uint32_t rkey[ROCE_MAX_LOCAL_HCAS];
+@@ -81,6 +81,7 @@ typedef struct {
+     int world;
+     int rank;
+     int ring4;
++    int mesh_rotate;
+     int n_hca;
+     int n_stripes;
+     int gid_index;
+@@ -246,6 +247,10 @@ static int open_hca(roce_ctx_t *c, int h, const char *name) {
+     return 0;
+ }
+ 
++static int peer_width(int world, int rank, int peer, int stripes) {
++    return stripes == 4 && peer != (rank + 2) % world ? 2 : stripes;
++}
++
+ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n_hca,
+                         const int *route_hca, int n_stripes, int gid_index,
+                         int traffic_class, int ring4,
+@@ -256,7 +261,8 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_LOCAL_HCAS ||
+         n_stripes < 1 || n_stripes > ROCE_MAX_STRIPES || route_hca == NULL ||
+         traffic_class < 0 || traffic_class > 255 ||
+-        (ring4 < 0 || ring4 > 2) || (ring4 && world != 4)) {
++        (ring4 < 0 || ring4 > 2) || (ring4 && world != 4) ||
++        (n_stripes > 2 && (n_stripes != 4 || ring4 != 2 || n_hca != 4))) {
+         snprintf(err, err_len, "invalid roce runtime geometry");
+         return NULL;
+     }
+@@ -272,6 +278,13 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         }
+         for (int lane = 0; lane < n_stripes; lane++) {
+             int h = route_hca[p * n_stripes + lane];
++            if (lane >= peer_width(world, rank, p, n_stripes)) {
++                if (h != -1) {
++                    snprintf(err, err_len, "unused neighbor path has a route");
++                    return NULL;
++                }
++                continue;
++            }
+             if (h < 0 || h >= n_hca) {
+                 snprintf(err, err_len,
+                          "invalid HCA route for peer %d lane %d: %d", p, lane, h);
+@@ -286,11 +299,35 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+             }
+         }
+     }
++    if (n_stripes == 4) {
++        unsigned used = 0;
++        for (int p = 0; p < world; p++) {
++            if (p == rank || p == (rank + 2) % world) continue;
++            for (int lane = 0; lane < 2; lane++) {
++                unsigned bit = 1u << route_hca[p * n_stripes + lane];
++                if (used & bit) {
++                    snprintf(err, err_len, "neighbor paths must cover four distinct HCAs");
++                    return NULL;
++                }
++                used |= bit;
++            }
++        }
++    }
+     roce_ctx_t *c = calloc(1, sizeof(*c));
+     if (c == NULL) {
+         snprintf(err, err_len, "out of memory");
+         return NULL;
+     }
++    const char *rotate = getenv("B12X_ROCE_MESH_ROTATE");
++    if (rotate && strcmp(rotate, "0") && strcmp(rotate, "1")) {
++        snprintf(err, err_len, "B12X_ROCE_MESH_ROTATE must be 0 or 1");
++        free(c); return NULL;
++    }
++    c->mesh_rotate = rotate && !strcmp(rotate, "1");
++    if (c->mesh_rotate && n_stripes != 4) {
++        snprintf(err, err_len, "rotating posts require four mesh paths");
++        free(c); return NULL;
++    }
+     c->world = world;
+     c->rank = rank;
+     c->ring4 = ring4;
+@@ -330,6 +367,7 @@ int roce_local_blob(roce_ctx_t *c, void *out, uint64_t out_len) {
+     blob.world = c->world;
+     blob.rank = c->rank;
+     blob.ring4 = c->ring4;
++    blob.mesh_rotate = c->mesh_rotate;
+     blob.slot_bytes = c->slot_bytes;
+     blob.region_addr = (uint64_t)(uintptr_t)c->region;
+     blob.n_hca = (uint8_t)c->n_hca;
+@@ -412,14 +450,16 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+             all[p].rank != (uint32_t)p || all[p].ring4 != (uint32_t)c->ring4 ||
+             all[p].slot_bytes != c->slot_bytes ||
+             all[p].n_hca < 1 || all[p].n_hca > ROCE_MAX_LOCAL_HCAS ||
+-            all[p].n_stripes != c->n_stripes) {
++            all[p].n_stripes != c->n_stripes ||
++            all[p].mesh_rotate != (uint32_t)c->mesh_rotate) {
+             snprintf(c->err, sizeof(c->err), "rank %d published incompatible transport geometry", p);
+             return -1;
+         }
+         for (int q = 0; q < c->world; q++) {
+             for (int lane = 0; lane < c->n_stripes; lane++) {
+                 unsigned h = all[p].route_hca[q][lane];
+-                if (adjacent(c->world, p, q, c->ring4)
++                if ((adjacent(c->world, p, q, c->ring4) &&
++                     lane < peer_width(c->world, p, q, c->n_stripes))
+                         ? (h >= all[p].n_hca || !all[p].qp_num[h][q])
+                         : h != UINT8_MAX) {
+                     snprintf(c->err, sizeof(c->err), "rank %d published invalid route to %d", p, q);
+@@ -431,7 +471,7 @@ int roce_connect(roce_ctx_t *c, const void *blobs, uint64_t blobs_len) {
+     for (int p = 0; p < c->world; p++) {
+         if (!adjacent(c->world, c->rank, p, c->ring4)) continue;
+         c->peer_addr[p] = all[p].region_addr;
+-        for (int lane = 0; lane < c->n_stripes; lane++) {
++        for (int lane = 0; lane < peer_width(c->world, c->rank, p, c->n_stripes); lane++) {
+             int local_h = c->route_hca[p][lane];
+             int remote_h = all[p].route_hca[c->rank][lane];
+             if (remote_h < 0 || remote_h >= all[p].n_hca) {
+@@ -470,13 +510,16 @@ static int drain_cq(roce_ctx_t *c, int h) {
+     return 0;
+ }
+ 
+-static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+-                     int origin, int p, uint8_t *send) {
++static int post_path(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
++                     int origin, int p, uint8_t *send, int lane) {
+     uint32_t slot = seq & 1u;
+     uint32_t seq_copy = seq;
+     uint32_t total_packs = nbytes / 16;
+-    uint32_t pack_offset = 0;
+-    for (int lane = 0; lane < c->n_stripes; lane++) {
++    uint32_t width = (uint32_t)peer_width(c->world, c->rank, p, c->n_stripes);
++    uint32_t remainder = total_packs % width;
++    uint32_t pack_offset = (uint32_t)lane * (total_packs / width) +
++        ((uint32_t)lane < remainder ? (uint32_t)lane : remainder);
++    {
+         int h = c->route_hca[p][lane];
+         roce_hca_t *hca = &c->hca[h];
+         // Two work requests per stripe; keep the queue at most a quarter
+@@ -495,8 +538,8 @@ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+                 return -1;
+             }
+         }
+-        uint32_t stripe_packs = total_packs / (uint32_t)c->n_stripes;
+-        if ((uint32_t)lane < total_packs % (uint32_t)c->n_stripes) {
++        uint32_t stripe_packs = total_packs / width;
++        if ((uint32_t)lane < total_packs % width) {
+             stripe_packs += 1;
+         }
+         uint32_t stripe_bytes = stripe_packs * 16;
+@@ -550,11 +593,17 @@ static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
+         }
+         hca->outstanding[p] += 1;
+         hca->bytes_posted += stripe_bytes;
+-        pack_offset += stripe_packs;
+     }
+     return 0;
+ }
+ 
++static int post_peer(roce_ctx_t *c, uint32_t seq, uint32_t nbytes,
++                     int origin, int p, uint8_t *send) {
++    for (int lane = 0; lane < peer_width(c->world, c->rank, p, c->n_stripes); lane++)
++        if (post_path(c, seq, nbytes, origin, p, send, lane) != 0) return -1;
++    return 0;
++}
++
+ static int wait_relay(roce_ctx_t *c, uint32_t seq, int origin) {
+     struct timespec start, now;
+     clock_gettime(CLOCK_MONOTONIC, &start);
+@@ -609,10 +658,29 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+     }
+     uint32_t slot = seq & 1u;
+     uint8_t *send = c->region + c->send_off + (size_t)slot * c->slot_bytes;
++    if (c->mesh_rotate) {
++        // Equal byte striping is independent of submission order. Give each
++        // HCA one write before the next round; rotate first HCA and class.
++        int opposite = (c->rank + 2) % c->world;
++        int first = (c->rank + (int)(seq & 3u)) % c->n_hca;
++        for (int round = 0; round < 2; round++) {
++            int want_opposite = (round + (int)(seq & 1u)) % 2;
++            for (int offset = 0; offset < c->n_hca; offset++) {
++                int h = (first + offset) % c->n_hca;
++                for (int p = 0; p < c->world; p++) {
++                    if (p == c->rank || ((p == opposite) != want_opposite)) continue;
++                    for (int lane = 0; lane < peer_width(c->world, c->rank, p, c->n_stripes); lane++)
++                        if (c->route_hca[p][lane] == h &&
++                            post_path(c, seq, nbytes, c->rank, p, send, lane) != 0) return -1;
++                }
++            }
++        }
++    } else {
+     for (int p = 0; p < c->world; p++) {
+         if (adjacent(c->world, c->rank, p, c->ring4) &&
+             post_peer(c, seq, nbytes, c->rank, p, send) != 0) return -1;
+     }
++    }
+     if (c->ring4 == 1) {
+         int prev = (c->rank + c->world - 1) % c->world;
+         int next = (c->rank + 1) % c->world;
+@@ -726,6 +794,10 @@ uint64_t roce_stat(roce_ctx_t *c, int which) {
+         return c->writes_completed;
+     case 2:
+         return c->last_seq;
++    case 3:
++        return c->n_stripes;
++    case 4:
++        return c->mesh_rotate;
+     default:
+         return 0;
+     }
+diff --git a/b12x/comm/roce/roce_oneshot.py b/b12x/comm/roce/roce_oneshot.py
+index e01ae13..0910df8 100644
+--- a/b12x/comm/roce/roce_oneshot.py
++++ b/b12x/comm/roce/roce_oneshot.py
+@@ -202,7 +202,12 @@ def _resolve_hca_topology(
+             f"missing={missing}, extra={extra}"
+         )
+     widths = {len(route) for route in normalized.values()}
+-    if len(widths) != 1 or not widths or not 1 <= next(iter(widths)) <= MAX_STRIPES:
++    four_path = (topology == "mesh4" and len(normalized.get((rank + 2) % 4, ())) == 4)
++    if four_path:
++        if any(len(route) != (4 if peer == (rank + 2) % 4 else 2)
++               for peer, route in normalized.items()):
++            raise ValueError("four-path mesh requires two neighbor and four opposite paths")
++    elif len(widths) != 1 or not widths or not 1 <= next(iter(widths)) <= MAX_STRIPES:
+         raise ValueError(
+             f"every peer HCA route must use the same 1..{MAX_STRIPES} stripe count"
+         )
+@@ -226,7 +231,7 @@ def _resolve_hca_topology(
+     routes = tuple(
+         normalized.get(peer, ()) for peer in range(world_size)
+     )
+-    return names, routes, next(iter(widths))
++    return names, routes, 4 if four_path else next(iter(widths))
+ 
+ 
+ def is_supported(device: torch.device | int | str | None = None) -> bool:
+@@ -468,6 +473,7 @@ class RoceOneshotAllReduce:
+                 peer_stripes = tuple(s[2].get("peer_stripes", ()))
+                 expected = tuple(
+                     0 if peer == i or (self.topology == "ring4" and peer == (i + 2) % 4)
++                    else 2 if reference["hca_count"] == 4 and peer != (i + 2) % 4
+                     else reference["hca_count"]
+                     for peer in range(self.world_size)
+                 )
+diff --git a/tests/comm/roce_proxy_fake/run.py b/tests/comm/roce_proxy_fake/run.py
+index 8d56a83..7e8e781 100644
+--- a/tests/comm/roce_proxy_fake/run.py
++++ b/tests/comm/roce_proxy_fake/run.py
+@@ -54,3 +54,19 @@ for rank in range(4):
+     assert stripes == 2 and result[rank] == ()
+     assert all(result[p] == routes[p] for p in routes)
+ print("PASS: Python mesh4 full peer routing")
++
++for rank in range(4):
++    routes = {(rank+1)%4: ("a", "b"), (rank-1)%4: ("c", "d"),
++              (rank+2)%4: ("a", "c", "b", "d")}
++    names, result, slots = resolve(world_size=4, rank=rank, hca_names=None,
++        peer_hca_names=routes, gid_index=3, topology="mesh4")
++    assert slots == 4 and len(names) == 4
++    assert len(result[(rank+2)%4]) == 4
++    for peer in ((rank+1)%4, (rank-1)%4): assert len(result[peer]) == 2
++    for width in (1, 3, 4):
++        bad = dict(routes); bad[(rank+1)%4] = tuple("abcd"[:width])
++        try: resolve(world_size=4, rank=rank, hca_names=None,
++            peer_hca_names=bad, gid_index=3, topology="mesh4")
++        except ValueError: pass
++        else: raise AssertionError("invalid mixed peer widths accepted")
++print("PASS: four-path mesh keeps neighbors on two paths and rejects malformed geometry")
+diff --git a/tests/comm/roce_proxy_fake/simulate.c b/tests/comm/roce_proxy_fake/simulate.c
+index 5ab8d6d..f26255b 100644
+--- a/tests/comm/roce_proxy_fake/simulate.c
++++ b/tests/comm/roce_proxy_fake/simulate.c
+@@ -18,13 +18,30 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+ static roce_ctx_t *ranks[4];
+ static uint32_t rng = 1;
+ static unsigned random_u32(void) { rng ^= rng << 13; rng ^= rng >> 17; return rng ^= rng << 5; }
+-static int world, ring4, stripes;
++static int world, ring4, stripes, rotate;
+ static uint64_t messages;
++static unsigned posted_in_round[4];
++static uint32_t posted_seq[4];
+ 
+ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
+     (void)bad;
+     assert(qp && qp->source != qp->dest);
+     if (ring4 == 1) assert((qp->source + 2) % 4 != qp->dest);
++    if (rotate) {
++        struct ibv_send_wr *last = wr;
++        while (last->next) last = last->next;
++        uint32_t seq;
++        memcpy(&seq, (void *)(uintptr_t)last->sg_list->addr, sizeof(seq));
++        int r = qp->source;
++        if (!posted_in_round[r] || posted_seq[r] != seq) {
++            assert(!posted_in_round[r] || posted_in_round[r] == 8);
++            posted_seq[r] = seq; posted_in_round[r] = 0;
++        }
++        unsigned ordinal = posted_in_round[r]++;
++        assert(ordinal < 8);
++        assert(qp->hca == (r + (int)(seq & 3u) + (int)(ordinal % 4)) % 4);
++        assert((qp->dest == (r+2)%4) == ((ordinal / 4 + (seq & 1u)) % 2));
++    }
+     pthread_mutex_lock(&lock);
+     for (; wr; wr = wr->next) {
+         assert(wr->num_sge == 1 && wr->opcode == IBV_WR_RDMA_WRITE);
+@@ -43,7 +60,11 @@ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr
+             assert(t->source >= c->region && t->source + t->bytes <= c->region + c->region_bytes);
+             assert(wr->sg_list->lkey == c->hca[qp->hca].mr->lkey);
+         }
+-        assert(wr->wr.rdma.rkey == c->peer_rkey[qp->hca % stripes][qp->dest]);
++        int path = -1;
++        for (int i = 0; i < peer_width(world, qp->source, qp->dest, stripes); i++)
++            if (c->route_hca[qp->dest][i] == qp->hca) path = i;
++        assert(path >= 0);
++        assert(wr->wr.rdma.rkey == c->peer_rkey[path][qp->dest]);
+         t->id = wr->wr_id;
+         if (qp->tail) qp->tail->next = t; else qp->head = t;
+         qp->tail = t;
+@@ -76,7 +97,7 @@ static void progress(void) {
+     pthread_mutex_lock(&lock);
+     // Independently delay each direction and stripe; preserve RC QP FIFO only.
+     for (int i = 0; i < 8; i++) {
+-        int r = random_u32() % world, h = random_u32() % (2 * stripes), p = random_u32() % world;
++        int r = random_u32() % world, h = random_u32() % ranks[r]->n_hca, p = random_u32() % world;
+         deliver(ranks[r]->hca[h].qp[p]);
+     }
+     pthread_mutex_unlock(&lock);
+@@ -90,11 +111,12 @@ static unsigned size_at(uint32_t seq) {
+     return sizes[seq % 7];
+ }
+ static void setup(uint32_t seed) {
++    memset(posted_in_round, 0, sizeof(posted_in_round));
+     uint64_t layout[7];
+     assert(!roce_layout(world, 4096, layout));
+     for (int r = 0; r < world; r++) {
+         roce_ctx_t *c = ranks[r] = calloc(1, sizeof(*c));
+-        c->world = world; c->rank = r; c->ring4 = ring4; c->n_stripes = stripes; c->n_hca = 2 * stripes;
++        c->world = world; c->rank = r; c->ring4 = ring4; c->n_stripes = stripes; c->mesh_rotate = rotate; c->n_hca = stripes == 4 ? 4 : 2 * stripes;
+         c->slot_bytes=4096; c->region_bytes=layout[4]; c->region=calloc(1, layout[4]);
+         c->recv_off=layout[0]; c->flag_off=layout[1]; c->send_off=layout[2]; c->ctrl_off=layout[3];
+         memset(c->route_hca, 255, sizeof(c->route_hca));
+@@ -107,8 +129,10 @@ static void setup(uint32_t seed) {
+         for (int p=0; p<world; p++) {
+             for (int lane=0; lane<stripes; lane++) {
+                 for (int slot=0; slot<2; slot++) *flag(c,p,slot,lane)=seed;
+-                if (p==r || (ring4 == 1 && p==(r+2)%4)) continue;
+-                int h=(edge % 2)*stripes+lane;
++                if (p==r || (ring4 == 1 && p==(r+2)%4) ||
++                    lane >= peer_width(world, r, p, stripes)) continue;
++                int h = stripes == 4 ? (p == (r+2)%4 ? lane :
++                    (p == (r+1)%4 ? 0 : 2) + lane) : (edge % 2)*stripes+lane;
+                 c->route_hca[p][lane]=h;
+                 struct ibv_qp *q=c->hca[h].qp[p]=calloc(1,sizeof(*q));
+                 q->source=r; q->dest=p; q->hca=h; q->cq=c->hca[h].cq; q->qp_num=1+r*16+h*4+p;
+@@ -123,6 +147,9 @@ static void setup(uint32_t seed) {
+     blobs[2].ring4 ^= 1;
+     assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
+     blobs[2].ring4 ^= 1;
++    blobs[2].mesh_rotate ^= 1;
++    assert(roce_connect(ranks[0],blobs,sizeof(blobs))==-1);
++    blobs[2].mesh_rotate ^= 1;
+     for(int r=0;r<world;r++) assert(!roce_connect(ranks[r],blobs,sizeof(blobs)));
+ }
+ static void cleanup(void) {
+@@ -164,7 +191,7 @@ static void run(unsigned count, uint32_t seed) {
+             }
+             if(active[r]) {
+                 int ready=1;
+-                for(int p=0;p<world;p++) if(p!=r) for(int l=0;l<stripes;l++)
++                for(int p=0;p<world;p++) if(p!=r) for(int l=0;l<peer_width(world,r,p,stripes);l++)
+                     ready &= __atomic_load_n(flag(c,p,seq,l),__ATOMIC_ACQUIRE)==seq;
+                 if(ready) {
+                     for(int p=0;p<world;p++) if(p!=r) {
+@@ -208,7 +235,9 @@ int main(void) {
+         failures();
+         world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+     }
+-    printf("PASS: direct3/ring4/mesh4, 1/2 stripes, 18000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
++    stripes=4;world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
++    rotate=1;run(3000,0);run(1000,UINT32_MAX-100);rotate=0;
++    printf("PASS: direct3/ring4/mesh4, 1/2/4 paths, fixed/rotating posts, 26000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+-- 
+2.54.0 (Apple Git-157)
+

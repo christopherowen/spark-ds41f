@@ -16,3 +16,18 @@ installed library is the one it built.
   path is touched; RoCEnante carries the small decode collectives and NCCL
   the rest. Upstream: NVIDIA/nccl#2393 (open), fixing NVIDIA/nccl#1983.
   Applying it to the base yields patch head `7522cb27` and tree `47687d2a`.
+
+- `0002-bidirectional-switchless-rings.patch`,
+  `0003-balanced-channel-allocation.patch` and
+  `0004-adaptive-small-ring-threads.patch` balance NCCL's switchless ring
+  channels across both directions and both NIC roots
+  (`NCCL_SWITCHLESS_BIDIRECTIONAL`), expose the allocation floor
+  (`NCCL_MIN_TRAFFIC_PER_CHANNEL`), and size tiny ring thread blocks before
+  dropping channels. Unset, the ordinary policy is unchanged, as on the
+  triangle. Reversed rings can change floating-point summation order. From
+  `experiments/2026-10-03-nccl-bidirectional` and
+  `experiments/2026-10-03-balanced-policy`; the TP4 recipe uses them.
+  0001-0004 on the base yield patch head `eeacf1c6` and tree `6af10aa7`, the
+  r5p image.
+
+`series-r5o` keeps the r5o series (0001) for the records that pinned it.

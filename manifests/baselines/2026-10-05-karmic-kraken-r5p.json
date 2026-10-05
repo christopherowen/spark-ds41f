@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "status": "promoted-baseline",
+  "captured_at": "20261005T012143Z",
+  "container_name": "dsv41-karmic-kraken",
+  "image_tag": "vllm-ds41f-kkref:04c30fa98e79-r5p",
+  "image_id": "sha256:4995e0d39fdee7cdf2dd5740b51fc85d216233a4cf7d5f766a6e6a23e63389a4",
+  "nodes": {
+    "dgx1": {
+      "image_id": "sha256:4995e0d39fdee7cdf2dd5740b51fc85d216233a4cf7d5f766a6e6a23e63389a4",
+      "role": "api-head-rank-0"
+    },
+    "dgx2": {
+      "image_id": "sha256:4995e0d39fdee7cdf2dd5740b51fc85d216233a4cf7d5f766a6e6a23e63389a4",
+      "role": "headless-rank-1"
+    },
+    "dgx3": {
+      "image_id": "sha256:4995e0d39fdee7cdf2dd5740b51fc85d216233a4cf7d5f766a6e6a23e63389a4",
+      "role": "headless-rank-2"
+    }
+  },
+  "source_identity": {
+    "vllm_repository": "https://github.com/local-inference-lab/vllm",
+    "vllm_ref": "integration/karmic-kraken-beta",
+    "vllm_revision": "04c30fa98e7917fee0a24c739ea503ce1e22538d",
+    "vllm_patch_head": "8d1eb01e989d4ea183ad89a45f0e4417923212d7",
+    "vllm_tree": "eaa33543b34eac629c252dd72c01ee1b0b7a3986",
+    "b12x_repository": "https://github.com/local-inference-lab/b12x",
+    "b12x_ref": "integration/karmic-kraken-beta",
+    "b12x_revision": "f8069b2c0be1311df3b112591c6b8876a843f8be",
+    "b12x_patch_head": "97dc180b5434889244ff8600df508a6dcc077945",
+    "b12x_tree": "7f6663808eec2459849dce7293a3558dd2980bea",
+    "nccl_repository": "https://github.com/NVIDIA/nccl",
+    "nccl_ref": "refs/tags/v2.30.7-1",
+    "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+    "nccl_patch_head": "eeacf1c6343f0499e4e7ab20ec7eecfb6f62eda6",
+    "nccl_tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+    "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+    "image_build_deployment_commit": "0f665a9f3a415295b7dbb7bb179b0bf4c81eef35",
+    "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+    "image_build_recipe": "bin/spark3 build (docker/Dockerfile)"
+  },
+  "runtime_choices": {
+    "B12X_W4A8_TINY_DECODE": "0 (tiny decode omits swiglu_limit; see experiment README)",
+    "B12X_AUTOTUNE": "0 (autotune race budget is free memory // 2 on unified memory)",
+    "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP 3, adaptive verification cost scale 2 on curves profiled for this image (tp3-b12x-512k-20261005), dead verification rows below survival 0.2, block rejection; greedy drafts vocabulary-parallel (vLLM patch 0012) over the checkpoint's BF16 draft head (the target head's own tensor) and BF16 Markov projection (VLLM_DS41_DRAFT_NVFP4_HEAD=0, VLLM_DS41_MARKOV_NVFP4=0), and a column-sharded drafter main_proj (0013)",
+    "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-48 (adds 40 and 48 for eight streams at 1 + 5 rows)",
+    "max_num_batched_tokens": 4096,
+    "memguards_gib": {
+      "startup": 5,
+      "steady": 3
+    },
+    "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): it saved 0 configs, and only the sampler uses FlashInfer",
+    "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+    "engram_rows": "read beside the forward launch (SPARK3_ENGRAM_ASYNC=1, vLLM patch 0002 re-ported); the base's Engram overlap is off (VLLM_DS41_ENGRAM_OVERLAP=0)",
+    "compile_cache": "/cache/kkref/jit/vllm-r5o",
+    "multimodal": "vision tower loaded (no --language-model-only), up to 4 images per request; --mm-processor-cache-gb 0 (vLLM's default 4 GiB host cache would come out of dgx1's guard margin)",
+    "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+    "l2_prefetch": "on (the base's default on SM121): side-stream L2 prefetch of the next decode projections; it compiles from r5i on (quack-kernels needs CuTe DSL 4.7), so earlier baselines recorded it on while it disabled itself at startup",
+    "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence and the four-node ring patches) in place of the base image's wheel",
+    "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+    "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens at TP 3; vLLM patches 0014-0018, no setting): per-layer all-reduces become reduce-scatters, row-wise work runs on a third of the rows, CED encoder layers only",
+    "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+    "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+    "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit) and TileLang cache on the /cache mount, beside the B12X, CuTe DSL, FlashInfer and Triton caches",
+    "jit_warmup": "the dead-row variants of the draft combine and sampled/rejected-count Triton kernels are compiled at warmup (vLLM patch 0020); no kernel compiles after readiness",
+    "display_carveout": "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 with the GB10 display device passed to the container: embed_tokens and the packed lm_head are created in the firmware scanout reserve and the checkpoint loader writes straight into them (vLLM 0030); the text console keeps its 8 MiB framebuffer",
+    "attention_compute": "VLLM_DS41_ATTENTION_COMPUTE=auto (B12X's tuned arithmetic; BF16 pending a fidelity test)",
+    "indexer_split": "always under sequence-parallel prefill (patch 0025; SPARK3_DS41_INDEXER_SPLIT_CHECK=1 validates it against the full-row indexer)",
+    "display_carveout_check": "off (SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
+    "topk_ties": "lowest logical position (B12X 0003); indexer selections repeat exactly",
+    "dense_gemm_stage_release": "async-proxy fence before each TMA-refilled stage release (B12X 0004)",
+    "prefill_stage_release": "async-proxy fence before each TMA-refilled stage release in the BF16 and mHC prefill projections and contiguous attention (B12X 0005)",
+    "host_memory": "64 KiB pages; memory-saver DKMS 0.2.0, UVM leaf-table packing enabled; THP never, vm.min_free_kbytes=45166, /swap-64k.img",
+    "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1; B12X 0012, vLLM 0028): a 4-bit exponent window code plus a per-row list of out-of-window values, bit-identical to the BF16 weights",
+    "collective_policy": "the requested RoCE collective policy is explicit and enforced (vLLM 0027): a declined or lost RoCE backend fails startup instead of falling back to another path",
+    "profiling_context": "the fabricated context of startup profiling and dummy runs takes its own blocks per KV cache group and request (vLLM 0039), so no group reads another group's records",
+    "four_node_transports": "present in the image and inactive at TP3: B12X 0006-0011 (RoCEnante ring relay, NIC-forwarded mesh, four-path mesh, bidirectional relay, dispatch capacity, loader ABI) and NCCL 0002-0004 (bidirectional switchless rings, balanced channels, adaptive small-ring threads)"
+  },
+  "capacity": {
+    "kv_cache_bytes_per_rank": 3758096384,
+    "kv_cache_tokens": 2845543,
+    "max_model_len": 524288,
+    "max_num_seqs": 8,
+    "reported_full_context_concurrency": 5.43,
+    "graph_capture_gib": 0.98,
+    "vision_tower_gib": 0.9,
+    "display_carveout_weights_mib": 842.5,
+    "checkpoint_native_max_position_embeddings": 1048576
+  },
+  "change_from_previous": "Native BF16 drafter heads in place of load-time NVFP4 re-quantization, the exact 12-bit packed BF16 vocabulary head, vocabulary weights loaded straight into the display carve-out, the explicit RoCE collective policy and the fabricated profiling context's own blocks, on a new image that also carries the four-node transport patches. The TP3 shape, memory guards and weights are unchanged. The same image serves the TP4 1M recipe (the tp4 tuning profile).",
+  "evidence": {
+    "experiments": [
+      "experiments/2026-10-05-r5p-promotion/",
+      "experiments/2026-10-03-native-drafter-heads/",
+      "experiments/2026-10-03-packed-bf16-head/",
+      "experiments/2026-10-04-streamed-embeddings/",
+      "experiments/2026-10-04-tp4-memory-tuning/"
+    ],
+    "summary": "Owner acceptance: one benchmark per configuration at its limits. TP3 on the dgx1-dgx3 triangle (2026-10-05 01:10-01:22 UTC): quality 5/5; decode prose 50.4/75.9/118.8/173.3 and code 60.1/90.8/136.3/192.3 tok/s at 1/2/4/8 streams, every point the same as r5o within its interval; single-stream steps 41.92/46.44 ms against 40.84/45.36 (the native heads); real-text prefill 3,778/3,632/3,432 tok/s at 32K/256K/500K; minimum MemAvailable 5.93/7.11/7.19 GiB; no thermal slowdown. TP4 recipe on the ring (00:10-00:26 UTC): quality 5/5; decode prose 62.1-297.3 and code 72.5-323.5 tok/s at 1-16 streams; prefill 5,117/4,873/4,026 tok/s at 32K/256K/1M; minimum MemAvailable 20.4 GiB."
+  },
+  "build": {
+    "image": "vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tp4-1m-v1 (tagged -r5p at promotion)",
+    "image_id": "sha256:4995e0d39fdee7cdf2dd5740b51fc85d216233a4cf7d5f766a6e6a23e63389a4",
+    "built_utc": "2026-10-04T23:46:57Z",
+    "build_host": "dgx4",
+    "build_directory": ".work/build/vllm-04c30fa98e79-b12x-f8069b2c0be1-<input hash>"
+  },
+  "benchmark_reference": "manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json",
+  "previous_baseline": "2026-10-02-karmic-kraken-r5o-64k",
+  "hosts": {
+    "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+    "kernel": "7.0.0-1019-nvidia-64k with kho=off",
+    "nvidia_driver": "580.178.04",
+    "boot_target": "multi-user.target (no desktop)",
+    "sysctl": "vm.watermark_boost_factor=0",
+    "page_size": 65536,
+    "memory_saver": {
+      "package": "dgx-spark-memory-saver",
+      "version": "0.2.0",
+      "repository": "https://github.com/christopherowen/dgx-spark-memory-saver.git",
+      "revision": "2dd6ef107616ef13f1c7f87817c07e5aabc9199e",
+      "srcversion": "34683B82C2D3339BBD2EEC9"
+    },
+    "secure_boot": "enabled; existing enrolled DGX Fleet key signs the DKMS module",
+    "uvm_leaf_packing": "Y",
+    "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
+    "memory_policy": {
+      "thp": "never",
+      "min_free_kbytes": 45166,
+      "swap": "/swap-64k.img"
+    }
+  }
+}

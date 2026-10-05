@@ -33,17 +33,22 @@ before tuning anything on this basis.
 
 ## Current reference
 
-`manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json`: the 64 KiB kernel
-with the memory saver, 512K limit, 3.5 GiB of KV, 2,845,543 tokens. Aggregate
-tok/s across all streams, temperature 0, 256 output tokens, reasoning on:
+`manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json`: r5p on the 64 KiB
+kernel with the memory saver, 512K limit, 3.5 GiB of KV, 2,845,543 tokens, BF16
+drafter heads and the packed output head. Aggregate tok/s across all streams,
+temperature 0, 256 output tokens, reasoning on:
 
 | Workload | 1 | 2 | 4 | 8 |
 |---|---:|---:|---:|---:|
-| Code, reasoning on | 64.8 | 90.7 | 135.6 | 195.8 |
-| Prose, reasoning on | 52.8 | 79.4 | 117.9 | 171.2 |
+| Code, reasoning on | 60.1 | 90.8 | 136.3 | 192.3 |
+| Prose, reasoning on | 50.4 | 75.9 | 118.8 | 173.3 |
 
-Single-stream steps are 40.8 ms on prose and 45.4 ms on code. This reference
-has no answer-only rows; `2026-09-29-karmic-kraken-r5l.json` has the last ones.
+Single-stream steps are 41.9 ms on prose and 46.4 ms on code, 1.1 ms more than
+r5o's NVFP4 drafter heads (40.8 and 45.4). Source-text prefill is 3.8k tok/s
+at 32K, 3.6k at 256K and 3.4k at 500K. This reference has no answer-only rows;
+`2026-09-29-karmic-kraken-r5l.json` has the last ones. The TP4 1M recipe's
+benchmark is in `experiments/2026-10-05-r5p-promotion`. The bullets below
+were measured on r5o:
 
 - **Time to first token (short prompts):** 0.20-0.21 s at one stream and
   0.54-0.60 s at eight.
@@ -424,10 +429,12 @@ preparation 24, KV setup and warmup 16, graph capture ~8 s of real work.
 
 ## Four nodes (TP4)
 
-TP4 on the four-node ring is a measured candidate, not production
-(`experiments/2026-10-03-tp3-tp4-comparison`): decode +14 to +27% from one to
-eight streams (single-stream steps -19%), source-text prefill +21 to +22%,
-acceptance unchanged. It needs no model-dimension padding (16 heads per rank).
+The TP4 1M recipe (`experiments/2026-10-04-tp4-memory-tuning`, the `tp4`
+tuning profile) is promoted with r5p and benchmarked at its limits
+(`experiments/2026-10-05-r5p-promotion`): 62.1/72.5 tok/s prose/code at one
+stream, 297.3/323.5 at sixteen, 4.0k tok/s prefill at 1M, at least 20.4 GiB
+available on every node. It needs no model-dimension padding (16 heads per
+rank).
 
 - **Long prefill runs hot.** dgx1 and dgx2 reach 83 °C with 3-4 °C of reported
   headroom. The thermal guard aborted a 256K TP3 prefill on the restored
@@ -436,10 +443,10 @@ acceptance unchanged. It needs no model-dimension padding (16 heads per rank).
   the relay; the cause is open. dgx3 stays near 67 °C.
 - **Collective policy:** the RoCEnante neighbour relay for small collectives and
   NCCL Ring with four channels for large transfers
-  (`experiments/2026-10-03-collective-serving/decision.md`). The explicit-policy
-  image (`experiments/2026-10-03-collective-contract`) is source-qualified,
-  unbuilt and launch-disabled.
-- **Open:** sustained-load cooling and full-context qualification.
+  (`experiments/2026-10-03-collective-serving/decision.md`), enforced by vLLM
+  0027 in r5p.
+- **Open:** sustained-load cooling and a long-context admission and retrieval
+  check at 1M (the recipe's benchmark prefilled 1M once per repeat).
 - **Cabling decides the profile.** TP3 needs the dgx1-dgx2-dgx3 triangle and
   TP4 the four-node ring, each with a matching node map (the current site
   `config/nodes.json` is a triangle map). The cabling has changed back and
@@ -451,20 +458,22 @@ acceptance unchanged. It needs no model-dimension padding (16 heads per rank).
 ## TileLang kernel family
 
 The TileLang family (TileLang attention, projections and MoE, TileKernels
-routing and mHC, TileLang vocabulary heads, sparknet collectives) is a
-candidate on the TP4 1M recipe, on branch `tilelang-1m`
-(`experiments/2026-10-04-tilelang-1m`). The default is expected to move to it
-once the comparison below is done.
+routing and mHC, TileLang vocabulary heads, sparknet collectives) lives on
+branch `tilelang-1m`. Its benchmarks against r5p's configurations
+(2026-10-05, same windows) are recorded there:
+decode up to +15% at eight streams and prefill +7 to +12%, numerics level with
+B12X.
 
-1. **End-to-end validation and benchmark, TP4.** Run the full validation and
-   bench matrix for the TileLang candidate and for the B12X TP4 1M recipe
-   (branch `tp4-memory-tuning`, image `-tp4-1m-v1`, not built yet), in the same
-   windows. The B12X recipe now carries the fabricated-context fix (vLLM 0039),
-   so its DSpark cost curves must be profiled again.
-2. **Then the same on TP3.** The TileLang family's TP3 configurations
-   (`experiments/2026-10-03-tilelang-kernels/tp3`, on branches
-   `tilelang-kernel-policy` and `tilelang-1m`) predate the current kernels;
-   bring them onto the current TP3 recipe first.
+1. **vLLM 0041 and 0042 in an image.** The TileLang TP3 start needed them
+   (dummy layouts give each KV cache group its own blocks; the drafter marks its
+   padding rows for the routers) and ran them as mounts over `-tilelang-1m-v3`.
+   Build them into the TileLang image, and decide whether B12X takes them too;
+   B12X serves without them because its router tolerates the rows they protect.
+2. **Single-stream acceptance on the bench's prompts.** TileLang's steps are
+   4-5.5% shorter at one stream, but its single deterministic text on the
+   bench's prose and code prompts accepts 4-5% fewer drafts, so single-stream
+   tok/s comes out level. Over 13 texts acceptance is level. Rotate prompts
+   across samples, or quote step time, before announcing single-stream gains.
 3. **mHC: fold `finalize` into `project_streams`.** After vLLM 0040 the
    sublayer entry is two launches: the projection (about 10.5 µs at one token
    with fn cold) and the per-token finalize (about 4 µs). Let the last CTA of

@@ -72,37 +72,47 @@ class TransportProfilesTest(unittest.TestCase):
                              [43136, 43136, 43008] if tp3 else [32320] * 4)
             self.assertEqual([r["padding_rows"] for r in draft["vocabulary_shards"]],
                              [0, 0, 128] if tp3 else [0] * 4)
-            if tp3:
-                # The promoted TP3 profile still re-quantizes both drafter heads.
-                self.assertEqual(draft["head_formats"], {"lm_head": "nvfp4", "markov_output": "nvfp4"})
-                self.assertEqual(draft["lm_head_nvfp4"]["packed_values_uint8_shape"], [43136, 2560])
-                self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"], [43136, 320])
-                self.assertEqual(draft["lm_head_nvfp4"]["scale_alignment_extra_bytes"], 0)
-                self.assertEqual(draft["markov_output_nvfp4"]["scale_alignment_extra_bytes"], 0)
-                self.assertEqual(len(draft["quantized_activation_examples"]), 3)
-            else:
-                # The TP4 candidate keeps the checkpoint's BF16 heads; the draft
-                # head is the target head's own tensor.
-                self.assertEqual(draft["head_formats"], {"lm_head": "bf16", "markov_output": "bf16"})
-                self.assertEqual(draft["lm_head_bf16"],
-                                 {"logical_shape": [32320, 5120], "bf16_bytes": 330956800,
-                                  "shared_with_target_head": True})
-                self.assertEqual(draft["markov_output_bf16"],
-                                 {"logical_shape": [32320, 256], "bf16_bytes": 16547840})
-                self.assertNotIn("lm_head_nvfp4", draft)
-                self.assertEqual(draft["quantized_activation_examples"], [])
-            self.assertEqual(draft["aux_context_bf16_buffer_shape"], [48, 15360])
+            # Both profiles keep the checkpoint's BF16 drafter heads; the draft
+            # head is the target head's own tensor, packed exactly in 12 bits.
+            rows = 43136 if tp3 else 32320
+            self.assertEqual(draft["head_formats"], {"lm_head": "packed_bf16", "markov_output": "bf16"})
+            head = draft["lm_head_packed_bf16"]
+            self.assertEqual(head["packed_values_uint8_shape"], [rows, 7680])
+            self.assertEqual(head["packed_values_bytes"] * 4, head["bf16_bytes"] * 3)
+            self.assertTrue(head["shared_with_target_head"])
+            self.assertEqual(draft["markov_output_bf16"], {"logical_shape": [rows, 256], "bf16_bytes": rows * 512})
+            self.assertNotIn("lm_head_nvfp4", draft)
+            self.assertEqual(draft["quantized_activation_examples"], [])
+            # TP3 captures graphs to 48 rows; the TP4 recipe's 16 sequences capture to 96.
+            self.assertEqual(draft["aux_context_bf16_buffer_shape"], [48 if tp3 else 96, 15360])
             self.assertEqual(report["model_dimensions"]["draft_aux_projection_output"]["allocated_per_rank"],
                              1728 if tp3 else 1280)
             graphs = report["scheduled_rows"]
-            self.assertEqual(graphs["draft_context_graph_capacities_if_full_supported"], [1, 2, 4, 8, 16, 32, 48])
-            self.assertEqual(graphs["draft_query_graph_capacities_if_full_supported"], [6, 12, 18, 24, 30, 36, 42, 48])
+            self.assertEqual(graphs["draft_context_graph_capacities_if_full_supported"],
+                             [1, 2, 4, 8, 16, 32, 48] if tp3 else [1, 2, 4, 8, 16, 32, 64, 96])
+            self.assertEqual(graphs["draft_query_graph_capacities_if_full_supported"],
+                             [6, 12, 18, 24, 30, 36, 42, 48] if tp3
+                             else [6, 12, 18, 24, 30, 36, 42, 48, 60, 66, 72, 84, 90, 96])
             self.assertIn({"requests": 1, "rows": 5}, graphs["target_exact_low_concurrency_graphs"])
+
+    def test_nvfp4_drafter_heads_keep_their_storage_alignment(self):
+        # r5o's TP3 heads: both re-quantized to NVFP4, with an unpacked target head.
+        _, base = self.resolve("tp3")
+        cluster = copy.deepcopy(base)
+        cluster["environment"].update(VLLM_DS41_PACKED_BF16_LM_HEAD="0", VLLM_DS41_DRAFT_NVFP4_HEAD="1",
+                                      VLLM_DS41_MARKOV_NVFP4="1")
+        draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
+        self.assertEqual(draft["head_formats"], {"lm_head": "nvfp4", "markov_output": "nvfp4"})
+        self.assertEqual(draft["lm_head_nvfp4"]["packed_values_uint8_shape"], [43136, 2560])
+        self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"], [43136, 320])
+        self.assertEqual(draft["lm_head_nvfp4"]["scale_alignment_extra_bytes"], 0)
+        self.assertEqual(draft["markov_output_nvfp4"]["scale_alignment_extra_bytes"], 0)
+        self.assertEqual(len(draft["quantized_activation_examples"]), 3)
 
     def test_layout_describes_either_drafter_head_format(self):
         _, base = self.resolve("tp4")
         cluster = copy.deepcopy(base)
-        cluster["environment"]["VLLM_DS41_DRAFT_NVFP4_HEAD"] = "1"
+        cluster["environment"].update(VLLM_DS41_PACKED_BF16_LM_HEAD="0", VLLM_DS41_DRAFT_NVFP4_HEAD="1")
         draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
         self.assertEqual(draft["head_formats"], {"lm_head": "nvfp4", "markov_output": "bf16"})
         self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"], [32384, 320])

@@ -1,0 +1,214 @@
+From f7639617b6ba677cc2996b7351b99baa35f45b4f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 16:00:00 +0000
+Subject: [PATCH] Add explicit NIC-forwarded mesh4 QP routing
+
+Upstream-base: f8069b2c0be1311df3b112591c6b8876a843f8be plus deployment patches 0001-0006.
+
+Rationale: opposite TP4 ranks use endpoint RC QPs through an externally managed CX7 hairpin fabric. Mode 2 opens every peer QP, marks only opposite-peer flow labels, and skips the CPU relay. Geometry handshakes reject mixed modes. ABI 6 prevents an older proxy from accepting this mode.
+
+Quality: GPU buffers, reductions and numerical kernels are unchanged. The transport is experimental and requires real bidirectional RDMA and CUDA-graph qualification before serving.
+
+Tests: 18,000 simulated collective rounds, one/two stripes, delayed DMA, changing lengths, sequence wrap and error/stop paths with ASan/UBSan; validates opposite-only flow labels. Python topology resolver checks.
+
+Upstream-status: local experiment; not submitted.
+---
+ b12x/comm/roce/_proxy.py              |  8 ++++----
+ b12x/comm/roce/_roce_proxy.c          | 15 +++++++++------
+ b12x/comm/roce/roce_oneshot.py        | 10 +++++-----
+ tests/comm/roce_proxy_fake/run.py     |  8 ++++++++
+ tests/comm/roce_proxy_fake/simulate.c | 13 +++++++------
+ 5 files changed, 33 insertions(+), 21 deletions(-)
+
+diff --git a/b12x/comm/roce/_proxy.py b/b12x/comm/roce/_proxy.py
+index 46b7707..a73f915 100644
+--- a/b12x/comm/roce/_proxy.py
++++ b/b12x/comm/roce/_proxy.py
+@@ -118,7 +118,7 @@ def load() -> ctypes.CDLL:
+             ctypes.c_int,
+             ctypes.c_int,
+             ctypes.c_int,
+-            ctypes.c_int,  # ring4
++            ctypes.c_int,  # topology: direct=0, ring4=1, mesh4=2
+             p,
+             u64,
+             u64,
+@@ -143,7 +143,7 @@ def load() -> ctypes.CDLL:
+         lib.roce_hca_stat.argtypes = [p, ctypes.c_int, ctypes.c_int]
+         lib.roce_destroy.restype = None
+         lib.roce_destroy.argtypes = [p]
+-        if lib.roce_abi_version() != 5:
++        if lib.roce_abi_version() != 6:
+             raise RuntimeError("unexpected b12x RoCE proxy ABI version")
+         _LIB = lib
+         return lib
+@@ -199,7 +199,7 @@ class Proxy:
+         topology: str = "direct",
+     ) -> None:
+         """Create the proxy context: open the HCAs, register the pinned region, create the queue pairs."""
+-        if topology not in ("direct", "ring4"):
++        if topology not in ("direct", "ring4", "mesh4"):
+             raise ValueError(f"unknown RoCE topology: {topology}")
+         self.topology = topology
+         self.traffic_class = _traffic_class()
+@@ -223,7 +223,7 @@ class Proxy:
+             int(stripe_count),
+             int(gid_index),
+             self.traffic_class,
+-            int(topology == "ring4"),
++            {"direct": 0, "ring4": 1, "mesh4": 2}[topology],
+             ctypes.c_void_p(int(region_ptr)),
+             int(region_bytes),
+             int(slot_bytes),
+diff --git a/b12x/comm/roce/_roce_proxy.c b/b12x/comm/roce/_roce_proxy.c
+index a585136..0217ad5 100644
+--- a/b12x/comm/roce/_roce_proxy.c
++++ b/b12x/comm/roce/_roce_proxy.c
+@@ -43,7 +43,7 @@
+ #define ROCE_FLAG_STRIDE 128
+ #define ROCE_PORT 1
+ #define ROCE_SEND_DEPTH 256
+-#define ROCE_ABI_VERSION 5
++#define ROCE_ABI_VERSION 6
+ // Model graphs leave sub-millisecond gaps between collectives.  Keep the
+ // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
+ // every collective on the graph's critical path.
+@@ -148,9 +148,9 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
+ 
+ uint64_t roce_blob_bytes(void) { return sizeof(roce_blob_t); }
+ 
+-// Ranks are in physical cable order. Opposite peers never get a QP.
++// Modes: 0 direct, 1 CPU relay, 2 NIC-forwarded mesh. Only mode 1 omits opposite QPs.
+ static int adjacent(int world, int rank, int peer, int ring4) {
+-    return peer != rank && (!ring4 || peer == (rank + 1) % world ||
++    return peer != rank && (ring4 != 1 || peer == (rank + 1) % world ||
+                             peer == (rank + world - 1) % world);
+ }
+ 
+@@ -256,7 +256,7 @@ roce_ctx_t *roce_create(int world, int rank, const char *const *hca_names, int n
+         rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_LOCAL_HCAS ||
+         n_stripes < 1 || n_stripes > ROCE_MAX_STRIPES || route_hca == NULL ||
+         traffic_class < 0 || traffic_class > 255 ||
+-        (ring4 != 0 && ring4 != 1) || (ring4 && world != 4)) {
++        (ring4 < 0 || ring4 > 2) || (ring4 && world != 4)) {
+         snprintf(err, err_len, "invalid roce runtime geometry");
+         return NULL;
+     }
+@@ -370,7 +370,10 @@ static int connect_qp(roce_ctx_t *c, int local_h, int remote_h, int p,
+     rtr.ah_attr.grh.sgid_index = (uint8_t)c->gid_index;
+     rtr.ah_attr.grh.hop_limit = 64;
+     rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
+-    rtr.ah_attr.grh.flow_label = 0;
++    // mlx5 maps flow label 16383 to UDP source 65535. The host fabric
++    // marks only this reserved source port for intermediate NIC forwarding.
++    rtr.ah_attr.grh.flow_label =
++        (c->ring4 == 2 && p == (c->rank + 2) % 4) ? 16383 : 0;
+     int rc = ibv_modify_qp(hca->qp[p], &rtr,
+                            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+@@ -610,7 +613,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
+         if (adjacent(c->world, c->rank, p, c->ring4) &&
+             post_peer(c, seq, nbytes, c->rank, p, send) != 0) return -1;
+     }
+-    if (c->ring4) {
++    if (c->ring4 == 1) {
+         int prev = (c->rank + c->world - 1) % c->world;
+         int next = (c->rank + 1) % c->world;
+         if (wait_relay(c, seq, prev) != 0) return -1;
+diff --git a/b12x/comm/roce/roce_oneshot.py b/b12x/comm/roce/roce_oneshot.py
+index 73da3fa..e01ae13 100644
+--- a/b12x/comm/roce/roce_oneshot.py
++++ b/b12x/comm/roce/roce_oneshot.py
+@@ -170,18 +170,18 @@ def _resolve_hca_topology(
+     Without a peer map this preserves the clique behavior: the same one or two
+     HCAs reach every peer. A peer map may use up to four local HCA functions,
+     while every edge still carries one or two stripes. Direct mode names all
+-    non-self peers; ring4 names only the two neighbours in physical rank order.
++    non-self peers (including mesh4 NIC-forwarded peers); ring4 names only the two neighbours in physical rank order.
+     All edges use the same stripe count so GPU launch geometry remains fixed.
+     """
+ 
+-    if topology not in ("direct", "ring4") or (topology == "ring4" and world_size != 4):
+-        raise ValueError("RoCE topology must be direct, or ring4 with four ranks")
++    if topology not in ("direct", "ring4", "mesh4") or (topology != "direct" and world_size != 4):
++        raise ValueError("RoCE topology must be direct, or ring4/mesh4 with four ranks")
+     explicit_routes = peer_hca_names
+     if explicit_routes is None:
+         explicit_routes = _peer_hca_names_from_env()
+     if explicit_routes is None:
+-        if topology == "ring4":
+-            raise ValueError("ring4 requires explicit neighbour HCA routes in cable order")
++        if topology != "direct":
++            raise ValueError("ring4/mesh4 requires explicit HCA routes in cable order")
+         names = tuple(hca_names) if hca_names else discover_hcas(gid_index)
+         names = names[:MAX_STRIPES]
+         if not names:
+diff --git a/tests/comm/roce_proxy_fake/run.py b/tests/comm/roce_proxy_fake/run.py
+index 8c17047..8d56a83 100644
+--- a/tests/comm/roce_proxy_fake/run.py
++++ b/tests/comm/roce_proxy_fake/run.py
+@@ -46,3 +46,11 @@ for world, routes in ((3, {1:("a",), 2:("b",)}), (4, None),
+     else:
+         raise AssertionError("invalid ring4 geometry accepted")
+ print("PASS: Python neighbour routing and geometry rejection")
++
++for rank in range(4):
++    routes = {p: (f"h{p%2}a", f"h{p%2}b") for p in range(4) if p != rank}
++    names, result, stripes = resolve(world_size=4, rank=rank, hca_names=None,
++        peer_hca_names=routes, gid_index=3, topology="mesh4")
++    assert stripes == 2 and result[rank] == ()
++    assert all(result[p] == routes[p] for p in routes)
++print("PASS: Python mesh4 full peer routing")
+diff --git a/tests/comm/roce_proxy_fake/simulate.c b/tests/comm/roce_proxy_fake/simulate.c
+index f3c6cc5..5ab8d6d 100644
+--- a/tests/comm/roce_proxy_fake/simulate.c
++++ b/tests/comm/roce_proxy_fake/simulate.c
+@@ -24,7 +24,7 @@ static uint64_t messages;
+ int ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr, struct ibv_send_wr **bad) {
+     (void)bad;
+     assert(qp && qp->source != qp->dest);
+-    if (ring4) assert((qp->source + 2) % 4 != qp->dest);
++    if (ring4 == 1) assert((qp->source + 2) % 4 != qp->dest);
+     pthread_mutex_lock(&lock);
+     for (; wr; wr = wr->next) {
+         assert(wr->num_sge == 1 && wr->opcode == IBV_WR_RDMA_WRITE);
+@@ -107,13 +107,13 @@ static void setup(uint32_t seed) {
+         for (int p=0; p<world; p++) {
+             for (int lane=0; lane<stripes; lane++) {
+                 for (int slot=0; slot<2; slot++) *flag(c,p,slot,lane)=seed;
+-                if (p==r || (ring4 && p==(r+2)%4)) continue;
+-                int h=edge*stripes+lane;
++                if (p==r || (ring4 == 1 && p==(r+2)%4)) continue;
++                int h=(edge % 2)*stripes+lane;
+                 c->route_hca[p][lane]=h;
+                 struct ibv_qp *q=c->hca[h].qp[p]=calloc(1,sizeof(*q));
+                 q->source=r; q->dest=p; q->hca=h; q->cq=c->hca[h].cq; q->qp_num=1+r*16+h*4+p;
+             }
+-            if (p!=r && (!ring4 || p!=(r+2)%4)) edge++;
++            if (p!=r && (ring4 != 1 || p!=(r+2)%4)) edge++;
+         }
+         *(uint32_t *)(c->region+c->ctrl_off)=seed;
+     }
+@@ -206,8 +206,9 @@ int main(void) {
+         world=3;ring4=0;run(1000,0);
+         world=4;ring4=1;run(3000,0);run(1000,UINT32_MAX-100);
+         failures();
++        world=4;ring4=2;run(3000,0);run(1000,UINT32_MAX-100);
+     }
+-    printf("PASS: direct3/ring4, 1/2 stripes, 10000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
++    printf("PASS: direct3/ring4/mesh4, 1/2 stripes, 18000 collectives, wrap, sizes, delayed DMA, stop/errors (%llu writes)\n", (unsigned long long)messages);
+ }
+ 
+ /* Setup/teardown stubs. Contexts are supplied by setup; no fake successful NIC discovery. */
+@@ -222,7 +223,7 @@ struct ibv_pd *ibv_alloc_pd(struct ibv_context *c) {(void)c;return NULL;}
+ struct ibv_mr *ibv_reg_mr(struct ibv_pd *p,void *a,size_t n,int f) {(void)p;(void)a;(void)n;(void)f;return NULL;}
+ struct ibv_cq *ibv_create_cq(struct ibv_context *c,int n,void *a,void *b,int v) {(void)c;(void)n;(void)a;(void)b;(void)v;return NULL;}
+ struct ibv_qp *ibv_create_qp(struct ibv_pd *p,struct ibv_qp_init_attr *a) {(void)p;(void)a;return NULL;}
+-int ibv_modify_qp(struct ibv_qp *q,struct ibv_qp_attr *a,int f) {(void)f;assert(q); if(a->qp_state==IBV_QPS_RTR)assert(a->dest_qp_num); return 0;}
++int ibv_modify_qp(struct ibv_qp *q,struct ibv_qp_attr *a,int f) {(void)f;assert(q); if(a->qp_state==IBV_QPS_RTR) {assert(a->dest_qp_num); assert(a->ah_attr.grh.flow_label == ((ring4 == 2 && q->dest == (q->source+2)%4) ? 16383 : 0));} return 0;}
+ int ibv_destroy_qp(struct ibv_qp *p) {free(p);return 0;}
+ int ibv_destroy_cq(struct ibv_cq *p) {free(p);return 0;}
+ int ibv_dereg_mr(struct ibv_mr *p) {free(p);return 0;}
+-- 
+2.54.0 (Apple Git-157)
+
