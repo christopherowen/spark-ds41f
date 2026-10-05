@@ -122,6 +122,7 @@ NCCL then fails with an unhandled system error.
 | --- | --- |
 | The serving container exists and is running | error |
 | Its image tag, vLLM command line and environment equal the configuration's | error |
+| Its bind mounts (`HostConfig.Binds`) equal the configuration's `container.mounts`; an extra, missing or different mount fails | error |
 | The image's source-tree labels equal the configuration's `expected_labels` | error |
 | While serving, the GPU clock is at least 1,000 MHz | error; a lower clock is the [GB10 clock latch](recovery.md#gb10-gpu-clock-latch), cleared only by removing AC power |
 

@@ -404,6 +404,67 @@ class ClockLatchTest(unittest.TestCase):
         )
 
 
+# HostConfig.Binds of the TP4 production container, as dgx1-4 reported it on 2026-10-06.
+PRODUCTION_BINDS = [
+    "/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/"
+    "dba1be0a40aa45a94ad051997016db3960a90277:/models:ro",
+    "/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs:/blobs:ro",
+    "/home/swank/projects/spark-ds41f/cache:/cache:rw",
+]
+SPARKNET_BIND = "/home/swank/sparknet-port/sparknet:/usr/local/lib/python3.12/dist-packages/sparknet:ro"
+
+
+class LiveMountsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cluster = spark.json.loads((ROOT / "config" / "cluster-tp4.json").read_text())
+        self.wanted = spark.expected_binds(self.cluster)
+
+    def test_docker_run_is_given_the_compared_binds(self) -> None:
+        node = spark.json.loads((ROOT / "config" / "nodes.example.json").read_text())["nodes"][0]
+        command = spark.rendered_docker_command(self.cluster, node)
+        volumes = [command[i + 1] for i, flag in enumerate(command) if flag == "--volume"]
+        self.assertEqual(volumes, self.wanted)
+
+    def test_production_container_passes_in_any_order(self) -> None:
+        self.assertEqual(spark.mount_problems("dgx1", self.wanted, PRODUCTION_BINDS), [])
+        self.assertEqual(spark.mount_problems("dgx1", self.wanted, PRODUCTION_BINDS[::-1]), [])
+
+    def test_lab_arm_with_an_extra_mount_fails_the_live_match(self) -> None:
+        # 2026-10-05: a measure bracket arm (cluster-tp4.json plus the sparknet
+        # port) stayed serving because doctor --live matched it to production.
+        problems = spark.mount_problems("dgx1", self.wanted, PRODUCTION_BINDS + [SPARKNET_BIND])
+        self.assertEqual(problems, [f"dgx1: extra mount {SPARKNET_BIND!r}"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = spark.report_doctor(problems, [], live=True)
+        self.assertEqual(status, 1)
+        self.assertIn(f"ERROR: dgx1: extra mount {SPARKNET_BIND!r}", output.getvalue())
+        self.assertNotIn("live cluster matches", output.getvalue())
+
+    def test_missing_mount_is_reported(self) -> None:
+        self.assertEqual(
+            spark.mount_problems("dgx3", self.wanted, PRODUCTION_BINDS[:2]),
+            [f"dgx3: missing mount {PRODUCTION_BINDS[2]!r}"],
+        )
+
+    def test_container_without_binds_misses_every_mount(self) -> None:
+        problems = spark.mount_problems("dgx2", self.wanted, None)
+        self.assertEqual(problems, [f"dgx2: missing mount {bind!r}" for bind in self.wanted])
+
+    def test_different_source_or_mode_is_reported_against_the_wanted_mount(self) -> None:
+        writable_models = PRODUCTION_BINDS[0].replace(":/models:ro", ":/models:rw")
+        other_cache = "/home/swank/projects/spark-ds41f-lab/cache:/cache:rw"
+        problems = spark.mount_problems(
+            "dgx4", self.wanted, [writable_models, PRODUCTION_BINDS[1], other_cache]
+        )
+        self.assertEqual(
+            problems,
+            [
+                f"dgx4: mount {writable_models!r}, expected {PRODUCTION_BINDS[0]!r}",
+                f"dgx4: mount {other_cache!r}, expected {PRODUCTION_BINDS[2]!r}",
+            ],
+        )
+
 
 class SiteNodesTest(unittest.TestCase):
     def test_missing_site_file_points_at_the_example(self) -> None:
