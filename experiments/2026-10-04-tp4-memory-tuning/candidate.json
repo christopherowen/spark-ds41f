@@ -3,10 +3,10 @@
   "promoted_baseline": "2026-10-02-karmic-kraken-r5o-64k",
   "container": {
     "name": "dsv41-karmic-kraken",
-    "image": "vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-v1",
+    "image": "vllm-ds41f-kkref:04c30fa98e79-r5o-roce-contract-tp4-1m-v1",
     "expected_labels": {
-      "local.spark3.vllm.tree": "eddc36748f26903f27fc81eefe5435b0348dcf57",
-      "local.spark3.b12x.tree": "cd615bd69ed1a99d6b59217329a3ff429b5277fe",
+      "local.spark3.vllm.tree": "eaa33543b34eac629c252dd72c01ee1b0b7a3986",
+      "local.spark3.b12x.tree": "7f6663808eec2459849dce7293a3558dd2980bea",
       "local.spark3.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469"
     },
     "docker_run_args": [
@@ -120,6 +120,7 @@
     "VLLM_DS41_DRAFT_NVFP4_HEAD": "0",
     "VLLM_DS41_ENGRAM_OVERLAP": "0",
     "VLLM_DS41_MARKOV_NVFP4": "0",
+    "VLLM_DS41_PACKED_BF16_LM_HEAD": "1",
     "VLLM_ENABLE_PCIE_ALLREDUCE": "0",
     "VLLM_ENABLE_ROCE_ALLREDUCE": "1",
     "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
@@ -151,7 +152,7 @@
     "NCCL_IB_SUBNET_PREFIX_LEN": "24",
     "B12X_ROCE_TOPOLOGY": "ring4",
     "B12X_ROCE_MESH_ROTATE": "0",
-    "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/ring4-collective-nativeheads-20261003",
+    "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/ring4-tp4-1m-20261005",
     "NCCL_SWITCHLESS_BIDIRECTIONAL": "2",
     "NCCL_MIN_TRAFFIC_PER_CHANNEL": "512",
     "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1",
@@ -178,19 +179,19 @@
     "--enable-prefix-caching",
     "--enable-chunked-prefill",
     "--max-model-len",
-    "524288",
+    "1048576",
     "--max-num-seqs",
-    "8",
+    "16",
     "--max-parallel-prefills",
     "1",
     "--gpu-memory-utilization",
     "0.82",
     "--max-num-batched-tokens",
-    "4096",
+    "8192",
     "--kv-cache-memory-bytes",
-    "3758096384",
+    "11274289152",
     "--max-cudagraph-capture-size",
-    "48",
+    "96",
     "--generation-config",
     "vllm",
     "--engram-config",
@@ -206,11 +207,11 @@
     "--jit-monitor-mode",
     "warn",
     "--compilation-config",
-    "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48]}",
+    "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48,56,64,72,80,88,96]}",
     "--prefix-cache-retention-interval",
-    "512",
+    "8192",
     "--long-prefill-token-threshold",
-    "4096",
+    "8192",
     "--async-scheduling",
     "--reasoning-parser",
     "deepseek_v41",
@@ -228,7 +229,7 @@
     "--mm-processor-cache-gb",
     "0",
     "--profiler-config",
-    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"/cache/kkref/profiles/ring4-collective-20261003\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true,\"torch_profiler_use_gzip\":true}"
+    "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"/cache/kkref/profiles/ring4-collective-packedhead-20261003\",\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true,\"torch_profiler_use_gzip\":true}"
   ],
   "distributed": {
     "master_addr": "10.0.1.71",
@@ -245,5 +246,5 @@
   "fabric": {
     "transport": "rocenante-ring4"
   },
-  "upstreams_config": "experiments/2026-10-03-collective-contract/upstreams.lock.json"
+  "upstreams_config": "experiments/2026-10-04-tp4-memory-tuning/upstreams.lock.json"
 }
