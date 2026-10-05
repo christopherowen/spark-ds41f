@@ -2635,7 +2635,10 @@ def command_build_smoke(args: argparse.Namespace) -> int:
 
 
 BENCH_SCHEMA = 1
-BENCH_SUITES = ("quality", "decode", "sampled", "prefill", "prefix", "admission")
+BENCH_SUITES = ("quality", "compliance", "decode", "sampled", "prefill", "prefix", "admission")
+# --full runs the promotion report; compliance is selected explicitly with --suites
+# until constrained decoding beside DSpark has been qualified on the cluster.
+FULL_SUITES = tuple(suite for suite in BENCH_SUITES if suite != "compliance")
 BENCH_TIMEOUT_SECONDS = 1800
 # These prompts and settings match the client behind every baseline manifest
 # since 2026-09-20, so decode means stay comparable with published figures.
@@ -2663,8 +2666,20 @@ class DecodeCase(NamedTuple):
         streams (cycled, with a stream tag once they repeat).
     per_stream: tag a single prompt with each stream's number, so concurrent
         streams neither share a prefix-cache block nor produce one output.
-    fixed_length: generate exactly DECODE_TOKENS tokens (min_tokens and
+    fixed_length: generate exactly max_tokens tokens (min_tokens and
         ignore_eos), so every stack and sample measures the same length.
+    max_tokens: the output budget per request; the portable protocol's 256.
+    min_samples / max_samples: sampling floors for this case. The command-line
+        values apply when they are larger.
+    converge_on: the per-sample metric whose confidence interval ends the
+        point's sampling (tps, step_ms or accepted_per_verified); None defers
+        to --converge-on, then tps.
+    response_format: an OpenAI response_format object, for the server's
+        structured output.
+    json_schema: score every output as a JSON array of objects against this
+        item schema (a tuple pairs one schema with each prompt): completed
+        objects, whether the truncated prefix parses once closed, and how many
+        objects conform. Outputs are also written to the report directory.
     """
 
     prompt: str | tuple[str, ...]
@@ -2673,6 +2688,12 @@ class DecodeCase(NamedTuple):
     per_stream: bool = False
     temperature: float = 0.0
     top_p: float | None = None
+    max_tokens: int = DECODE_TOKENS
+    min_samples: int | None = None
+    max_samples: int | None = None
+    converge_on: str | None = None
+    response_format: dict | None = None
+    json_schema: dict | tuple[dict, ...] | None = None
 
 
 # Extra decode cases, selected with --decode-cases. The server reasons by
@@ -2761,6 +2782,191 @@ DECODE_CASES["chat-sampled"] = DecodeCase(
 )
 # Names --decode-cases expands.
 DECODE_CASE_GROUPS = {"portable": [*PORTABLE_CASES, "chat-sampled"]}
+# The internal precision set resolves small differences between arms. It keeps
+# the portable protocol's settings (reasoning off, temperature 0) but gives
+# every sample four times the decode steps, uses prompts whose natural answer
+# exceeds the budget so nothing is forced to continue past its end, takes at
+# least five samples per point, and converges on step time rather than tok/s,
+# which inherits the acceptance swing of whichever text the run produced.
+PRECISION_TOKENS = 1024
+PRECISION_MIN_SAMPLES = 5
+PRECISION_MAX_SAMPLES = 12
+CONVERGENCE_METRICS = ("tps", "step_ms", "accepted_per_verified")
+PRECISION_PROSE = (
+    "Write a continuous essay of about 2,500 words on how cities have managed "
+    "fresh water, from Roman aqueducts and medieval wells to modern treatment "
+    "plants and desalination. Use full paragraphs only: no headings, no lists "
+    "and no Markdown. Do not stop early."
+)
+
+
+def record_schema(**properties: dict) -> dict:
+    """An object schema requiring exactly these keys."""
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def strings(count: int) -> dict:
+    return {"type": "array", "items": {"type": "string"}, "minItems": count, "maxItems": count}
+
+
+def percent() -> dict:
+    return {"type": "number", "minimum": 0, "maximum": 100}
+
+
+# One schema per record type. The prompt text is generated from the schema, so
+# what the model is asked for and what its output is checked against cannot
+# drift apart.
+PRECISION_JSON_RECORDS = (
+    ("library books", record_schema(
+        title={"type": "string"}, author={"type": "string"}, year={"type": "integer"},
+        genres=strings(2), isbn={"type": "string"}, pages={"type": "integer"},
+        available={"type": "boolean"}, rating={"type": "number", "minimum": 1, "maximum": 5},
+    )),
+    ("server telemetry records", record_schema(
+        hostname={"type": "string"}, rack={"type": "string"}, cpuPct=percent(), memPct=percent(),
+        diskIops={"type": "number"}, netMbps={"type": "number"}, status={"type": "string"},
+        sampledAt={"type": "string"},
+    )),
+    ("employees", record_schema(
+        employeeId={"type": "string"}, firstName={"type": "string"}, lastName={"type": "string"},
+        department={"type": "string"}, title={"type": "string"}, hiredOn={"type": "string"},
+        salary={"type": "number"}, remote={"type": "boolean"},
+    )),
+    ("retail products", record_schema(
+        sku={"type": "string"}, name={"type": "string"}, category={"type": "string"},
+        priceCents={"type": "integer"}, currency={"type": "string"}, inStock={"type": "boolean"},
+        tags=strings(3), weightGrams={"type": "number"},
+    )),
+    ("airline flights", record_schema(
+        flightNumber={"type": "string"}, origin={"type": "string"}, destination={"type": "string"},
+        departs={"type": "string"}, arrives={"type": "string"}, aircraft={"type": "string"},
+        seatsSold={"type": "integer"}, onTime={"type": "boolean"},
+    )),
+    ("weather observations", record_schema(
+        station={"type": "string"}, observedAt={"type": "string"}, temperatureC={"type": "number"},
+        humidityPct=percent(), windKph={"type": "number"}, windDirection={"type": "string"},
+        pressureHpa={"type": "number"}, conditions={"type": "string"},
+    )),
+    ("invoices", record_schema(
+        invoiceId={"type": "string"}, customer={"type": "string"}, issuedOn={"type": "string"},
+        dueOn={"type": "string"},
+        lineItems={
+            "type": "array", "minItems": 2, "maxItems": 2,
+            "items": record_schema(description={"type": "string"}, amountCents={"type": "integer"}),
+        },
+        paid={"type": "boolean"},
+    )),
+    ("IoT sensor readings", record_schema(
+        sensorId={"type": "string"}, site={"type": "string"}, kind={"type": "string"},
+        value={"type": "number"}, unit={"type": "string"}, batteryPct=percent(),
+        firmware={"type": "string"}, lastSeen={"type": "string"},
+    )),
+)
+NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+
+
+def schema_key_text(schema: dict) -> str:
+    """How a prompt describes an object schema's keys and value types."""
+    def phrase(prop: dict) -> str:
+        kind = prop.get("type")
+        if kind == "array":
+            items = prop.get("items", {})
+            noun = {"string": "strings", "integer": "integers", "number": "numbers",
+                    "boolean": "booleans", "object": "objects"}.get(items.get("type"), "values")
+            inner = f" with {schema_key_text(items)}" if items.get("type") == "object" else ""
+            count = prop.get("minItems") if prop.get("minItems") == prop.get("maxItems") else None
+            size = f"{NUMBER_WORDS.get(count, count)} " if count else ""
+            return f"an array of {size}{noun}{inner}"
+        if kind == "number" and "minimum" in prop and "maximum" in prop:
+            return f"a number from {prop['minimum']:g} to {prop['maximum']:g}"
+        return {"string": "a string", "integer": "an integer", "number": "a number", "boolean": "a boolean"}[kind]
+
+    parts = [f"{name} ({phrase(prop)})" for name, prop in schema["properties"].items()]
+    return ", ".join(parts[:-1]) + " and " + parts[-1] if len(parts) > 1 else parts[0]
+
+
+def json_records_prompt(subject: str, schema: dict, count: int = 80) -> str:
+    return (
+        f"Output only a JSON array of {count} invented {subject}. Each object has exactly the keys "
+        f"{schema_key_text(schema)}. Use realistic, varied values. No Markdown, no code fence and no "
+        f"commentary: begin with [ and keep adding objects until the array has {count} entries."
+    )
+
+
+PRECISION_JSON_PROMPTS = tuple(json_records_prompt(subject, schema) for subject, schema in PRECISION_JSON_RECORDS)
+# Code tasks whose natural answer runs well past the budget: an implementation,
+# a complete test suite and a command-line interface for each. The portable
+# tasks are single functions and can stop early.
+PRECISION_CODE_TAIL = (
+    "Reply with Python source only: no comments, no docstrings, no Markdown fences. Write the full "
+    "implementation, then a complete unittest suite covering every public method and edge case, then "
+    "an argparse command-line interface for it. Keep writing code until all three parts are complete."
+)
+PRECISION_CODE_TASKS = tuple(
+    f"{name}\n{spec}\n{PRECISION_CODE_TAIL}"
+    for name, spec in (
+        ("library", "A library system: Book, Member and Library classes with borrowing limits, due dates, "
+                    "late fees, reservations and title/author search."),
+        ("inventory", "An inventory manager: products with SKUs, stock levels, reorder thresholds, suppliers, "
+                      "CSV import/export and a low-stock report."),
+        ("scheduler", "A task scheduler: tasks with dependencies, priorities and durations, topological ordering, "
+                      "cycle detection and a critical-path calculation."),
+        ("ledger", "A bank ledger: accounts, deposits, withdrawals, transfers with overdraft rules, monthly "
+                   "interest and statement generation."),
+        ("expressions", "An arithmetic expression engine: tokenizer, recursive-descent parser to an AST, "
+                        "evaluator with variables and functions, and a pretty printer."),
+        ("matrix", "A matrix library over lists of lists: construction, addition, multiplication, transpose, "
+                   "determinant, inverse and solving linear systems, with shape checking."),
+        ("cache", "A caching package: LRU, LFU and TTL caches behind one interface, with statistics, "
+                  "eviction callbacks and a decorator for memoizing functions."),
+        ("adventure", "A text-adventure engine: rooms, exits, items, inventory, a command parser, save and "
+                      "load of game state, and a scripted sample world."),
+    )
+)
+PRECISION_JSON_SCHEMAS = tuple(schema for _, schema in PRECISION_JSON_RECORDS)
+PRECISION_JSON_SCHEMA = {
+    "name": "records",
+    "schema": {
+        "type": "array",
+        "items": record_schema(
+            id={"type": "integer"}, name={"type": "string"}, category={"type": "string"},
+            value={"type": "number"}, active={"type": "boolean"}, tags=strings(2),
+        ),
+    },
+}
+PRECISION_CASES = {
+    "prose-1k": DecodeCase(
+        PRECISION_PROSE, {"thinking": False}, per_stream=True, max_tokens=PRECISION_TOKENS,
+        min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
+    ),
+    "code-1k": DecodeCase(
+        PRECISION_CODE_TASKS, {"thinking": False}, max_tokens=PRECISION_TOKENS,
+        min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
+    ),
+    "json-1k": DecodeCase(
+        PRECISION_JSON_PROMPTS, {"thinking": False}, max_tokens=PRECISION_TOKENS,
+        min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
+        json_schema=PRECISION_JSON_SCHEMAS,
+    ),
+}
+DECODE_CASES.update(PRECISION_CASES)
+DECODE_CASE_GROUPS["precision"] = list(PRECISION_CASES)
+# Structured output through the server's grammar-constrained decoding. Opt in
+# with --decode-cases json-schema-1k. It stays out of the precision group:
+# constrained decoding changes the sampler path and needs its own
+# qualification beside speculative decoding before its numbers mean anything.
+DECODE_CASES["json-schema-1k"] = DecodeCase(
+    json_records_prompt("inventory records", PRECISION_JSON_SCHEMA["schema"]["items"]),
+    {"thinking": False}, per_stream=True, max_tokens=PRECISION_TOKENS,
+    min_samples=PRECISION_MIN_SAMPLES, max_samples=PRECISION_MAX_SAMPLES, converge_on="step_ms",
+    response_format={"type": "json_schema", "json_schema": PRECISION_JSON_SCHEMA},
+    json_schema=PRECISION_JSON_SCHEMA["schema"]["items"],
+)
 SAMPLED_PROMPTS = {
     "prose": (
         "Write a short essay about how rivers shape the land and the people "
@@ -3132,6 +3338,7 @@ def stream_request(
     last: float | None = None
     status: int | None = None
     usage: dict = {}
+    finish: str | None = None
     content: list[str] = []
     reasoning_chars = 0
     content_chars = 0
@@ -3152,6 +3359,7 @@ def stream_request(
                 event = json.loads(line[6:])
                 usage = event.get("usage") or usage
                 for choice in event.get("choices") or []:
+                    finish = choice.get("finish_reason") or finish
                     delta = choice.get("delta") or {}
                     pieces = (
                         delta.get("reasoning_content"),
@@ -3187,6 +3395,8 @@ def stream_request(
         "elapsed_s": round(ended - started, 4),
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": tokens,
+        # "stop" is a natural end, "length" the budget; None when the server sent neither.
+        "finish_reason": finish,
         "decode_tps": None if decode is None else round(decode, 2),
         "output_sha256": digest.hexdigest()[:16],
         "reasoning_chars": reasoning_chars,
@@ -3644,9 +3854,11 @@ def decode_payloads(model: str, case: str, concurrency: int) -> list[tuple[str, 
     if spec.template_kwargs:
         extra["chat_template_kwargs"] = spec.template_kwargs
     if spec.fixed_length:
-        extra.update(min_tokens=DECODE_TOKENS, ignore_eos=True)
+        extra.update(min_tokens=spec.max_tokens, ignore_eos=True)
     if spec.top_p is not None:
         extra["top_p"] = spec.top_p
+    if spec.response_format is not None:
+        extra["response_format"] = spec.response_format
     payloads = []
     for stream in range(concurrency):
         if isinstance(spec.prompt, tuple):
@@ -3659,7 +3871,7 @@ def decode_payloads(model: str, case: str, concurrency: int) -> list[tuple[str, 
             prompt = spec.prompt
         seed = 42 + stream if spec.temperature else 42
         payloads.append(
-            chat_payload(model, prompt, DECODE_TOKENS, temperature=spec.temperature, seed=seed, **extra)
+            chat_payload(model, prompt, spec.max_tokens, temperature=spec.temperature, seed=seed, **extra)
         )
     return payloads
 
@@ -3756,9 +3968,175 @@ def step_times_ms(samples: list[dict]) -> list[float]:
     return times
 
 
+def step_time_ms(requests: list[dict], accepted: float | None, concurrency: int) -> float | None:
+    """Milliseconds per engine step for one sample.
+
+    Each step gives every active stream one token plus its accepted drafts. A
+    single stream is exact from that request's decode rate. Concurrent streams
+    use the aggregate decode window; they finish a few steps apart, so the
+    window's tail runs with fewer streams and the value is a slight
+    overestimate.
+    """
+    ok = [request for request in requests if request.get("ok")]
+    if accepted is None or len(ok) != len(requests) or len(ok) != concurrency:
+        return None
+    if concurrency == 1:
+        rate = ok[0].get("decode_tps")
+        return round(1000 * (1 + accepted) / rate, 3) if rate else None
+    window = decode_window_tps(requests)
+    return round(1000 * (1 + accepted) * concurrency / window, 3) if window else None
+
+
+def used_whole_budget(request: dict, max_tokens: int) -> bool:
+    """Whether a request ran to its token budget: the server's finish reason
+    when it sent one, otherwise the token count."""
+    finish = request.get("finish_reason")
+    if finish is not None:
+        return finish == "length"
+    return (request.get("completion_tokens") or 0) >= max_tokens
+
+
+def sample_step_times(entries: list[dict]) -> list[float]:
+    """Step times stored with each sample, or derived from older reports that
+    kept only single-stream requests."""
+    stored = [entry["step_ms"] for entry in entries if entry.get("step_ms")]
+    return stored if stored else step_times_ms(entries)
+
+
+def convergence_values(entries: list[dict], metric: str) -> list[float]:
+    values = sample_step_times(entries) if metric == "step_ms" else [entry.get(metric) for entry in entries]
+    return [value for value in values if value is not None]
+
+
+def sample_metrics(result: dict, concurrency: int) -> dict:
+    """One decode sample: the primary numbers, measured and derived throughput,
+    and the compact per-request receipts."""
+    requests = result["requests"]
+    ok = [request for request in requests if request["ok"]]
+    tokens = sum(request["completion_tokens"] or 0 for request in ok)
+    metrics = result["metrics"]
+    drafts = metrics["spec_decode_num_drafts"]
+    draft_tokens = metrics["spec_decode_num_draft_tokens"]
+    accepted = acceptance(metrics)
+    entry = {
+        "tps": round(tokens / result["wall_s"], 3),
+        "decode_window_tps": decode_window_tps(requests),
+        "accepted_per_draft": accepted,
+        # Adaptive verification trims draft rows per step; step time follows
+        # the rows it keeps, so record them with each sample.
+        "verified_per_draft": round(draft_tokens / drafts, 4) if drafts else None,
+        # Primary numbers: the draft's hit rate on the rows it was given, the
+        # tokens each engine step produced, and how long a step took. The
+        # first two follow the generated text; step time stays stable.
+        "accepted_per_verified": (
+            round(metrics["spec_decode_num_accepted_tokens"] / draft_tokens, 4) if draft_tokens else None
+        ),
+        "tokens_per_step": None if accepted is None else round(1 + accepted, 4),
+        "step_ms": step_time_ms(requests, accepted, concurrency),
+        "derived_tps": None,
+        "requests": compact(requests),
+    }
+    if entry["step_ms"] and entry["tokens_per_step"]:
+        # What the primaries imply: every stream contributes its tokens each step.
+        entry["derived_tps"] = round(1000 * entry["tokens_per_step"] * concurrency / entry["step_ms"], 3)
+    return entry
+
+
+_SCHEMA_VALIDATORS: dict[str, object] = {}
+
+
+def schema_validator(schema: dict):
+    """A cached Draft 2020-12 validator from python-jsonschema, the reference
+    implementation. The schema itself is checked the first time."""
+    try:
+        import jsonschema
+    except ImportError as error:
+        raise SystemExit(
+            "JSON decode cases need the jsonschema package: on the dgx hosts "
+            "`sudo apt install python3-jsonschema`; elsewhere "
+            "`python3 -m pip install --require-hashes -r requirements/bench-client.txt`"
+        ) from error
+    key = json.dumps(schema, sort_keys=True)
+    validator = _SCHEMA_VALIDATORS.get(key)
+    if validator is None:
+        jsonschema.Draft202012Validator.check_schema(schema)
+        validator = _SCHEMA_VALIDATORS[key] = jsonschema.Draft202012Validator(schema)
+    return validator
+
+
+def json_schema_violations(value, schema: dict) -> list[str]:
+    """Schema violations as ``$.path: message`` lines, in document order."""
+    def order(error):
+        return [(0, part) if isinstance(part, int) else (1, part) for part in error.absolute_path]
+
+    lines = []
+    for error in sorted(schema_validator(schema).iter_errors(value), key=order):
+        path = "$" + "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path)
+        lines.append(f"{path}: {error.message}")
+    return lines
+
+
+def json_schema_for(spec: DecodeCase, index: int) -> dict | None:
+    """The item schema for a case's index-th stream, following prompt cycling."""
+    schemas = spec.json_schema
+    if isinstance(schemas, tuple):
+        return schemas[index % len(schemas)]
+    return schemas
+
+
+def json_array_progress(content: str, item_schema: dict | None = None) -> dict:
+    """Completed elements of a (possibly truncated) JSON array, decoded one at a
+    time with the standard library parser; whether the prefix up to the last
+    complete element parses once closed; and, given an item schema, how many
+    elements conform. The closed prefix is returned under ``json_prefix`` for
+    the caller to save."""
+    start = content.find("[")
+    if start < 0:
+        return {"json_objects": 0, "json_prefix_valid": False}
+    decoder = json.JSONDecoder()
+    index = start + 1
+    items: list = []
+    end = start + 1
+    while True:
+        while index < len(content) and content[index] in " \t\r\n,":
+            index += 1
+        if index >= len(content) or content[index] == "]":
+            break
+        try:
+            value, index = decoder.raw_decode(content, index)
+        except ValueError:
+            break
+        items.append(value)
+        end = index
+    result = {"json_objects": sum(1 for item in items if isinstance(item, dict)), "json_prefix_valid": bool(items)}
+    if items:
+        result["json_prefix"] = content[start:end] + "]"
+    if item_schema is not None:
+        violations = [json_schema_violations(item, item_schema) for item in items]
+        result["json_valid_objects"] = sum(1 for found in violations if not found)
+        result["json_violation"] = next(
+            (f"$[{position}]{found[0][1:]}" for position, found in enumerate(violations) if found), None
+        )
+    return result
+
+
+def save_output(directory: Path | None, point: str, tag: str, index: int, request: dict) -> None:
+    """Keep a JSON case's raw text and, when it parses, the closed prefix for
+    offline inspection (jq, a full schema validator)."""
+    if directory is None:
+        return
+    folder = directory / "outputs" / point
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"{tag}-stream{index + 1}"
+    (folder / f"{name}.txt").write_text(request.get("content") or "", encoding="utf-8")
+    if request.get("json_prefix"):
+        (folder / f"{name}.json").write_text(request["json_prefix"] + "\n", encoding="utf-8")
+
+
 def compact(results: list[dict]) -> list[dict]:
     keys = ("ok", "ttft_s", "first_s", "last_s", "prompt_tokens", "completion_tokens", "decode_tps",
-            "output_sha256", "reasoning_chars", "content_chars", "error")
+            "output_sha256", "reasoning_chars", "content_chars", "error", "finish_reason", "json_objects",
+            "json_prefix_valid", "json_valid_objects", "json_violation")
     return [{key: result[key] for key in keys if key in result} for result in results]
 
 
@@ -3800,17 +4178,147 @@ def suite_quality(bench: Bench, options: argparse.Namespace, rng: random.Random)
     return {"passed": passed, "runs": runs, "ok": passed == len(runs)}
 
 
+COMPLIANCE_OBJECTS = 12
+COMPLIANCE_MAX_TOKENS = 4096
+COMPLIANCE_CONCURRENCY = 4
+
+
+def compliance_payloads(model: str, constrained: bool) -> list[tuple[str, dict]]:
+    """One request per record type, asking for a complete array of
+    COMPLIANCE_OBJECTS objects, with room to finish naturally. The constrained
+    arm sends the same prompt with the array schema as response_format."""
+    payloads = []
+    for subject, schema in PRECISION_JSON_RECORDS:
+        extra: dict = {"chat_template_kwargs": {"thinking": False}}
+        if constrained:
+            extra["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "records",
+                    "schema": {"type": "array", "items": schema,
+                               "minItems": COMPLIANCE_OBJECTS, "maxItems": COMPLIANCE_OBJECTS},
+                },
+            }
+        payloads.append(chat_payload(
+            model, json_records_prompt(subject, schema, COMPLIANCE_OBJECTS), COMPLIANCE_MAX_TOKENS,
+            temperature=0, seed=42, **extra,
+        ))
+    return payloads
+
+
+def assess_json_records(content: str, schema: dict, count: int) -> dict:
+    """Whole-output compliance: exactly a JSON array of ``count`` objects, each
+    conforming to ``schema``, with no fence or commentary around it."""
+    text = content.strip()
+    fenced = text.startswith("```")
+    if fenced:
+        text = re.sub(r"^```[A-Za-z]*\s*|\s*```$", "", text).strip()
+    try:
+        parsed = json.loads(text)
+    except ValueError as error:
+        return {"parsed": False, "fenced": fenced, "objects": 0, "conforming": 0,
+                "violation": f"not JSON: {error}", "ok": False}
+    if not isinstance(parsed, list):
+        return {"parsed": True, "fenced": fenced, "objects": 0, "conforming": 0,
+                "violation": "top level is not an array", "ok": False}
+    violations = [json_schema_violations(item, schema) for item in parsed]
+    conforming = sum(1 for found in violations if not found)
+    violation = next((f"$[{index}]{found[0][1:]}" for index, found in enumerate(violations) if found), None)
+    if violation is None and len(parsed) != count:
+        violation = f"{len(parsed)} objects, {count} requested"
+    return {"parsed": True, "fenced": fenced, "objects": len(parsed), "conforming": conforming,
+            "violation": violation, "ok": not fenced and violation is None}
+
+
+def suite_compliance(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Structured-output compliance on natural completion.
+
+    Two arms over the same eight record prompts: prompt-only, then the same
+    requests constrained by the array schema through response_format. A
+    request passes when it stopped on its own, parsed as exactly the requested
+    number of objects, and every object conforms. This measures correctness,
+    not speed; the decode suite's json cases measure speed.
+    """
+    output_dir = getattr(options, "output_dir", None)
+    arms = {}
+    for arm, constrained in (("prompt_only", False), ("constrained", True)):
+        result = bench.run(f"compliance {arm}", compliance_payloads(options.model, constrained),
+                           concurrency=COMPLIANCE_CONCURRENCY, keep_content=True)
+        rows = []
+        for (subject, schema), request in zip(PRECISION_JSON_RECORDS, result["requests"]):
+            row = {"subject": subject, "ok": False, "finish_reason": request.get("finish_reason"),
+                   "completion_tokens": request.get("completion_tokens"), "elapsed_s": request.get("elapsed_s")}
+            if request["ok"]:
+                row.update(assess_json_records(request.get("content") or "", schema, COMPLIANCE_OBJECTS))
+                if request.get("finish_reason") == "length":
+                    row["ok"] = False
+                    row["violation"] = row["violation"] or "hit the token budget"
+            else:
+                row["error"] = request.get("error")
+            rows.append(row)
+            if output_dir is not None:
+                folder = output_dir / "outputs" / f"compliance-{arm}"
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / f"{subject.replace(' ', '-')}.txt").write_text(request.get("content") or "", encoding="utf-8")
+            print(f"  compliance {arm} {subject}: {'pass' if row['ok'] else row.get('violation') or row.get('error')}", flush=True)
+        metrics = result["metrics"]
+        draft_tokens = metrics["spec_decode_num_draft_tokens"]
+        arms[arm] = {
+            "requests": rows,
+            "passed": sum(row["ok"] for row in rows),
+            "failed_requests": sum(1 for request in result["requests"] if not request["ok"]),
+            "accepted_per_draft": acceptance(metrics),
+            "accepted_per_verified": (
+                round(metrics["spec_decode_num_accepted_tokens"] / draft_tokens, 4) if draft_tokens else None
+            ),
+            "elapsed_s": describe([row["elapsed_s"] for row in rows if row.get("elapsed_s")]),
+        }
+    return {"arms": arms, "objects_requested": COMPLIANCE_OBJECTS, "max_tokens": COMPLIANCE_MAX_TOKENS,
+            "ok": all(arm["passed"] == len(arm["requests"]) for arm in arms.values())}
+
+
+def decode_plan(options: argparse.Namespace, point: str) -> tuple[DecodeCase, int, str, int, int]:
+    """A point's case, concurrency, convergence metric and sample bounds.
+
+    --converge-on wins when given; otherwise the case decides, then tps. The
+    case's sampling floors apply when they exceed the command-line values.
+    """
+    case, concurrency = point.rsplit("-c", 1)
+    spec = DECODE_CASES[case]
+    metric = getattr(options, "converge_on", None) or spec.converge_on or "tps"
+    minimum = max(options.min_samples, spec.min_samples or 0)
+    maximum = max(options.max_samples, minimum, spec.max_samples or 0)
+    return spec, int(concurrency), metric, minimum, maximum
+
+
 def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
-    """Temperature-0 serving matrix, sampled until every point is precise."""
+    """Temperature-0 serving matrix, sampled until every point is precise.
+
+    Each point reports three primary numbers (step_ms, accepted_per_verified,
+    tokens_per_step), the measured throughput (tps and decode_window_tps) and
+    derived_tps, the throughput the primaries imply. Only step_ms is stable
+    across samples: acceptance follows the generated text, which does not
+    repeat. A point keeps sampling until the metric it converges on has a
+    confidence interval within --precision.
+    """
     points = [f"{case}-c{concurrency}" for case in options.decode_cases for concurrency in options.concurrency]
 
-    def sample(point: str) -> dict:
-        case, concurrency = point.rsplit("-c", 1)
-        return bench.run(point, decode_payloads(options.model, case, int(concurrency)))
+    output_dir = getattr(options, "output_dir", None)
+
+    def sample(point: str, tag: str) -> dict:
+        spec, concurrency, _, _, _ = decode_plan(options, point)
+        case = point.rsplit("-c", 1)[0]
+        scored = spec.json_schema is not None
+        result = bench.run(point, decode_payloads(options.model, case, concurrency), keep_content=scored)
+        if scored:
+            for index, request in enumerate(result["requests"]):
+                request.update(json_array_progress(request.get("content") or "", json_schema_for(spec, index)))
+                save_output(output_dir, point, tag, index, request)
+        return result
 
     print("  warmup: one discarded sample per point", flush=True)
     for point in rng.sample(points, len(points)):
-        sample(point)
+        sample(point, "warmup")
     samples: dict[str, list[dict]] = {point: [] for point in points}
     active = list(points)
     rounds = 0
@@ -3818,50 +4326,64 @@ def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) 
         rounds += 1
         rng.shuffle(active)
         for point in active:
-            result = sample(point)
-            requests = result["requests"]
-            tokens = sum(request["completion_tokens"] or 0 for request in requests if request["ok"])
-            metrics = result["metrics"]
-            drafts = metrics["spec_decode_num_drafts"]
-            samples[point].append({
-                "tps": round(tokens / result["wall_s"], 3),
-                "decode_window_tps": decode_window_tps(requests),
-                "accepted_per_draft": acceptance(metrics),
-                # Adaptive verification trims draft rows per step; step time
-                # follows the rows it keeps, so record them with each sample.
-                "verified_per_draft": round(metrics["spec_decode_num_draft_tokens"] / drafts, 4) if drafts else None,
-                "requests": compact(requests),
-            })
+            _, concurrency, _, _, _ = decode_plan(options, point)
+            samples[point].append(sample_metrics(sample(point, f"sample{len(samples[point]) + 1:02d}"), concurrency))
         remaining = []
+        status = []
         for point in active:
-            summary = describe([entry["tps"] for entry in samples[point]])
-            if summary["n"] >= options.max_samples:
+            _, _, metric, minimum, maximum = decode_plan(options, point)
+            summary = describe(convergence_values(samples[point], metric))
+            interval = summary.get("ci95_pct")
+            if summary["n"] >= maximum:
                 continue
-            if summary["n"] < options.min_samples or (summary["ci95_pct"] or 100) > options.precision:
+            if summary["n"] < minimum or interval is None or interval > options.precision:
                 remaining.append(point)
-        status = ", ".join(
-            f"{point} ±{describe([entry['tps'] for entry in samples[point]])['ci95_pct'] or '-'}%"
-            for point in sorted(remaining)
-        )
-        print(f"  round {rounds}: {status or 'all points converged'}", flush=True)
+                status.append(f"{point} {metric} ±{'-' if interval is None else interval}%")
+        print(f"  round {rounds}: {', '.join(sorted(status)) or 'all points converged'}", flush=True)
         active = remaining
     summary = {}
     for point in points:
+        spec, _, metric, _, _ = decode_plan(options, point)
         entries = samples[point]
         requests = [request for entry in entries for request in entry["requests"]]
         ok = [request for request in requests if request["ok"]]
         summary[point] = {
+            # Primary numbers.
+            "step_ms": describe(sample_step_times(entries)),
+            "accepted_per_verified": describe(convergence_values(entries, "accepted_per_verified")),
+            "tokens_per_step": describe(convergence_values(entries, "tokens_per_step")),
+            # Measured throughput, then what the primaries imply.
             "tps": describe([entry["tps"] for entry in entries]),
             "decode_window_tps": describe([entry["decode_window_tps"] for entry in entries if entry.get("decode_window_tps")]),
+            "derived_tps": describe(convergence_values(entries, "derived_tps")),
             "per_stream_decode_tps": describe([request["decode_tps"] for request in ok if request["decode_tps"]]),
             "ttft_s": describe([request["ttft_s"] for request in ok]),
             "accepted_per_draft": describe([entry["accepted_per_draft"] for entry in entries if entry["accepted_per_draft"] is not None]),
-            "step_ms": describe(step_times_ms(entries)),
             "verified_per_draft": describe([entry["verified_per_draft"] for entry in entries if entry.get("verified_per_draft") is not None]),
+            "converge_on": metric,
+            "max_tokens": spec.max_tokens,
+            # Outputs that used the whole budget. A precision case wants every
+            # one: a prompt that stops early measures a shorter workload.
+            "full_length_outputs": sum(1 for request in ok if used_whole_budget(request, spec.max_tokens)),
             "failed_requests": len(requests) - len(ok),
             "distinct_outputs": len({request["output_sha256"] for request in ok}),
             "reasoning_share": reasoning_share(ok),
         }
+        if spec.json_schema is not None:
+            scored = [request for request in ok if "json_objects" in request]
+            objects = sum(request["json_objects"] for request in scored)
+            summary[point]["json_objects"] = describe([request["json_objects"] for request in scored])
+            summary[point]["json_prefix_valid"] = (
+                round(sum(1 for request in scored if request["json_prefix_valid"]) / len(scored), 3)
+                if scored else None
+            )
+            # Conforming objects over completed objects, across every stream.
+            summary[point]["json_schema_valid"] = (
+                round(sum(request.get("json_valid_objects", 0) for request in scored) / objects, 3) if objects else None
+            )
+            summary[point]["json_violation_example"] = next(
+                (request["json_violation"] for request in scored if request.get("json_violation")), None
+            )
     return {"points": summary, "samples": samples}
 
 
@@ -4006,6 +4528,7 @@ def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Rando
 
 BENCH_SUITE_FUNCTIONS = {
     "quality": suite_quality,
+    "compliance": suite_compliance,
     "decode": suite_decode,
     "sampled": suite_sampled,
     "prefill": suite_prefill,
@@ -4050,6 +4573,48 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
     return identity
 
 
+def decode_primary_rows(points: dict) -> list[str]:
+    """Primary numbers and both throughputs per decode point, plus warnings for
+    outputs that stopped before a precision budget."""
+    def cell(stat: dict | None, digits: int) -> str:
+        if not stat or not stat.get("n"):
+            return "-"
+        return f"{stat['mean']:.{digits}f} ±{stat['ci95_pct'] or 0:.1f}%"
+
+    rows = [(point, summary) for point, summary in points.items() if summary.get("tokens_per_step", {}).get("n")]
+    if not rows:
+        return []
+    lines = [
+        "decode primaries (mean ±95% CI): step ms | accepted/verified | tokens/step "
+        "|| tok/s measured aggregate / decode window | derived"
+    ]
+    for point, summary in rows:
+        lines.append(
+            f"  {point:<18} {cell(summary.get('step_ms'), 2):>15} | {cell(summary['accepted_per_verified'], 3):>14} | "
+            f"{cell(summary['tokens_per_step'], 3):>14} || {cell(summary['tps'], 1):>14} / "
+            f"{cell(summary.get('decode_window_tps'), 1):>14} | {cell(summary.get('derived_tps'), 1):>14}"
+        )
+        budget = summary.get("max_tokens") or 0
+        concurrency = int(point.rsplit("-c", 1)[1])
+        completed = summary["tps"]["n"] * concurrency - summary.get("failed_requests", 0)
+        full = summary.get("full_length_outputs", completed)
+        if budget > DECODE_TOKENS and full < completed:
+            lines.append(
+                f"  WARN {point}: {completed - full} of {completed} outputs stopped before {budget} tokens; "
+                "lengthen the prompt or the point measures a shorter workload"
+            )
+        if "json_prefix_valid" in summary:
+            lines.append(
+                f"  {point:<18} JSON: {cell(summary.get('json_objects'), 1)} completed objects per output, "
+                f"prefix parses {summary['json_prefix_valid']}, objects conform {summary.get('json_schema_valid')}"
+            )
+            if summary.get("json_violation_example"):
+                lines.append(f"  {point:<18} first violation: {summary['json_violation_example']}")
+            if (summary["json_prefix_valid"] or 0) < 1:
+                lines.append(f"  WARN {point}: some outputs are not JSON arrays; see outputs/{point}/ in the report directory")
+    return lines
+
+
 def bench_rows(report: dict, reference: dict | None, tolerance: float) -> tuple[list[str], list[str]]:
     """Summary lines and regressions against the reference run."""
     lines: list[str] = []
@@ -4071,22 +4636,35 @@ def bench_rows(report: dict, reference: dict | None, tolerance: float) -> tuple[
     if "quality" in suites:
         quality = suites["quality"]
         lines.append(f"quality: LRU {quality['passed']}/{len(quality['runs'])}")
+    if "compliance" in suites:
+        compliance = suites["compliance"]
+        for arm, summary in compliance["arms"].items():
+            lines.append(
+                f"compliance {arm}: {summary['passed']}/{len(summary['requests'])} complete and conforming, "
+                f"accepted/verified {summary.get('accepted_per_verified')}, "
+                f"completion p-max {summary['elapsed_s'].get('max')} s"
+            )
+            for row in summary["requests"]:
+                if not row["ok"]:
+                    lines.append(f"  {row['subject']}: {row.get('violation') or row.get('error')}")
     if "decode" in suites:
         lines.append("decode (aggregate tok/s, 95% CI):")
         ref_points = ref_suites.get("decode", {}).get("points", {})
         for point, summary in suites["decode"]["points"].items():
             if summary["tps"]["n"]:
                 compare(point, summary["tps"], ref_points.get(point, {}).get("tps"), "tok/s")
+        lines.extend(decode_primary_rows(suites["decode"]["points"]))
         ref_samples = ref_suites.get("decode", {}).get("samples", {})
         steps = [
-            (point, describe(step_times_ms(entries)))
+            (point, describe(sample_step_times(entries)))
             for point, entries in suites["decode"].get("samples", {}).items()
         ]
         steps = [(point, summary) for point, summary in steps if summary["n"]]
         if steps:
-            lines.append("single-stream step time (ms, lower is better; independent of acceptance):")
+            lines.append("step time (ms, lower is better; independent of acceptance; "
+                         "concurrent points are decode-window estimates):")
         for point, summary in steps:
-            ref = describe(step_times_ms(ref_samples.get(point, [])))
+            ref = describe(sample_step_times(ref_samples.get(point, [])))
             text = f"  {point:<18} {summary['mean']:>9.2f} ±{summary['ci95_pct'] or 0:>4.1f}% n={summary['n']:<3}"
             change = difference(summary, ref) if ref["n"] else None
             if change:
@@ -4146,7 +4724,7 @@ def command_bench(args: argparse.Namespace) -> int:
     cluster, nodes, _ = configuration(args)
     config_path, config_name = cluster_config_path(args)
     if args.suites is None:
-        args.suites = ",".join(BENCH_SUITES) if args.full else "quality,decode"
+        args.suites = ",".join(FULL_SUITES) if args.full else "quality,decode"
     if args.min_samples is None:
         args.min_samples = 6 if args.full else 3
     if args.max_samples is None:
@@ -4168,6 +4746,8 @@ def command_bench(args: argparse.Namespace) -> int:
     unknown_cases = sorted(set(args.decode_cases) - set(DECODE_CASES))
     if unknown_cases:
         raise SystemExit(f"unknown decode cases: {', '.join(unknown_cases)}")
+    if "compliance" in suites or any(DECODE_CASES[case].json_schema is not None for case in args.decode_cases):
+        schema_validator({"type": "object"})
     if args.min_samples < 2 or args.max_samples < args.min_samples:
         raise SystemExit("--min-samples must be at least 2 and no more than --max-samples")
     if args.admission_output_tokens < 1 or args.admission_output_tokens + 1024 >= args.max_model_len:
@@ -4207,6 +4787,7 @@ def command_bench(args: argparse.Namespace) -> int:
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     output = Path(args.output) if args.output else ROOT / "results/private/bench" / stamp
     output.mkdir(parents=True, exist_ok=True)
+    args.output_dir = output
     report_path = output / "bench.json"
     report = {
         "schema": BENCH_SCHEMA,
@@ -4221,6 +4802,7 @@ def command_bench(args: argparse.Namespace) -> int:
             "max_samples": args.max_samples,
             "concurrency": args.concurrency,
             "decode_cases": args.decode_cases,
+            "converge_on": args.converge_on,
             "prefill_text": args.prefill_text,
             "sampled_requests": args.sampled_requests,
             "prefill_sizes": args.prefill_sizes,
@@ -4232,6 +4814,12 @@ def command_bench(args: argparse.Namespace) -> int:
             "memory_floor_gib": floor_gib,
             "prompts_sha256": hashlib.sha256(
                 json.dumps([DECODE_PROMPTS, SAMPLED_PROMPTS, LRU_PROMPT], sort_keys=True).encode()
+            ).hexdigest(),
+            "precision_prompts_sha256": hashlib.sha256(
+                json.dumps(
+                    [PRECISION_PROSE, PRECISION_JSON_PROMPTS, PRECISION_JSON_SCHEMAS, PRECISION_JSON_SCHEMA],
+                    sort_keys=True,
+                ).encode()
             ).hexdigest(),
         },
         "reference": str(reference_path.relative_to(ROOT)) if reference_path and reference_path.is_relative_to(ROOT) else (str(reference_path) if reference_path else None),
@@ -4283,10 +4871,16 @@ def command_bench(args: argparse.Namespace) -> int:
         failures.append("quality gate failed")
     if "admission" in report["suites"] and not report["suites"]["admission"]["ok"]:
         failures.append("admission failed")
+    if "compliance" in report["suites"] and not report["suites"]["compliance"]["ok"]:
+        failures.append("compliance failed")
     failed_requests = sum(
         point.get("failed_requests", 0)
         for suite in ("decode", "sampled", "prefill")
         for point in report["suites"].get(suite, {}).get("points", {}).values()
+    )
+    failed_requests += sum(
+        arm.get("failed_requests", 0)
+        for arm in report["suites"].get("compliance", {}).get("arms", {}).values()
     )
     if failed_requests:
         failures.append(f"{failed_requests} requests failed")
@@ -4472,6 +5066,12 @@ def parser() -> argparse.ArgumentParser:
             "comma-separated decode cases (default prose,code): "
             f"{', '.join(DECODE_CASES)}; groups: {', '.join(DECODE_CASE_GROUPS)}"
         ),
+    )
+    bench.add_argument(
+        "--converge-on",
+        choices=CONVERGENCE_METRICS,
+        help="the per-sample metric whose 95%% CI must reach --precision before a decode point stops "
+        "sampling; default: the case's choice (step_ms for the precision group), otherwise tps",
     )
     bench.add_argument(
         "--prefill-text",

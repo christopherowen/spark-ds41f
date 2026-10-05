@@ -281,6 +281,16 @@ Suites of the full run, in order (`--suites` selects a subset):
 
 - `quality`: the fixed LRU request five times at temperature 0; all five must
   pass, or the run stops before measuring anything.
+- `compliance` (explicit `--suites compliance`; not part of `--full` until
+  constrained decoding beside DSpark is qualified): structured-output
+  correctness on natural completion. Eight record prompts, each asking for a
+  complete array of twelve objects with 4,096 tokens of room, run prompt-only
+  and then constrained by the same array schema through `response_format`. A
+  request passes when it stopped on its own (`finish_reason`), parsed as
+  exactly twelve objects with no fence or commentary, and every object
+  conforms to its schema (python-jsonschema). Outputs are saved under
+  `outputs/compliance-<arm>/`. Every request receipt in every suite now
+  records `finish_reason`.
 - `decode`: prose and code prompts at concurrency 1, 2, 4, and 8, 256 output
   tokens, reasoning on, temperature 0, and the same prompts and metric
   (aggregate completion tokens per wall second) as every published baseline.
@@ -306,6 +316,40 @@ Suites of the full run, in order (`--suites` selects a subset):
   stream's first, over the span from the earliest first token to the latest
   last token. It leaves out prefill and the start stagger of a concurrent
   wave.
+
+  Three primary numbers accompany every point: `step_ms` (time per engine
+  step; exact for one stream, a decode-window estimate for several),
+  `accepted_per_verified` (accepted tokens per verified draft token) and
+  `tokens_per_step` (one plus accepted drafts per step). Throughput is
+  reported twice: measured (`tps` and `decode_window_tps`) and `derived_tps`,
+  what the primaries imply (`tokens_per_step` times streams over `step_ms`).
+  Temperature-0 output text does not repeat between samples, and draft
+  acceptance follows the text, so `accepted_per_verified`, `tokens_per_step`
+  and tok/s all swing between samples of the same prompt; `step_ms` stays
+  within about 1%. Gate kernel, transport and host changes on `step_ms`, and
+  use the acceptance numbers to explain why tok/s moved.
+
+  The `precision` group (`prose-1k`, `code-1k`, `json-1k`) resolves small
+  differences between arms: 1,024 output tokens, prompts whose natural answer
+  exceeds that budget so nothing is forced to continue past its end, at least
+  five and at most twelve samples per point, and convergence on `step_ms`
+  rather than `tps`. `--converge-on` overrides the convergence metric for
+  every point. A `WARN` line names outputs that stopped before the budget;
+  lengthen the prompt when it appears. `json-1k` gives each stream a distinct
+  record type whose prompt is generated from a JSON schema, and scores every
+  output against that schema: completed objects, whether the truncated prefix
+  parses once closed, and the share of objects that conform (`json_schema_valid`,
+  with the first violation quoted). Each output is also written under
+  `outputs/<point>/` in the report directory, as the raw text and, when it
+  parses, the closed prefix as `.json`, so `jq` can be run on it afterwards.
+  Validation uses python-jsonschema (Draft 2020-12): `sudo apt install
+  python3-jsonschema` on the dgx hosts, or the hashed
+  `requirements/bench-client.txt` elsewhere. `json-schema-1k` requests the
+  same through the server's structured output (`response_format` with a JSON
+  schema). It is opt-in and
+  outside the group, because constrained decoding changes the sampler path and
+  needs its own qualification beside speculative decoding before its numbers
+  mean anything.
 - `sampled`: DSpark accepted drafts per step at temperature 1.0 from the
   engine counters, 32 requests per case at concurrency 1 and 4.
 - `prefill`: cold prefill at 2K, 32K, 64K, and 128K tokens, three unique
