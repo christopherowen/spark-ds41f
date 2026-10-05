@@ -1218,8 +1218,16 @@ def require_local_deployment_state(cluster: dict, nodes: dict, upstreams: dict) 
     return repository_revision()
 
 
+# The repository was renamed from spark3-vllm-ds41f on 2026-10-05. Configurations
+# recorded before then name the former URL, which now holds a pointer repository.
+FORMER_REPOSITORY_URLS = {
+    "https://github.com/christopherowen/spark3-vllm-ds41f": "https://github.com/christopherowen/spark-ds41f",
+}
+
+
 def normalized_repository_url(url: str) -> str:
-    return url.rstrip("/").removesuffix(".git")
+    url = url.rstrip("/").removesuffix(".git")
+    return FORMER_REPOSITORY_URLS.get(url, url)
 
 
 def remote_status_command(cluster: dict) -> str:

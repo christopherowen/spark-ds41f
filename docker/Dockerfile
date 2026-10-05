@@ -152,7 +152,7 @@ ARG NCCL_PATCH_HEAD=unrecorded
 ARG NCCL_TREE=unrecorded
 ARG DEPLOYMENT_COMMIT=uncommitted
 
-LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark3-vllm-ds41f" \
+LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-ds41f" \
       org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
       org.opencontainers.image.base.name="${BASE_IMAGE_NAME}" \
       org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \

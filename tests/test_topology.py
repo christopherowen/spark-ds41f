@@ -283,6 +283,16 @@ class TopologyTest(unittest.TestCase):
                     spark3.command_topology_create(argparse.Namespace(nodes_config="nodes.json", output="candidate.json"))
             self.assertEqual((root / "candidate.json").read_text(), "preserve me")
 
+    def test_former_repository_url_names_the_renamed_repository(self):
+        current = "https://github.com/christopherowen/spark-ds41f.git"
+        self.assertEqual(self.base["deployment"]["repository"], current)
+        for former in ("https://github.com/christopherowen/spark3-vllm-ds41f",
+                       "https://github.com/christopherowen/spark3-vllm-ds41f.git/"):
+            self.assertEqual(spark3.normalized_repository_url(former),
+                             spark3.normalized_repository_url(current))
+        self.assertNotEqual(spark3.normalized_repository_url("https://github.com/example/spark-ds41f"),
+                            spark3.normalized_repository_url(current))
+
 
 if __name__ == "__main__":
     unittest.main()
