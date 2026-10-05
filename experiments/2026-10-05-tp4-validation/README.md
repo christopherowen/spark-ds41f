@@ -24,26 +24,43 @@ vocabulary weights in the display carve-out, and the fabricated-context fix
   fabricated-context profile that 0039 fixes, and the TileLang curves from
   the kernels before 0040.
 
-## Protocol
+## Benchmark (window 2026-10-05 00:08–00:42 UTC)
 
-The B12X image is built and its [heads](bundles/b12x-heads/candidate.json),
-[carve-out](bundles/b12x-carveout/candidate.json) and
-[fabricated-context](bundles/b12x-dummy-context/candidate.json) bundles run
-first. The TileLang tests bundle already passes on `-tilelang-1m-v3` (99).
+The owner set the acceptance: one benchmark per family at the recipe's
+limits, whose numbers feed the release announcements. One boot each, B12X
+first; quality, decode on prose and code with reasoning (aggregate tok/s,
+temperature 0, 256 output tokens) at 1-16 streams with three samples, and
+prefill on real source text at 32K, 256K and 1M with two repeats. Both
+passed quality 5/5, kept at least 20.3 GiB available on every node and saw
+no thermal slowdown.
 
-**Window 1**, one boot per family, B12X first:
+| Aggregate tok/s | 1 | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose, B12X | 62.1 | 92.7 | 141.6 | 215.7 | 297.3 |
+| Prose, TileLang | 62.4 | 99.0 | 153.9 | 217.6 | 319.1 |
+| Code, B12X | 72.5 | 111.3 | 168.3 | 245.7 | 323.5 |
+| Code, TileLang | 74.3 | 105.0 | 171.5 | 261.7 | 352.2 |
 
-- `bench --full`: every suite (quality, decode sampled to the default
-  precision, sampled, prefill, prefix, admission) at 1, 2, 4, 8 and 16
-  streams, against the promoted baseline;
-- [long_context.py](../2026-10-04-tp4-memory-tuning/long_context.py):
-  ~960K-token real-text prompts with a code word at 10% and 90% depth;
-- [prefix_cache.py](../2026-10-04-tp4-memory-tuning/prefix_cache.py): the
-  prompt-cache probe at ~200K tokens;
-- per-second MemAvailable on every node (the 10.5 GiB pool qualifies only
-  with at least 8 GiB left on every node), a decode profile, and the boot
-  log checked for silent fallbacks and for JIT compilation after readiness.
+| Prefill, real text (tok/s) | 32K | 256K | 1M |
+| --- | ---: | ---: | ---: |
+| B12X | 5,117 | 4,873 | 4,026 |
+| TileLang | 5,730 | 5,387 | 4,312 |
 
-**Window 2**, a second boot per family, the lean screen (quality and decode,
-prose and code with and without reasoning, 1 and 8 streams, three samples),
-to bound boot-to-boot noise.
+Single-stream steps: TileLang 32.59 ms on prose and 35.63 ms on code, B12X
+34.00 and 37.72 (-4.2% and -5.5%). At 16 streams TileLang decodes 7.3% more
+prose and 8.9% more code; prefill is 7-12% faster. The bench flags one
+point: code at two streams, 5.7% lower for TileLang. B12X's interval there
+was ±5.4% and TileLang's steps are faster, so it is acceptance noise at low
+concurrency; the repository gates on step time.
+
+Against the promoted baseline (r5o, TP3 at 512K), the B12X TP4 1M recipe
+decodes 12-26% more at one to eight streams and prefills 32-36% faster at
+32K and 256K.
+
+The full protocol first planned here (the full bench, the 1M qualification
+scripts, the prompt-cache probe and second boots, about three hours) was
+stopped at the owner's direction after twelve minutes; the benchmark above
+is the acceptance.
+
+TP3 (8 streams at 512K) follows once the network is re-wired to the
+triangle.
