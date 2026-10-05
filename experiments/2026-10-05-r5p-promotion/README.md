@@ -3,9 +3,10 @@
 Base: main `c3b0595` with the TP4 1M recipe branch (`tp4-memory-tuning`,
 `64f30e5`) merged.
 
-r5p promotes the B12X work since r5o. The TileLang kernel family stays on the
-`tilelang-1m` branch; its benchmarks against these same configurations are
-recorded there.
+r5p promotes the B12X work since r5o. The TileLang kernel family, merged
+after r5p as an alternative kernel backend, was benchmarked against these same
+configurations in [TP4](../2026-10-05-tp4-validation/README.md) and
+[TP3](../2026-10-05-tp3-benchmark/README.md).
 
 ## What changes
 
@@ -64,9 +65,10 @@ The owner's acceptance is one benchmark per configuration at its limits:
 - **Windows:** both ran on 2026-10-05 from `bin/spark3 bench`:
   - TP4 on the ring, 00:10-00:26 UTC: [report](runs/tp4-bench.json), [summary](runs/tp4-bench.txt);
   - TP3 on the triangle, 01:10-01:22 UTC: [report](runs/tp3-bench.json), [summary](runs/tp3-bench.txt).
-- **Report paths:** the reports name the configurations by their paths on the
-  `tilelang-1m` branch. The copies in `runs/` have the same SHA-256 as those
-  files.
+- **Report paths:** the reports name the configurations by their paths
+  (`experiments/2026-10-05-tp3-benchmark/b12x.json`,
+  `experiments/2026-10-05-tp4-validation/b12x.json`). The copies in `runs/`
+  have the same SHA-256 as those files.
 
 Both configurations passed quality 5/5 and saw no thermal slowdown.
 
@@ -115,9 +117,10 @@ streams and prefills 32-36% faster at 32K and 256K.
   give each KV cache group its own blocks, and the drafter marks its padding
   rows for the routers. B12X's router routes the rows they protect without
   complaint, so B12X serves without them. Adding them needs an image build
-  and a benchmark. They are on `tilelang-1m`.
+  and a benchmark. They are in the TileLang experiment's series
+  (`experiments/2026-10-04-tilelang-1m/vllm/`).
 - **The TileLang kernel family** (TileLang, TileKernels, sparknet and the
-  kernel backend policy) stays on `tilelang-1m`.
+  kernel backend policy) is an alternative backend, not the r5p default.
 - **The bench precision set** (PR #6) has not run against a live service yet.
 
 ## Deployment

@@ -21,9 +21,13 @@ shows the TP4 recipe; `tuning create` generates a complete configuration
 for a site node map. The generated configuration starts with launch disabled.
 
 The TileLang kernel family (TileLang, DeepSeek's TileKernels and sparknet
-collectives in place of B12X's kernels) is developed on the `tilelang-1m`
-branch; its TP3 and TP4 configurations were benchmarked against r5p's in the
-same windows.
+collectives in place of B12X's kernels) is an alternative kernel backend
+(`kernel_backend: tilelang`, see `scripts/kernel_backend.py`). Its TP3 and TP4
+configurations ([TP3](experiments/2026-10-05-tp3-benchmark/tilelang.json),
+[TP4](experiments/2026-10-04-tilelang-1m/candidate.json)) were benchmarked
+against r5p's in the same windows
+([TP4](experiments/2026-10-05-tp4-validation/README.md),
+[TP3](experiments/2026-10-05-tp3-benchmark/README.md)).
 
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is

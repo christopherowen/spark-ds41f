@@ -462,9 +462,11 @@ rank).
 ## TileLang kernel family
 
 The TileLang family (TileLang attention, projections and MoE, TileKernels
-routing and mHC, TileLang vocabulary heads, sparknet collectives) lives on
-branch `tilelang-1m`. Its benchmarks against r5p's configurations
-(2026-10-05, same windows) are recorded there:
+routing and mHC, TileLang vocabulary heads, sparknet collectives) is an
+alternative kernel backend (`kernel_backend: tilelang`); B12X stays the
+promoted default. Its benchmarks against r5p's configurations (2026-10-05,
+same windows) are in `experiments/2026-10-05-tp4-validation` and
+`experiments/2026-10-05-tp3-benchmark`:
 decode up to +15% at eight streams and prefill +7 to +12%, numerics level with
 B12X.
 

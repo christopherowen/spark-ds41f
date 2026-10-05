@@ -248,8 +248,10 @@ Base: `local-inference-lab/vllm@04c30fa98e7917fee0a24c739ea503ce1e22538d`
   read another's records in its own format. From
   `experiments/2026-10-04-tp4-memory-tuning`. Upstream status: candidate.
 
-0029 and 0031-0038 are the TileLang family's patches on the `tilelang-1m`
-branch. Applying the series (0001-0028, 0030, 0039) to the base yields patch
+0029 and 0032-0042 are the TileLang family's patches, in
+`experiments/2026-10-04-tilelang-1m/vllm/` (0041 and 0042 are not in its
+series yet); 0031 was the dropped autotune patch. Applying the series
+(0001-0028, 0030, 0039) to the base yields patch
 head `8d1eb01e` and tree `eaa33543`, the r5p image. `series-r5o` keeps the
 r5o series (0001-0026) for the records that pinned it.
 
