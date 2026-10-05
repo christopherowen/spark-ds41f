@@ -203,7 +203,7 @@ which does not depend on acceptance, is the kernel comparison. The B12X TP4
 
 The native benchmark reports
 ([TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r6.json),
-[TP4](experiments/2026-10-05-tilelang-r6/runs-tp4/bench.json), and r5p's
+[TP4](manifests/benchmarks/2026-10-05-karmic-kraken-r6-tp4.json), and r5p's
 [TP3](manifests/benchmarks/2026-10-05-karmic-kraken-r5p.json) and
 [TP4](experiments/2026-10-05-r5p-promotion/runs/tp4-bench.json)) record
 intervals, prompts, memory and thermal results. The
@@ -473,13 +473,20 @@ Measurements stay clean and safe:
 
 The report is still written if the run stops early.
 
-With a reference run (by default
-`manifests/benchmarks/<promoted_baseline>.json`, or `--compare PATH`), each
-decode and prefill point shows its percent change with a Welch 95% interval.
-The command exits non-zero on a failed quality or admission check, any failed
-request, an early stop, or a point that is significantly slower by more than
-`--tolerance` (3%). A promotion adds its reference run to
-`manifests/benchmarks/`.
+With a reference run, each decode and prefill point shows its percent change
+with a Welch 95% interval. The default reference is the profile's
+`benchmark_reference` when it names one, as
+[config/cluster-tp4.json](config/cluster-tp4.json) does for its four-node run,
+and otherwise `manifests/benchmarks/<promoted_baseline>.json`. A run is only
+comparable with a reference of the same node count, transport and kernel
+backend. The bench refuses a default reference that differs in any of them;
+`--compare PATH` names a reference explicitly and only warns about a
+difference, and `--compare none` skips the comparison. The command exits
+non-zero on a failed quality or admission check, any failed request, an early
+stop, or a point that is significantly slower by more than `--tolerance` (3%).
+A promotion adds a reference run to `manifests/benchmarks/` for each topology
+it promotes: `<baseline>.json`, plus a suffixed run such as
+`<baseline>-tp4.json` that the other topology's profile names.
 
 ## Upstreams
 
