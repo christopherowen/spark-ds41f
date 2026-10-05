@@ -26,6 +26,25 @@ its kernel backends. sparknet's one-shot collectives take B12X's TP3 RoCE
 sizes (4 MiB all-gather, 2 MiB all-reduce). Each family profiles its own
 DSpark cost curves.
 
+## The attention profile's shared block (vLLM 0041)
+
+TileLang's first TP3 start stopped in the DeepSeek V4 attention memory
+profile: TileKernels' fused gate refused non-finite logits on five rows, the
+drafter's query block. The profile runs a full-budget prefill on a minimal
+cache of one block, and every KV cache group used that block at once. The
+groups overlay the same memory, so the drafter read the target's records in
+its own format: the same fault as 0039, on another dummy layout. TP4 had read
+finite garbage there by chance; B12X's router routes non-finite logits
+without complaint.
+
+[0041](../2026-10-04-tilelang-1m/vllm/0041-dummy-blocks-per-group.patch)
+gives each group its own slice of the pool in every dummy layout (the
+fabricated profiling context included), and the attention profile allocates
+one block per group. It changes no serving path. Until the next image build,
+[tilelang.json](tilelang.json) mounts the two changed files
+([overlay](overlay/vllm/v1/worker/gpu/)) over `-tilelang-1m-v3`; the dummy
+layout tests pass on that image.
+
 ## Numerical check
 
 The TP4 benchmark showed TileLang accepting fewer drafts at most points while
