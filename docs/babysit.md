@@ -10,8 +10,7 @@ Check them all at once:
 ```sh
 for ref in tile-ai/tilelang#3430 tile-ai/tilelang#3099 tile-ai/tilelang#3081 \
            tile-ai/tilelang#3286 tile-ai/tilelang#3287 tile-ai/tilelang#3288 \
-           NVIDIA/open-gpu-kernel-modules#1269 NVIDIA/cutlass#3038 \
-           eugr/spark-vllm-docker#4 christopherowen/dgx-spark-power-control#1; do
+           NVIDIA/open-gpu-kernel-modules#1269 christopherowen/dgx-spark-power-control#1; do
   gh api "repos/${ref%#*}/issues/${ref#*#}" --jq "\"$ref [\(.state)] \(.updated_at[:10]) \(.title)\""
 done
 ```
@@ -30,8 +29,6 @@ done
 | Thread | What | Status (2026-10-05) | Next |
 | --- | --- | --- | --- |
 | [tile-ai/tilelang#3430](https://github.com/tile-ai/tilelang/pull/3430) | `[CUDA] Enable SM120 block-scaled MMA on SM121`: without it every block-scaled MMA compiles to a trap on `sm_121a` | Ready for review since 2026-10-05. On GB10: NVF4 tests 162 passed; SASS for `sm_121a` has 32 `OMMA.SF` with the fix and 32 `BPT.TRAP` without | Answer review comments |
-| [NVIDIA/cutlass#3038](https://github.com/NVIDIA/cutlass/pull/3038) | Enable the SM121-gated MXFP4 MoE kernel path | Open since 2026-02-16, mergeable, review required | Answer review comments; rebase if it stops being mergeable |
-| [eugr/spark-vllm-docker#4](https://github.com/eugr/spark-vllm-docker/pull/4) | Cache encodings to shorten rebuilds | Open since 2025-12-19, no activity | Close it if it is no longer wanted |
 | [christopherowen/dgx-spark-power-control#1](https://github.com/christopherowen/dgx-spark-power-control/pull/1) | Power diagnosis, passive tracing and firmware recovery analysis | Draft | Merge only after the hardware writes have been tested with the owner's approval |
 
 ## Planned pull requests
