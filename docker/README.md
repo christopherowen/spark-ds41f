@@ -1,7 +1,9 @@
 # Image build
 
 `docker/Dockerfile` builds the promoted image: Local Inference Lab's
-karmic-kraken-beta vLLM and B12X with the local patch series, on the canonical
+karmic-kraken-beta vLLM and B12X with the local patch series, plus TileLang,
+DeepSeek's TileKernels and sparknet for the promoted TileLang kernel family
+(the `runtime-tilelang-sparknet` stage), on the canonical
 vLLM ARM64 nightly `af1c0149`. Only vLLM's `_C_stable_libtorch` and
 `_moe_C_stable_libtorch` are rebuilt, for SM121, and NCCL 2.30.7 (the base
 image's version) is rebuilt from its release tag with `patches/nccl`, replacing
@@ -9,7 +11,7 @@ the wheel's `libnccl.so.2`; the image build checks the installed library's
 version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
-`bin/spark build`, and the promoted image is `vllm-ds41f-kkref:04c30fa98e79-r5p`.
+`bin/spark build`, and the promoted image is `vllm-ds41f-kkref:04c30fa98e79-r6`.
 
 ```sh
 bin/spark build prepare        # create or repair the build directory
@@ -81,7 +83,7 @@ prepares the other parts.
 ## TileLang kernel backend
 
 For a lock that lists `tilelang` and `tile_kernels`
-([kernel-backends.md](../docs/kernel-backends.md)), `prepare` checks out
+([scripts/kernel_backend.py](../scripts/kernel_backend.py)), `prepare` checks out
 TileLang's submodules recursively at the commits the patched tree records and
 refuses commits that differ from the source manifest. `build image` passes
 their contexts, `TILELANG_*` and `TILE_KERNELS_*` arguments (revision, patch

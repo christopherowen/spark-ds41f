@@ -1,9 +1,12 @@
 # Replicating the promoted baseline
 
-This reproduces `manifests/baselines/2026-10-05-karmic-kraken-r5p.json`:
+This reproduces `manifests/baselines/2026-10-05-karmic-kraken-r6.json`:
 DeepSeek V4.1 Flash on three DGX Spark (GB10) nodes, tensor parallelism 3,
-direct-cabled dual ConnectX-7 ring, Local Inference Lab's
-`integration/karmic-kraken-beta` vLLM and B12X.
+direct-cabled dual ConnectX-7 triangle, Local Inference Lab's
+`integration/karmic-kraken-beta` vLLM with the TileLang kernel family
+(TileLang, DeepSeek's TileKernels and sparknet collectives) and B12X as the
+alternative backend. [Four Sparks](#four-sparks-tp4) covers the TP4 1M
+recipe on a four-node ring.
 
 ## Hardware and hosts
 
@@ -100,10 +103,12 @@ bin/spark build image --apply
 ```
 
 `build prepare` fills `.work/build/<vllm>-<b12x>-<input hash>/`, a directory
-named by the lock's inputs. It fetches the pinned vLLM and B12X revisions,
-applies the patch series, and checks both against the source manifest's
-patch heads and trees. It also fetches CUTLASS and the hash-locked CuTe DSL
-wheels, then exports clean build contexts. Re-running it reuses or repairs the
+named by the lock's inputs. It fetches the pinned vLLM, B12X, NCCL, TileLang
+(with its submodules), TileKernels and sparknet revisions, applies the patch
+series, and checks each against the source manifest's patch heads and trees.
+It also fetches CUTLASS and the hash-locked CuTe DSL wheels, then exports
+clean build contexts. The TileLang stage builds TileLang and TileKernels
+wheels, so the first build takes longer. Re-running it reuses or repairs the
 directory. `build image --apply`:
 
 - refuses to run next to a live service;
@@ -115,8 +120,9 @@ directory. `build image --apply`:
   memory-capped container.
 
 The launcher checks the image's source-tree labels
-(`local.spark3.vllm.tree`, `local.spark3.b12x.tree`) against the
-configuration. Your digest will differ from ours because the image also
+(`local.spark3.vllm.tree`, `local.spark3.b12x.tree`,
+`local.spark3.tilelang.tree`, `local.spark3.tile_kernels.tree`,
+`local.spark3.sparknet.tree`) against the configuration. Your digest will differ from ours because the image also
 records the deployment commit; the tree labels must match. See
 [docker/README.md](../docker/README.md).
 
@@ -126,22 +132,23 @@ Copy the image to the other two nodes and confirm all three report the same ID:
 
 ```sh
 for host in dgx2 dgx3; do
-  docker save vllm-ds41f-kkref:04c30fa98e79-r5p | ssh "$host" docker load
+  docker save vllm-ds41f-kkref:04c30fa98e79-r6 | ssh "$host" docker load
 done
 for host in dgx1 dgx2 dgx3; do
-  ssh "$host" docker image inspect vllm-ds41f-kkref:04c30fa98e79-r5p --format '{{.Id}}'
+  ssh "$host" docker image inspect vllm-ds41f-kkref:04c30fa98e79-r6 --format '{{.Id}}'
 done
 ```
 
 ## First start
 
-The first start compiles B12X kernels into `cache/kkref/jit/` and takes longer;
-later starts reuse the cache. To keep FlashInfer's sampling-module compile out
+The first start JIT-compiles the TileLang kernels (and the B12X kernels the
+family still uses) into `cache/kkref/jit/` and takes longer; later starts
+reuse the cache. To keep FlashInfer's sampling-module compile out
 of the memory-guarded startup, prebuild it on each node first:
 
 ```sh
 experiments/2026-09-23-canonical-minimal/prebuild_flashinfer.sh \
-  vllm-ds41f-kkref:04c30fa98e79-r5p kkref/flashinfer
+  vllm-ds41f-kkref:04c30fa98e79-r6 kkref/flashinfer
 ```
 
 Then, from the head node with a clean checkout of the published `main` commit:
@@ -176,3 +183,31 @@ the promoted reference run in `manifests/benchmarks/`. `--full` runs every
 suite to tighter intervals (about 35 minutes). It exits non-zero if the
 quality gate fails, any request fails, or a point is significantly slower than
 the reference by more than 3%. See the README's Benchmarking section.
+
+## Four Sparks (TP4)
+
+The same image serves the checkpoint's full 1,048,576-token context with 16
+sequences on four Sparks cabled as a ring (each node to the next and the
+previous, two ConnectX-7 paths per cable;
+[switchless topology](switchless-topology.md)).
+
+1. Cable the ring and address each cable as its own pair of /24 subnets
+   (`10.<a><b>.<path>.<node>`, for example `10.12.1.1` and `10.12.1.2` on the
+   dgx1-dgx2 cable's first path). Check every path with a 9000-byte ping and
+   that `/sys/class/infiniband/<device>/ports/1/gids/3` holds the IPv4 GID.
+2. Write a four-node map from
+   [config/examples/nodes-ring4.json](../config/examples/nodes-ring4.json) as
+   `config/nodes-ring4.local.json` (git-ignored, like `config/nodes.json`):
+   ranks in ring order, management IPs, and each peer's RoCE devices.
+3. Copy [experiments/2026-10-05-tilelang-r6/tp4.json](../experiments/2026-10-05-tilelang-r6/tp4.json)
+   for your site: `nodes_config`, `distributed.master_addr`, `host.home` and
+   the socket interface names, as for the three-node profile, then
+   `bin/spark --cluster-config <your tp4.json> doctor`.
+4. Download the model on the fourth node, copy the image to it, and start:
+
+   ```sh
+   bin/spark --cluster-config <your tp4.json> cluster start --apply
+   ```
+
+Its acceptance benchmark (decode at 1-16 streams, real-text prefill at 32K to
+1M) is in the [r6 promotion record](../experiments/2026-10-05-tilelang-r6/README.md).

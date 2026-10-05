@@ -1,8 +1,9 @@
-# r6: TileLang as the TP4 kernel family
+# r6: TileLang as the promoted kernel family
 
 r6 is the TileLang kernel family (TileLang, DeepSeek's TileKernels and
-sparknet's one-shot collectives) on the TP4 1M recipe, built as one image with
-no files mounted over it.
+sparknet's one-shot collectives) as the promoted backend, on the TP3 recipe
+(eight sequences at 512K) and the TP4 1M recipe, built as one image with no
+files mounted over it.
 
 ## Sources
 
@@ -36,9 +37,73 @@ Each uses its own DSpark cost directory (`ring4-r6-20261005`).
 
 ## Benchmark
 
-[run_benchmark.sh](run_benchmark.sh): one boot; quality, the single-stream
-decode profile, decode on prose and code with reasoning at 1-16 streams
-(three samples) and real-text prefill at 32K, 256K, 500K and 1M (two
-repeats), the TP4 acceptance benchmark's points.
+[run_benchmark.sh](run_benchmark.sh): one boot per recipe; quality, the
+single-stream decode profile, decode on prose and code with reasoning (three
+samples) and real-text prefill (two repeats) at the recipe's limits: TP4 at
+1-16 streams and 32K-1M, TP3 at 1-8 streams and 32K-500K.
 
-Results: pending.
+Each value is the mean ± its 95% interval (three decode samples, two prefill
+repeats); **bold** marks a point whose interval does not overlap B12X r5p's
+(its [promotion benchmark](../2026-10-05-r5p-promotion/README.md), and
+[2026-10-05-tp4-500k](../2026-10-05-tp4-500k/README.md) for B12X's TP4 500K).
+
+**TP4**, the four-node ring, 2026-10-05 11:48-12:10 UTC
+([runs-tp4](runs-tp4)): quality 5/5, every node at least 19.35 GiB
+available, no thermal slowdown. The 1M prefill point ran on the same boot
+afterwards with the benchmark's size 1,000,000 (1,048,576 is skipped because
+it exceeds the context once output is added).
+
+| | 1 | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prose, B12X r5p | 62.1 ± 3.8% | 92.7 ± 8.0% | 141.6 ± 7.9% | 215.7 ± 7.5% | 297.3 ± 1.2% |
+| Prose, r6 | 62.4 ± 1.2% | 100.2 ± 2.7% | 147.1 ± 10.2% | 222.1 ± 0.3% | **318.4 ± 1.6%** |
+| Code, B12X r5p | 72.5 ± 7.5% | 111.3 ± 5.4% | 168.3 ± 9.6% | 245.7 ± 1.3% | 323.5 ± 1.5% |
+| Code, r6 | 76.0 ± 0.6% | 116.8 ± 18.9% | 174.9 ± 0.6% | **264.3 ± 0.6%** | **349.8 ± 2.5%** |
+
+| Prefill, real text (tok/s) | 32K | 256K | 500K | 1M |
+| --- | ---: | ---: | ---: | ---: |
+| B12X r5p | 5,117 ± 1.7% | 4,873 ± 2.5% | 4,645 ± 1.7% | 4,026 ± 0.9% |
+| r6 | **5,836 ± 4.2%** | **5,471 ± 3.1%** | **5,072 ± 1.3%** | **4,370 ± 0.6%** |
+
+Single-stream steps: **31.79** (prose) and **34.75 ms** (code) against
+34.00 and 37.72.
+
+**TP3**, the dgx1-dgx3 triangle after recabling, 2026-10-05 12:16-12:29 UTC
+([runs-tp3](runs-tp3)): quality 5/5, dgx1 at least 5.99 GiB available, no
+thermal slowdown.
+
+| | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| Prose, B12X r5p | 50.4 ± 12.2% | 75.9 ± 10.6% | 118.8 ± 12.9% | 173.3 ± 8.4% |
+| Prose, r6 | 52.2 ± 0.7% | 84.4 ± 0.6% | 125.7 ± 0.5% | **198.6 ± 0.4%** |
+| Code, B12X r5p | 60.1 ± 2.0% | 90.8 ± 5.0% | 136.3 ± 6.3% | 192.3 ± 3.2% |
+| Code, r6 | **63.0 ± 0.5%** | 97.3 ± 8.5% | 159.2 ± 44.2% | **240.3 ± 1.0%** |
+
+| Prefill, real text (tok/s) | 32K | 256K | 500K |
+| --- | ---: | ---: | ---: |
+| B12X r5p | 3,778 ± 14.9% | 3,632 ± 2.2% | 3,432 ± 0.6% |
+| r6 | 4,306 ± 20.9% | **4,034 ± 0.3%** | **3,743 ± 0.8%** |
+
+Single-stream steps: **38.21** (prose) and **42.43 ms** (code) against 41.92
+and 46.44.
+
+r6 is behind on no point. B12X's intervals are wider because its text changes
+between samples; r6 generates the same text each sample, and its wide points
+(two- and four-stream code) come from scheduling that interleaves streams
+differently between samples.
+
+The TP4 boot's rank-0 decode profile (`ring4-r6-20261005`) shows the kernel
+set of the decode-kernel experiment's window 3 (the same patches mounted
+over the earlier image), with a 40.5 ms six-row step against B12X's 44.9;
+its routed-expert calls read slower than window 3's (297 against 250 µs)
+while the benchmark's step times were not.
+
+## Promotion
+
+r6 becomes the promoted baseline
+([manifests/baselines/2026-10-05-karmic-kraken-r6.json](../../manifests/baselines/2026-10-05-karmic-kraken-r6.json)):
+the TileLang patches join `patches/vllm` (series-r5p keeps r5p's series),
+the root lock and source manifest become r6's, and `config/cluster*.json`
+become the TP3 recipe with `kernel_backend: tilelang`. [r5p/](r5p) keeps
+r5p's lock and TP3 configuration, which the B12X tuning profiles and the
+topology tests use.
