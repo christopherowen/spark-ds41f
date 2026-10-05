@@ -1,0 +1,35 @@
+From c992128fbc4db2e48e3d8c9c74b165d142b53f30 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:00:53 +0200
+Subject: [PATCH] fix(moe): keep a deterministic single row off the M=1
+ materialized launch
+
+With B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1, a one-token W4A8 launch still took
+the M=1 materialized path, which does not reduce in a fixed order: the same
+call repeated gave different bits, and never the bits the row gets in any
+larger batch. A deterministic single row now takes the path larger batches
+take. Replayed through serving's one-plan path, one target row gives the same
+bits at every position of batches of 1 to 8 and 28 rows, with random or
+shared-expert neighbours, and every call repeats (256 calls). Without the
+deterministic flag nothing changes.
+---
+ b12x/moe/fused_moe/_impl.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index 8848ec54..94dd88b1 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -2107,6 +2107,9 @@ def _w4a8_dynamic_materialized_enabled(
+     )
+     m1_candidate = bool(
+         int(num_tokens) == 1
++        # The M=1 materialized launch does not reduce in a fixed order; a
++        # deterministic single row takes the same path as larger batches.
++        and not deterministic_output
+         and k % 256 == 0
+         # Half-aligned ceil-tiled rp storage keeps the up/gate halves on
+         # 128-row tile boundaries, so the per-tile pairing works for any
+-- 
+2.43.0
+

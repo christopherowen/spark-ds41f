@@ -1,0 +1,85 @@
+From 2cc0ce08ae9511b9c1ad4fc7957a84e04bb6712f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 16:32:21 +0200
+Subject: [PATCH] fix(moe): bind live token counts to the smallest planned
+ variant
+
+A fused-MoE execution plan holds one variant per planned token count: the
+serving graph sizes and the prefill capacity. variant_for used the exact
+count when planned and otherwise fell back to the prefill capacity. Each
+variant fixes its own launch shape and FC2 reduction, so a live count
+between planned variants, such as a 19-token prefill alone, computed its
+rows differently than the same rows padded into a planned 20- to 48-row
+batch, and the routed output depended on what else was scheduled.
+
+Take the smallest planned variant at or above the live count instead. Every
+variant already serves any live count up to its capacity, so no new launch
+is compiled; counts above the largest graph size still use the prefill
+capacity.
+---
+ b12x/moe/fused_moe/_preparation.py            | 10 ++++++++--
+ tests/moe/test_fused_moe_variant_selection.py | 10 +++++-----
+ 2 files changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/b12x/moe/fused_moe/_preparation.py b/b12x/moe/fused_moe/_preparation.py
+index 0d90548..67537c6 100644
+--- a/b12x/moe/fused_moe/_preparation.py
++++ b/b12x/moe/fused_moe/_preparation.py
+@@ -752,14 +752,20 @@ class _FusedMoeState:
+ 
+ 
+ def variant_for(variants: Mapping[int, object], tokens: int):
+-    """Use an exact planned variant, otherwise the declared prefill capacity."""
++    """Use the smallest planned variant that holds the live token count.
++
++    Each variant fixes its own launch shape and FC2 reduction, and serves any
++    live count up to its capacity. Falling back to the prefill capacity for a
++    count between planned variants computed those rows differently than the
++    same rows padded into a planned batch.
++    """
+     tokens = int(tokens)
+     capacity = max(variants, default=0)
+     if not 0 < tokens <= capacity:
+         raise ValueError(
+             f"token count {tokens} exceeds prepared MoE capacity {capacity}"
+         )
+-    return variants[tokens] if tokens in variants else variants[capacity]
++    return variants[min(count for count in variants if count >= tokens)]
+ 
+ 
+ @dataclass(frozen=True)
+diff --git a/tests/moe/test_fused_moe_variant_selection.py b/tests/moe/test_fused_moe_variant_selection.py
+index 9f17c2e..a044700 100644
+--- a/tests/moe/test_fused_moe_variant_selection.py
++++ b/tests/moe/test_fused_moe_variant_selection.py
+@@ -80,22 +80,22 @@ def test_nonverifier_tuning_routes_retain_cyclic_coverage(tokens):
+     )
+ 
+ 
+-def test_variant_for_preserves_exact_counts_and_reuses_prefill_capacity():
++def test_variant_for_takes_the_smallest_planned_variant_that_holds_the_rows():
+     variants = {count: _Variant(count) for count in (1, 2, 4, 8, 125, 128)}
+     assert variant_for(variants, 4) is variants[4]
+     assert variant_for(variants, 125) is variants[125]
+-    for count in (3, 11, 31, 126, 128):
+-        assert variant_for(variants, count) is variants[128]
++    for count, planned in ((3, 4), (5, 8), (11, 125), (31, 125), (126, 128), (128, 128)):
++        assert variant_for(variants, count) is variants[planned]
+     with pytest.raises(ValueError, match="exceeds prepared MoE capacity 128"):
+         variant_for(variants, 129)
+ 
+ 
+ def test_capacity_state_binds_the_planned_variant_with_the_live_activations():
+-    variants = {count: _Variant(count) for count in (4, 128)}
++    variants = {count: _Variant(count) for count in (4, 16, 128)}
+     state = _FusedMoeCapacityState(variants)
+     activations = torch.empty(11, 16)
+     count, kwargs = state.bind(a=activations, topk_ids=None)
+-    assert count == 128
++    assert count == 16
+     assert kwargs["a"] is activations
+     with pytest.raises(TypeError):
+         state.bind(a=torch.empty(11))
+-- 
+2.43.0
+

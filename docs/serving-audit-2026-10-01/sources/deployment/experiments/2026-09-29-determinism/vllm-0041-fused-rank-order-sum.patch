@@ -1,0 +1,130 @@
+From fbe701b02ac250c91598642f73761952270aa8d0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:21:12 +0200
+Subject: [PATCH] perf(distributed): fused rank-order sum for the
+ batch-invariant reduce-scatter
+
+The float32 rank-order sum ran as separate conversions, additions, a copy of
+the local chunk and a downcast. Three CUDA parts now go through one Triton
+kernel that reads each part once (the local chunk in place) and writes once,
+with the same arithmetic: float32 additions in rank order, rounded once to the
+output type (round to nearest even). Bit-identical to the previous sequence on
+BF16 and FP16 inputs including signed zeros, extremes, infinities and NaN.
+---
+ .../test_reduce_scatter_rank_order.py         | 25 ++++++++
+ .../device_communicators/cuda_communicator.py | 62 +++++++++++++++++--
+ 2 files changed, 82 insertions(+), 5 deletions(-)
+
+diff --git a/tests/distributed/test_reduce_scatter_rank_order.py b/tests/distributed/test_reduce_scatter_rank_order.py
+index 410283b54..9cde3159c 100644
+--- a/tests/distributed/test_reduce_scatter_rank_order.py
++++ b/tests/distributed/test_reduce_scatter_rank_order.py
+@@ -79,3 +79,28 @@ def test_one_rounding_differs_from_rounding_each_add():
+     for value in values[1:]:
+         each.add_(value)
+     assert not torch.equal(each, _rank_order_sum(values))
++
++
++def test_fused_rank_order_sum_matches_the_float32_sequence_on_gpu():
++    """The fused three-part kernel rounds exactly as float32 additions in rank order."""
++    import pytest
++
++    if not torch.cuda.is_available():
++        pytest.skip("needs a CUDA device")
++    from vllm.distributed.device_communicators.cuda_communicator import (
++        _rank_order_sum as fused,
++    )
++
++    torch.manual_seed(0)
++    for dtype in (torch.bfloat16, torch.float16):
++        parts = [torch.randn(4001, 5120, device="cuda").to(dtype) for _ in range(3)]
++        big = torch.finfo(dtype).max
++        specials = torch.tensor([0.0, -0.0, 1e-38, -1e-38, big, -big, float("inf"),
++                                 float("-inf"), float("nan"), 3.0, -3.0, 65504.0],
++                                device="cuda").to(dtype)
++        for i, part in enumerate(parts):
++            part.view(-1)[: specials.numel()] = specials.roll(i)
++        got = fused(parts)
++        want = _rank_order_sum(parts)
++        assert got.dtype == dtype
++        assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 69ee88497..0b0396001 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -618,11 +618,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 pynccl_comm.send(chunks[peer], peer)
+                 pynccl_comm.recv(parts[peer], peer)
+         pynccl_comm.group_end()
+-        parts[rank].copy_(chunks[rank])
+-        total = parts[0].float()
+-        for part in parts[1:]:
+-            total += part.float()
+-        return total.to(input_tensor.dtype)
++        # This rank's own chunk is read in place.
++        return _rank_order_sum(
++            [chunks[peer] if peer == rank else parts[peer] for peer in range(self.world_size)]
++        )
+ 
+     def reduce_scatterv(
+         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+@@ -1060,3 +1059,56 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             pynccl_comm.batch_isend_irecv(p2p_ops)
+         else:
+             raise ValueError("No PyNCCL communicator found")
++
++
++def _rank_order_sum(parts: list[torch.Tensor]) -> torch.Tensor:
++    """Sum equal-shape BF16/FP16 tensors in float32 in list order, rounded once.
++
++    The arithmetic of ``total = parts[0].float(); total += part.float() ...;
++    total.to(dtype)``. Three CUDA parts go through one fused kernel (one read of
++    each part, one write) instead of separate conversions and additions.
++    """
++    if len(parts) == 3 and parts[0].is_cuda and all(p.is_contiguous() for p in parts):
++        from vllm.triton_utils import triton
++
++        out = torch.empty_like(parts[0])
++        n = out.numel()
++        block = 2048
++        _rank_order_sum3_kernel[(triton.cdiv(n, block),)](
++            parts[0], parts[1], parts[2], out, n, BLOCK=block
++        )
++        return out
++    total = parts[0].float()
++    for part in parts[1:]:
++        total += part.float()
++    return total.to(parts[0].dtype)
++
++
++def _make_rank_order_sum3_kernel():
++    from vllm.triton_utils import tl, triton
++
++    @triton.jit
++    def kernel(a, b, c, out, n, BLOCK: tl.constexpr):
++        offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
++        mask = offsets < n
++        total = tl.load(a + offsets, mask=mask).to(tl.float32)
++        total = total + tl.load(b + offsets, mask=mask).to(tl.float32)
++        total = total + tl.load(c + offsets, mask=mask).to(tl.float32)
++        tl.store(out + offsets, total.to(out.dtype.element_ty, fp_downcast_rounding="rtne"), mask=mask)
++
++    return kernel
++
++
++class _LazyKernel:
++    """Compiles the Triton kernel on first use (the module also loads without Triton)."""
++
++    def __init__(self, make):
++        self._make, self._kernel = make, None
++
++    def __getitem__(self, grid):
++        if self._kernel is None:
++            self._kernel = self._make()
++        return self._kernel[grid]
++
++
++_rank_order_sum3_kernel = _LazyKernel(_make_rank_order_sum3_kernel)
+-- 
+2.43.0
+

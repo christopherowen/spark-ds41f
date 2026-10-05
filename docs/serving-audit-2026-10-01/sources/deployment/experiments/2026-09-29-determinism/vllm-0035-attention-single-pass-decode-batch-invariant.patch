@@ -1,0 +1,45 @@
+From 97fd5d90fe3079f55184a6c06ac8f8e571264784 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:37:03 +0200
+Subject: [PATCH] feat(deepseek-v4.1): decode rows on the single-pass attention
+ kernel in batch-invariant mode
+
+Decode steps run the split (multi-pass) sparse MLA kernel and steps with a
+prefill the single-pass one, so a decode row rounds differently when it
+shares a step with a prefill. With VLLM_DS41_BATCH_INVARIANT=1 decode plans
+take the single-pass kernel too (as the reference compute mode does), and
+keep the default arithmetic.
+---
+ vllm/models/deepseek_v4_1/attention.py | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 86ffd89da..716b07d48 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -61,6 +61,9 @@ from vllm.v1.worker.workspace import (
+ )
+ 
+ logger = init_logger(__name__)
++# Opt-in batch-invariant mode: decode rows run the extend (single-pass) kernel,
++# so a decode row rounds the same in a decode step as beside a prefill.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+ 
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+@@ -690,8 +693,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             ("decode", min(self.capacity, decode_rows)),
+             ("extend", self.capacity),
+         ):
+-            # "reference" gives decode rows the single-pass kernel as well.
+-            kernel_mode = "extend" if compute == "reference" else mode
++            # "reference" gives decode rows the single-pass kernel as well (and
++            # BF16 arithmetic below); batch-invariant mode keeps the arithmetic.
++            single_pass = compute == "reference" or _BATCH_INVARIANT
++            kernel_mode = "extend" if single_pass else mode
+             caps = mla.Caps(
+                 device=device,
+                 num_q_heads=self.n_local_heads,
+-- 
+2.43.0
+

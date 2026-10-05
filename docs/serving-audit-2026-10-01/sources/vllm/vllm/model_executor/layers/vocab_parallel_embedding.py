@@ -1,0 +1,827 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Literal
+
+import torch
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+
+import vllm.envs as envs
+from vllm import _custom_ops as ops
+from vllm.distributed import (
+    GroupCoordinator,
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
+from vllm.logger import init_logger
+from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.determinism.batch_invariant import (
+    linear_batch_invariant,
+)
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+    method_has_implemented_embedding,
+    resolve_quant_method,
+)
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.weight_transfer import copy_weight
+from vllm.platforms import current_platform
+
+DEFAULT_VOCAB_PADDING_SIZE = 64
+logger = init_logger(__name__)
+
+
+def _register_b12x_embedding_collective(
+    owner, prefix: str, width: int, tp_size: int
+) -> None:
+    if tp_size <= 1:
+        return
+    from vllm.distributed.parallel_state import register_b12x_collective_describer
+
+    def describe(requirements):
+        if not prefix:
+            raise ValueError(
+                "B12X embedding collective preparation requires a stable module prefix"
+            )
+        from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+            B12xPcieInvocation,
+        )
+
+        return tuple(
+            B12xPcieInvocation(
+                name=f"{prefix}.embedding_all_reduce.m{rows}",
+                operation="all_reduce",
+                shape=(rows, width),
+                dtype=requirements.output_dtype,
+            )
+            for rows in requirements.token_counts
+        )
+
+    register_b12x_collective_describer(owner, describe)
+
+
+def _supports_default_lm_head_quantization(
+    recipe: Literal["mxfp8", "nvfp4"],
+    params_dtype: torch.dtype,
+    input_size: int,
+    output_size: int,
+) -> bool:
+    from vllm.config import get_current_vllm_config
+
+    config = get_current_vllm_config()
+    if (
+        config.model_config is None
+        or config.model_config.dtype != torch.bfloat16
+        or params_dtype != torch.bfloat16
+        or input_size % 128
+        or output_size % 8
+        or config.kernel_config.linear_backend not in ("auto", "b12x")
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability_family(120)
+    ):
+        return False
+
+    if recipe == "nvfp4":
+        from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+            B12xNvFp4LinearKernel,
+        )
+
+        return (
+            B12xNvFp4LinearKernel.__name__ not in envs.VLLM_DISABLED_KERNELS
+            and B12xNvFp4LinearKernel.is_supported()[0]
+        )
+
+    from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
+    from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
+
+    try:
+        return isinstance(init_mxfp8_linear_kernel(), B12xMxfp8LinearKernel)
+    except ValueError:
+        return False
+
+
+class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+    """Unquantized method for embeddings."""
+
+    supports_pre_processed_weights = True
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        """Create weights for embedding layer."""
+        weight = Parameter(
+            torch.empty(
+                sum(output_partition_sizes),
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if current_platform.is_cpu():
+            from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+
+            dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if envs.VLLM_BATCH_INVARIANT and (
+            current_platform.is_cuda_alike() or current_platform.is_xpu()
+        ):
+            return linear_batch_invariant(x, layer.weight, bias)
+        return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        return F.embedding(input_, layer.weight)
+
+    def tie_weights(
+        self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
+    ):
+        layer.weight = embed_tokens.weight
+        return layer
+
+
+def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
+    """Pad the vocab size to the given value."""
+    return ((vocab_size + pad_to - 1) // pad_to) * pad_to
+
+
+def vocab_range_from_per_partition_vocab_size(
+    per_partition_vocab_size: int, rank: int, offset: int = 0
+) -> Sequence[int]:
+    index_f = rank * per_partition_vocab_size
+    index_l = index_f + per_partition_vocab_size
+    return index_f + offset, index_l + offset
+
+
+def vocab_range_from_global_vocab_size(
+    global_vocab_size: int, rank: int, world_size: int, offset: int = 0
+) -> Sequence[int]:
+    per_partition_vocab_size = divide(global_vocab_size, world_size)
+    return vocab_range_from_per_partition_vocab_size(
+        per_partition_vocab_size, rank, offset=offset
+    )
+
+
+@dataclass
+class VocabParallelEmbeddingShardIndices:
+    """Indices for a shard of a vocab parallel embedding."""
+
+    padded_org_vocab_start_index: int
+    padded_org_vocab_end_index: int
+    padded_added_vocab_start_index: int
+    padded_added_vocab_end_index: int
+
+    org_vocab_start_index: int
+    org_vocab_end_index: int
+    added_vocab_start_index: int
+    added_vocab_end_index: int
+
+    @property
+    def num_org_elements(self) -> int:
+        return self.org_vocab_end_index - self.org_vocab_start_index
+
+    @property
+    def num_added_elements(self) -> int:
+        return self.added_vocab_end_index - self.added_vocab_start_index
+
+    @property
+    def num_org_elements_padded(self) -> int:
+        return self.padded_org_vocab_end_index - self.padded_org_vocab_start_index
+
+    @property
+    def num_added_elements_padded(self) -> int:
+        return self.padded_added_vocab_end_index - self.padded_added_vocab_start_index
+
+    @property
+    def num_org_vocab_padding(self) -> int:
+        return self.num_org_elements_padded - self.num_org_elements
+
+    @property
+    def num_added_vocab_padding(self) -> int:
+        return self.num_added_elements_padded - self.num_added_elements
+
+    @property
+    def num_elements_padded(self) -> int:
+        return self.num_org_elements_padded + self.num_added_elements_padded
+
+    def __post_init__(self):
+        # sanity checks
+        assert self.padded_org_vocab_start_index <= self.padded_org_vocab_end_index
+        assert self.padded_added_vocab_start_index <= self.padded_added_vocab_end_index
+
+        assert self.org_vocab_start_index <= self.org_vocab_end_index
+        assert self.added_vocab_start_index <= self.added_vocab_end_index
+
+        assert self.org_vocab_start_index <= self.padded_org_vocab_start_index
+        assert self.added_vocab_start_index <= self.padded_added_vocab_start_index
+        assert self.org_vocab_end_index <= self.padded_org_vocab_end_index
+        assert self.added_vocab_end_index <= self.padded_added_vocab_end_index
+
+        assert self.num_org_elements <= self.num_org_elements_padded
+        assert self.num_added_elements <= self.num_added_elements_padded
+
+
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+def get_masked_input_and_mask(
+    input_: torch.Tensor,
+    org_vocab_start_index: int,
+    org_vocab_end_index: int,
+    num_org_vocab_padding: int,
+    added_vocab_start_index: int,
+    added_vocab_end_index: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # torch.compile will fuse all of the pointwise ops below
+    # into a single kernel, making it very fast
+    org_vocab_mask = (input_ >= org_vocab_start_index) & (input_ < org_vocab_end_index)
+    added_vocab_mask = (input_ >= added_vocab_start_index) & (
+        input_ < added_vocab_end_index
+    )
+    added_offset = (
+        added_vocab_start_index
+        - (org_vocab_end_index - org_vocab_start_index)
+        - num_org_vocab_padding
+    )
+    valid_offset = (org_vocab_start_index * org_vocab_mask) + (
+        added_offset * added_vocab_mask
+    )
+    vocab_mask = org_vocab_mask | added_vocab_mask
+    input_ = vocab_mask * (input_ - valid_offset)
+    return input_, ~vocab_mask
+
+
+# --8<-- [start:vocab_parallel_embedding]
+@PluggableLayer.register("vocab_parallel_embedding")
+class VocabParallelEmbedding(PluggableLayer):
+    """Embedding parallelized in the vocabulary dimension.
+
+    Adapted from torch.nn.Embedding, note that we pad the vocabulary size to
+    make sure it is divisible by the number of model parallel GPUs.
+
+    In order to support various loading methods, we ensure that LoRA-added
+    embeddings are always at the end of TP-sharded tensors. In other words,
+    we shard base embeddings and LoRA embeddings separately (both padded),
+    and place them in the same tensor.
+    In this example, we will have the original vocab size = 1010,
+    added vocab size = 16 and padding to 64. Therefore, the total
+    vocab size with padding will be 1088 (because we first pad 1010 to
+    1024, add 16, and then pad to 1088).
+    Therefore, the tensor format looks like the following:
+    TP1, rank 0 (no sharding):
+                            |< --------BASE-------- >|< -BASE PADDING-- >|< -----LORA------ >|< -LORA PADDING-- >|
+    corresponding token_id: |  0  |  1  | ... | 1009 |  -1  | ... |  -1  | 1010 | ... | 1025 |  -1  | ... |  -1  |
+                     index: |  0  |  1  | ... | 1009 | 1010 | ... | 1023 | 1024 | ... | 1039 | 1040 | ... | 1087 |
+
+    TP2, rank 0:
+                            |< --------------------BASE--------------------- >|< -----LORA------ >|< -LORA PADDING- >|
+    corresponding token_id: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 1010 | ... | 1025 |  -1  | ... |  -1 |
+                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 527  |  528 | ... | 543 |
+    TP2, rank 1:
+                            |< -----------BASE----------- >|< -BASE PADDING- >|< -----------LORA PADDING----------- >|
+    corresponding token_id: | 512 | 513 | 514 | ... | 1009 | -1  | ...  | -1  |  -1  | ... |  -1  | -1  | ... |   -1 |
+                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 527  | 528 | ... |  543 |
+
+    Args:
+        num_embeddings: vocabulary size.
+        embedding_dim: size of hidden state.
+        params_dtype: type of the parameters.
+        org_num_embeddings: original vocabulary size (without LoRA).
+        padding_size: padding size for the vocabulary.
+        quant_config: quant config for the layer
+        prefix: full name of the layer in the state dict
+        disable_tp: If true, tensor parallelism will be disabled for this layer.
+        quant_method: Preselected quantization method for model-specific layers.
+        parallel_group: Process group used to shard and reduce the embedding.
+    """  # noqa: E501
+
+    # --8<-- [end:vocab_parallel_embedding]
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        params_dtype: torch.dtype | None = None,
+        org_num_embeddings: int | None = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        disable_tp: bool = False,
+        quant_method: QuantizeMethodBase | None = None,
+        parallel_group: GroupCoordinator | None = None,
+        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+    ):
+        super().__init__()
+
+        # Keep the input dimensions.
+        self.disable_tp = disable_tp
+        self.parallel_group = parallel_group
+        if disable_tp:
+            tp_rank, self.tp_size = 0, 1
+        elif parallel_group is not None:
+            tp_rank = parallel_group.rank_in_group
+            self.tp_size = parallel_group.world_size
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = tp_rank
+        self.num_embeddings = num_embeddings
+        # The global padded vocabulary must satisfy both the requested storage
+        # alignment and the TP partitioning constraint for every world size.
+        self.padding_size = math.lcm(padding_size, self.tp_size)
+        self.org_vocab_size = org_num_embeddings or num_embeddings
+        num_added_embeddings = num_embeddings - self.org_vocab_size
+        self.org_vocab_size_padded = pad_vocab_size(
+            self.org_vocab_size, self.padding_size
+        )
+        self.num_embeddings_padded = pad_vocab_size(
+            self.org_vocab_size_padded + num_added_embeddings, self.padding_size
+        )
+        assert self.org_vocab_size_padded <= self.num_embeddings_padded
+
+        self.shard_indices = self._get_indices(
+            self.num_embeddings_padded,
+            self.org_vocab_size_padded,
+            self.num_embeddings,
+            self.org_vocab_size,
+            tp_rank,
+            self.tp_size,
+        )
+        self.embedding_dim = embedding_dim
+
+        # Avoid overriding a preselected model-specific method with generic
+        # config-based dispatch.
+        if quant_method is None and quant_config is not None:
+            quant_method = resolve_quant_method(quant_config, self, prefix=prefix)
+        if quant_method is None:
+            quant_method = UnquantizedEmbeddingMethod()
+
+        is_embedding_layer = not isinstance(self, ParallelLMHead)
+        head_quantization = lm_head_quantization
+        if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
+            head_quantization = "mxfp8"
+        self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
+        if not is_embedding_layer and head_quantization is not None:
+            from vllm.config import get_current_vllm_config
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            from vllm.model_executor.layers.quantization.online.mxfp8 import (
+                Mxfp8OnlineLinearMethod,
+            )
+
+            unquantized = isinstance(
+                quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+            )
+            flag = (
+                "VLLM_MTP_NVFP4_LM_HEAD"
+                if head_quantization == "nvfp4"
+                else "VLLM_MXFP8_LM_HEAD"
+            )
+            model_config = get_current_vllm_config().model_config
+            tied = getattr(
+                getattr(model_config, "hf_text_config", None),
+                "tie_word_embeddings",
+                False,
+            )
+            default_supported = _supports_default_lm_head_quantization(
+                head_quantization,
+                params_dtype or torch.get_default_dtype(),
+                embedding_dim,
+                self.num_embeddings_padded // self.tp_size,
+            )
+            if not envs.is_set(flag) and (
+                not unquantized or tied or not default_supported
+            ):
+                head_quantization = None
+            elif not unquantized:
+                raise ValueError(
+                    "Runtime LM head quantization requires an unquantized LM head "
+                    "checkpoint"
+                )
+            use_a16 = envs.VLLM_LM_HEAD_A16 and (
+                envs.is_set("VLLM_LM_HEAD_A16") or default_supported
+            )
+            if head_quantization == "nvfp4":
+                from vllm.model_executor.layers.quantization.online.nvfp4 import (
+                    Nvfp4OnlineLinearMethod,
+                )
+
+                quant_method = Nvfp4OnlineLinearMethod(use_a16=use_a16)
+            elif head_quantization == "mxfp8":
+                quant_method = Mxfp8OnlineLinearMethod(use_a16=use_a16)
+            self.runtime_lm_head_quantization = head_quantization
+            if head_quantization is not None:
+                logger.info_once(
+                    "Quantizing LM head shards to %s with %s activations.",
+                    head_quantization.upper(),
+                    "BF16" if use_a16 else "quantized",
+                )
+        quant_method_implements_embedding = method_has_implemented_embedding(
+            type(quant_method)
+        )
+        if is_embedding_layer and not quant_method_implements_embedding:
+            raise NotImplementedError(
+                f"The class {type(quant_method).__name__} must implement "
+                "the 'embedding' method, see UnquantizedEmbeddingMethod."
+            )
+
+        self.quant_method: QuantizeMethodBase = quant_method
+
+        if params_dtype is None:
+            params_dtype = torch.get_default_dtype()
+        self.params_dtype = params_dtype
+        # Divide the weight matrix along the vocabulary dimension.
+        self.num_added_embeddings = self.num_embeddings - self.org_vocab_size
+        self.num_embeddings_per_partition = divide(
+            self.num_embeddings_padded, self.tp_size
+        )
+        assert (
+            self.shard_indices.num_elements_padded == self.num_embeddings_per_partition
+        )
+        self.num_org_embeddings_per_partition = (
+            self.shard_indices.org_vocab_end_index
+            - self.shard_indices.org_vocab_start_index
+        )
+        self.num_added_embeddings_per_partition = (
+            self.shard_indices.added_vocab_end_index
+            - self.shard_indices.added_vocab_start_index
+        )
+
+        # The fused kernel masks, shifts and gathers in one pass; it assumes a
+        # plain row-major shard, so it only applies to unquantized weights.
+        self.use_fused_embedding = (
+            self.tp_size > 1
+            and current_platform.is_cuda()
+            and isinstance(quant_method, UnquantizedEmbeddingMethod)
+        )
+
+        self.quant_method.create_weights(
+            self,
+            self.embedding_dim,
+            [self.num_embeddings_per_partition],
+            self.embedding_dim,
+            self.num_embeddings_padded,
+            params_dtype=params_dtype,
+            weight_loader=self.weight_loader,
+        )
+        self.update_param_tp_status()
+        _register_b12x_embedding_collective(
+            self,
+            prefix,
+            self.embedding_dim,
+            self.tp_size,
+        )
+
+    def update_param_tp_status(self):
+        for param in self.parameters():
+            if isinstance(param, BasevLLMParameter):
+                param.tp_rank = self.tp_rank
+                param.tp_size = self.tp_size
+
+    @classmethod
+    def _get_indices(
+        cls,
+        vocab_size_padded: int,
+        org_vocab_size_padded: int,
+        vocab_size: int,
+        org_vocab_size: int,
+        tp_rank: int,
+        tp_size: int,
+    ) -> VocabParallelEmbeddingShardIndices:
+        """Get start and end indices for vocab parallel embedding, following the
+        layout outlined in the class docstring, based on the given tp_rank and
+        tp_size."""
+        num_added_embeddings_padded = vocab_size_padded - org_vocab_size_padded
+        padded_org_vocab_start_index, padded_org_vocab_end_index = (
+            vocab_range_from_global_vocab_size(org_vocab_size_padded, tp_rank, tp_size)
+        )
+        padded_added_vocab_start_index, padded_added_vocab_end_index = (
+            vocab_range_from_global_vocab_size(
+                num_added_embeddings_padded, tp_rank, tp_size, offset=org_vocab_size
+            )
+        )
+        # remove padding
+        org_vocab_start_index = min(padded_org_vocab_start_index, org_vocab_size)
+        org_vocab_end_index = min(padded_org_vocab_end_index, org_vocab_size)
+        added_vocab_start_index = min(padded_added_vocab_start_index, vocab_size)
+        added_vocab_end_index = min(padded_added_vocab_end_index, vocab_size)
+        return VocabParallelEmbeddingShardIndices(
+            padded_org_vocab_start_index,
+            padded_org_vocab_end_index,
+            padded_added_vocab_start_index,
+            padded_added_vocab_end_index,
+            org_vocab_start_index,
+            org_vocab_end_index,
+            added_vocab_start_index,
+            added_vocab_end_index,
+        )
+
+    def get_sharded_to_full_mapping(self) -> list[int] | None:
+        """Get a mapping that can be used to reindex the gathered
+        logits for sampling.
+
+        During sampling, we gather logits from all ranks. The relationship
+        of index->token_id will follow the same format as outlined in the class
+        docstring. However, after the gather, we want to reindex the final
+        logits tensor to map index->token_id one-to-one (the index is always
+        equal the token_id it corresponds to). The indices returned by this
+        method allow us to do that.
+        """
+        if self.tp_size < 2:
+            return None
+
+        base_embeddings: list[int] = []
+        added_embeddings: list[int] = []
+        padding: list[int] = []
+        for tp_rank in range(self.tp_size):
+            shard_indices = self._get_indices(
+                self.num_embeddings_padded,
+                self.org_vocab_size_padded,
+                self.num_embeddings,
+                self.org_vocab_size,
+                tp_rank,
+                self.tp_size,
+            )
+            range_start = self.num_embeddings_per_partition * tp_rank
+            range_end = self.num_embeddings_per_partition * (tp_rank + 1)
+            base_embeddings.extend(
+                range(range_start, range_start + shard_indices.num_org_elements)
+            )
+            padding.extend(
+                range(
+                    range_start + shard_indices.num_org_elements,
+                    range_start + shard_indices.num_org_elements_padded,
+                )
+            )
+            added_embeddings.extend(
+                range(
+                    range_start + shard_indices.num_org_elements_padded,
+                    range_start
+                    + shard_indices.num_org_elements_padded
+                    + shard_indices.num_added_elements,
+                )
+            )
+            padding.extend(
+                range(
+                    range_start
+                    + shard_indices.num_org_elements_padded
+                    + shard_indices.num_added_elements,
+                    range_start
+                    + shard_indices.num_org_elements_padded
+                    + shard_indices.num_added_elements_padded,
+                )
+            )
+            assert (
+                range_start
+                + shard_indices.num_org_elements_padded
+                + shard_indices.num_added_elements_padded
+                == range_end
+            )
+        ret = base_embeddings + added_embeddings + padding
+        assert len(ret) == self.num_embeddings_padded
+        return ret
+
+    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        output_dim = getattr(param, "output_dim", None)
+        packed_dim = getattr(param, "packed_dim", None)
+
+        # Parameters without an output dimension are copied onto all GPUs.
+        if output_dim is None:
+            if (
+                loaded_weight.ndim == 0
+                and param.data.ndim == 1
+                and param.data.numel() == 1
+            ):
+                loaded_weight = loaded_weight.reshape(1)
+            assert param.data.shape == loaded_weight.shape
+            copy_weight(param.data, loaded_weight)
+            return
+
+        # Shard indexes for loading the weight
+        start_idx = self.shard_indices.org_vocab_start_index
+        shard_size = self.shard_indices.org_vocab_end_index - start_idx
+
+        # If param packed on the same dim we are sharding on, then
+        # need to adjust offsets of loaded weight by pack_factor.
+        if packed_dim is not None and packed_dim == output_dim:
+            packed_factor = (
+                param.packed_factor
+                if isinstance(param, BasevLLMParameter)
+                else param.pack_factor
+            )
+            assert loaded_weight.shape[output_dim] == (
+                self.org_vocab_size // param.packed_factor
+            )
+            start_idx = start_idx // packed_factor
+            shard_size = shard_size // packed_factor
+        else:
+            assert loaded_weight.shape[output_dim] == self.org_vocab_size
+
+        # Copy the data. Select chunk corresponding to current shard.
+        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
+        param[loaded_weight.shape[0] :].data.fill_(0)
+
+    def forward(self, input_):
+        if self.tp_size == 1:
+            return self.quant_method.embedding(self, input_.long())
+
+        if self.use_fused_embedding:
+            output_parallel = ops.vocab_parallel_embedding(
+                input_ if input_.ndim == 1 else input_.reshape(-1),
+                self.weight,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            if input_.ndim != 1:
+                output_parallel = output_parallel.view(
+                    *input_.shape, self.embedding_dim
+                )
+        else:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+            if output_parallel.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ):
+                # Each vocab token has one owner, so FP8 bytes can use int8 SUM.
+                comm_output = output_parallel.view(torch.int8)
+                comm_output.masked_fill_(input_mask.unsqueeze(-1), 0)
+                output = (
+                    self.parallel_group.all_reduce(comm_output)
+                    if self.parallel_group is not None
+                    else tensor_model_parallel_all_reduce(comm_output)
+                )
+                return output.view(output_parallel.dtype)
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        # Reduce across all the model parallel GPUs.
+        if self.parallel_group is not None:
+            return self.parallel_group.all_reduce(output_parallel)
+        return tensor_model_parallel_all_reduce(output_parallel)
+
+    def forward_reduce_scatter(
+        self, input_: torch.Tensor, padded_rows: int
+    ) -> torch.Tensor:
+        """Embed ``input_`` and reduce-scatter the rows over the TP group.
+
+        For sequence parallelism: the partial embeddings are written into a
+        ``padded_rows`` buffer whose trailing rows are zero, and rank r
+        receives rows ``[r * padded_rows // tp_size, (r + 1) * ...)`` of the
+        full embeddings. Each token has one owning shard, so the reduction is
+        exact, as in :meth:`forward`.
+        """
+        rows = input_.shape[0]
+        if (
+            self.tp_size == 1
+            or self.parallel_group is not None
+            or input_.ndim != 1
+            or padded_rows < rows
+            or padded_rows % self.tp_size
+        ):
+            raise ValueError(
+                "Embedding reduce-scatter needs 1-D ids, the default TP group "
+                f"and padded rows divisible by it (rows={rows}, "
+                f"padded_rows={padded_rows}, tp_size={self.tp_size})"
+            )
+        if self.use_fused_embedding:
+            output_parallel = torch.empty(
+                (padded_rows, self.weight.shape[1]),
+                dtype=self.weight.dtype,
+                device=self.weight.device,
+            )
+            ops.vocab_parallel_embedding(
+                input_,
+                self.weight,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+                out=output_parallel[:rows],
+            )
+        else:
+            masked_input, input_mask = get_masked_input_and_mask(
+                input_,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            local = self.quant_method.embedding(self, masked_input.long())
+            if local.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                raise NotImplementedError("FP8 embedding reduce-scatter")
+            output_parallel = local.new_empty((padded_rows, *local.shape[1:]))
+            output_parallel[:rows].copy_(local.masked_fill_(input_mask[:, None], 0))
+        output_parallel[rows:].zero_()
+        return tensor_model_parallel_reduce_scatter(output_parallel, dim=0)
+
+    def extra_repr(self) -> str:
+        s = f"num_embeddings={self.num_embeddings}"
+        s += f", num_embeddings_per_partition={self.num_embeddings_per_partition}"
+        s += f", embedding_dim={self.embedding_dim}"
+        s += f", org_vocab_size={self.org_vocab_size}"
+        s += f", num_embeddings_padded={self.num_embeddings_padded}"
+        s += f", tp_size={self.tp_size}"
+        return s
+
+
+# --8<-- [start:parallel_lm_head]
+@PluggableLayer.register("parallel_lm_head")
+class ParallelLMHead(VocabParallelEmbedding):
+    """Parallelized LM head.
+
+    Output logits weight matrices used in the Sampler. The weight and bias
+    tensors are padded to make sure they are divisible by the number of
+    model parallel GPUs.
+
+    Args:
+        num_embeddings: vocabulary size.
+        embedding_dim: size of hidden state.
+        bias: whether to use bias.
+        params_dtype: type of the parameters.
+        org_num_embeddings: original vocabulary size (without LoRA).
+        padding_size: padding size for the vocabulary.
+        disable_tp: If true, tensor parallelism will be disabled for this layer.
+    """
+
+    # --8<-- [end:parallel_lm_head]
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        bias: bool = False,
+        params_dtype: torch.dtype | None = None,
+        org_num_embeddings: int | None = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        *,
+        disable_tp: bool = False,
+        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype,
+            org_num_embeddings,
+            padding_size,
+            quant_config,
+            prefix,
+            disable_tp=disable_tp,
+            lm_head_quantization=lm_head_quantization,
+        )
+        self.quant_config = quant_config
+        if bias:
+            self._register_bias()
+        else:
+            self.register_parameter("bias", None)
+
+    def _register_bias(self):
+        data = torch.empty(self.num_embeddings_per_partition, dtype=self.params_dtype)
+        self.bias = Parameter(data, requires_grad=False)
+        weight_attrs = dict(output_dim=0, weight_loader=self.weight_loader)
+        set_weight_attrs(weight=self.bias, weight_attrs=weight_attrs)
+
+    def tie_weights(self, embed_tokens: VocabParallelEmbedding):
+        """Tie the weights with word embeddings."""
+        return self.quant_method.tie_weights(self, embed_tokens)
+
+    def forward(self, input_):
+        del input_
+        raise RuntimeError("LMHead's weights should be used in the sampler.")

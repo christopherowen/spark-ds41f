@@ -1,0 +1,87 @@
+From 0e622d45b0d78b9e4e8add41c5a7fb8ee75cace4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:35:15 +0200
+Subject: [PATCH] feat(deepseek-v4.1): SIMT GEMV at every capacity in
+ batch-invariant mode
+
+The default GEMV selection changes backend with the capacity (SIMT for
+small plans, then cuBLAS, whose kernel also changes with the row count,
+or the TMA prefill kernel), so a projection row rounds differently in a
+small step than in a large one. With VLLM_DS41_BATCH_INVARIANT=1 every
+capacity plans the SIMT backend, which rounds a row the same way at
+every row count from 1 to 4096 for each V4.1 projection shape.
+---
+ ...test_deepseek_v4_1_prepared_projections.py | 14 ++++++--------
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 19 ++++++++-----------
+ 2 files changed, 14 insertions(+), 19 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index ad401ca08..3156c37ad 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -128,8 +128,8 @@ def test_projections_take_the_smallest_prepared_capacity(monkeypatch):
+         B12xLinearMethod().apply(layer, torch.empty(4097, 16, dtype=torch.bfloat16))
+ 
+ 
+-def test_batch_invariant_mode_plans_torch_backend_capacities_on_simt(monkeypatch):
+-    """Only torch-backend capacities below 256 rows change, and only when enabled."""
++def test_batch_invariant_mode_plans_every_gemv_capacity_on_simt(monkeypatch):
++    """Every capacity and output dtype runs SIMT when enabled; nothing changes otherwise."""
+     from b12x.gemm.bf16_gemv import GemvQuery
+ 
+     from vllm.models.deepseek_v4_1 import b12x_layers
+@@ -148,14 +148,12 @@ def test_batch_invariant_mode_plans_torch_backend_capacities_on_simt(monkeypatch
+             weight_aligned=True,
+         )
+ 
++    cases = [(32, "bfloat16", 20), (512, "bfloat16", 192), (512, "bfloat16", 384),
++             (32, "bfloat16", 8), (384, "float32", 20), (384, "float32", 4096)]
+     monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", False)
+-    assert b12x_layers._gemv_override(query(32, "bfloat16", 20)) is None
++    assert all(b12x_layers._gemv_override(query(*case)) is None for case in cases)
+     monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
+-    assert b12x_layers._gemv_override(query(32, "bfloat16", 20)).backend == "simt"
+-    assert b12x_layers._gemv_override(query(512, "bfloat16", 192)).backend == "simt"
+-    assert b12x_layers._gemv_override(query(512, "bfloat16", 384)) is None
+-    assert b12x_layers._gemv_override(query(32, "bfloat16", 8)) is None
+-    assert b12x_layers._gemv_override(query(384, "float32", 20)) is None
++    assert all(b12x_layers._gemv_override(query(*case)).backend == "simt" for case in cases)
+ 
+ 
+ def test_batch_invariant_mode_plans_block_fp8_without_split_k(monkeypatch):
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 8b95895a1..a77838d1b 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -223,20 +223,17 @@ _BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+ 
+ 
+ def _gemv_override(query):
+-    """The SIMT backend for a torch-backend capacity in batch-invariant mode.
++    """The SIMT backend at every capacity in batch-invariant mode.
+ 
+-    Below 256 rows the FP32-output projections already run SIMT by default;
+-    larger capacities keep their default (the prefill kernel where eligible).
++    The default selection changes backend with the capacity: SIMT for small
++    plans, then cuBLAS (whose kernel also changes with the row count) or the
++    TMA prefill kernel, each rounding a row differently. SIMT rounds a row the
++    same way at every capacity from 1 to 4096 rows, for every V4.1 projection
++    shape.
+     """
+-    from b12x.gemm.bf16_gemv._tuning import GemvConfig, default_config
++    from b12x.gemm.bf16_gemv._tuning import GemvConfig
+ 
+-    if (
+-        _BATCH_INVARIANT
+-        and query.max_rows < 256
+-        and default_config(query, None).backend == "torch"
+-    ):
+-        return GemvConfig(backend="simt")
+-    return None
++    return GemvConfig(backend="simt") if _BATCH_INVARIANT else None
+ 
+ 
+ def _block32_plan(caps):
+-- 
+2.43.0
+

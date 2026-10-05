@@ -1,0 +1,180 @@
+From 4332980afd88dec6cfa3664a5af9d37b75f3e042 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 00:40:30 +0200
+Subject: [PATCH] feat(distributed): one-shot-order reduce-scatter in
+ batch-invariant mode
+
+NCCL adds the ranks' partials of a reduce-scatter chunk in an order that
+depends on the receiving rank and the message size, so under DeepSeek
+V4.1 prefill sequence parallelism a row's bits change with the batch's
+row count and the row's position. With VLLM_DS41_BATCH_INVARIANT=1 the
+TP reduce-scatter exchanges the chunks (grouped send/recv on the same
+communicator, the same bytes) and adds them as the RoCE one-shot
+all-reduce does (float32, rank order, one rounding), so a row has the
+same bits whether its step was reduce-scattered or all-reduced.
+---
+ .../test_reduce_scatter_rank_order.py         | 81 +++++++++++++++++++
+ .../device_communicators/cuda_communicator.py | 38 ++++++++-
+ 2 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 tests/distributed/test_reduce_scatter_rank_order.py
+
+diff --git a/tests/distributed/test_reduce_scatter_rank_order.py b/tests/distributed/test_reduce_scatter_rank_order.py
+new file mode 100644
+index 000000000..410283b54
+--- /dev/null
++++ b/tests/distributed/test_reduce_scatter_rank_order.py
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Host test of the batch-invariant reduce-scatter (three simulated ranks)."""
++
++import torch
++
++from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
++
++
++class _Exchange:
++    """Stands in for one rank\x27s NCCL communicator: recv reads the peer\x27s chunk."""
++
++    def __init__(self, inputs, rank):
++        self.inputs, self.rank = inputs, rank
++
++    def group_start(self):
++        pass
++
++    def group_end(self):
++        pass
++
++    def send(self, tensor, peer):
++        pass
++
++    def recv(self, tensor, peer):
++        world = len(self.inputs)
++        tensor.copy_(self.inputs[peer].view(world, -1, *tensor.shape[1:])[self.rank])
++
++
++def _reduce_scatter(inputs, rank):
++    comm = object.__new__(CudaCommunicator)
++    comm.world_size, comm.rank_in_group = len(inputs), rank
++    comm.pynccl_comm = _Exchange(inputs, rank)
++    return comm._reduce_scatter_rank_order(inputs[rank])
++
++
++def _rank_order_sum(values):
++    """The RoCE one-shot all-reduce's arithmetic: float32, rank order, one rounding."""
++    total = values[0].float()
++    for value in values[1:]:
++        total += value.float()
++    return total.to(values[0].dtype)
++
++
++def test_rows_add_as_the_one_shot_all_reduce():
++    torch.manual_seed(0)
++    world, local, width = 3, 5, 64
++    inputs = [torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)]
++    for rank in range(world):
++        rows = slice(rank * local, (rank + 1) * local)
++        expected = _rank_order_sum([x[rows] for x in inputs])
++        assert torch.equal(_reduce_scatter(inputs, rank), expected)
++
++
++def test_row_bits_do_not_depend_on_owner_or_padding():
++    # One row\x27s partials placed at every position of batches of two sizes: the
++    # reduced row is bitwise the same wherever it lands and whichever rank owns it.
++    torch.manual_seed(1)
++    world, width = 3, 256
++    row = [torch.randn(width).to(torch.bfloat16) * 10 ** k for k in range(world)]
++    results = set()
++    for local in (4, 7):
++        for position in range(world * local):
++            inputs = [torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)]
++            for x, part in zip(inputs, row):
++                x[position] = part
++            owner, offset = divmod(position, local)
++            out = _reduce_scatter(inputs, owner)[offset]
++            results.add(out.view(torch.int16).numpy().tobytes())
++    assert len(results) == 1
++
++
++def test_one_rounding_differs_from_rounding_each_add():
++    # The float32 accumulation is observable: rounding after every BF16 add
++    # gives other bits for some rows, so the test above would catch it.
++    torch.manual_seed(2)
++    values = [torch.randn(4096).to(torch.bfloat16) * 10 ** k for k in range(3)]
++    each = values[0].clone()
++    for value in values[1:]:
++        each.add_(value)
++    assert not torch.equal(each, _rank_order_sum(values))
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index f0969847f..69ee88497 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import os
++
+ import torch
+ from torch.distributed import ProcessGroup
+ 
+@@ -23,6 +25,10 @@ from ..utils import StatelessProcessGroup
+ from .aiter_custom_all_reduce import AiterCustomAllreduce
+ from .base_device_communicator import DeviceCommunicatorBase
+ 
++# Opt-in batch-invariant mode (DeepSeek V4.1): reduce-scatters add every row's
++# partials in rank order, whatever the message size or the row's position.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
+ logger = init_logger(__name__)
+ 
+ 
+@@ -577,7 +583,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         chunk_size = input_tensor.shape[0] // world_size
+         output_shape = (chunk_size,) + input_tensor.shape[1:]
+ 
+-        if should_nccl_symm_mem_ag_rs():
++        if _BATCH_INVARIANT:
++            output = self._reduce_scatter_rank_order(input_tensor)
++        elif should_nccl_symm_mem_ag_rs():
+             output = self._reduce_scatter_symm_mem(input_tensor)
+         else:
+             output = torch.empty(
+@@ -588,6 +596,34 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         # Reshape before returning
+         return output.movedim(0, dim).contiguous()
+ 
++    def _reduce_scatter_rank_order(self, input_tensor: torch.Tensor) -> torch.Tensor:
++        """Reduce-scatter with the RoCE one-shot all-reduce's arithmetic.
++
++        NCCL's reduce-scatter adds the ranks' partials of a chunk in an order
++        that depends on the receiving rank and on the message size (ring
++        rotation, channel split), so a row's bits change with the row count of
++        the batch and the row's position in it. This exchanges the chunks (an
++        all-to-all over the same communicator, the same bytes) and adds them as
++        the one-shot all-reduce of smaller messages does: in float32, in rank
++        order, rounded once. A row then has the same bits whether its step was
++        reduce-scattered or all-reduced.
++        """
++        pynccl_comm = self.pynccl_comm
++        rank = self.rank_in_group
++        chunks = input_tensor.view(self.world_size, -1, *input_tensor.shape[1:])
++        parts = torch.empty_like(chunks)
++        pynccl_comm.group_start()
++        for peer in range(self.world_size):
++            if peer != rank:
++                pynccl_comm.send(chunks[peer], peer)
++                pynccl_comm.recv(parts[peer], peer)
++        pynccl_comm.group_end()
++        parts[rank].copy_(chunks[rank])
++        total = parts[0].float()
++        for part in parts[1:]:
++            total += part.float()
++        return total.to(input_tensor.dtype)
++
+     def reduce_scatterv(
+         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+     ):
+-- 
+2.43.0
+

@@ -1,0 +1,3877 @@
+#!/usr/bin/env python3
+"""Reproducible cluster control and build helpers."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import concurrent.futures
+import fcntl
+import functools
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import sysconfig
+import tempfile
+import threading
+import time
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import NamedTuple
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
+
+
+
+def read_json(relative: str) -> dict:
+    with (ROOT / relative).open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def cluster_config_path(args: argparse.Namespace | None = None) -> tuple[Path, str]:
+    raw = getattr(args, "cluster_config", DEFAULT_CLUSTER_CONFIG)
+    relative = Path(raw)
+    if relative.is_absolute():
+        raise SystemExit("--cluster-config must be relative to the repository root")
+    resolved = (ROOT / relative).resolve()
+    try:
+        canonical = resolved.relative_to(ROOT.resolve()).as_posix()
+    except ValueError as error:
+        raise SystemExit("--cluster-config must remain inside the repository") from error
+    if not resolved.is_file():
+        raise SystemExit(f"cluster configuration does not exist: {canonical}")
+    return resolved, canonical
+
+
+def configuration(
+    args: argparse.Namespace | None = None,
+) -> tuple[dict, dict, dict]:
+    cluster_path, _ = cluster_config_path(args)
+    return (
+        json.loads(cluster_path.read_text(encoding="utf-8")),
+        read_json("config/nodes.json"),
+        read_json("upstreams.lock.json"),
+    )
+
+
+def node_by_name(nodes: dict, name: str) -> dict:
+    for node in nodes["nodes"]:
+        if node["name"] == name:
+            return node
+    raise SystemExit(f"unknown node {name!r}")
+
+
+def expected_environment(cluster: dict, node: dict) -> dict[str, str]:
+    env = {key: str(value) for key, value in cluster["environment"].items()}
+    env["VLLM_HOST_IP"] = node["management_ip"]
+    env["B12X_ROCE_PEER_HCAS"] = json.dumps(
+        node["roce_peer_hcas"], separators=(",", ":")
+    )
+    return env
+
+
+def expected_command(cluster: dict, node: dict) -> list[str]:
+    command = list(cluster["serve_args"])
+    command.extend(
+        [
+            "--node-rank",
+            str(node["rank"]),
+            "--master-addr",
+            cluster["distributed"]["master_addr"],
+            "--master-port",
+            cluster["distributed"]["master_port"],
+        ]
+    )
+    if not node["head"]:
+        command.append("--headless")
+    return command
+
+
+def rendered_docker_command(cluster: dict, node: dict) -> list[str]:
+    container = cluster["container"]
+    home = cluster["host"]["home"]
+    command = ["docker", "run", "-d", "--name", container["name"]]
+    command.extend(container["docker_run_args"])
+    for key, value in sorted(expected_environment(cluster, node).items()):
+        command.extend(["--env", f"{key}={value}"])
+    for source, destination, mode in container["mounts"]:
+        source = source.format(home=home)
+        command.extend(["--volume", f"{source}:{destination}:{mode}"])
+    command.append(container["image"])
+    command.extend(expected_command(cluster, node))
+    return command
+
+
+def ssh_target(nodes: dict, node: dict) -> str:
+    return f"{nodes['ssh_user']}@{node.get('ssh_host', node['name'])}"
+
+
+SSH_CONTROL_DIR = Path(tempfile.gettempdir()) / f"spark3-ssh-{os.getuid()}"
+
+
+def ssh_options() -> list[str]:
+    """Batch-mode SSH options that reuse one connection per node.
+
+    A fresh connection between the Sparks takes about 0.3 s and a
+    multiplexed call about 6 ms; a cluster start makes dozens of calls.
+    """
+    SSH_CONTROL_DIR.mkdir(mode=0o700, exist_ok=True)
+    return [
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={SSH_CONTROL_DIR}/%C",
+        "-o", "ControlPersist=120",
+    ]
+
+
+def run_ssh(nodes: dict, node: dict, *command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "ssh",
+            *ssh_options(),
+            ssh_target(nodes, node),
+            shlex.join(command),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def remote_shell(nodes: dict, node: dict, script: str) -> subprocess.CompletedProcess[str]:
+    return run_ssh(nodes, node, "bash", "-lc", script)
+
+
+def repository_path(cluster: dict) -> str:
+    return cluster["deployment"]["path"].format(home=cluster["host"]["home"])
+
+
+def repository_revision(revision: str = "HEAD") -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{revision}^{{commit}}"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or f"cannot resolve {revision!r}")
+    return result.stdout.strip()
+
+
+def repository_dirty() -> str:
+    result = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "cannot inspect repository status")
+    return result.stdout.strip()
+
+
+def tracked_secret_problems() -> list[str]:
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode:
+        return ["cannot enumerate tracked files for secret checks"]
+    paths = [Path(item.decode()) for item in result.stdout.split(b"\0") if item]
+    forbidden_names = {".env", "id_rsa", "id_ed25519", "credentials.json"}
+    forbidden_suffixes = (".pem", ".key", ".local.env", ".local.json")
+    signatures = (
+        b"-----BEGIN " + b"PRIVATE KEY-----",
+        b"-----BEGIN OPENSSH " + b"PRIVATE KEY-----",
+    )
+    token_patterns = (
+        re.compile(rb"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+        re.compile(rb"\bghp_[A-Za-z0-9]{20,}\b"),
+        re.compile(rb"\bhf_[A-Za-z0-9]{20,}\b"),
+        re.compile(rb"\btskey-[A-Za-z0-9-]{20,}\b"),
+    )
+    problems: list[str] = []
+    for relative in paths:
+        if relative.name in forbidden_names or relative.name.endswith(forbidden_suffixes):
+            problems.append(f"tracked secret-like path: {relative}")
+            continue
+        candidate = ROOT / relative
+        if not candidate.is_file() or candidate.stat().st_size > 2 * 1024 * 1024:
+            continue
+        contents = candidate.read_bytes()
+        if any(signature in contents for signature in signatures) or any(
+            pattern.search(contents) for pattern in token_patterns
+        ):
+            problems.append(f"tracked file contains a secret-like signature: {relative}")
+    return problems
+
+
+class Warn(str):
+    """A doctor finding that does not fail doctor or block a benchmark.
+
+    Errors are what breaks serving, safety or a required capability now: the
+    display carve-out and the kept text console (modeset, fbdev, DRM master,
+    console mode), fan control, RoCE GIDs, the GPU clock and any difference from
+    the promoted configuration. Warnings are latent (effective at the next
+    boot), cost a little, or could not be read.
+    """
+
+
+def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
+    problems: list[str] = []
+    node_list = nodes.get("nodes", [])
+    ranks = sorted(node.get("rank") for node in node_list)
+    if ranks != [0, 1, 2]:
+        problems.append(f"node ranks must be [0, 1, 2], got {ranks}")
+    if sum(bool(node.get("head")) for node in node_list) != 1:
+        problems.append("exactly one node must be the API head")
+    if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
+        problems.append("cluster and upstream locks name different baselines")
+    host = cluster.get("host", {})
+    for key in (
+        "memguard_gib",
+        "startup_memguard_gib",
+        "startup_memguard_wait_seconds",
+    ):
+        value = host.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            problems.append(f"host.{key} must be a positive integer")
+    for key in ("memguard_interval_seconds", "startup_memguard_interval_seconds"):
+        value = host.get(key)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value <= 0
+        ):
+            problems.append(f"host.{key} must be a positive number")
+    if (
+        isinstance(host.get("startup_memguard_gib"), int)
+        and isinstance(host.get("memguard_gib"), int)
+        and host["startup_memguard_gib"] <= host["memguard_gib"]
+    ):
+        problems.append(
+            "host.startup_memguard_gib must exceed host.memguard_gib"
+        )
+    deployment = cluster.get("deployment", {})
+    for key in ("repository", "path", "ready_url", "ready_timeout_seconds"):
+        if not deployment.get(key):
+            problems.append(f"deployment.{key} is not configured")
+    if "branch" in deployment and not deployment["branch"]:
+        problems.append("deployment.branch must be omitted or name a branch")
+    if not isinstance(deployment.get("launch_enabled"), bool):
+        problems.append("deployment.launch_enabled must be true or false")
+    for name, source in upstreams["sources"].items():
+        if not source.get("upstream"):
+            problems.append(f"{name}: canonical upstream is not recorded")
+        if source["kind"] == "git":
+            if len(source["revision"]) != 40:
+                problems.append(f"{name}: revision is not a full commit SHA")
+            if not source.get("tracking_ref"):
+                problems.append(f"{name}: upstream tracking ref is not recorded")
+        series = source.get("patch_series")
+        if series:
+            series_path = ROOT / series
+            if not series_path.is_file():
+                problems.append(f"{name}: missing patch series {series}")
+            else:
+                for patch_name in read_series(series_path):
+                    if not patch_name.startswith("TODO-") and not (
+                        series_path.parent / patch_name
+                    ).is_file():
+                        problems.append(f"{name}: missing patch {patch_name}")
+        lockfile = source.get("lockfile")
+        if lockfile and not (ROOT / lockfile).is_file():
+            problems.append(f"{name}: missing dependency lock {lockfile}")
+    watchlist_path = ROOT / "docs/inspiration.md"
+    watchlist = (
+        watchlist_path.read_text(encoding="utf-8") if watchlist_path.is_file() else ""
+    )
+    if not watchlist:
+        problems.append(Warn("missing improvement watchlist docs/inspiration.md"))
+    for name, reference in upstreams.get("references", {}).items():
+        if reference.get("kind") != "git-watch":
+            problems.append(Warn(f"{name}: reference kind must be git-watch"))
+        if not reference.get("url") or not reference.get("role"):
+            problems.append(Warn(f"{name}: reference URL and role are required"))
+        elif reference["url"] not in watchlist:
+            problems.append(Warn(f"{name}: reference URL is absent from the watchlist"))
+    source_manifest = read_json(
+        upstreams.get("source_manifest", "manifests/sources/2026-09-20-active-source.json")
+    )
+    for name in BUILD_PROJECTS:
+        wanted = source_manifest[name].get("patchset_sha256")
+        actual = patchset_sha256(upstreams["sources"][name])
+        if wanted != actual:
+            problems.append(f"{name}: patch-set fingerprint differs from source manifest")
+    for relative, wanted in source_manifest.get("deployment_artifacts", {}).items():
+        candidate = ROOT / relative
+        if not candidate.is_file():
+            problems.append(f"missing deployment artifact {relative}")
+        elif sha256(candidate) != wanted:
+            problems.append(f"deployment artifact differs from manifest: {relative}")
+    problems.extend(tracked_secret_problems())
+    return problems
+
+
+DESKTOP_QUERY = "systemctl get-default; systemctl is-active display-manager.service"
+
+
+def desktop_problems(node_name: str, output: str) -> list[str]:
+    """Problems when a node boots to a desktop or runs its display manager.
+
+    The display stack's processes and GPU buffers come out of the same unified
+    memory as the model, and dgx1 has little to spare above its startup guard.
+    """
+    default_target, manager = (output.split() + ["", ""])[:2]
+    problems = []
+    if default_target != "multi-user.target":
+        problems.append(
+            Warn(
+                f"{node_name}: boots to {default_target or 'an unknown target'}, "
+                "expected multi-user.target (no desktop); run "
+                "sudo systemctl set-default multi-user.target"
+            )
+        )
+    if manager in ("active", "activating", "reloading"):
+        problems.append(
+            f"{node_name}: display manager is {manager}; run "
+            "sudo systemctl disable --now display-manager.service"
+        )
+    return problems
+
+
+def boot_order_problems(node_name: str, output: str) -> list[str]:
+    """Problems when UEFI tries another boot entry before the installed OS.
+
+    A network (PXE) entry first costs about a minute of DHCP timeouts on every
+    boot; a firmware update left dgx3 that way.
+    """
+    order: list[str] = []
+    entries: dict[str, str] = {}
+    for line in output.splitlines():
+        if line.startswith("BootOrder:"):
+            order = [item.strip().upper() for item in line.split(":", 1)[1].split(",") if item.strip()]
+        elif match := re.match(r"Boot([0-9A-Fa-f]{4})\*?\s+(.*)", line):
+            entries[match.group(1).upper()] = match.group(2)
+    if not order:
+        return [Warn(f"{node_name}: cannot read the UEFI boot order")]
+    def installed(entry: str) -> bool:
+        return (
+            entry.split("\t")[0].strip().lower() == "ubuntu"
+            or "\\efi\\ubuntu\\" in entry.lower()
+        )
+
+    first = entries.get(order[0], "")
+    label = first.split("\t")[0].strip()
+    if installed(first):
+        return []
+    ubuntu = next((number for number in order if installed(entries.get(number, ""))), None)
+    ubuntu = ubuntu or next((number for number, entry in entries.items() if installed(entry)), None)
+    fix = (
+        "run sudo efibootmgr --bootorder "
+        + ",".join([ubuntu] + [number for number in order if number != ubuntu])
+        if ubuntu
+        else "no installed-OS boot entry exists; reinstall the boot loader with grub-install"
+    )
+    return [
+        Warn(
+            f"{node_name}: UEFI boots {label or 'entry ' + order[0]!r} before the "
+            f"installed OS (BootOrder {','.join(order)}); {fix}"
+        )
+    ]
+
+
+# Desktop services that serve nothing on a headless inference node:
+# scripts/host-recovery disables them (the display manager has its own check).
+IDLE_SERVICES = (
+    "bluetooth.service",
+    "cups.service",
+    "cups.socket",
+    "cups.path",
+    "cups-browsed.service",
+    "snapd.service",
+    "snapd.socket",
+    "snapd.seeded.service",
+    "snapd.snap-repair.timer",
+    "fwupd-refresh.timer",
+    "dgx-dashboard.service",
+    "dgx-dashboard-admin.service",
+)
+
+HOST_FACTS_QUERY = """
+printf 'modeset=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)"
+printf 'fbdev=%s\\n' "$(sudo -n cat /sys/module/nvidia_drm/parameters/fbdev 2>/dev/null)"
+printf 'cmdline_splash=%s\\n' "$(grep -cw splash /proc/cmdline)"
+printf 'grub_splash=%s\\n' "$(sudo -n grep -E '^[[:space:]]*linux[[:space:]]' /boot/grub/grub.cfg 2>/dev/null | grep -cw splash)"
+card=""
+for entry in /sys/class/drm/card[0-9]*; do
+  [ "$(basename "$(readlink "$entry/device/driver")")" = nvidia ] && card=${entry##*/card}
+done
+printf 'drm_card=%s\\n' "$card"
+clients=/sys/kernel/debug/dri/$card/clients
+if sudo -n test -r "$clients"; then
+  printf 'drm_masters=%s\\n' "$(sudo -n cat "$clients" | awk 'NR > 1 && $4 == "y" {print $1 "/" $2}' | paste -sd, -)"
+else
+  printf 'drm_masters=unreadable\\n'
+fi
+vt=$(cat /sys/class/tty/tty0/active 2>/dev/null)
+printf 'console=%s:%s\\n' "$vt" "$(sudo -n python3 -c 'import fcntl, struct, sys; f = open(sys.argv[1], "rb"); print(struct.unpack("i", fcntl.ioctl(f, 0x4B3B, struct.pack("i", 0)))[0])' "/dev/$vt" 2>/dev/null)"
+printf 'kernel=%s\\n' "$(uname -r)"
+printf 'fan_dkms=%s\\n' "$(dkms status -m dgx-spark-fan-control -k "$(uname -r)" 2>/dev/null | head -1)"
+printf 'fan_module=%s\\n' "$(grep -c '^dgx_ec_fan_control ' /proc/modules)"
+printf 'fan_cooling_device=%s\\n' "$(grep -lx dgx_ec_fan_floor /sys/class/thermal/cooling_device*/type 2>/dev/null | wc -l)"
+printf 'fan_service=%s/%s\\n' "$(systemctl is-enabled dgx-fan-control.service 2>/dev/null)" \\
+  "$(systemctl is-active dgx-fan-control.service 2>/dev/null)"
+printf 'gpu=%s\\n' "$(nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)"
+"""
+HOST_FACTS_QUERY += (
+    r"""printf 'idle_services=%s\n' "$(for unit in """
+    + " ".join(IDLE_SERVICES)
+    + r"""; do
+  state=$(systemctl is-enabled "$unit" 2>/dev/null)
+  if systemctl is-active --quiet "$unit" || [ "$state" = enabled ] || [ "$state" = alias ]; then
+    printf '%s\n' "$unit"
+  fi
+done | paste -sd, -)"
+"""
+)
+
+
+def host_facts(output: str) -> dict[str, str]:
+    facts = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            facts[key.strip()] = value.strip()
+    return facts
+
+
+def modeset_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when nvidia-drm does not drive displays (kernel mode setting, required).
+
+    Without it only the firmware framebuffer shows a console, and only for a
+    display attached at boot: a monitor or KVM connected later stays dark.
+    nvidia-drm also offers DRM dumb buffers only with mode setting, so the
+    display carve-out that holds the embedding and output head (vLLM patch
+    0021) cannot be allocated and the worker refuses to start.
+    """
+    value = facts.get("modeset", "")
+    if value == "Y":
+        return []
+    return [
+        f"{node_name}: nvidia-drm modeset is {value or 'unreadable'}, expected Y "
+        "(a display attached after boot stays dark and the display carve-out cannot "
+        "be allocated); run sudo apt purge nvidia-drm-options-modeset0 and reboot "
+        "with the service stopped"
+    ]
+
+
+def fbdev_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when nvidia-drm provides no framebuffer console (required).
+
+    With fbdev off, a display attached to the node shows no text console. The
+    console framebuffer takes 8 MiB of the display carve-out at 1920x1080,
+    which the serving configuration leaves free.
+    """
+    value = facts.get("fbdev", "")
+    if value == "Y":
+        return []
+    return [
+        f"{node_name}: nvidia-drm fbdev is {value or 'unreadable'}, expected Y "
+        "(an attached display gets no text console); remove the nvidia-drm fbdev=0 "
+        "option (grep -rn fbdev /etc/modprobe.d), run sudo update-initramfs -u, and "
+        "reboot with the service stopped"
+    ]
+
+
+def drm_card_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when no DRM card belongs to the nvidia driver.
+
+    The display carve-out (vLLM patch 0021) allocates through that card, which
+    the container bind-mounts by its PCI path (Docker device flags split on its colons)
+    (/dev/dri/by-path/pci-000f:01:00.0-card): a node that boots with a display
+    attached registers simpledrm first, so the GPU can be card1 there.
+    """
+    if facts.get("drm_card"):
+        return []
+    return [
+        f"{node_name}: no DRM card belongs to the nvidia driver, so the display "
+        "carve-out cannot be allocated; check that nvidia-drm is loaded with "
+        "modeset=Y (ls -l /dev/dri/by-path)"
+    ]
+
+
+def drm_master_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when a userspace process holds DRM master.
+
+    The kernel's framebuffer console stops drawing while a userspace master
+    exists. The serving worker closes its DRM file right after importing the
+    display carve-out, so nothing should hold master on these headless nodes.
+    """
+    value = facts.get("drm_masters", "unreadable")
+    if not value:
+        return []
+    if value == "unreadable":
+        return [
+            Warn(
+                f"{node_name}: cannot read the DRM clients "
+                "(/sys/kernel/debug/dri/<card>/clients)"
+            )
+        ]
+    return [
+        f"{node_name}: {value} holds DRM master, so the text console cannot draw; stop "
+        "or restart that process (the serving worker releases the device right after "
+        "startup)"
+    ]
+
+
+def console_mode_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Problems when the active virtual console is in graphics mode.
+
+    The boot splash can leave it there after Plymouth quits; the kernel then
+    draws no text on an attached display although fbcon is available.
+    """
+    console, _, mode = facts.get("console", "").partition(":")
+    if mode == "0":
+        return []
+    if mode == "1":
+        return [
+            f"{node_name}: the active console ({console}) is in graphics mode, so an "
+            "attached display shows no text; run scripts/host-recovery apply on the node "
+            "(it switches the console to text mode now and removes splash from later boots)"
+        ]
+    return [Warn(f"{node_name}: cannot read the active console mode")]
+
+
+def splash_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Warnings when the kernel boots with the Plymouth splash.
+
+    Latent until the next boot: console_mode_problems reports a console that
+    is in graphics mode now.
+
+    Plymouth leaves the active console in graphics mode after it quits, so an
+    attached display shows no text console after a boot. host-recovery
+    installs /etc/default/grub.d/zz-spark-console.cfg, which drops splash from
+    the command line that dgxstation-grub's menu.cfg sets.
+    """
+    if facts.get("cmdline_splash", "0") == "0":
+        return []
+    if facts.get("grub_splash") == "0":
+        return [
+            Warn(
+                f"{node_name}: booted with splash, but the boot configuration omits it "
+                "now; reboot with the service stopped to apply"
+            )
+        ]
+    return [
+        Warn(
+            f"{node_name}: the kernel command line has splash, which leaves the console "
+            "in graphics mode after boot; run scripts/host-recovery apply on the node (it "
+            "installs /etc/default/grub.d/zz-spark-console.cfg and runs update-grub), "
+            "then reboot with the service stopped"
+        )
+    ]
+
+
+def idle_service_warnings(node_name: str, facts: dict[str, str]) -> list[str]:
+    """Warnings when desktop services run on a headless inference node.
+
+    Bluetooth, CUPS, cups-browsed and snapd (every installed snap is a desktop
+    application) each hold memory on every node, up to about 50 MiB, and
+    cups-browsed listens on the network. fwupd's daily refresh timer keeps its
+    daemon resident; fwupdmgr starts the daemon on demand without it. NVIDIA's
+    DGX Dashboard runs periodic update checks (spark-ota-check) that peak near
+    850 MiB and wake fwupd and PackageKit.
+    host-recovery disables them. These are warnings: they cost a little memory
+    and do not fail doctor or block a benchmark.
+    """
+    units = [unit for unit in facts.get("idle_services", "").split(",") if unit]
+    if not units:
+        return []
+    return [
+        Warn(
+            f"{node_name}: {', '.join(units)} enabled or running, though unused on a "
+            f"headless inference node; run sudo systemctl disable --now "
+            f"{' '.join(units)} (scripts/host-recovery apply does the same)"
+        )
+    ]
+
+
+def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
+    """The first missing layer of the DGX Spark additive fan-floor control.
+
+    Each layer needs the one before it: the signed DKMS module for the running
+    kernel, the loaded module, its dgx_ec_fan_floor cooling device, and the
+    dgx-fan-control daemon, enabled and running.
+    """
+    kernel = facts.get("kernel") or "the running kernel"
+    if "installed" not in facts.get("fan_dkms", ""):
+        return [
+            f"{node_name}: DKMS dgx-spark-fan-control is not installed for {kernel}; run "
+            f"sudo dkms autoinstall -k {facts.get('kernel') or '$(uname -r)'}"
+        ]
+    if facts.get("fan_module") != "1":
+        return [
+            f"{node_name}: dgx_ec_fan_control is not loaded; run sudo modprobe "
+            "dgx_ec_fan_control (if it is refused, check that the fleet signing key is "
+            "enrolled with mokutil --list-enrolled)"
+        ]
+    if facts.get("fan_cooling_device") != "1":
+        return [
+            f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
+            "is missing (the driver refused it at probe; see dmesg)"
+        ]
+    if facts.get("fan_service") != "enabled/active":
+        return [
+            f"{node_name}: dgx-fan-control.service is {facts.get('fan_service') or 'unknown'}, "
+            "expected enabled/active; run sudo systemctl enable --now dgx-fan-control.service"
+        ]
+    return []
+
+
+def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
+    """The GID index B12X and NCCL are configured to use, and the node's HCAs."""
+    env = expected_environment(cluster, node)
+    index = int(env.get("B12X_ROCE_GID_INDEX") or env.get("NCCL_IB_GID_INDEX") or 3)
+    hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
+    return index, hcas
+
+
+def roce_gid_query(hcas: list[str]) -> str:
+    """Every populated GID slot of each HCA as `hca index type gid ndev`."""
+    return (
+        f"for d in {' '.join(shlex.quote(hca) for hca in hcas)}; do "
+        'p=/sys/class/infiniband/$d/ports/1; '
+        '[ -d $p ] || { echo "$d missing"; continue; }; '
+        'for g in $p/gids/*; do i=${g##*/}; '
+        't=$(cat $p/gid_attrs/types/$i 2>/dev/null | tr -d " "); [ -n "$t" ] || continue; '
+        'echo "$d $i $t $(cat $g) $(cat $p/gid_attrs/ndevs/$i 2>/dev/null)"; done; done'
+    )
+
+
+def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str) -> list[str]:
+    """Problems when an HCA's configured GID slot is not its IPv4 RoCE v2 address.
+
+    B12X and NCCL both use one fixed GID index. The kernel files a re-added
+    address in the lowest free slot, so a link flap while RDMA resources still
+    hold the old entry moves the IPv4 RoCE v2 GID (dgx3 moved from 3 to 4 when
+    its peers rebooted under a starting service), and NCCL then fails with an
+    unhandled system error.
+    """
+    slots: dict[str, dict[int, tuple[str, str, str]]] = {hca: {} for hca in hcas}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == "missing" and fields[0] in slots:
+            slots.pop(fields[0])
+        elif len(fields) >= 4 and fields[0] in slots and fields[1].isdigit():
+            ndev = fields[4] if len(fields) > 4 else ""
+            slots[fields[0]][int(fields[1])] = (fields[2], fields[3], ndev)
+    problems = []
+    for hca in hcas:
+        if hca not in slots:
+            problems.append(f"{node_name}: RDMA device {hca} is missing")
+            continue
+        entries = slots[hca]
+        kind, gid, _ = entries.get(index, ("", "", ""))
+        if kind == "RoCEv2" and gid.startswith("0000:0000:0000:0000:0000:ffff:"):
+            continue
+        found = [
+            (slot, ndev) for slot, (slot_kind, slot_gid, ndev) in sorted(entries.items())
+            if slot_kind == "RoCEv2" and slot_gid.startswith("0000:0000:0000:0000:0000:ffff:")
+        ]
+        where = (
+            f"its IPv4 RoCE v2 GID is at index {found[0][0]}; re-activate {found[0][1]} "
+            "with nmcli while nothing uses RDMA"
+            if found else "it has no IPv4 RoCE v2 GID"
+        )
+        problems.append(
+            f"{node_name}: {hca} GID index {index} is "
+            f"{kind + ' ' + gid if kind else 'empty'}; {where}"
+        )
+    return problems
+
+
+LATCHED_CLOCK_MHZ = 1000
+
+
+def clock_latch_problems(node_name: str, facts: dict[str, str], serving: bool) -> list[str]:
+    """Problems when a serving GB10 GPU is held far below its normal clock.
+
+    With the service running, a healthy GB10 stays in P0 at about 2,400 MHz
+    even between requests. The known GB10 clock latch holds it at about
+    500-720 MHz and 10-14 W with no throttle reason; nvidia-smi -lgc and a warm
+    reboot do not clear it, removing AC power does (docs/recovery.md).
+    """
+    if not serving:
+        return []
+    clock, _, power = facts.get("gpu", "").partition(",")
+    try:
+        clock_mhz = float(clock)
+    except ValueError:
+        return [Warn(f"{node_name}: cannot read the GPU clock")]
+    if clock_mhz >= LATCHED_CLOCK_MHZ:
+        return []
+    return [
+        f"{node_name}: GPU clock is {clock_mhz:.0f} MHz at {power.strip() or '?'} W while serving; "
+        "the GB10 clock latch holds it there until AC power is removed (docs/recovery.md)"
+    ]
+
+
+def live_doctor(cluster: dict, nodes: dict) -> list[str]:
+    """Findings about the live cluster: errors, and Warn for the minor ones."""
+    problems: list[str] = []
+    name = cluster["container"]["name"]
+    for node in nodes["nodes"]:
+        desktop = remote_shell(nodes, node, DESKTOP_QUERY)
+        problems.extend(desktop_problems(node["name"], desktop.stdout))
+        boot = run_ssh(nodes, node, "efibootmgr")
+        problems.extend(boot_order_problems(node["name"], boot.stdout))
+        facts = host_facts(remote_shell(nodes, node, HOST_FACTS_QUERY).stdout)
+        problems.extend(modeset_problems(node["name"], facts))
+        problems.extend(fbdev_problems(node["name"], facts))
+        problems.extend(drm_card_problems(node["name"], facts))
+        problems.extend(drm_master_problems(node["name"], facts))
+        problems.extend(console_mode_problems(node["name"], facts))
+        problems.extend(splash_problems(node["name"], facts))
+        problems.extend(idle_service_warnings(node["name"], facts))
+        problems.extend(fan_control_problems(node["name"], facts))
+        gid_index, hcas = roce_gid_setting(cluster, node)
+        gids = remote_shell(nodes, node, roce_gid_query(hcas))
+        problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+        result = run_ssh(nodes, node, "docker", "inspect", name)
+        if result.returncode:
+            problems.append(f"{node['name']}: cannot inspect {name}: {result.stderr.strip()}")
+            continue
+        inspection = json.loads(result.stdout)[0]
+        if not inspection["State"]["Running"]:
+            problems.append(f"{node['name']}: container is not running")
+        problems.extend(
+            clock_latch_problems(node["name"], facts, bool(inspection["State"]["Running"]))
+        )
+        if inspection["Config"]["Image"] != cluster["container"]["image"]:
+            problems.append(
+                f"{node['name']}: image tag {inspection['Config']['Image']!r} differs"
+            )
+        actual_command = inspection["Config"]["Cmd"]
+        wanted_command = expected_command(cluster, node)
+        if actual_command != wanted_command:
+            problems.append(f"{node['name']}: vLLM command differs from promoted config")
+        actual_env = dict(item.split("=", 1) for item in inspection["Config"]["Env"])
+        for key, wanted in expected_environment(cluster, node).items():
+            if actual_env.get(key) != wanted:
+                problems.append(
+                    f"{node['name']}: {key}={actual_env.get(key)!r}, expected {wanted!r}"
+                )
+        label_result = run_ssh(
+            nodes,
+            node,
+            "docker",
+            "image",
+            "inspect",
+            cluster["container"]["image"],
+        )
+        if label_result.returncode:
+            problems.append(f"{node['name']}: cannot inspect image labels")
+            continue
+        labels = json.loads(label_result.stdout)[0]["Config"].get("Labels") or {}
+        for key, wanted in cluster["container"]["expected_labels"].items():
+            if labels.get(key) != wanted:
+                problems.append(
+                    f"{node['name']}: image label {key}={labels.get(key)!r}, expected {wanted!r}"
+                )
+    return problems
+
+
+def split_findings(findings: list[str]) -> tuple[list[str], list[str]]:
+    """Errors and warnings, each in their original order."""
+    errors = [finding for finding in findings if not isinstance(finding, Warn)]
+    warnings = [finding for finding in findings if isinstance(finding, Warn)]
+    return errors, warnings
+
+
+def report_doctor(problems: list[str], warnings: list[str], live: bool) -> int:
+    """Print warnings and problems; only problems fail."""
+    for warning in warnings:
+        print(f"WARN: {warning}")
+    for problem in problems:
+        print(f"ERROR: {problem}")
+    if problems:
+        return 1
+    summary = "configuration OK" + ("; live cluster matches" if live else "")
+    if warnings:
+        summary += f" with {len(warnings)} warning" + ("s" if len(warnings) > 1 else "")
+    print(summary)
+    return 0
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    cluster, nodes, upstreams = configuration(args)
+    findings = local_doctor(cluster, nodes, upstreams)
+    if args.live:
+        findings.extend(live_doctor(cluster, nodes))
+    problems, warnings = split_findings(findings)
+    return report_doctor(problems, warnings, args.live)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    name = cluster["container"]["name"]
+    failed = False
+    for node in nodes["nodes"]:
+        result = run_ssh(
+            nodes,
+            node,
+            "docker",
+            "ps",
+            "--filter",
+            f"name=^{name}$",
+            "--format",
+            "{{.Names}}|{{.Image}}|{{.Status}}",
+        )
+        guard = run_ssh(
+            nodes,
+            node,
+            "systemctl",
+            "is-active",
+            f"{name}-memguard.service",
+        )
+        output = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()
+        guard_state = guard.stdout.strip() if guard.returncode == 0 else "inactive"
+        print(f"{node['name']}\t{output or 'not running'}\tmemguard={guard_state}")
+        failed |= result.returncode != 0 or not bool(result.stdout.strip())
+    return int(failed)
+
+
+def deployment_order(nodes: dict) -> list[dict]:
+    workers = sorted(
+        (node for node in nodes["nodes"] if not node["head"]),
+        key=lambda node: node["rank"],
+    )
+    heads = [node for node in nodes["nodes"] if node["head"]]
+    return workers + heads
+
+
+def require_local_deployment_state(cluster: dict, nodes: dict, upstreams: dict) -> str:
+    problems, warnings = split_findings(local_doctor(cluster, nodes, upstreams))
+    for warning in warnings:
+        print(f"WARN: {warning}", file=sys.stderr)
+    dirty = repository_dirty()
+    if dirty:
+        problems.append("deployment requires a clean local repository")
+    if problems:
+        for problem in problems:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+    return repository_revision()
+
+
+def normalized_repository_url(url: str) -> str:
+    return url.rstrip("/").removesuffix(".git")
+
+
+def remote_status_command(cluster: dict) -> str:
+    repo = Path(repository_path(cluster))
+    pathspecs = ["."]
+    for source, _, mode in cluster["container"]["mounts"]:
+        if mode != "rw":
+            continue
+        source_path = Path(source.format(home=cluster["host"]["home"]))
+        try:
+            relative = source_path.relative_to(repo)
+        except ValueError:
+            continue
+        pathspecs.append(f":(exclude){relative.as_posix()}")
+    return shlex.join(
+        ["git", "status", "--porcelain", "--untracked-files=all", "--", *pathspecs]
+    )
+
+
+def remote_repository_state(
+    cluster: dict, nodes: dict, node: dict
+) -> tuple[str, str, str]:
+    path = shlex.quote(repository_path(cluster))
+    result = remote_shell(
+        nodes,
+        node,
+        f"cd {path} && printf '%s\\n' \"$(git rev-parse HEAD)\" && "
+        "git remote get-url origin && "
+        f"{remote_status_command(cluster)}",
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"{node['name']}: cannot inspect checkout: {detail}")
+    lines = result.stdout.splitlines()
+    if len(lines) < 2:
+        raise RuntimeError(f"{node['name']}: checkout returned incomplete identity")
+    return lines[0], lines[1], "\n".join(lines[2:]).strip()
+
+
+def remote_runtime_problems(
+    cluster: dict,
+    nodes: dict,
+    revision: str,
+    *,
+    allow_existing: bool,
+    cluster_config: str,
+) -> list[str]:
+    problems: list[str] = []
+    repo = repository_path(cluster)
+    name = cluster["container"]["name"]
+    for node in nodes["nodes"]:
+        try:
+            remote_revision, remote_origin, dirty = remote_repository_state(
+                cluster, nodes, node
+            )
+        except RuntimeError as error:
+            problems.append(str(error))
+            continue
+        if remote_revision != revision:
+            problems.append(
+                f"{node['name']}: checkout {remote_revision} differs from deployment {revision}"
+            )
+        if normalized_repository_url(remote_origin) != normalized_repository_url(
+            cluster["deployment"]["repository"]
+        ):
+            problems.append(
+                f"{node['name']}: origin {remote_origin!r} differs from deployment repository"
+            )
+        if dirty:
+            problems.append(f"{node['name']}: checkout has uncommitted files")
+        gid_index, hcas = roce_gid_setting(cluster, node)
+        gids = remote_shell(nodes, node, roce_gid_query(hcas))
+        problems.extend(roce_gid_problems(node["name"], gid_index, hcas, gids.stdout))
+        doctor = run_ssh(
+            nodes,
+            node,
+            f"{repo}/bin/spark3",
+            "--cluster-config",
+            cluster_config,
+            "doctor",
+        )
+        if doctor.returncode:
+            detail = doctor.stdout.strip() or doctor.stderr.strip()
+            problems.append(f"{node['name']}: repository doctor failed: {detail}")
+        for source, _, mode in cluster["container"]["mounts"]:
+            source = source.format(home=cluster["host"]["home"])
+            test = "-w" if mode == "rw" else "-r"
+            exists = run_ssh(nodes, node, "test", test, source)
+            if exists.returncode:
+                problems.append(
+                    f"{node['name']}: {mode} mount source is unavailable: {source}"
+                )
+        image = run_ssh(
+            nodes,
+            node,
+            "docker",
+            "image",
+            "inspect",
+            cluster["container"]["image"],
+        )
+        if image.returncode:
+            problems.append(
+                f"{node['name']}: image is unavailable: {cluster['container']['image']}"
+            )
+        else:
+            labels = json.loads(image.stdout)[0]["Config"].get("Labels") or {}
+            for key, wanted in cluster["container"]["expected_labels"].items():
+                if labels.get(key) != wanted:
+                    problems.append(
+                        f"{node['name']}: image label {key}={labels.get(key)!r}, "
+                        f"expected {wanted!r}"
+                    )
+        existing = run_ssh(nodes, node, "docker", "inspect", name)
+        if existing.returncode == 0 and not allow_existing:
+            problems.append(
+                f"{node['name']}: container {name} already exists; use --replace explicitly"
+            )
+        sudo = run_ssh(nodes, node, "sudo", "-n", "true")
+        if sudo.returncode:
+            problems.append(f"{node['name']}: passwordless sudo is unavailable for memguard")
+    return problems
+
+
+def command_cluster_sync(args: argparse.Namespace) -> int:
+    cluster, nodes, upstreams = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    revision = repository_revision(args.revision or "HEAD")
+    path = repository_path(cluster)
+    for node in nodes["nodes"]:
+        print(f"{node['name']}: fetch origin and detach {path} at {revision}")
+    if not args.apply:
+        print("plan only; pass --apply to synchronize")
+        return 0
+
+    local_revision = require_local_deployment_state(cluster, nodes, upstreams)
+    if revision != local_revision and args.revision is None:
+        raise SystemExit("resolved deployment revision changed unexpectedly")
+    # Only published commits deploy. A configured branch (the promoted config
+    # uses main) restricts deployment to that branch; without one, any commit
+    # reachable from a branch on origin qualifies, so experiment configs keep
+    # working after their branch is merged and deleted.
+    branch = cluster["deployment"].get("branch")
+    checked(["git", "fetch", "--quiet", "--prune", "origin"], cwd=ROOT)
+    containing = [
+        ref.removeprefix("origin/")
+        for ref in subprocess.run(
+            ["git", "branch", "--remotes", "--contains", revision,
+             "--format=%(refname:short)"],
+            cwd=ROOT,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout.split()
+        if ref.startswith("origin/") and ref != "origin/HEAD"
+    ]
+    if branch is not None and branch not in containing:
+        raise SystemExit(
+            f"refusing to deploy {revision}: it is not published on origin/{branch}"
+        )
+    if not containing:
+        raise SystemExit(
+            f"refusing to deploy {revision}: it is not published on any origin branch"
+        )
+
+    previous: dict[str, str] = {}
+    for node in nodes["nodes"]:
+        try:
+            old_revision, remote_origin, dirty = remote_repository_state(
+                cluster, nodes, node
+            )
+        except RuntimeError as error:
+            raise SystemExit(str(error)) from error
+        if dirty:
+            raise SystemExit(
+                f"{node['name']}: checkout is dirty; preserve or remove its changes explicitly"
+            )
+        if normalized_repository_url(remote_origin) != normalized_repository_url(
+            cluster["deployment"]["repository"]
+        ):
+            raise SystemExit(
+                f"{node['name']}: origin {remote_origin!r} is not the configured repository"
+            )
+        previous[node["name"]] = old_revision
+
+    quoted_path = shlex.quote(path)
+    fetch_script = (
+        f"cd {quoted_path} && git fetch --quiet --prune origin && "
+        f"git cat-file -e {shlex.quote(revision)}^{{commit}}"
+    )
+    for node in nodes["nodes"]:
+        result = remote_shell(nodes, node, fetch_script)
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise SystemExit(f"{node['name']}: fetch failed: {detail}")
+
+    changed: list[dict] = []
+    try:
+        for node in nodes["nodes"]:
+            checkout = remote_shell(
+                nodes,
+                node,
+                f"cd {quoted_path} && git checkout --quiet --detach {shlex.quote(revision)}",
+            )
+            if checkout.returncode:
+                detail = checkout.stderr.strip() or checkout.stdout.strip()
+                raise RuntimeError(f"{node['name']}: checkout failed: {detail}")
+            changed.append(node)
+            doctor = run_ssh(
+                nodes,
+                node,
+                f"{path}/bin/spark3",
+                "--cluster-config",
+                config_relative,
+                "doctor",
+            )
+            if doctor.returncode:
+                detail = doctor.stdout.strip() or doctor.stderr.strip()
+                raise RuntimeError(f"{node['name']}: doctor failed after checkout: {detail}")
+    except RuntimeError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        print("rolling changed checkouts back", file=sys.stderr)
+        for node in reversed(changed):
+            remote_shell(
+                nodes,
+                node,
+                f"cd {quoted_path} && git checkout --quiet --detach "
+                f"{shlex.quote(previous[node['name']])}",
+            )
+        return 1
+
+    print(f"all nodes now use deployment commit {revision}")
+    return 0
+
+
+def stop_memguard(cluster: dict, nodes: dict, node: dict) -> subprocess.CompletedProcess[str]:
+    unit = f"{cluster['container']['name']}-memguard.service"
+    return run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", unit)
+
+
+def memguard_is_active(cluster: dict, nodes: dict, node: dict) -> bool:
+    unit = f"{cluster['container']['name']}-memguard.service"
+    result = run_ssh(nodes, node, "systemctl", "is-active", "--quiet", unit)
+    return result.returncode == 0
+
+
+def wait_for_api(cluster: dict, nodes: dict) -> None:
+    head = next(node for node in nodes["nodes"] if node["head"])
+    name = cluster["container"]["name"]
+    url = cluster["deployment"]["ready_url"]
+    timeout = int(cluster["deployment"]["ready_timeout_seconds"])
+    deadline = time.monotonic() + timeout
+    unreachable_since: dict[str, float] = {}
+    print(f"waiting up to {timeout}s for {head['name']} API readiness", flush=True)
+    while time.monotonic() < deadline:
+        unavailable = False
+        for node in nodes["nodes"]:
+            state = run_ssh(
+                nodes,
+                node,
+                "docker",
+                "inspect",
+                "--format",
+                "{{.State.Running}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}}",
+                name,
+            )
+            if state.returncode:
+                unavailable = True
+                if node["name"] not in unreachable_since:
+                    unreachable_since[node["name"]] = time.monotonic()
+                    detail = state.stderr.strip() or "SSH unavailable"
+                    print(
+                        f"WARN: {node['name']} temporarily unreachable during "
+                        f"startup ({detail}); waiting for an inspectable state",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                continue
+            if node["name"] in unreachable_since:
+                elapsed = int(time.monotonic() - unreachable_since.pop(node["name"]))
+                print(
+                    f"{node['name']}: control path recovered after {elapsed}s",
+                    flush=True,
+                )
+            if not state.stdout.startswith("true "):
+                state_detail = state.stdout.strip() or state.stderr.strip() or "absent"
+                logs = run_ssh(nodes, node, "docker", "logs", "--tail", "20", name)
+                log_detail = (logs.stdout or logs.stderr).strip()
+                if len(log_detail) > 4000:
+                    log_detail = log_detail[-4000:]
+                raise RuntimeError(
+                    f"{node['name']}: {name} stopped before readiness "
+                    f"({state_detail})\n{log_detail}"
+                )
+            if not memguard_is_active(cluster, nodes, node):
+                raise RuntimeError(
+                    f"{node['name']}: startup memguard is no longer active; "
+                    "refusing to continue an unguarded launch"
+                )
+        if unavailable:
+            time.sleep(10)
+            continue
+        result = run_ssh(
+            nodes,
+            head,
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "3",
+            url,
+        )
+        if result.returncode == 0:
+            print("API ready; JIT/autotuning startup has completed", flush=True)
+            return
+        time.sleep(1)
+    unreachable = ", ".join(sorted(unreachable_since))
+    suffix = f"; unreachable nodes: {unreachable}" if unreachable else ""
+    raise RuntimeError(f"API did not become ready within {timeout}s{suffix}")
+
+
+def start_memguard(
+    cluster: dict,
+    nodes: dict,
+    node: dict,
+    cluster_config: str,
+    phase: str,
+    *,
+    prelaunch: bool = False,
+) -> None:
+    script = f"{repository_path(cluster)}/scripts/memguard-start.sh"
+    arguments = [script, cluster_config, phase]
+    if prelaunch:
+        arguments.append("prelaunch")
+    result = run_ssh(nodes, node, *arguments)
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"{node['name']}: cannot arm {phase} memguard: {detail}"
+        )
+    print(f"{node['name']}: {result.stdout.strip()}", flush=True)
+
+
+def start_memguards(
+    cluster: dict,
+    nodes: dict,
+    cluster_config: str,
+    phase: str,
+) -> None:
+    for node in nodes["nodes"]:
+        start_memguard(cluster, nodes, node, cluster_config, phase)
+
+
+def preserve_failed_start_logs(
+    cluster: dict,
+    nodes: dict,
+    started: list[dict],
+    cluster_config: str,
+) -> Path | None:
+    """Copy complete container logs locally before rollback removes containers."""
+    if not started:
+        return None
+
+    config_path = ROOT / cluster_config
+    if config_path.parent.parent == ROOT / "experiments":
+        base = config_path.parent / "runs" / "failed-starts"
+    else:
+        base = ROOT / "results" / "private" / "failed-starts"
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    destination = base / f"{stamp}-{cluster['container']['name']}"
+    destination.mkdir(parents=True, exist_ok=False)
+
+    name = cluster["container"]["name"]
+    for node in started:
+        state = run_ssh(nodes, node, "docker", "inspect", name)
+        logs = remote_shell(
+            nodes,
+            node,
+            f"docker logs --timestamps {shlex.quote(name)} 2>&1",
+        )
+        content = (
+            f"node: {node['name']}\n"
+            f"container: {name}\n"
+            f"inspect_returncode: {state.returncode}\n"
+            "\n[docker inspect]\n"
+            f"{state.stdout}{state.stderr}"
+            "\n[docker logs]\n"
+            f"{logs.stdout}{logs.stderr}"
+        )
+        (destination / f"{node['name']}.log").write_text(content, encoding="utf-8")
+    return destination
+
+
+def restore_containers(
+    cluster: dict,
+    nodes: dict,
+    backups: dict[str, str],
+    started: list[dict],
+    cluster_config: str,
+) -> None:
+    name = cluster["container"]["name"]
+    for node in nodes["nodes"]:
+        stop_memguard(cluster, nodes, node)
+    for node in started:
+        run_ssh(nodes, node, "docker", "rm", "--force", name)
+    for node in deployment_order(nodes):
+        backup = backups.get(node["name"])
+        if not backup:
+            continue
+        renamed = run_ssh(nodes, node, "docker", "rename", backup, name)
+        if renamed.returncode:
+            print(f"WARN: {node['name']}: could not restore container name", file=sys.stderr)
+            continue
+        try:
+            start_memguard(
+                cluster,
+                nodes,
+                node,
+                cluster_config,
+                "startup",
+                prelaunch=True,
+            )
+        except RuntimeError as error:
+            print(
+                f"WARN: {error}; did not start restored container unguarded",
+                file=sys.stderr,
+            )
+            continue
+        start_result = run_ssh(nodes, node, "docker", "start", name)
+        if start_result.returncode:
+            stop_memguard(cluster, nodes, node)
+            print(f"WARN: {node['name']}: could not restart previous container", file=sys.stderr)
+            continue
+
+
+def command_cluster_start(args: argparse.Namespace) -> int:
+    cluster, nodes, upstreams = configuration(args)
+    _, config_relative = cluster_config_path(args)
+    if args.apply and not cluster["deployment"]["launch_enabled"]:
+        print(
+            "ERROR: this cluster configuration is not authorized for launch",
+            file=sys.stderr,
+        )
+        return 1
+    name = cluster["container"]["name"]
+    order = deployment_order(nodes)
+    print("start plan (fail-closed startup memory guards):")
+    for node in order:
+        print(f"  {node['name']}: pre-arm startup memguard")
+        print(f"  {node['name']}: {shlex.join(rendered_docker_command(cluster, node))}")
+    print("  wait for API/JIT readiness, then switch every node to steady memguard")
+    if not args.apply:
+        print("plan only; pass --apply to start the cluster")
+        return 0
+
+    revision = require_local_deployment_state(cluster, nodes, upstreams)
+    problems = remote_runtime_problems(
+        cluster,
+        nodes,
+        revision,
+        allow_existing=args.replace,
+        cluster_config=config_relative,
+    )
+    if problems:
+        for problem in problems:
+            print(f"ERROR: {problem}", file=sys.stderr)
+        return 1
+
+    backup_suffix = f"pre-{int(time.time())}"
+    backups: dict[str, str] = {}
+    started: list[dict] = []
+    launch_began = time.monotonic()
+
+    def elapsed() -> str:
+        return f"+{time.monotonic() - launch_began:.1f}s"
+
+    try:
+        for node in nodes["nodes"]:
+            stop_memguard(cluster, nodes, node)
+            if memguard_is_active(cluster, nodes, node):
+                raise RuntimeError(
+                    f"{node['name']}: stale memguard is still active; refusing startup"
+                )
+        if args.replace:
+            for node in nodes["nodes"]:
+                exists = run_ssh(nodes, node, "docker", "inspect", name)
+                if exists.returncode:
+                    continue
+                backup = f"{name}-{backup_suffix}"
+                stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
+                if stopped.returncode:
+                    raise RuntimeError(f"{node['name']}: could not stop {name}")
+                renamed = run_ssh(nodes, node, "docker", "rename", name, backup)
+                if renamed.returncode:
+                    run_ssh(nodes, node, "docker", "start", name)
+                    raise RuntimeError(f"{node['name']}: could not preserve {name}")
+                backups[node["name"]] = backup
+        for node in order:
+            start_memguard(
+                cluster,
+                nodes,
+                node,
+                config_relative,
+                "startup",
+                prelaunch=True,
+            )
+            if not memguard_is_active(cluster, nodes, node):
+                raise RuntimeError(
+                    f"{node['name']}: pre-armed startup memguard is not active; "
+                    "refusing launch"
+                )
+            result = run_ssh(nodes, node, *rendered_docker_command(cluster, node))
+            if result.returncode:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(f"{node['name']}: launch failed: {detail}")
+            started.append(node)
+            print(f"{node['name']}: launched {result.stdout.strip()} ({elapsed()})", flush=True)
+        wait_for_api(cluster, nodes)
+        print(f"API ready at {elapsed()}", flush=True)
+        start_memguards(cluster, nodes, config_relative, "steady")
+    except (RuntimeError, KeyboardInterrupt) as error:
+        detail = str(error) if str(error) else "cluster start interrupted"
+        print(f"ERROR: {detail}", file=sys.stderr)
+        log_directory = preserve_failed_start_logs(
+            cluster, nodes, started, config_relative
+        )
+        if log_directory is not None:
+            print(
+                f"preserved complete failed-start logs in "
+                f"{log_directory.relative_to(ROOT)}",
+                file=sys.stderr,
+            )
+        print("rolling back containers started by this command", file=sys.stderr)
+        restore_containers(cluster, nodes, backups, started, config_relative)
+        if backups:
+            try:
+                wait_for_api(cluster, nodes)
+                start_memguards(cluster, nodes, config_relative, "steady")
+            except RuntimeError as rollback_error:
+                print(f"WARN: rollback health check failed: {rollback_error}", file=sys.stderr)
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+    for node in nodes["nodes"]:
+        backup = backups.get(node["name"])
+        if backup:
+            result = run_ssh(nodes, node, "docker", "rm", backup)
+            if result.returncode:
+                print(f"WARN: {node['name']}: retained backup container {backup}")
+    print(f"cluster ready; memory guards are active on all nodes ({elapsed()})")
+    return 0
+
+
+def command_cluster_stop(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    name = cluster["container"]["name"]
+    action = "stop and remove" if args.remove else "stop"
+    for node in nodes["nodes"]:
+        print(f"{node['name']}: {action} exact container {name} and stop its memguard")
+    if not args.apply:
+        print("plan only; pass --apply to stop the cluster")
+        return 0
+
+    failed = False
+    for node in nodes["nodes"]:
+        guard = stop_memguard(cluster, nodes, node)
+        if memguard_is_active(cluster, nodes, node):
+            detail = guard.stderr.strip() or "unit remains active"
+            print(f"ERROR: {node['name']}: could not stop memguard: {detail}", file=sys.stderr)
+            failed = True
+            continue
+        exists = run_ssh(nodes, node, "docker", "inspect", name)
+        if exists.returncode:
+            print(f"{node['name']}: {name} is already absent")
+            continue
+        stopped = run_ssh(nodes, node, "docker", "stop", "--time", "60", name)
+        if stopped.returncode:
+            print(f"ERROR: {node['name']}: {stopped.stderr.strip()}", file=sys.stderr)
+            failed = True
+            continue
+        if args.remove:
+            removed = run_ssh(nodes, node, "docker", "rm", name)
+            if removed.returncode:
+                print(f"ERROR: {node['name']}: {removed.stderr.strip()}", file=sys.stderr)
+                failed = True
+    return int(failed)
+
+
+def command_render(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    node = node_by_name(nodes, args.node)
+    print(shlex.join(rendered_docker_command(cluster, node)))
+    return 0
+
+
+def read_series(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def checked(command: list[str], cwd: Path | None = None) -> None:
+    subprocess.run(command, cwd=cwd, check=True)
+
+
+def command_upstream(args: argparse.Namespace) -> int:
+    _, _, upstreams = configuration(args)
+    sources = upstreams["sources"]
+    git_sources = {key: value for key, value in sources.items() if value["kind"] == "git"}
+    if args.upstream_command == "list":
+        for name, source in git_sources.items():
+            print(f"{name}\t{source['revision']}\t{source['upstream']}")
+        return 0
+
+    source = git_sources.get(args.name)
+    if source is None:
+        raise SystemExit(f"unknown Git upstream {args.name!r}")
+    destination = ROOT / ".work" / "upstreams" / args.name
+    if destination.exists():
+        raise SystemExit(f"{destination} already exists; remove it explicitly to recreate")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    checked(["git", "clone", source["upstream"], str(destination)])
+    checked(["git", "remote", "rename", "origin", "upstream"], cwd=destination)
+    contribution = source.get("contribution_remote")
+    if contribution:
+        checked(["git", "remote", "add", "origin", contribution], cwd=destination)
+    # Release commits are not always reachable from the canonical default branch.
+    # Fetch the full pinned object explicitly before detaching at it.
+    checked(["git", "fetch", "upstream", source["revision"]], cwd=destination)
+    checked(["git", "checkout", "--detach", source["revision"]], cwd=destination)
+    if source.get("submodules"):
+        checked(["git", "submodule", "update", "--init", "--recursive"], cwd=destination)
+    for commit in source.get("applied_upstream_commits", []):
+        checked(["git", "fetch", "upstream", commit["revision"]], cwd=destination)
+        checked(
+            ["git", "cherry-pick", "--no-commit", commit["revision"]],
+            cwd=destination,
+        )
+    pending: list[str] = []
+    series = source.get("patch_series")
+    if series:
+        series_path = ROOT / series
+        for patch_name in read_series(series_path):
+            if patch_name.startswith("TODO-"):
+                pending.append(patch_name)
+                continue
+            checked(["git", "apply", str(series_path.parent / patch_name)], cwd=destination)
+    print(f"prepared {args.name} in {destination}")
+    print("remotes:")
+    checked(["git", "remote", "-v"], cwd=destination)
+    if pending:
+        print("pending local patches not yet exported:", file=sys.stderr)
+        for patch_name in pending:
+            print(f"  {patch_name}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts or "__pycache__" in relative.parts:
+            continue
+        digest.update(str(relative).encode())
+        if path.is_symlink():
+            digest.update(b"L")
+            digest.update(path.readlink().as_posix().encode())
+        elif path.is_file():
+            digest.update(b"F")
+            digest.update(oct(path.stat().st_mode & 0o777).encode())
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        elif path.is_dir():
+            digest.update(b"D")
+    return digest.hexdigest()
+
+
+def expected_wheel_hashes() -> dict[str, str]:
+    lock = ROOT / "requirements/cutlass-dsl-aarch64.txt"
+    expected: dict[str, str] = {}
+    package = ""
+    for raw_line in lock.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "==" in line:
+            package = line.split("==", 1)[0].replace("-", "_")
+        if "--hash=sha256:" in line and package:
+            expected[package] = line.split("--hash=sha256:", 1)[1].rstrip(" \\")
+    return expected
+
+
+def patchset_sha256(source: dict) -> str:
+    digest = hashlib.sha256()
+    for commit in source.get("applied_upstream_commits", []):
+        digest.update(commit["revision"].encode())
+        digest.update(b"\0")
+    series = source.get("patch_series")
+    if series:
+        series_path = ROOT / series
+        digest.update(series_path.read_bytes())
+        for patch_name in read_series(series_path):
+            if patch_name.startswith("TODO-"):
+                continue
+            digest.update(patch_name.encode())
+            digest.update(b"\0")
+            digest.update((series_path.parent / patch_name).read_bytes())
+    return digest.hexdigest()
+
+
+BUILD_ROOT = ROOT / ".work/build"
+# Bump when the directory layout or context export changes, so older
+# directories are re-prepared.
+BUILD_LAYOUT = 2
+BUILD_PROJECTS = ("vllm", "b12x", "nccl")
+BUILD_PARTS = ("vllm", "b12x", "nccl", "cutlass", "wheels")
+BUILD_CONTEXTS = (
+    "vllm-source", "b12x-source", "nccl-source", "cutlass-source", "cutlass-dsl-wheels", "vllm-deletions"
+)
+# git am with a fixed committer and committer date reproduces the recorded
+# patch heads byte for byte.
+PATCH_COMMITTER = ("Christopher Owen", "3221756+christopherowen@users.noreply.github.com")
+GIB = 1024**3
+BUILD_MIN_AVAILABLE_GIB = 64
+BUILD_RESERVE_GIB = 24
+BUILD_MEMORY_PER_JOB_GIB = 8
+BUILD_NVCC_THREADS = 2
+BUILD_CPU_RESERVE = 4
+BUILD_MAX_JOBS = 10
+SMOKE_MEMORY_GIB = 16
+BUILD_LOCK = Path("/tmp/spark3-build.lock")
+SMOKE_SCRIPT = """\
+import torch
+
+assert torch.cuda.is_available()
+print("device", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
+import vllm.distributed.device_communicators.b12x_roce_all_reduce  # noqa: F401
+import vllm.models.deepseek_v4_1.nvidia.dspark  # noqa: F401
+import vllm.models.deepseek_v4_1.nvidia.model  # noqa: F401
+import vllm.models.deepseek_v4_1.nvidia.vl_model  # noqa: F401
+import vllm.v1.attention.backends.mla.b12x_mla_sparse  # noqa: F401
+from vllm.models.deepseek_v41 import DeepseekV41ForCausalLM
+
+print("DS4.1 SM12x class:", DeepseekV41ForCausalLM.__module__)
+assert DeepseekV41ForCausalLM.__module__.startswith("vllm.models.deepseek_v4_1")
+print("GPU import smoke passed")
+"""
+
+
+def git_output(directory: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments], cwd=directory, check=True, text=True, stdout=subprocess.PIPE
+    ).stdout.strip()
+
+
+def build_inputs(upstreams: dict) -> dict:
+    """Everything that determines the build contexts, read from the lock."""
+    manifest = read_json(upstreams["source_manifest"])
+    sources = upstreams["sources"]
+    base = sources["vllm_base_image"]
+    inputs = {
+        "base_image": f"{base['upstream']}@{base['recorded_base_digest']}",
+        "base_source_revision": base["source_revision"],
+        "cutlass": {key: sources["cutlass"][key] for key in ("upstream", "revision", "release_tag")},
+        "cutlass_dsl_wheels": expected_wheel_hashes(),
+    }
+    for name in BUILD_PROJECTS:
+        source = sources[name]
+        record = manifest[name]
+        patchset = patchset_sha256(source)
+        if patchset != record["patchset_sha256"]:
+            raise SystemExit(
+                f"{name}: the patch series differs from {upstreams['source_manifest']}; "
+                "record its new patch head and tree there first"
+            )
+        inputs[name] = {
+            "upstream": source["upstream"],
+            "tracking_ref": source["tracking_ref"],
+            "revision": source["revision"],
+            "patch_series": source.get("patch_series"),
+            "patchset_sha256": patchset,
+            "patch_head": record["patch_head"],
+            "expected_tree": record["expected_tree"],
+        }
+    if sources["vllm"].get("canonical_base"):
+        inputs["vllm"]["canonical_upstream"] = sources["vllm"]["canonical_base"]["upstream"]
+    return inputs
+
+
+def build_directory(inputs: dict) -> Path:
+    """One directory per set of build inputs: same lock, same directory."""
+    digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    return BUILD_ROOT / (
+        f"vllm-{inputs['vllm']['revision'][:12]}-b12x-{inputs['b12x']['revision'][:12]}-{digest[:8]}"
+    )
+
+
+def project_problems(source: Path, record: dict) -> list[str]:
+    if not (source / ".git").exists():
+        return [f"{source.name}: source checkout is missing"]
+    problems = []
+    if git_output(source, "status", "--porcelain", "--untracked-files=all"):
+        problems.append(f"{source.name}: source checkout has local changes")
+    head = git_output(source, "rev-parse", "HEAD")
+    tree = git_output(source, "rev-parse", "HEAD^{tree}")
+    if tree != record["expected_tree"]:
+        problems.append(f"{source.name}: tree {tree}, expected {record['expected_tree']}")
+    if head != record["patch_head"]:
+        problems.append(f"{source.name}: patch head {head}, expected {record['patch_head']}")
+    return problems
+
+
+def replace_directory(temporary: Path, destination: Path) -> None:
+    if destination.exists():
+        shutil.rmtree(destination)
+    temporary.rename(destination)
+
+
+def prepare_project(directory: Path, name: str, record: dict) -> None:
+    source = directory / "src" / name
+    if source.is_dir() and not project_problems(source, record):
+        print(f"{name}: reusing {source.relative_to(ROOT)}")
+        return
+    source.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=source.parent))
+    try:
+        checked(["git", "init", "--quiet"], cwd=temporary)
+        checked(["git", "remote", "add", "upstream", record["upstream"]], cwd=temporary)
+        checked(
+            ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", record["revision"]],
+            cwd=temporary,
+        )
+        checked(["git", "switch", "--quiet", "--create", "spark3/build", "FETCH_HEAD"], cwd=temporary)
+        if record.get("patch_series"):
+            series = ROOT / record["patch_series"]
+            for patch_name in read_series(series):
+                checked(
+                    [
+                        "git", "-c", f"user.name={PATCH_COMMITTER[0]}",
+                        "-c", f"user.email={PATCH_COMMITTER[1]}",
+                        "am", "--quiet", "--committer-date-is-author-date",
+                        str(series.parent / patch_name),
+                    ],
+                    cwd=temporary,
+                )
+        checked(["git", "diff", "--check", record["revision"], "HEAD"], cwd=temporary)
+        problems = project_problems(temporary, record)
+        if problems:
+            raise SystemExit("; ".join(problems))
+        replace_directory(temporary, source)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print(f"{name}: prepared {record['patch_head'][:12]} (tree {record['expected_tree'][:12]})")
+
+
+def prepare_cutlass(directory: Path, record: dict) -> None:
+    source = directory / "src/cutlass"
+    if (source / ".git").exists() and git_output(source, "rev-parse", "HEAD") == record["revision"]:
+        print(f"cutlass: reusing {source.relative_to(ROOT)}")
+        return
+    source.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".cutlass.", dir=source.parent))
+    try:
+        checked(["git", "init", "--quiet"], cwd=temporary)
+        checked(["git", "remote", "add", "upstream", record["upstream"]], cwd=temporary)
+        checked(["git", "fetch", "--quiet", "--depth", "1", "upstream", record["revision"]], cwd=temporary)
+        checked(["git", "checkout", "--quiet", "--detach", "FETCH_HEAD"], cwd=temporary)
+        if git_output(temporary, "rev-parse", "HEAD") != record["revision"]:
+            raise SystemExit("cutlass: fetched revision differs from the lock")
+        replace_directory(temporary, source)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print(f"cutlass: prepared {record['release_tag']} ({record['revision'][:12]})")
+
+
+def wheel_problems(wheel_dir: Path) -> list[str]:
+    if not wheel_dir.is_dir():
+        return ["cutlass-dsl-wheels: missing"]
+    problems = []
+    expected = expected_wheel_hashes()
+    found: set[str] = set()
+    for wheel in sorted(wheel_dir.iterdir()):
+        normalized = wheel.name.replace("-", "_").lower()
+        package = next(
+            (name for name in sorted(expected, key=len, reverse=True)
+             if normalized.startswith(name.lower() + "_")),
+            None,
+        )
+        if package is None or not wheel.name.endswith(".whl"):
+            problems.append(f"cutlass-dsl-wheels: unlocked file {wheel.name}")
+            continue
+        found.add(package)
+        if sha256(wheel) != expected[package]:
+            problems.append(f"cutlass-dsl-wheels: {wheel.name} differs from the lock hash")
+    for package in sorted(set(expected) - found):
+        problems.append(f"cutlass-dsl-wheels: missing {package}")
+    return problems
+
+
+def prepare_wheels(directory: Path, upstreams: dict) -> None:
+    destination = directory / "context/cutlass-dsl-wheels"
+    if not wheel_problems(destination):
+        print("cutlass-dsl wheels: reusing verified wheels")
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=".wheels.", dir=destination.parent))
+    try:
+        checked([
+            sys.executable, "-m", "pip", "download", "--quiet", "--dest", str(temporary),
+            "--require-hashes", "--no-deps", "--only-binary=:all:",
+            "--platform", "manylinux_2_28_aarch64", "--implementation", "cp",
+            "--python-version", "3.12", "--abi", "cp312",
+            "--requirement", str(ROOT / upstreams["sources"]["cutlass_dsl"]["lockfile"]),
+        ])
+        problems = wheel_problems(temporary)
+        if problems:
+            raise SystemExit("; ".join(problems))
+        replace_directory(temporary, destination)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print("cutlass-dsl wheels: downloaded and verified")
+
+
+def export_source(source: Path, destination: Path) -> None:
+    """Copy a checkout without Git metadata or bytecode, replacing atomically."""
+    temporary = destination.with_name(f".{destination.name}.export")
+    shutil.rmtree(temporary, ignore_errors=True)
+    shutil.copytree(
+        source, temporary, symlinks=True, ignore=shutil.ignore_patterns(".git", "__pycache__")
+    )
+    replace_directory(temporary, destination)
+
+
+def normalize_modes(root: Path) -> None:
+    """Git's two file modes, so contexts do not depend on the host umask."""
+    for path in [root, *root.rglob("*")]:
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o755)
+        else:
+            path.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
+
+
+def vllm_deletions(directory: Path, inputs: dict) -> list[str]:
+    """Files the pinned vLLM deletes relative to the base image's revision."""
+    source = directory / "src/vllm"
+    base = inputs["base_source_revision"]
+    present = subprocess.run(
+        ["git", "cat-file", "-e", f"{base}^{{commit}}"], cwd=source, stderr=subprocess.DEVNULL
+    )
+    if present.returncode:
+        checked(
+            ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags",
+             inputs["vllm"]["canonical_upstream"], base],
+            cwd=source,
+        )
+    output = git_output(source, "diff", "--name-only", "--diff-filter=D", base, "HEAD", "--", "vllm")
+    return [path.removeprefix("vllm/") for path in output.splitlines()]
+
+
+def build_problems(directory: Path, inputs: dict) -> list[str]:
+    record_path = directory / "inputs.json"
+    if not record_path.is_file():
+        return [f"{directory.relative_to(ROOT)} is not prepared; run bin/spark3 build prepare"]
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    problems = []
+    if record.get("schema") != BUILD_LAYOUT:
+        problems.append(f"prepared with build layout {record.get('schema')}, now {BUILD_LAYOUT}")
+    if record.get("inputs") != inputs:
+        problems.append("inputs.json does not match the lock")
+    for name in BUILD_PROJECTS:
+        problems.extend(project_problems(directory / "src" / name, inputs[name]))
+    for name, digest in record.get("contexts", {}).items():
+        context = directory / "context" / name
+        if not context.is_dir():
+            problems.append(f"{name}: context is missing")
+        elif tree_digest(context) != digest:
+            problems.append(f"{name}: context changed since it was prepared")
+    if sorted(record.get("contexts", {})) != sorted(BUILD_CONTEXTS):
+        problems.append("inputs.json does not record every build context")
+    problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels"))
+    if not (directory / "context/cutlass-source/include/cutlass/cutlass.h").is_file():
+        problems.append("cutlass-source: include/cutlass/cutlass.h is missing")
+    return problems
+
+
+def command_build_prepare(args: argparse.Namespace) -> int:
+    _, _, upstreams = configuration(args)
+    inputs = build_inputs(upstreams)
+    directory = build_directory(inputs)
+    parts = args.only.split(",") if args.only else list(BUILD_PARTS)
+    unknown = sorted(set(parts) - set(BUILD_PARTS))
+    if unknown:
+        raise SystemExit(f"unknown build parts: {', '.join(unknown)}")
+    if not args.only and not build_problems(directory, inputs):
+        print(f"build inputs ready: {directory.relative_to(ROOT)}")
+        return 0
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "inputs.json").unlink(missing_ok=True)
+    print(f"preparing {directory.relative_to(ROOT)}", flush=True)
+    for name in BUILD_PROJECTS:
+        if name in parts:
+            prepare_project(directory, name, inputs[name])
+    if "cutlass" in parts:
+        prepare_cutlass(directory, inputs["cutlass"])
+    if "wheels" in parts:
+        prepare_wheels(directory, upstreams)
+    if args.only:
+        print("partial preparation; run bin/spark3 build prepare for the complete inputs")
+        return 0
+    context = directory / "context"
+    for name in (*BUILD_PROJECTS, "cutlass"):
+        export_source(directory / "src" / name, context / f"{name}-source")
+    deleted = vllm_deletions(directory, inputs)
+    deletions = context / "vllm-deletions"
+    deletions.mkdir(exist_ok=True)
+    (deletions / "deleted.txt").write_text("".join(f"{path}\n" for path in deleted), encoding="utf-8")
+    (context / "empty").mkdir(exist_ok=True)
+    normalize_modes(context)
+    record = {
+        "schema": BUILD_LAYOUT,
+        "inputs": inputs,
+        "contexts": {name: tree_digest(context / name) for name in BUILD_CONTEXTS},
+        "vllm_deletions": len(deleted),
+    }
+    temporary = directory / ".inputs.json"
+    temporary.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.rename(directory / "inputs.json")
+    problems = build_problems(directory, inputs)
+    if problems:
+        for problem in problems:
+            print(f"WARN: {problem}")
+        return 1
+    print(f"build inputs ready: {directory.relative_to(ROOT)} ({len(deleted)} vLLM deletions)")
+    return 0
+
+
+def command_build_check(args: argparse.Namespace) -> int:
+    _, _, upstreams = configuration(args)
+    inputs = build_inputs(upstreams)
+    directory = build_directory(inputs)
+    problems = build_problems(directory, inputs)
+    if problems:
+        for problem in problems:
+            print(f"WARN: {problem}")
+        return 1
+    print(f"build inputs OK: {directory.relative_to(ROOT)}")
+    return 0
+
+
+def available_memory_gib() -> float:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024 / GIB
+    except (OSError, ValueError) as error:
+        raise SystemExit(f"cannot read host MemAvailable: {error}") from error
+    raise SystemExit("cannot read host MemAvailable")
+
+
+def compile_jobs(available_gib: float) -> int:
+    if available_gib < BUILD_MIN_AVAILABLE_GIB:
+        raise SystemExit(
+            f"the build needs {BUILD_MIN_AVAILABLE_GIB} GiB MemAvailable to start; "
+            f"found {available_gib:.1f} GiB"
+        )
+    cpu_jobs = max(1, (len(os.sched_getaffinity(0)) - BUILD_CPU_RESERVE) // BUILD_NVCC_THREADS)
+    memory_jobs = int((available_gib - BUILD_RESERVE_GIB) // BUILD_MEMORY_PER_JOB_GIB)
+    return min(BUILD_MAX_JOBS, cpu_jobs, memory_jobs)
+
+
+def cancel_process_group(process: subprocess.Popen) -> None:
+    for signal_number, seconds in ((signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal_number)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def run_memory_guarded(command: list[str], reserve_gib: float) -> float:
+    """Run a command, cancelling it if MemAvailable falls below the reserve."""
+    minimum = available_memory_gib()
+    process = subprocess.Popen(command, start_new_session=True)
+    try:
+        while True:
+            try:
+                result = process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                available = available_memory_gib()
+                minimum = min(minimum, available)
+                if available < reserve_gib:
+                    cancel_process_group(process)
+                    raise SystemExit(
+                        f"canceled: MemAvailable fell to {available:.1f} GiB, "
+                        f"below the {reserve_gib} GiB reserve"
+                    )
+                continue
+            if result:
+                raise SystemExit(f"{command[0]} {command[1]} failed with exit status {result}")
+            return minimum
+    except KeyboardInterrupt:
+        cancel_process_group(process)
+        raise SystemExit("canceled") from None
+    except BaseException:
+        cancel_process_group(process)
+        raise
+
+
+def require_idle_build_host(cluster: dict) -> None:
+    running = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"], check=True, text=True, stdout=subprocess.PIPE
+    ).stdout.split()
+    service = cluster["container"]["name"]
+    if any(name == service or name.startswith("dsv41-") for name in running):
+        raise SystemExit("a DS4.1 service is running on this host; stop it before building")
+
+
+def image_labels(tag: str) -> dict | None:
+    result = subprocess.run(
+        ["docker", "image", "inspect", tag], text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    if result.returncode:
+        return None
+    inspection = json.loads(result.stdout)[0]
+    return {"id": inspection["Id"], "labels": inspection["Config"].get("Labels") or {}}
+
+
+def smoke_image(cluster: dict, tag: str) -> None:
+    require_idle_build_host(cluster)
+    available = available_memory_gib()
+    if available < SMOKE_MEMORY_GIB + 8:
+        raise SystemExit(
+            f"the GPU import smoke needs {SMOKE_MEMORY_GIB + 8} GiB MemAvailable; found {available:.1f} GiB"
+        )
+    subprocess.run(
+        [
+            "docker", "run", "--rm", "-i", "--gpus", "all",
+            f"--memory={SMOKE_MEMORY_GIB}g", f"--memory-swap={SMOKE_MEMORY_GIB}g",
+            "--entrypoint", "/usr/bin/python3", tag, "-",
+        ],
+        input=SMOKE_SCRIPT,
+        text=True,
+        check=True,
+    )
+
+
+def command_build_image(args: argparse.Namespace) -> int:
+    cluster, _, upstreams = configuration(args)
+    inputs = build_inputs(upstreams)
+    directory = build_directory(inputs)
+    problems = build_problems(directory, inputs)
+    if problems:
+        for problem in problems:
+            print(f"WARN: {problem}")
+        return 1
+    if repository_dirty():
+        print("WARN: the image records the deployment commit; commit changes first")
+        return 1
+    tag = args.tag or cluster["container"]["image"]
+    context = directory / "context"
+    base = upstreams["sources"]["vllm_base_image"]
+    deployment_commit = repository_revision()
+
+    def command(jobs: int | str) -> list[str]:
+        rendered = [
+            "docker", "buildx", "build", "--platform", "linux/arm64", "--network", "host", "--load",
+            "--file", str(ROOT / "docker/Dockerfile"), "--tag", tag,
+        ]
+        for name in BUILD_CONTEXTS:
+            rendered += ["--build-context", f"{name}={context / name}"]
+        build_args = {
+            "BASE_IMAGE": inputs["base_image"],
+            "BASE_IMAGE_NAME": base["upstream"],
+            "BASE_IMAGE_DIGEST": base["recorded_base_digest"],
+            "DEPLOYMENT_COMMIT": deployment_commit,
+            "VLLM_COMPILE_JOBS": str(jobs),
+            "VLLM_NVCC_THREADS": str(BUILD_NVCC_THREADS),
+        }
+        for name in BUILD_PROJECTS:
+            record = inputs[name]
+            prefix = name.upper()
+            build_args.update({
+                f"{prefix}_UPSTREAM": record["upstream"].removesuffix(".git"),
+                f"{prefix}_REF": record["tracking_ref"].removeprefix("refs/heads/"),
+                f"{prefix}_REVISION": record["revision"],
+                f"{prefix}_PATCH_HEAD": record["patch_head"],
+                f"{prefix}_TREE": record["expected_tree"],
+            })
+        for key, value in build_args.items():
+            rendered += ["--build-arg", f"{key}={value}"]
+        if os.environ.get("GITHUB_TOKEN"):
+            rendered += ["--secret", "id=github_token,env=GITHUB_TOKEN"]
+        return rendered + [str(context / "empty")]
+
+    if not args.apply:
+        print(shlex.join(command("<sized from MemAvailable>")))
+        print("plan only; pass --apply on an idle build host to build and smoke-test")
+        return 0
+    lock = BUILD_LOCK.open("w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit("another image build is running on this host") from None
+    require_idle_build_host(cluster)
+    if image_labels(tag) is not None:
+        raise SystemExit(f"{tag} already exists here; pass --tag with a new tag rather than overwrite it")
+    available = available_memory_gib()
+    jobs = compile_jobs(available)
+    print(
+        f"building {tag} from {directory.relative_to(ROOT)}: {jobs} compile jobs x "
+        f"{BUILD_NVCC_THREADS} NVCC threads, {available:.1f} GiB available, "
+        f"cancel below {BUILD_RESERVE_GIB} GiB",
+        flush=True,
+    )
+    started = time.monotonic()
+    minimum = run_memory_guarded(command(jobs), BUILD_RESERVE_GIB)
+    elapsed = time.monotonic() - started
+    image = image_labels(tag)
+    if image is None:
+        raise SystemExit(f"the build finished but {tag} is not present")
+    for name in BUILD_PROJECTS:
+        label = image["labels"].get(f"local.spark3.{name}.tree")
+        if label != inputs[name]["expected_tree"]:
+            raise SystemExit(f"{tag}: label local.spark3.{name}.tree is {label!r}")
+    print(f"built {tag} {image['id']} in {elapsed:.0f}s; lowest MemAvailable {minimum:.1f} GiB", flush=True)
+    smoke_image(cluster, tag)
+    receipts = directory / "images"
+    receipts.mkdir(exist_ok=True)
+    receipt = {
+        "tag": tag,
+        "image_id": image["id"],
+        "deployment_commit": deployment_commit,
+        "compile_jobs": jobs,
+        "elapsed_seconds": round(elapsed),
+        "min_available_gib": round(minimum, 1),
+        "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    (receipts / f"{image['id'].removeprefix('sha256:')[:16]}.json").write_text(
+        json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
+    )
+    return 0
+
+
+def command_build_smoke(args: argparse.Namespace) -> int:
+    cluster, _, _ = configuration(args)
+    smoke_image(cluster, args.image or cluster["container"]["image"])
+    return 0
+
+
+BENCH_SCHEMA = 1
+BENCH_SUITES = ("quality", "decode", "sampled", "prefill", "prefix", "admission")
+BENCH_TIMEOUT_SECONDS = 1800
+# These prompts and settings match the client behind every baseline manifest
+# since 2026-09-20, so decode means stay comparable with published figures.
+DECODE_PROMPTS = {
+    "prose": (
+        "Explain, in precise technical prose, how speculative decoding can "
+        "increase language-model serving throughput while preserving the "
+        "target model's output distribution. Discuss acceptance rate, "
+        "verification cost, batching, and latency."
+    ),
+    "code": (
+        "Write a complete Python implementation of an LRU cache using only "
+        "the standard library. Include type hints, O(1) get and put methods, "
+        "capacity validation, and a short executable example. Explain the "
+        "complexity after the code."
+    ),
+}
+DECODE_TOKENS = 256
+
+
+class DecodeCase(NamedTuple):
+    """One decode workload.
+
+    prompt: one prompt, or a tuple of distinct prompts given to successive
+        streams (cycled, with a stream tag once they repeat).
+    per_stream: tag a single prompt with each stream's number, so concurrent
+        streams neither share a prefix-cache block nor produce one output.
+    fixed_length: generate exactly DECODE_TOKENS tokens (min_tokens and
+        ignore_eos), so every stack and sample measures the same length.
+    """
+
+    prompt: str | tuple[str, ...]
+    template_kwargs: dict | None = None
+    fixed_length: bool = False
+    per_stream: bool = False
+    temperature: float = 0.0
+    top_p: float | None = None
+
+
+# Extra decode cases, selected with --decode-cases. The server reasons by
+# default, so most of what "prose" and "code" measure is reasoning text; the
+# -nothink cases turn reasoning off to measure the answer itself, where draft
+# acceptance differs most.
+DECODE_CASES = {
+    "prose-nothink": DecodeCase(DECODE_PROMPTS["prose"], {"thinking": False}),
+    "code-nothink": DecodeCase(DECODE_PROMPTS["code"], {"thinking": False}),
+    "json-nothink": DecodeCase(
+        "Return only a JSON array of twelve objects describing fictional "
+        "library books, with no prose and no code fence. Each object has "
+        "the keys title, author, year, genres (an array of two strings), "
+        "isbn, pages, available (a boolean), and rating (a number from 1 "
+        "to 5).",
+        {"thinking": False},
+    ),
+}
+DECODE_CASES.update((case, DecodeCase(prompt)) for case, prompt in DECODE_PROMPTS.items())
+# Portable cases follow the protocol public DGX Spark benchmarks use, so
+# figures line up with theirs: reasoning off, exactly 256 tokens, a distinct
+# prompt per stream, and workloads from highly predictable (a count) to
+# free-running prose and sampled chat.
+PORTABLE_CODE_TAIL = (
+    "Reply with Python source only: no comments, no docstrings, no Markdown "
+    "fences. After it, write unit tests and any helpers they need, and keep "
+    "writing code."
+)
+PORTABLE_CODE_TASKS = tuple(
+    f"{name}\n{spec}\n{PORTABLE_CODE_TAIL}"
+    for name, spec in (
+        ("flatten", "def flatten(items) -> list: flatten arbitrarily nested lists of ints, preserving order."),
+        ("stack", "class Stack: push, pop, peek and is_empty over a list, raising IndexError on underflow."),
+        ("palindrome", "def is_palindrome(text) -> bool: ignore case and every non-alphanumeric character."),
+        ("word_counts", "def word_counts(text) -> dict: count words case-insensitively, ignoring punctuation."),
+        ("matmul", "def matmul(a, b) -> list: multiply two matrices given as lists of rows, checking shapes."),
+        ("trie", "class Trie: insert(word), contains(word) and starts_with(prefix) over nested dicts."),
+        ("roman", "def roman_to_int(text) -> int: convert a Roman numeral, including subtractive pairs."),
+        ("rotate", "def rotate(nums, k) -> list: rotate a list right by k positions, for any integer k."),
+    )
+)
+PORTABLE_CASES = {
+    "count": "Count upward from 1 to 400. Write only the numbers, separated by single spaces, and nothing else.",
+    "explain": (
+        "Explain step by step how a B-tree index works in a database: node "
+        "layout, search, insertion with node splits, deletion with merges, and "
+        "the cost of each operation. Be thorough and precise."
+    ),
+    "tasks": PORTABLE_CODE_TASKS,
+    "rows": (
+        "Output only a JSON array of invented server telemetry records. Each "
+        "record has hostname, rack, cpuPct, memPct, diskIops, netMbps and "
+        "status. Produce as many records as you can, with no Markdown and no "
+        "commentary."
+    ),
+    "math": (
+        "Solve this step by step, showing every calculation: a train leaves a "
+        "station at 9:40 at 84 km/h, and a second train follows on the same "
+        "track at 10:15 at 112 km/h. When and how far from the station does "
+        "the second train catch the first? Then write and solve three similar "
+        "problems with different numbers."
+    ),
+    "chat": (
+        "Explain to a curious twelve-year-old how the heart pumps blood around "
+        "the body, why it beats faster during exercise, and what blood pressure "
+        "means. Be friendly and concrete."
+    ),
+    "essay": (
+        "Write a flowing essay of about 900 words on the history of bridges, "
+        "from rope bridges and Roman arches to modern cable-stayed spans. Use "
+        "full paragraphs only: no headings, no lists and no Markdown."
+    ),
+    "story": (
+        "Write continuous literary prose of about 900 words following a "
+        "mountain town through one winter, seen by a baker, a schoolteacher "
+        "and a snowplough driver. No headings and no lists."
+    ),
+}
+DECODE_CASES.update(
+    (case, DecodeCase(prompt, {"thinking": False}, fixed_length=True, per_stream=True))
+    for case, prompt in PORTABLE_CASES.items()
+)
+DECODE_CASES["chat-sampled"] = DecodeCase(
+    PORTABLE_CASES["chat"], {"thinking": False}, fixed_length=True, per_stream=True,
+    temperature=0.7, top_p=0.95,
+)
+# Names --decode-cases expands.
+DECODE_CASE_GROUPS = {"portable": [*PORTABLE_CASES, "chat-sampled"]}
+SAMPLED_PROMPTS = {
+    "prose": (
+        "Write a short essay about how rivers shape the land and the people "
+        "who live near them."
+    ),
+    "code": (
+        "Write a Python module with a thread-safe LRU cache class (get, put, "
+        "delete, clear) and unit tests using unittest."
+    ),
+}
+LRU_PROMPT = (
+    "Write a short Python LRU cache class with get and put methods using "
+    "OrderedDict. Give code and one sentence on complexity."
+)
+NOVEL_LETTERS = "abcdefghijklmnopqrstuvwxyz"
+FILLER_WORDS = (
+    "river stone lantern orchard meadow harbor canyon glacier prairie "
+    "summit valley forest desert island marsh delta ridge basin"
+).split()
+BENCH_METRICS = (
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:kv_cache_usage_perc",
+    "vllm:request_success_total",
+    "vllm:num_preemptions_total",
+    "vllm:prefix_cache_queries_total",
+    "vllm:prefix_cache_hits_total",
+    "vllm:spec_decode_num_drafts_total",
+    "vllm:spec_decode_num_draft_tokens_total",
+    "vllm:spec_decode_num_accepted_tokens_total",
+)
+# Two-sided 95% Student t quantiles by degrees of freedom (lower bound).
+T_95 = (
+    (1, 12.706), (2, 4.303), (3, 3.182), (4, 2.776), (5, 2.571), (6, 2.447),
+    (7, 2.365), (8, 2.306), (9, 2.262), (10, 2.228), (12, 2.179), (15, 2.131),
+    (20, 2.086), (30, 2.042), (60, 2.000), (120, 1.980),
+)
+
+
+class BenchAbort(RuntimeError):
+    """Stop issuing requests; the partial report is still written."""
+
+
+def t_95(degrees: float) -> float:
+    quantile = T_95[0][1]
+    for bound, value in T_95:
+        if degrees >= bound:
+            quantile = value
+    return quantile
+
+
+def describe(values: list[float]) -> dict:
+    count = len(values)
+    if not count:
+        return {"n": 0}
+    mean = sum(values) / count
+    ordered = sorted(values)
+    middle = count // 2
+    median = ordered[middle] if count % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+    summary = {
+        "n": count,
+        "mean": round(mean, 3),
+        "median": round(median, 3),
+        "min": round(ordered[0], 3),
+        "max": round(ordered[-1], 3),
+        "sd": None,
+        "ci95": None,
+        "ci95_pct": None,
+    }
+    if count > 1:
+        sd = (sum((value - mean) ** 2 for value in values) / (count - 1)) ** 0.5
+        half = t_95(count - 1) * sd / count**0.5
+        summary.update(sd=round(sd, 3), ci95=round(half, 3))
+        if mean:
+            summary["ci95_pct"] = round(100 * half / mean, 2)
+    return summary
+
+
+def difference(new: dict, reference: dict) -> tuple[float, float, float] | None:
+    """Percent change of the new mean and its Welch 95% interval."""
+    if not new.get("n") or not reference.get("n") or not reference.get("mean"):
+        return None
+    new_var = (new.get("sd") or 0.0) ** 2 / new["n"]
+    ref_var = (reference.get("sd") or 0.0) ** 2 / reference["n"]
+    denominator = 0.0
+    if new["n"] > 1:
+        denominator += new_var**2 / (new["n"] - 1)
+    if reference["n"] > 1:
+        denominator += ref_var**2 / (reference["n"] - 1)
+    degrees = (new_var + ref_var) ** 2 / denominator if denominator else 120
+    change = new["mean"] / reference["mean"] - 1
+    half = t_95(degrees) * (new_var + ref_var) ** 0.5 / reference["mean"]
+    return 100 * change, 100 * (change - half), 100 * (change + half)
+
+
+def scrape_metrics(base: str) -> dict[str, float]:
+    with urllib.request.urlopen(f"{base}/metrics", timeout=10) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    return parse_metrics(text)
+
+
+def parse_metrics(text: str) -> dict[str, float]:
+    values = dict.fromkeys(BENCH_METRICS, 0.0)
+    for line in text.splitlines():
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in values:
+            values[name] += float(line.rsplit(" ", 1)[1])
+    return values
+
+
+MetricSeries = dict[tuple[str, tuple[tuple[str, str], ...]], float]
+
+WORKLOAD_GAUGES = (
+    "vllm:num_requests_running",
+    "vllm:num_requests_waiting",
+    "vllm:kv_cache_usage_perc",
+    "vllm:scheduler_local_prefill_backlog_tokens",
+)
+
+WORKLOAD_LATENCIES = {
+    "queue": "vllm:request_queue_time_seconds",
+    "first_token": "vllm:time_to_first_token_seconds",
+    "inter_token": "vllm:inter_token_latency_seconds",
+    "prefill": "vllm:request_prefill_time_seconds",
+    "decode": "vllm:request_decode_time_seconds",
+    "end_to_end": "vllm:e2e_request_latency_seconds",
+}
+
+# A decode-only step carries at most max-num-seqs x (1 + drafts) = 48 tokens.
+DECODE_ONLY_STEP_TOKENS = 64
+
+
+def parse_metric_series(text: str) -> MetricSeries:
+    """Every sample keyed by name and labels, summed over engine and model."""
+    series: MetricSeries = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        head, _, value = line.rpartition(" ")
+        name, _, labels = head.partition("{")
+        pairs = tuple(sorted(
+            (key, label)
+            for key, label in re.findall(r'(\w+)="([^"]*)"', labels)
+            if key not in ("engine", "model_name")
+        ))
+        try:
+            series[(name, pairs)] = series.get((name, pairs), 0.0) + float(value)
+        except ValueError:
+            continue
+    return series
+
+
+def scrape_metric_series(base: str) -> MetricSeries:
+    with urllib.request.urlopen(f"{base}/metrics", timeout=10) as response:
+        return parse_metric_series(response.read().decode("utf-8", errors="replace"))
+
+
+def series_sum(series: MetricSeries, name: str, **labels: str) -> float:
+    return sum(
+        value
+        for (key, pairs), value in series.items()
+        if key == name and all(dict(pairs).get(label) == want for label, want in labels.items())
+    )
+
+
+def series_by_label(series: MetricSeries, name: str, label: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for (key, pairs), value in series.items():
+        if key == name and label in dict(pairs):
+            values[dict(pairs)[label]] = values.get(dict(pairs)[label], 0.0) + value
+    return values
+
+
+def histogram_buckets(series: MetricSeries, name: str) -> list[tuple[float, float]]:
+    cumulative = {
+        float("inf") if bound == "+Inf" else float(bound): count
+        for bound, count in series_by_label(series, f"{name}_bucket", "le").items()
+    }
+    return sorted(cumulative.items())
+
+
+def histogram_quantile(series: MetricSeries, name: str, quantile: float) -> float | None:
+    """Prometheus-style estimate, linear inside the bucket that crosses the quantile."""
+    buckets = histogram_buckets(series, name)
+    if not buckets or buckets[-1][1] <= 0:
+        return None
+    target = quantile * buckets[-1][1]
+    lower, below = 0.0, 0.0
+    for upper, count in buckets:
+        if count >= target:
+            if upper == float("inf"):
+                return lower
+            share = (target - below) / (count - below) if count > below else 1.0
+            return lower + (upper - lower) * share
+        lower, below = upper, count
+    return lower
+
+
+def histogram_above(series: MetricSeries, name: str, bound: float) -> float:
+    buckets = histogram_buckets(series, name)
+    if not buckets:
+        return 0.0
+    at_or_below = max((count for upper, count in buckets if upper <= bound), default=0.0)
+    return buckets[-1][1] - at_or_below
+
+
+def workload_summary(
+    delta: MetricSeries, seconds: float, gauges: dict[str, list[float]]
+) -> dict:
+    """What the server did over one window: traffic shape, latency, drafts, load."""
+    def total(name: str, **labels: str) -> float:
+        return series_sum(delta, name, **labels)
+
+    def ratio(numerator: float, denominator: float, digits: int = 3) -> float | None:
+        return round(numerator / denominator, digits) if denominator else None
+
+    def quantiles(name: str) -> dict[str, float | None]:
+        estimates = {}
+        for quantile in (0.5, 0.9, 0.99):
+            value = histogram_quantile(delta, name, quantile)
+            estimates[f"p{round(quantile * 100)}"] = None if value is None else round(value, 3)
+        return estimates
+
+    reasons = {
+        reason: int(round(count))
+        for reason, count in series_by_label(
+            delta, "vllm:request_success_total", "finished_reason"
+        ).items()
+        if round(count)
+    }
+    finished = sum(reasons.values())
+    hours = seconds / 3600
+    prompt = total("vllm:prompt_tokens_total")
+    generated = total("vllm:generation_tokens_total")
+    drafts = total("vllm:spec_decode_num_drafts_total")
+    accepted_at = series_by_label(delta, "vllm:spec_decode_num_accepted_tokens_per_pos_total", "position")
+    drafted_at = series_by_label(delta, "vllm:spec_decode_num_draft_tokens_per_pos_total", "position")
+    steps = total("vllm:iteration_tokens_total_count")
+    return {
+        "seconds": round(seconds, 1),
+        "requests": {
+            "finished": finished,
+            "by_reason": reasons,
+            "per_hour": ratio(finished, hours, 1),
+            "preemptions": int(round(total("vllm:num_preemptions_total"))),
+        },
+        "prompt": {
+            "tokens": int(prompt),
+            "cached_share": ratio(total("vllm:prompt_tokens_cached_total"), prompt),
+            "per_request": quantiles("vllm:request_prompt_tokens"),
+        },
+        "output": {
+            "tokens": int(generated),
+            "tok_per_s": ratio(generated, seconds, 1),
+            "per_request": quantiles("vllm:request_generation_tokens"),
+        },
+        "latency_s": {label: quantiles(name) for label, name in WORKLOAD_LATENCIES.items()},
+        "speculative": {
+            "accepted_per_draft": ratio(total("vllm:spec_decode_num_accepted_tokens_total"), drafts),
+            "verified_per_draft": ratio(total("vllm:spec_decode_num_draft_tokens_total"), drafts),
+            "acceptance_by_position": [
+                ratio(accepted_at.get(position, 0.0), drafted_at[position])
+                for position in sorted(drafted_at, key=int)
+            ],
+        },
+        "steps": {
+            "count": int(steps),
+            "carrying_prefill_share": ratio(
+                histogram_above(delta, "vllm:iteration_tokens_total", DECODE_ONLY_STEP_TOKENS), steps
+            ),
+        },
+        "load": {
+            name.removeprefix("vllm:"): {
+                "max": round(max(values), 3),
+                "mean": round(sum(values) / len(values), 3),
+            }
+            for name, values in gauges.items()
+            if values
+        },
+    }
+
+
+def print_workload(summary: dict) -> None:
+    requests, prompt, output = summary["requests"], summary["prompt"], summary["output"]
+    latency, speculative = summary["latency_s"], summary["speculative"]
+
+    def spread(values: dict, unit: str = "") -> str:
+        return " / ".join("-" if value is None else f"{value:g}{unit}" for value in values.values())
+
+    print(f"window {summary['seconds']:.0f} s: {requests['finished']} requests finished "
+          f"({requests['per_hour'] or 0:g}/h), "
+          f"{requests['preemptions']} preemptions, reasons {requests['by_reason'] or {}}")
+    print(f"prompt tokens {prompt['tokens']} ({(prompt['cached_share'] or 0) * 100:.0f}% from the "
+          f"prefix cache), per request p50/p90/p99 {spread(prompt['per_request'])}")
+    print(f"output tokens {output['tokens']} ({output['tok_per_s'] or 0:g} tok/s over the window), "
+          f"per request p50/p90/p99 {spread(output['per_request'])}")
+    for label, values in latency.items():
+        print(f"  {label.replace('_', ' '):<12} p50/p90/p99 {spread(values, ' s')}")
+    print(f"drafts: {speculative['accepted_per_draft']} accepted of {speculative['verified_per_draft']} "
+          f"verified per step, by position {speculative['acceptance_by_position']}")
+    share = summary["steps"]["carrying_prefill_share"]
+    print(f"engine steps {summary['steps']['count']}, "
+          f"{'-' if share is None else f'{share * 100:.1f}%'} carrying prefill")
+    for name, values in summary["load"].items():
+        print(f"  {name:<40} max {values['max']:g}  mean {values['mean']:g}")
+
+
+def command_workload(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    head = next(node for node in nodes["nodes"] if node["head"])
+    base = (args.url or f"http://{head['management_ip']}:{serve_arg(cluster, '--port')}").rstrip("/")
+    gauges: dict[str, list[float]] = {name: [] for name in WORKLOAD_GAUGES}
+    if args.run and args.run[0] == "--":
+        args.run = args.run[1:]
+
+    def sample() -> MetricSeries:
+        series = scrape_metric_series(base)
+        for name in WORKLOAD_GAUGES:
+            if any(key == name for key, _ in series):
+                gauges[name].append(series_sum(series, name))
+        return series
+
+    before = sample()
+    started = time.monotonic()
+    child = subprocess.Popen(args.run) if args.run else None
+    deadline = started + args.duration if args.duration else None
+    returncode = 0
+    try:
+        while True:
+            if child is not None and child.poll() is not None:
+                returncode = child.returncode
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            remaining = deadline - time.monotonic() if deadline else args.interval
+            time.sleep(max(0.1, min(args.interval, remaining)))
+            sample()
+    except KeyboardInterrupt:
+        if child is not None:
+            child.send_signal(signal.SIGINT)
+            returncode = child.wait()
+    seconds = time.monotonic() - started
+    after = sample()
+    delta = {key: value - before.get(key, 0.0) for key, value in after.items()}
+    if any(value < 0 for (key, _), value in delta.items() if key.endswith(("_total", "_count", "_bucket"))):
+        raise SystemExit("a counter went backwards: the server restarted inside the window")
+    summary = workload_summary(delta, seconds, gauges)
+    summary["label"] = args.label
+    summary["command"] = args.run or None
+    if args.json:
+        Path(args.json).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    print_workload(summary)
+    return returncode
+
+
+def stream_request(
+    url: str, payload: dict, stop: threading.Event, keep_content: bool = False
+) -> dict:
+    """Stream one request; every failure stays in the receipt."""
+    body = dict(payload, stream=True, stream_options={"include_usage": True})
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.perf_counter()
+    first: float | None = None
+    last: float | None = None
+    status: int | None = None
+    usage: dict = {}
+    content: list[str] = []
+    reasoning_chars = 0
+    content_chars = 0
+    digest = hashlib.sha256()
+    error: str | None = None
+    try:
+        with urllib.request.urlopen(request, timeout=BENCH_TIMEOUT_SECONDS) as response:
+            status = response.status
+            for raw in response:
+                if stop.is_set():
+                    error = "aborted by bench"
+                    break
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                if line == "data: [DONE]":
+                    break
+                event = json.loads(line[6:])
+                usage = event.get("usage") or usage
+                for choice in event.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    pieces = (
+                        delta.get("reasoning_content"),
+                        delta.get("reasoning"),
+                        delta.get("content"),
+                        choice.get("text"),
+                    )
+                    emitted = "".join(piece for piece in pieces if isinstance(piece, str))
+                    # Completions stream their first token directly; chat
+                    # streams open with an empty role delta.
+                    if first is None and (emitted or "text" in choice):
+                        first = time.perf_counter()
+                    if not emitted:
+                        continue
+                    last = time.perf_counter()
+                    digest.update(emitted.encode())
+                    for key in ("reasoning_content", "reasoning"):
+                        if isinstance(delta.get(key), str):
+                            reasoning_chars += len(delta[key])
+                    if isinstance(delta.get("content"), str):
+                        content_chars += len(delta["content"])
+                        content.append(delta["content"])
+    except Exception as exception:
+        error = f"{type(exception).__name__}: {exception}"
+    ended = time.perf_counter()
+    tokens = usage.get("completion_tokens")
+    decode = None
+    if tokens and tokens > 1 and first is not None and ended > first:
+        decode = (tokens - 1) / (ended - first)
+    result = {
+        "ok": error is None and status == 200 and first is not None,
+        "ttft_s": None if first is None else round(first - started, 4),
+        "elapsed_s": round(ended - started, 4),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": tokens,
+        "decode_tps": None if decode is None else round(decode, 2),
+        "output_sha256": digest.hexdigest()[:16],
+        "reasoning_chars": reasoning_chars,
+        "content_chars": content_chars,
+        "error": error,
+        # Absolute clock readings; Bench.run turns them into offsets from the
+        # sample's start (first_s, last_s).
+        "first_at": first,
+        "last_at": last,
+    }
+    if keep_content:
+        result["content"] = "".join(content)
+    return result
+
+
+THERMAL_FIELDS = (
+    "temperature.gpu",
+    "temperature.gpu.tlimit",
+    "clocks.sm",
+    "power.draw",
+    "clocks_event_reasons_counters.sw_thermal_slowdown",
+    "clocks_event_reasons_counters.hw_thermal_slowdown",
+    "clocks_event_reasons_counters.sw_power_cap",
+    "clocks_event_reasons_counters.hw_power_brake_slowdown",
+)
+# Stop measuring when a GPU comes within this many degrees of its slowdown limit.
+THERMAL_HEADROOM_FLOOR_C = 5.0
+# DGX Spark board zones trip a critical shutdown at 104 C; stop well before it.
+BOARD_CEILING_C = 98.0
+
+
+def parse_thermal(text: str) -> dict:
+    """One node sample: nvidia-smi fields, then the hottest thermal zone (m°C)."""
+
+    def number(value: str) -> float | None:
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    values = [number(value) for value in text.strip().split(",")]
+    values += [None] * (len(THERMAL_FIELDS) + 1 - len(values))
+    gpu, headroom, clock, power, sw_thermal, hw_thermal, sw_power, hw_brake, zone = values[: len(THERMAL_FIELDS) + 1]
+
+    def total(*parts: float | None) -> float | None:
+        known = [part for part in parts if part is not None]
+        return sum(known) if known else None
+
+    return {
+        "gpu_c": gpu,
+        "headroom_c": headroom,
+        "sm_mhz": clock,
+        "power_w": power,
+        "thermal_slowdown_us": total(sw_thermal, hw_thermal),
+        "power_cap_us": total(sw_power, hw_brake),
+        "system_c": None if zone is None else zone / 1000,
+    }
+
+
+class MemoryWatch:
+    """Per-node memory each second and GPU/board temperatures every fifteen.
+
+    Temperatures change slowly; polling nvidia-smi less often keeps its GPU
+    queries out of more of the timed steps.
+    """
+
+    SCRIPT = (
+        "i=0; while :; do "
+        "awk '/^(MemAvailable|SwapTotal|SwapFree):/{v[$1]=$2} "
+        'END{print "M", v["MemAvailable:"], v["SwapTotal:"]-v["SwapFree:"]}\' /proc/meminfo; '
+        'if [ $((i % 15)) -eq 0 ]; then echo "T $(nvidia-smi --query-gpu='
+        + ",".join(THERMAL_FIELDS)
+        + " --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '),"
+        + '$(cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | sort -n | tail -1)"; fi; '
+        "i=$((i + 1)); sleep 1; done"
+    )
+
+    def __init__(self, nodes: dict, floor_gib: float, halt) -> None:
+        self.floor_kib = floor_gib * 1048576
+        self.floor_gib = floor_gib
+        self.halt = halt
+        self.lock = threading.Lock()
+        self.state: dict[str, dict] = {}
+        self.thermal: dict[str, dict] = {}
+        self.processes: list[subprocess.Popen] = []
+        for node in nodes["nodes"]:
+            process = subprocess.Popen(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "-o", "ServerAliveInterval=5", ssh_target(nodes, node),
+                    shlex.join(["bash", "-c", self.SCRIPT]),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self.processes.append(process)
+            self.state[node["name"]] = {"last": None}
+            self.thermal[node["name"]] = {}
+            threading.Thread(
+                target=self._read, args=(node["name"], process), daemon=True
+            ).start()
+
+    def _read(self, name: str, process: subprocess.Popen) -> None:
+        for line in process.stdout:
+            kind, _, rest = line.strip().partition(" ")
+            if kind == "M":
+                self._memory(name, rest)
+            elif kind == "T":
+                self._temperature(name, parse_thermal(rest))
+
+    def _memory(self, name: str, text: str) -> None:
+        try:
+            available, swap = (int(float(value)) for value in text.split())
+        except ValueError:
+            return
+        with self.lock:
+            state = self.state[name]
+            state["last"] = time.monotonic()
+            state["min_available_kib"] = min(state.get("min_available_kib", available), available)
+            state.setdefault("swap_start_kib", swap)
+            state["swap_max_kib"] = max(state.get("swap_max_kib", swap), swap)
+        if available < self.floor_kib:
+            self.halt(
+                f"{name}: MemAvailable {available / 1048576:.2f} GiB fell below "
+                f"the {self.floor_gib:g} GiB bench floor"
+            )
+
+    def _temperature(self, name: str, sample: dict) -> None:
+        with self.lock:
+            state = self.thermal[name]
+            for key, better in (("gpu_c", max), ("system_c", max), ("power_w", max), ("headroom_c", min)):
+                if sample[key] is not None:
+                    state[key] = better(state.get(key, sample[key]), sample[key])
+            for key in ("thermal_slowdown_us", "power_cap_us"):
+                if sample[key] is not None:
+                    state.setdefault(f"{key}_start", sample[key])
+                    state[f"{key}_last"] = sample[key]
+        board = sample["system_c"]
+        if board is not None and board >= BOARD_CEILING_C:
+            self.halt(
+                f"{name}: board thermal zone at {board:g} C reached the {BOARD_CEILING_C:g} C "
+                "bench ceiling (critical trip 104 C)"
+            )
+        headroom = sample["headroom_c"]
+        if headroom is not None and headroom <= THERMAL_HEADROOM_FLOOR_C:
+            self.halt(
+                f"{name}: GPU at {sample['gpu_c']:g} C is within {headroom:g} C of its "
+                "thermal slowdown limit"
+            )
+
+    def wait_ready(self, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.lock:
+                if all(state["last"] is not None for state in self.state.values()):
+                    return
+            time.sleep(0.5)
+        raise BenchAbort("memory telemetry did not start on every node")
+
+    def check(self) -> None:
+        now = time.monotonic()
+        with self.lock:
+            for name, state in self.state.items():
+                if state["last"] is None or now - state["last"] > 15:
+                    raise BenchAbort(f"{name}: memory telemetry stopped reporting")
+
+    def thermal_summary(self) -> dict:
+        summary = {}
+        with self.lock:
+            for name, state in self.thermal.items():
+                if not state:
+                    continue
+                entry = {
+                    "max_gpu_c": state.get("gpu_c"),
+                    "min_headroom_c": state.get("headroom_c"),
+                    "max_system_c": state.get("system_c"),
+                    "max_power_w": state.get("power_w"),
+                }
+                for key, label in (("thermal_slowdown_us", "thermal_slowdown_ms"), ("power_cap_us", "power_cap_ms")):
+                    if f"{key}_last" in state:
+                        entry[label] = round((state[f"{key}_last"] - state[f"{key}_start"]) / 1000, 1)
+                summary[name] = entry
+        return summary
+
+    def close(self) -> dict:
+        for process in self.processes:
+            process.terminate()
+        for process in self.processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        with self.lock:
+            return {
+                name: {
+                    "min_available_gib": round(state["min_available_kib"] / 1048576, 2),
+                    "swap_growth_gib": round(
+                        (state["swap_max_kib"] - state["swap_start_kib"]) / 1048576, 2
+                    ),
+                }
+                for name, state in self.state.items()
+                if state["last"] is not None
+            }
+
+
+class PeakWatch:
+    """Peak KV use and request counts while one sample runs."""
+
+    def __init__(self, base: str) -> None:
+        self.base = base
+        self.peak = {"kv_cache_usage": 0.0, "running": 0.0, "active": 0.0}
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._poll, daemon=True)
+        self.thread.start()
+
+    def _poll(self) -> None:
+        while not self.done.wait(1.0):
+            try:
+                metrics = scrape_metrics(self.base)
+            except Exception:
+                continue
+            running = metrics["vllm:num_requests_running"]
+            active = running + metrics["vllm:num_requests_waiting"]
+            self.peak["kv_cache_usage"] = max(self.peak["kv_cache_usage"], metrics["vllm:kv_cache_usage_perc"])
+            self.peak["running"] = max(self.peak["running"], running)
+            self.peak["active"] = max(self.peak["active"], active)
+
+    def finish(self) -> dict:
+        self.done.set()
+        self.thread.join()
+        return self.peak
+
+
+class Bench:
+    def __init__(self, base: str, nodes: dict, floor_gib: float) -> None:
+        self.base = base
+        self.stop = threading.Event()
+        self.reason: str | None = None
+        self.sent = 0
+        self.foreign = 0
+        self.start_total: float | None = None
+        self.discarded: list[dict] = []
+        self.memory = MemoryWatch(nodes, floor_gib, self.halt)
+
+    def halt(self, reason: str) -> None:
+        if not self.stop.is_set():
+            self.reason = reason
+            self.stop.set()
+
+    def wait_idle(self, timeout: float = 300) -> dict:
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.stop.is_set():
+                raise BenchAbort(self.reason)
+            self.memory.check()
+            metrics = scrape_metrics(self.base)
+            if not metrics["vllm:num_requests_running"] and not metrics["vllm:num_requests_waiting"]:
+                # Let the success counter settle before attributing requests.
+                time.sleep(0.5)
+                metrics = scrape_metrics(self.base)
+                if self.start_total is None:
+                    self.start_total = metrics["vllm:request_success_total"]
+                finished = metrics["vllm:request_success_total"] - self.start_total
+                self.foreign = max(self.foreign, int(finished) - self.sent)
+                return metrics
+            if time.monotonic() > deadline:
+                raise BenchAbort("the service stayed busy with other requests")
+            time.sleep(2)
+
+    def run(
+        self,
+        label: str,
+        payloads: list[tuple[str, dict]],
+        concurrency: int | None = None,
+        keep_content: bool = False,
+        retries: int = 3,
+    ) -> dict:
+        """Send one sample; repeat it when other traffic overlapped."""
+        concurrency = concurrency or len(payloads)
+        for attempt in range(retries + 1):
+            before = self.wait_idle()
+            peak = PeakWatch(self.base)
+            started = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(concurrency) as pool:
+                try:
+                    results = list(
+                        pool.map(
+                            lambda item: stream_request(
+                                f"{self.base}{item[0]}", item[1], self.stop, keep_content
+                            ),
+                            payloads,
+                        )
+                    )
+                except BaseException:
+                    self.halt("interrupted")
+                    raise
+            wall = time.perf_counter() - started
+            for result in results:
+                for key in ("first", "last"):
+                    at = result.pop(f"{key}_at", None)
+                    result[f"{key}_s"] = None if at is None else round(at - started, 4)
+            peaks = peak.finish()
+            self.sent += len(payloads)
+            if self.stop.is_set():
+                raise BenchAbort(self.reason)
+            after = scrape_metrics(self.base)
+            finished = after["vllm:request_success_total"] - self.start_total
+            foreign = int(finished) - self.sent - self.foreign
+            # A closed loop may briefly show a finished request beside its successor.
+            slack = 1 if len(payloads) > concurrency else 0
+            if foreign > 0 or peaks["active"] > concurrency + slack:
+                self.foreign += max(foreign, 0)
+                self.discarded.append({"label": label, "attempt": attempt, "foreign": foreign})
+                print(f"  {label}: other traffic overlapped; repeating", flush=True)
+                continue
+            metrics = {
+                name.removeprefix("vllm:").removesuffix("_total"): after[name] - before[name]
+                for name in BENCH_METRICS
+                if name.endswith("_total")
+            }
+            return {"wall_s": wall, "requests": results, "metrics": metrics, "peak": peaks}
+        raise BenchAbort(f"{label}: other traffic overlapped {retries + 1} attempts")
+
+
+def chat_payload(model: str, prompt: str, max_tokens: int, **extra) -> tuple[str, dict]:
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+    }
+    payload.update(extra)
+    return "/v1/chat/completions", payload
+
+
+def decode_payloads(model: str, case: str, concurrency: int) -> list[tuple[str, dict]]:
+    spec = DECODE_CASES[case]
+    extra: dict = {}
+    if spec.template_kwargs:
+        extra["chat_template_kwargs"] = spec.template_kwargs
+    if spec.fixed_length:
+        extra.update(min_tokens=DECODE_TOKENS, ignore_eos=True)
+    if spec.top_p is not None:
+        extra["top_p"] = spec.top_p
+    payloads = []
+    for stream in range(concurrency):
+        if isinstance(spec.prompt, tuple):
+            prompt = spec.prompt[stream % len(spec.prompt)]
+            if stream >= len(spec.prompt):
+                prompt = f"[stream {stream + 1}]\n{prompt}"
+        elif spec.per_stream and concurrency > 1:
+            prompt = f"{spec.prompt} (stream {stream + 1}/{concurrency})"
+        else:
+            prompt = spec.prompt
+        seed = 42 + stream if spec.temperature else 42
+        payloads.append(
+            chat_payload(model, prompt, DECODE_TOKENS, temperature=spec.temperature, seed=seed, **extra)
+        )
+    return payloads
+
+
+def decode_window_tps(requests: list[dict]) -> float | None:
+    """Tokens after each stream's first, over the span from the earliest first
+    token to the latest last token: aggregate decode without prefill or the
+    start stagger of a concurrent wave."""
+    ok = [
+        request for request in requests
+        if request.get("ok") and request.get("first_s") is not None
+        and request.get("last_s") is not None and (request.get("completion_tokens") or 0) > 1
+    ]
+    if not ok:
+        return None
+    window = max(request["last_s"] for request in ok) - min(request["first_s"] for request in ok)
+    tokens = sum(request["completion_tokens"] - 1 for request in ok)
+    return round(tokens / window, 3) if window > 0 else None
+
+
+def filler(tokens: int, seed: int) -> str:
+    # About one token per word for these plain lowercase words.
+    body = " ".join(FILLER_WORDS[(i * 7 + seed) % len(FILLER_WORDS)] for i in range(tokens))
+    return f"Document {seed}:\n{body}"
+
+
+def novel_text(tokens: int, seed: int) -> str:
+    """Random pseudo-words: n-grams the Engram tables have not cached.
+
+    The filler repeats 18 words, so its Engram rows stay in the page cache
+    and "cold" prefill never reads the tables from disk. Words of two to
+    four random letters average 1.9 tokens each (measured on the served
+    tokenizer at 4K-64K).
+    """
+    rng = random.Random(seed)
+    words = (
+        "".join(rng.choice(NOVEL_LETTERS) for _ in range(rng.randint(2, 4)))
+        for _ in range(int(tokens / 1.9))
+    )
+    return f"Document {seed}:\n" + " ".join(words)
+
+
+# Python standard-library source averages about 3.8 characters per token on
+# the served tokenizer (2.6-4.3 depending on the files, measured at 4K-64K).
+SOURCE_CHARS_PER_TOKEN = 3.8
+
+
+@functools.cache
+def standard_library_sources() -> tuple[Path, ...]:
+    root = Path(sysconfig.get_paths()["stdlib"])
+    return tuple(sorted(path for path in root.glob("*.py") if path.stat().st_size > 4096))
+
+
+def source_text(tokens: int, seed: int) -> str:
+    """Real text: the Python standard library's source and docstrings, read
+    from a seeded file onward, like the documentation and code prompts
+    public benchmarks prefill with. The first line keeps every prompt's
+    prefix unique."""
+    files = standard_library_sources()
+    index = random.Random(seed).randrange(len(files))
+    chars = int(tokens * SOURCE_CHARS_PER_TOKEN)
+    parts: list[str] = []
+    size = 0
+    while size < chars:
+        text = files[index % len(files)].read_text(encoding="utf-8", errors="replace")
+        parts.append(text)
+        size += len(text)
+        index += 1
+    return f"Document {seed}:\n" + "".join(parts)[:chars]
+
+
+def acceptance(metrics: dict) -> float | None:
+    drafts = metrics["spec_decode_num_drafts"]
+    return round(metrics["spec_decode_num_accepted_tokens"] / drafts, 4) if drafts else None
+
+
+def step_times_ms(samples: list[dict]) -> list[float]:
+    """Milliseconds per decode step for single-stream samples.
+
+    Each step emits one token plus the accepted drafts, so the step time is
+    (1 + accepted per draft) / decode tok/s. It is independent of how many
+    drafts the text lets the model accept, which makes it far steadier than
+    tok/s for changes to kernels or host overhead.
+    """
+    times = []
+    for sample in samples:
+        accepted = sample.get("accepted_per_draft")
+        requests = sample.get("requests") or []
+        if accepted is None or len(requests) != 1:
+            continue
+        rate = requests[0].get("decode_tps")
+        if requests[0].get("ok") and rate:
+            times.append(1000 * (1 + accepted) / rate)
+    return times
+
+
+def compact(results: list[dict]) -> list[dict]:
+    keys = ("ok", "ttft_s", "first_s", "last_s", "prompt_tokens", "completion_tokens", "decode_tps",
+            "output_sha256", "reasoning_chars", "content_chars", "error")
+    return [{key: result[key] for key in keys if key in result} for result in results]
+
+
+def assess_lru(content: str) -> str:
+    match = re.search(r"```(?:python)?\s*\n(.*?)```", content, re.DOTALL)
+    if match is None:
+        return "missing Python code block"
+    try:
+        tree = ast.parse(match.group(1))
+    except SyntaxError as error:
+        return f"Python syntax error: {error.msg} at line {error.lineno}"
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        methods = {item.name: item for item in node.body if isinstance(item, ast.FunctionDef)}
+        if {"get", "put"} <= methods.keys():
+            arguments = [argument.arg for argument in methods["put"].args.args]
+            if arguments != ["self", "key", "value"]:
+                return f"put signature uses {arguments!r}"
+            return "pass"
+    return "missing LRU class with get and put methods"
+
+
+def suite_quality(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """The fixed LRU request, five times; every answer must pass."""
+    runs = []
+    for index in range(5):
+        sample = bench.run(
+            f"quality {index + 1}/5",
+            [chat_payload(options.model, LRU_PROMPT, 256, temperature=0, seed=42,
+                          chat_template_kwargs={"thinking": False})],
+            keep_content=True,
+        )
+        result = sample["requests"][0]
+        verdict = assess_lru(result["content"]) if result["ok"] else f"request failed: {result['error']}"
+        runs.append({"verdict": verdict, "content": result["content"]})
+        print(f"  quality {index + 1}/5: {verdict}", flush=True)
+    passed = sum(run["verdict"] == "pass" for run in runs)
+    return {"passed": passed, "runs": runs, "ok": passed == len(runs)}
+
+
+def suite_decode(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Temperature-0 serving matrix, sampled until every point is precise."""
+    points = [f"{case}-c{concurrency}" for case in options.decode_cases for concurrency in options.concurrency]
+
+    def sample(point: str) -> dict:
+        case, concurrency = point.rsplit("-c", 1)
+        return bench.run(point, decode_payloads(options.model, case, int(concurrency)))
+
+    print("  warmup: one discarded sample per point", flush=True)
+    for point in rng.sample(points, len(points)):
+        sample(point)
+    samples: dict[str, list[dict]] = {point: [] for point in points}
+    active = list(points)
+    rounds = 0
+    while active:
+        rounds += 1
+        rng.shuffle(active)
+        for point in active:
+            result = sample(point)
+            requests = result["requests"]
+            tokens = sum(request["completion_tokens"] or 0 for request in requests if request["ok"])
+            metrics = result["metrics"]
+            drafts = metrics["spec_decode_num_drafts"]
+            samples[point].append({
+                "tps": round(tokens / result["wall_s"], 3),
+                "decode_window_tps": decode_window_tps(requests),
+                "accepted_per_draft": acceptance(metrics),
+                # Adaptive verification trims draft rows per step; step time
+                # follows the rows it keeps, so record them with each sample.
+                "verified_per_draft": round(metrics["spec_decode_num_draft_tokens"] / drafts, 4) if drafts else None,
+                "requests": compact(requests),
+            })
+        remaining = []
+        for point in active:
+            summary = describe([entry["tps"] for entry in samples[point]])
+            if summary["n"] >= options.max_samples:
+                continue
+            if summary["n"] < options.min_samples or (summary["ci95_pct"] or 100) > options.precision:
+                remaining.append(point)
+        status = ", ".join(
+            f"{point} ±{describe([entry['tps'] for entry in samples[point]])['ci95_pct'] or '-'}%"
+            for point in sorted(remaining)
+        )
+        print(f"  round {rounds}: {status or 'all points converged'}", flush=True)
+        active = remaining
+    summary = {}
+    for point in points:
+        entries = samples[point]
+        requests = [request for entry in entries for request in entry["requests"]]
+        ok = [request for request in requests if request["ok"]]
+        summary[point] = {
+            "tps": describe([entry["tps"] for entry in entries]),
+            "decode_window_tps": describe([entry["decode_window_tps"] for entry in entries if entry.get("decode_window_tps")]),
+            "per_stream_decode_tps": describe([request["decode_tps"] for request in ok if request["decode_tps"]]),
+            "ttft_s": describe([request["ttft_s"] for request in ok]),
+            "accepted_per_draft": describe([entry["accepted_per_draft"] for entry in entries if entry["accepted_per_draft"] is not None]),
+            "step_ms": describe(step_times_ms(entries)),
+            "verified_per_draft": describe([entry["verified_per_draft"] for entry in entries if entry.get("verified_per_draft") is not None]),
+            "failed_requests": len(requests) - len(ok),
+            "distinct_outputs": len({request["output_sha256"] for request in ok}),
+            "reasoning_share": reasoning_share(ok),
+        }
+    return {"points": summary, "samples": samples}
+
+
+def reasoning_share(requests: list[dict]) -> float | None:
+    """Fraction of streamed characters that were reasoning, not answer."""
+    reasoning = sum(request.get("reasoning_chars") or 0 for request in requests)
+    total = reasoning + sum(request.get("content_chars") or 0 for request in requests)
+    return round(reasoning / total, 3) if total else None
+
+
+def suite_sampled(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """DSpark acceptance on temperature-1.0 traffic, from the engine counters."""
+    points = {}
+    for case, prompt in SAMPLED_PROMPTS.items():
+        for concurrency in (1, 4):
+            label = f"{case}-c{concurrency}"
+            payloads = [
+                chat_payload(options.model, prompt, 256, temperature=1.0, top_p=0.95,
+                             seed=1000 + index, chat_template_kwargs={"thinking": False})
+                for index in range(options.sampled_requests)
+            ]
+            result = bench.run(label, payloads, concurrency=concurrency)
+            requests = result["requests"]
+            tokens = sum(request["completion_tokens"] or 0 for request in requests if request["ok"])
+            metrics = result["metrics"]
+            draft_tokens = metrics["spec_decode_num_draft_tokens"]
+            points[label] = {
+                "requests": len(requests),
+                "failed_requests": sum(not request["ok"] for request in requests),
+                "aggregate_tps": round(tokens / result["wall_s"], 2),
+                "accepted_per_draft": acceptance(metrics),
+                "acceptance_rate": round(metrics["spec_decode_num_accepted_tokens"] / draft_tokens, 4) if draft_tokens else None,
+                "drafts": metrics["spec_decode_num_drafts"],
+            }
+            print(f"  {label}: {points[label]['accepted_per_draft']} accepted per draft", flush=True)
+    return {"points": points}
+
+
+def suite_prefill(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Cold prefill: unique uncached prompts, one output token."""
+    prefill_text = {"filler": filler, "novel": novel_text, "source": source_text}[options.prefill_text]
+    sizes = [size for size in options.prefill_sizes if size < options.max_model_len - 64]
+    samples: dict[str, list[dict]] = {str(size): [] for size in sizes}
+    for _ in range(options.prefill_repeats):
+        for size in rng.sample(sizes, len(sizes)):
+            payload = {
+                "model": options.model,
+                "prompt": prefill_text(int(size * 0.97), rng.randrange(1 << 30)) + "\n\nReply with the word ok.",
+                "max_tokens": 1,
+                "temperature": 0,
+                "cache_salt": uuid.uuid4().hex,
+            }
+            request = bench.run(f"prefill {size}", [("/v1/completions", payload)])["requests"][0]
+            samples[str(size)].append(compact([request])[0])
+            if request["ok"]:
+                print(f"  prefill {size}: {request['prompt_tokens'] / request['ttft_s']:.0f} tok/s", flush=True)
+    summary = {}
+    for size, requests in samples.items():
+        ok = [request for request in requests if request["ok"]]
+        summary[size] = {
+            "prefill_tps": describe([request["prompt_tokens"] / request["ttft_s"] for request in ok]),
+            "ttft_s": describe([request["ttft_s"] for request in ok]),
+            "prompt_tokens": ok[0]["prompt_tokens"] if ok else None,
+            "failed_requests": len(requests) - len(ok),
+        }
+    return {"points": summary, "samples": samples}
+
+
+def suite_prefix(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Prefix-cache replay: one cold request, then two identical replays."""
+    runs = []
+    for index in range(3):
+        payload = {
+            "model": options.model,
+            "prompt": filler(int(options.prefix_tokens * 0.97), rng.randrange(1 << 30)) + "\n\nReply with the word ok.",
+            "max_tokens": 1,
+            "temperature": 0,
+            "cache_salt": uuid.uuid4().hex,
+        }
+        cold = bench.run(f"prefix cold {index + 1}/3", [("/v1/completions", payload)])
+        warm = [bench.run(f"prefix warm {index + 1}/3", [("/v1/completions", payload)]) for _ in range(2)]
+        queries = sum(sample["metrics"]["prefix_cache_queries"] for sample in warm)
+        hits = sum(sample["metrics"]["prefix_cache_hits"] for sample in warm)
+        runs.append({
+            "cold_ttft_s": cold["requests"][0]["ttft_s"],
+            "warm_ttft_s": [sample["requests"][0]["ttft_s"] for sample in warm],
+            "warm_hit_rate": round(hits / queries, 4) if queries else None,
+            "ok": all(sample["requests"][0]["ok"] for sample in [cold, *warm]),
+        })
+        print(f"  prefix {index + 1}/3: cold {runs[-1]['cold_ttft_s']} s, warm {runs[-1]['warm_ttft_s']} s", flush=True)
+    return {
+        "prompt_tokens": options.prefix_tokens,
+        "cold_ttft_s": describe([run["cold_ttft_s"] for run in runs if run["ok"]]),
+        "warm_ttft_s": describe([value for run in runs if run["ok"] for value in run["warm_ttft_s"]]),
+        "warm_hit_rate": describe([run["warm_hit_rate"] for run in runs if run["warm_hit_rate"] is not None]),
+        "runs": runs,
+    }
+
+
+def suite_admission(bench: Bench, options: argparse.Namespace, rng: random.Random) -> dict:
+    """Four concurrent long contexts must all be admitted without preemption."""
+    tokens = min(options.admission_tokens, options.max_model_len - 1024)
+    payloads = [
+        chat_payload(
+            options.model,
+            filler(int(tokens * 0.97), rng.randrange(1 << 30))
+            + "\n\nWrite a 400-word story that uses words from the document above.",
+            256,
+            temperature=0,
+            seed=42,
+            chat_template_kwargs={"thinking": False},
+        )
+        for _ in range(4)
+    ]
+    for _, payload in payloads:
+        payload["cache_salt"] = uuid.uuid4().hex
+    result = bench.run("admission 4 x %d" % tokens, payloads)
+    requests = result["requests"]
+    ok = [request for request in requests if request["ok"]]
+    admitted = (
+        len(ok) == len(requests)
+        and not result["metrics"]["num_preemptions"]
+        and result["peak"]["running"] >= len(requests)
+    )
+    print(f"  admission: {'pass' if admitted else 'FAIL'}; peak KV {result['peak']['kv_cache_usage']:.0%}", flush=True)
+    return {
+        "context_tokens": tokens,
+        "ok": admitted,
+        "preemptions": result["metrics"]["num_preemptions"],
+        "peak_running": result["peak"]["running"],
+        "peak_kv_cache_usage": round(result["peak"]["kv_cache_usage"], 4),
+        "wall_s": round(result["wall_s"], 2),
+        "ttft_s": [request["ttft_s"] for request in requests],
+        "per_stream_decode_tps": describe([request["decode_tps"] for request in ok if request["decode_tps"]]),
+        "requests": compact(requests),
+    }
+
+
+BENCH_SUITE_FUNCTIONS = {
+    "quality": suite_quality,
+    "decode": suite_decode,
+    "sampled": suite_sampled,
+    "prefill": suite_prefill,
+    "prefix": suite_prefix,
+    "admission": suite_admission,
+}
+
+
+def serve_arg(cluster: dict, flag: str) -> str | None:
+    arguments = cluster["serve_args"]
+    return arguments[arguments.index(flag) + 1] if flag in arguments else None
+
+
+def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Path) -> dict:
+    name = cluster["container"]["name"]
+    identity = {
+        "cluster_config": config_name,
+        "cluster_config_sha256": sha256(config_path),
+        "promoted_baseline": cluster.get("promoted_baseline"),
+        "image": cluster["container"]["image"],
+        "client_commit": repository_revision(),
+        "client_dirty": bool(repository_dirty()),
+        "client_host": socket.gethostname(),
+        "nodes": {},
+    }
+    for node in nodes["nodes"]:
+        container = run_ssh(nodes, node, "docker", "inspect", "--format", "{{.Image}} {{.State.StartedAt}}", name)
+        checkout = run_ssh(nodes, node, "git", "-C", repository_path(cluster), "rev-parse", "HEAD")
+        image_id, _, started_at = container.stdout.strip().partition(" ")
+        identity["nodes"][node["name"]] = {
+            "image_id": image_id or None,
+            "container_started_at": started_at or None,
+            "checkout": checkout.stdout.strip() or None,
+        }
+    problems, warnings = split_findings(live_doctor(cluster, nodes))
+    identity["live_problems"] = [str(problem) for problem in problems]
+    identity["live_warnings"] = [str(warning) for warning in warnings]
+    return identity
+
+
+def bench_rows(report: dict, reference: dict | None, tolerance: float) -> tuple[list[str], list[str]]:
+    """Summary lines and regressions against the reference run."""
+    lines: list[str] = []
+    regressions: list[str] = []
+    suites = report["suites"]
+    ref_suites = (reference or {}).get("suites", {})
+
+    def compare(label: str, new: dict, ref: dict | None, unit: str) -> None:
+        text = f"  {label:<18} {new['mean']:>9.1f} ±{new['ci95_pct'] or 0:>4.1f}% n={new['n']:<3}"
+        change = difference(new, ref) if ref else None
+        if change:
+            mean, low, high = change
+            verdict = "faster" if low > 0 else "slower" if high < 0 else "same"
+            text += f" ref {ref['mean']:>8.1f}  {mean:+5.1f}% [{low:+.1f}, {high:+.1f}] {verdict}"
+            if verdict == "slower" and mean < -tolerance:
+                regressions.append(f"{label} {unit} {mean:+.1f}%")
+        lines.append(text)
+
+    if "quality" in suites:
+        quality = suites["quality"]
+        lines.append(f"quality: LRU {quality['passed']}/{len(quality['runs'])}")
+    if "decode" in suites:
+        lines.append("decode (aggregate tok/s, 95% CI):")
+        ref_points = ref_suites.get("decode", {}).get("points", {})
+        for point, summary in suites["decode"]["points"].items():
+            if summary["tps"]["n"]:
+                compare(point, summary["tps"], ref_points.get(point, {}).get("tps"), "tok/s")
+        ref_samples = ref_suites.get("decode", {}).get("samples", {})
+        steps = [
+            (point, describe(step_times_ms(entries)))
+            for point, entries in suites["decode"].get("samples", {}).items()
+        ]
+        steps = [(point, summary) for point, summary in steps if summary["n"]]
+        if steps:
+            lines.append("single-stream step time (ms, lower is better; independent of acceptance):")
+        for point, summary in steps:
+            ref = describe(step_times_ms(ref_samples.get(point, [])))
+            text = f"  {point:<18} {summary['mean']:>9.2f} ±{summary['ci95_pct'] or 0:>4.1f}% n={summary['n']:<3}"
+            change = difference(summary, ref) if ref["n"] else None
+            if change:
+                mean, low, high = change
+                verdict = "faster" if high < 0 else "slower" if low > 0 else "same"
+                text += f" ref {ref['mean']:>8.2f}  {mean:+5.1f}% [{low:+.1f}, {high:+.1f}] {verdict}"
+                if verdict == "slower" and mean > tolerance:
+                    regressions.append(f"{point} step time {mean:+.1f}%")
+            lines.append(text)
+    if "sampled" in suites:
+        lines.append("sampled (accepted drafts per step, temperature 1.0):")
+        ref_points = ref_suites.get("sampled", {}).get("points", {})
+        for point, summary in suites["sampled"]["points"].items():
+            ref = ref_points.get(point, {}).get("accepted_per_draft")
+            suffix = f" ref {ref}" if ref is not None else ""
+            lines.append(f"  {point:<18} {summary['accepted_per_draft']}  {summary['aggregate_tps']} tok/s{suffix}")
+    if "prefill" in suites:
+        lines.append("prefill (tok/s):")
+        ref_points = ref_suites.get("prefill", {}).get("points", {})
+        for size, summary in suites["prefill"]["points"].items():
+            if summary["prefill_tps"]["n"]:
+                compare(f"{size} tokens", summary["prefill_tps"], ref_points.get(size, {}).get("prefill_tps"), "prefill tok/s")
+    if "prefix" in suites:
+        prefix = suites["prefix"]
+        lines.append(
+            f"prefix replay: cold {prefix['cold_ttft_s'].get('mean')} s, warm "
+            f"{prefix['warm_ttft_s'].get('mean')} s, hit rate {prefix['warm_hit_rate'].get('mean')}"
+        )
+    if "admission" in suites:
+        admission = suites["admission"]
+        lines.append(
+            f"admission 4 x {admission['context_tokens']}: {'pass' if admission['ok'] else 'FAIL'}, "
+            f"peak KV {admission['peak_kv_cache_usage']:.0%}, per-stream "
+            f"{admission['per_stream_decode_tps'].get('mean')} tok/s"
+        )
+    for name, memory in report.get("memory", {}).items():
+        lines.append(
+            f"{name}: min MemAvailable {memory['min_available_gib']} GiB, "
+            f"swap growth {memory['swap_growth_gib']} GiB"
+        )
+    for name, thermal in report.get("thermal", {}).items():
+        lines.append(
+            f"{name}: GPU max {thermal.get('max_gpu_c')} C "
+            f"({thermal.get('min_headroom_c')} C below its limit at the closest), "
+            f"board max {thermal.get('max_system_c')} C, power max {thermal.get('max_power_w')} W, "
+            f"thermal slowdown {thermal.get('thermal_slowdown_ms')} ms"
+        )
+        if thermal.get("thermal_slowdown_ms"):
+            regressions.append(
+                f"{name} spent {thermal['thermal_slowdown_ms']} ms in thermal slowdown; "
+                "results are not comparable"
+            )
+    return lines, regressions
+
+
+def command_bench(args: argparse.Namespace) -> int:
+    cluster, nodes, _ = configuration(args)
+    config_path, config_name = cluster_config_path(args)
+    if args.suites is None:
+        args.suites = ",".join(BENCH_SUITES) if args.full else "quality,decode"
+    if args.min_samples is None:
+        args.min_samples = 6 if args.full else 3
+    if args.max_samples is None:
+        args.max_samples = 40 if args.full else 4
+    suites = [suite.strip() for suite in args.suites.split(",") if suite.strip()]
+    unknown = sorted(set(suites) - set(BENCH_SUITES))
+    if unknown:
+        raise SystemExit(f"unknown suites: {', '.join(unknown)}")
+    head = next(node for node in nodes["nodes"] if node["head"])
+    base = (args.url or f"http://{head['management_ip']}:{serve_arg(cluster, '--port')}").rstrip("/")
+    args.model = serve_arg(cluster, "--served-model-name")
+    args.max_model_len = int(serve_arg(cluster, "--max-model-len"))
+    max_seqs = int(serve_arg(cluster, "--max-num-seqs") or 1)
+    if not args.concurrency or max(args.concurrency) > max_seqs or min(args.concurrency) < 1:
+        raise SystemExit(f"--concurrency values must be between 1 and --max-num-seqs ({max_seqs})")
+    args.decode_cases = list(dict.fromkeys(
+        expanded for case in args.decode_cases for expanded in DECODE_CASE_GROUPS.get(case, [case])
+    ))
+    unknown_cases = sorted(set(args.decode_cases) - set(DECODE_CASES))
+    if unknown_cases:
+        raise SystemExit(f"unknown decode cases: {', '.join(unknown_cases)}")
+    if args.min_samples < 2 or args.max_samples < args.min_samples:
+        raise SystemExit("--min-samples must be at least 2 and no more than --max-samples")
+    floor_gib = float(cluster["host"]["memguard_gib"]) + 1
+
+    reference_path = None
+    if args.compare != "none":
+        reference_path = Path(args.compare) if args.compare else ROOT / "manifests/benchmarks" / f"{cluster.get('promoted_baseline')}.json"
+        if not reference_path.is_absolute():
+            reference_path = ROOT / reference_path
+        if not reference_path.is_file():
+            if args.compare:
+                raise SystemExit(f"reference does not exist: {args.compare}")
+            reference_path = None
+    reference = json.loads(reference_path.read_text(encoding="utf-8")) if reference_path else None
+
+    if args.report:
+        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        lines, regressions = bench_rows(report, reference, args.tolerance)
+        print("\n".join(lines))
+        if reference_path:
+            print(f"reference: {reference_path}")
+        for regression in regressions:
+            print(f"FAIL: regression: {regression}")
+        return 1 if regressions else 0
+
+    identity = bench_identity(cluster, nodes, config_name, config_path)
+    for warning in identity["live_warnings"]:
+        print(f"WARN: {warning}")
+    if identity["live_problems"]:
+        for problem in identity["live_problems"]:
+            print(f"ERROR: {problem}")
+        if not args.allow_mismatch:
+            print("refusing to benchmark a cluster that differs from its configuration")
+            return 1
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    output = Path(args.output) if args.output else ROOT / "results/private/bench" / stamp
+    output.mkdir(parents=True, exist_ok=True)
+    report_path = output / "bench.json"
+    report = {
+        "schema": BENCH_SCHEMA,
+        "started_utc": stamp,
+        "identity": identity,
+        "workload": {
+            "url": base,
+            "suites": suites,
+            "seed": args.seed,
+            "precision_pct": args.precision,
+            "min_samples": args.min_samples,
+            "max_samples": args.max_samples,
+            "concurrency": args.concurrency,
+            "decode_cases": args.decode_cases,
+            "prefill_text": args.prefill_text,
+            "sampled_requests": args.sampled_requests,
+            "prefill_sizes": args.prefill_sizes,
+            "prefill_repeats": args.prefill_repeats,
+            "prefix_tokens": args.prefix_tokens,
+            "admission_tokens": args.admission_tokens,
+            "memory_floor_gib": floor_gib,
+            "prompts_sha256": hashlib.sha256(
+                json.dumps([DECODE_PROMPTS, SAMPLED_PROMPTS, LRU_PROMPT], sort_keys=True).encode()
+            ).hexdigest(),
+        },
+        "reference": str(reference_path.relative_to(ROOT)) if reference_path and reference_path.is_relative_to(ROOT) else (str(reference_path) if reference_path else None),
+        "suites": {},
+    }
+
+    def save() -> None:
+        report_path.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+
+    print(f"benchmarking {base} ({config_name}); writing {report_path}", flush=True)
+    rng = random.Random(args.seed)
+    bench = Bench(base, nodes, floor_gib)
+    try:
+        bench.memory.wait_ready()
+        for suite in BENCH_SUITES:
+            if suite not in suites:
+                continue
+            print(f"{suite}:", flush=True)
+            report["suites"][suite] = BENCH_SUITE_FUNCTIONS[suite](bench, args, rng)
+            save()
+            if suite == "quality" and not report["suites"][suite]["ok"]:
+                raise BenchAbort("the quality gate failed; performance numbers would be meaningless")
+    except BenchAbort as abort:
+        report["aborted"] = str(abort)
+    except OSError as error:
+        bench.halt(str(error))
+        report["aborted"] = f"API or telemetry error: {error}"
+    except KeyboardInterrupt:
+        bench.halt("interrupted")
+        report["aborted"] = "interrupted"
+    finally:
+        report["thermal"] = bench.memory.thermal_summary()
+        report["memory"] = bench.memory.close()
+        report["discarded_samples"] = bench.discarded
+        report["finished_utc"] = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        save()
+
+    lines, regressions = bench_rows(report, reference, args.tolerance)
+    print("\n".join(lines))
+    failures = []
+    if report.get("aborted"):
+        failures.append(f"aborted: {report['aborted']}")
+    if "quality" in report["suites"] and not report["suites"]["quality"]["ok"]:
+        failures.append("quality gate failed")
+    if "admission" in report["suites"] and not report["suites"]["admission"]["ok"]:
+        failures.append("admission failed")
+    failed_requests = sum(
+        point.get("failed_requests", 0)
+        for suite in ("decode", "sampled", "prefill")
+        for point in report["suites"].get(suite, {}).get("points", {}).values()
+    )
+    if failed_requests:
+        failures.append(f"{failed_requests} requests failed")
+    failures.extend(f"regression: {item}" for item in regressions)
+    if reference_path:
+        print(f"reference: {report['reference']}")
+    for failure in failures:
+        print(f"FAIL: {failure}")
+    print(f"report: {report_path}")
+    return 1 if failures else 0
+
+
+def int_list(value: str) -> list[int]:
+    try:
+        return [int(item) for item in value.split(",") if item.strip()]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers: {value!r}") from error
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(prog="spark3")
+    root.add_argument(
+        "--cluster-config",
+        default=DEFAULT_CLUSTER_CONFIG,
+        metavar="PATH",
+        help="repository-relative cluster config (default: config/cluster.json)",
+    )
+    commands = root.add_subparsers(dest="command", required=True)
+    doctor = commands.add_parser("doctor", help="validate repository and optional live state")
+    doctor.add_argument("--live", action="store_true")
+    doctor.set_defaults(func=command_doctor)
+    status = commands.add_parser("status", help="show the three live containers")
+    status.set_defaults(func=command_status)
+    cluster = commands.add_parser(
+        "cluster", help="plan or apply coordinated three-node operations"
+    )
+    cluster_commands = cluster.add_subparsers(dest="cluster_command", required=True)
+    cluster_sync = cluster_commands.add_parser(
+        "sync", help="detach every clean node checkout at one published commit"
+    )
+    cluster_sync.add_argument("--revision", help="published commit; defaults to local HEAD")
+    cluster_sync.add_argument(
+        "--apply", action="store_true", help="perform the planned synchronization"
+    )
+    cluster_sync.set_defaults(func=command_cluster_sync)
+    cluster_start = cluster_commands.add_parser(
+        "start", help="preflight and start workers, head, then memory guards"
+    )
+    cluster_start.add_argument(
+        "--replace", action="store_true", help="replace existing exact containers"
+    )
+    cluster_start.add_argument(
+        "--apply", action="store_true", help="perform the planned coordinated start"
+    )
+    cluster_start.set_defaults(func=command_cluster_start)
+    cluster_stop = cluster_commands.add_parser(
+        "stop", help="stop the exact promoted container on every node"
+    )
+    cluster_stop.add_argument(
+        "--remove", action="store_true", help="remove stopped containers as well"
+    )
+    cluster_stop.add_argument(
+        "--apply", action="store_true", help="perform the planned coordinated stop"
+    )
+    cluster_stop.set_defaults(func=command_cluster_stop)
+    render = commands.add_parser("render", help="render, but do not execute, one rank launch")
+    render.add_argument("node", choices=("dgx1", "dgx2", "dgx3"))
+    render.set_defaults(func=command_render)
+    upstream = commands.add_parser("upstream", help="inspect or prepare pinned upstreams")
+    upstream_commands = upstream.add_subparsers(dest="upstream_command", required=True)
+    upstream_list = upstream_commands.add_parser("list")
+    upstream_list.set_defaults(func=command_upstream)
+    upstream_prepare = upstream_commands.add_parser("prepare")
+    upstream_prepare.add_argument("name", help="Git source key from upstreams.lock.json")
+    upstream_prepare.set_defaults(func=command_upstream)
+    build = commands.add_parser("build", help="prepare, verify, and build the pinned image")
+    build_commands = build.add_subparsers(dest="build_command", required=True)
+    build_prepare = build_commands.add_parser(
+        "prepare", help="create or repair the build directory the lock determines"
+    )
+    build_prepare.add_argument(
+        "--only",
+        metavar="PARTS",
+        help="comma-separated subset of: " + ", ".join(BUILD_PARTS) + " (sources only, no contexts)",
+    )
+    build_prepare.set_defaults(func=command_build_prepare)
+    build_check = build_commands.add_parser("check", help="verify the prepared build directory")
+    build_check.set_defaults(func=command_build_check)
+    build_image = build_commands.add_parser(
+        "image", help="plan, or build and smoke-test, the image on an idle host"
+    )
+    build_image.add_argument(
+        "--tag", help="image tag (default: container.image from the cluster config)"
+    )
+    build_image.add_argument(
+        "--apply", action="store_true", help="build under the memory guard, then run the GPU smoke"
+    )
+    build_image.set_defaults(func=command_build_image)
+    build_smoke = build_commands.add_parser(
+        "smoke", help="GPU import smoke of a built image on an idle host"
+    )
+    build_smoke.add_argument(
+        "--image", help="image to test (default: container.image from the cluster config)"
+    )
+    build_smoke.set_defaults(func=command_build_smoke)
+    bench = commands.add_parser(
+        "bench", help="benchmark the live service and compare it with a reference run"
+    )
+    bench.add_argument(
+        "--full",
+        action="store_true",
+        help="every suite, each decode point sampled to --precision (about 35 minutes); "
+        "the default is the quality gate and decode with 3-4 samples (about 6 minutes)",
+    )
+    bench.add_argument(
+        "--suites",
+        help="comma-separated subset of: " + ", ".join(BENCH_SUITES),
+    )
+    bench.add_argument("--url", help="API base URL (default: head node management IP)")
+    bench.add_argument(
+        "--output", metavar="DIR", help="report directory (default: results/private/bench/<UTC time>)"
+    )
+    bench.add_argument(
+        "--compare",
+        metavar="PATH",
+        help="reference bench.json (default: manifests/benchmarks/<promoted_baseline>.json "
+        "when present; 'none' skips the comparison)",
+    )
+    bench.add_argument(
+        "--precision",
+        type=float,
+        default=2.0,
+        help="sample each decode point until its 95%% CI is within this percent of the mean",
+    )
+    bench.add_argument("--min-samples", type=int, help="default 3, or 6 with --full")
+    bench.add_argument("--max-samples", type=int, help="default 4, or 40 with --full")
+    bench.add_argument("--concurrency", type=int_list, default=[1, 2, 4, 8])
+    bench.add_argument(
+        "--decode-cases",
+        type=lambda value: [case.strip() for case in value.split(",") if case.strip()],
+        default=["prose", "code"],
+        help=(
+            "comma-separated decode cases (default prose,code): "
+            f"{', '.join(DECODE_CASES)}; groups: {', '.join(DECODE_CASE_GROUPS)}"
+        ),
+    )
+    bench.add_argument(
+        "--prefill-text",
+        choices=("filler", "novel", "source"),
+        default="filler",
+        help="cold-prefill prompt text: the repeating filler (default), random "
+        "pseudo-words whose Engram rows are not cached, or real text (Python "
+        "standard-library source)",
+    )
+    bench.add_argument("--sampled-requests", type=int, default=32)
+    bench.add_argument("--prefill-sizes", type=int_list, default=[2048, 32768, 65536, 131072])
+    bench.add_argument("--prefill-repeats", type=int, default=3)
+    bench.add_argument("--prefix-tokens", type=int, default=32768)
+    bench.add_argument("--admission-tokens", type=int, default=65536)
+    bench.add_argument(
+        "--tolerance",
+        type=float,
+        default=3.0,
+        help="fail when a point is significantly slower than the reference by more than this percent",
+    )
+    bench.add_argument("--seed", type=int, default=0, help="seed for sample order and prompts")
+    bench.add_argument(
+        "--report",
+        metavar="PATH",
+        help="summarize an existing bench.json against --compare instead of measuring",
+    )
+    bench.add_argument(
+        "--allow-mismatch",
+        action="store_true",
+        help="benchmark even when doctor --live reports differences",
+    )
+    bench.set_defaults(func=command_bench)
+    workload = commands.add_parser(
+        "workload",
+        help="summarize live traffic over a window (read-only; sends no requests)",
+        description="Snapshot the server's metrics, wait for --duration, Ctrl-C, or the "
+        "command after --, then report the traffic shape, latency, draft acceptance, and "
+        "load for that window.",
+    )
+    workload.add_argument("--url", help="API base URL (default: head node management IP)")
+    workload.add_argument("--duration", type=float, help="window length in seconds")
+    workload.add_argument("--interval", type=float, default=5.0, help="gauge sampling period")
+    workload.add_argument("--label", help="name recorded in the JSON report")
+    workload.add_argument("--json", metavar="PATH", help="also write the summary as JSON")
+    workload.add_argument("run", nargs=argparse.REMAINDER, help="-- command to time the window around")
+    workload.set_defaults(func=command_workload)
+    return root
+
+
+if __name__ == "__main__":
+    arguments = parser().parse_args()
+    raise SystemExit(arguments.func(arguments))

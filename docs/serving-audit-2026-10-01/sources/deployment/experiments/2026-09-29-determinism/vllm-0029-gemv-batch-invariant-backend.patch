@@ -1,0 +1,161 @@
+From 7510da2498592d8ad8960c6174a6ee2ba296c10a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 21:59:25 +0200
+Subject: [PATCH] feat(deepseek-v4.1): batch-invariant GEMV backend behind an
+ opt-in variable
+
+The BF16-output V4.1 projections (index head weights, the index key and the
+ratio-1 compressor) take the torch backend at capacities from 10 rows, and
+cuBLAS picks its kernel by row count, so a row rounds differently with
+different neighbours. On the traced prose target the ratio-1 compressor at
+layer 20 was where its solo prefill and mixed batches first diverged.
+
+With VLLM_DS41_BATCH_INVARIANT=1, capacities below 256 rows whose default is
+the torch backend are planned on the SIMT GEMV instead, as the FP32-output
+projections already are. Unset, the production setting, nothing changes.
+---
+ ...test_deepseek_v4_1_prepared_projections.py | 30 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 26 +++++++++++++++-
+ vllm/models/deepseek_v4_1/compressor.py       | 26 ++++++++--------
+ 3 files changed, 69 insertions(+), 13 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_prepared_projections.py b/tests/models/test_deepseek_v4_1_prepared_projections.py
+index 7caabfd05..1e5d3e8e0 100644
+--- a/tests/models/test_deepseek_v4_1_prepared_projections.py
++++ b/tests/models/test_deepseek_v4_1_prepared_projections.py
+@@ -128,6 +128,36 @@ def test_projections_take_the_smallest_prepared_capacity(monkeypatch):
+         B12xLinearMethod().apply(layer, torch.empty(4097, 16, dtype=torch.bfloat16))
+ 
+ 
++def test_batch_invariant_mode_plans_torch_backend_capacities_on_simt(monkeypatch):
++    """Only torch-backend capacities below 256 rows change, and only when enabled."""
++    from b12x.gemm.bf16_gemv import GemvQuery
++
++    from vllm.models.deepseek_v4_1 import b12x_layers
++
++    def query(out_features, output_dtype, rows):
++        return GemvQuery(
++            source_dtype="bfloat16",
++            weight_dtype="bfloat16",
++            output_dtype=output_dtype,
++            max_rows=rows,
++            in_features=5120,
++            out_features=out_features,
++            source_contiguous=True,
++            source_aligned=True,
++            weight_contiguous=True,
++            weight_aligned=True,
++        )
++
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", False)
++    assert b12x_layers._gemv_override(query(32, "bfloat16", 20)) is None
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
++    assert b12x_layers._gemv_override(query(32, "bfloat16", 20)).backend == "simt"
++    assert b12x_layers._gemv_override(query(512, "bfloat16", 192)).backend == "simt"
++    assert b12x_layers._gemv_override(query(512, "bfloat16", 384)) is None
++    assert b12x_layers._gemv_override(query(32, "bfloat16", 8)) is None
++    assert b12x_layers._gemv_override(query(384, "float32", 20)) is None
++
++
+ def test_mhc_takes_the_smallest_prepared_plan(monkeypatch):
+     """Counts between prepared mHC sizes use the next larger plan, not the largest."""
+     from vllm.models.deepseek_v4_1 import b12x_layers
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index d0a9663fd..7505e2e2a 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import os
+ from bisect import bisect_left
+ from functools import cache
+ from weakref import WeakValueDictionary
+@@ -215,6 +216,29 @@ class B12xEmbeddingMethod(UnquantizedEmbeddingMethod):
+         return out
+ 
+ 
++# Experimental: plan projections whose default backend picks its kernel by row
++# count (cuBLAS through the torch backend) on the SIMT GEMV instead, so a row
++# rounds the same whatever it is batched with. Off unless set.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
++
++def _gemv_override(query):
++    """The SIMT backend for a torch-backend capacity in batch-invariant mode.
++
++    Below 256 rows the FP32-output projections already run SIMT by default;
++    larger capacities keep their default (the prefill kernel where eligible).
++    """
++    from b12x.gemm.bf16_gemv._tuning import GemvConfig, default_config
++
++    if (
++        _BATCH_INVARIANT
++        and query.max_rows < 256
++        and default_config(query, None).backend == "torch"
++    ):
++        return GemvConfig(backend="simt")
++    return None
++
++
+ def _smallest_capacity(capacities: tuple[int, ...], rows: int) -> int:
+     """The smallest prepared row capacity that holds ``rows``.
+ 
+@@ -284,7 +308,7 @@ class B12xLinearMethod(UnquantizedLinearMethod):
+                         weight_contiguous=weight.is_contiguous(),
+                         weight_aligned=weight.data_ptr() % 16 == 0,
+                     )
+-                    plan = bf16_gemv.plan(query)
++                    plan = bf16_gemv.plan(query, override=_gemv_override(query))
+                     layer.b12x_linear_plans[key] = plan
+                 requests.append(
+                     plan.request(
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index d0c418a4a..f8f19c70e 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -13,6 +13,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+ from vllm.models.deepseek_v4_1.b12x_layers import (
+     B12xLinearMethod,
+     B12xRMSNorm,
++    _gemv_override,
+     _smallest_capacity,
+ )
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
+@@ -300,19 +301,20 @@ class DeepseekCompressor(nn.Module):
+         requests = []
+         for rows in capacities:
+             if rows not in self._projection_plans:
++                query = bf16_gemv.GemvQuery(
++                    source_dtype="bfloat16",
++                    weight_dtype="bfloat16",
++                    output_dtype=str(dtype).removeprefix("torch."),
++                    max_rows=rows,
++                    in_features=weight.shape[1],
++                    out_features=512,
++                    source_contiguous=True,
++                    source_aligned=True,
++                    weight_contiguous=weight.is_contiguous(),
++                    weight_aligned=weight.data_ptr() % 16 == 0,
++                )
+                 self._projection_plans[rows] = bf16_gemv.plan(
+-                    bf16_gemv.GemvQuery(
+-                        source_dtype="bfloat16",
+-                        weight_dtype="bfloat16",
+-                        output_dtype=str(dtype).removeprefix("torch."),
+-                        max_rows=rows,
+-                        in_features=weight.shape[1],
+-                        out_features=512,
+-                        source_contiguous=True,
+-                        source_aligned=True,
+-                        weight_contiguous=weight.is_contiguous(),
+-                        weight_aligned=weight.data_ptr() % 16 == 0,
+-                    )
++                    query, override=_gemv_override(query)
+                 )
+             requests.append(
+                 self._projection_plans[rows].request(
+-- 
+2.43.0
+

@@ -1,0 +1,82 @@
+From e1dd37063494860d00b8043247d083e77ddedd85 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 14:21:12 +0200
+Subject: [PATCH] feat(deepseek-v4.1): TMA prefill GEMV at every capacity where
+ it serves, in batch-invariant mode
+
+Replaces SIMT at every capacity for the router gate (384x5120) and the
+compressor projections (512x5120, 1024x5120). SIMT re-reads every row once per
+output column and took 1.5-4.5 ms per call at 1334 rows; the TMA prefill kernel
+accumulates each output over the whole K in one CTA, so a row rounds the same
+at every row count, and it is the kernel the default already uses at prefill
+sizes. Replayed on serving hidden states: one group from 1 to 4096 rows in
+both positions for all three shapes; 164-328 us per call at 1334 rows; 38-48
+us per call at decode sizes (SIMT: 7-31 us). Other shapes keep SIMT.
+---
+ .../test_deepseek_v4_1_mhc_batch_invariant.py  | 18 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py       | 18 ++++++++++++------
+ 2 files changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+index fd64b2e16..09f4e504c 100644
+--- a/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
++++ b/tests/models/test_deepseek_v4_1_mhc_batch_invariant.py
+@@ -25,3 +25,21 @@ def test_batch_invariant_mode_pins_the_lagged_native_route(monkeypatch):
+         assert config.projection_k_splits == 1
+     assert (decode.partials_per_cta, capacity.partials_per_cta) == (4, 13)
+ 
++
++def _query(out_features, in_features, out_dtype="float32"):
++    from b12x.gemm import bf16_gemv
++
++    return bf16_gemv.GemvQuery(source_dtype="bfloat16", weight_dtype="bfloat16",
++                               output_dtype=out_dtype, max_rows=4096, in_features=in_features,
++                               out_features=out_features, source_contiguous=True, source_aligned=True,
++                               weight_contiguous=True, weight_aligned=True)
++
++
++def test_batch_invariant_gemvs_take_the_prefill_kernel_where_it_serves(monkeypatch):
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", True)
++    router, compressor, index_weights = _query(384, 5120), _query(512, 5120, "bfloat16"), _query(32, 5120, "bfloat16")
++    assert b12x_layers._gemv_override(router).backend == "prefill"
++    assert b12x_layers._gemv_override(compressor).backend == "prefill"
++    assert b12x_layers._gemv_override(index_weights).backend == "simt"
++    monkeypatch.setattr(b12x_layers, "_BATCH_INVARIANT", False)
++    assert b12x_layers._gemv_override(router) is None
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index 7bbe3e946..ff81dd02d 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -223,17 +223,23 @@ _BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
+ 
+ 
+ def _gemv_override(query):
+-    """The SIMT backend at every capacity in batch-invariant mode.
++    """One GEMV kernel at every capacity in batch-invariant mode.
+ 
+     The default selection changes backend with the capacity: SIMT for small
+     plans, then cuBLAS (whose kernel also changes with the row count) or the
+-    TMA prefill kernel, each rounding a row differently. SIMT rounds a row the
+-    same way at every capacity from 1 to 4096 rows, for every V4.1 projection
+-    shape.
++    TMA prefill kernel, each rounding a row differently. The shapes the TMA
++    prefill kernel serves (the router gate and the compressor projections)
++    take it at every capacity: it accumulates each output over the whole K in
++    one CTA, so a row rounds the same from 1 to 4096 rows, and at prefill sizes
++    it is the kernel the default already picks (SIMT, which re-reads every row
++    once per output column, is several times slower there). The other shapes
++    keep SIMT at every capacity, which is likewise row-invariant.
+     """
+-    from b12x.gemm.bf16_gemv._tuning import GemvConfig
++    if not _BATCH_INVARIANT:
++        return None
++    from b12x.gemm.bf16_gemv._tuning import GemvConfig, _prefill_eligible
+ 
+-    return GemvConfig(backend="simt") if _BATCH_INVARIANT else None
++    return GemvConfig(backend="prefill" if _prefill_eligible(query) else "simt")
+ 
+ 
+ def _block32_plan(caps):
+-- 
+2.43.0
+

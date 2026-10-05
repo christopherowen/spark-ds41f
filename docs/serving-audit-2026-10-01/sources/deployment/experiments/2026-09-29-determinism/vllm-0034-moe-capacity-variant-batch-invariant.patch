@@ -1,0 +1,53 @@
+From 2db15553d1817457dabbbd7e7d939a125950549a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <christopherowen@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 09:36:31 +0200
+Subject: [PATCH] feat(fused-moe): one B12X MoE variant for every count in
+ batch-invariant mode
+
+The routed MoE plans a variant per graph size plus the prefill capacity;
+the graph-size variants round a row differently from the capacity one, so
+a row's bits depend on whether its step had more tokens than the
+largest graph. With VLLM_DS41_BATCH_INVARIANT=1 only the capacity is
+warm, and every live count binds that one variant.
+---
+ vllm/model_executor/layers/fused_moe/b12x.py | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/vllm/model_executor/layers/fused_moe/b12x.py b/vllm/model_executor/layers/fused_moe/b12x.py
+index 48cf518e1..b73a988db 100644
+--- a/vllm/model_executor/layers/fused_moe/b12x.py
++++ b/vllm/model_executor/layers/fused_moe/b12x.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """b12x modular tensor-parallel fused MoE backend."""
+ 
++import os
+ import weakref
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+@@ -54,6 +55,9 @@ _B12X_MOE_MODES: dict[
+     ("q8_0", None): ("w4a16", "q8_0", "w31"),
+ }
+ 
++# Opt-in batch-invariant mode (DeepSeek V4.1): one MoE variant for every live count.
++_BATCH_INVARIANT = os.environ.get("VLLM_DS41_BATCH_INVARIANT") == "1"
++
+ 
+ def _require_b12x_fused_moe() -> Any:
+     fused_moe = get_b12x_fused_moe()
+@@ -668,6 +672,12 @@ class B12xExperts(mk.FusedMoEExpertsModular):
+             raise ValueError("b12x MoE output dtype differs from its loaded contract")
+         prepared = self._prepared()
+         counts = tuple(sorted({workload.max_tokens, *workload.fixed_token_counts}))
++        if _BATCH_INVARIANT:
++            # The graph-size variants round a row differently from the
++            # prefill-capacity variant, so a row's bits would depend on whether
++            # its step had more tokens than the largest graph. Warm only the
++            # capacity: every live count binds one variant.
++            counts = (workload.max_tokens,)
+         activation = layer.activation
+         topk = int(self.moe_config.experts_per_token)
+         route_on_input = bool(layer.apply_router_weight_on_input)
+-- 
+2.43.0
+

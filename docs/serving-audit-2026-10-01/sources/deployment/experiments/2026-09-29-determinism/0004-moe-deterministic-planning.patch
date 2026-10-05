@@ -1,0 +1,205 @@
+From dba11ec417f87f4852bf39ae3780e55cf715e020 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 22:29:39 +0200
+Subject: [PATCH] fix(moe): plan with the requested deterministic output
+
+Deterministic MoE output was requested through RoutingSpec or
+B12X_DYNAMIC_DETERMINISTIC_OUTPUT, but planning dropped it: the dynamic
+route-mode heuristic, the tuning materialization check and both direct-routing
+capacity checks passed a literal False, and an unset request stayed None in
+the query while launches resolved it from the environment. Small launches
+were planned for direct routing, which scatters routes with atomics, and the
+launch then rejected the plan ("planned dynamic direct routing is unsupported
+for this launch shape").
+
+Preparation now resolves an unset request the way the launch does (it stays
+None when the variable is off, so production queries and compile keys are
+unchanged), every planning site uses the resolved flag, and a deterministic
+request does not prefer the tiny-decode or trellis micro kernels, whose
+combines are atomic. Deterministic requests plan grouped dynamic routing and
+its fixed-order top-k reduction.
+---
+ b12x/moe/fused_moe/_impl.py                 | 18 +++++--
+ b12x/moe/fused_moe/_preparation.py          | 22 +++++++-
+ b12x/moe/fused_moe/_tuning.py               |  2 +-
+ tests/preparation/test_tuning_predicates.py | 57 +++++++++++++++++++++
+ 4 files changed, 94 insertions(+), 5 deletions(-)
+
+diff --git a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+index 979476e4..927aefb8 100644
+--- a/b12x/moe/fused_moe/_impl.py
++++ b/b12x/moe/fused_moe/_impl.py
+@@ -2507,6 +2507,13 @@ def _w4a8_mx_micro_preferred(
+     query: MoeDecodeQuery,
+     device: DeviceIdentity | None,
+ ) -> bool:
++    if query.deterministic_output and not (
++        _canonical_moe_policy_source_format(query.source_format) == "fp4_e8m0_k32"
++        and query.intermediate_size % 128 == 64
++    ):
++        # Only the compact micro kernel reduces routes in a fixed order; tiny
++        # decode and the trellis micro kernel scatter them with atomics.
++        return False
+     if not _w4a8_mx_micro_supported(
+         num_tokens=query.num_tokens,
+         k=query.hidden_size,
+@@ -2573,7 +2580,7 @@ def _heuristic_dynamic_route_mode(
+         routed_rows=query.routed_rows,
+         num_experts=query.num_experts,
+         n=dynamic_n,
+-        deterministic_output=False,
++        deterministic_output=bool(query.deterministic_output),
+         planned_tile_m=planned_tile_m,
+     )
+     if (
+@@ -3813,7 +3820,7 @@ def _plan_core_workspace(
+             routed_rows=routed_rows,
+             num_experts=state_E,
+             n=dynamic_kernel_n,
+-            deterministic_output=False,
++            deterministic_output=deterministic_output,
+             planned_tile_m=dynamic_tile_m,
+         ):
+             direct_groups = max(
+@@ -7084,6 +7091,11 @@ def plan_tp_moe_execution(
+                 tile_n=dynamic_tile_n,
+             )
+         )
++        if deterministic_output is None:
++            deterministic_output = _dynamic_deterministic_output_enabled(
++                quant_mode=quant_mode,
++                device=device,
++            )
+         if _dynamic_direct_routing_selected(
+             route_mode=decode_config.dynamic_route_mode or "",
+             quant_mode=quant_mode,
+@@ -7091,7 +7103,7 @@ def plan_tp_moe_execution(
+             routed_rows=routed_rows,
+             num_experts=state_E,
+             n=dynamic_kernel_n,
+-            deterministic_output=False,
++            deterministic_output=bool(deterministic_output),
+             planned_tile_m=dynamic_tile_m,
+         ):
+             direct_groups = max(
+diff --git a/b12x/moe/fused_moe/_preparation.py b/b12x/moe/fused_moe/_preparation.py
+index 0d90548e..5e60aaf8 100644
+--- a/b12x/moe/fused_moe/_preparation.py
++++ b/b12x/moe/fused_moe/_preparation.py
+@@ -119,6 +119,26 @@ def _control_snapshot() -> FrozenMapping:
+     })
+ 
+ 
++def _planned_deterministic_output(routing: RoutingSpec, quant_modes) -> bool | None:
++    """Resolve an unset request the way the launch will.
++
++    Launches resolve ``deterministic_output=None`` from
++    ``B12X_DYNAMIC_DETERMINISTIC_OUTPUT``; planning must see the same answer or
++    it lowers kernels (direct routing, tiny decode) the launch then rejects. An
++    unset request with the variable off stays ``None``, so production queries
++    and their compile keys are unchanged.
++    """
++    from . import _impl
++
++    if routing.deterministic_output is not None:
++        return bool(routing.deterministic_output)
++    if any(mode != "w4a16" for mode in quant_modes) and _impl._env_flag(
++        "B12X_DYNAMIC_DETERMINISTIC_OUTPUT", default=False
++    ):
++        return True
++    return None
++
++
+ def _query(
+     experts: PreparedExperts,
+     capacity: ExecutionCapacity,
+@@ -148,7 +168,7 @@ def _query(
+         route_logits_dtype=None if routing.logits_dtype is None else str(routing.logits_dtype).removeprefix("torch."),
+         apply_router_weight_on_input=bool(routing.apply_router_weight_on_input),
+         collect_activation_amax=bool(routing.collect_activation_amax),
+-        deterministic_output=routing.deterministic_output,
++        deterministic_output=_planned_deterministic_output(routing, plan.quant_modes),
+         swiglu_limit=_codec_scalar(experts.plan.activation.swiglu_limit),
+         swiglu_alpha=_codec_scalar(experts.plan.activation.swiglu_alpha),
+         swiglu_beta=_codec_scalar(experts.plan.activation.swiglu_beta),
+diff --git a/b12x/moe/fused_moe/_tuning.py b/b12x/moe/fused_moe/_tuning.py
+index b1a9f8e3..03ac0e76 100644
+--- a/b12x/moe/fused_moe/_tuning.py
++++ b/b12x/moe/fused_moe/_tuning.py
+@@ -486,7 +486,7 @@ def _materialize_tuning(query, device, choice):
+                 routed_rows=query.routed_rows,
+                 num_experts=query.num_experts,
+                 n=_dynamic_kernel_intermediate_size(query.intermediate_size, effective_query.quant_mode),
+-                deterministic_output=False,
++                deterministic_output=bool(query.deterministic_output),
+                 planned_tile_m=config.dynamic_tile_m,
+             )
+         except RuntimeError as exc:
+diff --git a/tests/preparation/test_tuning_predicates.py b/tests/preparation/test_tuning_predicates.py
+index c320f358..219d58b4 100644
+--- a/tests/preparation/test_tuning_predicates.py
++++ b/tests/preparation/test_tuning_predicates.py
+@@ -782,3 +782,60 @@ def test_nvfp4_partial_resident_grids_share_the_compiled_kernel(sms, capability)
+     with pytest.raises(ValueError, match="resident SM count"):
+         component.TUNING.configure(query, device=device,
+             override=replace(configs[0], max_active_clusters=sms + 1))
++
++
++@pytest.mark.parametrize("tiny_decode", ("1", "0"))
++@pytest.mark.parametrize("tokens", (1, 4, 5))
++def test_deterministic_request_plans_fixed_order_route_reduction(
++    monkeypatch, tokens, tiny_decode
++):
++    from b12x.moe.fused_moe import _tuning as component
++    from b12x.moe.fused_moe._impl import _heuristic_moe_decode_config
++
++    monkeypatch.setenv("B12X_W4A8_TINY_DECODE", tiny_decode)
++
++    _, original = _contract_and_query(
++        "moe.decode", DECLARED[("moe.decode", "nvfp4 rows10")]
++    )
++    # DeepSeek V4.1 Flash at TP3: tiny decode below five tokens, direct routing
++    # through 32 routed rows, both of which scatter routes with atomics.
++    query = replace(
++        original, quant_mode="w4a8_mx", quant_modes=("w4a8_mx",),
++        source_format="fp4_e8m0_k32", num_experts=384, hidden_size=5120,
++        intermediate_size=768, top_k=6, num_tokens=tokens, routed_rows=6 * tokens,
++        route_num_experts=None, route_logits_dtype=None,
++        w13_layout="w31", weight_layouts=("fused",), controls=FrozenMapping(),
++    )
++    device = DeviceIdentity("nvidia", (12, 1), 48, "NVIDIA GB10")
++    atomic = _heuristic_moe_decode_config(query, device)
++    assert (atomic.backend, atomic.dynamic_route_mode) == (
++        ("micro", None) if tokens <= 4 and tiny_decode == "1" else ("dynamic", "direct")
++    )
++    deterministic = replace(query, deterministic_output=True)
++    config = _heuristic_moe_decode_config(deterministic, device)
++    assert (config.backend, config.dynamic_route_mode) == ("dynamic", "grouped")
++    component._materialize_tuning(
++        deterministic, device, component.TUNING.encode_config(config)
++    )
++    direct = component.TUNING.encode_config(replace(config, dynamic_route_mode="direct"))
++    if atomic.backend == "dynamic":
++        component._materialize_tuning(query, device, direct)
++    with pytest.raises(ValueError, match="direct routing"):
++        component._materialize_tuning(deterministic, device, direct)
++
++
++def test_planned_deterministic_output_matches_launch_resolution(monkeypatch):
++    from b12x.moe.fused_moe._preparation import _planned_deterministic_output
++    from b12x.moe.fused_moe.execution import RoutingSpec
++
++    monkeypatch.delenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", raising=False)
++    assert _planned_deterministic_output(RoutingSpec(), ("w4a8_mx",)) is None
++    assert _planned_deterministic_output(
++        RoutingSpec(deterministic_output=False), ("w4a8_mx",)
++    ) is False
++    monkeypatch.setenv("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
++    assert _planned_deterministic_output(RoutingSpec(), ("w4a8_mx",)) is True
++    assert _planned_deterministic_output(RoutingSpec(), ("w4a16",)) is None
++    assert _planned_deterministic_output(
++        RoutingSpec(deterministic_output=False), ("w4a8_mx",)
++    ) is False
+-- 
+2.54.0 (Apple Git-157)
+
