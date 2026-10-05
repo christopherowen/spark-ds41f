@@ -20,6 +20,8 @@ the open levers, measured dead ends, and the lean screening routine.
 - `manifests/baselines/` is immutable evidence. Never rewrite a published baseline.
 - `manifests/benchmarks/<baseline>.json` is that baseline's reference
   `bin/spark bench` run. It is immutable too; a new promotion adds its own.
+  A profile of another topology names its own run in `benchmark_reference`
+  (`manifests/benchmarks/<baseline>-tp4.json` for `config/cluster-tp4.json`).
 - `experiments/` is the only place for unpromoted tuning.
 - `docs/inspiration.md` is a research watchlist, never a source or deployment
   authority. It names each source, what to review it for, and the adoption

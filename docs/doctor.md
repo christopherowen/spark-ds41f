@@ -49,6 +49,7 @@ repository. Every one is an error unless marked **warn**.
 | Serving arguments | `--tensor-parallel-size`, `--nnodes` or the drafter's TP differ from the node count; the transport's required settings are missing; a sparknet transport carries B12X `B12X_ROCE_*` settings or the reverse |
 | Kernel backend | `--attention-backend`, `--linear-backend`, `--moe-backend`, the drafter's attention backend or `VLLM_DS41_KERNEL_BACKEND` disagree with `kernel_backend` (absent means B12X) |
 | Baseline | the configuration and the lock name different baselines |
+| Benchmark reference | a `benchmark_reference` is set but is not a repository-relative path to an existing report, or that report was measured on another node count, transport or `kernel_backend`; **warn** when the report does not record one of them |
 | Memory guards | a guard value is missing or not positive; the startup guard is not larger than the steady guard |
 | Deployment | `repository`, `path`, `ready_url` or `ready_timeout_seconds` is empty; `launch_enabled` is not true or false |
 | Sources | a revision is not a full commit SHA; a tracking ref or upstream is missing; a patch series or patch file is missing; a patch set's fingerprint differs from the source manifest; TileLang is listed without TileKernels (or the reverse) |

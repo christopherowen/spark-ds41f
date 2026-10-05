@@ -278,6 +278,7 @@ class Warn(str):
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems: list[str] = topology.problems(cluster, nodes)
     problems.extend(kernel_backend.problems(cluster))
+    problems.extend(benchmark_reference_problems(cluster, nodes))
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")
     host = cluster.get("host", {})
@@ -4647,6 +4648,72 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
     return identity
 
 
+# What a reference run must share with the run compared against it: across node
+# counts, transports or kernel families the numbers describe different systems.
+BENCH_SHAPE = ("nodes", "transport", "kernel_backend")
+
+
+def bench_shape(identity: dict) -> dict:
+    """The node count, transport and kernel family a report's identity records.
+    None marks a field it does not record; reports from before r6 omit
+    kernel_backend, which then means B12X."""
+    nodes = (identity.get("topology") or {}).get("nodes")
+    return {
+        "nodes": len(nodes) if nodes else None,
+        "transport": identity.get("transport"),
+        "kernel_backend": identity.get("kernel_backend", kernel_backend.DEFAULT),
+    }
+
+
+def profile_shape(cluster: dict, nodes: dict) -> dict:
+    return bench_shape(
+        {"topology": nodes, "transport": topology.transport(cluster), "kernel_backend": kernel_backend.backend(cluster)}
+    )
+
+
+def shape_differences(run: dict, reference: dict) -> tuple[list[str], list[str]]:
+    """The fields whose recorded values differ, and those either side does not record."""
+    unrecorded = [key for key in BENCH_SHAPE if run[key] is None or reference[key] is None]
+    return [key for key in BENCH_SHAPE if key not in unrecorded and run[key] != reference[key]], unrecorded
+
+
+def shape_text(shape: dict, keys: list[str]) -> str:
+    return ", ".join(f"{key} {shape[key]}" for key in keys)
+
+
+def benchmark_reference(cluster: dict) -> tuple[Path, bool]:
+    """A profile's default reference run, and whether the profile names it. A
+    profile whose topology differs from its baseline's reference run names its
+    own with benchmark_reference."""
+    if "benchmark_reference" in cluster:
+        return repository_config_path(cluster["benchmark_reference"]), True
+    return ROOT / "manifests/benchmarks" / f"{cluster.get('promoted_baseline')}.json", False
+
+
+def benchmark_reference_problems(cluster: dict, nodes: dict) -> list[str]:
+    """A benchmark_reference must name an existing run of the profile's own shape."""
+    raw = cluster.get("benchmark_reference")
+    if raw is None:
+        return []
+    if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or not (ROOT / raw).resolve().is_relative_to(ROOT):
+        return ["benchmark_reference must be a bench.json path relative to the repository root"]
+    path = ROOT / raw
+    if not path.is_file():
+        return [f"benchmark_reference does not exist: {raw}"]
+    reference = bench_shape(json.loads(path.read_text(encoding="utf-8")).get("identity") or {})
+    profile = profile_shape(cluster, nodes)
+    differing, unrecorded = shape_differences(profile, reference)
+    problems: list[str] = []
+    if differing:
+        problems.append(
+            f"benchmark_reference {raw} was measured with {shape_text(reference, differing)}; "
+            f"this profile has {shape_text(profile, differing)}"
+        )
+    if unrecorded:
+        problems.append(Warn(f"benchmark_reference {raw} does not record {', '.join(unrecorded)}; bench cannot check them"))
+    return problems
+
+
 def decode_primary_rows(points: dict) -> list[str]:
     """Primary numbers and both throughputs per decode point, plus warnings for
     outputs that stopped before a precision budget."""
@@ -4829,18 +4896,45 @@ def command_bench(args: argparse.Namespace) -> int:
     floor_gib = float(cluster["host"]["memguard_gib"]) + 1
 
     reference_path = None
-    if args.compare != "none":
-        reference_path = Path(args.compare) if args.compare else ROOT / "manifests/benchmarks" / f"{cluster.get('promoted_baseline')}.json"
+    if args.compare is None:
+        reference_path, named = benchmark_reference(cluster)
+        if not reference_path.is_file():
+            if named:
+                raise SystemExit(f"benchmark_reference does not exist: {cluster['benchmark_reference']}")
+            reference_path = None
+    elif args.compare != "none":
+        reference_path = Path(args.compare)
         if not reference_path.is_absolute():
             reference_path = ROOT / reference_path
         if not reference_path.is_file():
-            if args.compare:
-                raise SystemExit(f"reference does not exist: {args.compare}")
-            reference_path = None
+            raise SystemExit(f"reference does not exist: {args.compare}")
     reference = json.loads(reference_path.read_text(encoding="utf-8")) if reference_path else None
+    report = json.loads(Path(args.report).read_text(encoding="utf-8")) if args.report else None
 
-    if args.report:
-        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    if reference:
+        # The run's shape: the report's own record, or the profile that doctor
+        # --live holds the cluster to.
+        run = bench_shape(report.get("identity") or {}) if report else profile_shape(cluster, nodes)
+        ref = bench_shape(reference.get("identity") or {})
+        differing, unrecorded = shape_differences(run, ref)
+        shown = reference_path.relative_to(ROOT) if reference_path.is_relative_to(ROOT) else reference_path
+        if unrecorded:
+            print(f"WARN: cannot compare {', '.join(unrecorded)} with reference {shown}: not recorded")
+        if differing:
+            mismatch = (
+                f"reference {shown} was measured with {shape_text(ref, differing)}; "
+                f"this run has {shape_text(run, differing)}"
+            )
+            if args.compare is None:
+                print(f"ERROR: {mismatch}")
+                print(
+                    "refusing to compare with a default reference of another shape; name the profile's own "
+                    "run in benchmark_reference, or pass --compare PATH (or --compare none) explicitly"
+                )
+                return 1
+            print(f"WARN: {mismatch}")
+
+    if report:
         lines, regressions = bench_rows(report, reference, args.tolerance)
         print("\n".join(lines))
         if reference_path:
@@ -5110,8 +5204,10 @@ def parser() -> argparse.ArgumentParser:
     bench.add_argument(
         "--compare",
         metavar="PATH",
-        help="reference bench.json (default: manifests/benchmarks/<promoted_baseline>.json "
-        "when present; 'none' skips the comparison)",
+        help="reference bench.json (default: the profile's benchmark_reference, else "
+        "manifests/benchmarks/<promoted_baseline>.json when present; a default measured on another "
+        "node count, transport or kernel backend is refused, an explicit one only warns; "
+        "'none' skips the comparison)",
     )
     bench.add_argument(
         "--precision",

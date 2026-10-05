@@ -474,19 +474,12 @@ bin/spark bench
 
 It checks that the live cluster matches the profile, runs the quality gate
 and the decode matrix (about six minutes), and compares the result with the
-promoted reference run. `--full` runs every suite to tighter intervals (about
+profile's promoted reference run, which has the same node count, transport and
+kernel backend. `--full` runs every suite to tighter intervals (about
 35 minutes). It exits non-zero if the quality gate fails, any request fails,
 or a point is significantly slower than the reference (Welch 95% interval) by
 more than 3%. See the README's [Benchmarking](../README.md#benchmarking)
 section.
-
-The default reference is the three-node run. On four nodes, compare with the
-TP4 acceptance run instead:
-
-```sh
-bin/spark --cluster-config config/cluster-tp4.json bench \
-  --compare experiments/2026-10-05-tilelang-r6/runs-tp4/bench.json
-```
 
 ## When something fails
 

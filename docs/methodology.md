@@ -86,6 +86,8 @@ A promotion commit must:
 6. pass `bin/spark doctor --live` after coordinated deployment;
 7. add the deployed service's complete `bin/spark bench` report as
    `manifests/benchmarks/<baseline>.json`, the reference later runs compare with.
+   Each promoted profile of another topology gets its own run (for example
+   `<baseline>-tp4.json`), named by that profile's `benchmark_reference`.
 
 Rollback is a new coordinated deployment of the previous promoted commit. It is
 not an ad hoc reconstruction from shell history.
