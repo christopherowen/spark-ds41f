@@ -9,7 +9,7 @@ E=experiments/2026-09-29-determinism
 out=results/private/determinism
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/overlap_repro.py dgx3:/tmp/overlap_repro.py
 log "overlap repro on dgx3"
@@ -37,5 +37,5 @@ run --atomic
 REMOTE
 log "overlap repro done"
 grep -E "^==|equal|OK|FAIL|Error|Traceback" "$out/overlap-repro.txt" | head -30
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

@@ -18,7 +18,7 @@ REFERENCE = ROOT / "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json"
 
 def main():
     raw, output = map(Path, sys.argv[1:])
-    cli = runpy.run_path(str(ROOT / "bin/spark3"))
+    cli = runpy.run_path(str(ROOT / "bin/spark"))
     reference = json.loads(REFERENCE.read_text())
     measured = json.loads((raw / "bench-tp4.json").read_text())
     combined = json.loads((raw / "prefill-cooled.json").read_text())

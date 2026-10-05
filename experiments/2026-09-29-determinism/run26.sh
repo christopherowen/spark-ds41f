@@ -23,13 +23,13 @@ ARGS="$*"
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
 }
 pinned() {
   docker logs dsv41-karmic-kraken 2>&1 | grep -E "pinned DSpark cost curves|Pinned DSpark cost curves" | tail -1 \
@@ -89,7 +89,7 @@ if [[ "$ARGS" != *--skip-perf* ]]; then
     pinned
     python3 $E/ttft_short.py http://10.0.1.71:8000 | tee "$out/ttft-$2.jsonl"
     log "ttft $2 exit ${PIPESTATUS[0]}"
-    bin/spark3 --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode \
+    bin/spark --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode \
       --decode-cases prose,json-nothink --concurrency 1,8 --min-samples 6 --max-samples 6 \
       --output "results/private/bench/lookup-$2"
     log "decode $2 exit $?"
@@ -102,5 +102,5 @@ if [[ "$ARGS" != *--skip-perf* ]]; then
   measure detm-r5o-lookup-pin detm-lookup-1
 fi
 start config/cluster.json
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

@@ -12,7 +12,7 @@ IMAGE=vllm-ds41f-kkref:04c30fa98e79-r5o
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
   experiments/2026-09-30-r5n/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 ssh -n dgx3 'mkdir -p /tmp/lookup/cache'
 scp -q $E/moe_serving_replay.py dgx3:/tmp/lookup/

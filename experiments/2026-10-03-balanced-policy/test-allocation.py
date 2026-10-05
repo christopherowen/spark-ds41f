@@ -2,7 +2,7 @@
 from pathlib import Path
 import importlib.machinery,importlib.util,argparse,subprocess,tempfile,os
 ROOT=Path(__file__).resolve().parents[2]
-l=importlib.machinery.SourceFileLoader('allocation_build',str(ROOT/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
+l=importlib.machinery.SourceFileLoader('allocation_build',str(ROOT/'bin/spark'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 _,_,lock=m.configuration(argparse.Namespace(cluster_config=os.environ.get('BALANCED_TEST_PROFILE','experiments/2026-10-03-balanced-policy/paired.json')))
 inputs=m.build_inputs(lock);tree=m.build_directory(inputs)/'src/nccl'
 assert not m.project_problems(tree,inputs['nccl'])

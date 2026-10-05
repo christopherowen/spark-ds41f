@@ -11,9 +11,9 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 log "build prepare (MemAvailable ${avail} GiB)"
-bin/spark3 build prepare
+bin/spark build prepare
 log "build image $TAG"
-bin/spark3 build image --apply --tag "$TAG"
+bin/spark build image --apply --tag "$TAG"
 local_id=$(docker image inspect "$TAG" --format "{{.Id}}")
 for host in dgx2 dgx3; do
   log "copy image to $host"

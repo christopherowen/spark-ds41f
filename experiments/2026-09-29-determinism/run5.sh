@@ -11,7 +11,7 @@ E=experiments/2026-09-29-determinism
 out=results/private/determinism
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/moe_repeat_check.py dgx3:/tmp/moe_repeat_check.py
 log "checks on dgx3"
@@ -44,5 +44,5 @@ done
 REMOTE
 log "checks done"
 grep -E "^==|^m=|OK|FAIL|ERROR SUMMARY|Invalid|Uninitialized|hazard|Race" "$out/sanitizer.txt" | head -60
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

@@ -2,7 +2,7 @@ from pathlib import Path
 import subprocess,tempfile
 import importlib.machinery,importlib.util,argparse
 ROOT=Path(__file__).resolve().parents[2]
-loader=importlib.machinery.SourceFileLoader("spark3_nccl_rings",str(ROOT/"bin/spark3"))
+loader=importlib.machinery.SourceFileLoader("spark3_nccl_rings",str(ROOT/"bin/spark"))
 spec=importlib.util.spec_from_loader(loader.name,loader)
 spark3=importlib.util.module_from_spec(spec);loader.exec_module(spark3)
 _,_,lock=spark3.configuration(argparse.Namespace(cluster_config="experiments/2026-10-03-nccl-bidirectional/cluster.json"))

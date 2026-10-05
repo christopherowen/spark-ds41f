@@ -13,7 +13,7 @@ E=$PWD/experiments/2026-09-29-determinism
 TREE=c108cd6d1fe8e2d3b91c065feefe818742159020
 SRC=$(for d in .work/build/vllm-04c30fa98e79-*/src/vllm; do
   [ "$(git -C "$d" rev-parse HEAD^{tree})" = $TREE ] && echo "$d" && break; done)
-[ -n "$SRC" ] || { echo "no prepared r5o vLLM tree; run bin/spark3 build prepare"; exit 1; }
+[ -n "$SRC" ] || { echo "no prepared r5o vLLM tree; run bin/spark build prepare"; exit 1; }
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 git clone -q "$SRC" "$T/vllm"
@@ -22,7 +22,7 @@ git -C "$T/vllm" apply "$E/vllm-0027-gemv-smallest-capacity.patch"
 BTREE=1a8b9401584ada0372939df49e658c3dbeae7658
 BSRC=$(for d in .work/build/vllm-04c30fa98e79-*/src/b12x; do
   [ "$(git -C "$d" rev-parse HEAD^{tree})" = $BTREE ] && echo "$d" && break; done)
-[ -n "$BSRC" ] || { echo "no prepared r5o B12X tree; run bin/spark3 build prepare"; exit 1; }
+[ -n "$BSRC" ] || { echo "no prepared r5o B12X tree; run bin/spark build prepare"; exit 1; }
 git clone -q "$BSRC" "$T/b12x"
 git -C "$T/b12x" apply "$E/b12x-0006-moe-smallest-variant.patch"
 MV=$T/moe-variant/b12x/moe/fused_moe DV=$T/det-variant

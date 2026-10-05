@@ -31,13 +31,13 @@ done
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-29-determinism/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
 }
 pinned() {
   docker logs dsv41-karmic-kraken 2>&1 | grep -E "pinned DSpark cost curves|Pinned DSpark cost curves" | tail -1 | tee -a "$out/pin.log"
@@ -49,7 +49,7 @@ prefill() {
   log "prefill $1 exit ${PIPESTATUS[0]}"
 }
 decode() {
-  bin/spark3 --cluster-config "$1" bench --allow-mismatch --compare none --suites decode \
+  bin/spark --cluster-config "$1" bench --allow-mismatch --compare none --suites decode \
     --decode-cases prose,json-nothink --concurrency 1,8 --min-samples 6 --max-samples 6 \
     --output "results/private/bench/r5o-$2"
   log "decode $2 exit $?"

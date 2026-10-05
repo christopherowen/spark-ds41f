@@ -14,7 +14,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 mkdir -p "$out"
@@ -41,6 +41,6 @@ for script in gemv_geometry_replay; do
   log "$script exit $?"
   grep -hE 'bit_equal|invariant|compile_error|done|Error|Traceback' "$out/$script.txt" | cut -c1-260 | head -40
 done
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

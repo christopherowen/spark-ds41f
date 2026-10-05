@@ -18,7 +18,7 @@ out=results/private/determinism
 NODE=${1:-dgx3}
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5n/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/moe_combine_bench.py $E/gemm_fence_timing.py $NODE:/tmp/
 log "run22 on $NODE"
@@ -57,5 +57,5 @@ done
 REMOTE
 log "run22 done"
 grep -E "^==|passed|failed|exit|cap [0-9]|Error|Traceback" "$out/run22.txt" | head -40
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

@@ -17,7 +17,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 for n in dgx1 dgx2 dgx3; do
@@ -44,7 +44,7 @@ for arm in "detm-r5o-lookup-mhc-variant-exact trace4 2" "detm-r5o-lookup-mhc-bi-
   set -- $arm
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config $E/cluster-$1.json cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config $E/cluster-$1.json cluster start --replace --apply | grep -v 'docker run'
   for n in dgx1 dgx2 dgx3; do  # fresh plan dumps for this boot
     ssh -n $n "docker exec dsv41-karmic-kraken sh -c 'rm -f /cache/kkref/moe-checksums/plans-rank*.json'" || true
   done
@@ -53,8 +53,8 @@ for arm in "detm-r5o-lookup-mhc-variant-exact trace4 2" "detm-r5o-lookup-mhc-bi-
   docker exec dsv41-karmic-kraken sh -c 'cat /cache/kkref/moe-checksums/plans-rank0.json' > "$out/plans-$2.json"
 done
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 for t in trace4 trace5; do
   for prompt in json prose; do
     for mode in "" --main; do

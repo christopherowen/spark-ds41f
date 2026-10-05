@@ -11,12 +11,12 @@ mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-29-r5k/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 stop_all
 log "start baseline-profile"
-bin/spark3 --cluster-config $E/cluster-baseline-profile.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-baseline-profile.json cluster start --replace --apply | grep -v 'docker run'
 python3 $E/capture_depth.py http://10.0.1.71:8000 --profile | tee "$out/baseline-depth.jsonl"
 log "capture exit ${PIPESTATUS[0]}"
 sleep 60  # let every rank finish writing its trace
@@ -25,5 +25,5 @@ for n in dgx1 dgx2 dgx3; do
 done
 stop_all
 log "restore promoted configuration"
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

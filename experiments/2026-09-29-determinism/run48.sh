@@ -16,7 +16,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 mkdir -p "$out"
@@ -46,7 +46,7 @@ docker run --rm --gpus all --ipc=host $DET \
 log "replays done"
 grep -hE '"changes"|"family"|done|Error|Traceback' "$out/map-reference.txt" | cut -c1-400 | head -30
 log "start exact4 trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-rs2-exact4-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-rs2-exact4-trace.json cluster start --replace --apply | grep -v 'docker run'
 python3 $E/scenario_trace.py http://10.0.1.71:8000 "$out/scenarios" --scenarios cache,chunked_end --repeats 1 \
   | tee "$out/scenario-runs.jsonl"
 log "scenarios exit ${PIPESTATUS[0]}"
@@ -60,6 +60,6 @@ docker run --rm --memory=16g -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/compare_index_c
   -v $PWD/$out/scenarios:/t:ro --entrypoint python3 $IMAGE /c.py /t/logs-cache-0-prefix-cold-r0 \
   /t/logs-cache-prefix-warm-r0 2>&1 | grep -v Warn > "$out/index-capture-cache-prefix.txt"
 log "analysed"
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

@@ -2,7 +2,7 @@
 from pathlib import Path
 import ast,types,argparse,importlib.util,importlib.machinery
 ROOT=Path(__file__).resolve().parents[2]
-l=importlib.machinery.SourceFileLoader('dispatch_build',str(ROOT/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
+l=importlib.machinery.SourceFileLoader('dispatch_build',str(ROOT/'bin/spark'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 _,_,lock=m.configuration(argparse.Namespace(cluster_config='experiments/2026-10-03-balanced-policy/selected.json'))
 i=m.build_inputs(lock);tree=m.build_directory(i)/'src/b12x';assert not m.project_problems(tree,i['b12x'])
 s=(tree/'b12x/comm/roce/roce_oneshot.py').read_text();mod=ast.parse(s);cls=next(n for n in mod.body if isinstance(n,ast.ClassDef) and n.name=='RoceOneshotAllReduce')

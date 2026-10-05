@@ -1,7 +1,7 @@
 #!/bin/bash
 # usage: overlay.sh   (on dgx1, deployment checkout)
 # Applies vLLM patches 0001-0021 to the base in a throwaway worktree, the way
-# bin/spark3 build prepare does, checks the tree, and copies patch 0021 runtime
+# bin/spark build prepare does, checks the tree, and copies patch 0021 runtime
 # files to ~/spark3-overlay/display-kv on every node for mounting over r5j.
 set -eu
 cd ~/projects/spark3-vllm-ds41f

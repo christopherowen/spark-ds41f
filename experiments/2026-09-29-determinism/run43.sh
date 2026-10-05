@@ -14,18 +14,18 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
 stop_all
 log "start c8 trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-rs-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-rs-trace.json cluster start --replace --apply | grep -v 'docker run'
 python3 $E/c8_trace.py http://10.0.1.71:8000 "$out/c8" --rounds 2 --tokens 16 | tee "$out/c8-runs.jsonl"
 log "c8 exit ${PIPESTATUS[0]}"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 for node in dgx1 dgx2 dgx3; do
   docker run --rm -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_trace3.py:/a.py:ro -v $PWD/$out/c8:/t:ro \
     --entrypoint python3 $IMAGE /a.py /t c8 --node $node --chain 12 2>&1 | grep -v Warn \

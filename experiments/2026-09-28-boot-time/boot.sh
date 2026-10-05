@@ -17,7 +17,7 @@ out=results/private/boot/$label
 mkdir -p "$out"
 CONFIG=${CONFIG:-$E/cluster-$arm.json}
 for config in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 for _ in $(seq 1 60); do
   avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
@@ -31,7 +31,7 @@ if [ "$mode" = pyspy ]; then
   sampler=$!
 fi
 date -u +%FT%T.%3NZ > "$out/launch_t0"
-bin/spark3 --cluster-config "$CONFIG" cluster start --replace --apply 2>&1 \
+bin/spark --cluster-config "$CONFIG" cluster start --replace --apply 2>&1 \
   | grep --line-buffered -v 'docker run' \
   | while IFS= read -r line; do echo "$(date -u +%FT%T.%3NZ) $line"; done | tee "$out/launcher.log" \
   | grep -E "launched|API ready|cluster ready|ERROR"

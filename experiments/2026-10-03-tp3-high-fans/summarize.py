@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     raw, destination = map(Path, sys.argv[1:])
-    cli = runpy.run_path(str(ROOT / "bin/spark3"))
+    cli = runpy.run_path(str(ROOT / "bin/spark"))
     report = json.loads((raw / "bench.json").read_text())
     main_path = ROOT / "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json"
     previous_main = json.loads(main_path.read_text())

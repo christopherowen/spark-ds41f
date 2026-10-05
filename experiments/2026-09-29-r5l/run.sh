@@ -15,13 +15,13 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-29-indexer-split/cluster-*.json \
       experiments/2026-09-29-r5k/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
 }
 start candidate-check
 # On dgx3: beside rank 0 and the API server, dgx1 leaves a second CUDA process
@@ -48,13 +48,13 @@ done
 if [ "$bad" != 0 ]; then log "check failed; stopping before the candidate"; exit 1; fi
 start candidate
 C=$E/cluster-candidate.json
-bin/spark3 --cluster-config $C doctor --live || true
-bin/spark3 --cluster-config $C bench --allow-mismatch --compare none \
+bin/spark --cluster-config $C doctor --live || true
+bin/spark --cluster-config $C bench --allow-mismatch --compare none \
   --suites quality,decode,prefill,prefix,admission \
   --decode-cases prose,code,prose-nothink,code-nothink,json-nothink \
   --output results/private/bench/r5l-reference
 log "bench exit $?"
-bin/spark3 --cluster-config $C bench --allow-mismatch --compare none --suites prefill \
+bin/spark --cluster-config $C bench --allow-mismatch --compare none --suites prefill \
   --prefill-text source --prefill-sizes 4096,16384,32768,65536,131072,200000 --prefill-repeats 2 \
   --output results/private/bench/r5l-prefill-source
 log "real-text prefill exit $?"

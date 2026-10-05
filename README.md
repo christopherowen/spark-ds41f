@@ -195,8 +195,8 @@ See [Benchmarking](#benchmarking) to reproduce them.
 
 The project was `spark3-vllm-ds41f` until 2026-10-05. The former GitHub name
 now holds a pointer, and deployment checks accept configurations that name
-it. The command is `bin/spark`; dated experiment records and their scripts
-keep `bin/spark3` as they ran it.
+it. The command is `bin/spark`, and experiment scripts call it; dated
+experiment records keep `bin/spark3` as they ran it.
 
 Names built into images or installed on the hosts keep `spark3` until they
 are rebuilt or reinstalled:

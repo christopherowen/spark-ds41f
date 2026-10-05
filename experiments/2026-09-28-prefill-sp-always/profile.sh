@@ -8,7 +8,7 @@ E=experiments/2026-09-28-prefill-sp-always
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for arm in ${ARMS:-current-profile always2-profile}; do
   for config in config/cluster.json $E/cluster-*.json; do
-    bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
   for _ in $(seq 1 60); do
     avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
@@ -16,7 +16,7 @@ for arm in ${ARMS:-current-profile always2-profile}; do
     sleep 5
   done
   log "start $arm (dgx1 MemAvailable ${avail} GiB)"
-  bin/spark3 --cluster-config "$E/cluster-$arm.json" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$E/cluster-$arm.json" cluster start --replace --apply | grep -v 'docker run'
   python3 $E/capture_tiny.py http://10.0.1.71:8000
   log "arm $arm exit $?"
   sleep 30  # let every rank finish writing its trace

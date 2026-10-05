@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--b12x-repo")
     args = parser.parse_args()
     if not args.vllm_repo or not args.b12x_repo:
-        loader = importlib.machinery.SourceFileLoader("layout_build", str(ROOT / "bin/spark3"))
+        loader = importlib.machinery.SourceFileLoader("layout_build", str(ROOT / "bin/spark"))
         spec = importlib.util.spec_from_loader(loader.name, loader)
         build = importlib.util.module_from_spec(spec)
         loader.exec_module(build)

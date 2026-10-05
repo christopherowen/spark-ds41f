@@ -14,7 +14,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 for n in dgx1 dgx2 dgx3; do
@@ -23,13 +23,13 @@ for n in dgx1 dgx2 dgx3; do
 done
 stop_all
 log "start final trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-final-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-final-trace.json cluster start --replace --apply | grep -v 'docker run'
 python3 $E/trace_mixes.py http://10.0.1.71:8000 "$out/final" --repeats 3 --tokens 128 --prompts json,prose,long \
   | tee "$out/final-runs.jsonl"
 log "final exit ${PIPESTATUS[0]}"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 for prompt in json prose long; do
   for node in dgx1 dgx2 dgx3; do
     docker run --rm -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_trace3.py:/a.py:ro -v $PWD/$out/final:/t:ro \

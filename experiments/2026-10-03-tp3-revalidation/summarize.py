@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def main():
     raw, output = map(Path, sys.argv[1:])
-    cli = runpy.run_path(str(ROOT / "bin/spark3"))
+    cli = runpy.run_path(str(ROOT / "bin/spark"))
     baseline = ROOT / "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json"
     old = json.loads(baseline.read_text())
     tp4_path = ROOT / "experiments/2026-10-03-tp3-tp4-comparison/results.json"

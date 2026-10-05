@@ -19,13 +19,13 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
   return "${PIPESTATUS[0]}"
 }
 LOGDIR=/cache/kkref/moe-checksums
@@ -55,7 +55,7 @@ measure() {  # arm label
   docker logs dsv41-karmic-kraken 2>&1 | grep -E "pinned DSpark cost curves|Pinned DSpark cost curves" | tail -1 \
     | tee -a "$mout/pin.log"
   sha256sum $PIN/*.json | tee -a "$mout/pin.log"
-  bin/spark3 --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode,prefill \
+  bin/spark --cluster-config $E/cluster-$1.json bench --allow-mismatch --compare none --suites decode,prefill \
     --decode-cases prose,json-nothink --concurrency 1 --min-samples 5 --max-samples 5 \
     --prefill-text source --prefill-sizes 1024,4096,16384,65536 --prefill-repeats 3 \
     --output "results/private/bench/$REC-$2"
@@ -71,6 +71,6 @@ for label in "$@"; do
   measure detm-r5o-$label-pin $label
 done
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

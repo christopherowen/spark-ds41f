@@ -10,7 +10,7 @@ arm=$1
 suites=${2:-quality,decode,sampled}
 shift $(( $# < 2 ? $# : 2 ))
 for config in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 for _ in $(seq 1 60); do
   avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
@@ -18,7 +18,7 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 echo "$(date -u +%FT%TZ) start $arm (dgx1 MemAvailable ${avail} GiB)"
-bin/spark3 --cluster-config "$E/cluster-$arm.json" cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 --cluster-config "$E/cluster-$arm.json" doctor --live
-bin/spark3 --cluster-config "$E/cluster-$arm.json" bench --suites "$suites" \
+bin/spark --cluster-config "$E/cluster-$arm.json" cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config "$E/cluster-$arm.json" doctor --live
+bin/spark --cluster-config "$E/cluster-$arm.json" bench --suites "$suites" \
   --output "results/private/bench/ab-$arm-$(date -u +%H%M)" "$@"

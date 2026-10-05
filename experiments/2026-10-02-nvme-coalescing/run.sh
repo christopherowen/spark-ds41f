@@ -35,11 +35,11 @@ for arm in on off on; do
   done
   wait
   counters "$label-start"
-  (cd "$REPO" && bin/spark3 bench --suites decode,prefill --decode-cases prose,code --concurrency 1,8 \
+  (cd "$REPO" && bin/spark bench --suites decode,prefill --decode-cases prose,code --concurrency 1,8 \
      --min-samples 3 --max-samples 3 --prefill-text source --prefill-sizes 4096,32768 --prefill-repeats 2 \
      --compare none --output "results/private/bench/nvme-$label" > "$OUT/bench-$label.txt" 2>&1)
   log "bench $label exit $?"
-  (cd "$REPO" && bin/spark3 bench --suites prefill --prefill-text novel --prefill-sizes 4096,32768 \
+  (cd "$REPO" && bin/spark bench --suites prefill --prefill-text novel --prefill-sizes 4096,32768 \
      --prefill-repeats 2 --compare none --output "results/private/bench/nvme-$label-novel" > "$OUT/bench-$label-novel.txt" 2>&1)
   log "novel $label exit $?"
   counters "$label-end"

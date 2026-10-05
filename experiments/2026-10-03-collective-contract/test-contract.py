@@ -21,7 +21,7 @@ else:
 
     root = Path(__file__).resolve().parents[2]
     loader = importlib.machinery.SourceFileLoader(
-        "contract_build", str(root / "bin/spark3")
+        "contract_build", str(root / "bin/spark")
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     build = importlib.util.module_from_spec(spec)

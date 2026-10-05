@@ -2,7 +2,7 @@
 from pathlib import Path
 import subprocess,tempfile,importlib.machinery,importlib.util,argparse
 ROOT=Path(__file__).resolve().parents[2]
-l=importlib.machinery.SourceFileLoader('thread_build',str(ROOT/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
+l=importlib.machinery.SourceFileLoader('thread_build',str(ROOT/'bin/spark'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 _,_,lock=m.configuration(argparse.Namespace(cluster_config='experiments/2026-10-03-balanced-policy/adaptive.json'))
 i=m.build_inputs(lock);tree=m.build_directory(i)/'src/nccl';assert not m.project_problems(tree,i['nccl'])
 s=(tree/'src/enqueue.cc').read_text();a=s.index('static void balanceSwitchlessThreads(');b=s.index('\n}\n',a)+3

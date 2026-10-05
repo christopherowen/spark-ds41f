@@ -19,7 +19,7 @@ from pathlib import Path
 base = sys.argv[1].rstrip("/")
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else 2048
 root = Path(__file__).resolve().parents[2]
-TEXTS = ["bin/spark3", "scripts/topology.py", "TODO.md", "README.md"]
+TEXTS = ["bin/spark", "scripts/topology.py", "TODO.md", "README.md"]
 model = json.load(urllib.request.urlopen(f"{base}/v1/models"))["data"][0]["id"]
 
 

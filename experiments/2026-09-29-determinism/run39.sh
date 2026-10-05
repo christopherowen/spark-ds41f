@@ -10,7 +10,7 @@ IMAGE=vllm-ds41f-kkref:04c30fa98e79-r5o
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
   experiments/2026-09-30-r5n/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 ssh -n dgx3 'mkdir -p /tmp/lookup/cache'
 scp -q $E/moe_position_replay.py dgx3:/tmp/lookup/
@@ -32,6 +32,6 @@ docker run --rm --gpus all --ipc=host $m $extra -w $B -e CUTE_DSL_ARCH=sm_121a -
 REMOTE
   grep -vE "Warning|warn\(" "$out/moe-position-replay-$mode.txt" | tail -12
 done
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

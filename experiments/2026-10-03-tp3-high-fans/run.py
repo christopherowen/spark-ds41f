@@ -96,7 +96,7 @@ def command(name, arguments, timeout):
 
 
 def main():
-    cli = runpy.run_path(str(ROOT / "bin/spark3"))
+    cli = runpy.run_path(str(ROOT / "bin/spark"))
     nodes = json.loads((ROOT / "config/nodes-tp3.local.json").read_text())
     controls = json.loads((RAW / "fan-controls.json").read_text())
     cooldown = json.loads((RAW / "cooldown.json").read_text())
@@ -130,7 +130,7 @@ def main():
             (RAW / "cooldown-complete.json").write_text(json.dumps({
                 "utc": now(), "elapsed_seconds": (datetime.now(timezone.utc) - start_time).total_seconds()}, indent=2))
             launched = True
-            assert command("start", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
+            assert command("start", ["env", "TMPDIR=/tmp", "bin/spark", "--cluster-config", CONFIG,
                                      "cluster", "start", "--replace", "--apply"], 3600) == 0
         # Preserve maximum fans through the check. The CLI's ordinary cooling
         # routine would restore automatic control when it owns no fan service.
@@ -150,7 +150,7 @@ def main():
         # Permit exactly that known doctor difference, after checking the full
         # live configuration; every other finding must still fail the run.
         verify = """import runpy,json
-m=runpy.run_path('bin/spark3')
+m=runpy.run_path('bin/spark')
 a=m['parser']().parse_args(['--cluster-config',%r,'doctor'])
 c,n,_=m['configuration'](a)
 errors,warnings=m['split_findings'](m['live_doctor'](c,n))
@@ -159,7 +159,7 @@ print(json.dumps({'errors':errors,'warnings':warnings,'expected_manual_fan_error
 assert set(errors)==expected, errors
 """ % CONFIG
         assert command("manual-fan-preflight", ["env", "TMPDIR=/tmp", "python3", "-c", verify], 180) == 0
-        result = command("bench", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
+        result = command("bench", ["env", "TMPDIR=/tmp", "bin/spark", "--cluster-config", CONFIG,
             "bench", "--suites", "quality,decode,prefill,prefix", "--min-samples", "3", "--max-samples", "3",
             "--seed", "0", "--prefill-text", "source", "--prefill-sizes", "1024,32768,65536,262144",
             "--prefill-repeats", "2", "--cool-below", "0", "--allow-mismatch",
@@ -169,7 +169,7 @@ assert set(errors)==expected, errors
     finally:
         if launched:
             try:
-                if command("stop-final" if resume_ready else "stop", ["env", "TMPDIR=/tmp", "bin/spark3", "--cluster-config", CONFIG,
+                if command("stop-final" if resume_ready else "stop", ["env", "TMPDIR=/tmp", "bin/spark", "--cluster-config", CONFIG,
                                     "cluster", "stop", "--apply", "--parallel"], 180):
                     restore_errors.append("coordinated stop failed")
             except BaseException as error:

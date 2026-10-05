@@ -15,7 +15,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 for n in dgx1 dgx2 dgx3; do
@@ -41,13 +41,13 @@ wait
 log "replays done"
 grep -hE "^\[|^layer|Error|Traceback" "$out/mhc-serving-replay-small.txt" "$out/engram-wkv-replay.txt" | cut -c1-300 | head -40
 log "start probe"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-lookup-mhc-bi-variant-probe.json cluster start --replace --apply \
+bin/spark --cluster-config $E/cluster-detm-r5o-lookup-mhc-bi-variant-probe.json cluster start --replace --apply \
   | grep -v 'docker run'
 python3 $E/trace_mixes.py http://10.0.1.71:8000 "$out/probe2" --repeats 1 --tokens 128 | tee "$out/probe2-runs.jsonl"
 log "probe2 exit ${PIPESTATUS[0]}"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 docker run --rm -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_probe.py:/a.py:ro -v $PWD/$out/probe2:/t:ro \
   --entrypoint python3 $IMAGE /a.py /t 2>&1 | grep -v Warn | tee "$out/probe2-analysis.txt"
 for prompt in json prose; do

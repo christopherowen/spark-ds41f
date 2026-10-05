@@ -7,7 +7,7 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[2]
-m = runpy.run_path(str(ROOT / 'bin/spark3'))
+m = runpy.run_path(str(ROOT / 'bin/spark'))
 args = m['parser']().parse_args(sys.argv[1:])
 cluster, nodes, _ = m['configuration'](args)
 errors, warnings = m['split_findings'](m['live_doctor'](cluster, nodes))

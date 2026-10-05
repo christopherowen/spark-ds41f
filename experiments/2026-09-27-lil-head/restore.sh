@@ -3,7 +3,7 @@
 set -eu
 cd ~/projects/spark3-vllm-ds41f
 for config in experiments/2026-09-27-lil-head/cluster-*.json; do
-  bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live || true
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live || true

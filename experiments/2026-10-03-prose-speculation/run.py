@@ -17,7 +17,7 @@ HOLD = Path.home() / 'spark3-hold.json'
 HOLDER = 'prose-speculation'
 COST = Path('/home/swank/projects/spark3-vllm-ds41f/cache/kkref/dspark-costs/prose-focus-20261003')
 IMAGE = 'sha256:aad8a74089ff379f5bc7905e86f9c7e2c053396d0a4027039e869c505ca7621b'
-m = runpy.run_path(str(ROOT / 'bin/spark3'))
+m = runpy.run_path(str(ROOT / 'bin/spark'))
 nodes = json.loads((ROOT / 'config/nodes-tp3.local.json').read_text())
 
 
@@ -83,7 +83,7 @@ def command(name, argv, timeout=900, fans=True):
 
 
 def cluster(action):
-    return ['bin/spark3', '--cluster-config', CONFIG, 'cluster', action, '--apply'] + (['--replace'] if action == 'start' else [])
+    return ['bin/spark', '--cluster-config', CONFIG, 'cluster', action, '--apply'] + (['--replace'] if action == 'start' else [])
 
 
 def cool(name):

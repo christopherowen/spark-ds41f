@@ -7,7 +7,7 @@ import runpy
 import sys
 
 ROOT = Path(__file__).resolve().parents[2]
-m = runpy.run_path(str(ROOT / 'bin/spark3'))
+m = runpy.run_path(str(ROOT / 'bin/spark'))
 raw, destination = map(Path, sys.argv[1:])
 arms = ('fresh', 'pinned-1', 'pinned-2')
 reports = {a: json.loads((raw / a / 'bench.json').read_text()) for a in arms}

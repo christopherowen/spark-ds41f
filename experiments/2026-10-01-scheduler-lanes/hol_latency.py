@@ -46,7 +46,7 @@ def post(path, body):
 
 def source_text():
     text = []
-    for pattern in ("bin/spark3", "scripts/*.py", "docs/*.md", "experiments/*/*.py", "experiments/*/README.md"):
+    for pattern in ("bin/spark", "scripts/*.py", "docs/*.md", "experiments/*/*.py", "experiments/*/README.md"):
         for path in sorted(ROOT.glob(pattern)):
             text.append(path.read_text(encoding="utf-8", errors="replace"))
     return "\n\n".join(text)
