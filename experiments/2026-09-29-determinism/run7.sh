@@ -12,7 +12,7 @@ mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 stop_all
@@ -20,7 +20,7 @@ for n in dgx1 dgx2 dgx3; do
   ssh -n "$n" "rm -f ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/dump ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/reset ~/projects/spark3-vllm-ds41f/cache/kkref/moe-checksums/rank*.pt 2>/dev/null; true"
 done
 log "start $ARM"
-bin/spark3 --cluster-config $E/cluster-$ARM.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-$ARM.json cluster start --replace --apply | grep -v 'docker run'
 dump() {
   for n in dgx1 dgx2 dgx3; do
     ssh -n "$n" "docker exec dsv41-karmic-kraken sh -c 'mkdir -p /cache/kkref/moe-checksums; touch /cache/kkref/moe-checksums/dump'"
@@ -46,5 +46,5 @@ for n in dgx1 dgx2 dgx3; do
 done
 ls -la "$out"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

@@ -8,31 +8,31 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark3", str(ROOT / "bin" / "spark3"))
-spec = importlib.util.spec_from_loader("spark3", loader)
-spark3 = importlib.util.module_from_spec(spec)
-loader.exec_module(spark3)
+loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
+spec = importlib.util.spec_from_loader("spark", loader)
+spark = importlib.util.module_from_spec(spec)
+loader.exec_module(spark)
 
 
 class DesktopTest(unittest.TestCase):
     def test_headless_node_passes(self) -> None:
-        self.assertEqual(spark3.desktop_problems("dgx1", "multi-user.target\ninactive\n"), [])
+        self.assertEqual(spark.desktop_problems("dgx1", "multi-user.target\ninactive\n"), [])
 
     def test_graphical_target_and_running_display_manager_are_reported(self) -> None:
-        problems = spark3.desktop_problems("dgx2", "graphical.target\nactive\n")
+        problems = spark.desktop_problems("dgx2", "graphical.target\nactive\n")
         self.assertEqual(len(problems), 2)
         self.assertIn("boots to graphical.target", problems[0])
         self.assertIn("display manager is active", problems[1])
 
     def test_display_manager_started_by_hand_is_reported(self) -> None:
-        problems = spark3.desktop_problems("dgx3", "multi-user.target\nactive\n")
+        problems = spark.desktop_problems("dgx3", "multi-user.target\nactive\n")
         self.assertEqual(
             problems,
             ["dgx3: display manager is active; run sudo systemctl disable --now display-manager.service"],
         )
 
     def test_missing_output_is_reported(self) -> None:
-        problems = spark3.desktop_problems("dgx1", "")
+        problems = spark.desktop_problems("dgx1", "")
         self.assertEqual(len(problems), 1)
         self.assertIn("unknown target", problems[0])
 
@@ -56,10 +56,10 @@ Boot0004* ubuntu\tHD(1,GPT,88df73c8-497a-4b1d-be95-4e318905d1fb,0x800,0x95000)/F
 
 class BootOrderTest(unittest.TestCase):
     def test_installed_os_first_passes(self) -> None:
-        self.assertEqual(spark3.boot_order_problems("dgx1", DGX1_BOOT), [])
+        self.assertEqual(spark.boot_order_problems("dgx1", DGX1_BOOT), [])
 
     def test_network_boot_first_is_reported(self) -> None:
-        problems = spark3.boot_order_problems("dgx3", DGX3_PXE_FIRST_BOOT)
+        problems = spark.boot_order_problems("dgx3", DGX3_PXE_FIRST_BOOT)
         self.assertEqual(len(problems), 1)
         self.assertIn("UEFI: PXE IPv4 Realtek PCIe 10 GBE Family Controller", problems[0])
         self.assertIn("BootOrder 0002,0004", problems[0])
@@ -67,11 +67,11 @@ class BootOrderTest(unittest.TestCase):
 
     def test_fixed_order_passes(self) -> None:
         fixed = DGX3_PXE_FIRST_BOOT.replace("BootOrder: 0002,0004", "BootOrder: 0004,0002")
-        self.assertEqual(spark3.boot_order_problems("dgx3", fixed), [])
+        self.assertEqual(spark.boot_order_problems("dgx3", fixed), [])
 
     def test_unreadable_boot_order_is_reported(self) -> None:
         self.assertEqual(
-            spark3.boot_order_problems("dgx2", ""),
+            spark.boot_order_problems("dgx2", ""),
             ["dgx2: cannot read the UEFI boot order"],
         )
 
@@ -94,42 +94,42 @@ FAN_WORKING = (
 
 
 def facts(**changes: str) -> dict[str, str]:
-    values = spark3.host_facts(FAN_WORKING)
+    values = spark.host_facts(FAN_WORKING)
     values.update(changes)
     return values
 
 
 class ModesetTest(unittest.TestCase):
     def test_kernel_mode_setting_passes(self) -> None:
-        self.assertEqual(spark3.modeset_problems("dgx1", facts()), [])
+        self.assertEqual(spark.modeset_problems("dgx1", facts()), [])
 
     def test_disabled_mode_setting_is_reported(self) -> None:
-        problems = spark3.modeset_problems("dgx1", facts(modeset="N"))
+        problems = spark.modeset_problems("dgx1", facts(modeset="N"))
         self.assertEqual(len(problems), 1)
         self.assertIn("modeset is N, expected Y", problems[0])
 
     def test_unreadable_mode_setting_is_reported(self) -> None:
-        problems = spark3.modeset_problems("dgx1", facts(modeset=""))
+        problems = spark.modeset_problems("dgx1", facts(modeset=""))
         self.assertIn("modeset is unreadable", problems[0])
 
 
 class ConsoleTest(unittest.TestCase):
     def test_working_console_passes(self) -> None:
-        self.assertEqual(spark3.fbdev_problems("dgx3", facts()), [])
-        self.assertEqual(spark3.drm_master_problems("dgx3", facts()), [])
-        self.assertEqual(spark3.console_mode_problems("dgx3", facts()), [])
+        self.assertEqual(spark.fbdev_problems("dgx3", facts()), [])
+        self.assertEqual(spark.drm_master_problems("dgx3", facts()), [])
+        self.assertEqual(spark.console_mode_problems("dgx3", facts()), [])
 
     def test_fbdev_off_is_reported(self) -> None:
-        problems = spark3.fbdev_problems("dgx3", facts(fbdev="N"))
+        problems = spark.fbdev_problems("dgx3", facts(fbdev="N"))
         self.assertEqual(len(problems), 1)
         self.assertIn("fbdev is N, expected Y", problems[0])
 
     def test_unreadable_fbdev_is_reported(self) -> None:
-        problems = spark3.fbdev_problems("dgx3", facts(fbdev=""))
+        problems = spark.fbdev_problems("dgx3", facts(fbdev=""))
         self.assertIn("fbdev is unreadable", problems[0])
 
     def test_drm_master_holder_is_reported(self) -> None:
-        problems = spark3.drm_master_problems(
+        problems = spark.drm_master_problems(
             "dgx3", facts(drm_masters="VLLM::Worker_TP/2855221")
         )
         self.assertEqual(
@@ -142,72 +142,72 @@ class ConsoleTest(unittest.TestCase):
         )
 
     def test_unreadable_drm_clients_are_reported(self) -> None:
-        problems = spark3.drm_master_problems("dgx3", facts(drm_masters="unreadable"))
+        problems = spark.drm_master_problems("dgx3", facts(drm_masters="unreadable"))
         self.assertIn("cannot read the DRM clients", problems[0])
-        missing = spark3.host_facts("modeset=Y\n")
-        self.assertIn("cannot read the DRM clients", spark3.drm_master_problems("dgx3", missing)[0])
+        missing = spark.host_facts("modeset=Y\n")
+        self.assertIn("cannot read the DRM clients", spark.drm_master_problems("dgx3", missing)[0])
 
     def test_graphics_mode_console_is_reported(self) -> None:
-        problems = spark3.console_mode_problems("dgx3", facts(console="tty1:1"))
+        problems = spark.console_mode_problems("dgx3", facts(console="tty1:1"))
         self.assertEqual(len(problems), 1)
         self.assertIn("the active console (tty1) is in graphics mode", problems[0])
 
     def test_unreadable_console_mode_is_reported(self) -> None:
-        problems = spark3.console_mode_problems("dgx3", facts(console="tty1:"))
+        problems = spark.console_mode_problems("dgx3", facts(console="tty1:"))
         self.assertEqual(problems, ["dgx3: cannot read the active console mode"])
 
     def test_splash_boot_is_reported_with_its_fix(self) -> None:
-        problems = spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1"))
+        problems = spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1"))
         self.assertEqual(len(problems), 1)
         self.assertIn("scripts/host-recovery apply", problems[0])
         self.assertIn("zz-spark-console.cfg", problems[0])
 
     def test_configured_splash_removal_waits_for_a_reboot(self) -> None:
-        problems = spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0"))
+        problems = spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0"))
         self.assertEqual(len(problems), 1)
         self.assertIn("reboot with the service stopped to apply", problems[0])
 
     def test_no_splash_passes(self) -> None:
-        self.assertEqual(spark3.splash_problems("dgx1", facts()), [])
+        self.assertEqual(spark.splash_problems("dgx1", facts()), [])
 
     def test_every_console_problem_names_a_fix(self) -> None:
         for problems in (
-            spark3.fbdev_problems("dgx3", facts(fbdev="N")),
-            spark3.console_mode_problems("dgx3", facts(console="tty1:1")),
-            spark3.modeset_problems("dgx3", facts(modeset="N")),
+            spark.fbdev_problems("dgx3", facts(fbdev="N")),
+            spark.console_mode_problems("dgx3", facts(console="tty1:1")),
+            spark.modeset_problems("dgx3", facts(modeset="N")),
         ):
             self.assertRegex(problems[0], r"; (run|remove) ")
 
     def test_modeset_message_names_the_carveout(self) -> None:
-        problems = spark3.modeset_problems("dgx1", facts(modeset="N"))
+        problems = spark.modeset_problems("dgx1", facts(modeset="N"))
         self.assertIn("display carve-out cannot be allocated", problems[0])
 
 
 class NvmeCoalescingTest(unittest.TestCase):
     def test_coalescing_off_and_service_masked_passes(self) -> None:
-        self.assertEqual(spark3.nvme_coalescing_warnings(
+        self.assertEqual(spark.nvme_coalescing_warnings(
             "dgx1", facts(nvme_coalescing="nvme0:00000000", nvme_coalescing_service="masked")), [])
 
     def test_missing_facts_pass(self) -> None:
-        self.assertEqual(spark3.nvme_coalescing_warnings("dgx1", facts()), [])
+        self.assertEqual(spark.nvme_coalescing_warnings("dgx1", facts()), [])
 
     def test_coalescing_on_is_reported_with_its_fix(self) -> None:
-        warnings = spark3.nvme_coalescing_warnings(
+        warnings = spark.nvme_coalescing_warnings(
             "dgx2", facts(nvme_coalescing="nvme0:0x00000107", nvme_coalescing_service="enabled"))
         self.assertEqual(len(warnings), 2)
         self.assertIn("nvme0=0x00000107", warnings[0])
         self.assertIn("systemctl mask --now nvidia-nvme-interrupt-coalescing.service", warnings[0])
         self.assertIn("next boot", warnings[1])
-        self.assertTrue(all(isinstance(w, spark3.Warn) for w in warnings))
+        self.assertTrue(all(isinstance(w, spark.Warn) for w in warnings))
 
     def test_enabled_service_alone_is_reported(self) -> None:
-        warnings = spark3.nvme_coalescing_warnings(
+        warnings = spark.nvme_coalescing_warnings(
             "dgx3", facts(nvme_coalescing="nvme0:00000000", nvme_coalescing_service="enabled"))
         self.assertEqual(len(warnings), 1)
         self.assertIn("next boot", warnings[0])
 
     def test_unreadable_controller_is_reported(self) -> None:
-        warnings = spark3.nvme_coalescing_warnings(
+        warnings = spark.nvme_coalescing_warnings(
             "dgx4", facts(nvme_coalescing="nvme0:", nvme_coalescing_service="masked"))
         self.assertEqual(len(warnings), 1)
         self.assertIn("cannot read", warnings[0])
@@ -215,7 +215,7 @@ class NvmeCoalescingTest(unittest.TestCase):
 
 class IdleServicesTest(unittest.TestCase):
     def test_idle_services_are_reported_with_their_fix(self) -> None:
-        problems = spark3.idle_service_warnings(
+        problems = spark.idle_service_warnings(
             "dgx2", facts(idle_services="bluetooth.service,snapd.socket")
         )
         self.assertEqual(len(problems), 1)
@@ -226,9 +226,9 @@ class IdleServicesTest(unittest.TestCase):
         self.assertIn("scripts/host-recovery apply", problems[0])
 
     def test_no_idle_services_pass(self) -> None:
-        self.assertEqual(spark3.idle_service_warnings("dgx2", facts()), [])
+        self.assertEqual(spark.idle_service_warnings("dgx2", facts()), [])
         self.assertEqual(
-            spark3.idle_service_warnings("dgx2", spark3.host_facts("modeset=Y\n")), []
+            spark.idle_service_warnings("dgx2", spark.host_facts("modeset=Y\n")), []
         )
 
     def test_warnings_do_not_fail_doctor(self) -> None:
@@ -237,7 +237,7 @@ class IdleServicesTest(unittest.TestCase):
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            status = spark3.report_doctor([], ["dgx2: snapd.service running"], live=True)
+            status = spark.report_doctor([], ["dgx2: snapd.service running"], live=True)
         self.assertEqual(status, 0)
         self.assertIn("WARN: dgx2: snapd.service running", output.getvalue())
         self.assertIn("configuration OK; live cluster matches with 1 warning", output.getvalue())
@@ -248,60 +248,60 @@ class IdleServicesTest(unittest.TestCase):
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            status = spark3.report_doctor(["dgx1: container is not running"], [], live=True)
+            status = spark.report_doctor(["dgx1: container is not running"], [], live=True)
         self.assertEqual(status, 1)
         self.assertIn("ERROR: dgx1: container is not running", output.getvalue())
 
     def test_query_lists_every_idle_unit(self) -> None:
-        for unit in spark3.IDLE_SERVICES:
-            self.assertIn(unit, spark3.HOST_FACTS_QUERY)
+        for unit in spark.IDLE_SERVICES:
+            self.assertIn(unit, spark.HOST_FACTS_QUERY)
         # fwupd.service itself runs legitimately after a manual fwupdmgr call.
-        self.assertIn("fwupd-refresh.timer", spark3.IDLE_SERVICES)
-        self.assertNotIn("fwupd.service", spark3.IDLE_SERVICES)
+        self.assertIn("fwupd-refresh.timer", spark.IDLE_SERVICES)
+        self.assertNotIn("fwupd.service", spark.IDLE_SERVICES)
 
 
 class SeverityTest(unittest.TestCase):
     """Required capabilities are errors; latent or minor findings are warnings."""
 
     def test_missing_nvidia_card_is_an_error(self) -> None:
-        self.assertEqual(spark3.drm_card_problems("dgx3", facts()), [])
-        self.assertEqual(spark3.drm_card_problems("dgx3", facts(drm_card="1")), [])
-        problems = spark3.drm_card_problems("dgx3", facts(drm_card=""))
+        self.assertEqual(spark.drm_card_problems("dgx3", facts()), [])
+        self.assertEqual(spark.drm_card_problems("dgx3", facts(drm_card="1")), [])
+        problems = spark.drm_card_problems("dgx3", facts(drm_card=""))
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark3.Warn)
+        self.assertNotIsInstance(problems[0], spark.Warn)
         self.assertIn("display carve-out cannot be allocated", problems[0])
 
     def test_required_display_pieces_are_errors(self) -> None:
         for problems in (
-            spark3.modeset_problems("dgx1", facts(modeset="N")),
-            spark3.fbdev_problems("dgx1", facts(fbdev="N")),
-            spark3.drm_master_problems("dgx1", facts(drm_masters="Xorg/123")),
-            spark3.console_mode_problems("dgx1", facts(console="tty1:1")),
+            spark.modeset_problems("dgx1", facts(modeset="N")),
+            spark.fbdev_problems("dgx1", facts(fbdev="N")),
+            spark.drm_master_problems("dgx1", facts(drm_masters="Xorg/123")),
+            spark.console_mode_problems("dgx1", facts(console="tty1:1")),
         ):
             self.assertEqual(len(problems), 1)
-            self.assertNotIsInstance(problems[0], spark3.Warn)
+            self.assertNotIsInstance(problems[0], spark.Warn)
 
     def test_latent_and_unreadable_findings_warn(self) -> None:
         for problems in (
-            spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1")),
-            spark3.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0")),
-            spark3.drm_master_problems("dgx1", facts(drm_masters="unreadable")),
-            spark3.console_mode_problems("dgx1", facts(console="tty1:")),
-            spark3.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
-            spark3.desktop_problems("dgx1", "graphical.target\ninactive\n"),
-            spark3.boot_order_problems("dgx1", ""),
+            spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="1")),
+            spark.splash_problems("dgx1", facts(cmdline_splash="1", grub_splash="0")),
+            spark.drm_master_problems("dgx1", facts(drm_masters="unreadable")),
+            spark.console_mode_problems("dgx1", facts(console="tty1:")),
+            spark.idle_service_warnings("dgx1", facts(idle_services="cups.service")),
+            spark.desktop_problems("dgx1", "graphical.target\ninactive\n"),
+            spark.boot_order_problems("dgx1", ""),
         ):
             self.assertEqual(len(problems), 1)
-            self.assertIsInstance(problems[0], spark3.Warn)
+            self.assertIsInstance(problems[0], spark.Warn)
 
     def test_running_display_manager_is_an_error(self) -> None:
-        problems = spark3.desktop_problems("dgx1", "multi-user.target\nactive\n")
+        problems = spark.desktop_problems("dgx1", "multi-user.target\nactive\n")
         self.assertEqual(len(problems), 1)
-        self.assertNotIsInstance(problems[0], spark3.Warn)
+        self.assertNotIsInstance(problems[0], spark.Warn)
 
     def test_split_findings_keeps_order(self) -> None:
-        errors, warnings = spark3.split_findings(
-            ["a", spark3.Warn("b"), "c", spark3.Warn("d")]
+        errors, warnings = spark.split_findings(
+            ["a", spark.Warn("b"), "c", spark.Warn("d")]
         )
         self.assertEqual(errors, ["a", "c"])
         self.assertEqual(warnings, ["b", "d"])
@@ -309,10 +309,10 @@ class SeverityTest(unittest.TestCase):
 
 class FanControlTest(unittest.TestCase):
     def test_working_fan_floor_passes(self) -> None:
-        self.assertEqual(spark3.fan_control_problems("dgx1", facts()), [])
+        self.assertEqual(spark.fan_control_problems("dgx1", facts()), [])
 
     def test_missing_dkms_module_is_the_only_report(self) -> None:
-        problems = spark3.fan_control_problems(
+        problems = spark.fan_control_problems(
             "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0", fan_service="/inactive")
         )
         self.assertEqual(
@@ -321,20 +321,20 @@ class FanControlTest(unittest.TestCase):
         )
 
     def test_unloaded_module_is_reported(self) -> None:
-        problems = spark3.fan_control_problems("dgx3", facts(fan_module="0"))
+        problems = spark.fan_control_problems("dgx3", facts(fan_module="0"))
         self.assertIn("dgx_ec_fan_control is not loaded", problems[0])
 
     def test_refused_cooling_device_is_reported(self) -> None:
         # dgx3 on firmware 5.36_0ACUM027: the driver loads, then the EC rejects
         # its capability read and it refuses to register the cooling device.
-        problems = spark3.fan_control_problems(
+        problems = spark.fan_control_problems(
             "dgx3", facts(fan_cooling_device="0", fan_service="disabled/inactive")
         )
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
 
     def test_stopped_daemon_is_reported(self) -> None:
-        problems = spark3.fan_control_problems("dgx1", facts(fan_service="enabled/failed"))
+        problems = spark.fan_control_problems("dgx1", facts(fan_service="enabled/failed"))
         self.assertEqual(
             problems, ["dgx1: dgx-fan-control.service is enabled/failed, expected enabled/active; "
                 "run sudo systemctl enable --now dgx-fan-control.service"]
@@ -357,22 +357,22 @@ rocep1s0f0 4 RoCEv2 0000:0000:0000:0000:0000:ffff:c0a8:0202 enp1s0f0np0
 
 class RoceGidTest(unittest.TestCase):
     def test_ipv4_roce_v2_at_the_configured_index_passes(self) -> None:
-        self.assertEqual(spark3.roce_gid_problems("dgx1", 3, ["rocep1s0f0"], HEALTHY_GIDS), [])
+        self.assertEqual(spark.roce_gid_problems("dgx1", 3, ["rocep1s0f0"], HEALTHY_GIDS), [])
 
     def test_shifted_gid_names_the_slot_and_interface(self) -> None:
-        problems = spark3.roce_gid_problems("dgx3", 3, ["rocep1s0f0"], SHIFTED_GIDS)
+        problems = spark.roce_gid_problems("dgx3", 3, ["rocep1s0f0"], SHIFTED_GIDS)
         self.assertEqual(len(problems), 1)
         self.assertIn("rocep1s0f0 GID index 3 is empty", problems[0])
         self.assertIn("index 4; re-activate enp1s0f0np0", problems[0])
 
     def test_ipv6_roce_v2_at_the_index_is_reported(self) -> None:
-        problems = spark3.roce_gid_problems("dgx1", 1, ["rocep1s0f0"], HEALTHY_GIDS)
+        problems = spark.roce_gid_problems("dgx1", 1, ["rocep1s0f0"], HEALTHY_GIDS)
         self.assertIn("GID index 1 is RoCEv2 fe80", problems[0])
         self.assertIn("at index 3", problems[0])
 
     def test_missing_device_and_missing_ipv4_are_reported(self) -> None:
         output = "rocep1s0f1 missing\nrocep1s0f0 1 RoCEv2 fe80:0000:0000:0000:4ebb:47ff:fee9:7f2b enp1s0f0np0\n"
-        problems = spark3.roce_gid_problems("dgx2", 3, ["rocep1s0f0", "rocep1s0f1"], output)
+        problems = spark.roce_gid_problems("dgx2", 3, ["rocep1s0f0", "rocep1s0f1"], output)
         self.assertEqual(
             problems,
             [
@@ -384,20 +384,20 @@ class RoceGidTest(unittest.TestCase):
 
 class ClockLatchTest(unittest.TestCase):
     def test_serving_node_at_full_clock_passes(self) -> None:
-        self.assertEqual(spark3.clock_latch_problems("dgx1", facts(gpu="2411, 11.47"), True), [])
+        self.assertEqual(spark.clock_latch_problems("dgx1", facts(gpu="2411, 11.47"), True), [])
 
     def test_latched_serving_node_is_reported(self) -> None:
         # dgx3 on 2026-09-26: 520-565 MHz at about 10 W, ignoring nvidia-smi -lgc.
-        problems = spark3.clock_latch_problems("dgx3", facts(gpu="559, 9.90"), True)
+        problems = spark.clock_latch_problems("dgx3", facts(gpu="559, 9.90"), True)
         self.assertEqual(len(problems), 1)
         self.assertIn("GPU clock is 559 MHz at 9.90 W while serving", problems[0])
 
     def test_idle_node_without_the_service_is_not_judged(self) -> None:
-        self.assertEqual(spark3.clock_latch_problems("dgx2", facts(gpu="208, 4.1"), False), [])
+        self.assertEqual(spark.clock_latch_problems("dgx2", facts(gpu="208, 4.1"), False), [])
 
     def test_unreadable_clock_is_reported(self) -> None:
         self.assertEqual(
-            spark3.clock_latch_problems("dgx2", facts(gpu=""), True),
+            spark.clock_latch_problems("dgx2", facts(gpu=""), True),
             ["dgx2: cannot read the GPU clock"],
         )
 
@@ -407,18 +407,18 @@ class SiteNodesTest(unittest.TestCase):
     def test_missing_site_file_points_at_the_example(self) -> None:
         import tempfile
 
-        original = spark3.ROOT
+        original = spark.ROOT
         with tempfile.TemporaryDirectory() as directory:
-            spark3.ROOT = Path(directory)
+            spark.ROOT = Path(directory)
             try:
                 with self.assertRaises(SystemExit) as raised:
-                    spark3.site_nodes()
+                    spark.site_nodes()
             finally:
-                spark3.ROOT = original
+                spark.ROOT = original
         self.assertIn("config/nodes.example.json", str(raised.exception))
 
     def test_example_is_a_complete_site_file(self) -> None:
-        example = spark3.json.loads((ROOT / "config" / "nodes.example.json").read_text())
+        example = spark.json.loads((ROOT / "config" / "nodes.example.json").read_text())
         self.assertEqual(sum(node["head"] for node in example["nodes"]), 1)
         for node in example["nodes"]:
             self.assertEqual(set(node), {"name", "rank", "management_ip", "head", "roce_peer_hcas"})
@@ -437,18 +437,18 @@ class CoolingTest(unittest.TestCase):
             if command[:2] == ("sh", "-c"):
                 values = readings[node["name"]]
                 value = values.pop(0) if len(values) > 1 else values[0]
-                return spark3.subprocess.CompletedProcess(command, 0, f"{int(value * 1000)}\n", "")
+                return spark.subprocess.CompletedProcess(command, 0, f"{int(value * 1000)}\n", "")
             if command[:3] == ("systemctl", "is-active", "--quiet"):
-                return spark3.subprocess.CompletedProcess(command, 0 if service_active else 3, "", "")
-            return spark3.subprocess.CompletedProcess(command, 0, "", "")
+                return spark.subprocess.CompletedProcess(command, 0 if service_active else 3, "", "")
+            return spark.subprocess.CompletedProcess(command, 0, "", "")
 
-        original = spark3.run_ssh
-        spark3.run_ssh = fake_ssh
+        original = spark.run_ssh
+        spark.run_ssh = fake_ssh
         try:
             nodes = {"ssh_user": "u", "nodes": [{"name": n} for n in temps]}
-            records = spark3.cool_nodes(nodes, nodes["nodes"], 55.0, timeout, poll_s=0)
+            records = spark.cool_nodes(nodes, nodes["nodes"], 55.0, timeout, poll_s=0)
         finally:
-            spark3.run_ssh = original
+            spark.run_ssh = original
         return records, calls
 
     @staticmethod
@@ -485,32 +485,32 @@ class CoolingTest(unittest.TestCase):
         def fake_ssh(nodes, node, *command):
             calls.append((node["name"], *command))
             out = "70000\n" if command[:2] == ("sh", "-c") else ""
-            return spark3.subprocess.CompletedProcess(command, 0, out, "")
+            return spark.subprocess.CompletedProcess(command, 0, out, "")
 
-        original = spark3.run_ssh
-        spark3.run_ssh = fake_ssh
+        original = spark.run_ssh
+        spark.run_ssh = fake_ssh
         try:
             nodes = {"ssh_user": "u", "nodes": [{"name": "dgx1"}, {"name": "dgx4"}]}
             with self.assertRaises(RuntimeError):
-                spark3.cool_nodes(nodes, nodes["nodes"], 55.0, 0.0, poll_s=0)
+                spark.cool_nodes(nodes, nodes["nodes"], 55.0, 0.0, poll_s=0)
         finally:
-            spark3.run_ssh = original
+            spark.run_ssh = original
         for node in ("dgx1", "dgx4"):
             self.assertEqual(self.fan_commands(calls, node)[-1],
                              ("sudo", "-n", "systemctl", "start", "dgx-fan-control.service"))
 
     def test_unreadable_node_stops_before_touching_fans(self) -> None:
         def fake_ssh(nodes, node, *command):
-            return spark3.subprocess.CompletedProcess(command, 0, "", "")
+            return spark.subprocess.CompletedProcess(command, 0, "", "")
 
-        original = spark3.run_ssh
-        spark3.run_ssh = fake_ssh
+        original = spark.run_ssh
+        spark.run_ssh = fake_ssh
         try:
             nodes = {"ssh_user": "u", "nodes": [{"name": "dgx2"}]}
             with self.assertRaises(RuntimeError):
-                spark3.cool_nodes(nodes, nodes["nodes"], 55.0, 600.0, poll_s=0)
+                spark.cool_nodes(nodes, nodes["nodes"], 55.0, 600.0, poll_s=0)
         finally:
-            spark3.run_ssh = original
+            spark.run_ssh = original
 
 class MountTestScriptTest(unittest.TestCase):
     def test_one_script_reports_exactly_the_unavailable_sources(self) -> None:
@@ -524,7 +524,7 @@ class MountTestScriptTest(unittest.TestCase):
                 ["{home}/missing dir", "/b", "rw"],
                 ["{home}/ok", "/c", "rw"],
             ]}}
-            result = subprocess.run(["sh", "-c", spark3.mount_test_script(cluster)],
+            result = subprocess.run(["sh", "-c", spark.mount_test_script(cluster)],
                                     capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.splitlines(), [f"rw {home}/missing dir"])
@@ -554,30 +554,30 @@ class ClusterReplaceTest(unittest.TestCase):
 
         import subprocess
         patches = [
-            mock.patch.object(spark3, "configuration", return_value=(cluster, nodes, {})),
-            mock.patch.object(spark3, "cluster_config_path", return_value=(None, "config/cluster.json")),
-            mock.patch.object(spark3, "rendered_docker_command", return_value=["docker", "run"]),
-            mock.patch.object(spark3, "require_local_deployment_state", return_value="rev"),
-            mock.patch.object(spark3, "remote_runtime_problems", return_value=[]),
-            mock.patch.object(spark3, "stop_memguard",
+            mock.patch.object(spark, "configuration", return_value=(cluster, nodes, {})),
+            mock.patch.object(spark, "cluster_config_path", return_value=(None, "config/cluster.json")),
+            mock.patch.object(spark, "rendered_docker_command", return_value=["docker", "run"]),
+            mock.patch.object(spark, "require_local_deployment_state", return_value="rev"),
+            mock.patch.object(spark, "remote_runtime_problems", return_value=[]),
+            mock.patch.object(spark, "stop_memguard",
                               side_effect=lambda c, n, node: guards.discard(node["name"])),
-            mock.patch.object(spark3, "start_memguard",
+            mock.patch.object(spark, "start_memguard",
                               side_effect=lambda c, n, node, *rest, **kw: guards.add(node["name"])),
-            mock.patch.object(spark3, "start_memguards"),
-            mock.patch.object(spark3, "wait_for_api"),
-            mock.patch.object(spark3, "memguard_is_active",
+            mock.patch.object(spark, "start_memguards"),
+            mock.patch.object(spark, "wait_for_api"),
+            mock.patch.object(spark, "memguard_is_active",
                               side_effect=lambda c, n, node: node["name"] in guards),
-            mock.patch.object(spark3, "run_ssh", side_effect=run_ssh),
-            mock.patch.object(spark3, "preserve_failed_start_logs", return_value=None),
-            mock.patch.object(spark3, "restore_containers"),
+            mock.patch.object(spark, "run_ssh", side_effect=run_ssh),
+            mock.patch.object(spark, "preserve_failed_start_logs", return_value=None),
+            mock.patch.object(spark, "restore_containers"),
         ]
         for patch in patches:
             patch.start()
         try:
             args = argparse.Namespace(apply=True, replace=True, cluster_config="config/cluster.json")
             with mock.patch("sys.stdout"), mock.patch("sys.stderr"):
-                code = spark3.command_cluster_start(args)
-            restore = spark3.restore_containers
+                code = spark.command_cluster_start(args)
+            restore = spark.restore_containers
             return code, calls, restore
         finally:
             for patch in patches:
@@ -602,11 +602,11 @@ class ClusterReplaceTest(unittest.TestCase):
 
 class KernelPolicyPathTest(unittest.TestCase):
     def test_default_and_experiment(self):
-        self.assertEqual(spark3.kernel_policy_path({}), ROOT / "config/kernel-trial.json")
-        self.assertEqual(spark3.kernel_policy_path({"host": {"kernel_policy": "experiments/policy.json"}}),
+        self.assertEqual(spark.kernel_policy_path({}), ROOT / "config/kernel-trial.json")
+        self.assertEqual(spark.kernel_policy_path({"host": {"kernel_policy": "experiments/policy.json"}}),
                          ROOT / "experiments/policy.json")
 
     def test_outside_repository_rejected(self):
         for path in ("../policy.json", "/tmp/policy.json"):
             with self.assertRaises(ValueError):
-                spark3.kernel_policy_path({"host": {"kernel_policy": path}})
+                spark.kernel_policy_path({"host": {"kernel_policy": path}})

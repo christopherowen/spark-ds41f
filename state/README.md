@@ -10,7 +10,7 @@ promoted deployment, not node-local configuration:
 
 Their SHA-256 values are recorded under `deployment_artifacts` in
 `manifests/sources/2026-09-20-active-source.json` and checked by
-`bin/spark3 doctor`. Regenerate them from the recorded inputs; do not edit a
+`bin/spark doctor`. Regenerate them from the recorded inputs; do not edit a
 copy on an individual Spark.
 
 No credentials, tokens, private keys, or machine-local environment files belong

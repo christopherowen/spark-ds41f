@@ -17,7 +17,7 @@ import time
 
 import mesh_fabric as fabric
 
-PROBE = 'spark3-collective-probe'
+PROBE = 'spark-collective-probe'
 
 
 def execute(command):
@@ -45,7 +45,7 @@ def run(args):
     if os.geteuid() != 0:
         raise ValueError('the fabric probe requires sudo')
     # One host owner. Do not replace somebody else's route, filter or container.
-    with open('/run/lock/spark3-mesh-probe.lock', 'w') as lock:
+    with open('/run/lock/spark-mesh-probe.lock', 'w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         errors, fixes = fabric.findings(node, fabric.inventory(node))
         if errors:

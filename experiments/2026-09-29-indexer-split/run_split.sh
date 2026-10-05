@@ -13,13 +13,13 @@ mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-29-r5k/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$E/cluster-$1.json" cluster start --replace --apply | grep -v 'docker run'
 }
 start split-check
 python3 $E/capture_depth.py http://10.0.1.71:8000 --rounds 1 --background 4 | tee "$out/split-check-depth.jsonl"
@@ -32,12 +32,12 @@ done | tee "$out/split-check-logs.txt"
 start split
 python3 $E/capture_depth.py http://10.0.1.71:8000 --rounds 2 | tee "$out/split-depth.jsonl"
 log "split capture exit ${PIPESTATUS[0]}"
-bin/spark3 --cluster-config "$E/cluster-split.json" bench --allow-mismatch --compare none \
+bin/spark --cluster-config "$E/cluster-split.json" bench --allow-mismatch --compare none \
   --suites quality,decode,prefill --decode-cases prose,code \
   --concurrency 1,8 --min-samples 3 --max-samples 3 --prefill-text source \
   --output "results/private/bench/indexer-split-split"
 log "bench exit $?"
 stop_all
 log "restore promoted configuration"
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

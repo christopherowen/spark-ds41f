@@ -1,15 +1,15 @@
 #!/bin/bash
 # usage: build.sh   (on dgx1, deployment checkout at this experiment's commit, service stopped)
-# Builds the r4b candidate image with bin/spark3 build and copies it to the
+# Builds the r4b candidate image with bin/spark build and copies it to the
 # other nodes, checking that every node holds one image ID.
 set -eu
 cd ~/projects/spark3-vllm-ds41f
 TAG=vllm-ds41f-kkref:01f1b874c774-r4b
 log() { echo "$(date -u +%FT%TZ) $*"; }
 log "build prepare"
-bin/spark3 build prepare
+bin/spark build prepare
 log "build image $TAG"
-bin/spark3 build image --apply --tag "$TAG"
+bin/spark build image --apply --tag "$TAG"
 local_id=$(docker image inspect "$TAG" --format '{{.Id}}')
 for host in dgx2 dgx3; do
   log "copy image to $host"

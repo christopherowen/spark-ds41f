@@ -56,7 +56,7 @@ apt), and NVIDIA's DGX Dashboard, whose periodic update checks
 PackageKit. Re-enable the dashboard with
 `sudo systemctl enable --now dgx-dashboard.service dgx-dashboard-admin.service`
 when its web interface is wanted.
-`check` and `bin/spark3 doctor --live` warn about any that is enabled or running;
+`check` and `bin/spark doctor --live` warn about any that is enabled or running;
 a warning never fails either command or blocks a benchmark.
 fwupd stays installed: it delivers the embedded-controller, UEFI, ConnectX-7
 and NVMe firmware from LVFS. `apply` disables only its daily refresh timer and

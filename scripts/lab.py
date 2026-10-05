@@ -13,11 +13,11 @@ usage (on dgx1, from the deployment checkout):
   scripts/lab.py watchdog [--max-age SECONDS] [--once]
 
 A window holds the cluster for one experiment session. While it is open the hold file
-(~/spark3-hold.json on dgx1) names this runner as holder; other agents must not stop,
+(~/spark-hold.json on dgx1) names this runner as holder; other agents must not stop,
 restart, sync or benchmark the cluster, and this runner refuses to open a window over a
 hold someone else wrote. Jobs inside a window run back to back with no restore of r5o in
 between; the window closes (r5o booted, doctor --live, hold removed) when the run ends,
-when a job fails, when someone writes ~/spark3-request.json, or at its time cap. A
+when a job fails, when someone writes ~/spark-request.json, or at its time cap. A
 watchdog started with the window closes it if the runner stops refreshing the heartbeat.
 
 A queue runner opens one window and runs queued specs back to back (oldest first), so the
@@ -55,15 +55,19 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-_loader = importlib.machinery.SourceFileLoader("spark3", str(ROOT / "bin" / "spark3"))
-_spec = importlib.util.spec_from_loader("spark3", _loader)
-spark3 = importlib.util.module_from_spec(_spec)
-_loader.exec_module(spark3)
+_loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
+_spec = importlib.util.spec_from_loader("spark", _loader)
+spark = importlib.util.module_from_spec(_spec)
+_loader.exec_module(spark)
 
-HOLD = Path.home() / "spark3-hold.json"
-LAB_HOME = Path.home() / "spark3-lab"
-REQUEST = Path.home() / "spark3-request.json"
-HOLDER_PREFIX = "spark3-lab"
+HOLD = Path.home() / "spark-hold.json"
+LAB_HOME = Path.home() / "spark-lab"
+REQUEST = Path.home() / "spark-request.json"
+# The names before the project was renamed from spark3: a hold or request an
+# agent still writes there counts the same.
+LEGACY_HOLD = Path.home() / "spark3-hold.json"
+LEGACY_REQUEST = Path.home() / "spark3-request.json"
+HOLDER_PREFIX = "spark-lab"
 CONTAINER = "dsv41-karmic-kraken"
 CANDIDATE = "/opt/spark3/candidate"
 # The GPU's DRM card by PCI path, as the serving container mounts it for the display carve-out.
@@ -122,7 +126,7 @@ def write_json_atomic(path: Path, data: dict) -> None:
 
 
 def nodes_config() -> dict:
-    return spark3.configuration()[1]
+    return spark.configuration()[1]
 
 
 def head_url() -> str:
@@ -132,13 +136,15 @@ def head_url() -> str:
 
 # ---------------------------------------------------------------- hold file and guards
 
-def read_hold(path: Path = HOLD) -> dict | None:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return None
-    except json.JSONDecodeError:
-        return {"holder": "unreadable hold file"}
+def read_hold(path: Path | None = None) -> dict | None:
+    for candidate in (path,) if path else (HOLD, LEGACY_HOLD):
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError:
+            return {"holder": "unreadable hold file"}
+    return None
 
 
 def hold_is_ours(hold: dict | None) -> bool:
@@ -177,8 +183,9 @@ def beat(note: str | None = None) -> None:
 
 def window_should_close(hold: dict, at: float | None = None) -> str | None:
     at = time.time() if at is None else at
-    if REQUEST.exists():
-        return f"cluster requested ({REQUEST})"
+    for request in (REQUEST, LEGACY_REQUEST):
+        if request.exists():
+            return f"cluster requested ({request})"
     if at > parse_time(hold["expected_end"]):
         return "time cap reached"
     return None
@@ -217,12 +224,12 @@ def published_problems() -> list[str]:
                           capture_output=True).stdout.strip()
     if subprocess.run(["git", "-C", str(ROOT), "merge-base", "--is-ancestor", "HEAD", "origin/main"]).returncode:
         problems.append(f"deployment commit {head[:8]} is not on origin/main")
-    cluster, nodes, _ = spark3.configuration()
-    repo = spark3.repository_path(cluster)
+    cluster, nodes, _ = spark.configuration()
+    repo = spark.repository_path(cluster)
     for node in nodes["nodes"]:
         if node["head"]:
             continue
-        theirs = spark3.run_ssh(nodes, node, "git", "-C", repo, "rev-parse", "HEAD").stdout.strip()
+        theirs = spark.run_ssh(nodes, node, "git", "-C", repo, "rev-parse", "HEAD").stdout.strip()
         if theirs != head:
             problems.append(f"{node['name']} checkout {theirs[:8]} differs from {head[:8]}")
     return problems
@@ -230,8 +237,8 @@ def published_problems() -> list[str]:
 
 # ---------------------------------------------------------------- cluster actions
 
-def spark3_cli(*arguments: str, dry: bool = False, capture: list | None = None) -> int:
-    command = [sys.executable, str(ROOT / "bin" / "spark3"), *arguments]
+def spark_cli(*arguments: str, dry: bool = False, capture: list | None = None) -> int:
+    command = [sys.executable, str(ROOT / "bin" / "spark"), *arguments]
     if dry:
         print("  $ " + shlex.join(command[1:]))
         return 0
@@ -245,7 +252,7 @@ def spark3_cli(*arguments: str, dry: bool = False, capture: list | None = None) 
 
 
 def ready_seconds(lines: list[str]) -> float | None:
-    """Seconds from launch to ready, from bin/spark3's 'cluster ready ... (+N.Ns)' line."""
+    """Seconds from launch to ready, from bin/spark's 'cluster ready ... (+N.Ns)' line."""
     for line in lines:
         found = re.search(r"cluster ready.*\(\+([0-9.]+)s\)", line)
         if found:
@@ -256,14 +263,14 @@ def ready_seconds(lines: list[str]) -> float | None:
 def boot(config: str, dry: bool = False) -> bool:
     # A lab window restores the promoted physical fabric. It cannot undo
     # recabling or safely clean up a candidate with a different node set.
-    candidate_nodes = spark3.configuration(argparse.Namespace(cluster_config=config))[1]
+    candidate_nodes = spark.configuration(argparse.Namespace(cluster_config=config))[1]
     if candidate_nodes != nodes_config():
         log("lab windows require the promoted node topology; qualify a new fabric "
             "with explicit cluster commands before using it in lab runs")
         return False
     log(f"start {config}")
     started, lines = time.time(), []
-    ok = spark3_cli("--cluster-config", config, "cluster", "start", "--replace", "--apply", dry=dry,
+    ok = spark_cli("--cluster-config", config, "cluster", "start", "--replace", "--apply", dry=dry,
                     capture=lines) == 0
     if not dry:
         log(f"boot {Path(config).name}: ready +{ready_seconds(lines)} s, command {time.time() - started:.0f} s"
@@ -273,11 +280,11 @@ def boot(config: str, dry: bool = False) -> bool:
 
 def stop_cluster(dry: bool = False) -> bool:
     log("stop")
-    return spark3_cli("cluster", "stop", "--remove", "--apply", "--parallel", dry=dry) == 0
+    return spark_cli("cluster", "stop", "--remove", "--apply", "--parallel", dry=dry) == 0
 
 
 def production_live() -> bool:
-    process = subprocess.run([sys.executable, str(ROOT / "bin" / "spark3"), "doctor", "--live"], cwd=ROOT,
+    process = subprocess.run([sys.executable, str(ROOT / "bin" / "spark"), "doctor", "--live"], cwd=ROOT,
                              text=True, capture_output=True)
     return process.returncode == 0 and "live cluster matches" in process.stdout
 
@@ -286,7 +293,7 @@ def restore_production(dry: bool = False) -> bool:
     if not dry and production_live():
         log("r5o already serving")
         return True
-    ok = boot(spark3.DEFAULT_CLUSTER_CONFIG, dry=dry)
+    ok = boot(spark.DEFAULT_CLUSTER_CONFIG, dry=dry)
     if not dry:
         ok = production_live() and ok
         log("doctor --live " + ("OK" if ok else "FAILED"))
@@ -298,7 +305,7 @@ def container_running(node: dict | None = None) -> bool:
     if node is None:
         output = subprocess.run(command, text=True, capture_output=True).stdout
     else:
-        output = spark3.run_ssh(nodes_config(), node, *command).stdout
+        output = spark.run_ssh(nodes_config(), node, *command).stdout
     return bool(output.strip())
 
 
@@ -389,7 +396,7 @@ def fence_problems(mounts: list, image: str, home: str, read_image=None) -> list
     An overlay built from an older B12X tree silently drops fences the image gained; the
     gemv-geom and mhc-mt overlays did exactly that before r5o.
     """
-    read_image = read_image or (lambda path: image_file(image, path, Path.home() / ".cache" / "spark3-lab"))
+    read_image = read_image or (lambda path: image_file(image, path, Path.home() / ".cache" / "spark-lab"))
     problems = []
     for source, destination, _mode in mounts:
         if not (destination.startswith(f"{CANDIDATE}/b12x/") and destination.endswith(".py")):
@@ -541,7 +548,7 @@ def describe_step(step: dict) -> str:
     if step["kind"] == "boot":
         return f"boot {step['config']} ({step['label']})"
     if step["kind"] == "cli":
-        return "bin/spark3 " + shlex.join(step["argv"])
+        return "bin/spark " + shlex.join(step["argv"])
     if step["kind"] == "script":
         return "python3 " + shlex.join(step["argv"]) + f" > {step['out']}"
     if step["kind"] == "profile":
@@ -574,7 +581,7 @@ def run_script(step: dict) -> int:
 def fresh_inventory() -> None:
     nodes = nodes_config()
     for node in nodes["nodes"]:
-        spark3.run_ssh(nodes, node, "docker", "exec", CONTAINER, "sh", "-c",
+        spark.run_ssh(nodes, node, "docker", "exec", CONTAINER, "sh", "-c",
                        f"rm -f {TRACE_LOG_DIR}/inventory-* {TRACE_LOG_DIR}/plans-*")
 
 
@@ -618,13 +625,13 @@ def profile_workload(step: dict) -> None:
     container_dir = profiler_dir(step["config"])
     host_relative = container_dir.replace("/cache/", "cache/", 1)
     nodes = nodes_config()
-    repo = spark3.repository_path(spark3.configuration()[0])
+    repo = spark.repository_path(spark.configuration()[0])
     out = ROOT / step["out"]
     out.mkdir(parents=True, exist_ok=True)
     workload = step["workload"]
 
     def in_container(node: dict, script: str) -> subprocess.CompletedProcess:
-        return spark3.run_ssh(nodes, node, "docker", "exec", CONTAINER, "sh", "-c", script)
+        return spark.run_ssh(nodes, node, "docker", "exec", CONTAINER, "sh", "-c", script)
 
     def each(function):
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes["nodes"])) as pool:
@@ -638,7 +645,7 @@ def profile_workload(step: dict) -> None:
     log(f"profile {step['label']} {workload} exit {code}")
 
     def trace_bytes(node: dict) -> int:
-        result = spark3.run_ssh(nodes, node, "sh", "-c",
+        result = spark.run_ssh(nodes, node, "sh", "-c",
                                 f"cat {repo}/{host_relative}/*rank*.json.gz 2>/dev/null | wc -c")
         return int(result.stdout.strip() or 0)
 
@@ -657,8 +664,8 @@ def profile_workload(step: dict) -> None:
     def fetch(node: dict) -> None:
         target = out / f"{workload}-trace" / node["name"]
         target.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["rsync", "-a", "-e", "ssh " + " ".join(spark3.ssh_options()),
-                        f"{spark3.ssh_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
+        subprocess.run(["rsync", "-a", "-e", "ssh " + " ".join(spark.ssh_options()),
+                        f"{spark.ssh_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
                        check=False)
 
     each(fetch)
@@ -709,7 +716,7 @@ def sync_checkouts() -> bool:
         return False
     head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"], text=True,
                           capture_output=True).stdout.strip()
-    ok = spark3_cli("cluster", "sync", "--apply") == 0
+    ok = spark_cli("cluster", "sync", "--apply") == 0
     log(f"sync to {head} " + ("OK" if ok else "FAILED"))
     return ok
 
@@ -808,42 +815,42 @@ def summarize_analysis(out: Path) -> dict:
 
 
 def run_kernel_bundles(step: dict) -> list[dict]:
-    """Ship each bundle to ~/spark3-lab on its node and run kernel-local there, nodes concurrently.
+    """Ship each bundle to ~/spark-lab on its node and run kernel-local there, nodes concurrently.
 
     Bundles, their inputs and outputs stay outside the deployment checkout: a bundle under
     development never dirties a node's checkout (a dirty checkout blocks cluster start), and
     ignored files never enter a checkout by copy. Paths listed under "sync" (inputs such as
-    captures, kept out of git) go to ~/spark3-lab/inputs/<path> on the other nodes.
+    captures, kept out of git) go to ~/spark-lab/inputs/<path> on the other nodes.
     """
     nodes = nodes_config()
-    cluster, _, _ = spark3.configuration()
-    repo = spark3.repository_path(cluster)
+    cluster, _, _ = spark.configuration()
+    repo = spark.repository_path(cluster)
     run = Path(step["out"]).name
     home = cluster["host"]["home"]
 
     def rsync(node: dict, source: Path, destination: str) -> None:
-        spark3.run_ssh(nodes, node, "mkdir", "-p", str(Path(destination).parent))
+        spark.run_ssh(nodes, node, "mkdir", "-p", str(Path(destination).parent))
         subprocess.run(["rsync", "-a", "--delete" if source.is_dir() else "--checksum",
-                        "-e", "ssh " + " ".join(spark3.ssh_options()),
+                        "-e", "ssh " + " ".join(spark.ssh_options()),
                         f"{source}/" if source.is_dir() else str(source),
-                        f"{spark3.ssh_target(nodes, node)}:{destination}{'/' if source.is_dir() else ''}"],
+                        f"{spark.ssh_target(nodes, node)}:{destination}{'/' if source.is_dir() else ''}"],
                        check=False)
 
     def one(entry: dict) -> dict:
-        node = spark3.node_by_name(nodes, entry["node"])
+        node = spark.node_by_name(nodes, entry["node"])
         bundle = ROOT / entry["bundle"]
         candidate = json.loads((bundle / "candidate.json").read_text())
-        remote = f"{home}/spark3-lab/bundles/{run}/{bundle.name}"
-        out = f"{home}/spark3-lab/results/{run}/{bundle.name}-{entry['node']}"
+        remote = f"{home}/spark-lab/bundles/{run}/{bundle.name}"
+        out = f"{home}/spark-lab/results/{run}/{bundle.name}-{entry['node']}"
         rsync(node, bundle, remote)
         if not node["head"]:
             for relative in candidate.get("sync", []):
-                rsync(node, ROOT / relative, f"{home}/spark3-lab/inputs/{relative}")
-        process = spark3.run_ssh(nodes, node, "bash", "-lc",
+                rsync(node, ROOT / relative, f"{home}/spark-lab/inputs/{relative}")
+        process = spark.run_ssh(nodes, node, "bash", "-lc",
                                  f"cd {shlex.quote(repo)} && python3 scripts/lab.py kernel-local "
                                  f"{shlex.quote(remote)} --out {shlex.quote(out)}")
         verdict = {"node": entry["node"], "bundle": entry["bundle"], "exit": process.returncode}
-        fetched = spark3.run_ssh(nodes, node, "cat", f"{out}/verdict.json")
+        fetched = spark.run_ssh(nodes, node, "cat", f"{out}/verdict.json")
         if fetched.returncode == 0:
             verdict.update(json.loads(fetched.stdout))
         else:
@@ -852,8 +859,8 @@ def run_kernel_bundles(step: dict) -> list[dict]:
 
     # Same thermal starting point as a bench: every node below the cooling threshold.
     names = sorted({entry["node"] for entry in step["bundles"]})
-    spark3.cool_nodes(nodes, [spark3.node_by_name(nodes, name) for name in names],
-                      spark3.COOL_BELOW_C, spark3.COOL_TIMEOUT_S)
+    spark.cool_nodes(nodes, [spark.node_by_name(nodes, name) for name in names],
+                      spark.COOL_BELOW_C, spark.COOL_TIMEOUT_S)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(step["bundles"])) as pool:
         verdicts = list(pool.map(one, step["bundles"]))
     local = ROOT / step["out"]
@@ -883,7 +890,7 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
     hold = read_hold()
     if not hold_is_ours(hold):
         window_open(spec.get("minutes", DEFAULT_MINUTES), f"run {spec['run']}")
-    home = spark3.configuration()[0]["host"]["home"]
+    home = spark.configuration()[0]["host"]["home"]
     checked = set()
     failed = None
     current = {"note": "starting"}
@@ -926,7 +933,7 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
                 failed = f"boot of {step['config']} failed"
                 break
         elif step["kind"] == "cli":
-            log(f"bench {step['label']} exit {spark3_cli(*step['argv'])}")
+            log(f"bench {step['label']} exit {spark_cli(*step['argv'])}")
         elif step["kind"] == "script":
             log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
         elif step["kind"] == "sync":
@@ -1058,12 +1065,12 @@ def queue_status() -> None:
 
 def compile_cache(candidate: dict) -> Path:
     """Per-node compile caches shared by every bundle; the GPU lock keeps jobs one at a time."""
-    return Path(os.path.expanduser(candidate.get("cache", "~/.cache/spark3-lab/compile")))
+    return Path(os.path.expanduser(candidate.get("cache", "~/.cache/spark-lab/compile")))
 
 
 def bundle_mounts(bundle: Path, candidate: dict) -> list[tuple[Path, str]]:
     """Mount sources: ~-paths and absolute paths as given; otherwise the bundle's own file, else a
-    synced input under ~/spark3-lab/inputs, else the path in this node's checkout. A source that
+    synced input under ~/spark-lab/inputs, else the path in this node's checkout. A source that
     exists nowhere is reported by kernel-local; nothing falls back silently to an empty mount."""
     mounts = []
     for source, destination in candidate.get("mounts", []):
@@ -1181,7 +1188,7 @@ def kernel_local(bundle_dir: str, out_dir: str | None, dry: bool) -> int:
         raise SystemExit("missing bundle inputs: " + ", ".join(missing))
     out.mkdir(parents=True, exist_ok=True)
     compile_cache(candidate).mkdir(parents=True, exist_ok=True)
-    with open("/tmp/spark3-lab-gpu.lock", "w") as lock:
+    with open("/tmp/spark-lab-gpu.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         started = time.time()
         process = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

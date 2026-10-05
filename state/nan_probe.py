@@ -2,7 +2,7 @@
 """Fail at the first non-finite DeepSeek V4.1 activation when armed.
 
 This is an opt-in diagnostic entry point.  Startup and warmup run normally;
-creating ``/tmp/spark3-nan-probe`` inside a live container arms checks for the
+creating ``/tmp/spark-nan-probe`` inside a live container arms checks for the
 next request.  The wrapper then launches the ordinary vLLM CLI in-process.
 """
 
@@ -18,7 +18,7 @@ from typing import Any
 
 import torch
 
-_ARM_FILE = "/tmp/spark3-nan-probe"
+_ARM_FILE = "/tmp/spark-nan-probe"
 
 
 def _tensors(value: Any) -> Iterator[torch.Tensor]:
@@ -51,7 +51,7 @@ def _check(stage: str, value: Any) -> None:
         nan_count = int(torch.isnan(tensor).sum().item())
         inf_count = int(torch.isinf(tensor).sum().item())
         raise RuntimeError(
-            "spark3 NaN probe: first non-finite activation at "
+            "spark NaN probe: first non-finite activation at "
             f"{stage}[{index}], shape={tuple(tensor.shape)}, "
             f"dtype={tensor.dtype}, nan={nan_count}, inf={inf_count}"
         )
@@ -64,7 +64,7 @@ def _trace(stage: str, tensor: torch.Tensor) -> None:
     finite = torch.isfinite(values)
     good = values[finite]
     print(
-        "spark3 NaN probe: "
+        "spark NaN probe: "
         f"{stage} shape={tuple(tensor.shape)} dtype={tensor.dtype} "
         f"finite={int(finite.sum().item())}/{tensor.numel()} "
         f"min={float(good.min().item()) if good.numel() else None} "
@@ -81,7 +81,7 @@ def _wrap_engram_prepare(owner: type[Any]) -> None:
         armed = os.path.exists(_ARM_FILE)
         stage = f"Engram[{self.layer_hash_index}]"
         print(
-            f"spark3 NaN probe: {stage}.prepare_disk invoked "
+            f"spark NaN probe: {stage}.prepare_disk invoked "
             f"armed={armed} tokens={hash_ids.shape[0]}",
             flush=True,
         )
@@ -89,7 +89,7 @@ def _wrap_engram_prepare(owner: type[Any]) -> None:
             raw = hash_ids.detach().contiguous().view(torch.uint8).cpu()
             digest = hashlib.sha256(raw.numpy().tobytes()).hexdigest()
             print(
-                f"spark3 NaN probe: {stage}.hash_ids "
+                f"spark NaN probe: {stage}.hash_ids "
                 f"shape={tuple(hash_ids.shape)} sha256={digest}",
                 flush=True,
             )
@@ -112,7 +112,7 @@ def _wrap_engram_prepare(owner: type[Any]) -> None:
             cache_values = table.weight[: hash_ids.numel()]
             cache_scales = table.scale_bytes[: hash_ids.numel()]
             print(
-                f"spark3 NaN probe: {stage}.bad_heads "
+                f"spark NaN probe: {stage}.bad_heads "
                 f"count={bad_heads.shape[0]} first16={details} "
                 f"cache_value_nan={int(torch.isnan(cache_values.float()).sum().item())} "
                 f"cache_scale_ff={int((cache_scales == 255).sum().item())}",
@@ -131,7 +131,7 @@ def _wrap_model_state(owner: type[Any], default_owner: type[Any]) -> None:
     def checked_init(self: Any, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
         print(
-            "spark3 NaN probe: model_state initialized "
+            "spark NaN probe: model_state initialized "
             f"type={type(self).__name__} "
             f"lookback={None if self.lookback_token_ids is None else tuple(self.lookback_token_ids.shape)} "
             f"disk_engram_models={len(self.disk_engram_models)}",
@@ -142,7 +142,7 @@ def _wrap_model_state(owner: type[Any], default_owner: type[Any]) -> None:
     def checked_prepare(self: Any, *args: Any, **kwargs: Any) -> Any:
         if os.path.exists(_ARM_FILE):
             print(
-                "spark3 NaN probe: custom model_state.prepare_inputs "
+                "spark NaN probe: custom model_state.prepare_inputs "
                 f"lookback_present={self.lookback_token_ids is not None} "
                 f"disk_engram_models={len(self.disk_engram_models)}",
                 flush=True,
@@ -153,7 +153,7 @@ def _wrap_model_state(owner: type[Any], default_owner: type[Any]) -> None:
     def checked_base_prepare(self: Any, *args: Any, **kwargs: Any) -> Any:
         if os.path.exists(_ARM_FILE):
             print(
-                "spark3 NaN probe: base model_state.prepare_inputs "
+                "spark NaN probe: base model_state.prepare_inputs "
                 f"type={type(self).__name__}",
                 flush=True,
             )
@@ -265,7 +265,7 @@ def _wrap_function(module: Any, function_name: str) -> None:
             actual = output[0]
             error = (actual.float() - reference.float()).abs()
             print(
-                "spark3 NaN probe: mhc_shifted_post_pre "
+                "spark NaN probe: mhc_shifted_post_pre "
                 f"call={calls} x_max={float(x.float().abs().max().item())} "
                 f"residual_max={float(residual.float().abs().max().item())} "
                 f"post_mix_max={float(post_mix.float().abs().max().item())} "
@@ -332,7 +332,7 @@ def _wrap_b12x_attention(owner: type[Any]) -> None:
             ]
             if getattr(self, "layer_id", None) == 2:
                 print(
-                    "spark3 NaN probe: "
+                    "spark NaN probe: "
                     f"{prefix}.indexed_block_table "
                     f"swa_first={kwargs['block_table'][0, :4].detach().cpu().tolist()} "
                     f"compressed_first={compressed.block_table[0, :4].detach().cpu().tolist()}",
@@ -402,7 +402,7 @@ def _wrap_b12x_attention(owner: type[Any]) -> None:
             valid = indices >= 0
             valid_indices = indices[valid]
             print(
-                f"spark3 NaN probe: {prefix}.b12x_inputs "
+                f"spark NaN probe: {prefix}.b12x_inputs "
                 f"q={tuple(q.shape)} rows={int(q.shape[0])} "
                 f"swa_width={int(indices.shape[1])} "
                 f"lengths={lengths.detach().cpu().tolist()} "
@@ -424,7 +424,7 @@ def _wrap_b12x_attention(owner: type[Any]) -> None:
             assert expected is not None
             error = (output.float() - expected.float()).abs()
             print(
-                "spark3 NaN probe: "
+                "spark NaN probe: "
                 f"{prefix}.b12x_native_vs_reference "
                 f"max_abs={float(error.max().item())} "
                 f"mean_abs={float(error.mean().item())} "
@@ -434,7 +434,7 @@ def _wrap_b12x_attention(owner: type[Any]) -> None:
             )
             if not bool(finite.all().item()):
                 raise RuntimeError(
-                    "spark3 NaN probe: B12X native output is non-finite while "
+                    "spark NaN probe: B12X native output is non-finite while "
                     f"the live-cache reference is finite; shape={tuple(output.shape)}, "
                     f"native_nan={int(torch.isnan(output).sum().item())}, "
                     f"native_inf={int(torch.isinf(output).sum().item())}, "
@@ -503,7 +503,7 @@ def _wrap_indexed_cache_insert(owner: type[Any]) -> None:
                 error = (decoded.float() - expected.float()).abs()
                 _trace(f"{self.prefix}.decoded_indexed_cache", decoded)
                 print(
-                    "spark3 NaN probe: "
+                    "spark NaN probe: "
                     f"{self.prefix}.indexed_cache_write "
                     f"slots={slots[valid].detach().cpu().tolist()} "
                     f"expected_max={float(expected.float().abs().max().item())} "

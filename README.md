@@ -1,4 +1,4 @@
-# spark3-vllm-ds41f
+# spark-ds41f
 
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric.
@@ -16,7 +16,7 @@ same image as the three-node deployment, and was benchmarked at those limits
 The promoted configuration below is the three-node deployment.
 
 Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profiles/README.md)
-keep the measured limits and NCCL settings together. `bin/spark3 tuning show tp4`
+keep the measured limits and NCCL settings together. `bin/spark tuning show tp4`
 shows the TP4 recipe; `tuning create` generates a complete configuration
 for a site node map. The generated configuration starts with launch disabled.
 
@@ -107,7 +107,7 @@ To reproduce the deployment on your own three Sparks, follow
 
 ## Performance
 
-The r5p acceptance benchmark (2026-10-05, `bin/spark3 bench` from dgx1:
+The r5p acceptance benchmark (2026-10-05, `bin/spark bench` from dgx1:
 quality, then prose and code prompts with reasoning on, temperature 0, 256
 output tokens, three samples per decode point, and real source text for
 prefill) measured, on the three-node deployment against r5o's 64 KiB
@@ -148,7 +148,7 @@ contexts) and near-limit retrieval (3/3 at 519,142 tokens), measured on r5o.
 
 The tables below retain the historical **4 KiB r5l** reference (r5o added the
 top-k tie rule and TMA stage-release fences). These were measured with
-`bin/spark3 bench` from dgx1: prose and code
+`bin/spark bench` from dgx1: prose and code
 prompts, temperature 0, 256 output tokens. With reasoning on (the server
 default) every measured token is reasoning text:
 
@@ -191,6 +191,23 @@ threshold), which moves acceptance from sample to sample. Report:
 [decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5l.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
+## Names
+
+The project was `spark3-vllm-ds41f` until 2026-10-05. The former GitHub name
+now holds a pointer, and deployment checks accept configurations that name
+it. The command is `bin/spark`, and experiment scripts call it; dated
+experiment records keep `bin/spark3` as they ran it.
+
+Names built into images or installed on the hosts keep `spark3` until they
+are rebuilt or reinstalled:
+- the `SPARK3_*` environment variables that the vLLM patches read;
+- the `local.spark3.*` image labels and the `/opt/spark3` paths inside the
+  image;
+- the hosts' `spark3-kernel-memory` service and RoCE marker.
+
+Lab windows also honour holds and requests written as `~/spark3-hold.json`
+and `~/spark3-request.json`.
+
 ## Repository contract
 
 There are three deliberately separate kinds of state:
@@ -208,22 +225,22 @@ the desired configuration and baseline record together.
 All commands are run from the repository root.
 
 ```sh
-bin/spark3 doctor
-bin/spark3 doctor --live
-bin/spark3 status
-bin/spark3 render dgx1
-bin/spark3 cluster sync
-bin/spark3 cluster start --replace
-bin/spark3 cluster stop
-bin/spark3 bench
-bin/spark3 upstream list
-bin/spark3 upstream prepare vllm
-bin/spark3 upstream prepare b12x
-bin/spark3 build prepare
-bin/spark3 build check
-bin/spark3 build image
-bin/spark3 build image --apply
-bin/spark3 build smoke
+bin/spark doctor
+bin/spark doctor --live
+bin/spark status
+bin/spark render dgx1
+bin/spark cluster sync
+bin/spark cluster start --replace
+bin/spark cluster stop
+bin/spark bench
+bin/spark upstream list
+bin/spark upstream prepare vllm
+bin/spark upstream prepare b12x
+bin/spark build prepare
+bin/spark build check
+bin/spark build image
+bin/spark build image --apply
+bin/spark build smoke
 scripts/host-recovery check
 scripts/host-recovery apply
 ```
@@ -242,7 +259,7 @@ successful trial boot. The [boot trial](experiments/2026-10-02-kernel-64k/boot-t
 node. It reports every shard whose current extent count exceeds ext4's best
 count, even if `e4defrag` assigns it a severity score of zero; ideal layouts
 remain quiet. Large files can have a best count greater than one. Run
-`bin/spark3 doctor --fragmentation-commands` to print exact correction commands
+`bin/spark doctor --fragmentation-commands` to print exact correction commands
 for affected blob files, grouped by node. This only prints commands: any actual
 defragmentation belongs in a coordinated maintenance window. The check reads
 the checkpoint index and extent metadata using `sudo -n e4defrag -c`, resolves
@@ -274,7 +291,7 @@ The promoted configuration is launch-enabled on `main`. Experiment
 configurations set `launch_enabled` for themselves.
 
 `scripts/` holds the memory guard that `cluster start` installs on each node
-and host recovery, which has not yet moved into `bin/spark3`. Experiments keep
+and host recovery, which has not yet moved into `bin/spark`. Experiments keep
 their own scripts in their directories.
 
 Host management-plane recovery is versioned separately under `host/recovery/`.
@@ -284,11 +301,11 @@ policy boundary are documented in [docs/recovery.md](docs/recovery.md).
 
 ## Benchmarking
 
-`bin/spark3 bench` measures the live service from the head node and writes one
+`bin/spark bench` measures the live service from the head node and writes one
 self-contained report to `results/private/bench/<UTC time>/bench.json`
 (`--output` to change). By default it is a quick check of about six minutes:
 the quality gate and every decode point with three or four samples each.
-`bin/spark3 bench --full` runs every suite below and samples each decode
+`bin/spark bench --full` runs every suite below and samples each decode
 point to its precision target, about 35 minutes; use it for experiments that
 need to resolve small differences. Before sending anything it runs the `doctor --live`
 comparison and refuses a cluster that differs from its configuration. It also
@@ -412,7 +429,7 @@ but are not build inputs are kept separately in
 
 ## Transition status
 
-`bin/spark3 build` builds the promoted image from the pinned sources in
+`bin/spark build` builds the promoted image from the pinned sources in
 `upstreams.lock.json` and the patch series ([docker/README.md](docker/README.md)),
 and one content digest runs on all three nodes.
 

@@ -8,10 +8,10 @@ E=experiments/2026-09-29-r5k
 TAG=vllm-ds41f-kkref:04c30fa98e79-r5k
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for config in config/cluster.json $E/cluster-*.json experiments/2026-09-29-display-carveout-kv/cluster-*.json; do
-  bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
-bin/spark3 build prepare
-bin/spark3 build image --apply --tag "$TAG"
+bin/spark build prepare
+bin/spark build image --apply --tag "$TAG"
 local_id=$(docker image inspect "$TAG" --format "{{.Id}}")
 for host in dgx2 dgx3; do
   docker save "$TAG" | ssh "$host" docker load

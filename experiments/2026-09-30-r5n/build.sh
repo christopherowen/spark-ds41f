@@ -12,10 +12,10 @@ if docker image inspect "$TAG" >/dev/null 2>&1; then
   exit 1
 fi
 for config in config/cluster.json experiments/2026-09-30-r5n/cluster-*.json; do
-  bin/spark3 --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$config" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
-bin/spark3 build prepare
-bin/spark3 build image --apply --tag "$TAG"
+bin/spark build prepare
+bin/spark build image --apply --tag "$TAG"
 local_id=$(docker image inspect "$TAG" --format "{{.Id}}")
 for host in dgx2 dgx3; do
   docker save "$TAG" | ssh "$host" docker load

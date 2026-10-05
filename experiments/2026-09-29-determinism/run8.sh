@@ -9,7 +9,7 @@ E=experiments/2026-09-29-determinism
 out=results/private/determinism
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/gemm_concurrency_check.py dgx3:/tmp/gemm_concurrency_check.py
 log "gemm checks on dgx3"
@@ -31,5 +31,5 @@ run -e B12X_DENSE_SPLITK_TURBO=0 --entrypoint /opt/compute-sanitizer/compute-san
 REMOTE
 log "gemm checks done"
 grep -E "^==|capacity|OK|FAIL|ERROR SUMMARY|hazard|Race" "$out/gemm-concurrency.txt" | head -40
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

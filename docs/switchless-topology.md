@@ -66,11 +66,11 @@ Create a complete candidate from a base profile:
 mkdir -p experiments/2026-10-02-switchless-ring4
 cp config/examples/nodes-ring4.json config/nodes-ring4.local.json
 # Edit config/nodes-ring4.local.json for the actual hosts and cable subnets.
-bin/spark3 topology create \
+bin/spark topology create \
   --nodes-config config/nodes-ring4.local.json \
   --output experiments/2026-10-02-switchless-ring4/cluster.json
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json doctor
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json render dgx4
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json doctor
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json render dgx4
 ```
 
 To use the 4 KiB base profile, put `--cluster-config config/cluster-4k.json`
@@ -134,10 +134,10 @@ With serving stopped and the fabric addressed, render one probe command per
 node and run each command on the node it names, concurrently:
 
 ```sh
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx1
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx2
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx3
-bin/spark3 --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx4
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx1
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx2
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx3
+bin/spark --cluster-config experiments/2026-10-02-switchless-ring4/cluster.json topology probe dgx4
 ```
 
 These commands **print plans** and do not start containers. Each printed command

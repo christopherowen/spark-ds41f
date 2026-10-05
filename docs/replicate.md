@@ -15,7 +15,7 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
 - About 480 GiB of free disk per node for the model (the Engram tables are read
   from disk) plus caches, and 64 GiB of free memory on the build host.
 - DGX Spark 26.09.2 or later on every node, booted to `multi-user.target`
-  (no desktop; `bin/spark3 doctor --live` reports a node that is not), with
+  (no desktop; `bin/spark doctor --live` reports a node that is not), with
   the installed OS first in the UEFI boot order. A network (PXE) entry first
   adds about a minute of DHCP timeouts to every boot; `doctor --live` reports
   it, and `sudo efibootmgr -o <ubuntu>,<others>` fixes it.
@@ -28,7 +28,7 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
   `dgx-spark-fan-control` DKMS module with its `dgx_ec_fan_floor` cooling
   device, and the `dgx-fan-control` daemon. Its source and signing key live
   outside this repository; `doctor --live` reports the first missing layer.
-  `bin/spark3 bench` and kernel-lab jobs use it to pre-cool before measuring.
+  `bin/spark bench` and kernel-lab jobs use it to pre-cool before measuring.
   If any node is at or above 55 °C, all of them cool together until every node
   is below it. Without it they wait for the node to cool under
   NVIDIA's curve.
@@ -62,14 +62,14 @@ direct-cabled dual ConnectX-7 ring, Local Inference Lab's
 
 ## Site configuration
 
-Edit these for your site, then run `bin/spark3 doctor`:
+Edit these for your site, then run `bin/spark doctor`:
 
 - `config/nodes.json`: node names, ranks, management IPs, `ssh_user`, and
   `roce_peer_hcas`, which maps each peer rank to the local RoCE devices cabled
   to it (`ibv_devices` and `rdma link` show the names). The file is
   git-ignored because it describes your site. Create it on the head node
   with `cp config/nodes.example.json config/nodes.json` and edit it there.
-  `bin/spark3 cluster sync --apply` copies the head node's file to every node
+  `bin/spark cluster sync --apply` copies the head node's file to every node
   after it moves their checkouts.
 - `config/cluster.json` and both named `config/cluster-4k.json` /
   `config/cluster-64k.json` profiles: `distributed.master_addr` (the head node's management
@@ -95,8 +95,8 @@ huggingface-cli download deepseek-ai/DeepSeek-V4.1-Flash \
 On the build host, from a clean checkout of `main`:
 
 ```sh
-bin/spark3 build prepare
-bin/spark3 build image --apply
+bin/spark build prepare
+bin/spark build image --apply
 ```
 
 `build prepare` fills `.work/build/<vllm>-<b12x>-<input hash>/`, a directory
@@ -147,9 +147,9 @@ experiments/2026-09-23-canonical-minimal/prebuild_flashinfer.sh \
 Then, from the head node with a clean checkout of the published `main` commit:
 
 ```sh
-bin/spark3 cluster sync --apply
-bin/spark3 cluster start --apply
-bin/spark3 doctor --live
+bin/spark cluster sync --apply
+bin/spark cluster start --apply
+bin/spark doctor --live
 ```
 
 `cluster start` arms a 5 GiB startup memory guard on every node before any
@@ -167,7 +167,7 @@ The API is OpenAI-compatible on the head node's port 8000, model
 From the head node against the running, otherwise idle service:
 
 ```sh
-bin/spark3 bench
+bin/spark bench
 ```
 
 It checks that the live cluster matches `config/cluster.json`, runs the quality

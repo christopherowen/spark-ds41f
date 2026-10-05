@@ -19,10 +19,10 @@ declare -A MEASURED=(
   [b12x/_lib/dense_gemm.py]=ffc7c4a491621018ab54982878ebc5334e5aa31bea86194a8772c1e4af3bb9a8
 )
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 log "start candidate"
-bin/spark3 --cluster-config $C cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $C cluster start --replace --apply | grep -v 'docker run'
 bad=0
 for n in dgx1 dgx2 dgx3; do
   for f in "${!MEASURED[@]}"; do
@@ -36,12 +36,12 @@ log "shipped files match the measured ones on every node"
 bash $E/sass_gate.sh --expect-fenced > "$out/sass-gate.txt" 2>&1
 log "sass gate exit $?"
 tail -1 "$out/sass-gate.txt"
-bin/spark3 --cluster-config $C bench --allow-mismatch --compare none --suites quality \
+bin/spark --cluster-config $C bench --allow-mismatch --compare none --suites quality \
   --output results/private/bench/r5o-quality
 log "quality exit $?"
 python3 experiments/2026-09-29-r5k/needle.py http://10.0.1.71:8000 180000 | tee "$out/needle.txt"
 log "needle exit ${PIPESTATUS[0]}"
-bin/spark3 --cluster-config $C doctor --live | tee "$out/doctor.txt"
+bin/spark --cluster-config $C doctor --live | tee "$out/doctor.txt"
 log "doctor exit ${PIPESTATUS[0]}"
 for n in dgx1 dgx2 dgx3; do
   ssh -n "$n" "docker logs dsv41-karmic-kraken 2>&1 | grep -o 'Display carve-out holds [0-9.]* MiB' | head -1 | sed \"s/^/\$(hostname): /\""

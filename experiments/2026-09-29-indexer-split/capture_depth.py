@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-loader = importlib.machinery.SourceFileLoader("spark3", str(ROOT / "bin/spark3"))
+loader = importlib.machinery.SourceFileLoader("spark3", str(ROOT / "bin/spark"))
 spec = importlib.util.spec_from_loader("spark3", loader)
 spark3 = importlib.util.module_from_spec(spec)
 loader.exec_module(spark3)

@@ -141,7 +141,7 @@ def ssh_target(nodes: dict, node: dict) -> str:
     return f"{nodes['ssh_user']}@{node.get('ssh_host', node['name'])}"
 
 
-SSH_CONTROL_DIR = Path(tempfile.gettempdir()) / f"spark3-ssh-{os.getuid()}"
+SSH_CONTROL_DIR = Path(tempfile.gettempdir()) / f"spark-ssh-{os.getuid()}"
 
 
 def ssh_options() -> list[str]:
@@ -1071,7 +1071,7 @@ def command_topology_create(args: argparse.Namespace) -> int:
 def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) -> list[str]:
     env = expected_environment(cluster, node)
     env.update(NCCL_DEBUG="INFO", NCCL_DEBUG_SUBSYS="INIT,GRAPH,NET")
-    command = ["docker", "run", "--rm", "--name=spark3-collective-probe",
+    command = ["docker", "run", "--rm", "--name=spark-collective-probe",
                "--network=host", "--gpus=all", "--memory=12g", "--memory-swap=12g",
                "--device=/dev/infiniband:/dev/infiniband:rwm", "--cap-add=IPC_LOCK",
                "--ulimit=memlock=-1:-1", "--shm-size=256m",
@@ -1339,7 +1339,7 @@ def node_runtime_problems(
     doctor = run_ssh(
         nodes,
         node,
-        f"{repo}/bin/spark3",
+        f"{repo}/bin/spark",
         "--cluster-config",
         cluster_config,
         "doctor",
@@ -1478,7 +1478,7 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
             doctor = run_ssh(
                 nodes,
                 node,
-                f"{path}/bin/spark3",
+                f"{path}/bin/spark",
                 "--cluster-config",
                 config_relative,
                 "doctor",
@@ -2043,7 +2043,7 @@ BUILD_NVCC_THREADS = 2
 BUILD_CPU_RESERVE = 4
 BUILD_MAX_JOBS = 10
 SMOKE_MEMORY_GIB = 16
-BUILD_LOCK = Path("/tmp/spark3-build.lock")
+BUILD_LOCK = Path("/tmp/spark-build.lock")
 SMOKE_SCRIPT = """\
 import torch
 
@@ -2261,7 +2261,7 @@ def prepare_project(directory: Path, name: str, record: dict) -> None:
             ["git", "fetch", "--quiet", "--filter=blob:none", "--no-tags", "upstream", record["revision"]],
             cwd=temporary,
         )
-        checked(["git", "switch", "--quiet", "--create", "spark3/build", "FETCH_HEAD"], cwd=temporary)
+        checked(["git", "switch", "--quiet", "--create", "spark/build", "FETCH_HEAD"], cwd=temporary)
         if record.get("patch_series"):
             series = ROOT / record["patch_series"]
             for patch_name in read_series(series):
@@ -2404,7 +2404,7 @@ def vllm_deletions(directory: Path, inputs: dict) -> list[str]:
 def build_problems(directory: Path, inputs: dict) -> list[str]:
     record_path = directory / "inputs.json"
     if not record_path.is_file():
-        return [f"{directory.relative_to(ROOT)} is not prepared; run bin/spark3 build prepare"]
+        return [f"{directory.relative_to(ROOT)} is not prepared; run bin/spark build prepare"]
     record = json.loads(record_path.read_text(encoding="utf-8"))
     problems = []
     if record.get("schema") != BUILD_LAYOUT:
@@ -2455,7 +2455,7 @@ def command_build_prepare(args: argparse.Namespace) -> int:
     if "wheels" in parts:
         prepare_wheels(directory, upstreams)
     if args.only:
-        print("partial preparation; run bin/spark3 build prepare for the complete inputs")
+        print("partial preparation; run bin/spark build prepare for the complete inputs")
         return 0
     context = directory / "context"
     for name in (*build_projects(inputs), "cutlass"):
@@ -4975,7 +4975,7 @@ def int_list(value: str) -> list[int]:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="spark3")
+    root = argparse.ArgumentParser(prog="spark")
     root.add_argument(
         "--cluster-config",
         default=DEFAULT_CLUSTER_CONFIG,

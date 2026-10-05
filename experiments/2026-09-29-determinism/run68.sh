@@ -16,13 +16,13 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
 }
 settle() {  # profile dir: wait until rank 0's newest trace exists and stops growing
   local dir=$1 before=-1 now
@@ -81,6 +81,6 @@ for arm in detm-r5o-ref4d-b4144-pin-prof detm-r5o-ref4e-s40-b4144-pin-prof; do
     > "$out/costs-$arm-prefill.txt" 2>&1
 done
 log "costs"
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

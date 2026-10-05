@@ -15,17 +15,17 @@ if [ "$(cat /proc/sys/vm/watermark_boost_factor)" != 0 ]; then
   exit 1
 fi
 TRACE=/tmp/vision-memtrace-$(date -u +%H%M%S).txt
-bin/spark3 cluster stop --remove --apply >/dev/null 2>&1
-bin/spark3 --cluster-config $E/cluster-vision.json cluster stop --remove --apply >/dev/null 2>&1
+bin/spark cluster stop --remove --apply >/dev/null 2>&1
+bin/spark --cluster-config $E/cluster-vision.json cluster stop --remove --apply >/dev/null 2>&1
 $E/memtrace.sh "$TRACE" & TRACER=$!
-bin/spark3 --cluster-config $E/cluster-vision.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-vision.json cluster start --replace --apply | grep -v 'docker run'
 started=${PIPESTATUS[0]}
 mark() { echo "$(date +%T.%N | cut -c1-12) X $*" >> "$TRACE"; }
 trap 'kill $TRACER' EXIT
 echo "memory trace: $TRACE"
 mark "start exit $started"
 [ "$started" -eq 0 ] || exit 1
-bin/spark3 --cluster-config $E/cluster-vision.json doctor --live || exit 1
+bin/spark --cluster-config $E/cluster-vision.json doctor --live || exit 1
 mark "doctor done"
 python3 $E/vision_check.py || exit 1
 mark "vision check done"
@@ -35,6 +35,6 @@ if [ "$IDLE" -gt 0 ]; then
   mark "idle done"
   exit 0
 fi
-bin/spark3 --cluster-config $E/cluster-vision.json bench --compare none --output results/private/bench/vision || exit 1
+bin/spark --cluster-config $E/cluster-vision.json bench --compare none --output results/private/bench/vision || exit 1
 mark "bench done"
 echo "vision arm ready"

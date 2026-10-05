@@ -8,10 +8,10 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark3", str(ROOT / "bin" / "spark3"))
-spec = importlib.util.spec_from_loader("spark3", loader)
-spark3 = importlib.util.module_from_spec(spec)
-loader.exec_module(spark3)
+loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spark"))
+spec = importlib.util.spec_from_loader("spark", loader)
+spark = importlib.util.module_from_spec(spec)
+loader.exec_module(spark)
 
 MODEL = 'engine="0",model_name="m"'
 
@@ -47,37 +47,37 @@ def exposition(requests: int, prompt: float, cached: float, steps: tuple[int, in
 
 class MetricSeriesTest(unittest.TestCase):
     def test_parse_drops_engine_and_model_and_keeps_other_labels(self) -> None:
-        series = spark3.parse_metric_series(exposition(4, 1000, 250, (90, 10)))
+        series = spark.parse_metric_series(exposition(4, 1000, 250, (90, 10)))
         self.assertEqual(series[("vllm:request_success_total", (("finished_reason", "stop"),))], 4.0)
         self.assertEqual(series[("vllm:prompt_tokens_total", ())], 1000.0)
-        self.assertEqual(spark3.series_sum(series, "vllm:request_success_total"), 5.0)
+        self.assertEqual(spark.series_sum(series, "vllm:request_success_total"), 5.0)
         self.assertEqual(
-            spark3.series_sum(series, "vllm:tool_call_parser_invocations_total", outcome="tool_call"), 4.0
+            spark.series_sum(series, "vllm:tool_call_parser_invocations_total", outcome="tool_call"), 4.0
         )
 
     def test_histogram_quantile_interpolates_inside_the_crossing_bucket(self) -> None:
-        series = spark3.parse_metric_series("\n".join([
+        series = spark.parse_metric_series("\n".join([
             'h_bucket{le="1.0"} 0',
             'h_bucket{le="2.0"} 50',
             'h_bucket{le="4.0"} 100',
             'h_bucket{le="+Inf"} 100',
         ]))
-        self.assertAlmostEqual(spark3.histogram_quantile(series, "h", 0.5), 2.0)
-        self.assertAlmostEqual(spark3.histogram_quantile(series, "h", 0.75), 3.0)
-        self.assertAlmostEqual(spark3.histogram_quantile(series, "h", 0.25), 1.5)
-        self.assertIsNone(spark3.histogram_quantile(series, "missing", 0.5))
+        self.assertAlmostEqual(spark.histogram_quantile(series, "h", 0.5), 2.0)
+        self.assertAlmostEqual(spark.histogram_quantile(series, "h", 0.75), 3.0)
+        self.assertAlmostEqual(spark.histogram_quantile(series, "h", 0.25), 1.5)
+        self.assertIsNone(spark.histogram_quantile(series, "missing", 0.5))
 
     def test_quantile_in_the_open_bucket_reports_its_lower_bound(self) -> None:
-        series = spark3.parse_metric_series('h_bucket{le="10.0"} 1\nh_bucket{le="+Inf"} 4')
-        self.assertEqual(spark3.histogram_quantile(series, "h", 0.9), 10.0)
+        series = spark.parse_metric_series('h_bucket{le="10.0"} 1\nh_bucket{le="+Inf"} 4')
+        self.assertEqual(spark.histogram_quantile(series, "h", 0.9), 10.0)
 
 
 class WorkloadSummaryTest(unittest.TestCase):
     def test_window_delta_summary(self) -> None:
-        before = spark3.parse_metric_series(exposition(2, 1000, 200, (50, 5)))
-        after = spark3.parse_metric_series(exposition(6, 9000, 6200, (150, 30)))
+        before = spark.parse_metric_series(exposition(2, 1000, 200, (50, 5)))
+        after = spark.parse_metric_series(exposition(6, 9000, 6200, (150, 30)))
         delta = {key: value - before.get(key, 0.0) for key, value in after.items()}
-        summary = spark3.workload_summary(delta, 1800.0, {"vllm:num_requests_running": [1.0, 3.0]})
+        summary = spark.workload_summary(delta, 1800.0, {"vllm:num_requests_running": [1.0, 3.0]})
         self.assertEqual(summary["requests"]["finished"], 4)
         self.assertEqual(summary["requests"]["by_reason"], {"stop": 4})
         self.assertEqual(summary["requests"]["per_hour"], 8.0)

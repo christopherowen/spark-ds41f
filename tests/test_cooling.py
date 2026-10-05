@@ -7,10 +7,10 @@ import unittest
 from unittest.mock import patch
 
 loader = importlib.machinery.SourceFileLoader(
-    "spark3_cooling_tests", str(Path(__file__).resolve().parents[1] / "bin/spark3"))
+    "spark_cooling_tests", str(Path(__file__).resolve().parents[1] / "bin/spark"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
-spark3 = importlib.util.module_from_spec(spec)
-loader.exec_module(spark3)
+spark = importlib.util.module_from_spec(spec)
+loader.exec_module(spark)
 
 
 class CoolingTest(unittest.TestCase):
@@ -27,33 +27,33 @@ class CoolingTest(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0 if state["active"] else 3)
             return subprocess.CompletedProcess(command, 0)
 
-        with patch.object(spark3, "run_ssh", side_effect=systemctl):
-            result = spark3.restore_fan_control({}, {}, {"service": True, "floor": True})
-        self.assertEqual(result, spark3.FAN_SERVICE)
+        with patch.object(spark, "run_ssh", side_effect=systemctl):
+            result = spark.restore_fan_control({}, {}, {"service": True, "floor": True})
+        self.assertEqual(result, spark.FAN_SERVICE)
         self.assertTrue(state["active"])
 
     def test_successful_start_does_not_hide_a_failed_daemon(self):
         def systemctl(nodes, node, *command):
             return subprocess.CompletedProcess(command, 3 if "is-active" in command else 0)
 
-        with patch.object(spark3, "run_ssh", side_effect=systemctl):
-            result = spark3.restore_fan_control({}, {}, {"service": True, "floor": True})
+        with patch.object(spark, "run_ssh", side_effect=systemctl):
+            result = spark.restore_fan_control({}, {}, {"service": True, "floor": True})
         self.assertTrue(result.startswith("FAILED"))
 
     def test_failed_restore_aborts_even_after_temperatures_fall(self):
-        with patch.object(spark3, "hottest_zone_c", side_effect=[60.0, 50.0]), \
-             patch.object(spark3, "take_fan_control", return_value={"service": True, "floor": True}), \
-             patch.object(spark3, "restore_fan_control", return_value="FAILED: service"), \
-             patch.object(spark3.time, "sleep"):
+        with patch.object(spark, "hottest_zone_c", side_effect=[60.0, 50.0]), \
+             patch.object(spark, "take_fan_control", return_value={"service": True, "floor": True}), \
+             patch.object(spark, "restore_fan_control", return_value="FAILED: service"), \
+             patch.object(spark.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "cannot restore fan control"):
-                spark3.cool_nodes({}, [{"name": "node"}], 55, 60)
+                spark.cool_nodes({}, [{"name": "node"}], 55, 60)
 
     def test_failed_take_still_restores_the_original_control(self):
-        with patch.object(spark3, "hottest_zone_c", return_value=60.0), \
-             patch.object(spark3, "take_fan_control", return_value={"service": True, "floor": False}), \
-             patch.object(spark3, "restore_fan_control", return_value=spark3.FAN_SERVICE) as restore:
+        with patch.object(spark, "hottest_zone_c", return_value=60.0), \
+             patch.object(spark, "take_fan_control", return_value={"service": True, "floor": False}), \
+             patch.object(spark, "restore_fan_control", return_value=spark.FAN_SERVICE) as restore:
             with self.assertRaisesRegex(RuntimeError, "cannot select maximum fan floor"):
-                spark3.cool_nodes({}, [{"name": "node"}], 55, 60)
+                spark.cool_nodes({}, [{"name": "node"}], 55, 60)
         restore.assert_called_once()
 
 

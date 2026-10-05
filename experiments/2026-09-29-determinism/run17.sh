@@ -10,7 +10,7 @@ E=experiments/2026-09-29-determinism
 out=results/private/determinism
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 # The r5m B12X tree plus 0007, built like overlay.sh builds its overlays.
 B=$PWD/.work/upstreams/b12x
@@ -50,5 +50,5 @@ run "$base -v /tmp/dense_gemm-0007.py:$B/b12x/_lib/dense_gemm.py:ro" --shape dow
 REMOTE
 log "stress done"
 grep -E "^==|cap|OK|FAIL|Error|Traceback" "$out/gemm-race-0007.txt" | head -30
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

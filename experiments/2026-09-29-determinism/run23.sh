@@ -11,15 +11,15 @@ out=results/private/determinism/batch-trace
 mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 log "start detm-r5o-trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-trace.json cluster start --replace --apply | grep -v 'docker run'
 docker logs dsv41-karmic-kraken 2>&1 | grep -E "pinned DSpark cost curves" | tail -1
 python3 $E/trace_mixes.py http://10.0.1.71:8000 "$out" --repeats 3 --tokens 128 | tee "$out/runs.jsonl"
 log "trace exit ${PIPESTATUS[0]}"
 for c in $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

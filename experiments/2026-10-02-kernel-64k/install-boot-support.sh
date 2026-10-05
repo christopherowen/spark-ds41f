@@ -29,7 +29,7 @@ for i, line in enumerate(lines):
 assert found == 1, 'expected exactly one existing swap entry'
 p.write_text('\n'.join(lines) + '\n')
 PY
-install -m 0755 "$root/host/kernel-memory/spark3-kernel-memory" /usr/local/sbin/spark3-kernel-memory
+install -m 0755 "$root/host/kernel-memory/spark3-kernel-memory" /usr/local/sbin/spark-kernel-memory
 install -m 0644 "$root/host/kernel-memory/spark3-kernel-memory.service" /etc/systemd/system/spark3-kernel-memory.service
 systemctl daemon-reload
 systemctl enable spark3-kernel-memory.service

@@ -15,13 +15,13 @@ mkdir -p "$out"
 log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 start() {
   stop_all
   log "start $1"
-  bin/spark3 --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
+  bin/spark --cluster-config "$1" cluster start --replace --apply | grep -v 'docker run'
 }
 measure() {
   python3 $E/determinism.py http://10.0.1.71:8000 --repeats 5 --tokens 256 \
@@ -32,7 +32,7 @@ measure() {
   log "prefill $2 exit ${PIPESTATUS[0]}"
 }
 decode() {
-  bin/spark3 --cluster-config "$1" bench --allow-mismatch --compare none --suites decode \
+  bin/spark --cluster-config "$1" bench --allow-mismatch --compare none --suites decode \
     --decode-cases prose,json-nothink --concurrency 1,8 --min-samples 6 --max-samples 6 \
     --output "results/private/bench/determinism-$2"
   log "decode $2 exit $?"

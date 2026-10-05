@@ -147,7 +147,7 @@ fan-floor driver had been active, and on the latched boot the EC reported a
 fan lower floor of 0 instead of unset; dgx1 and dgx2 run the same driver and
 restore it on every reboot without latching, so that correlation is unproven.
 
-`bin/spark3 doctor --live` reports a serving node whose GPU clock is below
+`bin/spark doctor --live` reports a serving node whose GPU clock is below
 1,000 MHz. To recover: stop the service (so the peers' RoCE GIDs cannot move),
 power the node off, remove AC power for at least a minute, and power it on.
 

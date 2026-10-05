@@ -40,8 +40,8 @@ The stable suite must cover:
 7. minimum available host memory, swap movement, KV use, OOMs, allocation retries,
    request failures, and output-integrity gates.
 
-`bin/spark3 bench` implements items 1-5 and 7; the agent workload remains
-manual. Wrap an agent run in `bin/spark3 workload --json <path> -- <command>`
+`bin/spark bench` implements items 1-5 and 7; the agent workload remains
+manual. Wrap an agent run in `bin/spark workload --json <path> -- <command>`
 to record the server side of that window without sending requests: requests
 per hour, prompt and output lengths, prefix-cache share, draft acceptance by
 position, the share of engine steps carrying prefill, latency quantiles, and
@@ -49,7 +49,7 @@ peak load. Findings per hour come from the agent's own report.
 
 Every benchmark starts from the same thermal baseline: each node's hottest
 thermal zone below 55 °C.
-- `bin/spark3 bench` checks every node before measuring.
+- `bin/spark bench` checks every node before measuring.
 - If any node is at or above the threshold, every node is pre-cooled at the
   maximum floor of dgx-spark-fan-control (`dgx-fan-control set-state 12`), with
   its `dgx-fan-control` service paused. They stay there until the last one is
@@ -83,8 +83,8 @@ A promotion commit must:
 3. link the accepted experiment and all native receipts;
 4. update upstream pins or patch series when source changed;
 5. prove all configured ranks use the same content-addressed image;
-6. pass `bin/spark3 doctor --live` after coordinated deployment;
-7. add the deployed service's complete `bin/spark3 bench` report as
+6. pass `bin/spark doctor --live` after coordinated deployment;
+7. add the deployed service's complete `bin/spark bench` report as
    `manifests/benchmarks/<baseline>.json`, the reference later runs compare with.
 
 Rollback is a new coordinated deployment of the previous promoted commit. It is

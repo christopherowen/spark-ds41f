@@ -1,7 +1,7 @@
 from pathlib import Path
 import argparse,importlib.machinery,importlib.util,json,subprocess,shlex,time,sys
 root=Path(__file__).resolve().parents[2]
-l=importlib.machinery.SourceFileLoader('spark3_probe_runner',str(root/'bin/spark3'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
+l=importlib.machinery.SourceFileLoader('spark3_probe_runner',str(root/'bin/spark'));s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 parser=argparse.ArgumentParser(description='Bounded four-rank collective screen')
 parser.add_argument('arm')
 parser.add_argument('run_id')

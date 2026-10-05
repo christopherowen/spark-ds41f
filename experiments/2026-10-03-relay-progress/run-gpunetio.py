@@ -19,7 +19,7 @@ p.add_argument('--source',choices=('spark','debug','syndrome','system'),default=
 p.add_argument('--iterations',type=int,default=512)
 a=p.parse_args()
 if a.iterations <= 0: p.error('--iterations must be positive')
-l=importlib.machinery.SourceFileLoader('relay_run',str(ROOT/'bin/spark3'))
+l=importlib.machinery.SourceFileLoader('relay_run',str(ROOT/'bin/spark'))
 s=importlib.util.spec_from_loader(l.name,l);m=importlib.util.module_from_spec(s);l.exec_module(m)
 c,n,_=m.configuration(argparse.Namespace(cluster_config='experiments/2026-10-03-balanced-policy/selected.json'))
 hold=json.loads(subprocess.check_output(['ssh','swank@dgx1','cat ~/spark3-hold.json'],text=True));assert hold['holder']=='relay-progress'

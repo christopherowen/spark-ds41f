@@ -1,6 +1,6 @@
 """Run the matched prefill/prefix suffix from a separately cooled start.
 
-Use the normal `bin/spark3 bench` arguments, with suites prefill,prefix (or either
+Use the normal `bin/spark bench` arguments, with suites prefill,prefix (or either
 section separately), seed 0,
 decode cases prose,code, concurrency 1,2,4,8 and min/max samples both 3.
 Only the skipped decode suite's RNG draws are replayed. No decode GPU requests
@@ -38,7 +38,7 @@ def advance_past_prefill(rng, options):
 
 def main():
     root = Path(__file__).resolve().parents[2]
-    loader = importlib.machinery.SourceFileLoader("matched_bench", str(root / "bin/spark3"))
+    loader = importlib.machinery.SourceFileLoader("matched_bench", str(root / "bin/spark"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     sys.modules[loader.name] = module

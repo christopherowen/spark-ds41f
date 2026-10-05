@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Model-free qualification of the actual vLLM TP communicator and CUDA graphs.
 
-Run one rank per node using commands rendered by `spark3 topology probe`.
+Run one rank per node using commands rendered by `spark topology probe`.
 The surrounding container supplies a 600-second timeout and a 12 GiB limit (two NCCL groups plus compilation).
 This checks uniform TP collectives, not EP all-to-all or arbitrary send/recv.
 """

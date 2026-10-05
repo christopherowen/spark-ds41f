@@ -33,7 +33,7 @@ while true; do
     running=
   fi
   if [[ "$inspectable" == "false" && "$observed_running" == "true" ]]; then
-    logger -t spark3-memguard \
+    logger -t spark-memguard \
       "cannot inspect $CONTAINER_NAME after startup during $MEMGUARD_PHASE; failing closed"
     docker kill --signal KILL "$CONTAINER_NAME" >/dev/null 2>&1 || true
     exit 1
@@ -43,14 +43,14 @@ while true; do
   elif [[ "$observed_running" == "true" ]]; then
     exit 0
   elif ((SECONDS >= deadline)); then
-    logger -t spark3-memguard \
+    logger -t spark-memguard \
       "$CONTAINER_NAME did not start within ${WAIT_FOR_CONTAINER_SECONDS}s; leaving no unbounded watcher"
     exit 1
   fi
 
   available_kib=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
   if [[ -z "$available_kib" ]]; then
-    logger -t spark3-memguard \
+    logger -t spark-memguard \
       "cannot read MemAvailable during $MEMGUARD_PHASE; failing closed"
     if [[ "$running" == "true" ]]; then
       docker kill --signal KILL "$CONTAINER_NAME" >/dev/null
@@ -59,11 +59,11 @@ while true; do
   fi
   if ((available_kib < threshold_kib)); then
     if [[ "$running" == "true" ]]; then
-      logger -t spark3-memguard \
+      logger -t spark-memguard \
         "killing $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below ${threshold_kib} KiB"
       docker kill --signal KILL "$CONTAINER_NAME" >/dev/null
     else
-      logger -t spark3-memguard \
+      logger -t spark-memguard \
         "refusing to wait for $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below ${threshold_kib} KiB"
     fi
     exit 1

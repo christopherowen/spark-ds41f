@@ -4,12 +4,12 @@ Promoted 2026-10-05 as
 [`2026-10-05-karmic-kraken-r5p`](../manifests/baselines/2026-10-05-karmic-kraken-r5p.json)
 for all three nodes from `config/cluster.json`
 ([promotion record](../experiments/2026-10-05-r5p-promotion/README.md)).
-The same image serves the TP4 1M recipe (`bin/spark3 tuning show tp4`).
+The same image serves the TP4 1M recipe (`bin/spark tuning show tp4`).
 
 | Setting | Active value |
 |---|---:|
 | Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `04c30fa9` + patches 0001-0028, 0030 and 0039 (0005-0009, 0011 and 0026 off by default; 0023 off in configuration), B12X `f8069b2c` + switchless RoCEnante, CuTe DSL 4.7.1 pin, top-k position-tie, dense GEMM and prefill stage-fence patches, four-node relay and mesh transports, packed BF16 vocabulary projection, NCCL 2.30.7 + IB send-path fence and four-node ring patches |
-| Image | `vllm-ds41f-kkref:04c30fa98e79-r5p` (`sha256:4995e0d3`), one digest on all ranks, built by `bin/spark3 build` |
+| Image | `vllm-ds41f-kkref:04c30fa98e79-r5p` (`sha256:4995e0d3`), one digest on all ranks, built by `bin/spark build` |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia-64k` with `kho=off`, driver 580.178.04, no desktop |
 | Tensor parallel ranks | 3 |
 | Maximum model length | 524,288 tokens |

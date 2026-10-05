@@ -17,7 +17,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 mkdir -p "$out"
@@ -54,7 +54,7 @@ wait
 log "replays done"
 grep -hE '"changes"|done|Error|Traceback' "$out"/map-*.txt | cut -c1-400 | head -60
 log "start exact4 trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-rs2-exact4-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-rs2-exact4-trace.json cluster start --replace --apply | grep -v 'docker run'
 for n in dgx1 dgx2 dgx3; do
   ssh -n $n "docker exec dsv41-karmic-kraken sh -c 'rm -f /cache/kkref/moe-checksums/inventory-rank*.json /cache/kkref/moe-checksums/plans-rank*.json'" || true
 done
@@ -74,6 +74,6 @@ for node in dgx1 dgx2 dgx3; do
     | grep -v Warn > "$out/analysis4-cache-$node.jsonl"
 done
 log "analysed"
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 log "done"

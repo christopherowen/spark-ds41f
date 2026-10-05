@@ -9,7 +9,7 @@ E=experiments/2026-09-29-determinism
 out=results/private/determinism
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/linear_poison_check.py dgx3:/tmp/linear_poison_check.py
 log "linear poison checks on dgx3"
@@ -31,5 +31,5 @@ run -e B12X_DENSE_SPLITK_TURBO=0 -e PYTORCH_NO_CUDA_MEMORY_CACHING=1 --entrypoin
 REMOTE
 log "linear poison checks done"
 grep -E "^==|rows|OK|FAIL|ERROR SUMMARY|Uninitialized|Error" "$out/linear-poison.txt" | head -60
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

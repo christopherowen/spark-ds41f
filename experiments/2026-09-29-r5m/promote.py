@@ -126,9 +126,9 @@ sub(rd, "  CuTe DSL pin moved to the 4.7.1 that vLLM requires; its FP4 KV writer
     "  CuTe DSL pin moved to the 4.7.1 that vLLM requires; its FP4 KV writer\n"
     "  rounds like DeepSeek's reference quantizer, and its indexer top-k breaks\n"
     "  score ties by position, so selections repeat), with B12X attention,")
-sub(rd, "Current baseline, measured with `bin/spark3 bench` from dgx1:",
+sub(rd, "Current baseline, measured with `bin/spark bench` from dgx1:",
     "Measured on r5l (r5m differs only by the top-k tie rule, measured neutral) with\n"
-    "`bin/spark3 bench` from dgx1:")
+    "`bin/spark bench` from dgx1:")
 
 # 5. TODO: the tie item is done; record what still varies.
 todo = Path("TODO.md")

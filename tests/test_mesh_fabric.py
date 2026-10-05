@@ -15,10 +15,10 @@ sys.path.insert(0, str(ROOT/'scripts'))
 import mesh_fabric as fabric
 import mesh_probe
 import topology
-loader = importlib.machinery.SourceFileLoader('spark3_mesh_test', str(ROOT/'bin/spark3'))
+loader = importlib.machinery.SourceFileLoader('spark_mesh_test', str(ROOT/'bin/spark'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
-spark3 = importlib.util.module_from_spec(spec)
-loader.exec_module(spark3)
+spark = importlib.util.module_from_spec(spec)
+loader.exec_module(spark)
 EXPERIMENT = 'experiments/2026-10-02-rocenante-mesh4'
 
 
@@ -103,19 +103,19 @@ class MeshTest(unittest.TestCase):
         self.assertTrue(topology.problems(self.cluster, self.nodes))
 
     def test_doctor_checks_candidate_source_and_prevents_unqualified_serving(self):
-        cluster, nodes, lock = spark3.configuration(argparse.Namespace(cluster_config=EXPERIMENT+'/cluster.json'))
-        errors, _ = spark3.split_findings(spark3.local_doctor(cluster,nodes,lock))
+        cluster, nodes, lock = spark.configuration(argparse.Namespace(cluster_config=EXPERIMENT+'/cluster.json'))
+        errors, _ = spark.split_findings(spark.local_doctor(cluster,nodes,lock))
         self.assertEqual(errors, [])
         cluster['deployment']['launch_enabled']=True
-        errors, _ = spark3.split_findings(spark3.local_doctor(cluster,nodes,lock))
+        errors, _ = spark.split_findings(spark.local_doctor(cluster,nodes,lock))
         self.assertTrue(any('bounded collective' in e for e in errors))
 
     def test_probe_owns_fabric_lifetime_and_checks_correct_runtime(self):
-        command = spark3.collective_probe_command(self.cluster, self.nodes, self.by_rank[0], 29581)
+        command = spark.collective_probe_command(self.cluster, self.nodes, self.by_rank[0], 29581)
         self.assertEqual(command[:2], ['sudo','python3'])
         self.assertTrue(command[2].endswith('/scripts/mesh_probe.py'))
         self.assertIn('B12X_ROCE_TOPOLOGY=mesh4', command)
-        self.assertIn('--name=spark3-collective-probe', command)
+        self.assertIn('--name=spark-collective-probe', command)
 
     def facts(self):
         node = self.by_rank[0]
@@ -174,7 +174,7 @@ class MeshTest(unittest.TestCase):
             return json.dumps(rules)
         args = argparse.Namespace(paths=2, nodes=ROOT/EXPERIMENT/'nodes.example.json',rank=0,
             serving_container='serving',marker=Path('/marker'),
-            command=['--','docker','run','--rm','--name=spark3-collective-probe'])
+            command=['--','docker','run','--rm','--name=spark-collective-probe'])
         with mock.patch.object(mesh_probe.os,'geteuid',return_value=0), \
              mock.patch.object(mesh_probe,'open',mock.mock_open()), \
              mock.patch.object(mesh_probe.fcntl,'flock'), \

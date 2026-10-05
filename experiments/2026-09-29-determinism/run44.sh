@@ -16,7 +16,7 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 stop_all() {
   for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json \
     experiments/2026-09-30-r5n/cluster-*.json; do
-    bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+    bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
   done
 }
 for n in dgx1 dgx2 dgx3; do
@@ -26,15 +26,15 @@ done
 curl -s http://10.0.1.71:8000/metrics | grep -E '^vllm:num_requests_running' || true
 stop_all
 log "start rs2 trace"
-bin/spark3 --cluster-config $E/cluster-detm-r5o-rs2-trace.json cluster start --replace --apply | grep -v 'docker run'
+bin/spark --cluster-config $E/cluster-detm-r5o-rs2-trace.json cluster start --replace --apply | grep -v 'docker run'
 python3 $E/c8_trace.py http://10.0.1.71:8000 "$out/c8-rs2" --rounds 2 --tokens 16 | tee "$out/c8-rs2-runs.jsonl"
 log "c8 exit ${PIPESTATUS[0]}"
 python3 $E/trace_mixes.py http://10.0.1.71:8000 "$out/rs2" --repeats 2 --tokens 128 --prompts long \
   | tee "$out/rs2-runs.jsonl"
 log "long exit ${PIPESTATUS[0]}"
 stop_all
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
-bin/spark3 doctor --live 2>&1 | tail -3
+bin/spark cluster start --replace --apply | grep -v 'docker run'
+bin/spark doctor --live 2>&1 | tail -3
 for node in dgx1 dgx2 dgx3; do
   docker run --rm -e CUDA_VISIBLE_DEVICES= -v $PWD/$E/analyze_trace3.py:/a.py:ro -v $PWD/$out/c8-rs2:/t:ro \
     --entrypoint python3 $IMAGE /a.py /t c8 --node $node --chain 12 2>&1 | grep -v Warn \

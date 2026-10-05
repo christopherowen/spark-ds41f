@@ -16,7 +16,7 @@ $E/boot.sh cublas-log cublas-log
 date -u +%FT%T.%3NZ > "$out/serving_t0"
 python3 - <<'PY'
 import importlib.machinery, importlib.util, json, urllib.request
-loader = importlib.machinery.SourceFileLoader("spark3", "bin/spark3")
+loader = importlib.machinery.SourceFileLoader("spark3", "bin/spark")
 spec = importlib.util.spec_from_loader("spark3", loader)
 spark3 = importlib.util.module_from_spec(spec)
 loader.exec_module(spark3)

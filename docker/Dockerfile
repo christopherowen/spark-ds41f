@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-# Built by `bin/spark3 build image` from the contexts that `bin/spark3 build
+# Built by `bin/spark build image` from the contexts that `bin/spark build
 # prepare` exports from upstreams.lock.json and patches/*/series.
 #
 # Canonical ARM64 nightly af1c0149, the same runtime base as the 2026-09-20
@@ -9,7 +9,7 @@
 # stable CUDA extensions are rebuilt from the overlaid source.
 ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf
 # The image is the `runtime` stage unless the lock lists the TileLang sources;
-# `bin/spark3 build image` then selects `runtime-tilelang`, or
+# `bin/spark build image` then selects `runtime-tilelang`, or
 # `runtime-tilelang-sparknet` when the lock also lists sparknet. BuildKit
 # builds only the stages the selected one needs, so a B12X-only build neither
 # builds TileLang nor needs its contexts, and its layers are unchanged.
@@ -47,7 +47,7 @@ RUN --mount=type=secret,id=github_token,required=false \
       export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $github_auth"; \
     fi; \
     python_path=$(python3 -c 'import sys; print(":".join(sys.path))'); \
-    sed -i -E 's#^([[:space:]]*)include\(cmake/external_projects/[a-z0-9_]+\.cmake\)#\1message(STATUS "spark3: external project skipped")#' \
+    sed -i -E 's#^([[:space:]]*)include\(cmake/external_projects/[a-z0-9_]+\.cmake\)#\1message(STATUS "spark: external project skipped")#' \
       /workspace/vllm/CMakeLists.txt; \
     if grep -n 'include(cmake/external_projects/' /workspace/vllm/CMakeLists.txt; then exit 1; fi; \
     grep -q '#define CUTLASS_MAJOR 4' /workspace/cutlass/include/cutlass/version.h; \
@@ -123,7 +123,7 @@ RUN set -eux; \
     ls /opt/tilelang/tilelang-*.whl /opt/tilelang/tile_kernels-*.whl
 
 # sparknet (christopherowen/dgx-spark-networking): the one-shot RoCE
-# collectives vendored from B12X with spark3's patches 0001-0011, used by the
+# collectives vendored from B12X with spark's patches 0001-0011, used by the
 # TileLang family instead of b12x.comm.roce. Pure Python plus a C proxy.
 FROM ${BASE_IMAGE} AS sparknet-builder
 
@@ -199,7 +199,7 @@ RUN apt-get update \
 # Keep install-only generated modules and matching native extensions from the
 # base install without overwriting any candidate source file, then remove the
 # files the candidate deliberately deletes relative to the base image's
-# canonical commit (listed by `bin/spark3 build prepare` from git).
+# canonical commit (listed by `bin/spark build prepare` from git).
 COPY --from=vllm-deletions deleted.txt /tmp/vllm-deleted.txt
 RUN set -eux; \
     installed=$(python3 -c \

@@ -11,16 +11,16 @@ log() { echo "$(date -u +%FT%TZ) $*"; }
 restore() { log "restore"; $E/restore.sh; log "restore exit $?"; }
 
 log "stop promoted service"
-bin/spark3 cluster stop --remove --apply || { restore; exit 1; }
+bin/spark cluster stop --remove --apply || { restore; exit 1; }
 for _ in $(seq 1 60); do
   avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
   [ "$avail" -ge 100 ] && break
   sleep 5
 done
 log "build prepare"
-bin/spark3 build prepare || { restore; exit 1; }
+bin/spark build prepare || { restore; exit 1; }
 log "build image $TAG"
-bin/spark3 build image --apply --tag "$TAG" || { restore; exit 1; }
+bin/spark build image --apply --tag "$TAG" || { restore; exit 1; }
 local_id=$(docker image inspect "$TAG" --format '{{.Id}}')
 for host in dgx2 dgx3; do
   log "copy image to $host"

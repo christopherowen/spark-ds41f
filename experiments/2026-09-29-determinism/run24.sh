@@ -10,7 +10,7 @@ out=results/private/determinism
 NODE=${1:-dgx3}
 log() { echo "$(date -u +%FT%TZ) $*"; }
 for c in config/cluster.json $E/cluster-*.json experiments/2026-09-30-r5o/cluster-*.json; do
-  bin/spark3 --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
+  bin/spark --cluster-config "$c" cluster stop --remove --apply >/dev/null 2>&1 || true
 done
 scp -q $E/moe_batch_invariance.py $NODE:/tmp/
 log "moe batch invariance on $NODE"
@@ -34,5 +34,5 @@ run --atomic
 REMOTE
 log "done invariance"
 grep -E "^==|mode|batch|Error|Traceback|assert" "$out/moe-batch-invariance.txt" | head -40
-bin/spark3 cluster start --replace --apply | grep -v 'docker run'
+bin/spark cluster start --replace --apply | grep -v 'docker run'
 log "done"

@@ -12,7 +12,7 @@ NAME=spark3-gemm-sweep
 IMAGE=$(jq -r .container.image config/cluster.json)
 mkdir -p "$OUT"
 
-bin/spark3 cluster stop --apply
+bin/spark cluster stop --apply
 for _ in $(seq 1 60); do
   avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
   [ "$avail" -ge 100 ] && break
@@ -51,6 +51,6 @@ docker run --rm --name "$NAME" --gpus=all --ipc=host --memory=24g --memory-swap=
 rc=$?
 kill "$WATCHDOG" 2>/dev/null
 
-bin/spark3 cluster start --apply
-bin/spark3 doctor --live
+bin/spark cluster start --apply
+bin/spark doctor --live
 echo "sweep exit $rc; results in $OUT"

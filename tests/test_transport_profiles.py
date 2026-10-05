@@ -11,11 +11,11 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader("spark3_tuning_test", str(ROOT / "bin/spark3"))
+loader = importlib.machinery.SourceFileLoader("spark_tuning_test", str(ROOT / "bin/spark"))
 spec = importlib.util.spec_from_loader(loader.name, loader)
-spark3 = importlib.util.module_from_spec(spec)
-loader.exec_module(spark3)
-profiles = spark3.transport_profiles
+spark = importlib.util.module_from_spec(spec)
+loader.exec_module(spark)
+profiles = spark.transport_profiles
 
 
 class TransportProfilesTest(unittest.TestCase):
@@ -27,14 +27,14 @@ class TransportProfilesTest(unittest.TestCase):
                                 ("tp4", "config/examples/nodes-ring4.json")):
             with self.subTest(name=name):
                 profile, resolved = self.resolve(name)
-                base = spark3.read_json(profile["base_config"])
+                base = spark.read_json(profile["base_config"])
                 self.assertEqual(resolved, base)
-                nodes = spark3.read_json(node_file)
+                nodes = spark.read_json(node_file)
                 result = profiles.materialize(profile, resolved, nodes, node_file)
                 self.assertEqual(result["environment"], base["environment"])
                 self.assertEqual(result["serve_args"], base["serve_args"])
                 self.assertEqual(result["container"], base["container"])
-                self.assertEqual(spark3.topology.problems(result, nodes), [])
+                self.assertEqual(spark.topology.problems(result, nodes), [])
                 self.assertFalse(result["deployment"]["launch_enabled"])
                 self.assertNotIn("branch", result["deployment"])
                 self.assertEqual(resolved, base)
@@ -45,7 +45,7 @@ class TransportProfilesTest(unittest.TestCase):
             with self.subTest(name=name):
                 _, cluster = self.resolve(name)
                 original = copy.deepcopy(cluster)
-                report = spark3.model_layout.describe(ROOT, cluster, 2097152)
+                report = spark.model_layout.describe(ROOT, cluster, 2097152)
                 dims = report["model_dimensions"]
                 actual = tuple(dims[key]["padded_global"] for key in (
                     "attention_heads", "attention_output_groups", "engram_wkv_width", "target_vocabulary_rows"))
@@ -65,7 +65,7 @@ class TransportProfilesTest(unittest.TestCase):
     def test_draft_storage_and_graph_alignment(self):
         for name in ("tp3", "tp4"):
             _, cluster = self.resolve(name)
-            report = spark3.model_layout.describe(ROOT, cluster, 2097152)
+            report = spark.model_layout.describe(ROOT, cluster, 2097152)
             draft = report["drafter"]
             tp3 = name == "tp3"
             self.assertEqual([r["real_rows"] for r in draft["vocabulary_shards"]],
@@ -101,7 +101,7 @@ class TransportProfilesTest(unittest.TestCase):
         cluster = copy.deepcopy(base)
         cluster["environment"].update(VLLM_DS41_PACKED_BF16_LM_HEAD="0", VLLM_DS41_DRAFT_NVFP4_HEAD="1",
                                       VLLM_DS41_MARKOV_NVFP4="1")
-        draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
+        draft = spark.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
         self.assertEqual(draft["head_formats"], {"lm_head": "nvfp4", "markov_output": "nvfp4"})
         self.assertEqual(draft["lm_head_nvfp4"]["packed_values_uint8_shape"], [43136, 2560])
         self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"], [43136, 320])
@@ -113,7 +113,7 @@ class TransportProfilesTest(unittest.TestCase):
         _, base = self.resolve("tp4")
         cluster = copy.deepcopy(base)
         cluster["environment"].update(VLLM_DS41_PACKED_BF16_LM_HEAD="0", VLLM_DS41_DRAFT_NVFP4_HEAD="1")
-        draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
+        draft = spark.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
         self.assertEqual(draft["head_formats"], {"lm_head": "nvfp4", "markov_output": "bf16"})
         self.assertEqual(draft["lm_head_nvfp4"]["swizzled_scales_e4m3_storage_shape"], [32384, 320])
         self.assertEqual(draft["lm_head_nvfp4"]["scale_alignment_extra_bytes"], 20480)
@@ -123,7 +123,7 @@ class TransportProfilesTest(unittest.TestCase):
 
     def test_layout_describes_the_packed_target_head(self):
         cluster = json.loads((ROOT / "experiments/2026-10-04-tp4-memory-tuning/candidate.json").read_text())
-        draft = spark3.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
+        draft = spark.model_layout.describe(ROOT, cluster, 2097152)["drafter"]
         self.assertEqual(draft["head_formats"], {"lm_head": "packed_bf16", "markov_output": "bf16"})
         head = draft["lm_head_packed_bf16"]
         self.assertEqual(head["packed_values_uint8_shape"], [32320, 7680])
@@ -132,7 +132,7 @@ class TransportProfilesTest(unittest.TestCase):
         # The packed head is audited only when the drafter shares it.
         cluster["environment"]["VLLM_DS41_DRAFT_NVFP4_HEAD"] = "1"
         with self.assertRaisesRegex(ValueError, "packed BF16 target head"):
-            spark3.model_layout.describe(ROOT, cluster, 2097152)
+            spark.model_layout.describe(ROOT, cluster, 2097152)
 
     def test_layout_rejects_incompatible_execution_flags(self):
         _, base = self.resolve("tp4")
@@ -145,11 +145,11 @@ class TransportProfilesTest(unittest.TestCase):
             cluster = copy.deepcopy(base)
             cluster["environment"][key] = value
             with self.assertRaises(ValueError):
-                spark3.model_layout.describe(ROOT, cluster, 2097152)
+                spark.model_layout.describe(ROOT, cluster, 2097152)
         cluster = copy.deepcopy(base)
-        spark3.topology.set_argument(cluster, "--engram-config", '{"projection_tp":false}')
+        spark.topology.set_argument(cluster, "--engram-config", '{"projection_tp":false}')
         with self.assertRaisesRegex(ValueError, "Engram"):
-            spark3.model_layout.describe(ROOT, cluster, 2097152)
+            spark.model_layout.describe(ROOT, cluster, 2097152)
 
     def test_layout_rejects_unaudited_sources_and_checkpoint(self):
         _, base = self.resolve("tp4")
@@ -160,15 +160,15 @@ class TransportProfilesTest(unittest.TestCase):
             else:
                 cluster["container"]["mounts"][0][0] = "/some/other/checkpoint"
             with self.assertRaises(ValueError):
-                spark3.model_layout.describe(ROOT, cluster, 2097152)
+                spark.model_layout.describe(ROOT, cluster, 2097152)
 
     def test_wrong_topology_rejected(self):
         profile, base = self.resolve("tp3")
         with self.assertRaisesRegex(ValueError, "does not match"):
-            profiles.materialize(profile, base, spark3.read_json("config/examples/nodes-ring4.json"), "nodes.json")
+            profiles.materialize(profile, base, spark.read_json("config/examples/nodes-ring4.json"), "nodes.json")
 
     def test_catalog_validation(self):
-        original = spark3.read_json(profiles.DEFAULT_PROFILES)
+        original = spark.read_json(profiles.DEFAULT_PROFILES)
         mutations = [
             ("tp4", lambda p: p.update(base_sha256="0" * 64), "base config changed"),
             ("tp4", lambda p: p["rocenante"].update(B12X_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES="4194304"), "dispatch"),
@@ -194,16 +194,16 @@ class TransportProfilesTest(unittest.TestCase):
         profile, resolved = self.resolve("tp4")
         resolved["environment"]["NCCL_MIN_NCHANNELS"] = "2"
         with self.assertRaisesRegex(ValueError, "matching"):
-            profiles.materialize(profile, resolved, spark3.read_json("config/examples/nodes-ring4.json"), "nodes.json")
+            profiles.materialize(profile, resolved, spark.read_json("config/examples/nodes-ring4.json"), "nodes.json")
 
     def test_cli_materializes_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory(dir=ROOT / "experiments") as directory:
             output = str((Path(directory) / "candidate.json").relative_to(ROOT))
-            args = spark3.parser().parse_args([
+            args = spark.parser().parse_args([
                 "tuning", "create", "tp4", "--nodes-config", "config/examples/nodes-ring4.json", "--output", output])
             with mock.patch("builtins.print"):
                 self.assertEqual(args.func(args), 0)
-            generated = spark3.read_json(output)
+            generated = spark.read_json(output)
             self.assertEqual(generated["tuning_origin"]["profile"], "tp4")
             self.assertEqual(generated["tuning_origin"]["derived_layout"]["tensor_parallel_size"], 4)
             self.assertFalse(generated["deployment"]["launch_enabled"])
@@ -214,7 +214,7 @@ class TransportProfilesTest(unittest.TestCase):
         for argv in (["--cluster-config", "config/cluster-4k.json", "tuning", "show", "tp4"],
                      ["tuning", "create", "tp4", "--nodes-config", "config/examples/nodes-ring4.json",
                       "--output", "config/new.json"]):
-            args = spark3.parser().parse_args(argv)
+            args = spark.parser().parse_args(argv)
             with self.assertRaises(SystemExit):
                 args.func(args)
 
