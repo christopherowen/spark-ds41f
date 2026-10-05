@@ -91,7 +91,9 @@ def test_mxfp8_gemm(n, k):
             # only live rows; every tile tall enough gives the same bits.
             for block_M, kernel in decode.items():
                 if rows <= block_M:
-                    kernel(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out)
+                    kernel(
+                        xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out
+                    )
                     outs[rows, block_M] = out.clone()
         else:
             large(xq[:rows], weight, words[:rows], weight_sf, out)

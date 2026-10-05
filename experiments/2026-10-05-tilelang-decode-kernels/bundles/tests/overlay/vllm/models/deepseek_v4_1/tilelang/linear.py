@@ -5,10 +5,10 @@
 Block-32 FP8 projections quantize activations to MXFP8 with TileKernels'
 per-token cast (DeepSeek's E4M3, one UE8M0 scale per 32 elements) and run
 ``mxfp8_gemm``; decode rows go through whole 16-, 32- or 64-row activation
-tiles from the padded workspace. Unquantized projections run ``bf16_gemm``; projections with
-few output tiles (the router) split K over the SMs for decode rows and reduce
-the FP32 partials in a fixed order. Every path keeps each row's accumulation
-order fixed, so results do not depend on the batch.
+tiles from the padded workspace. Unquantized projections run ``bf16_gemm``;
+projections with few output tiles (the router) split K over the SMs for
+decode rows and reduce the FP32 partials in a fixed order. Every path keeps
+each row's accumulation order fixed, so results do not depend on the batch.
 
 The kernels run inside custom ops, which keeps them opaque to torch.compile,
 and borrow activation scratch from vLLM's workspace.

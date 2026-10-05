@@ -344,30 +344,44 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
 DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
 
 # Decode tiles of the block-32 FP8 projections by (N, K) and tile height, from
-# the kernel-lab sweep on GB10 (whole calls with the activation cast, weights
-# cold and warm in L2, against B12X's block_fp8_linear). Every field only
-# changes speed: each tile accumulates K in the same order, so a row's bits do
-# not depend on the tile or on prefill.
+# the kernel-lab sweep on GB10 at the TP4 serving shapes: whole calls with the
+# activation cast against B12X's block_fp8_linear, with the weight warm in L2,
+# cold, and racing its own L2 prefetch; each tile is the one whose worst ratio
+# to B12X over the three is lowest. Every field only changes speed: each tile
+# accumulates K in the same order, so a row's bits do not depend on the tile
+# or on prefill.
 DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
-    # TP4: Q-B, indexer Q-B, fused Q-A/KV, DSpark main projection.
+    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
     (8192, 1280): {
-        16: dict(block_N=64, block_K=256, num_stages=4),
-        32: dict(block_N=64, block_K=128, num_stages=4),
-        64: dict(block_N=64, block_K=128, num_stages=4),
+        16: dict(block_N=128, block_K=128, num_stages=3),
+        32: dict(block_N=64, block_K=128, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
     },
     (4096, 1280): {
-        16: dict(block_N=128, block_K=128, num_stages=3),
-        32: dict(block_N=128, block_K=128, num_stages=4),
+        16: dict(block_N=64, block_K=256, num_stages=4),
+        32: dict(block_N=128, block_K=128, num_stages=3),
         64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
     },
     (1792, 5120): {
-        16: dict(block_N=64, block_K=256, num_stages=3),
+        16: dict(block_N=64, block_K=256, num_stages=2),
         32: dict(block_N=64, block_K=256, num_stages=3),
         64: dict(block_N=64, block_K=256, num_stages=2),
     },
-    (6400, 5120): {
-        16: dict(block_N=32, block_K=256, num_stages=6, threads=64),
-        32: dict(block_N=32, block_K=256, num_stages=4),
+    # TP4 shared expert: gate/up and down.
+    (1152, 5120): {
+        16: dict(block_N=32, block_K=256, num_stages=3),
+        32: dict(block_N=32, block_K=256, num_stages=3),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (5120, 576): {
+        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
+        32: dict(block_N=128, block_K=64, num_stages=2),
+        64: dict(block_N=64, block_K=64, num_stages=2),
+    },
+    # TP4 DSpark main projection.
+    (6400, 6144): {
+        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+        32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
         64: dict(block_N=64, block_K=256, num_stages=2),
     },
 }
@@ -390,14 +404,14 @@ def fp8_decode_config(N: int, K: int, block_M: int = DECODE_ROWS) -> dict:
 def fp8_prefill_config(N: int, K: int) -> dict:
     """Prefill tile of an (N, K) block-32 FP8 projection.
 
-    A weight larger than L2 (the DSpark main projection, 33 MB at TP4) is
+    A weight larger than L2 (the DSpark main projection, 39 MB at TP4) is
     re-read from DRAM by every row of tiles in launch order; panels of eight N
-    tiles made its 4096-row GEMM three times faster. Smaller weights stay in
-    L2 either way and run fastest unswizzled.
+    tiles made a 33 MB projection's 4096-row GEMM three times faster. Smaller
+    weights stay in L2 either way and run fastest unswizzled.
     """
     device = torch.cuda.current_device()
     l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
-    swizzle_panel = 8 if N * K > l2_bytes else 0
+    swizzle_panel = 8 if l2_bytes < N * K else 0
     return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
 
 

@@ -1,0 +1,367 @@
+From abec9d086620045b746831ebd71fa6ad4869931c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 12:14:07 +0200
+Subject: [PATCH] Serve TileLang FP8 decode rows on race-free 16, 32 and 64-row
+ tiles
+
+Decode rows of the block-32 FP8 projections ran on one 64-row tile, so
+one stream's six verified rows paid for 64 rows of tensor-core work and
+lost to B12X's dense GEMM on the latency-bound projections. Decode rows
+now run on the shortest of 16-, 32- and 64-row tiles that holds them,
+each with its own swept configuration per TP4 shape (DECODE_FP8_CONFIGS),
+including K blocks of 256.
+
+The decode tiles run TileLang's unspecialized pipeline. With warp
+specialization, the cp.async scale staging of short tiles raced on SM121:
+identical inputs gave different, wrong results in up to every run of a
+16-row tile, while the unspecialized pipeline never did and is as fast
+for decode. Prefill keeps the warp-specialized pipeline, which is up to
+17% faster there. Every tile accumulates K in the same order, so rows
+keep the prefill kernel's bits on every route.
+
+A prefill weight larger than L2 (the DSpark main projection, 39 MB at
+TP4) was re-read from DRAM by every row of tiles; it now rasterizes in
+panels of eight N tiles, which made a 33 MB projection's 4096-row GEMM
+three times faster.
+
+The decode tiles come from a sweep at the TP4 serving shapes (attention,
+shared expert and DSpark projections) with the weight warm, cold and
+racing its own L2 prefetch, keeping each tile's best worst case against
+B12X.
+
+The tests cover every tile height and the swizzled prefill tile against
+the full batch bit for bit, and repeat the narrowest tile that raced.
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  67 +++++++++---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 102 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  32 ++++--
+ 3 files changed, 172 insertions(+), 29 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 6ab9abf7d..3724b99e2 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -17,18 +17,21 @@ tile_kernels = pytest.importorskip("tile_kernels")
+ 
+ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+     DECODE_ROWS,
++    DECODE_TILE_ROWS,
+     bf16_gemm,
+     bf16_gemm_partials,
+     bf16_shards,
+-    default_config,
++    fp8_decode_config,
++    fp8_prefill_config,
+     mxfp8_gemm,
++    mxfp8_gemm_decode,
+     pack_scale_words,
+     splitk_reduce,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm  # noqa: E402
+ 
+ DEVICE = "cuda"
+-ROWS = (1, 7, 64, 65, 200)
++ROWS = (1, 7, 16, 17, 32, 33, 64, 65, 200)
+ 
+ 
+ def _gen(seed):
+@@ -72,27 +75,65 @@ def test_mxfp8_gemm(n, k):
+     xq, sf, x_values = _mxfp8(x)
+     ref = x_values @ weight_values.T
+     words = sf.contiguous().view(torch.uint32)
+-    decode = mxfp8_gemm(n, k, **default_config(DECODE_ROWS, k), padded_rows=True)
+-    large = mxfp8_gemm(n, k, **default_config(DECODE_ROWS + 1, k))
++    decode = {
++        block_M: mxfp8_gemm_decode(
++            n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
++        )
++        for block_M in DECODE_TILE_ROWS
++    }
++    large = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
++    swizzled = mxfp8_gemm(n, k, **dict(fp8_prefill_config(n, k), swizzle_panel=2))
+     outs = {}
+     for rows in ROWS:
+         out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
+         if rows <= DECODE_ROWS:
+-            # Decode rows read one whole 64-row tile; only live rows are stored.
+-            decode(xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out)
++            # Decode rows read whole tiles of the padded workspace and store
++            # only live rows; every tile tall enough gives the same bits.
++            for block_M, kernel in decode.items():
++                if rows <= block_M:
++                    kernel(
++                        xq[:DECODE_ROWS], weight, words[:DECODE_ROWS], weight_sf, out
++                    )
++                    outs[rows, block_M] = out.clone()
+         else:
+             large(xq[:rows], weight, words[:rows], weight_sf, out)
+-        torch.testing.assert_close(
+-            out.float(), ref[:rows], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+-        )
+-        outs[rows] = out
++            outs[rows, "prefill"] = out.clone()
++            swizzled(xq[:rows], weight, words[:rows], weight_sf, out)
++            outs[rows, "swizzled"] = out.clone()
++    full = outs[max(ROWS), "prefill"]
++    torch.testing.assert_close(
++        full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
++    )
+     # Rows agree bit for bit across batch sizes, padding and tile configurations.
+-    for rows, out in outs.items():
+-        assert torch.equal(out, outs[max(ROWS)][:rows]), (
+-            f"rows={rows} differs from the full batch"
++    for (rows, tile), out in outs.items():
++        assert torch.equal(out, full[:rows]), (
++            f"rows={rows} on the {tile} tile differs from the full batch"
+         )
+ 
+ 
++def test_mxfp8_decode_tile_repeats(n=2048, k=2048, runs=100):
++    """Narrow 16-row decode tiles give the same bits on every run.
++
++    With TileLang's warp-specialized pipeline, this tile's cp.async scale
++    staging raced on SM121 and returned wrong results; decode tiles run the
++    unspecialized pipeline.
++    """
++    weight, exps, _ = _block32_weight(n, k, 5)
++    weight_sf = pack_scale_words(exps, rows=n)
++    x = torch.randn((DECODE_ROWS, k), generator=_gen(6), device=DEVICE).bfloat16()
++    xq, sf, _ = _mxfp8(x)
++    words = sf.contiguous().view(torch.uint32)
++    tile = dict(block_M=16, block_N=32, block_K=128, num_stages=2, threads=128)
++    kernel = mxfp8_gemm_decode(n, k, **tile, padded_rows=True)
++    full = torch.empty((DECODE_ROWS, n), dtype=torch.bfloat16, device=DEVICE)
++    mxfp8_gemm(n, k, **fp8_prefill_config(n, k))(xq, weight, words, weight_sf, full)
++    want = full[:16]
++    out = torch.empty_like(want)
++    for run in range(runs):
++        kernel(xq, weight, words, weight_sf, out)
++        assert torch.equal(out, want), f"run {run} differs"
++
++
+ @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+ # The router (384 x 5120) splits K eight ways; (100, 200) cannot split.
+ @pytest.mark.parametrize("n, k", [(32, 4096), (384, 512), (384, 5120), (100, 200)])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index a14d792a5..d61f14d38 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -45,8 +45,7 @@ def pick_block_K(K: int, widest: int = 192) -> int:
+     raise ValueError(f"K={K} must be a multiple of 64")
+ 
+ 
+-@tilelang.jit
+-def mxfp8_gemm(
++def _mxfp8_gemm(
+     N: int,
+     K: int,
+     block_M: int = 128,
+@@ -56,6 +55,7 @@ def mxfp8_gemm(
+     threads: int = 128,
+     out_dtype: T.dtype = T.bfloat16,
+     padded_rows: bool = False,
++    swizzle_panel: int = 0,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -72,6 +72,9 @@ def mxfp8_gemm(
+ 
+     Each output accumulates over K in the same order whatever the tile shape
+     or padding, so a row's result does not depend on M or the configuration.
++    ``swizzle_panel`` rasterizes the CTAs in panels of that many N tiles, so a
++    weight larger than L2 is read once per panel rather than once per row of
++    tiles; it only changes the order tiles run in.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0, (
+         "block_K must divide K and be a multiple of 64"
+@@ -95,6 +98,8 @@ def mxfp8_gemm(
+         with T.Kernel(
+             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+         ) as (bx, by):
++            if swizzle_panel:
++                T.use_swizzle(panel_size=swizzle_panel)
+             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
+             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+@@ -133,6 +138,18 @@ def mxfp8_gemm(
+     return main
+ 
+ 
++# Prefill tiles use TileLang's warp-specialized pipeline (TMA producer warps,
++# up to 17% faster there). Decode tiles do not: with warp specialization the
++# cp.async scale staging races on SM121 at decode tile shapes (16-row tiles
++# returned wrong results in up to every run; 64-row tiles were not seen to),
++# while the unspecialized pipeline is race-free and as fast for decode. Both
++# run the same arithmetic, so their bits agree.
++mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
++mxfp8_gemm_decode = tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++)(_mxfp8_gemm)
++
++
+ @tilelang.jit
+ def splitk_reduce(
+     N: int,
+@@ -322,12 +339,87 @@ def bf16_shards(N: int, K: int, block_N: int = 64, block_K: int = 64) -> int:
+     return best
+ 
+ 
++# Decode tile heights: rows up to DECODE_ROWS run on the shortest that holds
++# them (one stream's verified rows fit 16; 32 rows hold four streams').
++DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
++
++# Decode tiles of the block-32 FP8 projections by (N, K) and tile height, from
++# the kernel-lab sweep on GB10 at the TP4 serving shapes: whole calls with the
++# activation cast against B12X's block_fp8_linear, with the weight warm in L2,
++# cold, and racing its own L2 prefetch; each tile is the one whose worst ratio
++# to B12X over the three is lowest. Every field only changes speed: each tile
++# accumulates K in the same order, so a row's bits do not depend on the tile
++# or on prefill.
++DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
++    # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
++    (8192, 1280): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++        32: dict(block_N=64, block_K=128, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++    (4096, 1280): {
++        16: dict(block_N=64, block_K=256, num_stages=4),
++        32: dict(block_N=128, block_K=128, num_stages=3),
++        64: dict(block_N=64, block_K=128, num_stages=2, threads=64),
++    },
++    (1792, 5120): {
++        16: dict(block_N=64, block_K=256, num_stages=2),
++        32: dict(block_N=64, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++    # TP4 shared expert: gate/up and down.
++    (1152, 5120): {
++        16: dict(block_N=32, block_K=256, num_stages=3),
++        32: dict(block_N=32, block_K=256, num_stages=3),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++    (5120, 576): {
++        16: dict(block_N=128, block_K=64, num_stages=2, threads=64),
++        32: dict(block_N=128, block_K=64, num_stages=2),
++        64: dict(block_N=64, block_K=64, num_stages=2),
++    },
++    # TP4 DSpark main projection.
++    (6400, 6144): {
++        16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
++        32: dict(block_N=32, block_K=256, num_stages=4, threads=64),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++}
++
++
++def decode_tile_rows(rows: int) -> int:
++    """Height of the decode tile that serves ``rows`` (at most DECODE_ROWS)."""
++    return next(height for height in DECODE_TILE_ROWS if rows <= height)
++
++
++def fp8_decode_config(N: int, K: int, block_M: int = DECODE_ROWS) -> dict:
++    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall."""
++    config = dict(
++        block_M=block_M, block_N=64, block_K=pick_block_K(K), num_stages=3, threads=128
++    )
++    config.update(DECODE_FP8_CONFIGS.get((N, K), {}).get(block_M, {}))
++    return config
++
++
++def fp8_prefill_config(N: int, K: int) -> dict:
++    """Prefill tile of an (N, K) block-32 FP8 projection.
++
++    A weight larger than L2 (the DSpark main projection, 39 MB at TP4) is
++    re-read from DRAM by every row of tiles in launch order; panels of eight N
++    tiles made a 33 MB projection's 4096-row GEMM three times faster. Smaller
++    weights stay in L2 either way and run fastest unswizzled.
++    """
++    device = torch.cuda.current_device()
++    l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
++    swizzle_panel = 8 if l2_bytes < N * K else 0
++    return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
++
++
+ def default_config(M: int, K: int) -> dict:
+     """Tile choice by row count: decode needs more, smaller N tiles to fill the GPU.
+ 
+-    Tiles stay at least 64 rows tall. On SM121, warp-specialized 32x64 tiles
+-    with cp.async scale staging intermittently read stale scales. The large
+-    tiles keep K blocks of 128 or 64 to stay within 99 KiB of shared memory.
++    The large tiles keep K blocks of 128 or 64 to stay within 99 KiB of
++    shared memory. Block-32 FP8 decode tiles come from ``fp8_decode_config``.
+     """
+     if M <= DECODE_ROWS:
+         return dict(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index eead5a2fc..70965bbc5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -4,11 +4,11 @@
+ 
+ Block-32 FP8 projections quantize activations to MXFP8 with TileKernels'
+ per-token cast (DeepSeek's E4M3, one UE8M0 scale per 32 elements) and run
+-``mxfp8_gemm``; decode rows go through whole 64-row activation tiles from the
+-padded workspace. Unquantized projections run ``bf16_gemm``; projections with
+-few output tiles (the router) split K over the SMs for decode rows and reduce
+-the FP32 partials in a fixed order. Every path keeps each row's accumulation
+-order fixed, so results do not depend on the batch.
++``mxfp8_gemm``; decode rows go through whole 16-, 32- or 64-row activation
++tiles from the padded workspace. Unquantized projections run ``bf16_gemm``;
++projections with few output tiles (the router) split K over the SMs for
++decode rows and reduce the FP32 partials in a fixed order. Every path keeps
++each row's accumulation order fixed, so results do not depend on the batch.
+ 
+ The kernels run inside custom ops, which keeps them opaque to torch.compile,
+ and borrow activation scratch from vLLM's workspace.
+@@ -29,12 +29,16 @@ from vllm.v1.worker.workspace import (
+ 
+ from .gemm import (
+     DECODE_ROWS,
++    DECODE_TILE_ROWS,
+     SF_BLOCK,
+     bf16_gemm,
+     bf16_gemm_partials,
+     bf16_shards,
+-    default_config,
++    decode_tile_rows,
++    fp8_decode_config,
++    fp8_prefill_config,
+     mxfp8_gemm,
++    mxfp8_gemm_decode,
+     pack_scale_words,
+     scale_words,
+     splitk_reduce,
+@@ -137,7 +141,10 @@ def _block32_linear(
+         use_packed_ue8m0=True,
+         out=(xq[:rows], sf[:rows]),
+     )
+-    gemm = layer.tilelang_gemms[0 if rows <= DECODE_ROWS else 1]
++    if rows > DECODE_ROWS:
++        gemm = layer.tilelang_prefill
++    else:
++        gemm = layer.tilelang_decode[decode_tile_rows(rows)]
+     gemm(
+         xq,
+         layer.weight,
+@@ -185,10 +192,13 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+         layer.tilelang_weight_sf = pack_scale_words(
+             layer.weight_scale_inv.view(torch.uint8), rows=n
+         )
+-        layer.tilelang_gemms = (
+-            mxfp8_gemm(n, k, **default_config(DECODE_ROWS, k), padded_rows=True),
+-            mxfp8_gemm(n, k, **default_config(DECODE_ROWS + 1, k)),
+-        )
++        layer.tilelang_decode = {
++            block_M: mxfp8_gemm_decode(
++                n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
++            )
++            for block_M in DECODE_TILE_ROWS
++        }
++        layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
+         layer.tilelang_key = id(layer)
+         _LAYERS[layer.tilelang_key] = layer
+ 
+-- 
+2.54.0 (Apple Git-157)
+
