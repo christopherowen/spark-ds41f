@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import http.server
+import io
 import random
 import tempfile
 import importlib.machinery
@@ -341,8 +343,10 @@ class PrecisionSetTest(unittest.TestCase):
                                          min_samples=3, max_samples=4, precision=2.0, converge_on=None,
                                          output_dir=Path(tmp))
             bench = StubBench()
-            report = spark.suite_decode(bench, options, random.Random(0))
+            with contextlib.redirect_stdout(io.StringIO()) as progress:
+                report = spark.suite_decode(bench, options, random.Random(0))
             saved = sorted(path.name for path in (Path(tmp) / "outputs" / "json-1k-c2").iterdir())
+        self.assertIn("all points converged", progress.getvalue())
         self.assertIn("warmup-stream2.txt", saved)
         self.assertIn("sample05-stream1.json", saved)
         self.assertEqual(len(saved), 2 * 2 * 6)
@@ -456,8 +460,10 @@ class ComplianceSuiteTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             options = argparse.Namespace(model="m", output_dir=Path(tmp))
             bench = StubBench()
-            report = spark.suite_compliance(bench, options, random.Random(0))
+            with contextlib.redirect_stdout(io.StringIO()) as progress:
+                report = spark.suite_compliance(bench, options, random.Random(0))
             saved = sorted(p.name for p in (Path(tmp) / "outputs" / "compliance-constrained").iterdir())
+        self.assertIn("compliance prompt_only library books: hit the token budget", progress.getvalue())
         self.assertEqual(bench.labels, ["compliance prompt_only", "compliance constrained"])
         self.assertEqual(report["arms"]["prompt_only"]["passed"], len(spark.PRECISION_JSON_RECORDS) - 1)
         self.assertEqual(report["arms"]["prompt_only"]["requests"][0]["violation"], "hit the token budget")
