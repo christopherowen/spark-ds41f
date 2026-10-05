@@ -78,3 +78,66 @@ Then, in the same boot: quality, decode on prose and code with reasoning at
 1, 2, 4 and 8 streams (three samples), and prefill on real source text at
 32K, 256K and 500K (two repeats). B12X compares with the promoted TP3
 baseline, TileLang with B12X.
+
+## Results
+
+B12X ran in the window of 2026-10-05 01:03–01:22 UTC. TileLang ran at 01:47–02:08 UTC, after
+0041 and 0042; its first three starts stopped as described above. Both
+passed quality 5/5 and saw no thermal slowdown.
+
+**Numerical check: no numerical issue.**
+
+| | B12X | TileLang |
+| --- | ---: | ---: |
+| Same tokens (8,188): mean NLL | 1.5527 | 1.5525 |
+| Same tokens: top-1 accuracy | 68.04% | 67.84% |
+| Same top token in both families | | 93.89% |
+| Decode against prefill: mean logprob gap | 0.0565 | 0.0469 |
+| Decode against prefill: argmax differs | 3.32% | 2.59% |
+| Accepted drafts per step, mean of 13 texts | 2.384 | 2.401 |
+| Single-stream step, mean of 13 texts | 45.66 ms | 43.80 ms |
+
+On the same tokens the two families score the same text equally well, and
+TileLang's decode agrees with its own prefill more closely than B12X's.
+Across 13 texts acceptance is level (TileLang higher in 7, median ratio
+1.01), with a per-text spread of about 5% in either direction. That spread is
+why single points of the TP4 benchmark showed lower acceptance: each point is
+one text, and TileLang generates the same text in every sample.
+
+**Benchmark** (8 streams at 512K):
+
+| Aggregate tok/s | 1 | 2 | 4 | 8 |
+| --- | ---: | ---: | ---: | ---: |
+| Prose, B12X | 50.4 | 75.9 | 118.8 | 173.3 |
+| Prose, TileLang | 50.5 | 78.7 | 122.5 | 181.6 |
+| Code, B12X | 60.1 | 90.8 | 136.3 | 192.3 |
+| Code, TileLang | 60.9 | 88.3 | 137.6 | 221.6 |
+
+| Prefill, real text (tok/s) | 32K | 256K | 500K |
+| --- | ---: | ---: | ---: |
+| B12X | 3,778 | 3,632 | 3,432 |
+| TileLang | 4,243 | 3,971 | 3,682 |
+
+TileLang's single-stream steps are 5.5% and 5.4% shorter (39.60 and
+43.91 ms), eight-stream code is 15.2% faster, and prefill is 7-12% faster.
+Code at two streams reads 2.8% lower, inside its interval. Against the
+promoted r5o TP3 baseline, the B12X configuration is level within noise.
+
+Memory is tighter than on TP4. During the 500K prefill, the lowest MemAvailable
+was 5.9 GiB on dgx1 for B12X and 6.4 GiB for TileLang, with the promoted 3.5
+GiB of KV per rank; the startup guard is at 5 GiB.
+
+**Coherence (TileLang).** [coherence.py](coherence.py) answers to six prompts
+are coherent and correct: an explanation of hash-map collisions, an
+expand-around-centre palindrome function, the arrival time (12:10), a
+five-sentence story, a JSON list (FORTRAN 1957, Lisp 1958, C 1972; cut by the
+1,200-token budget after long reasoning) and a syllogism ("No"). The repeated
+n-grams come from the reasoning drafting the final text. At ~420K tokens,
+`long_context.py` found both code words (10% and 90% depth); time to first
+token was about 112 s and decode ran at 113-119 tok/s with the context
+resident.
+
+**Images.** 0041 and 0042 still need to be built into the TileLang and B12X
+images; this run mounted them over `-tilelang-1m-v3`. Neither changes a
+serving step except 0042, which keeps the drafter's CUDA graph padding rows
+out of the routers.
