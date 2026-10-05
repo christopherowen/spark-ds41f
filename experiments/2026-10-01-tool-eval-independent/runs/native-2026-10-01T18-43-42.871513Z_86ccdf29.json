@@ -1,0 +1,111 @@
+{
+  "run_id": "2026-10-01T18-43-42.871513Z_86ccdf29",
+  "status": "completed",
+  "config": {
+    "model": "deepseek-v4.1-flash",
+    "backend": "vllm",
+    "base_url": "http://***:8000/v1",
+    "endpoint_id": "endpoint:5249430294fb",
+    "temperature": 0.0,
+    "timeout_seconds": 120.0,
+    "max_turns": 8,
+    "seed": 42,
+    "reference_date": "2026-10-01",
+    "scenario_count": 1,
+    "scenario_ids": [
+      "TC-88"
+    ],
+    "concurrency": 1,
+    "error_rate": 0.0,
+    "alpha": 0.7,
+    "extra_params": {
+      "max_tokens": 16384,
+      "chat_template_kwargs": {
+        "thinking": true,
+        "drop_thinking": false
+      }
+    },
+    "weight_by_difficulty": false,
+    "config_fingerprint": "df8d9962eba0"
+  },
+  "scores": {
+    "final_score": 100,
+    "total_points": 2,
+    "max_points": 2,
+    "rating": "\u2605\u2605\u2605\u2605\u2605 Excellent",
+    "category_scores": [
+      {
+        "category": "P",
+        "label": "Hard Mode",
+        "earned": 2,
+        "max": 2,
+        "percent": 100,
+        "pass_count": 1,
+        "partial_count": 0,
+        "fail_count": 0
+      }
+    ],
+    "scenario_results": [
+      {
+        "scenario_id": "TC-88",
+        "status": "pass",
+        "points": 2,
+        "summary": "Returned three distinct values satisfying every visible cross-turn constraint.",
+        "note": "Reasoning transport is a separate diagnostic; number occurrence does not prove private verification.",
+        "tool_calls_made": [],
+        "expected_behavior": "Preserve provider-exposed private planning across two user follow-ups.",
+        "duration_seconds": 33.45,
+        "turn_count": 3,
+        "ttft_ms": 310.6,
+        "turn_latencies_ms": [
+          29105.0,
+          2265.3,
+          2082.7
+        ],
+        "prompt_tokens": 5236,
+        "completion_tokens": 2467,
+        "total_tokens": 7703,
+        "diagnostics": {
+          "reasoning_transport": "observed"
+        },
+        "raw_log": "model=deepseek-v4.1-flash\nscenario=TC-88 Preserved Reasoning Across Follow-Ups\nprompt=Privately construct three distinct 20-digit numbers with no leading zero. Their digit sums must be 73, 91, and 109 in that order. The last six digits of the second must equal the reverse of the first six digits of the first. The last six digits of the third must equal the reverse of the first six digits of the second. Verify every length, sum, and reversal in your reasoning. Do not use tools. Reply with only the first number and nothing else.\n\nassistant=starting\navailable_tools=(none)\nassistant_turn_1=12345699999700000000\nassistant_reasoning_1=We need answer only first number. Need construct privately. Need satisfy constraints. We need output only first number. Need ensure 20-digit, no leading zero, digit sum 73. Also constraints involving second/third but only output first. However must construct all to verify? We can choose first, then second/third possible. Need ensure there exist second with sum 91 and last six = reverse first six; third sum 109 and last six = reverse first six of second. Since only output first, but need be valid in context. We can construct.\n\nLet's reason carefully.\n\nWe need three distinct 20-digit numbers A, B, C.\nA digit sum 73.\nB digit sum 91.\nC digit sum 109.\nLast six digits of B = reverse of first six digits of A.\nLast six digits of C = reverse of first six digits of B.\n\nNeed output A only. But must ensure B and C exist. We can design.\n\nLet A = a1...a20. First six digits F_A = a1..a6. Last six of B = reverse(F_A) = a6 a5 a4 a3 a2 a1.\n\nB first six digits F_B = b1..b6. Last six of C = reverse(F_B) = b6 b5 b4 b3 b2 b1.\n\nNeed B sum 91. B has 20 digits. We can choose B middle 8 digits to adjust sum. Need B last six fixed by A. B first six can be chosen. B sum = sum(F_B) + sum(middle 8) + sum(reverse(F_A)) = sum(F_B)+sum(middle8)+sum(F_A) = 91. Since sum(F_A) part of A.\n\nC sum = sum(F_C) + sum(middle8_C) + sum(reverse(F_B)) = sum(F_C)+sum(midC)+sum(F_B)=109.\n\nWe can choose A with sum 73. Need sum(F_A) <=? B sum 91. B last six sum = sum(F_A). B first six sum at least 1 (no leading zero) and max 54. Middle 8 max 72. So B possible if 91 - sum(F_A) between 1 and 126. Since sum(F_A) <=54, 91 - <=90, okay. Need at least 1. If sum(F_A)=54, B first+middle sum=37 possible. Fine.\n\nC possible if 109 - sum(F_B) between 1 and 126. sum(F_B) <=54, so >=55, possible. Need C first+middle sum = 109 - sum(F_B). Max 126. If sum(F_B) small, okay. Need at least 1. If sum(F_B)=54, 55 possible. Fine.\n\nSimplest: choose A with digit sum 73. Need first six digits maybe sum something. Let's pick A digits.\n\nWe need output A. Let's construct A = 123456789...? Need sum 73 over 20 digits. Average 3.65. Easy.\n\nLet's choose first six digits F_A = 1 2 3 4 5 6 sum=21. Then B last six = 6 5 4 3 2 1 sum=21. B total 91, so B first six + middle 8 sum = 70. We can choose B first six sum maybe 21, middle 8 sum 49. C last six = reverse(F_B). Need C sum 109. If choose F_B sum 21, then C first six + middle 8 sum = 109 - 21 = 88. Max first six 54 + middle 72 =126, so possible. Need C first six no leading zero. Easy.\n\nNow A remaining 14 digits sum = 73 - 21 = 52. Need 20-digit no leading zero. First digit 1 okay. Choose remaining digits sum 52. For example 14 digits: 9+9+9+9+9+7 =52? That's 6 digits. Need 14 digits. Let's just pick A = 123456 + 14 digits sum 52. Need 14 digits. Could use 99999999999999 sum 126 too high. Need sum 52. Let's pick 14 digits: 9,9,9,9,9,7,0,0,0,0,0,0,0,0 sum=52? 9*5=45+7=52, plus eight zeros = 14 digits? 5+1+8=14 yes. So A = 12345699999700000000? Let's count: first six 123456, then 999997, then 00000000? That's 6+6+8=20. Digits: 1 2 3 4 5 6 9 9 9 9 9 7 0 0 0 0 0 0 0 0. Sum first six 21 + (9*5+7=52) =73. Length 20. No leading zero. Good.\n\nBut wait A = 12345699999700000000. Last six digits are 000000. First six 123456. B last six must be reverse of first six = 654321. Good.\n\nNow B: last six 654321 sum=21. Need B sum 91. Need first six + middle 8 sum =70. Choose B first six maybe 123456 sum=21. Then middle 8 sum=49. Need B distinct from A. B = 123456 + 8 digits sum 49 + 654321. Choose middle 8 digits sum 49. For example 9,9,9,9,9,4,0,0 sum=49? 9*5=45+4=49, plus two zeros =8 digits. So B = 12345699999400 654321? Let's count: first six 123456, middle 8 = 99999400, last six 654321. Total 20. B = 12345699999400654321? Wait concatenate: 123456 + 99999400 + 654321 = 12345699999400654321. Count: 6+8+6=20. Sum: first six 21 + middle 49 + last six 21 =91. Good. Last six 654321 = reverse of A first six 123456. Good.\n\nNow C: last six must equal reverse of B first six. B first six = 123456, reverse = 654321. So C last six = 654321 sum=21. Need C sum 109. Need C first six + middle 8 sum = 109 - 21 = 88. Choose C first six maybe 999999 sum=54. Then middle 8 sum = 34. Need C distinct. C = 999999 + 8 digits sum 34 + 654321. Choose middle 8 sum 34. For example 9,9,9,7,0,0,0,0 sum=34? 9+9+9+7=34, plus four zeros =8 digits. So C = 99999999970000654321? Let's concatenate: 999999 + 99970000 + 654321 = 99999999970000654321. Count 6+8+6=20. Sum first six 54 + middle 34 + last six 21 =109. Last six 654321 = reverse of B first six 123456. Good.\n\nCheck C first six 999999, no leading zero. Distinct from A and B. All good.\n\nBut wait requirement: \"The last six digits of the second must equal the reverse of the first six digits of the first.\" A first six = 123456, reverse = 654321. B last six = 654321. Yes.\n\"The last six digits of the third must equal the reverse of the first six digits of the second.\" B first six = 123456, reverse = 654321. C last six = 654321. Yes.\n\nSo A = 12345699999700000000. Need output only first number and nothing else. Ensure no extra punctuation? \"Reply with only the first number and nothing else.\" So final should be just 12345699999700000000.\n\nDouble-check A length: 12345699999700000000. Count digits: 1 2 3 4 5 6 9 9 9 9 9 7 0 0 0 0 0 0 0 0 = 20. Sum: 1+2+3+4+5+6=21; 9*5=45; +7=52; total 73. Yes.\n\nNeed be careful: A = 12345699999700000000. Let's write: 123456 999997 00000000? Wait earlier I said 999997 (five 9s and 7) = 6 digits. Then eight zeros. So string: 12345699999700000000. Count after 123456: 999997 (6 digits) then 00000000 (8 digits). Total 20. Let's count characters: \"123456\" (6) + \"999997\" (6) =12 + \"00000000\" (8)=20. The string \"12345699999700000000\": let's count: 1(1)2(2)3(3)4(4)5(5)6(6)9(7)9(8)9(9)9(10)9(11)7(12)0(13)0(14)0(15)0(16)0(17)0(18)0(19)0(20). Yes.\n\nBut wait I wrote A = 12345699999700000000. That has five 9s? \"999997\" = five 9s and a 7. Yes. Sum 5*9+7=52. Good.\n\nFinal only number.\nuser_follow_up_1=Now reply with only the second number you constructed and nothing else.\nassistant_turn_2=12345699999400654321\nassistant_reasoning_2=We need output second number constructed. Earlier B = 12345699999400654321. Need ensure correct. Let's verify B: first six 123456, middle 8 99999400, last six 654321. Concatenate: 12345699999400654321. Count: 123456 (6) + 99999400 (8) =14 + 654321 (6)=20. Sum: 1+2+3+4+5+6=21; 9+9+9+9+9+4+0+0=49; 6+5+4+3+2+1=21; total 91. Last six 654321 reverse of A first six 123456. Good. Output only second number.\nuser_follow_up_2=Now reply with only the third number you constructed and nothing else.\nassistant_turn_3=99999999970000654321\nassistant_reasoning_3=We need output third number constructed: C = 99999999970000654321. Verify: first six 999999, middle 8 99970000, last six 654321. Concatenate: 99999999970000654321. Count: 999999 (6) + 99970000 (8) =14 + 654321 (6)=20. Sum: 54 + (9+9+9+7=34) + 21 =109. Last six 654321 reverse of B first six 123456. Good. Output only.\nfinal_answer=99999999970000654321\n\nverdict=pass\nsummary=Returned three distinct values satisfying every visible cross-turn constraint.\nnote=Reasoning transport is a separate diagnostic; number occurrence does not prove private verification."
+      }
+    ],
+    "worst_category": "P Hard Mode (100%)",
+    "worst_category_percent": 100,
+    "deployability": 88,
+    "responsiveness": 60,
+    "median_turn_ms": 2265.3,
+    "alpha": 0.7,
+    "total_tokens": 7703,
+    "token_efficiency": 0.26
+  },
+  "metadata": {
+    "tool_version": "2.6.1.dev72+gd84fce442",
+    "hostname": "Christophers-MacBook-Pro-2.local",
+    "platform_info": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python_version": "3.13.15",
+    "model": "deepseek-v4.1-flash",
+    "backend": "vllm",
+    "base_url": "http://***:8000/v1",
+    "temperature": 0.0,
+    "max_turns": 8,
+    "timeout_seconds": 120.0,
+    "seed": 42,
+    "scenario_selector": "TC-88",
+    "trials": 3,
+    "parallel": 1,
+    "error_rate": 0.0,
+    "thinking_enabled": true,
+    "extra_params": {
+      "max_tokens": 16384,
+      "chat_template_kwargs": {
+        "thinking": true,
+        "drop_thinking": false
+      }
+    },
+    "label": "r5o-tc88-preserve-reasoning",
+    "max_tokens": 16384
+  },
+  "report_path": "runs/preserve-reasoning/2026/10/2026-10-01T18-43-42.871513Z_86ccdf29--r5o-tc88-preserve-reasoning.md"
+}
