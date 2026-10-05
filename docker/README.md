@@ -9,14 +9,14 @@ the wheel's `libnccl.so.2`; the image build checks the installed library's
 version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
-`bin/spark3 build`, and the promoted image is `vllm-ds41f-kkref:04c30fa98e79-r5p`.
+`bin/spark build`, and the promoted image is `vllm-ds41f-kkref:04c30fa98e79-r5p`.
 
 ```sh
-bin/spark3 build prepare        # create or repair the build directory
-bin/spark3 build check          # verify it
-bin/spark3 build image          # print the build command
-bin/spark3 build image --apply  # build and smoke-test on an idle host
-bin/spark3 build smoke          # rerun the GPU import smoke
+bin/spark build prepare        # create or repair the build directory
+bin/spark build check          # verify it
+bin/spark build image          # print the build command
+bin/spark build image --apply  # build and smoke-test on an idle host
+bin/spark build smoke          # rerun the GPU import smoke
 ```
 
 ## Build directory
@@ -70,7 +70,7 @@ umask and are identical on every host. The earlier recipe copied whole
 checkouts, which put about 100 MB of `.git` history into the image and
 changed the build cache key on every fresh clone.
 
-**CI:** CI runs `bin/spark3 build prepare --only vllm` and `--only b12x` to
+**CI:** CI runs `bin/spark build prepare --only vllm` and `--only b12x` to
 check that the series still apply and reproduce the recorded trees, and
 `--only vllm,tilelang,tile_kernels` for the TileLang candidate.
 
@@ -116,5 +116,5 @@ The default tag is `container.image` from the cluster configuration. The
 command refuses to overwrite an existing tag, so a node never silently holds a
 different image under the promoted name. Build once, then load the same image
 on every node and confirm all three report the same ID (`docs/replicate.md`).
-Start the service only through `bin/spark3 cluster start`, with its startup and
+Start the service only through `bin/spark cluster start`, with its startup and
 steady memory guards.

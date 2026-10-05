@@ -16,7 +16,7 @@ spec = importlib.util.spec_from_loader("lab", loader)
 lab = importlib.util.module_from_spec(spec)
 loader.exec_module(lab)
 # Host-independent: read the shipped example, not the site's git-ignored config/nodes.json.
-lab.spark3.site_nodes = lambda: lab.spark3.read_json("config/nodes.example.json")
+lab.spark.site_nodes = lambda: lab.spark.read_json("config/nodes.example.json")
 
 SPEC = {
     "experiment": "experiments/2026-09-29-determinism",
@@ -46,11 +46,27 @@ class HoldTest(unittest.TestCase):
     def test_window_closes_on_request_or_cap(self) -> None:
         hold = lab.new_hold(10, "", at=1_000_000.0)
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(lab, "REQUEST", Path(directory) / "request.json"):
+                mock.patch.object(lab, "REQUEST", Path(directory) / "request.json"), \
+                mock.patch.object(lab, "LEGACY_REQUEST", Path(directory) / "legacy-request.json"):
             self.assertIsNone(lab.window_should_close(hold, at=1_000_060.0))
             self.assertEqual(lab.window_should_close(hold, at=1_000_000.0 + 601), "time cap reached")
             lab.REQUEST.write_text("{}")
             self.assertIn("requested", lab.window_should_close(hold, at=1_000_060.0))
+
+    def test_former_hold_and_request_names_still_count(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "HOLD", Path(directory) / "spark-hold.json"), \
+                mock.patch.object(lab, "LEGACY_HOLD", Path(directory) / "spark3-hold.json"), \
+                mock.patch.object(lab, "REQUEST", Path(directory) / "spark-request.json"), \
+                mock.patch.object(lab, "LEGACY_REQUEST", Path(directory) / "spark3-request.json"):
+            self.assertIsNone(lab.read_hold())
+            lab.LEGACY_HOLD.write_text('{"holder": "another agent"}')
+            self.assertEqual(lab.read_hold()["holder"], "another agent")
+            self.assertFalse(lab.hold_is_ours(lab.read_hold()))
+            hold = lab.new_hold(10, "", at=1_000_000.0)
+            self.assertIsNone(lab.window_should_close(hold, at=1_000_060.0))
+            lab.LEGACY_REQUEST.write_text("{}")
+            self.assertIn("spark3-request.json", lab.window_should_close(hold, at=1_000_060.0))
 
     def test_read_hold_tolerates_damage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -118,9 +134,9 @@ class BootTimeTest(unittest.TestCase):
 
         promoted = {"nodes": [{"rank": 0}, {"rank": 1}, {"rank": 2}]}
         candidate = {"nodes": [*promoted["nodes"], {"rank": 3}]}
-        with mock.patch.object(lab.spark3, "configuration", return_value=({}, candidate, {})), \
+        with mock.patch.object(lab.spark, "configuration", return_value=({}, candidate, {})), \
              mock.patch.object(lab, "nodes_config", return_value=promoted), \
-             mock.patch.object(lab, "spark3_cli") as launch:
+             mock.patch.object(lab, "spark_cli") as launch:
             self.assertFalse(lab.boot("ring4.json"))
             launch.assert_not_called()
 

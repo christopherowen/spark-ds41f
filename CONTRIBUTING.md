@@ -5,7 +5,7 @@ evidence. It does not replace the vLLM, B12X, FlashInfer, or CUTLASS projects.
 
 For a deployment change, open a branch here and follow `docs/methodology.md`. For
 source work, first identify the owner in `upstreams.lock.json`, prepare that tree
-with `bin/spark3 upstream prepare NAME`, and create one narrowly scoped branch in
+with `bin/spark upstream prepare NAME`, and create one narrowly scoped branch in
 the appropriate source fork. Do not combine unrelated vLLM and B12X changes into
 one upstream contribution.
 
@@ -21,6 +21,6 @@ promotion. Preserve the upstream pull-request link and benchmark receipts in the
 promotion commit.
 
 Operational changes are deployed only from a clean, published commit with
-`bin/spark3 cluster sync --apply`. Do not add credentials, node-local environment
+`bin/spark cluster sync --apply`. Do not add credentials, node-local environment
 files, caches, or private benchmark inputs, and do not synchronize a working tree
 with rsync or scp.

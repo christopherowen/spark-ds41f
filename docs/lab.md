@@ -15,7 +15,7 @@ scripts/lab.py window close
 
 - the deployment commit is on `origin/main` and every node's checkout matches;
 - the cluster has served no requests for 30 s;
-- no one else holds `~/spark3-hold.json`.
+- no one else holds `~/spark-hold.json`.
 
 It then writes the hold file and starts a watchdog. The hold file records the time cap
 and a heartbeat that the runner refreshes every minute. The watchdog restores the
@@ -29,7 +29,7 @@ A window closes itself:
 - when its run completes, unless the run uses `--keep-open`;
 - when a job fails;
 - at its time cap;
-- when someone writes `~/spark3-request.json`. The runner finishes the current job first.
+- when someone writes `~/spark-request.json`. The runner finishes the current job first.
 
 ## Runs
 
@@ -80,8 +80,8 @@ Overlay files are mounted over `/opt/spark3/candidate/<package>/<package>/...`.
 `candidate.json` holds:
 - `image`, `env`, `argv` (the harness command inside the container);
 - `mounts`: `[source, destination]` pairs. A source is resolved from the bundle first, then
-  from `~/spark3-lab/inputs`, then from the node's checkout;
-- `sync`: inputs that are not in Git, copied to `~/spark3-lab/inputs` on the other nodes;
+  from `~/spark-lab/inputs`, then from the node's checkout;
+- `sync`: inputs that are not in Git, copied to `~/spark-lab/inputs` on the other nodes;
 - `variant_configs`: configurations allowed more than one row group, such as production;
 - `workdir`: the container working directory (default `/opt/spark3/candidate/b12x`);
 - `verdict`: `"exit"` for a test-suite bundle, such as pytest over the image's own
@@ -93,7 +93,7 @@ Before replaying, a kernel job brings its nodes below the bench's cooling thresh
 floor until the last is below it; then their usual fan control returns. This is the
 same thermal baseline every bench starts from ([methodology](methodology.md)).
 
-Bundles, synced inputs and outputs stay under `~/spark3-lab/` on each node, outside
+Bundles, synced inputs and outputs stay under `~/spark-lab/` on each node, outside
 the deployment checkout.
 
 ```sh
@@ -102,7 +102,7 @@ scripts/lab.py kernel-local experiments/2026-09-29-determinism/bundles/mhc-smoke
 
 `kernel-local` runs on the node itself. It:
 - refuses while the serving container runs there;
-- takes `/tmp/spark3-lab-gpu.lock`;
+- takes `/tmp/spark-lab-gpu.lock`;
 - writes `output.txt` and `verdict.json`: row groups, bit-equality sets, timings, errors,
   input hashes and pass/fail.
 
@@ -114,4 +114,4 @@ A verdict passes when:
 A test-suite verdict passes when the suite exits 0 and reports passed tests and no
 failures or errors.
 
-Compile caches persist per node in `~/.cache/spark3-lab/compile`.
+Compile caches persist per node in `~/.cache/spark-lab/compile`.

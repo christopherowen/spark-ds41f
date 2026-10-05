@@ -22,7 +22,7 @@ def load(name, path):
 
 
 probe = load("weight_fragmentation", ROOT / "scripts/weight_fragmentation.py")
-spark3 = load("spark3", ROOT / "bin/spark3")
+spark = load("spark", ROOT / "bin/spark")
 
 
 class FragmentationTest(unittest.TestCase):
@@ -41,21 +41,21 @@ class FragmentationTest(unittest.TestCase):
         return {"shards": [{"name": "shard", "path": "/weights/a blob", "current": current, "best": best}]}
 
     def test_ideal_large_files_remain_quiet(self):
-        self.assertEqual(spark3.report_weight_fragmentation({"dgx1": self.report(48, 48)}), [])
+        self.assertEqual(spark.report_weight_fragmentation({"dgx1": self.report(48, 48)}), [])
 
     def test_every_nonideal_file_warns_even_when_nodes_match(self):
         reports = {node: self.report(49, 48) for node in ("dgx1", "dgx2", "dgx3")}
-        findings = spark3.report_weight_fragmentation(reports)
+        findings = spark.report_weight_fragmentation(reports)
         self.assertEqual(len(findings), 4)
-        self.assertTrue(all(isinstance(f, spark3.Warn) for f in findings))
+        self.assertTrue(all(isinstance(f, spark.Warn) for f in findings))
         self.assertIn("49 current / 48 best", findings[0])
 
     def test_unknown_is_not_reported_as_clean(self):
-        findings = spark3.report_weight_fragmentation({"dgx3": {"error": "sudo unavailable"}})
+        findings = spark.report_weight_fragmentation({"dgx3": {"error": "sudo unavailable"}})
         self.assertIn("cannot check", findings[0])
 
     def test_correction_commands_are_quoted_and_only_for_nonideal_files(self):
-        findings = spark3.report_weight_fragmentation({
+        findings = spark.report_weight_fragmentation({
             "dgx1": self.report(48, 48), "dgx3": self.report(49, 48),
         }, commands=True)
         self.assertEqual(findings[-1], "sudo e4defrag -v '/weights/a blob'")

@@ -62,8 +62,8 @@ branch to inspect for future pulls; it does not float the build.
 Prepare an isolated tree:
 
 ```sh
-bin/spark3 upstream prepare vllm
-bin/spark3 upstream prepare b12x
+bin/spark upstream prepare vllm
+bin/spark upstream prepare b12x
 ```
 
 The helper clones the canonical repository as `upstream`, adds Christopher's fork

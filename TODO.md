@@ -11,7 +11,7 @@ owner.
 Step time and the bench matrix are proxies. The outcome that matters is
 end-to-end throughput of the production agent workload: findings per hour on a
 fixed scope and tool policy. Record the server side of every agent run with
-`bin/spark3 workload --json <path> -- <agent command>` (read-only; it sends no
+`bin/spark workload --json <path> -- <agent command>` (read-only; it sends no
 requests) and judge candidates on that whenever a change could shift the
 result.
 
@@ -70,7 +70,7 @@ and eight streams for every decode change.
 ## Running a round
 
 - **Screen lean, promote thorough.** One boot per arm:
-  `bin/spark3 bench --suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink --concurrency 1,8 --min-samples 3 --max-samples 3`
+  `bin/spark bench --suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink --concurrency 1,8 --min-samples 3 --max-samples 3`
   (about 8 minutes with the boot). Run the full matrix only for a promotion
   candidate.
 - **Pin the verification cost table.** Same-TP arms share one pinned
@@ -163,7 +163,7 @@ separately.
   prompt's time to first token, and total tokens in the window.
   `experiments/2026-09-29-determinism/mixed_latency.py` and
   `experiments/2026-10-01-scheduler-lanes/hol_latency.py` already do parts of
-  this; fold them into `bin/spark3 bench`. In production,
+  this; fold them into `bin/spark bench`. In production,
   watch `inter_token` p99 and `carrying_prefill_share` from `workload`.
 - **Levers (restart required):** a smaller batched-token budget while decodes
   are running (1,024-2,048), trading prefill rate for shorter stalls;

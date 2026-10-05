@@ -19,7 +19,7 @@ the open levers, measured dead ends, and the lean screening routine.
 - `patches/*/series` owns the ordered local patch stacks.
 - `manifests/baselines/` is immutable evidence. Never rewrite a published baseline.
 - `manifests/benchmarks/<baseline>.json` is that baseline's reference
-  `bin/spark3 bench` run. It is immutable too; a new promotion adds its own.
+  `bin/spark bench` run. It is immutable too; a new promotion adds its own.
 - `experiments/` is the only place for unpromoted tuning.
 - `docs/inspiration.md` is a research watchlist, never a source or deployment
   authority. It names each source, what to review it for, and the adoption
@@ -53,7 +53,7 @@ configured nodes; mixed rank state is invalid. See `docs/switchless-topology.md`
 for three-node direct-peer and four-node neighbour-ring profiles. A new topology
 needs its own hardware qualification before promotion.
 
-Use `bin/spark3 cluster sync`, `start`, and `stop` for node operations. They are
+Use `bin/spark cluster sync`, `start`, and `stop` for node operations. They are
 plans unless `--apply` is supplied. Never deploy with rsync or copy a dirty
 working tree: publish one commit, require clean node checkouts, and detach every
 node at that exact commit. Do not bypass the coordinated start with a one-rank
@@ -62,11 +62,11 @@ launch script.
 ## Shared cluster windows
 
 The three Sparks serve production and host experiments, and several agents use them.
-Coordinate through `~/spark3-hold.json` on dgx1:
+Coordinate through `~/spark-hold.json` on dgx1:
 
 - Before any GPU experiment, benchmark, cluster start, stop, restart or sync, read the
   hold file. If it exists and you are not its holder, do not act. To ask for the
-  cluster, write `~/spark3-request.json` (who, why, how long); a runner holding a
+  cluster, write `~/spark-request.json` (who, why, how long); a runner holding a
   window closes it after its current job.
 - To take the cluster, write the hold file with `holder`, `since`, `expected_end`,
   `heartbeat` and the rule it imposes, and remove it once production is restored.
@@ -109,6 +109,6 @@ an accidental deployment input.
 Use deterministic paths and pinned revisions. Build once and distribute the same
 OCI digest to every rank. Never overwrite a tag in place and assume ranks match.
 
-Before proposing a change, run `bin/spark3 doctor`, apply the affected upstream
+Before proposing a change, run `bin/spark doctor`, apply the affected upstream
 series in a fresh prepared tree, and run `git diff --check`. When complete build
-inputs are present, also run `bin/spark3 build check`.
+inputs are present, also run `bin/spark build check`.

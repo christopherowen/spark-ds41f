@@ -8,7 +8,7 @@ fi
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 image=$1
-name=spark3-memguard-smoke
+name=spark-memguard-smoke
 unit=${name}-memguard.service
 config=tests/fixtures/memguard-kill-cluster.json
 

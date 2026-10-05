@@ -34,7 +34,7 @@ both its named file and `cluster.json` together.
 ## Install memory-saver
 
 Reserve the cluster through `scripts/lab.py window open`, then stop all ranks
-with `bin/spark3 cluster stop --remove --apply --parallel`. From the same clean,
+with `bin/spark cluster stop --remove --apply --parallel`. From the same clean,
 published deployment checkout on each node, run:
 
 ```sh
@@ -67,8 +67,8 @@ profile requires a matching installed and loaded memory-saver module. These
 requirements also run before any serving container is launched.
 
 ```sh
-bin/spark3 --cluster-config config/cluster-64k.json doctor --live
-bin/spark3 --cluster-config config/cluster-64k.json cluster start --apply
+bin/spark --cluster-config config/cluster-64k.json doctor --live
+bin/spark --cluster-config config/cluster-64k.json cluster start --apply
 ```
 
 Before starting, doctor naturally reports absent containers when the service
