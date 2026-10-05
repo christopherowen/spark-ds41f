@@ -1,0 +1,92 @@
+--- barrier.h.orig	2026-10-05 11:40:03
++++ barrier.h	2026-10-05 11:40:17
+@@ -26,7 +26,7 @@
+                "selp.b32 %0, 1, 0, P1; \n\t"
+                "}"
+                : "=r"(waitComplete)
+-               : "r"(smem_int_ptr), "r"(phase_bit));
++               : "r"(smem_int_ptr), "r"(phase_bit) : "memory");
+ 
+   return waitComplete;
+ }
+@@ -44,7 +44,7 @@
+                "DONE: \n\t"
+                "}"
+                :
+-               : "r"(smem_int_ptr), "r"(phase_bit), "r"(ticks));
++               : "r"(smem_int_ptr), "r"(phase_bit), "r"(ticks) : "memory");
+ }
+ 
+ TL_DEVICE void mbarrier_test_wait(uint64_t &smem_barrier, int phase_bit) {
+@@ -60,7 +60,7 @@
+       "bra.uni                   LAB_WAIT;\n"
+       "DONE:\n"
+       "}\n" ::"r"(smem_int_ptr),
+-      "r"(phase_bit));
++      "r"(phase_bit) : "memory");
+ }
+ 
+ TL_DEVICE bool mbarrier_test_wait(uint64_t &smem_barrier, int phase_bit,
+@@ -76,7 +76,7 @@
+       "selp.b32 %0, 1, 0, P1; \n\t"
+       "}"
+       : "=r"(wait_complete)
+-      : "r"(smem_int_ptr), "r"(phase_bit), "r"(pred));
++      : "r"(smem_int_ptr), "r"(phase_bit), "r"(pred) : "memory");
+   return static_cast<bool>(wait_complete);
+ }
+ 
+@@ -84,7 +84,7 @@
+   uint32_t smem_int_ptr = smem_ptr_to_uint(&smem_barrier);
+   asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];"
+                :
+-               : "r"(smem_int_ptr));
++               : "r"(smem_int_ptr) : "memory");
+ }
+ 
+ TL_DEVICE void mbarrier_arrive(uint64_t &smem_barrier, int cta_id,
+@@ -97,7 +97,7 @@
+                  "mbarrier.arrive.shared::cluster.b64  _, [remAddr32];\n\t"
+                  "}"
+                  :
+-                 : "r"(smem_int_ptr), "r"(cta_id));
++                 : "r"(smem_int_ptr), "r"(cta_id) : "memory");
+   }
+ }
+ 
+@@ -114,7 +114,7 @@
+   uint32_t smem_int_ptr = smem_ptr_to_uint(&smem_barrier);
+   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0;"
+                :
+-               : "r"(transaction_bytes), "r"(smem_int_ptr));
++               : "r"(transaction_bytes), "r"(smem_int_ptr) : "memory");
+ }
+ 
+ TL_DEVICE void mbarrier_arrive_expect_tx(uint64_t &smem_barrier,
+@@ -131,7 +131,7 @@
+                "}"
+                :
+                : "r"(smem_int_ptr), "r"(cta_id), "r"(pred),
+-                 "r"(transaction_bytes));
++                 "r"(transaction_bytes) : "memory");
+ }
+ 
+ template <typename BarrierType = uint64_t>
+@@ -144,7 +144,7 @@
+   }
+   asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];"
+                :
+-               : "r"(smem_int_mbar));
++               : "r"(smem_int_mbar) : "memory");
+ }
+ 
+ template <typename BarrierType = uint64_t>
+@@ -159,7 +159,7 @@
+                "cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n\t"
+                "}"
+                :
+-               : "r"(smem_int_mbar));
++               : "r"(smem_int_mbar) : "memory");
+ }
+ 
+ template <bool kDependentFalse = false> TL_DEVICE void fence_proxy_async() {

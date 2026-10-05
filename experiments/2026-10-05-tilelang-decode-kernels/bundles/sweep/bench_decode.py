@@ -1,6 +1,6 @@
 """Decode kernels of the TileLang family at TP4 serving shapes: projections and sparse MLA.
 
-usage: bench_decode.py [gemm] [mla]
+usage: bench_decode.py [gemm] [small] [pairs] [mla]
 
 GEMM: every block-32 FP8 decode projection of the TP4 decode step, swept over
 tile width, pipeline stages and K shards. Each configuration is timed at 6,
@@ -179,6 +179,236 @@ def bench_gemm(g_base, g):
     return results, failures
 
 
+# ---------------------------------------------------------------- B12X pairs
+
+def bench_pairs(g):
+    """Each projection's whole decode call, BF16 in and BF16 out, in both families.
+
+    TileLang: TileKernels' per-token MXFP8 cast, then the chosen decode route
+    (``fp8_decode_config``). B12X: ``block_fp8_linear`` (its own quantization
+    and dense GEMM), planned for the row count as vLLM plans graph sizes.
+    """
+    import tile_kernels
+    from b12x.gemm import block_fp8_linear
+
+    results = {}
+    for name, ((n, k), _) in GEMM_SHAPES.items():
+        copies = max(2, -(-160 * 2**20 // (n * k)))
+        weights = [fp8((n, k)) for _ in range(copies)]
+        block_scales = [torch.randint(124, 131, (n // 32, k // 32), device=DEV, generator=GEN, dtype=torch.uint8)
+                        for _ in range(copies)]
+        wsf = [g.pack_scale_words(s, rows=n) for s in block_scales]
+        packed = [block_fp8_linear.pack_weight(w, s.view(torch.float8_e8m0fnu), block_size=(32, 32))
+                  for w, s in zip(weights, block_scales)]
+        cfg = g.fp8_decode_config(n, k)
+        shards = cfg.pop("shards")
+        tile = dict(block_M=g.DECODE_ROWS, **cfg)
+        kernel = g.mxfp8_gemm_partials(n, k, shards, **tile) if shards > 1 else g.mxfp8_gemm(n, k, **tile, padded_rows=True)
+        reduce = g.splitk_reduce(n, shards) if shards > 1 else None
+        xq = torch.empty(g.DECODE_ROWS, k, dtype=torch.float8_e4m3fn, device=DEV)
+        sf = torch.empty(g.DECODE_ROWS, 4 * g.scale_words(k), dtype=torch.uint8, device=DEV)
+        entry = {}
+        for rows in ROWS:
+            x = (torch.randn(rows, k, device=DEV, generator=GEN) * 0.5).bfloat16()
+            out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+            part = torch.empty(shards, rows, n, dtype=torch.float32, device=DEV) if shards > 1 else None
+
+            def tl(i):
+                def call():
+                    tile_kernels.quant.per_token_cast(x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True,
+                                                      out=(xq[:rows], sf[:rows]))
+                    if reduce is None:
+                        kernel(xq, weights[i], sf.view(torch.uint32), wsf[i], out)
+                    else:
+                        kernel(xq, weights[i], sf.view(torch.uint32), wsf[i], part)
+                        reduce(part, out)
+                return call
+
+            plan = block_fp8_linear.plan(block_fp8_linear.Caps(
+                device=DEV, max_tokens=rows, in_features=k, out_features=n, block_size=(32, 32)))
+            scratch = [torch.empty(s.shape, dtype=s.dtype, device=DEV) for s in plan.scratch_specs()]
+            bout = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+            bindings = [block_fp8_linear.bind(plan, scratch=scratch, source=x, packed_weight=packed[i],
+                                              output=bout.view(rows, n, 1)) for i in range(copies)]
+
+            def bx(i):
+                return lambda: block_fp8_linear.run(binding=bindings[i])
+
+            entry[rows] = {
+                "tilelang": {"cold": timed([tl(i % copies) for i in range(2 * copies)]), "warm": timed([tl(0)] * 16)},
+                "b12x": {"cold": timed([bx(i % copies) for i in range(2 * copies)]), "warm": timed([bx(0)] * 16)},
+            }
+            tl(0)(); bx(0)(); torch.cuda.synchronize()
+            entry[rows]["rel_diff"] = ((out.float() - bout.float()).norm() / bout.float().norm()).item()
+        results[name] = entry
+        print(f"pair {name} {n}x{k}: " + "; ".join(
+            f"{r} rows TL {e['tilelang']['warm']:.1f}/{e['tilelang']['cold']:.1f} vs B12X {e['b12x']['warm']:.1f}/{e['b12x']['cold']:.1f} us (warm/cold), diff {e['rel_diff']:.1e}"
+            for r, e in entry.items()))
+    return results
+
+
+# ---------------------------------------------------------------- small decode tiles
+
+KEY = "s{shards}-n{block_N}-st{num_stages}-t{threads}"
+SMALL_SHARDS = {"draft_main": (1, 2, 4, 5, 8)}
+
+
+def bench_shards(g, name):
+    """A shape's other kernels at each shard count: the 64-row decode tile at 24 and
+    48 rows (best tile), and the prefill kernel at 4096 rows."""
+    (n, k), _ = GEMM_SHAPES[name]
+    copies = max(2, -(-160 * 2**20 // (n * k)))
+    weights = [fp8((n, k)) for _ in range(copies)]
+    wsf = [sf_words(n, k, g) for _ in range(copies)]
+    a = fp8((4096, k))
+    asf = sf_words(4096, k, g)
+    for shards in SMALL_SHARDS[name]:
+        cells = []
+        for rows in (24, 48):
+            best = None
+            for cfg in gemm_configs(g, k):
+                if cfg["shards"] != shards:
+                    continue
+                kernel, reduce = compile_route(g, n, k, cfg)
+                out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+                part = torch.empty(shards, rows, n, dtype=torch.float32, device=DEV) if reduce else None
+
+                def run(i, kernel=kernel, reduce=reduce, part=part, out=out):
+                    if reduce is None:
+                        return lambda: kernel(a, weights[i], asf, wsf[i], out)
+                    return lambda: (kernel(a, weights[i], asf, wsf[i], part), reduce(part, out))
+
+                cold = timed([run(i % copies) for i in range(2 * copies)])
+                if best is None or cold < best[1]:
+                    best = ("n{block_N}-st{num_stages}".format(**cfg), cold)
+            cells.append(f"{rows} rows {best[0]} {best[1]:.1f}")
+        prefill = g.mxfp8_gemm(n, k, **g.default_config(4096, k), shards=shards)
+        out = torch.empty(4096, n, dtype=torch.bfloat16, device=DEV)
+        t = timed([lambda: prefill(a, weights[0], asf, wsf[0], out)] * 4, rounds=10)
+        cells.append(f"prefill 4096 rows {t:.0f}")
+        print(f"shards {name} s{shards}: " + ", ".join(cells) + " (cold us)")
+
+
+def bench_small(g):
+    """16-row decode tiles for one or two streams' rows, against B12X's call.
+
+    Every configuration keeps the shape's K shards, so its bits must equal the
+    prefill kernel's. The best configurations repeat that check over 64 rounds
+    of fresh inputs (an earlier sub-64-row pipeline on SM121 intermittently
+    read stale scales).
+    """
+    import tile_kernels
+    from b12x.gemm import block_fp8_linear
+
+    results, failures = {}, []
+    only = [a for a in sys.argv[1:] if a in GEMM_SHAPES]
+    for name, ((n, k), _) in GEMM_SHAPES.items():
+        if only and name not in only:
+            continue
+        table_shards = g.fp8_decode_config(n, k)["shards"]
+        copies = max(2, -(-160 * 2**20 // (n * k)))
+        weights = [fp8((n, k)) for _ in range(copies)]
+        block_scales = [torch.randint(124, 131, (n // 32, k // 32), device=DEV, generator=GEN, dtype=torch.uint8)
+                        for _ in range(copies)]
+        wsf = [g.pack_scale_words(s, rows=n) for s in block_scales]
+        packed = [block_fp8_linear.pack_weight(w, s.view(torch.float8_e8m0fnu), block_size=(32, 32))
+                  for w, s in zip(weights, block_scales)]
+        configs = []
+        # Changing a shape's shards changes its prefill kernel's fold too (bits must match).
+        for shards in SMALL_SHARDS.get(name, (table_shards,)):
+            for block_N, stages, threads in itertools.product((64, 128), (2, 3, 4, 6, 8), (64, 128)):
+                if stages * (16 + block_N) * 128 <= SMEM_LIMIT - 4096 and n % block_N == 0:
+                    configs.append(dict(block_M=16, block_N=block_N, block_K=128, num_stages=stages,
+                                        threads=threads, shards=shards))
+
+        def build(cfg):
+            cfg = dict(cfg)
+            shards = cfg.pop("shards")
+            try:
+                if shards > 1:
+                    return g.mxfp8_gemm_partials(n, k, shards, **cfg)
+                return g.mxfp8_gemm(n, k, **cfg, padded_rows=True)
+            except Exception as error:
+                return error
+
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            kernels = list(pool.map(build, configs))
+        reduces = {s: g.splitk_reduce(n, s) for s in {c["shards"] for c in configs} if s > 1}
+        xq = torch.empty(g.DECODE_ROWS, k, dtype=torch.float8_e4m3fn, device=DEV)
+        sf = torch.empty(g.DECODE_ROWS, 4 * g.scale_words(k), dtype=torch.uint8, device=DEV)
+        entry = {}
+        for rows in (6, 12):
+            x = (torch.randn(rows, k, device=DEV, generator=GEN) * 0.5).bfloat16()
+            out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+            parts = {s: torch.empty(s, rows, n, dtype=torch.float32, device=DEV) for s in reduces}
+            plan = block_fp8_linear.plan(block_fp8_linear.Caps(
+                device=DEV, max_tokens=rows, in_features=k, out_features=n, block_size=(32, 32)))
+            scratch = [torch.empty(s.shape, dtype=s.dtype, device=DEV) for s in plan.scratch_specs()]
+            bout = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+            bindings = [block_fp8_linear.bind(plan, scratch=scratch, source=x, packed_weight=packed[i],
+                                              output=bout.view(rows, n, 1)) for i in range(copies)]
+            row = {"b12x": {"cold": timed([(lambda i=i: block_fp8_linear.run(binding=bindings[i % copies])) for i in range(2 * copies)]),
+                            "warm": timed([lambda: block_fp8_linear.run(binding=bindings[0])] * 16)}}
+            for cfg, kernel in zip(configs, kernels):
+                if isinstance(kernel, Exception):
+                    continue
+                key = KEY.format(**cfg)
+                reduce, part = reduces.get(cfg["shards"]), parts.get(cfg["shards"])
+
+                def call(i, kernel=kernel, reduce=reduce, part=part):
+                    def run():
+                        tile_kernels.quant.per_token_cast(x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True,
+                                                          out=(xq[:rows], sf[:rows]))
+                        if reduce is None:
+                            kernel(xq, weights[i], sf.view(torch.uint32), wsf[i], out)
+                        else:
+                            kernel(xq, weights[i], sf.view(torch.uint32), wsf[i], part)
+                            reduce(part, out)
+                    return run
+
+                try:
+                    row[key] = {"cold": timed([call(i % copies) for i in range(2 * copies)]), "warm": timed([call(0)] * 16)}
+                except Exception as error:
+                    print(f"  {name} {key}: {type(error).__name__}: {str(error)[:100]}")
+                    torch.cuda.synchronize()
+            entry[rows] = row
+            ranked = sorted((k_ for k_ in row if k_ != "b12x"), key=lambda k_: row[k_]["warm"] + 0.25 * row[k_]["cold"])
+            print(f"small {name} {rows} rows: B12X {row['b12x']['warm']:.1f}/{row['b12x']['cold']:.1f}; " + ", ".join(
+                f"{k_} {row[k_]['warm']:.1f}/{row[k_]['cold']:.1f}" for k_ in ranked[:5]) + " (warm/cold us)")
+        # Bits: the best few small tiles against the prefill kernel, 64 rounds of fresh inputs.
+        both = sorted({k_ for r in entry.values() for k_ in r if k_ != "b12x"},
+                      key=lambda k_: sum(entry[r][k_]["warm"] + 0.25 * entry[r][k_]["cold"] for r in entry if k_ in entry[r]))[:4]
+        for key in both:
+            cfg = next(c for c in configs if KEY.format(**c) == key)
+            kernel = kernels[configs.index(cfg)]
+            shards = cfg["shards"]
+            reduce = reduces.get(shards)
+            prefill = g.mxfp8_gemm(n, k, **g.default_config(g.DECODE_ROWS + 1, k), shards=shards)
+            bad = 0
+            for round_ in range(64):
+                rows = (6, 12, 16)[round_ % 3]
+                a = fp8((g.DECODE_ROWS, k))
+                asf = sf_words(g.DECODE_ROWS, k, g)
+                w = round_ % copies
+                out = torch.empty(rows, n, dtype=torch.bfloat16, device=DEV)
+                if reduce is None:
+                    kernel(a, weights[w], asf, wsf[w], out)
+                else:
+                    part = torch.empty(shards, rows, n, dtype=torch.float32, device=DEV)
+                    kernel(a, weights[w], asf, wsf[w], part)
+                    reduce(part, out)
+                big = torch.empty(80, n, dtype=torch.bfloat16, device=DEV)
+                a_big = torch.cat([a[:rows], fp8((80 - rows, k))])
+                asf_big = torch.cat([asf[:rows], sf_words(80 - rows, k, g)])
+                prefill(a_big, weights[w], asf_big, wsf[w], big)
+                bad += not torch.equal(out.view(torch.int16), big[:rows].view(torch.int16))
+            print(f"  {name} {key}: {64 - bad}/64 rounds bit-identical to prefill {'PASS' if not bad else 'FAIL'}")
+            if bad:
+                failures.append(f"small {name} {key}")
+        results[name] = entry
+    return results, failures
+
+
 # ---------------------------------------------------------------- sparse MLA
 
 MLA = dict(heads=16, swa_width=128, idx_width=512, idx_page=64, swa_page=256, max_rows=96)
@@ -272,6 +502,13 @@ def main():
         g_base, g = load("gemm_base", "/b/gemm_base.py"), load("gemm_new", "/b/gemm.py")
         summary["gemm"], f = bench_gemm(g_base, g)
         failures += f
+    if "small" in parts:
+        summary["small"], f = bench_small(load("gemm_new", "/b/gemm.py"))
+        failures += f
+    if "shards" in parts:
+        bench_shards(load("gemm_new", "/b/gemm.py"), "draft_main")
+    if "pairs" in parts:
+        summary["pairs"] = bench_pairs(load("gemm_new", "/b/gemm.py"))
     if "mla" in parts:
         summary["mla"], f = bench_mla(load("mla_base", "/b/sparse_mla_base.py"), load("mla_new", "/b/sparse_mla.py"))
         failures += f

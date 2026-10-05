@@ -51,16 +51,16 @@ def main():
     set_profiler(control, "ring4-tl-control-20261005")
     candidate = copy.deepcopy(control)
     candidate["container"]["mounts"] += [mount(f) for f in KERNEL_FILES]
-    candidate["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v1-20261005"
-    set_profiler(candidate, "ring4-tl-decode-v1-20261005")
+    candidate["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v2-20261005"
+    set_profiler(candidate, "ring4-tl-decode-v2-20261005")
     b12x = json.loads((ROOT / "experiments/2026-10-05-tp4-500k/b12x.json").read_text())
     set_profiler(b12x, "ring4-b12x-1m-20261005")
     # Diagnostic: the candidate without the L2 weight prefetch, to separate kernel
     # time from prefetch overlap in the decode profile.
     no_prefetch = copy.deepcopy(candidate)
     no_prefetch["environment"]["VLLM_DS41_L2_PREFETCH"] = "0"
-    no_prefetch["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v1-nopf-20261005"
-    set_profiler(no_prefetch, "ring4-tl-decode-v1-nopf-20261005")
+    no_prefetch["environment"]["SPARK3_DSPARK_COST_DIR"] = "/cache/kkref/dspark-costs/ring4-tl-decode-v2-nopf-20261005"
+    set_profiler(no_prefetch, "ring4-tl-decode-v2-nopf-20261005")
     for name, cluster in (("control", control), ("candidate", candidate), ("candidate-nopf", no_prefetch),
                           ("b12x", b12x)):
         (HERE / f"{name}.json").write_text(json.dumps(cluster, indent=2) + "\n")
