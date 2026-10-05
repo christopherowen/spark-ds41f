@@ -14,6 +14,9 @@ the image as the alternative backend; a configuration without
 has both recipes and their benchmarks, and the
 [decode-kernel experiment](experiments/2026-10-05-tilelang-decode-kernels/README.md)
 compares the two families kernel by kernel.
+[docs/fundamentals.md](docs/fundamentals.md) explains the model itself: GEMM
+shapes, number formats, one decoder layer, attention, mHC, Engram, DSpark, and
+how TP3 and TP4 split the layers.
 
 The deployment tools also generate and validate a
 [four-node switchless ring profile](docs/switchless-topology.md). The
