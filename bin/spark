@@ -122,16 +122,40 @@ def expected_command(cluster: dict, node: dict) -> list[str]:
     return command
 
 
+def expected_binds(cluster: dict) -> list[str]:
+    """The --volume values; docker inspect keeps them verbatim in HostConfig.Binds."""
+    home = cluster["host"]["home"]
+    return [
+        f"{source.format(home=home)}:{destination}:{mode}"
+        for source, destination, mode in cluster["container"]["mounts"]
+    ]
+
+
+def mount_problems(node_name: str, wanted: list[str], actual: list[str] | None) -> list[str]:
+    """Extra, missing or different bind mounts, matched by container path."""
+    # Docker's Linux bind syntax is source:destination[:mode], with no colons in either path.
+    wanted_by_path = {bind.split(":")[1]: bind for bind in wanted}
+    actual_by_path = {bind.split(":")[1]: bind for bind in actual or []}
+    problems = []
+    for path, bind in actual_by_path.items():
+        if path not in wanted_by_path:
+            problems.append(f"{node_name}: extra mount {bind!r}")
+        elif bind != wanted_by_path[path]:
+            problems.append(f"{node_name}: mount {bind!r}, expected {wanted_by_path[path]!r}")
+    for path, bind in wanted_by_path.items():
+        if path not in actual_by_path:
+            problems.append(f"{node_name}: missing mount {bind!r}")
+    return problems
+
+
 def rendered_docker_command(cluster: dict, node: dict) -> list[str]:
     container = cluster["container"]
-    home = cluster["host"]["home"]
     command = ["docker", "run", "-d", "--name", container["name"]]
     command.extend(container["docker_run_args"])
     for key, value in sorted(expected_environment(cluster, node).items()):
         command.extend(["--env", f"{key}={value}"])
-    for source, destination, mode in container["mounts"]:
-        source = source.format(home=home)
-        command.extend(["--volume", f"{source}:{destination}:{mode}"])
+    for bind in expected_binds(cluster):
+        command.extend(["--volume", bind])
     command.append(container["image"])
     command.extend(expected_command(cluster, node))
     return command
@@ -955,6 +979,9 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
                 problems.append(
                     f"{node['name']}: {key}={actual_env.get(key)!r}, expected {wanted!r}"
                 )
+        problems.extend(
+            mount_problems(node["name"], expected_binds(cluster), inspection["HostConfig"]["Binds"])
+        )
         label_result = run_ssh(
             nodes,
             node,
