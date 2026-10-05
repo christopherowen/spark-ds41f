@@ -445,6 +445,10 @@ rank).
   NCCL Ring with four channels for large transfers
   (`experiments/2026-10-03-collective-serving/decision.md`), enforced by vLLM
   0027 in r5p.
+- **Prefill at 500K.** Report TP4 prefill at 32K, 256K, 500K and 1M, beside
+  TP3's 32K, 256K and 500K. The acceptance benchmarks measured 32K, 256K and
+  1M, so run 500K alone for each family (two repeats) at the next ring window;
+  it needs no other re-benchmark.
 - **Open:** sustained-load cooling and a long-context admission and retrieval
   check at 1M (the recipe's benchmark prefilled 1M once per repeat).
 - **Cabling decides the profile.** TP3 needs the dgx1-dgx2-dgx3 triangle and
