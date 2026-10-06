@@ -466,6 +466,95 @@ class LiveMountsTest(unittest.TestCase):
         )
 
 
+# Config.Env of the r6 image (sha256:b5225c98...) as dgx1 reported it on 2026-10-06, abridged.
+IMAGE_ENV = [
+    "PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:"
+    "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "CUDA_VERSION=13.0.2",
+    "NVIDIA_VISIBLE_DEVICES=all",
+    "NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+    "PYTHONPATH=/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x",
+    "SPARKNET_ROCE_CACHE_DIR=/opt/sparknet/roce",
+    "VLLM_USAGE_SOURCE=production-docker-image",
+]
+
+
+def container_env(wanted: dict[str, str]) -> list[str]:
+    """Config.Env as docker run builds it: the --env values, then the image's other entries."""
+    return [f"{key}={value}" for key, value in sorted(wanted.items())] + [
+        item for item in IMAGE_ENV if item.partition("=")[0] not in wanted
+    ]
+
+
+class LiveEnvironmentTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cluster = spark.json.loads((ROOT / "config" / "cluster-tp4.json").read_text())
+        site = spark.json.loads((ROOT / "config" / "examples" / "nodes-ring4.json").read_text())
+        self.node = site["nodes"][0]
+        self.wanted = spark.expected_environment(self.cluster, self.node)
+        self.production = container_env(self.wanted)
+
+    def test_docker_run_is_given_the_compared_environment(self) -> None:
+        command = spark.rendered_docker_command(self.cluster, self.node)
+        values = [command[i + 1] for i, flag in enumerate(command) if flag == "--env"]
+        self.assertEqual(dict(value.split("=", 1) for value in values), self.wanted)
+
+    def test_production_container_passes_in_any_order(self) -> None:
+        self.assertEqual(spark.environment_problems("dgx1", self.wanted, self.production, IMAGE_ENV), [])
+        self.assertEqual(
+            spark.environment_problems("dgx1", self.wanted, self.production[::-1], IMAGE_ENV), []
+        )
+
+    def test_lab_arm_with_an_extra_variable_fails_the_live_match(self) -> None:
+        # 2026-10-06: a prefetch arm (cluster-tp4.json plus VLLM_L2_PREFETCH_GRID=1)
+        # stayed serving because doctor --live matched it to production.
+        arm = spark.json.loads(spark.json.dumps(self.cluster))
+        arm["environment"]["VLLM_L2_PREFETCH_GRID"] = "1"
+        live = container_env(spark.expected_environment(arm, self.node))
+        problems = spark.environment_problems("dgx1", self.wanted, live, IMAGE_ENV)
+        self.assertEqual(problems, ["dgx1: extra variable VLLM_L2_PREFETCH_GRID='1'"])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            status = spark.report_doctor(problems, [], live=True)
+        self.assertEqual(status, 1)
+        self.assertIn("ERROR: dgx1: extra variable VLLM_L2_PREFETCH_GRID='1'", output.getvalue())
+        self.assertNotIn("live cluster matches", output.getvalue())
+
+    def test_changed_value_is_reported(self) -> None:
+        live = container_env({**self.wanted, "VLLM_DS41_KERNEL_BACKEND": "b12x"})
+        self.assertEqual(
+            spark.environment_problems("dgx2", self.wanted, live, IMAGE_ENV),
+            ["dgx2: VLLM_DS41_KERNEL_BACKEND='b12x', expected 'tilelang'"],
+        )
+
+    def test_missing_variable_is_reported(self) -> None:
+        live = container_env({k: v for k, v in self.wanted.items() if k != "NCCL_PROTO"})
+        self.assertEqual(
+            spark.environment_problems("dgx3", self.wanted, live, IMAGE_ENV),
+            ["dgx3: NCCL_PROTO=None, expected '^LL128'"],
+        )
+
+    def test_image_variables_are_ignored(self) -> None:
+        # PYTHONPATH is set by both; the rest only by the image.
+        image_only = [item for item in IMAGE_ENV if item.partition("=")[0] not in self.wanted]
+        self.assertTrue(image_only)
+        self.assertEqual(spark.environment_problems("dgx4", self.wanted, self.production, IMAGE_ENV), [])
+        # Without the image's entries, the same variables are not the profile's.
+        self.assertEqual(
+            spark.environment_problems("dgx4", self.wanted, self.production, None),
+            [f"dgx4: extra variable {item.partition('=')[0]}={item.partition('=')[2]!r}"
+             for item in image_only],
+        )
+
+    def test_image_variable_set_to_another_value_is_reported(self) -> None:
+        live = self.production + ["NVIDIA_VISIBLE_DEVICES=0"]
+        live.remove("NVIDIA_VISIBLE_DEVICES=all")
+        self.assertEqual(
+            spark.environment_problems("dgx1", self.wanted, live, IMAGE_ENV),
+            ["dgx1: NVIDIA_VISIBLE_DEVICES='0', expected the image's 'all'"],
+        )
+
+
 class SiteNodesTest(unittest.TestCase):
     def test_missing_site_file_points_at_the_example(self) -> None:
         import tempfile

@@ -148,6 +148,31 @@ def mount_problems(node_name: str, wanted: list[str], actual: list[str] | None) 
     return problems
 
 
+def environment_problems(
+    node_name: str, wanted: dict[str, str], actual: list[str], image: list[str] | None
+) -> list[str]:
+    """Changed, missing or extra variables in Config.Env.
+
+    docker run adds the --env values to the image's Config.Env, so an entry the
+    profile does not set must be the image's own, with the image's value.
+    """
+    actual_env = dict(item.partition("=")[::2] for item in actual)
+    image_env = dict(item.partition("=")[::2] for item in image or [])
+    problems = [
+        f"{node_name}: {key}={actual_env.get(key)!r}, expected {value!r}"
+        for key, value in wanted.items()
+        if actual_env.get(key) != value
+    ]
+    for key, value in actual_env.items():
+        if key in wanted or image_env.get(key) == value:
+            continue
+        if key in image_env:
+            problems.append(f"{node_name}: {key}={value!r}, expected the image's {image_env[key]!r}")
+        else:
+            problems.append(f"{node_name}: extra variable {key}={value!r}")
+    return problems
+
+
 def rendered_docker_command(cluster: dict, node: dict) -> list[str]:
     container = cluster["container"]
     command = ["docker", "run", "-d", "--name", container["name"]]
@@ -973,12 +998,20 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         wanted_command = expected_command(cluster, node)
         if actual_command != wanted_command:
             problems.append(f"{node['name']}: vLLM command differs from promoted config")
-        actual_env = dict(item.split("=", 1) for item in inspection["Config"]["Env"])
-        for key, wanted in expected_environment(cluster, node).items():
-            if actual_env.get(key) != wanted:
-                problems.append(
-                    f"{node['name']}: {key}={actual_env.get(key)!r}, expected {wanted!r}"
-                )
+        # The container's own image, not the configured tag: its Config.Env is
+        # what the container inherited.
+        image_result = run_ssh(nodes, node, "docker", "image", "inspect", inspection["Image"])
+        if image_result.returncode:
+            problems.append(f"{node['name']}: cannot inspect the container's image environment")
+            continue
+        problems.extend(
+            environment_problems(
+                node["name"],
+                expected_environment(cluster, node),
+                inspection["Config"]["Env"],
+                json.loads(image_result.stdout)[0]["Config"].get("Env"),
+            )
+        )
         problems.extend(
             mount_problems(node["name"], expected_binds(cluster), inspection["HostConfig"]["Binds"])
         )
