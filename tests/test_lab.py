@@ -396,6 +396,14 @@ class QueueTest(unittest.TestCase):
 
 
 class CustomWorkloadTest(unittest.TestCase):
+    def test_job_workloads_may_name_a_repository_script(self) -> None:
+        job = {"kind": "measure", "arms": [{"config": "cluster-a.json", "label": "a"}],
+               "extras": [["scripts/distinct_streams.py", ["--streams", "4"], "c4-distinct"],
+                          ["own.py", [], "own"]]}
+        scripts = [s["argv"][0] for s in lab.measure_steps({"experiment": "experiments/x", "run": "r"}, job)
+                   if s["kind"] == "script"]
+        self.assertEqual(scripts, ["scripts/distinct_streams.py", "experiments/x/own.py"])
+
     def test_a_job_may_skip_the_bench_and_name_its_own_workloads(self) -> None:
         spec = {"experiment": "experiments/x", "run": "s1", "jobs": [{
             "kind": "measure", "bench": False,
