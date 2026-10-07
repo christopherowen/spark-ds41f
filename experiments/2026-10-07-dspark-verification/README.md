@@ -216,3 +216,40 @@ fields by name, 0020 is unchanged, and `test_dead_rows.py` passes a `DeadRows`.
 An audit of the tree for every symbol that only 0006, 0008, 0009 or 0011
 defined finds no other reference. The fixed series is image `-r6-dspark-v2`;
 `-r6-dspark` is unused.
+
+### Second build (`-r6-dspark-v2`, tree `2c2f9d6d`)
+
+Window `dgx1-1791412329`, 2026-10-07 22:32-22:57 UTC, commit `dbae4e1`, run
+`dspark-candidate-tp4`, driven the same way.
+
+- The build took 9 min on dgx4. The image was loaded on all four nodes with one
+  ID, `sha256:030a65f6…`. The tests (with `--noconftest`) gave 29 passed and 1
+  skipped in the candidate, and 32 passed and 1 skipped in r6.
+- Boot, from the lab log (seconds to ready after the start command): `base`
+  102.0 from a stopped cluster, `candidate` 93.7, and `base-end` 115.6. The
+  last two include stopping the previous arm, so the like-for-like difference
+  is 21.9 s. From each container's own log, engine initialisation took 22.9 s
+  for `candidate` and 44.4 s for `base-end`. The DSpark cost step took 3.4 s
+  (the pinned table was found at once, then one pass over the eager shapes)
+  instead of 24.5 s. The existing `ring4-r6-20261005` table matched, as
+  intended.
+- Serving, against the pooled `base` and `base-end` (3 samples each):
+
+  | Streams | `base` | `candidate` | `base-end` |
+  | ---: | ---: | ---: | ---: |
+  | 1 | 86.5 | 86.6 | 86.6 |
+  | 8 | 178.9 | 179.4 | 180.9 |
+  | 16 | 221.0 | 221.2 | 221.1 |
+
+  At one stream, prose steps were 31.46 ms against 31.49 and 31.51 ms, with the
+  same 2.064 tokens per step. JSON steps were 37.48 ms against 37.33 and
+  37.34 ms, with 4.000 tokens per step in every arm. Prefill was level,
+  including the first, cold 16K sample (5,511 tok/s against 5,541 and 5,532),
+  so skipping the timed rounds adds no first-prefill compile.
+- Lowest MemAvailable on dgx1 was 20.3-20.7 GiB in every arm, with no swap
+  growth.
+
+The candidate passes its gate: serving is level and the boot is about 22 s
+shorter. It covers the TP4 recipe only. The vLLM series is shared with the
+TP3 recipes, so promoting it to `patches/vllm` needs the owner's acceptance
+and a TP3 bench on the triangle fabric as well.
