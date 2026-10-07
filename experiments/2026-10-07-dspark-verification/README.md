@@ -107,4 +107,82 @@ drift at 1, 8 or 16 streams. Boot time comes from each arm's lab log.
 
 ## Results
 
-Pending.
+Window `dgx1-1791407569`, 2026-10-07 21:12-21:30 UTC, commit `54041be`, run
+`dspark-verification-tp4`. Each arm was ready 111-113 s after its start
+command, including the stop of the previous arm. Lowest MemAvailable was
+20.2-22.1 GiB on every node, with no swap growth.
+
+`fixed` did not boot. Upstream's `SpeculativeConfig` rejects the cost scale
+without adaptive verification ("adaptive_verification_cost_scale requires DSpark
+adaptive verification"), and the arm still set it. The runner then closed the
+window and restored production, so `base-end` was not measured and there is no
+drift check for this window. `fixed.json` now leaves the cost scale out.
+
+Distinct prompts, aggregate tok/s, mean of 3 samples (range):
+
+| Streams | `base` | `all` (no host budget) | `nocut` (no dead-row cut) |
+| ---: | ---: | ---: | ---: |
+| 1 | 86.6 (86.5-86.8) | 87.3 (87.1-87.4), +0.8% | 83.3 (82.9-83.6), -3.8% |
+| 8 | 179.8 (178.9-180.6) | 157.9 (154.3-160.2), -12.2% | 174.6 (174.0-175.6), -2.9% |
+| 16 | 220.2 (217.7-223.3) | 201.4 (200.8-201.8), -8.6% | 220.7 (218.5-223.2), +0.2% |
+
+Bench at one stream (step ms, tokens per step, tok/s; 3 samples):
+
+| Case | `base` | `all` | `nocut` |
+| --- | --- | --- | --- |
+| prose | 31.48, 2.064, 65.6 | 32.39, 2.170, 67.0 (+2.2%) | 33.68, 2.188, 65.0 (-0.9%) |
+| JSON | 37.41, 4.000, 106.9 | 37.69, 4.062, 107.8 (+0.8%) | 38.87, 3.939, 101.3 (-5.2%) |
+
+- **Host budget: keep.** Without it, 8 and 16 streams lose 12.2% and 8.6%,
+  far outside the samples' ranges and the ~3% boot-to-boot spread recorded on
+  this stack. One stream is level: a single request verifies nearly every
+  draft anyway.
+- **Dead-row cut: keep.** Without it, one-stream steps are 1.5-2.2 ms longer
+  (+4-7%, against step-time intervals of 0.9% or less). JSON at one stream loses
+  5.2%, distinct prompts lose 3.8% at one stream and 2.9% at eight, and 16
+  streams are level. The margin is smaller than the budget's and has no
+  drift check, but the direction holds at four of five points and on step time.
+- **Fixed verification: not measured.** It verifies every draft like `all` and
+  also drops the cut, which `nocut` shows pays. To beat `base` it would need the
+  manager's per-step work to cost more than the 8-12% `all` lost. Not re-run.
+
+Under the decision rule, adaptive verification, its pinned table (0005) and
+the dead-row cut (0010, 0020) stay. 0006, 0008, 0009 and 0011 go, and so does
+`SPARK3_DSPARK_VERIFY_RULE=all`, the arm switch 0010 carried, which lost here.
+The pinned table is to be looked up before profiling.
+
+## Candidate: the simplified series
+
+`candidate-tp4.json` is the TP4 recipe on image
+`vllm-ds41f-kkref:04c30fa98e79-r6-dspark`, built from `vllm/series` through
+`upstreams.lock.json` and `source.json`. The series is r6's without 0006, 0008,
+0009 and 0011, with three patches rewritten:
+
+- **0005** looks the pinned table up before profiling. Its key is configuration
+  alone: TP size, draft count, request and token limits, capture limit,
+  profile context length, and the shapes a profile would time, named as the
+  profiled curves name them. The existing `ring4-r6-20261005` table therefore
+  still matches. Rank 0 reads the table and broadcasts the curves, and every
+  rank skips the timed rounds; the eager shapes past the capture limit run
+  once, so their kernels compile before the first long prefill. Without a
+  table the boot profiles and pins as before. `SPARK3_DSPARK_PROFILE_REPLAYS`
+  is gone.
+- **0010** keeps the dead-row cut and drops `SPARK3_DSPARK_VERIFY_RULE`.
+- **0042** treats every dummy drafter row as padding. It no longer reads
+  0009's profile token ids, which would otherwise fail on every dummy step.
+
+Against r6 the vLLM source loses 605 lines and gains 208. The tests lose 203
+and gain 98. `adaptive_verification.py` reads 2 environment variables instead
+of 7, and raises 2 errors instead of 7. Applying the series with the build's
+`git am` flags gives patch head `9644f65a` and tree `9c505063`. The same
+procedure on this machine reproduces r6's recorded `cf7703fb` and `20c7c758`.
+The model's arithmetic and the verification policy are r6's, so output is
+unchanged; the boot skips the timed profile.
+
+Expected: the boot about 20 s shorter, since 24 s of profile becomes one pass
+over 8 eager shapes, and serving level with `base`.
+
+Gate: build the image on an idle Spark, load it on all four nodes, run the
+changed unit tests in it, then one window with `base` and `candidate`
+bracketed on this experiment's workload, recording boot time. It is a
+promotion candidate if serving is level and the boot is shorter.
