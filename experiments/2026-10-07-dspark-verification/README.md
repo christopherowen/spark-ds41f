@@ -150,3 +150,39 @@ Under the decision rule, adaptive verification, its pinned table (0005) and
 the dead-row cut (0010, 0020) stay. 0006, 0008, 0009 and 0011 go, and so does
 `SPARK3_DSPARK_VERIFY_RULE=all`, the arm switch 0010 carried, which lost here.
 The pinned table is to be looked up before profiling.
+
+## Candidate: the simplified series
+
+`candidate-tp4.json` is the TP4 recipe on image
+`vllm-ds41f-kkref:04c30fa98e79-r6-dspark`, built from `vllm/series` through
+`upstreams.lock.json` and `source.json`. The series is r6's without 0006, 0008,
+0009 and 0011, with three patches rewritten:
+
+- **0005** looks the pinned table up before profiling. Its key is configuration
+  alone: TP size, draft count, request and token limits, capture limit,
+  profile context length, and the shapes a profile would time, named as the
+  profiled curves name them. The existing `ring4-r6-20261005` table therefore
+  still matches. Rank 0 reads the table and broadcasts the curves, and every
+  rank skips the timed rounds; the eager shapes past the capture limit run
+  once, so their kernels compile before the first long prefill. Without a
+  table the boot profiles and pins as before. `SPARK3_DSPARK_PROFILE_REPLAYS`
+  is gone.
+- **0010** keeps the dead-row cut and drops `SPARK3_DSPARK_VERIFY_RULE`.
+- **0042** treats every dummy drafter row as padding. It no longer reads
+  0009's profile token ids, which would otherwise fail on every dummy step.
+
+Against r6 the vLLM source loses 605 lines and gains 208. The tests lose 203
+and gain 98. `adaptive_verification.py` reads 2 environment variables instead
+of 7, and raises 2 errors instead of 7. Applying the series with the build's
+`git am` flags gives patch head `9644f65a` and tree `9c505063`. The same
+procedure on this machine reproduces r6's recorded `cf7703fb` and `20c7c758`.
+The model's arithmetic and the verification policy are r6's, so output is
+unchanged; the boot skips the timed profile.
+
+Expected: the boot about 20 s shorter, since 24 s of profile becomes one pass
+over 8 eager shapes, and serving level with `base`.
+
+Gate: build the image on an idle Spark, load it on all four nodes, run the
+changed unit tests in it, then one window with `base` and `candidate`
+bracketed on this experiment's workload, recording boot time. It is a
+promotion candidate if serving is level and the boot is shorter.
