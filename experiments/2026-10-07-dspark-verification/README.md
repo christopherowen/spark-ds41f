@@ -154,7 +154,7 @@ The pinned table is to be looked up before profiling.
 ## Candidate: the simplified series
 
 `candidate-tp4.json` is the TP4 recipe on image
-`vllm-ds41f-kkref:04c30fa98e79-r6-dspark`, built from `vllm/series` through
+`vllm-ds41f-kkref:04c30fa98e79-r6-dspark-v2`, built from `vllm/series` through
 `upstreams.lock.json` and `source.json`. The series is r6's without 0006, 0008,
 0009 and 0011, with three patches rewritten:
 
@@ -167,14 +167,15 @@ The pinned table is to be looked up before profiling.
   once, so their kernels compile before the first long prefill. Without a
   table the boot profiles and pins as before. `SPARK3_DSPARK_PROFILE_REPLAYS`
   is gone.
-- **0010** keeps the dead-row cut and drops `SPARK3_DSPARK_VERIFY_RULE`.
+- **0010** keeps the dead-row cut and drops `SPARK3_DSPARK_VERIFY_RULE`. Its
+  arguments travel as a `DeadRows` named tuple, the name 0020's warmup uses.
 - **0042** treats every dummy drafter row as padding. It no longer reads
   0009's profile token ids, which would otherwise fail on every dummy step.
 
-Against r6 the vLLM source loses 605 lines and gains 208. The tests lose 203
-and gain 98. `adaptive_verification.py` reads 2 environment variables instead
+Against r6 the vLLM source loses 581 lines and gains 202. The tests lose 201
+and gain 97. `adaptive_verification.py` reads 2 environment variables instead
 of 7, and raises 2 errors instead of 7. Applying the series with the build's
-`git am` flags gives patch head `9644f65a` and tree `9c505063`. The same
+`git am` flags gives patch head `709a159a` and tree `2c2f9d6d`. The same
 procedure on this machine reproduces r6's recorded `cf7703fb` and `20c7c758`.
 The model's arithmetic and the verification policy are r6's, so output is
 unchanged; the boot skips the timed profile.
@@ -186,3 +187,32 @@ Gate: build the image on an idle Spark, load it on all four nodes, run the
 changed unit tests in it, then one window with `base` and `candidate`
 bracketed on this experiment's workload, recording boot time. It is a
 promotion candidate if serving is level and the boot is shorter.
+
+### First build (`-r6-dspark`, tree `9c505063`)
+
+2026-10-07, windows `dgx1-1791410569` and `dgx1-1791411479`, driven from dgx1 by a
+node-local script. It opened the window, stopped the cluster with its containers kept,
+built on dgx4, loaded the image on dgx1-3, ran the tests, and then ran
+`scripts/lab.py run dspark-candidate-tp4.json`.
+
+- The build took 7.5 min on dgx4 (22:03-22:10 UTC). The image was loaded on all
+  four nodes with one ID, `sha256:a8d61d1c…`.
+- The first test run exited with pytest's usage error. vLLM's
+  `tests/conftest.py` imports `tblib`, which the serving image does not
+  install. The window closed and production was restored. The second window
+  ran the tests with `--noconftest`, as the TileLang kernel bundles do:
+  `test_adaptive_verification.py` and `test_dead_rows.py` gave 29 passed and 1
+  skipped in the candidate, and 32 passed and 1 skipped in r6, whose copies
+  still test the removed modes.
+- `base` booted in 100.8 s. `candidate` failed during engine initialisation on
+  dgx1 with `'tuple' object has no attribute 'cut'`. The dead-row kernel warmup
+  (0020) was written after 0011 and reads `dead_rows.cut` from 0011's
+  `DeadRows` object; without 0011, 0010 returned a plain tuple. The other
+  ranks then failed on the closed collective. The start rolled back to `base`,
+  and the window closed with production serving.
+
+The fix gives 0010 the `DeadRows` named tuple: the kernel wrapper reads the same
+fields by name, 0020 is unchanged, and `test_dead_rows.py` passes a `DeadRows`.
+An audit of the tree for every symbol that only 0006, 0008, 0009 or 0011
+defined finds no other reference. The fixed series is image `-r6-dspark-v2`;
+`-r6-dspark` is unused.

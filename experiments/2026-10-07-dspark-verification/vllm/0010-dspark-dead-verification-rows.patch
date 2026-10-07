@@ -1,4 +1,4 @@
-From 74bbbe230b66b25486feb263c9005b94413774ee Mon Sep 17 00:00:00 2001
+From 7c4d37f5a67f4d1707d65b18097860eb64cd0f4f Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 14:00:00 +0200
 Subject: [PATCH] perf(spec-decode): dead DSpark verification rows below a
@@ -21,20 +21,20 @@ live row (the rejection sampler also clamps before logprobs are taken). No
 host sync and no batch-shape or graph change. Off by default; output is
 unchanged because the target verifies every committed token.
 ---
- tests/v1/worker/test_dead_rows.py             | 67 +++++++++++++++++++
- vllm/v1/worker/gpu/input_batch.py             | 45 +++++++++++++
- vllm/v1/worker/gpu/model_runner.py            | 15 +++++
- .../gpu/spec_decode/adaptive_verification.py  | 31 +++++++++
+ tests/v1/worker/test_dead_rows.py             | 68 +++++++++++++++++++
+ vllm/v1/worker/gpu/input_batch.py             | 66 +++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            | 15 ++++
+ .../gpu/spec_decode/adaptive_verification.py  | 30 ++++++++
  .../gpu/spec_decode/rejection_sampler.py      | 12 ++++
- 5 files changed, 170 insertions(+)
+ 5 files changed, 190 insertions(+), 1 deletion(-)
  create mode 100644 tests/v1/worker/test_dead_rows.py
 
 diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
 new file mode 100644
-index 000000000..d86a6aaaa
+index 000000000..49510938c
 --- /dev/null
 +++ b/tests/v1/worker/test_dead_rows.py
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,68 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -44,6 +44,7 @@ index 000000000..d86a6aaaa
 +import torch
 +
 +from vllm.v1.worker.gpu.input_batch import (
++    DeadRows,
 +    combine_sampled_and_draft_tokens,
 +    get_num_sampled_and_rejected,
 +)
@@ -78,7 +79,7 @@ index 000000000..d86a6aaaa
 +    confidence[1] = torch.tensor([0.4, 0.9, 0.9, 0.9, 0.9])
 +    is_padding = torch.zeros(24, dtype=torch.bool, device=dev)
 +    cut = torch.empty(3, dtype=torch.int32, device=dev)
-+    ids_dead = _combine((confidence, is_padding, cut, math.log(0.5)))
++    ids_dead = _combine(DeadRows(confidence, is_padding, cut, math.log(0.5)))
 +    ids_plain = _combine(None)
 +    assert torch.equal(ids_dead, ids_plain)
 +    assert cut.tolist() == [2, 0, 9]  # the prefill request is never clamped
@@ -103,9 +104,18 @@ index 000000000..d86a6aaaa
 +    assert sampled.tolist() == [3, 1, 4]
 +    assert rejected.tolist() == [3, 5, 2]
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index 81b24b8b5..daeeaca07 100644
+index 81b24b8b5..e003d5a46 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, NamedTuple
+ 
+ import numpy as np
+ import torch
 @@ -419,11 +419,20 @@ def _combine_sampled_and_draft_tokens_kernel(
      draft_tokens_stride,
      cu_num_logits_ptr,
@@ -127,7 +137,7 @@ index 81b24b8b5..daeeaca07 100644
  
      # Get the number of logits and draft tokens.
      cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
-@@ -466,6 +475,24 @@ def _combine_sampled_and_draft_tokens_kernel(
+@@ -466,6 +475,39 @@ def _combine_sampled_and_draft_tokens_kernel(
              draft_tokens,
              mask=mask,
          )
@@ -149,27 +159,46 @@ index 81b24b8b5..daeeaca07 100644
 +                tl.full([BLOCK_SIZE], 1, tl.uint8),
 +                mask=mask & (block >= cut),
 +            )
++
++
++class DeadRows(NamedTuple):
++    """Verification rows to leave out of routed MoE, decided on device.
++
++    confidence: per-slot draft confidences, [max_num_reqs, num_steps].
++    is_padding: the batch's padding flags; dead rows are set in place.
++    cut: per-request output, the number of live drafts.
++    log_tau: log of the survival threshold below which a row is dead.
++    """
++
++    confidence: torch.Tensor
++    is_padding: torch.Tensor
++    cut: torch.Tensor
++    log_tau: float
  
  
  def combine_sampled_and_draft_tokens(
-@@ -479,7 +506,10 @@ def combine_sampled_and_draft_tokens(
+@@ -479,7 +521,9 @@ def combine_sampled_and_draft_tokens(
      cu_num_logits: torch.Tensor,
      num_logits: int,
      num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
-+    dead_rows: tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None = None,
++    dead_rows: "DeadRows | None" = None,
  ) -> torch.Tensor:
-+    """``dead_rows`` = (per-slot draft confidences, is_padding, per-request cut
-+    output, log of the survival threshold) marks low-survival draft rows."""
++    """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
      assert num_new_sampled_tokens in (0, 1), (
          f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
      )
-@@ -503,7 +533,14 @@ def combine_sampled_and_draft_tokens(
+@@ -503,7 +547,19 @@ def combine_sampled_and_draft_tokens(
          draft_tokens.stride(0),
          cu_num_logits,
          logits_indices,
 +        *(
-+            (dead_rows[0], dead_rows[0].stride(0), dead_rows[1].view(torch.uint8),
-+             dead_rows[2], dead_rows[3])
++            (
++                dead_rows.confidence,
++                dead_rows.confidence.stride(0),
++                dead_rows.is_padding.view(torch.uint8),
++                dead_rows.cut,
++                dead_rows.log_tau,
++            )
 +            if dead_rows is not None
 +            else (input_ids, 0, input_ids, input_ids, 0.0)
 +        ),
@@ -178,7 +207,7 @@ index 81b24b8b5..daeeaca07 100644
          # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
-@@ -521,6 +558,8 @@ def _get_num_sampled_and_rejected_kernel(
+@@ -521,6 +577,8 @@ def _get_num_sampled_and_rejected_kernel(
      cu_num_logits_ptr,
      idx_mapping_ptr,
      prefill_len_ptr,
@@ -187,7 +216,7 @@ index 81b24b8b5..daeeaca07 100644
  ):
      batch_idx = tl.program_id(0)
      req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
-@@ -530,6 +569,9 @@ def _get_num_sampled_and_rejected_kernel(
+@@ -530,6 +588,9 @@ def _get_num_sampled_and_rejected_kernel(
      is_chunked_prefilling = seq_len < prefill_len
  
      num_sampled = tl.load(num_sampled_ptr + batch_idx)
@@ -197,7 +226,7 @@ index 81b24b8b5..daeeaca07 100644
      num_sampled = tl.where(is_chunked_prefilling, 0, num_sampled)
      tl.store(num_sampled_ptr + batch_idx, num_sampled)
  
-@@ -548,6 +590,7 @@ def get_num_sampled_and_rejected(
+@@ -548,6 +609,7 @@ def get_num_sampled_and_rejected(
      cu_num_logits: torch.Tensor,
      idx_mapping: torch.Tensor,
      prefill_len: torch.Tensor,
@@ -205,7 +234,7 @@ index 81b24b8b5..daeeaca07 100644
  ) -> tuple[torch.Tensor, torch.Tensor]:
      num_reqs = idx_mapping.shape[0]
      num_rejected = torch.empty_like(num_sampled)
-@@ -558,6 +601,8 @@ def get_num_sampled_and_rejected(
+@@ -558,6 +620,8 @@ def get_num_sampled_and_rejected(
          cu_num_logits,
          idx_mapping,
          prefill_len,
@@ -215,7 +244,7 @@ index 81b24b8b5..daeeaca07 100644
      return num_sampled, num_rejected
  
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 4a4784940..1d902fd73 100644
+index 4a4784940..ef5697f7f 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1573,6 +1573,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -229,7 +258,7 @@ index 4a4784940..1d902fd73 100644
 +            dead_rows = adaptive_verification.dead_row_args(
 +                self.input_buffers.is_padding, num_reqs
 +            )
-+        self._dead_row_cut = dead_rows[2] if dead_rows is not None else None
++        self._dead_row_cut = dead_rows.cut if dead_rows is not None else None
 +
          # Some input token ids are directly read from the last sampled tokens
          # and draft tokens. Also, get the logits indices to sample tokens from.
@@ -255,10 +284,18 @@ index 4a4784940..1d902fd73 100644
  
          if shard_metadata is not None:
 diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-index 15ac44632..04622d8c1 100644
+index 15ac44632..88b32c3d0 100644
 --- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
 +++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
-@@ -32,6 +32,12 @@ _PROFILE_REPLAYS = 5
+@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+     get_query_lens_mismatch_unsupported_backend,
+ )
++from vllm.v1.worker.gpu.input_batch import DeadRows
+ 
+ logger = init_logger(__name__)
+ _PROFILE_REPLAYS = 5
+@@ -32,6 +33,12 @@ _PROFILE_REPLAYS = 5
  # set, and later boots with the same shapes read it instead of profiling, so
  # the draft budget does not depend on one boot's startup timing noise.
  _COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
@@ -271,7 +308,7 @@ index 15ac44632..04622d8c1 100644
  
  if TYPE_CHECKING:
      from vllm.config import VllmConfig
-@@ -172,6 +178,14 @@ class AdaptiveVerificationManager:
+@@ -172,6 +179,14 @@ class AdaptiveVerificationManager:
          # address the compacted layout, so the budget must fit one chunk.
          self._max_total_logits = max_total_logits
          self.cost_scale = cost_scale
@@ -286,13 +323,11 @@ index 15ac44632..04622d8c1 100644
          self.query_start_loc = query_start_loc
          self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
          # Largest cudagraph-captured token count; above it nothing pads.
-@@ -681,6 +695,23 @@ class AdaptiveVerificationManager:
+@@ -681,6 +696,21 @@ class AdaptiveVerificationManager:
          draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
          return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
  
-+    def dead_row_args(
-+        self, is_padding: torch.Tensor, num_reqs: int
-+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float] | None:
++    def dead_row_args(self, is_padding: torch.Tensor, num_reqs: int) -> DeadRows | None:
 +        """Arguments for the fused dead-row marking, or None when disabled.
 +
 +        The confidences are the current drafts', broadcast from rank 0, so
@@ -300,7 +335,7 @@ index 15ac44632..04622d8c1 100644
 +        """
 +        if self.dead_rows_tau <= 0:
 +            return None
-+        return (
++        return DeadRows(
 +            self._confidence_probs,
 +            is_padding,
 +            self._dead_row_cut[:num_reqs],
