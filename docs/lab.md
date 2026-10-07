@@ -84,8 +84,22 @@ window if none of ours is open.
     - 3 rounds of mixed traffic.
   - Profile `full`: the round-16 matrix.
   - `"bracket": true` measures the first arm again at the end, labelled `<label>-end`, to show drift.
+  - `"extras"` replaces the profile's workloads: `[script, [arguments], output stem]` each. A
+    bare script name is the experiment's own; a path such as `scripts/distinct_streams.py` is
+    repository-relative.
   - Results land where `tables_arms.py` reads them: `results/private/bench/<run>-<label>/` and
     `results/private/determinism/<run>/<kind>-<label>.jsonl`.
+- **Sweeps:** `scripts/lab_sweep.py` writes a `measure` job for one environment variable:
+  an arm config per value under the experiment directory (the base profile with only that
+  variable changed) and a run spec with the base profile first and bracketed. Each arm runs
+  the profile's bench and `scripts/distinct_streams.py` at the stream counts given
+  (distinct prompts, so concurrent streams do not share routing). Commit the experiment and
+  sync before running it.
+
+  ```sh
+  scripts/lab_sweep.py --base config/cluster-tp4.json --variable VLLM_L2_PREFETCH_GRID \
+    --values 1,2,3,6 --experiment experiments/<dir> --run <name> --streams 1,4,16
+  ```
 - **`validate`:** a trace arm.
   - Sequence: boot A, `c8_trace.py`, `scenario_trace.py --chunk <threshold>`, then
     `trace_mixes.py` (tier `full` only), then a restart (boot B) with the scenarios

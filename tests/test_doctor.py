@@ -506,18 +506,19 @@ class LiveEnvironmentTest(unittest.TestCase):
         )
 
     def test_lab_arm_with_an_extra_variable_fails_the_live_match(self) -> None:
-        # 2026-10-06: a prefetch arm (cluster-tp4.json plus VLLM_L2_PREFETCH_GRID=1)
+        # 2026-10-06: a prefetch arm (cluster-tp4.json plus one prefetch variable)
         # stayed serving because doctor --live matched it to production.
+        self.assertNotIn("VLLM_DS41_L2_PREFETCH_FFN_MB", self.wanted)
         arm = spark.json.loads(spark.json.dumps(self.cluster))
-        arm["environment"]["VLLM_L2_PREFETCH_GRID"] = "1"
+        arm["environment"]["VLLM_DS41_L2_PREFETCH_FFN_MB"] = "8"
         live = container_env(spark.expected_environment(arm, self.node))
         problems = spark.environment_problems("dgx1", self.wanted, live, IMAGE_ENV)
-        self.assertEqual(problems, ["dgx1: extra variable VLLM_L2_PREFETCH_GRID='1'"])
+        self.assertEqual(problems, ["dgx1: extra variable VLLM_DS41_L2_PREFETCH_FFN_MB='8'"])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             status = spark.report_doctor(problems, [], live=True)
         self.assertEqual(status, 1)
-        self.assertIn("ERROR: dgx1: extra variable VLLM_L2_PREFETCH_GRID='1'", output.getvalue())
+        self.assertIn("ERROR: dgx1: extra variable VLLM_DS41_L2_PREFETCH_FFN_MB='8'", output.getvalue())
         self.assertNotIn("live cluster matches", output.getvalue())
 
     def test_changed_value_is_reported(self) -> None:

@@ -35,7 +35,8 @@ checkouts to origin/main between jobs, so newly published arms can join an open 
 
 A run spec is JSON: {"experiment": "experiments/<dir>", "run": "rec6", "jobs": [...]} with
 jobs of kind "measure" (arms booted in turn and measured; profile "lean" or "full";
-"bracket" re-measures the first arm at the end), "validate" (a trace arm: boot A, scenario
+"bracket" re-measures the first arm at the end; scripts/lab_sweep.py writes one for a
+one-variable environment sweep), "validate" (a trace arm: boot A, scenario
 traces, optional restart, per-node analysis in parallel while stopped) and "kernel" (a
 kernel-lab bundle per node, run concurrently on the named nodes while the cluster is
 stopped). Results keep the layout tables_arms.py reads.
@@ -501,8 +502,9 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
                           "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
                                    "--output", f"results/private/bench/{run}-{label}"]})
         for script, extra, stem in profile["extras"]:
+            # A bare name is the experiment's own script; a path is repository-relative.
             steps.append({"kind": "script", "label": label,
-                          "argv": [f"{experiment}/{script}", head_url(), *extra],
+                          "argv": [arm_config_path(experiment, script), head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
     steps.append({"kind": "table", "argv": [f"{experiment}/tables_arms.py", run, *[a["label"] for a in arms]],
                   "out": f"results/private/lab/{run}-table.txt",
