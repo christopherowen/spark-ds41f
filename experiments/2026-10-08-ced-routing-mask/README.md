@@ -108,4 +108,28 @@ correctness fix; it does not need to be faster.
 
 ## Status
 
-Not built yet. Needs a lab window and the owner's acceptance.
+Gate run on the TP4 ring, 2026-10-08 13:22-13:56 UTC (window
+`dgx1-1791465750`):
+
+- **Build.** 9 minutes on dgx4; one image ID on all four nodes
+  (`sha256:6371971f`).
+- **Tests in the image.** 73 passed, 1 skipped, 2 failed. Both failures are
+  `test_padding_rows_are_not_routed` raising `AttributeError`: that fixture's
+  bare forward context has no `attn_metadata`, which 0045 now reads (a real
+  `ForwardContext` always has it). 0045's own tests passed. The test-only fix
+  is 0046 in the r6c candidate ([2026-10-08-lil-rebase](../2026-10-08-lil-rebase/)).
+- **Mixed-step reproduction.** r6a passed as well, so the first script never
+  reached the failing step: its streams ended at end of sequence after 7-55
+  chunks and each mixed request returned a single chunk. r6b passed three
+  rounds with the server healthy. The script now keeps eight streams decoding
+  with `ignore_eos`, staggers four prefix-cached requests per round, and fails
+  a round in which a mixed prefill did not overlap a decoding stream; r6c's
+  window runs it on r6a first.
+- **Quality** 5/5.
+- **Against r6a's TP4 run, same protocol.** Every decode step-time interval
+  includes zero except prose-c4 (-0.3%, [-0.7, -0.0]). Prefill at 32K, 262K,
+  500K and 1M tokens: -0.1, -0.2, -0.3 and -0.2%, intervals including zero.
+  No failed requests; minimum MemAvailable 19.8 GiB.
+
+Meets the acceptance criteria. Needs the owner's acceptance; the r6c candidate
+carries it onto the current upstream heads.
