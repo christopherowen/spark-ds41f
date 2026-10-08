@@ -196,11 +196,11 @@ curve. With Secure Boot, its installation creates and enrolls a MOK signing
 key, and the memory saver's install script in [stage 2](#2-kernel-64-kib-profiles)
 signs with the same key.
 
-Install its `dgx-fan-control.service` as well; `doctor --live` recommends it
-until it is installed. `bin/spark bench` starts the service's performance
-curve on every node while it measures, so every benchmark runs under the same
-fan policy, and stops it again where it started it. Whether it also runs while
-serving is your choice. The curve raises the fan floor from 50 °C, well before
+Install its `dgx-fan-control.service` as well; `doctor --live` reports an
+error until it is installed. `bin/spark bench` requires it: it starts the
+service's performance curve on every node while it measures, so every
+benchmark runs under the same fan policy, and stops it again where it started
+it. Whether it also runs while serving is your choice. The curve raises the fan floor from 50 °C, well before
 NVIDIA's curve, so nodes run cooler and louder under load; serving does not
 need it. Pick either
 [startup mode](https://github.com/christopherowen/dgx-spark-fan-control/blob/main/docs/installation.md#5-choose-your-startup-mode),

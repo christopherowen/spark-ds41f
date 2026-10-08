@@ -796,10 +796,10 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     kernel, the loaded module and its dgx_ec_fan_floor cooling device. Those are
     what bench and kernel-lab cooling use to select the maximum floor.
 
-    The dgx-fan-control service is recommended, not required: bench runs its
-    performance curve while it measures, so a node without it benchmarks on
-    NVIDIA's curve instead. Whether the service also runs while serving is the
-    site's choice, so only its absence is reported, as a warning.
+    The dgx-fan-control service must be installed too: bench runs its
+    performance curve while it measures, so every benchmark uses the same fan
+    policy. Whether the service also runs while serving is the site's choice,
+    so only its installation is checked.
     """
     kernel = facts.get("kernel") or "the running kernel"
     if "installed" not in facts.get("fan_dkms", ""):
@@ -819,13 +819,13 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
             "is missing (the driver refused it at probe; see dmesg)"
         ]
     if facts.get("fan_service") == "absent":
-        return [Warn(
-            f"{node_name}: dgx-fan-control.service is not installed, so bench measures this node "
-            "on NVIDIA's fan curve instead of the performance curve; from a dgx-spark-fan-control "
-            "checkout run sudo install -D -m 0644 systemd/dgx-fan-control.service "
+        return [
+            f"{node_name}: dgx-fan-control.service is not installed, and bench runs its "
+            "performance curve while measuring; from a dgx-spark-fan-control checkout run "
+            "sudo install -D -m 0644 systemd/dgx-fan-control.service "
             "/etc/systemd/system/dgx-fan-control.service && sudo systemctl daemon-reload "
             "(enabling it for serving is optional)"
-        )]
+        ]
     return []
 
 
@@ -3891,8 +3891,8 @@ def cool_nodes(
 
 # A benchmark measures under one fan policy whatever a site serves with: the
 # dgx-fan-control service's performance curve, started where it is installed but
-# not running and stopped again afterwards. A node without the service measures
-# on NVIDIA's curve, and its record says so.
+# not running and stopped again afterwards. A node that cannot run it stops the
+# benchmark, because its numbers would not be comparable.
 def start_fan_curve(nodes: dict, targets: list[dict]) -> list[dict]:
     """Run the dgx-fan-control performance curve on every target for a benchmark."""
     def start(node: dict) -> dict:
@@ -3922,11 +3922,22 @@ def start_fan_curve(nodes: dict, targets: list[dict]) -> list[dict]:
         elif record["service"] == "active":
             states.append(f"{record['node']} already running")
         elif record["service"] == "absent":
-            states.append(f"{record['node']} not installed (NVIDIA's curve)")
+            states.append(f"{record['node']} not installed")
         else:
-            states.append(f"{record['node']} failed to start (NVIDIA's curve): {record['error']}")
+            states.append(f"{record['node']} failed to start: {record['error']}")
     print("fan curve: " + ", ".join(states), flush=True)
     return records
+
+
+def fan_curve_problems(records: list[dict]) -> list[str]:
+    """The nodes start_fan_curve could not put on the performance curve."""
+    problems = []
+    for record in records:
+        if record["service"] == "absent":
+            problems.append(f"{record['node']}: dgx-fan-control.service is not installed (see doctor --live)")
+        elif record["service"] == "inactive" and not record["started"]:
+            problems.append(f"{record['node']}: dgx-fan-control.service did not start: {record['error']}")
+    return problems
 
 
 def stop_fan_curve(nodes: dict, targets: list[dict], records: list[dict]) -> list[str]:
@@ -5136,6 +5147,9 @@ def command_bench(args: argparse.Namespace) -> int:
             raise BenchAbort(f"cooling failed: {error}") from error
         report["fan_curve"] = start_fan_curve(nodes, nodes["nodes"])
         save()
+        missing_curve = fan_curve_problems(report["fan_curve"])
+        if missing_curve:
+            raise BenchAbort("the fan performance curve is not running everywhere: " + "; ".join(missing_curve))
         bench.memory.wait_ready()
         for suite in BENCH_SUITES:
             if suite not in suites:

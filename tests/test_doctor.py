@@ -333,10 +333,11 @@ class FanControlTest(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
 
-    def test_missing_service_is_a_recommendation(self) -> None:
+    def test_missing_service_is_an_error(self) -> None:
+        # bench needs it; whether it runs while serving is not checked.
         problems = spark.fan_control_problems("dgx2", facts(fan_service="absent"))
         self.assertEqual(len(problems), 1)
-        self.assertIsInstance(problems[0], spark.Warn)
+        self.assertNotIsInstance(problems[0], spark.Warn)
         self.assertIn("dgx-fan-control.service is not installed", problems[0])
         self.assertIn("sudo systemctl daemon-reload", problems[0])
 
@@ -383,6 +384,7 @@ class FanCurveTest(unittest.TestCase):
     def test_installed_service_runs_for_the_bench_and_stops_after(self) -> None:
         records, failures, started, stopped = self.run_curve({"dgx1": "inactive"})
         self.assertEqual(records, [{"node": "dgx1", "service": "inactive", "started": True, "stopped": True}])
+        self.assertEqual(spark.fan_curve_problems(records), [])
         self.assertEqual(failures, [])
         self.assertIn(("dgx1", "sudo", "-n", "systemctl", "start", spark.FAN_SERVICE), started)
         self.assertEqual(stopped, [("dgx1", "sudo", "-n", "systemctl", "stop", spark.FAN_SERVICE)])
@@ -390,20 +392,31 @@ class FanCurveTest(unittest.TestCase):
     def test_running_service_is_left_running(self) -> None:
         records, failures, started, stopped = self.run_curve({"dgx1": "active"})
         self.assertEqual(records, [{"node": "dgx1", "service": "active", "started": False}])
+        self.assertEqual(spark.fan_curve_problems(records), [])
         self.assertFalse(any(call[1] == "sudo" for call in started))
         self.assertEqual((failures, stopped), ([], []))
 
-    def test_node_without_the_service_measures_on_nvidia_curve(self) -> None:
+    def test_node_without_the_service_stops_the_bench(self) -> None:
         records, failures, started, stopped = self.run_curve({"dgx1": "absent", "dgx2": "inactive"})
         self.assertEqual(records[0], {"node": "dgx1", "service": "absent", "started": False})
+        self.assertEqual(
+            spark.fan_curve_problems(records),
+            ["dgx1: dgx-fan-control.service is not installed (see doctor --live)"],
+        )
+        # The node it did start is still returned to its own control.
         self.assertTrue(records[1]["started"])
-        self.assertFalse(any(call[0] == "dgx1" and call[1] == "sudo" for call in started + stopped))
+        self.assertEqual(stopped, [("dgx2", "sudo", "-n", "systemctl", "stop", spark.FAN_SERVICE)])
+        self.assertFalse(any(call[0] == "dgx1" and call[1] == "sudo" for call in started))
         self.assertEqual(failures, [])
 
     def test_failed_start_is_recorded_and_not_stopped(self) -> None:
         records, failures, _, stopped = self.run_curve({"dgx3": "inactive"}, start_fails=("dgx3",))
         self.assertFalse(records[0]["started"])
         self.assertEqual(records[0]["error"], "start-limit-hit")
+        self.assertEqual(
+            spark.fan_curve_problems(records),
+            ["dgx3: dgx-fan-control.service did not start: start-limit-hit"],
+        )
         self.assertEqual((failures, stopped), ([], []))
 
     def test_failed_stop_is_reported(self) -> None:

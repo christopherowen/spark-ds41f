@@ -81,7 +81,7 @@ revert it.
 | Unused desktop services | warn | Bluetooth, CUPS, snapd, fwupd's refresh timer and the DGX Dashboard hold memory; the dashboard's update checks peak near 850 MiB | `sudo systemctl disable --now …` (`scripts/host-recovery apply` does the same) |
 | NVMe interrupt coalescing off | warn | Engram's small direct disk reads wait for the coalescing timer | `sudo systemctl mask --now nvidia-nvme-interrupt-coalescing.service && sudo /usr/bin/nvidia-nvme-interrupt-coalescing.sh disable` |
 | Fan-floor control: DKMS module, loaded module, cooling device | error, first missing layer | `bin/spark bench` and kernel-lab jobs pre-cool through it; serving does not need it | the printed `dkms autoinstall` or `modprobe` command ([dgx-spark-fan-control](https://github.com/christopherowen/dgx-spark-fan-control)) |
-| `dgx-fan-control.service` installed | warn | `bin/spark bench` runs its performance curve while measuring; a node without it benchmarks on NVIDIA's curve. Whether it also runs while serving is the site's choice | the printed `install` and `daemon-reload` commands |
+| `dgx-fan-control.service` installed | error | `bin/spark bench` runs its performance curve while measuring and refuses to measure without it. Whether it also runs while serving is the site's choice and is not checked | the printed `install` and `daemon-reload` commands |
 
 ### Kernel and memory saver
 
