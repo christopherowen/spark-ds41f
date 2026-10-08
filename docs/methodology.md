@@ -55,7 +55,13 @@ thermal zone below 55 °C.
   its `dgx-fan-control` service paused. They stay there until the last one is
   below 55 °C, so the wait cools all of them.
 - Then each node's usual fan control returns: the service's curve, or firmware
-  automatic where the service is not running. Measurement then starts.
+  automatic where the service is not running.
+- For the measurement, bench starts the service's performance curve on every
+  node where it is installed but not running, so every benchmark runs under the
+  same fan policy, and stops it there when the run ends. A node where the curve
+  cannot run (the service is missing or does not start) aborts the bench before
+  measuring. The report's `fan_curve` section records each node's state, and a
+  curve that cannot be stopped fails the run.
 - The bench report's `cooling` section records each node's start and final
   temperature, whether it was cooled, and for how long.
 - `--cool-below` changes the threshold (0 skips the check). `--cool-timeout`
