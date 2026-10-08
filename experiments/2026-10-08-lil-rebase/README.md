@@ -137,4 +137,37 @@ the maintained branch; it does not need to be faster.
 
 ## Status
 
-Prepared; not built yet. Needs a lab window and the owner's acceptance.
+Gate run on the TP4 ring, 2026-10-08 14:01-14:39 UTC (window
+`dgx1-1791468092`), from main `83c5cb5`:
+
+- **Build.** 9 minutes on dgx4; one image ID on all four nodes
+  (`sha256:a59e7c93`).
+- **Tests in the image.** The router (including 0045's tests and the two
+  padded-step cases 0046 repairs), adaptive verification, acceptance estimator
+  and dead-row tests pass. `tests/models/test_deepseek_v4_1_engram.py`, new to
+  this gate, does not run under `--noconftest`: 15 tests need vLLM's
+  `dist_init` fixture, and
+  `test_disk_engram_model_allocates_hash_buffer_from_declared_caps` builds the
+  model from a stub parallel config without `tensor_parallel_size`, which the
+  sequence-parallel prefill patches have read since r5 (r6b's constructor
+  makes the same call). Neither is a rebase regression; the disk Engram path is
+  covered end to end by quality and the benchmarks below.
+- **Boot** 108 s; the log carries no widened-head warning, so
+  `VLLM_DS41_HEAD_DTYPE=model` keeps the packed and TileLang heads.
+- **Mixed-step reproduction.** Every mixed prefill overlapped all eight
+  decoding streams. r6c passed three rounds. r6a passed too: on this ring a
+  mixed step alone does not trip the assertion #15 reported from TP3 behind a
+  switch, so the fix rests on review and on 0045's GPU tests.
+- **Quality** 5/5.
+- **Against r6b's TP4 run, same protocol.** Eight decode points have step-time
+  intervals including zero; prose-c4 (+0.4%, [+0.1, +0.6]) and code-c1 (+0.5%,
+  [+0.2, +0.8]) are slower with intervals excluding zero, which meets the
+  rollback trigger as written. Against r6a every decode interval includes zero,
+  and prose-c4 is identical (55.68 and 55.69 ms): r6b's 55.49 ms was the fast
+  run, so these look like between-boot variation, which three samples within a
+  run do not capture. Prefill at 32K, 262K, 500K and 1M tokens: +0.1, -0.2,
+  +0.1 and +0.1% against r6b, intervals including zero. No failed requests;
+  minimum MemAvailable 20.0 GiB; no thermal slowdown.
+
+Needs the owner's decision on the two decode points: accept as noise, or a
+short same-window A/B/A of r6b and r6c at c1 and c4 to settle them.
