@@ -169,5 +169,5 @@ Gate run on the TP4 ring, 2026-10-08 14:01-14:39 UTC (window
   +0.1 and +0.1% against r6b, intervals including zero. No failed requests;
   minimum MemAvailable 20.0 GiB; no thermal slowdown.
 
-Needs the owner's decision on the two decode points: accept as noise, or a
-short same-window A/B/A of r6b and r6c at c1 and c4 to settle them.
+Accepted by the owner on 2026-10-08, who reads the two decode points as
+between-boot variation; no A/B/A was run.
