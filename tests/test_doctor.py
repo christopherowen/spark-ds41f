@@ -91,6 +91,7 @@ FAN_WORKING = (
     "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
     "fan_cooling_device=1\n"
+    "fan_service=installed\n"
 )
 
 
@@ -331,6 +332,83 @@ class FanControlTest(unittest.TestCase):
         problems = spark.fan_control_problems("dgx3", facts(fan_cooling_device="0"))
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
+
+    def test_missing_service_is_a_recommendation(self) -> None:
+        problems = spark.fan_control_problems("dgx2", facts(fan_service="absent"))
+        self.assertEqual(len(problems), 1)
+        self.assertIsInstance(problems[0], spark.Warn)
+        self.assertIn("dgx-fan-control.service is not installed", problems[0])
+        self.assertIn("sudo systemctl daemon-reload", problems[0])
+
+    def test_missing_driver_layer_is_reported_before_the_service(self) -> None:
+        problems = spark.fan_control_problems("dgx2", facts(fan_module="0", fan_service="absent"))
+        self.assertEqual(len(problems), 1)
+        self.assertNotIsInstance(problems[0], spark.Warn)
+        self.assertIn("dgx_ec_fan_control is not loaded", problems[0])
+
+
+class FanCurveTest(unittest.TestCase):
+    """bench runs the performance curve while it measures, then restores each node."""
+
+    def run_curve(self, services: dict[str, str], start_fails: tuple[str, ...] = (),
+                  stop_fails: tuple[str, ...] = ()):
+        calls: list[tuple[str, ...]] = []
+
+        def fake_ssh(nodes, node, *command):
+            name = node["name"]
+            calls.append((name, *command))
+            state = services[name]
+            if command[:3] == ("systemctl", "is-active", "--quiet"):
+                return spark.subprocess.CompletedProcess(command, 0 if state == "active" else 3, "", "")
+            if command[:2] == ("systemctl", "cat"):
+                return spark.subprocess.CompletedProcess(command, 1 if state == "absent" else 0, "", "")
+            if command[3:5] == ("start", spark.FAN_SERVICE) and name in start_fails:
+                return spark.subprocess.CompletedProcess(command, 1, "", "start-limit-hit\n")
+            if command[3:5] == ("stop", spark.FAN_SERVICE) and name in stop_fails:
+                return spark.subprocess.CompletedProcess(command, 1, "", "")
+            return spark.subprocess.CompletedProcess(command, 0, "", "")
+
+        original = spark.run_ssh
+        spark.run_ssh = fake_ssh
+        try:
+            nodes = {"ssh_user": "u", "nodes": [{"name": n} for n in services]}
+            with contextlib.redirect_stdout(io.StringIO()):
+                records = spark.start_fan_curve(nodes, nodes["nodes"])
+                started_calls = list(calls)
+                failures = spark.stop_fan_curve(nodes, nodes["nodes"], records)
+        finally:
+            spark.run_ssh = original
+        return records, failures, started_calls, calls[len(started_calls):]
+
+    def test_installed_service_runs_for_the_bench_and_stops_after(self) -> None:
+        records, failures, started, stopped = self.run_curve({"dgx1": "inactive"})
+        self.assertEqual(records, [{"node": "dgx1", "service": "inactive", "started": True, "stopped": True}])
+        self.assertEqual(failures, [])
+        self.assertIn(("dgx1", "sudo", "-n", "systemctl", "start", spark.FAN_SERVICE), started)
+        self.assertEqual(stopped, [("dgx1", "sudo", "-n", "systemctl", "stop", spark.FAN_SERVICE)])
+
+    def test_running_service_is_left_running(self) -> None:
+        records, failures, started, stopped = self.run_curve({"dgx1": "active"})
+        self.assertEqual(records, [{"node": "dgx1", "service": "active", "started": False}])
+        self.assertFalse(any(call[1] == "sudo" for call in started))
+        self.assertEqual((failures, stopped), ([], []))
+
+    def test_node_without_the_service_measures_on_nvidia_curve(self) -> None:
+        records, failures, started, stopped = self.run_curve({"dgx1": "absent", "dgx2": "inactive"})
+        self.assertEqual(records[0], {"node": "dgx1", "service": "absent", "started": False})
+        self.assertTrue(records[1]["started"])
+        self.assertFalse(any(call[0] == "dgx1" and call[1] == "sudo" for call in started + stopped))
+        self.assertEqual(failures, [])
+
+    def test_failed_start_is_recorded_and_not_stopped(self) -> None:
+        records, failures, _, stopped = self.run_curve({"dgx3": "inactive"}, start_fails=("dgx3",))
+        self.assertFalse(records[0]["started"])
+        self.assertEqual(records[0]["error"], "start-limit-hit")
+        self.assertEqual((failures, stopped), ([], []))
+
+    def test_failed_stop_is_reported(self) -> None:
+        _, failures, _, _ = self.run_curve({"dgx4": "inactive"}, stop_fails=("dgx4",))
+        self.assertEqual(failures, [f"dgx4: cannot stop {spark.FAN_SERVICE}"])
 
 
 HEALTHY_GIDS = """rocep1s0f0 0 IB/RoCEv1 fe80:0000:0000:0000:4ebb:47ff:fee9:7f2b enp1s0f0np0

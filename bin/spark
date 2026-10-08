@@ -563,6 +563,7 @@ printf 'kernel=%s\\n' "$(uname -r)"
 printf 'fan_dkms=%s\\n' "$(dkms status -m dgx-spark-fan-control -k "$(uname -r)" 2>/dev/null | head -1)"
 printf 'fan_module=%s\\n' "$(grep -c '^dgx_ec_fan_control ' /proc/modules)"
 printf 'fan_cooling_device=%s\\n' "$(grep -lx dgx_ec_fan_floor /sys/class/thermal/cooling_device*/type 2>/dev/null | wc -l)"
+printf 'fan_service=%s\\n' "$(systemctl cat dgx-fan-control.service >/dev/null 2>&1 && echo installed || echo absent)"
 printf 'gpu=%s\\n' "$(nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)"
 """
 HOST_FACTS_QUERY += (
@@ -793,9 +794,12 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
 
     Each layer needs the one before it: the signed DKMS module for the running
     kernel, the loaded module and its dgx_ec_fan_floor cooling device. Those are
-    what bench and kernel-lab cooling use to select the maximum floor. Whether
-    the dgx-fan-control service runs its performance curve is the site's choice:
-    serving does not need it, and cooling pauses and restores it when present.
+    what bench and kernel-lab cooling use to select the maximum floor.
+
+    The dgx-fan-control service is recommended, not required: bench runs its
+    performance curve while it measures, so a node without it benchmarks on
+    NVIDIA's curve instead. Whether the service also runs while serving is the
+    site's choice, so only its absence is reported, as a warning.
     """
     kernel = facts.get("kernel") or "the running kernel"
     if "installed" not in facts.get("fan_dkms", ""):
@@ -814,6 +818,14 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
             f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
             "is missing (the driver refused it at probe; see dmesg)"
         ]
+    if facts.get("fan_service") == "absent":
+        return [Warn(
+            f"{node_name}: dgx-fan-control.service is not installed, so bench measures this node "
+            "on NVIDIA's fan curve instead of the performance curve; from a dgx-spark-fan-control "
+            "checkout run sudo install -D -m 0644 systemd/dgx-fan-control.service "
+            "/etc/systemd/system/dgx-fan-control.service && sudo systemctl daemon-reload "
+            "(enabling it for serving is optional)"
+        )]
     return []
 
 
@@ -3877,6 +3889,67 @@ def cool_nodes(
     return records
 
 
+# A benchmark measures under one fan policy whatever a site serves with: the
+# dgx-fan-control service's performance curve, started where it is installed but
+# not running and stopped again afterwards. A node without the service measures
+# on NVIDIA's curve, and its record says so.
+def start_fan_curve(nodes: dict, targets: list[dict]) -> list[dict]:
+    """Run the dgx-fan-control performance curve on every target for a benchmark."""
+    def start(node: dict) -> dict:
+        record = {"node": node["name"], "service": "active", "started": False}
+        if run_ssh(nodes, node, "systemctl", "is-active", "--quiet", FAN_SERVICE).returncode == 0:
+            return record
+        if run_ssh(nodes, node, "systemctl", "cat", FAN_SERVICE).returncode:
+            record["service"] = "absent"
+            return record
+        record["service"] = "inactive"
+        # Cooling may just have cycled the service; clear its start-rate limit.
+        run_ssh(nodes, node, "sudo", "-n", "systemctl", "reset-failed", FAN_SERVICE)
+        started = run_ssh(nodes, node, "sudo", "-n", "systemctl", "start", FAN_SERVICE)
+        record["started"] = started.returncode == 0
+        if started.returncode:
+            record["error"] = (started.stderr or "").strip() or f"systemctl start exited {started.returncode}"
+        return record
+
+    if not targets:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        records = list(pool.map(start, targets))
+    states = []
+    for record in records:
+        if record["started"]:
+            states.append(f"{record['node']} started")
+        elif record["service"] == "active":
+            states.append(f"{record['node']} already running")
+        elif record["service"] == "absent":
+            states.append(f"{record['node']} not installed (NVIDIA's curve)")
+        else:
+            states.append(f"{record['node']} failed to start (NVIDIA's curve): {record['error']}")
+    print("fan curve: " + ", ".join(states), flush=True)
+    return records
+
+
+def stop_fan_curve(nodes: dict, targets: list[dict], records: list[dict]) -> list[str]:
+    """Stop the curve where start_fan_curve started it; return what could not be stopped.
+
+    The service returns its node to firmware automatic control when it stops.
+    """
+    started = [(node, record) for node, record in zip(targets, records) if record.get("started")]
+    if not started:
+        return []
+
+    def stop(pair: tuple[dict, dict]) -> str | None:
+        node, record = pair
+        stopped = run_ssh(nodes, node, "sudo", "-n", "systemctl", "stop", FAN_SERVICE)
+        record["stopped"] = stopped.returncode == 0
+        return None if stopped.returncode == 0 else f"{node['name']}: cannot stop {FAN_SERVICE}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(started)) as pool:
+        failures = [failure for failure in pool.map(stop, started) if failure]
+    print("fan curve: stopped on " + ", ".join(node["name"] for node, _ in started), flush=True)
+    return failures
+
+
 class Bench:
     def __init__(self, base: str, nodes: dict, floor_gib: float) -> None:
         self.base = base
@@ -5055,11 +5128,13 @@ def command_bench(args: argparse.Namespace) -> int:
     print(f"benchmarking {base} ({config_name}); writing {report_path}", flush=True)
     rng = random.Random(args.seed)
     bench = Bench(base, nodes, floor_gib)
+    fan_failures: list[str] = []
     try:
         try:
             report["cooling"] = cool_nodes(nodes, nodes["nodes"], args.cool_below, args.cool_timeout)
         except RuntimeError as error:
             raise BenchAbort(f"cooling failed: {error}") from error
+        report["fan_curve"] = start_fan_curve(nodes, nodes["nodes"])
         save()
         bench.memory.wait_ready()
         for suite in BENCH_SUITES:
@@ -5079,6 +5154,7 @@ def command_bench(args: argparse.Namespace) -> int:
         bench.halt("interrupted")
         report["aborted"] = "interrupted"
     finally:
+        fan_failures = stop_fan_curve(nodes, nodes["nodes"], report.get("fan_curve", []))
         report["thermal"] = bench.memory.thermal_summary()
         report["memory"] = bench.memory.close()
         report["discarded_samples"] = bench.discarded
@@ -5108,6 +5184,7 @@ def command_bench(args: argparse.Namespace) -> int:
     if failed_requests:
         failures.append(f"{failed_requests} requests failed")
     failures.extend(f"regression: {item}" for item in regressions)
+    failures.extend(f"fan curve: {item}" for item in fan_failures)
     if reference_path:
         print(f"reference: {report['reference']}")
     for failure in failures:
