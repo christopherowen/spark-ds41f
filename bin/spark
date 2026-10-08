@@ -563,8 +563,6 @@ printf 'kernel=%s\\n' "$(uname -r)"
 printf 'fan_dkms=%s\\n' "$(dkms status -m dgx-spark-fan-control -k "$(uname -r)" 2>/dev/null | head -1)"
 printf 'fan_module=%s\\n' "$(grep -c '^dgx_ec_fan_control ' /proc/modules)"
 printf 'fan_cooling_device=%s\\n' "$(grep -lx dgx_ec_fan_floor /sys/class/thermal/cooling_device*/type 2>/dev/null | wc -l)"
-printf 'fan_service=%s/%s\\n' "$(systemctl is-enabled dgx-fan-control.service 2>/dev/null)" \\
-  "$(systemctl is-active dgx-fan-control.service 2>/dev/null)"
 printf 'gpu=%s\\n' "$(nvidia-smi --query-gpu=clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1)"
 """
 HOST_FACTS_QUERY += (
@@ -794,8 +792,10 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
     """The first missing layer of the DGX Spark additive fan-floor control.
 
     Each layer needs the one before it: the signed DKMS module for the running
-    kernel, the loaded module, its dgx_ec_fan_floor cooling device, and the
-    dgx-fan-control daemon, enabled and running.
+    kernel, the loaded module and its dgx_ec_fan_floor cooling device. Those are
+    what bench and kernel-lab cooling use to select the maximum floor. Whether
+    the dgx-fan-control service runs its performance curve is the site's choice:
+    serving does not need it, and cooling pauses and restores it when present.
     """
     kernel = facts.get("kernel") or "the running kernel"
     if "installed" not in facts.get("fan_dkms", ""):
@@ -813,11 +813,6 @@ def fan_control_problems(node_name: str, facts: dict[str, str]) -> list[str]:
         return [
             f"{node_name}: dgx_ec_fan_control is loaded but its dgx_ec_fan_floor cooling device "
             "is missing (the driver refused it at probe; see dmesg)"
-        ]
-    if facts.get("fan_service") != "enabled/active":
-        return [
-            f"{node_name}: dgx-fan-control.service is {facts.get('fan_service') or 'unknown'}, "
-            "expected enabled/active; run sudo systemctl enable --now dgx-fan-control.service"
         ]
     return []
 

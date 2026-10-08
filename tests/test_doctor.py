@@ -91,7 +91,6 @@ FAN_WORKING = (
     "fan_dkms=dgx-spark-fan-control/0.1.3, 7.0.0-1019-nvidia, aarch64: installed\n"
     "fan_module=1\n"
     "fan_cooling_device=1\n"
-    "fan_service=enabled/active\n"
 )
 
 
@@ -315,7 +314,7 @@ class FanControlTest(unittest.TestCase):
 
     def test_missing_dkms_module_is_the_only_report(self) -> None:
         problems = spark.fan_control_problems(
-            "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0", fan_service="/inactive")
+            "dgx3", facts(fan_dkms="", fan_module="0", fan_cooling_device="0")
         )
         self.assertEqual(
             problems, ["dgx3: DKMS dgx-spark-fan-control is not installed for 7.0.0-1019-nvidia; run "
@@ -329,18 +328,9 @@ class FanControlTest(unittest.TestCase):
     def test_refused_cooling_device_is_reported(self) -> None:
         # dgx3 on firmware 5.36_0ACUM027: the driver loads, then the EC rejects
         # its capability read and it refuses to register the cooling device.
-        problems = spark.fan_control_problems(
-            "dgx3", facts(fan_cooling_device="0", fan_service="disabled/inactive")
-        )
+        problems = spark.fan_control_problems("dgx3", facts(fan_cooling_device="0"))
         self.assertEqual(len(problems), 1)
         self.assertIn("cooling device is missing", problems[0])
-
-    def test_stopped_daemon_is_reported(self) -> None:
-        problems = spark.fan_control_problems("dgx1", facts(fan_service="enabled/failed"))
-        self.assertEqual(
-            problems, ["dgx1: dgx-fan-control.service is enabled/failed, expected enabled/active; "
-                "run sudo systemctl enable --now dgx-fan-control.service"]
-        )
 
 
 HEALTHY_GIDS = """rocep1s0f0 0 IB/RoCEv1 fe80:0000:0000:0000:4ebb:47ff:fee9:7f2b enp1s0f0np0
