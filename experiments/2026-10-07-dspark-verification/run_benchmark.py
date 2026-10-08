@@ -8,7 +8,7 @@ the recipe's promoted profile, boots r6a-<recipe>.json once and runs quality, th
 single-stream decode profile, decode on prose and code with reasoning (three samples)
 and real-text prefill (two repeats) at the recipe's limits: TP4 at 1-16 streams and
 32K-512K plus a 1,000,000-token prefill on the same boot, TP3 at 1-8 streams and
-32K-500K. Copies the reports to runs-<recipe>/ and closes the window.
+32K-500K. Writes the reports to results/private/r6a/runs-<recipe>/ and closes the window.
 """
 import shutil
 import subprocess
@@ -34,7 +34,10 @@ def main() -> int:
     lab.PRODUCTION_CONFIG = production
     config = f"{EXP}/r6a-{recipe}.json"
     work = f".work/r6a/{recipe}"
-    runs = ROOT / EXP / f"runs-{recipe}"
+    # Reports stay in the git-ignored results/private: a dirty deployment checkout
+    # would stop the window from restoring production. Copy them into the
+    # experiment's runs-<recipe>/ when recording.
+    runs = ROOT / "results" / "private" / "r6a" / f"runs-{recipe}"
     runs.mkdir(parents=True, exist_ok=True)
     note = {"text": f"r6a {recipe} benchmark"}
     stop = threading.Event()

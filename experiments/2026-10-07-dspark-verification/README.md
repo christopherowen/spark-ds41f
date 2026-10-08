@@ -264,5 +264,6 @@ r6's acceptance benchmark on [r6a-tp4.json](r6a-tp4.json) and
 the single-stream decode profile, then decode on prose and code with reasoning
 (three samples) and real-text prefill (two repeats) at the recipe's limits.
 TP4 runs at 1-16 streams and 32K-1M, TP3 at 1-8 streams and 32K-500K. Reports
-go to `runs-tp4/` and `runs-tp3/`. TP3 runs on the dgx1-dgx3 triangle, which
+are written on dgx1 under `results/private/r6a/` and copied into `runs-tp4/`
+and `runs-tp3/` here. TP3 runs on the dgx1-dgx3 triangle, which
 needs the fleet recabled from the TP4 ring.
