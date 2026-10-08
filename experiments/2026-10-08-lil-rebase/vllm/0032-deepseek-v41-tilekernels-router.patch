@@ -1,0 +1,350 @@
+From 38ce18d9afcf47553a7fd650a506cbd1ff965de8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 14:27:23 +0200
+Subject: [PATCH] Route DeepSeek V4.1 with TileKernels' TileLang top-k gate
+
+The TileLang kernel family routed the target's MoE layers through vLLM's
+Triton dsv4_topk and the drafter's through a CUDA op. Both now use
+TileKernels' moe_topk_gate_forward, DeepSeek's TileLang router. It
+implements the V4.1 reference: sqrt(softplus) scores, the top-k of score
+plus the correction bias (the vision bias for image tokens) with the lowest
+expert first on ties, and the chosen scores normalized by their sum plus
+1e-20 and scaled. Its scores are bit-identical to torch's sqrt(softplus).
+It refuses non-finite logits.
+
+The image-token mask is computed once per step and shared by every layer.
+DeepseekV4MoE takes the router class from the kernel family. B12X keeps
+vLLM's router, and MegaMoE, which routes in its own kernel, refuses one.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  | 130 ++++++++++++++++++
+ vllm/models/deepseek_v4/nvidia/model.py       |  23 ++++
+ vllm/models/deepseek_v4_1/kernels.py          |   9 ++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   1 +
+ vllm/models/deepseek_v4_1/tilelang/router.py  |  91 ++++++++++++
+ 5 files changed, 254 insertions(+)
+ create mode 100644 tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/router.py
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+new file mode 100644
+index 000000000..45253de6b
+--- /dev/null
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 routing through TileKernels' TileLang top-k gate."""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++pytest.importorskip("tile_kernels")
++if not torch.cuda.is_available():
++    pytest.skip("needs CUDA", allow_module_level=True)
++
++from vllm.models.deepseek_v4_1.tilelang import router as tilelang_router  # noqa: E402
++
++LO = 129264  # the target's image sentinel token
++SCALE = 1.5  # V4.1's routed scaling factor
++
++
++def _reference(logits, bias, topk, image=None, bias_vl=None):
++    """DeepSeek's V4.1 reference gate (inference/model.py), in fp32."""
++    scores = F.softplus(logits).sqrt()
++    biased = scores + (
++        torch.where(image[:, None], bias_vl, bias) if image is not None else bias
++    )
++    # A stable descending sort puts the lower expert id first on exact ties,
++    # which torch.topk leaves unspecified.
++    ids = biased.sort(dim=-1, descending=True, stable=True).indices[:, :topk]
++    weights = scores.gather(1, ids)
++    weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * SCALE
++    return weights, ids
++
++
++def _router(experts, topk, bias, bias_vl=None, lo=0):
++    return tilelang_router.TileKernelsRouter(
++        top_k=topk,
++        global_num_experts=experts,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++        bias_vl=bias_vl,
++        image_sentinel_lo=lo,
++        image_sentinel_count=1,
++    )
++
++
++@pytest.mark.parametrize("experts,topk", [(384, 6), (128, 3)])
++@pytest.mark.parametrize("rows", [1, 6, 96, 8192])
++@pytest.mark.parametrize("scale", [0.1, 4.0, 40.0])
++def test_routes_like_deepseeks_reference(experts, topk, rows, scale):
++    generator = torch.Generator(device="cuda").manual_seed(rows * experts)
++    logits = torch.randn(rows, experts, device="cuda", generator=generator) * scale
++    bias = torch.randn(experts, device="cuda", generator=generator) * 0.1
++    weights, ids = _router(experts, topk, bias)._compute_routing(None, logits, None)
++    expected_weights, expected_ids = _reference(logits, bias, topk)
++    assert ids.dtype == torch.int64 and weights.dtype == torch.float32
++    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
++    # Only the order of the six-term sum may differ from torch's.
++    torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=0)
++
++
++def test_ties_go_to_the_lowest_expert():
++    logits = torch.zeros(4, 384, device="cuda")
++    bias = torch.zeros(384, device="cuda")
++    weights, ids = _router(384, 6, bias)._compute_routing(None, logits, None)
++    assert ids.tolist() == [list(range(6))] * 4
++    torch.testing.assert_close(weights, torch.full_like(weights, SCALE / 6))
++
++
++def test_image_tokens_route_with_the_vision_bias():
++    generator = torch.Generator(device="cuda").manual_seed(7)
++    logits = torch.randn(64, 384, device="cuda", generator=generator)
++    bias = torch.randn(384, device="cuda", generator=generator)
++    bias_vl = torch.randn(384, device="cuda", generator=generator)
++    input_ids = torch.randint(0, 1000, (64,), device="cuda", generator=generator)
++    input_ids[::3] = LO
++    router = _router(
++        384, 6, bias, torch.nn.Parameter(bias_vl, requires_grad=False), lo=LO
++    )
++    weights, ids = router._compute_routing(None, logits, None, input_ids=input_ids)
++    expected_weights, expected_ids = _reference(
++        logits, bias, 6, input_ids == LO, bias_vl
++    )
++    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=0)
++    with pytest.raises(ValueError, match="requires input_ids"):
++        router._compute_routing(None, logits, None)
++
++
++def test_image_token_mask_is_computed_once_per_step(monkeypatch):
++    context = type("Context", (), {})()
++    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
++    input_ids = torch.tensor([1, LO, LO + 1, LO], device="cuda")
++    first = tilelang_router._image_token_mask(input_ids, LO, 1)
++    assert first.tolist() == [False, True, False, True]
++    assert tilelang_router._image_token_mask(input_ids, LO, 1) is first
++    # The next step's ids are a new tensor.
++    other = tilelang_router._image_token_mask(input_ids.clone(), LO, 1)
++    assert other is not first and torch.equal(other, first)
++
++
++def test_refuses_what_v41_routing_does_not_have():
++    bias = torch.zeros(384, device="cuda")
++    table = torch.zeros(1000, 6, dtype=torch.int32, device="cuda")
++    with pytest.raises(ValueError, match="no hash-routed layers"):
++        tilelang_router.TileKernelsRouter(
++            top_k=6,
++            global_num_experts=384,
++            e_score_correction_bias=bias,
++            renormalize=True,
++            scoring_func="sqrtsoftplus",
++            hash_indices_table=table,
++        )
++    logits = torch.randn(2, 384, device="cuda")
++    with pytest.raises(ValueError, match="int64 expert ids"):
++        _router(384, 6, bias)._compute_routing(None, logits, torch.int32)
++
++
++def test_matches_the_triton_router_it_replaces():
++    """Same experts as vLLM's dsv4_topk; weights within its approximate math."""
++    from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
++
++    generator = torch.Generator(device="cuda").manual_seed(11)
++    logits = torch.randn(512, 384, device="cuda", generator=generator) * 3
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    weights, ids = _router(384, 6, bias)._compute_routing(None, logits, None)
++    triton_weights, triton_ids = dsv4_topk(logits, bias, torch.int64, SCALE)
++    torch.testing.assert_close(ids, triton_ids, rtol=0, atol=0)
++    torch.testing.assert_close(weights, triton_weights, rtol=1e-5, atol=0)
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index 3cc704baa..721b4eafd 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -791,10 +791,14 @@ class DeepseekV4MoE(nn.Module):
+         gate: nn.Module | None = None,
+         image_sentinel_lo: int | None = None,
+         image_sentinel_count: int = 5,
++        router_cls: type | None = None,
+     ):
+         super().__init__()
+ 
+         self.tp_size = get_tensor_model_parallel_world_size()
++        # A FusedTopKBiasRouter subclass that routes these experts instead of
++        # vLLM's choice for the config (the DS4.1 kernel family picks it).
++        self.router_cls = router_cls
+         config = vllm_config.model_config.hf_config
+         quant_config = vllm_config.quant_config
+         self.prefix = prefix
+@@ -802,6 +806,8 @@ class DeepseekV4MoE(nn.Module):
+         moe_backend = vllm_config.kernel_config.moe_backend
+         validate_fi_moe_ep_config(vllm_config)
+         self.use_mega_moe = moe_backend in MEGA_MOE_BACKENDS
++        if self.use_mega_moe and router_cls is not None:
++            raise ValueError("MegaMoE routes in its own kernel; it takes no router")
+         self.use_fi_mega_moe = is_fi_moe_ep_backend(moe_backend)
+         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
+             raise NotImplementedError(
+@@ -1008,9 +1014,26 @@ class DeepseekV4MoE(nn.Module):
+         self.n_logical_experts = self.n_routed_experts
+         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
+ 
++        router = None
++        if self.router_cls is not None:
++            if parallel_config.enable_eplb:
++                raise ValueError(f"{self.router_cls.__name__} does not support EPLB")
++            router = self.router_cls(
++                top_k=self.n_activated_experts,
++                global_num_experts=self.n_routed_experts,
++                e_score_correction_bias=self.gate.e_score_correction_bias,
++                renormalize=config.norm_topk_prob,
++                routed_scaling_factor=self.routed_scaling_factor,
++                scoring_func=self.scoring_func,
++                hash_indices_table=self.gate.tid2eid,
++                bias_vl=getattr(self.gate, "bias_vl", None),
++                image_sentinel_lo=self.image_sentinel_lo,
++                image_sentinel_count=self.image_sentinel_count,
++            )
+         self.experts = FusedMoEFactory(
+             shared_experts=self.shared_experts,
+             gate=self.gate,
++            router=router,
+             num_experts=self.n_routed_experts,
+             top_k=self.n_activated_experts,
+             hidden_size=config.hidden_size,
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 91e50c292..1db635571 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -51,6 +51,15 @@ def embedding_method():
+     return B12xEmbeddingMethod()
+ 
+ 
++def moe_router_class():
++    """Router class for the MoE layers; None keeps vLLM's for the config."""
++    if uses_tilelang():
++        from .tilelang.router import TileKernelsRouter
++
++        return TileKernelsRouter
++    return None
++
++
+ def rms_norm(hidden_size: int, eps: float = 1e-6) -> nn.Module:
+     if uses_tilelang():
+         from .tilelang.norm import TileLangRMSNorm
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 4366feb09..aa39b62ec 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -164,6 +164,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+             gate=gate,
+             image_sentinel_lo=0 if is_draft else 129264,
+             image_sentinel_count=1,
++            router_cls=kernels.moe_router_class(),
+         )
+ 
+         self.attn_norm = kernels.rms_norm(self.hidden_size, self.rms_norm_eps)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+new file mode 100644
+index 000000000..9cc62e875
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 expert routing with DeepSeek's TileLang top-k gate.
++
++The TileLang kernel family routes both the target's MoE layers (6 of 384
++experts) and the drafter's (3 of 128) with TileKernels'
++``moe_topk_gate_forward``, in place of vLLM's Triton ``dsv4_topk`` and its
++CUDA ``topk_hash_softplus_sqrt`` op. It implements DeepSeek's V4.1 reference
++routing:
++
++- scores ``sqrt(softplus(logits))``, with softplus the identity above 20;
++- the top-k experts by score plus the correction bias, or the vision bias for
++  image tokens, the lowest expert id first on ties;
++- weights the chosen scores without bias, divided by their sum plus 1e-20 and
++  multiplied by the routed scaling factor.
++
++One warp routes one token. The kernel refuses NaN or infinite logits instead
++of routing on them. V4.1 has no hash-routed layers.
++"""
++
++import torch
++
++from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
++    FusedTopKBiasRouter,
++)
++
++
++def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Tensor:
++    """Image sentinel tokens of this step, computed once and shared by every layer."""
++    context = get_forward_context() if is_forward_context_available() else None
++    cached = getattr(context, "_ds41_image_token_mask", None)
++    if cached is not None and cached[0] is input_ids:
++        return cached[1]
++    mask = (input_ids >= lo) & (input_ids < lo + count)
++    if context is not None:
++        context._ds41_image_token_mask = (input_ids, mask)
++    return mask
++
++
++class TileKernelsRouter(FusedTopKBiasRouter):
++    """V4.1 routing through TileKernels' TileLang top-k gate."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        if self._hash_indices_table is not None:
++            raise ValueError("DeepSeek V4.1 routing has no hash-routed layers")
++        if self.scoring_func != "sqrtsoftplus" or not self.renormalize:
++            raise ValueError("DeepSeek V4.1 routing is normalized sqrtsoftplus")
++        if self.e_score_correction_bias is None:
++            raise ValueError("DeepSeek V4.1 routing needs the correction bias")
++        if self.num_fused_shared_experts or self.eplb_state is not None:
++            raise ValueError(
++                "TileKernels routing covers routed experts without EPLB only"
++            )
++
++    def _compute_routing(
++        self,
++        hidden_states: torch.Tensor,
++        router_logits: torch.Tensor,
++        indices_type: torch.dtype | None,
++        *,
++        input_ids: torch.Tensor | None = None,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        from tile_kernels.moe import moe_topk_gate_forward
++
++        image_bias = image_token_mask = None
++        if self.bias_vl is not None and self.image_sentinel_lo > 0:
++            if input_ids is None:
++                raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
++            image_bias = self.bias_vl.data
++            image_token_mask = _image_token_mask(
++                input_ids, self.image_sentinel_lo, self.image_sentinel_count
++            )
++        topk_ids, topk_weights = moe_topk_gate_forward(
++            router_logits,
++            self.top_k,
++            use_shared_as_routed=False,
++            num_shared_experts=0,
++            routed_scaling_factor=self.routed_scaling_factor,
++            ep_rank=0,
++            bias=self.e_score_correction_bias.data,
++            image_bias=image_bias,
++            image_token_mask=image_token_mask,
++        )
++        # TileKernels writes int64 expert ids; the TileLang dispatch reads them.
++        if indices_type not in (None, torch.int64):
++            raise ValueError(
++                f"TileKernels routing writes int64 expert ids, not {indices_type}"
++            )
++        return topk_weights, topk_ids
+-- 
+2.54.0 (Apple Git-157)
+

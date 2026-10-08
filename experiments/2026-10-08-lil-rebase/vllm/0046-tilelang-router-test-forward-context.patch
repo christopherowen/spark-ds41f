@@ -1,0 +1,30 @@
+From e4913bfff62f7fd87e992493ea0fe1f760158cc6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 15:35:47 +0200
+Subject: [PATCH] Give the padded-step router test a forward context's
+ attn_metadata
+
+0045's routing mask reads attn_metadata to find CED decoder masks. The
+padded_step fixture built a bare context without it, so both
+test_padding_rows_are_not_routed cases raised AttributeError. A real
+ForwardContext always carries the field; None means no CED plan, which is
+what this fixture models.
+---
+ tests/kernels/moe/test_deepseek_v41_tilelang_router.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 891be45f1..4f9646079 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -226,6 +226,7 @@ def test_gate_router_routes_image_tokens(plain_scratch):
+ def padded_step(monkeypatch):
+     """A forward step whose last rows pad a CUDA graph's batch."""
+     context = type("Context", (), {})()
++    context.attn_metadata = None  # ForwardContext always has it; no CED plan here
+     monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
+     monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
+ 
+-- 
+2.54.0 (Apple Git-157)
+

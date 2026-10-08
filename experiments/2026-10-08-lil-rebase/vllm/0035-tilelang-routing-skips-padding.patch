@@ -1,0 +1,218 @@
+From a838976ebc0a330a490d4322972af62caed0b5e0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 15:51:13 +0200
+Subject: [PATCH] Skip CUDA-graph padding rows in TileLang routing
+
+vLLM's routers give the rows that pad a CUDA graph's batch expert -1 and
+weight 0 (VLLM_MOE_SKIP_PADDING, on by default), and the dispatch skips
+them. The TileLang routing passed no mask, so every padding row was routed
+to six real experts and lit extra expert tiles. Single-stream decode, whose
+adaptive verification often pads the batch, ran 6-12% slower per step.
+
+Both paths now take the step's routing mask, computed once and shared by
+every layer. TileKernels skips the masked rows, and route_partials writes
+the same -1 and 0 for them.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  | 53 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 50 ++++++++++++++---
+ 2 files changed, 95 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 0b24695b1..d3fd6f491 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -220,3 +220,56 @@ def test_gate_router_routes_image_tokens(plain_scratch):
+     )
+     assert torch.equal(ids, expected[1])
+     assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
++
++
++@pytest.fixture
++def padded_step(monkeypatch):
++    """A forward step whose last rows pad a CUDA graph's batch."""
++    context = type("Context", (), {})()
++    monkeypatch.setattr(tilelang_router, "is_forward_context_available", lambda: True)
++    monkeypatch.setattr(tilelang_router, "get_forward_context", lambda: context)
++
++    def pad(rows, padding):
++        context.is_padding = torch.zeros(rows, dtype=torch.bool, device="cuda")
++        context.is_padding[rows - padding :] = True
++        return context.is_padding
++
++    return pad
++
++
++@pytest.mark.parametrize("gate_router", [False, True])
++def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
++    rows, padding = 6, 2
++    is_padding = padded_step(rows, padding)
++    generator = torch.Generator(device="cuda").manual_seed(13)
++    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    gate = _Gate(384, seed=13)
++    kwargs = dict(
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    logits, _ = gate(x)
++    if gate_router:
++        router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++        weights, ids = router._compute_routing(None, x, None)
++    else:
++        weights, ids = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
++            None, logits, None
++        )
++    assert (ids[is_padding] == -1).all() and (weights[is_padding] == 0).all()
++    expected_weights, expected_ids = _reference(logits[~is_padding], bias, 6)
++    torch.testing.assert_close(ids[~is_padding], expected_ids, rtol=0, atol=0)
++    torch.testing.assert_close(
++        weights[~is_padding], expected_weights, rtol=2e-6, atol=0
++    )
++    if gate_router:
++        unfused = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
++            None, logits, None
++        )
++        assert torch.equal(ids, unfused[1])
++        assert torch.equal(weights.view(torch.int32), unfused[0].view(torch.int32))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index b4a9c77a2..4476b85dd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -15,7 +15,9 @@ routing:
+   multiplied by the routed scaling factor.
+ 
+ One warp routes one token. The kernel refuses NaN or infinite logits instead
+-of routing on them. V4.1 has no hash-routed layers.
++of routing on them. Rows that pad a CUDA graph's batch are not routed: they
++get expert -1 and weight 0, which the dispatch skips (``VLLM_MOE_SKIP_PADDING``,
++on by default, as vLLM's routers do). V4.1 has no hash-routed layers.
+ 
+ ``TileLangGateRouter`` also owns the gate projection. At decode the gate runs
+ as split-K FP32 partials, and ``route_partials`` adds them in shard order,
+@@ -29,6 +31,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+     FusedTopKBiasRouter,
+@@ -47,6 +50,21 @@ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Ten
+     return mask
+ 
+ 
++def _routing_mask(rows: int) -> torch.Tensor | None:
++    """Rows to route this step (False pads a CUDA graph's batch), computed once."""
++    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
++        return None
++    context = get_forward_context()
++    is_padding = context.is_padding
++    if is_padding is None:
++        return None
++    cached = getattr(context, "_ds41_routing_mask", None)
++    if cached is None or cached[0] is not is_padding:
++        cached = (is_padding, ~is_padding)
++        context._ds41_routing_mask = cached
++    return cached[1][:rows]
++
++
+ class TileKernelsRouter(FusedTopKBiasRouter):
+     """V4.1 routing through TileKernels' TileLang top-k gate."""
+ 
+@@ -88,6 +106,7 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+             num_shared_experts=0,
+             routed_scaling_factor=self.routed_scaling_factor,
+             ep_rank=0,
++            mask=_routing_mask(router_logits.shape[0]),
+             bias=self.e_score_correction_bias.data,
+             image_bias=image_bias,
+             image_token_mask=image_token_mask,
+@@ -112,7 +131,12 @@ _VECTOR = 4
+     },
+ )
+ def route_partials(
+-    num_topk: int, num_experts: int, shards: int, image_mask: bool, warps: int = 2
++    num_topk: int,
++    num_experts: int,
++    shards: int,
++    image_mask: bool,
++    routing_mask: bool,
++    warps: int = 2,
+ ):
+     """Sum a gate's split-K partials in shard order and route each token.
+ 
+@@ -121,7 +145,8 @@ def route_partials(
+     inputs are the partials ``P[shards, rows, experts]``, added from shard 0
+     as ``splitk_reduce`` adds them. Each round's warp-wide winner takes two
+     integer reductions instead of TileKernels' ten shuffles. Non-finite
+-    logits are refused once per lane, not once per logit.
++    logits are refused once per lane, not once per logit. Rows the routing
++    mask excludes get expert -1 and weight 0, as TileKernels gives them.
+     """
+     assert num_topk <= _WARP and num_experts % _VECTOR == 0
+     per_lane = tilelang.cdiv(tilelang.cdiv(num_experts, _WARP), _VECTOR) * _VECTOR
+@@ -133,6 +158,7 @@ def route_partials(
+         bias: T.Tensor((num_experts,), T.float32),
+         image_bias: T.Tensor((num_experts,), T.float32),
+         image_token_mask: T.Tensor((rows,), T.bool),
++        route_mask: T.Tensor((rows,), T.bool),
+         topk_idx: T.Tensor((rows, num_topk), T.int64),
+         topk_weights: T.Tensor((rows, num_topk), T.float32),
+         routed_scaling_factor: T.float32,
+@@ -144,6 +170,11 @@ def route_partials(
+             lane = thread % _WARP
+             if row >= rows:
+                 T.thread_return()
++            if routing_mask and not route_mask[row]:
++                if lane < num_topk:
++                    topk_idx[row, lane] = -1
++                    topk_weights[row, lane] = 0.0
++                T.thread_return()
+ 
+             unbiased = T.alloc_shared((warps, num_experts), T.float32)
+             bias_local = T.alloc_local((per_lane,), T.float32)
+@@ -242,7 +273,7 @@ class TileLangGateRouter(TileKernelsRouter):
+     def __init__(self, *args, gate: torch.nn.Module, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.gate = gate
+-        self._kernels: dict[bool, object] = {}
++        self._kernels: dict[tuple[bool, bool], object] = {}
+         # Text-only layers pass no image tokens; one all-false mask serves them.
+         self._no_image = None
+ 
+@@ -273,9 +304,11 @@ class TileLangGateRouter(TileKernelsRouter):
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+-        if image not in self._kernels:
+-            self._kernels[image] = route_partials(
+-                self.top_k, gate.weight.shape[0], gate.tilelang_shards, image
++        route_mask = _routing_mask(x.shape[0])
++        key = (image, route_mask is not None)
++        if key not in self._kernels:
++            self._kernels[key] = route_partials(
++                self.top_k, gate.weight.shape[0], gate.tilelang_shards, *key
+             )
+         rows = x.shape[0]
+         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
+@@ -296,11 +329,12 @@ class TileLangGateRouter(TileKernelsRouter):
+                     DECODE_ROWS, dtype=torch.bool, device=x.device
+                 )
+             image_bias, mask = bias, self._no_image[:rows]
+-        self._kernels[image](
++        self._kernels[key](
+             partials,
+             bias,
+             image_bias,
+             mask,
++            route_mask if route_mask is not None else mask,
+             topk_ids,
+             topk_weights,
+             self.routed_scaling_factor,
+-- 
+2.54.0 (Apple Git-157)
+

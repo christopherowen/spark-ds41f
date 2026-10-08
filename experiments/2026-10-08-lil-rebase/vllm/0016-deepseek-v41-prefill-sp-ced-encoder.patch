@@ -1,0 +1,72 @@
+From 5cacfde392143fc74d3917eb02f56ce26a1ecd3e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 20:57:29 +0200
+Subject: [PATCH] perf(deepseek-v4.1): sequence-parallel prefill through the
+ CED encoder
+
+Prefill with CED compaction (every prefill of DeepSeek V4.1) left SP off,
+so it never engaged. With CED only the encoder layers before
+ced_decoder_start run on every row, and those are the layers SP helps: run
+them sequence-parallel and gather the carried rows (layer output, residual,
+mixes, pre-mix) back in full before the boundary layer, which builds the
+decoder's global KV from every row and then compacts as before.
+---
+ vllm/models/deepseek_v4_1/nvidia/model.py | 16 +++++++++++++++-
+ vllm/models/deepseek_v4_1/sp_prefill.py   |  7 +++++--
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 9c079a1ed..4473194d7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -657,7 +657,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         ced_indices: torch.Tensor | None = None,
+     ) -> torch.Tensor | IntermediateTensors:
+         sp = None
+-        if self.prefill_sp_min_rows and ced_indices is None:
++        # With CED the encoder layers (before ced_decoder_start) still run on
++        # every row; SP covers them and hands full rows to the boundary layer.
++        sp_layers_available = ced_indices is None or (
++            self.ced_decoder_start is not None
++            and self.start_layer < self.ced_decoder_start
++        )
++        if self.prefill_sp_min_rows and sp_layers_available:
+             sp = sp_prefill.plan_rows(
+                 positions.shape[0],
+                 self.prefill_sp_min_rows,
+@@ -764,6 +770,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             start=self.start_layer,
+         ):
+             boundary_indices = ced_indices if idx == self.ced_decoder_start else None
++            if sp is not None and boundary_indices is not None:
++                # The CED boundary layer builds the decoder's global KV from every
++                # encoder row, then compacts; gather the carried rows first.
++                hidden_states, residual, post_mix, res_mix, pre_mix = (
++                    None if t is None else sp.gather(t)
++                    for t in (hidden_states, residual, post_mix, res_mix, pre_mix)
++                )
++                sp = None
+             hidden_states, residual, post_mix, res_mix, pre_mix = layer(
+                 hidden_states,
+                 positions,
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 563a6e98d..2e9c4236c 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -18,8 +18,11 @@ off. ``DeepseekV4Model.forward`` decides per forward from the token count T,
+ which every rank shares, so no agreement between ranks is needed. The
+ threshold is raised above the decode token counts (CUDA graph sizes and
+ ``max_num_seqs * (1 + num_speculative_tokens)``), so decode never uses SP. SP
+-is also off for CED compaction, pipeline parallelism, static sequence
+-parallelism and request boundary checkpoints.
++is off for pipeline parallelism, static sequence parallelism and request
++boundary checkpoints. With CED compaction, only the encoder layers before
++``ced_decoder_start`` run on every row: SP covers those, and the carried rows
++are gathered back in full before the boundary layer, which builds the
++decoder's global KV from every row and then compacts.
+ 
+ ## Rows
+ 
+-- 
+2.54.0 (Apple Git-157)
+

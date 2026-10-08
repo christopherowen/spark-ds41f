@@ -1,0 +1,492 @@
+From 6ae866b5001117186985400bc57b5233c8673644 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 10:32:06 +0200
+Subject: [PATCH] Load the vocabulary weights straight into the display
+ carve-out
+
+With SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 the worker used to load the embedding
+and output head into ordinary memory, copy them into the GB10 display
+carve-out and free the originals. On GB10 freed memory stays charged to the
+process, so that copy left part of the tables' size on the host for good.
+
+Vocabulary-sized weights are now created in the carve-out when the model is
+built, one dumb buffer per weight, so the checkpoint streams straight into
+them; the packed BF16 head is then packed where it lies. After loading the
+worker only confirms that every vocabulary-sized weight of the served model
+is in the carve-out and that no buffer was left behind by a dropped layer.
+
+The DSpark drafter's embedding and head are placeholders the target's
+replace after loading; they are now built on the meta device instead of as
+full-size tables that were allocated and then dropped.
+---
+ tests/v1/worker/test_display_carveout.py      |  94 +++++++++----
+ .../layers/quantization/online/packed_bf16.py |  14 +-
+ .../layers/vocab_parallel_embedding.py        |  16 ++-
+ vllm/models/deepseek_v41/nvidia/dspark.py     |  28 ++--
+ vllm/v1/worker/display_carveout.py            | 130 +++++++++++-------
+ vllm/v1/worker/gpu/model_runner.py            |   4 +-
+ 6 files changed, 191 insertions(+), 95 deletions(-)
+
+diff --git a/tests/v1/worker/test_display_carveout.py b/tests/v1/worker/test_display_carveout.py
+index f76c3b949..f39445b32 100644
+--- a/tests/v1/worker/test_display_carveout.py
++++ b/tests/v1/worker/test_display_carveout.py
+@@ -13,15 +13,21 @@ import torch
+ from vllm.v1.worker import display_carveout
+ 
+ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++needs_drm = pytest.mark.skipif(
++    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
++)
+ 
+ 
+ class _Table(torch.nn.Module):
++    """A vocabulary layer: its weight comes from ``allocate`` when required."""
++
+     def __init__(self, rows: int, width: int, device: str):
+         super().__init__()
+-        self.weight = torch.nn.Parameter(
+-            torch.randn(rows, width, dtype=torch.bfloat16, device=device),
+-            requires_grad=False,
+-        )
++        data = display_carveout.allocate((rows, width), torch.bfloat16, device)
++        if data is None:
++            data = torch.empty(rows, width, dtype=torch.bfloat16, device=device)
++        data.copy_(torch.randn(rows, width, dtype=torch.bfloat16))  # "loading"
++        self.weight = torch.nn.Parameter(data, requires_grad=False)
+ 
+ 
+ def _model(device: str) -> torch.nn.Module:
+@@ -37,6 +43,14 @@ def _model(device: str) -> torch.nn.Module:
+ @pytest.fixture
+ def tables(monkeypatch):
+     monkeypatch.setattr(display_carveout, "VocabParallelEmbedding", _Table)
++    monkeypatch.setattr(display_carveout, "_REQUIRED", False)
++    monkeypatch.setattr(display_carveout, "_carveouts", [])
++    monkeypatch.setattr(display_carveout, "_integrity", None)
++
++
++@pytest.fixture
++def required(tables, monkeypatch):
++    monkeypatch.setattr(display_carveout, "_REQUIRED", True)
+ 
+ 
+ def test_checksum_sees_one_flipped_bit():
+@@ -100,6 +114,20 @@ def test_struct_layouts_match_cuda_h():
+     assert display_carveout._ExternalMemoryHandleDesc.size.offset == 24
+ 
+ 
++def test_allocate_is_off_unless_required(monkeypatch):
++    monkeypatch.setattr(display_carveout, "_REQUIRED", False)
++    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
++    assert display_carveout.allocate((8192, 4096), torch.bfloat16, "cuda") is None
++
++
++def test_allocate_leaves_small_and_non_cuda_weights_alone(required, monkeypatch):
++    # Neither opens the DRM node, which does not exist here.
++    monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
++    assert display_carveout.allocate((16, 64), torch.bfloat16, "cuda:0") is None
++    assert display_carveout.allocate((8192, 4096), torch.bfloat16, "meta") is None
++    assert display_carveout._carveouts == []
++
++
+ @needs_cuda
+ def test_selects_large_tables_once(tables):
+     names = [name for name, _ in display_carveout.streamed_weights(_model("cuda"))]
+@@ -107,30 +135,31 @@ def test_selects_large_tables_once(tables):
+ 
+ 
+ @needs_cuda
+-def test_missing_drm_node_refuses(tables, monkeypatch):
++def test_missing_drm_node_refuses(required, monkeypatch):
+     monkeypatch.setattr(display_carveout, "_DRM_NODE", "/nonexistent/card0")
+     with pytest.raises(RuntimeError, match="display carve-out cannot hold"):
+-        display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
++        display_carveout.allocate((8192, 4096), torch.bfloat16, "cuda")
+ 
+ 
+ @needs_cuda
+-@pytest.mark.skipif(
+-    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
+-)
+-def test_relocation_preserves_values(tables, monkeypatch):
+-    monkeypatch.setattr(display_carveout, "_integrity", None)
++@needs_drm
++def test_weights_load_in_place(required, monkeypatch):
+     monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 300.0)
++    torch.cuda.synchronize()
++    free_before = torch.cuda.mem_get_info()[0]
+     model = _model("cuda")
+-    before = {
+-        name: weight.detach().clone() for name, weight in model.named_parameters()
+-    }
+-    head_ptr = model.lm_head.weight.data_ptr()
+-    display_carveout.relocate_streamed_weights(model, torch.device("cuda"))
+-    assert model.lm_head.weight.data_ptr() != head_ptr
+-    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
++    torch.cuda.synchronize()
++    # The 128 MiB of tables never touched ordinary memory (the small one did).
++    assert free_before - torch.cuda.mem_get_info()[0] < 32 << 20
++    assert len(display_carveout._carveouts) == 2
++    pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
++    before = {name: p.detach().clone() for name, p in model.named_parameters()}
++    display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
+     for name, weight in model.named_parameters():
++        assert weight.data_ptr() == pointers[name], name
+         assert torch.equal(weight, before[name]), name
+-    # With the check on, its baseline covers both moved tables and still matches.
++    assert model.drafter.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
++    # With the check on, its baseline covers both tables and matches.
+     check = display_carveout._integrity
+     assert [name for name, _ in check.weights] == [
+         "embed_tokens.weight",
+@@ -145,12 +174,27 @@ def test_relocation_preserves_values(tables, monkeypatch):
+ 
+ 
+ @needs_cuda
+-@pytest.mark.skipif(
+-    not os.access("/dev/dri/card0", os.R_OK | os.W_OK), reason="no DRM node"
+-)
+-def test_integrity_check_is_off_by_default(tables, monkeypatch):
+-    monkeypatch.setattr(display_carveout, "_integrity", None)
++def test_weight_outside_the_carveout_refuses(tables):
++    # Built with the carve-out not required: ordinary memory.
++    model = _model("cuda")
++    with pytest.raises(RuntimeError, match="not created in the display carve-out"):
++        display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
++
++
++@needs_cuda
++@needs_drm
++def test_dropped_layer_refuses(required):
++    model = _model("cuda")
++    model.drafter.embed_tokens = _Table(8192, 4096, "cuda")
++    del model.drafter.embed_tokens  # a placeholder replaced after loading
++    with pytest.raises(RuntimeError, match="1 display carve-out buffers"):
++        display_carveout.confirm_streamed_weights(model, torch.device("cuda"))
++
++
++@needs_cuda
++@needs_drm
++def test_integrity_check_is_off_by_default(required, monkeypatch):
+     monkeypatch.setattr(display_carveout, "_CHECK_SECONDS", 0.0)
+-    display_carveout.relocate_streamed_weights(_model("cuda"), torch.device("cuda"))
++    display_carveout.confirm_streamed_weights(_model("cuda"), torch.device("cuda"))
+     assert display_carveout._integrity is None
+     display_carveout.start_checks()
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index 181c57420..9ae0cc445 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -47,12 +47,16 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         params_dtype: torch.dtype,
+         **extra_weight_attrs,
+     ):
++        from vllm.v1.worker import display_carveout
++
++        shape = (sum(output_partition_sizes), input_size_per_partition)
++        # In the GB10 display carve-out when it is required: the checkpoint
++        # streams straight in and the head is then packed where it lies.
++        data = display_carveout.allocate(
++            shape, params_dtype, torch.get_default_device()
++        )
+         weight = Parameter(
+-            torch.empty(
+-                sum(output_partition_sizes),
+-                input_size_per_partition,
+-                dtype=params_dtype,
+-            ),
++            data if data is not None else torch.empty(*shape, dtype=params_dtype),
+             requires_grad=False,
+         )
+         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 8750c62c9..be1a66008 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -126,12 +126,18 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         **extra_weight_attrs,
+     ):
+         """Create weights for embedding layer."""
++        shape = (sum(output_partition_sizes), input_size_per_partition)
++        data = None
++        if isinstance(layer, VocabParallelEmbedding):
++            from vllm.v1.worker import display_carveout
++
++            # Vocabulary-sized tables go straight into the GB10 display
++            # carve-out when it is required, so loading streams into it.
++            data = display_carveout.allocate(
++                shape, params_dtype, torch.get_default_device()
++            )
+         weight = Parameter(
+-            torch.empty(
+-                sum(output_partition_sizes),
+-                input_size_per_partition,
+-                dtype=params_dtype,
+-            ),
++            data if data is not None else torch.empty(*shape, dtype=params_dtype),
+             requires_grad=False,
+         )
+         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+diff --git a/vllm/models/deepseek_v41/nvidia/dspark.py b/vllm/models/deepseek_v41/nvidia/dspark.py
+index 214681f3a..8b8f94955 100644
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -86,11 +86,15 @@ class DSparkDeepseekV4Model(nn.Module):
+         )
+ 
+         # Shared with the target (aliased by the speculator's loading utility).
+-        self.embed_tokens = VocabParallelEmbedding(
+-            config.vocab_size,
+-            config.hidden_size,
+-            prefix=maybe_prefix(prefix, "embed_tokens"),
+-        )
++        # A placeholder with no storage: the checkpoint has no draft embedding,
++        # and on GB10 a vocabulary-sized table allocated and then dropped stays
++        # charged to the process.
++        with torch.device("meta"):
++            self.embed_tokens = VocabParallelEmbedding(
++                config.vocab_size,
++                config.hidden_size,
++                prefix=maybe_prefix(prefix, "embed_tokens"),
++            )
+ 
+         self.main_proj = ReplicatedLinear(
+             config.hidden_size * len(self.target_layer_ids),
+@@ -277,12 +281,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         self.model = DSparkDeepseekV4Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+-        # Shared with the target (aliased by the speculator's load utility).
+-        self.lm_head = ParallelLMHead(
+-            self.config.vocab_size,
+-            self.config.hidden_size,
+-            prefix=maybe_prefix(prefix, "lm_head"),
+-        )
++        # Shared with the target (aliased by the speculator's load utility);
++        # a placeholder with no storage, like the embedding.
++        with torch.device("meta"):
++            self.lm_head = ParallelLMHead(
++                self.config.vocab_size,
++                self.config.hidden_size,
++                prefix=maybe_prefix(prefix, "lm_head"),
++            )
+         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+ 
+     # --- Hooks used by the speculator -------------------------------------
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+index 0497c7758..f30e09b96 100644
+--- a/vllm/v1/worker/display_carveout.py
++++ b/vllm/v1/worker/display_carveout.py
+@@ -18,12 +18,17 @@ slower. So only data read once per step belongs there. The embedding table
+ prefill's sampled positions) qualify, while the KV cache, which attention
+ gathers and re-reads, does not: holding it there cost 8% at eight streams.
+ 
+-With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` the worker moves those weights into
+-the carve-out right after loading, before any kernel plan or graph captures
+-them, and returns their ordinary memory to the allocator for the KV cache. It
+-refuses to start if the carve-out cannot hold them.
+-
+-Nothing writes the weights after the copy, and nothing else can reach them:
++With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
++carve-out when the model is built (``allocate``), so the checkpoint streams
++straight into it and they never occupy ordinary memory: on GB10, memory freed
++after loading stays charged to the process, so copying them in after loading
++and freeing the originals would cost host memory for good. Once loading is
++done, before any kernel plan or graph captures the weights, the worker confirms
++that every vocabulary-sized weight of the served model is in the carve-out and
++that no carve-out buffer was left behind by a layer the model dropped. It
++refuses to start otherwise, or when the carve-out cannot hold them.
++
++Nothing writes the weights after loading, and nothing else can reach them:
+ the DRM file and its buffer handle close right after the export, the dma-buf
+ stays private to the worker, the display engine only scans out its own
+ surfaces, and the scanout heap never hands out a range in use. A driver fault
+@@ -32,8 +37,8 @@ reuses, and the result would be wrong embeddings or logits with no error.
+ 
+ For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
+ turns on an integrity check; production leaves it unset, which adds no work
+-at all. The worker then checksums every moved weight before and after the
+-copy and, from the end of graph capture, re-checks it from a background
++at all. The worker then checksums every carve-out weight once loading is
++done and, from the end of graph capture, re-checks it from a background
+ thread on a side stream at that interval (about 20 ms per check for the
+ 842.5 MiB of a DS4.1 rank). A mismatch is logged and kills the worker, which
+ stops the engine; nothing runs in the serving loop.
+@@ -44,6 +49,7 @@ from __future__ import annotations
+ import contextlib
+ import ctypes
+ import fcntl
++import math
+ import os
+ import signal
+ import struct
+@@ -69,7 +75,6 @@ _DUMB_WIDTH = 4096
+ _DUMB_BPP = 32
+ _ROW_BYTES = _DUMB_WIDTH * _DUMB_BPP // 8
+ _GRANULE = 16 << 20
+-_ALIGN = 4096
+ # Vocabulary-sized tables only; small embeddings stay where they are.
+ _MIN_WEIGHT_BYTES = 64 << 20
+ _CU_EXTERNAL_MEMORY_HANDLE_TYPE_DMABUF_FD = 9
+@@ -179,6 +184,7 @@ def _check(cuda, status: int, what: str) -> None:
+         raise RuntimeError(f"{what} failed: {detail}")
+ 
+ 
++# One buffer per weight, alive for the whole process.
+ _carveouts: list[_Carveout] = []
+ 
+ 
+@@ -186,6 +192,39 @@ def required() -> bool:
+     return _REQUIRED
+ 
+ 
++def allocate(
++    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device | str
++) -> torch.Tensor | None:
++    """A vocabulary-sized weight created in its own carve-out buffer, or None.
++
++    Returns None unless the carve-out is required, the device is CUDA and the
++    weight reaches the vocabulary-sized threshold; the caller then allocates
++    ordinary memory as usual. Loading writes the checkpoint straight into the
++    returned tensor.
++    """
++    device = torch.device(device)
++    nbytes = math.prod(shape) * dtype.itemsize
++    if not _REQUIRED or device.type != "cuda" or nbytes < _MIN_WEIGHT_BYTES:
++        return None
++    rounded = -(-nbytes // _GRANULE) * _GRANULE
++    try:
++        carveout = _Carveout(rounded)
++    except OSError as error:
++        raise RuntimeError(
++            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
++            f"hold a {nbytes >> 20} MiB weight ({_DRM_NODE}: {error})"
++        ) from error
++    _carveouts.append(carveout)
++    backing = torch.as_tensor(carveout, device=device)
++    assert backing.data_ptr() == carveout.pointer.value
++    return backing[:nbytes].view(dtype).view(shape)
++
++
++def _holds(carveout: _Carveout, tensor: torch.Tensor) -> bool:
++    start = carveout.pointer.value
++    return start <= tensor.data_ptr() < start + carveout.nbytes
++
++
+ def _checksum(tensor: torch.Tensor) -> torch.Tensor:
+     """The sum of the tensor's 32-bit words in 64 bits: any flipped bit changes it.
+ 
+@@ -315,8 +354,12 @@ def streamed_weights(model: torch.nn.Module) -> list[tuple[str, torch.nn.Paramet
+     return list(found.values())
+ 
+ 
+-def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
+-    """Move the embedding and output-head weights into the display carve-out."""
++def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> None:
++    """Confirm the embedding and output-head weights loaded into the carve-out.
++
++    Every vocabulary-sized weight of the served model must sit in a buffer from
++    ``allocate``, and every such buffer must still hold one of them.
++    """
+     assert ctypes.sizeof(_ExternalMemoryHandleDesc) == 104
+     assert ctypes.sizeof(_ExternalMemoryBufferDesc) == 88
+     weights = streamed_weights(model)
+@@ -325,49 +368,42 @@ def relocate_streamed_weights(model: torch.nn.Module, device: torch.device) -> N
+             "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
+             "vocabulary-sized embedding or output-head weights"
+         )
+-    spans = [-(-_nbytes(weight) // _ALIGN) * _ALIGN for _, weight in weights]
+-    rounded = -(-sum(spans) // _GRANULE) * _GRANULE
+-    torch.cuda.synchronize(device)
+-    try:
+-        carveout = _Carveout(rounded)
+-    except OSError as error:
++    outside = [
++        name
++        for name, weight in weights
++        if not any(_holds(carveout, weight.data) for carveout in _carveouts)
++    ]
++    if outside:
+         raise RuntimeError(
+-            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
+-            f"hold {rounded >> 20} MiB of weights ({_DRM_NODE}: {error})"
+-        ) from error
+-    _carveouts.append(carveout)
+-    backing = torch.as_tensor(carveout, device=device)
+-    assert backing.data_ptr() == carveout.pointer.value
+-    free_before = torch.cuda.mem_get_info(device)[0]
++            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
++            f"were not created in the display carve-out: {', '.join(outside)}"
++        )
++    orphaned = [
++        carveout
++        for carveout in _carveouts
++        if not any(_holds(carveout, weight.data) for _, weight in weights)
++    ]
++    if orphaned:
++        # A vocabulary-sized layer built and then dropped would hold carve-out
++        # space for nothing; placeholders the model replaces after loading
++        # belong on the meta device.
++        raise RuntimeError(
++            f"{len(orphaned)} display carve-out buffers "
++            f"({sum(c.nbytes for c in orphaned) >> 20} MiB) hold no weight of the "
++            "served model; build placeholder layers on the meta device"
++        )
+     checking = _CHECK_SECONDS > 0
+-    if checking:
+-        expected = [int(_checksum(weight.data)) for _, weight in weights]
+-    held: list[tuple[str, torch.Tensor]] = []
+-    offset = 0
+-    for (name, weight), span in zip(weights, spans):
+-        moved = backing[offset : offset + _nbytes(weight)].view(weight.dtype)
+-        moved = moved.view(weight.shape)
+-        moved.copy_(weight.data)
+-        weight.data = moved
+-        held.append((name, moved))
+-        offset += span
+-    torch.cuda.synchronize(device)
+     if checking:
+         global _integrity
++        held = [(name, weight.data) for name, weight in weights]
++        torch.cuda.synchronize(device)
++        expected = [int(_checksum(weight)) for _, weight in held]
+         _integrity = _IntegrityCheck(held, expected, device, _CHECK_SECONDS)
+-        _integrity.check()
+-        if _integrity.failure is not None:
+-            raise RuntimeError(
+-                f"copy into the display carve-out failed: {_integrity.failure}"
+-            )
+-        _integrity.passed = 0
+-    torch.cuda.empty_cache()
+-    freed = torch.cuda.mem_get_info(device)[0] - free_before
+     logger.info(
+-        "Display carve-out holds %.1f MiB of streamed weights (%s); "
+-        "ordinary memory freed: %.1f MiB; debug integrity check %s",
++        "Display carve-out holds %.1f MiB of streamed weights in %d buffers, "
++        "loaded in place (%s); debug integrity check %s",
+         sum(_nbytes(weight) for _, weight in weights) / (1 << 20),
++        len(_carveouts),
+         ", ".join(name for name, _ in weights),
+-        freed / (1 << 20),
+         f"every {_CHECK_SECONDS:g} s" if checking else "off",
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5a44e55ab..8b4695adf 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -452,9 +452,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         self.speculator, self.speculative_config, load_dummy_weights
+                     )
+             # Before any kernel plan or graph sees the weights; the drafter
+-            # aliases the target's embedding and head, so both move together.
++            # aliases the target's embedding and head, which loaded in place.
+             if display_carveout.required():
+-                display_carveout.relocate_streamed_weights(self.model, self.device)
++                display_carveout.confirm_streamed_weights(self.model, self.device)
+         time_after_load = time.perf_counter()
+ 
+         self.model_memory_usage = m.consumed_memory
+-- 
+2.54.0 (Apple Git-157)
+
