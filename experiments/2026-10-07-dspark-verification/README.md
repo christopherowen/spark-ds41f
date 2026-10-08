@@ -253,3 +253,16 @@ The candidate passes its gate: serving is level and the boot is about 22 s
 shorter. It covers the TP4 recipe only. The vLLM series is shared with the
 TP3 recipes, so promoting it to `patches/vllm` needs the owner's acceptance
 and a TP3 bench on the triangle fabric as well.
+
+## Promotion: r6a
+
+The owner accepted the candidate for both recipes on 2026-10-08. r6a is the
+`-r6-dspark-v2` image under the tag `vllm-ds41f-kkref:04c30fa98e79-r6a`, with
+the same image ID on every node. [run_benchmark.py](run_benchmark.py) repeats
+r6's acceptance benchmark on [r6a-tp4.json](r6a-tp4.json) and
+[r6a-tp3.json](r6a-tp3.json). Each run is one boot in a lab window: quality,
+the single-stream decode profile, then decode on prose and code with reasoning
+(three samples) and real-text prefill (two repeats) at the recipe's limits.
+TP4 runs at 1-16 streams and 32K-1M, TP3 at 1-8 streams and 32K-500K. Reports
+go to `runs-tp4/` and `runs-tp3/`. TP3 runs on the dgx1-dgx3 triangle, which
+needs the fleet recabled from the TP4 ring.
