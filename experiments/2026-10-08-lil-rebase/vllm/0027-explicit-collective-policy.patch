@@ -1,0 +1,441 @@
+From 0fbed244f61108bb368972cea518daf6429a4495 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 09:23:52 +0000
+Subject: [PATCH] Make the requested RoCE collective policy explicit and
+ fail-stop
+
+Upstream base: 19f2c20ed4d64ae22bd009ceacadd85e2a81e354, after the
+spark3 vLLM 0001-0026 series. Requires B12X dispatch-capacity support.
+
+Report dispatch and registered capacity independently from the live runtime.
+Keep sequence-parallel prefill on its qualified capacity floor. Treat
+multi-node RoCE selection as a required RoCE/PyNCCL policy: startup errors
+abort, and ineligible operations go directly to PyNCCL without trying other
+accelerators or the PyTorch process-group fallback.
+
+Quality: no numerical kernel or size boundary changes in the selected arm.
+Single-node and non-RoCE groups retain the general upstream dispatch chain.
+Tests: CPU execution of extracted adapter/runtime predicates and dispatcher
+methods covers boundaries, logs, backend failures and the 205-token SP floor.
+GPU build/serving qualification remains required before deployment.
+Upstream status: local experimental patch, not submitted.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py |  4 +-
+ .../b12x_roce_all_reduce.py                   | 46 ++++++++-----
+ .../device_communicators/cuda_communicator.py | 66 +++++++++++++++++--
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 26 +++++---
+ 4 files changed, 108 insertions(+), 34 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index c2a6dd88c..6546fa388 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -104,7 +104,7 @@ def test_resolve_min_rows_follows_the_one_shot_all_reduce(monkeypatch):
+     # A 2 MiB RoCE all-reduce takes 204 rows of 5120 bf16; T = 205 pads to a
+     # 207-row message at TP 3, the first one it refuses.
+     monkeypatch.setattr(
+-        sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 2 * 1024 * 1024
++        sp_prefill, "_prefill_sp_capacity_bytes", lambda: 2 * 1024 * 1024
+     )
+     assert sp_prefill.resolve_min_rows(_config()) == 205
+     assert sp_prefill.resolve_min_rows(_config(tp=2)) == 205
+@@ -114,7 +114,7 @@ def test_resolve_min_rows_follows_the_one_shot_all_reduce(monkeypatch):
+ 
+ 
+ def test_resolve_min_rows(monkeypatch):
+-    monkeypatch.setattr(sp_prefill, "_one_shot_all_reduce_max_bytes", lambda: 0)
++    monkeypatch.setattr(sp_prefill, "_prefill_sp_capacity_bytes", lambda: 0)
+     # Without a one-shot all-reduce every reduce-scatter scatters: SP starts
+     # above the decode sizes, graphs and max_num_seqs * (1 + k).
+     assert sp_prefill.resolve_min_rows(_config()) == 49
+diff --git a/vllm/distributed/device_communicators/b12x_roce_all_reduce.py b/vllm/distributed/device_communicators/b12x_roce_all_reduce.py
+index 216fc781d..0d647aa55 100644
+--- a/vllm/distributed/device_communicators/b12x_roce_all_reduce.py
++++ b/vllm/distributed/device_communicators/b12x_roce_all_reduce.py
+@@ -13,8 +13,9 @@ Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
+ - Every rank parses the size limits and checks the API version before the
+   vote; the parsed limits are exchanged and must be identical, and the
+   runtime itself refuses ranks whose ABI, HCA count, slot geometry, spin
+-  limit or launch geometry differ.  Any rank that cannot take part disables
+-  the backend on every rank, at initialization only.
++  limit or launch geometry differ.  Any rank that cannot take part aborts
++  initialization on every rank. Explicit multi-node selection is required,
++  not a request to try other backends on failure.
+ - Dispatch is rank-invariant: eligibility depends on dtype, shape, contiguity
+   and size, never on pointer values, so all ranks route the same collective.
+ - Failures are fail-stop, never a fallback: a wait that times out freezes the
+@@ -65,6 +66,7 @@ class B12xRoceAllReduce:
+         device: torch.device,
+         *,
+         global_ranks: Sequence[int] | None = None,
++        nccl_available: bool = True,
+     ) -> None:
+         self.disabled = True
+         self.group = group
+@@ -86,22 +88,22 @@ class B12xRoceAllReduce:
+         self._plan = None
+ 
+         if device_group is None:
+-            logger.warning("RoCEnante requires a CUDA process group.")
+-            return
++            raise RuntimeError("RoCEnante requires a CUDA process group.")
+         if all(in_the_same_node_as(group, source_rank=0)):
+             logger.info("RoCEnante skipped: group is single-node.")
+             return
+ 
+         # Vote before the collective constructor so a rank that cannot take
+         # part (missing package, wrong API version, unsupported device, or an
+-        # unparsable limit) disables the backend on every rank instead of
++        # unparsable limit) fails initialization on every rank instead of
+         # leaving peers in the runtime's setup exchange.  The parsed limits
+         # travel with the vote and must be identical everywhere.
+         reason, limits = self._local_capability()
++        if not nccl_available:
++            reason = "RoCEnante policy requires an available PyNCCL communicator"
+         verdict = self._exchange_vote(reason, limits)
+         if verdict is not None:
+-            logger.warning("RoCEnante disabled on every rank: %s", verdict)
+-            return
++            raise RuntimeError(f"RoCEnante policy unavailable: {verdict}")
+         max_size, max_gather = limits
+ 
+         from b12x.comm import roce
+@@ -117,18 +119,20 @@ class B12xRoceAllReduce:
+                 max_gather_bytes=max_gather,
+             )
+         except Exception as exc:  # noqa: BLE001 - the runtime already coordinated ranks
+-            logger.warning("RoCEnante initialization failed: %s", exc)
+-            return
++            raise RuntimeError("RoCEnante policy initialization failed") from exc
+         self.disabled = False
+         register_b12x_unit_provider(self)
+         if self.rank == 0:
+             logger.info(
+                 "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
+-                "all-reduce max=%d bytes, all-gather shard max=%d bytes.",
++                "all-reduce dispatch <=%d bytes, registered all-reduce capacity=%d "
++                "bytes, all-gather input shard <=%d bytes. NCCL handles "
++                "ineligible inputs and reduce-scatter; backend failures are fatal.",
+                 self.world_size,
+                 ",".join(self._runtime.hca_names),
+-                max_size,
+-                max_gather,
++                self.all_reduce_max_bytes,
++                self.all_reduce_capacity_bytes,
++                self.all_gather_max_bytes,
+             )
+ 
+     def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
+@@ -267,8 +271,18 @@ class B12xRoceAllReduce:
+     @property
+     def all_reduce_max_bytes(self) -> int:
+         """The largest message ``should_custom_ar`` accepts; 0 when disabled."""
++        return 0 if self.disabled else int(self._runtime.dispatch_max_bytes)
++
++    @property
++    def all_reduce_capacity_bytes(self) -> int:
++        """Registered/primed capacity, independent of the dispatch cutoff."""
+         return 0 if self.disabled else int(self._runtime.max_size)
+ 
++    @property
++    def all_gather_max_bytes(self) -> int:
++        """Largest eligible input shard, not the gathered output size."""
++        return 0 if self.disabled else int(self._runtime.max_gather_bytes)
++
+     def should_custom_ar(self, inp: torch.Tensor) -> bool:
+         return not self.disabled and self._runtime.should_allreduce(inp)
+ 
+@@ -281,10 +295,11 @@ class B12xRoceAllReduce:
+             log = logger.info if self.rank == 0 else logger.debug
+             log(
+                 "RoCEnante all-reduce is live: first routed all-reduce is %d bytes "
+-                "(%s); NCCL remains the fallback above %s.",
++                "(%s); dispatch limit=%d bytes, registered capacity=%d bytes.",
+                 inp.numel() * inp.element_size(),
+                 str(inp.dtype).replace("torch.", ""),
+-                envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE,
++                self.all_reduce_max_bytes,
++                self.all_reduce_capacity_bytes,
+             )
+         return self._runtime.all_reduce(inp, plan=self._prepared_plan())
+ 
+@@ -299,10 +314,11 @@ class B12xRoceAllReduce:
+             log = logger.info if self.rank == 0 else logger.debug
+             log(
+                 "RoCEnante all-gather is live: first routed shard is %s %s "
+-                "along dim %d.",
++                "along dim %d; input shard dispatch limit=%d bytes.",
+                 tuple(inp.shape),
+                 str(inp.dtype).replace("torch.", ""),
+                 dim,
++                self.all_gather_max_bytes,
+             )
+         return self._runtime.all_gather(inp, dim=dim, plan=self._prepared_plan())
+ 
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 4eef04eee..c610608da 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -132,6 +132,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 and envs.VLLM_ENABLE_PCIE_ALLREDUCE
+                 and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+             )
++            if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
++                raise ValueError(
++                    "RoCEnante was requested but custom all-reduce is disabled"
++                )
+             use_roce_allreduce = (
+                 use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+             )
+@@ -180,6 +184,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         self.aiter_ar_comm: AiterCustomAllreduce | None = None
+         self.use_aiter_ag_rs: bool = False
+         self.b12x_ar_comm = None
++        self._roce_policy = False
++
++        if self.use_b12x_allreduce and self.use_roce_allreduce:
++            raise ValueError("Select either PCIe or RoCEnante collectives, not both")
+ 
+         if self.use_b12x_allreduce and self.world_size > 1:
+             from .b12x_pcie_all_reduce import B12xPcieAllReduce
+@@ -200,7 +208,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 device_group=self.device_group,
+                 device=self.device,
+                 global_ranks=self.ranks,
++                nccl_available=(
++                    self.pynccl_comm is not None and not self.pynccl_comm.disabled
++                ),
+             )
++            self._roce_policy = not self.b12x_ar_comm.disabled
++            if self._roce_policy:
++                # Multi-node RoCE is an explicit two-backend policy. Do not
++                # allocate or consider unrelated single-node accelerators.
++                use_torch_symm_mem = self.use_torch_symm_mem = False
++                self.use_flashinfer_pcie_ipc_allreduce = False
++                self.use_aiter_allreduce = False
+ 
+         if use_torch_symm_mem and current_platform.is_cuda():
+             self.symm_mem_comm = SymmMemCommunicator(
+@@ -354,6 +372,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         chosen at dispatch time for this group; the actual per-call choice
+         depends on the input tensor.
+         """
++        if self._roce_policy:
++            logger.info_once(
++                "Collective policy for group '%s': B12X_ROCENANTE for eligible "
++                "all-reduce/all-gather; PYNCCL for other inputs, reduce-scatter "
++                "and variable collectives. No backend-error fallback.",
++                self.unique_name or "<unnamed>",
++                scope="global",
++            )
++            return
+         all_potential_ar_backends = [
+             "FLASHINFER_PCIE_IPC",
+             "B12X_PCIE",
+@@ -426,7 +453,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             scope="global",
+         )
+ 
++    def _require_roce_policy(self) -> None:
++        """A selected policy cannot silently become a different backend."""
++        if not self._roce_policy:
++            return
++        if self.b12x_ar_comm is None or self.b12x_ar_comm.disabled:
++            raise RuntimeError("RoCEnante policy lost its RoCE communicator")
++        if self.pynccl_comm is None or self.pynccl_comm.disabled:
++            raise RuntimeError("RoCEnante policy lost its PyNCCL communicator")
++
+     def all_reduce(self, input_):
++        self._require_roce_policy()
+         b12x_ar_comm = self.b12x_ar_comm
+         if (
+             b12x_ar_comm is not None
+@@ -434,7 +471,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             and b12x_ar_comm.should_custom_ar(input_)
+         ):
+             out = b12x_ar_comm.custom_all_reduce(input_)
+-            assert out is not None
++            if out is None:
++                raise RuntimeError("Selected B12X all-reduce returned None")
++            return out
++
++        if self._roce_policy:
++            out = self.pynccl_comm.all_reduce(input_)
++            if out is None:
++                raise RuntimeError("RoCEnante policy: PyNCCL all-reduce returned None")
+             return out
+ 
+         fi_ar_comm = self.fi_ar_comm
+@@ -535,6 +579,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         return ca_comm.custom_reduce_scatter(input_.contiguous())
+ 
+     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
++        self._require_roce_policy()
+         # Route uniform dim-0 all-gathers through NVLS symmetric memory when
+         # enabled (mirrors reduce_scatter); otherwise fall back to the
+         # PyNccl/base-class all-gather. Sequence parallelism's
+@@ -554,7 +599,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         ):
+             assert all_gather is not None
+             return all_gather(input_, dim)
+-        if dim == 0 and should_nccl_symm_mem_ag_rs():
++        if not self._roce_policy and dim == 0 and should_nccl_symm_mem_ag_rs():
+             return self._all_gather_symm_mem(input_.contiguous())
+ 
+         pynccl_comm = self.pynccl_comm
+@@ -584,6 +629,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         )
+ 
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
++        self._require_roce_policy()
+         world_size = self.world_size
+         pynccl_comm = self.pynccl_comm
+         assert pynccl_comm is not None
+@@ -599,7 +645,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         chunk_size = input_tensor.shape[0] // world_size
+         output_shape = (chunk_size,) + input_tensor.shape[1:]
+ 
+-        if should_nccl_symm_mem_ag_rs():
++        if not self._roce_policy and should_nccl_symm_mem_ag_rs():
+             output = self._reduce_scatter_symm_mem(input_tensor)
+         else:
+             output = torch.empty(
+@@ -613,6 +659,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+     def reduce_scatterv(
+         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+     ):
++        self._require_roce_policy()
+         world_size = self.world_size
+         pynccl_comm = self.pynccl_comm
+         assert pynccl_comm is not None
+@@ -638,7 +685,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             chunk_size = input_tensor.shape[0] // world_size
+         output_shape = (chunk_size,) + input_tensor.shape[1:]
+ 
+-        if self._can_use_aiter_ag_rs(sizes):
++        if not self._roce_policy and self._can_use_aiter_ag_rs(sizes):
+             aiter_comm = self.aiter_ar_comm
+             assert aiter_comm is not None
+             if aiter_comm.should_custom_rs(input_tensor, dim=0):
+@@ -651,7 +698,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         # Symmetric memory is only used when all ranks have uniform sizes.
+         # ncclCommWindowRegister is collective: asymmetric pool allocations
+         # from variable per-rank sizes cause deadlocks.
+-        use_symm_mem = sizes is None and should_nccl_symm_mem_ag_rs()
++        use_symm_mem = (
++            not self._roce_policy and sizes is None and should_nccl_symm_mem_ag_rs()
++        )
+         if use_symm_mem:
+             output = self._reduce_scatter_symm_mem(input_tensor)
+         else:
+@@ -749,6 +798,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
+         """Sends a tensor to the destination rank in a blocking way"""
+         """NOTE: `dst` is the local rank of the destination rank."""
++        self._require_roce_policy()
+         if dst is None:
+             dst = (self.rank_in_group + 1) % self.world_size
+ 
+@@ -763,6 +813,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+     ) -> torch.Tensor:
+         """Receives a tensor from the source rank."""
+         """NOTE: `src` is the local rank of the source rank."""
++        self._require_roce_policy()
+         if src is None:
+             src = (self.rank_in_group - 1) % self.world_size
+ 
+@@ -869,6 +920,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         dim: int = 0,
+         sizes: list[int] | None = None,
+     ):
++        self._require_roce_policy()
+         if dim != 0:
+             raise NotImplementedError("only dim 0 all-gatherv is supported")
+         world_size = self.world_size
+@@ -878,7 +930,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         if sizes is not None and all(s == sizes[0] for s in sizes):
+             sizes = None
+ 
+-        if self._can_use_aiter_ag_rs(sizes):
++        if not self._roce_policy and self._can_use_aiter_ag_rs(sizes):
+             aiter_comm = self.aiter_ar_comm
+             assert aiter_comm is not None
+             if isinstance(input_, torch.Tensor):
+@@ -897,7 +949,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         # Symmetric memory is only used when all ranks have uniform sizes.
+         # ncclCommWindowRegister is collective: asymmetric pool allocations
+         # from variable per-rank sizes cause deadlocks.
+-        if sizes is None and should_nccl_symm_mem_ag_rs():
++        if not self._roce_policy and sizes is None and should_nccl_symm_mem_ag_rs():
+             if isinstance(input_, torch.Tensor):
+                 return self._all_gather_symm_mem(input_)
+             return self._all_gather_batched_symm_mem(input_)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index c59cd027e..94c125058 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -19,9 +19,10 @@ when that trade can pay; there is no setting. It must be prompt processing:
+ decode forwards (at most the largest CUDA graph capture size, and at most
+ ``max_num_seqs * (1 + num_speculative_tokens)`` tokens) replay captured
+ graphs and keep full rows. And its reduce-scatter must really scatter: a
+-hidden-state message that the TP group's one-shot RoCE all-reduce accepts
+-costs that all-reduce either way, and rows that few keep the row-wise
+-kernels latency-bound, so SP there would only add the gathers.
++conservative hidden-state byte threshold comes from the TP group's
++registered one-shot RoCE capacity. This preserves the qualified SP boundary
++when transport dispatch is tuned independently below that capacity. It is
++a performance policy, not a claim that every smaller message uses RoCE.
+ ``DeepseekV4Model.forward`` decides per forward from the token count T,
+ which every rank shares, so no agreement between ranks is needed. SP is off
+ only where it cannot apply: tensor parallel size 1, pipeline parallelism,
+@@ -82,12 +83,12 @@ from vllm.logger import init_logger
+ logger = init_logger(__name__)
+ 
+ 
+-def _one_shot_all_reduce_max_bytes() -> int:
+-    """The largest message the TP group's RoCE all-reduce takes; 0 if none."""
++def _prefill_sp_capacity_bytes() -> int:
++    """Registered RoCE capacity used as the conservative SP floor; 0 if none."""
+     if not model_parallel_is_initialized():
+         return 0
+     comm = getattr(get_tp_group().device_communicator, "b12x_ar_comm", None)
+-    return int(getattr(comm, "all_reduce_max_bytes", 0)) if comm is not None else 0
++    return int(getattr(comm, "all_reduce_capacity_bytes", 0)) if comm is not None else 0
+ 
+ 
+ def rows_above_bytes(limit: int, row_bytes: int, world_size: int) -> int:
+@@ -101,8 +102,8 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) ->
+ 
+     The larger of: one token more than any decode forward (the largest CUDA
+     graph capture size, ``max_num_seqs * (1 + num_speculative_tokens)``), and
+-    the fewest tokens whose padded hidden-state message the one-shot RoCE
+-    all-reduce refuses, so that the reduce-scatter really scatters.
++    the fewest tokens whose padded hidden-state message exceeds the
++    registered RoCE capacity. Dispatch tuning must not also retune SP.
+     """
+     parallel = vllm_config.parallel_config
+     reason = None
+@@ -125,13 +126,18 @@ def resolve_min_rows(vllm_config, *, static_sequence_parallel: bool = False) ->
+         parallel.tensor_parallel_size,
+     )
+     rows = decode_rows + 1
+-    limit = _one_shot_all_reduce_max_bytes()
++    limit = _prefill_sp_capacity_bytes()
+     if limit > 0:
+         model = vllm_config.model_config
+         row_bytes = model.get_hidden_size() * model.dtype.itemsize
+         tp = parallel.tensor_parallel_size
+         rows = max(rows, rows_above_bytes(limit, row_bytes, tp))
+-    logger.info("DeepSeek V4.1 prefill sequence parallelism from %d tokens", rows)
++    logger.info(
++        "DeepSeek V4.1 prefill sequence parallelism from %d tokens "
++        "(capacity floor=%d bytes; independent of all-reduce dispatch)",
++        rows,
++        limit,
++    )
+     return rows
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

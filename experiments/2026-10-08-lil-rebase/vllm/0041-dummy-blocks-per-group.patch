@@ -1,0 +1,180 @@
+From a01b030c3d844033c895d04e64fffc29fcd0b9c3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 03:30:17 +0200
+Subject: [PATCH] Give each KV cache group its own blocks in every dummy layout
+
+The DeepSeek V4 attention profile runs a full-budget prefill on a minimal
+cache of one block, which every KV cache group then used at once. The
+groups overlay the same memory, so at TP3 the drafter's sliding window
+read the target's records in its own format and its first attention
+returned non-finite rows, which TileKernels' fused gate refuses.
+
+assign_dummy_blocks gives each group its own slice of the pool after the
+null block, and each request of a group its own blocks within the slice,
+wrapping inside the slice when it runs out. set_dummy_context and the
+attention profile both use it, and the attention profile allocates one
+block per group.
+---
+ tests/v1/worker/test_gpu_pcp_manager.py | 28 +++++++++++++-
+ vllm/v1/worker/gpu/input_batch.py       | 50 ++++++++++++++++---------
+ vllm/v1/worker/gpu/model_runner.py      | 20 +++++++++-
+ 3 files changed, 79 insertions(+), 19 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_pcp_manager.py b/tests/v1/worker/test_gpu_pcp_manager.py
+index dcff3ff3a..d2e39843f 100644
+--- a/tests/v1/worker/test_gpu_pcp_manager.py
++++ b/tests/v1/worker/test_gpu_pcp_manager.py
+@@ -13,7 +13,12 @@ from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+ from vllm.v1.worker.gpu import cp_utils as gpu_cp_utils
+ from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
+ from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
++from vllm.v1.worker.gpu.input_batch import (
++    InputBatch,
++    InputBuffers,
++    assign_dummy_blocks,
++    set_dummy_context,
++)
+ from vllm.v1.worker.gpu.pcp_manager import PCPManager
+ 
+ 
+@@ -545,3 +550,24 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
+     )
+     assert local_batch.dcp_local_seq_lens is not None
+     assert torch.equal(local_batch.dcp_local_seq_lens.cpu(), expected)
++
++
++def test_dummy_blocks_give_each_group_its_own_block_in_a_minimal_pool():
++    # The attention profile's minimal cache: one block per group plus the null
++    # block. Every position of a group's long request wraps inside its block.
++    tables = tuple(torch.full((1, 16), -1, dtype=torch.int32) for _ in range(3))
++    block_tables = SimpleNamespace(
++        input_block_tables=tables,
++        kernel_block_sizes=(256, 64, 128),
++        blocks_per_kv_block=(1, 4, 2),
++    )
++    assign_dummy_blocks(block_tables, tables, num_reqs=1, seq_len=4096, num_kv_blocks=4)
++    owners = {}
++    for group, (table, bpk) in enumerate(zip(tables, (1, 4, 2))):
++        row = table[0]
++        assert torch.all(row > 0)
++        kv_blocks = set((row // bpk).tolist())
++        assert len(kv_blocks) == 1, "a group's request stays inside its one block"
++        for kv_block in kv_blocks:
++            assert owners.setdefault(kv_block, group) == group
++    assert sorted(owners) == [1, 2, 3]
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 207886e15..d3750457d 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -257,28 +257,44 @@ def set_dummy_context(
+     )
+     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+ 
+-    seq_len = context_len + query_len
+-    # Every KV cache group draws from one block pool and the groups overlay the
+-    # same memory, so the allocator gives each block to one group and request
+-    # at a time, and block 0 is the reserved null block. Fabricated spans keep
+-    # that: each request of each group gets its own whole blocks, after the
+-    # null block, so no span reads bytes another group wrote in its own
+-    # format. They wrap and share only when the pool runs out.
++    assign_dummy_blocks(
++        block_tables, input_block_tables, num_reqs, context_len + query_len, num_kv_blocks
++    )
++
++
++def assign_dummy_blocks(
++    block_tables: "BlockTables",
++    input_block_tables: Sequence[torch.Tensor],
++    num_reqs: int,
++    seq_len: int,
++    num_kv_blocks: int,
++) -> None:
++    """Point each dummy request's block-table rows at blocks of its own.
++
++    Every KV cache group draws from one block pool and the groups overlay the
++    same memory, so the allocator gives a block to one group and request at a
++    time, and block 0 is the reserved null block. Dummy layouts keep that: each
++    group takes its own slice of the pool after the null block, and each request
++    of a group its own whole blocks within that slice, wrapping inside the slice
++    when it runs out. No group then reads bytes another group wrote in its own
++    format; groups share blocks only when the pool has fewer blocks than groups.
++    """
+     usable = num_kv_blocks - 1
+-    next_block = 0
+-    for block_table, block_size, bpk in zip(
+-        input_block_tables,
+-        block_tables.kernel_block_sizes,
+-        block_tables.blocks_per_kv_block,
++    if usable < 1:
++        raise ValueError("dummy block layouts need a block besides the null block")
++    share = max(usable // len(input_block_tables), 1)
++    for group, (block_table, block_size, bpk) in enumerate(
++        zip(
++            input_block_tables,
++            block_tables.kernel_block_sizes,
++            block_tables.blocks_per_kv_block,
++        )
+     ):
+         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
+         kv_blocks = cdiv(num_blocks, bpk)
+         device = block_table.device
+-        kv_ids = (
+-            next_block
+-            + torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
+-        ) % usable + 1
+-        next_block = (next_block + num_reqs * kv_blocks) % usable
++        offsets = torch.arange(num_reqs * kv_blocks, dtype=torch.int64, device=device)
++        kv_ids = (group * share + offsets % share) % usable + 1
+         kernel_ids = kv_ids.view(num_reqs, kv_blocks, 1) * bpk + torch.arange(
+             bpk, dtype=torch.int64, device=device
+         )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 8b4695adf..78567059e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -135,6 +135,7 @@ from vllm.v1.worker.gpu.input_batch import (
+     post_update_num_computed_tokens,
+     prepare_pos_seq_lens,
+     prepare_prefill_inputs,
++    assign_dummy_blocks,
+     set_dummy_context,
+ )
+ from vllm.v1.worker.gpu.kv_connector import (
+@@ -1116,8 +1117,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         }:
+             return
+ 
++        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
++
++        # One block per KV cache group besides the null block: the groups
++        # overlay the same memory, so a block shared by every group would let
++        # one group read another's writes in its own format.
++        groups = get_kv_cache_groups(self.vllm_config, self.get_kv_cache_spec())
+         try:
+-            _init_minimal_kv_cache_for_profiling(self, num_blocks=1)
++            _init_minimal_kv_cache_for_profiling(self, num_blocks=1 + len(groups))
+             if prepare_profile_state is not None:
+                 prepare_profile_state()
+             self._dummy_run(
+@@ -2104,6 +2111,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     self.max_model_len,
+                     input_block_tables=block_tables,
+                 )
++            elif not skip_attn_for_dummy_run and profile_all_kv_cache_groups:
++                # The attention profile's minimal cache has one block per group.
++                assert block_tables is not None
++                assign_dummy_blocks(
++                    self.block_tables,
++                    block_tables,
++                    input_batch.num_reqs,
++                    input_batch.max_query_len
++                    or int(input_batch.num_scheduled_tokens.max()),
++                    self.kv_cache_config.num_blocks,
++                )
+ 
+         attn_metadata = None
+         slot_mappings_by_layer = None
+-- 
+2.54.0 (Apple Git-157)
+

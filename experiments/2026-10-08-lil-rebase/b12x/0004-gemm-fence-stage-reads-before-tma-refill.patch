@@ -1,0 +1,56 @@
+From a684879cf39eba6585394e34727d0e80409cb77b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 08:52:13 +0200
+Subject: [PATCH] fix(gemm): fence generic stage reads before the TMA refill
+
+The dense GEMM's MMA warps read each mainloop stage through the generic
+proxy (ldmatrix and scale-factor copies) and release it right after
+issuing the last k block's copies. With TMA loads the refill that the
+release permits is an async-proxy write, and the release's ordering does
+not extend to that proxy. When another kernel's CTAs share the SM and
+delay shared-memory traffic, a copy still in flight reads the next k
+tile's bytes: DeepSeek V4.1 Flash's shared-expert down projection (6 rows,
+16x64 tiles, four stages over six k tiles) returned whole wrong columns
+in about 5% of decode calls beside the routed MoE, with k block 0's last
+sub-block computed from k block 4 and k block 1's from k block 5.
+
+Fence the async proxy before each stage release on the TMA load path.
+---
+ b12x/_lib/dense_gemm.py | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/b12x/_lib/dense_gemm.py b/b12x/_lib/dense_gemm.py
+index 2d03a674..878f392c 100644
+--- a/b12x/_lib/dense_gemm.py
++++ b/b12x/_lib/dense_gemm.py
+@@ -2570,6 +2570,16 @@ class DenseGemmKernel:
+                                 packed_b_lookahead_state.advance()
+ 
+                         if k_block_idx == num_k_blocks - 1:
++                            # The stage was read through the generic proxy
++                            # (ldmatrix, scale copies, the last k block's just
++                            # issued); its TMA refill is an async-proxy write.
++                            # The release's ordering does not cover that proxy:
++                            # without this fence a copy still in flight can read
++                            # the next k tile's bytes (seen when another
++                            # kernel's CTAs share the SM and delay shared-memory
++                            # traffic, as wrong columns in the tile).
++                            if cutlass.const_expr(self.load_path == "tma"):
++                                cute.arch.fence_proxy("async.shared", space="cta")
+                             mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                             mainloop_consumer_state.advance()
+ 
+@@ -2765,6 +2775,10 @@ class DenseGemmKernel:
+                     )
+ 
+                     if k_block_idx == num_k_blocks - 1:
++                        # Generic-proxy reads before the async-proxy refill;
++                        # see the release in the loop above.
++                        if cutlass.const_expr(self.load_path == "tma"):
++                            cute.arch.fence_proxy("async.shared", space="cta")
+                         mainloop_pipeline.consumer_release(mainloop_consumer_state)
+                         mainloop_consumer_state.advance()
+ 
+-- 
+2.54.0 (Apple Git-157)
+

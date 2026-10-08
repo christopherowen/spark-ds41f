@@ -1,0 +1,74 @@
+From 86ec417198bcd229d4927859bcaed05c0fba2ca7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 15:45:32 +0200
+Subject: [PATCH] feat(deepseek-v4.1): choose the default head dtype by
+ environment
+
+Local Inference Lab 3540d5200 makes FP32 the default head_dtype of
+DeepSeek V4.1 and its DSpark drafter (DSparkV41DraftModel shares the
+config hook). A recipe cannot opt the drafter out: the target's dict
+hf_overrides are not forwarded to a DSpark draft.
+
+The FP32 path also bypasses the exact packed BF16 and TileLang vocabulary
+projections, which run only when head_dtype equals the model dtype; a
+packed head would fall back to its quant method and widen BF16 logits.
+
+VLLM_DS41_HEAD_DTYPE sets the default for both: "float32" (upstream's
+default, unchanged) or "model". An explicit head_dtype in hf_overrides
+still wins.
+---
+ vllm/envs.py                         | 11 +++++++++++
+ vllm/model_executor/models/config.py |  7 +++++--
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 97c6ca06f..1085bea52 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -222,6 +222,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
+     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
++    VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
+     VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+@@ -1894,6 +1895,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         "bf16",
+         ["bf16", "reference", "auto"],
+     ),
++    # Default output-head dtype of DeepSeek V4.1 and its DSpark drafter when
++    # hf_overrides names none. "float32" computes the logits in FP32 like
++    # DeepSeek's reference head; "model" keeps the model dtype, which the exact
++    # packed BF16 and TileLang vocabulary projections require. The drafter
++    # takes no dict hf_overrides from the target, so this sets both.
++    "VLLM_DS41_HEAD_DTYPE": env_with_choices(
++        "VLLM_DS41_HEAD_DTYPE",
++        "float32",
++        ["float32", "model"],
++    ),
+     # DeepSeek V4.1 kernel family on SM12x: "b12x" or "tilelang". It selects
+     # the attention, linear and MoE backends; explicit flags must agree.
+     "VLLM_DS41_KERNEL_BACKEND": env_with_choices(
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index c8d04a04d..d18085481 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -479,9 +479,12 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             ):
+                 quant_config["quant_method"] = "deepseek_v41_fp8"
+         # DeepSeek's reference head computes FP32 logits; a BF16 head rounds
+-        # them to steps of up to 1/8. An explicit head_dtype override wins.
++        # them to steps of up to 1/8. An explicit head_dtype override wins;
++        # VLLM_DS41_HEAD_DTYPE sets the default for the target and its drafter.
+         if getattr(model_config.hf_config, "head_dtype", None) is None:
+-            model_config.hf_config.head_dtype = "float32"
++            from vllm import envs
++
++            model_config.hf_config.head_dtype = envs.VLLM_DS41_HEAD_DTYPE
+ 
+     @staticmethod
+     def update_model_config_for_parallelism(
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,570 @@
+From b12e150ddc401c238e61f4a07b04c303018b08d9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 20:00:00 +0200
+Subject: [PATCH] fix(dsa-indexer): break exact top-k score ties by lowest
+ position
+
+The radix top-k handed the slots left at its threshold to whichever tied
+candidates reached a shared-memory counter first: the buffered arm's last
+round decremented a remaining-slot counter, and the exact overflow
+fallback's final pass incremented the output counter. Candidates whose
+float32 scores are bitwise equal were therefore chosen by thread timing.
+With MXFP4 index queries and keys such ties are common: on DeepSeek V4.1
+Flash two identical runs selected different sets for 78% of layer 2's
+prefill rows, about 5 of 512 positions each. DeepSeek's reference selects
+with torch.topk, which repeats for the same scores, and the technical report
+sets no tie rule.
+
+Both paths now collect the tied candidates and keep the ones with the lowest
+logical positions. The buffered arm gathers its last-round ties in the free
+candidate buffer; the fallback filters the row by the pivot score. An exact
+4-round 8-bit radix over the descending position key then finds the cut.
+Positions are unique within a row, including carried candidates, which keep
+their logical index, so the chosen set is a function of the scores alone and
+agrees across chunked folds. The compile-cache policies are bumped so cached
+cubins of the old behavior never load. The FP8 fused indexer keeps its own
+selection unchanged.
+---
+ b12x/attention/dsa_indexer/tiled_topk.py   | 381 +++++++++++++++++++--
+ tests/attention/test_topk_position_ties.py |  79 +++++
+ 2 files changed, 429 insertions(+), 31 deletions(-)
+ create mode 100644 tests/attention/test_topk_position_ties.py
+
+diff --git a/b12x/attention/dsa_indexer/tiled_topk.py b/b12x/attention/dsa_indexer/tiled_topk.py
+index c303e72b..3fd2c049 100644
+--- a/b12x/attention/dsa_indexer/tiled_topk.py
++++ b/b12x/attention/dsa_indexer/tiled_topk.py
+@@ -313,6 +313,244 @@ def _fallback_load_value(
+     return value
+ 
+ 
++@cute.jit
++def _position_key(
++    carry_indices,
++    row_start: Int32,
++    output_index_offset: Int32,
++    carry_base: Int32,
++    chunk_len: Int32,
++    vidx: Int32,
++    is_first: cutlass.Constexpr[bool],
++) -> Uint32:
++    """Descending-radix key of a candidate's logical K position (lower position, larger key).
++
++    Local candidates sit at row_start + vidx + output_index_offset; carried ones
++    keep the logical index their earlier chunk selected. Logical positions are
++    unique within a row, so the key totally orders tied candidates.
++    """
++    pos = Int32(0)
++    if cutlass.const_expr(is_first):
++        pos = row_start + vidx + output_index_offset
++    else:
++        if vidx < chunk_len:
++            pos = row_start + vidx + output_index_offset
++        else:
++            pos = Int32(carry_indices[carry_base + (vidx - chunk_len)])
++    return Uint32(0xFFFFFFFF) - Uint32(pos)
++
++
++@cute.jit
++def _select_lowest_position_ties(
++    tx: Int32,
++    count: Int32,
++    take: Int32,
++    out_slot_base: Int32,
++    pivot_key: Uint32,
++    from_buffer: cutlass.Constexpr[bool],
++    s_buf: cute.Tensor,
++    s_hist0: cute.Tensor,
++    s_hist1: cute.Tensor,
++    s_out: cute.Tensor,
++    h0: Int32,
++    ctr: Int32,
++    thr: Int32,
++    ni0: Int32,
++    ni1: Int32,
++    lr: Int32,
++    flat: cutlass.Constexpr[bool],
++    flat_values,
++    input_tensor,
++    carry_values,
++    carry_indices,
++    row_base: Int32,
++    row_start: Int32,
++    output_index_offset: Int32,
++    carry_base: Int32,
++    chunk_len: Int32,
++    block_q: cutlass.Constexpr[int],
++    block_k: cutlass.Constexpr[int],
++    is_tiled: cutlass.Constexpr[bool],
++    is_first: cutlass.Constexpr[bool],
++):
++    """Write the ``take`` tied candidates with the lowest logical positions.
++
++    Ties share the selection pivot's exact score key: the first ``count``
++    entries of ``s_buf`` (``from_buffer``), or every row candidate whose key
++    equals ``pivot_key``. An exact 4-round 8-bit radix over
++    ``_position_key`` finds the take-th lowest position, and the winners go to
++    ``s_out[out_slot_base : out_slot_base + take]``. The chosen set is then a
++    function of the scores alone, as with DeepSeek's reference ``torch.topk``,
++    instead of the order in which threads reached a shared counter. Clobbers
++    the histograms and the scalar slots. All 1024 threads must call this with
++    the same ``take``.
++    """
++    if take > Int32(0):
++        if tx == Int32(0):
++            _smem_st(ni0, Int32(0), Int32(0))
++            _smem_st(thr, Int32(0), take)
++        cute.arch.sync_threads()
++        for p_round in cutlass.range_constexpr(4):
++            p_shift = Uint32(24 - p_round * 8)
++            p_prefix = Uint32(_smem_ld(ni0, Int32(0)))
++            p_remaining = Int32(_smem_ld(thr, Int32(0)))
++            if tx < Int32(256):
++                s_hist0[tx] = Int32(0)
++            cute.arch.sync_threads()
++            e = Int32(tx)
++            while e < count:
++                if cutlass.const_expr(from_buffer):
++                    p_key = _position_key(
++                        carry_indices,
++                        row_start,
++                        output_index_offset,
++                        carry_base,
++                        chunk_len,
++                        Int32(s_buf[e]),
++                        is_first,
++                    )
++                    if cutlass.const_expr(p_round == 0):
++                        _smem_red_add(
++                            h0, Int32((p_key >> p_shift) & Uint32(0xFF)), Int32(1)
++                        )
++                    else:
++                        p_mask = Uint32(0xFFFFFFFF) << Uint32(32 - p_round * 8)
++                        if (p_key & p_mask) == p_prefix:
++                            _smem_red_add(
++                                h0, Int32((p_key >> p_shift) & Uint32(0xFF)), Int32(1)
++                            )
++                else:
++                    score_key = _convert_to_uint32(
++                        _fallback_load_value(
++                            flat,
++                            e,
++                            flat_values,
++                            input_tensor,
++                            carry_values,
++                            row_base,
++                            row_start,
++                            carry_base,
++                            chunk_len,
++                            block_q,
++                            block_k,
++                            is_tiled,
++                            is_first,
++                        )
++                    )
++                    if score_key == pivot_key:
++                        p_key = _position_key(
++                            carry_indices,
++                            row_start,
++                            output_index_offset,
++                            carry_base,
++                            chunk_len,
++                            e,
++                            is_first,
++                        )
++                        if cutlass.const_expr(p_round == 0):
++                            _smem_red_add(
++                                h0, Int32((p_key >> p_shift) & Uint32(0xFF)), Int32(1)
++                            )
++                        else:
++                            p_mask = Uint32(0xFFFFFFFF) << Uint32(32 - p_round * 8)
++                            if (p_key & p_mask) == p_prefix:
++                                _smem_red_add(
++                                    h0,
++                                    Int32((p_key >> p_shift) & Uint32(0xFF)),
++                                    Int32(1),
++                                )
++                e += Int32(_THREADS_PER_CTA)
++            cute.arch.sync_threads()
++            for p_stage in cutlass.range_constexpr(8):
++                p_j = Int32(1 << p_stage)
++                if tx < Int32(256):
++                    if (p_stage & 1) == 0:
++                        p_v = Int32(s_hist0[tx])
++                        if tx < Int32(256) - p_j:
++                            p_v = p_v + Int32(s_hist0[tx + p_j])
++                        s_hist1[tx] = p_v
++                    else:
++                        p_v = Int32(s_hist1[tx])
++                        if tx < Int32(256) - p_j:
++                            p_v = p_v + Int32(s_hist1[tx + p_j])
++                        s_hist0[tx] = p_v
++                cute.arch.sync_threads()
++            if tx == Int32(0):
++                _smem_st(ni1, Int32(0), Int32(0))
++                _smem_st(lr, Int32(0), p_remaining)
++            cute.arch.sync_threads()
++            if tx < Int32(256):
++                p_cge = Int32(s_hist0[tx])
++                p_cgt = Int32(0)
++                if tx + Int32(1) < Int32(256):
++                    p_cgt = Int32(s_hist0[tx + Int32(1)])
++                if (p_cge >= p_remaining) & (p_cgt < p_remaining):
++                    _smem_st(ni1, Int32(0), Int32(tx))
++                    _smem_st(lr, Int32(0), p_remaining - p_cgt)
++            cute.arch.sync_threads()
++            if tx == Int32(0):
++                p_bucket = Uint32(_smem_ld(ni1, Int32(0)))
++                _smem_st(ni0, Int32(0), Int32(p_prefix | (p_bucket << p_shift)))
++                _smem_st(thr, Int32(0), _smem_ld(lr, Int32(0)))
++            cute.arch.sync_threads()
++        # Positions are unique, so exactly ``take`` keys reach the pivot.
++        p_pivot = Uint32(_smem_ld(ni0, Int32(0)))
++        if tx == Int32(0):
++            _smem_st(ctr, Int32(0), Int32(0))
++        cute.arch.sync_threads()
++        e = Int32(tx)
++        while e < count:
++            if cutlass.const_expr(from_buffer):
++                c_idx = Int32(s_buf[e])
++                p_key = _position_key(
++                    carry_indices,
++                    row_start,
++                    output_index_offset,
++                    carry_base,
++                    chunk_len,
++                    c_idx,
++                    is_first,
++                )
++                if p_key >= p_pivot:
++                    slot = _smem_xadd(ctr, Int32(0), Int32(1))
++                    if slot < take:
++                        s_out[out_slot_base + slot] = c_idx
++            else:
++                score_key = _convert_to_uint32(
++                    _fallback_load_value(
++                        flat,
++                        e,
++                        flat_values,
++                        input_tensor,
++                        carry_values,
++                        row_base,
++                        row_start,
++                        carry_base,
++                        chunk_len,
++                        block_q,
++                        block_k,
++                        is_tiled,
++                        is_first,
++                    )
++                )
++                if score_key == pivot_key:
++                    p_key = _position_key(
++                        carry_indices,
++                        row_start,
++                        output_index_offset,
++                        carry_base,
++                        chunk_len,
++                        e,
++                        is_first,
++                    )
++                    if p_key >= p_pivot:
++                        slot = _smem_xadd(ctr, Int32(0), Int32(1))
++                        if slot < take:
++                            s_out[out_slot_base + slot] = e
++            e += Int32(_THREADS_PER_CTA)
++        cute.arch.sync_threads()
++
++
+ @cute.jit
+ def _exact_overflow_fallback(
+     tx: Int32,
+@@ -339,6 +577,9 @@ def _exact_overflow_fallback(
+     block_k: cutlass.Constexpr[int],
+     is_tiled: cutlass.Constexpr[bool],
+     is_first: cutlass.Constexpr[bool],
++    deterministic_ties: cutlass.Constexpr[bool] = False,
++    carry_indices=None,
++    output_index_offset=0,
+ ):
+     """Exact overflow fallback shared by the tiled and fused radix kernels.
+ 
+@@ -351,7 +592,8 @@ def _exact_overflow_fallback(
+     (re-scans n_total per round on one CTA) but only taken on the rare clustered
+     case; it overwrites s_out[0:topk_static]. All 1024 threads must call this.
+     Scalars: ni0=prefix, thr=remaining_k, ni1=bucket, lr=next remaining_k,
+-    ctr=output counter.
++    ctr=output counter. With ``deterministic_ties`` the candidates tied at the
++    pivot fill the remaining slots in logical-position order.
+     """
+     if tx == Int32(0):
+         _smem_st(ni0, Int32(0), Int32(0))
+@@ -454,31 +696,67 @@ def _exact_overflow_fallback(
+                 s_out[ex_pos] = idx_base
+         idx_base += Int32(_THREADS_PER_CTA)
+     cute.arch.sync_threads()
+-    idx_base = Int32(tx)
+-    while idx_base < n_total:
+-        ex_key = _convert_to_uint32(
+-            _fallback_load_value(
+-                flat,
+-                idx_base,
+-                flat_values,
+-                input_tensor,
+-                carry_values,
+-                row_base,
+-                row_start,
+-                carry_base,
+-                chunk_len,
+-                block_q,
+-                block_k,
+-                is_tiled,
+-                is_first,
+-            )
++    if cutlass.const_expr(deterministic_ties):
++        ex_greater = Int32(_smem_ld(ctr, Int32(0)))
++        cute.arch.sync_threads()
++        _select_lowest_position_ties(
++            tx,
++            n_total,
++            topk_static - ex_greater,
++            ex_greater,
++            ex_pivot,
++            False,
++            s_out,
++            s_hist0,
++            s_hist1,
++            s_out,
++            h0,
++            ctr,
++            thr,
++            ni0,
++            ni1,
++            lr,
++            flat,
++            flat_values,
++            input_tensor,
++            carry_values,
++            carry_indices,
++            row_base,
++            row_start,
++            Int32(output_index_offset),
++            carry_base,
++            chunk_len,
++            block_q,
++            block_k,
++            is_tiled,
++            is_first,
+         )
+-        if ex_key == ex_pivot:
+-            ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
+-            if ex_pos < topk_static:
+-                s_out[ex_pos] = idx_base
+-        idx_base += Int32(_THREADS_PER_CTA)
+-    cute.arch.sync_threads()
++    else:
++        idx_base = Int32(tx)
++        while idx_base < n_total:
++            ex_key = _convert_to_uint32(
++                _fallback_load_value(
++                    flat,
++                    idx_base,
++                    flat_values,
++                    input_tensor,
++                    carry_values,
++                    row_base,
++                    row_start,
++                    carry_base,
++                    chunk_len,
++                    block_q,
++                    block_k,
++                    is_tiled,
++                    is_first,
++                )
++            )
++            if ex_key == ex_pivot:
++                ex_pos = _smem_xadd(ctr, Int32(0), Int32(1))
++                if ex_pos < topk_static:
++                    s_out[ex_pos] = idx_base
++            idx_base += Int32(_THREADS_PER_CTA)
++        cute.arch.sync_threads()
+ 
+ 
+ def _to_kernel_tensor(tensor, dtype, *, assumed_align=16):
+@@ -1158,11 +1436,14 @@ class DSATiledTopkKernel:
+                                 else:
+                                     if Int32(bin) == sub_threshold:
+                                         if cutlass.const_expr(round_idx == 3):
+-                                            old_rem = _smem_xadd(
+-                                                lr, Int32(0), Int32(-1)
++                                            # Exact score ties: collect them in
++                                            # the free candidate buffer (ni0 was
++                                            # reset above) and choose by
++                                            # position below, not by arrival.
++                                            tie_pos = _smem_xadd(
++                                                ni0, Int32(0), Int32(1)
+                                             )
+-                                            if old_rem > Int32(0):
+-                                                s_out[topk_static - old_rem] = c_idx
++                                            s_cand0[tie_pos] = c_idx
+                                         else:
+                                             cand_pos = (
+                                                 _smem_xadd(ni0, Int32(0), Int32(1))
+@@ -1187,6 +1468,41 @@ class DSATiledTopkKernel:
+                                 i = i + Int32(_THREADS_PER_CTA)
+ 
+                             cute.arch.sync_threads()
++                            if cutlass.const_expr(round_idx == 3):
++                                n_ties = Int32(_smem_ld(ni0, Int32(0)))
++                                cute.arch.sync_threads()
++                                _select_lowest_position_ties(
++                                    tx,
++                                    n_ties,
++                                    topk,
++                                    topk_static - topk,
++                                    Uint32(0),
++                                    True,
++                                    s_cand0,
++                                    s_hist0,
++                                    s_hist1,
++                                    s_out,
++                                    h0,
++                                    ctr,
++                                    thr,
++                                    ni0,
++                                    ni1,
++                                    lr,
++                                    False,
++                                    input_tensor,
++                                    input_tensor,
++                                    carry_values,
++                                    carry_indices,
++                                    row_base,
++                                    row_start,
++                                    output_index_offset,
++                                    out_base,
++                                    length,
++                                    self.block_q,
++                                    self.block_k,
++                                    self.is_tiled,
++                                    self.is_first,
++                                )
+ 
+                 # Exact overflow fallback: the buffered refine above dropped
+                 # winners when more candidates than the buffer shared the coarse
+@@ -1226,6 +1542,9 @@ class DSATiledTopkKernel:
+                         block_k=self.block_k,
+                         is_tiled=self.is_tiled,
+                         is_first=self.is_first,
++                        deterministic_ties=True,
++                        carry_indices=carry_indices,
++                        output_index_offset=output_index_offset,
+                     )
+ 
+             cute.arch.sync_threads()
+@@ -1647,7 +1966,7 @@ def run_tiled_topk(
+             "output_page_table", output_page_table_key_tensor, dynamic=True
+         ),
+         (
+-            "tiled_topk_v30_initialized_overflow_output",
++            "tiled_topk_v31_position_ties",
+             topk,
+             block_q,
+             block_k,
+@@ -1859,7 +2178,7 @@ def run_row_topk(
+             "output_gather_table", output_gather_table_for_kernel, dynamic=True
+         ),
+         (
+-            "row_topk_v10_initialized_overflow_output",
++            "row_topk_v11_position_ties",
+             topk,
+             output_gather_table is not None,
+             smem_candidate_capacity,
+diff --git a/tests/attention/test_topk_position_ties.py b/tests/attention/test_topk_position_ties.py
+new file mode 100644
+index 00000000..2f3aee4c
+--- /dev/null
++++ b/tests/attention/test_topk_position_ties.py
+@@ -0,0 +1,79 @@
++"""The DSA radix top-k breaks exact score ties by lowest logical position."""
++
++import pytest
++import torch
++
++from b12x.attention.dsa_indexer.tiled_topk import run_row_topk
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
++
++TOPK = 512
++
++
++def _expected(
++    logits: torch.Tensor, lengths: torch.Tensor, topk: int
++) -> list[list[int]]:
++    """Descending score, ties by ascending position: a stable sort of -score."""
++    rows = []
++    for row, length in zip(logits.cpu(), lengths.tolist(), strict=True):
++        order = torch.sort(-row[:length], stable=True).indices[:topk]
++        rows.append(sorted(order.tolist()))
++    return rows
++
++
++def _selected(
++    logits: torch.Tensor, lengths: torch.Tensor, topk: int
++) -> list[list[int]]:
++    _, indices = run_row_topk(row_logits=logits, lengths=lengths, topk=topk)
++    torch.cuda.synchronize()
++    return [sorted(v for v in row if v >= 0) for row in indices.cpu().tolist()]
++
++
++def _tied_rows(rows: int, width: int, top: int, ties: int, seed: int) -> torch.Tensor:
++    """`top` distinct high scores, `ties` copies of 0.5 straddling the cut, low rest.
++
++    The high and low scores sit far from 0.5 so the tie group owns its coarse
++    radix bucket: with `ties` at most the candidate buffer (1,024 for top-k 512)
++    the buffered arm selects, above it the exact overflow fallback does.
++    """
++    generator = torch.Generator().manual_seed(seed)
++    logits = torch.empty(rows, width)
++    for r in range(rows):
++        values = -10.0 - 10.0 * torch.rand(width, generator=generator)
++        positions = torch.randperm(width, generator=generator)
++        values[positions[:top]] = 10.0 + 10.0 * torch.rand(top, generator=generator)
++        values[positions[top : top + ties]] = 0.5
++        logits[r] = values
++    return logits.cuda()
++
++
++@pytest.mark.parametrize("ties", [700, 5000], ids=["buffered", "overflow"])
++def test_ties_take_the_lowest_positions(ties):
++    logits = _tied_rows(rows=8, width=16384, top=300, ties=ties, seed=ties)
++    lengths = torch.full((8,), 16384, dtype=torch.int32, device="cuda")
++    assert _selected(logits, lengths, TOPK) == _expected(logits, lengths, TOPK)
++
++
++@pytest.mark.parametrize("ties", [700, 5000], ids=["buffered", "overflow"])
++def test_tied_selection_repeats(ties):
++    logits = _tied_rows(rows=32, width=16384, top=300, ties=ties, seed=7 + ties)
++    lengths = torch.full((32,), 16384, dtype=torch.int32, device="cuda")
++    first = _selected(logits, lengths, TOPK)
++    for _ in range(20):
++        assert _selected(logits, lengths, TOPK) == first
++
++
++def test_partial_rows_tie_by_position_within_their_length():
++    logits = _tied_rows(rows=4, width=8192, top=200, ties=900, seed=3)
++    lengths = torch.tensor([8192, 6000, 3000, 1500], dtype=torch.int32, device="cuda")
++    assert _selected(logits, lengths, TOPK) == _expected(logits, lengths, TOPK)
++
++
++def test_distinct_scores_match_torch_topk():
++    generator = torch.Generator().manual_seed(11)
++    logits = torch.randn(16, 65536, generator=generator).cuda()
++    lengths = torch.full((16,), 65536, dtype=torch.int32, device="cuda")
++    expected = [
++        sorted(row.tolist()) for row in torch.topk(logits, TOPK, dim=-1).indices.cpu()
++    ]
++    assert _selected(logits, lengths, TOPK) == expected
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,415 @@
+From 8c8143055948755589bc3be66d4d72560e02078f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 14:00:00 +0200
+Subject: [PATCH] perf(spec-decode): dead DSpark verification rows below a
+ confidence cut
+
+Adaptive verification picks how many drafts to verify on the host, before
+the drafts it verifies exist: with async scheduling the budget comes from
+the previous step's confidences, and the device can only redistribute it
+between requests. At one stream that redistribution does nothing, and a
+verified row costs several milliseconds of routed-expert reads.
+
+With SPARK3_DSPARK_DEAD_ROWS_TAU=t the draft combine, which already writes
+each request's draft rows, also computes each request's survival (running
+product of this step's confidences, broadcast from rank 0) and marks the
+rows past the first draft below t as padding. The routers give padding rows
+no experts (VLLM_MOE_SKIP_PADDING) and B12X skips expert id -1, so dead rows
+read no expert weights. Live rows are causal, so their outputs are
+unchanged; the sampled-token fix-up commits at most one token past the last
+live row (the rejection sampler also clamps before logprobs are taken). No
+host sync and no batch-shape or graph change. Off by default; output is
+unchanged because the target verifies every committed token.
+---
+ tests/v1/worker/test_dead_rows.py             | 68 +++++++++++++++++++
+ vllm/v1/worker/gpu/input_batch.py             | 66 +++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            | 15 ++++
+ .../gpu/spec_decode/adaptive_verification.py  | 30 ++++++++
+ .../gpu/spec_decode/rejection_sampler.py      | 12 ++++
+ 5 files changed, 190 insertions(+), 1 deletion(-)
+ create mode 100644 tests/v1/worker/test_dead_rows.py
+
+diff --git a/tests/v1/worker/test_dead_rows.py b/tests/v1/worker/test_dead_rows.py
+new file mode 100644
+index 000000000..49510938c
+--- /dev/null
++++ b/tests/v1/worker/test_dead_rows.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import math
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.input_batch import (
++    DeadRows,
++    combine_sampled_and_draft_tokens,
++    get_num_sampled_and_rejected,
++)
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++
++
++def _combine(dead_rows):
++    dev = "cuda"
++    # Two decode requests (slots 3 and 1) with 5 drafts each, one prefill.
++    idx_mapping = torch.tensor([3, 1, 0], dtype=torch.int32, device=dev)
++    query_start_loc = torch.tensor([0, 6, 12, 20], dtype=torch.int32, device=dev)
++    seq_lens = torch.tensor([106, 206, 8], dtype=torch.int32, device=dev)
++    prefill_len = torch.tensor([50, 100, 0, 100], dtype=torch.int32, device=dev)
++    last_sampled = torch.tensor([10, 11, 12, 13], dtype=torch.int32, device=dev)
++    draft_tokens = torch.arange(20, dtype=torch.int32, device=dev).view(4, 5) + 100
++    cu_num_logits = torch.tensor([0, 6, 12, 13], dtype=torch.int32, device=dev)
++    input_ids = torch.zeros(24, dtype=torch.int32, device=dev)
++    combine_sampled_and_draft_tokens(
++        input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
++        prefill_len, draft_tokens, cu_num_logits, 13, 1, dead_rows=dead_rows,
++    )
++    return input_ids
++
++
++def test_dead_rows_mark_rows_past_the_survival_cut():
++    dev = "cuda"
++    confidence = torch.ones(4, 5, dtype=torch.float32, device=dev)
++    # Slot 3: survival 0.9, 0.72, 0.36, ... -> cut 2 at tau 0.5.
++    confidence[3] = torch.tensor([0.9, 0.8, 0.5, 0.9, 0.9])
++    # Slot 1: first draft already below tau -> cut 0.
++    confidence[1] = torch.tensor([0.4, 0.9, 0.9, 0.9, 0.9])
++    is_padding = torch.zeros(24, dtype=torch.bool, device=dev)
++    cut = torch.empty(3, dtype=torch.int32, device=dev)
++    ids_dead = _combine(DeadRows(confidence, is_padding, cut, math.log(0.5)))
++    ids_plain = _combine(None)
++    assert torch.equal(ids_dead, ids_plain)
++    assert cut.tolist() == [2, 0, 9]  # the prefill request is never clamped
++    expected = torch.zeros(24, dtype=torch.bool)
++    expected[3:6] = True    # request 0: rows of drafts 3-5
++    expected[7:12] = True   # request 1: rows of drafts 1-5
++    assert torch.equal(is_padding.cpu(), expected)
++
++
++def test_dead_row_cut_clamps_committed_tokens():
++    dev = "cuda"
++    num_sampled = torch.tensor([6, 1, 4], dtype=torch.int32, device=dev)
++    seq_lens = torch.tensor([106, 206, 306], dtype=torch.int32, device=dev)
++    cu_num_logits = torch.tensor([0, 6, 12, 18], dtype=torch.int32, device=dev)
++    idx_mapping = torch.tensor([0, 1, 2], dtype=torch.int32, device=dev)
++    prefill_len = torch.tensor([10, 10, 10], dtype=torch.int32, device=dev)
++    cut = torch.tensor([2, 0, 6], dtype=torch.int32, device=dev)
++    sampled, rejected = get_num_sampled_and_rejected(
++        num_sampled, seq_lens, cu_num_logits, idx_mapping, prefill_len,
++        dead_row_cut=cut,
++    )
++    assert sampled.tolist() == [3, 1, 4]
++    assert rejected.tolist() == [3, 5, 2]
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 81b24b8b5..e003d5a46 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, NamedTuple
+ 
+ import numpy as np
+ import torch
+@@ -419,11 +419,20 @@ def _combine_sampled_and_draft_tokens_kernel(
+     draft_tokens_stride,
+     cu_num_logits_ptr,
+     logits_indices_ptr,
++    confidence_ptr,
++    confidence_stride,
++    is_padding_ptr,
++    dead_cut_ptr,
++    log_tau,
+     BLOCK_SIZE: tl.constexpr,
+     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
++    DEAD_ROWS: tl.constexpr = False,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
++    if DEAD_ROWS:
++        # Requests without drafts are never clamped.
++        tl.store(dead_cut_ptr + batch_idx, BLOCK_SIZE + 1)
+ 
+     # Get the number of logits and draft tokens.
+     cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
+@@ -466,6 +475,39 @@ def _combine_sampled_and_draft_tokens_kernel(
+             draft_tokens,
+             mask=mask,
+         )
++        if DEAD_ROWS:
++            # Dead rows: the drafts' survival is the running product of this
++            # step's confidences. Rows past the first draft below the
++            # threshold become padding, which routed MoE skips; the sampled
++            # fix-up then commits at most one token past the last live row.
++            confidence = tl.load(
++                confidence_ptr + req_state_idx * confidence_stride + block,
++                mask=mask,
++                other=1.0,
++            )
++            log_survival = tl.cumsum(tl.log(confidence), axis=0)
++            cut = tl.sum(((log_survival >= log_tau) & mask).to(tl.int32), axis=0)
++            tl.store(dead_cut_ptr + batch_idx, cut)
++            tl.store(
++                is_padding_ptr + query_end - num_draft_tokens + block,
++                tl.full([BLOCK_SIZE], 1, tl.uint8),
++                mask=mask & (block >= cut),
++            )
++
++
++class DeadRows(NamedTuple):
++    """Verification rows to leave out of routed MoE, decided on device.
++
++    confidence: per-slot draft confidences, [max_num_reqs, num_steps].
++    is_padding: the batch's padding flags; dead rows are set in place.
++    cut: per-request output, the number of live drafts.
++    log_tau: log of the survival threshold below which a row is dead.
++    """
++
++    confidence: torch.Tensor
++    is_padding: torch.Tensor
++    cut: torch.Tensor
++    log_tau: float
+ 
+ 
+ def combine_sampled_and_draft_tokens(
+@@ -479,7 +521,9 @@ def combine_sampled_and_draft_tokens(
+     cu_num_logits: torch.Tensor,
+     num_logits: int,
+     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
++    dead_rows: "DeadRows | None" = None,
+ ) -> torch.Tensor:
++    """``dead_rows`` marks low-survival draft rows as padding (see DeadRows)."""
+     assert num_new_sampled_tokens in (0, 1), (
+         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
+     )
+@@ -503,7 +547,19 @@ def combine_sampled_and_draft_tokens(
+         draft_tokens.stride(0),
+         cu_num_logits,
+         logits_indices,
++        *(
++            (
++                dead_rows.confidence,
++                dead_rows.confidence.stride(0),
++                dead_rows.is_padding.view(torch.uint8),
++                dead_rows.cut,
++                dead_rows.log_tau,
++            )
++            if dead_rows is not None
++            else (input_ids, 0, input_ids, input_ids, 0.0)
++        ),
+         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
++        DEAD_ROWS=dead_rows is not None,
+         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
+         # last sampled token in addition to all draft tokens.
+         BLOCK_SIZE=triton.next_power_of_2(
+@@ -521,6 +577,8 @@ def _get_num_sampled_and_rejected_kernel(
+     cu_num_logits_ptr,
+     idx_mapping_ptr,
+     prefill_len_ptr,
++    dead_cut_ptr,
++    DEAD_ROWS: tl.constexpr = False,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+@@ -530,6 +588,9 @@ def _get_num_sampled_and_rejected_kernel(
+     is_chunked_prefilling = seq_len < prefill_len
+ 
+     num_sampled = tl.load(num_sampled_ptr + batch_idx)
++    if DEAD_ROWS:
++        # Commit only tokens predicted by live rows.
++        num_sampled = tl.minimum(num_sampled, tl.load(dead_cut_ptr + batch_idx) + 1)
+     num_sampled = tl.where(is_chunked_prefilling, 0, num_sampled)
+     tl.store(num_sampled_ptr + batch_idx, num_sampled)
+ 
+@@ -548,6 +609,7 @@ def get_num_sampled_and_rejected(
+     cu_num_logits: torch.Tensor,
+     idx_mapping: torch.Tensor,
+     prefill_len: torch.Tensor,
++    dead_row_cut: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     num_reqs = idx_mapping.shape[0]
+     num_rejected = torch.empty_like(num_sampled)
+@@ -558,6 +620,8 @@ def get_num_sampled_and_rejected(
+         cu_num_logits,
+         idx_mapping,
+         prefill_len,
++        dead_row_cut if dead_row_cut is not None else num_sampled,
++        DEAD_ROWS=dead_row_cut is not None,
+     )
+     return num_sampled, num_rejected
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index feb9a3e94..f6b5b3233 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1603,6 +1603,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
++        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU) are marked inside
++        # the draft combine; sample() clamps committed tokens to live rows.
++        dead_rows = None
++        if adaptive_verification is not None and self.batch_sharder is None:
++            dead_rows = adaptive_verification.dead_row_args(
++                self.input_buffers.is_padding, num_reqs
++            )
++        self._dead_row_cut = dead_rows.cut if dead_rows is not None else None
++
+         # Some input token ids are directly read from the last sampled tokens
+         # and draft tokens. Also, get the logits indices to sample tokens from.
+         logits_indices = combine_sampled_and_draft_tokens(
+@@ -1616,6 +1625,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits,
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
++            dead_rows=dead_rows,
+         )
+ 
+         fast_prefill = None
+@@ -1785,6 +1795,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                dead_row_cut=(
++                    getattr(self, "_dead_row_cut", None)
++                    if shard_metadata is None
++                    else None
++                ),
+             )
+ 
+         if shard_metadata is not None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 15ac44632..88b32c3d0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -25,6 +25,7 @@ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+     get_query_lens_mismatch_unsupported_backend,
+ )
++from vllm.v1.worker.gpu.input_batch import DeadRows
+ 
+ logger = init_logger(__name__)
+ _PROFILE_REPLAYS = 5
+@@ -32,6 +33,12 @@ _PROFILE_REPLAYS = 5
+ # set, and later boots with the same shapes read it instead of profiling, so
+ # the draft budget does not depend on one boot's startup timing noise.
+ _COST_DIR = os.environ.get("SPARK3_DSPARK_COST_DIR") or None
++# Dead rows: verification rows past the first draft whose survival (running
++# product of this step's confidences) falls below this threshold are marked
++# as padding, so routed MoE skips them, and the request commits at most one
++# token past its last live row. Decided on device, inside the draft combine,
++# from the current drafts' confidences; the batch shape is unchanged. 0 = off.
++_DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+@@ -172,6 +179,14 @@ class AdaptiveVerificationManager:
+         # address the compacted layout, so the budget must fit one chunk.
+         self._max_total_logits = max_total_logits
+         self.cost_scale = cost_scale
++        self.dead_rows_tau = _DEAD_ROWS_TAU
++        self._dead_row_cut = torch.empty(
++            req_states.max_num_reqs, dtype=torch.int32, device=device
++        )
++        if self.dead_rows_tau > 0:
++            logger.info(
++                "DSpark dead verification rows below survival %.3g", self.dead_rows_tau
++            )
+         self.query_start_loc = query_start_loc
+         self.cost_tables: tuple[np.ndarray, np.ndarray] | None = None
+         # Largest cudagraph-captured token count; above it nothing pads.
+@@ -681,6 +696,21 @@ class AdaptiveVerificationManager:
+         draft_lens_cpu[: draft_budget % num_verification_reqs] += 1
+         return num_non_draft_tokens + draft_lens_cpu, cu_num_logits_np
+ 
++    def dead_row_args(self, is_padding: torch.Tensor, num_reqs: int) -> DeadRows | None:
++        """Arguments for the fused dead-row marking, or None when disabled.
++
++        The confidences are the current drafts', broadcast from rank 0, so
++        every rank marks the same rows.
++        """
++        if self.dead_rows_tau <= 0:
++            return None
++        return DeadRows(
++            self._confidence_probs,
++            is_padding,
++            self._dead_row_cut[:num_reqs],
++            float(np.log(self.dead_rows_tau)),
++        )
++
+     def get_verified_draft_counts(self, num_reqs: int) -> torch.Tensor:
+         """Return the device-selected draft count for each request."""
+         return self._batch_draft_capacity[:num_reqs]
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 609924e87..c3bc0d2fe 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -176,6 +176,7 @@ class RejectionSampler:
+         idx_mapping_np: np.ndarray,
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
++        max_sampled: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+@@ -205,6 +206,8 @@ class RejectionSampler:
+                 draft_sampled, expanded_idx_mapping, expanded_local_pos
+             ),
+         )
++        if max_sampled is not None:
++            num_sampled = torch.minimum(num_sampled, max_sampled)
+         return processed_logits, sampled, num_sampled
+ 
+     def _verify_in_chunks(
+@@ -216,6 +219,7 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         max_num_logprobs: int,
++        max_sampled: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+@@ -251,6 +255,7 @@ class RejectionSampler:
+                 input_batch.idx_mapping_np[start:end],
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
++                None if max_sampled is None else max_sampled[start:end],
+             )
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+@@ -289,6 +294,7 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
++        dead_row_cut: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+@@ -309,6 +315,11 @@ class RejectionSampler:
+             pos,
+             chunk_logit_limit,
+             max_num_logprobs,
++            # Logprobs take their token counts inside the chunks; clamp there
++            # too so they match the committed tokens.
++            dead_row_cut + 1
++            if dead_row_cut is not None and max_num_logprobs != NO_LOGPROBS
++            else None,
+         )
+ 
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+@@ -317,6 +328,7 @@ class RejectionSampler:
+             input_batch.cu_num_logits,
+             input_batch.idx_mapping,
+             self.sampler.req_states.prefill_len.gpu,
++            dead_row_cut=dead_row_cut,
+         )
+ 
+         return SamplerOutput(
+-- 
+2.54.0 (Apple Git-157)
+

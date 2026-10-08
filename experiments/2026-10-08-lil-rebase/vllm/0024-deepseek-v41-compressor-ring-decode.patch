@@ -1,0 +1,42 @@
+From 9dbb6ecddb79d58b6ebad102ef1cb173119fd940 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:13:01 +0200
+Subject: [PATCH] fix(deepseek-v4.1): write the ratio-2 compressor ring during
+ decode
+
+The ratio-2 compressor keeps the first key of an open pair in a per-request
+ring (a CircularBufferSpec group) so the next step can finish the pair.
+CircularBufferSpec opts out of slot mapping, so the block table hands its
+metadata builder an all-padding slot row, and the builder dropped every row
+that had no slot (input_slot >= 0). Nothing was ever saved to the ring, yet
+_load_partial_state still read it whenever a step started at an odd
+position: those compressed entries were built from a zeroed predecessor. It
+affects entries formed across decode-step boundaries, which persist in the
+KV cache and are reused through prefix caching; prefill, which finishes
+pairs within one step, was correct.
+
+For ring groups the builder already derives the slot from the ring block, so
+validity now comes from the request range, the position and a real block.
+---
+ vllm/models/deepseek_v4_1/sparse_mla.py | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index e9bfbbe46..9ee107171 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -70,7 +70,10 @@ def _tokens(
+     seq = tl.load(Seq + lo, valid, other=0)
+     pos = seq.to(tl.int64) - (end - start) + t - start
+     input_slot = tl.load(InputSlots + t, t < nt, other=-1)
+-    valid = valid & (pos >= 0) & (input_slot >= 0)
++    # A ring group takes no slot-mapping row (its spec opts out, so every entry
++    # is padding); its slot comes from the ring block below, and padded rows
++    # are excluded by the request range and block checks.
++    valid = valid & (pos >= 0) if CIRCULAR else valid & (pos >= 0) & (input_slot >= 0)
+     logical = pos // RATIO
+     page_col = tl.full((B,), 0, tl.int64) if CIRCULAR else logical // PAGE
+     valid = valid & (page_col < table_width)
+-- 
+2.54.0 (Apple Git-157)
+
