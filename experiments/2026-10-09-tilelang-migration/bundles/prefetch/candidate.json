@@ -1,0 +1,31 @@
+{
+  "description": "L2 prefetch port: the TileLang family's GPU tests, then a read-after-prefetch comparison with the CuTe family.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; r1 = subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', 'tests/models/test_glm5next_l2_prefetch_tilelang.py']); r2 = subprocess.call([sys.executable, '/b/bench_prefetch.py']); sys.exit(r1 or r2)"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "l2_prefetch.py",
+      "/opt/spark3/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch.py"
+    ],
+    [
+      "l2_prefetch_tilelang.py",
+      "/opt/spark3/candidate/vllm/vllm/models/glm5next/nvidia/l2_prefetch_tilelang.py"
+    ],
+    [
+      "test_glm5next_l2_prefetch_tilelang.py",
+      "/opt/spark3/candidate/vllm/tests/models/test_glm5next_l2_prefetch_tilelang.py"
+    ],
+    [
+      "bench_prefetch.py",
+      "/b/bench_prefetch.py"
+    ]
+  ]
+}
