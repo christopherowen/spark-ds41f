@@ -1,0 +1,35 @@
+{
+  "description": "B5 compressor projection: the split BF16 GEMM unit tests, then numerics, batch invariance and warm/cold CUDA-graph timing against B12X bf16_gemv at the TP4 serving shapes.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', '-k', 'split_linear or bf16_gemm', 'tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py']), subprocess.call([sys.executable, '/b/bench_compressor_projection.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__linear.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__gemm.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+    ],
+    [
+      "tests__kernels__quantization__test_deepseek_v41_tilelang_linear.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_compressor_projection.py",
+      "/b/bench_compressor_projection.py"
+    ]
+  ]
+}

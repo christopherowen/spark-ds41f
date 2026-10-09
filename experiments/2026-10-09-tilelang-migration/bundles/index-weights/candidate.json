@@ -1,0 +1,35 @@
+{
+  "description": "B8 index head weights: the scaled-projection unit test, then exact equality with the TileLang projection plus B12X's scale pass, and warm/cold CUDA-graph timing per step.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', '-k', 'scaled_linear', 'tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py']), subprocess.call([sys.executable, '/b/bench_index_weights.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__linear.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__gemm.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+    ],
+    [
+      "tests__kernels__quantization__test_deepseek_v41_tilelang_linear.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_index_weights.py",
+      "/b/bench_index_weights.py"
+    ]
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "description": "B7 Engram gate: unit tests against FP64 and TileKernels, then numerics, batch invariance and warm/cold CUDA-graph timing against B12X run_engram_mix, with TileKernels' kernel and other block shapes.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', '-k', 'engram_gate', 'tests/kernels/test_deepseek_v41_tilelang_engram.py']), subprocess.call([sys.executable, '/b/bench_engram_gate.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__engram.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/engram.py"
+    ],
+    [
+      "tests__kernels__test_deepseek_v41_tilelang_engram.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_engram.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_engram_gate.py",
+      "/b/bench_engram_gate.py"
+    ]
+  ]
+}

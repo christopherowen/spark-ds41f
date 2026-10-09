@@ -1,0 +1,47 @@
+{
+  "description": "B1 WO projection: unit tests (grouped GEMM equals per-group GEMMs, FP64), then numerics, batch invariance and warm/cold CUDA-graph timing against B12X's fused wo_projection, then decode-tile sweeps for WO-A and WO-B.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', 'tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py']), subprocess.call([sys.executable, '/b/bench_wo.py']), subprocess.call([sys.executable, '/b/sweep_wo.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__wo.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/wo.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__linear.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/linear.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__gemm.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__rope.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/rope.py"
+    ],
+    [
+      "tests__kernels__quantization__test_deepseek_v41_tilelang_wo.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_wo.py",
+      "/b/bench_wo.py"
+    ],
+    [
+      "sweep_wo.py",
+      "/b/sweep_wo.py"
+    ]
+  ]
+}

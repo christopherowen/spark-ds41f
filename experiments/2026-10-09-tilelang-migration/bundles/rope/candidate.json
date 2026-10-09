@@ -1,0 +1,31 @@
+{
+  "description": "B2 RoPE: unit tests against TileKernels' apply_rotary and FP64, then numerics, row independence and warm/cold CUDA-graph timing against B12X rotary.rotate at the five TP4 attention roles.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', '-k', 'rope', 'tests/kernels/test_deepseek_v41_tilelang_rope.py']), subprocess.call([sys.executable, '/b/bench_rope.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__rope.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/rope.py"
+    ],
+    [
+      "tests__kernels__test_deepseek_v41_tilelang_rope.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_rope.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_rope.py",
+      "/b/bench_rope.py"
+    ]
+  ]
+}
