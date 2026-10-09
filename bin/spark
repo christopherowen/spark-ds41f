@@ -190,6 +190,14 @@ def ssh_target(nodes: dict, node: dict) -> str:
     return f"{nodes['ssh_user']}@{node.get('ssh_host', node['name'])}"
 
 
+def transfer_target(nodes: dict, node: dict) -> str:
+    """Where bulk copies to and from a node go: the node map's ``transfer_host`` (an
+    SSH alias over the CX7 links, so large copies stay off the LAN switch) when it
+    names one, else the node's SSH host."""
+    host = node.get("transfer_host") or node.get("ssh_host", node["name"])
+    return f"{nodes['ssh_user']}@{host}"
+
+
 SSH_CONTROL_DIR = Path(tempfile.gettempdir()) / f"spark-ssh-{os.getuid()}"
 
 
