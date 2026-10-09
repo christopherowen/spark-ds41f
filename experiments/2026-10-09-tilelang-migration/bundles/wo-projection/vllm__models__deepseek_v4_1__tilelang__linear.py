@@ -14,6 +14,7 @@ The kernels run inside custom ops, which keeps them opaque to torch.compile,
 and borrow activation scratch from vLLM's workspace.
 """
 
+import math
 from weakref import WeakValueDictionary
 
 import torch
@@ -307,6 +308,27 @@ class _Part:
         self.out_dtype = out_dtype
 
 
+class TileLangScaledLinearMethod(TileLangLinearMethod):
+    """``TileLangLinearMethod`` with a power-of-two output scale folded into the
+    weight at load. Scaling by a power of two is exact in BF16 and commutes with
+    the FP32 accumulation, so the output equals the unscaled projection's times
+    ``scale``, bit for bit (checked on the weight), without a separate pass."""
+
+    def __init__(self, scale: float):
+        super().__init__()
+        if scale <= 0 or math.frexp(scale)[0] != 0.5:
+            raise ValueError(f"{scale} is not a power of two")
+        self.scale = scale
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        weight = layer.weight.data
+        scaled = weight * self.scale
+        if not torch.equal(scaled / self.scale, weight):
+            raise ValueError(f"{self.scale} does not scale this weight exactly")
+        weight.copy_(scaled)
+        super().process_weights_after_loading(layer)
+
+
 class TileLangSplitLinearMethod(UnquantizedLinearMethod):
     """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
     projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
@@ -351,6 +373,7 @@ __all__ = [
     "TileLangBlock32Rows",
     "TileLangFP8LinearMethod",
     "TileLangLinearMethod",
+    "TileLangScaledLinearMethod",
     "TileLangSplitLinearMethod",
     "project_parts",
 ]

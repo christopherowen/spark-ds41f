@@ -221,6 +221,35 @@ def test_split_linear(parts, out_dtype, k=5120):
             assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
 
 
+# The indexer's head weights (32 x 5120) scaled by 1/64.
+def test_scaled_linear(n=32, k=5120, scale=1 / 64):
+    from torch import nn
+
+    from vllm.models.deepseek_v4_1.tilelang.linear import (
+        TileLangLinearMethod,
+        TileLangScaledLinearMethod,
+    )
+    from vllm.v1.worker.workspace import use_preallocated_workspace
+
+    gen = _gen(8)
+    weight = (torch.randn((n, k), generator=gen, device=DEVICE) * 0.02).bfloat16()
+    plain, scaled = nn.Module(), nn.Module()
+    plain.weight = nn.Parameter(weight.clone(), requires_grad=False)
+    scaled.weight = nn.Parameter(weight.clone(), requires_grad=False)
+    plain_method = TileLangLinearMethod()
+    plain_method.process_weights_after_loading(plain)
+    scaled_method = TileLangScaledLinearMethod(scale)
+    scaled_method.process_weights_after_loading(scaled)
+    x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
+    with use_preallocated_workspace(scratch):
+        for rows in ROWS:
+            expected = plain_method.apply(plain, x[:rows]) * scale  # exact in BF16
+            assert torch.equal(scaled_method.apply(scaled, x[:rows]), expected), rows
+    with pytest.raises(ValueError):
+        TileLangScaledLinearMethod(0.3)
+
+
 # The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
 def test_block32_rows(n=1792, k=5120, start=1280):
     from torch import nn
