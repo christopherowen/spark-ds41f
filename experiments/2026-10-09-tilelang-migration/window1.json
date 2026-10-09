@@ -1,0 +1,82 @@
+{
+  "experiment": "experiments/2026-10-09-tilelang-migration",
+  "run": "migration-w1",
+  "jobs": [
+    {
+      "kind": "kernel",
+      "bundles": [
+        {
+          "node": "dgx1",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/prefetch"
+        },
+        {
+          "node": "dgx4",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/prefetch"
+        }
+      ]
+    },
+    {
+      "kind": "profile",
+      "workloads": [
+        "decode",
+        "c8",
+        "prefill"
+      ],
+      "arms": [
+        {
+          "config": "control.json",
+          "label": "control"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "profile": "lean",
+      "bracket": true,
+      "extras": [
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "1",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c1-distinct"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "8",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c8-distinct"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "control.json",
+          "label": "control"
+        },
+        {
+          "config": "prefetch.json",
+          "label": "prefetch"
+        },
+        {
+          "config": "sparknet-cute.json",
+          "label": "sparknet-cute"
+        },
+        {
+          "config": "sparknet-tilelang.json",
+          "label": "sparknet-tilelang"
+        }
+      ]
+    }
+  ]
+}
