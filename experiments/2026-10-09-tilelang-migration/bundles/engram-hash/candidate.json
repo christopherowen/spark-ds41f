@@ -1,0 +1,39 @@
+{
+  "description": "B9 Engram hash: unit tests against B12X's integer oracle, then exact equality with B12X's hash path and eager and CUDA-graph timing per step, decode and prefill.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', '-k', 'engram_hash', 'tests/kernels/test_deepseek_v41_tilelang_engram_hash.py']), subprocess.call([sys.executable, '/b/bench_engram_hash.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__engram_hash.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/engram_hash.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__common__engram.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/common/engram.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__nvidia__model.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model.py"
+    ],
+    [
+      "tests__kernels__test_deepseek_v41_tilelang_engram_hash.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_engram_hash.py",
+      "/b/bench_engram_hash.py"
+    ]
+  ]
+}

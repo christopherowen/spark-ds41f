@@ -99,6 +99,25 @@ PORTS = {
         },
         "environment": {},
     },
+    # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
+    # a copy per layer -> one TileLang launch for every layer.
+    "engram-hash": {
+        "commit": "004bf569c",
+        "files": (
+            "models/deepseek_v4_1/tilelang/engram_hash.py",
+            "models/deepseek_v4_1/common/engram.py",
+            "models/deepseek_v4_1/nvidia/model.py",
+        ),
+        "bundle": {
+            "description": "B9 Engram hash: unit tests against B12X's integer oracle, then exact "
+                           "equality with B12X's hash path and eager and CUDA-graph timing per step, "
+                           "decode and prefill.",
+            "tests": ("tests/kernels/test_deepseek_v41_tilelang_engram_hash.py",),
+            "select": "engram_hash",
+            "scripts": ("bench_engram_hash.py",),
+        },
+        "environment": {},
+    },
 }
 
 # sparknet's one-shot collectives: the image pins 0.2.0, which predates the TileLang

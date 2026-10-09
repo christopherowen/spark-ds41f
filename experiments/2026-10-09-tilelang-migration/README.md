@@ -114,6 +114,7 @@ completeness; not part of this migration unless the owner extends it.
 | B6 DSpark context KV | `e45271941` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
 | B7 Engram gate | `00fd5e6aa` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
 | B2 RoPE | `4e4af513b` | kernels compile for sm_121a; TileKernels' arithmetic plus the compressed-position floor and inverse direction, in place on the last 64 columns (B12X copies the whole head); unit test bit-equal to TileKernels' `apply_rotary`; bundle `rope` (all five roles) | pending (arm `rope.json`) | awaiting the first window |
+| B9 Engram hash | `004bf569c` | kernels compile for sm_121a; one launch hashes every layer and head straight into the step's rows (B12X: vLLM's metadata copy, then three Triton launches and a copy per layer, eager before each forward); unit test equal to B12X's integer oracle; bundle `engram-hash` (exact equality, eager and graph time per step) | pending (arm `engram-hash.json`) | awaiting the first window |
 
 ### 65 to 96 rows
 
@@ -137,7 +138,7 @@ Window 1 runs on the queue runner, so the kernel results can change the arms
 before they boot:
 
 1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5, B6, B7;
-   then B2, and B7 again on another node).
+   then B2, B7 again on another node, and B9).
 2. Read the verdicts; commit any tile or split change to the vLLM branch, sync the
    overlays, push to main.
 3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
