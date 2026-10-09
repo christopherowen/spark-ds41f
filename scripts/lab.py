@@ -58,6 +58,7 @@ import socket
 import subprocess
 import sys
 import threading
+import traceback
 import time
 import urllib.request
 from pathlib import Path
@@ -721,7 +722,7 @@ def profile_workload(step: dict) -> None:
         target = out / f"{workload}-trace" / node["name"]
         target.mkdir(parents=True, exist_ok=True)
         subprocess.run(["rsync", "-a", "-e", "ssh " + " ".join(spark.ssh_options()),
-                        f"{spark.ssh_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
+                        f"{spark.transfer_target(nodes, node)}:{repo}/{host_relative}/{workload}/", f"{target}/"],
                        check=False)
 
     each(fetch)
@@ -888,7 +889,7 @@ def run_kernel_bundles(step: dict) -> list[dict]:
         subprocess.run(["rsync", "-a", "--delete" if source.is_dir() else "--checksum",
                         "-e", "ssh " + " ".join(spark.ssh_options()),
                         f"{source}/" if source.is_dir() else str(source),
-                        f"{spark.ssh_target(nodes, node)}:{destination}{'/' if source.is_dir() else ''}"],
+                        f"{spark.transfer_target(nodes, node)}:{destination}{'/' if source.is_dir() else ''}"],
                        check=False)
 
     def one(entry: dict) -> dict:
@@ -972,63 +973,68 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             break
         current["note"] = describe_step(step)
         beat(current["note"])
-        if step["kind"] == "boot":
-            if step["config"] not in checked:
-                config = json.loads((ROOT / step["config"]).read_text())
-                problems = fence_problems(config["container"]["mounts"], config["container"]["image"], home)
-                if problems:
-                    failed = "stale overlay: " + "; ".join(problems)
+        try:
+            if step["kind"] == "boot":
+                if step["config"] not in checked:
+                    config = json.loads((ROOT / step["config"]).read_text())
+                    problems = fence_problems(config["container"]["mounts"], config["container"]["image"], home)
+                    if problems:
+                        failed = "stale overlay: " + "; ".join(problems)
+                        break
+                    manifest = ROOT / "results" / "private" / "lab" / f"overlays-{spec['run']}.txt"
+                    manifest.parent.mkdir(parents=True, exist_ok=True)
+                    with manifest.open("a") as handle:
+                        handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config, home)))
+                    checked.add(step["config"])
+                if not boot(step["config"]):
+                    failed = f"boot of {step['config']} failed"
                     break
-                manifest = ROOT / "results" / "private" / "lab" / f"overlays-{spec['run']}.txt"
-                manifest.parent.mkdir(parents=True, exist_ok=True)
-                with manifest.open("a") as handle:
-                    handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config, home)))
-                checked.add(step["config"])
-            if not boot(step["config"]):
-                failed = f"boot of {step['config']} failed"
-                break
-        elif step["kind"] == "cli":
-            log(f"bench {step['label']} exit {spark_cli(*step['argv'])}")
-        elif step["kind"] == "script":
-            log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
-        elif step["kind"] == "sync":
-            if not sync_checkouts():
-                failed = "sync failed"
-                break
-        elif step["kind"] == "profile":
-            profile_workload(step)
-        elif step["kind"] == "costs":
-            profile_costs(step)
-        elif step["kind"] == "curves":
-            save_curves(step)
-        elif step["kind"] == "table":
-            if (ROOT / step["argv"][0]).exists():
-                run_script(step)
-                table = (ROOT / step["out"]).read_text()
-            else:  # an experiment without tables_arms.py: each workload's summary line per arm
-                table = summary_lines(step.get("summaries", []))
-                (ROOT / step["out"]).parent.mkdir(parents=True, exist_ok=True)
-                (ROOT / step["out"]).write_text(table)
-            curves = curves_table(step.get("curves", []))
-            if curves:
-                table += "\n" + curves + "\n"
-                (ROOT / step["out"]).write_text(table)
-            print(table, flush=True)
-        elif step["kind"] == "fresh_inventory":
-            fresh_inventory()
-        elif step["kind"] == "stop":
-            if container_running() and not stop_cluster(remove=step.get("remove", False)):
-                failed = "stop failed"
-                break
-        elif step["kind"] == "analyze":
-            summary = analyze(step)
-            log(f"analysed {step['out']}: {'PASSED' if summary['passed'] else 'DIFFERENCES'}")
-        elif step["kind"] == "kernel":
-            verdicts = run_kernel_bundles(step)
-            for verdict in verdicts:
-                log(f"kernel {verdict['bundle']}@{verdict['node']}: "
-                    f"{'pass' if verdict.get('passed') else 'FAIL'} ({verdict.get('seconds', '?')} s)")
-            log(f"kernel verdicts {'agree' if verdicts_agree(verdicts) else 'DISAGREE'} across nodes")
+            elif step["kind"] == "cli":
+                log(f"bench {step['label']} exit {spark_cli(*step['argv'])}")
+            elif step["kind"] == "script":
+                log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
+            elif step["kind"] == "sync":
+                if not sync_checkouts():
+                    failed = "sync failed"
+                    break
+            elif step["kind"] == "profile":
+                profile_workload(step)
+            elif step["kind"] == "costs":
+                profile_costs(step)
+            elif step["kind"] == "curves":
+                save_curves(step)
+            elif step["kind"] == "table":
+                if (ROOT / step["argv"][0]).exists():
+                    run_script(step)
+                    table = (ROOT / step["out"]).read_text()
+                else:  # an experiment without tables_arms.py: each workload's summary line per arm
+                    table = summary_lines(step.get("summaries", []))
+                    (ROOT / step["out"]).parent.mkdir(parents=True, exist_ok=True)
+                    (ROOT / step["out"]).write_text(table)
+                curves = curves_table(step.get("curves", []))
+                if curves:
+                    table += "\n" + curves + "\n"
+                    (ROOT / step["out"]).write_text(table)
+                print(table, flush=True)
+            elif step["kind"] == "fresh_inventory":
+                fresh_inventory()
+            elif step["kind"] == "stop":
+                if container_running() and not stop_cluster(remove=step.get("remove", False)):
+                    failed = "stop failed"
+                    break
+            elif step["kind"] == "analyze":
+                summary = analyze(step)
+                log(f"analysed {step['out']}: {'PASSED' if summary['passed'] else 'DIFFERENCES'}")
+            elif step["kind"] == "kernel":
+                verdicts = run_kernel_bundles(step)
+                for verdict in verdicts:
+                    log(f"kernel {verdict['bundle']}@{verdict['node']}: "
+                        f"{'pass' if verdict.get('passed') else 'FAIL'} ({verdict.get('seconds', '?')} s)")
+                log(f"kernel verdicts {'agree' if verdicts_agree(verdicts) else 'DISAGREE'} across nodes")
+        except Exception as error:  # a step that raises fails the run; the window still closes
+            log("".join(traceback.format_exception(error)).rstrip())
+            failed = f"{describe_step(step)} raised {type(error).__name__}: {error}"
+            break
     stop_beating.set()
     if failed:
         log(f"run stopped: {failed}")

@@ -373,7 +373,12 @@ Two files describe your site and stay out of git:
   It names each node, its rank (the head is rank 0), management IP,
   `ssh_user`, and `roce_peer_hcas`: for each peer rank, the local RoCE
   devices cabled to it (`rdma link` shows them). `sparknet topology discover`
-  writes it.
+  writes it. Two optional fields per node change how the head reaches it:
+  `ssh_host` replaces the node name for every SSH call, and `transfer_host`
+  only for the lab's bulk copies (kernel bundles, their inputs, profiler
+  traces). A `transfer_host` that is an SSH alias over the CX7 links (in the
+  head's `~/.ssh/config`, with `ProxyJump` through a neighbour for a node the
+  head is not cabled to) keeps large copies off a struggling LAN switch.
 - **The profile.** In the profile you will run (`config/cluster.json`, its
   named copies, or `config/cluster-tp4.json`), set
   `distributed.master_addr` to the head's management IP, `host.home`,

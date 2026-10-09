@@ -557,3 +557,31 @@ class AnalysisTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TransferRouteTest(unittest.TestCase):
+    def test_bulk_copies_prefer_the_transfer_host(self) -> None:
+        nodes = {"ssh_user": "swank"}
+        target = lab.spark.transfer_target
+        self.assertEqual(target(nodes, {"name": "dgx3", "transfer_host": "dgx3-cx7"}), "swank@dgx3-cx7")
+        self.assertEqual(target(nodes, {"name": "dgx4", "ssh_host": "10.0.1.74"}), "swank@10.0.1.74")
+        self.assertEqual(target(nodes, {"name": "dgx2"}), "swank@dgx2")
+
+
+class StepFailureTest(unittest.TestCase):
+    def test_a_step_that_raises_fails_the_run_and_closes_the_window(self) -> None:
+        spec = {"experiment": "experiments/2026-09-29-determinism", "run": "t0",
+                "jobs": [{"kind": "kernel", "bundles": [{"bundle": "b/mhc", "node": "dgx2"}]}]}
+        with mock.patch.object(lab, "read_hold", return_value={"holder": "test"}), \
+                mock.patch.object(lab, "hold_is_ours", return_value=True), \
+                mock.patch.object(lab, "window_should_close", return_value=None), \
+                mock.patch.object(lab, "beat"), \
+                mock.patch.object(lab, "production_configuration", return_value=({"host": {"home": "/h"}}, {}, {})), \
+                mock.patch.object(lab, "container_running", return_value=False), \
+                mock.patch.object(lab, "run_kernel_bundles", side_effect=RuntimeError("cannot read dgx3")), \
+                mock.patch.object(lab, "window_close", return_value=True) as close, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = lab.execute(spec, dry=False, keep_open=True)
+        self.assertEqual(code, 1)
+        close.assert_called_once()
+        self.assertIn("raised RuntimeError: cannot read dgx3", close.call_args.args[0])
