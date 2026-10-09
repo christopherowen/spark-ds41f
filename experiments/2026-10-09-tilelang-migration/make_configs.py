@@ -3,7 +3,8 @@
 
 - control.json: r6c TP4 with the migration's modules mounted (they change nothing the
   model runs) and a torch profiler directory;
-- <port>.json: the modules plus one port's switch (overlay/<port>) and environment;
+- <port>.json: the modules with one port's switch files over them (overlay/<port>)
+  and its environment;
 - sparknet-cute.json / sparknet-tilelang.json: the control with sparknet main
   mounted, CuTe and TileLang kernel families.
 
@@ -23,11 +24,14 @@ BASE = "experiments/2026-10-08-lil-rebase/r6c-tp4.json"
 IMAGE_VLLM = "/opt/spark3/candidate/vllm/vllm"
 
 
-def mounts(arm):
-    """Every file of overlay/<arm>/vllm, over the image's vLLM tree."""
-    root = HERE / "overlay" / arm / "vllm"
-    return [[f"{{home}}/projects/spark-ds41f/{REL}/overlay/{arm}/vllm/{path}", f"{IMAGE_VLLM}/{path}", "ro"]
-            for path in sorted(p.relative_to(root).as_posix() for p in root.rglob("*.py"))]
+def mounts(*overlays):
+    """The files of each overlay over the image's vLLM tree, later overlays winning."""
+    chosen = {}
+    for overlay in overlays:
+        root = HERE / "overlay" / overlay / "vllm"
+        for path in sorted(p.relative_to(root).as_posix() for p in root.rglob("*.py")):
+            chosen[path] = f"{{home}}/projects/spark-ds41f/{REL}/overlay/{overlay}/vllm/{path}"
+    return [[source, f"{IMAGE_VLLM}/{path}", "ro"] for path, source in chosen.items()]
 
 
 def set_profiler(cluster, name):
@@ -46,9 +50,9 @@ def main():
     base = json.loads((ROOT / BASE).read_text())
 
     def arm(overlay, profile, environment=()):
-        """r6c TP4 plus one overlay (each overlay holds the modules)."""
+        """r6c TP4 plus the modules and one port's switch files."""
         cluster = copy.deepcopy(base)
-        cluster["container"]["mounts"] += mounts(overlay)
+        cluster["container"]["mounts"] += mounts("modules", overlay)
         cluster["environment"].update(environment)
         set_profiler(cluster, profile)
         return cluster

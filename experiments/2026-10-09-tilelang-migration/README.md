@@ -163,11 +163,12 @@ before they boot:
 - `ports.py`: the module tip, each port's switch commit, environment and kernel
   bundle.
 - `sync_overlay.py`: builds `overlay/modules/` (the control's files) and
-  `overlay/<port>/` (the modules plus that port's switch alone) from commits, and
-  regenerates `bundles/<port>/` (the module files under flattened path names, the
-  tests, `kbench.py` and `candidate.json`) around its bench scripts.
-- `make_configs.py`: writes `control.json` and one arm per port, each mounting
-  its overlay over the r6c TP4 recipe.
+  `overlay/<port>/` (the files that port's switch, applied to the modules alone,
+  changes) from commits, and regenerates `bundles/<port>/` (the module files its
+  tests and benches import, under flattened path names, the tests, `kbench.py`
+  and `candidate.json`) around its bench scripts.
+- `make_configs.py`: writes `control.json` (the modules over the r6c TP4 recipe)
+  and one arm per port (the modules with its switch files over them).
 - `kbench.py`: the benches' shared CUDA-graph timing (warm, and cold after an
   L2 eviction) and error helpers.
 - `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).

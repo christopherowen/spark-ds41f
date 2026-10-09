@@ -12,7 +12,7 @@ nothing else, so the switch is the only variable. The control mounts the modules
 alone. Each switch applies to the modules on its own, without the others.
 
 For each port: its switch commit, the environment its arm sets, and its kernel bundle
-(the vLLM tests and bench scripts it runs on the modules).
+(the module files its tests and benches import, the vLLM tests and the bench scripts).
 """
 
 VLLM_BRANCH = "tilelang-migration"
@@ -25,6 +25,7 @@ PORTS = {
         "switch": None,
         "environment": {"VLLM_L2_PREFETCH_KERNELS": "tilelang"},
         "bundle": {
+            "modules": ("vllm/models/glm5next/nvidia/l2_prefetch.py", "vllm/models/glm5next/nvidia/l2_prefetch_tilelang.py",),
             "description": "L2 prefetch port: the TileLang family's GPU tests, then a "
                            "read-after-prefetch comparison with the CuTe family.",
             "tests": ("tests/models/test_glm5next_l2_prefetch_tilelang.py",),
@@ -37,6 +38,7 @@ PORTS = {
         "switch": "c995d67a8",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/linear.py", "vllm/models/deepseek_v4_1/tilelang/gemm.py",),
             "description": "B5 compressor projection: the split BF16 GEMM unit tests, then numerics, "
                            "batch invariance and warm/cold CUDA-graph timing against B12X bf16_gemv at "
                            "the TP4 serving shapes.",
@@ -51,6 +53,7 @@ PORTS = {
         "switch": "9ead710ea",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/linear.py", "vllm/models/deepseek_v4_1/tilelang/gemm.py",),
             "description": "B6 DSpark context KV: the block-32 row-slice unit tests, numerics, batch "
                            "invariance and warm/cold CUDA-graph timing against B12X block_fp8_linear, "
                            "then a decode-tile sweep at 512 x 5120.",
@@ -65,6 +68,7 @@ PORTS = {
         "switch": "d6636c394",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
             "description": "B7 Engram gate: unit tests against FP64 and TileKernels, then numerics, "
                            "batch invariance and warm/cold CUDA-graph timing against B12X "
                            "run_engram_mix, with TileKernels' kernel and other block shapes.",
@@ -79,6 +83,7 @@ PORTS = {
         "switch": "11f3f48ff",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
             "description": "B2 RoPE: unit tests against TileKernels' apply_rotary and FP64, then "
                            "numerics, row independence and warm/cold CUDA-graph timing against B12X "
                            "rotary.rotate at the five TP4 attention roles.",
@@ -93,6 +98,7 @@ PORTS = {
         "switch": "d8c7527da",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
             "description": "B9 Engram hash: unit tests against B12X's integer oracle, then exact "
                            "equality with B12X's hash path and eager and CUDA-graph timing per step, "
                            "decode and prefill.",
@@ -107,6 +113,7 @@ PORTS = {
         "switch": "d9a5bebc9",
         "environment": {},
         "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/wo.py", "vllm/models/deepseek_v4_1/tilelang/linear.py", "vllm/models/deepseek_v4_1/tilelang/gemm.py", "vllm/models/deepseek_v4_1/tilelang/rope.py",),
             "description": "B1 WO projection: unit tests (grouped GEMM equals per-group GEMMs, FP64), "
                            "then numerics, batch invariance and warm/cold CUDA-graph timing against "
                            "B12X's fused wo_projection, then decode-tile sweeps for WO-A and WO-B.",

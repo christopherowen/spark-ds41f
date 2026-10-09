@@ -4,10 +4,11 @@
   sync_overlay.py [--vllm ~/projects/vllm-ds41-tilelang-migration]
 
 - overlay/modules/vllm/: the files the modules change from BASE (the control's arm);
-- overlay/<port>/vllm/: the modules plus the port's switch, applied on its own;
-- bundles/<port>/: the module files (under flattened path names, since names repeat
-  across directories), the port's tests, kbench.py and candidate.json, around its
-  bench scripts.
+- overlay/<port>/vllm/: the files the port's switch, applied to the modules on its
+  own, changes from them; an arm mounts these over the modules;
+- bundles/<port>/: the module files its tests and benches import (under flattened
+  path names, since names repeat across directories), the port's tests, kbench.py
+  and candidate.json, around its bench scripts.
 
 Everything comes from commits, through a scratch worktree, never a working tree.
 The previous overlays are replaced.
@@ -70,14 +71,16 @@ def main():
                 git("checkout", "-q", "--detach", MODULES, cwd=work)
                 if switch:
                     git("cherry-pick", "--no-commit", switch, cwd=work)
-                files = set(git("diff", "--name-only", BASE, "--", "vllm", cwd=work).split())
-                files |= set(git("diff", "--cached", "--name-only", BASE, "--", "vllm", cwd=work).split())
+                    files = set(git("diff", "--cached", "--name-only", MODULES, "--", "vllm", cwd=work).split())
+                else:
+                    files = set(module_files) if arm == "modules" else set()
                 overlay = HERE / "overlay" / arm
                 shutil.rmtree(overlay, ignore_errors=True)
                 for path in sorted(files):
                     out = overlay / path
                     out.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(work / path, out)
+                overlay.mkdir(parents=True, exist_ok=True)
                 (overlay / "COMMIT").write_text(
                     f"modules {rev(MODULES)}\nswitch {rev(switch) if switch else '-'}\n")
                 git("reset", "-q", "--hard", cwd=work)
@@ -90,13 +93,15 @@ def main():
         for stale in bundle.iterdir():  # keep only the bench scripts
             if stale.is_file() and stale.name not in port["bundle"]["scripts"]:
                 stale.unlink()
-        for path in module_files + list(port["bundle"]["tests"]):
+        modules = list(port["bundle"]["modules"])
+        assert set(modules) <= set(module_files), f"{name}: not a module file"
+        for path in modules + list(port["bundle"]["tests"]):
             data = subprocess.run(["git", "show", f"{MODULES}:{path}"], cwd=args.vllm,
                                   capture_output=True, check=True).stdout
             (bundle / bundled(path)).write_bytes(data)
         shutil.copyfile(HERE / "kbench.py", bundle / "kbench.py")
-        (bundle / "candidate.json").write_text(json.dumps(candidate(port["bundle"], module_files), indent=2) + "\n")
-        print(f"bundles/{name}: {len(module_files)} module files")
+        (bundle / "candidate.json").write_text(json.dumps(candidate(port["bundle"], modules), indent=2) + "\n")
+        print(f"bundles/{name}: {len(modules)} module files")
 
 
 if __name__ == "__main__":
