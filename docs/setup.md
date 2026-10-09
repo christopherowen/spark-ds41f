@@ -376,9 +376,10 @@ Two files describe your site and stay out of git:
   writes it. Two optional fields per node change how the head reaches it:
   `ssh_host` replaces the node name for every SSH call, and `transfer_host`
   only for the lab's bulk copies (kernel bundles, their inputs, profiler
-  traces). A `transfer_host` that is an SSH alias over the CX7 links (in the
-  head's `~/.ssh/config`, with `ProxyJump` through a neighbour for a node the
-  head is not cabled to) keeps large copies off a struggling LAN switch.
+  traces). Setting `transfer_host` to the node's name on a CX7 link cabled
+  to the head (the `dgxN-internal` names in `/etc/hosts`) keeps large copies
+  off a struggling LAN switch; the head's `known_hosts` must know that name.
+  A node the head is not cabled to keeps its LAN route.
 - **The profile.** In the profile you will run (`config/cluster.json`, its
   named copies, or `config/cluster-tp4.json`), set
   `distributed.master_addr` to the head's management IP, `host.home`,
