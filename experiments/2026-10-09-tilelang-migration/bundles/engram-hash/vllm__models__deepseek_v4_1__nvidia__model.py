@@ -229,7 +229,11 @@ class DeepseekV4DecoderLayer(nn.Module):
     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
         attn, device = self.attn, self.hc_attn_fn.device
-        wo = l2_prefetch.object_segments("wo", attn._wo_projection_weights)
+        weights = attn._wo_projection_weights
+        if hasattr(weights, "l2_segments"):  # the TileLang projection names its bytes
+            wo = weights.l2_segments()
+        else:
+            wo = l2_prefetch.object_segments("wo", weights)
         attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
         ffn = l2_prefetch.param_segments(
             "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
@@ -570,10 +574,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if self.engram_hash is None:
                 raise RuntimeError("Disk Engram requires initialized hash state")
             hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-            image_mask = image_sentinel_mask(input_ids)
             self.engram_hash.run_native(
                 input_ids,
-                image_mask if kernels.uses_tilelang() else ~image_mask,
+                ~image_sentinel_mask(input_ids),
                 query_start_loc,
                 lookback_token_ids,
                 hashes,
@@ -708,9 +711,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
             engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-            image_mask = image_sentinel_mask(input_ids)
-            # The TileLang gate takes DeepSeek's mask: True passes an image through.
-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
+            engram_mask = ~image_sentinel_mask(input_ids)
         elif self.engram_hash is not None and input_ids is not None:
             attn_metadata = (
                 get_forward_context().attn_metadata
@@ -735,7 +736,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 query_start_loc[1] = input_ids.shape[0]
                 lookback_token_ids = input_ids.new_full((1, 3), -1)
             image_mask = image_sentinel_mask(input_ids)
-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
+            engram_mask = ~image_mask
             engram_hashes = self.engram_hash(
                 input_ids,
                 positions,

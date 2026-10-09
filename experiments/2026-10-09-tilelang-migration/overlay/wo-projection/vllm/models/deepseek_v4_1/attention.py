@@ -105,20 +105,16 @@ class _AttentionHelpers:
         table = attn.rotary_emb.cos_sin_cache
         device = table.device
         attn._declare_attention(device)
-        roles = [("kv", 1, 512, 1)]
-        # TileLang RoPE needs no plan; the kv plan stays for the attention staging
-        # memory it carries and materializes.
-        if not kernels.uses_tilelang():
-            roles.append(("q", attn.n_local_heads, 512, 1))
-            if attn.indexer is not None:
-                roles.append(("index_query", attn.indexer.heads, 128, 1))
-            if attn.compressor is not None:
-                roles.extend(
-                    (
-                        ("index_key", 1, 128, attn.compress_ratio),
-                        ("latent", 1, 512, attn.compress_ratio),
-                    )
+        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
+        if attn.indexer is not None:
+            roles.append(("index_query", attn.indexer.heads, 128, 1))
+        if attn.compressor is not None:
+            roles.extend(
+                (
+                    ("index_key", 1, 128, attn.compress_ratio),
+                    ("latent", 1, 512, attn.compress_ratio),
                 )
+            )
         plans: dict[str, object] = {}
         requests = []
         for role, heads, dim, ratio in roles:
@@ -229,15 +225,15 @@ class _AttentionHelpers:
                 )
             )
         attn._helper_plans = plans
-        return (
-            B12xPreparationUnit(
-                name="V41AttentionHelpers",
-                key=(attn.prefix, attn.capacity),
-                requests=tuple(requests),
-                stage="weights",
-            ),
-            attn._wo_preparation_unit(workload),
+        helpers = B12xPreparationUnit(
+            name="V41AttentionHelpers",
+            key=(attn.prefix, attn.capacity),
+            requests=tuple(requests),
+            stage="weights",
         )
+        if kernels.uses_tilelang():  # the TileLang WO projection needs no plan
+            return (helpers,)
+        return (helpers, attn._wo_preparation_unit(workload))
 
 
 @triton.jit(do_not_specialize=["offset", "stride", "width"])
@@ -1150,17 +1146,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
 
         return prepare
 
-    def _rope(self, x, positions, role: str):
-        """``x`` rotated at ``positions``; in place under the TileLang kernels."""
-        table = self.rotary_emb.cos_sin_cache
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.rope import rope_
-
-            compressed = role in ("index_key", "latent")
-            rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
-            return x
-        return _rotated(x, positions, table, plan=self._helper_plan(role))
-
     def _helper_plan(self, role: str):
         try:
             return self._helper_plans[role]
@@ -1236,7 +1221,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             raise PreparationResourceUnavailableError(
                 "V4.1 attention metadata is not prepared"
             )
-        rotated = self._rope(kv, positions, "kv")
+        rotated = _rotated(
+            kv,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("kv"),
+        )
         mla.write_cache(
             rotated,
             self.swa_cache_layer.kv_cache,
@@ -1289,10 +1279,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         latent, slots = self.compressor(hidden_states, main, state)
         # Index K consumes the ordinary-normalized PRE-RoPE latent.
         key = indexer.k_norm(indexer.wk(latent))
-        key = self._rope(key, positions, "index_key")
+        key = _rotated(
+            key,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("index_key"),
+        )
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows])
-        latent = self._rope(latent, positions, "latent")
+        latent = _rotated(
+            latent,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("latent"),
+        )
         mla.write_cache(
             latent,
             self.kv_cache,
@@ -1346,7 +1346,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             qr, kv = self.q_norm(qr), self.kv_norm(kv)
         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
         l2_prefetch.issue(self._l2pf_wo, rows)
-        q = self._rope(q, positions, "q")
+        q = _rotated(
+            q,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("q"),
+        )
         output = torch.empty_like(q)
         metadata = cast(
             dict[str, DeepseekV41B12xMetadata] | None,
@@ -1390,7 +1395,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         rows = last - first
         h = self.indexer.heads
         iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
-        iq = self._rope(iq, positions[first:last], "index_query")
+        iq = _rotated(
+            iq,
+            positions[first:last],
+            self.rotary_emb.cos_sin_cache,
+            plan=self._helper_plan("index_query"),
+        )
         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
         self._quantize_index_query(
@@ -1812,6 +1822,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     f"V4.1 {name} shape mismatch: expected {shape}, "
                     f"got {tuple(tensor.shape)}"
                 )
+        if kernels.uses_tilelang():
+            from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
+
+            # The checkpoint tensors in place, no packing.
+            self._wo_projection_weights = TileLangWOProjection(
+                self.wo_a, self.wo_b, groups=groups
+            )
+            return
         self._wo_projection_weights = wo_projection.pack_weights(
             self.wo_a.weight.detach(),
             self.wo_a.weight_scale_inv.detach(),
@@ -1933,7 +1951,28 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         return self._wo_plans[key]
 
+    def _o_proj_tilelang(self, o, positions, sp_rows):
+        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place."""
+        rows, hidden = o.shape[0], self.hidden_size
+        if sp_rows is None:
+            local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
+        else:
+            if rows != sp_rows.num_tokens:
+                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+            # Leading rows of the zero-padded buffer the reduce-scatter reads.
+            padded = sp_rows.empty_padded((hidden,), torch.bfloat16, o.device)
+            local = padded[:rows]
+        self._wo_projection_weights(o, positions, self.rotary_emb.cos_sin_cache, local)
+        l2_prefetch.issue(self._l2pf_ffn, rows)
+        if sp_rows is not None:
+            return sp_rows.reduce_scatter(padded)
+        if get_tensor_model_parallel_world_size() > 1:
+            local = get_tp_group().all_reduce(local)
+        return local
+
     def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
+        if kernels.uses_tilelang():
+            return self._o_proj_tilelang(o, positions, sp_rows)
         from b12x.preparation import require_prepared
 
         rows = o.shape[0]

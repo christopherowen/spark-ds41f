@@ -1,23 +1,29 @@
-"""The ports of the TileLang migration: for each, its commit on the vLLM migration
-branch, the vLLM files it changes, its kernel bundle (the vLLM tests and bench scripts
-it runs), the environment its arm sets, and any package it mounts.
+"""The ports of the TileLang migration.
 
-An arm is the r6c TP4 recipe plus exactly one port, taken at the port's own commit, so
-a later port's edits to a shared file never reach an earlier port's arm. Ports are
-measured against the control, never against each other.
+The vLLM migration branch (~/projects/vllm-ds41-tilelang-migration, from r6c's tree
+BASE) holds module commits, then one switch commit per port:
+
+- module commits add kernels, refactors that compile to the same code, and imports,
+  and change nothing the model runs (the L2 prefetch family is chosen by environment);
+- a switch commit routes one part of the model to its TileLang kernel.
+
+Every arm mounts the modules; a port's arm adds its switch (or its environment) and
+nothing else, so the switch is the only variable. The control mounts the modules
+alone. Each switch applies to the modules on its own, without the others.
+
+For each port: its switch commit, the environment its arm sets, and its kernel bundle
+(the vLLM tests and bench scripts it runs on the modules).
 """
 
-# vLLM migration branch (~/projects/vllm-ds41-tilelang-migration, from r6c's 125c404e4).
 VLLM_BRANCH = "tilelang-migration"
+BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
+MODULES = "cb64a6cfd"  # the last module commit
 
 PORTS = {
-    # 1. The CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
+    # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
     "prefetch": {
-        "commit": "44c44e6e3",
-        "files": (
-            "models/glm5next/nvidia/l2_prefetch.py",
-            "models/glm5next/nvidia/l2_prefetch_tilelang.py",
-        ),
+        "switch": None,
+        "environment": {"VLLM_L2_PREFETCH_KERNELS": "tilelang"},
         "bundle": {
             "description": "L2 prefetch port: the TileLang family's GPU tests, then a "
                            "read-after-prefetch comparison with the CuTe family.",
@@ -25,15 +31,11 @@ PORTS = {
             "select": None,
             "scripts": ("bench_prefetch.py",),
         },
-        "environment": {"VLLM_L2_PREFETCH_KERNELS": "tilelang"},
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "commit": "1d3752533",
-        "files": (
-            "models/deepseek_v4_1/compressor.py",
-            "models/deepseek_v4_1/tilelang/linear.py",
-        ),
+        "switch": "c995d67a8",
+        "environment": {},
         "bundle": {
             "description": "B5 compressor projection: the split BF16 GEMM unit tests, then numerics, "
                            "batch invariance and warm/cold CUDA-graph timing against B12X bf16_gemv at "
@@ -42,16 +44,12 @@ PORTS = {
             "select": "split_linear or bf16_gemm",
             "scripts": ("bench_compressor_projection.py",),
         },
-        "environment": {},
     },
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "commit": "e45271941",
-        "files": (
-            "models/deepseek_v4_1/nvidia/dspark.py",
-            "models/deepseek_v4_1/tilelang/linear.py",
-        ),
+        "switch": "9ead710ea",
+        "environment": {},
         "bundle": {
             "description": "B6 DSpark context KV: the block-32 row-slice unit tests, numerics, batch "
                            "invariance and warm/cold CUDA-graph timing against B12X block_fp8_linear, "
@@ -60,17 +58,12 @@ PORTS = {
             "select": "block32_rows or mxfp8",
             "scripts": ("bench_context_kv.py", "sweep_context_kv.py"),
         },
-        "environment": {},
     },
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "commit": "00fd5e6aa",
-        "files": (
-            "models/deepseek_v4_1/tilelang/engram.py",
-            "models/deepseek_v4_1/common/engram.py",
-            "models/deepseek_v4_1/nvidia/model.py",
-        ),
+        "switch": "d6636c394",
+        "environment": {},
         "bundle": {
             "description": "B7 Engram gate: unit tests against FP64 and TileKernels, then numerics, "
                            "batch invariance and warm/cold CUDA-graph timing against B12X "
@@ -79,16 +72,12 @@ PORTS = {
             "select": "engram_gate",
             "scripts": ("bench_engram_gate.py",),
         },
-        "environment": {},
     },
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "commit": "4e4af513b",
-        "files": (
-            "models/deepseek_v4_1/tilelang/rope.py",
-            "models/deepseek_v4_1/attention.py",
-        ),
+        "switch": "11f3f48ff",
+        "environment": {},
         "bundle": {
             "description": "B2 RoPE: unit tests against TileKernels' apply_rotary and FP64, then "
                            "numerics, row independence and warm/cold CUDA-graph timing against B12X "
@@ -97,17 +86,12 @@ PORTS = {
             "select": "rope",
             "scripts": ("bench_rope.py",),
         },
-        "environment": {},
     },
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "commit": "004bf569c",
-        "files": (
-            "models/deepseek_v4_1/tilelang/engram_hash.py",
-            "models/deepseek_v4_1/common/engram.py",
-            "models/deepseek_v4_1/nvidia/model.py",
-        ),
+        "switch": "d8c7527da",
+        "environment": {},
         "bundle": {
             "description": "B9 Engram hash: unit tests against B12X's integer oracle, then exact "
                            "equality with B12X's hash path and eager and CUDA-graph timing per step, "
@@ -116,7 +100,20 @@ PORTS = {
             "select": "engram_hash",
             "scripts": ("bench_engram_hash.py",),
         },
+    },
+    # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
+    # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
+    "wo-projection": {
+        "switch": "d9a5bebc9",
         "environment": {},
+        "bundle": {
+            "description": "B1 WO projection: unit tests (grouped GEMM equals per-group GEMMs, FP64), "
+                           "then numerics, batch invariance and warm/cold CUDA-graph timing against "
+                           "B12X's fused wo_projection, then decode-tile sweeps for WO-A and WO-B.",
+            "tests": ("tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py",),
+            "select": None,
+            "scripts": ("bench_wo.py", "sweep_wo.py"),
+        },
     },
 }
 

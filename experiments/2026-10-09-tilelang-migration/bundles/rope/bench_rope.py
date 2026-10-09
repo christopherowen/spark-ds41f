@@ -1,6 +1,6 @@
 """Port B2: RoPE on the last 64 columns, B12X's rotary.rotate (out of place, copying the
 leading columns) against the TileLang kernel in tilelang/rope.py (in place), at the TP4
-roles: query (16 x 512), index query (64 x 128), KV (1 x 512), latent (1 x 512, ratio 4)
+roles: query (16 x 512), index query (32 x 128, replicated), KV (1 x 512), latent (1 x 512, ratio 4)
 and index key (1 x 128, ratio 4), with the model's FP32 table.
 
 1. Error against FP64, no worse than B12X's (max and RMS); leading columns unchanged.
@@ -25,7 +25,7 @@ from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
 from vllm.models.deepseek_v4_1.tilelang.rope import rope_  # noqa: E402
 
 ROPE, POSITIONS = 64, 1 << 20
-ROLES = {"q": (16, 512, 1), "index_query": (64, 128, 1), "kv": (1, 512, 1), "latent": (1, 512, 4),
+ROLES = {"q": (16, 512, 1), "index_query": (32, 128, 1), "kv": (1, 512, 1), "latent": (1, 512, 4),
          "index_key": (1, 128, 4)}
 failures = []
 

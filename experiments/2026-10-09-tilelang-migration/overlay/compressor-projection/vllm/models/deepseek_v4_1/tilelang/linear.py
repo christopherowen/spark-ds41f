@@ -130,6 +130,7 @@ def _block32_linear(
 ) -> None:
     layer = _LAYERS[key]
     n, k = layer.weight.shape
+    k *= layer.tilelang_groups  # a grouped weight reads every group's columns
     x = x.reshape(-1, k)
     rows = x.shape[0]
     xq, sf = _scratch(_activation_specs(rows, k), scratch)
@@ -183,24 +184,55 @@ def _bf16_linear_fake(x, out, key, scratch):
     return None
 
 
+def _prepare_block32(layer, groups: int = 1) -> None:
+    """Compile the GEMMs of ``layer.weight`` (E4M3 ``[N, K]``) and its 32x32 block
+    scales ``layer.weight_scale_inv``, and register the layer for the custom op.
+
+    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``N / groups`` rows,
+    each applied to its own K columns of ``groups * K``-wide activations.
+    """
+    n, k = layer.weight.shape
+    part = n // groups
+    # The 32x32 block scales become per-row words of four K32 exponents.
+    layer.tilelang_weight_sf = pack_scale_words(
+        layer.weight_scale_inv.view(torch.uint8), rows=n
+    )
+    layer.tilelang_groups = groups
+    layer.tilelang_decode = {
+        block_M: mxfp8_gemm_decode(
+            part,
+            k,
+            **fp8_decode_config(part, k, block_M, groups),
+            padded_rows=True,
+            groups=groups,
+        )
+        for block_M in DECODE_TILE_ROWS
+    }
+    layer.tilelang_prefill = mxfp8_gemm(
+        part, k, **fp8_prefill_config(part, k, groups), groups=groups
+    )
+    layer.tilelang_key = id(layer)
+    _LAYERS[layer.tilelang_key] = layer
+
+
+def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        (*x.shape[:-1], layer.weight.shape[0]),
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    scratch = (
+        None if torch.compiler.is_compiling() else current_preallocated_workspace()
+    )
+    _block32_linear(x, out, layer.tilelang_key, scratch)
+    return out
+
+
 class TileLangFP8LinearMethod(Block32FP8LinearMethod):
     """Checkpoint block-32 FP8 weights with MXFP8 activations."""
 
     def process_weights_after_loading(self, layer):
-        n, k = layer.weight.shape
-        # The 32x32 block scales become per-row words of four K32 exponents.
-        layer.tilelang_weight_sf = pack_scale_words(
-            layer.weight_scale_inv.view(torch.uint8), rows=n
-        )
-        layer.tilelang_decode = {
-            block_M: mxfp8_gemm_decode(
-                n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
-            )
-            for block_M in DECODE_TILE_ROWS
-        }
-        layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
-        layer.tilelang_key = id(layer)
-        _LAYERS[layer.tilelang_key] = layer
+        _prepare_block32(layer)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
         return _spec_bytes(_activation_specs(num_tokens, layer.weight.shape[1]))
@@ -208,16 +240,26 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
     def apply(self, layer, x, bias=None):
         if bias is not None:
             raise ValueError("V4.1 block32 projections require bias-free weights")
-        out = torch.empty(
-            (*x.shape[:-1], layer.weight.shape[0]),
-            dtype=torch.bfloat16,
-            device=x.device,
-        )
-        scratch = (
-            None if torch.compiler.is_compiling() else current_preallocated_workspace()
-        )
-        _block32_linear(x, out, layer.tilelang_key, scratch)
-        return out
+        return _apply_block32(layer, x)
+
+
+class TileLangBlock32Rows:
+    """Output rows ``start:`` of a loaded block-32 FP8 projection as their own GEMM.
+
+    The DSpark drafter projects the target's hidden states through only the KV
+    rows of each layer's fused Q-A/KV weight. Views of the weight and its scales
+    share the checkpoint storage; the owner must keep this object alive.
+    """
+
+    def __init__(self, layer: nn.Module, start: int):
+        if start % 32:
+            raise ValueError(f"rows from {start} do not start on a 32-row scale block")
+        self.weight = layer.weight[start:]
+        self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
+        _prepare_block32(self)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        return _apply_block32(self, x)
 
 
 class TileLangLinearMethod(UnquantizedLinearMethod):
@@ -306,6 +348,7 @@ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None
 
 
 __all__ = [
+    "TileLangBlock32Rows",
     "TileLangFP8LinearMethod",
     "TileLangLinearMethod",
     "TileLangSplitLinearMethod",

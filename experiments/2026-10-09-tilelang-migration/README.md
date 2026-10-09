@@ -7,9 +7,22 @@ preferably beat**, the kernel it replaces. B12X itself is archived upstream
 (its code continues in FlashInfer), which makes moving off it overdue.
 
 Base: r6c (`experiments/2026-10-08-lil-rebase`, image
-`vllm-ds41f-kkref:19f2c20ed4d6-r6c`, vLLM `19f2c20e` + series). Ports live
-on the vLLM branch `tilelang-migration` (from r6c's `125c404e4`), one commit
-per port, and are screened as file overlays on the r6c image.
+`vllm-ds41f-kkref:19f2c20ed4d6-r6c`, vLLM `19f2c20e` + series). The ports live
+on the vLLM branch `tilelang-migration` (from r6c's `125c404e4`) in two kinds of
+commit:
+
+- **Module commits** add kernels, refactors that compile to the same code, and
+  imports. They change nothing the model runs; the L2 prefetch family is chosen
+  by environment.
+- **One switch commit per port** routes one part of the model to its TileLang
+  kernel. Each switch applies to the modules on its own, without the others.
+
+Every arm mounts the modules over the r6c image. A port's arm adds its switch
+(or sets its environment) and nothing else, and the control mounts the modules
+alone, so the switch is the only variable. The first layout pinned each port
+to its own commit on a linear branch, which carried earlier ports' edits to
+shared files (`model.py`, `attention.py`) into later arms; it was replaced
+before any window ran (old branch `tilelang-migration-v1`).
 
 ## Gate for every port
 
@@ -106,15 +119,16 @@ completeness; not part of this migration unless the owner extends it.
 
 ## Status
 
-| Port | Branch commit | Kernel checks | Serving screen | State |
+| Port | Switch commit | Kernel checks | Serving screen | State |
 | --- | --- | --- | --- | --- |
-| C1 L2 prefetch | `44c44e6e3` | compiles for sm_121a: 22 registers, `UBLKPF.L2` per chunk; GPU tests written | pending (arm `prefetch.json`) | awaiting the first window |
+| C1 L2 prefetch | `c916fed96` (module; environment switch) | compiles for sm_121a: 22 registers, `UBLKPF.L2` per chunk; GPU tests written | pending (arm `prefetch.json`) | awaiting the first window |
 | C2 sparknet | sparknet `b61660f` | bit-identical, register fix (2026-10-05) | pending (arms `sparknet-cute.json`, `sparknet-tilelang.json`) | awaiting the first window |
-| B5 compressor projection | `1d3752533` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
-| B6 DSpark context KV | `e45271941` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
-| B7 Engram gate | `00fd5e6aa` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
-| B2 RoPE | `4e4af513b` | kernels compile for sm_121a; TileKernels' arithmetic plus the compressed-position floor and inverse direction, in place on the last 64 columns (B12X copies the whole head); unit test bit-equal to TileKernels' `apply_rotary`; bundle `rope` (all five roles) | pending (arm `rope.json`) | awaiting the first window |
-| B9 Engram hash | `004bf569c` | kernels compile for sm_121a; one launch hashes every layer and head straight into the step's rows (B12X: vLLM's metadata copy, then three Triton launches and a copy per layer, eager before each forward); unit test equal to B12X's integer oracle; bundle `engram-hash` (exact equality, eager and graph time per step) | pending (arm `engram-hash.json`) | awaiting the first window |
+| B5 compressor projection | `c995d67a8` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
+| B6 DSpark context KV | `9ead710ea` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
+| B7 Engram gate | `d6636c394` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
+| B2 RoPE | `11f3f48ff` | kernels compile for sm_121a; TileKernels' arithmetic plus the compressed-position floor and inverse direction, in place on the last 64 columns (B12X copies the whole head); unit test bit-equal to TileKernels' `apply_rotary`; bundle `rope` (all five roles) | pending (arm `rope.json`) | awaiting the first window |
+| B9 Engram hash | `d8c7527da` | kernels compile for sm_121a; one launch hashes every layer and head straight into the step's rows (B12X: vLLM's metadata copy, then three Triton launches and a copy per layer, eager before each forward); unit test equal to B12X's integer oracle; bundle `engram-hash` (exact equality, eager and graph time per step) | pending (arm `engram-hash.json`) | awaiting the first window |
+| B1 WO projection | `d9a5bebc9` | kernels compile for sm_121a; the MXFP8 GEMM gains `groups` (one launch for every WO-A group; with one group it compiles to the same code); inverse RoPE in place (B2's kernel), grouped WO-A and WO-B on the checkpoint tensors, as DeepSeek's reference rounds them; unit tests (grouped equals per-group bit for bit, FP64, batch invariance); bundle `wo-projection` (vs B12X's fused projection, plus decode-tile sweeps) | pending (arm `wo-projection.json`) | awaiting the first window |
 
 ### 65 to 96 rows
 
@@ -138,7 +152,7 @@ Window 1 runs on the queue runner, so the kernel results can change the arms
 before they boot:
 
 1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5, B6, B7;
-   then B2, B7 again on another node, and B9).
+   then B2, B7 again on another node, B9 and B1).
 2. Read the verdicts; commit any tile or split change to the vLLM branch, sync the
    overlays, push to main.
 3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
@@ -146,18 +160,17 @@ before they boot:
 
 ## Files
 
-- `ports.py`: each port's commit on the vLLM branch, its files, kernel bundle,
-  environment and mounts. Arms take a port at its own commit, so a later port's
-  edit to a shared file (`model.py`, `linear.py`) never reaches an earlier arm.
-- `sync_overlay.py`: copies each port's files at its commit into
-  `overlay/<port>/`, and regenerates `bundles/<port>/` (the files under flattened
-  path names, the tests, `kbench.py` and `candidate.json`) around its bench
-  scripts.
+- `ports.py`: the module tip, each port's switch commit, environment and kernel
+  bundle.
+- `sync_overlay.py`: builds `overlay/modules/` (the control's files) and
+  `overlay/<port>/` (the modules plus that port's switch alone) from commits, and
+  regenerates `bundles/<port>/` (the module files under flattened path names, the
+  tests, `kbench.py` and `candidate.json`) around its bench scripts.
+- `make_configs.py`: writes `control.json` and one arm per port, each mounting
+  its overlay over the r6c TP4 recipe.
 - `kbench.py`: the benches' shared CUDA-graph timing (warm, and cold after an
   L2 eviction) and error helpers.
 - `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).
-- `make_configs.py`: writes `control.json` and one arm per port from the r6c
-  TP4 recipe.
 - `profile_*.py`, `summarize_kernels.py`, `analyze_costs.py`, `tables_arms.py`:
   the lab runner's profile and table scripts (from
   `experiments/2026-09-29-determinism`).

@@ -245,6 +245,7 @@ class EngramLayout:
         )
         if compressed_size != config.engram_compressed_vocab_size:
             raise ValueError("Engram tokenizer compressed vocabulary mismatch")
+        self.token_map = token_map
         device = torch.device("cuda", torch.accelerator.current_device_index())
         self.caps = tuple(
             native.Caps(

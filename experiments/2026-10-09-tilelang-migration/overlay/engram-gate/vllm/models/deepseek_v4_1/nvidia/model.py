@@ -229,7 +229,11 @@ class DeepseekV4DecoderLayer(nn.Module):
     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
         attn, device = self.attn, self.hc_attn_fn.device
-        wo = l2_prefetch.object_segments("wo", attn._wo_projection_weights)
+        weights = attn._wo_projection_weights
+        if hasattr(weights, "l2_segments"):  # the TileLang projection names its bytes
+            wo = weights.l2_segments()
+        else:
+            wo = l2_prefetch.object_segments("wo", weights)
         attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
         ffn = l2_prefetch.param_segments(
             "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")

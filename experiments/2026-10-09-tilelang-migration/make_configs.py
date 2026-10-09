@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Write the window's arms from the r6c TP4 recipe.
+"""Write the window's arms from the r6c TP4 recipe (run sync_overlay.py first).
 
-- control.json: r6c TP4 as it serves, with a torch profiler directory;
-- <port>.json: control plus one port's overlay files and environment;
-- sparknet-cute.json / sparknet-tilelang.json: control with sparknet main mounted,
-  CuTe and TileLang kernel families.
+- control.json: r6c TP4 with the migration's modules mounted (they change nothing the
+  model runs) and a torch profiler directory;
+- <port>.json: the modules plus one port's switch (overlay/<port>) and environment;
+- sparknet-cute.json / sparknet-tilelang.json: the control with sparknet main
+  mounted, CuTe and TileLang kernel families.
 
-Every arm keeps the control's pinned DSpark cost curves, so the kernel is the only
+Every arm keeps the control's pinned DSpark cost curves, so the switch is the only
 variable.
 """
 import copy
@@ -22,8 +23,11 @@ BASE = "experiments/2026-10-08-lil-rebase/r6c-tp4.json"
 IMAGE_VLLM = "/opt/spark3/candidate/vllm/vllm"
 
 
-def mount(port, path):
-    return [f"{{home}}/projects/spark-ds41f/{REL}/overlay/{port}/vllm/{path}", f"{IMAGE_VLLM}/{path}", "ro"]
+def mounts(arm):
+    """Every file of overlay/<arm>/vllm, over the image's vLLM tree."""
+    root = HERE / "overlay" / arm / "vllm"
+    return [[f"{{home}}/projects/spark-ds41f/{REL}/overlay/{arm}/vllm/{path}", f"{IMAGE_VLLM}/{path}", "ro"]
+            for path in sorted(p.relative_to(root).as_posix() for p in root.rglob("*.py"))]
 
 
 def set_profiler(cluster, name):
@@ -40,22 +44,22 @@ def set_profiler(cluster, name):
 
 def main():
     base = json.loads((ROOT / BASE).read_text())
-    arms = {}
-    control = copy.deepcopy(base)
-    set_profiler(control, "migration-control")
-    arms["control"] = control
+
+    def arm(overlay, profile, environment=()):
+        """r6c TP4 plus one overlay (each overlay holds the modules)."""
+        cluster = copy.deepcopy(base)
+        cluster["container"]["mounts"] += mounts(overlay)
+        cluster["environment"].update(environment)
+        set_profiler(cluster, profile)
+        return cluster
+
+    arms = {"control": arm("modules", "migration-control")}
     for name, port in PORTS.items():
-        arm = copy.deepcopy(control)
-        arm["container"]["mounts"] += [mount(name, f) for f in port["files"]]
-        arm["environment"].update(port["environment"])
-        set_profiler(arm, f"migration-{name}")
-        arms[name] = arm
+        arms[name] = arm(name, f"migration-{name}", port["environment"])
     for family in ("cute", "tilelang"):
-        arm = copy.deepcopy(control)
-        arm["container"]["mounts"].append(list(SPARKNET_MAIN["mount"]))
-        arm["environment"]["SPARKNET_ROCE_KERNELS"] = family
-        set_profiler(arm, f"migration-sparknet-{family}")
-        arms[f"sparknet-{family}"] = arm
+        cluster = arm("modules", f"migration-sparknet-{family}", {"SPARKNET_ROCE_KERNELS": family})
+        cluster["container"]["mounts"].append(list(SPARKNET_MAIN["mount"]))
+        arms[f"sparknet-{family}"] = cluster
     for name, cluster in arms.items():
         (HERE / f"{name}.json").write_text(json.dumps(cluster, indent=2) + "\n")
         print(f"wrote {REL}/{name}.json")
