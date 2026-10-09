@@ -81,6 +81,24 @@ PORTS = {
         },
         "environment": {},
     },
+    # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
+    # arithmetic, in place on the last 64 columns, for all five attention roles.
+    "rope": {
+        "commit": "4e4af513b",
+        "files": (
+            "models/deepseek_v4_1/tilelang/rope.py",
+            "models/deepseek_v4_1/attention.py",
+        ),
+        "bundle": {
+            "description": "B2 RoPE: unit tests against TileKernels' apply_rotary and FP64, then "
+                           "numerics, row independence and warm/cold CUDA-graph timing against B12X "
+                           "rotary.rotate at the five TP4 attention roles.",
+            "tests": ("tests/kernels/test_deepseek_v41_tilelang_rope.py",),
+            "select": "rope",
+            "scripts": ("bench_rope.py",),
+        },
+        "environment": {},
+    },
 }
 
 # sparknet's one-shot collectives: the image pins 0.2.0, which predates the TileLang

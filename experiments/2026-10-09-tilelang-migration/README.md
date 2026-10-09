@@ -113,6 +113,7 @@ completeness; not part of this migration unless the owner extends it.
 | B5 compressor projection | `1d3752533` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
 | B6 DSpark context KV | `e45271941` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
 | B7 Engram gate | `00fd5e6aa` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
+| B2 RoPE | `4e4af513b` | kernels compile for sm_121a; TileKernels' arithmetic plus the compressed-position floor and inverse direction, in place on the last 64 columns (B12X copies the whole head); unit test bit-equal to TileKernels' `apply_rotary`; bundle `rope` (all five roles) | pending (arm `rope.json`) | awaiting the first window |
 
 ### 65 to 96 rows
 
@@ -123,12 +124,20 @@ prefill path: the BF16 GEMM unsplit (B5: 16 CTAs on 48 SMs) and 128 x 128 FP8 ti
 times split-K there. If TileLang loses, the fix is decode tiles up to 96 rows for
 every TileLang projection, which is its own port with its own arm.
 
+### Attention staging memory
+
+The B12X KV RoPE plan carries the attention's staging memory requirement and
+materializes it during preparation. B2 keeps that one plan declared, though
+unused, under TileLang. The staging memory needs its own reservation before the
+last attention helper (B3, B8) leaves B12X.
+
 ## Windows
 
 Window 1 runs on the queue runner, so the kernel results can change the arms
 before they boot:
 
-1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5, B6, B7).
+1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5, B6, B7;
+   then B2, and B7 again on another node).
 2. Read the verdicts; commit any tile or split change to the vLLM branch, sync the
    overlays, push to main.
 3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
