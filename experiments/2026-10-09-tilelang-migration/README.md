@@ -110,12 +110,38 @@ completeness; not part of this migration unless the owner extends it.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `44c44e6e3` | compiles for sm_121a: 22 registers, `UBLKPF.L2` per chunk; GPU tests written | pending (arm `prefetch.json`) | awaiting the first window |
 | C2 sparknet | sparknet `b61660f` | bit-identical, register fix (2026-10-05) | pending (arms `sparknet-cute.json`, `sparknet-tilelang.json`) | awaiting the first window |
+| B5 compressor projection | `1d3752533` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
+| B6 DSpark context KV | `e45271941` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
+
+### 65 to 96 rows
+
+TP4 serves up to 16 streams x 6 tokens, so decode steps reach 96 rows, but the
+TileLang decode tiles stop at 64 rows (`DECODE_ROWS`). Rows 65 to 96 take the
+prefill path: the BF16 GEMM unsplit (B5: 16 CTAs on 48 SMs) and 128 x 128 FP8 tiles
+(B6: 4 CTAs). The B5 and B6 bundles time those sizes against B12X, and B5 also
+times split-K there. If TileLang loses, the fix is decode tiles up to 96 rows for
+every TileLang projection, which is its own port with its own arm.
+
+## Windows
+
+Window 1 runs on the queue runner, so the kernel results can change the arms
+before they boot:
+
+1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5 twice, B6).
+2. Read the verdicts; commit any tile or split change to the vLLM branch, sync the
+   overlays, push to main.
+3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
+   prefill), then the lean screen of every arm, bracketed by the control.
 
 ## Files
 
-- `ports.py`: each port's vLLM files, environment and mounts.
+- `ports.py`: each port's vLLM files, bundle tests, environment and mounts.
 - `sync_overlay.py`: copies the ports' committed files from the vLLM branch
-  into `overlay/<port>/`.
+  into `overlay/<port>/`, and into `bundles/<port>/` with their tests and
+  `kbench.py`.
+- `kbench.py`: the benches' shared CUDA-graph timing (warm, and cold after an
+  L2 eviction) and error helpers.
+- `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).
 - `make_configs.py`: writes `control.json` and one arm per port from the r6c
   TP4 recipe.
 - `profile_*.py`, `summarize_kernels.py`, `analyze_costs.py`, `tables_arms.py`:
