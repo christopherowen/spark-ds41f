@@ -112,6 +112,7 @@ completeness; not part of this migration unless the owner extends it.
 | C2 sparknet | sparknet `b61660f` | bit-identical, register fix (2026-10-05) | pending (arms `sparknet-cute.json`, `sparknet-tilelang.json`) | awaiting the first window |
 | B5 compressor projection | `1d3752533` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
 | B6 DSpark context KV | `e45271941` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
+| B7 Engram gate | `00fd5e6aa` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
 
 ### 65 to 96 rows
 
@@ -127,7 +128,7 @@ every TileLang projection, which is its own port with its own arm.
 Window 1 runs on the queue runner, so the kernel results can change the arms
 before they boot:
 
-1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5 twice, B6).
+1. `w1-kernels.json`: the kernel bundles, one per node (prefetch, B5, B6, B7).
 2. Read the verdicts; commit any tile or split change to the vLLM branch, sync the
    overlays, push to main.
 3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
@@ -135,10 +136,13 @@ before they boot:
 
 ## Files
 
-- `ports.py`: each port's vLLM files, bundle tests, environment and mounts.
-- `sync_overlay.py`: copies the ports' committed files from the vLLM branch
-  into `overlay/<port>/`, and into `bundles/<port>/` with their tests and
-  `kbench.py`.
+- `ports.py`: each port's commit on the vLLM branch, its files, kernel bundle,
+  environment and mounts. Arms take a port at its own commit, so a later port's
+  edit to a shared file (`model.py`, `linear.py`) never reaches an earlier arm.
+- `sync_overlay.py`: copies each port's files at its commit into
+  `overlay/<port>/`, and regenerates `bundles/<port>/` (the files under flattened
+  path names, the tests, `kbench.py` and `candidate.json`) around its bench
+  scripts.
 - `kbench.py`: the benches' shared CUDA-graph timing (warm, and cold after an
   L2 eviction) and error helpers.
 - `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).

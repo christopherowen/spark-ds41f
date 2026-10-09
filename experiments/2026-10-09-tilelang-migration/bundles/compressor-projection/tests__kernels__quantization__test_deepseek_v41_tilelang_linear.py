@@ -221,34 +221,6 @@ def test_split_linear(parts, out_dtype, k=5120):
             assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
 
 
-# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
-def test_block32_rows(n=1792, k=5120, start=1280):
-    from torch import nn
-
-    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
-    from vllm.v1.worker.workspace import use_preallocated_workspace
-
-    weight, exps, weight_values = _block32_weight(n, k, 6)
-    layer = nn.Module()
-    layer.weight, layer.weight_scale_inv = weight, exps
-    fused, rows = TileLangBlock32Rows(layer, 0), TileLangBlock32Rows(layer, start)
-    x = torch.randn((max(ROWS), k), generator=_gen(7), device=DEVICE).bfloat16()
-    _, _, x_values = _mxfp8(x)
-    ref = x_values @ weight_values[start:].T
-    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
-    with use_preallocated_workspace(scratch):
-        for count in ROWS:
-            out = rows(x[:count])
-            torch.testing.assert_close(
-                out.float(), ref[:count], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
-            )
-            # Every tile accumulates K in the same order: the slice gives the
-            # fused projection's bits.
-            assert torch.equal(out, fused(x[:count])[:, start:]), f"rows={count}"
-    with pytest.raises(ValueError):
-        TileLangBlock32Rows(layer, start + 16)
-
-
 @pytest.mark.parametrize("hidden", [128, 512, 4096])
 def test_rmsnorm(hidden, rows=33, eps=1e-6):
     gen = _gen(4)
