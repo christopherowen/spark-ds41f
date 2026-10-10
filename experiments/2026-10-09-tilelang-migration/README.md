@@ -393,7 +393,9 @@ one `cvt.rn.satfinite.e2m1x2.f32` per two values (both divide by `div.rn.f32`).
 Module `52f622e6d` converts each lane's four quotients with two of those
 instructions, in B12X's operand order, through a `T.import_source` helper. SWA is
 unchanged: within 5% of B12X everywhere, 1.05x warm at one row and 1.06x at
-8192. Window 10 (`w10.json`) reruns the bundle (module tip `52f622e6d`).
+8192; module `75fc1b687` gives it B12X's paired conversion too (two
+`cvt.rn.satfinite.e4m3x2.f32` per lane instead of four scalar casts). Window 10
+(`w10.json`) reruns the bundle (module tip `75fc1b687`).
 
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two

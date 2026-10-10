@@ -36,9 +36,23 @@ _E4M3_MAX = 448.0
 _WORD = {"swa": (4, T.uint32, torch.uint32), "indexed": (2, T.uint16, torch.uint16)}
 _PER_THREAD = 4
 
-# Four FP32 values to four E2M1 codes, low nibble first: the operand order of
-# B12X's cvt_e2m1x8_f32 (the second source fills the low nibble).
-_E2M1_HEADER = r"""
+# Four FP32 values to four E4M3 bytes or E2M1 codes, first value lowest: B12X's
+# paired conversions in its operand order (the second source fills the low half).
+_CVT_HEADER = r"""
+__device__ __forceinline__ unsigned int dsv41_e4m3x4(float v0, float v1,
+                                                    float v2, float v3) {
+  unsigned int packed;
+  asm("{\n"
+      ".reg .b16 lo, hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(packed)
+      : "f"(v0), "f"(v1), "f"(v2), "f"(v3));
+  return packed;
+}
+
 __device__ __forceinline__ unsigned short dsv41_e2m1x4(float v0, float v1,
                                                       float v2, float v3) {
   unsigned short packed;
@@ -84,8 +98,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
         slots: T.Tensor((tokens,), slot_dtype),
     ):
         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
-            if cache_kind == "indexed":
-                T.import_source(_E2M1_HEADER)
+            T.import_source(_CVT_HEADER)
             tx = T.get_thread_binding()
             token = bx * tokens_per_block + tx // per_token
             item = tx % per_token
@@ -123,11 +136,14 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                             T.cast(T.shift_left(254 - exponent, 23), T.uint32),
                             T.float32,
                         )
-                        for i in T.unroll(per_thread):
-                            code = T.cast(T.fmul(values[i], inverse), T.float8_e4m3fn)
-                            word = word | T.shift_left(
-                                T.cast(T.reinterpret(code, T.uint8), word_dtype), 8 * i
-                            )
+                        word = T.call_extern(
+                            "uint32",
+                            "dsv41_e4m3x4",
+                            T.fmul(values[0], inverse),
+                            T.fmul(values[1], inverse),
+                            T.fmul(values[2], inverse),
+                            T.fmul(values[3], inverse),
+                        )
                         words[page, (base + col) // word_bytes] = word
                         if lane == 0:
                             cache[page, base + payload + group] = T.cast(
