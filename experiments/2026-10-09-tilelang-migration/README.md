@@ -369,6 +369,21 @@ modules ([2026-10-10-sp-overlap](../2026-10-10-sp-overlap/),
 [2026-10-10-sp-fused-sum](../2026-10-10-sp-fused-sum/)), which change nothing
 without their switches; the ports' switch hashes are remapped (module tip `bfaf9b54b`).
 
+Window 8 results (2026-10-10, 18:31 UTC, dgx1 and dgx2 agree): both writers'
+records equal B12X's at every size and repeat over 200 graph replays.
+- SWA is level with or faster than B12X everywhere: 0.88-1.03x warm at 1-96 rows,
+  1.01 / 0.98 / 1.06x at 512 / 2048 / 8192 rows, and cold 0.86-1.0x. Window 6's
+  writer was 1.7-4.8x slower at 512-8192 rows.
+- Indexed is slower: level at one row, then about 5.2 us from 2 to 96 rows (3.1x)
+  and 4.3-5.1x at 512-8192.
+
+One thread per 16-value group left 32 threads per token, each running sixteen
+loads, IEEE divisions and E2M1 codes in series. Module `2e05d829a` gives the
+indexed writer the SWA writer's shape: 128 threads per token, four values each,
+four lanes per group, one 16-bit word of packed E2M1 per lane, and the amax
+shuffled across the lanes. Window 9 (`w9.json`) reruns the bundle (module tip
+`2e05d829a`).
+
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
 recipe runs differ by up to 20% at some sizes); two or four queue pairs per
