@@ -37,6 +37,7 @@ TILELANG_EXPERIMENTS = (
     "experiments/2026-10-07-dspark-verification",
     "experiments/2026-10-08-ced-routing-mask",
     "experiments/2026-10-08-lil-rebase",
+    "experiments/2026-10-10-r6d-deterministic",
 )
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
