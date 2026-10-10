@@ -397,6 +397,22 @@ unchanged: within 5% of B12X everywhere, 1.05x warm at one row and 1.06x at
 `cvt.rn.satfinite.e4m3x2.f32` per lane instead of four scalar casts). Window 10
 (`w10.json`) reruns the bundle (module tip `75fc1b687`).
 
+Window 10 results (2026-10-10, 18:51 UTC, dgx1 and dgx2 agree): records equal
+B12X's at every size and repeat over 200 replays; both writers now beat B12X
+nearly everywhere (warm, dgx1 / dgx2):
+
+| Writer | 1 row | 2-96 rows | 512 | 2048 | 8192 |
+| --- | --- | --- | --- | --- | --- |
+| SWA | 1.08x | 0.88-0.96x | 0.95x | 0.99 / 0.91x | 0.81 / 1.00x |
+| indexed | 1.01 / 1.04x | 0.68-0.76x | 0.65 / 0.72x | 0.93 / 0.90x | 1.13 / 1.21x |
+
+Cold, both are level or faster (indexed 0.65-0.97x at 2-512 rows; the few cold
+readings above 1.0 are one 0.2 us tick of a 4.1 us measurement). What remains is
+a single row (+70 ns warm; a DSpark decode step writes 1 + spec rows per stream)
+and 8192 indexed rows warm (cold level), more than an 8096-token chunk writes
+(about 2024 compressed rows, where the writer is 0.9x). B3 is ready for the next
+candidate; window 6 found its serving effect level with identical records.
+
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
 recipe runs differ by up to 20% at some sizes); two or four queue pairs per
