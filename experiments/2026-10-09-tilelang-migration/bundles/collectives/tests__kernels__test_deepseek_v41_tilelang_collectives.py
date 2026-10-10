@@ -10,6 +10,8 @@ import pytest
 import torch
 
 from vllm.models.deepseek_v4_1.tilelang.collectives import (
+    RankOrderParts,
+    exchange_into,
     rank_order_sum,
     reduce_scatter_rank_order,
 )
@@ -57,16 +59,16 @@ class _Comm:
         fabric.barrier.wait()
 
 
-def _run(inputs):
+def _run(inputs, collective=None):
     world = len(inputs)
     fabric = _Fabric(world)
     out, errors = [None] * world, []
+    if collective is None:
+        collective = reduce_scatter_rank_order
 
     def rank_main(rank):
         try:
-            out[rank] = reduce_scatter_rank_order(
-                _Comm(fabric, rank), inputs[rank], rank, world
-            )
+            out[rank] = collective(_Comm(fabric, rank), inputs[rank], rank, world)
         except BaseException as error:  # surface failures from the threads
             errors.append(error)
             fabric.barrier.abort()
@@ -104,6 +106,39 @@ def test_rows_add_as_the_one_shot_all_reduce(world, local):
         assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))
 
 
+def _exchange_in_slices(bounds):
+    """The exchange of every row range ``bounds[i]:bounds[i + 1]`` of each rank's
+    block into one parts buffer, this rank's own block written in its slot."""
+
+    def collective(comm, x, rank, world):
+        chunks = x.view(world, -1, *x.shape[1:])
+        parts = torch.full_like(chunks, float("nan"))
+        parts[rank] = chunks[rank]
+        for lo, hi in zip(bounds, bounds[1:]):
+            exchange_into(comm, chunks[:, lo:hi], parts[:, lo:hi], rank, world)
+        return RankOrderParts(parts)
+
+    return collective
+
+
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("bounds", [(0, 7), (0, 3, 7), (0, 1, 2, 7)])
+def test_sliced_exchange_into_parts_sums_alike(world, bounds):
+    torch.manual_seed(world * 100 + len(bounds))
+    local, width = bounds[-1], 24
+    inputs = [
+        torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
+    ]
+    whole = _run(inputs)
+    sliced = _run(inputs, _exchange_in_slices(bounds))
+    for rank in range(world):
+        rows = slice(rank * local, (rank + 1) * local)
+        assert sliced[rank].world == world and sliced[rank].shape == (local, width)
+        for r in range(world):
+            assert torch.equal(sliced[rank].packed[r], inputs[r][rows])
+        assert torch.equal(sliced[rank].sum(), whole[rank])
+
+
 def test_row_bits_do_not_depend_on_owner_or_batch():
     # One row's partials at every position of batches of two sizes: the reduced
     # row has the same bits wherever it lands and whichever rank owns it.
@@ -122,6 +157,15 @@ def test_row_bits_do_not_depend_on_owner_or_batch():
             owner, offset = divmod(position, local)
             results.add(_run(inputs)[owner][offset].view(torch.int16).numpy().tobytes())
     assert len(results) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_torch_sum_leaves_its_inputs(dtype):
+    parts = [torch.randn(3, 8).to(dtype) for _ in range(4)]
+    before = [p.clone() for p in parts]
+    first = rank_order_sum(parts)
+    assert all(torch.equal(p, b) for p, b in zip(parts, before))
+    assert torch.equal(rank_order_sum(parts), first)
 
 
 def test_one_rounding_differs_from_rounding_each_add():

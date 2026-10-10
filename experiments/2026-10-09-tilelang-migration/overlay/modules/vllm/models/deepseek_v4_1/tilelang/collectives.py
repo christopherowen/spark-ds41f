@@ -18,6 +18,8 @@ neighbour, so the four links carry equal bytes. Fewer ranks exchange directly.
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
 # annotations eagerly, and the symbolic shape must resolve.
+from dataclasses import dataclass
+
 import tilelang
 import tilelang.language as T
 import torch
@@ -131,22 +133,21 @@ def rank_order_sum(
                 *(p.view(-1, _VEC) for p in parts), out.view(-1, _VEC)
             )
         return out
-    total = parts[0].float()
+    total = parts[0].to(torch.float32, copy=True)  # never add into an input
     for part in parts[1:]:
         total += part.float()
     return out.copy_(total)
 
 
-def exchange_rank_order(
-    comm, input_tensor: torch.Tensor, rank: int, world: int
-) -> list[torch.Tensor]:
-    """Every rank's chunk ``rank`` of ``input_tensor`` (contiguous, ``world * L``
-    rows), unreduced and in rank order; this rank's own is a view of the input.
+def exchange_into(
+    comm, chunks: torch.Tensor, parts: torch.Tensor, rank: int, world: int
+) -> None:
+    """Send ``chunks[r]`` to every rank ``r`` and receive its chunk for this rank
+    into ``parts[r]``; ``chunks[rank]`` and ``parts[rank]`` are not touched.
 
-    ``comm`` is the group's PyNCCL communicator (``send``, ``recv``,
-    ``group_start``, ``group_end``)."""
-    chunks = input_tensor.view(world, -1, *input_tensor.shape[1:])
-    parts = torch.empty_like(chunks)
+    ``chunks`` and ``parts`` are ``(world, L, ...)``, each ``[r]`` contiguous (a
+    row range of a larger buffer will do). ``comm`` is the group's PyNCCL
+    communicator (``send``, ``recv``, ``group_start``, ``group_end``)."""
     if world == 4:
         nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
         half = -(-chunks.shape[1] // 2)
@@ -177,7 +178,38 @@ def exchange_rank_order(
                 _send(comm, chunks[peer], peer)
                 _recv(comm, parts[peer], peer)
         comm.group_end()
+
+
+def exchange_rank_order(
+    comm, input_tensor: torch.Tensor, rank: int, world: int
+) -> list[torch.Tensor]:
+    """Every rank's chunk ``rank`` of ``input_tensor`` (contiguous, ``world * L``
+    rows), unreduced and in rank order; this rank's own is a view of the input."""
+    chunks = input_tensor.view(world, -1, *input_tensor.shape[1:])
+    parts = torch.empty_like(chunks)
+    exchange_into(comm, chunks, parts, rank, world)
     return [chunks[r] if r == rank else parts[r] for r in range(world)]
+
+
+@dataclass(frozen=True)
+class RankOrderParts:
+    """This rank's rows of a sum over ranks, not yet added: ``packed[r]`` is rank
+    ``r``'s partial, ``(world, L, ...)`` contiguous. A consumer that reads every
+    part can add them itself (TileLang mHC's ``post_pre``); ``sum()`` gives the
+    rank-order reduce-scatter's result, the same bits."""
+
+    packed: torch.Tensor
+
+    @property
+    def world(self) -> int:
+        return int(self.packed.shape[0])
+
+    @property
+    def shape(self) -> torch.Size:
+        return self.packed.shape[1:]
+
+    def sum(self, out: torch.Tensor | None = None) -> torch.Tensor:
+        return rank_order_sum(list(self.packed.unbind(0)), out)
 
 
 def reduce_scatter_rank_order(
@@ -200,6 +232,8 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
 
 
 __all__ = [
+    "RankOrderParts",
+    "exchange_into",
     "exchange_rank_order",
     "rank_order_sum",
     "rank_order_sum_kernel",

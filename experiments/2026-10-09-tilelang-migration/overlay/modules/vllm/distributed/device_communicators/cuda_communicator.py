@@ -682,18 +682,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
-            # DS4.1's TileLang family: the one-shot all-reduce's arithmetic, so a
-            # row reduces to the same bits whether its step was reduce-scattered
-            # (prefill sequence parallelism) or all-reduced.
-            from vllm.models.deepseek_v4_1.tilelang.collectives import (
-                reduce_scatter_rank_order,
-            )
-
-            output = reduce_scatter_rank_order(
-                pynccl_comm, input_tensor, self.rank_in_group, world_size
-            )
-        elif not self._roce_policy and should_nccl_symm_mem_ag_rs():
+        if not self._roce_policy and should_nccl_symm_mem_ag_rs():
             output = self._reduce_scatter_symm_mem(input_tensor)
         else:
             output = torch.empty(

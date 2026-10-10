@@ -341,6 +341,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             # SP: attention gathers every row and reduce-scatters its output.
             with sp_prefill.activate(sp_rows):
                 x = self.attn(positions, x, None, global_kv_ready=global_kv_ready)
+            if sp_rows.unreduced:
+                x = sp_prefill.unreduced_parts(x)
         residual, post_mix, res_mix, x, ffn_pre = self.mhc.post_pre(
             x,
             residual,
@@ -356,9 +358,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             x = self.ffn(x, input_ids)
         else:
             # SP: route every row; the TP partial sum is reduce-scattered.
-            x = self.ffn(
-                sp_rows.gather(x), input_ids, reduce_scatter_rows=sp_rows.padded_rows
-            )
+            with sp_prefill.activate(sp_rows):
+                x = self.ffn(
+                    sp_rows.gather(x),
+                    input_ids,
+                    reduce_scatter_rows=sp_rows.padded_rows,
+                )
+            if sp_rows.unreduced:
+                x = sp_prefill.unreduced_parts(x)
         return x, residual, post_mix, res_mix, ffn_pre
 
 
@@ -465,6 +472,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+        # SP results stay unreduced for mHC to add (see sp_prefill).
+        self.prefill_sp_unreduced = (
+            bool(self.prefill_sp_min_rows) and sp_prefill.unreduced_enabled()
+        )
+        if self.prefill_sp_unreduced:
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                object.__setattr__(
+                    layer.ffn.experts,
+                    "_sp_project_reduce_scatter_hook",
+                    sp_prefill.project_reduce_scatter_current,
+                )
 
         # Hashing reads the runner's accepted-only lookback, never KV slot state.
         self.engram_hash: NgramHashState | None = None
@@ -687,6 +705,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 self.prefill_sp_min_rows,
                 get_tensor_model_parallel_world_size(),
                 get_tensor_model_parallel_rank(),
+                unreduced=self.prefill_sp_unreduced,
             )
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
