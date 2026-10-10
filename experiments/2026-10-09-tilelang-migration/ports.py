@@ -232,12 +232,20 @@ PORTS = {
             "scripts": ("bench_cache_writer.py",),
         },
     },
+    # 14. NCCL point-to-point tuning for C3's exchange (send/recv only; NCCL's
+    # collectives keep their settings): four channels per network peer and 512 KiB
+    # chunks instead of two and 128 KiB.
+    "p2p-channels": {
+        "switch": None,
+        "environment": {"NCCL_NCHANNELS_PER_NET_PEER": "4", "NCCL_P2P_NET_CHUNKSIZE": "524288"},
+    },
 }
 
 # Arms of several ports together (their switches touch different files): whether the
 # determinism fixes together make the outputs independent of the company they keep.
 COMBOS = {
     "deterministic": ("collectives", "compressor-projection", "chunk-align"),
+    "collectives-p2p": ("collectives", "p2p-channels"),
 }
 
 # Kernel bundles that are not ports (no switch, no arm): they measure the modules.
