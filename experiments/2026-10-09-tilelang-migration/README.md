@@ -119,26 +119,41 @@ completeness; not part of this migration unless the owner extends it.
 
 ## Status
 
-| Port | Switch commit | Kernel checks | Serving screen | State |
+The owner's bar since window 1 (2026-10-10): faster than the replaced kernel
+everywhere, at every row count, warm and cold.
+
+| Port | Switch commit | Kernels (window 1, 2026-10-09) | Serving screen (window 1) | Next |
 | --- | --- | --- | --- | --- |
-| C1 L2 prefetch | `c916fed96` (module; environment switch) | compiles for sm_121a: 22 registers, `UBLKPF.L2` per chunk; GPU tests written | pending (arm `prefetch.json`) | awaiting the first window |
-| C2 sparknet | sparknet `b61660f` | bit-identical, register fix (2026-10-05) | pending (arms `sparknet-cute.json`, `sparknet-tilelang.json`) | awaiting the first window |
-| B5 compressor projection | `350ee6e88` | kernels compile for sm_121a; unit test `test_split_linear`; bundle `compressor-projection` (error vs FP64, batch invariance, warm/cold timing vs B12X, split-K at 72-96 rows) | pending (arm `compressor-projection.json`) | awaiting the first window |
-| B6 DSpark context KV | `feb625636` | kernels compile for sm_121a; unit test `test_block32_rows` (the slice equals the fused projection's bits); bundle `context-kv` (same checks, plus a decode-tile sweep at 512 x 5120) | after its tiles are tuned | awaiting the first window |
-| B7 Engram gate | `5c41eed08` | kernels compile for sm_121a; DeepSeek's arithmetic in one 256-thread block per token and stream, every load (the value too) before the reduction; unit test against FP64 and TileKernels' `engram_gate_fwd`; bundle `engram-gate` (B12X, ours at four block shapes, TileKernels' one-warp kernel) | pending (arm `engram-gate.json`) | awaiting the first window |
-| B2 RoPE | `df5bae349` | kernels compile for sm_121a; TileKernels' arithmetic plus the compressed-position floor and inverse direction, in place on the last 64 columns (B12X copies the whole head); unit test bit-equal to TileKernels' `apply_rotary`; bundle `rope` (all five roles) | pending (arm `rope.json`) | awaiting the first window |
-| B9 Engram hash | `16a78a612` | kernels compile for sm_121a; one launch hashes every layer and head straight into the step's rows (B12X: vLLM's metadata copy, then three Triton launches and a copy per layer, eager before each forward); unit test equal to B12X's integer oracle; bundle `engram-hash` (exact equality, eager and graph time per step) | pending (arm `engram-hash.json`) | awaiting the first window |
-| B1 WO projection | `4098dc1a6` | kernels compile for sm_121a; the MXFP8 GEMM gains `groups` (one launch for every WO-A group; with one group it compiles to the same code); inverse RoPE in place (B2's kernel), grouped WO-A and WO-B on the checkpoint tensors, as DeepSeek's reference rounds them; unit tests (grouped equals per-group bit for bit, FP64, batch invariance); bundle `wo-projection` (vs B12X's fused projection, plus decode-tile sweeps) | pending (arm `wo-projection.json`) | awaiting the first window |
-| B8 index head weights | `e8854a2a3` | no kernel: DeepSeek's (heads x head_dim)^-0.5 = 1/64 scale folded into the projection's BF16 weight at load (checked exact; a power of two commutes with the FP32 accumulation), so B12X's scale pass and its plan go; unit test bit-equal; bundle `index-weights` (bits and time against projection + B12X pass) | pending (arm `index-weights.json`) | awaiting the first window |
+| C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass**: a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control | ready |
+| C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe | ready |
+| B5 compressor projection | `03ce20c16` | fail: faster than B12X at 4-64 rows and prefill, 1.7x slower at 72-96 (prefill path), FP32 error 20x B12X's | c8 -4.4% with changed acceptance | window 2: one fused launch for both parts, split-K to 128 rows, shard sweep; error gated against DeepSeek's FP32 reference |
+| B6 DSpark context KV | `43e30271d` | fail: numerics equal to B12X, faster at 1-32 rows, slower at 48-64 (1.3x), 72-96 (3.1x) and 512 (1.7x) | not screened | window 2: split-K MXFP8 to 128 rows, split prefill tiles, sweep |
+| B7 Engram gate | `80bb28564` | **pass**: 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | arm |
+| B2 RoPE | `bf8c1c72a` | unit tests pass (bit-equal to TileKernels); bench crashed (device without index) | not screened | window 2 |
+| B9 Engram hash | `ee4871959` | **pass**: exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | arm |
+| B1 WO projection | `60e79424a` | unit tests pass; bench crashed (no workspace); tile sweep ran (WO-A small wins) | not screened | window 2 |
+| B8 index head weights | `b4abab04f` | not run (window 1's third job stopped on a LAN drop) | not screened | window 2 |
 
-### 65 to 96 rows
+### Window 1 (2026-10-09, 22:02-22:32 UTC)
 
-TP4 serves up to 16 streams x 6 tokens, so decode steps reach 96 rows, but the
-TileLang decode tiles stop at 64 rows (`DECODE_ROWS`). Rows 65 to 96 take the
-prefill path: the BF16 GEMM unsplit (B5: 16 CTAs on 48 SMs) and 128 x 128 FP8 tiles
-(B6: 4 CTAs). The B5 and B6 bundles time those sizes against B12X, and B5 also
-times split-K there. If TileLang loses, the fix is decode tiles up to 96 rows for
-every TileLang projection, which is its own port with its own arm.
+The arms spec ran before the kernel spec (the queue sorts by name). Arms booted in
+80-97 s each. The third kernel job stopped when the cooling check could not read
+dgx3 during a LAN-switch drop; the window closed itself and production was back at
+22:32:44.
+
+### Narrow projections
+
+512 columns are 8 tiles of 64 on 48 SMs, so B5 and B6 left most SMs idle at decode,
+and rows 65-96 fell to prefill tiles (4-16 CTAs). The split-K module (`35b5b1e8f`)
+splits K for decode rows up to 128 and adds the shards in order; the prefill GEMM
+accumulates the same shards, so a row's bits stay batch-invariant. B5 projects both
+parts in one launch. Shard counts change bits, so window 2's sweeps choose one per
+shape (`SPLIT_FP8`, `SPLIT_BF16`).
+
+DeepSeek's reference computes the compressor's wkv/wgate as FP32 `Linear` layers on
+`x.float()`: an FP32 GEMM of BF16-exact values (the checkpoint stores them BF16).
+B12X's GEMV reduces in a tree and is more precise than the reference; B5's gate is
+the reference's error.
 
 ### Attention staging memory
 
@@ -149,7 +164,7 @@ last attention helper (B3, B8) leaves B12X.
 
 ## Windows
 
-Window 1 runs on the queue runner, so the kernel results can change the arms
+Window 1 ran on the queue runner, so the kernel results could change the arms
 before they boot:
 
 1. `w1-kernels.json`: the kernel bundles, one per node, in three jobs
@@ -159,6 +174,11 @@ before they boot:
    overlays, push to main.
 3. `w1-arms.json`: sync the node checkouts, profile the control (decode, c8,
    prefill), then the lean screen of every arm, bracketed by the control.
+
+Window 2 (`w2-kernels.json`) is kernels only: B5, B6, B1 and B2, then B8 with B6
+and B5 again on other nodes. It sweeps shard counts and tiles for the narrow
+projections; their chosen configurations go into `SPLIT_FP8` and `SPLIT_BF16`
+before the arms run again.
 
 ## Files
 
