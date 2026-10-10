@@ -1,0 +1,79 @@
+# r6c's series (experiments/2026-10-08-lil-rebase) and the TileLang migration's
+# vLLM branch tilelang-migration (experiments/2026-10-09-tilelang-migration):
+# 0048-0071 are its module commits (kernels, refactors that compile to the same
+# code, imports; they change nothing the model runs), 0072-0079 the switches of
+# the ports that passed: B5 compressor projection, B7 Engram gate, B2 RoPE, B9
+# Engram hash, B8 index-weight scale, D1 decode rows, C3 rank-order collectives
+# and aligned prefill chunks. Together C3, B5 and the aligned chunks make the
+# temperature-0 outputs independent of the batch (window 5).
+../../2026-10-08-lil-rebase/vllm/0001-engram-projection-tp-padding.patch
+../../2026-10-08-lil-rebase/vllm/0002-engram-async-disk-rows.patch
+../../2026-10-08-lil-rebase/vllm/0004-mm-block-hash-window.patch
+../../2026-10-08-lil-rebase/vllm/0005-dspark-pinned-cost-curves.patch
+../../2026-10-08-lil-rebase/vllm/0007-dspark-v41-gathered-markov-bias.patch
+../../2026-10-08-lil-rebase/vllm/0010-dspark-dead-verification-rows.patch
+../../2026-10-08-lil-rebase/vllm/0012-dspark-vocab-parallel-greedy.patch
+../../2026-10-08-lil-rebase/vllm/0013-dspark-main-proj-column-parallel.patch
+../../2026-10-08-lil-rebase/vllm/0014-deepseek-v41-prefill-sp-state.patch
+../../2026-10-08-lil-rebase/vllm/0015-deepseek-v41-prefill-sp-dataflow.patch
+../../2026-10-08-lil-rebase/vllm/0016-deepseek-v41-prefill-sp-ced-encoder.patch
+../../2026-10-08-lil-rebase/vllm/0017-deepseek-v41-prefill-sp-local-attention-front.patch
+../../2026-10-08-lil-rebase/vllm/0018-deepseek-v41-prefill-sp-transport-threshold.patch
+../../2026-10-08-lil-rebase/vllm/0019-custom-op-fill-defaults-one-read.patch
+../../2026-10-08-lil-rebase/vllm/0020-spec-decode-dead-row-kernel-warmup.patch
+../../2026-10-08-lil-rebase/vllm/0021-worker-display-carveout-weights.patch
+../../2026-10-08-lil-rebase/vllm/0024-deepseek-v41-compressor-ring-decode.patch
+../../2026-10-08-lil-rebase/vllm/0025-deepseek-v41-indexer-sp-split.patch
+../../2026-10-08-lil-rebase/vllm/0026-worker-display-carveout-integrity.patch
+../../2026-10-08-lil-rebase/vllm/0027-explicit-collective-policy.patch
+../../2026-10-08-lil-rebase/vllm/0028-deepseek-v41-packed-bf16-lm-head.patch
+../../2026-10-08-lil-rebase/vllm/0030-worker-display-carveout-streamed-weights.patch
+../../2026-10-08-lil-rebase/vllm/0029-deepseek-v41-tilelang-kernels.patch
+../../2026-10-08-lil-rebase/vllm/0032-deepseek-v41-tilekernels-router.patch
+../../2026-10-08-lil-rebase/vllm/0033-tilelang-splitk-row-tiles.patch
+../../2026-10-08-lil-rebase/vllm/0034-tilelang-fused-gate-router.patch
+../../2026-10-08-lil-rebase/vllm/0035-tilelang-routing-skips-padding.patch
+../../2026-10-08-lil-rebase/vllm/0036-tilelang-vocab-heads.patch
+../../2026-10-08-lil-rebase/vllm/0037-tilelang-tilekernels-mhc.patch
+../../2026-10-08-lil-rebase/vllm/0038-tilelang-sparknet-collectives.patch
+../../2026-10-08-lil-rebase/vllm/0039-dummy-context-disjoint-blocks.patch
+../../2026-10-08-lil-rebase/vllm/0040-tilelang-mhc-register-fold.patch
+../../2026-10-08-lil-rebase/vllm/0041-dummy-blocks-per-group.patch
+../../2026-10-08-lil-rebase/vllm/0042-dspark-drafter-padding-rows.patch
+../../2026-10-08-lil-rebase/vllm/0043-tilelang-decode-tiles.patch
+../../2026-10-08-lil-rebase/vllm/0044-tilelang-prefetch-scale-words.patch
+../../2026-10-05-ced-decoder-routing-mask/vllm/0045-tilelang-ced-decoder-routing-mask.patch
+../../2026-10-08-lil-rebase/vllm/0046-tilelang-router-test-forward-context.patch
+../../2026-10-08-lil-rebase/vllm/0047-deepseek-v41-head-dtype-env.patch
+0048-tilelang-l2-prefetch-family.patch
+0049-tilelang-split-bf16-linear.patch
+0050-tilelang-block32-row-gemm.patch
+0051-tilelang-engram-gate-kernel.patch
+0052-tilelang-rope-kernel.patch
+0053-tilelang-engram-hash-kernel.patch
+0054-tilelang-wo-projection-kernels.patch
+0055-tilelang-scaled-linear.patch
+0056-tilelang-splitk-narrow-projections.patch
+0057-tilelang-splitk-one-launch.patch
+0058-tilelang-rope-one-head-blocks.patch
+0059-tilelang-wide-decode-rows.patch
+0060-tilelang-rank-order-reduce-scatter.patch
+0061-tilelang-split-bf16-decode-tiles.patch
+0062-tilelang-context-kv-tiles.patch
+0063-scheduler-aligned-prefill-chunks.patch
+0064-tilelang-engram-hash-int32-history.patch
+0065-tilelang-wo-decode-tiles.patch
+0066-tilelang-compressor-decode-tiles.patch
+0067-tilelang-kv-cache-writers.patch
+0068-deepseek-v41-cache-write-helper.patch
+0069-tilelang-rank-order-exchange.patch
+0070-tilelang-kv-cache-writers-coalesced.patch
+0071-scheduler-aligned-chunks-fit.patch
+0072-tilelang-compressor-projection.patch
+0073-tilelang-engram-gate.patch
+0074-tilelang-rope.patch
+0075-tilelang-engram-hash.patch
+0076-tilelang-index-weights-scale.patch
+0077-tilelang-decode-rows.patch
+0078-tilelang-rank-order-collectives.patch
+0079-tilelang-aligned-prefill-chunks.patch

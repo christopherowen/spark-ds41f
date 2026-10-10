@@ -353,6 +353,11 @@ mixed-traffic latency for the control, `oneshot-dispatch`, B5, C3, chunk
 alignment and `deterministic`, then the arms window 4 did not reach (B9, B2,
 B8), bracketed by the control.
 
+**r6d candidate** ([2026-10-10-r6d-deterministic](../2026-10-10-r6d-deterministic/)):
+the owner chose to benchmark the passing ports now (C3, B5, aligned chunks, B2,
+B7, B8, B9, D1 on r6c), then overlap the reduce-scatter with compute, then fuse
+its sum.
+
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
 recipe runs differ by up to 20% at some sizes); two or four queue pairs per

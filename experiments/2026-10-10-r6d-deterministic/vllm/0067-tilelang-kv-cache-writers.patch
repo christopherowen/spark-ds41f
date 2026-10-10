@@ -1,0 +1,267 @@
+From 6549f267f1749b7fb2d892244fee6fdb41b8dbe8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:21:53 +0200
+Subject: [PATCH] TileLang V4.1 KV-cache record writers
+
+The SWA (528-byte E4M3 plus UE8M0) and indexed (288-byte E2M1 plus E4M3)
+records of DeepSeek-V4.1's paged caches, one thread per quantization group,
+with B12X write_cache's arithmetic step for step: the power-of-two scale
+bump and its exact reciprocal, the IEEE amax / 6 and division by the decoded
+E4M3 scale, nearest-even E2M1. Tested byte for byte against a torch replica
+over flat, padded and record-shaped pages. Nothing calls it yet.
+---
+ ...test_deepseek_v41_tilelang_cache_writer.py | 100 +++++++++++++
+ .../deepseek_v4_1/tilelang/cache_writer.py    | 134 ++++++++++++++++++
+ 2 files changed, 234 insertions(+)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py b/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
+new file mode 100644
+index 000000000..0e1bae963
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_cache_writer.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang V4.1 cache records against a torch replica of B12X's arithmetic."""
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("needs a CUDA device", allow_module_level=True)
++
++from vllm.models.deepseek_v4_1.tilelang.cache_writer import RECORD_BYTES, write_cache
++
++DEVICE = torch.device("cuda")
++BOUNDARIES = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
++
++
++def _records(kv: torch.Tensor, kind: str) -> torch.Tensor:
++    """B12X's V4.1 records, one row per token, computed in torch."""
++    group = 32 if kind == "swa" else 16
++    x = kv.float().cpu().reshape(kv.shape[0], 512 // group, group)
++    amax = x.abs().amax(dim=-1)
++    if kind == "swa":
++        scale = amax.clamp_min(1e-4) * torch.tensor(1.0 / 448.0, dtype=torch.float32)
++        bits = scale.view(torch.int32)
++        bumped = torch.where(
++            (bits & 0x7FFFFF) != 0, (bits + 0x800000) & 0x7F800000, bits
++        )
++        exponent = (bumped >> 23) & 0xFF
++        inverse = ((254 - exponent) << 23).view(torch.float32)
++        payload = (x * inverse[..., None]).to(torch.float8_e4m3fn).view(torch.uint8)
++        return torch.cat((payload.reshape(-1, 512), exponent.to(torch.uint8)), dim=-1)
++    scale = amax.clamp_min(6 * 2**-9) / 6.0
++    code = scale.clamp(max=448.0).to(torch.float8_e4m3fn)
++    q = x / code.float()[..., None]
++    magnitude = q.abs()
++    codes = torch.bucketize(magnitude, BOUNDARIES)
++    midpoint = BOUNDARIES[codes.clamp(max=6)]
++    codes += (codes < 7) & (magnitude == midpoint) & ((codes & 1) != 0)
++    codes = (codes.to(torch.uint8) | (torch.signbit(q).to(torch.uint8) << 3)).reshape(
++        -1, 512
++    )
++    payload = codes[:, 0::2] | (codes[:, 1::2] << 4)
++    return torch.cat((payload, code.view(torch.uint8)), dim=-1)
++
++
++def _kv(tokens: int, seed: int) -> torch.Tensor:
++    gen = torch.Generator().manual_seed(seed)
++    kv = (
++        torch.randn(tokens, 512, generator=gen) * torch.logspace(-3, 2, tokens)[:, None]
++    )
++    kv[0, :64] = 0.0  # a zero group: the scale floors
++    kv[0, 64:128] = -0.0
++    kv[1, :32] = 448.0 * 2.0**-3  # amax / 448 is a power of two
++    kv[1, 32:48] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2) * 0.5
++    kv[2, :] *= 1e4  # E4M3 scales saturate in the indexed records
++    return kv.bfloat16()
++
++
++@pytest.mark.parametrize("kind", ["swa", "indexed"])
++@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("layout", ["flat", "padded", "records"])
++def test_records_match_b12x(kind, slot_dtype, layout):
++    page_size, pages, tokens = 64, 6, 200
++    record = RECORD_BYTES[kind]
++    kv = _kv(tokens, 3)
++    gen = torch.Generator().manual_seed(4)
++    slots = torch.randperm(pages * page_size, generator=gen)[:tokens].to(slot_dtype)
++    slots[5] = -1  # a padded CUDA-graph slot is skipped
++    slots[6] = pages * page_size  # beyond the pool: skipped
++    pad = 48 if layout == "padded" else 0
++    storage = torch.full((pages, page_size * record + pad), 0xA5, dtype=torch.uint8)
++    cache = storage.to(DEVICE)
++    view = cache
++    if layout == "records":
++        view = cache.view(pages, page_size, record)
++    elif layout == "padded":
++        view = cache[:, : page_size * record]
++    write_cache(
++        kv.to(DEVICE), view, slots.to(DEVICE), page_size=page_size, cache_kind=kind
++    )
++    expected = storage.clone()
++    flat = expected[:, : page_size * record].reshape(-1, record)
++    live = (slots >= 0) & (slots < pages * page_size)
++    flat[slots[live].long()] = _records(kv[live], kind)
++    expected[:, : page_size * record] = flat.reshape(pages, -1)
++    assert torch.equal(cache.cpu(), expected)
++
++
++def test_strided_rows():
++    # The writer reads rows of a wider buffer (row stride above 512).
++    page_size, kind = 64, "swa"
++    wide = _kv(70, 5).repeat(1, 2).to(DEVICE)
++    kv = wide[:, :512]
++    slots = torch.arange(70, device=DEVICE)
++    cache = torch.zeros(
++        (2, page_size * RECORD_BYTES[kind]), dtype=torch.uint8, device=DEVICE
++    )
++    write_cache(kv, cache, slots, page_size=page_size, cache_kind=kind)
++    got = cache.view(-1, RECORD_BYTES[kind])[:70].cpu()
++    assert torch.equal(got, _records(kv.cpu(), kind))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+new file mode 100644
+index 000000000..0197832c4
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -0,0 +1,134 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang writers of DeepSeek-V4.1's paged KV-cache records.
++
++A token's 512 latent values become one record at its slot (``slot // page_size``
++selects the page, ``slot % page_size`` the record; negative or out-of-range slots
++are skipped):
++
++- ``swa`` (528 bytes): 16 groups of 32 values as E4M3, then 16 UE8M0 scales.
++  A group's scale is ``max(amax, 1e-4) * fp32(1/448)`` rounded up to a power of
++  two (the exponent is bumped when the mantissa is nonzero).
++- ``indexed`` (288 bytes): 32 groups of 16 values as packed E2M1 (low nibble
++  first), then 32 E4M3 scales. A group's scale is ``max(amax, 6 * 2^-9) / 6``
++  (IEEE division) rounded to E4M3, saturating; the values are divided by its
++  decoded value (a rounded reciprocal would move exact E2M1 midpoints off their
++  ties-to-even) and rounded to nearest-even E2M1.
++
++The arithmetic is B12X's ``write_cache`` for ``cache_format="deepseek_v41"``,
++step for step, so the records are the same bytes. One thread writes one group.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
++import torch
++
++from .indexer import _e2m1_code
++
++DIM = 512
++RECORD_BYTES = {"swa": 528, "indexed": 288}
++_GROUP = {"swa": 32, "indexed": 16}
++_E4M3_MAX = 448.0
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def cache_writer_kernel(
++    cache_kind: str, page_size: int, slot_dtype: str = "int64", threads: int = 128
++):
++    group_size = _GROUP[cache_kind]
++    groups = DIM // group_size
++    record = RECORD_BYTES[cache_kind]
++    payload = DIM if cache_kind == "swa" else DIM // 2  # scale bytes follow
++    tokens, kv_stride = T.dynamic("tokens, kv_stride")
++    pages, page_bytes, page_stride = T.dynamic("pages, page_bytes, page_stride")
++
++    @T.prim_func
++    def write(
++        kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
++        cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
++        slots: T.Tensor((tokens,), slot_dtype),
++    ):
++        with T.Kernel(T.ceildiv(tokens * groups, threads), threads=threads) as bx:
++            item = bx * threads + T.get_thread_binding()
++            token, group = item // groups, item % groups
++            values = T.alloc_local((group_size,), T.float32)
++            amax = T.alloc_var(T.float32)
++            if token < tokens:
++                slot = T.cast(slots[token], T.int64)
++                page = slot // page_size
++                if (slot >= 0) & (page < pages):
++                    base = (slot % page_size) * record
++                    amax = 0.0
++                    for i in T.unroll(group_size):
++                        values[i] = T.cast(kv[token, group * group_size + i], T.float32)
++                        amax = T.max(amax, T.abs(values[i]))
++                    if cache_kind == "swa":
++                        bits = T.reinterpret(
++                            T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
++                            T.uint32,
++                        )
++                        bumped = T.if_then_else(
++                            (bits & 0x7FFFFF) != 0,
++                            (bits + 0x800000) & 0x7F800000,
++                            bits,
++                        )
++                        exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
++                        # The exact reciprocal of the power-of-two scale.
++                        inverse = T.reinterpret(
++                            T.cast(T.shift_left(254 - exponent, 23), T.uint32),
++                            T.float32,
++                        )
++                        for i in T.unroll(group_size):
++                            code = T.cast(T.fmul(values[i], inverse), T.float8_e4m3fn)
++                            cache[page, base + group * group_size + i] = T.reinterpret(
++                                code, T.uint8
++                            )
++                        cache[page, base + payload + group] = T.cast(exponent, T.uint8)
++                    else:
++                        scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
++                        scale_code = T.cast(T.min(scale, _E4M3_MAX), T.float8_e4m3fn)
++                        decoded = T.cast(scale_code, T.float32)
++                        for i in T.unroll(group_size // 2):
++                            lo = _e2m1_code(values[2 * i] / decoded)
++                            hi = _e2m1_code(values[2 * i + 1] / decoded)
++                            cache[page, base + group * (group_size // 2) + i] = T.cast(
++                                lo | (hi << 4), T.uint8
++                            )
++                        cache[page, base + payload + group] = T.reinterpret(
++                            scale_code, T.uint8
++                        )
++
++    return write
++
++
++def write_cache(
++    kv: torch.Tensor,
++    cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    *,
++    page_size: int,
++    cache_kind: str,
++) -> None:
++    """Write ``kv`` ([T, 512] BF16, unit column stride) into ``cache`` (``[pages,
++    page bytes]`` or ``[pages, records, record bytes]`` bytes, any page stride) at
++    ``slot_mapping`` ([T] int32 or int64)."""
++    if kv.shape[0] == 0:
++        return
++    if kv.dtype != torch.bfloat16 or kv.shape[1] != DIM or kv.stride(1) != 1:
++        raise ValueError("V4.1 cache records come from [T, 512] BF16 rows")
++    pages = cache.view(torch.uint8)
++    if pages.dim() > 2:  # [pages, records, record bytes]
++        pages = pages.flatten(1)
++    if pages.shape[1] < page_size * RECORD_BYTES[cache_kind]:
++        raise ValueError(
++            f"cache pages hold fewer than {page_size} {cache_kind} records"
++        )
++    kernel = cache_writer_kernel(
++        cache_kind, page_size, str(slot_mapping.dtype).removeprefix("torch.")
++    )
++    kernel(kv, pages, slot_mapping)
++
++
++__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache"]
+-- 
+2.54.0 (Apple Git-157)
+

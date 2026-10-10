@@ -1,0 +1,134 @@
+From 8c2add83af8c33b96e288127df7a71f23ee07d65 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:08 +0200
+Subject: [PATCH] TileLang split BF16 linear method for row-block weights
+
+TileLangSplitLinearMethod projects each equal row block of a BF16 weight (the
+compressor's wkv and wgate) through TileLangLinearMethod's split-K GEMM into its
+own output. No caller yet.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 44 +++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 55 ++++++++++++++++++-
+ 2 files changed, 98 insertions(+), 1 deletion(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 3724b99e2..476cb56c0 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -177,6 +177,50 @@ def test_bf16_gemm(n, k, out_dtype):
+             )
+ 
+ 
++# The compressor's wkv (ratio 1, BF16 out) and wkv + wgate (ratio 2, FP32 out).
++@pytest.mark.parametrize("parts, out_dtype", [(1, torch.bfloat16), (2, torch.float32)])
++def test_split_linear(parts, out_dtype, k=5120):
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangSplitLinearMethod,
++        project_parts,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    gen = _gen(5)
++    layer = nn.Module()
++    weight = torch.randn((512 * parts, k), generator=gen, device=DEVICE) * 0.02
++    layer.weight = nn.Parameter(weight.bfloat16(), requires_grad=False)
++    layer.out_dtype = out_dtype
++    method = TileLangSplitLinearMethod(parts)
++    method.process_weights_after_loading(layer)
++    x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
++    scratch = torch.empty(
++        method.get_workspace_size(layer, DECODE_ROWS), dtype=torch.uint8, device=DEVICE
++    )
++
++    def project(rows):
++        outs = [
++            torch.full((max(ROWS), 512), float("nan"), dtype=out_dtype, device=DEVICE)
++            for _ in range(parts)
++        ]
++        with use_preallocated_workspace(scratch):
++            project_parts(layer, x[:rows], outs, rows)
++        return outs
++
++    full = project(max(ROWS))
++    for index, out in enumerate(full):
++        ref = x.float() @ layer.weight[index * 512 : (index + 1) * 512].float().T
++        torch.testing.assert_close(
++            out.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
++        )
++    for rows in ROWS:
++        for out, whole in zip(project(rows), full):
++            assert torch.equal(out[:rows], whole[:rows]), f"rows={rows}"
++            assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
++
++
+ @pytest.mark.parametrize("hidden", [128, 512, 4096])
+ def test_rmsnorm(hidden, rows=33, eps=1e-6):
+     gen = _gen(4)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 70965bbc5..fde1fa755 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -257,4 +257,57 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         return _spec_bytes(_partial_specs(layer, num_tokens))
+ 
+ 
+-__all__ = ["TileLangFP8LinearMethod", "TileLangLinearMethod"]
++class _Part:
++    """One row block of a split weight; weak-referenceable for ``_LAYERS``."""
++
++    def __init__(self, weight: torch.Tensor, out_dtype: torch.dtype):
++        self.weight = weight
++        self.out_dtype = out_dtype
++
++
++class TileLangSplitLinearMethod(UnquantizedLinearMethod):
++    """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
++    projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
++
++    def __init__(self, parts: int):
++        super().__init__()
++        self.parts = parts
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        super().process_weights_after_loading(layer)
++        n = layer.weight.shape[0]
++        if n % self.parts:
++            raise ValueError(f"{n} rows do not split into {self.parts} parts")
++        rows = n // self.parts
++        out_dtype = getattr(layer, "out_dtype", torch.bfloat16)
++        layer.tilelang_parts = []
++        for index in range(self.parts):
++            part = _Part(
++                layer.weight.data[index * rows : (index + 1) * rows], out_dtype
++            )
++            TileLangLinearMethod().process_weights_after_loading(part)
++            layer.tilelang_parts.append(part)
++
++    def get_workspace_size(self, layer, num_tokens: int) -> int:
++        return max(
++            _spec_bytes(_partial_specs(part, num_tokens))
++            for part in layer.tilelang_parts
++        )
++
++
++def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None:
++    """Project ``x`` (rows x K) through each row block of a split layer into the
++    matching output's first ``rows`` rows."""
++    scratch = (
++        None if torch.compiler.is_compiling() else current_preallocated_workspace()
++    )
++    for part, out in zip(layer.tilelang_parts, outputs):
++        _bf16_linear(x, out[:rows], part.tilelang_key, scratch)
++
++
++__all__ = [
++    "TileLangFP8LinearMethod",
++    "TileLangLinearMethod",
++    "TileLangSplitLinearMethod",
++    "project_parts",
++]
+-- 
+2.54.0 (Apple Git-157)
+

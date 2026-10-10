@@ -1,0 +1,45 @@
+From 355a49600ea1500b924bd826094fd50eba0991ef Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 09:35:05 +0200
+Subject: [PATCH] Collectives: the rank-order reduce-scatter under the TileLang
+ kernel backend
+
+Prefill sequence parallelism reduce-scatters every layer's attention and
+MoE outputs from 205 rows; NCCL's ring sums made a row's bits depend on the
+step's size and the row's owner. Under DS4.1's TileLang family the RoCE
+policy now reduce-scatters with the one-shot all-reduce's arithmetic (FP32,
+rank order, one rounding), so a decode row that shares a step with a
+prefill chunk reduces as it does alone. With sparknet's dispatch at its
+2 MiB capacity (204 rows, where sequence parallelism starts), every
+hidden-state reduction then has one arithmetic.
+---
+ .../device_communicators/cuda_communicator.py       | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index d4ddf51a6..e9ad6b078 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -675,7 +675,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         chunk_size = input_tensor.shape[0] // world_size
+         output_shape = (chunk_size,) + input_tensor.shape[1:]
+ 
+-        if not self._roce_policy and should_nccl_symm_mem_ag_rs():
++        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++            # DS4.1's TileLang family: the one-shot all-reduce's arithmetic, so a
++            # row reduces to the same bits whether its step was reduce-scattered
++            # (prefill sequence parallelism) or all-reduced.
++            from vllm.models.deepseek_v4_1.tilelang.collectives import (
++                reduce_scatter_rank_order,
++            )
++
++            output = reduce_scatter_rank_order(
++                pynccl_comm, input_tensor, self.rank_in_group, world_size
++            )
++        elif not self._roce_policy and should_nccl_symm_mem_ag_rs():
+             output = self._reduce_scatter_symm_mem(input_tensor)
+         else:
+             output = torch.empty(
+-- 
+2.54.0 (Apple Git-157)
+

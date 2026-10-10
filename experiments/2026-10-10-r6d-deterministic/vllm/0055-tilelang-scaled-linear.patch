@@ -1,0 +1,105 @@
+From 15e22312b8636de311554bd2ec18b3c99f4bd66b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 23:01:48 +0200
+Subject: [PATCH] TileLang linear method with a power-of-two output scale
+ folded in
+
+TileLangScaledLinearMethod multiplies a BF16 weight by a power of two at load
+(checked exact), so the projection's output equals the unscaled output times
+the scale, bit for bit, without a separate pass. No caller yet.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 29 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 23 +++++++++++++++
+ 2 files changed, 52 insertions(+)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 4249dba27..348dd08aa 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -221,6 +221,35 @@ def test_split_linear(parts, out_dtype, k=5120):
+             assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+ 
+ 
++# The indexer's head weights (32 x 5120) scaled by 1/64.
++def test_scaled_linear(n=32, k=5120, scale=1 / 64):
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import (
++        TileLangLinearMethod,
++        TileLangScaledLinearMethod,
++    )
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    gen = _gen(8)
++    weight = (torch.randn((n, k), generator=gen, device=DEVICE) * 0.02).bfloat16()
++    plain, scaled = nn.Module(), nn.Module()
++    plain.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    scaled.weight = nn.Parameter(weight.clone(), requires_grad=False)
++    plain_method = TileLangLinearMethod()
++    plain_method.process_weights_after_loading(plain)
++    scaled_method = TileLangScaledLinearMethod(scale)
++    scaled_method.process_weights_after_loading(scaled)
++    x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
++    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for rows in ROWS:
++            expected = plain_method.apply(plain, x[:rows]) * scale  # exact in BF16
++            assert torch.equal(scaled_method.apply(scaled, x[:rows]), expected), rows
++    with pytest.raises(ValueError):
++        TileLangScaledLinearMethod(0.3)
++
++
+ # The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
+ def test_block32_rows(n=1792, k=5120, start=1280):
+     from torch import nn
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 827458fb9..cb874eda5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -14,6 +14,7 @@ The kernels run inside custom ops, which keeps them opaque to torch.compile,
+ and borrow activation scratch from vLLM's workspace.
+ """
+ 
++import math
+ from weakref import WeakValueDictionary
+ 
+ import torch
+@@ -307,6 +308,27 @@ class _Part:
+         self.out_dtype = out_dtype
+ 
+ 
++class TileLangScaledLinearMethod(TileLangLinearMethod):
++    """``TileLangLinearMethod`` with a power-of-two output scale folded into the
++    weight at load. Scaling by a power of two is exact in BF16 and commutes with
++    the FP32 accumulation, so the output equals the unscaled projection's times
++    ``scale``, bit for bit (checked on the weight), without a separate pass."""
++
++    def __init__(self, scale: float):
++        super().__init__()
++        if scale <= 0 or math.frexp(scale)[0] != 0.5:
++            raise ValueError(f"{scale} is not a power of two")
++        self.scale = scale
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        weight = layer.weight.data
++        scaled = weight * self.scale
++        if not torch.equal(scaled / self.scale, weight):
++            raise ValueError(f"{self.scale} does not scale this weight exactly")
++        weight.copy_(scaled)
++        super().process_weights_after_loading(layer)
++
++
+ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+     """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
+     projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
+@@ -351,6 +373,7 @@ __all__ = [
+     "TileLangBlock32Rows",
+     "TileLangFP8LinearMethod",
+     "TileLangLinearMethod",
++    "TileLangScaledLinearMethod",
+     "TileLangSplitLinearMethod",
+     "project_parts",
+ ]
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,49 @@
+From 81e1338a82c50a051e3dee8a6dbc19b4a2acc717 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 09:21:07 +0200
+Subject: [PATCH] Decode rows: decode tiles and split-K for 16-stream steps
+
+TP4 steps of 16 streams with DSpark drafts reach 96 rows, where the fused
+Q-A/KV and the shared experts' projections fell onto prefill tiles (a
+handful of CTAs) and the router and indexer head weights onto their
+unsplit GEMMs. Decode tiles and split-K give the same bits at a fraction
+of the time: the shared experts' gate/up 2.4x faster warm, the router 2.2x
+up to 128 rows, the indexer head weights 31 us down to 5-16 us.
+---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index f58c4dfb7..0a3b66278 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -841,13 +841,22 @@ def split_row_tile(rows: int) -> int:
+ # Block-32 FP8 projections whose decode tiles also serve rows past DECODE_ROWS
+ # (16-stream steps reach 96 rows), by (N, K): {up to this many rows: tile height}.
+ # Others take their prefill tile past DECODE_ROWS. Only speed changes: every tile
+-# adds K in the same order.
+-WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {}
++# adds K in the same order. From the kernel lab's decode-rows bundle (2026-10-10,
++# whole calls warm, cold and after their own prefetch): the fused Q-A/KV and the
++# shared experts' gate/up and down; Q-B, the indexer's Q-B and the DSpark main
++# projection run faster on their prefill tiles.
++WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
++    (1792, 5120): {96: 32, 128: 64},
++    (1152, 5120): {128: 64},
++    (5120, 576): {96: 32},
++}
+ 
+ # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
+ # (N, K): the most rows it serves. The partials plus their reduce add the same
+-# shards in the same order as the shard GEMM, so the bits do not change.
+-BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {}
++# shards in the same order as the shard GEMM, so the bits do not change. The
++# router (8 shards) splits faster up to 256 rows, the indexer's head weights (40
++# shards) up to 1024 (decode-rows bundle, 2026-10-10).
++BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {(384, 5120): 256, (32, 5120): 1024}
+ 
+ 
+ def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:
+-- 
+2.54.0 (Apple Git-157)
+

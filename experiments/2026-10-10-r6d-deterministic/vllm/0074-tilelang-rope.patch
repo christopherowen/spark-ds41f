@@ -1,0 +1,133 @@
+From 5119c740e8d237ac33e88645d0493e7f7f40a876 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:08 +0200
+Subject: [PATCH] RoPE: TileLang under the TileLang kernel backend
+
+The query, index query, KV, latent and index key rotate in place with the
+TileLang kernel instead of B12X's rotary.rotate and its copy of the leading
+columns. The kv helper plan stays declared for the attention staging memory
+it carries.
+---
+ vllm/models/deepseek_v4_1/attention.py | 68 +++++++++++---------------
+ 1 file changed, 29 insertions(+), 39 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index ec29de332..6ceb72830 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -118,16 +118,20 @@ class _AttentionHelpers:
+         table = attn.rotary_emb.cos_sin_cache
+         device = table.device
+         attn._declare_attention(device)
+-        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
+-        if attn.indexer is not None:
+-            roles.append(("index_query", attn.indexer.heads, 128, 1))
+-        if attn.compressor is not None:
+-            roles.extend(
+-                (
+-                    ("index_key", 1, 128, attn.compress_ratio),
+-                    ("latent", 1, 512, attn.compress_ratio),
++        roles = [("kv", 1, 512, 1)]
++        # TileLang RoPE needs no plan; the kv plan stays for the attention staging
++        # memory it carries and materializes.
++        if not kernels.uses_tilelang():
++            roles.append(("q", attn.n_local_heads, 512, 1))
++            if attn.indexer is not None:
++                roles.append(("index_query", attn.indexer.heads, 128, 1))
++            if attn.compressor is not None:
++                roles.extend(
++                    (
++                        ("index_key", 1, 128, attn.compress_ratio),
++                        ("latent", 1, 512, attn.compress_ratio),
++                    )
+                 )
+-            )
+         plans: dict[str, object] = {}
+         requests = []
+         for role, heads, dim, ratio in roles:
+@@ -1159,6 +1163,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+         return prepare
+ 
++    def _rope(self, x, positions, role: str):
++        """``x`` rotated at ``positions``; in place under the TileLang kernels."""
++        table = self.rotary_emb.cos_sin_cache
++        if kernels.uses_tilelang():
++            from vllm.models.deepseek_v4_1.tilelang.rope import rope_
++
++            compressed = role in ("index_key", "latent")
++            rope_(x, positions, table, self.compress_ratio if compressed else 1, False)
++            return x
++        return _rotated(x, positions, table, plan=self._helper_plan(role))
++
+     def _helper_plan(self, role: str):
+         try:
+             return self._helper_plans[role]
+@@ -1234,12 +1249,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             raise PreparationResourceUnavailableError(
+                 "V4.1 attention metadata is not prepared"
+             )
+-        rotated = _rotated(
+-            kv,
+-            positions,
+-            self.rotary_emb.cos_sin_cache,
+-            plan=self._helper_plan("kv"),
+-        )
++        rotated = self._rope(kv, positions, "kv")
+         _write_v41_cache(
+             rotated,
+             self.swa_cache_layer.kv_cache,
+@@ -1291,20 +1301,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         latent, slots = self.compressor(hidden_states, main, state)
+         # Index K consumes the ordinary-normalized PRE-RoPE latent.
+         key = indexer.k_norm(indexer.wk(latent))
+-        key = _rotated(
+-            key,
+-            positions,
+-            self.rotary_emb.cos_sin_cache,
+-            plan=self._helper_plan("index_key"),
+-        )
++        key = self._rope(key, positions, "index_key")
+         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
+         self._write_index_keys(key, index_meta.slot_mapping[:rows])
+-        latent = _rotated(
+-            latent,
+-            positions,
+-            self.rotary_emb.cos_sin_cache,
+-            plan=self._helper_plan("latent"),
+-        )
++        latent = self._rope(latent, positions, "latent")
+         _write_v41_cache(
+             latent,
+             self.kv_cache,
+@@ -1357,12 +1357,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             qr, kv = self.q_norm(qr), self.kv_norm(kv)
+         q = self.wq_b(qr).view(rows, self.n_local_heads, 512)
+         l2_prefetch.issue(self._l2pf_wo, rows)
+-        q = _rotated(
+-            q,
+-            positions,
+-            self.rotary_emb.cos_sin_cache,
+-            plan=self._helper_plan("q"),
+-        )
++        q = self._rope(q, positions, "q")
+         output = torch.empty_like(q)
+         metadata = cast(
+             dict[str, DeepseekV41B12xMetadata] | None,
+@@ -1406,12 +1401,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         rows = last - first
+         h = self.indexer.heads
+         iq = self.indexer.wq_b(qr[first:last]).view(rows, h, 128)
+-        iq = _rotated(
+-            iq,
+-            positions[first:last],
+-            self.rotary_emb.cos_sin_cache,
+-            plan=self._helper_plan("index_query"),
+-        )
++        iq = self._rope(iq, positions[first:last], "index_query")
+         iq_data = torch.empty((rows, h, 64), dtype=torch.uint8, device=qr.device)
+         iq_scale = torch.empty((rows, h, 4), dtype=torch.uint8, device=qr.device)
+         self._quantize_index_query(
+-- 
+2.54.0 (Apple Git-157)
+

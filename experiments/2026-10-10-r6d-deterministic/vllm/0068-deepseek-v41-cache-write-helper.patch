@@ -1,0 +1,68 @@
+From f4974f02381626b780fcaeb191e4de04dca67dae Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:23:57 +0200
+Subject: [PATCH] V4.1 attention: cache writes through one helper
+
+Both KV-cache writes call _write_v41_cache, which calls B12X's write_cache
+as before, so a backend can be chosen in one place.
+---
+ vllm/models/deepseek_v4_1/attention.py | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index a872e9795..ec29de332 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -90,6 +90,19 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
+     return out
+ 
+ 
++def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
++    """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
++    mla.write_cache(
++        x,
++        cache,
++        slots,
++        page_size=page_size,
++        cache_kind=cache_kind,
++        cache_format="deepseek_v41",
++        plan=plan,
++    )
++
++
+ class _AttentionHelpers:
+     """Loaded-resource owner, independent of unpublished attention caches."""
+ 
+@@ -1227,13 +1240,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.rotary_emb.cos_sin_cache,
+             plan=self._helper_plan("kv"),
+         )
+-        mla.write_cache(
++        _write_v41_cache(
+             rotated,
+             self.swa_cache_layer.kv_cache,
+             slot_mapping,
+             page_size=self.swa_cache_layer.block_size,
+             cache_kind="swa",
+-            cache_format="deepseek_v41",
+             plan=self._helper_plan("swa_cache_write"),
+         )
+ 
+@@ -1293,13 +1305,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.rotary_emb.cos_sin_cache,
+             plan=self._helper_plan("latent"),
+         )
+-        mla.write_cache(
++        _write_v41_cache(
+             latent,
+             self.kv_cache,
+             slots,
+             page_size=self._main_page,
+             cache_kind="indexed",
+-            cache_format="deepseek_v41",
+             plan=self._helper_plan("indexed_cache_write"),
+         )
+ 
+-- 
+2.54.0 (Apple Git-157)
+

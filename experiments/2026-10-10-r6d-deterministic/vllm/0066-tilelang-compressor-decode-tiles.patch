@@ -1,0 +1,49 @@
+From 181919364baf9077cad8dfc429058fe1e8005f3c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:21:27 +0200
+Subject: [PATCH] TileLang compressor projection decode tiles from the window 5
+ sweep
+
+Per row tile, the one-launch split-K's columns, stages and threads with the
+lowest worst warm/cold ratio to B12X: ratio 1 (wkv, 512 columns) 0.94-0.96
+up to 32 rows and within 1% at 33-96; ratio 2 (wkv + wgate) 0.25-0.94. The
+shards and K blocks stay, so the bits do too.
+---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index f119d0855..f58c4dfb7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -805,8 +805,25 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
+     # (PARTIAL_ROW_TILES) to the one-launch split-K's block_N, num_stages and
+     # threads, which only change speed; block_K stays 64, since blocked
+     # accumulation adds one block at a time.
+-    (1024, 5120): dict(shards=5, blocked=True),
+-    (512, 5120): dict(shards=5, blocked=True),
++    # Decode tiles: window 5's sweep, the lowest worst warm/cold ratio to B12X.
++    (1024, 5120): dict(
++        shards=5,
++        blocked=True,
++        decode={
++            16: dict(block_N=64, num_stages=4, threads=128),
++            32: dict(block_N=64, num_stages=2, threads=256),
++            64: dict(block_N=64, num_stages=3, threads=256),
++        },
++    ),
++    (512, 5120): dict(
++        shards=5,
++        blocked=True,
++        decode={
++            16: dict(block_N=32, num_stages=3, threads=128),
++            32: dict(block_N=32, num_stages=3, threads=128),
++            64: dict(block_N=32, num_stages=2, threads=256),
++        },
++    ),
+ }
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

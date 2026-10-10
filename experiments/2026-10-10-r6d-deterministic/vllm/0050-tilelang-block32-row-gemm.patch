@@ -1,0 +1,162 @@
+From 4151b831138332b56496cf0a1dc0c48682fdbac6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:08 +0200
+Subject: [PATCH] TileLang block-32 GEMM over a loaded weight's rows
+
+_prepare_block32 now holds TileLangFP8LinearMethod's setup (the same kernels),
+and TileLangBlock32Rows applies it to rows start: of a loaded block-32 FP8
+projection, sharing the checkpoint storage. No caller yet.
+---
+ .../test_deepseek_v41_tilelang_linear.py      | 28 +++++++
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 78 +++++++++++++------
+ 2 files changed, 82 insertions(+), 24 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 476cb56c0..4249dba27 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -221,6 +221,34 @@ def test_split_linear(parts, out_dtype, k=5120):
+             assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+ 
+ 
++# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
++def test_block32_rows(n=1792, k=5120, start=1280):
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, weight_values = _block32_weight(n, k, 6)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    fused, rows = TileLangBlock32Rows(layer, 0), TileLangBlock32Rows(layer, start)
++    x = torch.randn((max(ROWS), k), generator=_gen(7), device=DEVICE).bfloat16()
++    _, _, x_values = _mxfp8(x)
++    ref = x_values @ weight_values[start:].T
++    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        for count in ROWS:
++            out = rows(x[:count])
++            torch.testing.assert_close(
++                out.float(), ref[:count], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
++            )
++            # Every tile accumulates K in the same order: the slice gives the
++            # fused projection's bits.
++            assert torch.equal(out, fused(x[:count])[:, start:]), f"rows={count}"
++    with pytest.raises(ValueError):
++        TileLangBlock32Rows(layer, start + 16)
++
++
+ @pytest.mark.parametrize("hidden", [128, 512, 4096])
+ def test_rmsnorm(hidden, rows=33, eps=1e-6):
+     gen = _gen(4)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index fde1fa755..a59472978 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -183,24 +183,43 @@ def _bf16_linear_fake(x, out, key, scratch):
+     return None
+ 
+ 
++def _prepare_block32(layer) -> None:
++    """Compile the GEMMs of ``layer.weight`` (E4M3 ``[N, K]``) and its 32x32 block
++    scales ``layer.weight_scale_inv``, and register the layer for the custom op."""
++    n, k = layer.weight.shape
++    # The 32x32 block scales become per-row words of four K32 exponents.
++    layer.tilelang_weight_sf = pack_scale_words(
++        layer.weight_scale_inv.view(torch.uint8), rows=n
++    )
++    layer.tilelang_decode = {
++        block_M: mxfp8_gemm_decode(
++            n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
++        )
++        for block_M in DECODE_TILE_ROWS
++    }
++    layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
++    layer.tilelang_key = id(layer)
++    _LAYERS[layer.tilelang_key] = layer
++
++
++def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
++    out = torch.empty(
++        (*x.shape[:-1], layer.weight.shape[0]),
++        dtype=torch.bfloat16,
++        device=x.device,
++    )
++    scratch = (
++        None if torch.compiler.is_compiling() else current_preallocated_workspace()
++    )
++    _block32_linear(x, out, layer.tilelang_key, scratch)
++    return out
++
++
+ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+     """Checkpoint block-32 FP8 weights with MXFP8 activations."""
+ 
+     def process_weights_after_loading(self, layer):
+-        n, k = layer.weight.shape
+-        # The 32x32 block scales become per-row words of four K32 exponents.
+-        layer.tilelang_weight_sf = pack_scale_words(
+-            layer.weight_scale_inv.view(torch.uint8), rows=n
+-        )
+-        layer.tilelang_decode = {
+-            block_M: mxfp8_gemm_decode(
+-                n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
+-            )
+-            for block_M in DECODE_TILE_ROWS
+-        }
+-        layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
+-        layer.tilelang_key = id(layer)
+-        _LAYERS[layer.tilelang_key] = layer
++        _prepare_block32(layer)
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+         return _spec_bytes(_activation_specs(num_tokens, layer.weight.shape[1]))
+@@ -208,16 +227,26 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+     def apply(self, layer, x, bias=None):
+         if bias is not None:
+             raise ValueError("V4.1 block32 projections require bias-free weights")
+-        out = torch.empty(
+-            (*x.shape[:-1], layer.weight.shape[0]),
+-            dtype=torch.bfloat16,
+-            device=x.device,
+-        )
+-        scratch = (
+-            None if torch.compiler.is_compiling() else current_preallocated_workspace()
+-        )
+-        _block32_linear(x, out, layer.tilelang_key, scratch)
+-        return out
++        return _apply_block32(layer, x)
++
++
++class TileLangBlock32Rows:
++    """Output rows ``start:`` of a loaded block-32 FP8 projection as their own GEMM.
++
++    The DSpark drafter projects the target's hidden states through only the KV
++    rows of each layer's fused Q-A/KV weight. Views of the weight and its scales
++    share the checkpoint storage; the owner must keep this object alive.
++    """
++
++    def __init__(self, layer: nn.Module, start: int):
++        if start % 32:
++            raise ValueError(f"rows from {start} do not start on a 32-row scale block")
++        self.weight = layer.weight[start:]
++        self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
++        _prepare_block32(self)
++
++    def __call__(self, x: torch.Tensor) -> torch.Tensor:
++        return _apply_block32(self, x)
+ 
+ 
+ class TileLangLinearMethod(UnquantizedLinearMethod):
+@@ -306,6 +335,7 @@ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None
+ 
+ 
+ __all__ = [
++    "TileLangBlock32Rows",
+     "TileLangFP8LinearMethod",
+     "TileLangLinearMethod",
+     "TileLangSplitLinearMethod",
+-- 
+2.54.0 (Apple Git-157)
+

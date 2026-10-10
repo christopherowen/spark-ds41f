@@ -1,0 +1,46 @@
+From 0e92eb2e5edbea6a762dcfafda89c96b9a963c34 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:11:22 +0200
+Subject: [PATCH] TileLang WO decode tiles from the WO sweep
+
+The grouped WO-A takes 64-column tiles with four stages at 16 and 32 rows
+and 256-deep K blocks at 64; WO-B's 16-row tile takes 128 columns: 5-10%
+faster warm and cold than the default tile in the kernel lab, with the same
+bits (checked 120 rounds against the prefill GEMM). Only B1's arm uses them.
+---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 4a34f0acc..f119d0855 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -730,7 +730,7 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
+ # to B12X over the three is lowest. Every field only changes speed: each tile
+ # accumulates K in the same order, so a row's bits do not depend on the tile
+ # or on prefill.
+-DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
++DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
+     # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
+     (8192, 1280): {
+         16: dict(block_N=128, block_K=128, num_stages=3),
+@@ -758,6 +758,16 @@ DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
+         32: dict(block_N=128, block_K=64, num_stages=2),
+         64: dict(block_N=64, block_K=64, num_stages=2),
+     },
++    # TP4 attention output: the grouped WO-A (2 groups) and WO-B (window 3's WO
++    # sweep, ranked against the default tile; WO-B keeps it from 32 rows).
++    (1024, 4096, 2): {
++        16: dict(block_N=64, block_K=128, num_stages=4),
++        32: dict(block_N=64, block_K=128, num_stages=4),
++        64: dict(block_N=64, block_K=256, num_stages=2),
++    },
++    (5120, 2048): {
++        16: dict(block_N=128, block_K=128, num_stages=3),
++    },
+     # TP4 DSpark main projection.
+     (6400, 6144): {
+         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
+-- 
+2.54.0 (Apple Git-157)
+

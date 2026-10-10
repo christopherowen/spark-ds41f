@@ -1,0 +1,97 @@
+From c4963ea8eab8179a0993e8ad68373e6b570b88c9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:05:49 +0200
+Subject: [PATCH] TileLang Engram hash: int32 or int64 history
+
+The runner keeps each request's lookback tokens as int32; the kernel read
+them as int64, so window 4's B9 arm failed its profile run. The history's
+type is now a kernel parameter, like the ids', and the tests cover both.
+---
+ .../test_deepseek_v41_tilelang_engram_hash.py |  5 +++--
+ .../deepseek_v4_1/tilelang/engram_hash.py     | 19 +++++++++++++------
+ 2 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+index d625278dd..2d4195404 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+@@ -69,11 +69,12 @@ def _expected(token_map, ids, history, starts, geometry):
+ 
+ 
+ @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("history_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize(
+     "lengths, padding",
+     [((1,), 0), ((6, 1, 3, 6), 5), ((700, 1, 2, 1300), 0), ((0, 4, 0, 2), 3)],
+ )
+-def test_engram_hash(lengths, padding, ids_dtype):
++def test_engram_hash(lengths, padding, ids_dtype, history_dtype):
+     geometry = build_geometry(
+         layer_ids=LAYERS, base_table_size=16_000_000, compressed_vocab_size=COMPRESSED
+     )
+@@ -89,7 +90,7 @@ def test_engram_hash(lengths, padding, ids_dtype):
+         ids.to(DEVICE, ids_dtype),
+         image.to(DEVICE),
+         starts.to(DEVICE),
+-        history.to(DEVICE),
++        history.to(DEVICE, history_dtype),
+         token_map.to(DEVICE),
+         *geometry_tensors(geometry, DEVICE),
+         out,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+index cee4122f0..1a450a877 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+@@ -34,7 +34,9 @@ PAD_TOKEN = 2
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
++def engram_hash_kernel(
++    layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
++):
+     threads = (layers * HEADS + 31) // 32 * 32
+     tokens = T.dynamic("tokens")
+     seqs1 = T.dynamic("seqs1")  # requests + 1
+@@ -47,7 +49,9 @@ def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
+         ids: T.Tensor((tokens,), ids_dtype),
+         image_mask: T.Tensor((tokens,), T.bool),
+         starts: T.Tensor((seqs1,), T.int32),
+-        history: T.StridedTensor((history_rows, HISTORY), (history_stride, 1), T.int64),
++        history: T.StridedTensor(
++            (history_rows, HISTORY), (history_stride, 1), history_dtype
++        ),
+         token_map: T.Tensor((vocab,), T.int64),
+         multipliers: T.Tensor((layers, LAGS), T.int64),
+         primes: T.Tensor((layers, HEADS), T.int64),
+@@ -90,7 +94,7 @@ def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
+                             if raw >= 0 and raw < vocab and not image_mask[t - lag]:
+                                 source = token_map[raw]
+                         elif relative >= -HISTORY:
+-                            raw = history[request, HISTORY + relative]
++                            raw = T.cast(history[request, HISTORY + relative], T.int64)
+                             if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
+                                 source = token_map[raw]
+                         blocked = blocked or source == -1
+@@ -121,12 +125,15 @@ def engram_hash(
+ ) -> None:
+     """Hash ``ids`` ([T], int32 or int64; T may include padding past the live count
+     ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64) and write the request
+-    and live token counts. ``history`` holds each request's last three committed
+-    token ids, oldest first."""
++    and live token counts. ``history`` (int32 or int64; the runner keeps int32)
++    holds each request's last three committed token ids, oldest first."""
+     if ids.numel() == 0:
+         return
+     kernel = engram_hash_kernel(
+-        multipliers.shape[0], token_map.numel(), str(ids.dtype).removeprefix("torch.")
++        multipliers.shape[0],
++        token_map.numel(),
++        str(ids.dtype).removeprefix("torch."),
++        str(history.dtype).removeprefix("torch."),
+     )
+     kernel(
+         ids,
+-- 
+2.54.0 (Apple Git-157)
+

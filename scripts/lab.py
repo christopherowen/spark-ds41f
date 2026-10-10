@@ -499,8 +499,10 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
         steps.append({"kind": "boot", "config": config, "label": label})
         steps.append({"kind": "curves", "label": label, "config": config, "out": f"{out}/curves-{label}.json"})
         if job.get("bench", True):
+            # "bench_args" replaces the screen's bench with the job's own (an acceptance run).
+            bench = [str(a) for a in job["bench_args"]] if "bench_args" in job else [*BENCH_BASE, *profile["bench"]]
             steps.append({"kind": "cli", "label": label,
-                          "argv": ["--cluster-config", config, "bench", *BENCH_BASE, *profile["bench"],
+                          "argv": ["--cluster-config", config, "bench", *bench,
                                    "--output", f"results/private/bench/{run}-{label}"]})
         for script, extra, stem in profile["extras"]:
             # A bare name is the experiment's own script; a path is repository-relative.
@@ -588,6 +590,16 @@ def sync_steps(spec: dict, job: dict) -> list[dict]:
     return [{"kind": "sync"}]
 
 
+def image_steps(spec: dict, job: dict) -> list[dict]:
+    """Build an arm's image on one node with serving stopped (unless that node has the tag),
+    copy it to the others in the listed order ([source node, target ssh address]: the CX7
+    links), and require one image ID on every node."""
+    experiment = spec["experiment"]
+    return [stop_step(job),
+            {"kind": "image", "config": arm_config_path(experiment, job["config"]), "node": job["node"],
+             "copies": [list(c) for c in job.get("copies", [])], "out": f"results/private/lab/{spec['run']}"}]
+
+
 def fabric_steps(spec: dict, job: dict) -> list[dict]:
     """A model-free script on every node at once (rank = the node's rank), in one arm's image,
     environment and mounts: the collective probe's container with the arm's overlays, while
@@ -603,7 +615,7 @@ def fabric_steps(spec: dict, job: dict) -> list[dict]:
 
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
-                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps}
+                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -637,6 +649,8 @@ def describe_step(step: dict) -> str:
         return "kernel-lab " + ", ".join(f"{b['bundle']}@{b['node']}" for b in step["bundles"])
     if step["kind"] == "fabric":
         return f"fabric {step['script']} on every node ({step['config']})"
+    if step["kind"] == "image":
+        return f"image of {step['config']} built on {step['node']}, copied {len(step['copies'])} times"
     return step["kind"]
 
 
@@ -931,6 +945,46 @@ def run_fabric(step: dict) -> list[dict]:
         return list(pool.map(one, nodes["nodes"]))
 
 
+def run_image(step: dict) -> str | None:
+    """Build and distribute an image step's image; None on success, else the failure."""
+    cluster, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=step["config"]))
+    image = cluster["container"]["image"]
+    repo = spark.repository_path(cluster)
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+
+    def image_id(node: dict) -> str:
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format", "{{.Id}}")
+        return process.stdout.strip() if process.returncode == 0 else ""
+
+    builder = spark.node_by_name(nodes, step["node"])
+    if image_id(builder):
+        log(f"image {image} already on {builder['name']}; not rebuilt")
+    else:
+        config = shlex.quote(step["config"])
+        process = spark.run_ssh(nodes, builder, "bash", "-lc",
+                                f"cd {shlex.quote(repo)} && bin/spark --cluster-config {config} build prepare"
+                                f" && bin/spark --cluster-config {config} build image --apply")
+        (out / f"image-build-{builder['name']}.txt").write_text(process.stdout + process.stderr)
+        if process.returncode or not image_id(builder):
+            return f"build of {image} on {builder['name']} failed (exit {process.returncode})"
+        log(f"image {image} built on {builder['name']}")
+    for source, target in step["copies"]:
+        node = spark.node_by_name(nodes, source)
+        started = time.time()
+        process = spark.run_ssh(nodes, node, "bash", "-o", "pipefail", "-c",
+                                f"docker save {shlex.quote(image)} | ssh -o BatchMode=yes {shlex.quote(target)}"
+                                f" docker load")
+        if process.returncode:
+            return f"copy {source} -> {target} failed: {process.stderr.strip()[-300:]}"
+        log(f"image copied {source} -> {target} in {time.time() - started:.0f} s")
+    ids = {node["name"]: image_id(node) for node in nodes["nodes"]}
+    if len(set(ids.values())) != 1 or not all(ids.values()):
+        return f"image IDs differ: {ids}"
+    log(f"image {image}: one ID on every node ({next(iter(ids.values()))[:19]})")
+    return None
+
+
 def run_kernel_bundles(step: dict) -> list[dict]:
     """Ship each bundle to ~/spark-lab on its node and run kernel-local there, nodes concurrently.
 
@@ -1085,6 +1139,11 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             elif step["kind"] == "analyze":
                 summary = analyze(step)
                 log(f"analysed {step['out']}: {'PASSED' if summary['passed'] else 'DIFFERENCES'}")
+            elif step["kind"] == "image":
+                problem = run_image(step)
+                if problem:
+                    failed = problem
+                    break
             elif step["kind"] == "fabric":
                 for verdict in run_fabric(step):
                     log(f"fabric {step['label']}@{verdict['node']}: exit {verdict['exit']}")
