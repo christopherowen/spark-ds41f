@@ -16,7 +16,9 @@ import torch
 from torch import nn
 
 sys.path.insert(0, "/b")
-from kbench import CAPACITY, DECODE, DEVICE, PREFILL, per_call, slower, timing_line  # noqa: E402
+from kbench import (  # noqa: E402
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, per_call, repeatable, slower, timing_line,
+)
 
 from b12x.attention.compressed_sparse_mla import weight_scale  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
@@ -73,6 +75,10 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
     if differ:
         failures.append(f"bits differ at {differ}")
     print(f"folded projection differs from projection + B12X scale at {differ or 'no'} sizes", flush=True)
+    flaky = [rows for rows in REPEAT if repeatable(lambda: port(rows), lambda: [outs[rows]])]
+    if flaky:
+        failures.append(f"folded not repeatable at {flaky}")
+    print(f"folded projection not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
     print("us per step, warm / cold (b12x = TileLang projection + B12X scale)", flush=True)
     for rows in DECODE + PREFILL:
         base = per_call(lambda: today(rows), rows)

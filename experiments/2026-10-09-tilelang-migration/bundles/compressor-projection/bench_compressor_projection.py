@@ -6,7 +6,8 @@ the TP4 shapes: ratio 1 (wkv, BF16 out) and ratio 2 (wkv + wgate, FP32 out).
 
 1. Error against FP64, no worse than DeepSeek's reference computation (an FP32 matmul
    of the BF16 values, TF32 off; max and RMS); B12X's error reported beside it.
-2. Batch invariance: every row count gives the same rows of the 8192-row batch.
+2. Batch invariance: every row count gives the same rows of the 8192-row batch, and
+   repeated graph replays give the same bits (the split-K arrival counters reset).
 3. Time per call (both parts) under CUDA graphs, warm and cold, at the decode capture
    sizes and prefill rows, against B12X.
 4. A sweep of shard counts and blocked accumulation (both change bits, so one
@@ -22,7 +23,8 @@ from torch import nn
 
 sys.path.insert(0, "/b")
 from kbench import (  # noqa: E402
-    CAPACITY, DECODE, DEVICE, PREFILL, errors, no_worse, per_call, slower, timing_line,
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, errors, no_worse, per_call, repeatable, slower,
+    timing_line,
 )
 
 from b12x.gemm import bf16_gemv  # noqa: E402
@@ -132,6 +134,10 @@ def run(parts, out_dtype, session):
     if varies:
         failures.append(f"ratio {parts}: TileLang differs from its full batch at {varies}")
     print(f"ratio {parts}: TileLang differs from its full batch at {varies or 'no'} sizes", flush=True)
+    flaky = [rows for rows in REPEAT if repeatable(lambda: tilelang(rows), lambda: [o[:rows] for o in tl_out])]
+    if flaky:
+        failures.append(f"ratio {parts}: TileLang not repeatable at {flaky}")
+    print(f"ratio {parts}: TileLang not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
 
     # 3. Time, serving configuration against B12X.
     print(f"ratio {parts} {name}: us per call (both parts), warm / cold; serving shards "

@@ -811,13 +811,22 @@ def split_row_tile(rows: int) -> int:
 # Block-32 FP8 projections whose decode tiles also serve rows past DECODE_ROWS
 # (16-stream steps reach 96 rows), by (N, K): {up to this many rows: tile height}.
 # Others take their prefill tile past DECODE_ROWS. Only speed changes: every tile
-# adds K in the same order.
-WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {}
+# adds K in the same order. From the kernel lab's decode-rows bundle (2026-10-10,
+# whole calls warm, cold and after their own prefetch): the fused Q-A/KV and the
+# shared experts' gate/up and down; Q-B, the indexer's Q-B and the DSpark main
+# projection run faster on their prefill tiles.
+WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {
+    (1792, 5120): {96: 32, 128: 64},
+    (1152, 5120): {128: 64},
+    (5120, 576): {96: 32},
+}
 
 # BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
 # (N, K): the most rows it serves. The partials plus their reduce add the same
-# shards in the same order as the shard GEMM, so the bits do not change.
-BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {}
+# shards in the same order as the shard GEMM, so the bits do not change. The
+# router (8 shards) splits faster up to 256 rows, the indexer's head weights (40
+# shards) up to 1024 (decode-rows bundle, 2026-10-10).
+BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {(384, 5120): 256, (32, 5120): 1024}
 
 
 def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:

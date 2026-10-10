@@ -6,7 +6,7 @@ _ContextKVProjection prepares it, against TileLangBlock32Rows.
    than B12X's (max and RMS). Both quantize the activations to MXFP8 (E4M3, one UE8M0
    scale per 32); the error includes that rounding, whichever way each side does it.
 2. Batch invariance: every row count gives the same rows of the 8192-row batch, bit for
-   bit (TileLang gated; B12X reported).
+   bit (TileLang gated; B12X reported), and repeated graph replays give the same bits.
 3. Time per call under CUDA graphs, warm and cold, at the decode capture sizes and
    prefill rows.
 
@@ -19,7 +19,8 @@ from torch import nn
 
 sys.path.insert(0, "/b")
 from kbench import (  # noqa: E402
-    CAPACITY, DECODE, DEVICE, PREFILL, errors, no_worse, per_call, slower, timing_line,
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, errors, no_worse, per_call, repeatable, slower,
+    timing_line,
 )
 
 from b12x.gemm import block_fp8_linear  # noqa: E402
@@ -108,6 +109,10 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
         failures.append(f"TileLang differs from its full batch at {tl_varies}")
     print(f"TileLang differs from its full batch at {tl_varies or 'no'} sizes; B12X at {b12x_varies or 'no'}",
           flush=True)
+    flaky = [rows for rows in REPEAT if repeatable(lambda: tilelang(rows), lambda: [tl_out[rows]])]
+    if flaky:
+        failures.append(f"TileLang not repeatable at {flaky}")
+    print(f"TileLang not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
 
     # 3. Time.
     print("us per call, warm / cold", flush=True)

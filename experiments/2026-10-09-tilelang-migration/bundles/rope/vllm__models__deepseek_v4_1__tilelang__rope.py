@@ -24,7 +24,11 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
     assert rope_dim <= dim and half % _PAIRS == 0
     lanes = half // _PAIRS  # threads per head
     heads_per_block = min(heads, 256 // lanes)
-    threads = heads_per_block * lanes
+    per_token = heads_per_block * lanes
+    # A few heads (the KV, latent and index key have one) share a block between
+    # tokens, so blocks keep 128 threads.
+    tokens_per_block = max(1, 128 // per_token) if heads == heads_per_block else 1
+    threads = per_token * tokens_per_block
     start = dim - rope_dim
     tokens = T.dynamic("tokens")
     positions_max = T.dynamic("positions_max")
@@ -35,17 +39,19 @@ def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
         positions: T.Tensor((tokens,), T.int64),
         cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
     ):
-        with T.Kernel(tokens, T.ceildiv(heads, heads_per_block), threads=threads) as (
-            t,
-            hb,
-        ):
+        with T.Kernel(
+            T.ceildiv(tokens, tokens_per_block),
+            T.ceildiv(heads, heads_per_block),
+            threads=threads,
+        ) as (tb, hb):
             tx = T.get_thread_binding()
-            head = hb * heads_per_block + tx // lanes
+            t = tb * tokens_per_block + tx // per_token
+            head = hb * heads_per_block + tx % per_token // lanes
             lane = tx % lanes
             xs = T.alloc_local((2 * _PAIRS,), T.bfloat16)
             cs = T.alloc_local((2 * _PAIRS,), T.float32)
             position = positions[t] // ratio * ratio if ratio > 1 else positions[t]
-            if head < heads:
+            if t < tokens and head < heads:
                 for i in T.vectorized(_PAIRS):
                     cs[i] = cos_sin[position, lane * _PAIRS + i]
                 for i in T.vectorized(_PAIRS):

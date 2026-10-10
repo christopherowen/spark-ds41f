@@ -4,7 +4,8 @@ warp per token and stream) and other block shapes of ours for comparison. A quar
 of the tokens are image tokens (B12X takes their complement as its mask).
 
 1. Error against FP64, no worse than B12X's (max and RMS); image tokens pass through.
-2. Batch invariance: every row count gives the same rows of the 8192-row batch.
+2. Batch invariance: every row count gives the same rows of the 8192-row batch, and
+   repeated graph replays give the same bits.
 3. Time per call under CUDA graphs, warm and cold, at the decode capture sizes and
    prefill rows.
 
@@ -17,7 +18,8 @@ import torch
 
 sys.path.insert(0, "/b")
 from kbench import (  # noqa: E402
-    CAPACITY, DECODE, DEVICE, PREFILL, errors, no_worse, per_call, slower, timing_line,
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, errors, no_worse, per_call, repeatable, slower,
+    timing_line,
 )
 
 from b12x.norm import hyperconnection  # noqa: E402
@@ -121,6 +123,10 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
         failures.append(f"TileLang differs from its full batch at {tl_varies}")
     print(f"TileLang differs from its full batch at {tl_varies or 'no'} sizes; B12X at {b_varies or 'no'}",
           flush=True)
+    flaky = [rows for rows in REPEAT if repeatable(lambda: tilelang(rows), lambda: [outs["tilelang"][:rows]])]
+    if flaky:
+        failures.append(f"TileLang not repeatable at {flaky}")
+    print(f"TileLang not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
 
     # 3. Time.
     shapes = [(t, v) for t, v in ((128, 8), (320, 8), (640, 8)) if DIM % (t * v) == 0]

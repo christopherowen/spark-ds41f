@@ -17,7 +17,7 @@ import time
 import torch
 
 sys.path.insert(0, "/b")
-from kbench import CAPACITY, DEVICE, per_call  # noqa: E402
+from kbench import CAPACITY, DEVICE, REPLAYS, per_call, repeatable  # noqa: E402
 
 import triton  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
@@ -125,6 +125,8 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
             failures.append(f"{name}: hashes differ")
         if (int(tl_counts[0]), int(tl_counts[1])) != (int(buffers["num_seqs"]), int(buffers["num_tokens"])):
             failures.append(f"{name}: counts differ")
+        if repeatable(lambda: tilelang(ids, image, starts, history, t_out), lambda: [t_out, *tl_counts]):
+            failures.append(f"{name}: not repeatable over {REPLAYS} replays")
         b_eager = eager(lambda: b12x(ids, keep, starts, history, b_out))
         t_eager = eager(lambda: tilelang(ids, image, starts, history, t_out))
         b_graph = per_call(lambda: b12x(ids, keep, starts, history, b_out), padded)[0]

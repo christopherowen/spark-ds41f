@@ -17,7 +17,7 @@ For each port: its switch commit, the environment its arm sets, and its kernel b
 
 VLLM_BRANCH = "tilelang-migration"
 BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
-MODULES = "e0da3df05"  # the last module commit
+MODULES = "a48174738"  # the last module commit
 
 PORTS = {
     # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
@@ -38,7 +38,7 @@ PORTS = {
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "switch": "b388e0d9b",
+        "switch": "34ab993d6",
         "environment": {},
         "bundle": {
             "modules": (
@@ -58,7 +58,7 @@ PORTS = {
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "switch": "936686bf0",
+        "switch": "4fd2e76da",
         "environment": {},
         "bundle": {
             "modules": (
@@ -78,7 +78,7 @@ PORTS = {
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "switch": "5336bf9d0",
+        "switch": "c3e29c9a7",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
@@ -93,7 +93,7 @@ PORTS = {
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "switch": "20dbc51f7",
+        "switch": "164d03e34",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
@@ -108,7 +108,7 @@ PORTS = {
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "switch": "bc36e6e93",
+        "switch": "3f18d6a07",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
@@ -123,7 +123,7 @@ PORTS = {
     # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
     # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
     "wo-projection": {
-        "switch": "2bd57a159",
+        "switch": "bb2331329",
         "environment": {},
         "bundle": {
             "modules": (
@@ -143,7 +143,7 @@ PORTS = {
     # 5. B8: the indexer's head-weight scale, B12X scale_index_weights -> folded exactly
     # into the TileLang projection's weight (no kernel).
     "index-weights": {
-        "switch": "cc1c5716b",
+        "switch": "86ef1c73e",
         "environment": {},
         "bundle": {
             "modules": (
@@ -160,22 +160,30 @@ PORTS = {
             "scripts": ("bench_index_weights.py",),
         },
     },
+    # 9. D1: rows 65-128 (16-stream steps) on the production TileLang projections: decode
+    # tiles for the fused Q-A/KV and shared experts, split-K for the router and the
+    # indexer head weights; same bits, speed only.
+    "decode-rows": {
+        "switch": "f2f8b602a",
+        "environment": {},
+        "bundle": {
+            "modules": (
+                "vllm/models/deepseek_v4_1/tilelang/gemm.py",
+                "vllm/models/deepseek_v4_1/tilelang/linear.py",
+            ),
+            "description": "Rows 65-128 on the production TileLang projections: prefill tiles "
+            "against 64- and 32-row decode tiles (warm, cold, after their own prefetch), and the "
+            "router's shard GEMM against split-K partials; bits and graph-replay repeatability "
+            "checked, after the TileLang linear unit tests.",
+            "tests": ("tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",),
+            "select": None,
+            "scripts": ("bench_decode_rows.py",),
+        },
+    },
 }
 
 # Kernel bundles that are not ports (no switch, no arm): they measure the modules.
-BUNDLES = {
-    # Rows 65-128 on the production TileLang projections: prefill tiles against
-    # padded decode tiles (same bits), FP8 shapes and the BF16 router.
-    "decode-rows": {
-        "modules": ("vllm/models/deepseek_v4_1/tilelang/gemm.py",),
-        "description": "Rows 65-128 on the production TileLang projections: prefill tiles "
-        "against 64- and 32-row decode tiles (warm, cold, after their own prefetch), and the "
-        "router's shard GEMM against split-K partials; bits checked.",
-        "tests": (),
-        "select": None,
-        "scripts": ("bench_decode_rows.py",),
-    },
-}
+BUNDLES = {}
 
 # sparknet's one-shot collectives: the image pins 0.2.0, which predates the TileLang
 # family, so both arms mount sparknet main (b61660f) and differ only in the family.

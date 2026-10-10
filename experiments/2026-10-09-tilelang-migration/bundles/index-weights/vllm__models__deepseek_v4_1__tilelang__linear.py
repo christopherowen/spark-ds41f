@@ -29,12 +29,14 @@ from vllm.v1.worker.workspace import (
 )
 
 from .gemm import (
+    BF16_SPLIT_ROWS,
     DECODE_ROWS,
     DECODE_TILE_ROWS,
     SF_BLOCK,
     SPLIT_BF16,
     SPLIT_DECODE_ROWS,
     SPLIT_FP8,
+    WIDE_DECODE,
     bf16_gemm,
     bf16_gemm_partials,
     bf16_gemm_splitk,
@@ -99,7 +101,7 @@ def partials_kernel(layer: nn.Module, rows: int):
 def _partial_specs(layer: nn.Module, rows: int):
     """FP32 split-K partials of a BF16 projection's decode rows, if it splits."""
     shards = layer.tilelang_shards
-    if shards == 1 or rows > DECODE_ROWS:
+    if shards == 1 or rows > layer.tilelang_split_rows:
         return ()
     return (((shards, rows, layer.weight.shape[0]), torch.float32),)
 
@@ -163,7 +165,7 @@ def _block32_linear(
     if rows > layer.tilelang_decode_rows:
         gemm = layer.tilelang_prefill
     else:
-        gemm = layer.tilelang_decode[decode_tile_rows(rows)]
+        gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
     gemm(
         xq,
         layer.weight,
@@ -246,7 +248,8 @@ def _prepare_block32(layer, groups: int = 1) -> None:
         layer.weight_scale_inv.view(torch.uint8), rows=n
     )
     layer.tilelang_groups = groups
-    layer.tilelang_decode_rows = DECODE_ROWS
+    layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+    layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
     split = SPLIT_FP8.get((n, k)) if groups == 1 else None
     layer.tilelang_shards = split["shards"] if split else 1
     if split:
@@ -303,7 +306,11 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
         _prepare_block32(layer)
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
-        return _spec_bytes(_activation_specs(num_tokens, layer.weight.shape[1]))
+        return _spec_bytes(
+            _activation_specs(
+                num_tokens, layer.weight.shape[1], layer.tilelang_decode_rows
+            )
+        )
 
     def apply(self, layer, x, bias=None):
         if bias is not None:
@@ -337,6 +344,7 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
         n, k = layer.weight.shape
         out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
         shards = layer.tilelang_shards = bf16_shards(n, k)
+        layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
         layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
         if shards > 1:
             layer.tilelang_partials = {

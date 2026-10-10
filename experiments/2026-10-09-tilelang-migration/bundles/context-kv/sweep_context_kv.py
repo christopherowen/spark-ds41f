@@ -79,7 +79,8 @@ sf = torch.empty(max(PREFILL_ROWS), 4 * g.scale_words(K), dtype=torch.uint8, dev
 out = torch.empty(max(PREFILL_ROWS), N, dtype=torch.bfloat16, device=DEV)
 session = PreparationSession(device=DEV, autotune=False, compile_workers=2)
 b12x = {}
-for rows in (*DECODE_ROWS, *PREFILL_ROWS):
+ALL_ROWS = sorted({*DECODE_ROWS, *PREFILL_ROWS})  # 512 is both; a repeated plan name is not prepared again
+for rows in ALL_ROWS:
     plan = block_fp8_linear.plan(block_fp8_linear.Caps(device=DEV, max_tokens=rows, in_features=K, out_features=N,
                                                        block_size=(32, 32), output_mode="provided"))
     owned = {}
@@ -120,7 +121,7 @@ def name_of(cfg):
 
 
 base = {rows: measure(lambda i, rows=rows: block_fp8_linear.run(binding=b12x[rows][i]), b_plans, rows,
-                      rows in DECODE_ROWS) for rows in (*DECODE_ROWS, *PREFILL_ROWS)}
+                      rows in DECODE_ROWS) for rows in ALL_ROWS}
 for rows, m in base.items():
     print(f"B12X {rows} rows: " + "/".join(f"{t:.1f}" for t in m), flush=True)
 

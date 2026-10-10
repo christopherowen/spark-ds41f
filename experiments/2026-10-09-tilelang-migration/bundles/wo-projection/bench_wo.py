@@ -5,7 +5,8 @@ place, grouped WO-A, WO-B).
 
 1. Error against FP64 (inverse rotation in FP64, unquantized activations, dequantized
    weights), no worse than B12X's (max and RMS).
-2. Batch invariance: every row count gives the same rows of the 8192-row batch.
+2. Batch invariance: every row count gives the same rows of the 8192-row batch, and
+   repeated graph replays give the same bits.
 3. Time per call under CUDA graphs, warm and cold, at the decode capture sizes and
    prefill rows.
 
@@ -19,7 +20,8 @@ from torch import nn
 
 sys.path.insert(0, "/b")
 from kbench import (  # noqa: E402
-    CAPACITY, DECODE, DEVICE, PREFILL, errors, no_worse, per_call, slower, timing_line,
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, errors, no_worse, per_call, repeatable, slower,
+    timing_line,
 )
 
 from b12x.gemm import wo_projection  # noqa: E402
@@ -146,6 +148,14 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
     if varies:
         failures.append(f"TileLang differs from its full batch at {varies}")
     print(f"TileLang differs from its full batch at {varies or 'no'} sizes", flush=True)
+
+    def fresh(rows):
+        work[:rows].copy_(o[:rows])
+        tilelang(rows)
+    flaky = [rows for rows in REPEAT if repeatable(lambda: fresh(rows), lambda: [t_out[:rows]])]
+    if flaky:
+        failures.append(f"TileLang not repeatable at {flaky}")
+    print(f"TileLang not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
 
     # 3. Time.
     print("us per call, warm / cold", flush=True)
