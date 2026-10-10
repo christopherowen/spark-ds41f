@@ -1,0 +1,44 @@
+From 35e5d26bc2be2b0861fe1ccb6fa51a96242d2b02 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:37:22 +0200
+Subject: [PATCH] TileLang router: the text-only mask covers the gate's split
+ rows
+
+The fused gate router takes the gate's split-K rows (DECODE_ROWS until a
+shape lists more in BF16_SPLIT_ROWS); its all-false image mask for
+text-only layers was sized DECODE_ROWS, so a split past 64 rows (the
+decode-rows port's 256) failed the routing kernel's mask shape check. The
+r6d gate's router test at 65 rows found it; DS4.1's routing builds the mask
+from the input ids and never takes this path.
+---
+ vllm/models/deepseek_v4_1/tilelang/router.py | 13 +++++++++----
+ 1 file changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index eedb28fe3..59eba3079 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -345,11 +345,16 @@ class TileLangGateRouter(TileKernelsRouter):
+                 input_ids, self.image_sentinel_lo, self.image_sentinel_count
+             )
+         else:
+-            if self._no_image is None or self._no_image.device != x.device:
+-                from .linear import DECODE_ROWS
+-
++            if (
++                self._no_image is None
++                or self._no_image.device != x.device
++                or self._no_image.numel() < rows
++            ):
++                # Every row count this fused path takes: the gate's split rows.
+                 self._no_image = torch.zeros(
+-                    DECODE_ROWS, dtype=torch.bool, device=x.device
++                    max(rows, gate.tilelang_split_rows),
++                    dtype=torch.bool,
++                    device=x.device,
+                 )
+             image_bias, mask = bias, self._no_image[:rows]
+         self._kernels[key](
+-- 
+2.54.0 (Apple Git-157)
+

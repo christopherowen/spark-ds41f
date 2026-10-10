@@ -17,7 +17,7 @@ For each port: its switch commit, the environment its arm sets, and its kernel b
 
 VLLM_BRANCH = "tilelang-migration"
 BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
-MODULES = "341fb9e6d"  # the last module commit
+MODULES = "c383b9edd"  # the last module commit
 
 PORTS = {
     # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
@@ -38,7 +38,7 @@ PORTS = {
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "switch": "0d96d5b6d",
+        "switch": "f51e849ea",
         "environment": {},
         "bundle": {
             "modules": (
@@ -58,7 +58,7 @@ PORTS = {
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "switch": "447714a35",
+        "switch": "657dd1a40",
         "environment": {},
         "bundle": {
             "modules": (
@@ -78,7 +78,7 @@ PORTS = {
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "switch": "28c32f865",
+        "switch": "5d0ffcbe4",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
@@ -93,7 +93,7 @@ PORTS = {
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "switch": "99dd6a566",
+        "switch": "998a9c39b",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
@@ -108,7 +108,7 @@ PORTS = {
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "switch": "7aecb9ba0",
+        "switch": "2c0cedf37",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
@@ -123,7 +123,7 @@ PORTS = {
     # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
     # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
     "wo-projection": {
-        "switch": "b51fa596b",
+        "switch": "392f865fe",
         "environment": {},
         "bundle": {
             "modules": (
@@ -143,7 +143,7 @@ PORTS = {
     # 5. B8: the indexer's head-weight scale, B12X scale_index_weights -> folded exactly
     # into the TileLang projection's weight (no kernel).
     "index-weights": {
-        "switch": "7b3e85c86",
+        "switch": "4eed6d622",
         "environment": {},
         "bundle": {
             "modules": (
@@ -164,18 +164,24 @@ PORTS = {
     # tiles for the fused Q-A/KV and shared experts, split-K for the router and the
     # indexer head weights; same bits, speed only.
     "decode-rows": {
-        "switch": "3a47679a0",
+        "switch": "ade07a46f",
         "environment": {},
         "bundle": {
             "modules": (
                 "vllm/models/deepseek_v4_1/tilelang/gemm.py",
                 "vllm/models/deepseek_v4_1/tilelang/linear.py",
+                "vllm/models/deepseek_v4_1/tilelang/router.py",
             ),
             "description": "Rows 65-128 on the production TileLang projections: prefill tiles "
             "against 64- and 32-row decode tiles (warm, cold, after their own prefetch), and the "
             "router's shard GEMM against split-K partials; bits and graph-replay repeatability "
             "checked, after the TileLang linear unit tests.",
-            "tests": ("tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",),
+            "tests": (
+                "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",
+                # The fused gate router takes the wider split rows (the r6d gate's
+                # 65-row router test found a mask sized for 64).
+                "tests/kernels/moe/test_deepseek_v41_tilelang_router.py",
+            ),
             "select": None,
             "scripts": ("bench_decode_rows.py",),
         },
@@ -191,7 +197,7 @@ PORTS = {
     # to 2 MiB, and sequence parallelism's reduce-scatter with its arithmetic (FP32,
     # rank order, one rounding) instead of NCCL's ring sums.
     "collectives": {
-        "switch": "cee7d51ac",
+        "switch": "0bc5a031a",
         "environment": {"SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152"},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/collectives.py",),
@@ -207,7 +213,7 @@ PORTS = {
     # (8096: the 8192-token budget less 16 streams of 6 decode rows), so a long prompt
     # splits at the same tokens whatever else is served.
     "chunk-align": {
-        "switch": "6be585068",
+        "switch": "f535d4210",
         "environment": {},
         "serve_args": {"--long-prefill-token-threshold": "8096"},
         "bundle": {
@@ -220,7 +226,7 @@ PORTS = {
     },
     # 13. B3: the KV-cache record writers, B12X write_cache -> TileLang (the same bytes).
     "cache-writer": {
-        "switch": "6048f0aa8",
+        "switch": "10bf4d0a2",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/cache_writer.py",),

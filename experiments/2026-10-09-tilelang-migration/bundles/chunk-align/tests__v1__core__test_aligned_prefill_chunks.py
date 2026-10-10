@@ -27,6 +27,23 @@ def test_chunks_end_at_multiples_of_the_threshold():
     assert _chunk(0, 1536, 5000) == 5000  # no threshold: unchanged
 
 
+def test_a_whole_chunk_must_fit_beside_the_decode_rows():
+    def check(threshold, budget, seqs=16, spec=5):
+        owner = SimpleNamespace(
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold),
+            max_num_running_reqs=seqs,
+            num_spec_tokens=spec,
+            max_num_scheduled_tokens=budget,
+        )
+        scheduler_module.Scheduler._check_aligned_prefill_chunks(owner)
+
+    check(8096, 8192)  # TP4: 16 streams of six rows beside a chunk
+    check(4048, 4096, seqs=8)  # TP3
+    for threshold, budget in ((8192, 8192), (0, 8192), (8097, 8192)):
+        with pytest.raises(ValueError):
+            check(threshold, budget)
+
+
 # A minimal OPT-125m configuration, so the scheduler builds without the hub.
 _OPT_CONFIG = {
     "architectures": ["OPTForCausalLM"],
