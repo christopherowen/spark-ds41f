@@ -14,11 +14,11 @@ back, so hiding one under the other is worth more than C3's cost.
 
 ## What changes (vLLM branch `r6d-overlap`, on r6d's tree)
 
-- `eb6cb782f` (module): `SPRows.project_reduce_scatter(project, ...)`. In
+- `440d27195` (module): `SPRows.project_reduce_scatter(project, ...)`. In
   slices, each rank's block is projected piece by piece into one contiguous
   buffer per piece, and each piece is reduce-scattered on a side stream while
   the next is projected; with one slice it is the existing path.
-- `c2b574ec6` (switch): under the TileLang family, sequence-parallel steps of
+- `0cd9a8d9c` (switch): under the TileLang family, sequence-parallel steps of
   2048 tokens or more project WO in two slices. The L2 prefetch of the next
   FFN weights still issues after the last projection, before the last
   reduce-scatter is awaited.

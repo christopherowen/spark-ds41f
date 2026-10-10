@@ -14,7 +14,7 @@ ROOT = HERE.parents[1]
 REL = HERE.relative_to(ROOT).as_posix()
 BASE = ROOT / "experiments/2026-10-10-r6d-deterministic/r6d-tp4.json"
 R6D = "r6d-candidate"  # the vLLM branch of the r6d image's tree
-OVERLAP = "c2b574ec6"  # the switch on top of its module commit
+OVERLAP = "0cd9a8d9c"  # the switch on top of its module commit
 TREE = "/opt/spark3/candidate/vllm"
 TEST = "tests/models/test_deepseek_v41_sp_project_reduce_scatter.py"
 
