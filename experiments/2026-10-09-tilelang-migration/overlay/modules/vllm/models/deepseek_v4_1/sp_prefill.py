@@ -224,6 +224,7 @@ class SPRows:
         device: torch.device,
         slices: int = 1,
         then=None,
+        per_block: bool = False,
     ) -> torch.Tensor:
         """This rank's L rows of the sum over ranks of a T-row projection.
 
@@ -238,10 +239,15 @@ class SPRows:
 
         With ``unreduced`` rows the result is every rank's unreduced partial of
         this rank's rows instead, ``(N, L, *row_shape)``; see "Unreduced results".
+        In one slice, ``per_block`` writes each rank's block with its own call,
+        this rank's straight into its slot (for writers that cost nothing per
+        call, such as an elementwise sum); otherwise one call writes every row
+        and this rank's block is copied into its slot (a projection reads its
+        weights once).
         """
         if self.unreduced:
             return self._project_exchange(
-                project, row_shape, dtype, device, slices, then
+                project, row_shape, dtype, device, slices, then, per_block
             )
         if slices <= 1:
             padded = self.empty_padded(row_shape, dtype, device)
@@ -279,7 +285,9 @@ class SPRows:
         main.wait_stream(side)
         return out
 
-    def _project_exchange(self, project, row_shape, dtype, device, slices, then):
+    def _project_exchange(
+        self, project, row_shape, dtype, device, slices, then, per_block=False
+    ):
         """``project_reduce_scatter`` without the sum: each rank's block goes into
         its slot of one send buffer, this rank's own straight into its slot of
         the parts, and the chunks are exchanged into the parts; with ``slices``
@@ -292,6 +300,15 @@ class SPRows:
         parts = torch.empty_like(send)
         comm = get_tp_group().device_communicator.pynccl_comm
         slices = max(slices, 1)
+        if slices == 1 and not per_block:
+            flat = send.view(world * local, *row_shape)
+            project(0, tokens, flat[:tokens])
+            flat[tokens:].zero_()
+            parts[self.rank].copy_(send[self.rank])
+            if then is not None:
+                then()
+            exchange_into(comm, send, parts, self.rank, world)
+            return parts
         bounds = [local * i // slices for i in range(slices + 1)]
         main = torch.cuda.current_stream(device)
         side = _side_stream(device) if slices > 1 else None
@@ -370,7 +387,9 @@ def project_reduce_scatter_current(
             f"SP reduce-scatter of {rows} rows ({padded_rows} padded) outside its "
             f"forward ({sp})"
         )
-    return sp.project_reduce_scatter(project, row_shape, dtype, device, then=then)
+    return sp.project_reduce_scatter(
+        project, row_shape, dtype, device, then=then, per_block=True
+    )
 
 
 _SIDE_STREAMS: dict = {}
