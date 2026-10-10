@@ -441,3 +441,30 @@ class KernelBackendTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TileLangProfileLabelTest(unittest.TestCase):
+    # Diagnostics whose locks moved on to a later series; frozen as they ran.
+    HISTORICAL = {
+        "experiments/2026-10-03-tilelang-tp4-performance/round2-tilelang.json",
+        "experiments/2026-10-03-tilelang-tp4-performance/tilelang.json",
+        "experiments/2026-10-04-tilelang-1m/diagnostics/ctx0.json",
+        "experiments/2026-10-04-tilelang-1m/diagnostics/seqs12.json",
+        "experiments/2026-10-04-tilelang-1m/diagnostics/seqs16-4k.json",
+        "experiments/2026-10-04-tilelang-1m/diagnostics/shapes8.json",
+    }
+
+    def test_tilelang_profiles_expect_their_manifest_trees(self):
+        """The launch preflight refuses a TileLang profile whose expected image trees
+        differ from its lock's source manifest (an arm generated from a recipe before
+        its series changed)."""
+        for path in sorted(glob.glob(str(ROOT / "experiments/**/*.json"), recursive=True)):
+            relative = Path(path).relative_to(ROOT).as_posix()
+            data = json.loads(Path(path).read_text())
+            if (not isinstance(data, dict) or data.get("kernel_backend") != "tilelang"
+                    or "container" not in data or relative in self.HISTORICAL):
+                continue
+            lock = spark.read_json(data.get("upstreams_config", "upstreams.lock.json"))
+            manifest = spark.read_json(lock["source_manifest"])
+            with self.subTest(profile=relative):
+                self.assertEqual(kernel_backend.source_problems(data, lock, manifest), [])
