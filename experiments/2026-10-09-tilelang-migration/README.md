@@ -137,17 +137,17 @@ gate). Numbers in parentheses are windows.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
 | C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
-| B5 compressor projection | `d900496ee` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
-| B6 DSpark context KV | `078679cd1` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
-| B7 Engram gate | `e9531fc3e` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
-| B2 RoPE | `8c91cddfb` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
-| B9 Engram hash | `2b35ac1e6` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
-| B1 WO projection | `5ee1a227e` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
-| B8 index head weights | `fa9072557` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
-| C3 collectives | `79fc22e95` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
-| Chunk alignment | `a094cabc9` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
-| B3 cache writers | `a7931a7eb` (modules `f236ddec2`, `69dd2c27b`) | record tests against a torch replica of B12X's arithmetic | not screened | window 6 kernels and arm |
-| D1 decode rows | `073375563` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
+| B5 compressor projection | `0d96d5b6d` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `447714a35` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `28c32f865` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `99dd6a566` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `7aecb9ba0` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `b51fa596b` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `7b3e85c86` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| C3 collectives | `cee7d51ac` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
+| Chunk alignment | `6be585068` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
+| B3 cache writers | `6048f0aa8` (modules `f236ddec2`, `69dd2c27b`) | record tests against a torch replica of B12X's arithmetic | not screened | window 6 kernels and arm |
+| D1 decode rows | `3a47679a0` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 
@@ -241,7 +241,7 @@ the relay hop ran after the direct transfers, and the sum (read 84 MB, write
 21 MB) after both. Module `729a29632` pipelines the exchange in slices of
 about 4 MiB per chunk: each NCCL group carries one slice's direct chunks and
 relay halves with the previous slice's relayed halves, and the previous slice
-is summed on a side stream meanwhile.
+is summed on a side stream meanwhile. (Window 6 measured it slower: dropped.)
 
 Window 6 measures it model-free on the fabric (`fabric_reduce_scatter.py`, a
 new lab `fabric` job: one container per node with an arm's image, environment
@@ -352,6 +352,28 @@ about 10,000 tokens, past one chunk), c1/c8 distinct streams and
 mixed-traffic latency for the control, `oneshot-dispatch`, B5, C3, chunk
 alignment and `deterministic`, then the arms window 4 did not reach (B9, B2,
 B8), bracketed by the control.
+
+Window 6 results (2026-10-10, 12:12-12:48 UTC):
+
+- Fabric, 8192 rows (slowest rank's median per call): NCCL's reduce-scatter
+  3.62 ms; the rank-order exchange 5.39 ms in one slice, 5.27 / 5.57 / 5.80 ms
+  in 2 / 4 / 8; the sum alone 0.56 ms. Every extra NCCL group costs about
+  150 us here, so pipelining loses at every size and is dropped. With four
+  channels per network peer and 512 KiB point-to-point chunks the exchange
+  takes 4.47 ms against NCCL's 3.19 ms (13-20% faster at 1024-8192 rows), about
+  1.4x; the remainder is the sum (about 43%) and the exchange (57%, near the
+  wire floor). Every rank-order result matched the all-gathered reference;
+  NCCL's differed in about 2% of elements.
+- Serving: `deterministic` with the pipelined exchange stays bit-identical in
+  every scenario but loses more prefill (-3.9% at 1K, -5.3% at 16K, against
+  -3.0% / -1.7% unpipelined in window 5). B3 is level in serving and its
+  records equal B12X's at every size, but its kernel took 3-16x B12X's time;
+  module `341fb9e6d` rewrites it with coalesced threads (a warp per SWA group,
+  eight threads per indexed group, shuffle-reduced scales).
+
+Window 7f (`w7f.json`): the fabric bench under NCCL point-to-point settings
+(channels per peer, chunk size, queue pairs per connection), bracketed by the
+recipe's, and the rewritten B3 bundle.
 
 Window 5 results (2026-10-10, 08:15-09:27 UTC), lean screen bracketed by the
 control (control-end within 0.2% of it):

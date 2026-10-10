@@ -16,7 +16,7 @@ are skipped):
   ties-to-even) and rounded to nearest-even E2M1.
 
 The arithmetic is B12X's ``write_cache`` for ``cache_format="deepseek_v41"``,
-step for step, so the records are the same bytes. One thread writes one group.
+step for step, so the records are the same bytes.
 """
 
 # No `from __future__ import annotations`: TileLang reads the prim_func
@@ -34,11 +34,17 @@ _E4M3_MAX = 448.0
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def cache_writer_kernel(
-    cache_kind: str, page_size: int, slot_dtype: str = "int64", threads: int = 128
-):
+def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int64"):
+    """One record per token. ``swa``: a warp per 32-value group, one value and one
+    E4M3 byte per thread. ``indexed``: eight threads per 16-value group, two values
+    and one packed E2M1 byte per thread. Each warp reads and writes contiguous
+    bytes; a group's amax is a shuffle reduction (a max, so the order is free)."""
+    threads = 128
     group_size = _GROUP[cache_kind]
     groups = DIM // group_size
+    per_thread = 1 if cache_kind == "swa" else 2  # values per thread
+    lanes = group_size // per_thread  # threads per group: 32 or 8
+    blocks = groups * lanes // threads  # blocks per token: 4 or 2
     record = RECORD_BYTES[cache_kind]
     payload = DIM if cache_kind == "swa" else DIM // 2  # scale bytes follow
     tokens, kv_stride = T.dynamic("tokens, kv_stride")
@@ -50,52 +56,51 @@ def cache_writer_kernel(
         cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
         slots: T.Tensor((tokens,), slot_dtype),
     ):
-        with T.Kernel(T.ceildiv(tokens * groups, threads), threads=threads) as bx:
-            item = bx * threads + T.get_thread_binding()
-            token, group = item // groups, item % groups
-            values = T.alloc_local((group_size,), T.float32)
+        with T.Kernel(tokens * blocks, threads=threads) as bx:
+            item = (bx % blocks) * threads + T.get_thread_binding()
+            token = bx // blocks
+            group, lane = item // lanes, item % lanes
+            col = group * group_size + lane * per_thread
+            first = T.cast(kv[token, col], T.float32)
+            second = T.alloc_var(T.float32)
             amax = T.alloc_var(T.float32)
-            if token < tokens:
-                slot = T.cast(slots[token], T.int64)
-                page = slot // page_size
-                if (slot >= 0) & (page < pages):
-                    base = (slot % page_size) * record
-                    amax = 0.0
-                    for i in T.unroll(group_size):
-                        values[i] = T.cast(kv[token, group * group_size + i], T.float32)
-                        amax = T.max(amax, T.abs(values[i]))
-                    if cache_kind == "swa":
-                        bits = T.reinterpret(
-                            T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)),
-                            T.uint32,
-                        )
-                        bumped = T.if_then_else(
-                            (bits & 0x7FFFFF) != 0,
-                            (bits + 0x800000) & 0x7F800000,
-                            bits,
-                        )
-                        exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
-                        # The exact reciprocal of the power-of-two scale.
-                        inverse = T.reinterpret(
-                            T.cast(T.shift_left(254 - exponent, 23), T.uint32),
-                            T.float32,
-                        )
-                        for i in T.unroll(group_size):
-                            code = T.cast(T.fmul(values[i], inverse), T.float8_e4m3fn)
-                            cache[page, base + group * group_size + i] = T.reinterpret(
-                                code, T.uint8
-                            )
+            amax = T.abs(first)
+            if cache_kind == "swa":
+                amax = T.warp_reduce_max(amax)
+            else:
+                second = T.cast(kv[token, col + 1], T.float32)
+                amax = T.max(amax, T.abs(second))
+                amax = T.max(amax, T.shfl_xor(amax, 1))
+                amax = T.max(amax, T.shfl_xor(amax, 2))
+                amax = T.max(amax, T.shfl_xor(amax, 4))
+            slot = T.cast(slots[token], T.int64)
+            page = slot // page_size
+            if (slot >= 0) & (page < pages):
+                base = (slot % page_size) * record
+                if cache_kind == "swa":
+                    bits = T.reinterpret(
+                        T.fmul(T.max(amax, 1e-4), T.float32(1.0 / _E4M3_MAX)), T.uint32
+                    )
+                    bumped = T.if_then_else(
+                        (bits & 0x7FFFFF) != 0, (bits + 0x800000) & 0x7F800000, bits
+                    )
+                    exponent = T.cast(T.shift_right(bumped, 23) & 0xFF, T.int32)
+                    # The exact reciprocal of the power-of-two scale.
+                    inverse = T.reinterpret(
+                        T.cast(T.shift_left(254 - exponent, 23), T.uint32), T.float32
+                    )
+                    code = T.cast(T.fmul(first, inverse), T.float8_e4m3fn)
+                    cache[page, base + col] = T.reinterpret(code, T.uint8)
+                    if lane == 0:
                         cache[page, base + payload + group] = T.cast(exponent, T.uint8)
-                    else:
-                        scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
-                        scale_code = T.cast(T.min(scale, _E4M3_MAX), T.float8_e4m3fn)
-                        decoded = T.cast(scale_code, T.float32)
-                        for i in T.unroll(group_size // 2):
-                            lo = _e2m1_code(values[2 * i] / decoded)
-                            hi = _e2m1_code(values[2 * i + 1] / decoded)
-                            cache[page, base + group * (group_size // 2) + i] = T.cast(
-                                lo | (hi << 4), T.uint8
-                            )
+                else:
+                    scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
+                    scale_code = T.cast(T.min(scale, _E4M3_MAX), T.float8_e4m3fn)
+                    decoded = T.cast(scale_code, T.float32)
+                    lo = _e2m1_code(first / decoded)
+                    hi = _e2m1_code(second / decoded)
+                    cache[page, base + col // 2] = T.cast(lo | (hi << 4), T.uint8)
+                    if lane == 0:
                         cache[page, base + payload + group] = T.reinterpret(
                             scale_code, T.uint8
                         )
