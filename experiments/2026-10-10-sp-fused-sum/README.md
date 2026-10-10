@@ -57,3 +57,36 @@ long prompt's reference (prefill sequence-parallel) must have the same bits.
 
 Acceptance: references bit-identical to the overlap arm, temperature-0 outputs
 identical, decode level, prefill faster than the overlap.
+
+## Status
+
+Window 1 (2026-10-10, 17:41-18:05 UTC, overlap / fused / overlap bracket):
+
+| Measure | overlap | fused | overlap (end) |
+| --- | --- | --- | --- |
+| prose c1 step | 31.48 ms | 31.55 ms (+0.2%) | 31.57 ms (+0.3%) |
+| json c1 step | 36.63 ms | 36.62 ms (-0.0%) | 36.91 ms (+0.8%) |
+| single stream, distinct prompts | 87.49 tok/s | -0.0% | +0.1% |
+| eight distinct concurrent prompts | 175.85 tok/s | +0.1% | +0.1% |
+| cold prefill 1K | 2648 tok/s | 2584 (-2.4%) | 2604 (-1.7%) |
+| cold prefill 16K | 5694 tok/s | 5781 (+1.5%) | 5704 (+0.2%) |
+| mixed: short TTFT median | 232.0 ms | -1.4% | -3.3% |
+| mixed: long TTFT mean | 904.7 ms | +1.8% | +2.2% |
+| temperature 0 | identical | identical | identical |
+| references against overlap | - | same bits | same bits |
+
+The fused arm's references, the eight prompts alone and the long prompt alone
+(prefilled sequence-parallel through the fused path), have the overlap arm's
+bits, and every temperature-0 scenario is identical. Decode is level. Prefill at
+16K is 1.4% faster than the mean of the two overlap runs, inside the 1-2%
+ceiling. At 1K it is 1.6% slower than that mean, near the bracket's own spread
+(1.7%), but with a cause: below 2048 tokens the unreduced path projected WO once
+per rank's block (four launches, each reading the weights) where the reduced
+path projects once. Fix: one projection into the send buffer and a copy of this
+rank's block (2.6 MB at 1K); per-block writes stay for the MoE's elementwise add.
+
+The kernel bundle's new SP layout test failed in every case on a latent bug in
+`rank_order_sum`'s torch path (FP32 parts: `.float()` returned the first part,
+which the sum then added into); serving's BF16 CUDA parts take the kernel. Fixed
+with a regression test (module `52f23588b`); the mHC parts-against-sum and
+exchange tests passed.
