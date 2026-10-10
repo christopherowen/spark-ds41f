@@ -1,0 +1,110 @@
+From 64cad715ceca15cebd187838c3dd96bfbafd9362 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:09 +0200
+Subject: [PATCH] Engram hash: TileLang under the TileLang kernel backend
+
+The step's Engram hashes come from the one-launch TileLang kernel instead of
+vLLM's metadata copy and B12X's three Triton launches and copy per layer, and
+no B12X hash plans are prepared. The TileLang model passes the image-token
+mask instead of its complement.
+---
+ vllm/models/deepseek_v4_1/common/engram.py | 37 ++++++++++++++++++++--
+ vllm/models/deepseek_v4_1/nvidia/model.py  |  3 +-
+ 2 files changed, 37 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 10f3f9083..f10595248 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -354,6 +354,16 @@ class NgramHashState(nn.Module):
+             self.register_buffer(
+                 name, torch.empty(shape, dtype=dtype, device=c.device), persistent=False
+             )
++        if kernels.uses_tilelang():
++            from vllm.models.deepseek_v4_1.tilelang.engram_hash import (
++                geometry_tensors,
++            )
++
++            # The TileLang hash reads the tokenizer map and geometry directly.
++            self._tl_token_map = torch.tensor(
++                layout.token_map, dtype=torch.int64, device=c.device
++            )
++            self._tl_geometry = geometry_tensors(layout.geometry, c.device)
+         set_b12x_preparation_provider(self, self)
+ 
+     def _ensure_bindings(self) -> None:
+@@ -395,6 +405,8 @@ class NgramHashState(nn.Module):
+     ) -> tuple[B12xPreparationUnit, ...]:
+         if workload.max_tokens > self.layout.caps[0].max_tokens:
+             return ()
++        if kernels.uses_tilelang():
++            return ()
+ 
+         def make_call(state):
+             from b12x.sequence.engram._impl import _bind_state
+@@ -461,8 +473,12 @@ class NgramHashState(nn.Module):
+         return True  # Hash history belongs to the runner, never the KV slot pool.
+ 
+     def run_native(self, ids, mask, starts, history, out):
++        """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
++
++        ``mask`` marks the tokens to hash under the B12X kernels, and the image
++        tokens to exclude (DeepSeek's mask) under the TileLang kernels.
++        """
+         retain_cuda_graph_capture_resource(self)
+-        self._ensure_bindings()
+         c = self.layout.caps[0]
+         seqs = starts.numel() - 1
+         if ids.numel() > c.max_tokens or seqs > c.max_seqs:
+@@ -471,6 +487,22 @@ class NgramHashState(nn.Module):
+             raise ValueError(
+                 "Engram requires chronological accepted history [requests,3]"
+             )
++        if kernels.uses_tilelang():
++            from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash
++
++            engram_hash(
++                ids,
++                mask,
++                starts,
++                history,
++                self._tl_token_map,
++                *self._tl_geometry,
++                out,
++                self.num_seqs,
++                self.num_tokens,
++            )
++            return
++        self._ensure_bindings()
+         work = max(c.max_tokens, c.max_seqs * 3, c.max_seqs + 1)
+         _prepare_metadata[(triton.cdiv(work, 256),)](
+             ids,
+@@ -513,7 +545,8 @@ class NgramHashState(nn.Module):
+             dtype=torch.int64,
+             device=input_ids.device,
+         )
+-        self.run_native(input_ids, ~dead_mask, query_start_loc, lookback_token_ids, out)
++        mask = dead_mask if kernels.uses_tilelang() else ~dead_mask
++        self.run_native(input_ids, mask, query_start_loc, lookback_token_ids, out)
+         return out
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 69b77dd1d..72a6ddc8c 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -574,9 +574,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if self.engram_hash is None:
+                 raise RuntimeError("Disk Engram requires initialized hash state")
+             hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
++            image_mask = image_sentinel_mask(input_ids)
+             self.engram_hash.run_native(
+                 input_ids,
+-                ~image_sentinel_mask(input_ids),
++                image_mask if kernels.uses_tilelang() else ~image_mask,
+                 query_start_loc,
+                 lookback_token_ids,
+                 hashes,
+-- 
+2.54.0 (Apple Git-157)
+

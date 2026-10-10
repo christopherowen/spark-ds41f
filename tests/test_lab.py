@@ -622,3 +622,21 @@ class FabricTest(unittest.TestCase):
             command = lab.fabric_command(cluster, {}, {}, "s.py", [], {"B": "3", "C": "4"})
         self.assertEqual(command, ["docker", "run", "--env", "A=1", "--env", "B=3", "--env", "C=4", "img",
                                    "python3", "/fabric.py", "--rank", "0"])
+
+
+class ImageAndBenchTest(unittest.TestCase):
+    def test_image_job_stops_serving_then_builds_and_copies(self):
+        steps = lab.plan({"experiment": "experiments/x", "run": "r", "jobs": [
+            {"kind": "image", "config": "arm.json", "node": "dgx4", "copies": [["dgx4", "10.14.1.1"]]}]})
+        self.assertEqual([s["kind"] for s in steps], ["stop", "image"])
+        self.assertEqual(steps[1]["config"], "experiments/x/arm.json")
+        self.assertEqual(steps[1]["copies"], [["dgx4", "10.14.1.1"]])
+
+    def test_bench_args_replace_the_screen_bench(self):
+        steps = lab.plan({"experiment": "experiments/x", "run": "r", "jobs": [
+            {"kind": "measure", "extras": [], "bench_args": ["--suites", "quality,decode", "--concurrency", "1,16"],
+             "arms": [{"config": "a.json", "label": "a"}]}]})
+        bench = next(s for s in steps if s["kind"] == "cli")["argv"]
+        self.assertEqual(bench[:7], ["--cluster-config", "experiments/x/a.json", "bench", "--suites",
+                                     "quality,decode", "--concurrency", "1,16"])
+        self.assertNotIn("--allow-mismatch", bench)

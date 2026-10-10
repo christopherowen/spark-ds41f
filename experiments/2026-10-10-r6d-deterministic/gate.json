@@ -1,0 +1,81 @@
+{
+  "experiment": "experiments/2026-10-10-r6d-deterministic",
+  "run": "r6d-gate",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "image",
+      "config": "r6d-tp4.json",
+      "node": "dgx4",
+      "copies": [
+        [
+          "dgx4",
+          "10.14.1.1"
+        ],
+        [
+          "dgx4",
+          "10.34.1.3"
+        ],
+        [
+          "dgx1",
+          "dgx2-internal"
+        ]
+      ]
+    },
+    {
+      "kind": "kernel",
+      "bundles": [
+        {
+          "node": "dgx1",
+          "bundle": "experiments/2026-10-10-r6d-deterministic/bundles/gate-tests"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "bracket": false,
+      "bench_args": [
+        "--suites",
+        "quality,decode,prefill",
+        "--min-samples",
+        "3",
+        "--max-samples",
+        "3",
+        "--concurrency",
+        "1,2,4,8,16",
+        "--decode-cases",
+        "prose,code",
+        "--prefill-text",
+        "source",
+        "--prefill-sizes",
+        "32768,262144,500000,1048576",
+        "--prefill-repeats",
+        "2"
+      ],
+      "extras": [
+        [
+          "experiments/2026-10-09-tilelang-migration/token_determinism.py",
+          [
+            "--tokens",
+            "192",
+            "--long-lines",
+            "700"
+          ],
+          "determinism"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "experiments/2026-10-08-lil-rebase/r6c-tp4.json",
+          "label": "r6c"
+        },
+        {
+          "config": "r6d-tp4.json",
+          "label": "r6d"
+        }
+      ]
+    }
+  ]
+}

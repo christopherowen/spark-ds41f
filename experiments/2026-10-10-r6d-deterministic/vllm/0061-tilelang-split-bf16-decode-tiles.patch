@@ -1,0 +1,67 @@
+From b89686dd6f0870bd0f9b65a7d86aa78cd6e4e915 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 09:39:11 +0200
+Subject: [PATCH] TileLang split BF16 decode tiles by row tile
+
+SPLIT_BF16 entries may set the one-launch split-K's block_N, stages and
+threads per row tile; block_K stays, since blocked accumulation adds one
+block at a time, so only speed can change. No entry sets them yet, and the
+counters are sized for the narrowest tile.
+---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py   |  5 ++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py | 12 ++++++++++--
+ 2 files changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index b6146adb7..c6b70bf15 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -791,7 +791,10 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
+ SPLIT_BF16: dict[tuple[int, int], dict] = {
+     # TP4 compressor wkv + wgate (ratio 2, one launch for both) and wkv (ratio 1):
+     # five shards are fastest; blocked accumulation keeps the FP32 error under
+-    # DeepSeek's FP32 reference.
++    # DeepSeek's FP32 reference. An entry's optional "decode" maps a row tile
++    # (PARTIAL_ROW_TILES) to the one-launch split-K's block_N, num_stages and
++    # threads, which only change speed; block_K stays 64, since blocked
++    # accumulation adds one block at a time.
+     (1024, 5120): dict(shards=5, blocked=True),
+     (512, 5120): dict(shards=5, blocked=True),
+ }
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index ec9387ce5..3dba62b77 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -419,6 +419,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+         out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+         split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
+         shards, blocked = split["shards"], split["blocked"]
++        decode = split.get("decode", {})
++        if any("block_K" in config for config in decode.values()):
++            raise ValueError(
++                "split-K decode tiles keep block_K (it sets the sum order)"
++            )
+         layer.tilelang_parts = self.parts
+         layer.tilelang_shards = shards
+         # Decode rows: one launch per call (the last CTA of a tile adds the shards).
+@@ -431,12 +436,15 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+                 out_dtype=out_dtype,
+                 parts=self.parts,
+                 blocked=blocked,
++                **decode.get(block_M, {}),
+             )
+             for block_M in PARTIAL_ROW_TILES
+         }
+-        # One zeroed counter per tile; every call leaves them zeroed.
++        # One zeroed counter per tile of the narrowest decode tile; every call
++        # leaves them zeroed.
++        block_N = min(config.get("block_N", 64) for config in (*decode.values(), {}))
+         layer.tilelang_counters = torch.zeros(
+-            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // 64)),
++            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
+             dtype=torch.int32,
+             device=layer.weight.device,
+         )
+-- 
+2.54.0 (Apple Git-157)
+

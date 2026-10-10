@@ -1,0 +1,624 @@
+From 8bcde05bfbbe7a5b2918e47f18850d76fcf8085f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 08:10:05 +0200
+Subject: [PATCH] TileLang split-K for narrow projections
+
+A narrow projection (512 columns are 8 tiles of 64 on 48 SMs) splits K for
+decode rows up to SPLIT_DECODE_ROWS (128), writes FP32 partials and adds them
+in shard order; its prefill GEMM accumulates the same shards in the same
+order, so a row's bits do not depend on the batch.
+
+- MXFP8: _mxfp8_gemm gains shards, and mxfp8_gemm_partials computes one
+  shard per CTA. Shapes listed in SPLIT_FP8 (the DSpark context KV) use them;
+  every other projection compiles to the same code as before.
+- BF16: TileLangSplitLinearMethod now projects every part in one launch over
+  the whole weight: split-K partials plus splitk_reduce_two for decode rows,
+  bf16_gemm_two for prefill, shard counts from SPLIT_BF16. No caller changes.
+---
+ .../test_deepseek_v41_tilelang_linear.py      |  29 ++-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 231 +++++++++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  | 168 +++++++++++--
+ 3 files changed, 388 insertions(+), 40 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 348dd08aa..26ef7555c 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -197,7 +197,7 @@ def test_split_linear(parts, out_dtype, k=5120):
+     method.process_weights_after_loading(layer)
+     x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+     scratch = torch.empty(
+-        method.get_workspace_size(layer, DECODE_ROWS), dtype=torch.uint8, device=DEVICE
++        method.get_workspace_size(layer, max(ROWS)), dtype=torch.uint8, device=DEVICE
+     )
+ 
+     def project(rows):
+@@ -250,30 +250,33 @@ def test_scaled_linear(n=32, k=5120, scale=1 / 64):
+         TileLangScaledLinearMethod(0.3)
+ 
+ 
+-# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
++# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight, a
++# narrow projection (512 x 5120) that splits K for decode rows.
+ def test_block32_rows(n=1792, k=5120, start=1280):
+     from torch import nn
+ 
++    from vllm.models.deepseek_v4_1.tilelang.gemm import SPLIT_DECODE_ROWS, SPLIT_FP8
+     from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
+     from vllm.v1.worker.workspace import use_preallocated_workspace
+ 
++    assert (n - start, k) in SPLIT_FP8
+     weight, exps, weight_values = _block32_weight(n, k, 6)
+     layer = nn.Module()
+     layer.weight, layer.weight_scale_inv = weight, exps
+-    fused, rows = TileLangBlock32Rows(layer, 0), TileLangBlock32Rows(layer, start)
+-    x = torch.randn((max(ROWS), k), generator=_gen(7), device=DEVICE).bfloat16()
++    rows = TileLangBlock32Rows(layer, start)
++    counts = (1, 7, 16, 17, 32, 33, 64, 65, 96, SPLIT_DECODE_ROWS, 200, 300)
++    x = torch.randn((max(counts), k), generator=_gen(7), device=DEVICE).bfloat16()
+     _, _, x_values = _mxfp8(x)
+     ref = x_values @ weight_values[start:].T
+-    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+     with use_preallocated_workspace(scratch):
+-        for count in ROWS:
+-            out = rows(x[:count])
+-            torch.testing.assert_close(
+-                out.float(), ref[:count], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+-            )
+-            # Every tile accumulates K in the same order: the slice gives the
+-            # fused projection's bits.
+-            assert torch.equal(out, fused(x[:count])[:, start:]), f"rows={count}"
++        full = rows(x)  # prefill rows: the split prefill GEMM
++        torch.testing.assert_close(
++            full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
++        )
++        for count in counts:
++            # Split-K decode rows add the shards as the prefill GEMM does.
++            assert torch.equal(rows(x[:count]), full[:count]), f"rows={count}"
+     with pytest.raises(ValueError):
+         TileLangBlock32Rows(layer, start + 16)
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 64abb16ea..a01701688 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -57,6 +57,7 @@ def _mxfp8_gemm(
+     padded_rows: bool = False,
+     swizzle_panel: int = 0,
+     groups: int = 1,
++    shards: int = 1,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -81,6 +82,11 @@ def _mxfp8_gemm(
+     ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
+     and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
+     columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
++
++    With ``shards`` > 1 each of the ``shards`` equal K ranges is summed from
++    zero and the shards are added in order: the arithmetic of
++    ``mxfp8_gemm_partials`` plus ``splitk_reduce``, so a narrow projection's
++    split-K decode rows give its prefill rows' bits.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0, (
+         "block_K must divide K and be a multiple of 64"
+@@ -88,6 +94,9 @@ def _mxfp8_gemm(
+     assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
+         "grouped tiles must not straddle a group"
+     )
++    assert shards == 1 or (groups == 1 and (K // block_K) % shards == 0), (
++        "shards must split K into whole blocks"
++    )
+     k_blocks = K // block_K
+     M = T.dynamic("M")
+     Mp = T.dynamic("Mp") if padded_rows else M
+@@ -119,7 +128,12 @@ def _mxfp8_gemm(
+             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+             SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
++            C_total = T.alloc_fragment(
++                (block_M, block_N) if shards > 1 else (1, 1), accum_dtype
++            )
+             T.clear(C_local)
++            if shards > 1:
++                T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
+                 T.copy(B[bx * block_N, ko * block_K], B_shared)
+@@ -148,7 +162,19 @@ def _mxfp8_gemm(
+                     sf_a_granularity_k=SF_BLOCK,
+                     sf_b_granularity_k=SF_BLOCK,
+                 )
+-            T.copy(C_local, C[by * block_M, bx * block_N])
++                if shards > 1:  # noqa: SIM102
++                    if (ko + 1) % (k_blocks // shards) == 0:
++                        for i, j in T.Parallel(block_M, block_N):
++                            C_total[i, j] = T.if_then_else(
++                                ko + 1 == k_blocks // shards,
++                                C_local[i, j],
++                                C_total[i, j] + C_local[i, j],
++                            )
++                        T.clear(C_local)
++            if shards > 1:
++                T.copy(C_total, C[by * block_M, bx * block_N])
++            else:
++                T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+     return main
+ 
+@@ -159,10 +185,83 @@ def _mxfp8_gemm(
+ # returned wrong results in up to every run; 64-row tiles were not seen to),
+ # while the unspecialized pipeline is race-free and as fast for decode. Both
+ # run the same arithmetic, so their bits agree.
++def _mxfp8_gemm_partials(
++    N: int,
++    K: int,
++    shards: int,
++    block_M: int = 64,
++    block_N: int = 64,
++    block_K: int = 128,
++    num_stages: int = 3,
++    threads: int = 128,
++):
++    """Split-K MXFP8 GEMM for decode rows: FP32 ``P[s] = (A * SFA) @ (B * SFB)^T``
++    over K shard ``s``, A and SFA padded to whole ``block_M`` tiles (the decode
++    workspace). A narrow projection has few N tiles; its shards fill the GPU.
++    """
++    assert K % block_K == 0 and block_K % 64 == 0 and (K // block_K) % shards == 0
++    shard_blocks = K // block_K // shards
++    M = T.dynamic("M")
++    Mp = T.dynamic("Mp")
++    in_dtype = T.float8_e4m3fn
++    sf_words = scale_words(K)
++    block_words = block_scale_words(block_K)
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((Mp, K), in_dtype),
++        B: T.Tensor((N, K), in_dtype),
++        SFA: T.Tensor((Mp, sf_words), T.uint32),
++        SFB: T.Tensor((N, sf_words), T.uint32),
++        P: T.Tensor((shards, M, N), T.float32),
++    ):
++        with T.Kernel(
++            T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
++        ) as (bx, s, by):
++            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
++            B_shared = T.alloc_shared((block_N, block_K), in_dtype)
++            SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
++            SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            T.clear(C_local)
++            for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
++                ko = s * shard_blocks + kb
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(B[bx * block_N, ko * block_K], B_shared)
++                word0 = ko * block_K // SF_WORD_K
++                for i, w in T.Parallel(block_M, block_words):
++                    SFA_shared[i, w] = SFA[
++                        T.min(by * block_M + i, Mp - 1),
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                for j, w in T.Parallel(block_N, block_words):
++                    SFB_shared[j, w] = SFB[
++                        T.min(bx * block_N + j, N - 1),
++                        T.min(word0 + w, sf_words - 1),
++                    ]
++                T.mma_gemm_blockscaled(
++                    A_shared,
++                    B_shared,
++                    C_local,
++                    SFA_shared,
++                    SFB_shared,
++                    transpose_B=True,
++                    k_start=ko * block_K % SF_WORD_K,
++                    sf_a_granularity_k=SF_BLOCK,
++                    sf_b_granularity_k=SF_BLOCK,
++                )
++            T.copy(C_local, P[s, by * block_M, bx * block_N])
++
++    return main
++
++
+ mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
+ mxfp8_gemm_decode = tilelang.jit(
+     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ )(_mxfp8_gemm)
++mxfp8_gemm_partials = tilelang.jit(
++    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++)(_mxfp8_gemm_partials)
+ 
+ 
+ @tilelang.jit
+@@ -263,6 +362,111 @@ def bf16_gemm(
+     return main
+ 
+ 
++@tilelang.jit
++def splitk_reduce_two(
++    N: int,
++    shards: int,
++    out_dtype: T.dtype = T.bfloat16,
++    block_N: int = 128,
++    threads: int = 128,
++):
++    """``splitk_reduce`` of ``2 * N`` columns into two outputs: columns below N
++    to ``C0``, the rest to ``C1`` (the compressor's values and gates)."""
++    assert N % block_N == 0
++    M = T.dynamic("M")
++    tiles = N // block_N
++
++    @T.prim_func
++    def main(
++        P: T.Tensor((shards, M, 2 * N), T.float32),
++        C0: T.Tensor((M, N), out_dtype),
++        C1: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(2 * tiles, M, threads=threads) as (bx, m):
++            acc = T.alloc_fragment((block_N,), T.float32)
++            for j in T.Parallel(block_N):
++                acc[j] = P[0, m, bx * block_N + j]
++            for s in T.serial(1, shards):
++                for j in T.Parallel(block_N):
++                    acc[j] += P[s, m, bx * block_N + j]
++            if bx < tiles:
++                for j in T.Parallel(block_N):
++                    C0[m, bx * block_N + j] = acc[j]
++            else:
++                for j in T.Parallel(block_N):
++                    C1[m, (bx - tiles) * block_N + j] = acc[j]
++
++    return main
++
++
++@tilelang.jit
++def bf16_gemm_two(
++    N: int,
++    K: int,
++    block_M: int = 64,
++    block_N: int = 64,
++    block_K: int = 64,
++    num_stages: int = 3,
++    threads: int = 128,
++    out_dtype: T.dtype = T.bfloat16,
++    shards: int = 1,
++):
++    """``bf16_gemm`` of a ``[2N, K]`` weight into two ``[M, N]`` outputs: rows below
++    N of the weight to ``C0``, the rest to ``C1``, with ``bf16_gemm``'s shard
++    arithmetic (so it gives ``bf16_gemm_partials`` plus ``splitk_reduce_two``'s bits).
++    """
++    k_blocks = tilelang.cdiv(K, block_K)
++    assert N % block_N == 0
++    assert shards == 1 or (K % block_K == 0 and k_blocks % shards == 0)
++    M = T.dynamic("M")
++    dtype = T.bfloat16
++    shard_blocks = k_blocks // shards
++    tiles = N // block_N
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, K), dtype),
++        B: T.Tensor((2 * N, K), dtype),
++        C0: T.Tensor((M, N), out_dtype),
++        C1: T.Tensor((M, N), out_dtype),
++    ):
++        with T.Kernel(2 * tiles, T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            A_shared = T.alloc_shared((block_M, block_K), dtype)
++            B_shared = T.alloc_shared((block_N, block_K), dtype)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_total = T.alloc_fragment(
++                (block_M, block_N) if shards > 1 else (1, 1), T.float32
++            )
++            T.clear(C_local)
++            if shards > 1:
++                T.clear(C_total)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(B[bx * block_N, ko * block_K], B_shared)
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++                if shards > 1:  # noqa: SIM102
++                    if (ko + 1) % shard_blocks == 0:
++                        for i, j in T.Parallel(block_M, block_N):
++                            C_total[i, j] = T.if_then_else(
++                                ko + 1 == shard_blocks,
++                                C_local[i, j],
++                                C_total[i, j] + C_local[i, j],
++                            )
++                        T.clear(C_local)
++            if bx < tiles:
++                if shards > 1:
++                    T.copy(C_total, C0[by * block_M, bx * block_N])
++                else:
++                    T.copy(C_local, C0[by * block_M, bx * block_N])
++            else:
++                if shards > 1:
++                    T.copy(C_total, C1[by * block_M, (bx - tiles) * block_N])
++                else:
++                    T.copy(C_local, C1[by * block_M, (bx - tiles) * block_N])
++
++    return main
++
++
+ @tilelang.jit
+ def bf16_gemm_partials(
+     N: int,
+@@ -402,6 +606,31 @@ DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
+ }
+ 
+ 
++# Narrow projections leave most SMs idle at decode (512 columns are 8 tiles of 64
++# on 48 SMs). They split K for decode rows up to SPLIT_DECODE_ROWS, write FP32
++# partials and add them in shard order; their prefill GEMM accumulates the same
++# shards in the same order, so a row's bits do not depend on the batch. Shard
++# counts and tiles come from the kernel lab against B12X at the TP4 shapes.
++SPLIT_DECODE_ROWS = 128
++SPLIT_FP8: dict[tuple[int, int], dict] = {
++    # TP4 DSpark context KV: the fused Q-A/KV weight's KV rows.
++    (512, 5120): dict(
++        shards=5,
++        decode=dict(block_N=64, block_K=256, num_stages=3, threads=128),
++        prefill=dict(block_M=64, block_N=64, block_K=128, num_stages=3),
++    ),
++}
++SPLIT_BF16: dict[tuple[int, int], int] = {
++    (1024, 5120): 10,  # TP4 compressor wkv + wgate (ratio 2), one fused launch
++    (512, 5120): 10,  # TP4 compressor wkv (ratio 1)
++}
++
++
++def split_row_tile(rows: int) -> int:
++    """Row tile of a split-K decode GEMM: the shortest that holds ``rows``, else 64."""
++    return next((height for height in (16, 32) if rows <= height), 64)
++
++
+ def decode_tile_rows(rows: int) -> int:
+     """Height of the decode tile that serves ``rows`` (at most DECODE_ROWS)."""
+     return next(height for height in DECODE_TILE_ROWS if rows <= height)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index cb874eda5..61dce59d5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -32,17 +32,24 @@ from .gemm import (
+     DECODE_ROWS,
+     DECODE_TILE_ROWS,
+     SF_BLOCK,
++    SPLIT_BF16,
++    SPLIT_DECODE_ROWS,
++    SPLIT_FP8,
+     bf16_gemm,
+     bf16_gemm_partials,
++    bf16_gemm_two,
+     bf16_shards,
+     decode_tile_rows,
+     fp8_decode_config,
+     fp8_prefill_config,
+     mxfp8_gemm,
+     mxfp8_gemm_decode,
++    mxfp8_gemm_partials,
+     pack_scale_words,
+     scale_words,
++    split_row_tile,
+     splitk_reduce,
++    splitk_reduce_two,
+ )
+ 
+ _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
+@@ -134,6 +141,9 @@ def _block32_linear(
+     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
+     x = x.reshape(-1, k)
+     rows = x.shape[0]
++    if layer.tilelang_shards > 1 and rows <= SPLIT_DECODE_ROWS:
++        _block32_split(layer, x, out.view(rows, n), scratch)
++        return
+     xq, sf = _scratch(_activation_specs(rows, k), scratch)
+     _tile_kernels().quant.per_token_cast(
+         x,
+@@ -161,6 +171,36 @@ def _block32_linear_fake(x, out, key, scratch):
+     return None
+ 
+ 
++def _split_specs(layer, rows: int):
++    """Split-K decode scratch: MXFP8 activations and scales padded to whole row
++    tiles, and the FP32 partials of the live rows."""
++    n, k = layer.weight.shape
++    tile = split_row_tile(rows)
++    padded = -(-rows // tile) * tile
++    return (
++        ((padded, k), torch.float8_e4m3fn),
++        ((padded, 4 * scale_words(k)), torch.uint8),
++        ((layer.tilelang_shards, rows, n), torch.float32),
++    )
++
++
++def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
++    rows = x.shape[0]
++    xq, sf, partials = _scratch(_split_specs(layer, rows), scratch)
++    _tile_kernels().quant.per_token_cast(
++        x,
++        "e4m3",
++        SF_BLOCK,
++        round_sf=True,
++        use_packed_ue8m0=True,
++        out=(xq[:rows], sf[:rows]),
++    )
++    layer.tilelang_partials[split_row_tile(rows)](
++        xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, partials
++    )
++    layer.tilelang_reduce(partials, out)
++
++
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_bf16_linear", mutates_args=("out", "scratch")
+ )
+@@ -199,6 +239,24 @@ def _prepare_block32(layer, groups: int = 1) -> None:
+         layer.weight_scale_inv.view(torch.uint8), rows=n
+     )
+     layer.tilelang_groups = groups
++    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
++    layer.tilelang_shards = split["shards"] if split else 1
++    if split:
++        # A narrow projection: split-K decode rows, and prefill tiles that add the
++        # same shards in the same order.
++        layer.tilelang_partials = {
++            block_M: mxfp8_gemm_partials(
++                n, k, split["shards"], block_M=block_M, **split["decode"]
++            )
++            for block_M in (16, 32, 64)
++        }
++        layer.tilelang_reduce = splitk_reduce(n, split["shards"])
++        layer.tilelang_prefill = mxfp8_gemm(
++            n, k, **split["prefill"], shards=split["shards"]
++        )
++        layer.tilelang_key = id(layer)
++        _LAYERS[layer.tilelang_key] = layer
++        return
+     layer.tilelang_decode = {
+         block_M: mxfp8_gemm_decode(
+             part,
+@@ -300,14 +358,6 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         return _spec_bytes(_partial_specs(layer, num_tokens))
+ 
+ 
+-class _Part:
+-    """One row block of a split weight; weak-referenceable for ``_LAYERS``."""
+-
+-    def __init__(self, weight: torch.Tensor, out_dtype: torch.dtype):
+-        self.weight = weight
+-        self.out_dtype = out_dtype
+-
+-
+ class TileLangScaledLinearMethod(TileLangLinearMethod):
+     """``TileLangLinearMethod`` with a power-of-two output scale folded into the
+     weight at load. Scaling by a power of two is exact in BF16 and commutes with
+@@ -330,43 +380,109 @@ class TileLangScaledLinearMethod(TileLangLinearMethod):
+ 
+ 
+ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+-    """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
+-    projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
++    """A BF16 weight of equal row blocks (the compressor's wkv and wgate), each
++    projected into its own output by one launch over the whole weight.
++
++    Decode rows (up to ``SPLIT_DECODE_ROWS``) split K over the SMs and add the FP32
++    partials in shard order into the outputs; prefill rows run one GEMM that adds
++    the same shards in the same order, so a row's bits do not depend on the batch.
++    """
+ 
+     def __init__(self, parts: int):
+         super().__init__()
++        if parts not in (1, 2):
++            raise ValueError("the split projection has one or two parts")
+         self.parts = parts
+ 
+     def process_weights_after_loading(self, layer: nn.Module) -> None:
+         super().process_weights_after_loading(layer)
+-        n = layer.weight.shape[0]
++        n, k = layer.weight.shape
+         if n % self.parts:
+             raise ValueError(f"{n} rows do not split into {self.parts} parts")
+-        rows = n // self.parts
+-        out_dtype = getattr(layer, "out_dtype", torch.bfloat16)
+-        layer.tilelang_parts = []
+-        for index in range(self.parts):
+-            part = _Part(
+-                layer.weight.data[index * rows : (index + 1) * rows], out_dtype
++        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
++        shards = SPLIT_BF16.get((n, k)) or bf16_shards(n, k)
++        layer.tilelang_parts = self.parts
++        layer.tilelang_shards = shards
++        layer.tilelang_partials = {
++            block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
++            for block_M in PARTIAL_ROW_TILES
++        }
++        if self.parts == 2:
++            part = n // 2
++            layer.tilelang_reduce = splitk_reduce_two(part, shards, out_dtype=out_dtype)
++            layer.tilelang_gemm = bf16_gemm_two(
++                part, k, out_dtype=out_dtype, shards=shards
+             )
+-            TileLangLinearMethod().process_weights_after_loading(part)
+-            layer.tilelang_parts.append(part)
++        else:
++            layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
++            layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
++        layer.tilelang_key = id(layer)
++        _LAYERS[layer.tilelang_key] = layer
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+-        return max(
+-            _spec_bytes(_partial_specs(part, num_tokens))
+-            for part in layer.tilelang_parts
++        rows = min(num_tokens, SPLIT_DECODE_ROWS)
++        n = layer.weight.shape[0]
++        return _spec_bytes((((layer.tilelang_shards, rows, n), torch.float32),))
++
++
++def _split_bf16(x, outputs, key, scratch) -> None:
++    layer = _LAYERS[key]
++    n, k = layer.weight.shape
++    rows = x.shape[0]
++    if rows <= SPLIT_DECODE_ROWS:
++        (partials,) = _scratch(
++            (((layer.tilelang_shards, rows, n), torch.float32),), scratch
+         )
++        partials_kernel(layer, rows)(x, layer.weight, partials)
++        layer.tilelang_reduce(partials, *outputs)
++    else:
++        layer.tilelang_gemm(x, layer.weight, *outputs)
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_split_linear_one", mutates_args=("out", "scratch")
++)
++def _split_linear_one(
++    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
++) -> None:
++    _split_bf16(x, (out,), key, scratch)
++
++
++@_split_linear_one.register_fake
++def _split_linear_one_fake(x, out, key, scratch):
++    return None
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_split_linear_two", mutates_args=("out0", "out1", "scratch")
++)
++def _split_linear_two(
++    x: torch.Tensor,
++    out0: torch.Tensor,
++    out1: torch.Tensor,
++    key: int,
++    scratch: torch.Tensor | None,
++) -> None:
++    _split_bf16(x, (out0, out1), key, scratch)
++
++
++@_split_linear_two.register_fake
++def _split_linear_two_fake(x, out0, out1, key, scratch):
++    return None
+ 
+ 
+ def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None:
+-    """Project ``x`` (rows x K) through each row block of a split layer into the
+-    matching output's first ``rows`` rows."""
++    """Project ``x`` (rows x K) through a split layer: each row block into the
++    first ``rows`` rows of its output."""
+     scratch = (
+         None if torch.compiler.is_compiling() else current_preallocated_workspace()
+     )
+-    for part, out in zip(layer.tilelang_parts, outputs):
+-        _bf16_linear(x, out[:rows], part.tilelang_key, scratch)
++    if layer.tilelang_parts == 2:
++        _split_linear_two(
++            x, outputs[0][:rows], outputs[1][:rows], layer.tilelang_key, scratch
++        )
++    else:
++        _split_linear_one(x, outputs[0][:rows], layer.tilelang_key, scratch)
+ 
+ 
+ __all__ = [
+-- 
+2.54.0 (Apple Git-157)
+

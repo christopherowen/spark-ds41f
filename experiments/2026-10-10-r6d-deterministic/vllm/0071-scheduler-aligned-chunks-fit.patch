@@ -1,0 +1,78 @@
+From b3a50917affce0be2d01891760aceb5a46abb033 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:06:04 +0200
+Subject: [PATCH] Scheduler: aligned prefill chunks must fit beside the decode
+ rows
+
+With aligned chunks on, the scheduler checks at start that a whole chunk
+(the long-prefill threshold) plus every running request's decode and draft
+rows fits the step budget; otherwise a long prompt would wait for the
+decodes to end. Aligned chunks stay off.
+---
+ tests/v1/core/test_aligned_prefill_chunks.py | 17 +++++++++++++++++
+ vllm/v1/core/sched/scheduler.py              | 14 ++++++++++++++
+ 2 files changed, 31 insertions(+)
+
+diff --git a/tests/v1/core/test_aligned_prefill_chunks.py b/tests/v1/core/test_aligned_prefill_chunks.py
+index a273a0169..208fe77b6 100644
+--- a/tests/v1/core/test_aligned_prefill_chunks.py
++++ b/tests/v1/core/test_aligned_prefill_chunks.py
+@@ -27,6 +27,23 @@ def test_chunks_end_at_multiples_of_the_threshold():
+     assert _chunk(0, 1536, 5000) == 5000  # no threshold: unchanged
+ 
+ 
++def test_a_whole_chunk_must_fit_beside_the_decode_rows():
++    def check(threshold, budget, seqs=16, spec=5):
++        owner = SimpleNamespace(
++            scheduler_config=SimpleNamespace(long_prefill_token_threshold=threshold),
++            max_num_running_reqs=seqs,
++            num_spec_tokens=spec,
++            max_num_scheduled_tokens=budget,
++        )
++        scheduler_module.Scheduler._check_aligned_prefill_chunks(owner)
++
++    check(8096, 8192)  # TP4: 16 streams of six rows beside a chunk
++    check(4048, 4096, seqs=8)  # TP3
++    for threshold, budget in ((8192, 8192), (0, 8192), (8097, 8192)):
++        with pytest.raises(ValueError):
++            check(threshold, budget)
++
++
+ # A minimal OPT-125m configuration, so the scheduler builds without the hub.
+ _OPT_CONFIG = {
+     "architectures": ["OPTForCausalLM"],
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index e81b9e3d1..3a32c6c89 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -312,6 +312,8 @@ class Scheduler(SchedulerInterface):
+         self.use_eagle_block_drop = False
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
++        if ALIGN_PREFILL_CHUNKS:
++            self._check_aligned_prefill_chunks()
+         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
+         self.dynamic_sd_lookup: list[int] | None = None
+         self.acceptance_length_controller: (
+@@ -838,6 +840,18 @@ class Scheduler(SchedulerInterface):
+                 return queue
+         return None
+ 
++    def _check_aligned_prefill_chunks(self) -> None:
++        """A whole aligned chunk must fit beside every decoding request's rows, or
++        a long prompt would wait for the decodes to end."""
++        threshold = self.scheduler_config.long_prefill_token_threshold
++        decode_rows = self.max_num_running_reqs * (1 + self.num_spec_tokens)
++        if threshold <= 0 or threshold + decode_rows > self.max_num_scheduled_tokens:
++            raise ValueError(
++                "aligned prefill chunks need long_prefill_token_threshold "
++                f"({threshold}) plus {decode_rows} decode rows within the "
++                f"{self.max_num_scheduled_tokens}-token step budget"
++            )
++
+     def _aligned_prefill_chunk(
+         self, num_computed_tokens: int, num_new_tokens: int
+     ) -> int:
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,429 @@
+From bd3416417bbcdd4086a0d80600a24a59ab7dc305 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:08 +0200
+Subject: [PATCH] TileLang WO projection kernels
+
+The MXFP8 GEMM gains a groups parameter, so one launch covers every WO-A
+group; with one group it compiles to the same code as before.
+TileLangWOProjection chains inverse RoPE in place, grouped WO-A and WO-B on the
+checkpoint tensors and names its weights for the L2 prefetch, which now asks a
+projection for its bytes when it can. No caller yet.
+---
+ .../test_deepseek_v41_tilelang_wo.py          | 139 ++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   6 +-
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    |  47 ++++--
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |  21 ++-
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |  68 +++++++++
+ 5 files changed, 262 insertions(+), 19 deletions(-)
+ create mode 100644 tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/wo.py
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+new file mode 100644
+index 000000000..c9c5892f2
+--- /dev/null
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -0,0 +1,139 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1 TileLang WO projection (inverse RoPE, grouped WO-A, WO-B)."""
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++tile_kernels = pytest.importorskip("tile_kernels")
++
++from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
++    _block32_linear,
++    _prepare_block32,
++)
++from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection  # noqa: E402
++from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
++
++DEVICE = "cuda"
++# TP4: 16 heads of 512 in 2 groups, rank 1024, hidden 5120.
++HEADS, HEAD_DIM, GROUPS, RANK, HIDDEN, ROPE = 16, 512, 2, 1024, 5120, 64
++ROWS = (1, 7, 16, 33, 64, 65, 200)
++
++
++def _gen(seed):
++    return torch.Generator(device=DEVICE).manual_seed(seed)
++
++
++def _block32(n, k, seed):
++    gen = _gen(seed)
++    layer = nn.Module()
++    layer.weight = (torch.randn((n, k), generator=gen, device=DEVICE) * 2).to(
++        torch.float8_e4m3fn
++    )
++    exps = torch.randint(118, 123, (n // 32, k // 32), generator=gen, device=DEVICE)
++    layer.weight_scale_inv = exps.to(torch.uint8).view(torch.float8_e8m0fnu)
++    return layer
++
++
++def _dequant(layer):
++    exps = layer.weight_scale_inv.view(torch.uint8).double()
++    scale = torch.exp2(exps - 127).repeat_interleave(32, 0).repeat_interleave(32, 1)
++    return layer.weight.double() * scale
++
++
++def _mxfp8_values(x):
++    xq, sf = tile_kernels.quant.per_token_cast(
++        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++    )
++    exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32].double()
++    return xq.double() * torch.exp2(exps - 127).repeat_interleave(32, -1)
++
++
++def _table(positions=4096):
++    inv = 1.0 / (10000 ** (torch.arange(0, ROPE, 2, device=DEVICE).double() / ROPE))
++    angles = torch.arange(positions, device=DEVICE).double()[:, None] * inv
++    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
++
++
++def test_wo_projection():
++    wo_a = _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1)
++    wo_b = _block32(HIDDEN, GROUPS * RANK, 2)
++    wo = TileLangWOProjection(wo_a, wo_b, groups=GROUPS)
++    rows = max(ROWS)
++    gen = _gen(3)
++    o = torch.randn((rows, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
++    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
++    table = _table()
++    scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
++
++    def project(count):
++        out = torch.empty((count, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++        with use_preallocated_workspace(scratch):
++            wo(o[:count].clone(), positions[:count], table, out)
++        return out
++
++    full = project(rows)
++    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs on the
++    # MXFP8 activations, the intermediate rounded to BF16 as the kernel stores it.
++    rotated = o.clone()
++    tile_kernels.transform.apply_rotary(
++        rotated[..., -ROPE:],
++        table,
++        positions=positions,
++        interleaved=True,
++        conjugate=True,
++    )
++    x = _mxfp8_values(rotated.view(rows, -1))
++    w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
++    a = torch.cat(
++        [
++            x[:, g * width : (g + 1) * width] @ w_a[g * RANK : (g + 1) * RANK].T
++            for g in range(GROUPS)
++        ],
++        dim=1,
++    ).bfloat16()
++    ref = _mxfp8_values(a) @ _dequant(wo_b).T
++    torch.testing.assert_close(
++        full.double(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
++    )
++    for count in ROWS:
++        assert torch.equal(project(count), full[:count]), f"rows={count}"
++
++
++@pytest.mark.parametrize("count", ROWS)
++def test_grouped_gemm_equals_groups(count):
++    """One grouped launch gives each group's ordinary GEMM bit for bit."""
++    width = HEADS // GROUPS * HEAD_DIM
++    grouped = _block32(GROUPS * RANK, width, 4)
++    _prepare_block32(grouped, GROUPS)
++    x = torch.randn(
++        (count, GROUPS * width), generator=_gen(5), device=DEVICE
++    ).bfloat16()
++    scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
++    out = torch.empty((count, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
++    with use_preallocated_workspace(scratch):
++        _block32_linear(x, out, grouped.tilelang_key, scratch)
++        for g in range(GROUPS):
++            part = nn.Module()
++            part.weight = grouped.weight[g * RANK : (g + 1) * RANK]
++            part.weight_scale_inv = grouped.weight_scale_inv[
++                g * RANK // 32 : (g + 1) * RANK // 32
++            ]
++            _prepare_block32(part)
++            single = torch.empty((count, RANK), dtype=torch.bfloat16, device=DEVICE)
++            _block32_linear(
++                x[:, g * width : (g + 1) * width].contiguous(),
++                single,
++                part.tilelang_key,
++                scratch,
++            )
++            assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 18a8a2093..adb49cbb8 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -229,7 +229,11 @@ class DeepseekV4DecoderLayer(nn.Module):
+     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+         attn, device = self.attn, self.hc_attn_fn.device
+-        wo = l2_prefetch.object_segments("wo", attn._wo_projection_weights)
++        weights = attn._wo_projection_weights
++        if hasattr(weights, "l2_segments"):  # the TileLang projection names its bytes
++            wo = weights.l2_segments()
++        else:
++            wo = l2_prefetch.object_segments("wo", weights)
+         attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
+         ffn = l2_prefetch.param_segments(
+             "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index d61f14d38..64abb16ea 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -56,6 +56,7 @@ def _mxfp8_gemm(
+     out_dtype: T.dtype = T.bfloat16,
+     padded_rows: bool = False,
+     swizzle_panel: int = 0,
++    groups: int = 1,
+ ):
+     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
+ 
+@@ -75,10 +76,18 @@ def _mxfp8_gemm(
+     ``swizzle_panel`` rasterizes the CTAs in panels of that many N tiles, so a
+     weight larger than L2 is read once per panel rather than once per row of
+     tiles; it only changes the order tiles run in.
++
++    With ``groups`` > 1 the projection is grouped (the attention's WO-A): ``A`` is
++    ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
++    and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
++    columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
+     """
+     assert K % block_K == 0 and block_K % 64 == 0, (
+         "block_K must divide K and be a multiple of 64"
+     )
++    assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
++        "grouped tiles must not straddle a group"
++    )
+     k_blocks = K // block_K
+     M = T.dynamic("M")
+     Mp = T.dynamic("Mp") if padded_rows else M
+@@ -86,20 +95,25 @@ def _mxfp8_gemm(
+     accum_dtype = T.float32
+     sf_words = scale_words(K)
+     block_words = block_scale_words(block_K)
++    total_N = groups * N
+ 
+     @T.prim_func
+     def main(
+-        A: T.Tensor((Mp, K), in_dtype),
+-        B: T.Tensor((N, K), in_dtype),
+-        SFA: T.Tensor((Mp, sf_words), T.uint32),
+-        SFB: T.Tensor((N, sf_words), T.uint32),
+-        C: T.Tensor((M, N), out_dtype),
++        A: T.Tensor((Mp, groups * K), in_dtype),
++        B: T.Tensor((total_N, K), in_dtype),
++        SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
++        SFB: T.Tensor((total_N, sf_words), T.uint32),
++        C: T.Tensor((M, total_N), out_dtype),
+     ):
+         with T.Kernel(
+-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
++            T.ceildiv(total_N, block_N), T.ceildiv(M, block_M), threads=threads
+         ) as (bx, by):
+             if swizzle_panel:
+                 T.use_swizzle(panel_size=swizzle_panel)
++            # The group's activation columns and scale words.
++            group = bx * block_N // N
++            a_k = group * K if groups > 1 else 0
++            a_word = group * sf_words if groups > 1 else 0
+             A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+             B_shared = T.alloc_shared((block_N, block_K), in_dtype)
+             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+@@ -107,18 +121,19 @@ def _mxfp8_gemm(
+             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+             T.clear(C_local)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
+                 T.copy(B[bx * block_N, ko * block_K], B_shared)
+                 # Edge tiles clamp their scale rows; those rows are never stored.
+                 word0 = ko * block_K // SF_WORD_K
+                 for i, w in T.Parallel(block_M, block_words):
+                     SFA_shared[i, w] = SFA[
+                         T.min(by * block_M + i, Mp - 1),
+-                        T.min(word0 + w, sf_words - 1),
++                        a_word + T.min(word0 + w, sf_words - 1),
+                     ]
+                 for j, w in T.Parallel(block_N, block_words):
+                     SFB_shared[j, w] = SFB[
+-                        T.min(bx * block_N + j, N - 1), T.min(word0 + w, sf_words - 1)
++                        T.min(bx * block_N + j, total_N - 1),
++                        T.min(word0 + w, sf_words - 1),
+                     ]
+                 # The staged words start at the block's first word; k_start
+                 # places the block inside it.
+@@ -392,16 +407,20 @@ def decode_tile_rows(rows: int) -> int:
+     return next(height for height in DECODE_TILE_ROWS if rows <= height)
+ 
+ 
+-def fp8_decode_config(N: int, K: int, block_M: int = DECODE_ROWS) -> dict:
+-    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall."""
++def fp8_decode_config(
++    N: int, K: int, block_M: int = DECODE_ROWS, groups: int = 1
++) -> dict:
++    """Decode tile of an (N, K) block-32 FP8 projection, ``block_M`` rows tall;
++    grouped projections (``groups`` blocks of N rows) are keyed (N, K, groups)."""
+     config = dict(
+         block_M=block_M, block_N=64, block_K=pick_block_K(K), num_stages=3, threads=128
+     )
+-    config.update(DECODE_FP8_CONFIGS.get((N, K), {}).get(block_M, {}))
++    key = (N, K) if groups == 1 else (N, K, groups)
++    config.update(DECODE_FP8_CONFIGS.get(key, {}).get(block_M, {}))
+     return config
+ 
+ 
+-def fp8_prefill_config(N: int, K: int) -> dict:
++def fp8_prefill_config(N: int, K: int, groups: int = 1) -> dict:
+     """Prefill tile of an (N, K) block-32 FP8 projection.
+ 
+     A weight larger than L2 (the DSpark main projection, 39 MB at TP4) is
+@@ -411,7 +430,7 @@ def fp8_prefill_config(N: int, K: int) -> dict:
+     """
+     device = torch.cuda.current_device()
+     l2_bytes = torch.cuda.get_device_properties(device).L2_cache_size
+-    swizzle_panel = 8 if l2_bytes < N * K else 0
++    swizzle_panel = 8 if l2_bytes < groups * N * K else 0
+     return dict(default_config(DECODE_ROWS + 1, K), swizzle_panel=swizzle_panel)
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index a59472978..827458fb9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -130,6 +130,7 @@ def _block32_linear(
+ ) -> None:
+     layer = _LAYERS[key]
+     n, k = layer.weight.shape
++    k *= layer.tilelang_groups  # a grouped weight reads every group's columns
+     x = x.reshape(-1, k)
+     rows = x.shape[0]
+     xq, sf = _scratch(_activation_specs(rows, k), scratch)
+@@ -183,21 +184,33 @@ def _bf16_linear_fake(x, out, key, scratch):
+     return None
+ 
+ 
+-def _prepare_block32(layer) -> None:
++def _prepare_block32(layer, groups: int = 1) -> None:
+     """Compile the GEMMs of ``layer.weight`` (E4M3 ``[N, K]``) and its 32x32 block
+-    scales ``layer.weight_scale_inv``, and register the layer for the custom op."""
++    scales ``layer.weight_scale_inv``, and register the layer for the custom op.
++
++    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``N / groups`` rows,
++    each applied to its own K columns of ``groups * K``-wide activations.
++    """
+     n, k = layer.weight.shape
++    part = n // groups
+     # The 32x32 block scales become per-row words of four K32 exponents.
+     layer.tilelang_weight_sf = pack_scale_words(
+         layer.weight_scale_inv.view(torch.uint8), rows=n
+     )
++    layer.tilelang_groups = groups
+     layer.tilelang_decode = {
+         block_M: mxfp8_gemm_decode(
+-            n, k, **fp8_decode_config(n, k, block_M), padded_rows=True
++            part,
++            k,
++            **fp8_decode_config(part, k, block_M, groups),
++            padded_rows=True,
++            groups=groups,
+         )
+         for block_M in DECODE_TILE_ROWS
+     }
+-    layer.tilelang_prefill = mxfp8_gemm(n, k, **fp8_prefill_config(n, k))
++    layer.tilelang_prefill = mxfp8_gemm(
++        part, k, **fp8_prefill_config(part, k, groups), groups=groups
++    )
+     layer.tilelang_key = id(layer)
+     _LAYERS[layer.tilelang_key] = layer
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+new file mode 100644
+index 000000000..e7ed29599
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -0,0 +1,68 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang output projection of the DeepSeek-V4.1 attention, as DeepSeek's
++reference computes it::
++
++    o[..., -64:] = inverse_rope(o[..., -64:])          (BF16, in place)
++    a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
++    out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
++
++with MXFP8 activations (DeepSeek's E4M3 and one UE8M0 scale per 32) for both GEMMs.
++WO-A runs every group in one launch of the grouped MXFP8 GEMM; WO-B is the
++ordinary block-32 projection. The checkpoint tensors are read in place.
++"""
++
++import torch
++from torch import nn
++
++from vllm.v1.worker.workspace import current_preallocated_workspace
++
++from .. import l2_prefetch
++from .linear import _block32_linear, _prepare_block32
++from .rope import rope_
++
++
++class _Weight:
++    """A block-32 FP8 weight and its scales; weak-referenceable for the custom op."""
++
++    def __init__(self, layer: nn.Module, groups: int):
++        self.weight = layer.weight.detach()
++        self.weight_scale_inv = layer.weight_scale_inv.detach()
++        _prepare_block32(self, groups)
++
++
++class TileLangWOProjection:
++    def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
++        self.a = _Weight(wo_a, groups)
++        self.b = _Weight(wo_b, 1)
++        self.hidden = wo_b.weight.shape[0]
++
++    def l2_segments(self) -> list:
++        """The bytes both GEMMs read, WO-A first: each weight and its scale words."""
++        return l2_prefetch.linear_segments(
++            "wo_a", self.a
++        ) + l2_prefetch.linear_segments("wo_b", self.b)
++
++    def __call__(
++        self,
++        o: torch.Tensor,
++        positions: torch.Tensor,
++        cos_sin_cache: torch.Tensor,
++        out: torch.Tensor,
++    ) -> torch.Tensor:
++        """Project ``o`` ([T, heads, head_dim], contiguous BF16; its RoPE columns
++        are overwritten) into ``out`` ([T, hidden] BF16)."""
++        rows = o.shape[0]
++        rope_(o, positions, cos_sin_cache, 1, True)
++        scratch = (
++            None if torch.compiler.is_compiling() else current_preallocated_workspace()
++        )
++        a = torch.empty(
++            (rows, self.a.weight.shape[0]), dtype=torch.bfloat16, device=o.device
++        )
++        _block32_linear(o.view(rows, -1), a, self.a.tilelang_key, scratch)
++        _block32_linear(a, out, self.b.tilelang_key, scratch)
++        return out
++
++
++__all__ = ["TileLangWOProjection"]
+-- 
+2.54.0 (Apple Git-157)
+

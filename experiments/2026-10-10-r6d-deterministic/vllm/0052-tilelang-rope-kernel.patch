@@ -1,0 +1,202 @@
+From d23be5b1934d4041a516964168f3c0fc5d08c099 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:54:08 +0200
+Subject: [PATCH] TileLang RoPE kernel
+
+TileKernels apply_rotary arithmetic (interleaved pairs, FP32 ieee_fmaf) with
+V4.1's compressed-position floor and inverse direction, rotating the last 64
+columns in place. No caller yet.
+---
+ .../test_deepseek_v41_tilelang_rope.py        |  67 +++++++++++
+ vllm/models/deepseek_v4_1/tilelang/rope.py    | 105 ++++++++++++++++++
+ 2 files changed, 172 insertions(+)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_rope.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/rope.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_rope.py b/tests/kernels/test_deepseek_v41_tilelang_rope.py
+new file mode 100644
+index 000000000..8bf4fa6a1
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_rope.py
+@@ -0,0 +1,67 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1 TileLang RoPE against TileKernels' apply_rotary and FP64."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++tile_kernels = pytest.importorskip("tile_kernels")
++
++from vllm.models.deepseek_v4_1.tilelang.rope import rope_  # noqa: E402
++
++DEVICE = "cuda"
++ROPE, POSITIONS = 64, 4096
++
++
++def _table():
++    inv = 1.0 / (10000 ** (torch.arange(0, ROPE, 2, device=DEVICE).double() / ROPE))
++    angles = torch.arange(POSITIONS, device=DEVICE).double()[:, None] * inv
++    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
++
++
++# q (TP4), index query, kv, latent and index key at compression ratio 4.
++@pytest.mark.parametrize(
++    "heads, dim, ratio",
++    [(16, 512, 1), (64, 128, 1), (1, 512, 1), (1, 512, 4), (1, 128, 4)],
++)
++@pytest.mark.parametrize("inverse", [False, True])
++def test_rope(heads, dim, ratio, inverse, rows=97):
++    gen = torch.Generator(device=DEVICE).manual_seed(heads + dim + ratio)
++    x = torch.randn((rows, heads, dim), generator=gen, device=DEVICE).bfloat16()
++    positions = torch.randint(0, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    table = _table()
++    out = x.clone()
++    rope_(out if heads > 1 else out.view(rows, dim), positions, table, ratio, inverse)
++    assert torch.equal(out[..., :-ROPE], x[..., :-ROPE]), "leading columns moved"
++    floored = positions // ratio * ratio
++    expected = x.clone()
++    tile_kernels.transform.apply_rotary(
++        expected[..., -ROPE:],
++        table,
++        positions=floored,
++        interleaved=True,
++        conjugate=inverse,
++    )
++    assert torch.equal(out, expected), "differs from TileKernels' apply_rotary"
++    # FP64: interleaved pairs (x0, x1) -> (x0 cos - x1 sin, x0 sin + x1 cos).
++    cos, sin = table.double()[floored].chunk(2, dim=-1)
++    sin = -sin if inverse else sin
++    pairs = x[..., -ROPE:].double().unflatten(-1, (ROPE // 2, 2))
++    first, second = pairs[..., 0], pairs[..., 1]
++    cos, sin = cos[:, None], sin[:, None]
++    ref = torch.stack((first * cos - second * sin, first * sin + second * cos), -1)
++    torch.testing.assert_close(
++        out[..., -ROPE:].double(), ref.flatten(-2), rtol=1e-2, atol=1e-2
++    )
++    # Rows are independent: a prefix rotates to the same bits.
++    part = x[:5].clone()
++    rope_(part, positions[:5], table, ratio, inverse)
++    assert torch.equal(part, out[:5])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/rope.py b/vllm/models/deepseek_v4_1/tilelang/rope.py
+new file mode 100644
+index 000000000..fb89756d3
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/rope.py
+@@ -0,0 +1,105 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang RoPE for DeepSeek-V4.1, in place on the last ``rope_dim`` columns.
++
++TileKernels' ``apply_rotary`` arithmetic (GPT-J interleaved pairs, FP32 with
++``ieee_fmaf``, cos and sin halves of one FP32 table row), with what V4.1 adds:
++compressed rows floor their position to a multiple of the compression ratio, and
++the rotation can run inverse. Only the rotated columns are read and written; the
++leading columns stay where they are.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
++import torch
++
++_PAIRS = 4  # pairs per thread: 8 BF16, one 16-byte access
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def rope_kernel(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
++    half = rope_dim // 2
++    assert rope_dim <= dim and half % _PAIRS == 0
++    lanes = half // _PAIRS  # threads per head
++    heads_per_block = min(heads, 256 // lanes)
++    threads = heads_per_block * lanes
++    start = dim - rope_dim
++    tokens = T.dynamic("tokens")
++    positions_max = T.dynamic("positions_max")
++
++    @T.prim_func
++    def rope(
++        x: T.Tensor((tokens, heads, dim), T.bfloat16),
++        positions: T.Tensor((tokens,), T.int64),
++        cos_sin: T.Tensor((positions_max, rope_dim), T.float32),
++    ):
++        with T.Kernel(tokens, T.ceildiv(heads, heads_per_block), threads=threads) as (
++            t,
++            hb,
++        ):
++            tx = T.get_thread_binding()
++            head = hb * heads_per_block + tx // lanes
++            lane = tx % lanes
++            xs = T.alloc_local((2 * _PAIRS,), T.bfloat16)
++            cs = T.alloc_local((2 * _PAIRS,), T.float32)
++            position = positions[t] // ratio * ratio if ratio > 1 else positions[t]
++            if head < heads:
++                for i in T.vectorized(_PAIRS):
++                    cs[i] = cos_sin[position, lane * _PAIRS + i]
++                for i in T.vectorized(_PAIRS):
++                    cs[_PAIRS + i] = cos_sin[position, half + lane * _PAIRS + i]
++                for j in T.vectorized(2 * _PAIRS):
++                    xs[j] = x[t, head, start + lane * 2 * _PAIRS + j]
++                for j in T.unroll(_PAIRS):
++                    first = T.cast(xs[2 * j], T.float32)
++                    second = T.cast(xs[2 * j + 1], T.float32)
++                    cosine = cs[j]
++                    sine = cs[_PAIRS + j]
++                    if inverse:
++                        xs[2 * j] = T.cast(
++                            T.ieee_fmaf(first, cosine, second * sine), T.bfloat16
++                        )
++                        xs[2 * j + 1] = T.cast(
++                            T.ieee_fmaf(first, -sine, second * cosine), T.bfloat16
++                        )
++                    else:
++                        xs[2 * j] = T.cast(
++                            T.ieee_fmaf(first, cosine, -(second * sine)), T.bfloat16
++                        )
++                        xs[2 * j + 1] = T.cast(
++                            T.ieee_fmaf(first, sine, second * cosine), T.bfloat16
++                        )
++                for j in T.vectorized(2 * _PAIRS):
++                    x[t, head, start + lane * 2 * _PAIRS + j] = xs[j]
++
++    return rope
++
++
++@torch.library.custom_op("vllm::dsv41_tilelang_rope", mutates_args=("x",))
++def rope_(
++    x: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    ratio: int,
++    inverse: bool,
++) -> None:
++    """Rotate the last ``cos_sin_cache.shape[1]`` columns of contiguous BF16 ``x``
++    ([T, D] or [T, H, D]) in place at ``positions`` (int64, non-negative)."""
++    rows = x.shape[0]
++    if rows == 0:
++        return
++    heads = x.shape[1] if x.ndim == 3 else 1
++    if not x.is_contiguous() or x.dtype != torch.bfloat16:
++        raise ValueError("TileLang RoPE rotates contiguous BF16 rows in place")
++    kernel = rope_kernel(heads, x.shape[-1], cos_sin_cache.shape[1], ratio, inverse)
++    kernel(x.view(rows, heads, x.shape[-1]), positions, cos_sin_cache)
++
++
++@rope_.register_fake
++def _rope_fake(x, positions, cos_sin_cache, ratio, inverse):
++    return None
++
++
++__all__ = ["rope_", "rope_kernel"]
+-- 
+2.54.0 (Apple Git-157)
+

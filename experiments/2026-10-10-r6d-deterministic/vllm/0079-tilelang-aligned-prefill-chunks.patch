@@ -1,0 +1,35 @@
+From 12fc0fc9d1b1e541716e8bf38cb850b873958c75 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:01:33 +0200
+Subject: [PATCH] Chunk alignment: aligned prefill chunks under the TileLang
+ kernel backend
+
+Under DS4.1's TileLang family every prefill chunk ends at a multiple of the
+long-prefill threshold, so a long prompt splits at the same tokens whatever
+else is served; with a threshold of the batch budget less the decode rows
+(8096 of 8192 at 16 streams of 6), a whole chunk always fits beside them.
+---
+ vllm/v1/core/sched/scheduler.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3a32c6c89..9f2c112f7 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -93,9 +93,10 @@ from vllm.v1.utils import record_function_or_nullcontext
+ logger = init_logger(__name__)
+ 
+ # Prefill chunks that end at absolute multiples of long_prefill_token_threshold,
+-# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism). Off: a
+-# chunk takes whatever budget the step's other requests leave.
+-ALIGN_PREFILL_CHUNKS = False
++# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism, under
++# its TileLang kernel family). Otherwise a chunk takes whatever budget the step's
++# other requests leave.
++ALIGN_PREFILL_CHUNKS = envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+ 
+ 
+ def _build_kv_connector_block_state(
+-- 
+2.54.0 (Apple Git-157)
+

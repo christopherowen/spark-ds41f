@@ -1,0 +1,124 @@
+From 03531010059fd57ff577e59155456dbe8a720f00 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 09:20:49 +0200
+Subject: [PATCH] TileLang decode rows past 64 and BF16 split rows by shape
+
+WIDE_DECODE lets a block-32 FP8 projection keep decode tiles (of a chosen
+height) for rows past DECODE_ROWS, and BF16_SPLIT_ROWS lets a BF16
+projection keep its split-K path for more rows. Both tables are empty: every
+projection runs as before. Every tile adds K in the same order, and split-K
+partials plus their reduce equal the shard GEMM, so filling them changes
+speed, not bits.
+---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py   | 26 +++++++++++++++++---
+ vllm/models/deepseek_v4_1/tilelang/linear.py | 16 +++++++++---
+ 2 files changed, 34 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index ddc655b0f..b6146adb7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -808,10 +808,28 @@ def split_row_tile(rows: int) -> int:
+     return min(split_bucket(rows), 64) if rows <= 128 else 64
+ 
+ 
+-def decode_tile_rows(rows: int) -> int:
+-    """Height of the decode tile that serves ``rows``; rows past DECODE_ROWS run in
+-    whole tiles of DECODE_ROWS (a layer that allows them)."""
+-    return next((height for height in DECODE_TILE_ROWS if rows <= height), DECODE_ROWS)
++# Block-32 FP8 projections whose decode tiles also serve rows past DECODE_ROWS
++# (16-stream steps reach 96 rows), by (N, K): {up to this many rows: tile height}.
++# Others take their prefill tile past DECODE_ROWS. Only speed changes: every tile
++# adds K in the same order.
++WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {}
++
++# BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
++# (N, K): the most rows it serves. The partials plus their reduce add the same
++# shards in the same order as the shard GEMM, so the bits do not change.
++BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {}
++
++
++def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:
++    """Height of the decode tile that serves ``rows``. Rows past DECODE_ROWS run in
++    whole tiles of the layer's ``wide`` height for them (``WIDE_DECODE``), else of
++    DECODE_ROWS (a layer that allows them)."""
++    if rows <= DECODE_ROWS:
++        return next(height for height in DECODE_TILE_ROWS if rows <= height)
++    return next(
++        (tile for bound, tile in sorted((wide or {}).items()) if rows <= bound),
++        DECODE_ROWS,
++    )
+ 
+ 
+ def fp8_decode_config(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index d00e1b409..ec9387ce5 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -29,12 +29,14 @@ from vllm.v1.worker.workspace import (
+ )
+ 
+ from .gemm import (
++    BF16_SPLIT_ROWS,
+     DECODE_ROWS,
+     DECODE_TILE_ROWS,
+     SF_BLOCK,
+     SPLIT_BF16,
+     SPLIT_DECODE_ROWS,
+     SPLIT_FP8,
++    WIDE_DECODE,
+     bf16_gemm,
+     bf16_gemm_partials,
+     bf16_gemm_splitk,
+@@ -99,7 +101,7 @@ def partials_kernel(layer: nn.Module, rows: int):
+ def _partial_specs(layer: nn.Module, rows: int):
+     """FP32 split-K partials of a BF16 projection's decode rows, if it splits."""
+     shards = layer.tilelang_shards
+-    if shards == 1 or rows > DECODE_ROWS:
++    if shards == 1 or rows > layer.tilelang_split_rows:
+         return ()
+     return (((shards, rows, layer.weight.shape[0]), torch.float32),)
+ 
+@@ -163,7 +165,7 @@ def _block32_linear(
+     if rows > layer.tilelang_decode_rows:
+         gemm = layer.tilelang_prefill
+     else:
+-        gemm = layer.tilelang_decode[decode_tile_rows(rows)]
++        gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+     gemm(
+         xq,
+         layer.weight,
+@@ -246,7 +248,8 @@ def _prepare_block32(layer, groups: int = 1) -> None:
+         layer.weight_scale_inv.view(torch.uint8), rows=n
+     )
+     layer.tilelang_groups = groups
+-    layer.tilelang_decode_rows = DECODE_ROWS
++    layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
++    layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
+     split = SPLIT_FP8.get((n, k)) if groups == 1 else None
+     layer.tilelang_shards = split["shards"] if split else 1
+     if split:
+@@ -303,7 +306,11 @@ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+         _prepare_block32(layer)
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+-        return _spec_bytes(_activation_specs(num_tokens, layer.weight.shape[1]))
++        return _spec_bytes(
++            _activation_specs(
++                num_tokens, layer.weight.shape[1], layer.tilelang_decode_rows
++            )
++        )
+ 
+     def apply(self, layer, x, bias=None):
+         if bias is not None:
+@@ -337,6 +344,7 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
+         n, k = layer.weight.shape
+         out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+         shards = layer.tilelang_shards = bf16_shards(n, k)
++        layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
+         layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
+         if shards > 1:
+             layer.tilelang_partials = {
+-- 
+2.54.0 (Apple Git-157)
+
