@@ -384,6 +384,19 @@ four lanes per group, one 16-bit word of packed E2M1 per lane, and the amax
 shuffled across the lanes. Window 9 (`w9.json`) reruns the bundle (module tip
 `2e05d829a`).
 
+Window 9 results (2026-10-10, 18:40 UTC, dgx1 and dgx2 agree): records equal
+and repeatable. Four lanes fixed the decode sizes: indexed is 1.19-1.31x B12X
+warm and 0.96-1.04x cold at 2-96 rows (1.05 / 0.95 at one row; 12-32 rows
+1.3-1.4x cold). It is still 2.0 / 2.8 / 4.4x warm at 512 / 2048 / 8192 rows,
+compute-bound on the E2M1 encode: seven comparisons per value, where B12X uses
+one `cvt.rn.satfinite.e2m1x2.f32` per two values (both divide by `div.rn.f32`).
+Module `52f622e6d` converts each lane's four quotients with two of those
+instructions, in B12X's operand order, through a `T.import_source` helper. SWA is
+unchanged: within 5% of B12X everywhere, 1.05x warm at one row and 1.06x at
+8192; module `75fc1b687` gives it B12X's paired conversion too (two
+`cvt.rn.satfinite.e4m3x2.f32` per lane instead of four scalar casts). Window 10
+(`w10.json`) reruns the bundle (module tip `75fc1b687`).
+
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
 recipe runs differ by up to 20% at some sizes); two or four queue pairs per

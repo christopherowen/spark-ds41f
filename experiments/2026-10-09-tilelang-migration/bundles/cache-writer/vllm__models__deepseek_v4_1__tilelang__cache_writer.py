@@ -13,7 +13,8 @@ are skipped):
   first), then 32 E4M3 scales. A group's scale is ``max(amax, 6 * 2^-9) / 6``
   (IEEE division) rounded to E4M3, saturating; the values are divided by its
   decoded value (a rounded reciprocal would move exact E2M1 midpoints off their
-  ties-to-even) and rounded to nearest-even E2M1.
+  ties-to-even) and converted by ``cvt.rn.satfinite.e2m1x2.f32`` (nearest even,
+  saturating), B12X's instruction.
 
 The arithmetic is B12X's ``write_cache`` for ``cache_format="deepseek_v41"``,
 step for step, so the records are the same bytes.
@@ -25,8 +26,6 @@ import tilelang
 import tilelang.language as T
 import torch
 
-from .indexer import _e2m1_code
-
 DIM = 512
 RECORD_BYTES = {"swa": 528, "indexed": 288}
 _GROUP = {"swa": 32, "indexed": 16}
@@ -36,6 +35,38 @@ _E4M3_MAX = 448.0
 # Payload bytes, TileLang and torch types of one thread's word: four values each.
 _WORD = {"swa": (4, T.uint32, torch.uint32), "indexed": (2, T.uint16, torch.uint16)}
 _PER_THREAD = 4
+
+# Four FP32 values to four E4M3 bytes or E2M1 codes, first value lowest: B12X's
+# paired conversions in its operand order (the second source fills the low half).
+_CVT_HEADER = r"""
+__device__ __forceinline__ unsigned int dsv41_e4m3x4(float v0, float v1,
+                                                    float v2, float v3) {
+  unsigned int packed;
+  asm("{\n"
+      ".reg .b16 lo, hi;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 lo, %2, %1;\n"
+      "cvt.rn.satfinite.e4m3x2.f32 hi, %4, %3;\n"
+      "mov.b32 %0, {lo, hi};\n"
+      "}"
+      : "=r"(packed)
+      : "f"(v0), "f"(v1), "f"(v2), "f"(v3));
+  return packed;
+}
+
+__device__ __forceinline__ unsigned short dsv41_e2m1x4(float v0, float v1,
+                                                      float v2, float v3) {
+  unsigned short packed;
+  asm("{\n"
+      ".reg .b8 lo, hi;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 lo, %2, %1;\n"
+      "cvt.rn.satfinite.e2m1x2.f32 hi, %4, %3;\n"
+      "mov.b16 %0, {lo, hi};\n"
+      "}"
+      : "=h"(packed)
+      : "f"(v0), "f"(v1), "f"(v2), "f"(v3));
+  return packed;
+}
+"""
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
@@ -67,6 +98,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
         slots: T.Tensor((tokens,), slot_dtype),
     ):
         with T.Kernel(T.ceildiv(tokens, tokens_per_block), threads=threads) as bx:
+            T.import_source(_CVT_HEADER)
             tx = T.get_thread_binding()
             token = bx * tokens_per_block + tx // per_token
             item = tx % per_token
@@ -104,11 +136,14 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                             T.cast(T.shift_left(254 - exponent, 23), T.uint32),
                             T.float32,
                         )
-                        for i in T.unroll(per_thread):
-                            code = T.cast(T.fmul(values[i], inverse), T.float8_e4m3fn)
-                            word = word | T.shift_left(
-                                T.cast(T.reinterpret(code, T.uint8), word_dtype), 8 * i
-                            )
+                        word = T.call_extern(
+                            "uint32",
+                            "dsv41_e4m3x4",
+                            T.fmul(values[0], inverse),
+                            T.fmul(values[1], inverse),
+                            T.fmul(values[2], inverse),
+                            T.fmul(values[3], inverse),
+                        )
                         words[page, (base + col) // word_bytes] = word
                         if lane == 0:
                             cache[page, base + payload + group] = T.cast(
@@ -118,9 +153,14 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                         scale = T.max(amax, 6.0 * 2.0**-9) / 6.0
                         scale_code = T.cast(T.min(scale, _E4M3_MAX), T.float8_e4m3fn)
                         decoded = T.cast(scale_code, T.float32)
-                        for i in T.unroll(per_thread):
-                            code = _e2m1_code(values[i] / decoded)
-                            word = word | T.shift_left(T.cast(code, word_dtype), 4 * i)
+                        word = T.call_extern(
+                            "uint16",
+                            "dsv41_e2m1x4",
+                            values[0] / decoded,
+                            values[1] / decoded,
+                            values[2] / decoded,
+                            values[3] / decoded,
+                        )
                         words[page, (base + col // 2) // word_bytes] = word
                         if lane == 0:
                             cache[page, base + payload + group] = T.reinterpret(
