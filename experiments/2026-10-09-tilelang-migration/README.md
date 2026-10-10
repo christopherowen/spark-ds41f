@@ -367,7 +367,7 @@ records against B12X's at every size, repeatability, and warm/cold timing, on
 two nodes. The module set now also carries the SP overlap and fused-sum
 modules ([2026-10-10-sp-overlap](../2026-10-10-sp-overlap/),
 [2026-10-10-sp-fused-sum](../2026-10-10-sp-fused-sum/)), which change nothing
-without their switches; the ports' switch hashes are remapped.
+without their switches; the ports' switch hashes are remapped (module tip `bfaf9b54b`).
 
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
