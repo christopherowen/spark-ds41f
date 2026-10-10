@@ -585,3 +585,30 @@ class StepFailureTest(unittest.TestCase):
         self.assertEqual(code, 1)
         close.assert_called_once()
         self.assertIn("raised RuntimeError: cannot read dgx3", close.call_args.args[0])
+
+
+class FabricTest(unittest.TestCase):
+    def test_plan_stops_serving_then_runs_on_every_node(self):
+        steps = lab.plan({"experiment": "experiments/x", "run": "r", "jobs": [
+            {"kind": "fabric", "config": "arm.json", "script": "bench.py", "args": ["--rows", 205]}]})
+        self.assertEqual([s["kind"] for s in steps], ["stop", "fabric"])
+        self.assertEqual(steps[1]["config"], "experiments/x/arm.json")
+        self.assertEqual(steps[1]["script"], "experiments/x/bench.py")  # a bare name is the experiment's
+        self.assertEqual(steps[1]["args"], ["--rows", "205"])
+        self.assertEqual(steps[1]["label"], "bench")
+
+    def test_command_is_the_probe_container_with_the_arm_mounts(self):
+        cluster = {"container": {"image": "img", "mounts": [["{home}/o/a.py", "/opt/a.py", "ro"]]},
+                   "host": {"home": "/h"}}
+        probe = ["docker", "run", "--env", "A=1", "--volume", "/repo/scripts/probe_collectives.py:/probe.py:ro",
+                 "img", "--signal=TERM", "600s", "python3", "/probe.py", "--rank", "1", "--world-size", "4",
+                 "--master-addr", "m", "--master-port", "29581"]
+        with mock.patch.object(lab.spark, "collective_probe_command", return_value=probe), \
+                mock.patch.object(lab.spark, "repository_path", return_value="/repo"), \
+                mock.patch.object(lab.spark.topology, "transport", return_value="oneshot-ring4"):
+            command = lab.fabric_command(cluster, {}, {}, "exp/bench.py", ["--rows", "205"])
+        self.assertEqual(command, [
+            "docker", "run", "--env", "A=1", "--volume", "/repo/exp/bench.py:/fabric.py:ro",
+            "--volume", "/h/o/a.py:/opt/a.py:ro", "img", "--signal=TERM", "600s",
+            "python3", "/fabric.py", "--rank", "1", "--world-size", "4", "--master-addr", "m",
+            "--master-port", "29581", "--rows", "205"])

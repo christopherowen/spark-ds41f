@@ -137,48 +137,108 @@ def rank_order_sum(
     return out.copy_(total)
 
 
+# Bytes of one rank's chunk per pipeline slice: larger chunks are exchanged in
+# slices so each slice's relay hop and sum run under the next slice's transfer.
+SLICE_BYTES = 4 << 20
+MAX_SLICES = 8
+
+
+def pipeline_slices(chunk_bytes: int) -> int:
+    """Pipeline slices for a reduce-scatter whose per-rank chunk has ``chunk_bytes``."""
+    return max(1, min(MAX_SLICES, chunk_bytes // SLICE_BYTES))
+
+
 def reduce_scatter_rank_order(
-    comm, input_tensor: torch.Tensor, rank: int, world: int
+    comm, input_tensor: torch.Tensor, rank: int, world: int, slices: int | None = None
 ) -> torch.Tensor:
     """Rows ``[rank * L, (rank + 1) * L)`` of the sum over ranks of ``input_tensor``
     (contiguous, ``world * L`` rows), with the one-shot all-reduce's arithmetic.
 
     ``comm`` is the group's PyNCCL communicator (``send``, ``recv``,
-    ``group_start``, ``group_end``)."""
+    ``group_start``, ``group_end``). At four ranks the rows go in ``slices``
+    (default by size): each NCCL group carries one slice's direct chunks and
+    relay halves and the previous slice's relayed halves, and the previous slice
+    is summed on a side stream meanwhile. Slicing changes no sum.
+    """
     chunks = input_tensor.view(world, -1, *input_tensor.shape[1:])
+    rows = chunks.shape[1]
     parts = torch.empty_like(chunks)
-    if world == 4:
-        nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
-        half = -(-chunks.shape[1] // 2)
-        # Halves of the opposite rank's chunks, in transit: from the previous rank
-        # for the next one (rows :half), from the next rank for the previous one.
-        relay_a = torch.empty_like(chunks[0, :half])
-        relay_b = torch.empty_like(chunks[0, half:])
-        comm.group_start()
-        _send(comm, chunks[nxt], nxt)
-        _send(comm, chunks[opp, :half], nxt)
-        _send(comm, chunks[prv], prv)
-        _send(comm, chunks[opp, half:], prv)
-        _recv(comm, parts[prv], prv)
-        _recv(comm, relay_a, prv)
-        _recv(comm, parts[nxt], nxt)
-        _recv(comm, relay_b, nxt)
-        comm.group_end()
-        comm.group_start()
-        _send(comm, relay_a, nxt)
-        _send(comm, relay_b, prv)
-        _recv(comm, parts[opp, :half], prv)
-        _recv(comm, parts[opp, half:], nxt)
-        comm.group_end()
-    else:
+    out = torch.empty_like(chunks[0])
+
+    def sources(lo, hi):  # this rank's own chunk is read in place
+        return [
+            chunks[r, lo:hi] if r == rank else parts[r, lo:hi] for r in range(world)
+        ]
+
+    if world != 4:
         comm.group_start()
         for peer in range(world):
             if peer != rank:
                 _send(comm, chunks[peer], peer)
                 _recv(comm, parts[peer], peer)
         comm.group_end()
-    # This rank's own chunk is read in place.
-    return rank_order_sum([chunks[r] if r == rank else parts[r] for r in range(world)])
+        return rank_order_sum(sources(0, rows), out)
+    if slices is None:
+        slices = pipeline_slices(chunks[0].numel() * chunks.element_size())
+    slices = max(1, min(slices, rows))
+    bounds = [rows * i // slices for i in range(slices + 1)]
+    nxt, prv, opp = (rank + 1) % 4, (rank + 3) % 4, (rank + 2) % 4
+    side = None
+    if slices > 1 and input_tensor.is_cuda:
+        main = torch.cuda.current_stream(input_tensor.device)
+        side = _side_stream(input_tensor.device)
+    relays = []
+    for s in range(slices + 1):
+        comm.group_start()
+        if s < slices:
+            # Slice s: the neighbours' chunks, and halves of the opposite rank's
+            # chunk to relay (rows lo:mid via the next rank, mid:hi via the
+            # previous one); the halves in transit arrive from the neighbours.
+            lo, hi = bounds[s], bounds[s + 1]
+            mid = lo + -(-(hi - lo) // 2)
+            relay_a = torch.empty_like(chunks[0, lo:mid])
+            relay_b = torch.empty_like(chunks[0, mid:hi])
+            relays.append((relay_a, relay_b))
+            _send(comm, chunks[nxt, lo:hi], nxt)
+            _send(comm, chunks[opp, lo:mid], nxt)
+            _send(comm, chunks[prv, lo:hi], prv)
+            _send(comm, chunks[opp, mid:hi], prv)
+            _recv(comm, parts[prv, lo:hi], prv)
+            _recv(comm, relay_a, prv)
+            _recv(comm, parts[nxt, lo:hi], nxt)
+            _recv(comm, relay_b, nxt)
+        if s > 0:
+            # Slice s - 1: forward the halves in transit; receive the opposite
+            # rank's halves of this rank's own rows.
+            lo, hi = bounds[s - 1], bounds[s]
+            mid = lo + -(-(hi - lo) // 2)
+            relay_a, relay_b = relays[s - 1]
+            _send(comm, relay_a, nxt)
+            _send(comm, relay_b, prv)
+            _recv(comm, parts[opp, lo:mid], prv)
+            _recv(comm, parts[opp, mid:hi], nxt)
+        comm.group_end()
+        if s > 0:
+            lo, hi = bounds[s - 1], bounds[s]
+            if side is None:
+                rank_order_sum(sources(lo, hi), out[lo:hi])
+            else:
+                side.wait_stream(main)
+                with torch.cuda.stream(side):
+                    rank_order_sum(sources(lo, hi), out[lo:hi])
+    if side is not None:
+        main.wait_stream(side)
+    return out
+
+
+_SIDE_STREAMS: dict = {}
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    """One side stream per device for the pipelined sums."""
+    if device not in _SIDE_STREAMS:
+        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
+    return _SIDE_STREAMS[device]
 
 
 def _send(comm, tensor: torch.Tensor, peer: int) -> None:
@@ -191,4 +251,9 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
         comm.recv(tensor, peer)
 
 
-__all__ = ["rank_order_sum", "rank_order_sum_kernel", "reduce_scatter_rank_order"]
+__all__ = [
+    "pipeline_slices",
+    "rank_order_sum",
+    "rank_order_sum_kernel",
+    "reduce_scatter_rank_order",
+]
