@@ -38,5 +38,9 @@ runs the layout test in the r6d image. The lean screen adds the
 temperature-0 output check and mixed-traffic latency; prefill at 16K tokens
 runs two 8096-token chunks, the sliced steps.
 
+Window 1 first rebuilds `-r6d` with the router fix of the r6d gate (patch
+0072; the image job replaces the stale tag on every node) and reruns the gate
+tests in it, then the layout test and the screen.
+
 Acceptance: temperature-0 outputs identical, decode level, prefill faster
-than r6d. Window 1 needs the r6d image (built by the r6d gate).
+than r6d.
