@@ -55,3 +55,25 @@ and the layout test pass in it; the r6d arm ran. The overlap arm did not boot:
 the old vLLM tree label, which the TileLang preflight refuses. Regenerated;
 a repository test now checks every TileLang profile's expected trees against
 its lock's manifest. Window 2 ([w2.json](w2.json)) reruns the screen.
+
+Window 2 (2026-10-10, 16:54-17:18 UTC, r6d / overlap / r6d bracket):
+
+| Measure | r6d | overlap | r6d (end) |
+| --- | --- | --- | --- |
+| prose c1 step | 31.59 ms | 31.52 ms (-0.2%) | 31.43 ms (-0.5%) |
+| json c1 step | 36.66 ms | 36.72 ms (+0.2%) | 37.04 ms (+1.0%) |
+| single stream, distinct prompts | 87.09 tok/s | +0.2% | +0.3% |
+| eight distinct concurrent prompts | 175.77 tok/s | +0.0% | -0.1% |
+| cold prefill 1K | 2673 tok/s | 2655 (-0.7%) | 2627 (-1.7%) |
+| cold prefill 16K | 5594 tok/s | 5721 (+2.3%) | 5610 (+0.3%) |
+| mixed: short TTFT median | 233.4 ms | -7.1% | -8.7% |
+| mixed: long TTFT mean | 903.6 ms | +1.8% | +0.9% |
+| mixed: gap p99 | 799.9 ms | +1.1% | -1.1% |
+| temperature 0 | identical | identical | identical |
+
+The overlap keeps the outputs bit-identical in every scenario and decode
+level. Prefill at 16K tokens, the only measure whose steps are sliced, is 2.0%
+faster than the mean of the two r6d runs, about the size of C3's measured cost
+at that length. The 1K prefill and mixed-traffic changes are within the
+bracket's own spread (its two r6d runs differ by 1.7% and 1.6%). The overlap is
+a candidate to fold into r6d before promotion; that is the owner's call.
