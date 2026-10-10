@@ -20,10 +20,13 @@ Each request asks for the chosen tokens' logprobs. Tokens must match the referen
 exactly; logprobs are compared bit for bit as well (equal tokens with unequal
 logprobs is a numeric difference that has not flipped a token yet). One JSON line
 per scenario, then the summary that lab.py's tables read: "identical" is true only
-when every token (and, where the server returns them, every logprob) matched. Exits
-0 either way; the run records.
+when every token (and, where the server returns them, every logprob) matched. The
+summary also carries SHA-256 digests of the references (the eight prompts alone, and
+the long prompt alone, whose prefill runs sequence-parallel), so two builds can be
+compared bit for bit. Exits 0 either way; the run records.
 """
 import argparse
+import hashlib
 import json
 import random
 import threading
@@ -118,6 +121,12 @@ def compare(result: dict, reference: dict) -> dict:
     return {"first_token_diff": first, "logprobs_equal": lp_equal, "first_logprob_diff": lp_first}
 
 
+def digest(results: list[dict]) -> str:
+    """SHA-256 of the results' tokens and logprobs (text where tokens are absent)."""
+    payload = [[r["tokens"], r["logprobs"]] if r["tokens"] is not None else r.get("text") for r in results]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("base_url")
@@ -154,7 +163,9 @@ def main() -> None:
         report[name] = {"token_diffs": token_diffs, "logprob_diffs": logprob_diffs}
         print(json.dumps({"scenario": name, **report[name], "requests": rows}), flush=True)
     print(json.dumps({"summary": "temperature-0 determinism", "identical": identical,
-                      "logprobs": client.logprobs, "tokens": tokens, "scenarios": report}), flush=True)
+                      "logprobs": client.logprobs, "tokens": tokens, "scenarios": report,
+                      "reference_sha256": digest(reference), "long_sha256": digest([long_reference])}),
+          flush=True)
 
 
 if __name__ == "__main__":
