@@ -137,16 +137,16 @@ gate). Numbers in parentheses are windows.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
 | C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
-| B5 compressor projection | `2f52fd34e` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
-| B6 DSpark context KV | `de217d045` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
-| B7 Engram gate | `28f2c6636` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
-| B2 RoPE | `52dfd7b4f` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
-| B9 Engram hash | `8426d531a` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
-| B1 WO projection | `c1cf9c29e` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
-| B8 index head weights | `93380ec6f` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
-| C3 collectives | `f68059195` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
-| Chunk alignment | `ab016fa81` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
-| D1 decode rows | `686befe6c` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
+| B5 compressor projection | `d4211888a` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `317a4b32f` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `0417d936b` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `6b667cded` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `6015f6c24` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `51d17d74e` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `518592849` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| C3 collectives | `4d455dce2` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
+| Chunk alignment | `c9bb8c0ef` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
+| D1 decode rows | `ff424e911` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 

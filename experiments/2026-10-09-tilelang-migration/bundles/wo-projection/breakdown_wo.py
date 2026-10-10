@@ -5,7 +5,7 @@
    RoPE in place, the WO-A activation cast, the grouped WO-A GEMM, the WO-B cast and
    the WO-B GEMM, each alone. Warm parts each keep their own data in L2, which the
    whole call (over 24 MB from 512 rows) cannot, so warm parts sum below it.
-2. Prefill tiles for WO-A (grouped) and WO-B at 512 and 2048 rows, warm and cold,
+2. Prefill tiles for WO-A (grouped) and WO-B at 512, 1024 and 2048 rows, warm and cold,
    with the bits of every tile checked against the current one. A tile that does
    not launch (shared memory) is skipped.
 """
@@ -94,7 +94,7 @@ for label, (n, k, groups, weight, weight_sf, xq, sf, dst) in {
     current = g.fp8_prefill_config(n, k, groups)
     configs = [dict(block_M=bm, block_N=bn, block_K=128, num_stages=st)
                for bm, bn, st in itertools.product((64, 128), (64, 128), (2, 3))]
-    for rows in (512, 2048):
+    for rows in (512, 1024, 2048):
         reference = None
         results = {}
         base = g.mxfp8_gemm(n, k, **current, groups=groups)
