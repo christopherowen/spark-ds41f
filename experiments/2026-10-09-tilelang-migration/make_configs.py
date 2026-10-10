@@ -3,8 +3,8 @@
 
 - control.json: r6c TP4 with the migration's modules mounted (they change nothing the
   model runs) and a torch profiler directory;
-- <port>.json: the modules with one port's switch files over them (overlay/<port>)
-  and its environment;
+- <port>.json: the modules with one port's switch files over them (overlay/<port>),
+  its environment and its serving arguments;
 - <combo>.json: the modules with several ports' switch files and environments
   (ports.COMBOS; their switches touch different files);
 - sparknet-cute.json / sparknet-tilelang.json: the control with sparknet main
@@ -52,17 +52,22 @@ def set_profiler(cluster, name):
 def main():
     base = json.loads((ROOT / BASE).read_text())
 
-    def arm(overlay, profile, environment=(), *more):
+    def arm(overlay, profile, environment=(), *more, serve_args=None):
         """r6c TP4 plus the modules and one port's switch files (or several ports')."""
         cluster = copy.deepcopy(base)
         cluster["container"]["mounts"] += mounts("modules", overlay, *more)
         cluster["environment"].update(environment)
+        for flag, value in (serve_args or {}).items():
+            args = cluster["serve_args"]
+            if flag not in args:
+                raise SystemExit(f"{profile}: {flag} is not a serving argument of the recipe")
+            args[args.index(flag) + 1] = value
         set_profiler(cluster, profile)
         return cluster
 
     arms = {"control": arm("modules", "migration-control")}
     for name, port in PORTS.items():
-        arms[name] = arm(name, f"migration-{name}", port["environment"])
+        arms[name] = arm(name, f"migration-{name}", port["environment"], serve_args=port.get("serve_args"))
     for name, ports in COMBOS.items():
         files = [{p.relative_to(HERE / "overlay" / port) for p in (HERE / "overlay" / port).rglob("*.py")}
                  for port in ports]
@@ -70,7 +75,8 @@ def main():
         if shared:
             raise SystemExit(f"{name}: {', '.join(ports)} switch the same files: {sorted(map(str, shared))}")
         environment = {k: v for port in ports for k, v in PORTS[port]["environment"].items()}
-        arms[name] = arm(ports[0], f"migration-{name}", environment, *ports[1:])
+        serve_args = {k: v for port in ports for k, v in PORTS[port].get("serve_args", {}).items()}
+        arms[name] = arm(ports[0], f"migration-{name}", environment, *ports[1:], serve_args=serve_args)
     for family in ("cute", "tilelang"):
         cluster = arm("modules", f"migration-sparknet-{family}", {"SPARKNET_ROCE_KERNELS": family})
         cluster["container"]["mounts"].append(list(SPARKNET_MAIN["mount"]))

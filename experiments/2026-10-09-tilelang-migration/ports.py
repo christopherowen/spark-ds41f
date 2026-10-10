@@ -17,7 +17,7 @@ For each port: its switch commit, the environment its arm sets, and its kernel b
 
 VLLM_BRANCH = "tilelang-migration"
 BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
-MODULES = "73e5089fb"  # the last module commit
+MODULES = "e859afc53"  # the last module commit
 
 PORTS = {
     # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
@@ -38,7 +38,7 @@ PORTS = {
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "switch": "76424506c",
+        "switch": "2f52fd34e",
         "environment": {},
         "bundle": {
             "modules": (
@@ -58,7 +58,7 @@ PORTS = {
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "switch": "dc1f9c30b",
+        "switch": "de217d045",
         "environment": {},
         "bundle": {
             "modules": (
@@ -78,7 +78,7 @@ PORTS = {
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "switch": "2dd03add3",
+        "switch": "28f2c6636",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
@@ -93,7 +93,7 @@ PORTS = {
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "switch": "350e8bdc3",
+        "switch": "52dfd7b4f",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
@@ -108,7 +108,7 @@ PORTS = {
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "switch": "5857a05c1",
+        "switch": "8426d531a",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
@@ -123,7 +123,7 @@ PORTS = {
     # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
     # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
     "wo-projection": {
-        "switch": "b87e2f53f",
+        "switch": "c1cf9c29e",
         "environment": {},
         "bundle": {
             "modules": (
@@ -143,7 +143,7 @@ PORTS = {
     # 5. B8: the indexer's head-weight scale, B12X scale_index_weights -> folded exactly
     # into the TileLang projection's weight (no kernel).
     "index-weights": {
-        "switch": "45a1806cd",
+        "switch": "93380ec6f",
         "environment": {},
         "bundle": {
             "modules": (
@@ -164,7 +164,7 @@ PORTS = {
     # tiles for the fused Q-A/KV and shared experts, split-K for the router and the
     # indexer head weights; same bits, speed only.
     "decode-rows": {
-        "switch": "8644e961b",
+        "switch": "686befe6c",
         "environment": {},
         "bundle": {
             "modules": (
@@ -191,7 +191,7 @@ PORTS = {
     # to 2 MiB, and sequence parallelism's reduce-scatter with its arithmetic (FP32,
     # rank order, one rounding) instead of NCCL's ring sums.
     "collectives": {
-        "switch": "58418ca15",
+        "switch": "f68059195",
         "environment": {"SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152"},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/collectives.py",),
@@ -203,12 +203,27 @@ PORTS = {
             "scripts": ("bench_rank_order_sum.py",),
         },
     },
+    # 12. Prefill chunks that end at absolute multiples of the long-prefill threshold
+    # (8096: the 8192-token budget less 16 streams of 6 decode rows), so a long prompt
+    # splits at the same tokens whatever else is served.
+    "chunk-align": {
+        "switch": "ab016fa81",
+        "environment": {},
+        "serve_args": {"--long-prefill-token-threshold": "8096"},
+        "bundle": {
+            "modules": (),
+            "description": "Aligned prefill chunks: the scheduler's unit tests.",
+            "tests": ("tests/v1/core/test_aligned_prefill_chunks.py",),
+            "select": None,
+            "scripts": (),
+        },
+    },
 }
 
 # Arms of several ports together (their switches touch different files): whether the
 # determinism fixes together make the outputs independent of the company they keep.
 COMBOS = {
-    "deterministic": ("collectives", "compressor-projection"),
+    "deterministic": ("collectives", "compressor-projection", "chunk-align"),
 }
 
 # Kernel bundles that are not ports (no switch, no arm): they measure the modules.

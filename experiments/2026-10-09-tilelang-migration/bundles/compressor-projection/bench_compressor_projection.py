@@ -105,16 +105,21 @@ def run(parts, out_dtype, session):
             failures.append(f"ratio {parts} part {i} error")
         del ref, reference
 
-    # 2. Batch invariance.
-    varies = []
+    # 2. Batch invariance (B12X reported: it takes the plan for the exact row count,
+    # else the 8192-row plan, and its backend follows the plan).
+    varies, b_varies = [], []
     for rows in DECODE + (g.SPLIT_DECODE_ROWS, 200) + PREFILL[:-1]:
         tilelang(rows)
+        b12x(rows)
         torch.cuda.synchronize()
         if not all(torch.equal(tl_out[i][:rows], full[i][:rows]) for i in range(parts)):
             varies.append(rows)
+        if not all(torch.equal(b_out[i][:rows], b_full[i][:rows]) for i in range(parts)):
+            b_varies.append(rows)
     if varies:
         failures.append(f"ratio {parts}: TileLang differs from its full batch at {varies}")
-    print(f"ratio {parts}: TileLang differs from its full batch at {varies or 'no'} sizes", flush=True)
+    print(f"ratio {parts}: TileLang differs from its full batch at {varies or 'no'} sizes; "
+          f"B12X at {b_varies or 'no'}", flush=True)
     flaky = [rows for rows in REPEAT if repeatable(lambda: tilelang(rows), lambda: [o[:rows] for o in tl_out])]
     if flaky:
         failures.append(f"ratio {parts}: TileLang not repeatable at {flaky}")

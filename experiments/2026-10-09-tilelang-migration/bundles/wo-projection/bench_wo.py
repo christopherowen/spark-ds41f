@@ -135,19 +135,25 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
     if not ok:
         failures.append("error")
     del ref
-    full = t_out.clone()
+    full, b_full = t_out.clone(), b_out.clone()
 
-    # 2. Batch invariance (fresh unrotated rows each time).
-    varies = []
+    # 2. Batch invariance (fresh unrotated rows each time). B12X is reported: decode
+    # steps take its plan for their row count, steps with a prefill row its 8192-row
+    # plan, so a row of a mixed step may round otherwise than in a pure decode step.
+    varies, b_varies = [], []
     for rows in DECODE + PREFILL[:-1]:
         work[:rows].copy_(o[:rows])
         tilelang(rows)
+        b12x(rows)
         torch.cuda.synchronize()
         if not torch.equal(t_out[:rows], full[:rows]):
             varies.append(rows)
+        if not torch.equal(b_out[:rows], b_full[:rows]):
+            b_varies.append(rows)
     if varies:
         failures.append(f"TileLang differs from its full batch at {varies}")
-    print(f"TileLang differs from its full batch at {varies or 'no'} sizes", flush=True)
+    print(f"TileLang differs from its full batch at {varies or 'no'} sizes; B12X at {b_varies or 'no'}",
+          flush=True)
 
     def fresh(rows):
         work[:rows].copy_(o[:rows])
