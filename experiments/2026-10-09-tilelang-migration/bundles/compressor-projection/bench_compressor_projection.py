@@ -1,6 +1,7 @@
 """Port B5: the compressor's wkv/wgate projection (5120 -> 512 per part), B12X's
-bf16_gemv against TileLangSplitLinearMethod (both parts in one launch: split-K
-partials and a two-output reduce for decode rows, a two-output GEMM for prefill), at
+bf16_gemv against TileLangSplitLinearMethod (both parts in one launch: one-launch
+split-K for decode rows, where the last CTA of a tile adds the shards, and a
+two-output GEMM for prefill), at
 the TP4 shapes: ratio 1 (wkv, BF16 out) and ratio 2 (wkv + wgate, FP32 out).
 
 1. Error against FP64, no worse than DeepSeek's reference computation (an FP32 matmul
@@ -8,8 +9,8 @@ the TP4 shapes: ratio 1 (wkv, BF16 out) and ratio 2 (wkv + wgate, FP32 out).
 2. Batch invariance: every row count gives the same rows of the 8192-row batch.
 3. Time per call (both parts) under CUDA graphs, warm and cold, at the decode capture
    sizes and prefill rows, against B12X.
-4. A sweep of shard counts (they change bits, so one is chosen per shape): time and
-   error at each.
+4. A sweep of shard counts and blocked accumulation (both change bits, so one
+   setting is chosen per shape): time and error at each, one launch for decode rows.
 
 Exits 1 if a check fails or the serving configuration is slower than B12X at any
 shape, warm or cold.
@@ -36,7 +37,7 @@ from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
 
 torch.backends.cuda.matmul.allow_tf32 = False
 K, PART = 5120, 512
-SWEEP = (5, 8, 10, 16, 20)
+SWEEP = (4, 5, 8, 10)
 failures = []
 
 
@@ -82,23 +83,23 @@ def run(parts, out_dtype, session):
         for w, o in zip(w_parts, b_out):
             bf16_gemv.mm(x[:rows], w, out=o[:rows], output_dtype=out_dtype, plan=plan)
 
-    def configuration(shards):
-        """A shard count's kernels, called like the serving path."""
-        partials = {bm: g.bf16_gemm_partials(PART * parts, K, shards, block_M=bm) for bm in (16, 32, 64)}
+    def configuration(shards, blocked):
+        """A shard count's kernels, called like the serving path (one launch for
+        decode rows, the shard GEMM for prefill)."""
+        splitk = {bm: g.bf16_gemm_splitk(PART * parts, K, shards, block_M=bm, out_dtype=tl_dtype, parts=parts,
+                                         blocked=blocked) for bm in (16, 32, 64)}
+        counters = torch.zeros(8 * (PART * parts // 64), dtype=torch.int32, device=DEVICE)
         if parts == 2:
-            reduce = g.splitk_reduce_two(PART, shards, out_dtype=tl_dtype)
-            gemm = g.bf16_gemm_two(PART, K, out_dtype=tl_dtype, shards=shards)
+            gemm = g.bf16_gemm_two(PART, K, out_dtype=tl_dtype, shards=shards, blocked=blocked)
         else:
-            reduce = g.splitk_reduce(PART, shards, out_dtype=tl_dtype)
-            gemm = g.bf16_gemm(PART, K, out_dtype=tl_dtype, shards=shards)
+            gemm = g.bf16_gemm(PART, K, out_dtype=tl_dtype, shards=shards, blocked=blocked)
         p = torch.empty((shards, g.SPLIT_DECODE_ROWS, PART * parts), dtype=torch.float32, device=DEVICE)
 
         def call(rows):
             outs = [o[:rows] for o in sw_out]
             if rows <= g.SPLIT_DECODE_ROWS:
                 view = p.view(-1)[:shards * rows * PART * parts].view(shards, rows, PART * parts)
-                partials[next((bm for bm in (16, 32) if rows <= bm), 64)](x[:rows], weight, view)
-                reduce(view, *outs)
+                splitk[next((bm for bm in (16, 32) if rows <= bm), 64)](x[:rows], weight, view, counters, *outs)
             else:
                 gemm(x[:rows], weight, *outs)
         return call
@@ -143,19 +144,20 @@ def run(parts, out_dtype, session):
             failures.append(f"ratio {parts} rows {rows}: TileLang slower")
 
     # 4. Shard sweep: warm / cold per call, and error vs FP64 of part 0.
-    print(f"ratio {parts} sweep: shards -> us warm/cold at rows 1, 6, 16, 48, 96, 512, 8192; error max/rms",
-          flush=True)
+    print(f"ratio {parts} sweep: shards, blocked -> us warm/cold at rows 1, 2, 6, 16, 48, 96, 512, 8192; "
+          "error max/rms", flush=True)
     ref0 = x.double() @ w_parts[0].double().T
     for shards in SWEEP:
-        if (K // 64) % shards:
-            continue
-        call = configuration(shards)
-        times = [per_call(lambda: call(rows), rows) for rows in (1, 6, 16, 48, 96, 512, CAPACITY)]
-        call(CAPACITY)
-        torch.cuda.synchronize()
-        err = errors(sw_out[0], ref0)
-        print(f"  shards {shards:2d}: " + "  ".join(f"{w:.2f}/{c:.2f}" for w, c in times)
-              + f"  error {err[0]:.3e}/{err[1]:.3e}", flush=True)
+        for blocked in (False, True):
+            if (K // 64) % shards:
+                continue
+            call = configuration(shards, blocked)
+            times = [per_call(lambda: call(rows), rows) for rows in (1, 2, 6, 16, 48, 96, 512, CAPACITY)]
+            call(CAPACITY)
+            torch.cuda.synchronize()
+            err = errors(sw_out[0], ref0)
+            print(f"  shards {shards:2d} blocked {int(blocked)}: " + "  ".join(f"{w:.2f}/{c:.2f}" for w, c in times)
+                  + f"  error {err[0]:.3e}/{err[1]:.3e}", flush=True)
     del ref0
 
 

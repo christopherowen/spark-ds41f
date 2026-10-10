@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import tempfile
 
-from ports import BASE, MODULES, PORTS, VLLM_BRANCH
+from ports import BASE, BUNDLES, MODULES, PORTS, VLLM_BRANCH
 
 HERE = pathlib.Path(__file__).resolve().parent
 IMAGE = "vllm-ds41f-kkref:19f2c20ed4d6-r6c"
@@ -38,7 +38,7 @@ def candidate(bundle: dict, files: list[str]) -> dict:
     select = "" if bundle["select"] is None else f"'-k', {bundle['select']!r}, "
     calls = [f"subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', "
              f"'no:cacheprovider', '-rfE', {select}"
-             + ", ".join(repr(t) for t in bundle["tests"]) + "])"]
+             + ", ".join(repr(t) for t in bundle["tests"]) + "])"] if bundle["tests"] else []
     calls += [f"subprocess.call([sys.executable, '/b/{script}'])" for script in bundle["scripts"]]
     argv = ("import subprocess, sys; codes = [" + ", ".join(calls) + "]; "
             "print('exit codes', codes); sys.exit(max(codes))")
@@ -87,20 +87,21 @@ def main():
                 print(f"overlay/{arm}: {len(files)} files (switch {switch or '-'})")
         finally:
             git("worktree", "remove", "--force", str(work))
-    for name, port in PORTS.items():
+    for name, port in {**PORTS, **BUNDLES}.items():
+        spec = port.get("bundle", port)  # a port nests its bundle; BUNDLES hold them bare
         bundle = HERE / "bundles" / name
         bundle.mkdir(parents=True, exist_ok=True)
         for stale in bundle.iterdir():  # keep only the bench scripts
-            if stale.is_file() and stale.name not in port["bundle"]["scripts"]:
+            if stale.is_file() and stale.name not in spec["scripts"]:
                 stale.unlink()
-        modules = list(port["bundle"]["modules"])
+        modules = list(spec["modules"])
         assert set(modules) <= set(module_files), f"{name}: not a module file"
-        for path in modules + list(port["bundle"]["tests"]):
+        for path in modules + list(spec["tests"]):
             data = subprocess.run(["git", "show", f"{MODULES}:{path}"], cwd=args.vllm,
                                   capture_output=True, check=True).stdout
             (bundle / bundled(path)).write_bytes(data)
         shutil.copyfile(HERE / "kbench.py", bundle / "kbench.py")
-        (bundle / "candidate.json").write_text(json.dumps(candidate(port["bundle"], modules), indent=2) + "\n")
+        (bundle / "candidate.json").write_text(json.dumps(candidate(spec, modules), indent=2) + "\n")
         print(f"bundles/{name}: {len(modules)} module files")
 
 

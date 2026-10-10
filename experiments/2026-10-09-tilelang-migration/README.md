@@ -134,6 +134,26 @@ everywhere, at every row count, warm and cold.
 | B1 WO projection | `60e79424a` | unit tests pass; bench crashed (no workspace); tile sweep ran (WO-A small wins) | not screened | window 2 |
 | B8 index head weights | `b4abab04f` | not run (window 1's third job stopped on a LAN drop) | not screened | window 2 |
 
+### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
+
+- B2 RoPE: faster nearly everywhere (up to 40x at prefill); a few ~1 us points
+  within noise.
+- B8: faster at decode; above 64 rows the 32-column projection itself takes
+  ~31 us on both sides (narrow BF16 projections leave split-K at 64 rows).
+- B6 (split-K): 0.34-0.55x B12X at 1-64 rows, 0.65x at 8192; slower at 72-96
+  cold (serving tile; the sweep's 96-row tile wins at 0.83x), 512 (1.14x with
+  the best prefill tile) and 2048 (1.02-1.13x). Five shards.
+- B5 (fused parts, split-K): FP32 path 2-9x faster from 4 rows; error below
+  DeepSeek's FP32 reference at 10 shards. Slower at 1-2 rows (the reduce
+  launch) and the BF16 path at 72-96 cold; five shards fastest.
+- B1: faster warm at 1-64 rows and at 8192; 3-7% slower cold at small rows,
+  1.1x at 72-96, 1.25x at 512, 1.05x at 2048.
+
+Window 3 (`w3-kernels.json`, module `e0da3df05`): one-launch split-K and blocked
+accumulation for B5, per-bucket tiles for B6 with split-K timed to 512 rows, WO
+decode tiles to 128 rows plus a component breakdown and prefill-tile sweep, and
+the production projections at 65-1024 rows (`decode-rows`).
+
 ### Window 1 (2026-10-09, 22:02-22:32 UTC)
 
 The arms spec ran before the kernel spec (the queue sorts by name). Arms booted in

@@ -17,7 +17,7 @@ For each port: its switch commit, the environment its arm sets, and its kernel b
 
 VLLM_BRANCH = "tilelang-migration"
 BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
-MODULES = "35b5b1e8f"  # the last module commit
+MODULES = "e0da3df05"  # the last module commit
 
 PORTS = {
     # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
@@ -38,7 +38,7 @@ PORTS = {
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "switch": "03ce20c16",
+        "switch": "b388e0d9b",
         "environment": {},
         "bundle": {
             "modules": (
@@ -58,7 +58,7 @@ PORTS = {
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "switch": "43e30271d",
+        "switch": "936686bf0",
         "environment": {},
         "bundle": {
             "modules": (
@@ -78,7 +78,7 @@ PORTS = {
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "switch": "80bb28564",
+        "switch": "5336bf9d0",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
@@ -93,7 +93,7 @@ PORTS = {
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "switch": "bf8c1c72a",
+        "switch": "20dbc51f7",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
@@ -108,7 +108,7 @@ PORTS = {
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "switch": "ee4871959",
+        "switch": "bc36e6e93",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
@@ -123,7 +123,7 @@ PORTS = {
     # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
     # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
     "wo-projection": {
-        "switch": "60e79424a",
+        "switch": "2bd57a159",
         "environment": {},
         "bundle": {
             "modules": (
@@ -137,13 +137,13 @@ PORTS = {
             "B12X's fused wo_projection, then decode-tile sweeps for WO-A and WO-B.",
             "tests": ("tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py",),
             "select": None,
-            "scripts": ("bench_wo.py", "sweep_wo.py"),
+            "scripts": ("bench_wo.py", "sweep_wo.py", "breakdown_wo.py"),
         },
     },
     # 5. B8: the indexer's head-weight scale, B12X scale_index_weights -> folded exactly
     # into the TileLang projection's weight (no kernel).
     "index-weights": {
-        "switch": "b4abab04f",
+        "switch": "cc1c5716b",
         "environment": {},
         "bundle": {
             "modules": (
@@ -159,6 +159,21 @@ PORTS = {
             "select": "scaled_linear",
             "scripts": ("bench_index_weights.py",),
         },
+    },
+}
+
+# Kernel bundles that are not ports (no switch, no arm): they measure the modules.
+BUNDLES = {
+    # Rows 65-128 on the production TileLang projections: prefill tiles against
+    # padded decode tiles (same bits), FP8 shapes and the BF16 router.
+    "decode-rows": {
+        "modules": ("vllm/models/deepseek_v4_1/tilelang/gemm.py",),
+        "description": "Rows 65-128 on the production TileLang projections: prefill tiles "
+        "against 64- and 32-row decode tiles (warm, cold, after their own prefetch), and the "
+        "router's shard GEMM against split-K partials; bits checked.",
+        "tests": (),
+        "select": None,
+        "scripts": ("bench_decode_rows.py",),
     },
 }
 

@@ -219,6 +219,8 @@ def test_split_linear(parts, out_dtype, k=5120):
         for out, whole in zip(project(rows), full):
             assert torch.equal(out[:rows], whole[:rows]), f"rows={rows}"
             assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+    # The one-launch split-K leaves its tile counters zeroed for the next call.
+    assert not layer.tilelang_counters.any()
 
 
 # The indexer's head weights (32 x 5120) scaled by 1/64.

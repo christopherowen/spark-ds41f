@@ -37,6 +37,7 @@ from .gemm import (
     SPLIT_FP8,
     bf16_gemm,
     bf16_gemm_partials,
+    bf16_gemm_splitk,
     bf16_gemm_two,
     bf16_shards,
     decode_tile_rows,
@@ -47,9 +48,9 @@ from .gemm import (
     mxfp8_gemm_partials,
     pack_scale_words,
     scale_words,
+    split_bucket,
     split_row_tile,
     splitk_reduce,
-    splitk_reduce_two,
 )
 
 _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
@@ -62,13 +63,19 @@ def _tile_kernels():
     return tile_kernels
 
 
-def _activation_specs(rows: int, k: int):
-    """MXFP8 activations and packed scales; decode rows fill one whole tile.
+def _activation_specs(rows: int, k: int, decode_rows: int = DECODE_ROWS):
+    """MXFP8 activations and packed scales; decode rows fill whole tiles.
 
     TileKernels pads each row's packed UE8M0 exponents to whole words. Rows
-    past ``rows`` in a decode tile are never stored by the GEMM.
+    past ``rows`` in a decode tile are never stored by the GEMM. A layer whose
+    decode tiles serve more than DECODE_ROWS rows pads to whole DECODE_ROWS tiles.
     """
-    tile_rows = DECODE_ROWS if rows <= DECODE_ROWS else rows
+    if rows <= DECODE_ROWS:
+        tile_rows = DECODE_ROWS
+    elif rows <= decode_rows:
+        tile_rows = -(-rows // DECODE_ROWS) * DECODE_ROWS
+    else:
+        tile_rows = rows
     return (
         ((tile_rows, k), torch.float8_e4m3fn),
         ((tile_rows, 4 * scale_words(k)), torch.uint8),
@@ -141,10 +148,10 @@ def _block32_linear(
     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
     x = x.reshape(-1, k)
     rows = x.shape[0]
-    if layer.tilelang_shards > 1 and rows <= SPLIT_DECODE_ROWS:
+    if layer.tilelang_shards > 1 and rows <= layer.tilelang_split_rows:
         _block32_split(layer, x, out.view(rows, n), scratch)
         return
-    xq, sf = _scratch(_activation_specs(rows, k), scratch)
+    xq, sf = _scratch(_activation_specs(rows, k, layer.tilelang_decode_rows), scratch)
     _tile_kernels().quant.per_token_cast(
         x,
         "e4m3",
@@ -153,7 +160,7 @@ def _block32_linear(
         use_packed_ue8m0=True,
         out=(xq[:rows], sf[:rows]),
     )
-    if rows > DECODE_ROWS:
+    if rows > layer.tilelang_decode_rows:
         gemm = layer.tilelang_prefill
     else:
         gemm = layer.tilelang_decode[decode_tile_rows(rows)]
@@ -195,7 +202,7 @@ def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
         use_packed_ue8m0=True,
         out=(xq[:rows], sf[:rows]),
     )
-    layer.tilelang_partials[split_row_tile(rows)](
+    layer.tilelang_partials[split_bucket(rows)](
         xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, partials
     )
     layer.tilelang_reduce(partials, out)
@@ -239,16 +246,18 @@ def _prepare_block32(layer, groups: int = 1) -> None:
         layer.weight_scale_inv.view(torch.uint8), rows=n
     )
     layer.tilelang_groups = groups
+    layer.tilelang_decode_rows = DECODE_ROWS
     split = SPLIT_FP8.get((n, k)) if groups == 1 else None
     layer.tilelang_shards = split["shards"] if split else 1
     if split:
         # A narrow projection: split-K decode rows, and prefill tiles that add the
         # same shards in the same order.
+        layer.tilelang_split_rows = split["rows"]
         layer.tilelang_partials = {
-            block_M: mxfp8_gemm_partials(
-                n, k, split["shards"], block_M=block_M, **split["decode"]
+            bucket: mxfp8_gemm_partials(
+                n, k, split["shards"], block_M=min(bucket, 64), **config
             )
-            for block_M in (16, 32, 64)
+            for bucket, config in split["decode"].items()
         }
         layer.tilelang_reduce = splitk_reduce(n, split["shards"])
         layer.tilelang_prefill = mxfp8_gemm(
@@ -400,22 +409,37 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
         if n % self.parts:
             raise ValueError(f"{n} rows do not split into {self.parts} parts")
         out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
-        shards = SPLIT_BF16.get((n, k)) or bf16_shards(n, k)
+        split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
+        shards, blocked = split["shards"], split["blocked"]
         layer.tilelang_parts = self.parts
         layer.tilelang_shards = shards
-        layer.tilelang_partials = {
-            block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
+        # Decode rows: one launch per call (the last CTA of a tile adds the shards).
+        layer.tilelang_splitk = {
+            block_M: bf16_gemm_splitk(
+                n,
+                k,
+                shards,
+                block_M=block_M,
+                out_dtype=out_dtype,
+                parts=self.parts,
+                blocked=blocked,
+            )
             for block_M in PARTIAL_ROW_TILES
         }
+        # One zeroed counter per tile; every call leaves them zeroed.
+        layer.tilelang_counters = torch.zeros(
+            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // 64)),
+            dtype=torch.int32,
+            device=layer.weight.device,
+        )
         if self.parts == 2:
-            part = n // 2
-            layer.tilelang_reduce = splitk_reduce_two(part, shards, out_dtype=out_dtype)
             layer.tilelang_gemm = bf16_gemm_two(
-                part, k, out_dtype=out_dtype, shards=shards
+                n // 2, k, out_dtype=out_dtype, shards=shards, blocked=blocked
             )
         else:
-            layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
-            layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
+            layer.tilelang_gemm = bf16_gemm(
+                n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
+            )
         layer.tilelang_key = id(layer)
         _LAYERS[layer.tilelang_key] = layer
 
@@ -433,8 +457,12 @@ def _split_bf16(x, outputs, key, scratch) -> None:
         (partials,) = _scratch(
             (((layer.tilelang_shards, rows, n), torch.float32),), scratch
         )
-        partials_kernel(layer, rows)(x, layer.weight, partials)
-        layer.tilelang_reduce(partials, *outputs)
+        block_M = next(
+            (bm for bm in PARTIAL_ROW_TILES if rows <= bm), PARTIAL_ROW_TILES[-1]
+        )
+        layer.tilelang_splitk[block_M](
+            x, layer.weight, partials, layer.tilelang_counters, *outputs
+        )
     else:
         layer.tilelang_gemm(x, layer.weight, *outputs)
 

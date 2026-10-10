@@ -310,6 +310,7 @@ def bf16_gemm(
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
     shards: int = 1,
+    blocked: bool = False,
 ):
     """``C[M, N] = A @ B^T`` for BF16 ``A[M, K]`` and ``B[N, K]``, accumulated in FP32.
 
@@ -335,6 +336,8 @@ def bf16_gemm(
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            if blocked:
+                C_block = T.alloc_fragment((block_M, block_N), T.float32)
             C_total = T.alloc_fragment(
                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
             )
@@ -344,7 +347,15 @@ def bf16_gemm(
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                if (
+                    blocked
+                ):  # each K block summed alone, then added: shorter FP32 chains
+                    T.clear(C_block)
+                    T.gemm(A_shared, B_shared, C_block, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        C_local[i, j] += C_block[i, j]
+                else:
+                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
                 if shards > 1:  # noqa: SIM102
                     if (ko + 1) % shard_blocks == 0:
                         for i, j in T.Parallel(block_M, block_N):
@@ -410,6 +421,7 @@ def bf16_gemm_two(
     threads: int = 128,
     out_dtype: T.dtype = T.bfloat16,
     shards: int = 1,
+    blocked: bool = False,
 ):
     """``bf16_gemm`` of a ``[2N, K]`` weight into two ``[M, N]`` outputs: rows below
     N of the weight to ``C0``, the rest to ``C1``, with ``bf16_gemm``'s shard
@@ -434,6 +446,8 @@ def bf16_gemm_two(
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            if blocked:
+                C_block = T.alloc_fragment((block_M, block_N), T.float32)
             C_total = T.alloc_fragment(
                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
             )
@@ -443,7 +457,15 @@ def bf16_gemm_two(
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                if (
+                    blocked
+                ):  # each K block summed alone, then added: shorter FP32 chains
+                    T.clear(C_block)
+                    T.gemm(A_shared, B_shared, C_block, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        C_local[i, j] += C_block[i, j]
+                else:
+                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
                 if shards > 1:  # noqa: SIM102
                     if (ko + 1) % shard_blocks == 0:
                         for i, j in T.Parallel(block_M, block_N):
@@ -477,6 +499,7 @@ def bf16_gemm_partials(
     block_K: int = 64,
     num_stages: int = 3,
     threads: int = 128,
+    blocked: bool = False,
 ):
     """Split-K BF16 GEMM for decode rows: FP32 ``P[s] = A @ B^T`` over K shard ``s``."""
     assert K % block_K == 0 and (K // block_K) % shards == 0
@@ -496,12 +519,22 @@ def bf16_gemm_partials(
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            if blocked:
+                C_block = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(C_local)
             for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
                 ko = s * shard_blocks + kb
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
-                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                if (
+                    blocked
+                ):  # each K block summed alone, then added: shorter FP32 chains
+                    T.clear(C_block)
+                    T.gemm(A_shared, B_shared, C_block, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        C_local[i, j] += C_block[i, j]
+                else:
+                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
             T.copy(
                 C_local,
                 P[
@@ -510,6 +543,134 @@ def bf16_gemm_partials(
                     bx * block_N : (bx + 1) * block_N,
                 ],
             )
+
+    return main
+
+
+# The last CTA to finish a split-K tile adds the shards. Every CTA publishes its
+# partial (stores, a device-scope fence, then an acq_rel arrival count); the last
+# one fences again before it reads the partials, which no earlier load on its SM
+# touched, so none sits stale in its L1.
+_SPLITK_HEADER = r"""
+__device__ __forceinline__ void splitk_fence() { __threadfence(); }
+"""
+
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+def bf16_gemm_splitk(
+    N: int,
+    K: int,
+    shards: int,
+    block_M: int = 16,
+    block_N: int = 64,
+    block_K: int = 64,
+    num_stages: int = 3,
+    threads: int = 128,
+    out_dtype: T.dtype = T.float32,
+    parts: int = 1,
+    blocked: bool = False,
+):
+    """Split-K BF16 GEMM in one launch: CTA ``(n, s, m)`` writes shard ``s``'s FP32
+    partial of its tile to ``P``; the tile's last CTA adds ``P[0] + P[1] + ...`` in
+    shard order (``splitk_reduce``'s arithmetic, so its bits) into the outputs and
+    resets the tile's counter. ``counters`` holds one zeroed int32 per tile
+    (``cdiv(M, block_M) * cdiv(N, block_N)``); it is left zeroed for the next call.
+    With ``parts`` = 2, columns below ``N / 2`` go to ``C0`` and the rest to ``C1``.
+    """
+    assert K % block_K == 0 and (K // block_K) % shards == 0
+    assert (
+        parts in (1, 2) and N % parts == 0 and (parts == 1 or (N // 2) % block_N == 0)
+    )
+    shard_blocks = K // block_K // shards
+    tiles_N = tilelang.cdiv(N, block_N)
+    part = N // parts
+    M = T.dynamic("M")
+    tiles = T.dynamic("tiles")
+    dtype = T.bfloat16
+
+    @T.macro
+    def body(A, B, P, counters, C0, C1):
+        with T.Kernel(tiles_N, shards, T.ceildiv(M, block_M), threads=threads) as (
+            bx,
+            s,
+            by,
+        ):
+            T.import_source(_SPLITK_HEADER)
+            tx = T.get_thread_binding()
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_N, block_K), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            if blocked:
+                C_block = T.alloc_fragment((block_M, block_N), T.float32)
+            last = T.alloc_shared((1,), T.int32)
+            T.clear(C_local)
+            for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+                ko = s * shard_blocks + kb
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(B[bx * block_N, ko * block_K], B_shared)
+                if blocked:
+                    T.clear(C_block)
+                    T.gemm(A_shared, B_shared, C_block, transpose_B=True)
+                    for i, j in T.Parallel(block_M, block_N):
+                        C_local[i, j] += C_block[i, j]
+                else:
+                    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, P[s, by * block_M, bx * block_N])
+            T.call_extern("handle", "splitk_fence")
+            T.sync_threads()
+            if tx == 0:
+                arrived = T.atomic_add(
+                    counters[by * tiles_N + bx],
+                    1,
+                    memory_order="acq_rel",
+                    return_prev=True,
+                )
+                last[0] = T.if_then_else(arrived == shards - 1, 1, 0)
+            T.sync_threads()
+            if last[0] == 1:
+                T.call_extern("handle", "splitk_fence")
+                for i, j in T.Parallel(block_M, block_N):
+                    m = by * block_M + i
+                    n = bx * block_N + j
+                    if m < M and n < N:
+                        acc = T.alloc_var(T.float32)
+                        acc = P[0, m, n]
+                        for t in T.serial(1, shards):
+                            acc = acc + P[t, m, n]
+                        if parts == 1:
+                            C0[m, n] = acc
+                        else:
+                            if n < part:  # noqa: SIM102
+                                C0[m, n] = acc
+                            else:
+                                C1[m, n - part] = acc
+                if tx == 0:
+                    counters[by * tiles_N + bx] = 0
+
+    if parts == 2:
+
+        @T.prim_func
+        def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((N, K), dtype),
+            P: T.Tensor((shards, M, N), T.float32),
+            counters: T.Tensor((tiles,), T.int32),
+            C0: T.Tensor((M, part), out_dtype),
+            C1: T.Tensor((M, part), out_dtype),
+        ):
+            body(A, B, P, counters, C0, C1)
+
+    else:
+
+        @T.prim_func
+        def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((N, K), dtype),
+            P: T.Tensor((shards, M, N), T.float32),
+            counters: T.Tensor((tiles,), T.int32),
+            C0: T.Tensor((M, N), out_dtype),
+        ):
+            body(A, B, P, counters, C0, None)
 
     return main
 
@@ -613,27 +774,44 @@ DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
 # counts and tiles come from the kernel lab against B12X at the TP4 shapes.
 SPLIT_DECODE_ROWS = 128
 SPLIT_FP8: dict[tuple[int, int], dict] = {
-    # TP4 DSpark context KV: the fused Q-A/KV weight's KV rows.
+    # TP4 DSpark context KV: the fused Q-A/KV weight's KV rows. Decode tiles by row
+    # bucket (128: rows 65-128 in 64-row tiles); window 2's sweep winners.
     (512, 5120): dict(
         shards=5,
-        decode=dict(block_N=64, block_K=256, num_stages=3, threads=128),
-        prefill=dict(block_M=64, block_N=64, block_K=128, num_stages=3),
+        rows=SPLIT_DECODE_ROWS,
+        decode={
+            16: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+            32: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+            64: dict(block_N=64, block_K=128, num_stages=3, threads=128),
+            128: dict(block_N=128, block_K=128, num_stages=2, threads=128),
+        },
+        prefill=dict(block_M=128, block_N=64, block_K=128, num_stages=2),
     ),
 }
-SPLIT_BF16: dict[tuple[int, int], int] = {
-    (1024, 5120): 10,  # TP4 compressor wkv + wgate (ratio 2), one fused launch
-    (512, 5120): 10,  # TP4 compressor wkv (ratio 1)
+SPLIT_BF16: dict[tuple[int, int], dict] = {
+    # TP4 compressor wkv + wgate (ratio 2, one launch for both) and wkv (ratio 1):
+    # five shards are fastest; blocked accumulation keeps the FP32 error under
+    # DeepSeek's FP32 reference.
+    (1024, 5120): dict(shards=5, blocked=True),
+    (512, 5120): dict(shards=5, blocked=True),
 }
+
+
+def split_bucket(rows: int) -> int:
+    """Decode bucket of a split-K call: 16, 32 or 64 rows (one tile that tall), or
+    128 (rows 65-128 in 64-row tiles)."""
+    return next(height for height in (16, 32, 64, 128) if rows <= height)
 
 
 def split_row_tile(rows: int) -> int:
     """Row tile of a split-K decode GEMM: the shortest that holds ``rows``, else 64."""
-    return next((height for height in (16, 32) if rows <= height), 64)
+    return min(split_bucket(rows), 64) if rows <= 128 else 64
 
 
 def decode_tile_rows(rows: int) -> int:
-    """Height of the decode tile that serves ``rows`` (at most DECODE_ROWS)."""
-    return next(height for height in DECODE_TILE_ROWS if rows <= height)
+    """Height of the decode tile that serves ``rows``; rows past DECODE_ROWS run in
+    whole tiles of DECODE_ROWS (a layer that allows them)."""
+    return next((height for height in DECODE_TILE_ROWS if rows <= height), DECODE_ROWS)
 
 
 def fp8_decode_config(

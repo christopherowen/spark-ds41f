@@ -1,8 +1,9 @@
 """Split-K sweep for the DSpark context-KV projection (512 x 5120 block-32 FP8 per rank).
 
 For each shard count (shards change bits, so one is chosen per shape):
-- decode: whole calls (activation cast, split-K partials, reduce) at 6, 24, 48 and 96
-  rows over partial tiles, against B12X's block_fp8_linear prepared as the drafter
+- decode: whole calls (activation cast, split-K partials, reduce) at 6, 24, 48, 96 and
+  128 rows over partial tiles, and at 256 and 512 rows to see how far split-K pays
+  against the prefill tiles, against B12X's block_fp8_linear prepared as the drafter
   prepares it; warm (same weight), cold (distinct weights) and self (each call
   follows the L2 prefetch of its own weight);
 - prefill: the shard-accumulating GEMM over prefill tiles at 512, 2048 and 8192 rows
@@ -28,9 +29,9 @@ DEV = torch.device("cuda", torch.cuda.current_device())
 GEN = torch.Generator(device=DEV).manual_seed(7)
 PF = L.L2Prefetcher.get(DEV)
 N, K = 512, 5120
-DECODE_ROWS = {6: 16, 24: 32, 48: 64, 96: 64}  # rows: partial tile height
+DECODE_ROWS = {6: 16, 24: 32, 48: 64, 96: 64, 128: 64, 256: 64, 512: 64}  # rows: partial tile height
 PREFILL_ROWS = (512, 2048, 8192)
-SHARDS = (4, 5, 10)
+SHARDS = (5,)
 
 
 def fp8(shape):
@@ -128,7 +129,7 @@ for shards in SHARDS:
     if (K // 128) % shards:
         continue
     reduce = g.splitk_reduce(N, shards)
-    partials_buf = torch.empty(shards, 128, N, dtype=torch.float32, device=DEV)
+    partials_buf = torch.empty(shards, max(DECODE_ROWS), N, dtype=torch.float32, device=DEV)
     entry = summary.setdefault(shards, {"decode": {}, "prefill": {}})
     winners = {}
     for rows, block_M in DECODE_ROWS.items():
@@ -195,15 +196,16 @@ for shards in SHARDS:
         block_M = DECODE_ROWS[rows]
         padded = -(-rows // block_M) * block_M
         p = partials_buf.view(-1)[:shards * rows * N].view(shards, rows, N)
+        R = max(DECODE_ROWS)
         for trial in range(20):
-            x_all[:256].copy_((torch.randn(256, K, device=DEV, generator=GEN) * 0.5).bfloat16())
-            cast(256)
+            x_all[:R].copy_((torch.randn(R, K, device=DEV, generator=GEN) * 0.5).bfloat16())
+            cast(R)
             w = trial % copies
             kernel(xq[:padded], ws_[w], sf[:padded].view(torch.uint32), wsf_[w], p)
             small = torch.empty(rows, N, dtype=torch.bfloat16, device=DEV)
             reduce(p, small)
-            big = torch.empty(256, N, dtype=torch.bfloat16, device=DEV)
-            pbest(xq[:256], ws_[w], sf[:256].view(torch.uint32), wsf_[w], big)
+            big = torch.empty(R, N, dtype=torch.bfloat16, device=DEV)
+            pbest(xq[:R], ws_[w], sf[:R].view(torch.uint32), wsf_[w], big)
             bad += not torch.equal(small.view(torch.int16), big[:rows].view(torch.int16))
     entry["bits_bad"] = bad
     print(f"shards {shards}: decode winners vs prefill bits {'PASS' if not bad else f'FAIL ({bad})'}", flush=True)
