@@ -33,24 +33,26 @@ _GROUP = {"swa": 32, "indexed": 16}
 _E4M3_MAX = 448.0
 
 
-_WORD = {"swa": (4, T.uint32, torch.uint32), "indexed": (8, T.uint64, torch.uint64)}
+# Payload bytes, TileLang and torch types of one thread's word: four values each.
+_WORD = {"swa": (4, T.uint32, torch.uint32), "indexed": (2, T.uint16, torch.uint16)}
+_PER_THREAD = 4
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int64"):
-    """One record per token, payload stored in whole words through a word view of
-    the pages (scales through the byte view). ``swa``: eight threads per 32-value
-    group, four values and one 32-bit word per thread, the group's amax shuffled
-    across its eight lanes. ``indexed``: one thread per 16-value group, sixteen
-    values and one 64-bit word of packed E2M1."""
+    """One record per token, 128 threads, four values per thread, payload stored in
+    whole words through a word view of the pages (scales through the byte view),
+    the group's amax shuffled across its lanes. ``swa``: eight lanes per 32-value
+    group, one 32-bit word of E4M3 each. ``indexed``: four lanes per 16-value
+    group, one 16-bit word of packed E2M1 each."""
     threads = 128
     group_size = _GROUP[cache_kind]
     groups = DIM // group_size
     word_bytes, word_dtype, _ = _WORD[cache_kind]
-    per_thread = word_bytes if cache_kind == "swa" else group_size  # values per thread
-    lanes = group_size // per_thread  # threads per group: 8 or 1
-    per_token = groups * lanes  # 128 or 32
-    tokens_per_block = threads // per_token  # 1 or 4
+    per_thread = _PER_THREAD  # values per thread
+    lanes = group_size // per_thread  # threads per group: 8 or 4
+    per_token = groups * lanes  # 128 either way
+    tokens_per_block = threads // per_token
     record = RECORD_BYTES[cache_kind]
     payload = DIM if cache_kind == "swa" else DIM // 2  # scale bytes follow
     tokens, kv_stride = T.dynamic("tokens, kv_stride")
@@ -78,9 +80,9 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                 for i in T.unroll(per_thread):
                     values[i] = T.cast(kv[token, col + i], T.float32)
                     amax = T.max(amax, T.abs(values[i]))
-            if cache_kind == "swa":
-                amax = T.max(amax, T.shfl_xor(amax, 1))
-                amax = T.max(amax, T.shfl_xor(amax, 2))
+            amax = T.max(amax, T.shfl_xor(amax, 1))
+            amax = T.max(amax, T.shfl_xor(amax, 2))
+            if lanes == 8:
                 amax = T.max(amax, T.shfl_xor(amax, 4))
             if token < tokens:
                 slot = T.cast(slots[token], T.int64)
@@ -120,9 +122,10 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
                             code = _e2m1_code(values[i] / decoded)
                             word = word | T.shift_left(T.cast(code, word_dtype), 4 * i)
                         words[page, (base + col // 2) // word_bytes] = word
-                        cache[page, base + payload + group] = T.reinterpret(
-                            scale_code, T.uint8
-                        )
+                        if lane == 0:
+                            cache[page, base + payload + group] = T.reinterpret(
+                                scale_code, T.uint8
+                            )
 
     return write
 

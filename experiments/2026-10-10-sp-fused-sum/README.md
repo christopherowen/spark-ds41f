@@ -93,3 +93,28 @@ exchange tests passed.
 
 Window 2 ([w2.json](w2.json)) reruns the bundle and the screen with the
 single-slice fix (module `3dc83d7ff`, switch `b19c623d5`).
+
+Window 2 (2026-10-10, 18:11-18:31 UTC, overlap / fused / overlap bracket; the
+bundle passes):
+
+| Measure | overlap | fused | overlap (end) |
+| --- | --- | --- | --- |
+| prose c1 step | 31.53 ms | 31.49 ms (-0.1%) | 31.43 ms (-0.3%) |
+| json c1 step | 36.97 ms | 36.66 ms (-0.8%) | 36.69 ms (-0.7%) |
+| single stream, distinct prompts | 87.34 tok/s | +0.2% | +0.1% |
+| eight distinct concurrent prompts | 175.57 tok/s | +0.1% | +0.1% |
+| cold prefill 1K | 2618 tok/s | 2652 (+1.3%) | 2609 (-0.3%) |
+| cold prefill 16K | 5727 tok/s | 5760 (+0.6%) | 5762 (+0.6%) |
+| mixed: short TTFT median | 230.1 ms | -5.0% | -2.2% |
+| mixed: long TTFT mean | 930.9 ms | -2.1% | -2.6% |
+| temperature 0 | identical | identical | identical |
+| references against overlap | - | same bits | same bits |
+
+The references have the same digests as in window 1, so the outputs repeat
+across windows as well as arms. With one projection per single-slice step the
+1K regression is gone: 1K prefill is 1.5% faster than the mean of this window's
+two overlap runs and 1.2% faster than the mean of all four (windows 1 and 2);
+16K is 0.3% faster than this window's mean and 0.8% faster than all four. Decode
+and mixed traffic are level. The fused sum is worth about 1% of prefill, the
+low end of its ceiling, with bit-identical outputs; whether it joins r6d with
+the overlap is the owner's call.
