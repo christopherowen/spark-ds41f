@@ -1,0 +1,77 @@
+{
+  "experiment": "experiments/2026-10-10-sp-fused-sum",
+  "run": "sp-fused-sum-w2",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "kernel",
+      "bundles": [
+        {
+          "node": "dgx1",
+          "bundle": "experiments/2026-10-10-sp-fused-sum/bundles/fused-sum"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "profile": "lean",
+      "bracket": true,
+      "extras": [
+        [
+          "experiments/2026-10-09-tilelang-migration/token_determinism.py",
+          [
+            "--tokens",
+            "192",
+            "--long-lines",
+            "700"
+          ],
+          "determinism"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "1",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c1-distinct"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "8",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c8-distinct"
+        ],
+        [
+          "experiments/2026-09-29-determinism/mixed_latency.py",
+          [
+            "--rounds",
+            "3"
+          ],
+          "mixed"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "experiments/2026-10-10-sp-overlap/overlap.json",
+          "label": "overlap"
+        },
+        {
+          "config": "fused.json",
+          "label": "fused"
+        }
+      ]
+    }
+  ]
+}

@@ -15,7 +15,7 @@ ROOT = HERE.parents[1]
 REL = HERE.relative_to(ROOT).as_posix()
 BASE = ROOT / "experiments/2026-10-10-r6d-deterministic/r6d-tp4.json"
 R6D = "r6d-candidate"  # the vLLM branch of the r6d image's tree
-FUSED = "d327bb377"  # the fused-sum switch, on its module commit and the overlap
+FUSED = "b19c623d5"  # the fused-sum switch, on its module commit and the overlap
 TREE = "/opt/spark3/candidate/vllm"
 TESTS = [
     "tests/kernels/test_deepseek_v41_tilelang_mhc.py",

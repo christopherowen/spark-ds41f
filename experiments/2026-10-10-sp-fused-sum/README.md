@@ -90,3 +90,6 @@ The kernel bundle's new SP layout test failed in every case on a latent bug in
 which the sum then added into); serving's BF16 CUDA parts take the kernel. Fixed
 with a regression test (module `52f23588b`); the mHC parts-against-sum and
 exchange tests passed.
+
+Window 2 ([w2.json](w2.json)) reruns the bundle and the screen with the
+single-slice fix (module `3dc83d7ff`, switch `b19c623d5`).

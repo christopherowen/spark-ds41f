@@ -58,7 +58,8 @@ def test_wo_slices():
 @pytest.mark.parametrize("tokens", [37, 40, 205])
 @pytest.mark.parametrize("rank", [0, 2, 3])
 @pytest.mark.parametrize("slices", [1, 2, 3])
-def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices):
+@pytest.mark.parametrize("per_block", [False, True])
+def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per_block):
     """Unreduced rows send every other rank's block, slice by slice, and keep this
     rank's own block in its slot of the parts (the other ranks stood in by
     copies of it)."""
@@ -96,8 +97,11 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices):
         source.device,
         slices=slices,
         then=lambda: order.append(len(calls)),
+        per_block=per_block,
     )
     torch.cuda.synchronize()
+    if slices == 1 and not per_block:
+        assert calls == [(0, tokens)]  # one projection
     padded = torch.zeros(rows.padded_rows, 8, device="cuda")
     padded[:tokens] = source
     blocks = padded.view(world, rows.local_rows, 8)
