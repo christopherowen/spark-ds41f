@@ -1,0 +1,27 @@
+{
+  "description": "Rows 65-128 on the production TileLang projections: prefill tiles against 64- and 32-row decode tiles (warm, cold, after their own prefetch), and the router's shard GEMM against split-K partials; bits checked.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '/b/bench_decode_rows.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__gemm.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_decode_rows.py",
+      "/b/bench_decode_rows.py"
+    ]
+  ]
+}

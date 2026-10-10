@@ -29,6 +29,8 @@ class _Weight:
         self.weight = layer.weight.detach()
         self.weight_scale_inv = layer.weight_scale_inv.detach()
         _prepare_block32(self, groups)
+        # 16-stream steps (up to 96 rows) stay on decode tiles, two of 64 rows.
+        self.tilelang_decode_rows = 128
 
 
 class TileLangWOProjection:
