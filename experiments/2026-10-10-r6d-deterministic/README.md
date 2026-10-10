@@ -92,3 +92,46 @@ TP3 needs the triangle cabling; [r6d-tp3.json](r6d-tp3.json) is ready for it.
 Rollback trigger: a test, quality or request failure, a temperature-0
 difference, a decode point slower than r6c with an interval excluding zero, or
 prefill slower than r6c by more than 4% at any size.
+
+## Status
+
+Gate run on the TP4 ring, 2026-10-10 15:16-16:09 UTC (window
+`dgx1-1791645401`), from main `32034c4` (series head `5a904da2`, before the
+router fix below):
+
+- **Build** 10 minutes on dgx4; copied over the CX7 links in 113, 113 and
+  128 s; one image ID on all four nodes (`sha256:286889f4`).
+- **Tests in the image** 163 passed, 1 failed:
+  `test_gate_router_matches_the_gate_then_the_router[65-384-6]`. The decode-
+  rows port lets the fused gate router take up to 256 rows, and its all-false
+  image mask for text-only layers was still sized for 64. DS4.1's routing
+  builds the mask from the input ids, so serving never took that path (and the
+  migration's decode-rows bundle ran only the linear tests). Fixed in patch
+  0072 (head `706760d0`, tree `a00a6b07`); the decode-rows bundle now runs the
+  router tests.
+- **Quality** 5/5 on both.
+- **Temperature 0.** r6d identical in every scenario (c8, staggered, mixed with
+  a 10,000-token prefill, cached, run to run); r6c differs in c8, staggered and
+  mixed.
+- **Against r6c, same protocol, same window** (step time, three samples):
+
+| Point | r6c | r6d | Change |
+| --- | ---: | ---: | ---: |
+| prose-c1 | 31.44 ms | 31.41 ms | -0.1% |
+| code-c1 | 34.33 ms | 34.62 ms | +0.9% (intervals 0.1%) |
+| prose-c2 / c4 / c8 / c16 | 42.1 / 55.8 / 75.6 / 105.6 ms | 38.3 / 44.2 / 53.6 / 61.3 ms | -9 / -21 / -29 / -42% |
+| code-c2 / c4 / c8 / c16 | 48.6 / 63.4 / 88.2 / 115.2 ms | 38.9 / 57.9 / 65.2 / 67.1 ms | -20 / -9 / -26 / -42% |
+| prefill 32K / 262K / 500K | 5782 / 5453 / 5058 tok/s | 5764 / 5413 / 5024 tok/s | -0.3 / -0.7 / -0.7% |
+
+  The concurrent decode points send copies of one prompt. With batch
+  invariance r6d's copies write the same text and route to the same experts,
+  which is cheaper; r6c's copies drift apart. Those gains measure determinism
+  on identical prompts, not kernel speed: with distinct prompts (migration
+  windows 5 and 6) decode is level. code-c1's +0.9% has an interval excluding
+  zero, which meets the rollback trigger as written; its text changed (B2 and
+  B7 follow DeepSeek's arithmetic, so accepted drafts went 1.78 to 1.76), as
+  at r6c's gate, where the owner read two such points as between-boot
+  variation. Neither run reached the 1M prefill point. No failed requests.
+
+Promotion is the owner's decision. The fixed series needs its image rebuilt
+and the tests rerun before it can serve.
