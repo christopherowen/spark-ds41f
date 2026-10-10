@@ -358,6 +358,17 @@ the owner chose to benchmark the passing ports now (C3, B5, aligned chunks, B2,
 B7, B8, B9, D1 on r6c), then overlap the reduce-scatter with compute, then fuse
 its sum.
 
+Window 8 (`w8.json`, kernels only): B3's writers store whole words (module
+`28092c1d1`): an SWA group's 32 E4M3 bytes as eight 32-bit words from eight
+lanes, an indexed group's 16 E2M1 values as one 64-bit word from one thread,
+through `uint32` / `uint64` views of the pages. Window 6 found single-byte
+stores capping the rate at 512-8192 rows (1.7-4.8x B12X). The bundle checks the
+records against B12X's at every size, repeatability, and warm/cold timing, on
+two nodes. The module set now also carries the SP overlap and fused-sum
+modules ([2026-10-10-sp-overlap](../2026-10-10-sp-overlap/),
+[2026-10-10-sp-fused-sum](../2026-10-10-sp-fused-sum/)), which change nothing
+without their switches; the ports' switch hashes are remapped (module tip `bfaf9b54b`).
+
 Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
 point-to-point settings do not move the exchange beyond run-to-run noise (two
 recipe runs differ by up to 20% at some sizes); two or four queue pairs per
