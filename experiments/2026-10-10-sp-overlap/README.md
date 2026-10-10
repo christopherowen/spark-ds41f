@@ -44,3 +44,14 @@ tests in it, then the layout test and the screen.
 
 Acceptance: temperature-0 outputs identical, decode level, prefill faster
 than r6d.
+
+## Status
+
+Window 1 (2026-10-10, 16:19-16:47 UTC): the r6d image rebuilt with the
+router fix (the stale tag removed on all four nodes, built in 10 minutes,
+copied over the CX7 links, one image ID `sha256:795eb1c7`); r6d's gate tests
+and the layout test pass in it; the r6d arm ran. The overlap arm did not boot:
+`overlap.json` was generated from r6d's recipe before the router fix and kept
+the old vLLM tree label, which the TileLang preflight refuses. Regenerated;
+a repository test now checks every TileLang profile's expected trees against
+its lock's manifest. Window 2 ([w2.json](w2.json)) reruns the screen.
