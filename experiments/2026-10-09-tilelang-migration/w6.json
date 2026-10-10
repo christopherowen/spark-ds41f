@@ -1,0 +1,103 @@
+{
+  "experiment": "experiments/2026-10-09-tilelang-migration",
+  "run": "migration-w6",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "fabric",
+      "config": "collectives.json",
+      "script": "fabric_reduce_scatter.py",
+      "args": [
+        "--iters",
+        "20"
+      ],
+      "label": "reduce-scatter"
+    },
+    {
+      "kind": "kernel",
+      "bundles": [
+        {
+          "node": "dgx1",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/cache-writer"
+        },
+        {
+          "node": "dgx2",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/chunk-align"
+        },
+        {
+          "node": "dgx3",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/compressor-projection"
+        },
+        {
+          "node": "dgx4",
+          "bundle": "experiments/2026-10-09-tilelang-migration/bundles/collectives"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "profile": "lean",
+      "bracket": true,
+      "extras": [
+        [
+          "token_determinism.py",
+          [
+            "--tokens",
+            "192",
+            "--long-lines",
+            "700"
+          ],
+          "determinism"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "1",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c1-distinct"
+        ],
+        [
+          "scripts/distinct_streams.py",
+          [
+            "--streams",
+            "8",
+            "--samples",
+            "3",
+            "--tokens",
+            "256"
+          ],
+          "c8-distinct"
+        ],
+        [
+          "experiments/2026-09-29-determinism/mixed_latency.py",
+          [
+            "--rounds",
+            "3"
+          ],
+          "mixed"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "control.json",
+          "label": "control"
+        },
+        {
+          "config": "deterministic.json",
+          "label": "deterministic"
+        },
+        {
+          "config": "cache-writer.json",
+          "label": "cache-writer"
+        }
+      ]
+    }
+  ]
+}

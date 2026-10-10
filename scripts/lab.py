@@ -588,9 +588,20 @@ def sync_steps(spec: dict, job: dict) -> list[dict]:
     return [{"kind": "sync"}]
 
 
+def fabric_steps(spec: dict, job: dict) -> list[dict]:
+    """A model-free script on every node at once (rank = the node's rank), in one arm's image,
+    environment and mounts: the collective probe's container with the arm's overlays, while
+    serving is stopped. Each node's output is saved under the run."""
+    experiment = spec["experiment"]
+    return [stop_step(job),
+            {"kind": "fabric", "config": arm_config_path(experiment, job["config"]),
+             "script": arm_config_path(experiment, job["script"]), "args": [str(a) for a in job.get("args", [])],
+             "label": job.get("label", Path(job["script"]).stem), "out": f"results/private/lab/{spec['run']}"}]
+
+
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
-                "profile": profile_steps, "sync": sync_steps}
+                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -622,6 +633,8 @@ def describe_step(step: dict) -> str:
         return f"analyze {step['out']} {','.join(step['dirs'])} on every node, in parallel"
     if step["kind"] == "kernel":
         return "kernel-lab " + ", ".join(f"{b['bundle']}@{b['node']}" for b in step["bundles"])
+    if step["kind"] == "fabric":
+        return f"fabric {step['script']} on every node ({step['config']})"
     return step["kind"]
 
 
@@ -871,6 +884,39 @@ def summarize_analysis(out: Path) -> dict:
     return totals
 
 
+FABRIC_PORT = 29581  # the fabric scripts' rendezvous, apart from serving's
+
+
+def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: list[str]) -> list[str]:
+    """The collective probe's container (image, per-node environment, devices, limits) with the
+    arm's mounts, running ``script`` with the probe's rank arguments followed by ``args``."""
+    if spark.topology.transport(cluster) == "rocenante-mesh4":
+        raise SystemExit("fabric scripts do not run on the mesh4 transport")
+    base = spark.collective_probe_command(cluster, nodes, node, FABRIC_PORT)
+    repo = spark.repository_path(cluster)
+    start = base.index("python3")
+    head = [f"{repo}/{script}:/fabric.py:ro" if arg == f"{repo}/scripts/probe_collectives.py:/probe.py:ro"
+            else arg for arg in base[:start]]
+    image = head.index(cluster["container"]["image"])
+    mounts = [value for bind in spark.expected_binds(cluster) for value in ("--volume", bind)]
+    return head[:image] + mounts + head[image:] + ["python3", "/fabric.py", *base[start + 2:], *args]
+
+
+def run_fabric(step: dict) -> list[dict]:
+    """Run a fabric step on every node concurrently; save each node's output."""
+    cluster, nodes, _ = spark.configuration(argparse.Namespace(cluster_config=step["config"]))
+    out = ROOT / step["out"]
+    out.mkdir(parents=True, exist_ok=True)
+
+    def one(node: dict) -> dict:
+        process = spark.run_ssh(nodes, node, *fabric_command(cluster, nodes, node, step["script"], step["args"]))
+        (out / f"fabric-{step['label']}-{node['name']}.txt").write_text(process.stdout + process.stderr)
+        return {"node": node["name"], "exit": process.returncode}
+
+    with concurrent.futures.ThreadPoolExecutor(len(nodes["nodes"])) as pool:
+        return list(pool.map(one, nodes["nodes"]))
+
+
 def run_kernel_bundles(step: dict) -> list[dict]:
     """Ship each bundle to ~/spark-lab on its node and run kernel-local there, nodes concurrently.
 
@@ -1025,6 +1071,9 @@ def execute(spec: dict, dry: bool, keep_open: bool) -> int:
             elif step["kind"] == "analyze":
                 summary = analyze(step)
                 log(f"analysed {step['out']}: {'PASSED' if summary['passed'] else 'DIFFERENCES'}")
+            elif step["kind"] == "fabric":
+                for verdict in run_fabric(step):
+                    log(f"fabric {step['label']}@{verdict['node']}: exit {verdict['exit']}")
             elif step["kind"] == "kernel":
                 verdicts = run_kernel_bundles(step)
                 for verdict in verdicts:

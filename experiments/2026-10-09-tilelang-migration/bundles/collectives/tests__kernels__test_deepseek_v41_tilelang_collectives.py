@@ -57,7 +57,7 @@ class _Comm:
         fabric.barrier.wait()
 
 
-def _run(inputs):
+def _run(inputs, slices=None):
     world = len(inputs)
     fabric = _Fabric(world)
     out, errors = [None] * world, []
@@ -65,7 +65,7 @@ def _run(inputs):
     def rank_main(rank):
         try:
             out[rank] = reduce_scatter_rank_order(
-                _Comm(fabric, rank), inputs[rank], rank, world
+                _Comm(fabric, rank), inputs[rank], rank, world, slices=slices
             )
         except BaseException as error:  # surface failures from the threads
             errors.append(error)
@@ -92,13 +92,14 @@ def _reference(values):
 
 @pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("local", [1, 4, 7])
-def test_rows_add_as_the_one_shot_all_reduce(world, local):
+@pytest.mark.parametrize("slices", [None, 1, 2, 3, 8])
+def test_rows_add_as_the_one_shot_all_reduce(world, local, slices):
     torch.manual_seed(world * 10 + local)
     width = 40
     inputs = [
         torch.randn(world * local, width).to(torch.bfloat16) for _ in range(world)
     ]
-    out = _run(inputs)
+    out = _run(inputs, slices)
     for rank in range(world):
         rows = slice(rank * local, (rank + 1) * local)
         assert torch.equal(out[rank], _reference([x[rows] for x in inputs]))

@@ -137,17 +137,17 @@ gate). Numbers in parentheses are windows.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
 | C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
-| B5 compressor projection | `7b4c48900` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
-| B6 DSpark context KV | `c4c3e932e` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
-| B7 Engram gate | `ef0fc64b0` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
-| B2 RoPE | `c52f1dca7` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
-| B9 Engram hash | `ff9b245d9` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
-| B1 WO projection | `f1e696017` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
-| B8 index head weights | `e047bf5ff` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
-| C3 collectives | `c1d379282` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
-| Chunk alignment | `e5cc1f4ce` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
-| B3 cache writers | `1eaf1605b` (modules `f236ddec2`, `69dd2c27b`) | record tests against a torch replica of B12X's arithmetic | not screened | window 6 kernels and arm |
-| D1 decode rows | `6ea478c9e` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
+| B5 compressor projection | `c1089596e` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `518fff0f6` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `785655d5b` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `c37841ba1` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `370e028dc` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `5e4d3eb6a` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `0d85ae595` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| C3 collectives | `f861f7df9` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
+| Chunk alignment | `9c7848981` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
+| B3 cache writers | `7f305a6c8` (modules `f236ddec2`, `69dd2c27b`) | record tests against a torch replica of B12X's arithmetic | not screened | window 6 kernels and arm |
+| D1 decode rows | `76f978e7a` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 
@@ -227,6 +227,27 @@ threshold).
   research's vLLM 0036, there at 4096).
 - `deterministic` combines C3, B5 and chunk alignment (the determinism breaks
   the audit found).
+
+**Tuning C3 (owner, 2026-10-10: before any promotion).** Window 5 put the
+price at 2-4% of prefill, about 0.6 ms per 8192-row reduce-scatter (84 MB per
+rank), 86 per chunk. Most of it has a floor: NCCL's ring adds partial sums as
+they travel, so each link direction carries 3/8 of the message, but partial
+sums would make a row's adding order depend on its owner. Raw chunks must
+cross instead, and the opposite rank's quarter takes two hops on ring4, so
+every link direction carries half the message: a third more wire time for any
+exact rank-order scheme (an owner-independent order, even one that changes
+with the column, still carries M/2). What is recoverable is the serialization:
+the relay hop ran after the direct transfers, and the sum (read 84 MB, write
+21 MB) after both. Module `729a29632` pipelines the exchange in slices of
+about 4 MiB per chunk: each NCCL group carries one slice's direct chunks and
+relay halves with the previous slice's relayed halves, and the previous slice
+is summed on a side stream meanwhile.
+
+Window 6 measures it model-free on the fabric (`fabric_reduce_scatter.py`, a
+new lab `fabric` job: one container per node with an arm's image, environment
+and overlays): NCCL's reduce-scatter against the exchange at 1, 2, 4 and 8
+slices and at its default, and the sum alone, at 205-8192 rows, every result
+checked bit for bit against an all-gathered FP32 reference.
 
 ### Window 3 (2026-10-10, 06:54-07:04 UTC, kernels only)
 
@@ -320,6 +341,10 @@ and B5 again on other nodes. It sweeps shard counts and tiles for the narrow
 projections; their chosen configurations go into `SPLIT_FP8` and `SPLIT_BF16`
 before the arms run again.
 
+Window 6 (`w6.json`): the fabric bench of C3's reduce-scatter, the B3, chunk
+alignment, B5 and C3 bundles, then the lean screen of the control,
+`deterministic` (with the pipelined exchange) and B3, bracketed.
+
 Window 5 (`w5.json`): the C3, B9, B5 (with a decode-tile sweep for its BF16
 path), B1 (with B12X's batch invariance reported) and chunk-alignment
 bundles, then the lean screen with the temperature-0 check (a long prompt of
@@ -387,6 +412,8 @@ B7, B9, B2 and B8, bracketed by the control.
   L2 eviction), error helpers and graph-replay repeatability check.
 - `token_determinism.py`: the temperature-0 output check of a serving arm
   (tokens and logprobs against each prompt served alone).
+- `fabric_reduce_scatter.py`: C3's reduce-scatter against NCCL's on the four
+  nodes, model-free (a lab `fabric` job).
 - `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).
 - `profile_*.py`, `summarize_kernels.py`, `analyze_costs.py`, `tables_arms.py`:
   the lab runner's profile and table scripts (from
