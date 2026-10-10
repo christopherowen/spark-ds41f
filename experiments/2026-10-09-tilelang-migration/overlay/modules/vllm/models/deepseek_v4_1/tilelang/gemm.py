@@ -57,6 +57,7 @@ def _mxfp8_gemm(
     padded_rows: bool = False,
     swizzle_panel: int = 0,
     groups: int = 1,
+    shards: int = 1,
 ):
     """``C[M, N] = (A * SFA) @ (B * SFB)^T`` for MXFP8 ``A[M, K]``, ``B[N, K]``.
 
@@ -81,12 +82,20 @@ def _mxfp8_gemm(
     ``[M, groups * K]``, ``B`` and ``SFB`` stack the groups' ``[N, K]`` weights,
     and ``C`` is ``[M, groups * N]``; output columns of group ``g`` read only A's
     columns ``g * K`` to ``(g + 1) * K``. One launch covers every group.
+
+    With ``shards`` > 1 each of the ``shards`` equal K ranges is summed from
+    zero and the shards are added in order: the arithmetic of
+    ``mxfp8_gemm_partials`` plus ``splitk_reduce``, so a narrow projection's
+    split-K decode rows give its prefill rows' bits.
     """
     assert K % block_K == 0 and block_K % 64 == 0, (
         "block_K must divide K and be a multiple of 64"
     )
     assert groups == 1 or (N % block_N == 0 and K % SF_WORD_K == 0), (
         "grouped tiles must not straddle a group"
+    )
+    assert shards == 1 or (groups == 1 and (K // block_K) % shards == 0), (
+        "shards must split K into whole blocks"
     )
     k_blocks = K // block_K
     M = T.dynamic("M")
@@ -119,7 +128,12 @@ def _mxfp8_gemm(
             SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
             SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
+            C_total = T.alloc_fragment(
+                (block_M, block_N) if shards > 1 else (1, 1), accum_dtype
+            )
             T.clear(C_local)
+            if shards > 1:
+                T.clear(C_total)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, a_k + ko * block_K], A_shared)
                 T.copy(B[bx * block_N, ko * block_K], B_shared)
@@ -148,7 +162,19 @@ def _mxfp8_gemm(
                     sf_a_granularity_k=SF_BLOCK,
                     sf_b_granularity_k=SF_BLOCK,
                 )
-            T.copy(C_local, C[by * block_M, bx * block_N])
+                if shards > 1:  # noqa: SIM102
+                    if (ko + 1) % (k_blocks // shards) == 0:
+                        for i, j in T.Parallel(block_M, block_N):
+                            C_total[i, j] = T.if_then_else(
+                                ko + 1 == k_blocks // shards,
+                                C_local[i, j],
+                                C_total[i, j] + C_local[i, j],
+                            )
+                        T.clear(C_local)
+            if shards > 1:
+                T.copy(C_total, C[by * block_M, bx * block_N])
+            else:
+                T.copy(C_local, C[by * block_M, bx * block_N])
 
     return main
 
@@ -159,10 +185,83 @@ def _mxfp8_gemm(
 # returned wrong results in up to every run; 64-row tiles were not seen to),
 # while the unspecialized pipeline is race-free and as fast for decode. Both
 # run the same arithmetic, so their bits agree.
+def _mxfp8_gemm_partials(
+    N: int,
+    K: int,
+    shards: int,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 128,
+    num_stages: int = 3,
+    threads: int = 128,
+):
+    """Split-K MXFP8 GEMM for decode rows: FP32 ``P[s] = (A * SFA) @ (B * SFB)^T``
+    over K shard ``s``, A and SFA padded to whole ``block_M`` tiles (the decode
+    workspace). A narrow projection has few N tiles; its shards fill the GPU.
+    """
+    assert K % block_K == 0 and block_K % 64 == 0 and (K // block_K) % shards == 0
+    shard_blocks = K // block_K // shards
+    M = T.dynamic("M")
+    Mp = T.dynamic("Mp")
+    in_dtype = T.float8_e4m3fn
+    sf_words = scale_words(K)
+    block_words = block_scale_words(block_K)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((Mp, K), in_dtype),
+        B: T.Tensor((N, K), in_dtype),
+        SFA: T.Tensor((Mp, sf_words), T.uint32),
+        SFB: T.Tensor((N, sf_words), T.uint32),
+        P: T.Tensor((shards, M, N), T.float32),
+    ):
+        with T.Kernel(
+            T.ceildiv(N, block_N), shards, T.ceildiv(M, block_M), threads=threads
+        ) as (bx, s, by):
+            A_shared = T.alloc_shared((block_M, block_K), in_dtype)
+            B_shared = T.alloc_shared((block_N, block_K), in_dtype)
+            SFA_shared = T.alloc_shared((block_M, block_words), T.uint32)
+            SFB_shared = T.alloc_shared((block_N, block_words), T.uint32)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            T.clear(C_local)
+            for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+                ko = s * shard_blocks + kb
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(B[bx * block_N, ko * block_K], B_shared)
+                word0 = ko * block_K // SF_WORD_K
+                for i, w in T.Parallel(block_M, block_words):
+                    SFA_shared[i, w] = SFA[
+                        T.min(by * block_M + i, Mp - 1),
+                        T.min(word0 + w, sf_words - 1),
+                    ]
+                for j, w in T.Parallel(block_N, block_words):
+                    SFB_shared[j, w] = SFB[
+                        T.min(bx * block_N + j, N - 1),
+                        T.min(word0 + w, sf_words - 1),
+                    ]
+                T.mma_gemm_blockscaled(
+                    A_shared,
+                    B_shared,
+                    C_local,
+                    SFA_shared,
+                    SFB_shared,
+                    transpose_B=True,
+                    k_start=ko * block_K % SF_WORD_K,
+                    sf_a_granularity_k=SF_BLOCK,
+                    sf_b_granularity_k=SF_BLOCK,
+                )
+            T.copy(C_local, P[s, by * block_M, bx * block_N])
+
+    return main
+
+
 mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
 mxfp8_gemm_decode = tilelang.jit(
     pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 )(_mxfp8_gemm)
+mxfp8_gemm_partials = tilelang.jit(
+    pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+)(_mxfp8_gemm_partials)
 
 
 @tilelang.jit
@@ -259,6 +358,111 @@ def bf16_gemm(
                 T.copy(C_total, C[by * block_M, bx * block_N])
             else:
                 T.copy(C_local, C[by * block_M, bx * block_N])
+
+    return main
+
+
+@tilelang.jit
+def splitk_reduce_two(
+    N: int,
+    shards: int,
+    out_dtype: T.dtype = T.bfloat16,
+    block_N: int = 128,
+    threads: int = 128,
+):
+    """``splitk_reduce`` of ``2 * N`` columns into two outputs: columns below N
+    to ``C0``, the rest to ``C1`` (the compressor's values and gates)."""
+    assert N % block_N == 0
+    M = T.dynamic("M")
+    tiles = N // block_N
+
+    @T.prim_func
+    def main(
+        P: T.Tensor((shards, M, 2 * N), T.float32),
+        C0: T.Tensor((M, N), out_dtype),
+        C1: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(2 * tiles, M, threads=threads) as (bx, m):
+            acc = T.alloc_fragment((block_N,), T.float32)
+            for j in T.Parallel(block_N):
+                acc[j] = P[0, m, bx * block_N + j]
+            for s in T.serial(1, shards):
+                for j in T.Parallel(block_N):
+                    acc[j] += P[s, m, bx * block_N + j]
+            if bx < tiles:
+                for j in T.Parallel(block_N):
+                    C0[m, bx * block_N + j] = acc[j]
+            else:
+                for j in T.Parallel(block_N):
+                    C1[m, (bx - tiles) * block_N + j] = acc[j]
+
+    return main
+
+
+@tilelang.jit
+def bf16_gemm_two(
+    N: int,
+    K: int,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 64,
+    num_stages: int = 3,
+    threads: int = 128,
+    out_dtype: T.dtype = T.bfloat16,
+    shards: int = 1,
+):
+    """``bf16_gemm`` of a ``[2N, K]`` weight into two ``[M, N]`` outputs: rows below
+    N of the weight to ``C0``, the rest to ``C1``, with ``bf16_gemm``'s shard
+    arithmetic (so it gives ``bf16_gemm_partials`` plus ``splitk_reduce_two``'s bits).
+    """
+    k_blocks = tilelang.cdiv(K, block_K)
+    assert N % block_N == 0
+    assert shards == 1 or (K % block_K == 0 and k_blocks % shards == 0)
+    M = T.dynamic("M")
+    dtype = T.bfloat16
+    shard_blocks = k_blocks // shards
+    tiles = N // block_N
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((2 * N, K), dtype),
+        C0: T.Tensor((M, N), out_dtype),
+        C1: T.Tensor((M, N), out_dtype),
+    ):
+        with T.Kernel(2 * tiles, T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_N, block_K), dtype)
+            C_local = T.alloc_fragment((block_M, block_N), T.float32)
+            C_total = T.alloc_fragment(
+                (block_M, block_N) if shards > 1 else (1, 1), T.float32
+            )
+            T.clear(C_local)
+            if shards > 1:
+                T.clear(C_total)
+            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+                T.copy(A[by * block_M, ko * block_K], A_shared)
+                T.copy(B[bx * block_N, ko * block_K], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                if shards > 1:  # noqa: SIM102
+                    if (ko + 1) % shard_blocks == 0:
+                        for i, j in T.Parallel(block_M, block_N):
+                            C_total[i, j] = T.if_then_else(
+                                ko + 1 == shard_blocks,
+                                C_local[i, j],
+                                C_total[i, j] + C_local[i, j],
+                            )
+                        T.clear(C_local)
+            if bx < tiles:
+                if shards > 1:
+                    T.copy(C_total, C0[by * block_M, bx * block_N])
+                else:
+                    T.copy(C_local, C0[by * block_M, bx * block_N])
+            else:
+                if shards > 1:
+                    T.copy(C_total, C1[by * block_M, (bx - tiles) * block_N])
+                else:
+                    T.copy(C_local, C1[by * block_M, (bx - tiles) * block_N])
 
     return main
 
@@ -400,6 +604,31 @@ DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
         64: dict(block_N=64, block_K=256, num_stages=2),
     },
 }
+
+
+# Narrow projections leave most SMs idle at decode (512 columns are 8 tiles of 64
+# on 48 SMs). They split K for decode rows up to SPLIT_DECODE_ROWS, write FP32
+# partials and add them in shard order; their prefill GEMM accumulates the same
+# shards in the same order, so a row's bits do not depend on the batch. Shard
+# counts and tiles come from the kernel lab against B12X at the TP4 shapes.
+SPLIT_DECODE_ROWS = 128
+SPLIT_FP8: dict[tuple[int, int], dict] = {
+    # TP4 DSpark context KV: the fused Q-A/KV weight's KV rows.
+    (512, 5120): dict(
+        shards=5,
+        decode=dict(block_N=64, block_K=256, num_stages=3, threads=128),
+        prefill=dict(block_M=64, block_N=64, block_K=128, num_stages=3),
+    ),
+}
+SPLIT_BF16: dict[tuple[int, int], int] = {
+    (1024, 5120): 10,  # TP4 compressor wkv + wgate (ratio 2), one fused launch
+    (512, 5120): 10,  # TP4 compressor wkv (ratio 1)
+}
+
+
+def split_row_tile(rows: int) -> int:
+    """Row tile of a split-K decode GEMM: the shortest that holds ``rows``, else 64."""
+    return next((height for height in (16, 32) if rows <= height), 64)
 
 
 def decode_tile_rows(rows: int) -> int:

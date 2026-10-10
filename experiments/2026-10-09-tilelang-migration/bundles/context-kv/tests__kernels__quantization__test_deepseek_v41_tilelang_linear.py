@@ -197,7 +197,7 @@ def test_split_linear(parts, out_dtype, k=5120):
     method.process_weights_after_loading(layer)
     x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
     scratch = torch.empty(
-        method.get_workspace_size(layer, DECODE_ROWS), dtype=torch.uint8, device=DEVICE
+        method.get_workspace_size(layer, max(ROWS)), dtype=torch.uint8, device=DEVICE
     )
 
     def project(rows):
@@ -250,30 +250,33 @@ def test_scaled_linear(n=32, k=5120, scale=1 / 64):
         TileLangScaledLinearMethod(0.3)
 
 
-# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight.
+# The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight, a
+# narrow projection (512 x 5120) that splits K for decode rows.
 def test_block32_rows(n=1792, k=5120, start=1280):
     from torch import nn
 
+    from vllm.models.deepseek_v4_1.tilelang.gemm import SPLIT_DECODE_ROWS, SPLIT_FP8
     from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
     from vllm.v1.worker.workspace import use_preallocated_workspace
 
+    assert (n - start, k) in SPLIT_FP8
     weight, exps, weight_values = _block32_weight(n, k, 6)
     layer = nn.Module()
     layer.weight, layer.weight_scale_inv = weight, exps
-    fused, rows = TileLangBlock32Rows(layer, 0), TileLangBlock32Rows(layer, start)
-    x = torch.randn((max(ROWS), k), generator=_gen(7), device=DEVICE).bfloat16()
+    rows = TileLangBlock32Rows(layer, start)
+    counts = (1, 7, 16, 17, 32, 33, 64, 65, 96, SPLIT_DECODE_ROWS, 200, 300)
+    x = torch.randn((max(counts), k), generator=_gen(7), device=DEVICE).bfloat16()
     _, _, x_values = _mxfp8(x)
     ref = x_values @ weight_values[start:].T
-    scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
+    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
     with use_preallocated_workspace(scratch):
-        for count in ROWS:
-            out = rows(x[:count])
-            torch.testing.assert_close(
-                out.float(), ref[:count], rtol=1e-2, atol=1e-2 * ref.abs().max().item()
-            )
-            # Every tile accumulates K in the same order: the slice gives the
-            # fused projection's bits.
-            assert torch.equal(out, fused(x[:count])[:, start:]), f"rows={count}"
+        full = rows(x)  # prefill rows: the split prefill GEMM
+        torch.testing.assert_close(
+            full.float(), ref, rtol=1e-2, atol=1e-2 * ref.abs().max().item()
+        )
+        for count in counts:
+            # Split-K decode rows add the shards as the prefill GEMM does.
+            assert torch.equal(rows(x[:count]), full[:count]), f"rows={count}"
     with pytest.raises(ValueError):
         TileLangBlock32Rows(layer, start + 16)
 

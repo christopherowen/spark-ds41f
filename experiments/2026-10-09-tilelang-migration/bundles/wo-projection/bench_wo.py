@@ -26,6 +26,7 @@ from b12x.gemm import wo_projection  # noqa: E402
 from b12x.preparation import PreparationSession, PreparedCall  # noqa: E402
 
 from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection  # noqa: E402
+from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
 
 HEADS, HEAD_DIM, GROUPS, RANK, HIDDEN, ROPE, POSITIONS = 16, 512, 2, 1024, 5120, 64, 1 << 20
 WIDTH = HEADS // GROUPS * HEAD_DIM
@@ -57,10 +58,12 @@ work = o.clone()  # TileLang rotates in place
 
 tilelang_wo = TileLangWOProjection(wo_a, wo_b, groups=GROUPS)
 t_out = torch.empty((CAPACITY, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+scratch = torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE)  # serving binds a workspace
 
 
 def tilelang(rows):
-    tilelang_wo(work[:rows], positions[:rows], table, t_out[:rows])
+    with use_preallocated_workspace(scratch):
+        tilelang_wo(work[:rows], positions[:rows], table, t_out[:rows])
 
 
 weights = wo_projection.pack_weights(wo_a.weight, wo_a.weight_scale_inv, wo_b.weight, wo_b.weight_scale_inv,

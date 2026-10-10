@@ -32,17 +32,24 @@ from .gemm import (
     DECODE_ROWS,
     DECODE_TILE_ROWS,
     SF_BLOCK,
+    SPLIT_BF16,
+    SPLIT_DECODE_ROWS,
+    SPLIT_FP8,
     bf16_gemm,
     bf16_gemm_partials,
+    bf16_gemm_two,
     bf16_shards,
     decode_tile_rows,
     fp8_decode_config,
     fp8_prefill_config,
     mxfp8_gemm,
     mxfp8_gemm_decode,
+    mxfp8_gemm_partials,
     pack_scale_words,
     scale_words,
+    split_row_tile,
     splitk_reduce,
+    splitk_reduce_two,
 )
 
 _LAYERS: WeakValueDictionary[int, nn.Module] = WeakValueDictionary()
@@ -134,6 +141,9 @@ def _block32_linear(
     k *= layer.tilelang_groups  # a grouped weight reads every group's columns
     x = x.reshape(-1, k)
     rows = x.shape[0]
+    if layer.tilelang_shards > 1 and rows <= SPLIT_DECODE_ROWS:
+        _block32_split(layer, x, out.view(rows, n), scratch)
+        return
     xq, sf = _scratch(_activation_specs(rows, k), scratch)
     _tile_kernels().quant.per_token_cast(
         x,
@@ -159,6 +169,36 @@ def _block32_linear(
 @_block32_linear.register_fake
 def _block32_linear_fake(x, out, key, scratch):
     return None
+
+
+def _split_specs(layer, rows: int):
+    """Split-K decode scratch: MXFP8 activations and scales padded to whole row
+    tiles, and the FP32 partials of the live rows."""
+    n, k = layer.weight.shape
+    tile = split_row_tile(rows)
+    padded = -(-rows // tile) * tile
+    return (
+        ((padded, k), torch.float8_e4m3fn),
+        ((padded, 4 * scale_words(k)), torch.uint8),
+        ((layer.tilelang_shards, rows, n), torch.float32),
+    )
+
+
+def _block32_split(layer, x: torch.Tensor, out: torch.Tensor, scratch) -> None:
+    rows = x.shape[0]
+    xq, sf, partials = _scratch(_split_specs(layer, rows), scratch)
+    _tile_kernels().quant.per_token_cast(
+        x,
+        "e4m3",
+        SF_BLOCK,
+        round_sf=True,
+        use_packed_ue8m0=True,
+        out=(xq[:rows], sf[:rows]),
+    )
+    layer.tilelang_partials[split_row_tile(rows)](
+        xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, partials
+    )
+    layer.tilelang_reduce(partials, out)
 
 
 @torch.library.custom_op(
@@ -199,6 +239,24 @@ def _prepare_block32(layer, groups: int = 1) -> None:
         layer.weight_scale_inv.view(torch.uint8), rows=n
     )
     layer.tilelang_groups = groups
+    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
+    layer.tilelang_shards = split["shards"] if split else 1
+    if split:
+        # A narrow projection: split-K decode rows, and prefill tiles that add the
+        # same shards in the same order.
+        layer.tilelang_partials = {
+            block_M: mxfp8_gemm_partials(
+                n, k, split["shards"], block_M=block_M, **split["decode"]
+            )
+            for block_M in (16, 32, 64)
+        }
+        layer.tilelang_reduce = splitk_reduce(n, split["shards"])
+        layer.tilelang_prefill = mxfp8_gemm(
+            n, k, **split["prefill"], shards=split["shards"]
+        )
+        layer.tilelang_key = id(layer)
+        _LAYERS[layer.tilelang_key] = layer
+        return
     layer.tilelang_decode = {
         block_M: mxfp8_gemm_decode(
             part,
@@ -300,14 +358,6 @@ class TileLangLinearMethod(UnquantizedLinearMethod):
         return _spec_bytes(_partial_specs(layer, num_tokens))
 
 
-class _Part:
-    """One row block of a split weight; weak-referenceable for ``_LAYERS``."""
-
-    def __init__(self, weight: torch.Tensor, out_dtype: torch.dtype):
-        self.weight = weight
-        self.out_dtype = out_dtype
-
-
 class TileLangScaledLinearMethod(TileLangLinearMethod):
     """``TileLangLinearMethod`` with a power-of-two output scale folded into the
     weight at load. Scaling by a power of two is exact in BF16 and commutes with
@@ -330,43 +380,109 @@ class TileLangScaledLinearMethod(TileLangLinearMethod):
 
 
 class TileLangSplitLinearMethod(UnquantizedLinearMethod):
-    """A BF16 weight made of equal row blocks (the compressor's wkv and wgate), each
-    projected into its own output by the BF16 GEMM of ``TileLangLinearMethod``."""
+    """A BF16 weight of equal row blocks (the compressor's wkv and wgate), each
+    projected into its own output by one launch over the whole weight.
+
+    Decode rows (up to ``SPLIT_DECODE_ROWS``) split K over the SMs and add the FP32
+    partials in shard order into the outputs; prefill rows run one GEMM that adds
+    the same shards in the same order, so a row's bits do not depend on the batch.
+    """
 
     def __init__(self, parts: int):
         super().__init__()
+        if parts not in (1, 2):
+            raise ValueError("the split projection has one or two parts")
         self.parts = parts
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         super().process_weights_after_loading(layer)
-        n = layer.weight.shape[0]
+        n, k = layer.weight.shape
         if n % self.parts:
             raise ValueError(f"{n} rows do not split into {self.parts} parts")
-        rows = n // self.parts
-        out_dtype = getattr(layer, "out_dtype", torch.bfloat16)
-        layer.tilelang_parts = []
-        for index in range(self.parts):
-            part = _Part(
-                layer.weight.data[index * rows : (index + 1) * rows], out_dtype
+        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+        shards = SPLIT_BF16.get((n, k)) or bf16_shards(n, k)
+        layer.tilelang_parts = self.parts
+        layer.tilelang_shards = shards
+        layer.tilelang_partials = {
+            block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
+            for block_M in PARTIAL_ROW_TILES
+        }
+        if self.parts == 2:
+            part = n // 2
+            layer.tilelang_reduce = splitk_reduce_two(part, shards, out_dtype=out_dtype)
+            layer.tilelang_gemm = bf16_gemm_two(
+                part, k, out_dtype=out_dtype, shards=shards
             )
-            TileLangLinearMethod().process_weights_after_loading(part)
-            layer.tilelang_parts.append(part)
+        else:
+            layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
+            layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
+        layer.tilelang_key = id(layer)
+        _LAYERS[layer.tilelang_key] = layer
 
     def get_workspace_size(self, layer, num_tokens: int) -> int:
-        return max(
-            _spec_bytes(_partial_specs(part, num_tokens))
-            for part in layer.tilelang_parts
+        rows = min(num_tokens, SPLIT_DECODE_ROWS)
+        n = layer.weight.shape[0]
+        return _spec_bytes((((layer.tilelang_shards, rows, n), torch.float32),))
+
+
+def _split_bf16(x, outputs, key, scratch) -> None:
+    layer = _LAYERS[key]
+    n, k = layer.weight.shape
+    rows = x.shape[0]
+    if rows <= SPLIT_DECODE_ROWS:
+        (partials,) = _scratch(
+            (((layer.tilelang_shards, rows, n), torch.float32),), scratch
         )
+        partials_kernel(layer, rows)(x, layer.weight, partials)
+        layer.tilelang_reduce(partials, *outputs)
+    else:
+        layer.tilelang_gemm(x, layer.weight, *outputs)
+
+
+@torch.library.custom_op(
+    "vllm::dsv41_tilelang_split_linear_one", mutates_args=("out", "scratch")
+)
+def _split_linear_one(
+    x: torch.Tensor, out: torch.Tensor, key: int, scratch: torch.Tensor | None
+) -> None:
+    _split_bf16(x, (out,), key, scratch)
+
+
+@_split_linear_one.register_fake
+def _split_linear_one_fake(x, out, key, scratch):
+    return None
+
+
+@torch.library.custom_op(
+    "vllm::dsv41_tilelang_split_linear_two", mutates_args=("out0", "out1", "scratch")
+)
+def _split_linear_two(
+    x: torch.Tensor,
+    out0: torch.Tensor,
+    out1: torch.Tensor,
+    key: int,
+    scratch: torch.Tensor | None,
+) -> None:
+    _split_bf16(x, (out0, out1), key, scratch)
+
+
+@_split_linear_two.register_fake
+def _split_linear_two_fake(x, out0, out1, key, scratch):
+    return None
 
 
 def project_parts(layer: nn.Module, x: torch.Tensor, outputs, rows: int) -> None:
-    """Project ``x`` (rows x K) through each row block of a split layer into the
-    matching output's first ``rows`` rows."""
+    """Project ``x`` (rows x K) through a split layer: each row block into the
+    first ``rows`` rows of its output."""
     scratch = (
         None if torch.compiler.is_compiling() else current_preallocated_workspace()
     )
-    for part, out in zip(layer.tilelang_parts, outputs):
-        _bf16_linear(x, out[:rows], part.tilelang_key, scratch)
+    if layer.tilelang_parts == 2:
+        _split_linear_two(
+            x, outputs[0][:rows], outputs[1][:rows], layer.tilelang_key, scratch
+        )
+    else:
+        _split_linear_one(x, outputs[0][:rows], layer.tilelang_key, scratch)
 
 
 __all__ = [

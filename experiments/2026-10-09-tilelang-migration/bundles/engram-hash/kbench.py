@@ -11,7 +11,8 @@ import torch
 
 sys.path.insert(0, "/opt/spark3/candidate/vllm")
 
-DEVICE = torch.device("cuda")
+# With its index: B12X compares a plan's device with its session's (cuda:0).
+DEVICE = torch.device("cuda", torch.cuda.current_device())
 # The serving decode capture sizes up to 16 streams x 6 tokens, and prefill chunks.
 DECODE = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 72, 80, 96)
 CAPACITY = 8192
