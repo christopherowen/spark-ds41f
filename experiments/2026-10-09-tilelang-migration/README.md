@@ -353,6 +353,21 @@ mixed-traffic latency for the control, `oneshot-dispatch`, B5, C3, chunk
 alignment and `deterministic`, then the arms window 4 did not reach (B9, B2,
 B8), bracketed by the control.
 
+Window 7f results (2026-10-10, 13:30-13:35 UTC, fabric only): NCCL's
+point-to-point settings do not move the exchange beyond run-to-run noise (two
+recipe runs differ by up to 20% at some sizes); two or four queue pairs per
+connection make it slower (5.6-5.9 ms at 8192 rows). At 8192 rows the exchange
+alone takes 3.9-4.4 ms against NCCL's reduce-scatter at 3.1-3.4 ms (1.2-1.35x),
+the wire floor of an exact sum on ring4; the sum adds 0.55 ms, and its 21 MB
+result mostly stays in L2 for the mHC that reads it, so fusing it would save
+about 0.1-0.2 ms. C3's remaining cost is structural on this cabling: about 2-3%
+of prefill (window 5: -3.0% at 1K, -1.7% at 16K with B5), decode level. On the
+TP3 triangle every pair is cabled, and the exchange carries the same bytes as
+NCCL's ring. B3's coalesced writers match or beat B12X at decode sizes
+(0.88-1.07 warm, at or under 1.0 cold) with the same bytes; they are 1.7-4.8x
+slower at 512-8192 rows, where single-byte stores cap the rate (next: 32- and
+64-bit payload stores).
+
 Window 6 results (2026-10-10, 12:12-12:48 UTC):
 
 - Fabric, 8192 rows (slowest rank's median per call): NCCL's reduce-scatter
