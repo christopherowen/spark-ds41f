@@ -4,6 +4,11 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
+Production is the four-node TP4 1M profile on **r6d** (2026-10-10,
+[promotion record](experiments/2026-10-10-r6d-deterministic/README.md)): r6c's
+rebase plus the first TileLang migration ports, with temperature-0 outputs that
+do not depend on the batch. The three-node profiles stay on r6.
+
 The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
 with DeepSeek's TileKernels and the one-shot RoCE collectives of
 [sparknet](https://github.com/christopherowen/dgx-spark-networking), in place
@@ -75,7 +80,10 @@ until the profile's kernel, fabric and image checks pass.
 
 ## Current baseline
 
-The active baseline is recorded in
+The production (TP4) baseline is
+[manifests/baselines/2026-10-10-karmic-kraken-r6d.json](manifests/baselines/2026-10-10-karmic-kraken-r6d.json)
+(see [docs/current-state.md](docs/current-state.md)). The three-node baseline,
+which the TP3 profiles keep, is recorded in
 [manifests/baselines/2026-10-05-karmic-kraken-r6.json](manifests/baselines/2026-10-05-karmic-kraken-r6.json)
 ([promotion record](experiments/2026-10-05-tilelang-r6/README.md)):
 
@@ -151,6 +159,16 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+r6d's deployed TP4 service (2026-10-10 20:00-20:16 UTC, same `bin/spark bench`
+protocol, against r6's TP4 run;
+[report](manifests/benchmarks/2026-10-10-karmic-kraken-r6d-tp4.json)): quality
+5/5; one-stream prose / code steps 31.59 / 34.65 ms (r6 31.79 / 34.75, level);
+source-text prefill 5,755 / 5,426 / 5,026 / 4,334 tok/s at 32K / 256K / 500K /
+1M (r6 5,836 / 5,471 / 5,072 / 4,370, level within the intervals). Its
+concurrent decode points send one prompt to every stream, which a deterministic
+build routes alike, so their apparent gains (+18% to +62%) are not kernel gains;
+see the [promotion record](experiments/2026-10-10-r6d-deterministic/README.md).
 
 The r6 acceptance benchmark (2026-10-05, `bin/spark bench` from dgx1:
 quality, then prose and code prompts with reasoning on, temperature 0, 256

@@ -135,3 +135,38 @@ router fix below):
 
 Promotion is the owner's decision. The fixed series needs its image rebuilt
 and the tests rerun before it can serve.
+
+## Promotion (2026-10-10)
+
+The owner accepted r6d for production. TP4 only: `config/cluster-tp4.json` takes
+the r6d recipe, the root lock takes its sources, and the baseline is
+[`2026-10-10-karmic-kraken-r6d`](../../manifests/baselines/2026-10-10-karmic-kraken-r6d.json).
+The TP3 profiles (`config/cluster.json`, `-4k`, `-64k`) stay on r6 and pin its
+lock ([r6/upstreams.lock.json](r6/upstreams.lock.json), the root lock as it
+was), since TP3 needs the triangle cabling to qualify. The seven r6-era
+TileLang experiment profiles that read the root lock implicitly pin it too.
+
+Deployment (from main `02babe5`, the r6d recipe; the image was already on every
+node with one ID, `sha256:795eb1c7`): the service was idle (30 s traffic
+window: no requests). r6 stopped 19:57:00 UTC; the first start refused to
+replace the stopped containers without `--replace`, so the service was down
+until r6d's API came up at 19:59:33 (79 s after launch). `doctor --live`: the
+live cluster matches, warnings only for weight-file fragmentation.
+
+The deployed service's benchmark (2026-10-10 20:00-20:16 UTC,
+[report](../../manifests/benchmarks/2026-10-10-karmic-kraken-r6d-tp4.json),
+against r6's TP4 run):
+
+| Workload | r6 | r6d |
+| --- | ---: | ---: |
+| Quality gate | 5/5 | 5/5 |
+| One-stream prose / code step time | 31.79 / 34.75 ms | 31.59 / 34.65 ms (level) |
+| Source-text prefill, 32K / 256K (tok/s) | 5,836 / 5,471 | 5,755 / 5,426 (level) |
+| Source-text prefill, 500K / 1M | 5,072 / 4,370 | 5,026 / 4,334 (level, -0.9 / -0.8%) |
+| Lowest MemAvailable | 19.35 GiB (dgx1) | 20.11 GiB (dgx1) |
+
+Single-stream tokens per second also moved (prose +9.8%, code -0.7%), but the
+step times are level: that change is the text, and so DSpark's acceptance. The
+concurrent points (+18% to +62%) send the same prompt to every stream, which a
+deterministic build routes alike; they are not kernel gains. Prefill pays the
+determinism (C3) and stays within the intervals. No thermal slowdown.

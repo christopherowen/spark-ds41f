@@ -102,10 +102,12 @@ class KernelBackendTest(unittest.TestCase):
         return [p for p in spark.local_doctor(cluster, self.nodes, lock) if not isinstance(p, spark.Warn)]
 
     def test_promoted_profiles_run_tilelang(self):
-        lock = spark.read_json("upstreams.lock.json")
+        # The TP3 profiles stay on r6 (unqualified on the ring cabling) and pin its lock.
         for name in ("config/cluster.json", "config/cluster-64k.json", "config/cluster-4k.json"):
             with self.subTest(name=name):
                 cluster = spark.read_json(name)
+                lock = spark.read_json(cluster.get("upstreams_config", "upstreams.lock.json"))
+                self.assertEqual(cluster["promoted_baseline"], lock["generated_from_baseline"])
                 cluster["distributed"]["master_addr"] = self.base["distributed"]["master_addr"]
                 self.assertEqual(cluster["kernel_backend"], "tilelang")
                 self.assertEqual(cluster["environment"][kernel_backend.ENVIRONMENT], "tilelang")
@@ -120,7 +122,7 @@ class KernelBackendTest(unittest.TestCase):
         cluster = spark.read_json("config/cluster-tp4.json")
         self.assertEqual(cluster["nodes_config"], "config/nodes-ring4.local.json")
         self.assertNotIn("upstreams_config", cluster)
-        self.assertEqual(cluster["promoted_baseline"], spark.read_json("config/cluster.json")["promoted_baseline"])
+        self.assertEqual(cluster["promoted_baseline"], lock["generated_from_baseline"])
         cluster["distributed"]["master_addr"] = next(n for n in nodes["nodes"] if n.get("head"))["management_ip"]
         self.assertEqual(cluster["kernel_backend"], "tilelang")
         self.assertEqual(spark.topology.argument(cluster, "--tensor-parallel-size"), "4")
