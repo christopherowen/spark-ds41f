@@ -593,7 +593,8 @@ def sync_steps(spec: dict, job: dict) -> list[dict]:
 def image_steps(spec: dict, job: dict) -> list[dict]:
     """Build an arm's image on one node with serving stopped (unless that node has the tag),
     copy it to the others in the listed order ([source node, target ssh address]: the CX7
-    links), and require one image ID on every node."""
+    links), and require one image ID on every node. A tag whose vLLM tree label differs
+    from the recipe's is stale and is removed from every node first."""
     experiment = spec["experiment"]
     return [stop_step(job),
             {"kind": "image", "config": arm_config_path(experiment, job["config"]), "node": job["node"],
@@ -957,6 +958,21 @@ def run_image(step: dict) -> str | None:
         process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format", "{{.Id}}")
         return process.stdout.strip() if process.returncode == 0 else ""
 
+    def tree(node: dict) -> str:
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format",
+                                '{{index .Config.Labels "local.spark3.vllm.tree"}}')
+        return process.stdout.strip() if process.returncode == 0 else ""
+
+    # A tag whose vLLM tree differs from the recipe's is a stale build of the same name:
+    # remove it everywhere (docker refuses while a container uses it) and build again.
+    expected = cluster["container"].get("expected_labels", {}).get("local.spark3.vllm.tree")
+    for node in nodes["nodes"]:
+        found = tree(node)
+        if found and expected and found != expected:
+            process = spark.run_ssh(nodes, node, "docker", "image", "rm", image)
+            if process.returncode:
+                return f"stale {image} on {node['name']} (tree {found[:12]}) could not be removed"
+            log(f"removed stale {image} from {node['name']} (tree {found[:12]}, recipe {expected[:12]})")
     builder = spark.node_by_name(nodes, step["node"])
     if image_id(builder):
         log(f"image {image} already on {builder['name']}; not rebuilt")
