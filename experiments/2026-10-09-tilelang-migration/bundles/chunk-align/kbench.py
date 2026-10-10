@@ -88,20 +88,27 @@ def slower(base: tuple[float, float], port: tuple[float, float]) -> bool:
 
 def repeatable(fn, outputs: Callable[[], list[torch.Tensor]], replays: int = REPLAYS) -> int:
     """Replays of a one-call CUDA graph of ``fn`` whose outputs differ in any bit from an
-    eager call's (0: repeatable). Every other replay follows an L2 eviction, so tiles
-    and pipeline stages land at different times. ``outputs`` is read after the eager
-    call and again after capture (a call that allocates its result writes it to the
-    graph's pool)."""
+    eager call's (0: repeatable). Replays cycle through warm, after an L2 eviction, and
+    beside a 128 MiB read on another stream (contention like the L2 prefetch's), so
+    tiles and pipeline stages land at different times. ``outputs`` is read after the
+    eager call and again after capture (a call that allocates its result writes it to
+    the graph's pool)."""
     fn()
     torch.cuda.synchronize()
     refs = [o.clone() for o in outputs()]
     g = graph(fn, 1)
     outs = outputs()
+    side = torch.cuda.Stream()
     bad = torch.zeros((), dtype=torch.int64, device=DEVICE)
     for i in range(replays):
-        if i % 2:
+        if i % 3 == 1:
             _EVICT.max()
+        elif i % 3 == 2:
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                _EVICT.max()
         g.replay()
         bad += torch.stack([(o.view(torch.uint8) != r.view(torch.uint8)).any() for o, r in zip(outs, refs)]).any()
+    torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     return int(bad)
