@@ -159,6 +159,15 @@ def test_row_bits_do_not_depend_on_owner_or_batch():
     assert len(results) == 1
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_torch_sum_leaves_its_inputs(dtype):
+    parts = [torch.randn(3, 8).to(dtype) for _ in range(4)]
+    before = [p.clone() for p in parts]
+    first = rank_order_sum(parts)
+    assert all(torch.equal(p, b) for p, b in zip(parts, before))
+    assert torch.equal(rank_order_sum(parts), first)
+
+
 def test_one_rounding_differs_from_rounding_each_add():
     # FP32 accumulation is observable: rounding after each BF16 add (as NCCL does
     # per hop) gives other bits, so the tests above would catch it.

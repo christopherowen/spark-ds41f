@@ -133,7 +133,7 @@ def rank_order_sum(
                 *(p.view(-1, _VEC) for p in parts), out.view(-1, _VEC)
             )
         return out
-    total = parts[0].float()
+    total = parts[0].to(torch.float32, copy=True)  # never add into an input
     for part in parts[1:]:
         total += part.float()
     return out.copy_(total)
