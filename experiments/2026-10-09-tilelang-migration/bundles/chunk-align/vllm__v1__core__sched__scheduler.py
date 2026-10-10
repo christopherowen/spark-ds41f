@@ -312,6 +312,8 @@ class Scheduler(SchedulerInterface):
         self.use_eagle_block_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+        if ALIGN_PREFILL_CHUNKS:
+            self._check_aligned_prefill_chunks()
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
         self.acceptance_length_controller: (
@@ -837,6 +839,18 @@ class Scheduler(SchedulerInterface):
             if request in queue:
                 return queue
         return None
+
+    def _check_aligned_prefill_chunks(self) -> None:
+        """A whole aligned chunk must fit beside every decoding request's rows, or
+        a long prompt would wait for the decodes to end."""
+        threshold = self.scheduler_config.long_prefill_token_threshold
+        decode_rows = self.max_num_running_reqs * (1 + self.num_spec_tokens)
+        if threshold <= 0 or threshold + decode_rows > self.max_num_scheduled_tokens:
+            raise ValueError(
+                "aligned prefill chunks need long_prefill_token_threshold "
+                f"({threshold}) plus {decode_rows} decode rows within the "
+                f"{self.max_num_scheduled_tokens}-token step budget"
+            )
 
     def _aligned_prefill_chunk(
         self, num_computed_tokens: int, num_new_tokens: int
