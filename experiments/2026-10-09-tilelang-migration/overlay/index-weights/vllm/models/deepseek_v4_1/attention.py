@@ -90,6 +90,19 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
     return out
 
 
+def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
+    """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+    mla.write_cache(
+        x,
+        cache,
+        slots,
+        page_size=page_size,
+        cache_kind=cache_kind,
+        cache_format="deepseek_v41",
+        plan=plan,
+    )
+
+
 class _AttentionHelpers:
     """Loaded-resource owner, independent of unpublished attention caches."""
 
@@ -1238,13 +1251,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.rotary_emb.cos_sin_cache,
             plan=self._helper_plan("kv"),
         )
-        mla.write_cache(
+        _write_v41_cache(
             rotated,
             self.swa_cache_layer.kv_cache,
             slot_mapping,
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
-            cache_format="deepseek_v41",
             plan=self._helper_plan("swa_cache_write"),
         )
 
@@ -1304,13 +1316,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             self.rotary_emb.cos_sin_cache,
             plan=self._helper_plan("latent"),
         )
-        mla.write_cache(
+        _write_v41_cache(
             latent,
             self.kv_cache,
             slots,
             page_size=self._main_page,
             cache_kind="indexed",
-            cache_format="deepseek_v41",
             plan=self._helper_plan("indexed_cache_write"),
         )
 

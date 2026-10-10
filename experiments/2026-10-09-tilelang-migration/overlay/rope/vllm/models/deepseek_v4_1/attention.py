@@ -90,6 +90,19 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
     return out
 
 
+def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
+    """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+    mla.write_cache(
+        x,
+        cache,
+        slots,
+        page_size=page_size,
+        cache_kind=cache_kind,
+        cache_format="deepseek_v41",
+        plan=plan,
+    )
+
+
 class _AttentionHelpers:
     """Loaded-resource owner, independent of unpublished attention caches."""
 
@@ -1237,13 +1250,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 "V4.1 attention metadata is not prepared"
             )
         rotated = self._rope(kv, positions, "kv")
-        mla.write_cache(
+        _write_v41_cache(
             rotated,
             self.swa_cache_layer.kv_cache,
             slot_mapping,
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
-            cache_format="deepseek_v41",
             plan=self._helper_plan("swa_cache_write"),
         )
 
@@ -1293,13 +1305,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows])
         latent = self._rope(latent, positions, "latent")
-        mla.write_cache(
+        _write_v41_cache(
             latent,
             self.kv_cache,
             slots,
             page_size=self._main_page,
             cache_kind="indexed",
-            cache_format="deepseek_v41",
             plan=self._helper_plan("indexed_cache_write"),
         )
 

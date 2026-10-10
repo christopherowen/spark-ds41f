@@ -137,16 +137,17 @@ gate). Numbers in parentheses are windows.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
 | C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
-| B5 compressor projection | `d4211888a` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
-| B6 DSpark context KV | `317a4b32f` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
-| B7 Engram gate | `0417d936b` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
-| B2 RoPE | `6b667cded` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
-| B9 Engram hash | `6015f6c24` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
-| B1 WO projection | `51d17d74e` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
-| B8 index head weights | `518592849` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
-| C3 collectives | `4d455dce2` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
-| Chunk alignment | `c9bb8c0ef` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
-| D1 decode rows | `ff424e911` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
+| B5 compressor projection | `7b4c48900` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `c4c3e932e` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `ef0fc64b0` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `c52f1dca7` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `ff9b245d9` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `f1e696017` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `e047bf5ff` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| C3 collectives | `c1d379282` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
+| Chunk alignment | `e5cc1f4ce` (module `e0c06e715`) + threshold 8096 | scheduler unit tests | not screened | window 5 arm |
+| B3 cache writers | `1eaf1605b` (modules `f236ddec2`, `69dd2c27b`) | record tests against a torch replica of B12X's arithmetic | not screened | window 6 kernels and arm |
+| D1 decode rows | `6ea478c9e` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 
@@ -270,6 +271,30 @@ DeepSeek's reference computes the compressor's wkv/wgate as FP32 `Linear` layers
 B12X's GEMV reduces in a tree and is more precise than the reference; B5's gate is
 the reference's error.
 
+### B3: KV-cache record writers
+
+DeepSeek-V4.1's two record formats, written by one TileLang thread per
+quantization group with B12X `write_cache`'s arithmetic step for step:
+
+- `swa` (528 bytes): 16 groups of 32 values as E4M3, then 16 UE8M0 scales; a
+  scale is `max(amax, 1e-4) * fp32(1/448)` rounded up to a power of two, and
+  the values are scaled by its exact reciprocal.
+- `indexed` (288 bytes): 32 groups of 16 values as packed E2M1, then 32 E4M3
+  scales; a scale is `max(amax, 6 * 2^-9) / 6` (IEEE), saturating to E4M3, and
+  the values are divided by its decoded value before nearest-even E2M1.
+
+The two attention call sites go through one helper (`_write_v41_cache`, a
+module commit), so the switch touches only its body, apart from B2's RoPE
+lines beside the calls.
+
+### Later: programmatic dependent launch
+
+B12X and TileKernels kernels launch with programmatic dependent launch, so a
+kernel's prologue overlaps its predecessor's tail inside CUDA graphs. TileLang
+has `T.pdl_trigger` / `T.pdl_sync`; a decode step runs on the order of a
+thousand kernels, so the TileLang family should adopt it once the ports are
+in (B2's 0.05-0.14 us misses on 1.2 us calls are the size of that overlap).
+
 ### Attention staging memory
 
 The B12X KV RoPE plan carries the attention's staging memory requirement and
@@ -302,6 +327,34 @@ about 10,000 tokens, past one chunk), c1/c8 distinct streams and
 mixed-traffic latency for the control, `oneshot-dispatch`, B5, C3, chunk
 alignment and `deterministic`, then the arms window 4 did not reach (B9, B2,
 B8), bracketed by the control.
+
+Window 5 results (2026-10-10, 08:15-09:27 UTC), lean screen bracketed by the
+control (control-end within 0.2% of it):
+
+| Arm | Temperature-0 outputs (c8 / staggered / mixed / cached / again) | c1 step | c8 distinct | Prefill 1K / 16K | Mixed long TTFT, p99 gap |
+| --- | --- | ---: | ---: | ---: | ---: |
+| control | 8 / 8 / 8 / 0 / 0 differ | 31.49 / 37.42 ms | 176.7 | 2719 / 5643 tok/s | 893 ms, 784 ms |
+| oneshot-dispatch | 8 / 8 / 9 / 0 / 0 | +0.2% / +0.5% | -1.7% | -0.6% / -0.1% | +1.0%, +0.5% |
+| B5 compressor | 8 / **0** / 8 / 0 / 0 | +0.3% / 0.0% | -1.1% | -0.3% / +2.3% | -2.5%, -1.5% |
+| C3 collectives | 8 / 8 / 8 / 0 / 0 | +0.4% / +0.1% | -2.4% | -2.1% / -3.8% | +2.8%, +3.4% |
+| chunk alignment | 8 / 8 / 9 / 0 / 0 | +0.2% / -0.3% | +1.4% | +0.3% / +0.6% | +0.1%, -1.0% |
+| **deterministic** | **0 / 0 / 0 / 0 / 0 (tokens and logprobs)** | +0.1% / -0.1% | +0.5% | -3.0% / -1.7% | +2.7%, +3.5% |
+| B9 Engram hash | 8 / 8 / 8 / 0 / 0 | +0.2% / -0.3% | +1.4% | +0.1% / +0.6% | +1.0%, +0.2% |
+| B2 RoPE | 8 / 8 / 8 / 0 / 0 (text shifts) | -0.8% / -1.4% | -1.1% | +0.6% / +2.7% | +0.4%, -0.9% |
+| B8 index weights | 8 / 8 / 8 / 0 / 0 | -0.1% / -0.3% | +0.5% | -1.0% / -0.1% | -0.2%, +0.5% |
+
+C3, B5 and chunk alignment together make the outputs independent of the company
+they keep: each prompt's 192 tokens and their logprobs are bit-identical alone,
+among eight, arriving staggered, beside a 10,000-token prefill that crosses a
+chunk boundary, from the prefix cache, and run to run. B5 alone fixes the
+staggered arrivals (short prompts prefilling beside decodes); c8 and mixed need
+the collectives and aligned chunks as well. Decode is level; the price is in
+prefill (2-4%), from C3's reduce-scatter exchange, which is next to recover.
+The kernels: C3's sum and exchange tests pass, B9 passes with int32 history,
+B5's bench confirms B12X's compressor varies with the batch (ratio 1 at 4-96
+rows, ratio 2 everywhere) while the port does not, and its tile sweep beats
+B12X up to 32 rows and is within 1% at 33-96 (module `747a2256b`). The
+chunk-alignment bundle mounted no scheduler and failed (fixed).
 
 Window 4 results (2026-10-10, 07:37-08:06 UTC): kernels pass for B7, B9, B8
 and D1; every bench is repeatable (200 graph replays per size, warm and

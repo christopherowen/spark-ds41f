@@ -805,8 +805,25 @@ SPLIT_BF16: dict[tuple[int, int], dict] = {
     # (PARTIAL_ROW_TILES) to the one-launch split-K's block_N, num_stages and
     # threads, which only change speed; block_K stays 64, since blocked
     # accumulation adds one block at a time.
-    (1024, 5120): dict(shards=5, blocked=True),
-    (512, 5120): dict(shards=5, blocked=True),
+    # Decode tiles: window 5's sweep, the lowest worst warm/cold ratio to B12X.
+    (1024, 5120): dict(
+        shards=5,
+        blocked=True,
+        decode={
+            16: dict(block_N=64, num_stages=4, threads=128),
+            32: dict(block_N=64, num_stages=2, threads=256),
+            64: dict(block_N=64, num_stages=3, threads=256),
+        },
+    ),
+    (512, 5120): dict(
+        shards=5,
+        blocked=True,
+        decode={
+            16: dict(block_N=32, num_stages=3, threads=128),
+            32: dict(block_N=32, num_stages=3, threads=128),
+            64: dict(block_N=32, num_stages=2, threads=256),
+        },
+    ),
 }
 
 

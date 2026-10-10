@@ -92,6 +92,12 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
 
 def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
     """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+    if kernels.uses_tilelang():
+        # The same bytes as B12X's writer; its plans stay declared.
+        from .tilelang.cache_writer import write_cache
+
+        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+        return
     mla.write_cache(
         x,
         cache,
@@ -238,15 +244,15 @@ class _AttentionHelpers:
                 )
             )
         attn._helper_plans = plans
-        helpers = B12xPreparationUnit(
-            name="V41AttentionHelpers",
-            key=(attn.prefix, attn.capacity),
-            requests=tuple(requests),
-            stage="weights",
+        return (
+            B12xPreparationUnit(
+                name="V41AttentionHelpers",
+                key=(attn.prefix, attn.capacity),
+                requests=tuple(requests),
+                stage="weights",
+            ),
+            attn._wo_preparation_unit(workload),
         )
-        if kernels.uses_tilelang():  # the TileLang WO projection needs no plan
-            return (helpers,)
-        return (helpers, attn._wo_preparation_unit(workload))
 
 
 @triton.jit(do_not_specialize=["offset", "stride", "width"])
@@ -1833,14 +1839,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                     f"V4.1 {name} shape mismatch: expected {shape}, "
                     f"got {tuple(tensor.shape)}"
                 )
-        if kernels.uses_tilelang():
-            from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection
-
-            # The checkpoint tensors in place, no packing.
-            self._wo_projection_weights = TileLangWOProjection(
-                self.wo_a, self.wo_b, groups=groups
-            )
-            return
         self._wo_projection_weights = wo_projection.pack_weights(
             self.wo_a.weight.detach(),
             self.wo_a.weight_scale_inv.detach(),
@@ -1962,28 +1960,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             )
         return self._wo_plans[key]
 
-    def _o_proj_tilelang(self, o, positions, sp_rows):
-        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place."""
-        rows, hidden = o.shape[0], self.hidden_size
-        if sp_rows is None:
-            local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
-        else:
-            if rows != sp_rows.num_tokens:
-                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
-            # Leading rows of the zero-padded buffer the reduce-scatter reads.
-            padded = sp_rows.empty_padded((hidden,), torch.bfloat16, o.device)
-            local = padded[:rows]
-        self._wo_projection_weights(o, positions, self.rotary_emb.cos_sin_cache, local)
-        l2_prefetch.issue(self._l2pf_ffn, rows)
-        if sp_rows is not None:
-            return sp_rows.reduce_scatter(padded)
-        if get_tensor_model_parallel_world_size() > 1:
-            local = get_tp_group().all_reduce(local)
-        return local
-
     def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
-        if kernels.uses_tilelang():
-            return self._o_proj_tilelang(o, positions, sp_rows)
         from b12x.preparation import require_prepared
 
         rows = o.shape[0]
