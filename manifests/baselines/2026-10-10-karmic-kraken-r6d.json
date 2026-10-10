@@ -1,0 +1,157 @@
+{
+ "schema_version": 1,
+ "status": "promoted-baseline",
+ "captured_at": "20261010T201611Z",
+ "container_name": "dsv41-karmic-kraken",
+ "image_tag": "vllm-ds41f-kkref:19f2c20ed4d6-r6d",
+ "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+ "nodes": {
+  "dgx1": {
+   "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+   "role": "api-head-rank-0"
+  },
+  "dgx2": {
+   "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+   "role": "headless-rank-1"
+  },
+  "dgx3": {
+   "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+   "role": "headless-rank-2"
+  },
+  "dgx4": {
+   "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+   "role": "headless-rank-3"
+  }
+ },
+ "source_identity": {
+  "vllm_repository": "https://github.com/local-inference-lab/vllm",
+  "vllm_ref": "integration/karmic-kraken-beta",
+  "vllm_revision": "19f2c20ed4d64ae22bd009ceacadd85e2a81e354",
+  "vllm_patch_head": "706760d0b311396a3fe6e56f93ee35bfce7ee08a",
+  "vllm_tree": "a00a6b07ff47deda27b9d9892bc8c79894a35ada",
+  "b12x_repository": "https://github.com/local-inference-lab/b12x",
+  "b12x_ref": "integration/karmic-kraken-beta",
+  "b12x_revision": "236ddff04a5f5064084b46464800b70b34ec7d8c",
+  "b12x_patch_head": "69e5795e2141fbb5fa2b3af096d51e754939bb41",
+  "b12x_tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
+  "nccl_repository": "https://github.com/NVIDIA/nccl",
+  "nccl_ref": "refs/tags/v2.30.7-1",
+  "nccl_revision": "73cf112295c33aee2b895f329f592f2a9b4b0f97",
+  "nccl_patch_head": "eeacf1c6343f0499e4e7ab20ec7eecfb6f62eda6",
+  "nccl_tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
+  "runtime_base_image": "docker.io/vllm/vllm-openai@sha256:3cf14c52765a0f0c2f09035e05fa79e1e4b2f9788b64afa90fa41c1ff12d29cf",
+  "image_build_deployment_commit": "653e0654496eaef958a7dd0c89e47fc8fc3fb704",
+  "model_revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "image_build_recipe": "bin/spark build (docker/Dockerfile, runtime-tilelang-sparknet stage)",
+  "tilelang_repository": "https://github.com/tile-ai/tilelang",
+  "tilelang_ref": "main",
+  "tilelang_revision": "b95ee4ffb52ae26e15619cad38c6f41e7e0a2b46",
+  "tilelang_patch_head": "30d854b6fa4baf55b90f46f33b0ba844d4509924",
+  "tilelang_tree": "1697ad52fab8379ce78f9abc547c7b1e02cd9c5e",
+  "tilelang_version": "0.1.15",
+  "tile_kernels_repository": "https://github.com/deepseek-ai/TileKernels",
+  "tile_kernels_ref": "main",
+  "tile_kernels_revision": "66258df6175d2f630ffecb04c5ab66bff8a2ae6a",
+  "tile_kernels_patch_head": "66258df6175d2f630ffecb04c5ab66bff8a2ae6a",
+  "tile_kernels_tree": "647708813ac13c2fac5bdcd252f6cb8390379b85",
+  "tile_kernels_version": "2.0.0",
+  "sparknet_repository": "https://github.com/christopherowen/dgx-spark-networking",
+  "sparknet_ref": "main",
+  "sparknet_revision": "f73a3ceaee3f0fdd4f3a9e7fb10d7f74de202962",
+  "sparknet_patch_head": "f73a3ceaee3f0fdd4f3a9e7fb10d7f74de202962",
+  "sparknet_tree": "bd4191b3241383e8ecb705ad291f2da5b064370f",
+  "sparknet_version": "0.2.0"
+ },
+ "runtime_choices": {
+  "kernel_backend": "tilelang: TileLang 0.1.15 (patches/tilelang 0001-0003), DeepSeek's TileKernels 2.0.0 and sparknet 0.2.0 run the attention, indexer, dense projections, experts, router, mHC, vocabulary heads and collectives (r6c's series), and now also the compressor projection (B5, split-K), RoPE (B2), the Engram gate (B7) and hash (B9), the index-head scale (B8), the 16-stream decode tiles (D1) and the reduce-scatter (C3) (vLLM 0048-0080); WO, KV cache writes and the remaining BF16 GEMVs stay B12X kernels",
+  "B12X_W4A8_TINY_DECODE": "0 (tiny decode omits swiglu_limit; see experiment README)",
+  "B12X_AUTOTUNE": "0 (autotune race budget is free memory // 2 on unified memory)",
+  "speculative": "DSpark, 5 tokens (the drafter's trained block), draft TP 4, adaptive verification cost scale 2 on curves profiled for this image (ring4-r6-20261005), dead verification rows below survival 0.2, block rejection; greedy drafts vocabulary-parallel (vLLM patch 0012) over the checkpoint's BF16 draft head (the target head's own tensor) and BF16 Markov projection (VLLM_DS41_DRAFT_NVFP4_HEAD=0, VLLM_DS41_MARKOV_NVFP4=0), and a column-sharded drafter main_proj (0013)",
+  "cudagraph": "FULL_AND_PIECEWISE, capture sizes 1-96 (16 streams at 1 + 5 rows)",
+  "max_num_batched_tokens": 8192,
+  "memguards_gib": {
+   "startup": 5,
+   "steady": 3
+  },
+  "flashinfer_autotune": "disabled (--no-enable-flashinfer-autotune): it saved 0 configs, and only the sampler uses FlashInfer",
+  "engram_projection": "sharded across ranks (projection_tp, padded to 25632 rows by vLLM patch 0001)",
+  "engram_rows": "read beside the forward launch (SPARK3_ENGRAM_ASYNC=1)",
+  "compile_cache": "/cache/kkref/jit/vllm-r5o",
+  "multimodal": "vision tower loaded (no --language-model-only), up to 4 images per request; --mm-processor-cache-gb 0 (vLLM's default 4 GiB host cache would come out of dgx1's guard margin)",
+  "host_sysctl": "vm.watermark_boost_factor=0 on every node (/etc/sysctl.d/90-watermark-boost.conf): a watermark boost hides up to 0.87 GiB from MemAvailable, which the memory guards read",
+  "l2_prefetch": "on (the base's default on SM121): side-stream L2 prefetch of the next decode projections; it compiles from r5i on (quack-kernels needs CuTe DSL 4.7), so earlier baselines recorded it on while it disabled itself at startup; the TileLang scale words ride with each projection's weight (vLLM 0044)",
+  "nccl": "2.30.7 rebuilt with patches/nccl (NVIDIA/nccl#2393 IB send-path fence and the four-node ring patches) in place of the base image's wheel",
+  "chat_template_defaults": "none: thinking is the default when a request names neither key, so a client's enable_thinking=false is honored",
+  "prefill": "sequence-parallel once a forward's reduce-scatter exceeds the one-shot RoCE all-reduce (205 tokens; vLLM patches 0014-0018, no setting): per-layer all-reduces become reduce-scatters, row-wise work runs on a third of the rows, CED encoder layers only",
+  "host": "mutating torch custom ops read their argument schema once per call (vLLM patch 0019, vllm/env_override.py), not once per argument",
+  "cutlass_dsl": "4.7.1 for every consumer (vLLM, quack-kernels, B12X via patch 0002, FlashInfer, cuDNN frontend)",
+  "jit_caches": "driver PTX JIT cache (CUDA_CACHE_PATH, 4 GiB limit) and TileLang cache on the /cache mount, beside the B12X, CuTe DSL, FlashInfer and Triton caches",
+  "jit_warmup": "the dead-row variants of the draft combine and sampled/rejected-count Triton kernels are compiled at warmup (vLLM patch 0020); no kernel compiles after readiness",
+  "display_carveout": "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 with the GB10 display device passed to the container: embed_tokens and the packed lm_head are created in the firmware scanout reserve and the checkpoint loader writes straight into them (vLLM 0030); the text console keeps its 8 MiB framebuffer",
+  "attention_compute": "VLLM_DS41_ATTENTION_COMPUTE=auto (B12X's tuned arithmetic; BF16 pending a fidelity test)",
+  "indexer_split": "always under sequence-parallel prefill (patch 0025; SPARK3_DS41_INDEXER_SPLIT_CHECK=1 validates it against the full-row indexer)",
+  "display_carveout_check": "off (SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS unset; patch 0026 debug mode)",
+  "topk_ties": "lowest logical position (B12X 0003); indexer selections repeat exactly (B12X backend)",
+  "dense_gemm_stage_release": "async-proxy fence before each TMA-refilled stage release (B12X 0004) (B12X backend)",
+  "prefill_stage_release": "async-proxy fence before each TMA-refilled stage release in the BF16 and mHC prefill projections and contiguous attention (B12X 0005) (B12X backend)",
+  "host_memory": "64 KiB pages; memory-saver DKMS 0.2.0, UVM leaf-table packing enabled; THP never, vm.min_free_kbytes=45166, /swap-64k.img",
+  "vocabulary_head": "exact 12-bit packed BF16 (VLLM_DS41_PACKED_BF16_LM_HEAD=1; B12X 0012, vLLM 0028): a 4-bit exponent window code plus a per-row list of out-of-window values, bit-identical to the BF16 weights",
+  "collective_policy": "sparknet's one-shot RoCE all-reduce up to 2 MiB (SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES=2097152) and all-gather over the ring (oneshot-ring4); sequence-parallel reduce-scatters exchange unreduced chunks through NCCL send/recv (opposite ranks relayed through the neighbours) and add them in rank order",
+  "profiling_context": "the fabricated context of startup profiling and dummy runs takes its own blocks per KV cache group and request (vLLM 0039), so no group reads another group's records",
+  "four_node_transports": "B12X's RoCEnante transports and NCCL 0002-0004 remain in the image; TileLang configurations use sparknet's ring4 transport at TP4",
+  "decode_tiles": "block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count, and split-K tiles up to 128 rows for 16-stream steps (D1), TileLang's unspecialized pipeline; prefill rasterizes weights larger than L2 in panels (vLLM 0043)",
+  "batch_invariance": "temperature-0 outputs do not depend on the batch: the reduce-scatter adds every rank's partial in FP32 in rank order with one rounding (C3, the one-shot all-reduce's arithmetic), the compressor projection runs one TileLang arithmetic at every row count (B5), and prefill chunks align (threshold 8096 = budget - 16 x (1 + 5) decode rows)",
+  "long_prefill_token_threshold": 8096
+ },
+ "capacity": {
+  "kv_cache_bytes_per_rank": 11274289152,
+  "kv_cache_tokens": 8580566,
+  "max_model_len": 1048576,
+  "max_num_seqs": 16,
+  "reported_full_context_concurrency": 8.18,
+  "graph_capture_gib": 1.88,
+  "display_carveout_weights_mib": 552.3,
+  "checkpoint_native_max_position_embeddings": 1048576
+ },
+ "change_from_previous": "TP4 only (config/cluster-tp4.json): r6c's rebase onto Local Inference Lab's vLLM 19f2c20e and B12X 236ddff0 plus the first TileLang migration ports, with temperature-0 outputs independent of the batch. The TP3 profiles stay on r6 (pinned to its lock) until they are qualified on the triangle cabling.",
+ "evidence": {
+  "experiments": [
+   "experiments/2026-10-10-r6d-deterministic/",
+   "experiments/2026-10-09-tilelang-migration/",
+   "experiments/2026-10-08-lil-rebase/"
+  ],
+  "summary": "Gate 2026-10-10 15:16-16:09 UTC (r6c bracket): temperature-0 identical in every scenario, quality 5/5. Deployed service 2026-10-10 20:00-20:16 UTC on the ring (bin/spark bench, three samples, against r6's TP4 run): quality 5/5; one-stream steps 31.59 / 34.65 ms prose / code (r6 31.79 / 34.75, level); real-text prefill 5,755 / 5,426 / 5,026 / 4,334 tok/s at 32K / 256K / 500K / 1M (r6 5,836 / 5,471 / 5,072 / 4,370, level within the intervals); concurrent decode points send identical prompts, which a deterministic build routes alike, so their gains are not kernel gains; minimum MemAvailable 20.11 GiB (dgx1); no thermal slowdown."
+ },
+ "build": {
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6d",
+  "image_id": "sha256:795eb1c77852a3e3f45e5888950d36a1558d7bf697ab8c8eecbdd3591be2aa43",
+  "built_utc": "2026-10-10T16:29:46Z",
+  "build_host": "dgx4",
+  "copies": "CX7 links (dgx4 to dgx1 and dgx3, dgx1 to dgx2), one ID verified on every node"
+ },
+ "benchmark_reference": "manifests/benchmarks/2026-10-10-karmic-kraken-r6d-tp4.json",
+ "previous_baseline": "2026-10-05-karmic-kraken-r6",
+ "hosts": {
+  "os": "DGX Spark 26.09.2 (dgx-spark-ota-update-meta)",
+  "kernel": "7.0.0-1019-nvidia-64k with kho=off",
+  "nvidia_driver": "580.178.04",
+  "boot_target": "multi-user.target (no desktop)",
+  "sysctl": "vm.watermark_boost_factor=0",
+  "page_size": 65536,
+  "memory_saver": {
+   "package": "dgx-spark-memory-saver",
+   "version": "0.2.0",
+   "repository": "https://github.com/christopherowen/dgx-spark-memory-saver.git",
+   "revision": "2dd6ef107616ef13f1c7f87817c07e5aabc9199e",
+   "srcversion": "34683B82C2D3339BBD2EEC9"
+  },
+  "secure_boot": "enabled; existing enrolled DGX Fleet key signs the DKMS module",
+  "uvm_leaf_packing": "Y",
+  "boot_default": "7.0.0-1019-nvidia-64k; 7.0.0-1019-nvidia retained",
+  "memory_policy": {
+   "thp": "never",
+   "min_free_kbytes": 45166,
+   "swap": "/swap-64k.img"
+  }
+ }
+}

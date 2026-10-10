@@ -579,7 +579,7 @@ class StreamTest(unittest.TestCase):
 
 class ReferenceShapeTest(unittest.TestCase):
     TP3_REFERENCE = "manifests/benchmarks/2026-10-05-karmic-kraken-r6.json"
-    TP4_REFERENCE = "manifests/benchmarks/2026-10-05-karmic-kraken-r6-tp4.json"
+    TP4_REFERENCE = "manifests/benchmarks/2026-10-10-karmic-kraken-r6d-tp4.json"
     OLD_REFERENCE = "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json"
     TP4_MISMATCH = "was measured with nodes 3, transport oneshot-direct; this {} has nodes 4, transport oneshot-ring4"
     # The profiles read the site's git-ignored node maps; use the example map
@@ -649,6 +649,8 @@ class ReferenceShapeTest(unittest.TestCase):
         # and for a saved report.
         cluster, nodes = self.profile("config/cluster-tp4.json")
         del cluster["benchmark_reference"]
+        # On the TP3 profiles' baseline, whose default reference is its three-node run.
+        cluster["promoted_baseline"] = spark.read_json("config/cluster.json")["promoted_baseline"]
         for argv in ([], ["--report", self.report(cluster, nodes)]):
             with self.subTest(argv=argv):
                 status, output = self.bench("config/cluster-tp4.json", cluster, nodes, *argv)

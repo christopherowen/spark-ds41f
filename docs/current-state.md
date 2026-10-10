@@ -1,12 +1,23 @@
 # Current state
 
-Promoted 2026-10-05 as
-[`2026-10-05-karmic-kraken-r6`](../manifests/baselines/2026-10-05-karmic-kraken-r6.json)
-for all three nodes from `config/cluster.json`
-([promotion record](../experiments/2026-10-05-tilelang-r6/README.md)).
+Production is the TP4 1M profile ([config/cluster-tp4.json](../config/cluster-tp4.json))
+on the four-node ring, promoted 2026-10-10 as
+[`2026-10-10-karmic-kraken-r6d`](../manifests/baselines/2026-10-10-karmic-kraken-r6d.json)
+([promotion record](../experiments/2026-10-10-r6d-deterministic/README.md)):
+image `vllm-ds41f-kkref:19f2c20ed4d6-r6d` (`sha256:795eb1c7`) on all four ranks,
+Local Inference Lab vLLM `19f2c20e` with r6c's series and the first TileLang
+migration ports (vLLM 0048-0080), B12X `236ddff0`. Its temperature-0 outputs do
+not depend on the batch: the reduce-scatter adds in rank order (C3), the
+compressor projection keeps one arithmetic at every row count (B5), and prefill
+chunks align (threshold 8096). Recipe changes from r6: sparknet's one-shot
+all-reduce up to 2 MiB, long-prefill threshold 8096.
+
+The three-node profiles below (`config/cluster.json`, promoted 2026-10-05 as
+[`2026-10-05-karmic-kraken-r6`](../manifests/baselines/2026-10-05-karmic-kraken-r6.json),
+[promotion record](../experiments/2026-10-05-tilelang-r6/README.md)) stay on r6
+and pin its lock until they are qualified on the triangle cabling.
 The TileLang kernel family runs the model; B12X is the alternative backend in
-the same image. The same image serves the TP4 1M profile
-([config/cluster-tp4.json](../config/cluster-tp4.json)) on the four-node ring.
+the same image.
 
 | Setting | Active value |
 |---|---:|
