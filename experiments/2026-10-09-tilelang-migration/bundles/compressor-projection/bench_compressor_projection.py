@@ -10,12 +10,14 @@ the TP4 shapes: ratio 1 (wkv, BF16 out) and ratio 2 (wkv + wgate, FP32 out).
    repeated graph replays give the same bits (the split-K arrival counters reset).
 3. Time per call (both parts) under CUDA graphs, warm and cold, at the decode capture
    sizes and prefill rows, against B12X.
-4. A sweep of shard counts and blocked accumulation (both change bits, so one
-   setting is chosen per shape): time and error at each, one launch for decode rows.
+4. A sweep of the one-launch split-K's decode tiles (block_N, stages, threads per
+   row tile) at the serving shards: bits checked against the serving tile, the
+   three best by worst warm/cold ratio to B12X.
 
 Exits 1 if a check fails or the serving configuration is slower than B12X at any
 shape, warm or cold.
 """
+import concurrent.futures
 import sys
 
 import torch
@@ -39,7 +41,7 @@ from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
 
 torch.backends.cuda.matmul.allow_tf32 = False
 K, PART = 5120, 512
-SWEEP = (4, 5, 8, 10)
+SPLIT_BLOCKED = True  # the serving setting (SPLIT_BF16)
 failures = []
 
 
@@ -85,27 +87,6 @@ def run(parts, out_dtype, session):
         for w, o in zip(w_parts, b_out):
             bf16_gemv.mm(x[:rows], w, out=o[:rows], output_dtype=out_dtype, plan=plan)
 
-    def configuration(shards, blocked):
-        """A shard count's kernels, called like the serving path (one launch for
-        decode rows, the shard GEMM for prefill)."""
-        splitk = {bm: g.bf16_gemm_splitk(PART * parts, K, shards, block_M=bm, out_dtype=tl_dtype, parts=parts,
-                                         blocked=blocked) for bm in (16, 32, 64)}
-        counters = torch.zeros(8 * (PART * parts // 64), dtype=torch.int32, device=DEVICE)
-        if parts == 2:
-            gemm = g.bf16_gemm_two(PART, K, out_dtype=tl_dtype, shards=shards, blocked=blocked)
-        else:
-            gemm = g.bf16_gemm(PART, K, out_dtype=tl_dtype, shards=shards, blocked=blocked)
-        p = torch.empty((shards, g.SPLIT_DECODE_ROWS, PART * parts), dtype=torch.float32, device=DEVICE)
-
-        def call(rows):
-            outs = [o[:rows] for o in sw_out]
-            if rows <= g.SPLIT_DECODE_ROWS:
-                view = p.view(-1)[:shards * rows * PART * parts].view(shards, rows, PART * parts)
-                splitk[next((bm for bm in (16, 32) if rows <= bm), 64)](x[:rows], weight, view, counters, *outs)
-            else:
-                gemm(x[:rows], weight, *outs)
-        return call
-
     # 1. Error against FP64 at the full batch, beside DeepSeek's FP32 reference.
     tilelang(CAPACITY)
     b12x(CAPACITY)
@@ -124,16 +105,21 @@ def run(parts, out_dtype, session):
             failures.append(f"ratio {parts} part {i} error")
         del ref, reference
 
-    # 2. Batch invariance.
-    varies = []
+    # 2. Batch invariance (B12X reported: it takes the plan for the exact row count,
+    # else the 8192-row plan, and its backend follows the plan).
+    varies, b_varies = [], []
     for rows in DECODE + (g.SPLIT_DECODE_ROWS, 200) + PREFILL[:-1]:
         tilelang(rows)
+        b12x(rows)
         torch.cuda.synchronize()
         if not all(torch.equal(tl_out[i][:rows], full[i][:rows]) for i in range(parts)):
             varies.append(rows)
+        if not all(torch.equal(b_out[i][:rows], b_full[i][:rows]) for i in range(parts)):
+            b_varies.append(rows)
     if varies:
         failures.append(f"ratio {parts}: TileLang differs from its full batch at {varies}")
-    print(f"ratio {parts}: TileLang differs from its full batch at {varies or 'no'} sizes", flush=True)
+    print(f"ratio {parts}: TileLang differs from its full batch at {varies or 'no'} sizes; "
+          f"B12X at {b_varies or 'no'}", flush=True)
     flaky = [rows for rows in REPEAT if repeatable(lambda: tilelang(rows), lambda: [o[:rows] for o in tl_out])]
     if flaky:
         failures.append(f"ratio {parts}: TileLang not repeatable at {flaky}")
@@ -142,30 +128,63 @@ def run(parts, out_dtype, session):
     # 3. Time, serving configuration against B12X.
     print(f"ratio {parts} {name}: us per call (both parts), warm / cold; serving shards "
           f"{layer.tilelang_shards}", flush=True)
+    base_times = {}
     for rows in DECODE + PREFILL:
-        base = per_call(lambda: b12x(rows), rows)
+        base = base_times[rows] = per_call(lambda: b12x(rows), rows)
         port = per_call(lambda: tilelang(rows), rows)
         print(timing_line(rows, base, port), flush=True)
         if slower(base, port):
             failures.append(f"ratio {parts} rows {rows}: TileLang slower")
 
-    # 4. Shard sweep: warm / cold per call, and error vs FP64 of part 0.
-    print(f"ratio {parts} sweep: shards, blocked -> us warm/cold at rows 1, 2, 6, 16, 48, 96, 512, 8192; "
-          "error max/rms", flush=True)
-    ref0 = x.double() @ w_parts[0].double().T
-    for shards in SWEEP:
-        for blocked in (False, True):
-            if (K // 64) % shards:
+    # 4. Decode tile sweep at the serving shards: block_N, stages and threads per
+    # row tile (they change speed, not bits; checked), warm / cold against B12X.
+    shards, blocked = layer.tilelang_shards, SPLIT_BLOCKED
+    counters = torch.zeros(8 * (PART * parts // 16), dtype=torch.int32, device=DEVICE)
+    p = torch.empty((shards, g.SPLIT_DECODE_ROWS, PART * parts), dtype=torch.float32, device=DEVICE)
+    print(f"ratio {parts} decode tiles (shards {shards}): best per row tile by worst ratio to B12X", flush=True)
+    for block_M, rows_set in ((16, (1, 2, 6, 16)), (32, (24, 32)), (64, (48, 64, 96))):
+        configs = [dict(block_N=bn, num_stages=st, threads=t)
+                   for bn in (32, 64, 128) for st in (2, 3, 4, 6) for t in (64, 128, 256)
+                   if (PART * parts // 2) % bn == 0]
+        def build(cfg, block_M=block_M):
+            try:
+                return g.bf16_gemm_splitk(PART * parts, K, shards, block_M=block_M, out_dtype=tl_dtype,
+                                          parts=parts, blocked=blocked, **cfg)
+            except Exception as error:
+                return error
+        with concurrent.futures.ThreadPoolExecutor(8) as pool:
+            kernels = list(pool.map(build, configs))
+        results = {}
+        for cfg, kernel in zip(configs, kernels):
+            if isinstance(kernel, Exception):
+                print(f"  m{block_M} {cfg}: {type(kernel).__name__}", flush=True)
                 continue
-            call = configuration(shards, blocked)
-            times = [per_call(lambda: call(rows), rows) for rows in (1, 2, 6, 16, 48, 96, 512, CAPACITY)]
-            call(CAPACITY)
-            torch.cuda.synchronize()
-            err = errors(sw_out[0], ref0)
-            print(f"  shards {shards:2d} blocked {int(blocked)}: " + "  ".join(f"{w:.2f}/{c:.2f}" for w, c in times)
-                  + f"  error {err[0]:.3e}/{err[1]:.3e}", flush=True)
-    del ref0
 
+            def call(rows, kernel=kernel):
+                view = p.view(-1)[:shards * rows * PART * parts].view(shards, rows, PART * parts)
+                kernel(x[:rows], weight, view, counters, *[o[:rows] for o in sw_out])
+            times, ok = {}, True
+            for rows in rows_set:
+                try:
+                    tilelang(rows)
+                    call(rows)
+                    torch.cuda.synchronize()
+                except Exception as error:
+                    print(f"  m{block_M} {cfg}: {type(error).__name__}: {str(error)[:60]}", flush=True)
+                    ok = False
+                    break
+                if not all(torch.equal(sw_out[i][:rows], tl_out[i][:rows]) for i in range(parts)):
+                    failures.append(f"ratio {parts} m{block_M} {cfg} rows {rows}: bits differ")
+                times[rows] = per_call(lambda rows=rows: call(rows), rows)
+            if ok:
+                results["n{block_N}-st{num_stages}-t{threads}".format(**cfg)] = times
+
+        def worst(times):
+            return max(max(w / base_times[r][0], c / base_times[r][1]) for r, (w, c) in times.items())
+        ranked = sorted(results, key=lambda key: (worst(results[key]), sum(sum(v) for v in results[key].values())))
+        for key in ranked[:3]:
+            print(f"  m{block_M} {key}: worst {worst(results[key]):.3f}  "
+                  + "  ".join(f"{r}: {w:.2f}/{c:.2f}" for r, (w, c) in results[key].items()), flush=True)
 
 for parts, out_dtype in ((1, torch.bfloat16), (2, torch.float32)):
     with PreparationSession(device=DEVICE, autotune=False, compile_workers=2) as session:

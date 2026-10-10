@@ -88,6 +88,8 @@ def main():
         finally:
             git("worktree", "remove", "--force", str(work))
     for name, port in {**PORTS, **BUNDLES}.items():
+        if name in PORTS and "bundle" not in port:
+            continue  # an environment-only arm: nothing of its own to bench
         spec = port.get("bundle", port)  # a port nests its bundle; BUNDLES hold them bare
         bundle = HERE / "bundles" / name
         bundle.mkdir(parents=True, exist_ok=True)

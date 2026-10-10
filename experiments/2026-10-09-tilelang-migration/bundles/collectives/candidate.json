@@ -1,0 +1,31 @@
+{
+  "description": "C3 rank-order reduce-scatter: the exchange (simulated ranks, ring4 neighbour relay) and the TileLang sum's GPU tests, then the sum's bits, repeatability and time at TP4 sequence-parallel chunk sizes.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6c",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys; codes = [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-rfE', 'tests/kernels/test_deepseek_v41_tilelang_collectives.py']), subprocess.call([sys.executable, '/b/bench_rank_order_sum.py'])]; print('exit codes', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm__models__deepseek_v4_1__tilelang__collectives.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/collectives.py"
+    ],
+    [
+      "tests__kernels__test_deepseek_v41_tilelang_collectives.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_collectives.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_rank_order_sum.py",
+      "/b/bench_rank_order_sum.py"
+    ]
+  ]
+}

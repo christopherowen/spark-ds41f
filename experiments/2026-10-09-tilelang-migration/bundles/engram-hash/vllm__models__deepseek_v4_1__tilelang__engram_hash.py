@@ -34,7 +34,9 @@ PAD_TOKEN = 2
 
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
-def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
+def engram_hash_kernel(
+    layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
+):
     threads = (layers * HEADS + 31) // 32 * 32
     tokens = T.dynamic("tokens")
     seqs1 = T.dynamic("seqs1")  # requests + 1
@@ -47,7 +49,9 @@ def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
         ids: T.Tensor((tokens,), ids_dtype),
         image_mask: T.Tensor((tokens,), T.bool),
         starts: T.Tensor((seqs1,), T.int32),
-        history: T.StridedTensor((history_rows, HISTORY), (history_stride, 1), T.int64),
+        history: T.StridedTensor(
+            (history_rows, HISTORY), (history_stride, 1), history_dtype
+        ),
         token_map: T.Tensor((vocab,), T.int64),
         multipliers: T.Tensor((layers, LAGS), T.int64),
         primes: T.Tensor((layers, HEADS), T.int64),
@@ -90,7 +94,7 @@ def engram_hash_kernel(layers: int, vocab: int, ids_dtype: str = "int64"):
                             if raw >= 0 and raw < vocab and not image_mask[t - lag]:
                                 source = token_map[raw]
                         elif relative >= -HISTORY:
-                            raw = history[request, HISTORY + relative]
+                            raw = T.cast(history[request, HISTORY + relative], T.int64)
                             if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
                                 source = token_map[raw]
                         blocked = blocked or source == -1
@@ -121,12 +125,15 @@ def engram_hash(
 ) -> None:
     """Hash ``ids`` ([T], int32 or int64; T may include padding past the live count
     ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64) and write the request
-    and live token counts. ``history`` holds each request's last three committed
-    token ids, oldest first."""
+    and live token counts. ``history`` (int32 or int64; the runner keeps int32)
+    holds each request's last three committed token ids, oldest first."""
     if ids.numel() == 0:
         return
     kernel = engram_hash_kernel(
-        multipliers.shape[0], token_map.numel(), str(ids.dtype).removeprefix("torch.")
+        multipliers.shape[0],
+        token_map.numel(),
+        str(ids.dtype).removeprefix("torch."),
+        str(history.dtype).removeprefix("torch."),
     )
     kernel(
         ids,

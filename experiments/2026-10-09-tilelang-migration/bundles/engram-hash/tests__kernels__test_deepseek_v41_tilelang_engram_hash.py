@@ -69,11 +69,12 @@ def _expected(token_map, ids, history, starts, geometry):
 
 
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("history_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "lengths, padding",
     [((1,), 0), ((6, 1, 3, 6), 5), ((700, 1, 2, 1300), 0), ((0, 4, 0, 2), 3)],
 )
-def test_engram_hash(lengths, padding, ids_dtype):
+def test_engram_hash(lengths, padding, ids_dtype, history_dtype):
     geometry = build_geometry(
         layer_ids=LAYERS, base_table_size=16_000_000, compressed_vocab_size=COMPRESSED
     )
@@ -89,7 +90,7 @@ def test_engram_hash(lengths, padding, ids_dtype):
         ids.to(DEVICE, ids_dtype),
         image.to(DEVICE),
         starts.to(DEVICE),
-        history.to(DEVICE),
+        history.to(DEVICE, history_dtype),
         token_map.to(DEVICE),
         *geometry_tensors(geometry, DEVICE),
         out,

@@ -730,7 +730,7 @@ DECODE_TILE_ROWS = (16, 32, DECODE_ROWS)
 # to B12X over the three is lowest. Every field only changes speed: each tile
 # accumulates K in the same order, so a row's bits do not depend on the tile
 # or on prefill.
-DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
+DECODE_FP8_CONFIGS: dict[tuple[int, ...], dict[int, dict]] = {
     # TP4 attention: Q-B, indexer Q-B, fused Q-A/KV.
     (8192, 1280): {
         16: dict(block_N=128, block_K=128, num_stages=3),
@@ -758,6 +758,16 @@ DECODE_FP8_CONFIGS: dict[tuple[int, int], dict[int, dict]] = {
         32: dict(block_N=128, block_K=64, num_stages=2),
         64: dict(block_N=64, block_K=64, num_stages=2),
     },
+    # TP4 attention output: the grouped WO-A (2 groups) and WO-B (window 3's WO
+    # sweep, ranked against the default tile; WO-B keeps it from 32 rows).
+    (1024, 4096, 2): {
+        16: dict(block_N=64, block_K=128, num_stages=4),
+        32: dict(block_N=64, block_K=128, num_stages=4),
+        64: dict(block_N=64, block_K=256, num_stages=2),
+    },
+    (5120, 2048): {
+        16: dict(block_N=128, block_K=128, num_stages=3),
+    },
     # TP4 DSpark main projection.
     (6400, 6144): {
         16: dict(block_N=32, block_K=256, num_stages=4, threads=64),
@@ -780,10 +790,10 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
         shards=5,
         rows=SPLIT_DECODE_ROWS,
         decode={
-            16: dict(block_N=32, block_K=256, num_stages=2, threads=128),
+            16: dict(block_N=32, block_K=256, num_stages=3, threads=128),
             32: dict(block_N=32, block_K=256, num_stages=2, threads=128),
-            64: dict(block_N=64, block_K=128, num_stages=3, threads=128),
-            128: dict(block_N=128, block_K=128, num_stages=2, threads=128),
+            64: dict(block_N=32, block_K=128, num_stages=3, threads=128),
+            128: dict(block_N=64, block_K=128, num_stages=2, threads=128),
         },
         prefill=dict(block_M=128, block_N=64, block_K=128, num_stages=2),
     ),
@@ -791,7 +801,10 @@ SPLIT_FP8: dict[tuple[int, int], dict] = {
 SPLIT_BF16: dict[tuple[int, int], dict] = {
     # TP4 compressor wkv + wgate (ratio 2, one launch for both) and wkv (ratio 1):
     # five shards are fastest; blocked accumulation keeps the FP32 error under
-    # DeepSeek's FP32 reference.
+    # DeepSeek's FP32 reference. An entry's optional "decode" maps a row tile
+    # (PARTIAL_ROW_TILES) to the one-launch split-K's block_N, num_stages and
+    # threads, which only change speed; block_K stays 64, since blocked
+    # accumulation adds one block at a time.
     (1024, 5120): dict(shards=5, blocked=True),
     (512, 5120): dict(shards=5, blocked=True),
 }

@@ -114,7 +114,8 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
         image = ids == IMAGE_SENTINEL
         keep = ~image
         starts = torch.tensor([0, *lengths], dtype=torch.int32, device=DEVICE).cumsum(0, dtype=torch.int32)
-        history = torch.randint(0, VOCAB, (len(lengths), 3), generator=gen, device=DEVICE)
+        # int32, as the runner keeps its lookback tokens (window 4's arm failed on int64).
+        history = torch.randint(0, VOCAB, (len(lengths), 3), generator=gen, device=DEVICE, dtype=torch.int32)
         history[torch.rand(len(lengths), 3, generator=gen, device=DEVICE) < 0.2] = -1
         b_out = torch.empty((padded, len(LAYERS), 24), dtype=torch.int64, device=DEVICE)
         t_out = torch.full_like(b_out, 7)
