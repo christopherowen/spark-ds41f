@@ -419,6 +419,11 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
         out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
         split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
         shards, blocked = split["shards"], split["blocked"]
+        decode = split.get("decode", {})
+        if any("block_K" in config for config in decode.values()):
+            raise ValueError(
+                "split-K decode tiles keep block_K (it sets the sum order)"
+            )
         layer.tilelang_parts = self.parts
         layer.tilelang_shards = shards
         # Decode rows: one launch per call (the last CTA of a tile adds the shards).
@@ -431,12 +436,15 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
                 out_dtype=out_dtype,
                 parts=self.parts,
                 blocked=blocked,
+                **decode.get(block_M, {}),
             )
             for block_M in PARTIAL_ROW_TILES
         }
-        # One zeroed counter per tile; every call leaves them zeroed.
+        # One zeroed counter per tile of the narrowest decode tile; every call
+        # leaves them zeroed.
+        block_N = min(config.get("block_N", 64) for config in (*decode.values(), {}))
         layer.tilelang_counters = torch.zeros(
-            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // 64)),
+            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
             dtype=torch.int32,
             device=layer.weight.device,
         )

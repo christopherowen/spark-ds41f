@@ -137,14 +137,15 @@ gate). Numbers in parentheses are windows.
 | --- | --- | --- | --- | --- |
 | C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
 | C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
-| B5 compressor projection | `34ab993d6` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
-| B6 DSpark context KV | `4fd2e76da` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
-| B7 Engram gate | `c3e29c9a7` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
-| B2 RoPE | `164d03e34` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
-| B9 Engram hash | `3f18d6a07` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
-| B1 WO projection | `bb2331329` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
-| B8 index head weights | `86ef1c73e` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
-| D1 decode rows | `f2f8b602a` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
+| B5 compressor projection | `76424506c` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `dc1f9c30b` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `2dd03add3` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `350e8bdc3` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `5857a05c1` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `b87e2f53f` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `45a1806cd` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| C3 collectives | `58418ca15` (module `888faa681`) + dispatch 2 MiB | GPU tests pending (host exchange tests pass) | not screened | window 5 arm |
+| D1 decode rows | `8644e961b` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 
@@ -184,9 +185,31 @@ What r6c does to a row's bits when its step changes size:
   the switches at 64 rows (router split-K, block-32 decode tiles) claim equal
   bits, which the kernel benches check against the full batch.
 
+- **B12X's compressor projection (B5)** picks SIMT (up to 8 rows), cuBLAS
+  (ratio 1, 9-255 rows) or its TMA prefill kernel by row count, with
+  different bits; the ratio-2 compressor's paired state (B4) inherits them.
+  The other B12X kernels on this path are row-invariant.
+
 Before the ports, window 4 measures the control's outputs at temperature 0:
 alone, at c8, staggered, beside a long prefill, from the prefix cache and run
 to run (`token_determinism.py`).
+
+### C3: one arithmetic for every hidden-state reduction
+
+- **Dispatch.** sparknet's one-shot all-reduce takes messages up to its 2 MiB
+  capacity (204 rows, the last step before sequence parallelism) instead of
+  1 MiB. NCCL was faster there (235 against 314 us at 2 MiB in the balanced
+  policy screen), so this costs time on 103-204-row steps; `oneshot-dispatch`
+  prices it alone.
+- **Reduce-scatter.** Under sequence parallelism the TP reduce-scatter
+  exchanges the chunks unreduced (NCCL send/recv, the same bytes) and adds
+  them as the one-shot does: FP32, rank order, one rounding (vLLM module
+  `tilelang/collectives.py`, a TileLang kernel reading the rank's own chunk in
+  place). On ring4 the opposite ranks are not cabled, so each half of the
+  opposite chunk is relayed through one neighbour: every link carries M/2 per
+  direction against NCCL's 3M/8. The r5o research did the same exchange
+  directly on the TP3 triangle (vLLM 0031/0041) for +17 ms at 16K tokens.
+- `deterministic` combines C3 with B5 (the two known determinism breaks).
 
 ### Window 3 (2026-10-10, 06:54-07:04 UTC, kernels only)
 
@@ -255,6 +278,11 @@ Window 2 (`w2-kernels.json`) is kernels only: B5, B6, B1 and B2, then B8 with B6
 and B5 again on other nodes. It sweeps shard counts and tiles for the narrow
 projections; their chosen configurations go into `SPLIT_FP8` and `SPLIT_BF16`
 before the arms run again.
+
+Window 5 (`w5.json`): the C3 and B5 kernel bundles (B5 with a decode-tile
+sweep for its BF16 path), then the lean screen with the temperature-0 check,
+c1/c8 distinct streams and mixed-traffic latency for the control,
+`oneshot-dispatch`, C3, B5 and `deterministic`, bracketed by the control.
 
 Window 4 (`w4.json`): every kernel bundle, now with graph-replay repeatability
 (B5, B9; B6; B1, B8; D1, B2, B7 on dgx1-4), then the lean screen with the

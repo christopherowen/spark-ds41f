@@ -17,7 +17,7 @@ For each port: its switch commit, the environment its arm sets, and its kernel b
 
 VLLM_BRANCH = "tilelang-migration"
 BASE = "125c404e4"  # r6c's vLLM tree, as the image ships it
-MODULES = "a48174738"  # the last module commit
+MODULES = "73e5089fb"  # the last module commit
 
 PORTS = {
     # 1. C1: the CuTe DSL L2 weight prefetch -> TileLang (same work split and PTX).
@@ -38,7 +38,7 @@ PORTS = {
     },
     # 3. B5: the compressor's wkv/wgate projection, B12X bf16_gemv -> TileLang BF16 GEMM.
     "compressor-projection": {
-        "switch": "34ab993d6",
+        "switch": "76424506c",
         "environment": {},
         "bundle": {
             "modules": (
@@ -58,7 +58,7 @@ PORTS = {
     # 3. B6: the DSpark drafter's context KV, B12X block_fp8_linear -> TileLang MXFP8 GEMM
     # over the fused Q-A/KV weight's KV rows.
     "context-kv": {
-        "switch": "4fd2e76da",
+        "switch": "dc1f9c30b",
         "environment": {},
         "bundle": {
             "modules": (
@@ -78,7 +78,7 @@ PORTS = {
     # 4. B7: the Engram gate, B12X run_engram_mix -> a TileLang kernel with DeepSeek's
     # arithmetic; the model passes the image-token mask instead of its complement.
     "engram-gate": {
-        "switch": "c3e29c9a7",
+        "switch": "2dd03add3",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram.py",),
@@ -93,7 +93,7 @@ PORTS = {
     # 4. B2: RoPE, B12X rotary.rotate (out of place) -> a TileLang kernel with TileKernels'
     # arithmetic, in place on the last 64 columns, for all five attention roles.
     "rope": {
-        "switch": "164d03e34",
+        "switch": "350e8bdc3",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/rope.py",),
@@ -108,7 +108,7 @@ PORTS = {
     # 4. B9: the Engram hash, vLLM's metadata copy plus B12X's three Triton launches and
     # a copy per layer -> one TileLang launch for every layer.
     "engram-hash": {
-        "switch": "3f18d6a07",
+        "switch": "5857a05c1",
         "environment": {},
         "bundle": {
             "modules": ("vllm/models/deepseek_v4_1/tilelang/engram_hash.py",),
@@ -123,7 +123,7 @@ PORTS = {
     # 5. B1: the attention's WO projection, B12X's fused wo_projection -> inverse RoPE in
     # place, grouped WO-A and WO-B as TileLang block-32 GEMMs.
     "wo-projection": {
-        "switch": "bb2331329",
+        "switch": "b87e2f53f",
         "environment": {},
         "bundle": {
             "modules": (
@@ -143,7 +143,7 @@ PORTS = {
     # 5. B8: the indexer's head-weight scale, B12X scale_index_weights -> folded exactly
     # into the TileLang projection's weight (no kernel).
     "index-weights": {
-        "switch": "86ef1c73e",
+        "switch": "45a1806cd",
         "environment": {},
         "bundle": {
             "modules": (
@@ -164,7 +164,7 @@ PORTS = {
     # tiles for the fused Q-A/KV and shared experts, split-K for the router and the
     # indexer head weights; same bits, speed only.
     "decode-rows": {
-        "switch": "f2f8b602a",
+        "switch": "8644e961b",
         "environment": {},
         "bundle": {
             "modules": (
@@ -180,6 +180,35 @@ PORTS = {
             "scripts": ("bench_decode_rows.py",),
         },
     },
+    # 10. sparknet's one-shot all-reduce up to its 2 MiB capacity (every step below
+    # 205 rows, where sequence parallelism starts) instead of NCCL above 1 MiB: the
+    # environment half of C3, alone, to price it.
+    "oneshot-dispatch": {
+        "switch": None,
+        "environment": {"SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152"},
+    },
+    # 11. C3: one arithmetic for every hidden-state reduction. The one-shot all-reduce
+    # to 2 MiB, and sequence parallelism's reduce-scatter with its arithmetic (FP32,
+    # rank order, one rounding) instead of NCCL's ring sums.
+    "collectives": {
+        "switch": "58418ca15",
+        "environment": {"SPARKNET_ROCE_ALLREDUCE_DISPATCH_MAX_BYTES": "2097152"},
+        "bundle": {
+            "modules": ("vllm/models/deepseek_v4_1/tilelang/collectives.py",),
+            "description": "C3 rank-order reduce-scatter: the exchange (simulated ranks, ring4 "
+            "neighbour relay) and the TileLang sum's GPU tests, then the sum's bits, "
+            "repeatability and time at TP4 sequence-parallel chunk sizes.",
+            "tests": ("tests/kernels/test_deepseek_v41_tilelang_collectives.py",),
+            "select": None,
+            "scripts": ("bench_rank_order_sum.py",),
+        },
+    },
+}
+
+# Arms of several ports together (their switches touch different files): whether the
+# determinism fixes together make the outputs independent of the company they keep.
+COMBOS = {
+    "deterministic": ("collectives", "compressor-projection"),
 }
 
 # Kernel bundles that are not ports (no switch, no arm): they measure the modules.
