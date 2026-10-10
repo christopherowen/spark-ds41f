@@ -4,12 +4,12 @@ against the rank-order exchange (one-shot arithmetic), model-free, one rank per 
 
 usage (a lab "fabric" job; the runner adds the probe's rank arguments):
     fabric_reduce_scatter.py --rank R --world-size N --master-addr A --master-port P
-        [--rows 205 512 ...] [--slices 1 2 4 8] [--iters 20]
+        [--rows 205 512 ...] [--iters 20]
 
 For each step size (BF16 rows of 5120, padded to whole chunks as sequence parallelism
 pads them): the median time per call of NCCL's reduce_scatter, of the rank-order
-exchange at each slice count and at its default, and of the local rank-order sum alone,
-the slowest rank's median after a barrier before every call. Every rank-order result is
+reduce-scatter, of its exchange alone and of its local sum alone, the slowest rank's
+median after a barrier before every call. Every rank-order result is
 checked bit for bit against the FP32 rank-order sum of an exact all-gather; NCCL's
 differing elements are counted. Rank 0 prints one JSON line per step size, then a
 summary; exits 1 if any rank-order result differs.
@@ -31,7 +31,6 @@ def main() -> None:
     parser.add_argument("--master-addr", required=True)
     parser.add_argument("--master-port", type=int, required=True)
     parser.add_argument("--rows", type=int, nargs="+", default=[205, 512, 1024, 2048, 4096, 8192])
-    parser.add_argument("--slices", type=int, nargs="+", default=[1, 2, 4, 8])
     parser.add_argument("--iters", type=int, default=20)
     args = parser.parse_args()
 
@@ -60,7 +59,7 @@ def main() -> None:
     if nccl is None or nccl.disabled:
         raise RuntimeError("PyNCCL communicator is unavailable")
     from vllm.models.deepseek_v4_1.tilelang.collectives import (
-        pipeline_slices,
+        exchange_rank_order,
         rank_order_sum,
         reduce_scatter_rank_order,
     )
@@ -108,18 +107,17 @@ def main() -> None:
                "nccl_us": timed(nccl_rs), "nccl_elements_differ": slowest(nccl_differ)}
         parts = [g[own].contiguous() for g in gathered]
         row["sum_only_us"] = timed(lambda parts=parts: rank_order_sum(parts))
-        for slices in [*args.slices, None]:
-            name = f"s{slices}" if slices else f"auto{pipeline_slices(local * HIDDEN * 2)}"
+        def rank_order(x=x):
+            return reduce_scatter_rank_order(nccl, x, rank, world)
 
-            def rank_order(x=x, slices=slices):
-                return reduce_scatter_rank_order(nccl, x, rank, world, slices=slices)
-
-            result = rank_order()
-            torch.cuda.synchronize()
-            bad = int(not torch.equal(result.view(torch.int16), reference.view(torch.int16)))
-            if slowest(bad):
-                failures.append(f"{rows} rows {name}: bits differ")
-            row[f"{name}_us"] = timed(rank_order)
+        result = rank_order()
+        torch.cuda.synchronize()
+        bad = int(not torch.equal(result.view(torch.int16), reference.view(torch.int16)))
+        if slowest(bad):
+            failures.append(f"{rows} rows: bits differ")
+        row["rank_order_us"] = timed(rank_order)
+        row["exchange_only_us"] = timed(lambda x=x: exchange_rank_order(nccl, x, rank, world))
+        row["ratio"] = round(row["rank_order_us"] / row["nccl_us"], 3)
         if rank == 0:
             print(json.dumps(row), flush=True)
     if rank == 0:
