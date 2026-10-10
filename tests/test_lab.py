@@ -612,3 +612,13 @@ class FabricTest(unittest.TestCase):
             "--volume", "/h/o/a.py:/opt/a.py:ro", "img", "--signal=TERM", "600s",
             "python3", "/fabric.py", "--rank", "1", "--world-size", "4", "--master-addr", "m",
             "--master-port", "29581", "--rows", "205"])
+
+    def test_environment_overrides_the_arms_variables(self):
+        cluster = {"container": {"image": "img", "mounts": []}, "host": {"home": "/h"}}
+        probe = ["docker", "run", "--env", "A=1", "--env", "B=2", "img", "python3", "/probe.py", "--rank", "0"]
+        with mock.patch.object(lab.spark, "collective_probe_command", return_value=probe), \
+                mock.patch.object(lab.spark, "repository_path", return_value="/repo"), \
+                mock.patch.object(lab.spark.topology, "transport", return_value="oneshot-ring4"):
+            command = lab.fabric_command(cluster, {}, {}, "s.py", [], {"B": "3", "C": "4"})
+        self.assertEqual(command, ["docker", "run", "--env", "A=1", "--env", "B=3", "--env", "C=4", "img",
+                                   "python3", "/fabric.py", "--rank", "0"])

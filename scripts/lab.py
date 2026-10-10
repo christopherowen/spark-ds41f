@@ -591,11 +591,13 @@ def sync_steps(spec: dict, job: dict) -> list[dict]:
 def fabric_steps(spec: dict, job: dict) -> list[dict]:
     """A model-free script on every node at once (rank = the node's rank), in one arm's image,
     environment and mounts: the collective probe's container with the arm's overlays, while
-    serving is stopped. Each node's output is saved under the run."""
+    serving is stopped. The job's "environment" overrides variables of the arm's (a sweep of
+    transport settings without an arm each). Each node's output is saved under the run."""
     experiment = spec["experiment"]
     return [stop_step(job),
             {"kind": "fabric", "config": arm_config_path(experiment, job["config"]),
              "script": arm_config_path(experiment, job["script"]), "args": [str(a) for a in job.get("args", [])],
+             "environment": {k: str(v) for k, v in job.get("environment", {}).items()},
              "label": job.get("label", Path(job["script"]).stem), "out": f"results/private/lab/{spec['run']}"}]
 
 
@@ -887,9 +889,11 @@ def summarize_analysis(out: Path) -> dict:
 FABRIC_PORT = 29581  # the fabric scripts' rendezvous, apart from serving's
 
 
-def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: list[str]) -> list[str]:
+def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: list[str],
+                   environment: dict | None = None) -> list[str]:
     """The collective probe's container (image, per-node environment, devices, limits) with the
-    arm's mounts, running ``script`` with the probe's rank arguments followed by ``args``."""
+    arm's mounts and ``environment`` over its variables, running ``script`` with the probe's
+    rank arguments followed by ``args``."""
     if spark.topology.transport(cluster) == "rocenante-mesh4":
         raise SystemExit("fabric scripts do not run on the mesh4 transport")
     base = spark.collective_probe_command(cluster, nodes, node, FABRIC_PORT)
@@ -897,9 +901,18 @@ def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: li
     start = base.index("python3")
     head = [f"{repo}/{script}:/fabric.py:ro" if arg == f"{repo}/scripts/probe_collectives.py:/probe.py:ro"
             else arg for arg in base[:start]]
-    image = head.index(cluster["container"]["image"])
+    environment = environment or {}
+    kept = []
+    for i, arg in enumerate(head):  # drop the arm's value of an overridden variable
+        if i > 0 and head[i - 1] == "--env" and arg.split("=", 1)[0] in environment:
+            kept.pop()
+            continue
+        kept.append(arg)
+    image = kept.index(cluster["container"]["image"])
+    overrides = [value for key, item in sorted(environment.items()) for value in ("--env", f"{key}={item}")]
     mounts = [value for bind in spark.expected_binds(cluster) for value in ("--volume", bind)]
-    return head[:image] + mounts + head[image:] + ["python3", "/fabric.py", *base[start + 2:], *args]
+    return (kept[:image] + overrides + mounts + kept[image:]
+            + ["python3", "/fabric.py", *base[start + 2:], *args])
 
 
 def run_fabric(step: dict) -> list[dict]:
@@ -909,7 +922,8 @@ def run_fabric(step: dict) -> list[dict]:
     out.mkdir(parents=True, exist_ok=True)
 
     def one(node: dict) -> dict:
-        process = spark.run_ssh(nodes, node, *fabric_command(cluster, nodes, node, step["script"], step["args"]))
+        process = spark.run_ssh(nodes, node, *fabric_command(cluster, nodes, node, step["script"], step["args"],
+                                                              step.get("environment")))
         (out / f"fabric-{step['label']}-{node['name']}.txt").write_text(process.stdout + process.stderr)
         return {"node": node["name"], "exit": process.returncode}
 
