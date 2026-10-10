@@ -1,11 +1,13 @@
 """Where the TileLang WO projection's time goes, and prefill tiles for its GEMMs (TP4:
 16 heads x 512 in 2 groups, rank 1024, hidden 5120).
 
-1. Components at 1, 96, 512 and 2048 rows, warm under CUDA graphs: inverse RoPE in
-   place, the WO-A activation cast, the grouped WO-A GEMM, the WO-B cast and the WO-B
-   GEMM, each alone.
+1. Components at 1, 96, 512 and 2048 rows under CUDA graphs, warm and cold: inverse
+   RoPE in place, the WO-A activation cast, the grouped WO-A GEMM, the WO-B cast and
+   the WO-B GEMM, each alone. Warm parts each keep their own data in L2, which the
+   whole call (over 24 MB from 512 rows) cannot, so warm parts sum below it.
 2. Prefill tiles for WO-A (grouped) and WO-B at 512 and 2048 rows, warm and cold,
-   with the bits of every tile checked against the current one.
+   with the bits of every tile checked against the current one. A tile that does
+   not launch (shared memory) is skipped.
 """
 import itertools
 import sys
@@ -69,7 +71,7 @@ def kernels_for(rows):
     return ka, kb, rows
 
 
-print("components, us warm: rope | cast A | WO-A | cast B | WO-B | sum", flush=True)
+print("components, us warm/cold: rope | cast A | WO-A | cast B | WO-B | sum", flush=True)
 for rows in ROWS:
     ka, kb, padded = kernels_for(rows)
     parts = {
@@ -81,9 +83,9 @@ for rows in ROWS:
                                                             use_packed_ue8m0=True, out=(xq_b[:rows], sf_b[:rows])),
         "WO-B": lambda: kb(xq_b[:padded], wb, sf_b[:padded].view(torch.uint32), wb_sf, out[:rows]),
     }
-    times = {name: per_call(call, rows)[0] for name, call in parts.items()}
-    print(f"  rows {rows:5d}: " + " | ".join(f"{name} {t:7.2f}" for name, t in times.items())
-          + f" | sum {sum(times.values()):7.2f}", flush=True)
+    times = {name: per_call(call, rows) for name, call in parts.items()}
+    print(f"  rows {rows:5d}: " + " | ".join(f"{name} {w:.2f}/{c:.2f}" for name, (w, c) in times.items())
+          + f" | sum {sum(w for w, _ in times.values()):.2f}/{sum(c for _, c in times.values()):.2f}", flush=True)
 
 failures = []
 for label, (n, k, groups, weight, weight_sf, xq, sf, dst) in {
@@ -102,11 +104,11 @@ for label, (n, k, groups, weight, weight_sf, xq, sf, dst) in {
         for cfg in configs:
             try:
                 kernel = g.mxfp8_gemm(n, k, **cfg, swizzle_panel=current.get("swizzle_panel", 0), groups=groups)
+                kernel(xq[:rows], weight, sf[:rows].view(torch.uint32), weight_sf, dst[:rows])
+                torch.cuda.synchronize()
             except Exception as error:
-                print(f"  {label} {cfg}: {type(error).__name__}")
+                print(f"  {label} {cfg}: {type(error).__name__}: {str(error)[:80]}")
                 continue
-            kernel(xq[:rows], weight, sf[:rows].view(torch.uint32), weight_sf, dst[:rows])
-            torch.cuda.synchronize()
             if not torch.equal(dst[:rows].view(torch.int16), reference.view(torch.int16)):
                 failures.append(f"{label} {rows} {cfg}: bits differ")
             results["m{block_M}-n{block_N}-st{num_stages}".format(**cfg)] = per_call(

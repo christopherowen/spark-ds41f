@@ -4,7 +4,8 @@ roles: query (16 x 512), index query (32 x 128, replicated), KV (1 x 512), laten
 and index key (1 x 128, ratio 4), with the model's FP32 table.
 
 1. Error against FP64, no worse than B12X's (max and RMS); leading columns unchanged.
-2. Rows are independent: a prefix rotates to the same bits.
+2. Rows are independent: a prefix rotates to the same bits; repeated graph replays
+   give the same bits.
 3. Time per call under CUDA graphs, warm and cold, at the decode capture sizes and
    prefill rows.
 
@@ -16,7 +17,8 @@ import torch
 
 sys.path.insert(0, "/b")
 from kbench import (  # noqa: E402
-    CAPACITY, DECODE, DEVICE, PREFILL, errors, no_worse, per_call, slower, timing_line,
+    CAPACITY, DECODE, DEVICE, PREFILL, REPEAT, REPLAYS, errors, no_worse, per_call, repeatable, slower,
+    timing_line,
 )
 
 from b12x.attention.compressed_sparse_mla import rotary  # noqa: E402
@@ -82,6 +84,15 @@ with PreparationSession(device="cuda", autotune=False, compile_workers=2) as ses
         rope_(prefix, positions[:7], table, ratio, False)
         if not torch.equal(prefix, work[:7]):
             failures.append(f"{role}: a prefix differs")
+
+        def fresh(rows, x=x, work=work, tilelang=tilelang):
+            work[:rows].copy_(x[:rows])
+            tilelang(rows)
+        flaky = [rows for rows in REPEAT
+                 if repeatable(lambda rows=rows: fresh(rows), lambda rows=rows, work=work: [work[:rows]])]
+        if flaky:
+            failures.append(f"{role}: not repeatable at {flaky}")
+        print(f"{role}: not repeatable at {flaky or 'no'} sizes ({REPLAYS} replays each)", flush=True)
 
         # 3. Time (repeated in-place rotation costs the same as the first).
         print(f"{role}: us per call, warm / cold", flush=True)

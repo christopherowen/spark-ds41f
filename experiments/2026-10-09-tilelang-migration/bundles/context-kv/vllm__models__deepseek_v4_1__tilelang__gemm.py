@@ -808,10 +808,28 @@ def split_row_tile(rows: int) -> int:
     return min(split_bucket(rows), 64) if rows <= 128 else 64
 
 
-def decode_tile_rows(rows: int) -> int:
-    """Height of the decode tile that serves ``rows``; rows past DECODE_ROWS run in
-    whole tiles of DECODE_ROWS (a layer that allows them)."""
-    return next((height for height in DECODE_TILE_ROWS if rows <= height), DECODE_ROWS)
+# Block-32 FP8 projections whose decode tiles also serve rows past DECODE_ROWS
+# (16-stream steps reach 96 rows), by (N, K): {up to this many rows: tile height}.
+# Others take their prefill tile past DECODE_ROWS. Only speed changes: every tile
+# adds K in the same order.
+WIDE_DECODE: dict[tuple[int, int], dict[int, int]] = {}
+
+# BF16 projections whose split-K decode path serves rows past DECODE_ROWS, by
+# (N, K): the most rows it serves. The partials plus their reduce add the same
+# shards in the same order as the shard GEMM, so the bits do not change.
+BF16_SPLIT_ROWS: dict[tuple[int, int], int] = {}
+
+
+def decode_tile_rows(rows: int, wide: dict[int, int] | None = None) -> int:
+    """Height of the decode tile that serves ``rows``. Rows past DECODE_ROWS run in
+    whole tiles of the layer's ``wide`` height for them (``WIDE_DECODE``), else of
+    DECODE_ROWS (a layer that allows them)."""
+    if rows <= DECODE_ROWS:
+        return next(height for height in DECODE_TILE_ROWS if rows <= height)
+    return next(
+        (tile for bound, tile in sorted((wide or {}).items()) if rows <= bound),
+        DECODE_ROWS,
+    )
 
 
 def fp8_decode_config(

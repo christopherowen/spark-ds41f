@@ -26,17 +26,27 @@ before any window ran (old branch `tilelang-migration-v1`).
 
 ## Gate for every port
 
-1. **Same results.** Bit-identical to the kernel it replaces at every serving
-   shape, or, where we already follow DeepSeek's reference semantics, equal to
+Owner, 2026-10-10: correctness comes before speed. Where a component is not
+deterministic at temperature 0, prefer the deterministic one; tune for speed
+beyond that, meeting or beating the current kernel, until the other engines can
+be removed.
+
+1. **Deterministic.** The same bits on every run (graph replays, warm and
+   L2-evicted, against an eager call: `kbench.repeatable`) and for every row
+   count (a row's output equals that row of the full batch). Atomics may only
+   elect which CTA reduces; every sum keeps one order.
+2. **Same results.** Bit-identical to the kernel it replaces at every serving
+   shape, or, where we follow DeepSeek's reference semantics, no worse than
    that reference.
-2. **No slower per call.** Timed under CUDA graphs at the serving shapes, with
+3. **No slower per call.** Timed under CUDA graphs at the serving shapes, with
    the weights warm and cold in L2 and beside the L2 prefetch where the kernel
    overlaps it.
-3. **Serving.** A lean screen against the control in the same window: one
-   boot per arm, c1 and c8 distinct streams, three samples, bracketed. The
-   port's step time must be within noise of the control or better, with
-   quality 5/5.
-4. **Then the old kernel goes.** Once a port passes, the replaced kernel and
+4. **Serving.** A lean screen against the control in the same window: one
+   boot per arm, c1, c8 and c16 distinct streams, three samples, bracketed, and
+   the temperature-0 output check (`token_determinism.py`). The port's step
+   time must be within noise of the control or better, with quality 5/5, and
+   its outputs no less deterministic than the control's.
+5. **Then the old kernel goes.** Once a port passes, the replaced kernel and
    its switch are removed; no fallback arm stays behind.
 
 Arms share the control's pinned DSpark cost curves, so the kernel is the only
@@ -120,19 +130,21 @@ completeness; not part of this migration unless the owner extends it.
 ## Status
 
 The owner's bar since window 1 (2026-10-10): faster than the replaced kernel
-everywhere, at every row count, warm and cold.
+everywhere, at every row count, warm and cold, after determinism (see the
+gate). Numbers in parentheses are windows.
 
-| Port | Switch commit | Kernels (window 1, 2026-10-09) | Serving screen (window 1) | Next |
+| Port | Switch commit | Kernels (latest window) | Serving screen | Next |
 | --- | --- | --- | --- | --- |
-| C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass**: a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control | ready |
-| C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe | ready |
-| B5 compressor projection | `03ce20c16` | fail: faster than B12X at 4-64 rows and prefill, 1.7x slower at 72-96 (prefill path), FP32 error 20x B12X's | c8 -4.4% with changed acceptance | window 2: one fused launch for both parts, split-K to 128 rows, shard sweep; error gated against DeepSeek's FP32 reference |
-| B6 DSpark context KV | `43e30271d` | fail: numerics equal to B12X, faster at 1-32 rows, slower at 48-64 (1.3x), 72-96 (3.1x) and 512 (1.7x) | not screened | window 2: split-K MXFP8 to 128 rows, split prefill tiles, sweep |
-| B7 Engram gate | `80bb28564` | **pass**: 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | arm |
-| B2 RoPE | `bf8c1c72a` | unit tests pass (bit-equal to TileKernels); bench crashed (device without index) | not screened | window 2 |
-| B9 Engram hash | `ee4871959` | **pass**: exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | arm |
-| B1 WO projection | `60e79424a` | unit tests pass; bench crashed (no workspace); tile sweep ran (WO-A small wins) | not screened | window 2 |
-| B8 index head weights | `b4abab04f` | not run (window 1's third job stopped on a LAN drop) | not screened | window 2 |
+| C1 L2 prefetch | `c916fed96` (module; environment switch) | **pass** (1): a weight reads 15-27% faster after the TileLang prefetch than after the CuTe one | level with the control (1) | ready |
+| C2 sparknet | sparknet `b61660f` | bit-identical (2026-10-05) | TileLang level with CuTe (1) | ready |
+| B5 compressor projection | `34ab993d6` | (3) FP32 path faster everywhere, error below DeepSeek's reference; BF16 path 4-15% slower cold at 1-2 and 48-96 rows | c8 -4.4% (1, before split-K) | BF16 cold tiles |
+| B6 DSpark context KV | `4fd2e76da` | (3) faster at 1-72 rows and 8192; slower at 96 cold, 512 and 2048 | not screened | prefill tiles and splits past 96 rows |
+| B7 Engram gate | `c3e29c9a7` | **pass** (1): 0.39-0.87x B12X at every size, error equal to B12X and TileKernels | not screened | window 4 arm |
+| B2 RoPE | `164d03e34` | (2) faster nearly everywhere; one-head roles now share blocks between tokens (`e03a76cb9`) | not screened | window 4 arm |
+| B9 Engram hash | `3f18d6a07` | **pass** (1): exact; 22 us a step eager instead of 100, 2.4 us instead of 10 under graphs | not screened | window 4 arm |
+| B1 WO projection | `bb2331329` | (3) faster warm at 1-48 rows and 8192; slower cold and at 64-2048 | not screened | the activation cast inside the GEMM |
+| B8 index head weights | `86ef1c73e` | (2) bits equal; faster at decode, level past 64 rows (D1 splits them) | not screened | window 4 arm |
+| D1 decode rows | `f2f8b602a` | (3) same bits; faster at 65-128 rows (router to 256, indexer head weights to 1024) | not screened | window 4 arm (c16) |
 
 ### Window 2 (2026-10-10, 06:18-06:36 UTC, kernels only)
 
@@ -153,6 +165,50 @@ Window 3 (`w3-kernels.json`, module `e0da3df05`): one-launch split-K and blocked
 accumulation for B5, per-bucket tiles for B6 with split-K timed to 512 rows, WO
 decode tiles to 128 rows plus a component breakdown and prefill-tile sweep, and
 the production projections at 65-1024 rows (`decode-rows`).
+
+### Determinism of r6c (source audit, 2026-10-10)
+
+What r6c does to a row's bits when its step changes size:
+
+- **Collectives** (the largest gap). sparknet's one-shot all-reduce adds the
+  four ranks in order 0-3 in FP32 and rounds once: the same bits at any batch
+  size, rank or restart. But it takes messages up to its 1 MiB dispatch limit
+  only: hidden-state all-reduces of 103-204 rows go to NCCL all-reduce, and
+  forwards of 205 rows or more switch to prefill sequence parallelism, whose
+  reduce-scatter is plain NCCL. NCCL's ring order depends on where a row falls
+  in the message and rounds to BF16 after every hop, so a decode row that
+  shares a step with a prefill chunk gets different bits than alone. The
+  drafter (at most 96 rows) always reduces one-shot.
+- **TileKernels and the TileLang kernels** (mHC, router, MoE grouping and
+  combine, norms, SwiGLU, activation cast) are row-invariant by construction;
+  the switches at 64 rows (router split-K, block-32 decode tiles) claim equal
+  bits, which the kernel benches check against the full batch.
+
+Before the ports, window 4 measures the control's outputs at temperature 0:
+alone, at c8, staggered, beside a long prefill, from the prefix cache and run
+to run (`token_determinism.py`).
+
+### Window 3 (2026-10-10, 06:54-07:04 UTC, kernels only)
+
+- B5 (one-launch split-K, blocked): the FP32 path is faster everywhere
+  (0.10-0.98x B12X) at an error of 1.6e-7, below DeepSeek's FP32 reference
+  (1.0e-6). The BF16 path is faster warm but 4-8% slower cold at 1-2 rows and
+  5-15% at 48-96.
+- B6: faster at 1-72 rows and 8192; slower at 96 cold (1.06x), 512 (1.14x) and
+  2048 (1.03x). The sweep stopped on a repeated B12X plan name (fixed).
+- B1: faster warm at 1-48 rows; 3-5% slower cold at small rows, 1.1-1.2x at
+  64-96, 1.27-1.33x at 512, 1.07x at 2048, 0.73-0.76x at 8192. The activation
+  cast reads 32 MB and writes 16 MB at 2048 rows, DRAM-bound (231 us); B12X
+  quantizes inside its GEMM. The breakdown's warm parts each kept their data
+  in L2, so they summed below the whole call; it now reports cold times too
+  and skips tiles that do not launch.
+- Production projections at 65-128 rows (`decode-rows`): every decode tile and
+  split gives the prefill path's bits. Decode tiles win for the fused Q-A/KV
+  (32-row tiles to 96 rows, 64 to 128), the shared experts' gate/up (2.4x
+  warm) and down (32-row tiles to 96); split-K wins for the router to 256 rows
+  and the indexer head weights to 1024 (31 us down to 5-16 us). Q-B, the
+  indexer's Q-B and the DSpark main projection keep their prefill tiles. This
+  is port D1, switch `f2f8b602a` (module `a48174738` adds the empty tables).
 
 ### Window 1 (2026-10-09, 22:02-22:32 UTC)
 
@@ -200,6 +256,11 @@ and B5 again on other nodes. It sweeps shard counts and tiles for the narrow
 projections; their chosen configurations go into `SPLIT_FP8` and `SPLIT_BF16`
 before the arms run again.
 
+Window 4 (`w4.json`): every kernel bundle, now with graph-replay repeatability
+(B5, B9; B6; B1, B8; D1, B2, B7 on dgx1-4), then the lean screen with the
+temperature-0 output check and c1/c8/c16 distinct streams for the control, D1,
+B7, B9, B2 and B8, bracketed by the control.
+
 ## Files
 
 - `ports.py`: the module tip, each port's switch commit, environment and kernel
@@ -212,7 +273,9 @@ before the arms run again.
 - `make_configs.py`: writes `control.json` (the modules over the r6c TP4 recipe)
   and one arm per port (the modules with its switch files over them).
 - `kbench.py`: the benches' shared CUDA-graph timing (warm, and cold after an
-  L2 eviction) and error helpers.
+  L2 eviction), error helpers and graph-replay repeatability check.
+- `token_determinism.py`: the temperature-0 output check of a serving arm
+  (tokens and logprobs against each prompt served alone).
 - `bundles/<port>/`: each port's kernel bundle (`candidate.json`, its bench).
 - `profile_*.py`, `summarize_kernels.py`, `analyze_costs.py`, `tables_arms.py`:
   the lab runner's profile and table scripts (from

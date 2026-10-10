@@ -9,7 +9,7 @@ warm (same weight), cold (distinct weights) and self (each call follows the L2
 prefetch of its own weight). For the narrow BF16 projections (the router and the
 indexer's head weights), at 72 to 1024 rows: the shard GEMM against split-K partials
 plus reduce, warm and cold. Checks the bits of every variant against the prefill
-GEMM. Exits 1 only if bits differ.
+GEMM, and that graph replays of each repeat its bits. Exits 1 only if bits differ.
 """
 import sys
 
@@ -17,7 +17,7 @@ import tile_kernels
 import torch
 
 sys.path.insert(0, "/b")
-from kbench import DEVICE, per_call  # noqa: E402
+from kbench import DEVICE, per_call, repeatable  # noqa: E402
 
 from vllm.models.deepseek_v4_1.tilelang import gemm as g  # noqa: E402
 from vllm.models.glm5next.nvidia import l2_prefetch as L  # noqa: E402
@@ -88,6 +88,8 @@ for name, (N, K) in SHAPES.items():
                 ref = bits
             elif not torch.equal(bits.view(torch.int16), ref.view(torch.int16)):
                 failures.append(f"{name} rows {rows} {label}: bits differ from prefill")
+            if repeatable(lambda run_one=run_one: run_one(0), lambda rows=rows: [out[:rows]]):
+                failures.append(f"{name} rows {rows} {label}: not repeatable")
             warm = timed([lambda: run_one(0)] * 16)
             cold = timed([(lambda i=i: run_one(i % copies)) for i in range(2 * copies)])
 
@@ -128,6 +130,8 @@ for label, (N, K, out_dtype, torch_dtype) in {
         torch.cuda.synchronize()
         if not torch.equal(out[:rows], ref):
             failures.append(f"{label} rows {rows}: split differs")
+        if repeatable(split, lambda rows=rows: [out[:rows]]):
+            failures.append(f"{label} rows {rows}: split not repeatable")
         a = per_call(lambda: full(x[:rows], w, out[:rows]), rows)
         b = per_call(split, rows)
         print(f"  rows {rows:5d}  full {a[0]:7.1f}/{a[1]:7.1f}  split {b[0]:7.1f}/{b[1]:7.1f}  "

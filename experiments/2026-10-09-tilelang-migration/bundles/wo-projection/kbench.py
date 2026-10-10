@@ -3,9 +3,14 @@
 Time per call under CUDA graphs: warm repeats the call inside one replay with the
 weights in L2; cold evicts L2 with a 128 MiB read before a one-call replay. Both sides
 of a comparison pay the same graph launch.
+
+Repeatability: a port must give the same bits on every run (temperature-0 serving
+replays the same graphs), so each bench replays its kernels' graphs, warm and cold,
+against an eager call.
 """
 import statistics
 import sys
+from collections.abc import Callable
 
 import torch
 
@@ -17,6 +22,8 @@ DEVICE = torch.device("cuda", torch.cuda.current_device())
 DECODE = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 72, 80, 96)
 CAPACITY = 8192
 PREFILL = (512, 2048, CAPACITY)
+REPEAT = (1, 6, 16, 48, 96, 128, 512, CAPACITY)  # sizes whose graphs are replayed for repeatability
+REPLAYS = 200
 SLOWER = 1.03  # a port may be at most 3% slower per call, warm or cold
 _EVICT = torch.ones(128 << 20, dtype=torch.uint8, device=DEVICE).view(torch.int32)
 
@@ -77,3 +84,24 @@ def timing_line(rows: int, base: tuple[float, float], port: tuple[float, float])
 
 def slower(base: tuple[float, float], port: tuple[float, float]) -> bool:
     return port[0] > base[0] * SLOWER or port[1] > base[1] * SLOWER
+
+
+def repeatable(fn, outputs: Callable[[], list[torch.Tensor]], replays: int = REPLAYS) -> int:
+    """Replays of a one-call CUDA graph of ``fn`` whose outputs differ in any bit from an
+    eager call's (0: repeatable). Every other replay follows an L2 eviction, so tiles
+    and pipeline stages land at different times. ``outputs`` is read after the eager
+    call and again after capture (a call that allocates its result writes it to the
+    graph's pool)."""
+    fn()
+    torch.cuda.synchronize()
+    refs = [o.clone() for o in outputs()]
+    g = graph(fn, 1)
+    outs = outputs()
+    bad = torch.zeros((), dtype=torch.int64, device=DEVICE)
+    for i in range(replays):
+        if i % 2:
+            _EVICT.max()
+        g.replay()
+        bad += torch.stack([(o.view(torch.uint8) != r.view(torch.uint8)).any() for o, r in zip(outs, refs)]).any()
+    torch.cuda.synchronize()
+    return int(bad)

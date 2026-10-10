@@ -68,13 +68,15 @@ for a in ARMS:
         cells.append(f"{size}: {tps:.0f} ({p['ttft_s']['mean']:.2f}){change(tps, base.get(size), True, p['prefill_tps']['ci95_pct'])}")
         base.setdefault(size, tps)
     print(f"  {a:10s} " + "; ".join(cells))
-print("eight distinct concurrent prompts (tok/s ±95%)")
-b = None
-for a in ARMS:
-    s = [x for x in lines("c8-distinct", a) if "summary" in x]
-    if s:
-        print(f"  {a:10s} {s[0]['tps_mean']:7.2f} ±{s[0]['ci95_pct']:.1f}%{change(s[0]['tps_mean'], b, True, s[0]['ci95_pct'])}")
-        b = b or s[0]["tps_mean"]
+for streams, words in ((8, "eight"), (16, "sixteen")):
+    print(f"{words} distinct concurrent prompts (tok/s ±95%)")
+    b = None
+    for a in ARMS:
+        s = [x for x in lines(f"c{streams}-distinct", a) if "summary" in x]
+        if s:
+            print(f"  {a:10s} {s[0]['tps_mean']:7.2f} ±{s[0]['ci95_pct']:.1f}%"
+                  f"{change(s[0]['tps_mean'], b, True, s[0]['ci95_pct'])}")
+            b = b or s[0]["tps_mean"]
 print("short prompts: request time, median over lengths (ms)")
 b = None
 for a in ARMS:
@@ -97,3 +99,11 @@ for a in ARMS:
         print(f"  {a:10s} " + "; ".join(cells))
         for k in keys:
             b.setdefault(k, s[k])
+print("temperature 0: requests differing from each prompt alone (tokens / logprobs only)")
+for a in ARMS:
+    s = [x for x in lines("determinism", a) if "summary" in x]
+    if s:
+        s = s[0]
+        cells = [f"{name} {r['token_diffs']}/{r['logprob_diffs']}" for name, r in s["scenarios"].items()]
+        verdict = "identical" if s["identical"] else "DIFFERS"
+        print(f"  {a:10s} {verdict}{'' if s['logprobs'] else ' (no logprobs)'}: " + "; ".join(cells))
