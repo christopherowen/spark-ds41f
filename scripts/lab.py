@@ -1198,7 +1198,11 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     break
             elif step["kind"] == "analyze":
                 summary = analyze(step)
-                log(f"analysed {step['out']}: {'PASSED' if summary['passed'] else 'DIFFERENCES'}")
+                passed = summary["passed"]
+                log(f"analysed {step['out']}: {'PASSED' if passed else 'DIFFERENCES'}")
+                if not passed:
+                    failed = f"analysis of {step['out']} found differences"
+                    break
             elif step["kind"] == "image":
                 problem = run_image(step)
                 if problem:
