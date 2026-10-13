@@ -1,18 +1,35 @@
-"""servebench command line: ``run`` measures a live server, ``compare`` judges two runs."""
+"""servebench command line: ``run`` measures a live server, ``engine`` times its steps,
+``model`` records what it computes, ``compare`` judges two results."""
 
 import argparse
 import datetime
+import gzip
 import json
 import os
 import sys
+import time
 import urllib.request
 
-from . import SCHEMA, __version__, engine, load, prompts, report
+from . import SCHEMA, __version__, behaviour, engine, load, prompts, report
 
 
 def model_id(base_url: str) -> str:
     with urllib.request.urlopen(base_url.rstrip("/") + "/v1/models", timeout=60) as response:
         return json.load(response)["data"][0]["id"]
+
+
+def write_json(path: str, value: dict) -> None:
+    """Pretty JSON, gzip-compressed when the path ends in .gz."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "wt", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=None if path.endswith(".gz") else 1)
+
+
+def read_json(path: str) -> dict:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -43,9 +60,7 @@ def command_run(args: argparse.Namespace) -> int:
             | {"events": [[round(t - origin, 4), n] for t, n in record["events"]]}
             for record in raw["records"]]
     if args.output:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as handle:
-            json.dump(result, handle, indent=1)
+        write_json(args.output, result)
     tps = summary.get("output_tps", {})
     line = {"summary": f"servebench {spec.mode}", "label": args.label, "mode": spec.mode,
             "concurrency": spec.concurrency if spec.mode != "poisson" else None,
@@ -78,9 +93,7 @@ def command_engine(args: argparse.Namespace) -> int:
                            "drafts": args.drafts},
               "engine": rows}
     if args.output:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as handle:
-            json.dump(result, handle, indent=1)
+        write_json(args.output, result)
     for row in rows:
         d = row["step_ms"]
         print(f"{row['label']:32s} {d['mean']:9.3f} ms ±{d['ci95_pct'] or 0:.2f}%", file=sys.stderr)
@@ -91,18 +104,61 @@ def command_engine(args: argparse.Namespace) -> int:
     return 0 if raw["prefix_cache_reset"] else 1
 
 
+def command_model(args: argparse.Namespace) -> int:
+    prompt_set = prompts.load(args.prompts)[:args.limit or None]
+    extra = json.loads(args.extra_body) if args.extra_body else {}
+    model = args.model or model_id(args.url)
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    generated = behaviour.generate(args.url, model, prompt_set, concurrency=args.concurrency,
+                                   max_tokens=args.max_tokens, fixed_length=args.fixed_length,
+                                   extra_body=extra)
+    sequences, source = generated["sequences"], "self"
+    if args.corpus:
+        sequences, source = read_json(args.corpus)["generation"]["sequences"], args.corpus
+    scores, score_seconds = None, None
+    if not args.no_score:
+        began = time.monotonic()
+        scores = behaviour.score(args.url, model, sequences, top=args.top, concurrency=args.score_concurrency)
+        score_seconds = round(time.monotonic() - began, 2)
+    result = {"schema": behaviour.SCHEMA, "tool": {"name": "servebench", "version": __version__},
+              "started_utc": started, "label": args.label, "server": {"url": args.url, "model": model},
+              "workload": {"prompts": args.prompts, "prompt_count": len(prompt_set),
+                           "prompts_sha256": prompts.digest(prompt_set), "concurrency": args.concurrency,
+                           "max_tokens": args.max_tokens, "fixed_length": args.fixed_length,
+                           "top": args.top, "extra_body": extra},
+              "generation": generated,
+              "corpus": {"source": source, "sha256": behaviour.corpus_digest(sequences),
+                         "sequences": sum(1 for s in sequences if not s.get("error"))},
+              "scores": scores, "score_seconds": score_seconds,
+              "self_agreement": behaviour.self_agreement(scores) if scores and source == "self" else None}
+    if args.output:
+        write_json(args.output, result)
+    failed = sum(1 for s in generated["sequences"] + (scores or []) if s.get("error"))
+    agreement = result["self_agreement"] or {}
+    print(json.dumps({"summary": "servebench model", "label": args.label,
+                      "acceptance_length": generated["acceptance"].get("acceptance_length"),
+                      "outputs_sha256": behaviour.corpus_digest(generated["sequences"]),
+                      "rank1_fraction": agreement.get("rank1_fraction"),
+                      "perplexity": agreement.get("perplexity"), "generate_s": generated["seconds"],
+                      "score_s": score_seconds, "failed": failed, "output": args.output}), flush=True)
+    return 1 if failed else 0
+
+
 def command_compare(args: argparse.Namespace) -> int:
-    runs = []
-    for path in (args.base, args.candidate):
-        with open(path, encoding="utf-8") as handle:
-            runs.append(json.load(handle))
+    runs = [read_json(path) for path in (args.base, args.candidate)]
     if runs[0].get("schema") != runs[1].get("schema"):
         raise SystemExit(f"different result kinds: {runs[0].get('schema')} vs {runs[1].get('schema')}")
+    labels = [run.get("label") or path for run, path in zip(runs, (args.base, args.candidate))]
+    if runs[0].get("schema") == behaviour.SCHEMA:
+        result = behaviour.compare(runs[0], runs[1])
+        print(behaviour.format_comparison(result, labels[0], labels[1]))
+        if args.json:
+            print(json.dumps(result))
+        return 0
     if runs[0].get("schema") == engine.SCHEMA:
         result = engine.compare(runs[0], runs[1], tolerance_pct=args.tolerance)
     else:
         result = report.compare(runs[0], runs[1], tolerance_pct=args.tolerance)
-    labels = [run.get("label") or path for run, path in zip(runs, (args.base, args.candidate))]
     print(report.format_comparison(result, labels[0][:12], labels[1][:12]))
     if args.json:
         print(json.dumps(result))
@@ -145,6 +201,25 @@ def main(argv: list[str] | None = None) -> int:
     grid.add_argument("--label", help="name for tables")
     grid.add_argument("--output", help="write the result JSON here")
     grid.set_defaults(func=command_engine)
+    behave = sub.add_parser("model", help="model behaviour: greedy acceptance by draft position and "
+                                          "teacher-forced log-probabilities")
+    behave.add_argument("url", help="base URL, e.g. http://127.0.0.1:8000")
+    behave.add_argument("--corpus", help="score this earlier model run's sequences (default: this run's own)")
+    behave.add_argument("--prompts", default="default", help="prompt set name or JSONL path")
+    behave.add_argument("--limit", type=int, help="first N prompts only")
+    behave.add_argument("--concurrency", type=int, default=16, help="greedy requests in flight")
+    behave.add_argument("--max-tokens", type=int, default=256)
+    behave.add_argument("--fixed-length", action="store_true",
+                        help="write exactly --max-tokens past end of sequence (default: stop there)")
+    behave.add_argument("--top", type=int, default=20,
+                        help="log-probabilities kept per position (vLLM's --max-logprobs, default 20)")
+    behave.add_argument("--score-concurrency", type=int, default=8)
+    behave.add_argument("--no-score", action="store_true", help="generation and acceptance only")
+    behave.add_argument("--model", help="model id (default: the server's first)")
+    behave.add_argument("--extra-body", help="JSON merged into every generation request body")
+    behave.add_argument("--label", help="name for tables")
+    behave.add_argument("--output", help="write the result JSON here (.gz to compress)")
+    behave.set_defaults(func=command_model)
     compare = sub.add_parser("compare", help="judge a candidate run against a base run")
     compare.add_argument("base")
     compare.add_argument("candidate")

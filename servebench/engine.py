@@ -63,10 +63,7 @@ def run(base_url: str, shapes: list[dict], *, replays: int = 30, warmup: int = 2
     """Time ``shapes`` on the server and reset its prefix cache afterwards."""
     base = base_url.rstrip("/")
     if require_idle:
-        counters = prom.scrape(base, prom.VLLM) or {}
-        busy = counters.get("requests_running", 0) + counters.get("requests_waiting", 0)
-        if busy:
-            raise RuntimeError(f"server not idle ({busy:.0f} requests): the grid needs it to itself")
+        prom.require_idle(base, "the grid")
     spec = {"shapes": [{k: v for k, v in s.items() if k != "kind"} for s in shapes],
             "replays": replays, "warmup": warmup}
     answer = _post(base + "/collective_rpc",

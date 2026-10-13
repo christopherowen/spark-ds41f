@@ -14,20 +14,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from servebench import __main__ as cli  # noqa: E402
-from servebench import client, engine, load, prom, prompts, report, stats  # noqa: E402
+from servebench import behaviour, client, engine, load, prom, prompts, report, stats  # noqa: E402
 
 CHUNK_TOKENS = 2      # tokens per streamed chunk (a "step" of the fake engine)
 CHUNK_DELAY_S = 0.004
+VOCAB = 1000
+
+
+def next_token(token: int) -> int:
+    """The fake model's greedy choice after ``token``."""
+    return (token * 7 + 3) % VOCAB
+
+
+def fake_distribution(previous: int, top: int, variant: bool) -> list[tuple[int, float]]:
+    """Top ``top`` (token, log-probability) after ``previous``: the greedy token first."""
+    probabilities = [0.5 ** (k + 1) for k in range(top)]
+    if variant:  # move a little mass from the greedy token to the runner-up
+        probabilities[0] -= 0.004
+        probabilities[1] += 0.004
+    return [((next_token(previous) + 37 * k) % VOCAB, math.log(p)) for k, p in enumerate(probabilities)]
 
 
 class FakeServer:
     """Streams max_tokens / 2 chunks of two tokens each; counts steps and tokens."""
 
-    def __init__(self, step_scale: float = 1.0):
+    def __init__(self, step_scale: float = 1.0, variant: bool = False):
         self.step_scale = step_scale  # engine grid: multiplies every step time
+        self.variant = variant        # model behaviour: a build whose numbers differ slightly
         self.resets = 0
         self.lock = threading.Lock()
-        self.counters = {"generation": 0, "steps": 0, "step_tokens": 0, "drafts": 0, "accepted": 0}
+        self.counters = {"generation": 0, "steps": 0, "step_tokens": 0, "drafts": 0, "accepted": 0,
+                         "pos0": 0, "pos1": 0}
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -47,6 +64,10 @@ class FakeServer:
                         f'vllm:iteration_tokens_total_sum{{engine="0"}} {c["step_tokens"]}\n'
                         f'vllm:spec_decode_num_drafts_total{{engine="0"}} {c["drafts"]}\n'
                         f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {c["accepted"]}\n'
+                        f'vllm:spec_decode_num_draft_tokens_per_pos{{engine="0",position="0"}} {c["drafts"]}\n'
+                        f'vllm:spec_decode_num_draft_tokens_per_pos{{engine="0",position="1"}} {c["drafts"]}\n'
+                        f'vllm:spec_decode_num_accepted_tokens_per_pos{{engine="0",position="0"}} {c["pos0"]}\n'
+                        f'vllm:spec_decode_num_accepted_tokens_per_pos{{engine="0",position="1"}} {c["pos1"]}\n'
                         'vllm:kv_cache_usage_perc{engine="0"} NaN\n').encode()
                 else:
                     self.send_error(404)
@@ -75,6 +96,13 @@ class FakeServer:
                                                "drafter_ms": [v * 0.2 for v in samples], "modes": []})
                             workers.append({"rank": rank, "replays": spec["replays"], "shapes": shapes})
                         body = json.dumps({"results": workers}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                if self.path == "/v1/completions" or not request.get("stream"):
+                    body = json.dumps(fake.answer(self.path, request)).encode()
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -113,6 +141,37 @@ class FakeServer:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
+
+    def answer(self, path: str, request: dict) -> dict:
+        """Non-streaming replies: greedy generation with token ids, or prompt scoring."""
+        if path == "/v1/completions":
+            tokens, top = request["prompt"], request["prompt_logprobs"]
+            rows = [None]
+            for j in range(1, len(tokens)):
+                pairs = fake_distribution(tokens[j - 1], top, self.variant)
+                entry = {str(t): {"logprob": lp, "rank": k + 1, "decoded_token": "x"}
+                         for k, (t, lp) in enumerate(pairs)}
+                entry.setdefault(str(tokens[j]), {"logprob": -9.0, "rank": 500, "decoded_token": "y"})
+                rows.append(entry)
+            return {"choices": [{"text": "x", "prompt_logprobs": rows}]}
+        text = request["messages"][0]["content"]
+        prompt_ids = [ord(ch) % VOCAB for ch in text[:12]]
+        output, token = [], prompt_ids[-1]
+        length = request["max_tokens"] if request.get("ignore_eos") else min(request["max_tokens"], 6 + len(text) % 5)
+        for i in range(length):
+            token = next_token(token)
+            if self.variant and len(text) % 3 == 0 and i == 4:
+                token = (token + 1) % VOCAB  # this build's greedy choice differs here
+            output.append(token)
+        with self.lock:
+            self.counters["generation"] += length
+            self.counters["drafts"] += length // 2
+            self.counters["accepted"] += length // 2 + length // 4
+            self.counters["pos0"] += length // 2
+            self.counters["pos1"] += length // 4
+        return {"prompt_token_ids": prompt_ids,
+                "choices": [{"message": {"content": "x"}, "token_ids": output,
+                             "finish_reason": "length" if length == request["max_tokens"] else "stop"}]}
 
     def close(self):
         self.server.shutdown()
@@ -274,6 +333,58 @@ class EngineTest(unittest.TestCase):
         finally:
             prom.scrape = original
             busy.close()
+
+
+class BehaviourTest(unittest.TestCase):
+    def test_by_label_sums_one_label(self):
+        text = ('m{engine="0",position="0"} 3\nm{engine="1",position="0"} 2\n'
+                'm{engine="0",position="1"} 4\nm{engine="0",xposition="1"} 9\nother{position="0"} 7\n')
+        self.assertEqual(prom.by_label(text, "m", "position"), {"0": 5.0, "1": 4.0})
+
+    def test_kl_divergence(self):
+        half = math.log(0.5)
+        self.assertEqual(behaviour.kl_divergence({1: half, 2: half}, {1: half, 2: half}, half), 0.0)
+        kl = behaviour.kl_divergence({1: half, 2: half}, {1: math.log(0.25), 2: math.log(0.75)}, -9.0)
+        self.assertAlmostEqual(kl, 0.5 * math.log(2) + 0.5 * math.log(0.5 / 0.75))
+        # the unlisted rest of the vocabulary is one bucket
+        kl = behaviour.kl_divergence({1: math.log(0.9)}, {1: math.log(0.8)}, -9.0)
+        self.assertAlmostEqual(kl, 0.9 * math.log(0.9 / 0.8) + 0.1 * math.log(0.1 / 0.2))
+
+    def test_model_runs_self_agreement_and_compare(self):
+        base, again, other = FakeServer(), FakeServer(), FakeServer(variant=True)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                paths = {name: os.path.join(tmp, f"{name}.json.gz") for name in ("base", "again", "other")}
+                self.assertEqual(cli.main(["model", base.url, "--limit", "12", "--top", "5",
+                                           "--label", "base", "--output", paths["base"]]), 0)
+                for name, server in (("again", again), ("other", other)):
+                    self.assertEqual(cli.main(["model", server.url, "--limit", "12", "--top", "5",
+                                               "--corpus", paths["base"], "--label", name,
+                                               "--output", paths[name]]), 0)
+                runs = {name: cli.read_json(path) for name, path in paths.items()}
+            self.assertEqual(runs["base"]["self_agreement"]["rank1_fraction"], 1.0)
+            accepted = runs["base"]["generation"]["acceptance"]
+            self.assertEqual([row["position"] for row in accepted["per_position"]], [0, 1])
+            self.assertGreater(accepted["acceptance_length"], 1.0)
+            self.assertEqual(runs["again"]["corpus"]["sha256"], runs["base"]["corpus"]["sha256"])
+
+            same = behaviour.compare(runs["base"], runs["again"])
+            self.assertEqual(same["warnings"], [])
+            self.assertEqual(same["generation"]["identical"], 12)
+            self.assertEqual(same["scores"]["identical_fraction"], 1.0)
+            self.assertEqual(same["scores"]["kl"]["max"], 0.0)
+
+            diff = behaviour.compare(runs["base"], runs["other"])
+            self.assertLess(diff["generation"]["identical"], 12)
+            self.assertEqual(diff["generation"]["divergence"]["p50"], 4)
+            scores = diff["scores"]
+            self.assertEqual((scores["skipped"], scores["identical_fraction"], scores["top1_agreement"]), (0, 0.0, 1.0))
+            self.assertGreater(scores["kl"]["mean"], 0.0)
+            self.assertLess(scores["kl"]["mean"], 1e-3)
+            self.assertIn("top-1 agreement", behaviour.format_comparison(diff, "base", "other"))
+        finally:
+            for server in (base, again, other):
+                server.close()
 
 
 class CompareTest(unittest.TestCase):

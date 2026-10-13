@@ -70,16 +70,51 @@ kernel and engine changes; tok/s judges what users get. It needs vLLM's dev-mode
 RPC (`VLLM_SERVER_DEV_MODE=1`) and a worker exposing `engine_grid`. It refuses a busy
 server and resets the prefix cache afterwards, since dummy steps write KV slots.
 
+## Model behaviour
+
+```sh
+python3 -m servebench model http://127.0.0.1:8000 --label base --output base.json.gz
+python3 -m servebench model http://127.0.0.1:8000 --label candidate --corpus base.json.gz \
+    --output candidate.json.gz
+python3 -m servebench compare base.json.gz candidate.json.gz
+```
+
+What a build computes, with no timing in it, so a repeat gives the same answer:
+- **Greedy generation.** Every prompt once at temperature 0, at a fixed concurrency (default
+  16), with each response's token ids. The speculative-decoding counters are read before
+  and after: mean acceptance length, draft tokens verified per step, and per draft
+  position the acceptance rate and how often that position was verified. On a
+  batch-invariant server the text, and with it the acceptance, belongs to the build.
+  Compared runs report how many responses are token-identical and where the rest diverge.
+- **Teacher-forced scoring.** Token sequences (by default this run's own prompts and
+  responses; with `--corpus`, an earlier run's) go back as prompts with
+  `prompt_logprobs`, keeping per response token its log-probability and rank and the top K
+  (`--top`, vLLM's `--max-logprobs` limit, default 20). Two builds that scored the same
+  tokens compare position by position:
+  - identical distributions;
+  - top-1 agreement;
+  - KL divergence, estimated from the top K with the rest of the vocabulary as one bucket;
+  - the given token's log-probability change;
+  - perplexity.
+- **Self-agreement.** A build scoring its own greedy text should rank every given token
+  first. Anything less means its prefill arithmetic and the decode arithmetic that wrote the
+  text pick different tokens.
+
+The base run is a property of the base build, so it can be kept and reused for every
+candidate measured against that build.
+
 ## Output
 
 `--output` writes `servebench/1` JSON: tool, server, workload (with the prompt set's
 SHA-256), and summary (`output_tps`, `server`, `server_batches`, `latency`,
 `inflight_mean`, `requests_per_s`, `requests`). `--save-requests` adds every request's
-timeline. The last stdout line is a one-line summary (`{"summary": ...}`) for tables.
+timeline. `engine` writes `servebench-engine/1`, `model` `servebench-model/1`; a path
+ending in `.gz` is compressed. The last stdout line is a one-line summary
+(`{"summary": ...}`) for tables.
 
 ## Planned
 
-Model behaviour per build (acceptance by draft position, teacher-forced log-probabilities:
-KL divergence, top-1 agreement, perplexity), concurrency and rate sweeps (throughput against per-user speed), and precision: per-token
-log-probabilities on fixed text against a baseline (KL divergence, top-1 agreement,
-perplexity) as a gate before speed.
+- Concurrency and rate sweeps: throughput against per-user speed.
+- A context sweep to the configuration's longest context.
+- Projected tok/s from the engine grid and the measured acceptance.
+- Adaptive window lengths that stop once the interval is tight enough.

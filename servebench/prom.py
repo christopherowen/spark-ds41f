@@ -6,6 +6,7 @@ per step, and speculative decoding's acceptance is reported on its own: the step
 is the engine's speed, and tokens per step moves with the text.
 """
 
+import re
 import urllib.request
 
 VLLM = {
@@ -43,14 +44,48 @@ def parse(text: str) -> dict[str, float]:
     return totals
 
 
-def scrape(base_url: str, names: dict[str, str], timeout: float = 10.0) -> dict[str, float] | None:
-    """The adapter's quantities from ``base_url``/metrics, or None if unreachable."""
+def by_label(text: str, name: str, label: str) -> dict[str, float]:
+    """One metric's series summed by the value of one label (e.g. draft position)."""
+    pattern = re.compile(r'(?:^|,)\s*' + re.escape(label) + r'="([^"]*)"')
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line.startswith(name + "{"):
+            continue
+        match = pattern.search(line[len(name) + 1:line.rindex("}")])
+        try:
+            number = float(line[line.rindex("}") + 1:].strip().split(" ")[0])
+        except ValueError:
+            continue
+        if match is None or number != number:
+            continue
+        totals[match.group(1)] = totals.get(match.group(1), 0.0) + number
+    return totals
+
+
+def fetch(base_url: str, timeout: float = 10.0) -> str | None:
+    """``base_url``/metrics as text, or None if unreachable."""
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/metrics", timeout=timeout) as response:
-            series = parse(response.read().decode("utf-8", errors="replace"))
+            return response.read().decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - a missing endpoint only drops the server columns
         return None
+
+
+def scrape(base_url: str, names: dict[str, str], timeout: float = 10.0) -> dict[str, float] | None:
+    """The adapter's quantities from ``base_url``/metrics, or None if unreachable."""
+    text = fetch(base_url, timeout)
+    if text is None:
+        return None
+    series = parse(text)
     return {key: series[name] for key, name in names.items() if name in series}
+
+
+def require_idle(base_url: str, purpose: str) -> None:
+    """Raise unless the server reports no running or waiting requests."""
+    counters = scrape(base_url, VLLM) or {}
+    busy = counters.get("requests_running", 0) + counters.get("requests_waiting", 0)
+    if busy:
+        raise RuntimeError(f"server not idle ({busy:.0f} requests): {purpose} needs it to itself")
 
 
 def window(start: dict | None, end: dict | None, seconds: float) -> dict:

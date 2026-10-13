@@ -29,3 +29,14 @@ That gives:
 - r6k against r6h on identical work;
 - the within-boot repeatability (grid 1 against grid 2);
 - the boot-to-boot spread (r6k against r6k again), the smallest difference worth believing.
+
+After its two grids, each boot also runs `servebench model`:
+- r6k generates greedily and scores its own text;
+- r6h and the second r6k boot score r6k's text (`--corpus`).
+
+That gives:
+- r6k's self-agreement: prefill against decode arithmetic;
+- r6h against r6k on identical tokens: KL divergence, top-1 agreement, perplexity;
+- acceptance by draft position for each build;
+- the model-behaviour A/A. With batch-invariant greedy decoding the second boot should
+  reproduce the first exactly.
