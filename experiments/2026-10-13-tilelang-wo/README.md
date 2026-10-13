@@ -65,8 +65,11 @@ The output moves toward the reference (new temperature-0 references).
 | sixteen, paired sweep | level | level |
 | prefill 32K / 256K | level | level / -0.3% |
 
-Faster at four and eight prompts, but not deterministic in mixed15, where prompts prefill
-sequence-parallel together and alone below the SP threshold. Not the kernels:
+Faster at four and eight prompts, but not deterministic in mixed15. The same seven
+requests differ in both arms, each from its first token's logprob: the prompt's prefill
+already differs. With `--max-parallel-prefills 1` each mixed15 prompt prefills in its own
+forward, beside the other streams' verification rows (well under the 205-token SP
+threshold), where alone it is the whole forward. Not the kernels:
 [check_wo_invariance.py](check_wo_invariance.py) found every row count 1-300 and every
 boundary to 4096, at offsets 0, 7, 100 and 1000, identical to the same rows of one
 8192-row call. The attention output is an ordinary allocation, and the TileLang and B12X
@@ -77,3 +80,50 @@ WO paths hand the same BF16 partials to the same `project_reduce_scatter` and
 `wo-determinism-debug` `d0bb54446`, `VLLM_DS41_WO_DEBUG`): a copy of the attention output
 instead of rotating it in place, a private scratch instead of the shared workspace, and
 one slice instead of two, each alone and all together; determinism only.
+
+## Debug results (2026-10-13, 16:58-17:15 UTC)
+
+| arm | temperature 0 |
+| --- | --- |
+| copy of the attention output | mixed15 7 of 16 differ |
+| private scratch (SP path) | 7 of 16 |
+| one slice | 7 of 16 |
+| all three | 7 of 16 |
+
+Every arm differs in the same seven requests at the same tokens as the screen, with the same
+references (`faa92269c192` / `a41b5636b5bd`): deterministic, and none of the three causes.
+The private scratch only covered the sequence-parallel path, and the mixed15 prefills
+run on the other one, where the WO still borrows vLLM's shared workspace (WO-A's split-K
+partials, up to 4 MiB at 128 rows, and WO-B's activation cast), so the workspace is not
+ruled out.
+
+[trace.json](trace.json) and [debug-privateall.json](debug-privateall.json) (vLLM
+`wo-row-trace` `03437d1d9`, DEBUG ONLY, mounted as [overlay-trace](overlay-trace)):
+
+- privateall: the WO's scratch private on every path (one buffer per device for the
+  target, one for the drafter);
+- trace: `VLLM_DS41_ROW_TRACE` hashes every row of each attention layer's input, its
+  output, the WO partial and the summed WO result on TP rank 0, in every eager forward
+  with a prefill. [compare_row_trace.py](compare_row_trace.py) pairs each prompt's
+  prefill alone with its prefill beside other rows and prints the first layer and stage
+  whose rows differ.
+
+## WO-A sweep 2 (2026-10-13, 16:47-16:58 UTC)
+
+Four shards, best configuration per row count (warm / cold µs, CUDA graphs):
+
+| rows | today | best | path and tile |
+| ---: | ---: | ---: | --- |
+| 64 | 19.4 / 53.5 | same | split 64x64x64 |
+| 72 | 34.5 (split 64) | **27.9 / 57.1** | split 96x64x64 |
+| 96 | 34.6 (in-kernel 32) | **29.5 / 59.9** | split 96x64x64 |
+| 128 | 38.9 / 72.7 | **38.2 / 64.3** | split 128x64x64 |
+| 256 | 69.1 / 74.2 | **61.1 / 81.9** | in-kernel 96x64x64 |
+| 512 | 131.8 / 139.3 | **119.1 / 139.3** | in-kernel 96x64x64 |
+| 2048 | 459.5 / 468.4 | 455.3 / 471.4 | in-kernel 96x64x64 |
+| 8192 | 1757.7 / 1770.4 | **1675.3 / 1685.7** | in-kernel 96x64x64 |
+
+96-row tiles win from 65 rows on, split at decode and in-kernel past 128 (the 72-96 bucket
+moves from in-kernel 32 to split 96). Every `block_M` 128 / `block_K` 128 in-kernel
+configuration failed to compile (shared memory). Bits do not depend on the tile. Adopted
+after the determinism fix, so the screen judges one change.

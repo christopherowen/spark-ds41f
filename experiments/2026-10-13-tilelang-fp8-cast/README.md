@@ -55,3 +55,26 @@ past 64 rows it takes the 128 x 128 prefill tile: in the WO window
 
 [sweep_gemm_cast.py](sweep_gemm_cast.py): the fused kernel's tiles at 256-8192 rows against
 production's cast + prefill GEMM, warm and cold, bits checked, at both shapes.
+
+### Window 2 results (2026-10-13, 17:15-17:16 UTC)
+
+**Bit-identical at every size, and 5-14 times slower** (warm / cold µs, best fused tile):
+
+| shape | rows | cast + GEMM | fused | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| context KV | 256 | 32.8 / 32.7 | 420.3 / 420.0 | 12.8 |
+| context KV | 512 | 35.0 / 35.0 | 438.7 / 438.8 | 12.5 |
+| context KV | 2048 | 246.8 / 232.0 | 1320.3 / 1314.7 | 5.4-5.7 |
+| context KV | 8192 | 896.2 / 894.5 | 4801.2 / 4800.8 | 5.4 |
+| WO-B | 256 | 50.1 / 49.8 | 692.9 / 693.1 | 13.8 |
+| WO-B | 512 | 92.6 / 92.8 | 1211.3 / 1210.5 | 13.1 |
+| WO-B | 2048 | 363.6 / 364.1 | 4643.8 / 4645.3 | 12.8 |
+| WO-B | 8192 | 1313.7 / 1386.0 | 18376.1 / 18380.4 | 13.3-14.0 |
+
+Each thread quantizes its rows' 32-element blocks one element at a time, inside every
+CTA's K loop, and every N tile repeats the cast of the same rows: the cast's arithmetic
+(an exponent, a scale and a saturating E4M3 conversion per element) is serialized in
+front of each MMA. The tile does not change that (64-row tiles, `block_K` 128, won
+throughout). The design needs the cast done once per row block and spread over the
+CTA's threads with vector loads, or kept as its own pass; until then production's
+`per_token_cast` (byte-identical to the reference's `act_quant`) stays.
