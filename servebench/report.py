@@ -90,7 +90,7 @@ COMPARED = (
     ("goodput req/s", ("latency", "slo", "goodput_rps"), True),
 )
 WORKLOAD_KEYS = ("mode", "concurrency", "rate", "warmup_s", "duration_s", "batches",
-                 "max_tokens", "fixed_length", "seed")
+                 "max_tokens", "fixed_length", "seed", "context_tokens")
 
 
 def _get(tree: dict, path: tuple):

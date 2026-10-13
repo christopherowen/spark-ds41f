@@ -42,6 +42,7 @@ class FakeServer:
         self.step_scale = step_scale  # engine grid: multiplies every step time
         self.variant = variant        # model behaviour: a build whose numbers differ slightly
         self.resets = 0
+        self.seen: list[tuple[str, int]] = []  # (cache salt, prompt characters) per streamed request
         self.lock = threading.Lock()
         self.counters = {"generation": 0, "steps": 0, "step_tokens": 0, "drafts": 0, "accepted": 0,
                          "pos0": 0, "pos1": 0}
@@ -101,6 +102,13 @@ class FakeServer:
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if self.path == "/tokenize":
+                    body = json.dumps({"count": len(request["prompt"]) // 4}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if self.path == "/v1/completions" or not request.get("stream"):
                     body = json.dumps(fake.answer(self.path, request)).encode()
                     self.send_response(200)
@@ -108,6 +116,8 @@ class FakeServer:
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                with fake.lock:
+                    fake.seen.append((request.get("cache_salt"), len(request["messages"][0]["content"])))
                 per_chunk = request.get("stream_options", {}).get("continuous_usage_stats", False)
                 total = request["max_tokens"]
                 self.send_response(200)
@@ -260,6 +270,30 @@ class LiveTest(unittest.TestCase):
         self.assertAlmostEqual(summary["server"]["output_tokens_per_step"]["mean"], CHUNK_TOKENS, places=6)
         self.assertAlmostEqual(summary["server"]["accepted_per_draft"]["mean"], CHUNK_TOKENS - 1, places=6)
         self.assertGreater(summary["latency"]["tpot_ms"]["p50"], 0)
+
+    def test_context_streams_keep_their_documents(self):
+        server = FakeServer()
+        try:
+            spec = load.Load(mode="closed", concurrency=2, warmup_s=0.1, duration_s=0.4, batches=2,
+                             max_tokens=8, context_tokens=2000)
+            raw = load.run(server.url, "fake-model", prompts.load("default"), spec, log=lambda m: None)
+        finally:
+            server.close()
+        self.assertEqual([d["slot"] for d in raw["documents"]], [0, 1])
+        for doc in raw["documents"]:
+            self.assertLess(abs(doc["tokens"] - 2000), 20)
+            self.assertIsNone(doc["prime_error"])
+        salts = {salt for salt, _ in server.seen}
+        self.assertEqual(len(salts), 2)  # priming and every question reuse the stream's salt
+        self.assertTrue(all(chars > 7000 for _, chars in server.seen))
+        self.assertGreater(len(server.seen), 4)
+
+    def test_source_text_is_seeded_and_sized(self):
+        a, b = prompts.source_text(1000, 3), prompts.source_text(1000, 3)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, prompts.source_text(1000, 4))
+        self.assertTrue(a.startswith("Document 3:\n"))
+        self.assertEqual(len(a), len("Document 3:\n") + int(1000 * prompts.SOURCE_CHARS_PER_TOKEN))
 
     def test_poisson_arrivals_follow_the_rate(self):
         spec = load.Load(mode="poisson", rate=40.0, warmup_s=0.2, duration_s=1.0, batches=2,

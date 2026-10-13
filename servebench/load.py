@@ -12,6 +12,12 @@ Closed and Poisson runs warm up first, then measure for a fixed duration split i
 equal sub-windows (batch means: each sub-window is one sample for the intervals), then
 stop issuing and let the in-flight requests drain outside the window. Server counters
 are read at every sub-window boundary.
+
+With ``context_tokens`` (closed mode) each stream owns a long document and asks every
+question after it, under one cache salt per stream. Each document is prefilled once
+before the clock starts, so the window measures decode at that depth plus each
+question's short prefill, as with a long conversation or a coding agent's repository
+context. The window's prefix-cache hit rate shows whether the documents stayed cached.
 """
 
 import itertools
@@ -22,7 +28,11 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 
+import json
+import urllib.request
+
 from . import client, prom
+from . import prompts as prompt_sets
 
 
 @dataclass
@@ -37,18 +47,22 @@ class Load:
     fixed_length: bool = True     # every request writes exactly max_tokens (vLLM adapter)
     seed: int = 0
     max_inflight: int = 512       # poisson safety cap; arrivals past it are counted, not sent
+    context_tokens: int = 0       # closed: each stream's cached document before every question
 
     def describe(self) -> dict:
         return asdict(self)
 
 
-def payload(model: str, prompt: dict, load: Load, *, vllm: bool, extra_body: dict) -> dict:
-    body = {"model": model, "messages": [{"role": "user", "content": prompt["text"]}],
+def payload(model: str, prompt: dict, load: Load, *, vllm: bool, extra_body: dict,
+            document: str | None = None, salt: str | None = None) -> dict:
+    text = prompt["text"] if document is None else f"{document}\n\n{prompt['text']}"
+    body = {"model": model, "messages": [{"role": "user", "content": text}],
             "max_tokens": load.max_tokens, "temperature": 0}
     if vllm:
         # A fresh salt per request: a prompt seen earlier in the run must not hit the
-        # prefix cache, or repeats would skip their prefill.
-        body["cache_salt"] = uuid.uuid4().hex
+        # prefix cache, or repeats would skip their prefill. A stream's own document
+        # keeps one salt so that it does.
+        body["cache_salt"] = salt or uuid.uuid4().hex
         if load.fixed_length:
             body["ignore_eos"] = True
             body["min_tokens"] = load.max_tokens
@@ -64,6 +78,34 @@ def _sleep_until(moment: float, clock) -> None:
         time.sleep(min(remaining, 0.5))
 
 
+def token_count(base_url: str, model: str, text: str) -> int | None:
+    """Tokens in ``text`` by the server's tokenizer (vLLM /tokenize), or None."""
+    request = urllib.request.Request(base_url.rstrip("/") + "/tokenize",
+                                     data=json.dumps({"model": model, "prompt": text}).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.load(response).get("count")
+    except Exception:  # noqa: BLE001 - sizing falls back to the characters-per-token estimate
+        return None
+
+
+def documents(base_url: str, model: str, load: Load, vllm: bool) -> list[dict]:
+    """One document per stream, sized to ``load.context_tokens`` by the server's tokenizer
+    when it has one (one rescaling step)."""
+    out = []
+    for slot in range(load.concurrency):
+        seed = load.seed * 1000 + slot
+        text = prompt_sets.source_text(load.context_tokens, seed)
+        counted = token_count(base_url, model, text) if vllm else None
+        if counted:
+            ratio = len(text) / counted
+            text = prompt_sets.source_text(load.context_tokens, seed, chars_per_token=ratio)
+            counted = token_count(base_url, model, text)
+        out.append({"slot": slot, "text": text, "tokens": counted, "salt": uuid.uuid4().hex})
+    return out
+
+
 def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: bool = True,
         extra_body: dict | None = None, metrics: dict | None = None, clock=time.monotonic,
         log=lambda message: print(message, file=sys.stderr, flush=True)) -> dict:
@@ -76,16 +118,36 @@ def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: boo
     lock = threading.Lock()
     records: list[dict] = []
     rejected = [0]
+    docs: list[dict] = []
+    timeout = 900.0
+    if load.context_tokens:
+        if load.mode != "closed":
+            raise ValueError("context_tokens needs closed mode")
+        docs = documents(base_url, model, load, vllm)
+        timeout = max(timeout, load.context_tokens / 500)
+        for doc in docs:  # one at a time: each prefill is bounded, and none is evicted mid-run
+            began = clock()
+            body = payload(model, order[doc["slot"] % len(order)], load, vllm=vllm,
+                           extra_body=extra_body | {"max_tokens": 1, "min_tokens": 1},
+                           document=doc["text"], salt=doc["salt"])
+            primed = client.stream_chat(base_url, body, continuous_usage=vllm, timeout=timeout, clock=clock)
+            doc["prime_s"] = round(clock() - began, 2)
+            doc["prime_error"] = primed["error"]
+            log(f"servebench: document {doc['slot'] + 1}/{len(docs)} "
+                f"({doc['tokens'] or load.context_tokens} tokens) primed in {doc['prime_s']:.0f} s")
 
     def send(slot: int) -> None:
         index = next(counter)
         prompt = order[index % len(order)]
-        body = payload(model, prompt, load, vllm=vllm, extra_body=extra_body)
-        record = client.stream_chat(base_url, body, continuous_usage=vllm, clock=clock)
+        doc = docs[slot] if docs else None
+        body = payload(model, prompt, load, vllm=vllm, extra_body=extra_body,
+                       document=doc["text"] if doc else None, salt=doc["salt"] if doc else None)
+        record = client.stream_chat(base_url, body, continuous_usage=vllm, timeout=timeout, clock=clock)
         record.update(prompt_id=prompt["id"], slot=slot, index=index)
         with lock:
             records.append(record)
 
+    documents_meta = [{key: doc[key] for key in ("slot", "tokens", "prime_s", "prime_error")} for doc in docs]
     start = clock()
     if load.mode == "burst":
         threads = [threading.Thread(target=send, args=(slot,)) for slot in range(load.concurrency)]
@@ -148,4 +210,5 @@ def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: boo
         thread.join()
     scraping.join()
     return {"records": records, "start": start, "window": [w0, w1], "boundaries": boundaries,
-            "scrapes": scrapes, "scrape_times": scrape_times, "rejected": rejected[0]}
+            "scrapes": scrapes, "scrape_times": scrape_times, "rejected": rejected[0],
+            "documents": documents_meta}

@@ -27,6 +27,13 @@ server scenario, GuideLLM and AIPerf.
   server sees a steady N with new prefills mixed into decode steps. `poisson` sends
   requests at a fixed rate whatever the server does (open loop), so queueing shows as
   latency. `burst` reproduces the old shape for comparison.
+- **Context.** With `--context TOKENS` (closed loop) each stream owns a long document,
+  Python standard-library source sized by the server's tokenizer, and asks every question
+  after it under one cache salt. Each document is prefilled once before the clock starts,
+  so the window measures decode at that depth plus each question's short prefill, as with
+  a long conversation or a coding agent's repository context. The window's prefix-cache
+  hit rate shows whether the documents stayed cached. Streams x context must fit the KV
+  cache.
 - **Window.** A warm-up (default 60 s) runs before the measurement window (default
   300 s); when the window closes no new requests start, and the in-flight ones drain
   outside it.
@@ -115,6 +122,7 @@ ending in `.gz` is compressed. The last stdout line is a one-line summary
 ## Planned
 
 - Concurrency and rate sweeps: throughput against per-user speed.
-- A context sweep to the configuration's longest context.
+- A context sweep profile: `--context` at about x4 steps to the configuration's longest
+  context, with fewer streams where the KV cache requires it.
 - Projected tok/s from the engine grid and the measured acceptance.
 - Adaptive window lengths that stop once the interval is tight enough.

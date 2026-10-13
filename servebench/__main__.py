@@ -37,7 +37,7 @@ def command_run(args: argparse.Namespace) -> int:
     spec = load.Load(mode=args.mode, concurrency=args.concurrency, rate=args.rate,
                      warmup_s=args.warmup, duration_s=args.duration, batches=args.batches,
                      max_tokens=args.max_tokens, fixed_length=not args.natural_length,
-                     seed=args.seed)
+                     seed=args.seed, context_tokens=args.context)
     extra = json.loads(args.extra_body) if args.extra_body else {}
     model = args.model or model_id(args.url)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
@@ -52,6 +52,8 @@ def command_run(args: argparse.Namespace) -> int:
                                        "extra_body": extra},
         "summary": summary,
     }
+    if raw.get("documents"):
+        result["documents"] = raw["documents"]
     if args.save_requests:
         origin = raw["start"]
         result["requests"] = [
@@ -68,6 +70,8 @@ def command_run(args: argparse.Namespace) -> int:
             "tps_mean": tps.get("mean"), "ci95_pct": tps.get("ci95_pct"), "windows": tps.get("n"),
             "steps_per_s": summary.get("server", {}).get("steps_per_s", {}).get("mean"),
             "tokens_per_step": summary.get("server", {}).get("output_tokens_per_step", {}).get("mean"),
+            "context_tokens": spec.context_tokens or None,
+            "prefix_cache_hit_rate": summary.get("server", {}).get("prefix_cache_hit_rate", {}).get("mean"),
             "ttft_p50_s": summary["latency"]["ttft_s"].get("p50"),
             "tpot_p50_ms": summary["latency"]["tpot_ms"].get("p50"),
             "failed": summary["requests"]["failed"], "output": args.output}
@@ -180,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--natural-length", action="store_true",
                      help="let requests stop at end of sequence (default: exactly --max-tokens each)")
     run.add_argument("--prompts", default="default", help="prompt set name or JSONL path")
+    run.add_argument("--context", type=int, default=0, metavar="TOKENS",
+                     help="closed: each stream keeps its own cached document of about TOKENS tokens "
+                          "before every question (decode at depth)")
     run.add_argument("--seed", type=int, default=0, help="orders the prompts and the arrivals")
     run.add_argument("--model", help="model id (default: the server's first)")
     run.add_argument("--extra-body", help="JSON merged into every request body")

@@ -5,6 +5,9 @@ handful of texts. The set is fixed and hashed; the run's seed only orders it."""
 
 import hashlib
 import json
+import random
+import sysconfig
+from pathlib import Path
 
 TEMPLATES = (
     "Explain {topic} to a curious teenager, with one concrete example.",
@@ -50,6 +53,30 @@ def default_prompts() -> list[dict]:
 
 
 SETS = {"default": default_prompts}
+
+# Python standard-library source averages about 3.8 characters per token on a DeepSeek
+# tokenizer; documents are calibrated against the server's tokenizer when it has one.
+SOURCE_CHARS_PER_TOKEN = 3.8
+
+
+def standard_library_sources() -> list[Path]:
+    root = Path(sysconfig.get_paths()["stdlib"])
+    return sorted(path for path in root.glob("*.py") if path.stat().st_size > 4096)
+
+
+def source_text(tokens: int, seed: int, chars_per_token: float = SOURCE_CHARS_PER_TOKEN) -> str:
+    """A long real-text document: the Python standard library's source read from a
+    seeded file onward. The first line makes every document's prefix its own."""
+    files = standard_library_sources()
+    index = random.Random(seed).randrange(len(files))
+    chars = int(tokens * chars_per_token)
+    parts, size = [], 0
+    while size < chars:
+        text = files[index % len(files)].read_text(encoding="utf-8", errors="replace")
+        parts.append(text)
+        size += len(text)
+        index += 1
+    return f"Document {seed}:\n" + "".join(parts)[:chars]
 
 
 def load(name: str) -> list[dict]:

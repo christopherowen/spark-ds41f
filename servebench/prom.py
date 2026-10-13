@@ -18,6 +18,8 @@ VLLM = {
     "draft_tokens": "vllm:spec_decode_num_draft_tokens_total",
     "accepted_tokens": "vllm:spec_decode_num_accepted_tokens_total",
     "preemptions": "vllm:num_preemptions_total",
+    "prefix_cache_queries": "vllm:prefix_cache_queries_total",
+    "prefix_cache_hits": "vllm:prefix_cache_hits_total",
     "requests_running": "vllm:num_requests_running",
     "requests_waiting": "vllm:num_requests_waiting",
 }
@@ -109,4 +111,6 @@ def window(start: dict | None, end: dict | None, seconds: float) -> dict:
         out["draft_tokens_per_draft"] = delta.get("draft_tokens", 0) / delta["drafts"]
     if "preemptions" in delta:
         out["preemptions"] = delta["preemptions"]
+    if delta.get("prefix_cache_queries"):
+        out["prefix_cache_hit_rate"] = delta.get("prefix_cache_hits", 0) / delta["prefix_cache_queries"]
     return out
