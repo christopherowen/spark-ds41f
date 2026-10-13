@@ -316,3 +316,29 @@ kernel bench put TileLang at 1.12-1.39x warm.
 - **f806f5103 did not compile.** It rotated `A_shared` in place after its copy, and TileLang's pipeline planner allows one write per stage.
 - **2d1c6b2a2 compiles and is correct, but far slower.** It copies to a raw tile and rotates as the tile moves to `A_shared`. The 14 WO tests pass, including the fused bytes against `rope_` + WO-A + `per_token_cast`, and invariance passes. But that elementwise pass runs over every K block: WO-A at 96 rows 29 -> 160 us, at 2048 rows 453 -> 2563 us.
 - **Not pursued further.** Rotating only the RoPE block needs the K loop split per head, too much for ~4 us a decode step. r6k keeps the fused cast without it.
+
+### WO-A tiles at 24-128 rows on the fused path (2026-10-13, 23:07-23:19 UTC)
+
+[bundles/wo-a-sweep3](bundles/wo-a-sweep3) ([sweep_wo_a_v3.py](sweep_wo_a_v3.py), image r6k, 73
+configs):
+- Every working config gives the same bytes. The six with 128-wide N tiles do not build.
+- Warm, 48-row split tiles beat today's at 40-48 rows by 2 us (16.4-17.1 against 18.6-18.9
+  us). Cold they are level (50.1-51.2 against 50.2-50.4).
+- Today's tiles are the fastest at 56-96 rows and 1024.
+
+Serving is the cold case: each layer's WO weights are read once a step. The tiles stay.
+
+### Ceiling of fusing the split-K reduce (from the fixed-row profile)
+
+At c8 (48 rows, rank 0), per call and per target step:
+
+| kernel | us/call | ms/step |
+| --- | ---: | ---: |
+| `gemm_fp8w_bf16_partials` (WO-A) | 23.5 | 0.322 |
+| `gemm_splitk_reduce_cast` | 1.9 | 0.016 |
+
+Folding the reduce into the GEMM (last split CTA reduces) would save that kernel and its
+launch gap: about 0.03 ms of a 31.7 ms step, 0.1%. Not built. The 48-row deficit is WO-A
+itself, a BF16 MMA on FP8 weights widened in the main loop. A warp-specialized W8A16 GEMM
+(producer warps load and widen, consumers multiply) is the lever left there, bounded at
+about 0.3% of a step if it matched an FP8 GEMM's weight-read time.
