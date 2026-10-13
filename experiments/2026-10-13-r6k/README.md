@@ -29,3 +29,38 @@ r6j's vLLM series plus vLLM branch `wo-retire` ([vllm/series](vllm/series), 0120
 [r6k-release.json](r6k-release.json) is r6j's release configuration with the r6k image
 (vLLM tree `69108474bcc7`, patch head `aa31eb85c656`). [image.json](image.json) builds and gates it;
 [release-tp4.json](release-tp4.json) is the release comparison against r6h.
+
+## Gate (2026-10-13)
+
+Deterministic in every scenario, greedy digest equal across runs, quality 5/5; 16 distinct
+streams 225.94 tok/s ±0.34%, 8 streams 176.86 ±0.38%.
+
+## Release comparison against r6h (TP4, 2026-10-13)
+
+Arms in the order r6k, r6h, r6k again on a fresh boot;
+`python3 scripts/release_table.py r6k-release-tp4 r6h r6k r6k-again`.
+
+| measure | r6h | r6k | change | verdict |
+|---|---:|---:|---:|---|
+| 4 distinct prompts tok/s | 133.9 | 134.5 | +0.4% ±0.9% | same |
+| 8 distinct prompts tok/s | 177.2 | 178.3 | +0.6% ±0.3% | faster |
+| 16 distinct prompts tok/s | 225.8 | 223.9 | -0.8% ±0.9% | same |
+| acceptance sweep tok/s (paired, 16 prompts) | | | +0.6% ±2.4% | same |
+| prefill 32,768 tok/s | 5835 | 5825 | -0.2% ±1.4% | same |
+| prefill 262,144 tok/s | 5490 | 5519 | +0.5% ±0.6% | same |
+| prefill 524,288 tok/s | 5046 | 5086 | +0.8% ±0.3% | faster |
+| prefill 1,000,000 tok/s | 4378 | 4400 | +0.5% ±0.1% | faster |
+
+- Determinism identical in every scenario for both builds, mixed15 included. The reference
+  digests differ from r6h's, as expected: WO-A now reads BF16 activations, so the text changes.
+- Latency (no intervals): mixed-load short-prompt TTFT -4.8%, mixed stream gap p95 +5.4%,
+  the rest within 2%.
+- The single-prompt bench points moved 9-14% either way, each with its draft acceptance
+  (prose-c1 1.48 -> 1.11 tokens per draft, code-c1 2.07 -> 2.37). The precision change
+  changed the text, and those points follow the text; they are not engine speed.
+- Boot to boot (r6k against r6k again): every measure "same": distinct-prompt decode within
+  0.5%, prefill within 0.3%, single-prompt points within 1.8% with identical acceptance.
+
+r6k reaches the reference's precision without being slower on any text-independent
+measure, and is faster at 8 streams and the two longest prefills. It is not yet well ahead.
+Promotion is the owner's call.
