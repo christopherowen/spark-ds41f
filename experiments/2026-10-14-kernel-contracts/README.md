@@ -156,3 +156,30 @@ NaN contract. A form is adopted only if it passes its contract, keeps r6k's bits
 stays within 1% of r6k's time at every shape. The winner replaces vLLM 0006 (and 0004
 for SwiGLU) on the `kernel-contracts` branch, and the fixed bundle is rerun before the
 next candidate is gated.
+
+### Round 2 results (09:25-09:28 UTC)
+
+Every form passed its contracts and the full indexer and SwiGLU tests, and every form kept
+r6k's bits on finite inputs. Worst median time ratio against r6k (warm / cold):
+
+| form | worst | where |
+| --- | ---: | --- |
+| indexer `isnan` (0006) | 1.034 / 1.039 | 8K x 2048 |
+| indexer `bits` (32-bit NaN test) | 1.022 / 1.022 | 8K x 2048; elsewhere 1.004-1.011 |
+| indexer `fixup` (separate NaN loop) | 1.072 / 1.082 | |
+| SwiGLU `fixed` (0004) | 1.032 / 1.338 | warm medians 0.98-1.01; the cold readings at 72 and 80 rows jump between two timer levels both ways (0.74, 1.34) |
+| SwiGLU `expr` | 1.059 / 1.049 | |
+
+- **SwiGLU:** 0004 is level with r6k. Its flagged points are the cold timer's two levels;
+  `expr` does not help. Keep 0004.
+- **Indexer:** `bits` still drew TileLang's serial-loop warning at 4 of 7 sizes. Every
+  float form so far either serializes or gets folded.
+
+### Round 3, queued ([relu3.json](relu3.json))
+
+- `ne_precise`: `dot != dot` with `TL_ENABLE_FAST_MATH` off for this kernel. If fast math
+  folded the test, this is both correct and vectorized. If TileLang's own simplifier
+  folds `x != x`, it fails the NaN contract again.
+- `r6k_precise`: r6k's `max` with fast math off. A control, expected to fail the NaN
+  contract: it shows what fast math off does to r6k's bits and time by itself.
+- `bits16`: the NaN test on BF16 bits.
