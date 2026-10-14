@@ -1,0 +1,55 @@
+{
+  "description": "Fourth round: NaN-keeping ReLUs from TileLang's existing surface (T.clamp; dot < 0 ? 0 : dot) against r6k, the generated CUDA and TVM analyzer on x != x, and what the index quantizer makes of NaN and inf beside TileKernels' reference.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6k",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import os, subprocess, sys; codes = [subprocess.call([sys.executable, '/b/bench_relu4.py']), subprocess.call([sys.executable, '/b/probe_quant_nan.py'])]; env = dict(os.environ, PYTHONPATH='/b' + os.pathsep + os.environ.get('PYTHONPATH', '')); RUNS = [('indexer=/b/indexer_clamp.py', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py'), ('indexer=/b/indexer_lt.py', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py')]; codes += [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-p', 'swap_plugin', '-rfEPxX', '-k', k, path], env=dict(env, SWAP=swap)) for swap, k, path in RUNS]; print('exit codes (bench, quantizer probe (report only), clamp tests, lt tests)', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "tests__kernels__deepseek_v41_contracts.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/deepseek_v41_contracts.py"
+    ],
+    [
+      "tests__kernels__attention__test_deepseek_v41_tilelang.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py"
+    ],
+    [
+      "r6k_indexer.py",
+      "/b/r6k_indexer.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_relu4.py",
+      "/b/bench_relu4.py"
+    ],
+    [
+      "probe_quant_nan.py",
+      "/b/probe_quant_nan.py"
+    ],
+    [
+      "swap_plugin.py",
+      "/b/swap_plugin.py"
+    ],
+    [
+      "indexer_ne.py",
+      "/b/indexer_ne.py"
+    ],
+    [
+      "indexer_clamp.py",
+      "/b/indexer_clamp.py"
+    ],
+    [
+      "indexer_lt.py",
+      "/b/indexer_lt.py"
+    ]
+  ]
+}
