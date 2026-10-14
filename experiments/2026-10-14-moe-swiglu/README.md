@@ -64,6 +64,22 @@ prefill). That is a second step, taken only if this one lands.
   When the port passes, the TileKernels call goes (the migration's rule: no
   fallback arm stays).
 
+## The NaN clamp (owner, 2026-10-14)
+
+TileKernels' kernel clamps with `T.min`/`T.max`, which lower to `fminf`/`fmaxf` and turn a
+NaN into the limit. DeepSeek's reference clamps with `torch.clamp`, which keeps it
+([kernel-contracts](../2026-10-14-kernel-contracts/README.md), the strict `xfail` on the
+routed experts). The port clamps by compare-and-select, as the shared expert's fix (vLLM
+kernel-contracts 0004) does:
+- on finite inputs the result equals `min`/`max`, so the bit-identity gate below still
+  holds;
+- a NaN gate or up value now passes through.
+
+This settles the TileKernels decision without patching TileKernels. Once the port passes,
+the routed-expert contract changes from `xfail` to a required pass. Keep the clamp
+expressions pure (no reassigned `alloc_var` scalars), and check TileLang's output for
+the serial-loop warning: the indexer's NaN fix lost its vectorization that way.
+
 ## Why the bits do not change
 
 Each output depends only on its row's gate and up values, its route weight and
