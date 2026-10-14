@@ -62,7 +62,7 @@ def layout(routes, gen):
 def outputs(rows):
     out = torch.zeros((rows, HIDDEN), dtype=torch.float8_e4m3fn, device=DEVICE)
     shape = get_sf_shape((rows, HIDDEN), config)
-    sf = torch.zeros(shape, dtype=config.sf_dtype if isinstance(config.sf_dtype, torch.dtype) else torch.int32, device=DEVICE)
+    sf = torch.zeros(shape, dtype=torch.uint8, device=DEVICE)  # the kernel takes uint8 scale storage
     return out, sf
 
 
