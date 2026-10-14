@@ -39,3 +39,31 @@ sampling noise, sets its floor.
 
 A lock below what serving reaches costs speed in that window only. Production keeps the
 default clocks.
+
+## Unlocked trace (2026-10-14, 05:42-05:52 UTC)
+
+Lab telemetry while r6k served sixteen streams in a closed loop (372 samples a node):
+
+| node | SM MHz p10 / p50 / p90 (min, max) | power p50 | GPU °C p50 (max) |
+| --- | --- | ---: | ---: |
+| dgx1 | 2489 / 2489 / 2496 (2411, 2509) | 38.9 W | 60 (62) |
+| dgx2 | 2489 / 2489 / 2496 (2411, 2515) | 41.0 W | 59 (61) |
+| dgx3 | 2496 / 2496 / 2502 (2411, 2515) | 39.7 W | 57 (58) |
+| dgx4 | 2489 / 2489 / 2489 (2405, 2515) | 37.7 W | 57 (58) |
+
+- **Clocks under load:** nearly fixed, 2489-2502 MHz. The minimum (about 2410) is the
+  step from idle to load. There were no clock-event reasons, and the memory clock is not
+  reported on GB10.
+- **During the grid:** the same pattern (dgx3 2496-2522).
+- **Why it can still matter:** nodes differ by up to about 13 MHz (0.5%), and the slowest
+  rank paces every all-reduce. That is the size of the grid's unexplained shifts.
+
+## Locked validation ([locked.json](locked.json))
+
+All four nodes are locked at 2489 MHz, the clock every node sustains under load:
+- the `screen` suite runs on r6k, r6h and r6k again (servebench#217);
+- then the clocks reset.
+
+Against the unlocked second grid validation, the question is whether r6k against r6k
+again moves less than +0.14 / +0.52% (geometric mean of the grid) and +0.13% (sixteen
+streams). [sync.json](sync.json) moves the runner to the suite code first.
