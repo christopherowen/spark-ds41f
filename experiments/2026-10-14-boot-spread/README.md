@@ -43,3 +43,45 @@ The questions:
 - Does compaction add to that?
 - Do slow boots line up with threads on slow cores, or with little free memory in
   blocks of 2 MiB or more?
+
+## Results (2026-10-14, 07:10-08:08 UTC)
+
+### Threads under real load (sixteen streams, closed loop)
+
+| node | container cores | busy threads (share of a core) | CPU time on slow cores |
+| --- | ---: | --- | ---: |
+| dgx1 | 4.17 | sparknet-proxy 1.00, EngineCore 1.00, Worker_TP 0.94, Worker 0.94, Worker_TP 0.20 | 2% unpinned, 0 pinned |
+| dgx2-4 | 3.12-3.13 | sparknet-proxy 1.00, Worker_TP 0.94, Worker 0.94, Worker_TP 0.19 | 1-2% unpinned, 0 pinned |
+
+- **Busy threads:** three or four per node, against ten fast cores, so pinning fits.
+- **Spinning:** the near-full threads mostly spin. The proxy busy-polls, and the CUDA
+  synchronization spins while waiting on the GPU. Sleeping instead would free cores but
+  add wake-up latency to every step.
+- **Throughput:** pinned 226.2 tok/s ±0.73% against 225.2 ±0.81% unpinned (+0.4%,
+  within the intervals).
+
+### Twelve boots, interleaved (one grid each, 100 replays, settle runs)
+
+| boots | decode step time vs the unpinned mean | boot-to-boot SD |
+| --- | --- | ---: |
+| unpinned u1-u4 | +0.85 / -0.04 / -0.57 / -0.24% | 0.61% |
+| pinned p1-p4 | +0.11 / -1.21 / -0.78 / -0.85% | 0.56% |
+| pinned, compacted c1-c4 | -1.06 / -0.75 / -1.31 / -1.06% | 0.23% |
+
+- **Pinned against unpinned (all eight pinned boots):** -0.86% ±0.9% step time,
+  borderline significant. Pinning never hurt anywhere.
+- **Clocks and free memory were the same at every boot:** SM 2496-2502 MHz, 80-93 GiB free
+  in blocks of 2 MiB or more after serving stopped. Compaction added only 0.1-1.5 GiB, so
+  fragmentation does not explain the spread.
+- **Unpinned boots spent only about 1% of their CPU time on slow cores**, yet ran slower.
+  The cost is more likely migration (a cold private 2 MB L2, or a move between the two
+  clusters' 8 MB L3s) than slow-core time itself.
+- **Compaction was confounded:** the compacted boots always ran third in each round, right
+  after another pinned boot. [compact.json](compact.json) repeats pinned against
+  pinned-and-compacted in a balanced order (ABBA BAAB).
+
+### Decision
+
+The TP4 profile pins serving to the fast cores (`--cpuset-cpus=5-9,15-19`, owner
+2026-10-14), and `doctor --live` checks it on every node. The TP3 profiles take the pin
+with their move to r6k at the next re-cable.

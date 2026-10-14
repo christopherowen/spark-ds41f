@@ -21,6 +21,11 @@ the last known deviation from DeepSeek's reference precision:
 - **sparknet's TileLang one-shot collectives** (bit-identical to its CuTe
   kernels, proxy on a big core) **and the TileLang L2 prefetch.**
 
+Since 2026-10-14 the TP4 profile pins serving to the GB10's ten fast cores
+(`--cpuset-cpus=5-9,15-19`; `experiments/2026-10-14-boot-spread`). Serving keeps three or
+four threads busy per node, so the slow cores are never needed. `doctor --live` checks the
+pin on every node.
+
 TP4 keeps the embedding and head in regular memory
 (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`) and runs
 on r6h's cost curves for that placement (`ring4-r6h-headout-20261012`), as its
