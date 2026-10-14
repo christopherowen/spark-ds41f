@@ -120,3 +120,16 @@ Bit-identity against TileKernels' kernel is the gate, not an assumption.
 
 Planned 2026-10-14. The ceiling is measured from existing traces. Nothing is
 built or run.
+
+## Window 0, queued 2026-10-14 ([tk-bench.json](tk-bench.json))
+
+[bundles/tk-swiglu](bundles/tk-swiglu) measures before anything is built:
+- TileKernels' kernel timed at 1-96 decode rows (six routes a row) and at 512-8,192 rows,
+  on synthetic dispatch layouts (aligned expert segments; `psum` marks where each
+  expert's real rows end);
+- the same kernel with its two clamp sites as compare-and-select
+  ([tk_swiglu_select.py](bundles/tk-swiglu/tk_swiglu_select.py)): bits on real rows,
+  three alternating timing rounds, and whether a NaN gate value reaches the output.
+
+If the select copy keeps the bits and the time, it is the interim NaN fix while the port
+is built. The decode timings say whether the time is in the boundary walk.
