@@ -144,6 +144,11 @@ before the first boot. `run --dry-run` prints the problems.
   The summary goes beside the step's output as `<output>.telemetry.json`: percentiles per
   field, event-reason counts, the busy threads with their core share and slow-core share,
   and the clock lock in force. Telemetry never fails a step.
+- **`"telemetry": false`** on a `measure` job turns the per-step sampling off (A/B checks
+  of its own effect).
+- **Failed steps keep their evidence:** when a script step exits non-zero, every node's
+  serving-container log tail (4,000 lines) is saved beside its output as
+  `<output>.engine-<node>.log`, before a later boot replaces the container.
 - **Arm options `memory_snapshot` and `compact_memory`:** before that arm's boot, serving
   stops and every node's free memory by block size (`/proc/buddyinfo`) is saved to
   `memory-<label>.json`. `compact_memory` then runs

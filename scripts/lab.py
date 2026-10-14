@@ -791,7 +791,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
             # A bare name is the experiment's own script; a path is repository-relative.
             # "{label}" and "{run}" in an argument become the arm's label and the run's name.
             extra = [str(a).replace("{label}", label).replace("{run}", run) for a in extra]
-            steps.append({"kind": "script", "label": label,
+            steps.append({"kind": "script", "label": label, "telemetry": job.get("telemetry", True),
                           "argv": [arm_config_path(experiment, script), head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
     table = profile.get("table", f"{experiment}/tables_arms.py")
@@ -819,7 +819,7 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
                 "--out", f"results/private/suites/{run}/{label}", "--label", label]
         if index:
             argv += ["--corpus", first]
-        steps.append({"kind": "script", "label": label, "argv": argv,
+        steps.append({"kind": "script", "label": label, "argv": argv, "telemetry": job.get("telemetry", True),
                       "out": f"results/private/determinism/{run}/suite-{label}.jsonl"})
     steps.append({"kind": "table", "argv": ["scripts/servebench_suite_table.py", run, *[a["label"] for a in arms]],
                   "out": f"results/private/lab/{run}-table.txt",
@@ -1189,6 +1189,22 @@ def summary_lines(paths: list[str]) -> str:
 CURVE_POINTS = (1, 6, 12, 24, 48, 256, 1024, 2048, 4096)
 
 
+def save_engine_logs(out: str, lines: int = 4000) -> None:
+    """After a failed step: every node's serving-container log tail, beside the step's
+    output (``<out>.engine-<node>.log``), so a crash keeps its stack trace after the next
+    boot replaces the container."""
+    try:
+        nodes = nodes_config()
+        for node in nodes["nodes"]:
+            result = spark.run_ssh(nodes, node, "docker", "logs", "--tail", str(lines), CONTAINER)
+            path = ROOT / f"{out}.engine-{node['name']}.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(result.stdout + result.stderr)
+        log(f"saved serving logs beside {out}")
+    except Exception as error:  # noqa: BLE001 - never fail the run over its evidence
+        log(f"serving logs not saved: {error}")
+
+
 def save_curves(step: dict) -> None:
     """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them.
 
@@ -1518,9 +1534,11 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     failed = f"bench {step['label']} exited {code}"
                     break
             elif step["kind"] == "script":
-                with Telemetry(step["out"]):
+                with Telemetry(step["out"]) if step.get("telemetry", True) else contextlib.nullcontext():
                     code = run_script(step)
                 log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {code}")
+                if code:
+                    save_engine_logs(step["out"])
             elif step["kind"] == "sync":
                 if not sync_checkouts():
                     failed = "sync failed"

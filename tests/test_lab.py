@@ -438,6 +438,14 @@ class PlanProblemsTest(unittest.TestCase):
             outputs = [s["argv"][-1] for s in lab.plan(spec) if s["kind"] == "script"]
         self.assertEqual(outputs, ["out/r-a.json", "out/r-b.json"])
 
+    def test_telemetry_switch(self) -> None:
+        spec = self.measure([["scripts/servebench_run.py", ["--mode", "closed"], "c"]])
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            on = [s for s in lab.plan(spec) if s["kind"] == "script"]
+            spec["jobs"][0]["telemetry"] = False
+            off = [s for s in lab.plan(spec) if s["kind"] == "script"]
+        self.assertEqual((on[0]["telemetry"], off[0]["telemetry"]), (True, False))
+
     def test_suite_job(self) -> None:
         spec = {"experiment": "experiments/2026-10-14-servebench", "run": "s", "jobs": [
             {"kind": "measure", "suite": "screen",
@@ -576,6 +584,15 @@ class TelemetryTest(unittest.TestCase):
             saved = json.loads((Path(directory) / "results/z/out.jsonl.telemetry.json").read_text())
         self.assertNotIn("error", saved["nodes"]["n1"])
         self.assertIn("threads", saved["nodes"]["n1"])
+
+    def test_engine_logs_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)), \
+                mock.patch.object(lab, "log"), \
+                mock.patch.object(lab, "nodes_config", return_value={"nodes": [{"name": "n1"}, {"name": "n2"}]}), \
+                mock.patch.object(lab.spark, "run_ssh", return_value=mock.Mock(stdout="Traceback: boom\n", stderr="")):
+            lab.save_engine_logs("results/r/goodput.jsonl")
+            saved = (Path(directory) / "results/r/goodput.jsonl.engine-n2.log").read_text()
+        self.assertIn("boom", saved)
 
     def test_never_fails_the_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
