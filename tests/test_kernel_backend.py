@@ -108,7 +108,7 @@ class KernelBackendTest(unittest.TestCase):
         return [p for p in spark.local_doctor(cluster, self.nodes, lock) if not isinstance(p, spark.Warn)]
 
     def test_promoted_profiles_run_tilelang(self):
-        # The TP3 profiles stay on r6 (unqualified on the ring cabling) and pin its lock.
+        # The TP3 profiles stay on r6h (r6k is unqualified on the triangle) and pin its frozen lock.
         for name in ("config/cluster.json", "config/cluster-64k.json", "config/cluster-4k.json"):
             with self.subTest(name=name):
                 cluster = spark.read_json(name)

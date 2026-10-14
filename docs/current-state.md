@@ -1,32 +1,39 @@
 # Current state
 
 Production is the TP4 1M profile ([config/cluster-tp4.json](../config/cluster-tp4.json))
-on the four-node ring, promoted 2026-10-12 as
-[`2026-10-12-karmic-kraken-r6h`](../manifests/baselines/2026-10-12-karmic-kraken-r6h.json)
-([promotion record](../experiments/2026-10-12-r6h/README.md)): image
-`vllm-ds41f-kkref:19f2c20ed4d6-r6h` (`sha256:0aaa5d8b`) on all four ranks, Local
-Inference Lab vLLM `19f2c20e` with r6f's series plus vLLM 0111-0117, B12X
-`236ddff0`. It keeps r6f's arithmetic at DeepSeek's reference precision and its
-batch-invariant temperature-0 outputs (the same references), and adds
-bit-identical decode work:
-- the shared expert folded into the MoE combine also when it runs on the aux
-  stream (decode);
-- greedy verification from vocabulary shards (no FP32 logits all-gather when
-  every request in a step is greedy and none asks for logprobs);
-- the vocabulary heads' token tiles vary fastest, so a call past 64 rows reads
-  each block from DRAM once. Since 2026-10-12 the TP4 profile keeps the embedding
-  and head in regular memory (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=0`): the carve-out
-  is mapped uncached, so its second token tile could not reuse L2 (2.22 ms a
-  two-tile call there, 1.73 ms in regular memory;
-  `experiments/2026-10-12-r6h-loss`);
-- the mHC fn split while loading, and the folded combine's early shared load;
-- DSpark cost curves profiled for this image and head placement
-  (`ring4-r6h-headout-20261012`).
+on the four-node ring, promoted 2026-10-14 as
+[`2026-10-13-karmic-kraken-r6k`](../manifests/baselines/2026-10-13-karmic-kraken-r6k.json)
+([promotion record](../experiments/2026-10-13-r6k/README.md)): image
+`vllm-ds41f-kkref:19f2c20ed4d6-r6k` (`sha256:cf2bb9a6`) on all four ranks, Local
+Inference Lab vLLM `19f2c20e` with r6h's series plus vLLM 0118-0133 (patch head
+`aa31eb85`, tree `69108474`), B12X `236ddff0`, sparknet 0.3.0 (`b61660f`). r6k
+keeps r6h's arithmetic and batch-invariant temperature-0 outputs, and removes
+the last known deviation from DeepSeek's reference precision:
+- **WO in TileLang at the reference's precision.** WO-A is a W8A16 GEMM on BF16
+  activations, as the reference's einsum (B12X quantized them to FP8). Its last
+  kernel applies the reference's per-token cast, so WO-B, the reference's MXFP8
+  linear, reads E4M3 straight from it. Sequence-parallel steps project through
+  the rank-order exchange.
+- **The drafter's context-KV projection in TileLang**, with the reference's
+  activation cast.
+- **One sparse-MLA fold on every route** (split, decode, extend), so a prompt
+  prefilled among others rounds as it does alone.
+- **sparknet's TileLang one-shot collectives** (bit-identical to its CuTe
+  kernels, proxy on a big core) **and the TileLang L2 prefetch.**
+
+TP4 keeps the embedding and head in regular memory
+(`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`) and runs
+on r6h's cost curves for that placement (`ring4-r6h-headout-20261012`), as its
+release comparison did. The temperature-0 references are new (70b3379cc289 /
+708ec5b17482), because the text follows the reference's arithmetic.
 
 The three-node profiles below (`config/cluster.json` and the 4 KiB / 64 KiB
-variants) are promoted to r6h as well, on the same image, with their own cost
-curves (`tp3-r6h-20261012`). The TileLang kernel family runs the model; B12X is
-the alternative backend in the same image.
+variants) stay on r6h
+([`2026-10-12-karmic-kraken-r6h`](../manifests/baselines/2026-10-12-karmic-kraken-r6h.json),
+image `sha256:0aaa5d8b`, cost curves `tp3-r6h-20261012`). They are pinned to
+r6h's lock (`experiments/2026-10-12-r6h/upstreams.lock.json`) until they boot
+and bench r6k at the next re-cable. The TileLang kernel family runs the model;
+B12X is the alternative backend in the same image.
 
 | Setting | Active value |
 |---|---:|

@@ -4,15 +4,17 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is the four-node TP4 1M profile on **r6h** (2026-10-12,
-[promotion record](experiments/2026-10-12-r6h/README.md)), and the three-node
-profiles are promoted to r6h too. r6h computes at DeepSeek's reference
-precision (FP32 logits, an exact FP32 mHC projection, the shared expert's
-SwiGLU in FP32, MoE partials rounded once) with temperature-0 outputs that do
-not depend on the batch, as r6f did, and adds bit-identical decode work: the
-shared expert folded into the MoE combine at decode, greedy verification from
-vocabulary shards, the vocabulary head reading its weights once per call, and
-DSpark cost curves profiled for the image.
+Production is the four-node TP4 1M profile on **r6k** (2026-10-14,
+[promotion record](experiments/2026-10-13-r6k/README.md)). The three-node
+profiles stay on r6h ([record](experiments/2026-10-12-r6h/README.md)) until
+they boot and bench r6k at the next re-cable. r6k removes the last known
+deviation from DeepSeek's reference precision. B12X's WO projection quantized
+its input to FP8; r6k runs it in TileLang on BF16 activations, as the
+reference's einsum, with WO-B's input cast exactly as the reference's
+`act_quant`. It also moves the drafter's context-KV projection, sparknet's
+collectives and the L2 prefetch to TileLang. As before, it keeps FP32 logits,
+an exact FP32 mHC projection, the shared expert's SwiGLU in FP32, MoE partials
+rounded once, and temperature-0 outputs that do not depend on the batch.
 
 The promoted kernel family is **TileLang** (r6): TileLang kernels for SM121,
 with DeepSeek's TileKernels and the one-shot RoCE collectives of
@@ -89,10 +91,14 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 
 ## Current baseline
 
-The baseline for both shapes is
+The four-node baseline is
+[manifests/baselines/2026-10-13-karmic-kraken-r6k.json](manifests/baselines/2026-10-13-karmic-kraken-r6k.json)
+([promotion record](experiments/2026-10-13-r6k/README.md)). The three-node
+baseline is still
 [manifests/baselines/2026-10-12-karmic-kraken-r6h.json](manifests/baselines/2026-10-12-karmic-kraken-r6h.json)
-([promotion record](experiments/2026-10-12-r6h/README.md); see
-[docs/current-state.md](docs/current-state.md)). The three-node deployment:
+([promotion record](experiments/2026-10-12-r6h/README.md)), on r6h's frozen lock
+(`experiments/2026-10-12-r6h/upstreams.lock.json`); see
+[docs/current-state.md](docs/current-state.md). The three-node deployment:
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
@@ -179,6 +185,35 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+r6k against r6h on four nodes (2026-10-13), measured with the
+[release comparison](docs/lab.md#release-comparison) in one session, candidate
+first ([results](experiments/2026-10-13-r6k/README.md);
+[report](manifests/benchmarks/2026-10-13-karmic-kraken-r6k-tp4.json)). Each
+change is shown with its combined 95% interval and counts (**bold**) only
+beyond it.
+
+| Workload | TP4 r6h | TP4 r6k |
+| --- | ---: | ---: |
+| Temperature 0, 15 streams + a long prompt (requests differing) | 0 of 16 | 0 of 16 |
+| Quality gate | 5/5 | 5/5 |
+| Decode, 1 stream, 16 prompts paired | | +0.6% ±2.4 |
+| Decode, 4 different prompts at once (tok/s) | 133.9 | 134.5 (+0.4% ±0.9) |
+| Decode, 8 different prompts at once | 177.2 | 178.3 (**+0.6%** ±0.3) |
+| Decode, 16 different prompts at once | 225.8 | 223.9 (-0.8% ±0.9) |
+| Source-text prefill, 32K (tok/s) | 5,835 | 5,825 (-0.2% ±1.4) |
+| Prefill, 128K | 5,717 | 5,761 (+0.8% ±0.9) |
+| Prefill, 256K | 5,490 | 5,519 (+0.5% ±0.6) |
+| Prefill, 512K | 5,046 | 5,086 (**+0.8%** ±0.3) |
+| Prefill, 1M | 4,378 | 4,400 (**+0.5%** ±0.1) |
+
+r6k is never slower on these measures, and it is faster at eight prompts and on
+the longest prefills, while computing WO at the reference's precision. Its
+temperature-0 text differs from r6h's: scored on the same tokens, r6h agrees
+with r6k on the most likely token at 95.1% of positions, with a KL divergence of
+0.021 nats ([servebench](experiments/2026-10-14-servebench/README.md)). The
+bench's single-prompt decode points follow the text and moved 9-14% either way
+with draft acceptance, so the table judges different prompts at once.
 
 r6h against r6d (2026-10-12), measured with the
 [release comparison](docs/lab.md#release-comparison) in one session per
