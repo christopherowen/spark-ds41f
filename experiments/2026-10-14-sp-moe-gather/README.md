@@ -116,3 +116,22 @@ the reduce-scatters, the decoder layers after the CED boundary, decode.
 
 Planned 2026-10-14. The ceiling is measured from existing traces. Nothing is
 built or run.
+
+## Review (2026-10-14, TileLang session)
+
+The plan holds: 5,328 bytes a row (5,120 MXFP8 + 160 packed scale bytes + 24 id bytes
++ 24 weight bytes) against 10,240, and each row's cast, router and top-k depend only on
+that row. Two corrections before building:
+
+- **Token ids.** Under sequence parallelism the FFN receives the whole step's `input_ids`
+  with the gathered rows (`self.ffn(sp_rows.gather(x), input_ids, ...)` in
+  `nvidia/model.py`). `DeepseekV4MoE` reads them in two places:
+  - the first `config.num_hash_layers` layers route by token id
+    (`gate.tid2eid`, no router GEMM);
+  - vision routing (`gate.bias_vl`) uses them to find image tokens.
+
+  Routing a rank's L rows needs that rank's slice of `input_ids`. The bundle's
+  router/top-k test must cover a hash layer and a step with image tokens.
+- **Ceiling.** The hash layers run no router GEMM today, so they save only the gather
+  and the casts there. Recompute the router saving over the non-hash encoder layers
+  with `sp_moe_front.py` (it will shave a little off the ~3.9%).
