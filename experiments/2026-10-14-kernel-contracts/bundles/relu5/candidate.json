@@ -1,0 +1,51 @@
+{
+  "description": "Fifth round: the index MXFP4 quantizer keeps a NaN (integer max on |x| bits, exponent clamp, zero codes for a non-finite group) against r6k's bytes and time, the NaN-input contracts with the clamp ReLU, and how the MMA reads scale 0xFF.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6k",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import os, subprocess, sys; codes = [subprocess.call([sys.executable, '/b/bench_relu5.py'])]; env = dict(os.environ, PYTHONPATH='/b' + os.pathsep + os.environ.get('PYTHONPATH', ''), SWAP='indexer=/b/indexer_clamp_quant.py'); codes += [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-p', 'swap_plugin', '-rfEPxX', '-k', 'indexer or mxfp4 or index_keys or quantizer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py', 'tests/kernels/attention/test_deepseek_v41_tilelang_nan_inputs.py'], env=env)]; print('exit codes (quantizer bench, clamp + NaN-keeping quantizer tests)', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "tests__kernels__deepseek_v41_contracts.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/deepseek_v41_contracts.py"
+    ],
+    [
+      "tests__kernels__attention__test_deepseek_v41_tilelang.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py"
+    ],
+    [
+      "tests__kernels__attention__test_deepseek_v41_tilelang_nan_inputs.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang_nan_inputs.py"
+    ],
+    [
+      "r6k_indexer.py",
+      "/b/r6k_indexer.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_relu5.py",
+      "/b/bench_relu5.py"
+    ],
+    [
+      "swap_plugin.py",
+      "/b/swap_plugin.py"
+    ],
+    [
+      "indexer_quant.py",
+      "/b/indexer_quant.py"
+    ],
+    [
+      "indexer_clamp_quant.py",
+      "/b/indexer_clamp_quant.py"
+    ]
+  ]
+}

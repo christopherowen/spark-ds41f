@@ -234,3 +234,25 @@ the loop.
   scale to byte 0x00. What the quantizer should do with a NaN is the owner's decision.
 
 Adoption rule as before: contract passes, r6k's bits, every shape within 1% of r6k.
+
+### Round 5, queued ([relu5.json](relu5.json)): the index quantizer keeps a NaN
+
+Owner, 2026-10-15: "we should handle the NaNs but without performance penalty". The index
+quantizer (queries and keys) gets the NaN treatment an infinity already has:
+- the group amax is an integer max on `|x|`'s FP32 bits; for non-negative values integer
+  order is float order with NaN above infinity, so the max keeps the NaN, and a finite
+  group gets fmaxf's value (same bytes);
+- the UE8M0 exponent is clamped at 255, so a NaN amax takes the NaN scale 0xFF (it would
+  round up to 256 and wrap to 0x00);
+- a non-finite group's codes are zeros, so its block's partial dot is zero and the 0xFF
+  scale makes the dot NaN however the MMA reads 0xFF (one select per group).
+
+[bundles/relu5](bundles/relu5):
+- bytes against r6k's quantizer on finite inputs (random, ties, zeros, signed zeros,
+  BF16 extremes, subnormals), contiguous (queries) and paged (keys); time at query and key
+  sizes, judged at 1%;
+- with the `clamp` ReLU: the indexer tests, the NaN contract, and new NaN-input contracts
+  (`test_deepseek_v41_tilelang_nan_inputs.py`): a non-finite group's bytes, a NaN key
+  reaches exactly the positions that read its slot, a NaN query exactly its row, and
+  everything else keeps its bits;
+- report only: how the MMA reads a query group's scale 0xFF with nonzero and zero codes.
