@@ -461,6 +461,20 @@ class SuiteTest(unittest.TestCase):
         self.assertEqual(suite.check({"name": "x", "steps": [{"id": "a", "command": "dance"}]}),
                          ["step a: command must be one of model, engine, run, prefill"])
 
+    def test_floor_verdicts(self):
+        def outcome(grid, tps):
+            return {"steps": {"grid": ("servebench-engine/1", {"rows": [
+                        {"metric": "decode geometric mean (20)", "change_pct": grid, "ci95_pct": 0.15}]}),
+                    "c16": ("servebench/1", {"rows": [
+                        {"metric": "output tok/s", "change_pct": tps, "ci95_pct": 0.9},
+                        {"metric": "TTFT p50 s", "change_pct": 9.0, "ci95_pct": None}]})}}
+        rows = suite.with_floor(outcome(-0.36, 2.5), outcome(-0.44, 0.1))
+        verdicts = {row["metric"]: row["verdict"] for row in rows}
+        self.assertEqual(verdicts, {"decode geometric mean (20)": "same", "output tok/s": "better"})
+        rows = suite.with_floor(outcome(-1.2, -2.0), outcome(0.2, 0.1))
+        self.assertEqual([row["verdict"] for row in rows], ["better", "worse"])  # faster steps; fewer tok/s
+        self.assertIn("against the run's own repeat", suite.format_floor(rows, "base", "cand", "again"))
+
     def test_suite_runs_and_compares(self):
         servers = [FakeServer(), FakeServer(variant=True)]
         try:

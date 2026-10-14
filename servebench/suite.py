@@ -113,3 +113,45 @@ def compare(read_json, base_dir: str, candidate_dir: str, compare_one) -> dict:
                                      read_json(str(Path(candidate_dir) / c["output"])))
     return {"suite": base["suite"]["name"], "suite_sha256": base["suite_sha256"],
             "labels": [base.get("label"), candidate.get("label")], "steps": steps}
+
+
+HEADLINE = ("decode geometric mean", "output tok/s", "prefill ")
+
+
+def with_floor(reference_to_candidate: dict, repeat: dict) -> list[dict]:
+    """Headline rows of a reference -> candidate suite comparison, judged against the run's
+    own repeat (candidate -> candidate again on another boot). A boot carries a few tenths
+    of a percent of its own that no within-run interval sees (2026-10-14: the same build
+    moved -0.44% to +0.52% on the grid between boots), so a change counts only beyond its
+    interval plus the repeat's own change."""
+    rows = []
+    for step, outcome in reference_to_candidate["steps"].items():
+        if "skipped" in outcome or step not in repeat["steps"] or "skipped" in repeat["steps"][step]:
+            continue
+        schema, result = outcome
+        if "rows" not in result:
+            continue
+        again = {row["metric"]: row for row in repeat["steps"][step][1].get("rows", [])}
+        for row in result["rows"]:
+            if not row["metric"].startswith(HEADLINE) or row["metric"] not in again or row["ci95_pct"] is None:
+                continue
+            floor = abs(again[row["metric"]]["change_pct"])
+            lower_is_better = row["metric"].startswith("decode")  # step times
+            margin = row["ci95_pct"] + floor
+            if abs(row["change_pct"]) <= margin:
+                verdict = "same"
+            else:
+                verdict = "better" if (row["change_pct"] < 0) == lower_is_better else "worse"
+            rows.append({"step": step, "metric": row["metric"], "change_pct": row["change_pct"],
+                         "ci95_pct": row["ci95_pct"], "repeat_pct": again[row["metric"]]["change_pct"],
+                         "verdict": verdict})
+    return rows
+
+
+def format_floor(rows: list[dict], reference: str, candidate: str, repeat: str) -> str:
+    lines = [f"verdicts: {reference} -> {candidate}, against the run's own repeat ({candidate} -> {repeat})",
+             f"{'metric':32s} {'change':>8s} {'±95%':>7s} {'repeat':>8s}  verdict"]
+    for row in rows:
+        lines.append(f"{row['step'] + ': ' + row['metric']:32s} {row['change_pct']:+7.2f}% {row['ci95_pct']:6.2f}% "
+                     f"{row['repeat_pct']:+7.2f}%  {row['verdict']}")
+    return "\n".join(lines)

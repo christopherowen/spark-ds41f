@@ -67,3 +67,28 @@ All four nodes are locked at 2489 MHz, the clock every node sustains under load:
 Against the unlocked second grid validation, the question is whether r6k against r6k
 again moves less than +0.14 / +0.52% (geometric mean of the grid) and +0.13% (sixteen
 streams). [sync.json](sync.json) moves the runner to the suite code first.
+
+## Locked results (2026-10-14, 05:54-06:40 UTC)
+
+The lock was accepted on every node, but GB10 ran under it. Telemetry showed 2463-2483 MHz
+(p50 2470 / 2483 / 2476 / 2476), about 0.6% below the unlocked clocks, still differing by
+node, with no clock-event reason. Sixteen streams fell from 225.3-225.7 to 224.7 tok/s.
+
+| comparison | grid geometric mean | 16 streams tok/s | prefill 32K / 256K |
+| --- | ---: | ---: | ---: |
+| r6h -> r6k | -0.36% ±0.15 | -0.26% ±0.89 | -0.80% / -0.30% (level) |
+| r6k -> r6k again (A/A, another boot) | **-0.44% ±0.16** | +0.10% ±0.93 | +0.42% / -0.00% |
+| unlocked A/A (second grid validation) | +0.14 / +0.52% | +0.13% ±1.04 | |
+
+- **Locking does not remove the boot-to-boot shift.** The same build still moved 0.44%
+  between boots, beyond the grid's within-run interval. The shift belongs to the boot,
+  not to the clocks. Within a boot, grids repeat to about ±0.05%.
+- **Locking costs speed and buys nothing**, so measurements stay unlocked. The
+  `gpu_clocks` job remains for experiments.
+- **Model behaviour reproduced bit for bit** across boots and sessions: r6h on r6k's text
+  had KL 0.0207 nats and top-1 agreement 95.15% on 128 prompts, against 0.0207 and 95.13%
+  on 256 earlier.
+- **Consequence:** a single comparison cannot resolve differences smaller than about half
+  a percent on the grid. Suite tables therefore judge reference -> candidate against the
+  run's own repeat: a change counts only beyond its interval plus the candidate's own
+  boot-to-boot change. Here r6h -> r6k is "same" on every headline measure.
