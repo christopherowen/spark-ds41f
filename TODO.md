@@ -324,6 +324,12 @@ floor.
    with the query path, on a second CUDA stream captured into the graph. First
    measure how much of the ~6 ms latency-bound bucket is serial dependency
    rather than kernel time.
+7. **The routed experts' SwiGLU** (`experiments/2026-10-14-moe-swiglu`, planned).
+   TileKernels' `swiglu_forward_and_per_token_cast` takes 23-30 µs a layer at
+   every decode row count and runs serially between the two grouped GEMMs, about
+   3% of a step at one to sixteen streams. The shared expert's SwiGLU takes about
+   3 µs. Ceiling of a kernel over the live tiles with the same bytes: 2.4-2.7% of
+   a decode step.
 
 ## Speculative decoding
 
@@ -374,6 +380,12 @@ floor.
 
 ## Prefill and first token
 
+- **The sequence-parallel MoE input** (`experiments/2026-10-14-sp-moe-gather`,
+  planned). Each encoder layer all-gathers BF16 rows, then casts them to MXFP8
+  twice (the shared and the routed experts) and routes them, on all T rows on
+  every rank: 4.4 ms a layer at an 8,096-row chunk. Routing and casting each
+  rank's own rows and gathering MXFP8 rows with their scales and routes keeps the
+  bits. Ceiling: about 3.9% of a 16K prefill and about 3% at 1M.
 - **First request after a restart** is still ~0.37 s slower to its first token
   (579 ms against ~210 ms), and nothing JIT-compiles after readiness on r5j.
   Untested suspects: CUDA lazy module loading (screen `CUDA_MODULE_LOADING=EAGER`
