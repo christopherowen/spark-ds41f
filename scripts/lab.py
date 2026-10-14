@@ -557,6 +557,7 @@ class Telemetry:
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE, text=True)
                 sampler.stdin.write(THREAD_SAMPLER)
                 sampler.stdin.close()
+                sampler.stdin = None  # sent and closed: communicate() must not flush it again
                 self.threads[node["name"]] = sampler
         except Exception as error:  # noqa: BLE001 - telemetry is advisory
             log(f"telemetry not started: {error}")
@@ -566,22 +567,25 @@ class Telemetry:
         lock = json.loads(GPU_CLOCKS_MARKER.read_text()) if GPU_CLOCKS_MARKER.exists() else None
         summary: dict = {"started_utc": dt.datetime.fromtimestamp(self.started, dt.timezone.utc).isoformat(timespec="seconds"),
                          "seconds": round(time.time() - self.started, 1), "gpu_clocks_lock": lock, "nodes": {}}
+        def collect(process: subprocess.Popen) -> str:
+            process.terminate()  # the remote command ends on its next write to the closed pipe
+            try:
+                return process.communicate(timeout=20)[0] or ""
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return process.communicate()[0] or ""
+
         for name, process in self.processes.items():
-            process.terminate()  # the remote nvidia-smi ends on its next write to the closed pipe
             try:
-                text = process.communicate(timeout=20)[0]
-            except subprocess.TimeoutExpired:
-                process.kill()
-                text = process.communicate()[0]
-            summary["nodes"][name] = summarize_telemetry(text or "")
+                summary["nodes"][name] = summarize_telemetry(collect(process))
+            except Exception as error:  # noqa: BLE001 - telemetry never fails a step
+                summary["nodes"][name] = {"error": f"{type(error).__name__}: {error}"[:200]}
         for name, process in self.threads.items():
-            process.terminate()
             try:
-                text = process.communicate(timeout=20)[0]
-            except subprocess.TimeoutExpired:
-                process.kill()
-                text = process.communicate()[0]
-            summary["nodes"].setdefault(name, {})["threads"] = summarize_threads(text or "")
+                threads = summarize_threads(collect(process))
+            except Exception as error:  # noqa: BLE001
+                threads = {"error": f"{type(error).__name__}: {error}"[:200]}
+            summary["nodes"].setdefault(name, {})["threads"] = threads
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(self.path, summary)

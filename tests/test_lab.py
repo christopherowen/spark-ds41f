@@ -10,6 +10,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -553,6 +554,28 @@ class TelemetryTest(unittest.TestCase):
         self.assertIn("suite-a.jsonl: 12 s, clocks locked to 2489-2489 MHz", text)
         self.assertIn("n1: SM 1100/2404/2408 MHz (min 1100), 54 W, 61 °C max", text)
         self.assertIn("clock events {'0x0000000000000004': 1}", text)
+
+    def test_real_processes_close_cleanly(self) -> None:
+        """Real pipes, as on the cluster: the sampler's stdin is written and closed at start."""
+        real = subprocess.Popen
+
+        def local(command, **kwargs):
+            script = "import sys; sys.stdin.read(); print('2026/10/14 07:00:00.000, 2400, 4266, 40.0, 60, 0x0')"
+            return real([sys.executable, "-c", script], **kwargs)
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "ROOT", Path(directory)), mock.patch.object(lab, "log"), \
+                mock.patch.object(lab, "GPU_CLOCKS_MARKER", Path(directory) / "none.json"), \
+                mock.patch.object(lab, "nodes_config", return_value={"ssh_user": "u", "nodes": [{"name": "n1"}]}), \
+                mock.patch.object(lab.spark, "ssh_options", return_value=[]), \
+                mock.patch.object(lab.subprocess, "Popen", side_effect=local):
+            with lab.Telemetry("results/z/out.jsonl") as telemetry:
+                time.sleep(0.3)
+                # Python 3.12's communicate() flushes a closed stdin and raises (3.13 does not):
+                # the sampler's stdin must be released once the script is sent.
+                self.assertTrue(all(process.stdin is None for process in telemetry.threads.values()))
+            saved = json.loads((Path(directory) / "results/z/out.jsonl.telemetry.json").read_text())
+        self.assertNotIn("error", saved["nodes"]["n1"])
+        self.assertIn("threads", saved["nodes"]["n1"])
 
     def test_never_fails_the_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
