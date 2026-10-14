@@ -65,10 +65,10 @@ class FakeServer:
                         f'vllm:iteration_tokens_total_sum{{engine="0"}} {c["step_tokens"]}\n'
                         f'vllm:spec_decode_num_drafts_total{{engine="0"}} {c["drafts"]}\n'
                         f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {c["accepted"]}\n'
-                        f'vllm:spec_decode_num_draft_tokens_per_pos{{engine="0",position="0"}} {c["drafts"]}\n'
-                        f'vllm:spec_decode_num_draft_tokens_per_pos{{engine="0",position="1"}} {c["drafts"]}\n'
-                        f'vllm:spec_decode_num_accepted_tokens_per_pos{{engine="0",position="0"}} {c["pos0"]}\n'
-                        f'vllm:spec_decode_num_accepted_tokens_per_pos{{engine="0",position="1"}} {c["pos1"]}\n'
+                        f'vllm:spec_decode_num_draft_tokens_per_pos_total{{engine="0",position="0"}} {c["drafts"]}\n'
+                        f'vllm:spec_decode_num_draft_tokens_per_pos_total{{engine="0",position="1"}} {c["drafts"]}\n'
+                        f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="0"}} {c["pos0"]}\n'
+                        f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="1"}} {c["pos1"]}\n'
                         'vllm:kv_cache_usage_perc{engine="0"} NaN\n').encode()
                 else:
                     self.send_error(404)
@@ -203,6 +203,14 @@ class StatsTest(unittest.TestCase):
         p = stats.percentiles(list(range(1, 101)))
         self.assertEqual((p["p50"], p["p90"], p["p99"]), (50, 90, 99))
 
+    def test_t_quantile_and_trim(self):
+        for df, exact in ((10, 2.228), (30, 2.042), (120, 1.980)):
+            self.assertAlmostEqual(stats.t_quantile(0.975, df), exact, places=2)
+        self.assertGreater(stats.t_quantile(1 - 0.025 / 18, 60), 3.0)  # Bonferroni over 18
+        kept, dropped = stats.trim_slow([21.4, 21.5, 21.3, 31.6, 21.2, 21.6, 32.0, 21.4])
+        self.assertEqual((dropped, max(kept)), (2, 21.6))
+        self.assertEqual(stats.trim_slow([1.0, 1.0, 1.0, 1.0, 1.0, 2.0])[1], 0)  # no spread: keep all
+
     def test_welch_and_verdict(self):
         same = stats.welch([10, 10.1, 9.9, 10.0], [10.05, 9.95, 10.0, 10.1])
         self.assertEqual(stats.verdict(same["change_pct"], same["ci95_pct"], True, 3), "same")
@@ -330,10 +338,13 @@ class EngineTest(unittest.TestCase):
     def test_default_grid_reaches_the_longest_context(self):
         shapes = engine.default_shapes(drafts=5, max_context=1048576)
         labels = [engine.label(s) for s in shapes]
-        self.assertIn("decode 16x96 rows @4K", labels)
-        self.assertIn("decode 1x6 rows @1016K", labels)  # 8K below the 1M maximum
-        self.assertIn("prefill 8192 @256K", labels)
-        self.assertNotIn("decode 1x6 rows @1016K", [engine.label(s) for s in engine.default_shapes(5, 262144)])
+        self.assertIn("decode 16x96 rows @4K", labels)  # full depth
+        self.assertIn("decode 16x32 rows @4K", labels)  # depth 1, as serving runs under load
+        self.assertIn("decode 1x3 rows @1016K", labels)  # 8K below the 1M maximum
+        self.assertFalse(any(s.get("prefill") for s in shapes))
+        self.assertEqual(len(labels), len(set(labels)))
+        self.assertIn("prefill 8192 @256K", [engine.label(s) for s in engine.default_shapes(5, 1048576, prefill=True)])
+        self.assertNotIn("decode 1x3 rows @1016K", [engine.label(s) for s in engine.default_shapes(5, 262144)])
 
     def test_grid_run_summary_and_compare(self):
         fast, slow = FakeServer(1.0), FakeServer(1.05)
@@ -352,6 +363,8 @@ class EngineTest(unittest.TestCase):
             self.assertIn("forward_ms", row)
             result = engine.compare(runs[0], runs[1])
             self.assertEqual({r["verdict"] for r in result["rows"]}, {"worse"})
+            self.assertTrue(result["rows"][-1]["metric"].startswith("decode geometric mean"))
+            self.assertIn("Bonferroni", result["note"])
             self.assertAlmostEqual(result["rows"][0]["change_pct"], 5.0, places=1)
         finally:
             fast.close()

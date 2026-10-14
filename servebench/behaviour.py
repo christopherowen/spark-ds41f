@@ -46,11 +46,14 @@ def _in_parallel(items: list, work, concurrency: int) -> list:
 
 
 def _positions(base_url: str) -> dict | None:
+    """Per-position counters; Prometheus clients may expose them with a ``_total`` suffix."""
     text = prom.fetch(base_url)
     if text is None:
         return None
-    return {"accepted": prom.by_label(text, ACCEPTED_PER_POSITION, "position"),
-            "drafted": prom.by_label(text, DRAFTED_PER_POSITION, "position")}
+    out = {}
+    for key, name in (("accepted", ACCEPTED_PER_POSITION), ("drafted", DRAFTED_PER_POSITION)):
+        out[key] = prom.by_label(text, name + "_total", "position") or prom.by_label(text, name, "position")
+    return out
 
 
 def acceptance(start: dict | None, end: dict | None, positions_start: dict | None,

@@ -82,19 +82,19 @@ def command_run(args: argparse.Namespace) -> int:
 def command_engine(args: argparse.Namespace) -> int:
     if args.grid == "default":
         longest = args.max_context or engine.max_model_len(args.url)
-        shapes = engine.default_shapes(drafts=args.drafts, max_context=longest)
+        shapes = engine.default_shapes(drafts=args.drafts, max_context=longest, prefill=args.prefill)
     else:
         with open(args.grid, encoding="utf-8") as handle:
             shapes = json.load(handle)
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    raw = engine.run(args.url, shapes, replays=args.replays, warmup=args.warmup)
+    raw = engine.run(args.url, shapes, replays=args.replays, warmup=args.warmup, settle=args.settle)
     rows = engine.summarize(raw)
     result = {"schema": engine.SCHEMA, "tool": {"name": "servebench", "version": __version__},
               "started_utc": started, "label": args.label,
               "server": {"url": args.url, "workers": raw["workers"], "rank": raw["rank"],
                          "prefix_cache_reset": raw["prefix_cache_reset"]},
               "workload": {"grid": args.grid, "replays": args.replays, "warmup": args.warmup,
-                           "drafts": args.drafts},
+                           "settle": raw["settle"], "drafts": args.drafts, "prefill": args.prefill},
               "engine": rows}
     if args.output:
         write_json(args.output, result)
@@ -201,8 +201,13 @@ def main(argv: list[str] | None = None) -> int:
     grid = sub.add_parser("engine", help="time identical dummy steps inside the server (engine cost grid)")
     grid.add_argument("url", help="base URL of a server with the dev-mode collective RPC")
     grid.add_argument("--grid", default="default", help="'default' or a JSON file of shapes")
-    grid.add_argument("--replays", type=int, default=30, help="timed rounds over every shape")
+    grid.add_argument("--replays", type=int, default=100, help="timed rounds over every shape")
     grid.add_argument("--warmup", type=int, default=2, help="untimed runs per shape first")
+    grid.add_argument("--settle", type=int, default=1,
+                      help="untimed runs of the same shape before each timed one (switching shapes "
+                           "rebuilds the dummy metadata, the harness's cost)")
+    grid.add_argument("--prefill", action="store_true",
+                      help="add 8K prefill chunks (dummy prefill does not track real prefill)")
     grid.add_argument("--drafts", type=int, default=5, help="drafts per request in verify rows")
     grid.add_argument("--max-context", type=int, help="longest context (default: the server's)")
     grid.add_argument("--label", help="name for tables")

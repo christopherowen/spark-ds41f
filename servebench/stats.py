@@ -50,9 +50,33 @@ def percentiles(values: list[float], points=(50, 90, 99)) -> dict:
     return out
 
 
-def welch(base: list[float], candidate: list[float]) -> dict | None:
-    """Relative change of the candidate's mean against the base's, with its 95% Welch
-    interval, both in % of the base mean."""
+def t_quantile(p: float, df: float) -> float:
+    """Student's t quantile, from the normal one by the Cornish-Fisher expansion (within
+    about 0.1% of the exact value for df >= 10)."""
+    z = statistics.NormalDist().inv_cdf(p)
+    g1 = (z ** 3 + z) / 4
+    g2 = (5 * z ** 5 + 16 * z ** 3 + 3 * z) / 96
+    g3 = (3 * z ** 7 + 19 * z ** 5 + 17 * z ** 3 - 15 * z) / 384
+    return z + g1 / df + g2 / df ** 2 + g3 / df ** 3
+
+
+def trim_slow(values: list[float], k: float = 5.0) -> tuple[list[float], int]:
+    """Drop slow outliers (above the median by more than ``k`` scaled MADs): stalls
+    outside the work being timed. Returns the kept values and how many were dropped."""
+    if len(values) < 5:
+        return list(values), 0
+    middle = statistics.median(values)
+    mad = statistics.median(abs(v - middle) for v in values) * 1.4826
+    if not mad:
+        return list(values), 0
+    kept = [v for v in values if v <= middle + k * mad]
+    return kept, len(values) - len(kept)
+
+
+def welch(base: list[float], candidate: list[float], confidence: float = 0.95) -> dict | None:
+    """Relative change of the candidate's mean against the base's, with its Welch
+    interval at ``confidence`` (95% by default), both in % of the base mean; ``se_pct``
+    is the change's standard error in the same units."""
     a = [v for v in base if v is not None]
     b = [v for v in candidate if v is not None]
     if len(a) < 2 or len(b) < 2:
@@ -64,7 +88,9 @@ def welch(base: list[float], candidate: list[float]) -> dict | None:
     se = math.sqrt(va + vb)
     df = (va + vb) ** 2 / ((va ** 2 / (len(a) - 1) if va else 0) + (vb ** 2 / (len(b) - 1) if vb else 0)) \
         if (va or vb) else len(a) + len(b) - 2
-    return {"change_pct": 100 * (mb / ma - 1), "ci95_pct": 100 * t95(df) * se / abs(ma)}
+    quantile = t95(df) if confidence == 0.95 else t_quantile(1 - (1 - confidence) / 2, max(df, 1.0))
+    return {"change_pct": 100 * (mb / ma - 1), "ci95_pct": 100 * quantile * se / abs(ma),
+            "se_pct": 100 * se / abs(ma), "df": df}
 
 
 def verdict(change_pct: float, ci95_pct: float | None, higher_is_better: bool,

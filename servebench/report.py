@@ -142,11 +142,14 @@ def _batch_samples(run: dict, path: tuple) -> list[float] | None:
 
 
 def format_comparison(result: dict, base_label: str, candidate_label: str) -> str:
-    lines = [f"{'metric':22s} {base_label:>12s} {candidate_label:>12s} {'change':>8s} {'±95%':>7s}  verdict"]
+    width = max([22] + [len(row["metric"]) for row in result["rows"]])
+    lines = [f"{'metric':{width}s} {base_label:>12s} {candidate_label:>12s} {'change':>8s} {'±95%':>7s}  verdict"]
     for row in result["rows"]:
-        ci = "" if row["ci95_pct"] is None else f"{row['ci95_pct']:.1f}%"
-        lines.append(f"{row['metric']:22s} {row['base']:12.3f} {row['candidate']:12.3f} "
-                     f"{row['change_pct']:+7.1f}% {ci:>7s}  {row['verdict']}")
+        ci = "" if row["ci95_pct"] is None else f"{row['ci95_pct']:.2f}%"
+        values = " ".join(f"{v:12.3f}" if v is not None else f"{'':12s}" for v in (row["base"], row["candidate"]))
+        lines.append(f"{row['metric']:{width}s} {values} {row['change_pct']:+7.2f}% {ci:>7s}  {row['verdict']}")
+    if result.get("note"):
+        lines.append(result["note"])
     for warning in result["warnings"]:
         lines.append(f"WARNING: {warning}")
     return "\n".join(lines)

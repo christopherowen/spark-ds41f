@@ -64,18 +64,32 @@ python3 -m servebench compare base-grid.json candidate-grid.json
 ```
 
 The server times its own fixed-shape dummy steps, the speculative-decoding cost profile's
-steps, at the shapes asked for. The default grid:
-- verification rows for 1-16 requests at 4K and 64K context;
-- one and eight requests at 256K;
-- one request at the server's longest context;
-- 8K prefill chunks at 0, 64K and 256K.
+steps, at the shapes asked for. The default grid is verification rows (requests x (1 +
+depth)):
+- 1, 4, 8 and 16 requests at depths 1 and 2, at 4K context. This is what adaptive
+  verification runs under load: about two rows a request at 8-16 streams.
+- 1-16 requests at the full five drafts, at 4K.
+- Depth 2 at 64K and 256K and at the server's longest context.
 
-Each shape is warmed and then timed in rounds of alternating order (default 30). Every
-build does identical work with no text, acceptance or scheduling in it, so the step times
-are the engine's speed and their intervals are tight. This is the measurement that judges
-kernel and engine changes; tok/s judges what users get. It needs vLLM's dev-mode collective
-RPC (`VLLM_SERVER_DEV_MODE=1`) and a worker exposing `engine_grid`. It refuses a busy
-server and resets the prefix cache afterwards, since dummy steps write KV slots.
+Every build does identical work with no text, acceptance or scheduling in it, so the step
+times are the engine's speed. This is the measurement that judges kernel and engine changes
+at decode; tok/s judges what users get. It needs vLLM's dev-mode collective RPC
+(`VLLM_SERVER_DEV_MODE=1`) and a worker exposing `engine_grid`. It refuses a busy server
+and resets the prefix cache afterwards, since dummy steps write KV slots.
+
+- **Timing.** Each shape is warmed, then timed in rounds of alternating order (default
+  100). Each timed step follows an untimed one of the same shape (`--settle`): switching
+  shapes rebuilds the dummy metadata, which once cost 11 ms after a jump between 1M and
+  no context. That is the harness's cost, not the engine's.
+- **Comparison.**
+  - Slow outliers (above the median by five scaled MADs) are dropped first.
+  - The Welch intervals hold for all shapes at once (Bonferroni), so a grid of twenty
+    shapes does not flag one by chance.
+  - The decode shapes' geometric mean gives one overall verdict.
+- **Prefill is not in the default grid.** Dummy prefill ran 1.7x faster than a real 16K
+  prefill's kernels, and called a build 1% slower that real cold prefill found level or
+  faster, presumably because identical dummy tokens route the MoE unlike text. `--prefill`
+  adds 8K chunks for completeness; judge prefill on real prompts.
 
 ## Model behaviour
 
