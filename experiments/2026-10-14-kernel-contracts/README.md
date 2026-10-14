@@ -90,4 +90,32 @@ The test prints the error table, the unquantized-down reference's error included
 
 ## Results
 
-Pending w1.
+### w1 (2026-10-14, 08:58-09:05 UTC, run by the TileLang session at the owner's request)
+
+**r6k's kernels (dgx3):** 183 passed, 4 failed, 1 expected failure. The failures are
+exactly the predicted gaps:
+- `test_indexer_nonfinite_query_scale`;
+- the shared SwiGLU's `test_nonfinite_like_the_reference`;
+- the Engram gate's `test_nonfinite_like_the_reference[key]` and `[residual]`.
+
+The expected failure is TileKernels' routed-expert clamp.
+
+**With 0004-0006 (dgx4):** 187 passed and the same expected failure.
+[bench_nan_fixes.py](bundles/fixed/bench_nan_fixes.py) found the fixed kernels
+**bit-identical to r6k's on every finite input at every shape**. Its 3% time budget
+flagged several points:
+
+| kernel | flagged | reading |
+| --- | --- | --- |
+| shared SwiGLU | 2, 6, 12, 48, 72, 80, 8192 rows | Noise. Calls take 1.2-1.5 us, the differences are 0.03-0.14 us, and cold times sit on the timer's steps (4.06 / 5.92 us). 512 rows read 17% faster. 8192 rows: +4.8% warm, +0.8% cold. |
+| Engram gate | 4, 6 rows warm; 32 rows cold | Noise. 2-17 us calls, 0.1-0.8 us differences, neighbouring sizes level or faster. |
+| indexer score | 8K positions x 2048 rows: +4.6% warm, +3.9% cold | **Real.** TileLang warned that the `max2` loop over pairs became serial ("could not find a valid vectorization plan"). Decode sizes and 64K / 1M positions cost +0.1-0.7%. |
+
+End to end, the indexer cost is roughly +0.17 ms per indexer call at an 8K prefill
+chunk, about 0.25% of a chunk; decode is unchanged within noise.
+
+**Verdict:** correct, bit-identical on finite inputs, and the contracts catch exactly
+the bugs they target. Selected for the next release (owner, 2026-10-14: "if the work is
+good, promote it to be selected for the next release"). One condition first: recover
+the indexer's paired max so prefill is not slower. One option is a NaN select that
+TileLang can vectorize, or applying the select after the vectorized `max2`.

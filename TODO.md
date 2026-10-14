@@ -33,6 +33,22 @@ before tuning anything on this basis.
 
 ## Next release
 
+**Selected** (in the next candidate's series):
+1. **Kernel contracts and three NaN fixes**
+   ([experiments/2026-10-14-kernel-contracts](experiments/2026-10-14-kernel-contracts/README.md),
+   #224; vLLM `kernel-contracts` 0001-0006 on r6k's patch head).
+   - **What it adds:** tolerance-free non-finite contracts for ten kernel families,
+     DeepSeek-derived oracles in place of B12X's, and a calibrated MoE check. The
+     shared SwiGLU clamps, the Engram gate floor and the indexer ReLU now keep a NaN
+     as DeepSeek's reference does.
+   - **w1:** all contracts pass with the fixes, and the kernels are bit-identical to
+     r6k's on finite inputs.
+   - **Before gating:** recover the indexer ReLU's vectorized `max2` (+4% on that
+     kernel at an 8K prefill chunk, about 0.25% of the chunk).
+   - **Open, the owner's decision:** TileKernels' routed-expert SwiGLU has the same
+     clamp. It needs a TileKernels patch or an upstream change; its contract is a
+     strict `xfail` until then.
+
 Ideas recorded while making r6f, r6g and r6h (2026-10-11 to 2026-10-12). Bound
 each one from existing traces before building it, and build one piece per
 branch.
@@ -77,10 +93,9 @@ r6h on every metric on both topologies.
    - **Greedy argmax in the head's epilogue.** Write each tile's (max, index)
      pair instead of its FP32 logits: about 12 MB less written and read per TP4
      call.
-4. **WO-A on BF16 activations.** This is the last known deviation from
-   DeepSeek's reference arithmetic: the reference keeps BF16 activations and
-   dequantizes the FP8 weights exactly. It belongs to the B1 port, and it
-   changes the output, so it is evaluated as a precision change.
+4. **WO-A on BF16 activations.** Done in r6k (promoted 2026-10-14): the TileLang WO
+   runs WO-A on BF16 activations as the reference does, with the reference's cast
+   fused into its last kernel.
 5. **Mixed traffic.** r6h's p95 gap between a stream's chunks read 90.0 and
    93.1 ms against r6d's 86.6 ms, from one run each without an interval. Give the
    release protocol's mixed-traffic rounds repeats and an interval before
