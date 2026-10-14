@@ -102,3 +102,11 @@ That gives:
   quantizations against FP16. The difference is mostly B12X's FP8 quantization of WO-A's
   input, which r6k removed to match the reference.
 - **Cost:** generation 283 s, scoring 40 s, result 15 MB compressed.
+
+## Engine grid, second pass ([engine-validate2.json](engine-validate2.json))
+
+The grid as of #210: settle runs, 100 replays, depth 1 and 2 shapes, no dummy prefill.
+- **Order:** r6k, r6h, r6k again.
+- **Heat soak:** each boot runs the sixteen-stream closed loop (300 s) before its two grids.
+- **What it shows:** whether the settle runs and the soak take out the half-percent drift,
+  and the steady state's boot-to-boot spread.
