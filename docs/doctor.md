@@ -128,6 +128,15 @@ NCCL then fails with an unhandled system error.
 | The image's source-tree labels equal the configuration's `expected_labels` | error |
 | While serving, the GPU clock is at least 1,000 MHz | error; a lower clock is the [GB10 clock latch](recovery.md#gb10-gpu-clock-latch), cleared only by removing AC power |
 
+### CPU pinning
+
+When a profile pins serving to CPUs (`--cpuset-cpus=` in `container.docker_run_args`),
+every node's running container must use exactly that set (Docker's
+`HostConfig.CpusetCpus`). The set must also be that node's fast cores: those whose
+`cpu_capacity` is above the midpoint of the smallest and largest, GB10's ten Cortex-X925
+(5-9 and 15-19). A pin to slow cores, or a container started without the pin, is an
+error. Profiles without a pin are not checked.
+
 ### Checkpoint fragmentation
 
 **Warn** when model shards on a node use more extents than ext4's best layout

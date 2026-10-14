@@ -853,3 +853,26 @@ class KernelPolicyPathTest(unittest.TestCase):
         for path in ("../policy.json", "/tmp/policy.json"):
             with self.assertRaises(ValueError):
                 spark.kernel_policy_path({"host": {"kernel_policy": path}})
+
+
+class CpusetTest(unittest.TestCase):
+    """A profile that pins serving to CPUs must run pinned, on exactly the fast cores."""
+
+    CAPACITIES = {**{c: 718 for c in range(5)}, **{c: 997 for c in range(5, 10)},
+                  **{c: 731 for c in range(10, 15)}, **{c: 1017 for c in range(15, 19)}, 19: 1024}
+
+    def test_parsing(self):
+        self.assertEqual(spark.cpu_list("5-9,15-19"), {5, 6, 7, 8, 9, 15, 16, 17, 18, 19})
+        self.assertEqual(spark.cpu_list(""), set())
+        text = "\n".join(f"/sys/devices/system/cpu/cpu{c}/cpu_capacity:{v}" for c, v in self.CAPACITIES.items())
+        self.assertEqual(spark.cpu_capacities(text), self.CAPACITIES)
+        self.assertEqual(spark.fast_cpus(self.CAPACITIES), spark.cpu_list("5-9,15-19"))
+        cluster = {"container": {"docker_run_args": ["--gpus=all", "--cpuset-cpus=5-9,15-19"]}}
+        self.assertEqual(spark.configured_cpuset(cluster), "5-9,15-19")
+        self.assertIsNone(spark.configured_cpuset({"container": {"docker_run_args": []}}))
+
+    def test_problems(self):
+        self.assertEqual(spark.cpuset_problems("n", None, "", self.CAPACITIES), [])
+        self.assertEqual(spark.cpuset_problems("n", "5-9,15-19", "15-19,5-9", self.CAPACITIES), [])
+        self.assertIn("runs on CPUs all", spark.cpuset_problems("n", "5-9,15-19", "", self.CAPACITIES)[0])
+        self.assertIn("not this node's fast cores", spark.cpuset_problems("n", "0-9", "0-9", self.CAPACITIES)[0])

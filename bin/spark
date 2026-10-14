@@ -173,6 +173,56 @@ def environment_problems(
     return problems
 
 
+def configured_cpuset(cluster: dict) -> str | None:
+    """The CPUs a profile pins serving to (``--cpuset-cpus=`` in docker_run_args), if any."""
+    for argument in cluster["container"]["docker_run_args"]:
+        if argument.startswith("--cpuset-cpus="):
+            return argument.split("=", 1)[1]
+    return None
+
+
+def cpu_list(text: str) -> set[int]:
+    """'5-9,15-19' as a set of CPU numbers; empty text is the empty set."""
+    cpus: set[int] = set()
+    for part in filter(None, (piece.strip() for piece in text.split(","))):
+        low, _, high = part.partition("-")
+        cpus.update(range(int(low), int(high or low) + 1))
+    return cpus
+
+
+def fast_cpus(capacities: dict[int, int]) -> set[int]:
+    """CPUs whose cpu_capacity is above the midpoint of the smallest and largest: GB10's
+    ten Cortex-X925 (sparknet's "big" rule)."""
+    if not capacities:
+        return set()
+    middle = (min(capacities.values()) + max(capacities.values())) / 2
+    return {cpu for cpu, capacity in capacities.items() if capacity > middle}
+
+
+def cpu_capacities(text: str) -> dict[int, int]:
+    """``grep -H . /sys/devices/system/cpu/cpu*/cpu_capacity`` output as {cpu: capacity}."""
+    out = {}
+    for line in text.splitlines():
+        match = re.search(r"cpu(\d+)/cpu_capacity:(\d+)$", line.strip())
+        if match:
+            out[int(match.group(1))] = int(match.group(2))
+    return out
+
+
+def cpuset_problems(node_name: str, configured: str | None, live: str, capacities: dict[int, int]) -> list[str]:
+    """A pinned profile must run pinned, on exactly the node's fast cores."""
+    if configured is None:
+        return []
+    problems = []
+    if cpu_list(live) != cpu_list(configured):
+        problems.append(f"{node_name}: container runs on CPUs {live or 'all'}, the profile pins {configured}")
+    fast = fast_cpus(capacities)
+    if fast and cpu_list(configured) != fast:
+        problems.append(f"{node_name}: --cpuset-cpus={configured} is not this node's fast cores "
+                        f"({','.join(map(str, sorted(fast)))})")
+    return problems
+
+
 def rendered_docker_command(cluster: dict, node: dict) -> list[str]:
     container = cluster["container"]
     command = ["docker", "run", "-d", "--name", container["name"]]
@@ -1046,6 +1096,11 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
         problems.extend(
             mount_problems(node["name"], expected_binds(cluster), inspection["HostConfig"]["Binds"])
         )
+        if configured_cpuset(cluster) is not None:
+            capacities = cpu_capacities(run_ssh(
+                nodes, node, "sh", "-c", "grep -H . /sys/devices/system/cpu/cpu[0-9]*/cpu_capacity").stdout)
+            problems.extend(cpuset_problems(node["name"], configured_cpuset(cluster),
+                                            inspection["HostConfig"].get("CpusetCpus") or "", capacities))
         label_result = run_ssh(
             nodes,
             node,
