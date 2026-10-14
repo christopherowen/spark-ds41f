@@ -85,3 +85,21 @@ The questions:
 The TP4 profile pins serving to the fast cores (`--cpuset-cpus=5-9,15-19`, owner
 2026-10-14), and `doctor --live` checks it on every node. The TP3 profiles take the pin
 with their move to r6k at the next re-cable.
+
+### Compaction, balanced order (08:09-08:37 UTC)
+
+Eight pinned boots in the order p5 c5 c6 p6 p7 c7 c8 p8, so a position in the sequence
+favours neither side:
+- **Pinned against pinned and compacted:** -0.15% ±0.64% (same). Across all sixteen
+  pinned boots, -0.26% ±0.41% (same).
+- **Compaction does nothing measurable**, matching the near-identical free memory. It is
+  not added to production.
+- **Unpinned against all sixteen pinned boots:** -0.89% ±0.93% step time. The
+  boot-to-boot SD falls from 0.61% to 0.38%.
+
+### Deployed
+
+TP4 production restarted pinned at 08:42 UTC:
+- `doctor --live` matches, including the pin check;
+- `HostConfig.CpusetCpus` is 5-9,15-19 on all four nodes;
+- a sanity request answered correctly.
