@@ -406,6 +406,67 @@ class QueueTest(unittest.TestCase):
         steps = lab.plan(dict(SPEC, jobs=[{"kind": "sync"}]))
         self.assertEqual([s["kind"] for s in steps], ["sync"])
 
+    def test_gpu_clocks_jobs(self) -> None:
+        steps = lab.plan(dict(SPEC, jobs=[{"kind": "gpu_clocks", "lock_mhz": [2400, 2400]},
+                                          {"kind": "gpu_clocks", "reset": True}]))
+        self.assertEqual([s["lock"] for s in steps], [[2400, 2400], None])
+        self.assertEqual(lab.describe_step(steps[0]), "lock GPU SM clocks to 2400-2400 MHz on every node")
+        self.assertEqual(lab.describe_step(steps[1]), "reset GPU clocks on every node")
+        for bad in ([2400, 2000], [0, 2400]):
+            with self.assertRaises(SystemExit):
+                lab.plan(dict(SPEC, jobs=[{"kind": "gpu_clocks", "lock_mhz": bad}]))
+
+
+class GpuClocksTest(unittest.TestCase):
+    """A lock applies to every node or to none, and restoring production resets it."""
+
+    NODES = {"nodes": [{"name": "n1"}, {"name": "n2"}]}
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.patches = [mock.patch.object(lab, "GPU_CLOCKS_MARKER", Path(self.directory.name) / "locked.json"),
+                        mock.patch.object(lab, "nodes_config", return_value=self.NODES),
+                        mock.patch.object(lab, "log")]
+        for patch in self.patches:
+            patch.start()
+        self.calls = []
+
+    def tearDown(self) -> None:
+        for patch in self.patches:
+            patch.stop()
+        self.directory.cleanup()
+
+    def ssh(self, fail_on: str | None = None):
+        def run(nodes, node, *command):
+            self.calls.append((node["name"], command))
+            failed = fail_on == node["name"] and "-lgc" in command
+            return mock.Mock(returncode=1 if failed else 0, stdout="2400 MHz, 3003 MHz", stderr="no")
+        return run
+
+    def test_lock_and_reset(self) -> None:
+        with mock.patch.object(lab.spark, "run_ssh", self.ssh()):
+            self.assertTrue(lab.set_gpu_clocks([2400, 2400]))
+            self.assertTrue(lab.GPU_CLOCKS_MARKER.exists())
+            self.assertTrue(lab.set_gpu_clocks(None))
+        self.assertFalse(lab.GPU_CLOCKS_MARKER.exists())
+        sudo = [command for _, command in self.calls if command[0] == "sudo"]
+        self.assertEqual(sudo, [("sudo", "-n", "nvidia-smi", "-lgc", "2400,2400")] * 2
+                         + [("sudo", "-n", "nvidia-smi", "-rgc")] * 2)
+
+    def test_partial_lock_resets_every_node(self) -> None:
+        with mock.patch.object(lab.spark, "run_ssh", self.ssh(fail_on="n2")):
+            self.assertFalse(lab.set_gpu_clocks([2400, 2400]))
+        self.assertFalse(lab.GPU_CLOCKS_MARKER.exists())
+        resets = [name for name, command in self.calls if command[-1] == "-rgc"]
+        self.assertEqual(resets, ["n1", "n2"])
+
+    def test_restore_resets_a_lock_first(self) -> None:
+        lab.GPU_CLOCKS_MARKER.write_text("{}")
+        with mock.patch.object(lab, "set_gpu_clocks") as clocks, \
+                mock.patch.object(lab, "production_live", return_value=True):
+            self.assertTrue(lab.restore_production())
+        clocks.assert_called_once_with(None)
+
 
 class QueueFailureTest(unittest.TestCase):
     """A failed job costs only itself in the queue; the window still ends on its own reasons."""

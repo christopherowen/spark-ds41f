@@ -120,6 +120,14 @@ window if none of ours is open.
 - **`kernel`:** runs kernel-lab bundles on the named nodes concurrently, with the cluster
   stopped. It writes `results/private/lab/<run>/verdicts.json` and checks that the
   nodes agree.
+- **`gpu_clocks`:** `{"kind": "gpu_clocks", "lock_mhz": [min, max]}` locks every node's
+  GPU SM clock (`sudo -n nvidia-smi -lgc`) for the jobs that follow, and
+  `{"kind": "gpu_clocks", "reset": true}` resets it (`-rgc`).
+  - The lock survives boots.
+  - A lock that fails on any node is reset on all of them and ends the run.
+  - While a lock is in place, `~/spark-lab/gpu-clocks-locked.json` records it.
+    Restoring production (closing the window, including the watchdog's close) resets
+    the clocks first, so production never serves locked.
 
 Jobs that stop the cluster (`validate`, `profile`, `kernel`) run
 `bin/spark --cluster-config <production profile> cluster stop --apply --parallel`. The

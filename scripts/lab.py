@@ -88,6 +88,8 @@ HEARTBEAT_MAX_AGE = 900
 # The profile a window restores; main() sets it from --production-config or the open window's hold.
 PRODUCTION_CONFIG = spark.DEFAULT_CLUSTER_CONFIG
 TRACE_LOG_DIR = "/cache/kkref/moe-checksums"
+# Present while a gpu_clocks job has the SM clocks locked; restoring production resets them.
+GPU_CLOCKS_MARKER = LAB_HOME / "gpu-clocks-locked.json"
 
 # Measurement profiles: (script, extra arguments, output stem). The bench command is built apart.
 PROFILES = {
@@ -363,7 +365,34 @@ def production_live(problems: list | None = None) -> bool:
     return process.returncode == 0 and "live cluster matches" in process.stdout
 
 
+def set_gpu_clocks(lock: list[int] | None) -> bool:
+    """Lock every node's GPU SM clock to ``lock`` [min, max] MHz (``nvidia-smi -lgc``), or
+    reset it (``-rgc``) when ``lock`` is None. A lock that fails on any node is reset
+    everywhere, so no measurement runs with nodes at different clocks."""
+    nodes = nodes_config()
+    command = ("sudo", "-n", "nvidia-smi") + (("-lgc", f"{lock[0]},{lock[1]}") if lock else ("-rgc",))
+    ok = True
+    for node in nodes["nodes"]:
+        result = spark.run_ssh(nodes, node, *command)
+        now = spark.run_ssh(nodes, node, "nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm",
+                            "--format=csv,noheader").stdout.strip()
+        log(f"{node['name']}: GPU clocks {'locked to ' + '-'.join(map(str, lock)) if lock else 'reset'} "
+            f"(exit {result.returncode}; now {now})" + (f": {result.stderr.strip()[:200]}" if result.returncode else ""))
+        ok = ok and result.returncode == 0
+    if lock and ok:
+        write_json_atomic(GPU_CLOCKS_MARKER, {"lock_mhz": lock, "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    elif lock:
+        set_gpu_clocks(None)
+    elif ok:
+        GPU_CLOCKS_MARKER.unlink(missing_ok=True)
+    return ok
+
+
 def restore_production(dry: bool = False) -> bool:
+    if GPU_CLOCKS_MARKER.exists():
+        log("resetting the GPU clocks a lab job locked")
+        if not dry:
+            set_gpu_clocks(None)
     if not dry and production_live():
         log(f"{PRODUCTION_CONFIG} already serving")
         return True
@@ -654,9 +683,21 @@ def fabric_steps(spec: dict, job: dict) -> list[dict]:
              "label": job.get("label", Path(job["script"]).stem), "out": f"results/private/lab/{spec['run']}"}]
 
 
+def gpu_clocks_steps(spec: dict, job: dict) -> list[dict]:
+    """Lock every node's GPU SM clock to "lock_mhz" [min, max] for the jobs that follow, or
+    reset it ("reset": true). The lock survives boots; closing the window resets it."""
+    if job.get("reset"):
+        return [{"kind": "gpu_clocks", "lock": None}]
+    low, high = (int(v) for v in job["lock_mhz"])
+    if not 0 < low <= high:
+        raise SystemExit(f"gpu_clocks lock_mhz needs 0 < min <= max, got {job['lock_mhz']}")
+    return [{"kind": "gpu_clocks", "lock": [low, high]}]
+
+
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
-                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps}
+                "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps,
+                "gpu_clocks": gpu_clocks_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -692,6 +733,9 @@ def describe_step(step: dict) -> str:
         return f"fabric {step['script']} on every node ({step['config']})"
     if step["kind"] == "image":
         return f"image of {step['config']} built on {step['node']}, copied {len(step['copies'])} times"
+    if step["kind"] == "gpu_clocks":
+        lock = step["lock"]
+        return f"lock GPU SM clocks to {lock[0]}-{lock[1]} MHz on every node" if lock else "reset GPU clocks on every node"
     return step["kind"]
 
 
@@ -1176,6 +1220,10 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             elif step["kind"] == "sync":
                 if not sync_checkouts():
                     failed = "sync failed"
+                    break
+            elif step["kind"] == "gpu_clocks":
+                if not set_gpu_clocks(step["lock"]):
+                    failed = "GPU clock change failed"
                     break
             elif step["kind"] == "profile":
                 profile_workload(step)
