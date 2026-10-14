@@ -430,6 +430,22 @@ class PlanProblemsTest(unittest.TestCase):
                              ["scripts/servebench_engine.py", ["--replays", "100"], "grid"]])
         self.assertEqual(lab.plan_problems(lab.plan(spec)), [])
 
+    def test_suite_job(self) -> None:
+        spec = {"experiment": "experiments/2026-10-14-servebench", "run": "s", "jobs": [
+            {"kind": "measure", "suite": "screen",
+             "arms": [{"config": "experiments/2026-10-14-servebench/engine-r6k.json", "label": "cand"},
+                      {"config": "experiments/2026-10-14-servebench/engine-r6h.json", "label": "base"}]}]}
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            steps = lab.plan(spec)
+            self.assertEqual(lab.plan_problems(steps), [])
+        scripts = [s["argv"] for s in steps if s["kind"] == "script"]
+        self.assertEqual(scripts[0][-2:], ["--label", "cand"])
+        self.assertEqual(scripts[1][-2:], ["--corpus", "results/private/suites/s/cand/model.json.gz"])
+        self.assertEqual(steps[-1]["argv"], ["scripts/servebench_suite_table.py", "s", "cand", "base"])
+        spec["jobs"][0]["suite"] = "no-such-suite"
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            self.assertTrue(lab.plan_problems(lab.plan(spec)))
+
     def test_bad_arguments_missing_files_and_configs(self) -> None:
         spec = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"],
                              ["no_such_script.py", [], "x"]])

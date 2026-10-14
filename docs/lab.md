@@ -129,6 +129,13 @@ before the first boot. `run --dry-run` prints the problems.
 - **`kernel`:** runs kernel-lab bundles on the named nodes concurrently, with the cluster
   stopped. It writes `results/private/lab/<run>/verdicts.json` and checks that the
   nodes agree.
+- **`measure` with `"suite": "<name>"`** (servebench's `screen` or `release`, or a suite
+  file) replaces `extras`, `bench` and the profile. Each arm boots and runs
+  `scripts/servebench_suite.py` into `results/private/suites/<run>/<label>`. Arms after
+  the first score the first arm's text in model steps. The table
+  (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
+  every other arm, and the first arm with the last as the run's own repeat. Order arms
+  candidate, reference, candidate again.
 - **Telemetry:** every bench and script step of a `measure` job samples each node's GPU
   SM and memory clocks, power, temperature and clock-event reasons once a second
   (`nvidia-smi` over SSH). The summary goes beside the step's output as

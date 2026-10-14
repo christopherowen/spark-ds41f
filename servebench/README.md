@@ -56,6 +56,40 @@ server scenario, GuideLLM and AIPerf.
   against a tolerance (default 3%) and marked "no interval". The comparison warns when
   the two runs' workloads differ.
 
+## Suites
+
+```sh
+python3 -m servebench suite http://127.0.0.1:8000 --suite screen --out runs/candidate --label candidate
+python3 -m servebench suite http://127.0.0.1:8000 --suite screen --out runs/base --label base \
+    --corpus runs/candidate/model.json.gz
+python3 -m servebench compare runs/base runs/candidate
+```
+
+A suite is a fixed, named set of measurements, kept as data in
+[suites/](suites/): steps, each a servebench command (`model`, `engine`, `run`,
+`prefill`) with its arguments. Every build measured with a suite is measured the same way:
+- a run writes each step's result and `suite.json`, which records the suite and its
+  SHA-256;
+- `compare` on two run directories compares step by step;
+- it refuses runs of different suites, so a changed suite is a new suite.
+
+Built in:
+- `screen`, about 18 minutes a build: model behaviour on 128 prompts (first, so it also
+  heat-soaks the GPU), the engine grid, sixteen streams in a closed loop, and prefill at
+  32K and 256K.
+- `release`, about 45 minutes: all 256 prompts, eight streams as well, and prefill from
+  32K to 1M.
+
+`--corpus` makes model steps score another run's text, so builds compare on identical tokens.
+
+## Prefill
+
+`python3 -m servebench prefill URL --sizes 32768,262144 --repeats 3` times cold prompts of
+fixed sizes. Each prompt is Python standard-library source from a fixed seed, so every
+build reads the same text; it is sized by the server's tokenizer and sent with a fresh
+cache salt. The rate is prompt tokens over time to first token. Repeats go round the
+sizes in turn, and comparisons use Welch intervals.
+
 ## Engine cost grid
 
 ```sh

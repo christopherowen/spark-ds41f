@@ -1,5 +1,6 @@
 """servebench command line: ``run`` measures a live server, ``engine`` times its steps,
-``model`` records what it computes, ``compare`` judges two results."""
+``model`` records what it computes, ``prefill`` times cold prompts, ``suite`` runs a fixed
+set of them, ``compare`` judges two results (or two suite runs)."""
 
 import argparse
 import datetime
@@ -10,7 +11,7 @@ import sys
 import time
 import urllib.request
 
-from . import SCHEMA, __version__, behaviour, engine, load, prompts, report
+from . import SCHEMA, __version__, behaviour, engine, load, prefill, prompts, report, suite
 
 
 def model_id(base_url: str) -> str:
@@ -148,25 +149,83 @@ def command_model(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def compare_results(base: dict, candidate: dict, tolerance: float) -> tuple[str, dict]:
+    schema = base.get("schema")
+    if schema != candidate.get("schema"):
+        raise SystemExit(f"different result kinds: {schema} vs {candidate.get('schema')}")
+    if schema == behaviour.SCHEMA:
+        return schema, behaviour.compare(base, candidate)
+    if schema == engine.SCHEMA:
+        return schema, engine.compare(base, candidate, tolerance_pct=tolerance)
+    if schema == prefill.SCHEMA:
+        return schema, prefill.compare(base["prefill"], candidate["prefill"], tolerance_pct=tolerance)
+    return schema, report.compare(base, candidate, tolerance_pct=tolerance)
+
+
+def format_result(schema: str, result: dict, labels: list[str]) -> str:
+    if schema == behaviour.SCHEMA:
+        return behaviour.format_comparison(result, labels[0], labels[1])
+    return report.format_comparison(result, labels[0][:12], labels[1][:12])
+
+
 def command_compare(args: argparse.Namespace) -> int:
-    runs = [read_json(path) for path in (args.base, args.candidate)]
-    if runs[0].get("schema") != runs[1].get("schema"):
-        raise SystemExit(f"different result kinds: {runs[0].get('schema')} vs {runs[1].get('schema')}")
-    labels = [run.get("label") or path for run, path in zip(runs, (args.base, args.candidate))]
-    if runs[0].get("schema") == behaviour.SCHEMA:
-        result = behaviour.compare(runs[0], runs[1])
-        print(behaviour.format_comparison(result, labels[0], labels[1]))
+    if os.path.isdir(args.base) and os.path.isdir(args.candidate):
+        result = suite.compare(read_json, args.base, args.candidate,
+                               lambda b, c: compare_results(b, c, args.tolerance))
+        labels = [label or path for label, path in zip(result["labels"], (args.base, args.candidate))]
+        print(f"suite {result['suite']} ({result['suite_sha256'][:12]}): {labels[0]} -> {labels[1]}")
+        for step, outcome in result["steps"].items():
+            print(f"\n== {step}")
+            print(f"skipped: {outcome['skipped']}" if "skipped" in outcome else format_result(*outcome, labels))
         if args.json:
             print(json.dumps(result))
         return 0
-    if runs[0].get("schema") == engine.SCHEMA:
-        result = engine.compare(runs[0], runs[1], tolerance_pct=args.tolerance)
-    else:
-        result = report.compare(runs[0], runs[1], tolerance_pct=args.tolerance)
-    print(report.format_comparison(result, labels[0][:12], labels[1][:12]))
+    runs = [read_json(path) for path in (args.base, args.candidate)]
+    labels = [run.get("label") or path for run, path in zip(runs, (args.base, args.candidate))]
+    schema, result = compare_results(runs[0], runs[1], args.tolerance)
+    print(format_result(schema, result, labels))
     if args.json:
         print(json.dumps(result))
     return 0
+
+
+def command_prefill(args: argparse.Namespace) -> int:
+    model = args.model or model_id(args.url)
+    longest = engine.max_model_len(args.url)
+    sizes = [int(size) for size in args.sizes.split(",")]
+    skipped = [size for size in sizes if longest and size > longest - 1024]
+    extra = json.loads(args.extra_body) if args.extra_body else {}
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    samples = prefill.run(args.url, model, [s for s in sizes if s not in skipped], repeats=args.repeats,
+                          vllm=not args.no_vllm, extra_body=extra,
+                          log=lambda message: print(message, file=sys.stderr, flush=True))
+    rows = prefill.summarize(samples)
+    result = {"schema": prefill.SCHEMA, "tool": {"name": "servebench", "version": __version__},
+              "started_utc": started, "label": args.label,
+              "server": {"url": args.url, "model": model, "max_model_len": longest},
+              "workload": {"sizes": sizes, "repeats": args.repeats, "skipped": skipped, "extra_body": extra,
+                           "question": prefill.QUESTION},
+              "prefill": rows, "samples": samples}
+    if args.output:
+        write_json(args.output, result)
+    failed = sum(row["failed"] for row in rows)
+    print(json.dumps({"summary": "servebench prefill", "label": args.label,
+                      "tps": {row["size"]: row["tps"].get("mean") for row in rows},
+                      "ci95_pct": {row["size"]: row["tps"].get("ci95_pct") for row in rows},
+                      "skipped": skipped, "failed": failed, "output": args.output}), flush=True)
+    return 1 if failed else 0
+
+
+def command_suite(args: argparse.Namespace) -> int:
+    definition = suite.load(args.suite)
+    index = suite.run(main, args.url, definition, args.out, label=args.label, corpus=args.corpus,
+                      log=lambda message: print(message, file=sys.stderr, flush=True))
+    failed = [step["id"] for step in index["steps"] if step["exit"] != 0]
+    print(json.dumps({"summary": "servebench suite", "suite": definition["name"],
+                      "suite_sha256": index["suite_sha256"][:12], "label": args.label, "out": args.out,
+                      "seconds": {step["id"]: step["seconds"] for step in index["steps"]}, "failed": failed}),
+          flush=True)
+    return 1 if failed else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -233,8 +292,25 @@ def build_parser() -> argparse.ArgumentParser:
     behave.add_argument("--label", help="name for tables")
     behave.add_argument("--output", help="write the result JSON here (.gz to compress)")
     behave.set_defaults(func=command_model)
+    cold = sub.add_parser("prefill", help="cold prefill rate on real-text prompts of fixed sizes")
+    cold.add_argument("url", help="base URL, e.g. http://127.0.0.1:8000")
+    cold.add_argument("--sizes", default="32768,262144", help="prompt sizes in tokens, comma-separated")
+    cold.add_argument("--repeats", type=int, default=3)
+    cold.add_argument("--model", help="model id (default: the server's first)")
+    cold.add_argument("--extra-body", help="JSON merged into every request body")
+    cold.add_argument("--no-vllm", action="store_true", help="plain OpenAI requests (no cache salt)")
+    cold.add_argument("--label", help="name for tables")
+    cold.add_argument("--output", help="write the result JSON here")
+    cold.set_defaults(func=command_prefill)
+    fixed = sub.add_parser("suite", help="run a fixed set of measurements (servebench/suites/*.json)")
+    fixed.add_argument("url", help="base URL, e.g. http://127.0.0.1:8000")
+    fixed.add_argument("--suite", default="screen", help="built-in suite name or JSON path")
+    fixed.add_argument("--out", required=True, help="directory for every step's result and suite.json")
+    fixed.add_argument("--corpus", help="model steps score this model result's text (the first arm's)")
+    fixed.add_argument("--label", help="name for tables")
+    fixed.set_defaults(func=command_suite)
     compare = sub.add_parser("compare", help="judge a candidate run against a base run")
-    compare.add_argument("base")
+    compare.add_argument("base", help="a result file, or a suite run's directory")
     compare.add_argument("candidate")
     compare.add_argument("--tolerance", type=float, default=3.0,
                          help="budget in %% for metrics without an interval")

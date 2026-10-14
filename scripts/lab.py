@@ -627,6 +627,8 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
     if "extras" in job:  # [[script, [args...], stem], ...]: the job's own workloads
         profile["extras"] = [tuple(extra) for extra in job["extras"]]
     arms = list(job["arms"])
+    if "suite" in job:
+        return suite_steps(spec, job, arms)
     if job.get("bracket") and len(arms) > 1:
         first = dict(arms[0])
         first["label"] = f"{first['label']}-end"
@@ -656,6 +658,31 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
                   "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms],
                   "summaries": [f"results/private/determinism/{run}/{stem}-{a['label']}.jsonl"
                                 for _, _, stem in profile["extras"] for a in arms]})
+    return steps
+
+
+def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
+    """A measure job with "suite": each arm boots and runs the servebench suite into
+    results/private/suites/<run>/<label>; arms after the first score the first arm's text
+    in model steps; the table compares the arms' suite runs."""
+    experiment, run = spec["experiment"], spec["run"]
+    first = f"results/private/suites/{run}/{arms[0]['label']}/model.json.gz"
+    steps = []
+    for index, arm in enumerate(arms):
+        config, label = arm_config_path(experiment, arm["config"]), arm["label"]
+        steps.append({"kind": "boot", "config": config, "label": label})
+        steps.append({"kind": "curves", "label": label, "config": config,
+                      "out": f"results/private/determinism/{run}/curves-{label}.json"})
+        argv = ["scripts/servebench_suite.py", head_url(), "--suite", job["suite"],
+                "--out", f"results/private/suites/{run}/{label}", "--label", label]
+        if index:
+            argv += ["--corpus", first]
+        steps.append({"kind": "script", "label": label, "argv": argv,
+                      "out": f"results/private/determinism/{run}/suite-{label}.jsonl"})
+    steps.append({"kind": "table", "argv": ["scripts/servebench_suite_table.py", run, *[a["label"] for a in arms]],
+                  "out": f"results/private/lab/{run}-table.txt",
+                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms],
+                  "summaries": [f"results/private/determinism/{run}/suite-{a['label']}.jsonl" for a in arms]})
     return steps
 
 
@@ -772,7 +799,7 @@ def gpu_clocks_steps(spec: dict, job: dict) -> list[dict]:
 
 # Lab extras that are servebench commands; their arguments are checked with its parser.
 SERVEBENCH_SHIMS = {"scripts/servebench_run.py": "run", "scripts/servebench_engine.py": "engine",
-                    "scripts/servebench_model.py": "model"}
+                    "scripts/servebench_model.py": "model", "scripts/servebench_suite.py": "suite"}
 
 
 def plan_problems(steps: list[dict]) -> list[str]:
@@ -793,9 +820,16 @@ def plan_problems(steps: list[dict]) -> list[str]:
             errors = io.StringIO()
             try:
                 with contextlib.redirect_stderr(errors):
-                    build_parser().parse_args([SERVEBENCH_SHIMS[script], *args])
+                    parsed = build_parser().parse_args([SERVEBENCH_SHIMS[script], *args])
+                    if SERVEBENCH_SHIMS[script] == "suite":
+                        # Every step of the suite, as the suite will run it.
+                        from servebench import suite
+                        for suite_step in suite.load(parsed.suite)["steps"]:
+                            build_parser().parse_args(suite.arguments(suite_step, parsed.url, "o.json", "l", parsed.corpus))
             except SystemExit:
                 problems.append(f"{script} {shlex.join(args[1:])}: {errors.getvalue().strip().splitlines()[-1]}")
+            except (ValueError, OSError) as error:
+                problems.append(f"{script} {shlex.join(args[1:])}: {error}")
     return list(dict.fromkeys(problems))
 
 

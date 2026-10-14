@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from servebench import __main__ as cli  # noqa: E402
-from servebench import behaviour, client, engine, load, prom, prompts, report, stats  # noqa: E402
+from servebench import behaviour, client, engine, load, prefill, prom, prompts, report, stats, suite  # noqa: E402
 
 CHUNK_TOKENS = 2      # tokens per streamed chunk (a "step" of the fake engine)
 CHUNK_DELAY_S = 0.004
@@ -431,6 +431,61 @@ class BehaviourTest(unittest.TestCase):
             self.assertIn("top-1 agreement", behaviour.format_comparison(diff, "base", "other"))
         finally:
             for server in (base, again, other):
+                server.close()
+
+
+class SuiteTest(unittest.TestCase):
+    TINY = {"name": "tiny", "version": 1, "steps": [
+        {"id": "model", "command": "model", "args": {"limit": 4, "top": 3, "concurrency": 2}},
+        {"id": "grid", "command": "engine", "args": {"replays": 4, "settle": 1}},
+        {"id": "c2", "command": "run", "args": {"mode": "closed", "concurrency": 2, "warmup": 0.1,
+                                                 "duration": 0.4, "batches": 2, "max_tokens": 8,
+                                                 "extra_body": {"chat_template_kwargs": {"thinking": False}}}},
+        {"id": "prefill", "command": "prefill", "args": {"sizes": [2000, 4000], "repeats": 2}}]}
+
+    def test_builtin_suites_parse(self):
+        for name in ("screen", "release"):
+            definition = suite.load(name)
+            for step in definition["steps"]:
+                with self.subTest(suite=name, step=step["id"]):
+                    cli.build_parser().parse_args(suite.arguments(step, "http://x", "/tmp/o.json", "l", "/tmp/c.json.gz"))
+
+    def test_arguments(self):
+        step = {"id": "p", "command": "prefill", "args": {"sizes": [1, 2], "repeats": 3, "no_vllm": True,
+                                                          "extra_body": {"a": 1}, "label_ignored": None}}
+        self.assertEqual(suite.arguments(step, "U", "O", "arm", None),
+                         ["prefill", "U", "--output", "O", "--label", "arm-p", "--sizes", "1,2", "--repeats", "3",
+                          "--no-vllm", "--extra-body", '{"a": 1}'])
+        model = {"id": "m", "command": "model", "args": {}}
+        self.assertIn("--corpus", suite.arguments(model, "U", "O", None, "C"))
+        self.assertEqual(suite.check({"name": "x", "steps": [{"id": "a", "command": "dance"}]}),
+                         ["step a: command must be one of model, engine, run, prefill"])
+
+    def test_suite_runs_and_compares(self):
+        servers = [FakeServer(), FakeServer(variant=True)]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                definition = os.path.join(tmp, "tiny.json")
+                Path(definition).write_text(json.dumps(self.TINY))
+                base, cand = os.path.join(tmp, "base"), os.path.join(tmp, "cand")
+                self.assertEqual(cli.main(["suite", servers[0].url, "--suite", definition, "--out", base, "--label", "base"]), 0)
+                self.assertEqual(cli.main(["suite", servers[1].url, "--suite", definition, "--out", cand, "--label", "cand",
+                                           "--corpus", os.path.join(base, "model.json.gz")]), 0)
+                index = json.loads(Path(base, "suite.json").read_text())
+                self.assertEqual([s["exit"] for s in index["steps"]], [0, 0, 0, 0])
+                self.assertEqual(index["suite_sha256"], suite.digest(self.TINY))
+                result = suite.compare(cli.read_json, base, cand, lambda b, c: cli.compare_results(b, c, 3.0))
+                self.assertEqual(list(result["steps"]), ["model", "grid", "c2", "prefill"])
+                self.assertEqual(result["steps"]["model"][0], behaviour.SCHEMA)
+                self.assertEqual(result["steps"]["prefill"][0], prefill.SCHEMA)
+                self.assertEqual(len(result["steps"]["prefill"][1]["rows"]), 2)
+                changed = json.loads(Path(cand, "suite.json").read_text())
+                changed["suite_sha256"] = "0" * 64
+                Path(cand, "suite.json").write_text(json.dumps(changed))
+                with self.assertRaises(SystemExit):
+                    suite.compare(cli.read_json, base, cand, lambda b, c: cli.compare_results(b, c, 3.0))
+        finally:
+            for server in servers:
                 server.close()
 
 

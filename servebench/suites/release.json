@@ -1,0 +1,68 @@
+{
+ "name": "release",
+ "version": 1,
+ "description": "Release measurement, about 45 minutes a build: the screen with all 256 prompts, eight streams as well, and real-text prefill from 32K to 1M.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "concurrency": 16,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 8,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072,
+     262144,
+     524288,
+     1000000
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

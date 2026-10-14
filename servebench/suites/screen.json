@@ -1,0 +1,51 @@
+{
+ "name": "screen",
+ "version": 1,
+ "description": "Per-change screen, about 18 minutes a build: model behaviour first (it also heat-soaks the GPU), the engine grid, sixteen streams in a closed loop, real-text prefill at 32K and 256K.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "limit": 128,
+    "concurrency": 16,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     262144
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}
