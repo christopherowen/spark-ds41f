@@ -1,0 +1,67 @@
+{
+  "description": "Indexer ReLU forms that keep a NaN (isnan, ne, sel) against r6k's kernel: bits on finite inputs, time per call in three alternating rounds, the indexer tests and NaN contract per variant; the shared SwiGLU and Engram gate fixes re-timed the same way.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6k",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import os, subprocess, sys; codes = [subprocess.call([sys.executable, '/b/bench_relu.py'])]; env = dict(os.environ, PYTHONPATH='/b' + os.pathsep + os.environ.get('PYTHONPATH', '')); codes += [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-p', 'variant_plugin', '-rfEPxX', '-k', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py'], env=dict(env, VARIANT=v)) for v in ('isnan', 'ne', 'sel')]; print('exit codes (bench, isnan, ne, sel)', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "tests__kernels__deepseek_v41_contracts.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/deepseek_v41_contracts.py"
+    ],
+    [
+      "tests__kernels__attention__test_deepseek_v41_tilelang.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__activation.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/activation.py"
+    ],
+    [
+      "vllm__models__deepseek_v4_1__tilelang__engram.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/engram.py"
+    ],
+    [
+      "r6k_indexer.py",
+      "/b/r6k_indexer.py"
+    ],
+    [
+      "r6k_activation.py",
+      "/b/r6k_activation.py"
+    ],
+    [
+      "r6k_engram.py",
+      "/b/r6k_engram.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_relu.py",
+      "/b/bench_relu.py"
+    ],
+    [
+      "variant_plugin.py",
+      "/b/variant_plugin.py"
+    ],
+    [
+      "indexer_isnan.py",
+      "/b/indexer_isnan.py"
+    ],
+    [
+      "indexer_ne.py",
+      "/b/indexer_ne.py"
+    ],
+    [
+      "indexer_sel.py",
+      "/b/indexer_sel.py"
+    ]
+  ]
+}
