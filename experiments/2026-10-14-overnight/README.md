@@ -49,3 +49,11 @@ Second queue, behind pin-boots:
 | 6 | [goodput2.json](goodput2.json) | the goodput curve again; a failure now names the server's error | 26 min |
 | 7 | [pin-c16.json](pin-c16.json) | sixteen streams on four unpinned and four pinned boots, alternating. Pinning's effect on real throughput (one pair so far: +0.4%) | 64 min |
 | 8 | [context-r6h.json](context-r6h.json) | the context sweep on r6h, pinned ([r6h-big.json](r6h-big.json)) against r6k's | 40 min |
+
+## Third queue (13:05 UTC): the new protocol's first release comparison
+
+| order | spec | what | about |
+| ---: | --- | --- | ---: |
+| 10 | [release-pair.json](release-pair.json) | the `release` suite on r6k, r6h, r6k again, all pinned and on fresh boots. The table judges r6h -> r6k against r6k's own repeat. Set it beside the 2026-10-13 release table ([r6k](../2026-10-13-r6k/README.md)) to test the new protocol | 2 h 10 min |
+
+Read it with `python3 scripts/servebench_suite_table.py overnight-release-pair r6k r6h r6k-again`.
