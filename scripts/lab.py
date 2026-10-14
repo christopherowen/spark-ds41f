@@ -388,6 +388,80 @@ def set_gpu_clocks(lock: list[int] | None) -> bool:
     return ok
 
 
+TELEMETRY_FIELDS = ("clocks.sm", "clocks.mem", "power.draw", "temperature.gpu", "clocks_event_reasons.active")
+
+
+def summarize_telemetry(text: str) -> dict:
+    """``nvidia-smi --query-gpu=timestamp,<TELEMETRY_FIELDS> --format=csv,noheader,nounits``
+    lines as per-field percentiles, plus how many samples showed each clock-event reason."""
+    columns: dict[str, list[float]] = {field: [] for field in TELEMETRY_FIELDS[:-1]}
+    reasons: dict[str, int] = {}
+    samples = 0
+    for line in text.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 1 + len(TELEMETRY_FIELDS):
+            continue
+        samples += 1
+        for field, value in zip(TELEMETRY_FIELDS[:-1], parts[1:-1]):
+            try:
+                columns[field].append(float(value))
+            except ValueError:
+                pass
+        reasons[parts[-1]] = reasons.get(parts[-1], 0) + 1
+    out: dict = {"samples": samples, "event_reasons": reasons}
+    for field, values in columns.items():
+        if values:
+            ranked = sorted(values)
+            pick = lambda q: ranked[min(len(ranked) - 1, max(0, round(q / 100 * len(ranked)) - 1))]
+            out[field] = {"min": ranked[0], "p10": pick(10), "p50": pick(50), "p90": pick(90),
+                          "max": ranked[-1], "mean": round(sum(values) / len(values), 3)}
+    return out
+
+
+class Telemetry:
+    """Every node's GPU clocks, power, temperature and clock-event reasons, sampled each
+    second while a measured step runs and summarized beside its output
+    (``<out>.telemetry.json``, with the GPU clock lock in force, if any). Telemetry never
+    fails a step: a node that cannot be sampled is recorded as such."""
+
+    def __init__(self, out: str):
+        self.path = ROOT / f"{out}.telemetry.json"
+        self.processes: dict[str, subprocess.Popen] = {}
+
+    def __enter__(self) -> "Telemetry":
+        self.started = time.time()
+        try:
+            nodes = nodes_config()
+            command = shlex.join(["timeout", "21600", "nvidia-smi", "--query-gpu=timestamp," + ",".join(TELEMETRY_FIELDS),
+                                  "--format=csv,noheader,nounits", "-lms", "1000"])
+            for node in nodes["nodes"]:
+                self.processes[node["name"]] = subprocess.Popen(
+                    ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), command],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
+        except Exception as error:  # noqa: BLE001 - telemetry is advisory
+            log(f"telemetry not started: {error}")
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        lock = json.loads(GPU_CLOCKS_MARKER.read_text()) if GPU_CLOCKS_MARKER.exists() else None
+        summary: dict = {"started_utc": dt.datetime.fromtimestamp(self.started, dt.timezone.utc).isoformat(timespec="seconds"),
+                         "seconds": round(time.time() - self.started, 1), "gpu_clocks_lock": lock, "nodes": {}}
+        for name, process in self.processes.items():
+            process.terminate()  # the remote nvidia-smi ends on its next write to the closed pipe
+            try:
+                text = process.communicate(timeout=20)[0]
+            except subprocess.TimeoutExpired:
+                process.kill()
+                text = process.communicate()[0]
+            summary["nodes"][name] = summarize_telemetry(text or "")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            write_json_atomic(self.path, summary)
+        except OSError as error:
+            log(f"telemetry not saved: {error}")
+        return False
+
+
 def restore_production(dry: bool = False) -> bool:
     if GPU_CLOCKS_MARKER.exists():
         log("resetting the GPU clocks a lab job locked")
@@ -1210,13 +1284,17 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     break
             elif step["kind"] == "cli":
                 # A bench refuses a cluster that differs from its arm; that ends the job.
-                code = spark_cli(*step["argv"])
+                with Telemetry(step["argv"][step["argv"].index("--output") + 1] if "--output" in step["argv"]
+                               else f"results/private/lab/{spec['run']}-{step['label']}-bench"):
+                    code = spark_cli(*step["argv"])
                 log(f"bench {step['label']} exit {code}")
                 if code:
                     failed = f"bench {step['label']} exited {code}"
                     break
             elif step["kind"] == "script":
-                log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {run_script(step)}")
+                with Telemetry(step["out"]):
+                    code = run_script(step)
+                log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {code}")
             elif step["kind"] == "sync":
                 if not sync_checkouts():
                     failed = "sync failed"

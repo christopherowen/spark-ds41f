@@ -120,6 +120,11 @@ window if none of ours is open.
 - **`kernel`:** runs kernel-lab bundles on the named nodes concurrently, with the cluster
   stopped. It writes `results/private/lab/<run>/verdicts.json` and checks that the
   nodes agree.
+- **Telemetry:** every bench and script step of a `measure` job samples each node's GPU
+  SM and memory clocks, power, temperature and clock-event reasons once a second
+  (`nvidia-smi` over SSH). The summary goes beside the step's output as
+  `<output>.telemetry.json`: percentiles per field, event-reason counts and the clock
+  lock in force. Telemetry never fails a step.
 - **`gpu_clocks`:** `{"kind": "gpu_clocks", "lock_mhz": [min, max]}` locks every node's
   GPU SM clock (`sudo -n nvidia-smi -lgc`) for the jobs that follow, and
   `{"kind": "gpu_clocks", "reset": true}` resets it (`-rgc`).

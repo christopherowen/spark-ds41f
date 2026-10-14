@@ -22,11 +22,14 @@ sampling noise, sets its floor.
 - `sudo -n nvidia-smi -lgc min,max` on every node, all or none;
 - any production restore resets the clocks first, so production never serves locked.
 
-1. [trace.json](trace.json): r6k unlocked. [load_with_clocks.py](load_with_clocks.py)
-   samples every node's SM and memory clocks, power, temperature and clock-event reasons
-   every 500 ms during servebench's sixteen-stream closed loop (60 s warm-up, 300 s
-   window), then one engine grid. This shows the clocks serving runs at, which sets the
+1. [trace.json](trace.json): r6k unlocked, servebench's sixteen-stream closed loop (60 s
+   warm-up, 300 s window), then one engine grid. The lab's telemetry samples every node's
+   SM and memory clocks, power, temperature and clock-event reasons for each step
+   (`<output>.telemetry.json`). This shows the clocks serving runs at, which sets the
    lock.
+   - The first attempt (05:28 UTC) used a one-off sampling script whose arguments did not
+     parse on the cluster. Its grid ran; the sampling moved into `lab.py`, so experiments
+     need no script for it.
 2. Locked validation, the same shape as the second grid validation:
    - r6k, r6h, r6k again;
    - each boot runs the closed loop with clock samples, then two grids;
