@@ -47,10 +47,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime as dt
 import fcntl
 import hashlib
 import importlib.machinery
+import io
 import importlib.util
 import json
 import os
@@ -768,6 +770,35 @@ def gpu_clocks_steps(spec: dict, job: dict) -> list[dict]:
     return [{"kind": "gpu_clocks", "lock": [low, high]}]
 
 
+# Lab extras that are servebench commands; their arguments are checked with its parser.
+SERVEBENCH_SHIMS = {"scripts/servebench_run.py": "run", "scripts/servebench_engine.py": "engine",
+                    "scripts/servebench_model.py": "model"}
+
+
+def plan_problems(steps: list[dict]) -> list[str]:
+    """What would fail only after a boot: a missing arm configuration or script, or
+    servebench arguments its parser rejects."""
+    problems = []
+    for step in steps:
+        if step["kind"] == "boot" and not (ROOT / step["config"]).is_file():
+            problems.append(f"arm configuration {step['config']} does not exist")
+        if step["kind"] not in ("script", "profile"):
+            continue
+        script, args = step["argv"][0], step["argv"][1:]
+        if not (ROOT / script).is_file():
+            problems.append(f"script {script} does not exist")
+        elif script in SERVEBENCH_SHIMS:
+            sys.path.insert(0, str(ROOT))
+            from servebench.__main__ import build_parser
+            errors = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(errors):
+                    build_parser().parse_args([SERVEBENCH_SHIMS[script], *args])
+            except SystemExit:
+                problems.append(f"{script} {shlex.join(args[1:])}: {errors.getvalue().strip().splitlines()[-1]}")
+    return list(dict.fromkeys(problems))
+
+
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
                 "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps,
@@ -1234,6 +1265,8 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
         print(f"run {spec['run']}: {len(steps)} steps; production {PRODUCTION_CONFIG}")
         for index, step in enumerate(steps, 1):
             print(f"{index:3d}. {describe_step(step)}")
+        for problem in plan_problems(steps):
+            print(f"  problem: {problem}")
         return 0
     hold = read_hold()
     if not hold_is_ours(hold):
@@ -1255,6 +1288,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                 return
 
     threading.Thread(target=heartbeat, daemon=True).start()
+    validated = False
     for step in steps:
         hold = read_hold()
         if not hold_is_ours(hold):
@@ -1266,6 +1300,14 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             break
         current["note"] = describe_step(step)
         beat(current["note"])
+        if step["kind"] != "sync" and not validated:
+            # After any sync, before the first boot: every file and servebench argument
+            # the run needs, so a mistake costs seconds rather than a boot.
+            validated = True
+            problems = plan_problems(steps)
+            if problems:
+                failed = "invalid spec: " + "; ".join(problems)
+                break
         try:
             if step["kind"] == "boot":
                 if step["config"] not in checked:
@@ -1365,7 +1407,14 @@ QUEUE = ROOT / "results" / "private" / "lab" / "queue"
 
 def queue_add(spec_path: str) -> Path:
     spec = json.loads(Path(spec_path).read_text())
-    plan(spec)  # reject a malformed spec now, not when its turn comes
+    # Reject a malformed spec now, not when its turn comes after a boot. A spec that syncs
+    # first may name files this checkout does not have yet: warn, and the run checks again
+    # after its sync, before the first boot.
+    problems = plan_problems(plan(spec))
+    if problems and not any(job["kind"] == "sync" for job in spec["jobs"]):
+        raise SystemExit("not queued:\n  " + "\n  ".join(problems))
+    for problem in problems:
+        print(f"warning (checked again after the run's sync): {problem}", file=sys.stderr)
     QUEUE.mkdir(parents=True, exist_ok=True)
     target = QUEUE / f"{time.strftime('%Y%m%dT%H%M%S', time.gmtime())}-{Path(spec_path).name}"
     target.write_text(json.dumps(spec, indent=2) + "\n")

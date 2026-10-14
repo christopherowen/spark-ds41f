@@ -169,7 +169,8 @@ def command_compare(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line, without running anything (lab tools validate arguments with it)."""
     parser = argparse.ArgumentParser(prog="servebench", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run", help="measure a live OpenAI-compatible server")
@@ -239,7 +240,11 @@ def main(argv: list[str] | None = None) -> int:
                          help="budget in %% for metrics without an interval")
     compare.add_argument("--json", action="store_true", help="also print the comparison as JSON")
     compare.set_defaults(func=command_compare)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return args.func(args)
 
 

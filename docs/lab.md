@@ -77,6 +77,15 @@ ssh dgx1 'cd ~/projects/spark-ds41f && setsid -f scripts/lab.py run SPEC.json \
 A spec names the experiment directory, a run name and a list of jobs. A run opens a
 window if none of ours is open.
 
+Specs are checked before anything boots:
+- every arm configuration and script must exist;
+- the arguments of servebench extras (`scripts/servebench_run.py`, `_engine.py`,
+  `_model.py`) must parse with servebench's own parser.
+
+`queue add` refuses a spec that fails. One whose jobs start with a `sync` is only warned
+about, because its files may arrive with the sync; the run checks again after the sync,
+before the first boot. `run --dry-run` prints the problems.
+
 - **`measure`:** boots each arm with `cluster start --replace --change-shape`, with no
   stop in between, and measures it. The arm's node map must equal production's (below),
   so an arm can change context or KV size but never the node set.

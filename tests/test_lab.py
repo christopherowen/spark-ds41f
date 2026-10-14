@@ -417,6 +417,41 @@ class QueueTest(unittest.TestCase):
                 lab.plan(dict(SPEC, jobs=[{"kind": "gpu_clocks", "lock_mhz": bad}]))
 
 
+class PlanProblemsTest(unittest.TestCase):
+    """Mistakes that would cost a boot are found from the spec alone."""
+
+    def measure(self, extras: list) -> dict:
+        return {"experiment": "experiments/2026-10-14-servebench", "run": "r", "jobs": [
+            {"kind": "measure", "bench": False, "extras": extras,
+             "arms": [{"config": "experiments/2026-10-14-servebench/engine-r6k.json", "label": "a"}]}]}
+
+    def test_good_servebench_arguments_pass(self) -> None:
+        spec = self.measure([["scripts/servebench_run.py", ["--mode", "closed", "--concurrency", "16"], "c16"],
+                             ["scripts/servebench_engine.py", ["--replays", "100"], "grid"]])
+        self.assertEqual(lab.plan_problems(lab.plan(spec)), [])
+
+    def test_bad_arguments_missing_files_and_configs(self) -> None:
+        spec = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"],
+                             ["no_such_script.py", [], "x"]])
+        spec["jobs"][0]["arms"].append({"config": "missing.json", "label": "b"})
+        problems = lab.plan_problems(lab.plan(spec))
+        self.assertTrue(any("servebench_run.py" in p and "invalid choice" in p for p in problems), problems)
+        self.assertTrue(any("no_such_script.py does not exist" in p for p in problems), problems)
+        self.assertTrue(any("missing.json does not exist" in p for p in problems), problems)
+
+    def test_queue_rejects_without_a_sync_and_warns_with_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "QUEUE", Path(directory) / "q"):
+            bad = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"]])
+            path = Path(directory) / "bad.json"
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                lab.queue_add(str(path))
+            path.write_text(json.dumps(dict(bad, jobs=[{"kind": "sync"}, *bad["jobs"]])))
+            with contextlib.redirect_stderr(io.StringIO()) as warned, contextlib.redirect_stdout(io.StringIO()):
+                lab.queue_add(str(path))
+            self.assertIn("checked again after the run's sync", warned.getvalue())
+
+
 class TelemetryTest(unittest.TestCase):
     """Node telemetry around a measured step: summarized, saved, never fatal."""
 
@@ -805,6 +840,8 @@ class StepFailureTest(unittest.TestCase):
                 mock.patch.object(lab, "boot", return_value=True), \
                 mock.patch.object(lab, "save_curves"), \
                 mock.patch.object(lab, "spark_cli", return_value=1), \
+                mock.patch.object(lab, "plan_problems", return_value=[]), \
+                mock.patch.object(lab, "Telemetry", return_value=contextlib.nullcontext()), \
                 mock.patch.object(lab, "run_script") as script, \
                 mock.patch.object(lab.Path, "read_text", return_value='{"container": {"mounts": [], "image": "i"}}'), \
                 mock.patch.object(lab, "production_configuration", return_value=(
