@@ -1,0 +1,67 @@
+{
+  "description": "Second round of NaN-keeping forms against r6k: indexer bits (NaN tested on the float's bits) and fixup (r6k's loop plus a separate NaN loop), SwiGLU clamps as pure expressions; bits, time in three alternating rounds, and each variant's tests and NaN contracts.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6k",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import os, subprocess, sys; codes = [subprocess.call([sys.executable, '/b/bench_relu2.py'])]; env = dict(os.environ, PYTHONPATH='/b' + os.pathsep + os.environ.get('PYTHONPATH', '')); RUNS = [('indexer=/b/indexer_isnan.py', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py'), ('indexer=/b/indexer_bits.py', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py'), ('indexer=/b/indexer_fixup.py', 'indexer', 'tests/kernels/attention/test_deepseek_v41_tilelang.py'), ('activation=/b/activation_fixed.py', '', 'tests/kernels/test_deepseek_v41_tilelang_activation.py'), ('activation=/b/activation_expr.py', '', 'tests/kernels/test_deepseek_v41_tilelang_activation.py')]; codes += [subprocess.call([sys.executable, '-m', 'pytest', '-q', '--noconftest', '-p', 'no:cacheprovider', '-p', 'swap_plugin', '-rfEPxX', *(['-k', k] if k else []), path], env=dict(env, SWAP=swap)) for swap, k, path in RUNS]; print('exit codes (bench, indexer isnan, bits, fixup, swiglu fixed, expr)', codes); sys.exit(max(codes))"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "tests__kernels__deepseek_v41_contracts.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/deepseek_v41_contracts.py"
+    ],
+    [
+      "tests__kernels__attention__test_deepseek_v41_tilelang.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/attention/test_deepseek_v41_tilelang.py"
+    ],
+    [
+      "tests__kernels__test_deepseek_v41_tilelang_activation.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_activation.py"
+    ],
+    [
+      "r6k_indexer.py",
+      "/b/r6k_indexer.py"
+    ],
+    [
+      "r6k_activation.py",
+      "/b/r6k_activation.py"
+    ],
+    [
+      "kbench.py",
+      "/b/kbench.py"
+    ],
+    [
+      "bench_relu2.py",
+      "/b/bench_relu2.py"
+    ],
+    [
+      "swap_plugin.py",
+      "/b/swap_plugin.py"
+    ],
+    [
+      "indexer_isnan.py",
+      "/b/indexer_isnan.py"
+    ],
+    [
+      "indexer_bits.py",
+      "/b/indexer_bits.py"
+    ],
+    [
+      "indexer_fixup.py",
+      "/b/indexer_fixup.py"
+    ],
+    [
+      "activation_fixed.py",
+      "/b/activation_fixed.py"
+    ],
+    [
+      "activation_expr.py",
+      "/b/activation_expr.py"
+    ]
+  ]
+}

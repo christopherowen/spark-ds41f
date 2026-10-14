@@ -119,3 +119,40 @@ the bugs they target. Selected for the next release (owner, 2026-10-14: "if the 
 good, promote it to be selected for the next release"). One condition first: recover
 the indexer's paired max so prefill is not slower. One option is a NaN select that
 TileLang can vectorize, or applying the select after the vectorized `max2`.
+
+### Keeping r6k's speed: round 1 ([relu.json](relu.json), 2026-10-14 09:16-09:19 UTC)
+
+Owner: "make the necessary improvements to keep or beat the original performance".
+[bundles/relu](bundles/relu) put three indexer ReLU forms against r6k's kernel: bits,
+three alternating timing rounds, and the indexer tests per variant through a pytest
+plugin that serves the variant as the module.
+
+| form | vectorized | bits (finite) | worst median ratio | NaN contract |
+| --- | --- | --- | ---: | --- |
+| `isnan(dot) ? dot : max(dot, 0)` (0006) | no (TileLang warns) | equal | 1.034 / 1.038 at 8K x 2048 | passes |
+| `dot != dot ? dot : max(dot, 0)` | yes | equal | 1.001 / 1.000 | **fails**: no NaN where the reference has 3980 |
+| `dot > 0 ? dot : (dot != dot ? dot : 0)` | no | equal | 1.019 / 1.023 | **fails** |
+
+Fast math folds `dot != dot` to false. The fast form was fast only because the NaN check
+was compiled away.
+
+With repeats, the SwiGLU fix still read over 3% at a few sizes (8 and 72 rows cold,
+512 warm; 72 rows cold has read 1.34-1.38 in both runs). Its compare-and-select clamps
+reassign `alloc_var` scalars inside the loop, the pattern TileLang's serial-loop warning
+names.
+
+### Round 2, queued to run unattended ([relu2.json](relu2.json))
+
+[bundles/relu2](bundles/relu2):
+- indexer `bits`: the NaN test on the float's bits (exponent all ones, mantissa nonzero),
+  which fast math cannot fold;
+- indexer `fixup`: r6k's vectorized loop unchanged, then a separate loop that writes the
+  NaN where the accumulator is NaN;
+- SwiGLU `expr`: the same clamps as pure expressions, no reassigned scalars;
+- the current `isnan` and SwiGLU fixes as controls.
+
+Each variant gets bits against r6k, three alternating timing rounds, and its tests and
+NaN contract. A form is adopted only if it passes its contract, keeps r6k's bits, and
+stays within 1% of r6k's time at every shape. The winner replaces vLLM 0006 (and 0004
+for SwiGLU) on the `kernel-contracts` branch, and the fixed bundle is rerun before the
+next candidate is gated.
