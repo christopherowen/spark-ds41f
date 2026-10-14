@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 20:42:50 +0200
+Subject: [PATCH] swiglu_forward_and_per_token_cast: clamp by compare and
+ select so a NaN passes through
+
+T.min / T.max lower to fminf / fmaxf, which return the other operand for a NaN,
+so a NaN gate or up value became the clamp limit. DeepSeek's reference clamps with
+torch.clamp, which keeps the NaN. The count_clamp branch already used T.Select.
+On finite inputs the result is unchanged bit for bit.
+---
+ tile_kernels/quant/swiglu_forward_cuda.py | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/tile_kernels/quant/swiglu_forward_cuda.py b/tile_kernels/quant/swiglu_forward_cuda.py
+index ae9b137..41bbec9 100644
+--- a/tile_kernels/quant/swiglu_forward_cuda.py
++++ b/tile_kernels/quant/swiglu_forward_cuda.py
+@@ -207,8 +207,10 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
+                                     counts_local[1] += clamp_upper
+                                     counts_local[2] += clamp_lower
+                                 else:
+-                                    val_l = T.min(val_l, clamp_value)
+-                                    val_r = T.max(T.min(val_r, clamp_value), -clamp_value)
++                                    # Compare and select, as torch.clamp: a NaN passes through.
++                                    val_l = T.Select(val_l > clamp_value, clamp_value, val_l)
++                                    val_r = T.Select(val_r > clamp_value, clamp_value, val_r)
++                                    val_r = T.Select(val_r < -clamp_value, -clamp_value, val_r)
+                             if use_fast_certificate:
+                                 val = T.alloc_var(
+                                     T.float32,
+@@ -261,8 +263,9 @@ def get_swiglu_forward_and_per_token_cast_kernel_cuda(
+                                         # Clamp counts were already accumulated in the main
+                                         # path; fallback recomputes values only and must not
+                                         # count the same elements again.
+-                                        val_l = T.min(val_l, clamp_value)
+-                                        val_r = T.max(T.min(val_r, clamp_value), -clamp_value)
++                                        val_l = T.Select(val_l > clamp_value, clamp_value, val_l)
++                                        val_r = T.Select(val_r > clamp_value, clamp_value, val_r)
++                                        val_r = T.Select(val_r < -clamp_value, -clamp_value, val_r)
+                                     val = T.alloc_var(T.float32, init=(val_l / (1 + T.exp(-val_l))) * val_r)
+                                     if with_weight:
+                                         val = val * topk_weights_var

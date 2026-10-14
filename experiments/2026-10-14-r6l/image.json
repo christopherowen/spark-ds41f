@@ -1,0 +1,88 @@
+{
+ "experiment": "experiments/2026-10-14-r6l",
+ "run": "r6l-image",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "image",
+   "config": "r6l-release.json",
+   "node": "dgx4",
+   "copies": [
+    [
+     "dgx4",
+     "10.14.1.1"
+    ],
+    [
+     "dgx4",
+     "10.34.1.3"
+    ],
+    [
+     "dgx1",
+     "dgx2-internal"
+    ]
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "16",
+      "--samples",
+      "4",
+      "--tokens",
+      "256"
+     ],
+     "c16-distinct"
+    ],
+    [
+     "scripts/distinct_streams.py",
+     [
+      "--streams",
+      "8",
+      "--samples",
+      "4",
+      "--tokens",
+      "256"
+     ],
+     "c8-distinct"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "r6l-release.json",
+     "label": "r6l"
+    }
+   ]
+  }
+ ]
+}

@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:43:19 +0100
+Subject: [PATCH 138/141] TileLang V4.1 Engram gate: the magnitude floor keeps
+ a NaN
+
+max(|dot|, 1e-6) lowers to fmaxf and turns a NaN dot into the floor, so a
+NaN residual or key gated its stream with sigmoid(+-1e-3) and left the
+stream finite. DeepSeek's gate uses clamp_min, which keeps the NaN and
+makes the stream NaN. Compare and select instead. Every other dot takes
+the same value as before.
+---
+ vllm/models/deepseek_v4_1/tilelang/engram.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+index 806cd625f..bda4370ea 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -11,7 +11,9 @@ the multi-stream residual. For each token and stream, with the stream's residual
+     gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
+     out  = x + gate * v
+ 
+-in FP32, rounded to BF16. Image tokens keep ``x``. One block per (token, stream)
++in FP32, rounded to BF16. Image tokens keep ``x``. The magnitude's floor compares
++and selects, as the reference's ``clamp_min``, so a NaN dot makes the stream NaN
++rather than gating it with the floor. One block per (token, stream)
+ spreads a row's loads over the whole block, and every load (the value too) is
+ issued before the reduction, so a decode row costs one DRAM round trip.
+ """
+@@ -100,9 +102,11 @@ def engram_gate_kernel(
+                         * T.rsqrt(acc[1] / hidden + eps)
+                         * scalar
+                     )
+-                    gate[0] = T.sigmoid(
+-                        T.copysign(T.sqrt(T.max(T.abs(dot), T.float32(CLAMP))), dot)
++                    magnitude = T.abs(dot)
++                    floored = T.if_then_else(
++                        magnitude < CLAMP, T.float32(CLAMP), magnitude
+                     )
++                    gate[0] = T.sigmoid(T.copysign(T.sqrt(floored), dot))
+                 T.sync_threads()
+                 for c in T.serial(chunks):
+                     for i in T.vectorized(vec):

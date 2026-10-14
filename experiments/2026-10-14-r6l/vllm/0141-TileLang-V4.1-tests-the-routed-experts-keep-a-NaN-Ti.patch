@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 20:43:09 +0200
+Subject: [PATCH 141/141] TileLang V4.1 tests: the routed experts keep a NaN
+ (TileKernels clamp patch); the indexer's NaN contract waits for a
+ vectorizable fix
+
+---
+ tests/kernels/attention/test_deepseek_v41_tilelang.py | 8 ++++++++
+ tests/kernels/moe/test_deepseek_v41_tilelang_moe.py   | 7 -------
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index 558b3bc2e..e1807fb2f 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -312,6 +312,14 @@ def test_indexer_dense(context, page_size=64, rows=4):
+     assert torch.equal(out, expected)
+ 
+ 
++@pytest.mark.xfail(
++    strict=True,
++    raises=AssertionError,
++    reason="the indexer's score ReLU is max(dot, 0), which drops a NaN; the NaN-keeping "
++    "forms tried so far either serialize the per-head loop (isnan, a 32-bit bit test) or "
++    "are folded away by TileLang's simplifier (dot != dot), so the fix waits for a "
++    "vectorizable NaN-keeping max (spark-ds41f experiments/2026-10-14-kernel-contracts)",
++)
+ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+     """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
+     head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 7d9237112..f745cf410 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -261,13 +261,6 @@ def test_moe_experts_nan_token_stays_in_its_row(rows):
+     assert_other_rows_equal(run(x), clean, [5])
+ 
+ 
+-@pytest.mark.xfail(
+-    strict=True,
+-    raises=AssertionError,
+-    reason="TileKernels' fused SwiGLU (66258df, quant/swiglu_forward_cuda.py "
+-    "210-211 and 264-265) clamps with T.min/T.max, which return the limit for a "
+-    "NaN; DeepSeek's Expert.forward uses torch.clamp, which keeps it",
+-)
+ def test_moe_experts_nan_token_is_nan(rows=12):
+     """A NaN in a token's input reaches every output of that token, as in DeepSeek's
+     ``Expert.forward``."""

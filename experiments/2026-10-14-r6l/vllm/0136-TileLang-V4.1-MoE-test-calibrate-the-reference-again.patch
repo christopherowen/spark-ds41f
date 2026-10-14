@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:43:12 +0100
+Subject: [PATCH 136/141] TileLang V4.1 MoE test: calibrate the reference
+ against injected defects
+
+test_moe_experts accepts the kernel within 3e-2 of an FP32 reference that
+leaves the down input unquantized, so the kernel already differs from it by
+MXFP8 rounding. A precision defect such as a BF16 combine adds less than
+that, and the check cannot see it.
+
+Add a reference that follows the plan's arithmetic (MXFP8 tokens, BF16
+gate/up, SwiGLU times the route weight cast to MXFP8 from FP32, BF16 down
+output, slot-order FP32 sum) and require the kernel to be at least four
+times closer to it than each injected defect: a dropped route, a wrong
+expert, missing route weights, a skipped K tile and a BF16 combine. The
+test prints the error table, the unquantized-down reference's included.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     | 73 +++++++++++++++++++
+ 1 file changed, 73 insertions(+)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 510ebe3c6..7d9237112 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -275,3 +275,76 @@ def test_moe_experts_nan_token_is_nan(rows=12):
+     x[5, 17] = NAN
+     assert_rows_nan(run(x), [5])
+ 
++
++def _arithmetic(x, ids, weights, w13, w2, intermediate, defect=None):
++    """The plan's arithmetic in torch, optionally with one injected defect.
++
++    MXFP8 tokens; the gate/up output rounded to BF16; the clamped SwiGLU times the
++    route weight in FP32, cast to MXFP8 straight from FP32 (TileKernels' fused
++    cast); the down output rounded to BF16; the routes summed in slot order in
++    FP32 and rounded once.
++    """
++    xd = _mxfp8_values(x)
++    if defect == "skipped K tile":  # gate/up never loads its first 128 columns
++        xd[:, :128] = 0
++    lowest = weights.argmin(1)
++    out = torch.zeros(x.shape, dtype=torch.float32, device=DEVICE)
++    for slot in range(ids.shape[1]):
++        e = ids[:, slot].long()
++        if defect == "wrong expert" and slot == 0:
++            e = (e + 1) % w13.shape[0]
++        h = torch.einsum("tk,tnk->tn", xd, w13[e]).bfloat16().float()
++        gate = h[:, :intermediate].clamp(max=LIMIT)
++        up = h[:, intermediate:].clamp(-LIMIT, LIMIT)
++        w = weights[:, slot : slot + 1]
++        if defect == "unweighted":
++            w = torch.ones_like(w)
++        act = _mxfp8_values(gate / (1 + torch.exp(-gate)) * up * w)
++        y = torch.einsum("tn,tkn->tk", act, w2[e]).bfloat16().float()
++        if defect == "dropped route":  # each token's lowest-weight route
++            y = torch.where((lowest == slot)[:, None], 0.0, y)
++        out = out + y
++        if defect == "BF16 combine":
++            out = out.bfloat16().float()
++    return out.bfloat16()
++
++
++DEFECTS = (
++    "dropped route",
++    "wrong expert",
++    "unweighted",
++    "skipped K tile",
++    "BF16 combine",
++)
++
++
++def _error(a, b):
++    """Mean absolute difference relative to the mean magnitude, in FP64."""
++    a, b = a.double(), b.double()
++    return ((a - b).abs().mean() / b.abs().mean()).item()
++
++
++@pytest.mark.parametrize("rows", [12, 300])
++def test_moe_reference_separates_defects(rows):
++    """Calibration of the MoE check (arXiv 2608.12700, section 3.3): a reference must
++    put the kernel well inside every defect it is meant to catch. The kernel must
++    be at least four times closer to the reference that follows its arithmetic than
++    each injected defect. ``test_moe_experts``'s FP32 reference leaves the down
++    input unquantized, so the kernel already differs from it by MXFP8 rounding,
++    more than a BF16 combine adds; the error table shows both."""
++    run, x, ids, route_weights, w13, w2, intermediate = _case(rows)
++    out = run(x)
++    exact = _arithmetic(x, ids, route_weights, w13, w2, intermediate)
++    loose = _reference(x, ids, route_weights, w13, w2, intermediate)
++    kernel = _error(out, exact)
++    defects = {
++        d: _error(_arithmetic(x, ids, route_weights, w13, w2, intermediate, d), exact)
++        for d in DEFECTS
++    }
++    table = "; ".join(
++        [f"kernel {kernel:.2e} (unquantized-down reference {_error(out, loose):.2e})"]
++        + [f"{d} {e:.2e}" for d, e in defects.items()]
++    )
++    print(f"rows={rows}: {table}")
++    for d, e in defects.items():
++        assert 4 * kernel < e, f"{d} is within 4x of the kernel: {table}"
