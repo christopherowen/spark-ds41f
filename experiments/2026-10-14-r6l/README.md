@@ -25,7 +25,7 @@ the loop (+2-3.5% on that kernel at prefill) or get folded away by TileLang's si
 It waits for a vectorizable NaN-keeping max.
 
 Source identity:
-- vLLM tree `bc089a5c` (patch head `977394c9c`), checked by replaying the series onto
+- vLLM tree `bc089a5c` (patch head `37e56d34`, as the build replays it with the fixed committer), checked by replaying the series onto
   `19f2c20e`;
 - TileKernels tree `cb2fa41c` (patch head `edfa64d0`), checked by applying the patch onto
   `66258df`.
