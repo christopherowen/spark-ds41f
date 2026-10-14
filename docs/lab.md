@@ -141,6 +141,9 @@ before the first boot. `run --dry-run` prints the problems.
   (`nvidia-smi` over SSH). The summary goes beside the step's output as
   `<output>.telemetry.json`: percentiles per field, event-reason counts and the clock
   lock in force. Telemetry never fails a step.
+- **Reading results:** `scripts/lab.py report RUN` prints the run's table and each
+  measured step's node telemetry: SM clock p10/p50/p90 and minimum, power, peak
+  temperature, clock-event reasons and the lock in force.
 - **`gpu_clocks`:** `{"kind": "gpu_clocks", "lock_mhz": [min, max]}` locks every node's
   GPU SM clock (`sudo -n nvidia-smi -lgc`) for the jobs that follow, and
   `{"kind": "gpu_clocks", "reset": true}` resets it (`-rgc`).

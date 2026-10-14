@@ -170,3 +170,21 @@ class CableSubnetTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncRevisionTest(unittest.TestCase):
+    """A named revision is resolved after a fetch, so a commit merged since the last fetch
+    (or origin/main) deploys instead of failing or detaching at a stale commit."""
+
+    def test_fetch_before_resolving(self):
+        calls = []
+        args = argparse.Namespace(revision="origin/main", apply=False)
+        with mock.patch.object(spark, "require_named_profile"), \
+                mock.patch.object(spark, "configuration", return_value=({"x": 1}, {"nodes": [{"name": "n1"}]}, {})), \
+                mock.patch.object(spark, "cluster_config_path", return_value=(None, "config/c.json")), \
+                mock.patch.object(spark, "repository_path", return_value="/p"), \
+                mock.patch.object(spark, "checked", side_effect=lambda command, **kw: calls.append(command[1])), \
+                mock.patch.object(spark, "repository_revision", side_effect=lambda r: calls.append(f"resolve {r}") or "abc"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(spark.command_cluster_sync(args), 0)
+        self.assertEqual(calls, ["fetch", "resolve origin/main"])

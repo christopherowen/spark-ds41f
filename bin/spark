@@ -1492,6 +1492,10 @@ def command_cluster_sync(args: argparse.Namespace) -> int:
     require_named_profile(args)
     cluster, nodes, upstreams = configuration(args)
     _, config_relative = cluster_config_path(args)
+    if args.revision:
+        # A named commit or ref may be newer than this checkout's last fetch (a hash just
+        # merged, or origin/main): fetch before resolving it.
+        checked(["git", "fetch", "--quiet", "--prune", "origin"], cwd=ROOT)
     revision = repository_revision(args.revision or "HEAD")
     path = repository_path(cluster)
     for node in nodes["nodes"]:
@@ -5442,7 +5446,8 @@ def parser() -> argparse.ArgumentParser:
     cluster_sync = cluster_commands.add_parser(
         "sync", help="detach every clean node checkout at one published commit"
     )
-    cluster_sync.add_argument("--revision", help="published commit; defaults to local HEAD")
+    cluster_sync.add_argument("--revision", help="published commit or ref, resolved after a fetch "
+                                                    "(origin/main is the latest main); defaults to local HEAD")
     cluster_sync.add_argument(
         "--apply", action="store_true", help="perform the planned synchronization"
     )

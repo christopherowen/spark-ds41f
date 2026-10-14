@@ -9,6 +9,7 @@ usage (on dgx1, from the deployment checkout):
   scripts/lab.py queue add SPEC.json      (queue a spec for the open or next window)
   scripts/lab.py queue run [--idle-minutes M] [--minutes M] [--production-config PATH]   (0: never)
   scripts/lab.py queue status
+  scripts/lab.py report RUN               (the run's table and each step's node telemetry)
   scripts/lab.py kernel-local BUNDLE_DIR [--out DIR] [--dry-run]   (on any node, cluster stopped)
   scripts/lab.py watchdog [--max-age SECONDS] [--once]
 
@@ -1678,6 +1679,32 @@ def kernel_local(bundle_dir: str, out_dir: str | None, dry: bool) -> int:
 
 # ---------------------------------------------------------------- CLI
 
+def report(run: str) -> str:
+    """A run's table, then each measured step's node telemetry: SM clock p10/p50/p90 (min),
+    power, peak temperature, any clock-event reasons, and the lock in force."""
+    lines = []
+    table = ROOT / "results" / "private" / "lab" / f"{run}-table.txt"
+    if table.exists():
+        lines.append(table.read_text().rstrip())
+    telemetry = sorted((ROOT / "results" / "private" / "determinism" / run).glob("*.telemetry.json"))
+    if telemetry:
+        lines.append(f"\ntelemetry ({run})")
+    for path in telemetry:
+        data = json.loads(path.read_text())
+        lock = data.get("gpu_clocks_lock")
+        lines.append(f"{path.name.removesuffix('.telemetry.json')}: {data['seconds']:.0f} s, "
+                     f"clocks {'locked to ' + '-'.join(map(str, lock['lock_mhz'])) + ' MHz' if lock else 'unlocked'}")
+        for name, node in data["nodes"].items():
+            sm, power, temp = (node.get(k, {}) for k in ("clocks.sm", "power.draw", "temperature.gpu"))
+            events = {reason: count for reason, count in node.get("event_reasons", {}).items()
+                      if reason.strip().lower() not in ("0x0000000000000000", "0x0", "not active")}
+            show = lambda value: "?" if value is None else f"{value:g}"
+            lines.append(f"  {name}: SM {show(sm.get('p10'))}/{show(sm.get('p50'))}/{show(sm.get('p90'))} MHz "
+                         f"(min {show(sm.get('min'))}), {show(power.get('p50'))} W, {show(temp.get('max'))} °C max"
+                         + (f", clock events {events}" if events else "") + ("" if node.get("samples") else " (no samples)"))
+    return "\n".join(lines) if lines else f"nothing recorded for run {run}"
+
+
 def main(argv: list[str] | None = None) -> int:
     global PRODUCTION_CONFIG
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -1705,10 +1732,15 @@ def main(argv: list[str] | None = None) -> int:
     kernel.add_argument("bundle")
     kernel.add_argument("--out")
     kernel.add_argument("--dry-run", action="store_true")
+    shown = commands.add_parser("report", help="a run's table and node telemetry")
+    shown.add_argument("run")
     dog = commands.add_parser("watchdog", parents=[production])
     dog.add_argument("--max-age", type=int, default=HEARTBEAT_MAX_AGE)
     dog.add_argument("--once", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "report":
+        print(report(args.run))
+        return 0
     if args.command != "kernel-local":
         PRODUCTION_CONFIG = resolve_production(args.production_config, read_hold())
 

@@ -502,6 +502,21 @@ class TelemetryTest(unittest.TestCase):
         self.assertIn("nvidia-smi", popen.call_args.args[0][-1])
         process.terminate.assert_called()
 
+    def test_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):
+            run = Path(directory) / "results/private/determinism/r"
+            run.mkdir(parents=True)
+            (Path(directory) / "results/private/lab").mkdir(parents=True)
+            (Path(directory) / "results/private/lab/r-table.txt").write_text("TABLE\n")
+            (run / "suite-a.jsonl.telemetry.json").write_text(json.dumps({
+                "seconds": 12.0, "gpu_clocks_lock": {"lock_mhz": [2489, 2489]},
+                "nodes": {"n1": lab.summarize_telemetry(self.LINES)}}))
+            text = lab.report("r")
+        self.assertIn("TABLE", text)
+        self.assertIn("suite-a.jsonl: 12 s, clocks locked to 2489-2489 MHz", text)
+        self.assertIn("n1: SM 1100/2404/2408 MHz (min 1100), 54 W, 61 °C max", text)
+        self.assertIn("clock events {'0x0000000000000004': 1}", text)
+
     def test_never_fails_the_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(lab, "ROOT", Path(directory)), mock.patch.object(lab, "log"), \
