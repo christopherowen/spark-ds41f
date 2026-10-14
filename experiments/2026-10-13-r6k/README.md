@@ -2,6 +2,12 @@
 
 **Promoted for TP4 on 2026-10-14** as [`2026-10-13-karmic-kraken-r6k`](../../manifests/baselines/2026-10-13-karmic-kraken-r6k.json). Owner: mildly ahead at higher precision, accept it. TP3 stays on r6h until it boots and benches r6k at the next re-cable.
 
+Deployed 2026-10-14 at 05:17 UTC from main 8ecce55:
+- `cluster start --apply --replace` was API-ready in 88 s;
+- `doctor --live` matches, with only the existing weight-fragmentation warnings;
+- all four ranks run `sha256:cf2bb9a6`;
+- a temperature-0 sanity request answered correctly.
+
 Owner, 2026-10-13: match DeepSeek's reference (quantize only where it does), and work until
 TileLang is well ahead so the B12X versions can be retired.
 
