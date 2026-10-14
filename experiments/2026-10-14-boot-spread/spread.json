@@ -1,0 +1,154 @@
+{
+  "experiment": "experiments/2026-10-14-boot-spread",
+  "run": "boot-spread",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "extras": [
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "16",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "inventory-unpinned",
+            "--output",
+            "results/private/boot-spread/inventory-unpinned.json"
+          ],
+          "closed-c16"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "experiments/2026-10-14-servebench/engine-r6k.json",
+          "label": "inventory-unpinned"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "extras": [
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "16",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "inventory-pinned",
+            "--output",
+            "results/private/boot-spread/inventory-pinned.json"
+          ],
+          "closed-c16"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "inventory-pinned"
+        }
+      ]
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "extras": [
+        [
+          "scripts/servebench_engine.py",
+          [
+            "--label",
+            "{label}",
+            "--output",
+            "results/private/boot-spread/{label}-grid.json"
+          ],
+          "grid"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "experiments/2026-10-14-servebench/engine-r6k.json",
+          "label": "u1",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "p1",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "c1",
+          "compact_memory": true
+        },
+        {
+          "config": "experiments/2026-10-14-servebench/engine-r6k.json",
+          "label": "u2",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "p2",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "c2",
+          "compact_memory": true
+        },
+        {
+          "config": "experiments/2026-10-14-servebench/engine-r6k.json",
+          "label": "u3",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "p3",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "c3",
+          "compact_memory": true
+        },
+        {
+          "config": "experiments/2026-10-14-servebench/engine-r6k.json",
+          "label": "u4",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "p4",
+          "memory_snapshot": true
+        },
+        {
+          "config": "experiments/2026-10-14-boot-spread/r6k-big.json",
+          "label": "c4",
+          "compact_memory": true
+        }
+      ]
+    }
+  ]
+}

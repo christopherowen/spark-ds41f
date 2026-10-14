@@ -430,6 +430,13 @@ class PlanProblemsTest(unittest.TestCase):
                              ["scripts/servebench_engine.py", ["--replays", "100"], "grid"]])
         self.assertEqual(lab.plan_problems(lab.plan(spec)), [])
 
+    def test_extras_name_each_arm(self) -> None:
+        spec = self.measure([["scripts/servebench_engine.py", ["--label", "{label}", "--output", "out/{run}-{label}.json"], "g"]])
+        spec["jobs"][0]["arms"].append({"config": "experiments/2026-10-14-servebench/engine-r6h.json", "label": "b"})
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            outputs = [s["argv"][-1] for s in lab.plan(spec) if s["kind"] == "script"]
+        self.assertEqual(outputs, ["out/r-a.json", "out/r-b.json"])
+
     def test_suite_job(self) -> None:
         spec = {"experiment": "experiments/2026-10-14-servebench", "run": "s", "jobs": [
             {"kind": "measure", "suite": "screen",
@@ -498,9 +505,39 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual(sorted(saved["nodes"]), ["n1", "n2"])
         self.assertEqual(saved["gpu_clocks_lock"], {"lock_mhz": [2400, 2400]})
         self.assertEqual(saved["nodes"]["n1"]["samples"], 11)
-        self.assertEqual(popen.call_count, 2)
-        self.assertIn("nvidia-smi", popen.call_args.args[0][-1])
+        self.assertEqual(popen.call_count, 4)  # clocks and threads on each node
+        commands = [call.args[0] for call in popen.call_args_list]
+        self.assertTrue(any("nvidia-smi" in c[-1] for c in commands))
+        self.assertTrue(any(c[-4:-2] == ["python3", "-"] for c in commands))  # the thread sampler
         process.terminate.assert_called()
+
+    def test_thread_summary(self) -> None:
+        lines = [json.dumps({"fast": [5, 6]})]
+        for step in range(3):
+            lines.append(json.dumps({"t": 100.0 + 2 * step, "threads": {
+                "11": ["VLLM::Worker_TP", 1.8 * step, 5],
+                "12": ["engram", 0.5 * step, 1],
+                "13": ["idle", 0.01 * step, 2]}}))
+        summary = lab.summarize_threads("\n".join(lines))
+        self.assertEqual(summary["window_s"], 4.0)
+        self.assertEqual([(t["name"], t["core_share"], t["slow_share"]) for t in summary["busy_threads"]],
+                         [("VLLM::Worker_TP", 0.9, 0.0), ("engram", 0.25, 1.0)])
+        self.assertAlmostEqual(summary["slow_core_share"], 1.02 / 4.62, places=3)
+        self.assertEqual(lab.summarize_threads("not json")["samples"], 0)
+
+    def test_buddy_free(self) -> None:
+        text = ("Node 0, zone      DMA      2      0      0      0      0      1\n"
+                "Node 0, zone   Normal      4      0      0      0      0      3\n")
+        free = lab.buddy_free(text, 65536)
+        self.assertEqual(free["free_gib_2mib_blocks"], round(4 * 2 ** 21 / 2 ** 30, 3))
+        self.assertEqual(free["free_gib_by_block"]["64 KiB"], round(6 * 65536 / 2 ** 30, 3))
+
+    def test_boot_step_memory_options(self) -> None:
+        self.assertNotIn("memory_out", lab.boot_step("r", {"label": "a"}, "c.json"))
+        step = lab.boot_step("r", {"label": "a", "compact_memory": True}, "c.json")
+        self.assertEqual((step["memory_out"], step["compact"]), ("results/private/determinism/r/memory-a.json", True))
+        self.assertIn("compact memory first", lab.describe_step(step))
+        self.assertIn("memory snapshot first", lab.describe_step(lab.boot_step("r", {"label": "b", "memory_snapshot": True}, "c.json")))
 
     def test_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):

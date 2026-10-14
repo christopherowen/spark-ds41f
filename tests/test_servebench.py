@@ -370,6 +370,20 @@ class EngineTest(unittest.TestCase):
             fast.close()
             slow.close()
 
+    def test_spread_across_boots(self):
+        def grid(label, scale):
+            rows = [{"label": f"s{i}", "shape": {"num_tokens": i}, "samples": [scale * (10 + i)] * 6} for i in range(3)]
+            return {"label": label, "engine": rows}
+        one = [grid("a1", 1.000), grid("a2", 1.004), grid("a3", 0.996)]
+        result = engine.spread(one)
+        self.assertAlmostEqual(result["range_pct"], 0.8, places=2)
+        self.assertAlmostEqual(result["sd_pct"], 0.4, places=2)
+        two = [grid("b1", 0.980), grid("b2", 0.984), grid("b3", 0.976)]
+        compared = engine.spread(one, two)
+        self.assertAlmostEqual(compared["difference"]["change_pct"], -2.0, places=1)
+        self.assertEqual(compared["difference"]["verdict"], "better")
+        self.assertIn("difference of means", engine.format_spread(compared))
+
     def test_grid_refuses_a_busy_server(self):
         busy = FakeServer()
         try:

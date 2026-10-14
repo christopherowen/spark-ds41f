@@ -136,11 +136,20 @@ before the first boot. `run --dry-run` prints the problems.
   (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
   every other arm, and the first arm with the last as the run's own repeat. Order arms
   candidate, reference, candidate again.
-- **Telemetry:** every bench and script step of a `measure` job samples each node's GPU
-  SM and memory clocks, power, temperature and clock-event reasons once a second
-  (`nvidia-smi` over SSH). The summary goes beside the step's output as
-  `<output>.telemetry.json`: percentiles per field, event-reason counts and the clock
-  lock in force. Telemetry never fails a step.
+- **Telemetry:** every bench and script step of a `measure` job samples, on each node:
+  - GPU SM and memory clocks, power, temperature and clock-event reasons, once a second
+    (`nvidia-smi` over SSH);
+  - the serving container's threads every 2 s: CPU use, and how much of it ran on slow
+    cores (`cpu_capacity` below the midpoint, as sparknet's "big").
+  The summary goes beside the step's output as `<output>.telemetry.json`: percentiles per
+  field, event-reason counts, the busy threads with their core share and slow-core share,
+  and the clock lock in force. Telemetry never fails a step.
+- **Arm options `memory_snapshot` and `compact_memory`:** before that arm's boot, serving
+  stops and every node's free memory by block size (`/proc/buddyinfo`) is saved to
+  `memory-<label>.json`. `compact_memory` then runs
+  `sudo -n sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'` and records the result.
+- **Placeholders:** `{label}` and `{run}` in extras arguments become each arm's label
+  and the run's name, so arms that share extras write their own outputs.
 - **Reading results:** `scripts/lab.py report RUN` prints the run's table and each
   measured step's node telemetry: SM clock p10/p50/p90 and minimum, power, peak
   temperature, clock-event reasons and the lock in force.

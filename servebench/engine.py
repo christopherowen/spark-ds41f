@@ -141,3 +141,55 @@ def compare(base: dict, candidate: dict, *, tolerance_pct: float = 0.5, confiden
     note = (f"intervals hold for all {len(pairs)} shapes at once ({100 * confidence:.0f}%, Bonferroni); "
             f"slow outliers (median + 5 MAD) dropped first: {sum(r.get('trimmed', 0) for r in rows)}")
     return {"warnings": warnings, "rows": rows, "note": note}
+
+
+def boot_ratios(results: list[dict], reference: dict) -> list[float]:
+    """Each grid's decode step time against ``reference``, as one geometric-mean ratio over
+    the shapes both have (slow outliers dropped first)."""
+    def means(run: dict) -> dict:
+        out = {}
+        for row in run["engine"]:
+            if not row["shape"].get("prefill"):
+                kept, _ = stats.trim_slow(row["samples"])
+                out[row["label"]] = sum(kept) / len(kept)
+        return out
+    base = means(reference)
+    ratios = []
+    for run in results:
+        logs = [math.log(value / base[label]) for label, value in means(run).items() if label in base]
+        ratios.append(math.exp(sum(logs) / len(logs)) if logs else float("nan"))
+    return ratios
+
+
+def spread(runs: list[dict], against: list[dict] | None = None) -> dict:
+    """Boot-to-boot spread of grids of one build (each grid on its own boot): every boot's
+    decode geometric mean against the set's mean, and their standard deviation. With
+    ``against`` (another set, such as a changed configuration), the difference of the two
+    sets' means, with a Welch interval over boots: the boot, not the replay, is the sample."""
+    ratios = boot_ratios(runs, runs[0])
+    middle = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
+    pct = [100 * (r / middle - 1) for r in ratios]
+    out = {"boots": [{"label": run.get("label"), "vs_mean_pct": round(v, 3)} for run, v in zip(runs, pct)],
+           "sd_pct": stats.describe(pct).get("sd"), "range_pct": max(pct) - min(pct)}
+    if against:
+        others = [100 * (r / middle - 1) for r in boot_ratios(against, runs[0])]
+        out["against"] = {"boots": [{"label": run.get("label"), "vs_mean_pct": round(v, 3)}
+                                    for run, v in zip(against, others)],
+                          "sd_pct": stats.describe(others).get("sd")}
+        mean_a, mean_b = sum(pct) / len(pct), sum(others) / len(others)
+        test = stats.welch([100 + v for v in pct], [100 + v for v in others])
+        out["difference"] = {"change_pct": mean_b - mean_a, "ci95_pct": test["ci95_pct"] if test else None,
+                             "verdict": stats.verdict(mean_b - mean_a, test["ci95_pct"] if test else None, False, 0.0)}
+    return out
+
+
+def format_spread(result: dict) -> str:
+    lines = ["boot  decode geometric mean vs the set's mean"]
+    lines += [f"  {b['label']}: {b['vs_mean_pct']:+.2f}%" for b in result["boots"]]
+    lines.append(f"boot-to-boot sd {result['sd_pct'] or 0:.2f}%, range {result['range_pct']:.2f}%")
+    if "against" in result:
+        lines += [f"  {b['label']}: {b['vs_mean_pct']:+.2f}%" for b in result["against"]["boots"]]
+        d = result["difference"]
+        lines.append(f"against set: sd {result['against']['sd_pct'] or 0:.2f}%; difference of means "
+                     f"{d['change_pct']:+.2f}% ±{d['ci95_pct'] or 0:.2f}% ({d['verdict']}; step time, lower is better)")
+    return "\n".join(lines)

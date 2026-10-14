@@ -125,6 +125,14 @@ and resets the prefix cache afterwards, since dummy steps write KV slots.
   faster, presumably because identical dummy tokens route the MoE unlike text. `--prefill`
   adds 8K chunks for completeness; judge prefill on real prompts.
 
+### Boot-to-boot spread
+
+`python3 -m servebench spread GRID... [--against GRID...]` takes engine grids of one build,
+each from its own boot. It gives every boot's decode geometric mean against the set's mean,
+and their standard deviation. With `--against`, it compares two sets with boots as the
+samples. Within a boot, grids repeat to about ±0.05%; between boots they moved up to 0.5%
+(2026-10-14), so changes this small need several boots per build.
+
 ## Model behaviour
 
 ```sh

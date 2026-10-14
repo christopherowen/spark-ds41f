@@ -349,6 +349,40 @@ def boot(config: str, dry: bool = False) -> bool:
     return ok
 
 
+def buddy_free(text: str, page_bytes: int) -> dict:
+    """/proc/buddyinfo as free GiB per block size (summed over zones) and the GiB free in
+    blocks of 2 MiB or more, the size a GPU large page needs."""
+    free: dict[int, int] = {}
+    for line in text.splitlines():
+        counts = line.split()[4:]
+        for order, count in enumerate(counts):
+            free[order] = free.get(order, 0) + int(count)
+    by_block = {f"{page_bytes * 2 ** order // 1024} KiB": round(count * page_bytes * 2 ** order / 2 ** 30, 3)
+                for order, count in sorted(free.items())}
+    large = sum(count * page_bytes * 2 ** order for order, count in free.items() if page_bytes * 2 ** order >= 2 ** 21)
+    return {"free_gib_by_block": by_block, "free_gib_2mib_blocks": round(large / 2 ** 30, 3),
+            "free_gib": round(sum(c * page_bytes * 2 ** o for o, c in free.items()) / 2 ** 30, 3)}
+
+
+def memory_before_boot(compact: bool) -> dict:
+    """With serving stopped: each node's free memory by block size, then (when asked) after
+    ``echo 1 > /proc/sys/vm/compact_memory``."""
+    nodes, out = nodes_config(), {}
+    for node in nodes["nodes"]:
+        page = int(spark.run_ssh(nodes, node, "getconf", "PAGESIZE").stdout.strip() or 4096)
+        record = {"page_bytes": page,
+                  "stopped": buddy_free(spark.run_ssh(nodes, node, "cat", "/proc/buddyinfo").stdout, page)}
+        if compact:
+            began = time.time()
+            result = spark.run_ssh(nodes, node, "sudo", "-n", "sh", "-c", "sync; echo 1 > /proc/sys/vm/compact_memory")
+            record["compact"] = {"exit": result.returncode, "seconds": round(time.time() - began, 1),
+                                 **buddy_free(spark.run_ssh(nodes, node, "cat", "/proc/buddyinfo").stdout, page)}
+        out[node["name"]] = record
+        log(f"{node['name']}: {record['stopped']['free_gib_2mib_blocks']} GiB free in blocks of 2 MiB or more"
+            + (f", {record['compact']['free_gib_2mib_blocks']} GiB after compaction" if compact else ""))
+    return out
+
+
 def stop_arguments(remove: bool = False) -> list[str]:
     """Stop the production profile's containers; they are kept (stopped) unless removal is asked for."""
     return ["--cluster-config", PRODUCTION_CONFIG, "cluster", "stop", *(["--remove"] if remove else []),
@@ -421,15 +455,92 @@ def summarize_telemetry(text: str) -> dict:
     return out
 
 
+# Runs on each node (python3 - CONTAINER SECONDS): every 2 s, one JSON line with the serving
+# container's threads (name, CPU seconds, current core); the first line lists the fast cores
+# (cpu_capacity above the midpoint, as sparknet's "big"). Ends at SECONDS or a closed pipe.
+THREAD_SAMPLER = r"""
+import json, os, subprocess, sys, time
+caps = {}
+for name in os.listdir("/sys/devices/system/cpu"):
+    if name[3:].isdigit():
+        try:
+            caps[int(name[3:])] = int(open(f"/sys/devices/system/cpu/{name}/cpu_capacity").read())
+        except OSError:
+            pass
+middle = (min(caps.values()) + max(caps.values())) / 2 if caps else 0
+tick = os.sysconf("SC_CLK_TCK")
+end = time.time() + float(sys.argv[2])
+try:
+    print(json.dumps({"fast": sorted(c for c, v in caps.items() if v > middle)}), flush=True)
+    while time.time() < end:
+        pids = subprocess.run(["docker", "top", sys.argv[1], "-eo", "pid"], capture_output=True,
+                              text=True).stdout.split()[1:]
+        threads = {}
+        for pid in pids:
+            try:
+                tids = os.listdir(f"/proc/{pid}/task")
+            except OSError:
+                continue
+            for tid in tids:
+                try:
+                    stat = open(f"/proc/{pid}/task/{tid}/stat").read()
+                except OSError:
+                    continue
+                fields = stat[stat.rindex(")") + 2:].split()
+                threads[tid] = [stat[stat.index("(") + 1:stat.rindex(")")],
+                                (int(fields[11]) + int(fields[12])) / tick, int(fields[36])]
+        print(json.dumps({"t": time.time(), "threads": threads}), flush=True)
+        time.sleep(2)
+except BrokenPipeError:
+    pass
+"""
+
+
+def summarize_threads(text: str, busy_share: float = 0.10) -> dict:
+    """Thread-sampler lines as each busy thread's share of a core and how much of its CPU
+    time ran on slow cores (each interval's CPU time counted on the core seen at its end)."""
+    fast, samples = None, []
+    for line in text.splitlines():
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if "fast" in record:
+            fast = set(record["fast"])
+        elif "threads" in record:
+            samples.append(record)
+    if fast is None or len(samples) < 2:
+        return {"samples": len(samples)}
+    used: dict[str, list] = {}  # tid -> [name, cpu seconds, seconds on slow cores]
+    for before, after in zip(samples, samples[1:]):
+        for tid, (name, cpu, core) in after["threads"].items():
+            if tid in before["threads"]:
+                spent = max(0.0, cpu - before["threads"][tid][1])
+                entry = used.setdefault(tid, [name, 0.0, 0.0])
+                entry[1] += spent
+                entry[2] += spent if core not in fast else 0.0
+    window = samples[-1]["t"] - samples[0]["t"]
+    total = sum(entry[1] for entry in used.values())
+    busy = sorted(((entry[1] / window, entry[2] / entry[1] if entry[1] else 0.0, entry[0], tid)
+                   for tid, entry in used.items() if entry[1] / window >= busy_share), reverse=True)
+    return {"samples": len(samples), "window_s": round(window, 1), "fast_cores": sorted(fast),
+            "container_cores": round(total / window, 3) if window else None,
+            "slow_core_share": round(sum(e[2] for e in used.values()) / total, 3) if total else None,
+            "busy_threads": [{"name": name, "tid": tid, "core_share": round(share, 3), "slow_share": round(slow, 3)}
+                             for share, slow, name, tid in busy]}
+
+
 class Telemetry:
     """Every node's GPU clocks, power, temperature and clock-event reasons, sampled each
-    second while a measured step runs and summarized beside its output
-    (``<out>.telemetry.json``, with the GPU clock lock in force, if any). Telemetry never
-    fails a step: a node that cannot be sampled is recorded as such."""
+    second, and the serving container's threads (their CPU use and how much of it ran on
+    slow cores), sampled every 2 s, while a measured step runs; summarized beside its
+    output (``<out>.telemetry.json``, with the GPU clock lock in force, if any). Telemetry
+    never fails a step: a node that cannot be sampled is recorded as such."""
 
     def __init__(self, out: str):
         self.path = ROOT / f"{out}.telemetry.json"
         self.processes: dict[str, subprocess.Popen] = {}
+        self.threads: dict[str, subprocess.Popen] = {}
 
     def __enter__(self) -> "Telemetry":
         self.started = time.time()
@@ -441,6 +552,12 @@ class Telemetry:
                 self.processes[node["name"]] = subprocess.Popen(
                     ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), command],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
+                sampler = subprocess.Popen(
+                    ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node), "python3", "-", CONTAINER, "21600"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE, text=True)
+                sampler.stdin.write(THREAD_SAMPLER)
+                sampler.stdin.close()
+                self.threads[node["name"]] = sampler
         except Exception as error:  # noqa: BLE001 - telemetry is advisory
             log(f"telemetry not started: {error}")
         return self
@@ -457,6 +574,14 @@ class Telemetry:
                 process.kill()
                 text = process.communicate()[0]
             summary["nodes"][name] = summarize_telemetry(text or "")
+        for name, process in self.threads.items():
+            process.terminate()
+            try:
+                text = process.communicate(timeout=20)[0]
+            except subprocess.TimeoutExpired:
+                process.kill()
+                text = process.communicate()[0]
+            summary["nodes"].setdefault(name, {})["threads"] = summarize_threads(text or "")
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             write_json_atomic(self.path, summary)
@@ -622,6 +747,16 @@ def stop_step(job: dict) -> dict:
     return {"kind": "stop", "remove": bool(job.get("remove_stopped", False))}
 
 
+def boot_step(run: str, arm: dict, config: str) -> dict:
+    """An arm's boot; with "memory_snapshot" (or "compact_memory") serving stops first and
+    each node's free memory by block size is recorded, compacted first with "compact_memory"."""
+    step = {"kind": "boot", "config": config, "label": arm["label"]}
+    if arm.get("memory_snapshot") or arm.get("compact_memory"):
+        step.update(memory_out=f"results/private/determinism/{run}/memory-{arm['label']}.json",
+                    compact=bool(arm.get("compact_memory")))
+    return step
+
+
 def measure_steps(spec: dict, job: dict) -> list[dict]:
     experiment, run = spec["experiment"], spec["run"]
     profile = dict(PROFILES[job.get("profile", "lean")])
@@ -638,7 +773,7 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
     for arm in arms:
         config, label = arm_config_path(experiment, arm["config"]), arm["label"]
         out = f"results/private/determinism/{run}"
-        steps.append({"kind": "boot", "config": config, "label": label})
+        steps.append(boot_step(run, arm, config))
         steps.append({"kind": "curves", "label": label, "config": config, "out": f"{out}/curves-{label}.json"})
         if job.get("bench", True):
             # "bench_args" replaces the screen's bench with the job's own (an acceptance run).
@@ -650,6 +785,8 @@ def measure_steps(spec: dict, job: dict) -> list[dict]:
                                    "--output", f"results/private/bench/{run}-{label}"]})
         for script, extra, stem in profile["extras"]:
             # A bare name is the experiment's own script; a path is repository-relative.
+            # "{label}" and "{run}" in an argument become the arm's label and the run's name.
+            extra = [str(a).replace("{label}", label).replace("{run}", run) for a in extra]
             steps.append({"kind": "script", "label": label,
                           "argv": [arm_config_path(experiment, script), head_url(), *extra],
                           "out": f"{out}/{stem}-{label}.jsonl"})
@@ -671,7 +808,7 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
     steps = []
     for index, arm in enumerate(arms):
         config, label = arm_config_path(experiment, arm["config"]), arm["label"]
-        steps.append({"kind": "boot", "config": config, "label": label})
+        steps.append(boot_step(run, arm, config))
         steps.append({"kind": "curves", "label": label, "config": config,
                       "out": f"results/private/determinism/{run}/curves-{label}.json"})
         argv = ["scripts/servebench_suite.py", head_url(), "--suite", job["suite"],
@@ -848,7 +985,8 @@ def plan(spec: dict) -> list[dict]:
 
 def describe_step(step: dict) -> str:
     if step["kind"] == "boot":
-        return f"boot {step['config']} ({step['label']})"
+        memory = (", compact memory first" if step.get("compact") else ", memory snapshot first") if step.get("memory_out") else ""
+        return f"boot {step['config']} ({step['label']}{memory})"
     if step["kind"] == "cli":
         return "bin/spark " + shlex.join(step["argv"])
     if step["kind"] == "script":
@@ -1356,6 +1494,13 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     with manifest.open("a") as handle:
                         handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config, home)))
                     checked.add(step["config"])
+                if step.get("memory_out"):
+                    if not stop_cluster():
+                        failed = "stop before the memory snapshot failed"
+                        break
+                    snapshot = memory_before_boot(step.get("compact", False))
+                    (ROOT / step["memory_out"]).parent.mkdir(parents=True, exist_ok=True)
+                    write_json_atomic(ROOT / step["memory_out"], snapshot)
                 if not boot(step["config"]):
                     failed = f"boot of {step['config']} failed"
                     break

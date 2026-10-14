@@ -189,6 +189,16 @@ def command_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_spread(args: argparse.Namespace) -> int:
+    runs = [read_json(path) for path in args.grids]
+    against = [read_json(path) for path in args.against] if args.against else None
+    result = engine.spread(runs, against)
+    print(engine.format_spread(result))
+    if args.json:
+        print(json.dumps(result))
+    return 0
+
+
 def command_prefill(args: argparse.Namespace) -> int:
     model = args.model or model_id(args.url)
     longest = engine.max_model_len(args.url)
@@ -292,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
     behave.add_argument("--label", help="name for tables")
     behave.add_argument("--output", help="write the result JSON here (.gz to compress)")
     behave.set_defaults(func=command_model)
+    spreads = sub.add_parser("spread", help="boot-to-boot spread of engine grids (one grid per boot)")
+    spreads.add_argument("grids", nargs="+", help="engine results of one build, each from its own boot")
+    spreads.add_argument("--against", nargs="+", help="another set to compare, boots as the samples")
+    spreads.add_argument("--json", action="store_true")
+    spreads.set_defaults(func=command_spread)
     cold = sub.add_parser("prefill", help="cold prefill rate on real-text prompts of fixed sizes")
     cold.add_argument("url", help="base URL, e.g. http://127.0.0.1:8000")
     cold.add_argument("--sizes", default="32768,262144", help="prompt sizes in tokens, comma-separated")
