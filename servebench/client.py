@@ -44,6 +44,10 @@ def stream_chat(base_url: str, payload: dict, *, continuous_usage: bool = False,
                     break
                 event = json.loads(line[6:])
                 now = clock()
+                if event.get("error"):  # a server error sent inside the stream (HTTP 200)
+                    detail = event["error"]
+                    record["error"] = "server: " + (detail.get("message") if isinstance(detail, dict) else str(detail))[:300]
+                    break
                 usage = event.get("usage") or usage
                 emitted = False
                 for choice in event.get("choices") or []:

@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import http.server as t_http
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -263,6 +264,26 @@ class LiveTest(unittest.TestCase):
         middle = (exact["events"][1][0] + exact["events"][2][0]) / 2
         self.assertEqual(client.tokens_at(exact, middle), 4)
         self.assertEqual(client.tokens_at(exact, exact["sent"]), 0)
+
+    def test_stream_error_event_is_recorded(self):
+        class Handler(t_http.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'data: {"error": {"message": "max_tokens is too large", "code": 400}}\n\n')
+                self.wfile.write(b"data: [DONE]\n\n")
+        server = t_http.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            record = client.stream_chat(f"http://127.0.0.1:{server.server_address[1]}", {"model": "m", "messages": []})
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(record["error"], "server: max_tokens is too large")
 
     def test_closed_loop_window_counts_tokens_and_steps(self):
         spec = load.Load(mode="closed", concurrency=3, warmup_s=0.3, duration_s=0.9, batches=3,
