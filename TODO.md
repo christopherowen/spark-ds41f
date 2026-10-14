@@ -48,6 +48,15 @@ before tuning anything on this basis.
    - **Open, the owner's decision:** TileKernels' routed-expert SwiGLU has the same
      clamp. It needs a TileKernels patch or an upstream change; its contract is a
      strict `xfail` until then.
+2. **No fallback in the RoCE collective policy** (vLLM `no-fallbacks` 15932cb42 on
+   r6l's patch head). The policy guarded the collectives DS4.1 routes, but in-place
+   all-reduce went straight to NCCL's ring and then to the PyTorch NCCL process
+   group, `gather` was inherited from the base class (PyTorch process group), and
+   `broadcast` and `batch_isend_irecv` skipped the guard. DS4.1 calls neither
+   in-place all-reduce nor gather, so under the policy both now raise; the other two
+   take the guard. Its CPU test refuses every PyTorch process-group collective and
+   fails if a base-class collective backed by one is inherited. Run it in the image
+   before gating.
 
 Ideas recorded while making r6f, r6g and r6h (2026-10-11 to 2026-10-12). Bound
 each one from existing traces before building it, and build one piece per
@@ -560,6 +569,12 @@ stays benchmarked in `experiments/2026-10-05-r5p-promotion`.
   without `--change-shape`; every `--apply` names its profile.
 - **Not selected, kept as experiments:** NIC-forwarded mesh4 and four fixed
   paths (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
+- **A RoCE broadcast for adaptive verification.** Adaptive verification broadcasts
+  rank 0's confidence snapshot every decode step through NCCL
+  (`adaptive_verification.py`): the only NCCL collective on every decode step.
+  Check sparknet's one-shot path for it instead (a broadcast, or the one-shot
+  all-gather of rank 0's row). Bound the gain from existing decode traces first:
+  the broadcast's share of the step against the one-shot's 13-15 µs.
 
 ## TileLang kernel family
 
@@ -600,6 +615,10 @@ alternative. The decode-kernel comparison is in
 
 ## Upstream and hygiene
 
+- **No fallbacks** (owner, 2026-10-14): a path production never exercises is
+  untested. Audit our vLLM series for fallbacks of that kind and make each either
+  the selected path or a raise with a traceback. The collective policy was the
+  first (Next release, item 2).
 - The one-read `fill_defaults` fix (0019) is still needed on PyTorch main.
 - The B12X tiny-decode clamp is still unfixed upstream; keep
   `B12X_W4A8_TINY_DECODE=0`.
