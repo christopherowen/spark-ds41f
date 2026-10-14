@@ -1,0 +1,110 @@
+{
+  "experiment": "experiments/2026-10-14-overnight",
+  "run": "overnight-context",
+  "jobs": [
+    {
+      "kind": "sync"
+    },
+    {
+      "kind": "measure",
+      "bench": false,
+      "bracket": false,
+      "extras": [
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "16",
+            "--context",
+            "65536",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "c16-64k",
+            "--output",
+            "results/private/overnight/context/c16-64k.json"
+          ],
+          "c16-64k"
+        ],
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "8",
+            "--context",
+            "262144",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "c8-256k",
+            "--output",
+            "results/private/overnight/context/c8-256k.json"
+          ],
+          "c8-256k"
+        ],
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "4",
+            "--context",
+            "524288",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "c4-512k",
+            "--output",
+            "results/private/overnight/context/c4-512k.json"
+          ],
+          "c4-512k"
+        ],
+        [
+          "scripts/servebench_run.py",
+          [
+            "--mode",
+            "closed",
+            "--concurrency",
+            "2",
+            "--context",
+            "1000000",
+            "--warmup",
+            "60",
+            "--duration",
+            "300",
+            "--extra-body",
+            "{\"chat_template_kwargs\":{\"thinking\":false}}",
+            "--label",
+            "c2-1m",
+            "--output",
+            "results/private/overnight/context/c2-1m.json"
+          ],
+          "c2-1m"
+        ]
+      ],
+      "arms": [
+        {
+          "config": "config/cluster-tp4.json",
+          "label": "r6k"
+        }
+      ]
+    }
+  ]
+}
