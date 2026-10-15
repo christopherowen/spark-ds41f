@@ -8,8 +8,9 @@ remove it once the change has landed here or no longer matters.
 Check them all at once:
 
 ```sh
-for ref in tile-ai/tilelang#3430 tile-ai/tilelang#3099 tile-ai/tilelang#3081 \
-           tile-ai/tilelang#3286 tile-ai/tilelang#3287 tile-ai/tilelang#3288 \
+for ref in tile-ai/tilelang#3430 tile-ai/tilelang#3495 Horizon-Tech-doo/tilelang#1 \
+           tile-ai/tilelang#3099 tile-ai/tilelang#3081 tile-ai/tilelang#3286 \
+           tile-ai/tilelang#3287 tile-ai/tilelang#3288 \
            NVIDIA/open-gpu-kernel-modules#1269 christopherowen/dgx-spark-power-control#1 \
            zephyrproject-rtos/zephyr#121740; do
   gh api "repos/${ref%#*}/issues/${ref#*#}" --jq "\"$ref [\(.state)] \(.updated_at[:10]) \(.title)\""
@@ -18,18 +19,20 @@ done
 
 ## Waiting on upstream
 
-| Thread | What | Our stake | Status (2026-10-05) | When it changes |
+| Thread | What | Our stake | Status | When it changes |
 | --- | --- | --- | --- | --- |
-| [tile-ai/tilelang#3287](https://github.com/tile-ai/tilelang/issues/3287), fix [#3288](https://github.com/tile-ai/tilelang/pull/3288) | Warp-specialized pipeline releases a stage before a synchronous (non-TMA, non-cp.async) shared copy is consumed | Ruled out as the cause of our decode-tile race on 2026-10-05: with #3288 our 16-row MXFP8 tiles still fail (1,222 of 3,600 runs, against 1,180 without it) and their generated CUDA is identical | Open, not ours | Nothing to do for us; see the planned issue below |
-| [tile-ai/tilelang#3099](https://github.com/tile-ai/tilelang/pull/3099), [#3081](https://github.com/tile-ai/tilelang/pull/3081) | qqq-tao's SM120 MXFP8 (`kind::mxf8f6f4`) and MXFP4 block-scaled MMA, the same features as our `sm120-mxfp8-mxfp4` branch | Decides whether we open our MXFP8/MXFP4 PR or fold it into theirs | Both stale and conflicting with main. [We asked](https://github.com/tile-ai/tilelang/pull/3099#issuecomment-5998824942) on 2026-10-05 which they prefer | On a reply, open [our MXFP8/MXFP4 PR](#planned-pull-requests) or help fold it in. If there is no reply by 2026-10-19, open ours crediting theirs |
-| [tile-ai/tilelang#3286](https://github.com/tile-ai/tilelang/pull/3286) | SM120 block-scaled register-A GEMM: scales loaded once per K atom | Its compact-scale path passes scale byte selector 0, which would break MXFP8/MXFP4 | Open. [We noted it](https://github.com/tile-ai/tilelang/pull/3286#issuecomment-5998825359) on 2026-10-05 | If it merges before our MXFP8/MXFP4 PR, that PR must pass the selectors through or limit the path to `scale_vec::4X`; our block_K=128 varying-scale test catches it |
+| [tile-ai/tilelang#3287](https://github.com/tile-ai/tilelang/issues/3287), fix [#3288](https://github.com/tile-ai/tilelang/pull/3288) | Warp-specialized pipeline releases a stage before a synchronous (non-TMA, non-cp.async) shared copy is consumed | Ruled out as the cause of our decode-tile race on 2026-10-05: with #3288 our 16-row MXFP8 tiles still fail (1,222 of 3,600 runs, against 1,180 without it) and their generated CUDA is identical | Checked 2026-10-12: both still open, with no activity since 2026-09-27 | Nothing to do for us; see the planned issue below |
+| [tile-ai/tilelang#3099](https://github.com/tile-ai/tilelang/pull/3099), [#3081](https://github.com/tile-ai/tilelang/pull/3081) | qqq-tao's SM120 MXFP8 and MXFP4 block-scaled MMA | Prior work credited by our smaller rebased implementation | Checked 2026-10-12: both still open and conflicting with main; no replies or new commits after [our 2026-10-05 comment](https://github.com/tile-ai/tilelang/pull/3099#issuecomment-5998824942). Opened [#3495](https://github.com/tile-ai/tilelang/pull/3495) | Coordinate scope if the authors respond; track our submission below |
+| [tile-ai/tilelang#3286](https://github.com/tile-ai/tilelang/pull/3286) | SM120 block-scaled register-A GEMM: scales loaded once per K atom | Its compact-scale path passes byte selector 0, which breaks MXFP8/MXFP4 when combined | Checked 2026-10-12: no reply or new commits after [our comment](https://github.com/tile-ai/tilelang/pull/3286#issuecomment-5998825359). Reproduced the selector failure and opened [Horizon-Tech-doo/tilelang#1](https://github.com/Horizon-Tech-doo/tilelang/pull/1) against its head branch | Incorporate the guard before combining it with #3495; re-run the varying-scale runtime tests in a GPU window |
 | [NVIDIA/open-gpu-kernel-modules#1269](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1269) | 64 KiB-page ARM64: DMA submap not 2 MiB-aligned, so large GPU mappings fault (Xid 31) | Blocks R610 on the 64 KiB profiles; production stays on 580.178.04 | Open, not ours; reported to NVIDIA in the developer forum. The qualification carries a one-line RM patch | When a driver release includes the fix, re-qualify R610 (memory saver 0.3.0, `NVreg_EnableSystemMemoryPools=0`) |
 
 ## Our pull requests
 
-| Thread | What | Status (2026-10-05) | Next |
+| Thread | What | Status | Next |
 | --- | --- | --- | --- |
-| [tile-ai/tilelang#3430](https://github.com/tile-ai/tilelang/pull/3430) | `[CUDA] Enable SM120 block-scaled MMA on SM121`: without it every block-scaled MMA compiles to a trap on `sm_121a` | Ready for review since 2026-10-05. On GB10: NVF4 tests 162 passed; SASS for `sm_121a` has 32 `OMMA.SF` with the fix and 32 `BPT.TRAP` without | Answer review comments |
+| [tile-ai/tilelang#3430](https://github.com/tile-ai/tilelang/pull/3430) | SM121 block-scaled MMA enablement | Merged 2026-10-10 as `5f803828`; our new MX PR is based on main containing it | The [main rebase candidate (#154)](https://github.com/christopherowen/spark-ds41f/pull/154) drops the redundant patch; qualify its image before promotion |
+| [tile-ai/tilelang#3495](https://github.com/tile-ai/tilelang/pull/3495) | SM120/SM121 MXFP8 and MXFP4 block-scaled MMA, including FP8 × FP4 | Opened 2026-10-12 on current main. Native compiler rebuilt; new suites 20 passed, 7 GPU tests skipped; all three operand paths compile for `sm_120a` and `sm_121a`; pre-commit passed. Earlier GB10 runtime suites: 213 passed, 4 skipped on 2026-10-05 | Answer review comments; re-run runtime coverage in a GPU window |
+| [Horizon-Tech-doo/tilelang#1](https://github.com/Horizon-Tech-doo/tilelang/pull/1) | Limit #3286 compact scale packages to `scale_vec::4X`, preserving per-K-atom MX selectors | Opened 2026-10-12 against `sm120-register-a-perf`. Combined with #3495 and #3286: selectors corrected; five block-scaled suites 144 passed, 74 GPU tests skipped; pre-commit passed | Have the author incorporate it into tile-ai/tilelang#3286 |
 | [christopherowen/dgx-spark-power-control#1](https://github.com/christopherowen/dgx-spark-power-control/pull/1) | Power diagnosis, passive tracing and firmware recovery analysis | Draft | Merge only after the hardware writes have been tested with the owner's approval |
 
 ## Our issues
@@ -42,8 +45,7 @@ done
 
 | Pull request | Branch | Waiting for | Before opening |
 | --- | --- | --- | --- |
-| `[CUDA] Support SM120 MXFP8 and MXFP4 block-scaled MMA in T.gemm_blockscaled` | [christopherowen/tilelang `sm120-mxfp8-mxfp4`](https://github.com/christopherowen/tilelang/commits/sm120-mxfp8-mxfp4) (stacked on #3430) | qqq-tao's answer on #3099 | Its block-scaled suites passed on GB10 on 2026-10-05 (213 passed, 4 skipped). Still to do: re-run with #3286 merged in; credit #3081/#3099 |
-| `[Example] DeepSeek-V4.1-Flash kernels for SM120/SM121` | the four example commits on `deepseek-v41-sm120`, squashed | The MXFP8/MXFP4 PR | Reword comments and the README that mention our serving shapes. `pytest examples/deepseek_v41` passed on GB10 on 2026-10-05 (11 passed) |
+| `[Example] DeepSeek-V4.1-Flash kernels for SM120/SM121` | the four example commits on `deepseek-v41-sm120`, squashed | [#3495](https://github.com/tile-ai/tilelang/pull/3495) | Reword comments and the README that mention our serving shapes. `pytest examples/deepseek_v41` passed on GB10 on 2026-10-05 (11 passed) |
 
 ## Planned issues
 
