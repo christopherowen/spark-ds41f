@@ -149,6 +149,36 @@ class PlanTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             lab.plan(dict(SPEC, jobs=[{"kind": "mystery"}]))
 
+    def test_kernel_cooling_honours_the_site_fan_policy(self) -> None:
+        """A no-fan site must not be made to take a fan floor before a kernel job.
+
+        The same site flag command_bench passes has to reach cool_nodes here: on a
+        board that cannot select a fan floor, cool_nodes raises and the job dies.
+        """
+        step = {"kind": "kernel", "out": "results/private/lab/r",
+                "bundles": [{"bundle": "bundles/mhc", "node": "dgx2"}]}
+        seen = {}
+
+        def cool(nodes, targets, below_c, timeout_s, poll_s=None, fan_control=True):
+            seen["fan_control"] = fan_control
+            return []
+
+        cluster = json.loads((ROOT / "config/cluster.json").read_text())
+        cluster["host"]["fan_control"] = False
+        nodes = json.loads((ROOT / "config/nodes.example.json").read_text())
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "ROOT", Path(directory)), \
+                mock.patch.object(lab.spark.repository_path, "__call__", create=True), \
+                mock.patch.object(lab, "production_configuration", return_value=(cluster, nodes, None)), \
+                mock.patch.object(lab.spark, "cool_nodes", side_effect=cool), \
+                mock.patch.object(lab.spark, "run_ssh", return_value=subprocess.CompletedProcess([], 0, "{}", "")), \
+                mock.patch.object(lab.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            bundle = Path(directory) / "bundles" / "mhc"
+            bundle.mkdir(parents=True)
+            (bundle / "candidate.json").write_text(json.dumps({"sync": []}))
+            lab.run_kernel_bundles(step)
+        self.assertIs(seen.get("fan_control"), False)
+
 
 class BootTimeTest(unittest.TestCase):
     def test_boot_rejects_a_different_physical_topology_before_launch(self) -> None:
