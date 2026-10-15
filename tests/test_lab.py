@@ -838,6 +838,17 @@ class KernelLabTest(unittest.TestCase):
             self.assertIn(arg, carveout)
             self.assertIn(arg, serving)
 
+    def test_io_uring_bundles_get_the_serving_io_uring_allowance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            plain = lab.bundle_command(bundle, self.CANDIDATE, bundle / "out")
+            uring = lab.bundle_command(bundle, dict(self.CANDIDATE, io_uring=True), bundle / "out")
+        self.assertFalse([arg for arg in plain if "seccomp" in arg or "memlock" in arg])
+        serving = json.loads((ROOT / "config/cluster.json").read_text())["container"]["docker_run_args"]
+        for arg in ("--security-opt=seccomp=unconfined", "--ulimit=memlock=-1:-1"):
+            self.assertIn(arg, uring)
+            self.assertIn(arg, serving)
+
     def test_verdict_passes_only_invariant_and_bit_equal(self) -> None:
         good = [json.dumps({"op": "mhc production layer 1 pre", "groups": 2}),
                 json.dumps({"op": "mhc candidate layer 1 pre", "groups": 1}),

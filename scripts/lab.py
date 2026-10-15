@@ -1730,6 +1730,10 @@ def bundle_command(bundle: Path, candidate: dict, out: Path) -> list[str]:
         # Tests that allocate from the display carve-out get the serving container's DRM access.
         command += [f"--mount=type=bind,source={DRM_CARD},target=/dev/dri/card0",
                     "--device-cgroup-rule=c 226:* rw"]
+    if candidate.get("io_uring"):
+        # Tests of io_uring readers (disk Engram rows) get the serving container's
+        # allowance: Docker's default seccomp profile refuses io_uring.
+        command += ["--security-opt=seccomp=unconfined", "--ulimit=memlock=-1:-1"]
     overlay = bundle / "overlay"
     if overlay.is_dir():
         for path in sorted(p for p in overlay.rglob("*") if p.is_file()):
