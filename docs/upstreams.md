@@ -118,3 +118,12 @@ model-specific patches do not enter our patch stack implicitly.
 The complete research-reference watchlist, review questions, and adoption gates
 are maintained in [inspiration.md](inspiration.md). Entries under `references` in
 `upstreams.lock.json` are deliberately excluded from build preparation.
+
+## TileLang main rebase candidate
+
+[The 2026-10-12 candidate](../experiments/2026-10-12-tilelang-main/README.md)
+pins TileLang main at `fd2ddda1` and applies the remaining MXFP8/MXFP4 changes
+from [#3495](https://github.com/tile-ai/tilelang/pull/3495). The SM121 enablement
+from #3430 is already upstream, so the candidate omits its local patch.
+The candidate has a reproducible source manifest and TP3/TP4 build profiles;
+runtime qualification against r6h is pending.

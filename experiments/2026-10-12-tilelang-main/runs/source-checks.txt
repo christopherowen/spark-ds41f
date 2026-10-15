@@ -1,0 +1,53 @@
+...............sssss.....ss                                              [100%]
+20 passed, 7 skipped in 2.13s
+Loading tilelang libs from dev root: /work/build
+Traceback (most recent call last):
+  File "/compile-check.py", line 22, in <module>
+    result = tilelang.lower(func, target=target, enable_device_compile=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/engine/lower.py", line 238, in lower
+    return lower_with_context(
+           ^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/engine/lower.py", line 165, in lower_with_context
+    return _lower_with_context_impl(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/engine/lower.py", line 184, in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/engine/lower.py", line 136, in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/backend/module.py", line 214, in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/backend/module.py", line 115, in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/backend/pass_pipeline/pipeline.py", line 31, in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/cuda/pipeline.py", line 171, in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/tilelang/cuda/pipeline.py", line 134, in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/3rdparty/tvm/python/tvm/ir/transform.py", line 171, in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "python/tvm_ffi/cython/function.pxi", line 968, in tvm_ffi.core.Function.__call__
+  File "<unknown>", line 0, in tvm::transform::Pass::operator()(tvm::IRModule) const
+  File "<unknown>", line 0, in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+  File "<unknown>", line 0, in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+  File "<unknown>", line 0, in std::_Function_handler<tvm::tirx::PrimFunc (tvm::tirx::PrimFunc, tvm::IRModule, tvm::transform::PassContext), tvm::tl::LayoutInference()::{lambda(tvm::tirx::PrimFunc, tvm::IRModule const&, tvm::transform::PassContext const&)#1}>::_M_invoke(std::_Any_data const&, tvm::tirx::PrimFunc&&, tvm::IRModule&&, tvm::transform::PassContext&&)
+  File "<unknown>", line 0, in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+  File "<unknown>", line 0, in tvm::tl::BufferUseDefCollector::Run()
+  File "<unknown>", line 0, in tvm::tl::BufferUseDefCollector::InferInFreeMode(tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void>&, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void> const&)
+  File "<unknown>", line 0, in tvm::tl::BufferUseDefCollector::RunOneAttempt(int, std::vector<int, std::allocator<int> > const&, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void> const&, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void> const&, std::vector<std::pair<tvm::tirx::Buffer, tvm::tl::Fragment>, std::allocator<std::pair<tvm::tirx::Buffer, tvm::tl::Fragment> > > const&, tvm::tl::LayoutCostModel const&, int)
+  File "<unknown>", line 0, in tvm::tl::BufferUseDefCollector::RunInferStep(int, tvm::tl::InferLevel, bool, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void>&, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void> const&, std::deque<int, std::allocator<int> >&, std::vector<bool, std::allocator<bool> >&, int)
+  File "<unknown>", line 0, in tvm::tl::ParallelOpNode::InferLayout(tvm::tl::LayoutInferArgs const&, tvm::tl::InferLevel) const
+  File "<unknown>", line 0, in tvm::tl::ParallelOpNode::ComputePlanCandidate(tvm::tl::LayoutInferArgs const&) const
+  File "<unknown>", line 0, in tvm::tl::GetVectorizeSize(tvm::tirx::For const&, tvm::arith::Analyzer*, tvm::ffi::Map<tvm::tirx::Buffer, tvm::tl::Layout, void> const&)
+  File "<unknown>", line 0, in tvm::tl::VectorizePlanner::Plan(tvm::tirx::For const&)
+  File "/work/tilelang/3rdparty/tvm/src/target/target.cc", line 219, in static tvm::Target tvm::Target::Current(bool)
+tvm.error.InternalError: Check failed: (allow_not_defined) is false: Target context required. Please set it by constructing a TargetContext
