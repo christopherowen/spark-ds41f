@@ -1,3 +1,5 @@
+**Superseded, not promoted (owner, 2026-10-17: "I don't like the arbitrary wait").** A longer startup wait tolerates the race instead of removing it. The fix is to prepare every kernel before any distributed phase: [experiments/2026-10-17-kernel-prepare](../2026-10-17-kernel-prepare/README.md). The gate passed (temperature-0 hashes 7748d638 / e27d573d, as r6s); the cold-rank run was withdrawn. 0156's profiling and warm-up error naming carries forward.
+
 # r6t: startup collectives wait as long as the startup rendezvous
 
 r6t is r6s ([experiments/2026-10-16-r6s](../2026-10-16-r6s/README.md)) with vLLM 0156 and

@@ -1,0 +1,38 @@
+{
+ "notes": "r6s on TP3 with every JIT compile traced (jittrace/sitecustomize.py) and an empty TileLang cache on every rank: which TileLang variants compile in which startup phase.",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp3-triangle"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{home}/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+     "/models",
+     "ro"
+    ],
+    [
+     "{home}/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs",
+     "/blobs",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-17-kernel-prepare/jittrace",
+     "/opt/spark3/jittrace",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "PYTHONPATH": "/opt/spark3/jittrace:/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x",
+   "JITTRACE_DIR": "/cache/kkref/jittrace/tilelang-cold",
+   "TILELANG_CACHE_DIR": "/cache/kkref/jit-trace/tilelang-cold"
+  }
+ }
+}
