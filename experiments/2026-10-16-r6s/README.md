@@ -44,3 +44,33 @@ at any queue depth from 128 up.
 
 Patch head `1fb7552e` (tree `937414d5`), replayed on `19f2c20e` as `build prepare` does.
 The same replay reproduces r6r's head and tree.
+
+## Results (2026-10-16, 19:06-19:41 UTC, TP3)
+
+- **Image:** built on dgx2 in 14 minutes, then copied over CX7 to dgx1 (124 s) and dgx3 (113 s).
+  One image ID on every node.
+- **Tests:**
+  - The reader and gather tests passed (18, with the column-mask cases), as did fail-stop.
+  - One model test failed on both nodes: `test_disk_rows_read_whole_table_sources` still
+    expected all 24 columns from a TP4 rank that now owns six, so 75.0% of elements
+    differed (the 18 unowned columns).
+  - vLLM 0155 corrects it (`bundles/engram-tests-fixed`, mounted over the image's copy). With
+    it, all 35 Engram model tests pass on dgx2 and dgx3. 0155 joins the next candidate's
+    series.
+- **Gate:** temperature 0 is identical in all six scenarios, and the reference and long-text
+  hashes (`7748d638`, `e27d573d`) equal r6r's and r6n's. Distinct prompts: eight streams
+  141.4 tok/s (±1.4%), four streams 110.0 (±1.2%), level with r6r.
+- **Timeline:** r6r's workload (cold 4K and 16K prompts, then eight streams), layer 1:
+
+| | r6r | r6s |
+| --- | ---: | ---: |
+| full 4K chunk read, rank 0 / 1 / 2 (median) | 51.6 / 67.9 / 74.8 ms | 64.6 / 63.3 / 68.3 ms |
+| cluster stall over 24 prefill steps (each step's slowest rank) | 217.6 ms | 181.3 ms |
+| largest single stalls | 39.6, 37.4, 34.6, 33.8 ms | 35.0, 30.0, 28.1, 25.4 ms |
+| planning per full chunk (`plan_ns`) | not recorded | 2.0-2.3 ms |
+
+- **The ranks now read evenly.** The slowest rank's chunk reads dropped 8.7% (13% was
+  estimated) and the cluster's Engram stall 17%: about 5 ms per prompt's first chunk, with
+  identical outputs.
+- **Planning is about 2 ms a chunk,** so a faster planner is not worth building. The
+  remaining lever is one read per row (scales stored beside their rows).
