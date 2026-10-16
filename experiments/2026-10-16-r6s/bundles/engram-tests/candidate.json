@@ -1,0 +1,22 @@
+{
+  "description": "r6s's Engram reader and gather (row and column ownership), Engram model and SP prefill tests, from the image; each step bounded and dumping every thread's stack after 240 s, the tests that stop the GPU last.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6s",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "io_uring": true,
+  "argv": [
+    "-c",
+    "import subprocess, sys; STEPS = [('rows', ['tests/kernels/test_deepseek_v41_engram_rows.py', '-k', 'not (reader_failure or timed_out)'], 600), ('engram', ['tests/models/test_deepseek_v4_1_engram.py', 'tests/models/test_deepseek_v4_1_sp_prefill.py'], 1200), ('fail-stop', ['tests/kernels/test_deepseek_v41_engram_rows.py', '-k', 'reader_failure or timed_out'], 300)]; codes = []\nfor name, args, limit in STEPS:\n    print(f'==== {name}', flush=True)\n    cmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'engram_fixtures',\n           '-o', 'faulthandler_timeout=240', '--basetemp', '/c/pytest-tmp-r6s-' + name, *args]\n    try:\n        codes.append(subprocess.run(cmd, timeout=limit).returncode)\n    except subprocess.TimeoutExpired:\n        print(f'==== {name} TIMED OUT after {limit} s', flush=True); codes.append('timeout')\nprint('exit codes', [s[0] for s in STEPS], codes, flush=True); sys.exit(0 if codes == [0] * len(STEPS) else 1)\n"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "engram_fixtures.py",
+      "/b/engram_fixtures.py"
+    ]
+  ]
+}
