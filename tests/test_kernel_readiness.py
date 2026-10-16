@@ -35,7 +35,7 @@ def ready(uuid="node-a"):
     return {"kernel": OLD, "page_size": 4096, "driver": POLICY["driver"],
             "loaded_nvidia_sources": {"nvidia": "stock-rm", "nvidia_uvm": "stock-uvm"},
             "uvm_leaf_packing": "stock",
-            "memory_saver_dkms": f"dgx-spark-memory-saver/0.2.0, {NEW}, aarch64: installed (Original modules exist)",
+            "memory_saver_dkms": f"dgx-spark-memory-saver/{POLICY['memory_saver']['version']}, {NEW}, aarch64: installed (Original modules exist)",
             "memory_saver_disk": {"srcversion": POLICY['memory_saver']['srcversion'],
                                   "filename": f"/lib/modules/{NEW}/updates/dkms/nvidia-uvm.ko.zst", "signer": "Fleet key"},
             "thp": "always [madvise] never", "min_free_kbytes": "45166",
@@ -183,7 +183,7 @@ class ReadinessTest(unittest.TestCase):
 
     def test_wrong_dkms_version_or_unsigned_module_is_reported(self):
         data = ready()
-        data["memory_saver_dkms"] = data["memory_saver_dkms"].replace("0.2.0", "0.1.0")
+        data["memory_saver_dkms"] = data["memory_saver_dkms"].replace(POLICY["memory_saver"]["version"], "0.1.0")
         data["memory_saver_disk"]["signer"] = ""
         self.assertEqual(len(kernel.memory_saver_problems("dgx1", data, POLICY)), 2)
 
