@@ -42,8 +42,19 @@ at any queue depth from 128 up.
 4. `timeline.json`: the r6r timeline workload (cold 4K and 16K prompts, then eight
    streams), for per-rank reads, first-chunk waits and planning time.
 
-Patch head `1fb7552e` (tree `937414d5`), replayed on `19f2c20e` as `build prepare` does.
+Patch head `1fb7552e` (tree `937414d5`) for the runs above, replayed on `19f2c20e` as `build prepare` does.
 The same replay reproduces r6r's head and tree.
+
+## Release (owner, 2026-10-16: "release r6s with 0155")
+
+The series now ends with 0155, which corrects the whole-table disk test. Patch head
+`238b7ea3`, tree `71c6e1df`. The image job removes the earlier r6s tag (tree `937414d5`) and
+builds again on dgx2.
+
+- `image.json`, then `tests.json`: the image's Engram tests, 0155 included.
+- `release.json`: release-tp3, with r6s, r6n and r6s again.
+
+On passing, r6s is promoted for TP3. TP4 stays unqualified until r6s is benched on the ring.
 
 ## Results (2026-10-16, 19:06-19:41 UTC, TP3)
 
