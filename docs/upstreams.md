@@ -33,7 +33,7 @@ tile-ai/tilelang main @ b95ee4ff (0.1.15)
         + patches/tilelang/series (SM120/SM121 block-scaled MMA:
           MXFP8, FP8 x FP4, MXFP4)
 deepseek-ai/TileKernels main @ 66258df6 (2.0.0, unpatched)
-christopherowen/dgx-spark-networking main @ f73a3cea (sparknet 0.2.0)
+christopherowen/dgx-spark-networking v0.4.0 @ f7fcc1e2 (the image installs 3bc8d101, the same sources before the version bump)
                      ---- vllm-ds41f-kkref:04c30fa98e79-r6 (sha256:b5225c98…)
                     /
 NVIDIA/nccl v2.30.7-1 @ 73cf1122
