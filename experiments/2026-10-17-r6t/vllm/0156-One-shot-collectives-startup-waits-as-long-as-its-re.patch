@@ -1,0 +1,233 @@
+From 3ceec30faa7d8c8889caf5bb02062dc2ae648f20 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:51:58 +0200
+Subject: [PATCH] One-shot collectives: startup waits as long as its
+ rendezvous; profiling names a stopped collective
+
+Kernels still JIT-compile inside memory profiling and warm-up, for as long
+as each rank's cache needs. The rendezvous lines ranks up at the entrance,
+but a rank whose cache is warm then waits in the next collective for one
+that is compiling, and the serving wait (10 s) stops the GPU there. With one
+rank's TileLang cache cold, r6s traps in profile_run every time: rank 0 waits
+for rank 1's attention-metadata compiles, Xid 43, and the error reads
+cuModuleLoadData CUDA_ERROR_LAUNCH_FAILED. Every failed start leaves the
+torn-down ranks further behind, so it repeats.
+
+- Startup's one-shot collectives wait as long as the startup rendezvous
+  (VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS) from the communicators' creation; the
+  serving wait (SPARKNET_ROCE_TIMEOUT_MS) returns once warm-up is done, before
+  the JIT monitor starts. A stopped collective still stops the GPU.
+- Memory profiling and warm-up re-raise a CUDA error as the stopped
+  collective's report, as execute_model and sample_tokens do: profile_run
+  calls the model runner directly, outside those wrappers.
+
+Needs sparknet's SparknetOneShotAllReduce.set_timeout_ms.
+
+Reported-by: huxiaofengtiger (NVIDIA Developer Forums, DeepSeek 4.1 Flash recipe thread, post 24)
+---
+ tests/v1/worker/test_b12x_roce_health.py      | 67 +++++++++++++++++++
+ .../device_communicators/cuda_communicator.py |  9 +++
+ vllm/v1/worker/gpu_worker.py                  | 50 +++++++++++++-
+ 3 files changed, 124 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/worker/test_b12x_roce_health.py b/tests/v1/worker/test_b12x_roce_health.py
+index abac53410..fdf45597e 100644
+--- a/tests/v1/worker/test_b12x_roce_health.py
++++ b/tests/v1/worker/test_b12x_roce_health.py
+@@ -8,6 +8,7 @@ completion: immediately for a synchronous output (or ``None``), and only after
+ ``get_output()`` for an asynchronous output.
+ """
+ 
++import contextlib
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+@@ -139,3 +140,69 @@ def test_errors_without_a_stopped_collective_pass_unchanged(monkeypatch):
+     ):
+         raise error
+     assert raised.value is error
++
++
++class _TimedCommunicator:
++    """A communicator on the TileLang family's RoCE policy: its wait can be set."""
++
++    def __init__(self, timeout_ms: int) -> None:
++        self.timeout_ms = timeout_ms
++        self.calls: list[int] = []
++
++    def set_roce_timeout_ms(self, timeout_ms: int) -> int:
++        self.calls.append(timeout_ms)
++        previous, self.timeout_ms = self.timeout_ms, timeout_ms
++        return previous
++
++
++def _worker_on(monkeypatch, communicator) -> Worker:
++    worker = Worker.__new__(Worker)
++    group = SimpleNamespace(device_communicator=communicator)
++    monkeypatch.setattr(gpu_worker_module, "get_tp_group", lambda: group)
++    return worker
++
++
++def test_startup_waits_as_long_as_its_rendezvous_then_serving_again(monkeypatch):
++    """Ranks compile inside profiling and warm-up for as long as each JIT cache
++    needs; startup's collectives wait as long as the rendezvous, and the serving
++    wait returns once, after warm-up."""
++    communicator = _TimedCommunicator(10_000)
++    worker = _worker_on(monkeypatch, communicator)
++    worker._startup_roce_timeout()
++    startup = gpu_worker_module.envs.VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS
++    assert communicator.timeout_ms == startup
++    worker._serving_roce_timeout()
++    assert communicator.timeout_ms == 10_000
++    worker._serving_roce_timeout()
++    assert communicator.calls == [startup, 10_000]
++
++
++def test_without_the_roce_policy_nothing_is_timed(monkeypatch):
++    # No setter (another communicator), or a setter whose policy is off.
++    off = SimpleNamespace(set_roce_timeout_ms=lambda _: None)
++    for communicator in (SimpleNamespace(), off):
++        worker = _worker_on(monkeypatch, communicator)
++        worker._startup_roce_timeout()
++        worker._serving_roce_timeout()
++        assert getattr(worker, "_serving_roce_timeout_ms", None) is None
++
++
++def test_profiling_and_warm_up_name_a_stopped_collective(monkeypatch):
++    """Memory profiling and warm-up run the model outside execute_model; a
++    collective that stops the GPU there is named as the cause too."""
++    worker = _worker_with_failure(monkeypatch, REPORT)
++
++    def stopped(*args, **kwargs):
++        raise RuntimeError("CUDA error: unspecified launch failure")
++
++    monkeypatch.setattr(Worker, "_determine_available_memory", stopped)
++    with pytest.raises(RuntimeError, match="saw nothing from rank 2") as raised:
++        worker.determine_available_memory()
++    assert "unspecified launch failure" in str(raised.value.__cause__)
++    monkeypatch.setattr(Worker, "_compile_or_warm_up_model_after_preparation", stopped)
++    monkeypatch.setattr(
++        gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
++    )
++    worker.vllm_config = None
++    with pytest.raises(RuntimeError, match="saw nothing from rank 2"):
++        worker.compile_or_warm_up_model()
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 9f5470783..7c9218c96 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -502,6 +502,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             return self.b12x_ar_comm.failure()
+         return None
+ 
++    def set_roce_timeout_ms(self, timeout_ms: int) -> int | None:
++        """Set how long a one-shot collective wait may see no peer before it
++        stops the GPU, and return the previous value; None without the TileLang
++        family's RoCE policy (B12X's collectives keep their spin limit). Every
++        rank sets the same value at the same point."""
++        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++            return self.b12x_ar_comm.set_timeout_ms(timeout_ms)
++        return None
++
+     def _require_roce_policy(self) -> None:
+         """A selected policy cannot silently become a different backend."""
+         if not self._roce_policy:
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2092c4c3f..ae087d760 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -278,6 +278,8 @@ class Worker(WorkerBase):
+         # the worker-local registry while publishing native resources.
+         self._b12x_session = None
+         self._b12x_stage: str | None = None
++        # The one-shot collectives' serving wait, while startup waits longer.
++        self._serving_roce_timeout_ms: int | None = None
+         self._b12x_profile_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_cache = False
+@@ -498,6 +500,7 @@ class Worker(WorkerBase):
+                 self.local_rank,
+                 current_platform.dist_backend,
+             )
++            self._startup_roce_timeout()
+ 
+             if self.use_v2_model_runner:
+                 logger.info_once("Using V2 Model Runner")
+@@ -652,7 +655,13 @@ class Worker(WorkerBase):
+ 
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+-        """Profile model memory through the ordinary vLLM admission path."""
++        """Profile model memory through the ordinary vLLM admission path; a
++        one-shot collective that stops the GPU while profiling is named as the
++        error's cause, as in a serving step."""
++        with _collective_cause(self._roce_failure):
++            return self._determine_available_memory()
++
++    def _determine_available_memory(self) -> int:
+         maybe_apply_startup_plan(self)
+         # Loading compiled each rank's kernels for as long as its cache needed.
+         self._startup_rendezvous("memory profiling")
+@@ -959,7 +968,10 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+-        with set_current_vllm_config(self.vllm_config):
++        with (
++            set_current_vllm_config(self.vllm_config),
++            _collective_cause(self._roce_failure),
++        ):
+             return self._compile_or_warm_up_model_after_preparation()
+ 
+     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
+@@ -1142,6 +1154,9 @@ class Worker(WorkerBase):
+ 
+             trigger_inductor_lazy_init(self.device)
+ 
++        # Warm-up is over, so a collective's wait is serving's again.
++        self._serving_roce_timeout()
++
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1376,6 +1391,37 @@ class Worker(WorkerBase):
+         failure = getattr(communicator, "roce_failure", None)
+         return None if failure is None else failure()
+ 
++    def _startup_roce_timeout(self) -> None:
++        """Let startup's one-shot collectives wait as long as its rendezvous.
++
++        Kernels still compile inside memory profiling and warm-up, for as long
++        as each rank's JIT cache needs, so a rank with a warm cache waits in
++        the next collective for one compiling. A cold or uneven cache puts
++        ranks minutes apart; the serving wait would stop the GPU there.
++        """
++        communicator = get_tp_group().device_communicator
++        setter = getattr(communicator, "set_roce_timeout_ms", None)
++        if setter is None:
++            return
++        startup = envs.VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS
++        serving = setter(startup)
++        if serving is not None:
++            self._serving_roce_timeout_ms = serving
++            logger.info(
++                "One-shot collectives wait up to %g s during startup, then %g s.",
++                startup / 1000,
++                serving / 1000,
++            )
++
++    def _serving_roce_timeout(self) -> None:
++        """Restore the one-shot collectives' serving wait, on every rank after
++        warm-up."""
++        serving = getattr(self, "_serving_roce_timeout_ms", None)
++        if serving is None:
++            return
++        get_tp_group().device_communicator.set_roce_timeout_ms(serving)
++        self._serving_roce_timeout_ms = None
++
+     def _startup_rendezvous(self, phase: str) -> None:
+         """Wait on the host until every rank reaches ``phase``.
+ 
+-- 
+2.54.0 (Apple Git-157)
+

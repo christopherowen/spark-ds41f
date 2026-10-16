@@ -1,0 +1,14 @@
+{
+  "description": "r6t's worker and RoCE-policy tests in the r6t image: startup's collective wait, its restore after warm-up, and a stopped collective named in profiling and warm-up.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6t",
+  "env": {
+    "HF_HUB_OFFLINE": "1"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-o', 'faulthandler_timeout=240', 'tests/v1/worker/test_b12x_roce_health.py', 'tests/distributed/test_roce_policy_no_fallback.py']\nsys.exit(subprocess.run(cmd, timeout=900).returncode)\n"
+  ],
+  "verdict": "exit",
+  "mounts": []
+}
