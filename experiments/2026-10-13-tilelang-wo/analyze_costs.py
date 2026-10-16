@@ -62,14 +62,15 @@ VOCAB_BLOCKS = {1010, 2020, 1348, 2696}
 def head_launch(name, grid):
     """Target LM head launches per step: the B12X-era kernels on rank 0's 43136-row shard
     count once; the TileLang packed head (main_kernel before vLLM 0118,
-    packed_vocab_projection_kernel since) counts one half, because the drafter calls it
-    once a step as well."""
+    packed_vocab_projection_kernel since, vocab_packed_projection_kernel since the
+    2026-10-13 kernel names) counts one half, because the drafter calls it once a step
+    as well."""
     if not grid:
         return 0
     if (("_row_kernel" in name and grid[0] == 43136) or ("nvjet" in name and grid[0] == 2696)
             or ("cutlass_80" in name and grid[1] == 337)):
         return 1
-    if name in ("main_kernel", "packed_vocab_projection_kernel") and (grid[0] in VOCAB_BLOCKS or grid[1] in VOCAB_BLOCKS):
+    if name in ("main_kernel", "packed_vocab_projection_kernel", "vocab_packed_projection_kernel") and (grid[0] in VOCAB_BLOCKS or grid[1] in VOCAB_BLOCKS):
         return 0.5
     return 0
 
