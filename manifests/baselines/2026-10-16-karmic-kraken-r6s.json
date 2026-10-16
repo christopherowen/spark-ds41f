@@ -114,7 +114,12 @@
   "engram_debug_timeline": "off (SPARK3_ENGRAM_TIMELINE, vLLM 0151; since r6s it records planning time too)"
  },
  "capacity": {
-  "note": "filled in from the deployed service after the TP3 restart"
+  "kv_cache_tokens": 2845543,
+  "max_model_len": 524288,
+  "max_num_seqs": 8,
+  "reported_full_context_concurrency": 5.43,
+  "graph_capture_gib": 1.15,
+  "note": "read from the deployed service on 2026-10-16 (GPU KV cache 2,845,543 tokens, 5.43x for 524,288; rank 0 graph capture 1.15 GiB); equal to r6n's TP3 KV"
  },
  "change_from_previous": "TP3: r6n plus r6o (Engram rows of the tokens the host already knows read before the step, vLLM 0148; checkpoint copies through anonymous memory, 0147), r6p (Engram's sequence-parallel wkv product exchanged all-to-all, 0150; a debug timeline, 0151), r6q (only real rows sent, read in place by a blocked gate, 0152), r6r (disk Engram shards on whole hash columns, joined by an all-gather instead of an all-reduce, 0153) and r6s (those columns interleaved across ranks, every tp-th, so each rank reads every n-gram order, 0154; its test, 0155). Temperature-0 outputs and teacher-forced distributions are identical to r6n's. tp4-ring resolves to r6s but stays unqualified (no benchmark_reference) until a TP4 release; r6n's recipe and lock are frozen in experiments/2026-10-16-r6s/r6n as the rollback.",
  "evidence": {
@@ -159,5 +164,5 @@
   },
   "nvme_power": "APST on with 2 s / 60 s idle thresholds (applied 2026-10-16 12:48 UTC)"
  },
- "deployment": "pending: TP3 restart from the merged promotion (cluster sync --revision, cluster start --apply --replace)"
+ "deployment": "TP3 production since 2026-10-16 22:30 UTC from b3f4e0a (cluster sync --revision, cluster start --apply --replace, shape unchanged; API ready in 90 s); doctor --live matches (only the weight-fragmentation warnings); it uses its build curves build-75cd5b96c4ec4942; a temperature-0 sanity request answered correctly"
 }

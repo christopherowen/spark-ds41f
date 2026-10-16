@@ -1,4 +1,4 @@
-**Promoted for TP3 on 2026-10-16** as [`2026-10-16-karmic-kraken-r6s`](../../manifests/baselines/2026-10-16-karmic-kraken-r6s.json) (owner: "release r6s with 0155"), on the release below ([suite run](../../manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/)). `tp4-ring` resolves to r6s but stays unqualified until a TP4 release. The r6n recipe this release ran against is frozen in [r6n/cluster.json](r6n/cluster.json) with its lock.
+**Promoted for TP3 on 2026-10-16** as [`2026-10-16-karmic-kraken-r6s`](../../manifests/baselines/2026-10-16-karmic-kraken-r6s.json) (owner: "release r6s with 0155"), on the release below ([suite run](../../manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/)). `tp4-ring` resolves to r6s but stays unqualified until a TP4 release. The r6n recipe this release ran against is frozen in [r6n/cluster.json](r6n/cluster.json) with its lock. Deployed on the triangle at 22:30 UTC from `b3f4e0a` (API ready in 90 s, `doctor --live` matches, KV 2,845,543 tokens as r6n's, its own cost curves `build-75cd5b96c4ec4942`).
 
 # r6s: Engram disk shards' hash columns interleaved across ranks
 
