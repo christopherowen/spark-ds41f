@@ -279,6 +279,9 @@ yours to run, as root, with the service stopped:
 1. **Kernel packages.** Install the five `7.0.0-1019-nvidia-64k` packages at
    the versions in `config/kernel-trial.json` (image, modules, headers,
    `linux-tools` for the CPU governor, and `linux-modules-nvidia-580-open`).
+   The NVIDIA modules package carries the kernel version plus a packaging suffix
+   (`+1`, `+2`, ...) that Ubuntu raises on a resync; install the archive's current
+   one, which `doctor --live` accepts.
    Keep the 4 KiB kernel installed: it is the fallback. With fan control
    installed, also run `sudo dkms autoinstall -k 7.0.0-1019-nvidia-64k` so
    its module is built for the new kernel. The memory saver's [kernel guide](https://github.com/christopherowen/dgx-spark-memory-saver/blob/main/docs/kernel.md)

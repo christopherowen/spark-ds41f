@@ -62,6 +62,18 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(any("package versions differ" in x for x in issues))
         self.assertIn(f"{package}={POLICY['packages'][package]}", fixes[0])
 
+    def test_nvidia_modules_match_on_the_kernel_version(self):
+        modules = next(p for p in POLICY["packages"] if p.startswith("linux-modules-nvidia-"))
+        for suffix in ("+1", "+2", "+9"):
+            data = ready()
+            data["packages"][modules] = POLICY["packages"][modules] + suffix
+            self.assertEqual(kernel.findings("dgx1", data, POLICY), ([], []))
+        data = ready()
+        data["packages"][modules] = "7.0.0-1020.20~24.04.1+1"
+        issues, fixes = kernel.findings("dgx1", data, POLICY)
+        self.assertTrue(any("package versions differ" in x for x in issues))
+        self.assertTrue(fixes[0].endswith(f"install {modules}"))
+
     def test_wrong_driver_and_vermagic(self):
         data = ready()
         data["modules"]["nvidia"] = {"version": "wrong", "vermagic": OLD}

@@ -141,10 +141,17 @@ def findings(name, data, policy):
         issues.append(f"{name}: loaded NVIDIA RM build differs from the required qualification build")
     if data.get("errors"):
         issues.append(f"{name}: incomplete kernel inventory: " + "; ".join(data["errors"]))
-    missing = [p for p, version in policy["packages"].items() if data.get("packages", {}).get(p) != version]
+    # Ubuntu's precompiled NVIDIA modules carry the kernel package version plus a
+    # packaging suffix (+1, +2, ...) that a resync raises: match the kernel version.
+    def matches(package, version):
+        installed = data.get("packages", {}).get(package)
+        return installed == version or (package.startswith("linux-modules-nvidia-")
+                                        and bool(installed) and installed.startswith(version + "+"))
+    missing = [p for p, version in policy["packages"].items() if not matches(p, version)]
     if missing:
         issues.append(f"{name}: 64 KiB package versions differ: {', '.join(missing)}")
-        fixes.append(f"{name}: sudo apt-get install " + " ".join(f"{p}={policy['packages'][p]}" for p in missing))
+        fixes.append(f"{name}: sudo apt-get install " + " ".join(
+            p if p.startswith("linux-modules-nvidia-") else f"{p}={policy['packages'][p]}" for p in missing))
     for path in [f"/boot/{kind}-{release}" for release in (policy["fallback"], target)
                  for kind in ("vmlinuz", "initrd.img", "config")]:
         if not data.get("files", {}).get(path):
