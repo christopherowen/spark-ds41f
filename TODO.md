@@ -33,12 +33,13 @@ before tuning anything on this basis.
 
 ## Next release
 
-**r6n** shipped for TP4 on 2026-10-15
-([experiments/2026-10-15-r6n](experiments/2026-10-15-r6n/README.md)). The indexer
+**r6s** shipped for TP3 on 2026-10-16
+([experiments/2026-10-16-r6s](experiments/2026-10-16-r6s/README.md)); TP4 stays on
+**r6n** (2026-10-15, [experiments/2026-10-15-r6n](experiments/2026-10-15-r6n/README.md))
+until r6s is released on the ring. The indexer
 ReLU and the index quantizer's NaN handling stay in the kernel contracts' rounds
 (round 6: the BF16 clamp is on the 1% line at 8K x 2048, the quantizer 1-3% slower);
-they join a candidate only within 1% of r6n with its bits. TP3 runs r6n since
-2026-10-16.
+they join a candidate only within 1% of r6n with its bits.
 
 **After r6n:**
 1. Drop `disk_resident_scales` from the recipe's serve arguments, then the field
@@ -50,9 +51,9 @@ they join a candidate only within 1% of r6n with its bits. TP3 runs r6n since
 4. One host channel: move the Engram control block's wait and publish helpers and
    the native worker into sparknet, then put DSpark's confidences on it with
    sparknet's broadcast.
-5. Credit huxiaofengtiger with a `Reported-by:` trailer on vLLM 0143: carried by r6o's
-   series ([experiments/2026-10-16-r6o](experiments/2026-10-16-r6o/README.md)); done when
-   r6o or its successor is promoted.
+5. ~~Credit huxiaofengtiger with a `Reported-by:` trailer on vLLM 0143~~: carried by r6o's
+   series ([experiments/2026-10-16-r6o](experiments/2026-10-16-r6o/README.md)) into r6s,
+   promoted for TP3 on 2026-10-16; TP4 carries it from its r6s release.
 6. **Unpin TP4's cost curves at its next release.** Since 2026-10-15 a profile without a
    pinned directory schedules on its own build's curves (`bin/spark` derives
    `SPARK3_DSPARK_COST_DIR` per build). `tp4-ring` still pins r6h's

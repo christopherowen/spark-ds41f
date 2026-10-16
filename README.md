@@ -4,11 +4,18 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **r6n** on both shapes: the four-node TP4 1M profile on the ring
-(2026-10-15, [promotion record](experiments/2026-10-15-r6n/README.md)) and the
-three-node TP3 512K profile on the triangle (2026-10-16,
-[record](experiments/2026-10-15-r6n-tp3/README.md)); the site is cabled as the
-triangle. r6n is r6k with Engram rows
+Production is **r6s** on the three-node TP3 512K profile, on the triangle the
+site is cabled as (2026-10-16, [promotion record](experiments/2026-10-16-r6s/README.md)).
+The four-node TP4 1M profile was last released on **r6n** (2026-10-15,
+[promotion record](experiments/2026-10-15-r6n/README.md)): the recipe's `tp4-ring`
+resolves to r6s but stays unqualified until a TP4 release, and r6n's recipe and
+lock are frozen in `experiments/2026-10-16-r6s/r6n`. r6s is r6n with faster
+Engram prefill: the rows of tokens the host already knows are read before the
+step, Engram's sequence-parallel product is exchanged all-to-all instead of
+all-gathered, and each rank's disk shard is whole hash columns, every third (or
+fourth), so every rank reads every n-gram order and the ranks finish together.
+Prefill is 4.8-5.6% faster, decode is level, and the temperature-0 text and the
+model's distributions are identical to r6n's. r6n is r6k with Engram rows
 read by a native worker in layer order and gathered in TileLang (one bounded
 wait per table, this rank's rows only), collectives that stop on a timed-out
 wait instead of falling back or computing on unwritten buffers, a host
@@ -99,11 +106,12 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 
 ## Current baseline
 
-The four-node baseline is
+The three-node baseline is
+[manifests/baselines/2026-10-16-karmic-kraken-r6s.json](manifests/baselines/2026-10-16-karmic-kraken-r6s.json)
+([promotion record](experiments/2026-10-16-r6s/README.md)), since 2026-10-16. The
+four-node baseline is still
 [manifests/baselines/2026-10-15-karmic-kraken-r6n.json](manifests/baselines/2026-10-15-karmic-kraken-r6n.json)
-([promotion record](experiments/2026-10-15-r6n/README.md)). The three-node
-profile runs the same baseline since 2026-10-16
-([TP3 record](experiments/2026-10-15-r6n-tp3/README.md)); see
+([promotion record](experiments/2026-10-15-r6n/README.md)); see
 [docs/current-state.md](docs/current-state.md). The three-node deployment:
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
@@ -194,6 +202,28 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+r6s against r6n on three nodes (2026-10-16), measured with the `release-tp3` suite
+in one session (r6s, r6n, r6s again; [results](experiments/2026-10-16-r6s/README.md);
+[suite run](manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/)), each on its own
+build's cost curves. Each change is shown with its 95% interval and judged against
+the run's own repeat; it counts (**bold**) only beyond both.
+
+| Workload | TP3 r6n | TP3 r6s |
+| --- | ---: | ---: |
+| Source-text prefill, 32K (tok/s) | 4,199 | 4,425 (**+5.4%** ±1.8) |
+| Prefill, 128K | 4,128 | 4,360 (**+5.6%** ±1.0) |
+| Prefill, 256K | 3,963 | 4,164 (**+5.1%** ±0.8) |
+| Prefill, 500K | 3,636 | 3,812 (**+4.8%** ±0.2) |
+| Decode step time, geometric mean of 15 shapes | | +0.5% ±0.14 (repeat -0.4%) |
+| Decode, 8 different prompts at once (tok/s) | 145.6 | 146.2 (+0.4% ±1.0) |
+| Decode, 4 different prompts at once | 112.5 | 112.3 (-0.2% ±2.0) |
+| Poisson arrivals at 0.42 req/s, output (tok/s) | 117.0 | 117.3 (+0.2% ±21) |
+
+Decode is level: the first r6s arm's +0.5% is within the run's own repeat (the second
+r6s arm is +0.1% against r6n). All 256 greedy responses are identical to r6n's, and the
+teacher-forced distributions are identical (KL 0). These r6n figures are 0.3-4% above
+r6n's own release run of 2026-10-15 (below, 8 streams the most); compare within a session.
 
 r6n against r6h on three nodes (2026-10-16), measured with the `release-tp3` suite
 in one session (r6n, r6h, r6n again; [results](experiments/2026-10-15-r6n-tp3/README.md);

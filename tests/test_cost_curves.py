@@ -44,8 +44,11 @@ class CostCurveDirectoryTest(unittest.TestCase):
         dev["environment"]["VLLM_SERVER_DEV_MODE"] = "1"
         self.assertEqual(self.directory(dev), self.directory(self.tp3))
         # The TP3 release's dev-mode arm and the recipe are the same build.
-        arm = spark.read_cluster("experiments/2026-10-15-r6n-tp3/r6n-tp3-dev.json")
+        arm = spark.read_cluster("experiments/2026-10-16-r6s/r6s-tp3-dev.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp3))
+        # The frozen r6n recipe keeps r6n's TP3 curves, the ones its production ran on.
+        r6n = spark.read_cluster("experiments/2026-10-15-r6n-tp3/r6n-tp3.json")
+        self.assertEqual(self.directory(r6n), "/cache/kkref/dspark-costs/build-77b3fa3c35f1ce6d")
         # A traced arm times differently: its curves never become the build's.
         traced = spark.read_cluster("experiments/2026-10-15-r6n-tp3/r6n-tp3-traced.json")
         self.assertNotEqual(self.directory(traced), self.directory(self.tp3))

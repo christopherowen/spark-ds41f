@@ -1,7 +1,37 @@
 # Current state
 
-Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json))
-on the four-node ring, promoted 2026-10-15 as
+Production is the recipe's `tp3-triangle` shape ([config/cluster.json](../config/cluster.json))
+on **r6s**, promoted 2026-10-16 as
+[`2026-10-16-karmic-kraken-r6s`](../manifests/baselines/2026-10-16-karmic-kraken-r6s.json)
+([promotion record](../experiments/2026-10-16-r6s/README.md)): image
+`vllm-ds41f-kkref:19f2c20ed4d6-r6s` (`sha256:2414b9d1`) on dgx1-dgx3, r6n's sources with
+vLLM 0146-0155 (patch head `238b7ea3`, tree `71c6e1df`). r6s changes only how Engram's
+rows reach a prefill:
+- **Rows before the step.** The native reader reads the rows of the tokens the host
+  already knows before the step starts (0148), so the first Engram layer waits less.
+- **An all-to-all for the prefill product.** Under sequence parallelism each rank sends
+  every other rank only that rank's real rows of its `wkv` column block (0150, 0152),
+  and the TileLang gate reads the received blocks in place.
+- **Interleaved hash columns.** A disk shard is whole hash columns, every tp-th (0153,
+  0154): every rank reads 2-, 3- and 4-gram heads, the ranks' columns are joined by an
+  all-gather, and the slowest rank's reads no longer set the step.
+- **Checkpoint copies through anonymous memory** (0147), never pinned: a large copy
+  from untouched file-mapped pages hangs on R580 with 64 KiB pages.
+
+Against r6n on the `release-tp3` suite: prefill 4.8-5.6% faster at 32K-500K, decode,
+8 and 4 streams and Poisson level, temperature-0 text and teacher-forced
+distributions identical. `tp3-triangle`'s `benchmark_reference` is the release's r6s
+run ([manifests/suites/2026-10-16-karmic-kraken-r6s-tp3](../manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/)).
+It schedules on its build's cost curves (`build-75cd5b96c4ec4942`, profiled on the
+release's first r6s boot). The r6n recipe and lock are frozen in
+`experiments/2026-10-16-r6s/r6n` as TP3's rollback
+(`experiments/2026-10-15-r6n-tp3/r6n-tp3.json`, curves `build-77b3fa3c35f1ce6d`).
+
+`tp4-ring` resolves to r6s but is not qualified on it until a TP4 release (no
+`benchmark_reference`); the four-node ring was last released on r6n, in the frozen
+recipe's `tp4-ring` shape, described below.
+
+The four-node ring's last release is the recipe's `tp4-ring` shape, promoted 2026-10-15 as
 [`2026-10-15-karmic-kraken-r6n`](../manifests/baselines/2026-10-15-karmic-kraken-r6n.json)
 ([promotion record](../experiments/2026-10-15-r6n/README.md)): image
 `vllm-ds41f-kkref:19f2c20ed4d6-r6n` (`sha256:5ec81bee`) on all four ranks, Local
@@ -49,7 +79,7 @@ on r6h's cost curves for that placement (`ring4-r6h-headout-20261012`), as the r
 and r6n release comparisons did. The temperature-0 references are r6k's
 (70b3379cc289 / 708ec5b17482).
 
-The three-node shape `tp3-triangle` runs r6n too, promoted 2026-10-16 on its release
+Before r6s, the three-node shape `tp3-triangle` ran r6n, promoted 2026-10-16 on its release
 against r6h ([experiments/2026-10-15-r6n-tp3](../experiments/2026-10-15-r6n-tp3/README.md),
 reference [manifests/suites/2026-10-15-karmic-kraken-r6n-tp3](../manifests/suites/2026-10-15-karmic-kraken-r6n-tp3/)):
 decode 5.5% faster at every shape, 8 and 4 streams faster, prefill level. It schedules
@@ -62,8 +92,8 @@ B12X is the alternative backend in the same image.
 | Setting | Active value |
 |---|---:|
 | Kernel backend | TileLang (`kernel_backend: tilelang`): TileLang 0.1.15 + SM120/SM121 block-scaled MMA patches, DeepSeek TileKernels 2.0.0, sparknet 0.4.0 one-shot RoCE collectives; TileLang also runs RoPE, the compressor and its projection, the KV cache writers, the Engram gate and hash and the sparse-MLA metadata; B12X runs the fused WO projection, the drafter's context-KV projection, the Engram row lookup, the vision tower's kernels and the checkpoint loader |
-| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + the r6h series (`experiments/2026-10-12-r6h/vllm/series`, patch head `e39cd9da`, tree `68c9abd9`), B12X `236ddff0` + switchless RoCEnante, CuTe DSL 4.7.1 pin, top-k position-tie, dense GEMM and prefill stage-fence patches, four-node relay and mesh transports, packed BF16 vocabulary projection, NCCL 2.30.7 + IB send-path fence and four-node ring patches |
-| Image | `vllm-ds41f-kkref:19f2c20ed4d6-r6h` (`sha256:0aaa5d8b`), one digest on all ranks, built by `bin/spark build` |
+| Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + the r6s series (`experiments/2026-10-16-r6s/vllm/series`, patch head `238b7ea3`, tree `71c6e1df`), B12X `236ddff0` + switchless RoCEnante, CuTe DSL 4.7.1 pin, top-k position-tie, dense GEMM and prefill stage-fence patches, four-node relay and mesh transports, packed BF16 vocabulary projection, NCCL 2.30.7 + IB send-path fence and four-node ring patches |
+| Image | `vllm-ds41f-kkref:19f2c20ed4d6-r6s` (`sha256:2414b9d1`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count, TileLang's unspecialized pipeline, no K split; prefill rasterizes weights larger than L2 in panels (vLLM 0043) |
 | Batch invariance | every kernel adds its reduction in a fixed order; collectives add every rank's partial in rank order with one FP32 rounding; prefill chunks leave room for every stream's decode and draft rows (threshold 4048); a mixed step runs sparse MLA per request, so decode rows keep the decode plan |
 | Hosts | DGX Spark 26.09.2, kernel `7.0.0-1019-nvidia-64k` with `kho=off`, driver 580.178.04, no desktop |
@@ -84,12 +114,12 @@ B12X is the alternative backend in the same image.
 | Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
 | Image input | vision tower loaded, up to 4 images per request, no host preprocessing cache |
-| DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this image with real rows (`tp3-r6h-20261012`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
+| DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
 | Collectives | sparknet one-shot all-reduce (up to 2 MiB) and all-gather over the triangle (`oneshot-direct`), larger all-reduces summed in rank order in FP32; the requested policy is enforced and a declined or lost backend fails startup (vLLM 0027, 0038) |
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
 | CUDA graphs | full, capture sizes 1-48 |
 | Engram projection | sharded across ranks (`projection_tp`) |
-| Engram rows | read beside the forward launch (`SPARK3_ENGRAM_ASYNC=1`) |
+| Engram rows | one native reader thread, rows of host-known tokens read before the step; disk shards on interleaved whole hash columns, joined by an all-gather; one bounded wait per table (`SPARK3_ENGRAM_ROWS_TIMEOUT_MS`, 10 s) |
 | L2 weight prefetch | on (base default on SM121); TileLang scale words prefetched with each weight (vLLM 0044) |
 | B12X autotune | disabled |
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |

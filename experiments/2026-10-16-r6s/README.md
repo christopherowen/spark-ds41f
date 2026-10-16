@@ -1,3 +1,5 @@
+**Promoted for TP3 on 2026-10-16** as [`2026-10-16-karmic-kraken-r6s`](../../manifests/baselines/2026-10-16-karmic-kraken-r6s.json) (owner: "release r6s with 0155"), on the release below ([suite run](../../manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/)). `tp4-ring` resolves to r6s but stays unqualified until a TP4 release. The r6n recipe this release ran against is frozen in [r6n/cluster.json](r6n/cluster.json) with its lock.
+
 # r6s: Engram disk shards' hash columns interleaved across ranks
 
 r6s is r6r ([experiments/2026-10-16-r6r](../2026-10-16-r6r/README.md)) with vLLM 0154.
@@ -55,6 +57,30 @@ builds again on dgx2.
 - `release.json`: release-tp3, with r6s, r6n and r6s again.
 
 On passing, r6s is promoted for TP3. TP4 stays unqualified until r6s is benched on the ring.
+
+### Release results (2026-10-16, 20:10-22:14 UTC, TP3)
+
+The rebuilt image (`sha256:2414b9d1`) passed the Engram tests. The suite ran r6s
+(20:10-20:50), r6n (20:52-21:32) and r6s again (21:34-22:14); every node began each arm
+below the 55 C cooling threshold (48-52 C), with no thermal or power slowdown.
+
+```
+verdicts: r6n -> r6s, against the run's own repeat (r6s -> r6s-again)
+metric                             change    ±95%   repeat  verdict
+grid: decode geometric mean (15)   +0.47%   0.14%   -0.40%  same
+c8: output tok/s                   +0.40%   1.04%   -0.18%  same
+c4: output tok/s                   -0.19%   1.95%   -0.08%  same
+poisson: output tok/s              +0.23%  20.99%   -0.02%  same
+prefill: prefill 32,768 tok/s      +5.37%   1.81%   -0.57%  better
+prefill: prefill 131,072 tok/s     +5.61%   0.96%   -0.60%  better
+prefill: prefill 262,144 tok/s     +5.09%   0.79%   -0.53%  better
+prefill: prefill 500,000 tok/s     +4.83%   0.20%   -0.49%  better
+```
+
+All 256 greedy responses are identical to r6n's and the teacher-forced distributions are
+identical (KL 0), in both r6s arms. The first arm's decode step (+0.47%) is inside the
+repeat; the second arm is +0.07% ±0.14 against r6n. The full table is in the
+[suite run](../../manifests/suites/2026-10-16-karmic-kraken-r6s-tp3/release-table.txt).
 
 ## Results (2026-10-16, 19:06-19:41 UTC, TP3)
 

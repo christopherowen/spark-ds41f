@@ -44,11 +44,20 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolved, expected)
 
     def test_tp4_ring_is_the_released_r6n_arm(self):
-        """Promotion runs what the release measured: tp4-ring resolves to r6n's release
-        arm, apart from the baseline, lock and reference that name it."""
-        resolved = recipe.resolve(self.recipe, "tp4-ring")
+        """Promotion runs what the release measured: tp4-ring, frozen at r6s's TP3-only
+        promotion, resolves to r6n's release arm, apart from the baseline, lock and
+        reference that name it."""
+        resolved = recipe.resolve(load("experiments/2026-10-16-r6s/r6n/cluster.json"), "tp4-ring")
         released = load_spark().read_cluster("experiments/2026-10-15-r6n/r6n-release.json")
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape")
+        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                         {k: v for k, v in released.items() if k not in naming})
+
+    def test_tp3_triangle_is_the_released_r6s_arm(self):
+        """tp3-triangle resolves to r6s's release arm, apart from the names."""
+        resolved = recipe.resolve(self.recipe, "tp3-triangle")
+        released = load_spark().read_cluster("experiments/2026-10-16-r6s/r6s-tp3.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
@@ -65,7 +74,8 @@ class RecipeTest(unittest.TestCase):
         self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-15-karmic-kraken-r6n-tp3")
+        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-16-karmic-kraken-r6s-tp3")
+        self.assertNotIn("benchmark_reference", tp4)  # r6s is not benched on TP4
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):

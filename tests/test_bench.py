@@ -608,6 +608,8 @@ class BenchAbortCleanupTest(unittest.TestCase):
 class ReferenceShapeTest(unittest.TestCase):
     TP3_REFERENCE = "manifests/benchmarks/2026-10-12-karmic-kraken-r6h.json"
     TP4_REFERENCE = "manifests/suites/2026-10-15-karmic-kraken-r6n-tp4"
+    # tp4-ring was last released on r6n: its qualified recipe is frozen with r6s's promotion.
+    TP4_RECIPE = "experiments/2026-10-16-r6s/r6n/cluster.json"
     TP4_BENCH = "manifests/benchmarks/2026-10-13-karmic-kraken-r6k-tp4.json"
     OLD_REFERENCE = "manifests/benchmarks/2026-10-02-karmic-kraken-r5o-64k.json"
     TP4_MISMATCH = "was measured with nodes 3, transport oneshot-direct; this {} has nodes 4, transport oneshot-ring4"
@@ -663,17 +665,19 @@ class ReferenceShapeTest(unittest.TestCase):
                     ([], []),
                 )
                 self.assertEqual(spark.benchmark_reference_problems(cluster, nodes), [])
-        self.assertIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
+        self.assertIn("benchmark_reference", recipe["shapes"]["tp3-triangle"])
+        # r6s was released on the triangle only; tp4-ring waits for a TP4 release.
+        self.assertNotIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
 
     def test_tp4_profile_compares_with_the_tp4_run(self) -> None:
-        cluster, nodes = self.profile("config/cluster.json", "tp4-ring")
+        cluster, nodes = self.profile(self.TP4_RECIPE, "tp4-ring")
         self.assertEqual(cluster["benchmark_reference"], self.TP4_REFERENCE)
         # The reference is a suite run: the old bench runs without a comparison (setup's verify step).
-        status, output = self.bench("config/cluster.json", cluster, nodes, "--report", self.report(cluster, nodes))
+        status, output = self.bench(self.TP4_RECIPE, cluster, nodes, "--report", self.report(cluster, nodes))
         self.assertEqual(status, 0)
         self.assertIn("is a servebench suite run; this bench compares with nothing", output)
         self.assertNotIn("reference:", output)
-        status, output = self.bench("config/cluster.json", cluster, nodes, "--report", self.report(cluster, nodes),
+        status, output = self.bench(self.TP4_RECIPE, cluster, nodes, "--report", self.report(cluster, nodes),
                                     "--compare", self.TP4_BENCH)
         self.assertEqual(status, 0)
         self.assertIn(f"reference: {ROOT / self.TP4_BENCH}", output)
@@ -681,7 +685,7 @@ class ReferenceShapeTest(unittest.TestCase):
         self.assertNotIn("ERROR", output)
         cluster["benchmark_reference"] = "manifests/benchmarks/missing.json"
         with self.assertRaisesRegex(SystemExit, "benchmark_reference does not exist: manifests/benchmarks/missing.json"):
-            self.bench("config/cluster.json", cluster, nodes, "--report", self.report(cluster, nodes))
+            self.bench(self.TP4_RECIPE, cluster, nodes, "--report", self.report(cluster, nodes))
 
     def suite_run(self, cluster: dict, nodes: dict, name: str, suite_name: str = "release") -> Path:
         """A run of the built-in suite, recorded on the profile's shape."""
@@ -704,9 +708,9 @@ class ReferenceShapeTest(unittest.TestCase):
 
     def test_suite_bench_refuses_a_default_reference_of_another_suite(self) -> None:
         # tp4-ring's reference is r6n's release run, from before the Poisson step.
-        cluster, nodes = self.profile("config/cluster.json", "tp4-ring")
+        cluster, nodes = self.profile(self.TP4_RECIPE, "tp4-ring")
         cluster["environment"]["VLLM_SERVER_DEV_MODE"] = "1"
-        status, output = self.bench("config/cluster.json", cluster, nodes, "--suite", "release")
+        status, output = self.bench(self.TP4_RECIPE, cluster, nodes, "--suite", "release")
         self.assertEqual(status, spark.SUITE_REFUSED)
         self.assertIn("a changed suite is a new suite", output)
         self.assertEqual(spark.bench_shape(spark.reference_identity(ROOT / self.TP4_REFERENCE)),
@@ -787,7 +791,7 @@ class ReferenceShapeTest(unittest.TestCase):
         # three-node run. Refuse it both live, before contacting the cluster,
         # and for a saved report.
         cluster, nodes = self.profile("config/cluster.json", "tp4-ring")
-        del cluster["benchmark_reference"]
+        self.assertNotIn("benchmark_reference", cluster)
         # On r6h's baseline, whose default reference is its three-node run.
         cluster["promoted_baseline"] = Path(self.TP3_REFERENCE).stem
         for argv in ([], ["--report", self.report(cluster, nodes)]):
