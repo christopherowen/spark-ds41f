@@ -1,0 +1,26 @@
+{
+  "description": "r6s's Engram model tests with vLLM 0155's corrected whole-table disk test mounted over the image's copy (a disk rank gathers only its hash columns).",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6s",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "io_uring": true,
+  "argv": [
+    "-c",
+    "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'engram_fixtures', '-o', 'faulthandler_timeout=240', '--basetemp', '/c/pytest-tmp-r6s-engram-fixed', 'tests/models/test_deepseek_v4_1_engram.py']\nsys.exit(subprocess.run(cmd, timeout=1200).returncode)\n"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "engram_fixtures.py",
+      "/b/engram_fixtures.py"
+    ],
+    [
+      "test_deepseek_v4_1_engram.py",
+      "/opt/spark3/candidate/vllm/tests/models/test_deepseek_v4_1_engram.py"
+    ]
+  ]
+}
