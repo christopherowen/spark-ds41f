@@ -46,8 +46,10 @@ bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh
 
 The script clones the revision pinned in `config/kernel-trial.json`, checks the
 existing fleet signing identity, registers only the build inputs, and builds
-and installs DKMS 0.2.0 for the pinned 64 KiB kernel. It refuses a dirty source
-checkout or existing registration rather than overwriting them. It preserves
+and installs DKMS 0.4.1 for the pinned 64 KiB kernel. It removes an older
+memory-saver registration first (its hook restores the stock UVM and its source
+stays in `/usr/src`), and refuses a dirty source checkout or an existing source
+directory for the new version rather than overwriting them. It preserves
 the system's DKMS signing configuration and stock NVIDIA RM. Inspect the key
 paths printed by DKMS; they must be the enrolled fleet key already configured
 for fan-control. Kernel prerequisites and both swap files must already be

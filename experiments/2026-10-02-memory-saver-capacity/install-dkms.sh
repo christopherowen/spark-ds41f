@@ -31,12 +31,18 @@ version=${pin[2]}
 kernel=${pin[3]}
 destination="/usr/src/dgx-spark-memory-saver-$version"
 test ! -e "$destination"
+# Replace an older registration. Its removal hook restores the stock UVM; its
+# source stays in /usr/src, as the memory saver's DKMS guide asks.
+for old in $(dkms status -m dgx-spark-memory-saver | sed -n 's|^dgx-spark-memory-saver/\([^,:]*\)[,:].*|\1|p' | sort -u); do
+  sudo dkms remove -m dgx-spark-memory-saver -v "$old" --all
+done
 test -z "$(dkms status -m dgx-spark-memory-saver)"
 sudo install -d "$destination/scripts" "$destination/patches" "$destination/packaging"
-sudo install -m 0644 dkms.conf provenance.json "$destination/"
+sudo install -m 0644 dkms.conf compatibility.json provenance.json provenance-610.json "$destination/"
 sudo install -m 0755 scripts/driver-build scripts/refresh-initramfs "$destination/scripts/"
 sudo install -m 0644 scripts/driver_build.py "$destination/scripts/"
-sudo install -m 0644 patches/0001-pack-user-leaf-tables.patch "$destination/patches/"
+sudo install -m 0644 patches/0001-pack-user-leaf-tables.patch \
+  patches/0002-pack-user-leaf-tables-610.patch "$destination/patches/"
 sudo install -m 0644 packaging/enable-packing.patch "$destination/packaging/"
 sudo dkms add -m dgx-spark-memory-saver -v "$version"
 sudo dkms build -m dgx-spark-memory-saver -v "$version" -k "$kernel"
@@ -47,4 +53,5 @@ fi
 sudo dkms install -m dgx-spark-memory-saver -v "$version" -k "$kernel"
 sudo depmod "$kernel"
 sudo update-initramfs -u -k "$kernel"
+if [ "$(uname -r)" = "$kernel" ]; then sudo modprobe nvidia_uvm; fi
 ./scripts/status --json

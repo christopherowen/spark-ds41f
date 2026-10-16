@@ -89,7 +89,7 @@ revert it.
 These compare each node with the kernel policy in
 [config/kernel-trial.json](../config/kernel-trial.json): the 4 KiB kernel
 `7.0.0-1019-nvidia`, the 64 KiB kernel `7.0.0-1019-nvidia-64k`, NVIDIA
-580.178.04 and memory-saver 0.2.0. Corrections are collected at the end under
+580.178.04 and memory-saver 0.4.1. Corrections are collected at the end under
 `Kernel corrections (not executed)`.
 
 | Check | Severity |

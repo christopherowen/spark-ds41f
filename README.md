@@ -108,7 +108,7 @@ profile runs the same baseline since 2026-10-16
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
-  0.2.0 with UVM leaf-table packing enabled, no desktop, and
+  0.4.1 with UVM leaf-table packing enabled, no desktop, and
   `vm.watermark_boost_factor=0`;
 - direct dual ConnectX-7 paths between every pair of nodes;
 - Local Inference Lab's `integration/karmic-kraken-beta` vLLM (plus Engram

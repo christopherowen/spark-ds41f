@@ -296,7 +296,7 @@ yours to run, as root, with the service stopped:
    reboot or touch the running system.
 3. **Memory saver.** Run `bash experiments/2026-10-02-memory-saver-capacity/install-dkms.sh`
    from a clean checkout. It clones the memory saver at the revision pinned
-   in `config/kernel-trial.json`, then builds and installs DKMS 0.2.0 for the
+   in `config/kernel-trial.json`, then builds and installs DKMS 0.4.1 for the
    64 KiB kernel. It signs with the key that dgx-spark-fan-control created
    (`/root/.local/share/dgx-spark-fan-control/keys`) and refuses to run unless
    that key is enrolled in MOK. Without fan control, follow the memory
