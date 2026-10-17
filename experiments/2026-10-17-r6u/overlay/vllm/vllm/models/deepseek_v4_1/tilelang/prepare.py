@@ -85,6 +85,7 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
 
         tilelang.prepare(
             [(key.function, key.args, key.kwargs) for key in compile_keys],
+            num_workers=compile_workers(),
             progress=PROGRESS.report,
         )
 
@@ -187,6 +188,15 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
     return list(calls.values())
 
 
+def compile_workers() -> int | None:
+    """Compile threads: the deployment's compile parallelism (``MAX_JOBS``), since every
+    compile holds host memory, which on unified-memory GPUs is the device's; all CPUs
+    when it is unset."""
+    from vllm import envs
+
+    return int(envs.MAX_JOBS) if envs.MAX_JOBS else None
+
+
 def prepare_declared(registry: JitWarmupRegistry) -> int:
     """Compile every TileLang call declared in ``registry`` in one thread pool;
     return the number of distinct calls."""
@@ -194,8 +204,18 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
 
     calls = declared_calls(registry)
     PROGRESS.start(len(calls))
-    tilelang.prepare(calls, progress=PROGRESS.report)
+    tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
     return len(calls)
+
+
+def release_host_memory() -> None:
+    """Return the compile threads' freed heap to the system (glibc keeps a malloc
+    arena per thread), so memory profiling starts from what serving holds."""
+    import contextlib
+    import ctypes
+
+    with contextlib.suppress(OSError, AttributeError):
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
 def _callbacks(registry: JitWarmupRegistry, index: int) -> list[Callable[[], None]]:

@@ -1449,6 +1449,8 @@ class Worker(WorkerBase):
                 with torch.inference_mode():
                     prepare.warm_declared(registry)
             registry.warmup()
+            if tilelang_calls:
+                prepare.release_host_memory()
         if tilelang_calls:
             prepare.freeze("every declared kernel was prepared before memory profiling")
             with set_current_vllm_config(self.vllm_config):
