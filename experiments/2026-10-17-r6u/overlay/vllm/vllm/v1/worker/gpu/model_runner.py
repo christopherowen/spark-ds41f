@@ -582,11 +582,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 mask_stride=self.decode_query_len,
                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
             )
-            # A step's Triton kernels (input preparation, sampling, verification,
-            # drafting), specialized on the runner's buffers, the loaded heads and
-            # the KV cache groups' block tables.
-            with self.jit_warmup_registry.activate():
-                self._register_step_warmups()
 
         if self.is_pooling_model and self.is_last_pp_rank:
             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
@@ -2032,13 +2027,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         return self._greedy_verification
 
-    def _register_step_warmups(self) -> None:
+    def declare_step_kernels(self) -> None:
         """Register the Triton kernels that input preparation, sampling, greedy
         verification and the drafter launch: for the runner's buffers, the loaded
         LM head's dtype and vocabulary shards, and the block tables of the KV cache
-        groups its spec gives (the KV cache does not exist yet)."""
+        groups its spec gives (the KV cache does not exist yet).
+
+        The worker calls this while preparing kernels, after the engine core set
+        the KV cache layout the groups depend on.
+        """
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
+        if not self.is_last_pp_rank or self.is_pooling_model:
+            return
         assert self.sampler is not None
         kv_cache_groups = get_kv_cache_groups(
             self.vllm_config, self.get_kv_cache_spec()

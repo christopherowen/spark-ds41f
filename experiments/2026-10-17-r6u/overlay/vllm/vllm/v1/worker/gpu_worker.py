@@ -1422,9 +1422,10 @@ class Worker(WorkerBase):
     def _prepare_kernels(self) -> None:
         """Compile every declared JIT kernel before any distributed work.
 
-        DeepSeek V4.1's TileLang family declares each call its modules can make
-        while the model is built; the runner's JIT registry also holds the Triton
-        kernels its samplers registered. They compile here on this rank alone,
+        DeepSeek V4.1's TileLang family declares each call its loaded modules can
+        make; the runner's JIT registry holds the Triton kernels its samplers and
+        model state registered, and the runner adds its step's kernels here, once
+        the KV cache layout is set. They compile here on this rank alone,
         TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
         so profiling, warm-up, capture and serving compile nothing: a kernel that
         was not declared fails by name on every rank alike.
@@ -1448,6 +1449,15 @@ class Worker(WorkerBase):
                 tilelang_calls = prepare.prepare_declared(registry)
                 with torch.inference_mode():
                     prepare.warm_declared(registry)
+            # A step's Triton kernels (input preparation, sampling, verification,
+            # drafting), specialized on the runner's buffers, the loaded heads and
+            # the block tables of the KV cache groups (the layout is set by now).
+            declare_step_kernels = getattr(
+                self.model_runner, "declare_step_kernels", None
+            )
+            if declare_step_kernels is not None:
+                with registry.activate():
+                    declare_step_kernels()
             registry.warmup()
             if tilelang_calls:
                 prepare.release_host_memory()
