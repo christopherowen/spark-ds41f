@@ -1,0 +1,20 @@
+{
+ "hardware": "4x NVIDIA DGX Spark (GB10, 128 GB unified memory each)",
+ "topology": "TP4 across four Sparks in a switchless RoCE ring: each node cabled to its two neighbours, two ConnectX-7 paths per cable, no switch",
+ "negotiated_link_speed": "200 Gb/s per ConnectX-7 port (4 cables, 8 RDMA paths)",
+ "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+ "model_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+ "quantisation": "the native checkpoint, not requantized: block-32 FP8 E4M3 dense weights (a UE8M0 scale per 32x32), MXFP4 (E2M1) routed experts, BF16 router gate, indexer head weights and compressor; MXFP8 activations where DeepSeek's reference quantizes them",
+ "kv_cache_dtype": "as DeepSeek's reference caches it: sliding-window KV in FP8 E4M3 with a UE8M0 scale per 32, compressed (indexed) KV in FP4 E2M1 with an E4M3 scale per 16, MXFP4 indexer keys",
+ "serving_engine": "vLLM: Local Inference Lab integration/karmic-kraken-beta 19f2c20e with the spark-ds41f patch series (patch head c001cc4e, tree d11e9836); TileLang 0.1.15 kernels, DeepSeek TileKernels 2.0.0, sparknet one-shot RoCE collectives",
+ "serving_image": "filled in at run time",
+ "drafter": "DSpark (the checkpoint's drafter), 5 speculative tokens, greedy drafts, block rejection, adaptive verification",
+ "context_limit": 1048576,
+ "scheduler": "max sequences 16; max batched tokens 8192; chunked prefill; asynchronous scheduling; prefix caching; CUDA graphs FULL_AND_PIECEWISE",
+ "competing_traffic": "none: run inside a held lab window, the cluster otherwise idle",
+ "recipe": "github.com/christopherowen/spark-ds41f (release r6v)",
+ "recipe_revision": "filled in at run time",
+ "kernel": "7.0.0-1019-nvidia-64k (64 KiB pages)",
+ "nccl": "2.30.7 rebuilt with the spark-ds41f patches",
+ "server_sampling_defaults": "temperature 1.0, top_p 1.0 for requests that set none"
+}
