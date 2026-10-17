@@ -35,7 +35,17 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
   - The startup rendezvous waits on liveness (each rank's heartbeat: phase and kernels
     prepared), not on a deadline; `VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS` is gone.
   - Profiling and warm-up name a stopped one-shot collective, as serving steps do.
-- **Serving is unchanged**: the same kernels and dispatch, the 10 s collective wait.
+- **DeepSeek's current reference**, for both V4.1 Flash checkpoints (the original dba1be0a and
+  1017's 1bae0e10, whose config, tokenizer and tensor layout are the same):
+  - WO-A quantizes its input as the reference's 2026-10-12 revision does (`act_quant(o, 32,
+    "ue8m0", inplace=True)`), inside the W8A16 GEMM's tile load (0177); outputs differ from
+    r6s by that quantization.
+  - The 2026-10-16 encoding fix (0178): the current turn's reasoning survives its tool results,
+    tool images follow their placeholders, image tokens in text are refused.
+  - The reference's `index_k` fix needs nothing: the indexer reads its owner's cache directly.
+- **Recipe**: `models`/`model` select the checkpoint; r6u's arm sets DeepSeek's sampling
+  defaults (`generation_defaults`: temperature 1.0, top_p 1.0) and the `-1017` arms serve 1017.
+- The collective wait stays 10 s.
 
 ## Runs
 
@@ -54,6 +64,9 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
 6. `head-exponent.json`: the packed head's exponent base as a runtime argument versus a
    constant (bit-identical; included only if no decode row count is slower).
 7. `release.json`: release-tp3, r6u / r6s / r6u again.
+8. On 1017 (the promotion target): `gate-1017.json`, `coldboots-1017.json` and
+   `release-1017.json` (r6u / r6s / r6u again, both on 1017); `gate.json` on the original
+   checkpoint shows it still serves.
 
 ## Results
 

@@ -1,0 +1,289 @@
+From 0736063114c90d101a0111eb84a030b0bae8e44c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:04:31 +0200
+Subject: [PATCH 177/178] DeepSeek V4.1 WO-A quantizes its input as the
+ reference does
+
+DeepSeek's reference (2026-10-12 revision, for both V4.1 Flash checkpoints, the
+original and 1017) quantizes the attention output before the grouped WO-A
+einsum, in the attention and the DSpark drafter attention alike:
+act_quant(o, 32, "ue8m0", inplace=True), each 32-value block to E4M3 with a
+UE8M0 scale and back to BF16. The W8A16 GEMM kept BF16 activations, as the
+earlier reference did.
+
+The W8A16 kernels (used only by WO-A) now quantize each activation tile as
+they load it (_reference_roundtrip: _reference_cast's amax floor and exponent,
+E4M3, times 2^e, exact in BF16), before expanding the weights and the MMA;
+block_K is a multiple of 32 and each group's K starts on a block, so a tile
+holds whole reference blocks, and split and in-kernel paths agree bit for bit.
+No extra pass over o. The BF16-activation path is gone.
+
+Tests: the projection against FP64 on act_quant's values; the quantizing
+kernel on x and on x already through TileKernels' per_token_cast (byte-
+identical to act_quant) give the same bits, below the amax floor too.
+---
+ .../test_deepseek_v41_tilelang_wo.py          | 34 ++++---
+ vllm/models/deepseek_v4_1/tilelang/gemm.py    | 95 +++++++++++++++----
+ vllm/models/deepseek_v4_1/tilelang/wo.py      |  9 +-
+ 3 files changed, 99 insertions(+), 39 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index 0bbac4925..6ae9a84fb 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -90,8 +90,9 @@ def test_wo_projection():
+ 
+     full = project(rows)
+     # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs: WO-A on the
+-    # BF16 activations (DeepSeek's dequantized BF16 einsum), WO-B on MXFP8 ones (its
+-    # linear), the intermediate rounded to BF16 as the kernel stores it.
++    # activations through act_quant (MXFP8 values; DeepSeek's quantize-dequantize, then
++    # its BF16 einsum on the dequantized weights), WO-B on MXFP8 ones (its linear), the
++    # intermediate rounded to BF16 as the kernel stores it.
+     rotated = o.clone()
+     tile_kernels.transform.apply_rotary(
+         rotated[..., -ROPE:],
+@@ -100,7 +101,7 @@ def test_wo_projection():
+         interleaved=True,
+         conjugate=True,
+     )
+-    x = rotated.view(rows, -1).double()
++    x = _mxfp8_values(rotated.view(rows, -1))
+     w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
+     a = torch.cat(
+         [
+@@ -218,35 +219,32 @@ def _wo_a_bf16(layer, x):
+     return out
+ 
+ 
+-def test_wo_a_keeps_bf16_activations():
+-    """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
+-    the exactly dequantized weights, well inside what MXFP8 activations give, with the
+-    same bits at every row count: decode rows split the K shards over CTAs and longer
+-    steps add them inside the kernel, in the same order."""
++def test_wo_a_quantizes_its_input_as_act_quant():
++    """WO-A within one BF16 rounding of the FP64 product of its input through the
++    reference's act_quant (MXFP8 values) and the exactly dequantized weights, with the
++    same bits at every row count (decode rows split the K shards over CTAs and longer
++    steps add them inside the kernel, in the same order). Quantizing is idempotent, so
++    the kernel on its input and on that input already through TileKernels'
++    per_token_cast (byte-identical to act_quant) give the same bits: the in-kernel
++    quantization is the reference's, below the amax floor too."""
+     width = HEADS // GROUPS * HEAD_DIM
+     layer = _block32(GROUPS * RANK, width, 7)
+     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
++    x[::5] *= 1e-7  # some blocks fall below the amax floor
+     w = _dequant(layer)
+ 
+     full = _wo_a_bf16(layer, x)
++    quantized = _mxfp8_values(x)
+     ref = torch.cat(
+         [
+-            x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
++            quantized[:, g * width : (g + 1) * width] @ w[g * RANK : (g + 1) * RANK].T
+             for g in range(GROUPS)
+         ],
+         dim=1,
+     )
+     error = (full.double() - ref).abs()
+     assert (error <= ref.abs() * 2**-8 + 1e-3 * ref.abs().max()).all()
+-    quantized = torch.cat(
+-        [
+-            _mxfp8_values(x[:, g * width : (g + 1) * width])
+-            @ w[g * RANK : (g + 1) * RANK].T
+-            for g in range(GROUPS)
+-        ],
+-        dim=1,
+-    )
+-    assert error.mean() < 0.25 * (quantized - ref).abs().mean()
++    assert torch.equal(_wo_a_bf16(layer, quantized.bfloat16()), full)
+     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
+         assert torch.equal(_wo_a_bf16(layer, x[:rows]), full[:rows]), rows
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index f73718efb..1d24ab53c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -326,6 +326,29 @@ def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
+             )
+ 
+ 
++@T.macro
++def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
++    """``A_q`` = the activation tile ``A_shared`` through the reference's
++    ``act_quant(x, 32, "ue8m0", inplace=True)``: per 32-element block of each row, the
++    E4M3 of ``x * 2^-e`` (``e`` as ``_reference_cast`` derives it) times ``2^e``, which
++    BF16 holds exactly."""
++    blocks = block_K // 32
++    for r, e in T.Parallel(block_M * blocks, 32):
++        X[r, e] = T.Cast(T.float32, A_shared[r // blocks, (r % blocks) * 32 + e])
++    T.reduce_absmax(X, amax, dim=1)
++    for r in T.Parallel(block_M * blocks):
++        floored = T.max(amax[r], T.float32(_AMAX_FLOOR))
++        bits = T.reinterpret(floored * T.float32(_FP8_MAX_INV), T.uint32)
++        exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
++        inv[r] = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
++        scale[r] = T.reinterpret(T.Cast(T.uint32, 127 + exponent) << 23, T.float32)
++    for r, e in T.Parallel(block_M * blocks, 32):
++        A_q[r // blocks, (r % blocks) * 32 + e] = T.Cast(
++            T.bfloat16,
++            T.Cast(T.float32, T.Cast(T.float8_e4m3fn, X[r, e] * inv[r])) * scale[r],
++        )
++
++
+ @tilelang.jit
+ def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128):
+     """``splitk_reduce`` to BF16, then the reference's activation cast: E4M3 ``Q`` and
+@@ -453,8 +476,11 @@ def fp8w_bf16_gemm(
+     launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
+     ``W[groups*N, K]`` (E4M3, one UE8M0 exponent per 32x32 block in ``E``), each weight
+     tile expanded exactly to BF16 (an E4M3 value times a power of two fits BF16) and
+-    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
+-    reference WO-A: BF16 activations on the FP8 weights dequantized by ``convert.py``.
++    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. Each activation
++    tile first goes through the reference's MXFP8 quantize-dequantize
++    (``_reference_roundtrip``). That is DeepSeek's reference WO-A:
++    ``act_quant(o, 32, "ue8m0", inplace=True)``, then the BF16 einsum on the FP8 weights
++    ``convert.py`` dequantizes.
+ 
+     Every M tile runs the same K loop, so a row's bits do not depend on its batch. With
+     ``shards`` > 1 each K shard is summed from zero and the shards added in order, the
+@@ -490,12 +516,20 @@ def fp8w_bf16_gemm(
+             C_total = T.alloc_fragment(
+                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
+             )
++            qa = block_M * (block_K // 32)
++            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
++            X_a = T.alloc_fragment((qa, 32), T.float32)
++            amax_a = T.alloc_fragment((qa,), T.float32)
++            inv_a = T.alloc_fragment((qa,), T.float32)
++            scale_a = T.alloc_fragment((qa,), T.float32)
+             T.clear(C_local)
+             if shards > 1:
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+-                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
++                            scale_a, W_shared, S_shared, B_shared,
++                            C_local, by, g, n0, ko, K, block_M,
++                            block_N, block_K)  # fmt: skip
+                 if shards > 1:  # noqa: SIM102
+                     if (ko + 1) % shard_blocks == 0:
+                         for i, j in T.Parallel(block_M, block_N):
+@@ -560,6 +594,12 @@ def fp8w_bf16_gemm_cast(
+             C_total = T.alloc_fragment(
+                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
+             )
++            qa = block_M * (block_K // 32)
++            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
++            X_a = T.alloc_fragment((qa, 32), T.float32)
++            amax_a = T.alloc_fragment((qa,), T.float32)
++            inv_a = T.alloc_fragment((qa,), T.float32)
++            scale_a = T.alloc_fragment((qa,), T.float32)
+             X = T.alloc_fragment((block_M * blocks, 32), T.float32)
+             amax = T.alloc_fragment((block_M * blocks,), T.float32)
+             inv = T.alloc_fragment((block_M * blocks,), T.float32)
+@@ -567,8 +607,10 @@ def fp8w_bf16_gemm_cast(
+             if shards > 1:
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+-                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
++                            scale_a, W_shared, S_shared, B_shared,
++                            C_local, by, g, n0, ko, K, block_M,
++                            block_N, block_K)  # fmt: skip
+                 if shards > 1:  # noqa: SIM102
+                     if (ko + 1) % shard_blocks == 0:
+                         for i, j in T.Parallel(block_M, block_N):
+@@ -591,14 +633,10 @@ def fp8w_bf16_gemm_cast(
+ 
+ 
+ @T.macro
+-def _w8a16_step(
+-    A, W, E, A_shared, W_shared, S_shared, B_shared, C_local, by, g, n0, ko, K,
+-    block_M, block_N, block_K,
+-):  # fmt: skip
+-    """One K block of the W8A16 GEMM: copy the activation and weight tiles, decode the
+-    tile's UE8M0 exponents to FP32 powers of two once (a per-element uint8 gather
+-    vectorizes to a byte pack nvcc rejects), expand the weights exactly to BF16, MMA."""
+-    T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
++def _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K):
++    """Copy a weight tile, decode its UE8M0 exponents to FP32 powers of two once (a
++    per-element uint8 gather vectorizes to a byte pack nvcc rejects) and expand the
++    weights exactly to BF16."""
+     T.copy(W[n0, ko * block_K], W_shared)
+     for r, c in T.Parallel(block_N // 32, block_K // 32):
+         exponent = T.Cast(T.uint32, E[n0 // 32 + r, ko * (block_K // 32) + c])
+@@ -608,7 +646,21 @@ def _w8a16_step(
+             T.bfloat16,
+             T.Cast(T.float32, W_shared[i, j]) * S_shared[i // 32, j // 32],
+         )
+-    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++
++
++@T.macro
++def _w8a16_step(
++    A, W, E, A_shared, A_q, X, amax, inv, scale, W_shared, S_shared, B_shared,
++    C_local, by, g, n0, ko, K, block_M, block_N, block_K,
++):  # fmt: skip
++    """One K block of the W8A16 GEMM: the activation tile through the reference's MXFP8
++    quantize-dequantize (``_reference_roundtrip``; ``block_K`` is a multiple of 32 and
++    each group's K starts on a block, so the tile holds whole reference blocks), the
++    expanded weight tile, MMA."""
++    T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
++    _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K)
++    _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K)
++    T.gemm(A_q, B_shared, C_local, transpose_B=True)
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@@ -650,11 +702,18 @@ def fp8w_bf16_gemm_partials(
+             S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
+             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            qa = block_M * (block_K // 32)
++            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
++            X_a = T.alloc_fragment((qa, 32), T.float32)
++            amax_a = T.alloc_fragment((qa,), T.float32)
++            inv_a = T.alloc_fragment((qa,), T.float32)
++            scale_a = T.alloc_fragment((qa,), T.float32)
+             T.clear(C_local)
+             for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
+-                            by, g, n0, s * shard_blocks + kb, K, block_M, block_N,
+-                            block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
++                            scale_a, W_shared, S_shared, B_shared,
++                            C_local, by, g, n0, s * shard_blocks + kb, K, block_M,
++                            block_N, block_K)  # fmt: skip
+             T.copy(
+                 C_local,
+                 P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 1d4a92bdf..c7cb305c1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -4,12 +4,15 @@
+ reference computes it::
+ 
+     o[..., -64:] = inverse_rope(o[..., -64:])          (BF16, in place)
++    o = act_quant(o, 32, "ue8m0", inplace=True)        (MXFP8 values, back in BF16)
+     a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
+     out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
+ 
+-WO-A keeps the BF16 activations, as the reference does (``convert.py`` dequantizes
+-``wo_a`` to BF16 and the projection is a BF16 einsum): one launch of the grouped
+-W8A16 GEMM expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
++WO-A quantizes its input as the reference does (since its 2026-10-12 revision, for
++both V4.1 Flash checkpoints): each 32-value block of ``o`` to E4M3 with a UE8M0 scale
++and back to BF16, then the BF16 einsum on the weights ``convert.py`` dequantizes. One
++launch of the grouped W8A16 GEMM does both: it quantizes each activation tile as it
++loads it, expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
+ WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
+ one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
+ kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
+-- 
+2.54.0 (Apple Git-157)
+
