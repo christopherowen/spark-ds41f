@@ -20,6 +20,16 @@ def load(relative: str) -> dict:
     return json.loads((ROOT / relative).read_text())
 
 
+def serving_arguments(cluster: dict) -> list[str]:
+    """``serve_args`` without what selects the checkpoint and its sampling defaults: the
+    model path and ``--override-generation-config``."""
+    args = cluster["serve_args"][1:]
+    if "--override-generation-config" in args:
+        at = args.index("--override-generation-config")
+        del args[at : at + 2]
+    return args
+
+
 def load_spark():
     import importlib.machinery
     import importlib.util
@@ -53,37 +63,37 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_tp3_triangle_is_the_released_r6s_arm(self):
-        """tp3-triangle resolves to r6s's release arm, apart from the names (the model
-        profiles, which r6s's recipe predates, resolve to the same mounts)."""
+    def test_tp3_triangle_is_the_released_r6u_arm(self):
+        """tp3-triangle resolves to r6u's release arm on 1017, apart from the names (the arm
+        extends the frozen r6s recipe and names r6u's lock)."""
         resolved = recipe.resolve(self.recipe, "tp3-triangle")
-        released = load_spark().read_cluster("experiments/2026-10-16-r6s/r6s-tp3.json")
-        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes",
-                  "model", "models")
+        released = load_spark().read_cluster("experiments/2026-10-17-r6u/r6u-tp3-1017.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
-        """Every shape mounts the recipe's model at /models and /blobs; an arm that sets
+        """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
+        the hub's shared store, the snapshot served from inside it); an arm that sets
         another model serves it, whatever mounts it lists."""
+        self.assertEqual(self.recipe["model"], "v41-flash-1017")
+        profile = self.recipe["models"]["v41-flash-1017"]
         for shape in ("tp3-triangle", "tp4-ring"):
             resolved = recipe.resolve(self.recipe, shape)
-            profile = self.recipe["models"][self.recipe["model"]]
-            self.assertEqual(resolved["container"]["mounts"][:2],
-                             [[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]])
+            self.assertEqual(resolved["container"]["mounts"][0], [profile["hub"], "/hub", "ro"])
+            self.assertEqual(resolved["serve_args"][0], f"/hub/{profile['snapshot']}")
         base = recipe.resolve(self.recipe, "tp3-triangle")
-        self.assertEqual(base["serve_args"][0], "/models")
-        # 1017's blobs link on into the hub's shared store: the hub is mounted and the
-        # snapshot served from inside it.
-        arm = recipe.overlay({"extends": {}, "set": {"model": "v41-flash-1017"}}, base)
-        profile = self.recipe["models"]["v41-flash-1017"]
+        self.assertEqual(recipe.model_snapshot(base), f"{profile['hub']}/{profile['snapshot']}")
+        # The original checkpoint: snapshot and blobs mounted, served from /models.
+        arm = recipe.overlay({"extends": {}, "set": {"model": "v41-flash"}}, base)
+        original = self.recipe["models"]["v41-flash"]
         mounts = arm["container"]["mounts"]
-        self.assertEqual(mounts[0], [profile["hub"], "/hub", "ro"])
-        self.assertEqual(mounts[1:], base["container"]["mounts"][2:])
-        self.assertEqual(arm["serve_args"][0], f"/hub/{profile['snapshot']}")
+        self.assertEqual(mounts[:2], [[original["snapshot"], "/models", "ro"],
+                                      [original["blobs"], "/blobs", "ro"]])
+        self.assertEqual(mounts[2:], base["container"]["mounts"][1:])
+        self.assertEqual(arm["serve_args"][0], "/models")
         self.assertEqual(arm["serve_args"][1:], base["serve_args"][1:])
-        self.assertEqual(recipe.model_snapshot(arm), f"{profile['hub']}/{profile['snapshot']}")
-        # And back: an arm over it that sets the original serves /models again.
+        # And back: an arm over it that sets 1017 serves from the hub again.
         back = recipe.overlay({"extends": {}, "set": {"model": self.recipe["model"]}}, arm)
         self.assertEqual(back["container"]["mounts"], base["container"]["mounts"])
         self.assertEqual(back["serve_args"], base["serve_args"])
@@ -91,14 +101,15 @@ class RecipeTest(unittest.TestCase):
             recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
 
     def test_generation_defaults_render_as_override_generation_config(self):
-        base = recipe.resolve(self.recipe, "tp3-triangle")
-        self.assertNotIn("--override-generation-config", base["serve_args"])
-        arm = recipe.overlay(
-            {"extends": {}, "set": {"generation_defaults": {"top_p": 1.0, "temperature": 1.0}}}, base)
+        """The recipe's sampling defaults (DeepSeek's for 1017) render once, beside
+        --generation-config; an arm merges its own values into them."""
+        self.assertEqual(self.recipe["generation_defaults"], {"temperature": 1.0, "top_p": 1.0})
+        arm = recipe.resolve(self.recipe, "tp3-triangle")
         args = arm["serve_args"]
         at = args.index("--generation-config")
         self.assertEqual(args[at + 2 : at + 4],
                          ["--override-generation-config", '{"temperature":1.0,"top_p":1.0}'])
+        self.assertEqual(args.count("--override-generation-config"), 1)
         # An arm over that one merges its values (as every overlay merges a dictionary)
         # and replaces the flag rather than repeating it.
         again = recipe.overlay({"extends": {}, "set": {"generation_defaults": {"temperature": 0.6}}}, arm)
@@ -109,7 +120,8 @@ class RecipeTest(unittest.TestCase):
         """TP3 keeps what the triangle and its memory need, and nothing else of r6h."""
         resolved = recipe.resolve(self.recipe, "tp3-triangle")
         old = load("experiments/2026-10-14-one-recipe/tp3-r6h-production.json")
-        self.assertEqual(resolved["serve_args"], old["serve_args"])  # sizing, drafts and capture ladder
+        # Sizing, drafts and capture ladder (r6u serves another checkpoint with sampling defaults).
+        self.assertEqual(serving_arguments(resolved), serving_arguments(old))
         self.assertEqual(resolved["fabric"], old["fabric"])
         for key, value in old["environment"].items():
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
@@ -118,8 +130,8 @@ class RecipeTest(unittest.TestCase):
         self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-16-karmic-kraken-r6s-tp3")
-        self.assertNotIn("benchmark_reference", tp4)  # r6s is not benched on TP4
+        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-17-karmic-kraken-r6u-tp3")
+        self.assertNotIn("benchmark_reference", tp4)  # r6u is not benched on TP4
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
@@ -144,7 +156,7 @@ class RecipeTest(unittest.TestCase):
         resolved = recipe.resolve(self.recipe, "tp3-triangle-4k")
         old = load("experiments/2026-10-14-one-recipe/tp3-4k-r6h.json")
         self.assertEqual(resolved["host"]["kernel"], old["host"]["kernel"])
-        self.assertEqual(resolved["serve_args"], old["serve_args"])
+        self.assertEqual(serving_arguments(resolved), serving_arguments(old))
         self.assertNotIn("benchmark_reference", resolved)
         qualified = dict(self.recipe)
         qualified["shapes"] = dict(self.recipe["shapes"])

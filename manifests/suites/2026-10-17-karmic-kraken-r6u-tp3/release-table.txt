@@ -1,0 +1,84 @@
+r6u's TP3 benchmark reference: the release-tp3 suite on r6u with vLLM 0179 mounted over the image through 0178
+(experiments/2026-10-17-r6u/wo-overlay.json, run r6u-wo-overlay, 2026-10-17 16:15-16:55 UTC; the promoted image
+carries the same files), against r6s on 1017 measured earlier the same afternoon (release-1017.json, 14:33-15:13 UTC).
+
+
+######## r6s-1017 -> r6u-wo-1017
+suite release-tp3 (fc769b27a99f): r6s-1017 -> r6u-wo-1017
+
+== model
+model behaviour: r6s-1017 -> r6u-wo-1017
+  greedy responses identical: 0/256; the others diverge at token p10/p50/p90 4/23/50
+  acceptance_length           2.301 ->    2.265  -1.53%
+  verified_per_draft          2.432 ->    2.681  +10.27%
+  accepted_per_verified       0.535 ->    0.472  -11.76%
+  acceptance by draft position: 0: 0.705->0.706, 1: 0.483->0.487, 2: 0.362->0.298, 3: 0.349->0.200, 4: 0.333->0.147
+  teacher-forced over 65536 positions in 256 sequences
+    identical distributions 0.00%, top-1 agreement 94.507%
+    KL mean 2.346e-02 (±1.1e-03 over sequences), p99 2.808e-01, max 4.780e+00 nats
+    given-token log-probability change mean +2.33e-02, mean |change| 7.03e-02, max 4.46e+00
+    perplexity 1.34438 -> 1.31340 (-2.304%)
+
+== grid
+metric                         r6s-1017  r6u-wo-1017   change    ±95%  verdict
+decode 1x2 rows @4K              23.200       22.894   -1.32%   0.81%  better
+decode 4x8 rows @4K              26.644       26.383   -0.98%   0.72%  better
+decode 8x16 rows @4K             29.893       29.688   -0.69%   0.68%  better
+decode 1x3 rows @4K              23.844       23.535   -1.29%   0.86%  better
+decode 4x12 rows @4K             28.587       28.083   -1.76%   0.70%  better
+decode 8x24 rows @4K             33.104       32.928   -0.53%   0.78%  same
+decode 1x6 rows @4K              24.922       24.706   -0.87%   0.71%  better
+decode 2x12 rows @4K             27.132       26.928   -0.75%   0.75%  better
+decode 4x24 rows @4K             33.111       32.828   -0.85%   0.69%  better
+decode 8x48 rows @4K             37.757       37.425   -0.88%   0.74%  better
+decode 1x3 rows @64K             23.816       23.768   -0.20%   0.93%  same
+decode 8x24 rows @64K            32.987       32.755   -0.70%   0.63%  better
+decode 1x3 rows @256K            23.953       23.475   -1.99%   0.99%  better
+decode 8x24 rows @256K           33.018       32.789   -0.69%   0.63%  better
+decode 1x3 rows @504K            23.717       23.467   -1.05%   0.83%  better
+decode geometric mean (15)                             -0.97%   0.13%  better
+intervals hold for all 15 shapes at once (95%, Bonferroni); slow outliers (median + 5 MAD) dropped first: 20
+
+== c8
+metric                     r6s-1017  r6u-wo-1017   change    ±95%  verdict
+output tok/s                146.613      145.607   -0.69%   1.29%  same
+engine steps/s                8.933        8.963   +0.34%   3.89%  same
+output tokens/step           16.442       16.272   -1.04%   4.56%  same
+accepted/draft                1.337        1.350   +0.95%   6.79%  same
+TTFT p50 s                    0.365        0.370   +1.25%          same (no interval)
+TTFT p99 s                    0.465        0.443   -4.65%          better (no interval)
+TPOT p50 ms                  54.068       54.192   +0.23%          same (no interval)
+TPOT p99 ms                  72.075       73.820   +2.42%          same (no interval)
+per-user tok/s p50           18.421       18.453   +0.18%          same (no interval)
+
+== c4
+metric                     r6s-1017  r6u-wo-1017   change    ±95%  verdict
+output tok/s                112.493      111.307   -1.05%   1.44%  same
+engine steps/s               13.083       13.067   -0.13%   1.99%  same
+output tokens/step            8.599        8.524   -0.87%   2.94%  same
+accepted/draft                1.285        1.273   -0.91%   5.19%  same
+TTFT p50 s                    0.263        0.264   +0.11%          same (no interval)
+TTFT p99 s                    0.337        0.326   -3.32%          better (no interval)
+TPOT p50 ms                  35.607       35.641   +0.09%          same (no interval)
+TPOT p99 ms                  43.976       44.854   +2.00%          same (no interval)
+per-user tok/s p50           28.049       28.058   +0.03%          same (no interval)
+
+== poisson
+metric                     r6s-1017  r6u-wo-1017   change    ±95%  verdict
+output tok/s                117.687      117.303   -0.33%  21.03%  same
+engine steps/s               13.040       13.100   +0.46%  27.48%  same
+output tokens/step           10.141       10.106   -0.35%  41.61%  same
+accepted/draft                1.307        1.301   -0.49%   6.14%  same
+TTFT p50 s                    0.305        0.303   -0.37%          same (no interval)
+TTFT p99 s                   12.383       12.738   +2.87%          same (no interval)
+TPOT p50 ms                  43.467       42.513   -2.20%          same (no interval)
+TPOT p99 ms                  64.950       68.941   +6.15%          worse (no interval)
+per-user tok/s p50           22.963       23.222   +1.12%          same (no interval)
+goodput req/s                 0.313        0.310   -1.06%          same (no interval)
+
+== prefill
+metric                     r6s-1017  r6u-wo-1017   change    ±95%  verdict
+prefill 32,768 tok/s       4414.396     4404.513   -0.22%   1.17%  same
+prefill 131,072 tok/s      4345.996     4342.602   -0.08%   0.59%  same
+prefill 262,144 tok/s      4153.366     4153.556   +0.00%   0.52%  same
+prefill 500,000 tok/s      3801.250     3800.698   -0.01%   0.16%  same

@@ -1,7 +1,34 @@
 # Current state
 
 Production is the recipe's `tp3-triangle` shape ([config/cluster.json](../config/cluster.json))
-on **r6s**, promoted 2026-10-16 as
+on **r6u**, serving DeepSeek-V4.1-Flash-1017 (revision `1bae0e10`), promoted 2026-10-17 as
+[`2026-10-17-karmic-kraken-r6u`](../manifests/baselines/2026-10-17-karmic-kraken-r6u.json)
+([promotion record](../experiments/2026-10-17-r6u/README.md)): image
+`vllm-ds41f-kkref:19f2c20ed4d6-r6u` on dgx1-dgx3, r6s's sources with vLLM 0156-0179
+(patch head `67403b8d`, tree `53b007b5`) and TileLang 0004 (tree `222b895d`). r6u adds:
+- **Kernel preparation** (0156-0172, TileLang 0004). Before memory profiling each rank
+  compiles every declared TileLang call (186 at TP3), runs TileKernels' warm calls and
+  the step's Triton kernels, then freezes TileLang's cache; profiling, warm-up, capture
+  and serving compile nothing, and a kernel not prepared fails by name on every rank.
+  The startup rendezvous waits on liveness (forum 384438#24: a cold rank used to stall a
+  one-shot collective). One rank's TileLang cache empty: ready in 159 s, the others
+  waiting on its heartbeat; every JIT cache empty: 180 s.
+- **DeepSeek's current reference** for both V4.1 Flash checkpoints: WO-A's input through
+  `act_quant` (0177), prepared once per row in the sparse MLA kernels' output store
+  (0179); the 2026-10-16 encoding (0178).
+- **The 1017 checkpoint** (the hub cache mounted whole, `models.v41-flash-1017`) with
+  DeepSeek's sampling defaults (`generation_defaults`: temperature 1.0, top_p 1.0).
+- **Release tests** on the promoted image ([testing](testing.md)): 58 DS4.1 Flash gate files.
+
+Against r6s on 1017 (`release-tp3`): prefill level at 32K-500K, decode level (the step
+time 1.0% faster, cross-session), outputs different by WO-A's input quantization.
+`tp3-triangle`'s `benchmark_reference` is
+[manifests/suites/2026-10-17-karmic-kraken-r6u-tp3](../manifests/suites/2026-10-17-karmic-kraken-r6u-tp3/)
+(0179 on the image through 0178: the same files). It schedules on its build's cost curves
+(`build-111f0abb94a12639`, profiled on the promoted image's first boot). The r6s recipe
+and lock are frozen in `experiments/2026-10-17-r6u/r6s` as TP3's rollback.
+
+TP3 ran **r6s** before it, promoted 2026-10-16 as
 [`2026-10-16-karmic-kraken-r6s`](../manifests/baselines/2026-10-16-karmic-kraken-r6s.json)
 ([promotion record](../experiments/2026-10-16-r6s/README.md)): image
 `vllm-ds41f-kkref:19f2c20ed4d6-r6s` (`sha256:2414b9d1`) on dgx1-dgx3, r6n's sources with
@@ -27,7 +54,7 @@ release's first r6s boot). The r6n recipe and lock are frozen in
 `experiments/2026-10-16-r6s/r6n` as TP3's rollback
 (`experiments/2026-10-15-r6n-tp3/r6n-tp3.json`, curves `build-77b3fa3c35f1ce6d`).
 
-`tp4-ring` resolves to r6s but is not qualified on it until a TP4 release (no
+`tp4-ring` resolves to r6u but is not qualified on it until a TP4 release (no
 `benchmark_reference`); the four-node ring was last released on r6n, in the frozen
 recipe's `tp4-ring` shape, described below.
 

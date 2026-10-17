@@ -516,10 +516,10 @@ class ClockLatchTest(unittest.TestCase):
 
 
 # HostConfig.Binds of the TP4 production container, as dgx1-4 reported it on 2026-10-06.
+# The production container's binds since r6u: the hub cache (1017's snapshot links into its
+# shared blob store) and the JIT caches.
 PRODUCTION_BINDS = [
-    "/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/"
-    "dba1be0a40aa45a94ad051997016db3960a90277:/models:ro",
-    "/home/swank/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs:/blobs:ro",
+    "/home/swank/.cache/huggingface/hub:/hub:ro",
     "/home/swank/projects/spark-ds41f/cache:/cache:rw",
 ]
 SPARKNET_BIND = "/home/swank/sparknet-port/sparknet:/usr/local/lib/python3.12/dist-packages/sparknet:ro"
@@ -554,8 +554,8 @@ class LiveMountsTest(unittest.TestCase):
 
     def test_missing_mount_is_reported(self) -> None:
         self.assertEqual(
-            spark.mount_problems("dgx3", self.wanted, PRODUCTION_BINDS[:2]),
-            [f"dgx3: missing mount {PRODUCTION_BINDS[2]!r}"],
+            spark.mount_problems("dgx3", self.wanted, PRODUCTION_BINDS[:1]),
+            [f"dgx3: missing mount {PRODUCTION_BINDS[1]!r}"],
         )
 
     def test_container_without_binds_misses_every_mount(self) -> None:
@@ -563,16 +563,14 @@ class LiveMountsTest(unittest.TestCase):
         self.assertEqual(problems, [f"dgx2: missing mount {bind!r}" for bind in self.wanted])
 
     def test_different_source_or_mode_is_reported_against_the_wanted_mount(self) -> None:
-        writable_models = PRODUCTION_BINDS[0].replace(":/models:ro", ":/models:rw")
+        writable_hub = PRODUCTION_BINDS[0].replace(":/hub:ro", ":/hub:rw")
         other_cache = "/home/swank/projects/spark-ds41f-lab/cache:/cache:rw"
-        problems = spark.mount_problems(
-            "dgx4", self.wanted, [writable_models, PRODUCTION_BINDS[1], other_cache]
-        )
+        problems = spark.mount_problems("dgx4", self.wanted, [writable_hub, other_cache])
         self.assertEqual(
             problems,
             [
-                f"dgx4: mount {writable_models!r}, expected {PRODUCTION_BINDS[0]!r}",
-                f"dgx4: mount {other_cache!r}, expected {PRODUCTION_BINDS[2]!r}",
+                f"dgx4: mount {writable_hub!r}, expected {PRODUCTION_BINDS[0]!r}",
+                f"dgx4: mount {other_cache!r}, expected {PRODUCTION_BINDS[1]!r}",
             ],
         )
 

@@ -1,5 +1,50 @@
 # r6u: every kernel prepared before any distributed work
 
+**Promoted for TP3 on 2026-10-17** as [`2026-10-17-karmic-kraken-r6u`](../../manifests/baselines/2026-10-17-karmic-kraken-r6u.json), serving DeepSeek-V4.1-Flash-1017 (owner: promote on the overlay's numbers, without benching the rebuilt image again), on the overlay release-suite run of 0179 ([suite run](../../manifests/suites/2026-10-17-karmic-kraken-r6u-tp3/)). `tp4-ring` resolves to r6u but stays unqualified until a TP4 release (`r6u-tp4-1017.json`, `gate-tp4-1017.json`, `coldboots-tp4-1017.json`, `release-tp4-1017.json`). The r6s recipe this release ran against is frozen in [r6s/cluster.json](r6s/cluster.json) with its lock; the arms built on it extend the frozen copy.
+
+### Release results (2026-10-17, TP3, 1017)
+
+On the image through 0178, the suite ran r6u (13:51-14:31), r6s (14:33-15:13) and r6u again
+(15:15-15:55):
+
+```
+verdicts: r6s-1017 -> r6u-1017, against the run's own repeat (r6u-1017 -> r6u-1017-again)
+metric                             change    ±95%   repeat  verdict
+grid: decode geometric mean (15)   +0.68%   0.14%   -1.52%  same
+c8: output tok/s                   -0.35%   1.46%   +0.03%  same
+c4: output tok/s                   -0.88%   1.45%   -0.23%  same
+poisson: output tok/s              -0.19%  21.12%   +0.02%  same
+prefill: prefill 32,768 tok/s      -3.11%   0.89%   -0.17%  worse
+prefill: prefill 131,072 tok/s     -3.15%   0.65%   -0.21%  worse
+prefill: prefill 262,144 tok/s     -3.01%   0.45%   -0.14%  worse
+prefill: prefill 500,000 tok/s     -2.77%   0.28%   -0.10%  worse
+```
+
+0177 quantized WO-A's input in the GEMM's activation tile loads, once per column tile.
+0179 prepares it once per row in the sparse MLA kernels' output store. On the image through
+0178 with 0179 mounted (`wo-overlay.json`, 16:15-16:55), against the r6s arm above:
+
+```
+metric                         r6s-1017  r6u-wo-1017   change    ±95%  verdict
+decode geometric mean (15)                             -0.97%   0.13%  better
+c8 output tok/s                 146.613      145.607   -0.69%   1.29%  same
+c4 output tok/s                 112.493      111.307   -1.05%   1.44%  same
+poisson output tok/s            117.687      117.303   -0.33%  21.03%  same
+prefill 32,768 tok/s           4414.396     4404.513   -0.22%   1.17%  same
+prefill 131,072 tok/s          4345.996     4342.602   -0.08%   0.59%  same
+prefill 262,144 tok/s          4153.366     4153.556   +0.00%   0.52%  same
+prefill 500,000 tok/s          3801.250     3800.698   -0.01%   0.16%  same
+```
+
+Temperature-0 (62313cb5 / 9742ac2c) and greedy (4d143977 / 12fd8257) outputs are identical
+to the image through 0178's, logprobs included; the release-test gate with 0179 mounted:
+1,361 passed, 41 skipped. The decode step time is cross-session (the same build read 1.5%
+apart in two sessions). The rebuilt image (`rebuild-wo.json`, `sha256:0aec88ed`) ran the
+release tests and the determinism gate before promotion; the cold boots and a second release
+were not rerun (0179 changes which kernels are declared, not how they are prepared, and the
+overlay boot prepared the changed kernels with the cache frozen and served the whole suite
+without a compile after preparation).
+
 r6u is r6s ([experiments/2026-10-16-r6s](../2026-10-16-r6s/README.md)) with kernel
 preparation ([design](../2026-10-17-kernel-prepare/README.md)).
 

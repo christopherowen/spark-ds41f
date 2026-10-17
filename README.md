@@ -4,13 +4,25 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **r6s** on the three-node TP3 512K profile, on the triangle the
-site is cabled as (2026-10-16, [promotion record](experiments/2026-10-16-r6s/README.md)).
-The four-node TP4 1M profile was last released on **r6n** (2026-10-15,
+Production is **r6u** on the three-node TP3 512K profile, on the triangle the
+site is cabled as, serving DeepSeek-V4.1-Flash-1017 (2026-10-17,
+[promotion record](experiments/2026-10-17-r6u/README.md)). The four-node TP4 1M
+profile was last released on **r6n** (2026-10-15,
 [promotion record](experiments/2026-10-15-r6n/README.md)): the recipe's `tp4-ring`
-resolves to r6s but stays unqualified until a TP4 release, and r6n's recipe and
-lock are frozen in `experiments/2026-10-16-r6s/r6n`. r6s is r6n with faster
-Engram prefill: the rows of tokens the host already knows are read before the
+resolves to r6u but stays unqualified until a TP4 release. r6s's recipe and lock
+are frozen in `experiments/2026-10-17-r6u/r6s` (r6n's in
+`experiments/2026-10-16-r6s/r6n`). r6u is r6s with every kernel prepared before
+any distributed work: each rank compiles its declared TileLang calls, TileKernels'
+warm calls and the step's Triton kernels before memory profiling, freezes
+TileLang's cache, and meets the other ranks on liveness, so a rank with a cold
+cache can no longer stall a one-shot collective at startup. It follows DeepSeek's
+current reference for both V4.1 Flash checkpoints (WO-A's input through
+`act_quant`, prepared once per row in the attention's output store; the
+2026-10-16 encoding fix), serves the 1017 checkpoint with DeepSeek's sampling
+defaults (temperature 1.0, top_p 1.0), and passes the release tests
+([docs/testing.md](docs/testing.md)) as part of every promotion. Prefill and
+decode are level with r6s on 1017; outputs differ from r6s's by WO-A's input
+quantization. r6s is r6n with faster Engram prefill: the rows of tokens the host already knows are read before the
 step, Engram's sequence-parallel product is exchanged all-to-all instead of
 all-gathered, and each rank's disk shard is whole hash columns, every third (or
 fourth), so every rank reads every n-gram order and the ranks finish together.
@@ -107,8 +119,8 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The three-node baseline is
-[manifests/baselines/2026-10-16-karmic-kraken-r6s.json](manifests/baselines/2026-10-16-karmic-kraken-r6s.json)
-([promotion record](experiments/2026-10-16-r6s/README.md)), since 2026-10-16. The
+[manifests/baselines/2026-10-17-karmic-kraken-r6u.json](manifests/baselines/2026-10-17-karmic-kraken-r6u.json)
+([promotion record](experiments/2026-10-17-r6u/README.md)), since 2026-10-17. The
 four-node baseline is still
 [manifests/baselines/2026-10-15-karmic-kraken-r6n.json](manifests/baselines/2026-10-15-karmic-kraken-r6n.json)
 ([promotion record](experiments/2026-10-15-r6n/README.md)); see
@@ -202,6 +214,29 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+r6u against r6s on three nodes, both serving DeepSeek-V4.1-Flash-1017 (2026-10-17),
+measured with the `release-tp3` suite ([results](experiments/2026-10-17-r6u/README.md);
+[suite run](manifests/suites/2026-10-17-karmic-kraken-r6u-tp3/)). r6u is measured with
+vLLM 0179 mounted over its image through 0178 (the promoted image carries the same
+files), in the session after r6s's, so the decode step time is cross-session (the same
+build read 1.5% apart in two sessions that day).
+
+| Workload | TP3 r6s | TP3 r6u |
+| --- | ---: | ---: |
+| Source-text prefill, 32K (tok/s) | 4,414 | 4,405 (-0.2% ±1.2) |
+| Prefill, 128K | 4,346 | 4,343 (-0.1% ±0.6) |
+| Prefill, 256K | 4,153 | 4,154 (0.0% ±0.5) |
+| Prefill, 500K | 3,801 | 3,801 (0.0% ±0.2) |
+| Decode step time, geometric mean of 15 shapes | | -1.0% ±0.13 |
+| Decode, 8 different prompts at once (tok/s) | 146.6 | 145.6 (-0.7% ±1.3) |
+| Decode, 4 different prompts at once | 112.5 | 111.3 (-1.1% ±1.4) |
+| Poisson arrivals at 0.42 req/s, output (tok/s) | 117.7 | 117.3 (-0.3% ±21) |
+
+r6u's image through 0178 quantized WO-A's input in the GEMM's column tiles and was
+2.8-3.2% slower at prefill (the same afternoon, r6u / r6s / r6u again); 0179 prepares
+it once per row and changes no output bit. No greedy response is identical to r6s's
+(WO-A's input quantization); r6s's teacher-forced KL on r6u's text is 0.023 nats.
 
 r6s against r6n on three nodes (2026-10-16), measured with the `release-tp3` suite
 in one session (r6s, r6n, r6s again; [results](experiments/2026-10-16-r6s/README.md);
