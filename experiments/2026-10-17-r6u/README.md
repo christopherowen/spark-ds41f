@@ -75,6 +75,12 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
    r6n being the ring's last release). The ring's arms schedule on their builds' DSpark cost
    curves, as TP3 does: the recipe's ring pins production's curves, which another site does
    not have.
+10. The WO-A fix (vLLM 0179): `wo-overlay.json` screens it on the r6u image through 0178 (its
+    changed files mounted): the release-test gate, the determinism gate and the release suite
+    on 1017. Then the rebuild chain, each its own run: `rebuild-wo.json` (the image, tagged
+    `-r6u`, the image through 0178 kept as `-r6u-0178`, and the release tests),
+    `gate-1017-wo.json`, `coldboots-1017-wo.json` (fresh cache directories,
+    `r6u-tp3-*-1017-wo.json`) and `release-1017-wo.json`.
 
 ## Results
 
@@ -107,3 +113,17 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
   objects, the deployment environment, TileLang coverage, DS4.1's config tests in their own file).
   The gate over the image with the fixed files mounted: 58 files, 1,350 passed, 41 skipped
   (39 need offline Hugging Face configs, the indexer's NaN contract, two GPUs), none failing, 6.2 min.
+- Release on 1017 (2026-10-17, `release-1017.json`, r6s / r6u / r6u again): decode level (8 and 4
+  streams, Poisson; the engine grid +0.68% within its repeat's 1.5% drift), prefill 2.8-3.2%
+  slower at every size (32K 4414 -> 4277 tok/s), the repeat within 0.2%. Cause: 0177 quantized
+  WO-A's input in the GEMM's activation tile loads, so each of a group's 16 column tiles redid
+  it; the image before 0177 was level with r6s. Model behaviour: no greedy response identical to
+  r6s's (WO-A's input quantization changes the outputs), r6s's teacher-forced KL on r6u's text
+  0.023 nats, top-1 agreement 94.5%, acceptance length 1.1% lower.
+- vLLM 0179: the sparse MLA kernels prepare WO-A's input in their output store, once per row
+  (`sparse_mla.wo_input`: the inverse RoPE, then `act_quant`'s quantize-dequantize), and WO-A's
+  GEMM loads its BF16 tiles as before 0177. Overlay screen (`wo-overlay.json`): the release-test
+  gate 1,361 passed, 41 skipped (two new tests: `wo_input` bit for bit against TileKernels'
+  rotation and `per_token_cast`); temperature 0 (62313cb5 / 9742ac2c) and greedy (4d143977 /
+  12fd8257) identical to r6u's on 1017, logprobs included.
+
