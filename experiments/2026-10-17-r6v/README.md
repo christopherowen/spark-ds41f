@@ -23,7 +23,26 @@ prefill 1,000,000 tok/s        4268.951     4405.278   +3.19%   0.45%  better
 
   Acceptance length 2.268 against 2.261; no greedy response identical to r6n's (top-1 agreement 94.5%: WO-A's input quantization).
 - Single stream (`single-stream-tp4-1017.json`): 71.05 tok/s (±3.8%), TTFT p50 0.103 s, TPOT p50 14.1 ms, 100 requests, none failed.
-- RigMark (`rigmark-tp4-1017.json`, alexellis/rigmark 770c3106, `reasoning_effort` low) for the release notes.
+- RigMark (`rigmark-tp4-1017.json`, alexellis/rigmark 770c3106, `reasoning_effort` low) for the release notes:
+  15/15 output gates; prose 66.4, code 109.6, structured 140.6 tok/s (medians, reasoning included);
+  prefill 6,272 / 6,685 / 6,684 tok/s at 8K / 32K / 64K; capped C1 / C2 / C4 77.7 / 124.5 / 176.9 tok/s.
+- MiaAI-Lab's release benchmark (`sparkdash_bench.mjs`: sparkDash 1.8.8's own decode and prefill code,
+  github.com/MiaAI-Lab/sparkDash 754f40a7, with their settings: greedy, thinking off, 256 new tokens),
+  run from the Mac against the ring, 2026-10-17 21:25 UTC. Aggregate tok/s (per stream):
+
+  | prompt type | c1 | c2 | c4 | c8 | c16 |
+  |---|---:|---:|---:|---:|---:|
+  | prose | 86.9 | 128.4 (65.7) | 185.7 (49.0) | 259.1 (34.6) | 380.5 (25.3) |
+  | code | 148.6 | 197.6 (102.4) | 252.2 (68.7) | 332.0 (46.6) | 469.7 (32.0) |
+  | structured | 163.6 | 236.0 (122.7) | 377.2 (97.6) | 577.4 (75.6) | 806.3 (53.6) |
+  | json | 129.9 | 202.6 (103.0) | 261.5 (70.9) | 422.6 (58.0) | 676.8 (44.2) |
+
+  Cold prefill, two passes (sparkDash's filler, one repeated token, so Engram reads one hot row):
+  4K 5,802 / 5,739, 16K 6,545 / 6,727, 32K 6,809 / 6,866, 64K 6,826 / 6,856, 128K 6,666 / 6,693,
+  262K 6,383 / 6,369 tok/s. MiaAI's TP4 line (switched fabric, 2026-09-25, original checkpoint):
+  prose 87.7 / 120.4 / 163.6 / 237.6 / 342.7, prefill 5,893-5,936 at 32K-64K. Their caveats apply to
+  both: prose c1 is one prompt whose greedy text follows each stack's arithmetic, and the non-prose
+  types use different prompts at each concurrency.
 
 r6v is r6u ([experiments/2026-10-17-r6u](../2026-10-17-r6u/README.md)) with vLLM 0180.
 
