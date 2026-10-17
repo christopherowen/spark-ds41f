@@ -443,13 +443,22 @@ Commands that change the nodes need the configuration named with
 
 ## 5. Model
 
-On every node, download the pinned revision into the Hugging Face cache the
-profile mounts:
+On every node, download the pinned revision of the recipe's model,
+DeepSeek-V4.1-Flash-1017 (476 GiB), into the Hugging Face cache the profile
+mounts:
 
 ```sh
-huggingface-cli download deepseek-ai/DeepSeek-V4.1-Flash \
-  --revision dba1be0a40aa45a94ad051997016db3960a90277
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --revision 1bae0e1088993b9b82de08f59de5be5a34e42170
 ```
+
+The profile (`models.v41-flash-1017` in [config/cluster.json](../config/cluster.json))
+mounts the whole hub cache, because recent `hf` versions link a repository's blobs
+into a shared store under `hub/blobs`. To copy the checkpoint between nodes, copy
+both `hub/blobs` and the repository's folder. The original checkpoint
+(`deepseek-ai/DeepSeek-V4.1-Flash`, revision
+`dba1be0a40aa45a94ad051997016db3960a90277`) still serves with `"model": "v41-flash"`;
+its config, tokenizer and tensor layout are the same, and every weight shard differs.
 
 ## 6. Image
 

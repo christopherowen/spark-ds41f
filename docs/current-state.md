@@ -132,7 +132,7 @@ B12X is the alternative backend in the same image.
 
 | Setting | Active value |
 |---|---:|
-| Kernel backend | TileLang (`kernel_backend: tilelang`): TileLang 0.1.15 + SM120/SM121 block-scaled MMA patches, DeepSeek TileKernels 2.0.0, sparknet 0.4.0 one-shot RoCE collectives; TileLang also runs RoPE, the compressor and its projection, the KV cache writers, the Engram gate and hash and the sparse-MLA metadata; B12X runs the fused WO projection, the drafter's context-KV projection, the Engram row lookup, the vision tower's kernels and the checkpoint loader |
+| Kernel backend | TileLang (`kernel_backend: tilelang`): TileLang 0.1.15 + SM120/SM121 block-scaled MMA patches, DeepSeek TileKernels 2.0.0, sparknet 0.4.0 one-shot RoCE collectives; TileLang also runs RoPE, the compressor and its projection, the KV cache writers, the Engram gate, hash and row gather, the sparse-MLA metadata, the WO projection and the drafter's context-KV projection; B12X runs the vision tower's kernels and the checkpoint loader |
 | Sources | Local Inference Lab `integration/karmic-kraken-beta` vLLM `19f2c20e` + the r6s series (`experiments/2026-10-16-r6s/vllm/series`, patch head `238b7ea3`, tree `71c6e1df`), B12X `236ddff0` + switchless RoCEnante, CuTe DSL 4.7.1 pin, top-k position-tie, dense GEMM and prefill stage-fence patches, four-node relay and mesh transports, packed BF16 vocabulary projection, NCCL 2.30.7 + IB send-path fence and four-node ring patches |
 | Image | `vllm-ds41f-kkref:19f2c20ed4d6-r6s` (`sha256:2414b9d1`), one digest on all ranks, built by `bin/spark build` |
 | Decode tiles | block-32 FP8 decode rows on 16-, 32- or 64-row tiles by row count, TileLang's unspecialized pipeline, no K split; prefill rasterizes weights larger than L2 in panels (vLLM 0043) |

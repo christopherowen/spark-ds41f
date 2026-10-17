@@ -23,7 +23,8 @@ prefill 1,000,000 tok/s        4268.951     4405.278   +3.19%   0.45%  better
 
   Acceptance length 2.268 against 2.261; no greedy response identical to r6n's (top-1 agreement 94.5%: WO-A's input quantization).
 - Single stream (`single-stream-tp4-1017.json`): 71.05 tok/s (±3.8%), TTFT p50 0.103 s, TPOT p50 14.1 ms, 100 requests, none failed.
-- RigMark (`rigmark-tp4-1017.json`, alexellis/rigmark 770c3106, `reasoning_effort` low) for the release notes:
+- RigMark (`rigmark-tp4-1017.json`, alexellis/rigmark 770c3106, `reasoning_effort` low) for the release notes
+  (the card and its JSON receipt, unmodified: [rigmark/](rigmark/)):
   15/15 output gates; prose 66.4, code 109.6, structured 140.6 tok/s (medians, reasoning included);
   prefill 6,272 / 6,685 / 6,684 tok/s at 8K / 32K / 64K; capped C1 / C2 / C4 77.7 / 124.5 / 176.9 tok/s.
 - MiaAI-Lab's release benchmark (`sparkdash_bench.mjs`: sparkDash 1.8.8's own decode and prefill code,
