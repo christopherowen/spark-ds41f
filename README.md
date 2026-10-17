@@ -4,14 +4,16 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **r6u** on the three-node TP3 512K profile, on the triangle the
-site is cabled as, serving DeepSeek-V4.1-Flash-1017 (2026-10-17,
-[promotion record](experiments/2026-10-17-r6u/README.md)). The four-node TP4 1M
-profile was last released on **r6n** (2026-10-15,
-[promotion record](experiments/2026-10-15-r6n/README.md)): the recipe's `tp4-ring`
-resolves to r6u but stays unqualified until a TP4 release. r6s's recipe and lock
-are frozen in `experiments/2026-10-17-r6u/r6s` (r6n's in
-`experiments/2026-10-16-r6s/r6n`). r6u is r6s with every kernel prepared before
+Production is **r6v**, serving DeepSeek-V4.1-Flash-1017 on both profiles: the
+four-node TP4 1M profile on the ring the site is cabled as (2026-10-17,
+[promotion record](experiments/2026-10-17-r6v/README.md)), and the three-node TP3
+512K profile on the triangle, whose path is r6u's (2026-10-17,
+[promotion record](experiments/2026-10-17-r6u/README.md)). r6v is r6u with
+Engram's sequence-parallel row exchange relayed through the neighbours on the
+four-node ring, which has no cable between ranks two apart; against r6n, the
+ring's previous release, prefill is 3.2-4.2% faster from 32K to 1M and decode is
+level. r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u` (r6s's in
+`experiments/2026-10-17-r6u/r6s`, r6n's in `experiments/2026-10-16-r6s/r6n`). r6u is r6s with every kernel prepared before
 any distributed work: each rank compiles its declared TileLang calls, TileKernels'
 warm calls and the step's Triton kernels before memory profiling, freezes
 TileLang's cache, and meets the other ranks on liveness, so a rank with a cold
@@ -118,12 +120,11 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 
 ## Current baseline
 
-The three-node baseline is
-[manifests/baselines/2026-10-17-karmic-kraken-r6u.json](manifests/baselines/2026-10-17-karmic-kraken-r6u.json)
-([promotion record](experiments/2026-10-17-r6u/README.md)), since 2026-10-17. The
-four-node baseline is still
-[manifests/baselines/2026-10-15-karmic-kraken-r6n.json](manifests/baselines/2026-10-15-karmic-kraken-r6n.json)
-([promotion record](experiments/2026-10-15-r6n/README.md)); see
+The baseline is
+[manifests/baselines/2026-10-17-karmic-kraken-r6v.json](manifests/baselines/2026-10-17-karmic-kraken-r6v.json)
+([promotion record](experiments/2026-10-17-r6v/README.md)), since 2026-10-17, on the ring
+and the triangle (whose release run is r6u's,
+[manifests/baselines/2026-10-17-karmic-kraken-r6u.json](manifests/baselines/2026-10-17-karmic-kraken-r6u.json)); see
 [docs/current-state.md](docs/current-state.md). The three-node deployment:
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
@@ -214,6 +215,27 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+r6v against r6n on four nodes, both serving DeepSeek-V4.1-Flash-1017 (2026-10-17),
+measured with the `release` suite in one session (r6v, r6n on its production ring
+curves; [results](experiments/2026-10-17-r6v/README.md);
+[suite run](manifests/suites/2026-10-17-karmic-kraken-r6v-tp4/)).
+
+| Workload | TP4 r6n | TP4 r6v |
+| --- | ---: | ---: |
+| Source-text prefill, 32K (tok/s) | 5,762 | 5,982 (**+3.8%** ±0.6) |
+| Prefill, 128K | 5,706 | 5,946 (**+4.2%** ±1.1) |
+| Prefill, 256K | 5,467 | 5,676 (**+3.8%** ±0.6) |
+| Prefill, 512K | 4,988 | 5,171 (**+3.7%** ±0.2) |
+| Prefill, 1M | 4,269 | 4,405 (**+3.2%** ±0.5) |
+| Decode step time, geometric mean of 20 shapes | | -0.05% ±0.14 |
+| Decode, 16 streams (tok/s) | 243.5 | 243.8 (+0.1% ±1.0) |
+| Decode, 8 streams | 185.4 | 185.4 (0.0% ±1.1) |
+| Poisson arrivals at 0.7 req/s, output (tok/s) | 180.2 | 180.4 (+0.1% ±17) |
+| One conversation at a time (tok/s, `single-stream`) | | 71.1 (TTFT p50 0.10 s) |
+
+No greedy response is identical to r6n's (WO-A's input quantization, DeepSeek's current
+reference); acceptance length is level (2.27).
 
 r6u against r6s on three nodes, both serving DeepSeek-V4.1-Flash-1017 (2026-10-17),
 measured with the `release-tp3` suite ([results](experiments/2026-10-17-r6u/README.md);

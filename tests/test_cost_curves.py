@@ -31,21 +31,31 @@ class CostCurveDirectoryTest(unittest.TestCase):
     def directory(self, cluster: dict) -> str:
         return spark.expected_environment(cluster, head(cluster))["SPARK3_DSPARK_COST_DIR"]
 
-    def test_tp3_derives_its_build_directory_and_tp4_keeps_its_pin(self) -> None:
-        derived = self.directory(self.tp3)
-        self.assertRegex(derived, r"^/cache/kkref/dspark-costs/build-[0-9a-f]{16}$")
-        self.assertEqual(derived, f"{spark.DSPARK_COST_ROOT}/build-{spark.build_fingerprint(self.tp3)}")
-        # TP4 runs the curves its release ran (r6h's), until its next release.
-        self.assertEqual(self.directory(self.tp4), self.tp4["environment"]["SPARK3_DSPARK_COST_DIR"])
+    def test_every_shape_derives_its_build_directory(self) -> None:
+        # Since r6v the ring, like the triangle, schedules on its build's own curves.
+        for cluster in (self.tp3, self.tp4):
+            derived = self.directory(cluster)
+            self.assertRegex(derived, r"^/cache/kkref/dspark-costs/build-[0-9a-f]{16}$")
+            self.assertEqual(derived, f"{spark.DSPARK_COST_ROOT}/build-{spark.build_fingerprint(cluster)}")
+            self.assertNotIn("SPARK3_DSPARK_COST_DIR", cluster["environment"])
+        # The frozen r6n arm on the ring keeps the curves r6n served it with (r6h's).
+        r6n = spark.read_cluster("experiments/2026-10-17-r6u/r6n-tp4-dev-1017-ring-curves.json")
+        self.assertEqual(self.directory(r6n), "/cache/kkref/dspark-costs/ring4-r6h-headout-20261012")
 
     def test_same_build_same_curves(self) -> None:
         # A setting that is not code (the dev-mode RPC) shares the build's curves.
         dev = copy.deepcopy(self.tp3)
         dev["environment"]["VLLM_SERVER_DEV_MODE"] = "1"
         self.assertEqual(self.directory(dev), self.directory(self.tp3))
-        # The TP3 release's dev-mode arm and the recipe are the same build.
-        arm = spark.read_cluster("experiments/2026-10-17-r6u/r6u-tp3-dev-1017.json")
+        # The ring's release arm (dev mode) and the recipe are the same build, and so are the
+        # triangle's r6v arm and the recipe.
+        arm = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp4-dev-1017.json")
+        self.assertEqual(self.directory(arm), self.directory(self.tp4))
+        arm = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp3-1017.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp3))
+        # r6u's TP3 release arm keeps r6u's curves, the ones its production ran on.
+        r6u = spark.read_cluster("experiments/2026-10-17-r6u/r6u-tp3-dev-1017.json")
+        self.assertEqual(self.directory(r6u), "/cache/kkref/dspark-costs/build-111f0abb94a12639")
         # The frozen r6s recipe keeps r6s's TP3 curves, the ones its production ran on.
         r6s = spark.read_cluster("experiments/2026-10-16-r6s/r6s-tp3-dev.json")
         self.assertEqual(self.directory(r6s), "/cache/kkref/dspark-costs/build-75cd5b96c4ec4942")

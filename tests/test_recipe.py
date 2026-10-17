@@ -63,14 +63,16 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_tp3_triangle_is_the_released_r6u_arm(self):
-        """tp3-triangle resolves to r6u's release arm on 1017, apart from the names (the arm
-        extends the frozen r6s recipe and names r6u's lock)."""
-        resolved = recipe.resolve(self.recipe, "tp3-triangle")
-        released = load_spark().read_cluster("experiments/2026-10-17-r6u/r6u-tp3-1017.json")
+    def test_each_shape_is_its_released_r6v_arm(self):
+        """tp4-ring resolves to r6v's release arm on the ring, tp3-triangle to r6v's arm on the
+        triangle (r6u's TP3 path), apart from the names (the arms extend the frozen r6u recipe
+        and name r6v's lock)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
-        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
-                         {k: v for k, v in released.items() if k not in naming})
+        for shape, arm in (("tp4-ring", "r6v-tp4-1017.json"), ("tp3-triangle", "r6v-tp3-1017.json")):
+            resolved = recipe.resolve(self.recipe, shape)
+            released = load_spark().read_cluster(f"experiments/2026-10-17-r6v/{arm}")
+            self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                             {k: v for k, v in released.items() if k not in naming}, shape)
 
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
@@ -130,16 +132,18 @@ class RecipeTest(unittest.TestCase):
         self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
+        # TP3 keeps r6u's release run (r6v's TP3 path is r6u's); the ring has r6v's own.
         self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-17-karmic-kraken-r6u-tp3")
-        self.assertNotIn("benchmark_reference", tp4)  # r6u is not benched on TP4
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-17-karmic-kraken-r6v-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
         different = {key for key in set(tp3["environment"]) | set(tp4["environment"])
                      if tp3["environment"].get(key) != tp4["environment"].get(key)}
+        # Since r6v both shapes derive their DSpark cost curves per build: no pinned directory.
         allowed = {key for key in different if key.startswith("NCCL_")} | {
-            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DSPARK_COST_DIR", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"}
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"}
         self.assertEqual(different, allowed)
         for name, entry in self.recipe["shapes"].items():
             self.assertTrue(entry.get("notes"), f"shape {name} says why it differs")

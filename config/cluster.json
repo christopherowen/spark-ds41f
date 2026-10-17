@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "promoted_baseline": "2026-10-17-karmic-kraken-r6u",
+  "promoted_baseline": "2026-10-17-karmic-kraken-r6v",
   "model": "v41-flash-1017",
   "models": {
     "v41-flash": {
@@ -20,9 +20,9 @@
   },
   "container": {
     "name": "dsv41-karmic-kraken",
-    "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6u",
+    "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v",
     "expected_labels": {
-      "local.spark3.vllm.tree": "53b007b532e08caef472d33c0e7cb27c5c7eedee",
+      "local.spark3.vllm.tree": "d11e9836e61bc2b763d6805d3324ec8fb5376360",
       "local.spark3.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark3.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark3.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
@@ -219,7 +219,7 @@
   "kernel_backend": "tilelang",
   "shapes": {
     "tp4-ring": {
-      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12).",
+      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. It schedules on its build's own DSpark cost curves, as TP3 does (since r6v). The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12).",
       "nodes": 4,
       "nodes_config": "config/nodes-ring4.local.json",
       "fabric": {
@@ -269,9 +269,9 @@
         "NCCL_SWITCHLESS_BIDIRECTIONAL": "2",
         "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1",
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "0",
-        "SPARK3_DSPARK_COST_DIR": "/cache/kkref/dspark-costs/ring4-r6h-headout-20261012",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152"
-      }
+      },
+      "benchmark_reference": "manifests/suites/2026-10-17-karmic-kraken-r6v-tp4"
     },
     "tp3-triangle": {
       "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md).",

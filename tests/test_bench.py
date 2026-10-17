@@ -657,8 +657,10 @@ class ReferenceShapeTest(unittest.TestCase):
                 self.assertTrue(named and (reference.is_file() or spark.is_suite_run(reference)))
                 relative = reference.relative_to(ROOT)
                 self.assertIn(relative.parent.as_posix(), ("manifests/benchmarks", "manifests/suites"))
-                # A promotion that moves promoted_baseline moves the reference too.
-                self.assertTrue(relative.stem.startswith(cluster["promoted_baseline"]))
+                # A reference is a baseline's release run of the shape: the promoted baseline's,
+                # or an earlier one's when the shape's path did not change (r6v's TP3 path is r6u's).
+                baseline = relative.stem.rsplit("-", 1)[0]
+                self.assertTrue((ROOT / "manifests" / "baselines" / f"{baseline}.json").is_file(), baseline)
                 identity = spark.reference_identity(reference)
                 self.assertEqual(
                     spark.shape_differences(spark.profile_shape(cluster, nodes), spark.bench_shape(identity)),
@@ -666,8 +668,8 @@ class ReferenceShapeTest(unittest.TestCase):
                 )
                 self.assertEqual(spark.benchmark_reference_problems(cluster, nodes), [])
         self.assertIn("benchmark_reference", recipe["shapes"]["tp3-triangle"])
-        # r6s was released on the triangle only; tp4-ring waits for a TP4 release.
-        self.assertNotIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
+        # r6v was released on the ring; the triangle keeps r6u's run of the same TP3 path.
+        self.assertIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
 
     def test_tp4_profile_compares_with_the_tp4_run(self) -> None:
         cluster, nodes = self.profile(self.TP4_RECIPE, "tp4-ring")
@@ -791,7 +793,7 @@ class ReferenceShapeTest(unittest.TestCase):
         # three-node run. Refuse it both live, before contacting the cluster,
         # and for a saved report.
         cluster, nodes = self.profile("config/cluster.json", "tp4-ring")
-        self.assertNotIn("benchmark_reference", cluster)
+        cluster.pop("benchmark_reference", None)  # a ring not yet benched with the image
         # On r6h's baseline, whose default reference is its three-node run.
         cluster["promoted_baseline"] = Path(self.TP3_REFERENCE).stem
         for argv in ([], ["--report", self.report(cluster, nodes)]):

@@ -1,7 +1,21 @@
 # Current state
 
-Production is the recipe's `tp3-triangle` shape ([config/cluster.json](../config/cluster.json))
-on **r6u**, serving DeepSeek-V4.1-Flash-1017 (revision `1bae0e10`), promoted 2026-10-17 as
+Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
+**r6v**, serving DeepSeek-V4.1-Flash-1017, promoted 2026-10-17 as
+[`2026-10-17-karmic-kraken-r6v`](../manifests/baselines/2026-10-17-karmic-kraken-r6v.json)
+([promotion record](../experiments/2026-10-17-r6v/README.md)): image
+`vllm-ds41f-kkref:19f2c20ed4d6-r6v` on dgx1-dgx4, r6u's sources with vLLM 0180 (patch head
+`c001cc4e`, tree `d11e9836`). 0180 relays Engram's sequence-parallel row all-to-all through the
+neighbours at four ranks: on the switchless ring ranks two apart share no cable, and r6u's
+direct exchange (r6s's, released on the triangle only) timed out there in memory profiling.
+Against r6n on the `release` suite: prefill 3.2-4.2% faster at 32K-1M, decode level, one
+conversation at a time 71.1 tok/s. `tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-17-karmic-kraken-r6v-tp4](../manifests/suites/2026-10-17-karmic-kraken-r6v-tp4/);
+the ring now schedules on its build's own DSpark cost curves (`build-2a95f7780992adb4`), as the
+triangle does. The triangle runs the same image on r6u's TP3 path (below, its reference r6u's
+run). r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u` as the rollback.
+
+On the triangle, r6v's TP3 path is **r6u**'s, serving DeepSeek-V4.1-Flash-1017 (revision `1bae0e10`), promoted 2026-10-17 as
 [`2026-10-17-karmic-kraken-r6u`](../manifests/baselines/2026-10-17-karmic-kraken-r6u.json)
 ([promotion record](../experiments/2026-10-17-r6u/README.md)): image
 `vllm-ds41f-kkref:19f2c20ed4d6-r6u` on dgx1-dgx3, r6s's sources with vLLM 0156-0179
@@ -54,7 +68,7 @@ release's first r6s boot). The r6n recipe and lock are frozen in
 `experiments/2026-10-16-r6s/r6n` as TP3's rollback
 (`experiments/2026-10-15-r6n-tp3/r6n-tp3.json`, curves `build-77b3fa3c35f1ce6d`).
 
-`tp4-ring` resolves to r6u but is not qualified on it until a TP4 release (no
+Before r6v, `tp4-ring` resolved to r6u but was not qualified on it (no
 `benchmark_reference`); the four-node ring was last released on r6n, in the frozen
 recipe's `tp4-ring` shape, described below.
 
