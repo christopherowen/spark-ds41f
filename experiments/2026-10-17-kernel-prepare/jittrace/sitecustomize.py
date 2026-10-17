@@ -136,12 +136,30 @@ def _patch_triton(module):
             setattr(module, attr, _timed("triton", original, _triton_name))
 
 
-def _patch_cute(module):
-    import inspect
+def _cute_name(args, kwargs):
+    kernel = args[0] if args else kwargs.get("function")
+    return getattr(kernel, "__name__", None) or type(kernel).__name__
 
+
+class _TracedCuteCompile:
+    """cute.compile is an object (cute.compile[options](...)), not a function."""
+
+    _jittrace = True
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __getitem__(self, options):
+        return _TracedCuteCompile(self._inner[options])
+
+    def __call__(self, *args, **kwargs):
+        return _timed("cute", self._inner, _cute_name)(*args, **kwargs)
+
+
+def _patch_cute(module):
     original = getattr(module, "compile", None)
-    if inspect.isfunction(original) and not getattr(original, "_jittrace", False):
-        module.compile = _timed("cute", original, lambda a, k: getattr(a[0], "__name__", _short(a[0], 120)) if a else "?")
+    if original is not None and not getattr(original, "_jittrace", False):
+        module.compile = _TracedCuteCompile(original)
 
 
 def _patch_worker(module):

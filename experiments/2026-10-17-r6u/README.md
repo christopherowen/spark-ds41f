@@ -25,6 +25,9 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
     TileKernels warm calls on placeholders, the JIT registry (Triton), then freezes, binds
     and starts the JIT monitor. Profiling, warm-up, capture and serving compile nothing.
   - Every TileLang family declares; weight processing transforms weights only.
+  - The TileLang compressor offers B12X no preparation unit: B12X prepares its units
+    while memory profiling, and that one compiled an unused CuTe DSL kernel there
+    when its cache was cold. Binding the compressor's kernels allocates its storage.
   - The sampler's warmups skip the unaligned-stride variants a 129,280 vocab cannot
     launch (66 of 132). A step's Triton kernels (input preparation, block tables,
     sampling, verification, drafting) register while kernels are prepared, after the
@@ -59,3 +62,18 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
     determinism scenarios (logprobs included) and 8 distinct streams.
   - Temperature-0 determinism identical to r6s (reference 7748d638, long e27d573d), no
     token or logprob difference in any scenario.
+- Image, first build (vLLM through 0171, 2026-10-17):
+  - Gate: temperature 0 (7748d638 / e27d573d) and greedy (97045b48 / 9e94db6b)
+    identical to r6s; 8 and 4 distinct streams pass.
+  - One rank's TileLang cache empty: ready in 282 s (dgx2 prepared 158 s, dgx1 and dgx3
+    waited 151 s). Every rank's empty: 283 s. No JIT compile after preparation.
+  - Every JIT cache empty: ready in 319 s, but each rank compiled B12X's CuTe DSL
+    `_Compress` in memory profiling (the TileLang compressor's leftover B12X unit, never
+    launched). A rank with only its CuTe DSL cache cold would compile it inside a
+    distributed forward. Fixed in 0172; the image is rebuilt and the cold boots rerun.
+  - The tests bundle stopped at collection (tests/conftest.py imports tblib, absent from
+    the image); it now runs with --noconftest and a plugin with the fixtures it uses.
+- Packed head exponent base as a runtime argument: bit-identical at every row count, but
+  slower at 13 of 20 TP3/TP4 decode row counts (+0.07% to +0.48%), so it is not included.
+  The script exited 0; the queue reports FAIL because the exit verdict also expects a
+  pytest summary line, which the script does not print.

@@ -1,0 +1,259 @@
+From e1d0156363ef47c8ebb87a514386f5ec1946b9e8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 06:00:07 +0200
+Subject: [PATCH] Kernel preparation: the TileLang compressor offers no B12X
+ unit
+
+Under TileLang the compressor still built B12X's mla_compress plan and offered
+it as a state-stage preparation unit, which B12X prepares while memory profiling:
+on a rank whose CuTe DSL cache was cold, B12X compiled its compression kernel
+there, inside a distributed forward, though the TileLang forward never launches
+it (the every-cache-cold boot logged "CuTeDSL JIT compilation during inference:
+_Compress" on every rank). That preparation also allocated the serving storage
+the TileLang forward uses.
+
+The TileLang compressor now offers no B12X unit; binding its declared kernels
+allocates the same serving storage (B12X's priming metadata is not needed) before
+memory profiling, and the forward checks that storage instead of the B12X plan.
+The TileLang kernels write every row they read (gather: every request slot;
+compress: rows [0, rows)), so the storage's initial contents reach no output.
+---
+ .../test_deepseek_v4_1_compressor_prepare.py  | 78 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/compressor.py       | 69 +++++++++-------
+ 2 files changed, 121 insertions(+), 26 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_compressor_prepare.py
+
+diff --git a/tests/models/test_deepseek_v4_1_compressor_prepare.py b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+new file mode 100644
+index 000000000..960f79acf
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Under TileLang the DeepSeek V4.1 compressor owes nothing to B12X preparation.
++
++B12X prepares its units' plans while memory profiling, a distributed forward, so a
++B12X unit would compile its CuTe kernel there on a rank whose cache is cold. The
++TileLang compressor offers none; binding its declared kernels allocates the serving
++storage before profiling instead.
++"""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.models.deepseek_v4_1 import compressor as compressor_module
++from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
++from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.utils.b12x import PreparationResourceUnavailableError
++
++TOKENS, REQUESTS = 64, 4
++
++
++def _compressor(monkeypatch, ratio: int) -> DeepseekCompressor:
++    monkeypatch.setattr(compressor_module.kernels, "uses_tilelang", lambda: True)
++    compressor = DeepseekCompressor.__new__(DeepseekCompressor)  # no weights or TP
++    torch.nn.Module.__init__(compressor)
++    compressor.prefix, compressor.compress_ratio = "layers.0.compressor", ratio
++    compressor.capacity, compressor.requests = TOKENS, REQUESTS
++    compressor.fused_wkv_wgate = SimpleNamespace(weight=torch.empty(512 * ratio, 32))
++    compressor._plan = None
++    compressor._values = compressor._latent = compressor._emitted = None
++    compressor._slots = compressor._gates = compressor._pending_values = None
++    compressor._pending_gates = compressor._pending_tags = None
++    compressor._local_ids = compressor._row_ids = None
++    compressor._primer_starts = None
++    return compressor
++
++
++def _bind(monkeypatch, compressor: DeepseekCompressor) -> None:
++    declared = {}
++    monkeypatch.setattr(
++        prepare,
++        "declare",
++        lambda calls=None, bind=None, warm=None: declared.update(bind=bind),
++    )
++    compressor.declare_kernels()
++    declared["bind"]()
++
++
++@pytest.mark.parametrize("ratio", [1, 2])
++def test_no_b12x_unit_and_no_b12x_plan(monkeypatch, ratio):
++    compressor = _compressor(monkeypatch, ratio)
++    workload = SimpleNamespace(max_tokens=TOKENS, token_counts=(1, TOKENS))
++    assert compressor.get_b12x_preparation_units(compressor, workload) == ()
++    assert compressor._plan is None
++
++
++def test_binding_allocates_the_serving_storage(monkeypatch):
++    compressor = _compressor(monkeypatch, 2)
++    _bind(monkeypatch, compressor)
++    assert compressor._values.shape == (TOKENS, 512)
++    assert compressor._values.dtype == torch.float32
++    assert compressor._gates.shape == (TOKENS, 512)
++    assert compressor._latent.shape == (TOKENS, 512)
++    assert compressor._latent.dtype == torch.bfloat16
++    assert compressor._emitted.shape == compressor._slots.shape == (TOKENS,)
++    assert compressor._pending_values.shape == (REQUESTS, 512)
++    assert compressor._pending_tags.shape == compressor._local_ids.shape == (REQUESTS,)
++    assert compressor._row_ids.tolist() == list(range(REQUESTS))
++    # B12X's priming metadata is not needed.
++    assert compressor._primer_starts is None
++
++
++def test_forwarding_before_binding_fails_by_name(monkeypatch):
++    compressor = _compressor(monkeypatch, 1)
++    with pytest.raises(PreparationResourceUnavailableError, match="bound"):
++        compressor.forward(torch.empty(1, 32), metadata=None)
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 4836e748a..552ec2f68 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -180,38 +180,43 @@ class DeepseekCompressor(nn.Module):
+         self._primer_slots = self._primer_counts = None
+         set_b12x_preparation_provider(self, self)
+ 
+-    def _ensure_capacity_buffers(self, caps) -> None:
+-        """Allocate reusable serving/priming storage only during preparation."""
++    def _ensure_capacity_buffers(self, device, t, r) -> None:
++        """Allocate the reusable serving storage for ``t`` tokens and ``r``
++        requests once, before memory profiling: B12X allocates it while
++        preparing its plan, TileLang when its kernels are bound."""
+         if self._values is not None:
+-            if self._values.shape[0] != caps.max_tokens:
++            if self._values.shape[0] != t:
+                 raise PreparationResourceUnavailableError(
+                     "compressor capacity changed after preparation"
+                 )
+             return
+-        device, t, r = caps.device, caps.max_tokens, caps.max_requests
+ 
+         def alloc(shape, dtype):
+             return torch.empty(shape, dtype=dtype, device=device)
+ 
+-        self._values = alloc(
+-            (t, 512), torch.float32 if caps.ratio == 2 else torch.bfloat16
+-        )
++        ratio = self.compress_ratio
++        self._values = alloc((t, 512), torch.float32 if ratio == 2 else torch.bfloat16)
+         self._latent = alloc((t, 512), torch.bfloat16)
+         self._emitted = alloc((t,), torch.bool)
+         self._slots = alloc((t,), SLOT_DTYPE)
+         self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
+-        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
+-        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
+-        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
+-        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
+-        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
+-        if caps.ratio == 2:
++        if ratio == 2:
+             self._gates = alloc((t, 512), torch.float32)
+             self._pending_values = alloc((r, 512), torch.float32)
+             self._pending_gates = alloc((r, 512), torch.float32)
+             self._pending_tags = alloc((r,), torch.int64)
+             self._local_ids = alloc((r,), torch.int64)
+ 
++    def _ensure_primer_buffers(self, device, t, r) -> None:
++        """Allocate the metadata of B12X's priming invocation."""
++        if self._primer_starts is not None:
++            return
++        self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
++        self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
++        self._primer_state_ids = torch.empty((r,), dtype=torch.int64, device=device)
++        self._primer_slots = torch.empty((t,), dtype=torch.int64, device=device)
++        self._primer_counts = torch.empty((2,), dtype=torch.int32, device=device)
++
+     def _reset_primer_state(self) -> None:
+         """Restore all reusable mutable capacity storage after a trial."""
+         self._values.zero_()
+@@ -361,6 +366,10 @@ class DeepseekCompressor(nn.Module):
+     def get_b12x_preparation_units(
+         self, layer: object, workload: B12xWorkload
+     ) -> tuple[B12xPreparationUnit, ...]:
++        # The TileLang compression and projection are declared kernels
++        # (declare_kernels); B12X prepares nothing for them.
++        if kernels.uses_tilelang():
++            return ()
+         if workload.max_tokens > self.capacity:
+             return ()
+         if self.fused_wkv_wgate.weight.is_meta or self.norm.weight.is_meta:
+@@ -379,7 +388,11 @@ class DeepseekCompressor(nn.Module):
+         declaration = self._plan
+ 
+         def make_call(state):
+-            self._ensure_capacity_buffers(state.caps)
++            caps = state.caps
++            self._ensure_capacity_buffers(
++                caps.device, caps.max_tokens, caps.max_requests
++            )
++            self._ensure_primer_buffers(caps.device, caps.max_tokens, caps.max_requests)
+             binding = self._primer_binding(state)
+             return PreparedCall(
+                 run=lambda: state.run(binding),
+@@ -410,12 +423,8 @@ class DeepseekCompressor(nn.Module):
+             prepare_call=make_call,
+             benchmark_call=make_call,
+         )
+-        # The TileLang projection needs no B12X plan.
+-        projection = (
+-            () if kernels.uses_tilelang() else (self._projection_unit(workload),)
+-        )
+         return (
+-            *projection,
++            self._projection_unit(workload),
+             B12xPreparationUnit(
+                 name="DeepseekCompressor",
+                 key=(self.prefix, self.compress_ratio, self.capacity, self.requests),
+@@ -442,16 +451,19 @@ class DeepseekCompressor(nn.Module):
+ 
+     def declare_kernels(self) -> None:
+         """Declare the TileLang compression kernels (the worker calls this after
+-        loading); binding allocates ratio 1's placeholder operands, so the first
+-        call, possibly under graph capture, allocates nothing."""
++        loading); binding allocates the serving storage and ratio 1's placeholder
++        operands before memory profiling, so the first call, possibly under graph
++        capture, allocates nothing."""
+         if not kernels.uses_tilelang():
+             return
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+         def bind() -> None:
++            device = self.fused_wkv_wgate.weight.device
++            self._ensure_capacity_buffers(device, self.capacity, self.requests)
+             if self.compress_ratio == 1:
+-                tl.placeholder(self.requests, self.fused_wkv_wgate.weight.device)
++                tl.placeholder(self.requests, device)
+ 
+         prepare.declare(self._tilelang_calls, bind=bind)
+ 
+@@ -487,15 +499,20 @@ class DeepseekCompressor(nn.Module):
+         )  # fmt: skip
+ 
+     def forward(self, hidden_states, metadata, state_metadata=None):
++        rows = hidden_states.shape[0]
++        if kernels.uses_tilelang():
++            if self._values is None:
++                raise PreparationResourceUnavailableError(
++                    "compressor kernels must be bound before forwarding"
++                )
++            self._project(hidden_states)
++            self._forward_tilelang(rows, metadata, state_metadata)
++            return self._latent[:rows], self._slots[:rows]
+         if self._plan is None or self._plan.prepared is None:
+             raise PreparationResourceUnavailableError(
+                 "compressor plan must be prepared before forwarding"
+             )
+-        rows = hidden_states.shape[0]
+         self._project(hidden_states)
+-        if kernels.uses_tilelang():
+-            self._forward_tilelang(rows, metadata, state_metadata)
+-            return self._latent[:rows], self._slots[:rows]
+         if self.compress_ratio == 2:
+             if state_metadata is None:
+                 raise RuntimeError("ratio2 compression requires request-state metadata")
+-- 
+2.54.0 (Apple Git-157)
+
