@@ -72,12 +72,21 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual(resolved["container"]["mounts"][:2],
                              [[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]])
         base = recipe.resolve(self.recipe, "tp3-triangle")
-        other = next(name for name in self.recipe["models"] if name != self.recipe["model"])
-        arm = recipe.overlay({"extends": {}, "set": {"model": other}}, base)
-        profile = self.recipe["models"][other]
+        self.assertEqual(base["serve_args"][0], "/models")
+        # 1017's blobs link on into the hub's shared store: the hub is mounted and the
+        # snapshot served from inside it.
+        arm = recipe.overlay({"extends": {}, "set": {"model": "v41-flash-1017"}}, base)
+        profile = self.recipe["models"]["v41-flash-1017"]
         mounts = arm["container"]["mounts"]
-        self.assertEqual(mounts[:2], [[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]])
-        self.assertEqual(mounts[2:], base["container"]["mounts"][2:])
+        self.assertEqual(mounts[0], [profile["hub"], "/hub", "ro"])
+        self.assertEqual(mounts[1:], base["container"]["mounts"][2:])
+        self.assertEqual(arm["serve_args"][0], f"/hub/{profile['snapshot']}")
+        self.assertEqual(arm["serve_args"][1:], base["serve_args"][1:])
+        self.assertEqual(recipe.model_snapshot(arm), f"{profile['hub']}/{profile['snapshot']}")
+        # And back: an arm over it that sets the original serves /models again.
+        back = recipe.overlay({"extends": {}, "set": {"model": self.recipe["model"]}}, arm)
+        self.assertEqual(back["container"]["mounts"], base["container"]["mounts"])
+        self.assertEqual(back["serve_args"], base["serve_args"])
         with self.assertRaises(SystemExit):
             recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
 

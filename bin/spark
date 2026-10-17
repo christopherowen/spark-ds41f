@@ -1472,12 +1472,12 @@ def report_weight_fragmentation(reports: dict, commands: bool = False) -> list[s
 
 def weight_fragmentation_findings(cluster: dict, nodes: dict, commands: bool = False) -> list[str]:
     """Read extent metadata and report only non-ideal layouts or unavailable checks."""
-    source = next(
+    source = cluster_recipe.model_snapshot(cluster) if "models" in cluster else next(
         (source for source, target, _ in cluster["container"]["mounts"] if target == "/models"),
         None,
     )
     if source is None:
-        return [Warn("cannot check weight fragmentation: no /models mount")]
+        return [Warn("cannot check weight fragmentation: no model mount")]
     root = source.format(home=cluster["host"]["home"])
     code = (ROOT / "scripts/weight_fragmentation.py").read_text()
 

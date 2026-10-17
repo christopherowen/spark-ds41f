@@ -16,8 +16,8 @@ A shape may ``extend`` another (the 4 KiB-page variant of TP3 changes the host
 kernel and the sizing only). An experiment arm is an overlay: ``extends`` names
 a configuration (the recipe at a shape, or another arm) and ``set``/``unset``
 hold only what the arm changes, so arms cannot drift from what they compare to. ``models``
-names each checkpoint the recipe serves (its snapshot and blob store) and ``model`` the one
-mounted at /models and /blobs; ``generation_defaults`` is the sampling a request that sets none
+names each checkpoint the recipe serves (a snapshot and its blob store, or a hub cache and the
+snapshot within it) and ``model`` the one mounted and served; ``generation_defaults`` is the sampling a request that sets none
 gets (vLLM's ``--override-generation-config``). An arm may set either. The site names the shape it is cabled as in
 ``config/site.json``; ``--shape`` overrides it for planning.
 
@@ -36,8 +36,10 @@ import string
 from pathlib import Path
 
 SITE_FILE = "config/site.json"
-# Where every shape mounts the selected model's snapshot and blob store.
-MODEL_MOUNTS = ("/models", "/blobs")
+# Where the selected model is mounted: a snapshot at /models with its blob store at
+# /blobs, or a whole Hugging Face hub cache at /hub (a snapshot whose blobs link on into
+# a shared store resolves only inside the hub it was laid out in).
+MODEL_MOUNTS = ("/models", "/blobs", "/hub")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
@@ -87,20 +89,38 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
-def model_mounts(cluster: dict) -> list[list[str]]:
-    """The mounts of the selected model (``model``, one of ``models``): its snapshot at
-    /models and its blob store at /blobs, both read-only."""
+def _model_profile(cluster: dict) -> dict:
     name, models = cluster.get("model"), cluster.get("models", {})
     if name not in models:
         raise SystemExit(f"unknown model {name!r}; the recipe defines {', '.join(sorted(models))}")
-    return [[models[name]["snapshot"], MODEL_MOUNTS[0], "ro"],
-            [models[name]["blobs"], MODEL_MOUNTS[1], "ro"]]
+    return models[name]
+
+
+def model_mounts(cluster: dict) -> tuple[list[list[str]], str]:
+    """The mounts of the selected model (``model``, one of ``models``) and the path vLLM
+    serves it from. A profile names a ``snapshot`` and its ``blobs`` (mounted at /models
+    and /blobs), or a ``hub`` cache root and the ``snapshot`` path within it (the root
+    mounted at /hub, served from /hub/<snapshot>); every mount is read-only."""
+    profile = _model_profile(cluster)
+    if "hub" in profile:
+        return [[profile["hub"], "/hub", "ro"]], f"/hub/{profile['snapshot']}"
+    return ([[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]],
+            "/models")
+
+
+def model_snapshot(cluster: dict) -> str:
+    """The selected model's snapshot directory on the host (``{home}`` unexpanded)."""
+    profile = _model_profile(cluster)
+    return f"{profile['hub']}/{profile['snapshot']}" if "hub" in profile else profile["snapshot"]
 
 
 def _with_model_mounts(cluster: dict) -> None:
-    mounts = cluster["container"].get("mounts", [])
-    cluster["container"]["mounts"] = model_mounts(cluster) + [
-        mount for mount in mounts if mount[1] not in MODEL_MOUNTS]
+    mounts, path = model_mounts(cluster)
+    cluster["container"]["mounts"] = mounts + [
+        mount for mount in cluster["container"].get("mounts", []) if mount[1] not in MODEL_MOUNTS]
+    if not cluster["serve_args"] or not cluster["serve_args"][0].startswith("/"):
+        raise SystemExit("serve_args must start with the model path")
+    cluster["serve_args"] = [path, *cluster["serve_args"][1:]]
 
 
 def _with_generation_defaults(cluster: dict) -> None:
