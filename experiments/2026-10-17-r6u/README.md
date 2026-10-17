@@ -44,6 +44,9 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
 2. `image.json`: r6u built on dgx2, copied over the CX7 links.
 3. `tests.json`: the prepare, rendezvous, worker and kernel tests in the image.
 4. `gate.json`: temperature-0 determinism and distinct streams, identical to r6s.
+   `release-tests-discovery.json`: every test file `scripts/release_tests.py` selects
+   (the stack's, the series', and those importing a module the series changes: 326)
+   run once on the image to learn their state; the release-test gate follows from it.
 5. `coldboots.json`: one rank's TileLang cache empty, every rank's empty, then every JIT
    cache empty; each must boot with the 10 s collective wait, and the trace must show no
    compile after preparation.
