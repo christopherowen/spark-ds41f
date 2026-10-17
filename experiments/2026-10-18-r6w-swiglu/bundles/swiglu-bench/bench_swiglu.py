@@ -13,6 +13,7 @@ For every row count of the serving decode captures and the prefill chunks:
 Exit 0 only if every bit check passes; the timing verdict is printed per bucket, each
 bucket judged by its slowest size against kbench's floor.
 """
+import os
 import statistics
 import sys
 import traceback
@@ -38,6 +39,9 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
 )
 
 LIMIT, ALIGN = 10.0, 32
+# Rows per CTA to compare (bits do not depend on it); the first is the module default.
+VARIANTS = tuple(None if v == "default" else int(v)
+                 for v in os.environ.get("SWIGLU_RPC", "default").split(","))
 SHAPES = (("tp4", 576, 384, 6), ("tp3", 768, 384, 6), ("drafter-tp4", 576, 128, 3))
 failures = 0
 
@@ -76,15 +80,15 @@ def same(a, a_sf, b, b_sf, live, cols):
         a_sf[live, :cols], b_sf[live, :cols])
 
 
-for name, inter, experts, topk in SHAPES:
-    dispatch = MoeDispatchV41Plan(experts, topk, ALIGN, 512, torch.int32, torch.bfloat16)
-    prepare.declare(lambda d=dispatch: _calls(d.kernels()), bind=dispatch.bind)
-    k_ours, k_theirs = moe_swiglu_cast(inter, ALIGN, LIMIT), theirs(inter, experts)
-    sizes = DECODE + PREFILL
-    print(f"== {name}: {inter} columns, {experts} experts, top {topk}", flush=True)
-    print("rows  tiles   theirs us (warm/cold)    ours us (warm/cold)   ours/theirs (warm/cold)  bits  replay", flush=True)
+def measure(name, inter, experts, topk, dispatch, k_theirs, rpc):
+    """One variant's table; returns the number of failed sizes."""
+    failed = 0
+    k_ours = moe_swiglu_cast(inter, ALIGN, LIMIT, rows_per_cta=rpc)
+    print(f"== {name}: {inter} columns, {experts} experts, top {topk}, {rpc or "default"} rows a CTA", flush=True)
+    print("rows  tiles   theirs us (warm/cold)    ours us (warm/cold)   ours/theirs (warm/cold)  bits  replay",
+          flush=True)
     ratios = {}
-    for rows in sizes:
+    for rows in DECODE + PREFILL:
         try:
             layout, h = case(rows, inter, experts, topk, dispatch, rows)
             live = layout["order"] >= 0
@@ -99,8 +103,6 @@ for name, inter, experts, topk in SHAPES:
             replay = "-"
             if rows in REPEAT:
                 eager, eager_sf = o1.clone(), s1.clone()
-                o1.zero_()
-                s1.zero_()
                 g = graph(run_ours, 1)
                 ok = True
                 for _ in range(2):
@@ -126,11 +128,12 @@ for name, inter, experts, topk in SHAPES:
             tc = statistics.median(t[1] for t in theirs_t)
             ow = statistics.median(t[0] for t in ours_t)
             oc = statistics.median(t[1] for t in ours_t)
-            failures += not bits
+            failed += not bits
             print(f"{rows:5d} {layout['tile_expert'].shape[0]:6d}  {tw:9.2f} / {tc:9.2f}  {ow:9.2f} / {oc:9.2f}  "
-                  f"{ratios[rows][0]:6.3f} / {ratios[rows][1]:6.3f}  {'equal' if bits else 'DIFFER'}  {replay}", flush=True)
+                  f"{ratios[rows][0]:6.3f} / {ratios[rows][1]:6.3f}  {'equal' if bits else 'DIFFER'}  {replay}",
+                  flush=True)
         except Exception:
-            failures += 1
+            failed += 1
             print(f"{rows:5d} ERROR\n{traceback.format_exc(limit=6)}", flush=True)
     for bucket, lo, hi in BUCKETS:
         sel = [v for k, v in ratios.items() if lo <= k <= hi]
@@ -138,6 +141,15 @@ for name, inter, experts, topk in SHAPES:
             worst = max(max(w, c) for w, c in sel)
             print(f"  {bucket}: worst ours/theirs {worst:.3f} "
                   f"({'within' if worst <= SLOWER else 'OVER'} the {SLOWER} floor)", flush=True)
+    return failed
 
-print(f"{len(SHAPES) - min(failures, len(SHAPES))} passed" if not failures else f"{failures} failed", flush=True)
+
+for name, inter, experts, topk in SHAPES:
+    dispatch = MoeDispatchV41Plan(experts, topk, ALIGN, 512, torch.int32, torch.bfloat16)
+    prepare.declare(lambda d=dispatch: _calls(d.kernels()), bind=dispatch.bind)
+    k_theirs = theirs(inter, experts)
+    for rpc in VARIANTS:
+        failures += measure(name, inter, experts, topk, dispatch, k_theirs, rpc)
+
+print(f"{len(SHAPES)} passed" if not failures else f"{failures} failed", flush=True)
 sys.exit(1 if failures else 0)

@@ -839,15 +839,16 @@ def tile_expert_weights(b_packed, block_N):
         tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
     },
 )
-def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=8):
+def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
     """The routed experts' SwiGLU, route weight and MXFP8 cast over the live tiles.
 
     ``H[L, 2I]`` (the gate/up GEMM's BF16 output, gate columns first) becomes
     ``Out[L, I]`` E4M3 with ``OutSF[L, *]`` UE8M0 bytes, one per 32 columns, for
     every layout row with ``Order[row] >= 0``; padding rows are not written, as the
     down GEMM's padding outputs are never read. A CTA takes ``rows_per_cta`` rows of
-    one tile, and the CTAs of tiles past ``num_tiles`` (``TileExpert < 0``) return
-    at once, so a decode step pays for its live rows only.
+    one tile, loading all of them before computing any, and the CTAs of tiles past
+    ``num_tiles`` (``TileExpert < 0``) stop there, so a decode step pays for its
+    live rows only.
 
     The arithmetic is TileKernels' ``swiglu_forward_and_per_token_cast`` (route
     weights, the clamp at ``limit`` by compare and select, as spark-ds41f's TileKernels
@@ -876,8 +877,13 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=8):
     chunk = warp * vec
     assert intermediate % chunk == 0, "a warp's columns must tile the row"
     assert SF_BLOCK % vec == 0, "a scale block spans whole thread vectors"
+    warps = intermediate // chunk  # one row's warps
+    if rows_per_cta is None:
+        # Fewer warps a row (TP3's 768 columns: 3) want fewer rows a CTA in flight
+        # (GB10 bench, experiments/2026-10-18-r6w-swiglu).
+        rows_per_cta = 4 if warps >= 4 else 2
     assert block_M % rows_per_cta == 0
-    threads = warp * (intermediate // chunk)
+    threads = warp * warps
     reduce_rounds = (SF_BLOCK // vec).bit_length() - 1
     sf_lanes = SF_BLOCK // vec
     sf_width = 4 * scale_words(intermediate)
@@ -897,8 +903,10 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=8):
         with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
             tid = T.get_thread_binding()
             col = (tid // warp) * chunk + (tid % warp) * vec
-            xl = T.alloc_local((vec,), in_dtype)
-            xr = T.alloc_local((vec,), in_dtype)
+            orders = T.alloc_local((rows_per_cta,), T.int32)
+            weights = T.alloc_local((rows_per_cta,), T.float32)
+            xl = T.alloc_local((rows_per_cta, vec), in_dtype)
+            xr = T.alloc_local((rows_per_cta, vec), in_dtype)
             xl_f = T.alloc_local((vec,), T.float32)
             xr_f = T.alloc_local((vec,), T.float32)
             x = T.alloc_local((vec,), T.float32)
@@ -906,18 +914,27 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=8):
             amax = T.alloc_local((2,), T.float32)
             cert_min_l = T.alloc_local((2,), T.float32)
             weight = T.alloc_var(T.float32)
+            base = t * block_M + slab * rows_per_cta
+            # Every row's loads issue before any row's arithmetic, so a cold call
+            # waits once for the layout words and once for its rows. ``Order`` is
+            # read in bounds for unused tiles too; their stale words are not used.
+            for r in T.unroll(rows_per_cta):
+                orders[r] = Order[base + r]
             if TileExpert[t] >= 0:
-                for r in T.serial(rows_per_cta):
-                    row = t * block_M + slab * rows_per_cta + r
-                    if Order[row] >= 0:
-                        weight = Weights[row]
+                for r in T.unroll(rows_per_cta):
+                    if orders[r] >= 0:
+                        weights[r] = Weights[base + r]
                         for j in T.vectorized(vec):
-                            xl[j] = H[row, col + j]
+                            xl[r, j] = H[base + r, col + j]
                         for j in T.vectorized(vec):
-                            xr[j] = H[row, intermediate + col + j]
+                            xr[r, j] = H[base + r, intermediate + col + j]
+                for r in T.unroll(rows_per_cta):
+                    row = base + r
+                    if orders[r] >= 0:
+                        weight = weights[r]
                         for j in T.vectorized(vec):
-                            xl_f[j] = T.float32(xl[j])
-                            xr_f[j] = T.float32(xr[j])
+                            xl_f[j] = T.float32(xl[r, j])
+                            xr_f[j] = T.float32(xr[r, j])
                         for j in T.unroll(vec):
                             val_l = T.alloc_var(T.float32, init=xl_f[j])
                             val_r = T.alloc_var(T.float32, init=xr_f[j])
