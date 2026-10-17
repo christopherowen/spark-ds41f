@@ -120,6 +120,10 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
    r6n being the ring's last release). The ring's arms schedule on their builds' DSpark cost
    curves, as TP3 does: the recipe's ring pins production's curves, which another site does
    not have.
+11. TP4 on our ring (2026-10-17, after re-cabling): `gate-tp4-1017.json`, then
+    `release-tp4-1017-ring.json` (the `release` suite, r6u then r6n, both on 1017; r6n on the
+    curves it served the ring with, `r6n-tp4-dev-1017-ring-curves.json`). Owner: only the
+    benching promotion and the release announcement need (no cold boots or repeat arm).
 10. The WO-A fix (vLLM 0179): `wo-overlay.json` screens it on the r6u image through 0178 (its
     changed files mounted): the release-test gate, the determinism gate and the release suite
     on 1017. Then the rebuild chain, each its own run: `rebuild-wo.json` (the image, tagged
