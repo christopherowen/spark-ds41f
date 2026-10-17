@@ -3,6 +3,8 @@
 
 usage: release_test_runner.py MANIFEST.json OUT_DIR
 
+The manifest's ``deselect`` node ids (each with its reason) are left out of their files.
+
 Files run in chunks of CHUNK per pytest process (one interpreter start per chunk), each with
 CHUNK_TIMEOUT. A chunk that times out, crashes or leaves no JUnit report is rerun file by
 file with FILE_TIMEOUT, so a hang or a crash costs only its own file. OUT_DIR gets
@@ -21,11 +23,16 @@ CHUNK, CHUNK_TIMEOUT, FILE_TIMEOUT = 10, 1800, 600
 BASETEMP = "/c/pytest-tmp-release"
 
 
+DESELECT: list[str] = []
+
+
 def pytest(paths, out: Path, tag: str, timeout: int) -> tuple[object, Path, float, str]:
     report = out / f"{tag}.xml"
     report.unlink(missing_ok=True)
-    command = [sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider",
-               "-p", "tblib_stub", "--continue-on-collection-errors",
+    deselect = [arg for node in DESELECT if node.split("::")[0] in paths
+                for arg in ("--deselect", node)]
+    command = [sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", *deselect,
+               "-p", "tblib_stub", "-p", "offline_skip", "--continue-on-collection-errors",
                "-o", "junit_family=xunit1", "-o", "faulthandler_timeout=300",
                "--junitxml", str(report), "--basetemp", f"{BASETEMP}/{tag}", *paths]
     started = time.time()
@@ -67,7 +74,9 @@ def summarize(path: str, cases: list[dict], seconds: float, status: str = "") ->
 
 
 def main(manifest_path: str, out_dir: str) -> int:
-    files = sorted(json.loads(Path(manifest_path).read_text())["files"])
+    manifest = json.loads(Path(manifest_path).read_text())
+    files = sorted(manifest["files"])
+    DESELECT[:] = sorted(manifest.get("deselect", {}))
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # pytest creates --basetemp itself but not its parent.

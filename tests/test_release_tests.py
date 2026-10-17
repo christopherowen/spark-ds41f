@@ -17,20 +17,15 @@ def load(name: str, path: Path):
 
 
 release_tests = load("release_tests", ROOT / "scripts/release_tests.py")
+# The plugin imports pytest only for its hook decorator; the matching rule is plain Python.
+sys.modules.setdefault("pytest", type(sys)("pytest"))
+sys.modules["pytest"].hookimpl = getattr(sys.modules["pytest"], "hookimpl",
+                                         lambda **kwargs: (lambda function: function))
+offline_skip = load("offline_skip", ROOT / "scripts/release_tests/offline_skip.py")
 runner = load("release_test_runner", ROOT / "scripts/release_tests/release_test_runner.py")
 
 
 class SelectionTest(unittest.TestCase):
-    def test_imports_name_modules_and_imported_names(self):
-        text = ("import vllm.envs as envs\n"
-                "from vllm.v1.worker import gpu_worker, utils\n"
-                "from vllm.models.deepseek_v4_1.tilelang import (\n    prepare,\n    vocab,\n)\n"
-                "def f():\n    from vllm.config import VllmConfig\n")
-        self.assertEqual(release_tests.imported_modules(text), {
-            "vllm.envs", "vllm.v1.worker", "vllm.v1.worker.gpu_worker", "vllm.v1.worker.utils",
-            "vllm.models.deepseek_v4_1.tilelang", "vllm.models.deepseek_v4_1.tilelang.prepare",
-            "vllm.models.deepseek_v4_1.tilelang.vocab", "vllm.config", "vllm.config.VllmConfig"})
-
     def test_stack_paths(self):
         for path in ("tests/kernels/test_deepseek_v41_tilelang_rope.py",
                      "tests/v1/worker/test_b12x_roce_health.py",
@@ -39,6 +34,56 @@ class SelectionTest(unittest.TestCase):
         for path in ("tests/models/multimodal/processing/test_common.py",
                      "tests/v1/core/test_scheduler.py"):
             self.assertFalse(release_tests.STACK.search(path), path)
+
+
+class ClassificationTest(unittest.TestCase):
+    CONFIG = {
+        "gate": {"tests/v1/worker/test_startup_rendezvous.py": "startup liveness"},
+        "periodic": {"tests/kernels/test_deepseek_v41_engram_rows.py": "timing-based"},
+        "excluded": {"tests/models/qwen4_exp/*": "a model this deployment does not serve",
+                     "tests/v1/worker/test_startup_*": "overlaps the gate entry"},
+    }
+
+    def test_each_class_and_unclassified(self):
+        classify = release_tests.classify
+        self.assertEqual(classify("tests/kernels/test_deepseek_v41_engram_rows.py", self.CONFIG),
+                         ["periodic"])
+        self.assertEqual(classify("tests/models/qwen4_exp/test_b12x_qsa.py", self.CONFIG),
+                         ["excluded"])
+        self.assertEqual(classify("tests/v1/core/test_scheduler.py", self.CONFIG), [])
+        # A gate file that also matches an exclusion is ambiguous, which check reports.
+        self.assertEqual(classify("tests/v1/worker/test_startup_rendezvous.py", self.CONFIG),
+                         ["gate", "excluded"])
+
+    def test_config_entries_need_reasons_and_exact_gate_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "c.json"
+            for broken in ({"gate": {"tests/a.py": ""}, "periodic": {}, "excluded": {}},
+                           {"gate": {"tests/*.py": "glob"}, "periodic": {}, "excluded": {}},
+                           {"gate": {}, "periodic": {}},
+                           {"gate": {"tests/a.py": "x"}, "periodic": {}, "excluded": {},
+                            "deselect": {"tests/b.py::test_x": "not a gate file"}},
+                           {"gate": {"tests/a.py": "x"}, "periodic": {}, "excluded": {},
+                            "deselect": {"tests/a.py": "a whole file"}}):
+                path.write_text(__import__("json").dumps(broken))
+                with self.assertRaises(ValueError):
+                    release_tests.load_config(path)
+
+
+class OfflineSkipTest(unittest.TestCase):
+    def test_only_missing_resources_skip(self):
+        missing = offline_skip.missing_resource
+        self.assertEqual(missing("ValueError: 1 validation error for ModelConfig\n  Value error, "
+                                 "Invalid repository ID or local directory specified: "
+                                 "'facebook/opt-125m'."),
+                         "Hugging Face facebook/opt-125m (offline)")
+        self.assertEqual(missing("ModuleNotFoundError: No module named 'ray'"),
+                         "ray (not in the serving image)")
+        self.assertEqual(missing("LocalEntryNotFoundError: Cannot find an appropriate cached snapshot"),
+                         "Hugging Face download (offline)")
+        self.assertIsNone(missing("ValueError: 1 validation error for ModelConfig\n  Value error, "
+                                  "max_model_len must be positive"))
+        self.assertIsNone(missing("AssertionError: tensors differ"))
 
 
 class RunnerReportTest(unittest.TestCase):

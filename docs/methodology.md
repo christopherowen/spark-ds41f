@@ -95,7 +95,10 @@ A promotion commit must:
    (every step's output except the model step's generated text, plus the release
    table), named by that shape's `benchmark_reference`. `bin/spark bench --suite`
    compares with it. Releases before r6l recorded a `bin/spark bench` report as
-   `manifests/benchmarks/<baseline>[-<shape>].json` instead.
+   `manifests/benchmarks/<baseline>[-<shape>].json` instead;
+8. pass the release tests on the promoted image ([testing](testing.md)):
+   `scripts/release_tests.py check` reports no unclassified, ambiguous or missing file
+   for the release's patch series, and the gate bundle exits 0.
 
 Rollback is a new coordinated deployment of the previous promoted commit. It is
 not an ad hoc reconstruction from shell history.
