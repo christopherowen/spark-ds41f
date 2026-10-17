@@ -1,0 +1,38 @@
+{
+ "notes": "r6u on the ring serving 1017 with every JIT cache empty (TileLang, Triton, CuTe DSL, B12X, TorchInductor, vLLM, FlashInfer, the driver's PTX cache); every JIT compile traced.",
+ "extends": {
+  "config": "experiments/2026-10-17-r6u/r6u-tp4-1017.json"
+ },
+ "set": {
+  "model": "v41-flash-1017",
+  "container": {
+   "mounts": [
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-17-kernel-prepare/jittrace",
+     "/opt/spark3/jittrace",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "PYTHONPATH": "/opt/spark3/jittrace:/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x",
+   "JITTRACE_DIR": "/cache/kkref/jittrace/r6u-tp4-1017-allcold",
+   "TILELANG_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/tilelang",
+   "TRITON_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/triton",
+   "CUTE_DSL_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/cute-dsl",
+   "B12X_COMPILE_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/b12x/compile",
+   "B12X_CUTE_COMPILE_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/b12x/cute",
+   "TORCHINDUCTOR_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/torchinductor",
+   "VLLM_CACHE_DIR": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/vllm",
+   "VLLM_CACHE_ROOT": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/vllm",
+   "CUDA_CACHE_PATH": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/nv-compute",
+   "FLASHINFER_WORKSPACE_BASE": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/flashinfer",
+   "XDG_CACHE_HOME": "/cache/kkref/jit-r6u/image-tp4-1017-allcold/xdg"
+  }
+ }
+}

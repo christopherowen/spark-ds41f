@@ -67,6 +67,14 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
 8. On 1017 (the promotion target): `gate-1017.json`, `coldboots-1017.json` and
    `release-1017.json` (r6u / r6s / r6u again, both on 1017); `gate.json` on the original
    checkpoint shows it still serves.
+9. The four-node ring on 1017, the same schedule at `tp4-ring` (16 streams, 1M context):
+   `tests.json` (shape-independent), `gate-tp4-1017.json` (16, 8 and 4 distinct streams),
+   `coldboots-tp4-1017.json` (`r6u-tp4-{coldrank,cold,allcold}-1017.json`; rank 1, dgx2,
+   is the cold rank, its TileLang cache absent while dgx1, dgx3 and dgx4 hold copies of a
+   warm r6u cache) and `release-tp4-1017.json` (the `release` suite, r6u / r6n / r6u again,
+   r6n being the ring's last release). The ring's arms schedule on their builds' DSpark cost
+   curves, as TP3 does: the recipe's ring pins production's curves, which another site does
+   not have.
 
 ## Results
 
