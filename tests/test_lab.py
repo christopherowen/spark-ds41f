@@ -431,6 +431,39 @@ class QueueTest(unittest.TestCase):
                 lab.plan(dict(SPEC, jobs=[{"kind": "gpu_clocks", "lock_mhz": bad}]))
 
 
+class NewCommitTest(unittest.TestCase):
+    def test_a_sync_to_another_commit_restarts_the_job(self) -> None:
+        """The steps after the sync never run on the code this process loaded; a sync that
+        leaves the commit where it was continues the job."""
+        steps = [{"kind": "sync"}, {"kind": "boot", "config": "arm.json", "label": "arm"}]
+
+        def run(commit_after_sync):
+            with mock.patch.object(lab, "plan", return_value=steps), \
+                    mock.patch.object(lab, "read_hold", return_value={}), \
+                    mock.patch.object(lab, "hold_is_ours", return_value=True), \
+                    mock.patch.object(lab, "window_should_close", return_value=None), \
+                    mock.patch.object(lab, "production_configuration",
+                                      return_value=({"host": {"home": "/h"}}, None, None)), \
+                    mock.patch.object(lab, "beat"), \
+                    mock.patch.object(lab, "sync_checkouts", return_value=True), \
+                    mock.patch.object(lab, "checkout_commit", return_value=commit_after_sync), \
+                    mock.patch.object(lab, "COMMIT_AT_START", "loaded"), \
+                    mock.patch.object(lab, "plan_problems", return_value=[]), \
+                    mock.patch.object(lab.spark, "read_cluster", side_effect=RuntimeError("boot step")), \
+                    mock.patch.object(lab, "boot") as boot, \
+                    mock.patch.object(lab, "window_close") as close, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                code = lab.execute({"run": "r"}, dry=False, keep_open=True, close_on_failure=False)
+            return code, boot, close
+
+        code, boot, close = run("synced")
+        self.assertEqual(code, lab.RESTART_ON_NEW_COMMIT)
+        boot.assert_not_called()
+        close.assert_not_called()
+        code, _, _ = run("loaded")  # same commit: the job goes on (to a boot step that fails here)
+        self.assertEqual(code, 1)
+
+
 class PlanProblemsTest(unittest.TestCase):
     """Mistakes that would cost a boot are found from the spec alone."""
 

@@ -1486,6 +1486,19 @@ def verdicts_agree(verdicts: list[dict]) -> bool:
     return all(len(keys) == 1 for keys in by_bundle.values())
 
 
+# Returned by execute when a sync step moved this checkout to another commit: the queue
+# puts the job back and restarts on that commit, which runs the job from its start.
+RESTART_ON_NEW_COMMIT = 75
+
+
+def checkout_commit() -> str:
+    return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+COMMIT_AT_START = checkout_commit()
+
+
 def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = True) -> int:
     """Run a spec's steps in the window (opening one unless held). The window closes when
     the run ends (unless ``keep_open``), when the window itself must end (hold lost, time
@@ -1520,6 +1533,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
 
     threading.Thread(target=heartbeat, daemon=True).start()
     validated = False
+    restart = False
     for step in steps:
         hold = read_hold()
         if not hold_is_ours(hold):
@@ -1588,6 +1602,10 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                 if not sync_checkouts():
                     failed = "sync failed"
                     break
+                if keep_open and checkout_commit() != COMMIT_AT_START:
+                    # The rest of the job must not run on the code this process loaded.
+                    restart = True
+                    break
             elif step["kind"] == "gpu_clocks":
                 if not set_gpu_clocks(step["lock"]):
                     failed = "GPU clock change failed"
@@ -1639,6 +1657,9 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             failed = f"{describe_step(step)} raised {type(error).__name__}: {error}"
             break
     stop_beating.set()
+    if restart:
+        log("sync moved the checkout to another commit: the job restarts on it")
+        return RESTART_ON_NEW_COMMIT
     if failed:
         log(f"run stopped: {failed}")
     if window_ending or not keep_open or (failed and close_on_failure):
@@ -1680,7 +1701,6 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
     if not hold_is_ours(read_hold()):
         return 1
     me = Path(__file__).resolve()
-    code_at_start = hashlib.sha256(me.read_bytes()).hexdigest()
     for state in ("running", "done", "failed"):
         (QUEUE / state).mkdir(parents=True, exist_ok=True)
     idle_since = None
@@ -1714,6 +1734,12 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
         log(f"QUEUE job {job.name} started")
         code = execute(json.loads(running.read_text()), dry=False, keep_open=True,
                        close_on_failure=False)
+        if code == RESTART_ON_NEW_COMMIT:
+            os.replace(running, job)
+            log(f"QUEUE job {job.name} requeued; restarting on the new commit (window stays open)")
+            os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
+                                      "--idle-minutes", str(idle_minutes), "--minutes", str(minutes),
+                                      "--production-config", PRODUCTION_CONFIG])
         os.replace(running, QUEUE / ("done" if code == 0 else "failed") / job.name)
         log(f"QUEUE job {job.name} {'done' if code == 0 else 'failed'}")
         if code and not hold_is_ours(read_hold()):
@@ -1723,9 +1749,9 @@ def queue_run(idle_minutes: int, minutes: int) -> int:
             # A failed job (a boot that never came up, a step that raised) costs only
             # itself: the next spec stops and boots what it needs.
             log("QUEUE continuing after the failed job")
-        if hashlib.sha256(me.read_bytes()).hexdigest() != code_at_start:
-            # A sync job brought new runner code: continue the same window on it.
-            log("QUEUE restarting on the synced runner (window stays open)")
+        if checkout_commit() != COMMIT_AT_START:
+            # A sync job moved the checkout: continue the same window on the new commit.
+            log("QUEUE restarting on the new commit (window stays open)")
             os.execv(sys.executable, [sys.executable, str(me), "queue", "run",
                                       "--idle-minutes", str(idle_minutes), "--minutes", str(minutes),
                                       "--production-config", PRODUCTION_CONFIG])
