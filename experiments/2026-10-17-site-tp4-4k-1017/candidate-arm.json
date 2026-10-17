@@ -1,0 +1,60 @@
+{
+  "notes": "External site: the recipe at tp4-ring on a stock 4 KiB kernel (6.17.0-1032-nvidia, no memory saver, Secure Boot on), serving DeepSeek-V4.1-Flash-1017 from a snapshot whose shards link over read-only NFS to the head's copy; shards 47/48 (the Engram tables) are local on every node. DSpark cost curves per build. Runtime: the r6u image plus upstream r6v's 0180 pynccl.py (ring relay of opposite-rank row blocks), mounted read-only; native kernels unchanged.",
+  "extends": {
+    "config": "config/cluster.json",
+    "shape": "tp4-ring"
+  },
+  "set": {
+    "models": {
+      "site-1017": {
+        "snapshot": "{home}/ds41f-1017/snapshot",
+        "blobs": "{home}/ds41f-1017/blobs",
+        "notes": "DeepSeek-V4.1-Flash-1017 rev 1bae0e10, every LFS file sha256-verified."
+      }
+    },
+    "model": "site-1017",
+    "host": {
+      "home": "/home/admin",
+      "kernel": {
+        "release": "6.17.0-1032-nvidia",
+        "page_size": 4096,
+        "memory_saver_required": false
+      }
+    },
+    "distributed": {
+      "master_addr": "192.0.2.1"
+    },
+    "deployment": {
+      "repository": "/home/admin/ds41f/origin.git",
+      "launch_enabled": true
+    },
+    "container": {
+      "mounts": [
+        [
+          "{home}/ds41f-1017/snapshot",
+          "/models",
+          "ro"
+        ],
+        [
+          "{home}/ds41f-1017/blobs",
+          "/blobs",
+          "ro"
+        ],
+        [
+          "{home}/projects/spark-ds41f/cache",
+          "/cache",
+          "rw"
+        ],
+        [
+          "{home}/projects/spark-ds41f/experiments/2026-10-17-site-tp4-4k-1017/r6v-0180/vllm/distributed/device_communicators/pynccl.py",
+          "/opt/spark3/candidate/vllm/vllm/distributed/device_communicators/pynccl.py",
+          "ro"
+        ]
+      ]
+    }
+  },
+  "unset": [
+    "environment.SPARK3_DSPARK_COST_DIR",
+    "deployment.branch"
+  ]
+}
