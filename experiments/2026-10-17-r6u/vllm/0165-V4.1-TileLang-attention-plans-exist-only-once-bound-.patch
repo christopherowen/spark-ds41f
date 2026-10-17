@@ -1,0 +1,36 @@
+From 5ef64eed8763ab369b40541f5127bd774e84fb29 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:16:32 +0200
+Subject: [PATCH 165/169] V4.1 TileLang attention: plans exist only once bound;
+ no lazy build in the forward
+
+The attention, linear and MoE backends agree with the kernel family, so a
+TileLang attention layer is always declared and bound before its first
+forward; a missing plan is an error naming the cause, not a build there.
+---
+ vllm/models/deepseek_v4_1/tilelang/attention.py | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index e4f867835..1101fde2d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -159,11 +159,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         are checked on first use)."""
+         plans = self.__dict__.get("_tilelang_plans")
+         if plans is None:
+-            if torch.cuda.is_current_stream_capturing():
+-                raise RuntimeError(
+-                    "V4.1 TileLang kernels must be built before CUDA graph capture"
+-                )
+-            plans = self._tilelang_plans = self._build_tilelang_plans()
++            raise RuntimeError(
++                "V4.1 TileLang attention plans are built when the layer's kernels "
++                "are bound: declare_kernels() was not run for this layer"
++            )
+         if not self.__dict__.get("_cache_pages_checked"):
+             self._check_cache_pages()
+             self._cache_pages_checked = True
+-- 
+2.54.0 (Apple Git-157)
+

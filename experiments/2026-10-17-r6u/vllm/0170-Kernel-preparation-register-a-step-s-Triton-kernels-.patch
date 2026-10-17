@@ -1,0 +1,91 @@
+From f243dd6a4a6dc7a9c622d2454b7cf477c522d297 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 04:23:56 +0200
+Subject: [PATCH] Kernel preparation: register a step's Triton kernels while
+ preparing, after the KV cache layout is set
+
+The step warmups derive block-table variants from the KV cache groups, whose
+packing reads the layout the engine core resolves before memory profiling.
+Registering them in load_model ran before that and failed on every rank; the
+worker now asks the runner for them (declare_step_kernels) in _prepare_kernels,
+just before the registry compiles.
+---
+ vllm/v1/worker/gpu/model_runner.py | 15 ++++++++-------
+ vllm/v1/worker/gpu_worker.py       | 16 +++++++++++++---
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 5b5b4bf9f..781c97821 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -582,11 +582,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 mask_stride=self.decode_query_len,
+                 num_bonus_tokens=self.model_state.num_new_sampled_tokens_per_step,
+             )
+-            # A step's Triton kernels (input preparation, sampling, verification,
+-            # drafting), specialized on the runner's buffers, the loaded heads and
+-            # the KV cache groups' block tables.
+-            with self.jit_warmup_registry.activate():
+-                self._register_step_warmups()
+ 
+         if self.is_pooling_model and self.is_last_pp_rank:
+             self.pooling_runner = PoolingRunner(self.model, self.vllm_config)
+@@ -2032,13 +2027,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+         return self._greedy_verification
+ 
+-    def _register_step_warmups(self) -> None:
++    def declare_step_kernels(self) -> None:
+         """Register the Triton kernels that input preparation, sampling, greedy
+         verification and the drafter launch: for the runner's buffers, the loaded
+         LM head's dtype and vocabulary shards, and the block tables of the KV cache
+-        groups its spec gives (the KV cache does not exist yet)."""
++        groups its spec gives (the KV cache does not exist yet).
++
++        The worker calls this while preparing kernels, after the engine core set
++        the KV cache layout the groups depend on.
++        """
+         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+ 
++        if not self.is_last_pp_rank or self.is_pooling_model:
++            return
+         assert self.sampler is not None
+         kv_cache_groups = get_kv_cache_groups(
+             self.vllm_config, self.get_kv_cache_spec()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2dfebe124..f01346af3 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1422,9 +1422,10 @@ class Worker(WorkerBase):
+     def _prepare_kernels(self) -> None:
+         """Compile every declared JIT kernel before any distributed work.
+ 
+-        DeepSeek V4.1's TileLang family declares each call its modules can make
+-        while the model is built; the runner's JIT registry also holds the Triton
+-        kernels its samplers registered. They compile here on this rank alone,
++        DeepSeek V4.1's TileLang family declares each call its loaded modules can
++        make; the runner's JIT registry holds the Triton kernels its samplers and
++        model state registered, and the runner adds its step's kernels here, once
++        the KV cache layout is set. They compile here on this rank alone,
+         TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
+         so profiling, warm-up, capture and serving compile nothing: a kernel that
+         was not declared fails by name on every rank alike.
+@@ -1448,6 +1449,15 @@ class Worker(WorkerBase):
+                 tilelang_calls = prepare.prepare_declared(registry)
+                 with torch.inference_mode():
+                     prepare.warm_declared(registry)
++            # A step's Triton kernels (input preparation, sampling, verification,
++            # drafting), specialized on the runner's buffers, the loaded heads and
++            # the block tables of the KV cache groups (the layout is set by now).
++            declare_step_kernels = getattr(
++                self.model_runner, "declare_step_kernels", None
++            )
++            if declare_step_kernels is not None:
++                with registry.activate():
++                    declare_step_kernels()
+             registry.warmup()
+             if tilelang_calls:
+                 prepare.release_host_memory()
+-- 
+2.54.0 (Apple Git-157)
+

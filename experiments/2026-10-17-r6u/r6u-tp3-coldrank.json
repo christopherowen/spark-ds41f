@@ -1,0 +1,37 @@
+{
+ "notes": "r6u on TP3 with a TileLang cache seeded on dgx1 and dgx3 (copies of production's) and empty on dgx2; every JIT compile traced (kernel-prepare/jittrace).",
+ "extends": {
+  "config": "experiments/2026-10-17-r6u/r6u-tp3.json"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{home}/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277",
+     "/models",
+     "ro"
+    ],
+    [
+     "{home}/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/blobs",
+     "/blobs",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-17-kernel-prepare/jittrace",
+     "/opt/spark3/jittrace",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "PYTHONPATH": "/opt/spark3/jittrace:/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x",
+   "JITTRACE_DIR": "/cache/kkref/jittrace/r6u-coldrank",
+   "TILELANG_CACHE_DIR": "/cache/kkref/jit-r6u/image-coldrank"
+  }
+ }
+}

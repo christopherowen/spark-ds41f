@@ -1,0 +1,677 @@
+From 60f42701531ac40e09c872cf40a165bccaecf1fb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:45:48 +0200
+Subject: [PATCH 157/169] Kernel preparation: compile declared kernels before
+ any distributed work; a startup rendezvous on liveness
+
+DeepSeek V4.1's TileLang modules declare every call they can make
+(tilelang/prepare.declare) into the runner's JIT registry while the model is
+built. Before memory profiling, the worker compiles them on this rank alone,
+in one thread pool (tilelang.prepare), runs the registry's other warmups, and
+freezes TileLang's kernel cache: profiling, warm-up, capture and serving
+compile nothing, and a call that was not declared fails by name on every
+rank alike.
+
+The startup rendezvous waits on the host for as long as every missing rank
+is alive: each rank publishes a heartbeat (counter, phase, kernels prepared)
+in the distributed store, a waiting rank reports what the missing ranks are
+doing, and fails naming a rank whose heartbeat stops changing for
+VLLM_STARTUP_HEARTBEAT_TIMEOUT_S (dead or hung). How long a rank prepares is
+not bounded; VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS is gone.
+
+JitWarmupRegistry.registrations() lists what was registered.
+
+Reported-by: huxiaofengtiger (NVIDIA Developer Forums, DeepSeek 4.1 Flash recipe thread, post 24)
+---
+ tests/models/test_deepseek_v4_1_prepare.py    |  56 +++++++
+ tests/v1/worker/test_startup_rendezvous.py    |  94 +++++++++++
+ vllm/envs.py                                  |  14 +-
+ vllm/model_executor/warmup/jit_warmup.py      |   6 +
+ vllm/models/deepseek_v4_1/tilelang/prepare.py | 155 ++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py                  |  89 ++++++++--
+ vllm/v1/worker/startup_rendezvous.py          | 122 ++++++++++++++
+ 7 files changed, 518 insertions(+), 18 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_prepare.py
+ create mode 100644 tests/v1/worker/test_startup_rendezvous.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/prepare.py
+ create mode 100644 vllm/v1/worker/startup_rendezvous.py
+
+diff --git a/tests/models/test_deepseek_v4_1_prepare.py b/tests/models/test_deepseek_v4_1_prepare.py
+new file mode 100644
+index 000000000..73a8e81e2
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_prepare.py
+@@ -0,0 +1,56 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 TileLang kernels are declared into the runner's JIT registry."""
++
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++
++def _gemm(n, k, block_M=16):  # stands in for a @tilelang.jit function
++    raise AssertionError("declaring must not compile")
++
++
++def _rope(heads, dim):
++    raise AssertionError("declaring must not compile")
++
++
++def test_declared_calls_are_collected_once_each():
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        prepare.declare(_gemm, lambda: [prepare.call(1024, 512, block_M=16)])
++        # A second owner declaring the same call (another layer of the same shape).
++        prepare.declare(
++            _gemm,
++            lambda: [
++                prepare.call(1024, 512, block_M=16),
++                prepare.call(1024, 512, block_M=32),
++            ],
++        )
++        prepare.declare(_rope, lambda: [prepare.call(8, 512)])
++    calls = prepare.declared_calls(registry)
++    assert sorted(
++        (fn.__name__, args, tuple(sorted(kw.items()))) for fn, args, kw in calls
++    ) == [
++        ("_gemm", (1024, 512), (("block_M", 16),)),
++        ("_gemm", (1024, 512), (("block_M", 32),)),
++        ("_rope", (8, 512), ()),
++    ]
++
++
++def test_declaring_outside_a_collecting_registry_is_a_no_op():
++    prepare.declare(_rope, lambda: [prepare.call(8, 512)])  # no active registry
++
++
++def test_calls_are_listed_when_preparing_not_when_declaring():
++    registry = JitWarmupRegistry(vllm_config=None)
++    listed = []
++
++    def calls():
++        listed.append(True)
++        return [prepare.call(4, 128)]
++
++    with registry.activate():
++        prepare.declare(_rope, calls)
++    assert not listed
++    prepare.declared_calls(registry)
++    assert listed
+diff --git a/tests/v1/worker/test_startup_rendezvous.py b/tests/v1/worker/test_startup_rendezvous.py
+new file mode 100644
+index 000000000..ef4bd164a
+--- /dev/null
++++ b/tests/v1/worker/test_startup_rendezvous.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The startup rendezvous waits on liveness, not on a deadline."""
++
++import threading
++
++import pytest
++
++from vllm.v1.worker import startup_rendezvous
++from vllm.v1.worker.startup_rendezvous import StartupHeartbeat, rendezvous
++
++
++class _Store:
++    """The part of torch's TCPStore the rendezvous uses."""
++
++    def __init__(self) -> None:
++        self._data: dict[str, bytes] = {}
++        self._lock = threading.Lock()
++
++    def set(self, key: str, value: str) -> None:
++        with self._lock:
++            self._data[key] = value.encode()
++
++    def check(self, keys: list[str]) -> bool:
++        with self._lock:
++            return all(key in self._data for key in keys)
++
++    def get(self, key: str) -> bytes:
++        with self._lock:
++            return self._data[key]
++
++
++def test_every_rank_arrived_returns_at_once():
++    store = _Store()
++    store.set("vllm/startup/arrived/profiling/1", "1")
++    waited = rendezvous(store, 0, 2, "profiling", 60, print, poll_s=0.01)
++    assert waited < 1
++
++
++class _SlowRankStore(_Store):
++    """Rank 1's heartbeat changes at every read; it arrives after ``polls`` checks."""
++
++    def __init__(self, polls: int) -> None:
++        super().__init__()
++        self.polls = polls
++        self.beats = 0
++
++    def check(self, keys: list[str]) -> bool:
++        if keys == ["vllm/startup/arrived/profiling/1"]:
++            self.polls -= 1
++            if self.polls <= 0:
++                self.set(keys[0], "1")
++        return super().check(keys)
++
++    def get(self, key: str) -> bytes:
++        if key == "vllm/startup/heartbeat/1":
++            self.beats += 1
++            return f"{self.beats}|preparing kernels|prepared {self.beats}/900".encode()
++        return super().get(key)
++
++
++def test_a_slow_rank_is_awaited_while_its_heartbeat_moves():
++    """However long a rank prepares, it is awaited while its heartbeat changes:
++    here for far longer than the heartbeat timeout (100 polls of 10 ms vs 1 ms)."""
++    store = _SlowRankStore(polls=100)
++    store.set("vllm/startup/heartbeat/1", "0|preparing kernels")
++    waited = rendezvous(store, 0, 2, "profiling", 0.001, print, poll_s=0.01)
++    assert waited > 0.5 and store.beats >= 99
++
++
++def test_a_rank_whose_heartbeat_stops_fails_by_name():
++    store = _Store()
++    store.set("vllm/startup/heartbeat/1", "7|preparing kernels|prepared 3/9 kernels")
++    with pytest.raises(RuntimeError) as raised:
++        rendezvous(store, 0, 2, "profiling", 0.05, print, poll_s=0.01)
++    message = str(raised.value)
++    assert "rank 1 stopped responding before profiling" in message
++    assert "preparing kernels, prepared 3/9 kernels" in message
++
++
++def test_progress_reports_name_the_missing_rank(monkeypatch):
++    monkeypatch.setattr(startup_rendezvous, "REPORT_INTERVAL_S", 0.02)
++    monkeypatch.setattr(startup_rendezvous, "HEARTBEAT_INTERVAL_S", 0.01)
++    store = _Store()
++    heartbeat = StartupHeartbeat(store, 1, lambda: "prepared 3/9 kernels")
++    heartbeat.phase = "preparing kernels"
++    heartbeat.start()
++    reports: list[str] = []
++    threading.Timer(
++        0.2, lambda: store.set("vllm/startup/arrived/warm-up/1", "1")
++    ).start()
++    rendezvous(store, 0, 2, "warm-up", 5, reports.append, poll_s=0.01)
++    heartbeat.stop()
++    assert any("rank 1 (preparing kernels, prepared 3/9 kernels)" in r for r in reports)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 9e5fe24af..2f320dfca 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -224,7 +224,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
+     VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
+-    VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS: int = 1_800_000
++    VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+@@ -1913,12 +1913,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         "b12x",
+         ["b12x", "tilelang"],
+     ),
+-    # How long a rank waits on the host for the others at a startup rendezvous
+-    # (before memory profiling, after the local JIT warm-up). Ranks finish
+-    # loading and compiling minutes apart on cold disks and caches; waiting on
+-    # the CPU spins no GPU, and the monitored barrier names a missing rank.
+-    "VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS": lambda: int(
+-        os.getenv("VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS", "1800000")
++    # A startup rendezvous waits for the other ranks as long as they are alive,
++    # however long they take to load and prepare kernels. A missing rank whose
++    # heartbeat (a daemon thread, every 2 s) has not changed for this long is dead
++    # or hung, and the rendezvous fails naming it.
++    "VLLM_STARTUP_HEARTBEAT_TIMEOUT_S": lambda: float(
++        os.getenv("VLLM_STARTUP_HEARTBEAT_TIMEOUT_S", "120")
+     ),
+     # Read DeepSeek V4.1 disk Engram rows while the target graph starts.
+     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index 84f713aa6..fc12272ff 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1077,6 +1077,12 @@ class JitWarmupRegistry:
+     def __len__(self) -> int:
+         return sum(len(registrations) for registrations in self._registrations.values())
+ 
++    def registrations(
++        self,
++    ) -> list[tuple[VllmJitKernel[Any], list[tuple[tuple[Any, ...], dict[str, Any]]]]]:
++        """Each registered kernel and its distinct registrations."""
++        return [(kernel, list(regs)) for kernel, regs in self._registrations.items()]
++
+     def warmup(self) -> None:
+         """Expand registrations and compile each wrapper/key pair once."""
+         from tqdm import tqdm
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+new file mode 100644
+index 000000000..12db8fa0c
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -0,0 +1,155 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Kernel preparation for DeepSeek V4.1's TileLang kernel family.
++
++Every TileLang kernel the deployment can launch is declared as a call, exactly as its
++call site makes it, by the module that owns it, while the model is built (``declare``).
++After loading, the worker compiles every declared call before any distributed work, in
++one thread pool (``prepare_declared``, through ``tilelang.prepare``), and then freezes
++TileLang's kernel cache. From then on a call that was not declared raises
++``KernelNotPreparedError`` on every rank alike, whatever each rank's disk cache holds,
++instead of compiling inside a distributed forward, where the ranks that already have the
++kernel would wait in a collective for the one that is compiling.
++
++A module declares a function and a callable that lists its calls. The callable runs when
++the worker prepares, after the weights are loaded, so a call may depend on what loading
++produced. The call site makes its call through the same key function, so the declared
++call and the launched call cannot drift apart.
++"""
++
++from __future__ import annotations
++
++import threading
++from collections.abc import Callable, Iterable
++from typing import Any
++
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry, VllmJitKernel
++
++# (positional arguments, keyword arguments), exactly as the call site passes them.
++Call = tuple[tuple[Any, ...], dict[str, Any]]
++
++
++def call(*args: Any, **kwargs: Any) -> Call:
++    """One declared call."""
++    return args, kwargs
++
++
++class _CallKey:
++    """A hashable call (TileLang argument values need not be hashable)."""
++
++    __slots__ = ("args", "kwargs", "_repr")
++
++    def __init__(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
++        self.args = tuple(args)
++        self.kwargs = dict(kwargs)
++        self._repr = repr((self.args, sorted(self.kwargs.items())))
++
++    def __hash__(self) -> int:
++        return hash(self._repr)
++
++    def __eq__(self, other: object) -> bool:
++        return isinstance(other, _CallKey) and self._repr == other._repr
++
++    def __repr__(self) -> str:
++        return self._repr
++
++
++class TileLangCalls(VllmJitKernel[_CallKey]):
++    """One ``@tilelang.jit`` function's declared calls in the runner's JIT registry."""
++
++    def __init__(self, function: Any) -> None:
++        super().__init__()
++        self.function = function
++        self.name = getattr(function, "__name__", None) or repr(function)
++
++    def get_warmup_keys(self, calls: Callable[[], Iterable[Call]]) -> list[_CallKey]:
++        return [_CallKey(args, kwargs) for args, kwargs in calls()]
++
++    def compile(self, compile_key: _CallKey) -> None:
++        self.compile_many([compile_key])
++
++    def compile_many(self, compile_keys: Iterable[_CallKey]) -> None:
++        import tilelang
++
++        tilelang.prepare(
++            [(self.function, key.args, key.kwargs) for key in compile_keys],
++            progress=PROGRESS.report,
++        )
++
++
++_adapters: dict[int, TileLangCalls] = {}
++_adapters_lock = threading.Lock()
++
++
++def declare(function: Any, calls: Callable[[], Iterable[Call]]) -> None:
++    """Declare the calls ``calls()`` lists for the ``@tilelang.jit`` ``function``.
++
++    ``calls`` runs when the worker prepares kernels, after loading. Must be called
++    while the model runner's JIT registry collects (model construction and loading).
++    """
++    with _adapters_lock:
++        adapter = _adapters.get(id(function))
++        if adapter is None:
++            adapter = _adapters[id(function)] = TileLangCalls(function)
++    JitWarmupRegistry.register(adapter, calls)
++
++
++class _Progress:
++    """Kernels prepared so far, for the startup rendezvous's progress reports."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self.done = 0
++        self.total = 0
++
++    def start(self, total: int) -> None:
++        with self._lock:
++            self.done, self.total = 0, total
++
++    def report(self, done: int, total: int) -> None:
++        with self._lock:
++            # tilelang.prepare counts the calls it compiles; keep the larger figures.
++            self.done = max(self.done, done)
++            self.total = max(self.total, total)
++
++    def snapshot(self) -> tuple[int, int]:
++        with self._lock:
++            return self.done, self.total
++
++
++PROGRESS = _Progress()
++
++
++def declared_calls(registry: JitWarmupRegistry) -> list[tuple[Any, tuple, dict]]:
++    """Every TileLang call declared in ``registry``, as ``(function, args, kwargs)``."""
++    calls: dict[tuple[int, _CallKey], tuple[Any, tuple, dict]] = {}
++    for kernel, registrations in registry.registrations():
++        if not isinstance(kernel, TileLangCalls):
++            continue
++        for args, kwargs in registrations:
++            for key in kernel.get_warmup_keys(*args, **kwargs):
++                calls.setdefault(
++                    (id(kernel), key), (kernel.function, key.args, key.kwargs)
++                )
++    return list(calls.values())
++
++
++def prepare_declared(registry: JitWarmupRegistry) -> int:
++    """Compile every TileLang call declared in ``registry`` in one thread pool.
++
++    Returns the number of distinct calls; kernels already compiled are not counted
++    again by the progress reports.
++    """
++    import tilelang
++
++    calls = declared_calls(registry)
++    PROGRESS.start(len(calls))
++    tilelang.prepare(calls, progress=PROGRESS.report)
++    return len(calls)
++
++
++def freeze(reason: str) -> None:
++    """Refuse every TileLang kernel that is not prepared, from now on."""
++    from tilelang.cache import freeze as freeze_cache
++
++    freeze_cache(reason)
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 6f2796846..f1f025041 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -278,6 +278,9 @@ class Worker(WorkerBase):
+         # the worker-local registry while publishing native resources.
+         self._b12x_session = None
+         self._b12x_stage: str | None = None
++        # This rank's startup heartbeat in the distributed store (see
++        # startup_rendezvous): runs from distributed init until warm-up is done.
++        self._startup_heartbeat = None
+         self._b12x_profile_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_cache = False
+@@ -498,6 +501,7 @@ class Worker(WorkerBase):
+                 self.local_rank,
+                 current_platform.dist_backend,
+             )
++            self._start_startup_heartbeat()
+ 
+             if self.use_v2_model_runner:
+                 logger.info_once("Using V2 Model Runner")
+@@ -660,7 +664,9 @@ class Worker(WorkerBase):
+ 
+     def _determine_available_memory(self) -> int:
+         maybe_apply_startup_plan(self)
+-        # Loading compiled each rank's kernels for as long as its cache needed.
++        # Every declared kernel compiles here, on this rank alone, for as long as
++        # its caches need; the ranks then meet on the host.
++        self._prepare_kernels()
+         self._startup_rendezvous("memory profiling")
+ 
+         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+@@ -1151,6 +1157,10 @@ class Worker(WorkerBase):
+ 
+             trigger_inductor_lazy_init(self.device)
+ 
++        if self._startup_heartbeat is not None:
++            self._startup_heartbeat.stop()
++            self._startup_heartbeat = None
++
+         # All warmup is done — start monitoring for unexpected JIT
+         # compilations that would cause latency spikes during inference.
+         from vllm.utils.jit_monitor import activate as activate_jit_monitor
+@@ -1385,24 +1395,81 @@ class Worker(WorkerBase):
+         failure = getattr(communicator, "roce_failure", None)
+         return None if failure is None else failure()
+ 
++    def _start_startup_heartbeat(self) -> None:
++        """Publish this rank's startup heartbeat (see ``startup_rendezvous``)."""
++        if get_world_group().world_size == 1:
++            return
++        from vllm.v1.worker.startup_rendezvous import StartupHeartbeat
++
++        store = torch.distributed.distributed_c10d._get_default_store()
++        self._startup_heartbeat = StartupHeartbeat(
++            store, get_world_group().rank, self._startup_progress
++        ).start()
++
++    def _startup_progress(self) -> str:
++        """What this rank's heartbeat reports besides its phase."""
++        if envs.VLLM_DS41_KERNEL_BACKEND != "tilelang":
++            return ""
++        from vllm.models.deepseek_v4_1.tilelang.prepare import PROGRESS
++
++        done, total = PROGRESS.snapshot()
++        return f"prepared {done}/{total} kernels" if total else ""
++
++    def _set_startup_phase(self, phase: str) -> None:
++        if self._startup_heartbeat is not None:
++            self._startup_heartbeat.phase = phase
++
++    def _prepare_kernels(self) -> None:
++        """Compile every declared JIT kernel before any distributed work.
++
++        DeepSeek V4.1's TileLang family declares each call its modules can make
++        while the model is built; the runner's JIT registry also holds the Triton
++        kernels its samplers registered. They compile here on this rank alone,
++        TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
++        so profiling, warm-up, capture and serving compile nothing: a kernel that
++        was not declared fails by name on every rank alike.
++        """
++        registry = getattr(self.model_runner, "jit_warmup_registry", None)
++        if registry is None:
++            return
++        self._set_startup_phase("preparing kernels")
++        started = time.monotonic()
++        tilelang_calls = 0
++        if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++            from vllm.models.deepseek_v4_1.tilelang import prepare
++
++            tilelang_calls = prepare.prepare_declared(registry)
++        registry.warmup()
++        if tilelang_calls:
++            prepare.freeze("every declared kernel was prepared before memory profiling")
++        logger.info(
++            "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
++            tilelang_calls,
++            time.monotonic() - started,
++        )
++
+     def _startup_rendezvous(self, phase: str) -> None:
+         """Wait on the host until every rank reaches ``phase``.
+ 
+-        On cold disks and JIT caches ranks finish loading and compiling minutes
+-        apart. Without this, the first rank in waits for the others inside the
+-        phase's first collective, spinning on the GPU, until its timeout stops
+-        it. On the host the wait costs nothing and names a missing rank.
++        Ranks finish loading and preparing kernels at their own pace. The wait
++        lasts while every missing rank is alive, however long it takes, and fails
++        naming a rank whose heartbeat stopped (see ``startup_rendezvous``).
+         """
+         group = get_world_group()
+         if group.world_size == 1:
+             return
+-        started = time.monotonic()
+-        torch.distributed.monitored_barrier(
+-            group=group.cpu_group,
+-            timeout=timedelta(milliseconds=envs.VLLM_STARTUP_RENDEZVOUS_TIMEOUT_MS),
+-            wait_all_ranks=True,
++        from vllm.v1.worker.startup_rendezvous import rendezvous
++
++        self._set_startup_phase(f"waiting before {phase}")
++        waited = rendezvous(
++            torch.distributed.distributed_c10d._get_default_store(),
++            group.rank,
++            group.world_size,
++            phase,
++            envs.VLLM_STARTUP_HEARTBEAT_TIMEOUT_S,
++            logger.info,
+         )
+-        waited = time.monotonic() - started
++        self._set_startup_phase(phase)
+         if waited >= 1.0:
+             logger.info("Waited %.1f s for every rank before %s.", waited, phase)
+ 
+diff --git a/vllm/v1/worker/startup_rendezvous.py b/vllm/v1/worker/startup_rendezvous.py
+new file mode 100644
+index 000000000..eb8326c55
+--- /dev/null
++++ b/vllm/v1/worker/startup_rendezvous.py
+@@ -0,0 +1,122 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A startup rendezvous on the host that waits on liveness, not on a deadline.
++
++Ranks finish loading and preparing kernels at their own pace: minutes apart when one
++rank's caches are cold. Waiting for the others on the host costs nothing, while waiting
++inside a phase's first GPU collective would stop the GPU at the collective's timeout.
++
++Each rank publishes a heartbeat in the distributed store from a daemon thread: a
++counter, its startup phase and its progress (kernels prepared so far). A rank at a
++rendezvous waits as long as every missing rank's heartbeat keeps changing, reports what
++the missing ranks are doing, and fails, naming the rank, only when a missing rank's
++heartbeat stops changing for ``VLLM_STARTUP_HEARTBEAT_TIMEOUT_S`` (its process died or
++hung). Staleness is measured on the waiting rank's own clock, so nodes need not agree
++on the time. How long a rank takes to prepare is never bounded.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from collections.abc import Callable
++
++HEARTBEAT_INTERVAL_S = 2.0
++REPORT_INTERVAL_S = 30.0
++
++
++def _heartbeat_key(rank: int) -> str:
++    return f"vllm/startup/heartbeat/{rank}"
++
++
++def _arrival_key(phase: str, rank: int) -> str:
++    return f"vllm/startup/arrived/{phase}/{rank}"
++
++
++class StartupHeartbeat:
++    """This rank's heartbeat: a counter, its phase and its progress."""
++
++    def __init__(
++        self, store, rank: int, progress: Callable[[], str] = lambda: ""
++    ) -> None:
++        self.store = store
++        self.rank = rank
++        self.progress = progress
++        self.phase = "starting"
++        self._count = 0
++        self._stop = threading.Event()
++        self._thread = threading.Thread(
++            target=self._run, name="vllm-startup-heartbeat", daemon=True
++        )
++
++    def start(self) -> StartupHeartbeat:
++        self._beat()
++        self._thread.start()
++        return self
++
++    def stop(self) -> None:
++        self._stop.set()
++
++    def _beat(self) -> None:
++        self._count += 1
++        detail = self.progress()
++        self.store.set(
++            _heartbeat_key(self.rank),
++            f"{self._count}|{self.phase}" + (f"|{detail}" if detail else ""),
++        )
++
++    def _run(self) -> None:
++        while not self._stop.wait(HEARTBEAT_INTERVAL_S):
++            try:
++                self._beat()
++            except Exception:  # the store is gone: the process is shutting down
++                return
++
++
++def _describe(value: str) -> str:
++    parts = value.split("|")
++    return ", ".join(parts[1:]) if len(parts) > 1 else "no heartbeat yet"
++
++
++def rendezvous(
++    store,
++    rank: int,
++    world_size: int,
++    phase: str,
++    heartbeat_timeout_s: float,
++    report: Callable[[str], None],
++    poll_s: float = 0.25,
++) -> float:
++    """Wait until every rank reaches ``phase``; return the seconds waited.
++
++    Raises RuntimeError naming a missing rank whose heartbeat stopped changing.
++    """
++    store.set(_arrival_key(phase, rank), "1")
++    started = last_report = time.monotonic()
++    seen: dict[int, tuple[str, float]] = {}
++    while True:
++        missing = [
++            r for r in range(world_size) if not store.check([_arrival_key(phase, r)])
++        ]
++        if not missing:
++            return time.monotonic() - started
++        now = time.monotonic()
++        for r in missing:
++            key = _heartbeat_key(r)
++            value = store.get(key).decode() if store.check([key]) else ""
++            previous = seen.get(r)
++            if previous is None or previous[0] != value:
++                seen[r] = (value, now)
++            elif now - previous[1] > heartbeat_timeout_s:
++                raise RuntimeError(
++                    f"rank {r} stopped responding before {phase}: its heartbeat "
++                    f"has not changed for {now - previous[1]:.0f} s "
++                    f"(last: {_describe(value)})"
++                )
++        if now - last_report >= REPORT_INTERVAL_S:
++            report(
++                f"waited {now - started:.0f} s before {phase} for "
++                + "; ".join(f"rank {r} ({_describe(seen[r][0])})" for r in missing)
++            )
++            last_report = now
++        time.sleep(poll_s)
+-- 
+2.54.0 (Apple Git-157)
+

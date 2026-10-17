@@ -1,0 +1,36 @@
+From 07b4f560af6105b1851035fc23509584ee717a5d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:58:58 +0200
+Subject: [PATCH 160/169] Kernel preparation: the JIT monitor watches from the
+ freeze on
+
+With DeepSeek V4.1's TileLang kernels prepared and the cache frozen, nothing
+should compile in profiling, warm-up, capture or serving; the JIT monitor now
+activates there (its configured mode) instead of after warm-up, so a Triton or
+other compile in those phases is reported or refused.
+---
+ vllm/v1/worker/gpu_worker.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2681e9a8f..73c539774 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1450,6 +1450,14 @@ class Worker(WorkerBase):
+         if tilelang_calls:
+             prepare.freeze("every declared kernel was prepared before memory profiling")
+             prepare.bind_declared(registry)
++            # Nothing compiles from here on: the JIT monitor reports (or, in error
++            # mode, refuses) any other compile, Triton's included, from profiling on.
++            from vllm.utils.jit_monitor import activate as activate_jit_monitor
++
++            activate_jit_monitor(
++                mode=self.observability_config.jit_monitor_mode,
++                verbose=self.observability_config.jit_monitor_verbose,
++            )
+         logger.info(
+             "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
+             tilelang_calls,
+-- 
+2.54.0 (Apple Git-157)
+

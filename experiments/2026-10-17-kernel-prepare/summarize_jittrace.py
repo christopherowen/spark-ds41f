@@ -12,7 +12,9 @@ import json
 import sys
 from pathlib import Path
 
-DISTRIBUTED = ("determine_available_memory", "after_determine_available_memory",
+# Compiles in determine_available_memory before _prepare_kernels (r6u) are counted too.
+DISTRIBUTED = ("determine_available_memory", "after_prepare_kernels",
+               "after_determine_available_memory",
                "initialize_from_config", "after_initialize_from_config",
                "compile_or_warm_up_model", "serving")
 

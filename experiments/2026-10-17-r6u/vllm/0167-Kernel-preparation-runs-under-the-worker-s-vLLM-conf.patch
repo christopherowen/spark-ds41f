@@ -1,0 +1,54 @@
+From bff0458dc7c266d99ed0fe96ed481c2f3dda719c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:22:16 +0200
+Subject: [PATCH 167/169] Kernel preparation runs under the worker's vLLM
+ config (declarations read scheduler sizing)
+
+---
+ vllm/v1/worker/gpu_worker.py | 27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 73c539774..2e814b2cb 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1435,21 +1435,24 @@ class Worker(WorkerBase):
+         self._set_startup_phase("preparing kernels")
+         started = time.monotonic()
+         tilelang_calls = 0
+-        if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+-            from vllm.models.deepseek_v4_1.tilelang import prepare
++        # Declarations read the scheduler sizing and model configuration.
++        with set_current_vllm_config(self.vllm_config):
++            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++                from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+-            speculator = getattr(self.model_runner, "speculator", None)
+-            with registry.activate():
+-                prepare.declare_modules(
+-                    self.model_runner.model, getattr(speculator, "model", None)
+-                )
+-            tilelang_calls = prepare.prepare_declared(registry)
+-            with torch.inference_mode():
+-                prepare.warm_declared(registry)
+-        registry.warmup()
++                speculator = getattr(self.model_runner, "speculator", None)
++                with registry.activate():
++                    prepare.declare_modules(
++                        self.model_runner.model, getattr(speculator, "model", None)
++                    )
++                tilelang_calls = prepare.prepare_declared(registry)
++                with torch.inference_mode():
++                    prepare.warm_declared(registry)
++            registry.warmup()
+         if tilelang_calls:
+             prepare.freeze("every declared kernel was prepared before memory profiling")
+-            prepare.bind_declared(registry)
++            with set_current_vllm_config(self.vllm_config):
++                prepare.bind_declared(registry)
+             # Nothing compiles from here on: the JIT monitor reports (or, in error
+             # mode, refuses) any other compile, Triton's included, from profiling on.
+             from vllm.utils.jit_monitor import activate as activate_jit_monitor
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,70 @@
+From e3468691c9ea64d03d5472e1236f62d505ac7d0b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:13:34 +0200
+Subject: [PATCH 161/169] TileLang linear tests: declare the layer's kernels
+ (standalone: prepared and bound at once)
+
+---
+ .../quantization/test_deepseek_v41_tilelang_linear.py    | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index fd5f6f3ac..12b5367b1 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -202,6 +202,7 @@ def test_split_linear(parts, out_dtype, k=5120):
+     layer.out_dtype = out_dtype
+     method = TileLangSplitLinearMethod(parts)
+     method.process_weights_after_loading(layer)
++    method.declare_layer_kernels(layer)  # standalone: prepares and binds now
+     x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+     scratch = torch.empty(
+         method.get_workspace_size(layer, max(ROWS)), dtype=torch.uint8, device=DEVICE
+@@ -247,8 +248,10 @@ def test_scaled_linear(n=32, k=5120, scale=1 / 64):
+     scaled.weight = nn.Parameter(weight.clone(), requires_grad=False)
+     plain_method = TileLangLinearMethod()
+     plain_method.process_weights_after_loading(plain)
++    plain_method.declare_layer_kernels(plain)
+     scaled_method = TileLangScaledLinearMethod(scale)
+     scaled_method.process_weights_after_loading(scaled)
++    scaled_method.declare_layer_kernels(scaled)
+     x = torch.randn((max(ROWS), k), generator=gen, device=DEVICE).bfloat16()
+     scratch = torch.empty(8 << 20, dtype=torch.uint8, device=DEVICE)
+     with use_preallocated_workspace(scratch):
+@@ -261,7 +264,7 @@ def test_scaled_linear(n=32, k=5120, scale=1 / 64):
+ 
+ # The DSpark drafter's context KV: rows 1280: of the fused Q-A/KV weight, a
+ # narrow projection (512 x 5120) that splits K for decode rows.
+-def test_block32_rows(n=1792, k=5120, start=1280):
++def test_block32_rows(default_vllm_config, n=1792, k=5120, start=1280):
+     from torch import nn
+ 
+     from vllm.models.deepseek_v4_1.tilelang.gemm import SPLIT_DECODE_ROWS, SPLIT_FP8
+@@ -273,6 +276,7 @@ def test_block32_rows(n=1792, k=5120, start=1280):
+     layer = nn.Module()
+     layer.weight, layer.weight_scale_inv = weight, exps
+     rows = TileLangBlock32Rows(layer, start)
++    rows.declare_kernels()  # standalone: prepares and binds now
+     counts = (1, 7, 16, 17, 32, 33, 64, 65, 96, SPLIT_DECODE_ROWS, 200, 300)
+     x = torch.randn((max(counts), k), generator=_gen(7), device=DEVICE).bfloat16()
+     _, _, x_values = _mxfp8(x)
+@@ -319,7 +323,7 @@ def test_bf16_gemm_nonfinite(n, k, rows):
+     assert_other_rows_equal(out, clean, poisoned)
+ 
+ 
+-def test_block32_rows_nan_row(n=1792, k=5120, start=1280):
++def test_block32_rows_nan_row(default_vllm_config, n=1792, k=5120, start=1280):
+     """A NaN in one row's activations survives the MXFP8 cast and reaches every output
+     of that row, at split-K decode sizes and in the prefill GEMM, and no other row
+     moves."""
+@@ -332,6 +336,7 @@ def test_block32_rows_nan_row(n=1792, k=5120, start=1280):
+     layer = nn.Module()
+     layer.weight, layer.weight_scale_inv = weight, exps
+     rows = TileLangBlock32Rows(layer, start)
++    rows.declare_kernels()
+     scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
+     for count in (7, 300):
+         x = torch.randn((count, k), generator=_gen(count), device=DEVICE).bfloat16()
+-- 
+2.54.0 (Apple Git-157)
+

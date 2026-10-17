@@ -1,0 +1,577 @@
+From 405f3fde08395aca96a47fc17d39b3fde77923c4 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:08:30 +0200
+Subject: [PATCH 162/169] Kernel preparation: WO, vocabulary heads and DSpark
+ context KV declare their TileLang kernels
+
+TileLangWOProjection lists WO-A's W8A16 kernels and WO-B's block-32 GEMMs as
+calls and declares them from declare_kernels(), which its attention layer
+calls; construction keeps only WO-B's scale words. WO-B takes WO-A's MXFP8
+output, so its declaration (_declare_block32 with cast=False) warms no
+per-token cast.
+
+The packed LM head's method declares its projection from
+declare_layer_kernels once the head is packed, since the kernels key on the
+exponent base packing found; the weight hook packs and records the logits
+dtype. A logits processor records the BF16 heads registered with it (the
+DSpark Markov projection) and declares their kernels from declare_kernels().
+The DSpark model declares its context KV projections.
+---
+ .../test_deepseek_v41_tilelang_wo.py          |  46 ++++++--
+ .../model_executor/layers/logits_processor.py |  24 +++-
+ .../layers/quantization/online/packed_bf16.py |  18 ++-
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  16 ++-
+ vllm/models/deepseek_v4_1/tilelang/linear.py  |   9 +-
+ vllm/models/deepseek_v4_1/tilelang/vocab.py   |  64 ++++++++---
+ vllm/models/deepseek_v4_1/tilelang/wo.py      | 103 +++++++++++++-----
+ 7 files changed, 211 insertions(+), 69 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index 8f06c99f5..0bbac4925 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -23,7 +23,8 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+ )
+ from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
+     _block32_linear,
+-    _prepare_block32,
++    _block32_scale_words,
++    _declare_block32,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.wo import TileLangWOProjection  # noqa: E402
+ from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
+@@ -73,6 +74,7 @@ def test_wo_projection():
+     wo_a = _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1)
+     wo_b = _block32(HIDDEN, GROUPS * RANK, 2)
+     wo = TileLangWOProjection(wo_a, wo_b, groups=GROUPS)
++    wo.declare_kernels()  # standalone: prepared and bound now
+     rows = max(ROWS)
+     gen = _gen(3)
+     o = torch.randn((rows, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+@@ -124,6 +126,7 @@ def test_wo_projection_nan_row(count):
+         _block32(HIDDEN, GROUPS * RANK, 2),
+         groups=GROUPS,
+     )
++    wo.declare_kernels()
+     gen = _gen(13)
+     o = torch.randn((count, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+     positions = torch.randint(0, 4096, (count,), generator=gen, device=DEVICE)
+@@ -144,11 +147,12 @@ def test_wo_projection_nan_row(count):
+ 
+ 
+ @pytest.mark.parametrize("count", ROWS)
+-def test_grouped_gemm_equals_groups(count):
++def test_grouped_gemm_equals_groups(count, default_vllm_config):
+     """One grouped launch gives each group's ordinary GEMM bit for bit."""
+     width = HEADS // GROUPS * HEAD_DIM
+     grouped = _block32(GROUPS * RANK, width, 4)
+-    _prepare_block32(grouped, GROUPS)
++    _block32_scale_words(grouped)
++    _declare_block32(grouped, GROUPS)
+     x = torch.randn(
+         (count, GROUPS * width), generator=_gen(5), device=DEVICE
+     ).bfloat16()
+@@ -162,7 +166,8 @@ def test_grouped_gemm_equals_groups(count):
+             part.weight_scale_inv = grouped.weight_scale_inv[
+                 g * RANK // 32 : (g + 1) * RANK // 32
+             ]
+-            _prepare_block32(part)
++            _block32_scale_words(part)
++            _declare_block32(part)
+             single = torch.empty((count, RANK), dtype=torch.bfloat16, device=DEVICE)
+             _block32_linear(
+                 x[:, g * width : (g + 1) * width].contiguous(),
+@@ -189,14 +194,26 @@ def _wo_a_bf16(layer, x):
+     e = layer.weight_scale_inv.view(torch.uint8)
+     out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
+     if tile["split"]:
+-        partials = torch.empty((_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE)
++        partials = torch.empty(
++            (_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE
++        )
+         gemm.fp8w_bf16_gemm_partials(
+-            n // GROUPS, k, GROUPS, _WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
++            n // GROUPS,
++            k,
++            GROUPS,
++            _WO_A_SHARDS,
++            block_M=tile["block_M"],
++            **_WO_A_COMMON,
+         )(x, layer.weight, e, partials)
+         gemm.splitk_reduce(n, _WO_A_SHARDS)(partials, out)
+     else:
+         gemm.fp8w_bf16_gemm(
+-            n // GROUPS, k, GROUPS, shards=_WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
++            n // GROUPS,
++            k,
++            GROUPS,
++            shards=_WO_A_SHARDS,
++            block_M=tile["block_M"],
++            **_WO_A_COMMON,
+         )(x, layer.weight, e, out)
+     return out
+ 
+@@ -243,6 +260,7 @@ def test_wo_a_casts_as_per_token_cast():
+     width = HEADS // GROUPS * HEAD_DIM
+     layer = _block32(GROUPS * RANK, width, 9)
+     wo_a = _GroupedBF16(layer, GROUPS)
++    wo_a.declare_kernels()
+     x = torch.randn((300, GROUPS * width), generator=_gen(10), device=DEVICE).bfloat16()
+     x[::5] *= 1e-7  # some rows' outputs fall below the amax floor
+     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200, 300):
+@@ -250,10 +268,18 @@ def test_wo_a_casts_as_per_token_cast():
+         ref_q, ref_sf = tile_kernels.quant.per_token_cast(
+             a, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+         )
+-        xq = torch.empty((rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE)
++        xq = torch.empty(
++            (rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE
++        )
+         sf = torch.empty((rows, GROUPS * RANK // 32), dtype=torch.uint8, device=DEVICE)
+         specs = wo_a.partial_specs(rows)
+-        partials = torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE) if specs else None
++        partials = (
++            torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE)
++            if specs
++            else None
++        )
+         wo_a(x[:rows], xq, sf, partials)
+         assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8)), rows
+-        assert torch.equal(sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]), rows
++        assert torch.equal(
++            sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]
++        ), rows
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 30634cd78..fffff730f 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -128,6 +128,8 @@ class LogitsProcessor(PluggableLayer):
+         kernel_config = get_current_vllm_config().kernel_config
+         # DS4.1's TileLang family projects its vocabulary heads with TileLang.
+         self.use_tilelang_vocab_projection = kernel_config.linear_backend == "tilelang"
++        # BF16 heads registered here, whose TileLang kernels this processor declares.
++        self._tilelang_vocab_heads: list[VocabParallelEmbedding] = []
+         self._b12x_vocab_projection = get_b12x_bf16_vocab_projection()
+         self._b12x_vocab_plans: dict[int, dict[int, object]] = {}
+         self._b12x_vocab_heads: dict[int, VocabParallelEmbedding] = {}
+@@ -151,18 +153,19 @@ class LogitsProcessor(PluggableLayer):
+     ) -> None:
+         """Register the loaded LM head; preparation happens in worker lifecycle.
+ 
+-        With the TileLang backend, a BF16 head's kernels are compiled here; a
+-        packed head's are compiled when it is packed.
++        With the TileLang backend, the first processor to register a BF16 head
++        fixes its logits dtype here and declares its kernels when the worker
++        prepares kernels (``declare_kernels``); a packed head's method declares
++        the packed head's kernels.
+         """
+         if self.use_tilelang_vocab_projection:
+             if (
+                 not _is_packed_head(lm_head)
+-                and not hasattr(lm_head, "tilelang_vocab")
++                and not hasattr(lm_head, "tilelang_vocab_dtype")
+                 and _is_plain_bf16_head(lm_head)
+             ):
+-                from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
+-
+-                prepare_bf16_head(lm_head, self.head_dtype or lm_head.weight.dtype)
++                lm_head.tilelang_vocab_dtype = self.head_dtype or lm_head.weight.dtype
++                self._tilelang_vocab_heads.append(lm_head)
+             return
+         if _is_packed_head(lm_head):
+             if (
+@@ -187,6 +190,15 @@ class LogitsProcessor(PluggableLayer):
+         object.__setattr__(lm_head, "_b12x_vocab_projection_owner", self)
+         set_b12x_preparation_provider(self, self)
+ 
++    def declare_kernels(self) -> None:
++        """Declare the TileLang projections of the BF16 heads registered here."""
++        if not self._tilelang_vocab_heads:
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
++
++        for head in self._tilelang_vocab_heads:
++            prepare_bf16_head(head, head.tilelang_vocab_dtype)
++
+     def _b12x_vocab_name(self, head: VocabParallelEmbedding, tokens: int) -> str:
+         return f"logits.vocab.{id(self):x}.{id(head):x}.m{tokens}"
+ 
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index 73433aecb..7157e4220 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -92,13 +92,12 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         layer.packed_bf16_exceptions = packed.exceptions
+         layer._already_called_process_weights_after_loading = True
+         if self.tilelang:
+-            from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
+-
+             # The model's head dtype: FP32 logits as DeepSeek's reference head, or
+-            # the model dtype.
++            # the model dtype. The projection is declared with it when the worker
++            # prepares kernels (declare_layer_kernels).
+             model_config = get_current_vllm_config().model_config
+-            prepare_packed_head(
+-                layer, model_config.head_dtype if model_config else torch.bfloat16
++            layer.tilelang_vocab_dtype = (
++                model_config.head_dtype if model_config else torch.bfloat16
+             )
+         logger.info_once(
+             "Packed the BF16 LM head exactly into 12 bits per weight: "
+@@ -108,6 +107,15 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+             packed.exceptions,
+         )
+ 
++    def declare_layer_kernels(self, layer: torch.nn.Module) -> None:
++        """With the TileLang backend, declare the packed head's projection: once the
++        head is packed, since its kernels depend on the exponent base packing found."""
++        if not self.tilelang or not hasattr(layer, "packed_bf16_exponent_base"):
++            return
++        from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
++
++        prepare_packed_head(layer, layer.tilelang_vocab_dtype)
++
+     @staticmethod
+     def packed_weight(layer: torch.nn.Module):
+         """The layer's current packed tensors (after any relocation)."""
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 1dab57cc7..8aa71cc12 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -33,7 +33,6 @@ from vllm.model_executor.layers.fused_moe import (
+     fused_moe_make_expert_params_mapping,
+ )
+ from vllm.model_executor.layers.linear import ReplicatedLinear
+-from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+@@ -48,6 +47,7 @@ from vllm.models.common.ops.sequence_parallel import (
+     sp_padding_mask,
+     sp_shard,
+ )
++from vllm.models.deepseek_v4_1.common.engram import _PaddedColumnParallelLinear
+ from vllm.utils.b12x import (
+     B12xPreparationUnit,
+     B12xWorkload,
+@@ -85,6 +85,7 @@ def _vocab_parallel_greedy() -> bool:
+         return False
+     return get_tensor_model_parallel_world_size() > 1
+ 
++
+ # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
+ # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
+ _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+@@ -366,7 +367,9 @@ class DSparkDeepseekV4Model(nn.Module):
+             os.environ.get("SPARK3_DSPARK_MAIN_PROJ_TP", "0") == "1"
+             and get_tensor_model_parallel_world_size() > 1
+         )
+-        main_proj_cls = _PaddedColumnParallelLinear if main_proj_tp else ReplicatedLinear
++        main_proj_cls = (
++            _PaddedColumnParallelLinear if main_proj_tp else ReplicatedLinear
++        )
+         self.main_proj = main_proj_cls(
+             config.hidden_size * len(self.target_layer_ids),
+             config.hidden_size,
+@@ -423,6 +426,15 @@ class DSparkDeepseekV4Model(nn.Module):
+                 prefix=maybe_prefix(prefix, "confidence_head"),
+             )
+ 
++    def declare_kernels(self) -> None:
++        """Declare the context KV projections' TileLang kernels (built after loading).
++
++        The draft layers' modules declare their own kernels, WO included, and the
++        Markov head's are declared by the logits processor it is registered with.
++        """
++        for projection in self._context_kv_projections:
++            projection.declare_kernels()
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         assert self.embed_tokens is not None
+         return self.embed_tokens(input_ids)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 26ebd3a7e..77f601795 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -344,9 +344,10 @@ def _warm_casts(k: int) -> None:
+         _warm_cast(k, CAST_SMALL_BATCH_ROWS + 1)
+ 
+ 
+-def _declare_block32(layer, groups: int = 1) -> None:
++def _declare_block32(layer, groups: int = 1, cast: bool = True) -> None:
+     """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
+-    register it for the custom op, and declare its kernels."""
++    register it for the custom op, and declare its kernels. ``cast=False``: the
++    caller hands the GEMMs MXFP8 activations (WO-B), so no per-token cast launches."""
+     n, k = layer.weight.shape
+     kernels = _block32_kernels(n, k, groups)
+     layer.tilelang_groups = groups
+@@ -364,7 +365,9 @@ def _declare_block32(layer, groups: int = 1) -> None:
+             setattr(layer, f"tilelang_{name}", kernel)
+ 
+     prepare.declare(
+-        lambda: _calls(kernels), bind=bind, warm=lambda: _warm_casts(k * groups)
++        lambda: _calls(kernels),
++        bind=bind,
++        warm=(lambda: _warm_casts(k * groups)) if cast else None,
+     )
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index 7f5cc8403..4ef095614 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -15,8 +15,8 @@ list order. Neither depends on the token count or the tile, so a token's
+ logits are the same bits in any batch.
+ 
+ Plain BF16 heads (DS4.1's 256-wide DSpark Markov projection) run TileLang's
+-BF16 GEMM with the same token tiles. Every head's kernels are compiled when
+-it is prepared, one per token tile.
++BF16 GEMM with the same token tiles. Every head declares one kernel per token
++tile; its owner declares it when the worker prepares kernels, after loading.
+ """
+ 
+ import tilelang
+@@ -24,6 +24,7 @@ import tilelang.language as T
+ import torch
+ from torch import nn
+ 
++from . import prepare
+ from .gemm import bf16_gemm
+ 
+ GROUP = 128  # columns per code group
+@@ -206,15 +207,13 @@ def packed_vocab_projection(
+ _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
+ 
+ 
+-def prepare_packed_head(
+-    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+-) -> None:
+-    """Compile a packed head's projection for every token tile, writing ``out_dtype``
+-    logits (BF16, or FP32 as DeepSeek's reference head computes them)."""
++def _packed_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
++    """A packed head's projection for every token tile, as calls (its exponent base
++    comes from the packed weights)."""
+     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
+-    layer.tilelang_vocab_dtype = out_dtype
+-    layer.tilelang_vocab = {
+-        block_M: packed_vocab_projection(
++    return {
++        block_M: prepare.call(
++            packed_vocab_projection,
+             n,
+             k,
+             layer.packed_bf16_exponent_base,
+@@ -226,21 +225,52 @@ def prepare_packed_head(
+     }
+ 
+ 
+-def prepare_bf16_head(
+-    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
+-) -> None:
+-    """Compile a BF16 head's projection for every token tile, writing ``out_dtype``."""
++def _bf16_head_kernels(layer: nn.Module, out_dtype: torch.dtype) -> dict:
++    """A BF16 head's projection for every token tile, as calls."""
+     n, k = map(int, layer.weight.shape)
+     kernels = {}
+     for block_M in ROW_TILES:
+         config = dict(BF16_HEAD_CONFIGS[block_M])
+         if k % config["block_K"]:
+             config["block_K"] = 64
+-        kernels[block_M] = bf16_gemm(
+-            n, k, block_M=block_M, num_stages=2, out_dtype=_OUT[out_dtype], **config
++        kernels[block_M] = prepare.call(
++            bf16_gemm,
++            n,
++            k,
++            block_M=block_M,
++            num_stages=2,
++            out_dtype=_OUT[out_dtype],
++            **config,
+         )
++    return kernels
++
++
++def _declare_head(layer: nn.Module, kernels: dict, out_dtype: torch.dtype) -> None:
+     layer.tilelang_vocab_dtype = out_dtype
+-    layer.tilelang_vocab = kernels
++
++    def bind() -> None:
++        layer.tilelang_vocab = {
++            block_M: function(*args, **kwargs)
++            for block_M, (function, args, kwargs) in kernels.items()
++        }
++
++    prepare.declare(lambda: list(kernels.values()), bind=bind)
++
++
++def prepare_packed_head(
++    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
++) -> None:
++    """Declare a packed head's projection for every token tile, writing ``out_dtype``
++    logits (BF16, or FP32 as DeepSeek's reference head computes them). The head must
++    be packed: the kernels depend on its exponent base."""
++    _declare_head(layer, _packed_head_kernels(layer, out_dtype), out_dtype)
++
++
++def prepare_bf16_head(
++    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
++) -> None:
++    """Declare a BF16 head's projection for every token tile, writing ``out_dtype``."""
++    _declare_head(layer, _bf16_head_kernels(layer, out_dtype), out_dtype)
+ 
+ 
+ def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 7a5f1c8bf..1d4a92bdf 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -23,8 +23,22 @@ from torch import nn
+ from vllm.v1.worker.workspace import current_preallocated_workspace
+ 
+ from .. import l2_prefetch
+-from .gemm import fp8w_bf16_gemm_cast, fp8w_bf16_gemm_partials, splitk_reduce_cast
+-from .linear import _activation_specs, _block32_gemm, _prepare_block32, _scratch
++from . import prepare
++from .gemm import (
++    SPLIT_FP8,
++    fp8w_bf16_gemm_cast,
++    fp8w_bf16_gemm_partials,
++    splitk_reduce_cast,
++)
++from .linear import (
++    _activation_specs,
++    _block32_gemm,
++    _block32_scale_words,
++    _calls,
++    _declare_block32,
++    _launch,
++    _scratch,
++)
+ from .rope import rope_
+ 
+ # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
+@@ -53,7 +67,13 @@ class _Weight:
+     def __init__(self, layer: nn.Module, groups: int):
+         self.weight = layer.weight.detach()
+         self.weight_scale_inv = layer.weight_scale_inv.detach()
+-        _prepare_block32(self, groups)
++        self.groups = groups
++        _block32_scale_words(self)
++
++    def declare_kernels(self) -> None:
++        """Declare the GEMMs; the caller hands them MXFP8 activations, so there is
++        no per-token cast to prepare."""
++        _declare_block32(self, self.groups, cast=False)
+         # Verification steps stay on decode tiles to 128 rows: one 96-row tile to 96
+         # (WIDE_DECODE), two of 64 rows past it.
+         self.tilelang_decode_rows = 128
+@@ -66,29 +86,49 @@ class _GroupedBF16:
+     def __init__(self, layer: nn.Module, groups: int):
+         self.weight = layer.weight.detach()
+         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
++        self.columns = self.weight.shape[0]
++        self.groups = groups
++
++    def _kernels(self) -> dict:
++        """Every kernel of WO-A, as calls: one per row bucket, and the split path's
++        reduce."""
+         n, k = self.weight.shape
+-        self.columns = n
+-        self.kernels = {
+-            bucket: fp8w_bf16_gemm_partials(
+-                n // groups,
+-                k,
+-                groups,
+-                _WO_A_SHARDS,
+-                block_M=tile["block_M"],
+-                **_WO_A_COMMON,
+-            )
+-            if tile["split"]
+-            else fp8w_bf16_gemm_cast(
+-                n // groups,
+-                k,
+-                groups,
+-                shards=_WO_A_SHARDS,
+-                block_M=tile["block_M"],
+-                **_WO_A_COMMON,
+-            )
+-            for bucket, tile in _WO_A_TILES.items()
++        groups = self.groups
++        return {
++            "kernels": {
++                bucket: prepare.call(
++                    fp8w_bf16_gemm_partials,
++                    n // groups,
++                    k,
++                    groups,
++                    _WO_A_SHARDS,
++                    block_M=tile["block_M"],
++                    **_WO_A_COMMON,
++                )
++                if tile["split"]
++                else prepare.call(
++                    fp8w_bf16_gemm_cast,
++                    n // groups,
++                    k,
++                    groups,
++                    shards=_WO_A_SHARDS,
++                    block_M=tile["block_M"],
++                    **_WO_A_COMMON,
++                )
++                for bucket, tile in _WO_A_TILES.items()
++            },
++            "reduce": prepare.call(splitk_reduce_cast, n, _WO_A_SHARDS),
+         }
+-        self.reduce = splitk_reduce_cast(n, _WO_A_SHARDS)
++
++    def declare_kernels(self) -> None:
++        """Declare WO-A's kernels, bound as ``kernels`` and ``reduce``."""
++        kernels = self._kernels()
++
++        def bind() -> None:
++            for name, kernel in _launch(kernels).items():
++                setattr(self, name, kernel)
++
++        prepare.declare(lambda: _calls(kernels), bind=bind)
+ 
+     @staticmethod
+     def bucket(rows: int):
+@@ -112,13 +152,21 @@ class _GroupedBF16:
+ 
+ 
+ class TileLangWOProjection:
++    """Inverse RoPE, WO-A and WO-B of one attention layer (built after loading; its
++    layer declares the kernels with ``declare_kernels``)."""
++
+     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
+         self.a = _GroupedBF16(wo_a, groups)
+         self.b = _Weight(wo_b, 1)
+-        if self.b.tilelang_shards > 1:
++        if SPLIT_FP8.get(tuple(self.b.weight.shape)):
+             raise ValueError("WO-B takes WO-A's MXFP8 output: no split-K path")
+         self.hidden = wo_b.weight.shape[0]
+ 
++    def declare_kernels(self) -> None:
++        """Declare WO-A's and WO-B's kernels (the inverse RoPE is the layer's)."""
++        self.a.declare_kernels()
++        self.b.declare_kernels()
++
+     def l2_segments(self) -> list:
+         """The bytes both GEMMs read, WO-A first: each weight and its scale words."""
+         return l2_prefetch.linear_segments(
+@@ -145,7 +193,10 @@ class TileLangWOProjection:
+         # input in whole decode tiles.
+         partial_specs = self.a.partial_specs(rows)
+         views = _scratch(
+-            (*partial_specs, *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows)),
++            (
++                *partial_specs,
++                *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows),
++            ),
+             scratch,
+         )
+         partials = views[0] if partial_specs else None
+-- 
+2.54.0 (Apple Git-157)
+

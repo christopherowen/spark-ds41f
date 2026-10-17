@@ -148,11 +148,15 @@ def _patch_worker(module):
     worker = getattr(module, "Worker", None)
     if worker is None or getattr(worker, "_jittrace", False):
         return
-    for name in ("load_model", "determine_available_memory", "initialize_from_config",
-                 "compile_or_warm_up_model"):
-        original = getattr(worker, name, None)
+    # _prepare_kernels (r6u) runs inside determine_available_memory, before the startup
+    # rendezvous: its compiles are "prepare_kernels", and the profiling after it is
+    # "after_prepare_kernels" until determine_available_memory ends.
+    for method in ("load_model", "determine_available_memory", "_prepare_kernels",
+                   "initialize_from_config", "compile_or_warm_up_model"):
+        original = getattr(worker, method, None)
         if original is None:
             continue
+        name = method.lstrip("_")
 
         def make(original, name):
             @functools.wraps(original)
@@ -166,7 +170,7 @@ def _patch_worker(module):
                     _state["phase"] = "serving" if name == "compile_or_warm_up_model" else f"after_{name}"
             return phase
 
-        setattr(worker, name, make(original, name))
+        setattr(worker, method, make(original, name))
     worker._jittrace = True
 
 

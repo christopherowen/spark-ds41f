@@ -1,0 +1,945 @@
+From 15aedacf3ed29c26b00e80821079b56a1fd5c933 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:21:14 +0200
+Subject: [PATCH 166/169] Kernel preparation: routing, activation, norm,
+ Engram, collective and L2-prefetch kernels declare from configuration
+
+The gate router declares route_partials for each (image, routing mask) a decode
+step can pass and binds them into its kernel table; it warms TileKernels' top-k
+gate when a forward can route more rows than the gate's split rows (the drafter
+bounds its rows by its query blocks). The routing mask variants follow
+VLLM_MOE_SKIP_PADDING and the model runner. Decoder layers declare their
+router, which is not a module.
+
+TileLangRMSNorm warms TileKernels' norm of its width; the shared expert's
+activation declares the kernel of its owner's width. Engram declares its packed
+gate, and the blocked gate when prefill sequence parallelism runs with a
+column-parallel projection; a disk table declares its row kernels and the hash
+state its hash. The model declares the rank-order sum of the TP group's
+collectives and the TileLang L2 prefetch, now a JIT factory keyed by its grid,
+block and chunk.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  |  14 +-
+ vllm/models/deepseek_v4_1/common/engram.py    | 134 ++++++++++++++---
+ vllm/models/deepseek_v4_1/kernels.py          |   9 +-
+ vllm/models/deepseek_v4_1/l2_prefetch.py      |  13 ++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  10 ++
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  24 +++-
+ .../deepseek_v4_1/tilelang/activation.py      |  22 ++-
+ .../deepseek_v4_1/tilelang/collectives.py     |  17 +++
+ .../deepseek_v4_1/tilelang/engram_rows.py     |  52 +++++--
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  23 +++
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 135 ++++++++++++++++--
+ .../glm5next/nvidia/tilelang/l2_prefetch.py   |  35 +++--
+ 12 files changed, 421 insertions(+), 67 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 4f9646079..3a9cf2ad5 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -142,7 +142,7 @@ class _Gate(torch.nn.Module):
+         self.weight = torch.nn.Parameter(weight.to(torch.bfloat16), requires_grad=False)
+         self.out_dtype = torch.float32
+         self.quant_method = TileLangLinearMethod()
+-        self.quant_method.process_weights_after_loading(self)
++        self.quant_method.declare_layer_kernels(self)  # standalone: prepares now
+ 
+     def forward(self, x):
+         return self.quant_method.apply(self, x), None
+@@ -181,6 +181,7 @@ def test_gate_router_matches_the_gate_then_the_router(
+         scoring_func="sqrtsoftplus",
+     )
+     fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    fused.declare_kernels()
+     weights, ids = fused._compute_routing(None, x, None)
+     logits, _ = gate(x)
+     expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+@@ -211,9 +212,9 @@ def test_gate_router_routes_image_tokens(plain_scratch):
+         image_sentinel_lo=LO,
+         image_sentinel_count=1,
+     )
+-    weights, ids = tilelang_router.TileLangGateRouter(
+-        gate=gate, **kwargs
+-    )._compute_routing(None, x, None, input_ids=input_ids)
++    fused = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++    fused.declare_kernels()
++    weights, ids = fused._compute_routing(None, x, None, input_ids=input_ids)
+     logits, _ = gate(x)
+     expected = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+         None, logits, None, input_ids=input_ids
+@@ -257,6 +258,7 @@ def test_padding_rows_are_not_routed(plain_scratch, padded_step, gate_router):
+     logits, _ = gate(x)
+     if gate_router:
+         router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++        router.declare_kernels()
+         weights, ids = router._compute_routing(None, x, None)
+     else:
+         weights, ids = tilelang_router.TileKernelsRouter(**kwargs)._compute_routing(
+@@ -289,9 +291,7 @@ def ced_step(monkeypatch):
+     from vllm.models.deepseek_v4_1.ced import CEDState, gather_rows
+ 
+     state = CEDState(6, 4096, (256, 512, 1024, 2048, 4096), "cuda")
+-    starts = torch.tensor(
+-        [0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda"
+-    )
++    starts = torch.tensor([0, 4, 8, 12, 16, 22, 353], dtype=torch.int32, device="cuda")
+     seq = torch.tensor([4000] * 5 + [3659], dtype=torch.int32, device="cuda")
+     state.stage(starts, seq, [6] * 5 + [331], [False] * 6, [0] * 5 + [3328])
+     indices = state.get_indices()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 01af3aeae..dfda54bfe 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -33,7 +33,6 @@ from vllm.utils.b12x import (
+ )
+ from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+ 
+-
+ _FP8_BLOCK_ROWS = 32
+ 
+ 
+@@ -73,13 +72,16 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+         """This rank's column block of the product, not gathered."""
+         return self.quant_method.apply(self, input_, None)
+ 
++
+ logger = init_logger(__name__)
+ DEAD_ID = -1
+ 
+ # How long a forward's gather waits for a step's disk rows before it stops the
+ # GPU with a record of the step (a liveness bound; the rows normally arrive
+ # within a millisecond).
+-ENGRAM_ROWS_TIMEOUT_S = float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
++ENGRAM_ROWS_TIMEOUT_S = (
++    float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
++)
+ # Tests only: delay every disk read, to show the forward waits for its rows.
+ ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
+ # Debug only (off and free in serving): every row ID the host hashed early must equal
+@@ -404,6 +406,24 @@ class NgramHashState(nn.Module):
+     def ensure_cache(self):
+         return True  # Hash history belongs to the runner, never the KV slot pool.
+ 
++    def declare_kernels(self) -> None:
++        """Declare the TileLang hash of every Engram layer. The runner's token ids
++        and the model state's lookback window are int32 (profiling's window takes
++        the ids' dtype)."""
++        if not kernels.uses_tilelang():
++            return
++        from vllm.models.deepseek_v4_1.tilelang import prepare
++        from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash_kernel
++
++        call = prepare.call(
++            engram_hash_kernel,
++            self._tl_geometry[0].shape[0],
++            self._tl_token_map.numel(),
++            "int32",
++            "int32",
++        )
++        prepare.declare(lambda: [call])
++
+     def run_native(self, ids, mask, starts, history, out):
+         """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
+ 
+@@ -616,7 +636,10 @@ class ParallelEngramEmbedding(nn.Module):
+             self._weight_allocation = None
+             try:
+                 self._weight_allocation = MappedHostAllocation(
+-                    self.weight_shape, torch.float8_e4m3fn, caps.device, write_combined=True
++                    self.weight_shape,
++                    torch.float8_e4m3fn,
++                    caps.device,
++                    write_combined=True,
+                 )
+                 self._scale_allocation = MappedHostAllocation(
+                     self.scale_shape, torch.uint8, caps.device, write_combined=True
+@@ -670,7 +693,9 @@ class ParallelEngramEmbedding(nn.Module):
+                 )
+         self.register_buffer(
+             "hashes",
+-            torch.full((caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device),
++            torch.full(
++                (caps.max_tokens, 24), DEAD_ID, dtype=torch.int64, device=caps.device
++            ),
+             persistent=False,
+         )
+         self.register_buffer(
+@@ -719,20 +744,40 @@ class ParallelEngramEmbedding(nn.Module):
+             loaded.add(name)
+         return loaded
+ 
++    def _disk_shard(self) -> dict[str, int]:
++        """The disk reader's rows: this rank's shard of the table, its hash columns
++        and the lookups of the largest step."""
++        return dict(
++            shard_start=min(self.shard_start, self.table_rows),
++            shard_end=min(self.shard_end, self.table_rows),
++            columns=self.column_mask,
++            max_lookups=self.caps.max_tokens * 24,
++        )
++
++    def declare_kernels(self) -> None:
++        """Declare a disk table's TileLang row kernels (the wait, the gather of its
++        reader's buffers and shard, and the release)."""
++        if self.table_memory != "disk":
++            return
++        from vllm.models.deepseek_v4_1.tilelang import prepare
++        from vllm.models.deepseek_v4_1.tilelang.engram_rows import row_kernel_calls
++
++        calls = row_kernel_calls(**self._disk_shard())
++        prepare.declare(lambda: calls)
++
+     def open_disk_rows(self) -> None:
+         """Start reading this rank's shard of the table from the checkpoint, once."""
+         if self.table_memory != "disk" or self.disk_rows is not None:
+             return
+         planes = sorted(scale for _, _, scale in self._disk_sources)
+         if planes != [False, True]:
+-            raise ValueError("Disk Engram needs the table's weight and scale planes, once each")
++            raise ValueError(
++                "Disk Engram needs the table's weight and scale planes, once each"
++            )
+         rows = EngramDiskRows(
+             device=self.caps.device,
+             table_rows=self.table_rows,
+-            shard_start=min(self.shard_start, self.table_rows),
+-            shard_end=min(self.shard_end, self.table_rows),
+-            columns=self.column_mask,
+-            max_lookups=self.caps.max_tokens * 24,
++            **self._disk_shard(),
+             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
+             delay_s=ENGRAM_READ_DELAY_S,
+             check_early=ENGRAM_CHECK_EARLY_IDS,
+@@ -812,6 +857,9 @@ class Engram(nn.Module):
+         )
+         self._disk_prepared = False
+         self._disk_prepared_tokens = 0
++        # The smallest forward the model runs sequence-parallel (0: never); the
++        # model sets it.
++        self.prefill_sp_min_rows = 0
+         projection_tp = getattr(layout, "projection_tp", False)
+         projection_cls = (
+             _PaddedColumnParallelLinear if projection_tp else ReplicatedLinear
+@@ -977,21 +1025,58 @@ class Engram(nn.Module):
+         )
+         units = []
+         if lookup_requests:
+-            units.append(B12xPreparationUnit(
+-                name="EngramLookup",
+-                key=(id(self), workload.max_tokens),
+-                requests=lookup_requests,
+-                stage="weights",
+-            ))
++            units.append(
++                B12xPreparationUnit(
++                    name="EngramLookup",
++                    key=(id(self), workload.max_tokens),
++                    requests=lookup_requests,
++                    stage="weights",
++                )
++            )
+         if mix_requests:
+-            units.append(B12xPreparationUnit(
+-                name="EngramMix",
+-                key=(id(self), workload.max_tokens),
+-                requests=mix_requests,
+-                stage="weights",
+-            ))
++            units.append(
++                B12xPreparationUnit(
++                    name="EngramMix",
++                    key=(id(self), workload.max_tokens),
++                    requests=mix_requests,
++                    stage="weights",
++                )
++            )
+         return tuple(units)
+ 
++    def declare_kernels(self) -> None:
++        """Declare the TileLang gate: on packed rows always, and on the column blocks
++        of a column-parallel projection when the model runs prefill sequence
++        parallel (the blocked gate, one block per rank). The model always passes
++        the image-token mask."""
++        if not kernels.uses_tilelang():
++            return
++        from vllm.models.deepseek_v4_1.tilelang import prepare
++        from vllm.models.deepseek_v4_1.tilelang.engram import (
++            engram_gate_blocked_kernel,
++            engram_gate_kernel,
++        )
++
++        calls = [
++            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, True)
++        ]
++        sequence_parallel = (
++            0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
++        )
++        if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
++            calls.append(
++                prepare.call(
++                    engram_gate_blocked_kernel,
++                    self.hc_mult,
++                    self.dim,
++                    self.eps,
++                    True,
++                    get_tensor_model_parallel_world_size(),
++                    self.wkv.output_size_per_partition,
++                )
++            )
++        prepare.declare(lambda: calls)
++
+     def process_weights_after_loading(self):
+         self.norm_weights.copy_(
+             (self.q_weight.float() * self.k_weight.float()).flatten()
+@@ -1097,7 +1182,12 @@ class Engram(nn.Module):
+             # The TileLang model passes DeepSeek's image-token mask (True skips).
+             gate = engram_gate_blocked if blocked else engram_gate
+             gate(
+-                state, kv, self.norm_weights, token_mask, mix_out, self.eps,
++                state,
++                kv,
++                self.norm_weights,
++                token_mask,
++                mix_out,
++                self.eps,
+                 self.hc_mult,
+             )
+             return out.view_as(hidden_states)
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index ce590b528..1383edf39 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -64,9 +64,10 @@ def moe_output_dtype() -> torch.dtype:
+ MOE_FP32_COMBINE = True
+ 
+ 
+-def shared_expert_activation(act_fn: nn.Module) -> nn.Module:
+-    """The shared expert's clamped SwiGLU; TileLang's keeps the reference's FP32
+-    product (one BF16 rounding) where vLLM's rounds ``silu(gate)`` first."""
++def shared_expert_activation(act_fn: nn.Module, width: int) -> nn.Module:
++    """The shared expert's clamped SwiGLU on ``width``-wide gate and up halves;
++    TileLang's keeps the reference's FP32 product (one BF16 rounding) where vLLM's
++    rounds ``silu(gate)`` first."""
+     from vllm.model_executor.layers.activation import SiluAndMulWithClamp
+ 
+     if (
+@@ -76,7 +77,7 @@ def shared_expert_activation(act_fn: nn.Module) -> nn.Module:
+     ):
+         from .tilelang.activation import SiluAndMulClampFP32
+ 
+-        return SiluAndMulClampFP32(act_fn.swiglu_limit)
++        return SiluAndMulClampFP32(act_fn.swiglu_limit, width)
+     return act_fn
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index eb759d6c1..063fbaa26 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -148,6 +148,19 @@ def warmup() -> bool:
+     return ENABLED and _l2pf._get_launcher() is not None
+ 
+ 
++def kernel_calls() -> list:
++    """The TileLang prefetch kernel's call, as ``warmup`` makes it, when the windows
++    prefetch through it (``VLLM_L2_PREFETCH_KERNELS=tilelang``)."""
++    if not ENABLED or _l2pf._KERNELS != "tilelang":
++        return []
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import l2_prefetch_kernel
++
++    return [
++        prepare.call(l2_prefetch_kernel, _l2pf._GRID, _l2pf._BLOCK, _l2pf._CHUNK_BYTES)
++    ]
++
++
+ def issue(plan: _l2pf.L2PrefetchPlan | None, num_tokens: int) -> None:
+     if ENABLED and plan is not None and plan.segs is not None:
+         _l2pf.L2Prefetcher.get(plan.segs.device).issue(plan, num_tokens)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 8aa71cc12..361cf6f5a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -399,6 +399,16 @@ class DSparkDeepseekV4Model(nn.Module):
+                 for i in range(self.num_dspark_layers)
+             ]
+         )
++        # A draft forward routes one query block per request, as DSparkSpeculator
++        # lays it out: the speculative tokens, plus the anchor unless the drafter
++        # predicts from it.
++        query_rows = vllm_config.speculative_config.num_speculative_tokens + (
++            0 if getattr(config, "sample_from_anchor", True) else 1
++        )
++        for layer in self.layers:
++            router = getattr(layer.ffn.experts, "router", None)
++            if hasattr(router, "max_rows"):
++                router.max_rows = vllm_config.scheduler_config.max_num_seqs * query_rows
+ 
+         # Heads: final norm, and the Markov + confidence heads.
+         # Loaded from the "final" MTP layer weights (mtp.*) in the target
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 46049b2ab..61396ebfb 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -167,7 +167,9 @@ class DeepseekV4DecoderLayer(nn.Module):
+ 
+         shared = getattr(self.ffn, "shared_experts", None)
+         if shared is not None:
+-            shared.act_fn = kernels.shared_expert_activation(shared.act_fn)
++            shared.act_fn = kernels.shared_expert_activation(
++                shared.act_fn, shared.gate_up_proj.output_size_per_partition // 2
++            )
+ 
+         # A CED decoder layer routes the compact decoder rows, whose padding
+         # mask differs from the step's. Tag its router by layer, never by the
+@@ -229,6 +231,13 @@ class DeepseekV4DecoderLayer(nn.Module):
+             requires_grad=False,
+         )
+ 
++    def declare_kernels(self) -> None:
++        """Declare the MoE router's kernels (a router is not a module)."""
++        router = getattr(self.ffn.experts, "router", None)
++        declare = getattr(router, "declare_kernels", None)
++        if declare is not None:
++            declare()
++
+     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+         attn, device = self.attn, self.hc_attn_fn.device
+@@ -486,6 +495,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     "_sp_project_reduce_scatter_hook",
+                     sp_prefill.project_reduce_scatter_current,
+                 )
++        # Under SP prefill an Engram layer gates this rank's rows (its blocked gate).
++        for layer in islice(self.layers, self.start_layer, self.end_layer):
++            if getattr(layer, "engram", None) is not None:
++                layer.engram.prefill_sp_min_rows = self.prefill_sp_min_rows
+ 
+         # Hashing reads the runner's accepted-only lookback, never KV slot state.
+         self.engram_hash: NgramHashState | None = None
+@@ -622,6 +635,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             }
+         )
+ 
++    def declare_kernels(self) -> None:
++        """Declare the TileLang kernels the forward reaches outside its modules: the
++        rank-order sum of the TP group's collectives and the L2 prefetch."""
++        from ..tilelang import collectives, prepare
++
++        prepare.declare(
++            lambda: [*collectives.rank_order_sum_calls(), *l2_prefetch.kernel_calls()]
++        )
++
+     def _build_l2_prefetch(self) -> None:
+         layers = list(islice(self.layers, self.start_layer, self.end_layer))
+         self._l2pf_ready = build_l2_prefetch_plans(layers, self.start_layer)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index 0163f677e..9e88588ba 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -18,6 +18,8 @@ import tilelang.language as T
+ import torch
+ from torch import nn
+ 
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
+ _VEC = 8
+ 
+ 
+@@ -65,11 +67,27 @@ def _kernel(n: int, limit: float):
+ 
+ 
+ class SiluAndMulClampFP32(nn.Module):
+-    """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product."""
++    """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product.
++
++    ``width`` is the gate (and up) width its owner runs it on, ``[M, 2 * width]``
++    inputs; the module declares that kernel. Without it (kernel tests) nothing is
++    declared.
++    """
+ 
+-    def __init__(self, swiglu_limit: float):
++    def __init__(self, swiglu_limit: float, width: int | None = None):
+         super().__init__()
+         self.limit = float(swiglu_limit)
++        self.width = width
++
++    def declare_kernels(self) -> None:
++        """Declare the kernel of the owner's width, and keep it in ``_kernel``."""
++        if self.width is None:
++            return
++        width, limit = self.width, self.limit
++        prepare.declare(
++            lambda: [prepare.call(swiglu_clamp_kernel, width, limit)],
++            bind=lambda: _kernel(width, limit),
++        )
+ 
+     def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
+         n = gate_up.shape[-1] // 2
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index ab431ecfe..c8ec8e436 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -24,6 +24,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
+ _VEC = 8  # BF16 per thread: one 16-byte access
+ 
+ 
+@@ -111,6 +113,21 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+     return collectives_rank_order_sum
+ 
+ 
++def rank_order_sum_calls() -> list[prepare.TileLangCall]:
++    """The rank-order sum the TP group's collectives launch, as ``rank_order_sum``
++    calls it: one part per rank, when the group's communicator all-reduces and
++    reduce-scatters in rank order (DS4.1's TileLang family on the RoCE policy,
++    ``rank_order_reduce_scatter``); ``RankOrderParts.sum`` adds as many parts."""
++    from vllm.distributed import get_tp_group
++
++    group = get_tp_group()
++    world = group.world_size
++    comm = group.device_communicator
++    if not 2 <= world <= 4 or not getattr(comm, "rank_order_reduce_scatter", False):
++        return []
++    return [prepare.call(rank_order_sum_kernel, world)]
++
++
+ def rank_order_sum(
+     parts: list[torch.Tensor], out: torch.Tensor | None = None
+ ) -> torch.Tensor:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 6e83e1833..7cedb9048 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -29,6 +29,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
+ HEADS = 24
+ ROW = 256
+ SCALES = ROW // 32
+@@ -43,7 +45,9 @@ _TIMING = (
+ )
+ 
+ # Control-block word offsets, as in engram_rows/_reader.c.
+-_HEADER = _TIMING + r"""
++_HEADER = (
++    _TIMING
++    + r"""
+ // Engram rows: the reader publishes a step by writing its sequence number into the
+ // control block in mapped host memory; this stream wrote the step it staged there.
+ #define ENGRAM_CTRL_IDS_SEQ 0
+@@ -122,7 +126,8 @@ __device__ __forceinline__ void engram_release_rows(void *control) {
+     asm volatile("st.release.sys.global.u32 [%0], %1;"
+                  :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
+ }
+-"""
++"""  # noqa: E501 (CUDA source)
++)
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@@ -132,7 +137,9 @@ def engram_rows_wait_kernel():
+         with T.Kernel(1, threads=32):
+             T.import_source(_HEADER)
+             if T.get_thread_binding() == 0:
+-                T.call_extern("engram_wait_rows", T.address_of(control[0]), dtype="handle")
++                T.call_extern(
++                    "engram_wait_rows", T.address_of(control[0]), dtype="handle"
++                )
+ 
+     return engram_rows_wait
+ 
+@@ -177,7 +184,9 @@ def engram_rows_gather_kernel(
+             lookup = t * HEADS + head
+             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
+             if columns != (1 << HEADS) - 1:
+-                owned = owned & (T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1)
++                owned = owned & (
++                    T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1
++                )
+             if owned:
+                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
+                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+@@ -185,7 +194,8 @@ def engram_rows_gather_kernel(
+                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
+                 for i in T.vectorized(vec):
+                     out[t, head * ROW + tx * vec + i] = T.cast(
+-                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale, T.bfloat16
++                        T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
++                        T.bfloat16,
+                     )
+             else:
+                 for i in T.vectorized(vec):
+@@ -194,6 +204,21 @@ def engram_rows_gather_kernel(
+     return engram_rows_gather
+ 
+ 
++def row_kernel_calls(
++    max_lookups: int, shard_start: int, shard_end: int, columns: int
++) -> list[prepare.TileLangCall]:
++    """The kernel calls ``engram_rows_gather`` makes for a reader of ``max_lookups``
++    rows a step (``rows.shape[0]``) and the rank's rows ``[shard_start, shard_end)``
++    of the hash columns in the mask ``columns``."""
++    return [
++        prepare.call(engram_rows_wait_kernel),
++        prepare.call(
++            engram_rows_gather_kernel, max_lookups, shard_start, shard_end, columns
++        ),
++        prepare.call(engram_rows_release_kernel),
++    ]
++
++
+ @torch.library.custom_op("vllm::dsv41_engram_rows_gather", mutates_args=("out",))
+ def engram_rows_gather(
+     ids: torch.Tensor,
+@@ -214,12 +239,23 @@ def engram_rows_gather(
+     engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+     if tokens:
+-        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end, columns)
++        kernel = engram_rows_gather_kernel(
++            rows.shape[0], shard_start, shard_end, columns
++        )
+         kernel(ids[:tokens], num_tokens, rows, scales, out)
+     engram_rows_release_kernel()(control)
+ 
+ 
+ @engram_rows_gather.register_fake
+-def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end,
+-                             columns=(1 << HEADS) - 1):
++def _engram_rows_gather_fake(
++    ids,
++    num_tokens,
++    rows,
++    scales,
++    control,
++    out,
++    shard_start,
++    shard_end,
++    columns=(1 << HEADS) - 1,
++):
+     return None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index fe536af86..6c2d0e5e3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -2,9 +2,13 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """TileLang RMSNorm for DeepSeek-V4.1, through TileKernels' ``norm_forward``."""
+ 
++import functools
++
+ import torch
+ from torch import nn
+ 
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
+ 
+ @torch.library.custom_op("vllm::dsv41_tilelang_rmsnorm", mutates_args=("out",))
+ def _rmsnorm(
+@@ -20,6 +24,16 @@ def _rmsnorm_fake(x, weight, out, eps):
+     return None
+ 
+ 
++@functools.cache
++def _warm(hidden: int, eps: float, dtype: torch.dtype) -> None:
++    """TileKernels' RMSNorm of one zero row of ``hidden`` (``dtype`` input and weight),
++    so its kernel (keyed by the width, eps and dtype, not the rows) is compiled
++    before the cache freezes."""
++    x = torch.zeros((1, hidden), dtype=dtype, device="cuda")
++    weight = torch.ones(hidden, dtype=dtype, device="cuda")
++    _rmsnorm(x, weight, torch.empty_like(x), eps)
++
++
+ class TileLangRMSNorm(nn.Module):
+     """``y = x * rsqrt(mean(x^2) + eps) * weight`` in FP32, in the input dtype."""
+ 
+@@ -30,6 +44,15 @@ class TileLangRMSNorm(nn.Module):
+         )
+         self.variance_epsilon = eps
+ 
++    def declare_kernels(self) -> None:
++        """TileKernels' norm of this width; its input has the weight's dtype."""
++        hidden, eps, dtype = (
++            self.weight.shape[0],
++            self.variance_epsilon,
++            self.weight.dtype,
++        )
++        prepare.declare(warm=lambda: _warm(hidden, eps, dtype))
++
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         shape = x.shape
+         x = x.reshape(-1, shape[-1]).contiguous()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 2ad97ce57..0772744d9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -27,15 +27,19 @@ memory and each MoE layer runs one launch fewer. At prefill the gate runs its
+ own GEMM and TileKernels routes the logits.
+ """
+ 
++import functools
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+ 
+ import vllm.envs as envs
++from vllm.config import get_current_vllm_config_or_none
+ from vllm.forward_context import get_forward_context, is_forward_context_available
+ from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+     FusedTopKBiasRouter,
+ )
++from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ 
+ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Tensor:
+@@ -82,6 +86,68 @@ def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | Non
+     return cached[1][:rows]
+ 
+ 
++def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
++    """Whether ``_routing_mask`` can return a mask (True) or None (False).
++
++    A mask needs ``VLLM_MOE_SKIP_PADDING``. The V2 model runner gives every
++    forward, the drafter's included, its padding rows; the V1 runner gives none,
++    so only a CED decoder layer's compact rows have a mask there. Without a
++    config (kernel tests) either can come.
++    """
++    if not envs.VLLM_MOE_SKIP_PADDING:
++        return (False,)
++    if vllm_config is not None and vllm_config.use_v2_model_runner:
++        return (True,)
++    return (False, True)
++
++
++def _topk_gate(
++    logits: torch.Tensor,
++    num_topk: int,
++    routed_scaling_factor: float,
++    mask: torch.Tensor | None,
++    bias: torch.Tensor,
++    image_bias: torch.Tensor | None,
++    image_token_mask: torch.Tensor | None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
++    bias and no shared experts."""
++    from tile_kernels.moe import moe_topk_gate_forward
++
++    return moe_topk_gate_forward(
++        logits,
++        num_topk,
++        use_shared_as_routed=False,
++        num_shared_experts=0,
++        routed_scaling_factor=routed_scaling_factor,
++        ep_rank=0,
++        mask=mask,
++        bias=bias,
++        image_bias=image_bias,
++        image_token_mask=image_token_mask,
++    )
++
++
++@functools.cache
++def _warm_topk_gate(num_topk: int, num_experts: int, image: bool, mask: bool) -> None:
++    """TileKernels' top-k gate of ``num_topk`` of ``num_experts``, run once on a zero
++    row with the inputs the router passes (an image bias and mask, a routing mask),
++    so its kernel (keyed by which inputs exist, not by the rows) is compiled before
++    the cache freezes."""
++    logits = torch.zeros((1, num_experts), dtype=torch.float32, device="cuda")
++    bias = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
++    flags = torch.zeros(1, dtype=torch.bool, device="cuda")
++    _topk_gate(
++        logits,
++        num_topk,
++        1.0,
++        mask=~flags if mask else None,
++        bias=bias,
++        image_bias=bias if image else None,
++        image_token_mask=flags if image else None,
++    )
++
++
+ class TileKernelsRouter(FusedTopKBiasRouter):
+     """V4.1 routing through TileKernels' TileLang top-k gate."""
+ 
+@@ -106,8 +172,6 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+         *,
+         input_ids: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        from tile_kernels.moe import moe_topk_gate_forward
+-
+         image_bias = image_token_mask = None
+         if self.bias_vl is not None and self.image_sentinel_lo > 0:
+             if input_ids is None:
+@@ -116,13 +180,10 @@ class TileKernelsRouter(FusedTopKBiasRouter):
+             image_token_mask = _image_token_mask(
+                 input_ids, self.image_sentinel_lo, self.image_sentinel_count
+             )
+-        topk_ids, topk_weights = moe_topk_gate_forward(
++        topk_ids, topk_weights = _topk_gate(
+             router_logits,
+             self.top_k,
+-            use_shared_as_routed=False,
+-            num_shared_experts=0,
+-            routed_scaling_factor=self.routed_scaling_factor,
+-            ep_rank=0,
++            self.routed_scaling_factor,
+             mask=_routing_mask(
+                 router_logits.shape[0],
+                 ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+@@ -296,6 +357,62 @@ class TileLangGateRouter(TileKernelsRouter):
+         self._kernels: dict[tuple[bool, bool], object] = {}
+         # Text-only layers pass no image tokens; one all-false mask serves them.
+         self._no_image = None
++        vllm_config = get_current_vllm_config_or_none()
++        # The most rows one forward routes (the drafter sets its query rows); None
++        # (kernel tests) is unbounded.
++        self.max_rows: int | None = (
++            None
++            if vllm_config is None
++            else vllm_config.scheduler_config.max_num_batched_tokens
++        )
++        self._mask_variants = _routing_mask_variants(vllm_config)
++
++    def _partials_kernels(self) -> dict[tuple[bool, bool], prepare.TileLangCall]:
++        """``route_partials`` for each (image, routing mask) a decode step can pass,
++        keyed as ``_compute_routing`` looks it up; none when the gate does not
++        split."""
++        gate = self.gate
++        if gate.tilelang_shards == 1:
++            return {}
++        image = self.bias_vl is not None and self.image_sentinel_lo > 0
++        return {
++            (image, mask): prepare.call(
++                route_partials,
++                self.top_k,
++                gate.weight.shape[0],
++                gate.tilelang_shards,
++                image,
++                mask,
++            )
++            for mask in self._mask_variants
++        }
++
++    def _warm(self) -> None:
++        """TileKernels' top-k gate for rows past the gate's split rows, if a forward
++        can have them."""
++        gate = self.gate
++        if (
++            gate.tilelang_shards > 1
++            and self.max_rows is not None
++            and self.max_rows <= gate.tilelang_split_rows
++        ):
++            return
++        image = self.bias_vl is not None and self.image_sentinel_lo > 0
++        for mask in self._mask_variants:
++            _warm_topk_gate(self.top_k, gate.weight.shape[0], image, mask)
++
++    def declare_kernels(self) -> None:
++        """Declare the router's kernels (its layer calls this when preparing): the
++        decode rows' ``route_partials`` and the prefill rows' TileKernels gate. They
++        read the gate's split, set when the gate declares its own kernels."""
++
++        def bind() -> None:
++            for key, (function, args, kwargs) in self._partials_kernels().items():
++                self._kernels[key] = function(*args, **kwargs)
++
++        prepare.declare(
++            lambda: self._partials_kernels().values(), bind=bind, warm=self._warm
++        )
+ 
+     def _compute_routing(
+         self,
+@@ -329,10 +446,6 @@ class TileLangGateRouter(TileKernelsRouter):
+             ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+         )
+         key = (image, route_mask is not None)
+-        if key not in self._kernels:
+-            self._kernels[key] = route_partials(
+-                self.top_k, gate.weight.shape[0], gate.tilelang_shards, *key
+-            )
+         rows = x.shape[0]
+         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
+         topk_weights = torch.empty(
+diff --git a/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py b/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
+index 938c6309e..55a7547af 100644
+--- a/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
++++ b/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
+@@ -11,6 +11,8 @@ only; nothing is written.
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+ # annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
+ import torch
+ 
+ # createpolicy has no side effects (the compiler may hoist it); the prefetch does.
+@@ -29,9 +31,10 @@ __device__ __forceinline__ void l2pf_bulk_prefetch(long long address, int bytes,
+ """
+ 
+ 
+-def _kernel(grid: int, block: int, chunk: int):
+-    import tilelang.language as T
+-
++@tilelang.jit(target="cuda")
++def l2_prefetch_kernel(grid: int, block: int, chunk: int):
++    """The prefetch of a shape-dynamic segment table by ``grid`` x ``block`` threads in
++    ``chunk``-byte requests; one kernel per (grid, block, chunk)."""
+     nseg2 = T.dynamic("nseg2")
+ 
+     @T.prim_func
+@@ -48,26 +51,34 @@ def _kernel(grid: int, block: int, chunk: int):
+                 nbytes = segs[2 * s + 1]
+                 nchunks = (nbytes + (chunk - 1)) // chunk
+                 # This thread's chunks: tid, tid + stride, ... below nchunks.
+-                for k in T.serial(T.max((nchunks - tid + (stride - 1)) // stride, T.int64(0))):
++                for k in T.serial(
++                    T.max((nchunks - tid + (stride - 1)) // stride, T.int64(0))
++                ):
+                     off = (tid + k * stride) * chunk
+                     size = T.min(nbytes - off, T.int64(chunk)) // 16 * 16
+                     if size > 0:
+-                        T.call_extern("l2pf_bulk_prefetch", base + off, T.cast(size, T.int32),
+-                                      policy[0], dtype="handle")
++                        T.call_extern(
++                            "l2pf_bulk_prefetch",
++                            base + off,
++                            T.cast(size, T.int32),
++                            policy[0],
++                            dtype="handle",
++                        )
+ 
+     return l2_prefetch
+ 
+ 
+ def compile_launcher(grid: int, block: int, chunk: int):
+-    """Compile once for a shape-dynamic segment table; returns
+-    (segs_tensor, cuda_stream_handle) -> None, like the CuTe launcher."""
+-    import tilelang
+-
+-    kernel = tilelang.compile(_kernel(grid, block, chunk), target="cuda")
++    """Compile once for a shape-dynamic segment table (a cache hit once the kernel
++    was prepared); returns (segs_tensor, cuda_stream_handle) -> None, like the CuTe
++    launcher."""
++    kernel = l2_prefetch_kernel(grid, block, chunk)
+ 
+     def launch(segs: torch.Tensor, stream_handle: int) -> None:
+         # TileLang launches on the current stream of the call.
+-        with torch.cuda.stream(torch.cuda.ExternalStream(stream_handle, device=segs.device)):
++        with torch.cuda.stream(
++            torch.cuda.ExternalStream(stream_handle, device=segs.device)
++        ):
+             kernel(segs)
+ 
+     return launch
+-- 
+2.54.0 (Apple Git-157)
+

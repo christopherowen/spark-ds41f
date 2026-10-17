@@ -1,0 +1,462 @@
+From 8c8ef6ec751aba246f5bff91f592bfdf50597fb9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:12:33 +0200
+Subject: [PATCH 163/169] Kernel preparation: TileLang MoE experts and mHC
+ declare, bind and warm
+
+The routed experts' plan lists its grouped GEMMs, TileKernels' fused SwiGLU
+(whose factory our code calls with every key) and both dispatch plans' dispatch,
+combine and fold kernels as calls, binds them once prepared, and warms
+TileKernels' MXFP8 token cast for each batch bucket. Weight processing keeps the
+tile-major repack; the layer's MoE method lets its modular experts declare.
+
+TileKernelsMHC declares project_streams for each entry mode (and the
+unreduced post_pre of the TP world under SP) and both finalize widths, binds
+the forward's cached kernels, and warms TileKernels' post and stream collapse
+on one zero token.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  24 ++--
+ .../layers/fused_moe/fused_moe_method_base.py |   7 +
+ .../layers/fused_moe/tilelang.py              |   7 +
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     |  74 +++++++++--
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 124 ++++++++++++++----
+ 5 files changed, 193 insertions(+), 43 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index f745cf410..ca9b68de9 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -25,6 +25,9 @@ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+     workspace_bytes,
+ )
+ 
++# Declaring a plan warms TileKernels' token cast for the scheduler's batch buckets.
++pytestmark = pytest.mark.usefixtures("default_vllm_config")
++
+ DEVICE = "cuda"
+ E2M1 = (
+     0.0,
+@@ -47,6 +50,13 @@ E2M1 = (
+ LIMIT = 10.0
+ 
+ 
++def _plan(*args, **kwargs):
++    """A plan with its kernels declared: outside a runner, prepared and bound now."""
++    plan = MoeExpertsV41Plan(*args, **kwargs)
++    plan.declare_kernels()
++    return plan
++
++
+ def _gen(seed):
+     return torch.Generator(device=DEVICE).manual_seed(seed)
+ 
+@@ -107,9 +117,7 @@ def _reference(x, ids, weights, w13, w2, intermediate):
+ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk=6):
+     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
+-    plan = MoeExpertsV41Plan(
+-        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
+-    )
++    plan = _plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
+     weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+     ids, route_weights = _routes(rows, num_experts, topk, 4, idx_dtype)
+@@ -140,7 +148,7 @@ def test_moe_experts_fp32_output(
+     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+     plans = {
+-        dtype: MoeExpertsV41Plan(
++        dtype: _plan(
+             num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT, out_dtype=dtype
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+@@ -175,7 +183,7 @@ def test_moe_experts_fold_shared(
+     result does not depend on which of them a step takes."""
+     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+-    plan = MoeExpertsV41Plan(
++    plan = _plan(
+         num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
+         out_dtype=torch.float32,
+     )  # fmt: skip
+@@ -204,7 +212,7 @@ def test_moe_experts_fold_deferred_shared(
+     has the bits of the shared rows passed directly."""
+     w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
+-    plan = MoeExpertsV41Plan(
++    plan = _plan(
+         num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
+         out_dtype=torch.float32,
+     )  # fmt: skip
+@@ -236,9 +244,7 @@ def test_moe_experts_fold_deferred_shared(
+ def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
+     w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
+     w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
+-    plan = MoeExpertsV41Plan(
+-        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
+-    )
++    plan = _plan(num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT)
+     weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
+     x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
+     ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+index 472c5a1d4..ebd5391a8 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+@@ -68,6 +68,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+             return impl.fused_experts
+         return None
+ 
++    def declare_layer_kernels(self, layer: "RoutedExperts") -> None:
++        """Let a modular kernel's experts declare their JIT kernels, after loading
++        (DeepSeek V4.1's kernel preparation calls this on every layer's method)."""
++        declare = getattr(self.modular_experts, "declare_kernels", None)
++        if declare is not None:
++            declare()
++
+     @property
+     def output_dtype(self) -> torch.dtype:
+         """Dtype produced by the routed experts: a modular kernel's experts say."""
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 8425d1872..2b8d8bb4d 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -179,6 +179,8 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         moe = _kernels()
+         w13, w2 = layer.w13_weight, layer.w2_weight  # [E, 2I, H/2], [E, H, I/2]
+         limit = self.quant_config.gemm1_clamp_limit
++        # The plan's geometry; its kernels are declared when the worker prepares
++        # kernels (``declare_kernels``).
+         self._plan = moe.MoeExpertsV41Plan(
+             w13.shape[0],
+             self.moe_config.experts_per_token,
+@@ -204,6 +206,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         self.quant_config._w1.scale = layer.w13_weight_scale
+         self.quant_config._w2.scale = layer.w2_weight_scale
+ 
++    def declare_kernels(self) -> None:
++        """Declare the plan's kernels (the layer's MoE method calls this after
++        loading, when the worker prepares kernels)."""
++        self._plan.declare_kernels()
++
+     # -- execution ----------------------------------------------------------
+ 
+     def moe_problem_size(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 1add03124..ea229b519 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -40,6 +40,7 @@ from torch import nn
+ 
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
++from vllm.models.deepseek_v4_1.tilelang import prepare
+ from vllm.models.deepseek_v4_1.tilelang.collectives import RankOrderParts
+ from vllm.v1.worker.workspace import (
+     current_workspace_manager,
+@@ -386,14 +387,31 @@ def finalize(
+     return mhc_finalize
+ 
+ 
++def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
++    """The ``project_streams`` call of a sublayer entry."""
++    return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
++
++
++def _finalize_call(
++    hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int
++) -> prepare.TileLangCall:
++    """The ``finalize`` call of a sublayer entry projecting ``k`` stream columns."""
++    return prepare.call(finalize, hidden, k, rms_eps, hc_eps, iterations, rms_eps)
++
++
++def _make(call: prepare.TileLangCall):
++    function, args, kwargs = call
++    return function(*args, **kwargs)
++
++
+ @cache
+-def _project(hidden: int, mode: str, world: int = 1):
+-    return project_streams(hidden, mode, block_M=BLOCK_M, world=world)
++def _project(hidden: int, mode: str, world: int):
++    return _make(_project_call(hidden, mode, world))
+ 
+ 
+ @cache
+ def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: int):
+-    return finalize(hidden, k, rms_eps, hc_eps, iterations, rms_eps)
++    return _make(_finalize_call(hidden, k, rms_eps, hc_eps, iterations))
+ 
+ 
+ def _tile_kernels_mhc():
+@@ -533,6 +551,19 @@ def _mhc_collapse_fake(state, mix, out):
+     return None
+ 
+ 
++@cache
++def _warm_post_and_collapse(hidden: int) -> None:
++    """TileKernels' post and stream collapse, run once on one zero token, so their
++    eager kernels (keyed by the stream count, the hidden size and TileKernels' PDL
++    switch) are compiled before the cache freezes."""
++    x = torch.zeros((1, hidden), dtype=torch.bfloat16, device="cuda")
++    residual = torch.zeros((1, MULT, hidden), dtype=torch.bfloat16, device="cuda")
++    mix = torch.zeros((1, MULT), dtype=torch.float32, device="cuda")
++    comb = torch.zeros((1, MULT, MULT), dtype=torch.float32, device="cuda")
++    _mhc_post(x, residual, mix, comb, torch.empty_like(residual))
++    _mhc_collapse(residual, mix, torch.empty_like(x))
++
++
+ class TileKernelsMHC(nn.Module):
+     """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
+ 
+@@ -544,15 +575,38 @@ class TileKernelsMHC(nn.Module):
+         self.rms_eps = config.rms_norm_eps
+         self.hc_eps = config.hc_eps
+         self.iterations = config.hc_sinkhorn_iters
+-        # Compile every kernel now, never during CUDA graph capture.
+-        for mode in ("pre", "post_pre", "broadcast"):
+-            _project(self.hidden_size, mode)
++
++    def _entries(self) -> list[tuple[str, int]]:
++        """The (mode, world) of every sublayer entry this layer can launch."""
++        entries = [(mode, 1) for mode in ("pre", "post_pre", "broadcast")]
+         if sp_prefill.unreduced_enabled():
+             # Sequence-parallel steps hand post_pre the ranks' unreduced parts.
+-            world = get_tensor_model_parallel_world_size()
+-            _project(self.hidden_size, "post_pre", world)
+-        for k in (self.hidden_size, MULT * self.hidden_size):
+-            _finalize(self.hidden_size, k, self.rms_eps, self.hc_eps, self.iterations)
++            entries.append(("post_pre", get_tensor_model_parallel_world_size()))
++        return entries
++
++    def declare_kernels(self) -> None:
++        """Declare every sublayer entry's kernels and warm TileKernels' post and
++        stream collapse, so that no forward (or CUDA graph capture) compiles."""
++        hidden = self.hidden_size
++        entries = self._entries()
++        # The broadcast entry projects one stream; the others all four.
++        widths = (hidden, MULT * hidden)
++        mix = (self.rms_eps, self.hc_eps, self.iterations)
++
++        def calls() -> list[prepare.TileLangCall]:
++            return [
++                *(_project_call(hidden, mode, world) for mode, world in entries),
++                *(_finalize_call(hidden, k, *mix) for k in widths),
++            ]
++
++        def bind() -> None:
++            # The forward's cached kernels, as its lookups name them.
++            for mode, world in entries:
++                _project(hidden, mode, world)
++            for k in widths:
++                _finalize(hidden, k, *mix)
++
++        prepare.declare(calls, bind=bind, warm=lambda: _warm_post_and_collapse(hidden))
+ 
+     def pre(
+         self,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index c1408ad82..b809191c6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -44,11 +44,14 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
+ from .gemm import (
+     SF_BLOCK,
+     pack_scale_words,
+     scale_words,
+ )
++from .linear import _calls, _launch, _warm_casts
+ 
+ # Routes handled by one CTA of the dispatch kernels.
+ _CHUNK = 512
+@@ -406,7 +409,8 @@ class MoeDispatchV41Plan:
+     The plan holds no buffers: ``workspace_specs(rows)`` lists the layout a
+     call needs, which a caller can borrow from a shared workspace.
+     ``dispatch`` and ``combine`` only launch kernels, so they can be captured
+-    in a CUDA graph.
++    in a CUDA graph. ``kernels()`` lists the plan's kernels as calls; ``bind()``
++    stores them once they are prepared (its owner declares them).
+     """
+ 
+     _LAYOUT = (
+@@ -435,28 +439,49 @@ class MoeDispatchV41Plan:
+             block_M,
+             hidden,
+         )
+-        tl_idx = {torch.int64: T.int64, torch.int32: T.int32}[idx_dtype]
+-        self.fused = moe_dispatch_v41(num_experts, topk, block_M, "fused", tl_idx)
+-        self.count = moe_dispatch_v41(num_experts, topk, block_M, "count", tl_idx)
+-        self.layout = moe_dispatch_v41(num_experts, topk, block_M, "layout", tl_idx)
+-        self.scatter = moe_dispatch_v41(num_experts, topk, block_M, "scatter", tl_idx)
+-        tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[out_dtype]
++        self.idx_dtype = idx_dtype
+         self.out_dtype = out_dtype
+-        self.combine_kernels = {
+-            (s, w): moe_combine_v41(hidden, topk, s, w, out_dtype=tl_out)
++
++    def kernels(self) -> dict:
++        """Every kernel of the plan, as the calls ``bind`` makes."""
++        num_experts, topk, block_M, hidden = (
++            self.num_experts,
++            self.topk,
++            self.block_M,
++            self.hidden,
++        )
++        tl_idx = {torch.int64: T.int64, torch.int32: T.int32}[self.idx_dtype]
++        tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[self.out_dtype]
++        kernels = {
++            part: prepare.call(
++                moe_dispatch_v41, num_experts, topk, block_M, part, tl_idx
++            )
++            for part in ("fused", "count", "layout", "scatter")
++        }
++        kernels["combine_kernels"] = {
++            (s, w): prepare.call(moe_combine_v41, hidden, topk, s, w, out_dtype=tl_out)
+             for s in (False, True)
+             for w in (False, True)
+         }
+         # A wider output (the FP32 partial) can instead take the shared expert's
+         # output, add it in FP32 and round once to BF16 (``combine(shared=...)``).
+-        self.fold_kernels = (
++        kernels["fold_kernels"] = (
+             {}
+-            if out_dtype == torch.bfloat16
++            if self.out_dtype == torch.bfloat16
+             else {
+-                w: moe_combine_v41(hidden, topk, True, w, out_dtype=T.bfloat16)
++                w: prepare.call(
++                    moe_combine_v41, hidden, topk, True, w, out_dtype=T.bfloat16
++                )
+                 for w in (False, True)
+             }
+         )
++        return kernels
++
++    def bind(self) -> None:
++        """Store the plan's kernels (``fused``, ``count``, ``layout``, ``scatter``,
++        ``combine_kernels``, ``fold_kernels``), once they are prepared."""
++        for name, kernel in _launch(self.kernels()).items():
++            setattr(self, name, kernel)
+ 
+     def tiles(self, rows):
+         return layout_tiles(rows, self.topk, self.block_M, self.num_experts)
+@@ -838,7 +863,8 @@ class MoeExpertsV41Plan:
+     its UE8M0 bytes, become tile-major. The TileKernels MXFP8 cast and fused
+     SwiGLU (DeepSeek's clamp, route weight before the down projection) run
+     between the GEMMs. The plan holds no buffers; ``workspace_specs(rows)``
+-    lists one call's scratch.
++    lists one call's scratch. Its owner calls ``declare_kernels()`` when
++    preparing kernels; ``run`` launches the kernels it binds.
+     """
+ 
+     def __init__(
+@@ -861,13 +887,8 @@ class MoeExpertsV41Plan:
+             intermediate,
+         )
+         self.block_M, self.block_N = block_M, block_N
+-        config = dict(block_N=block_N, num_stages=num_stages)
+-        self.gate_up = grouped_fp8_fp4_gemm(
+-            num_experts, 2 * intermediate, hidden, topk, True, block_M, **config
+-        )
+-        self.down = grouped_fp8_fp4_gemm(
+-            num_experts, hidden, intermediate, topk, False, block_M, **config
+-        )
++        self.num_stages = num_stages
++        self.swiglu_limit = swiglu_limit
+         # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
+         self.out_dtype = out_dtype
+         self.dispatch = {
+@@ -877,7 +898,60 @@ class MoeExpertsV41Plan:
+             for dtype in (torch.int32, torch.int64)
+         }
+         self.tk = _tile_kernels(block_M)
+-        self.swiglu = _swiglu_kernel(self.tk, intermediate, num_experts, swiglu_limit)
++
++    def kernels(self) -> dict:
++        """The grouped GEMMs and TileKernels' fused SwiGLU, as the calls ``bind``
++        makes."""
++        config = dict(block_N=self.block_N, num_stages=self.num_stages)
++        num_experts, topk, hidden, inter = (
++            self.num_experts,
++            self.topk,
++            self.hidden,
++            self.intermediate,
++        )
++        block_M = self.block_M
++        return {
++            "gate_up": prepare.call(
++                grouped_fp8_fp4_gemm,
++                num_experts,
++                2 * inter,
++                hidden,
++                topk,
++                True,
++                block_M,
++                **config,
++            ),
++            "down": prepare.call(
++                grouped_fp8_fp4_gemm,
++                num_experts,
++                hidden,
++                inter,
++                topk,
++                False,
++                block_M,
++                **config,
++            ),
++            "swiglu": _swiglu_call(self.tk, inter, num_experts, self.swiglu_limit),
++        }
++
++    def declare_kernels(self) -> None:
++        """Declare the grouped GEMMs, the fused SwiGLU and each dispatch plan's
++        kernels, stored on the plans once prepared, and warm TileKernels' MXFP8
++        cast of the tokens for each batch bucket a step can launch."""
++
++        def calls() -> list[prepare.TileLangCall]:
++            out = _calls(self.kernels())
++            for dispatch in self.dispatch.values():
++                out.extend(_calls(dispatch.kernels()))
++            return out
++
++        def bind() -> None:
++            for name, kernel in _launch(self.kernels()).items():
++                setattr(self, name, kernel)
++            for dispatch in self.dispatch.values():
++                dispatch.bind()
++
++        prepare.declare(calls, bind=bind, warm=lambda: _warm_casts(self.hidden))
+ 
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+         """Per GEMM ``(tiles, tails, scale words)`` from E2M1 weights and UE8M0.
+@@ -953,18 +1027,20 @@ def _tile_kernels(block_M):
+     return tile_kernels
+ 
+ 
+-def _swiglu_kernel(tk, intermediate, num_experts, limit):
++def _swiglu_call(tk, intermediate, num_experts, limit) -> prepare.TileLangCall:
+     """TileKernels' fused SwiGLU, route weight and MXFP8 cast, into caller buffers.
+ 
+     ``swiglu_forward_and_per_token_cast`` allocates its outputs; its kernel
+-    writes into ours.
++    writes into ours. The kernel's ``@tilelang.jit`` factory is called here with
++    every key, so it is declared like the plan's own kernels.
+     """
+     from tile_kernels.quant.common import get_cast_output_config
+     from tile_kernels.quant.swiglu_forward_cuda import (
+         get_swiglu_forward_and_per_token_cast_kernel_cuda,
+     )
+ 
+-    return get_swiglu_forward_and_per_token_cast_kernel_cuda(
++    return prepare.call(
++        get_swiglu_forward_and_per_token_cast_kernel_cuda,
+         intermediate,
+         num_experts,
+         tk.config.get_token_alignment(),
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,66 @@
+From a55c2161761b1ebf94e806353dcdeecc00af18bd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:57:05 +0200
+Subject: [PATCH 159/169] Sampler warmup: compile the unaligned-stride variants
+ only when they are reachable
+
+Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
+contiguous copy (the vocab size), so a row stride that is not a multiple of 16
+occurs only for a vocab size that is not. The top-k/top-p warmups compiled both
+alignments for every case; for a vocab of 129,280 the unaligned half (66 of 132
+kernels) can never launch.
+---
+ vllm/v1/sample/ops/topk_topp_triton.py | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/vllm/v1/sample/ops/topk_topp_triton.py b/vllm/v1/sample/ops/topk_topp_triton.py
+index 695ba624f..3bdf218b7 100755
+--- a/vllm/v1/sample/ops/topk_topp_triton.py
++++ b/vllm/v1/sample/ops/topk_topp_triton.py
+@@ -887,6 +887,10 @@ def _topk_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     split_enabled = current_platform.is_cuda_alike()
+     mode: Any = WarmupChoices((True, False), (True, True), (False, True))
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(1, _max_sampler_batch_size(vllm_config) + 1)
+     topk_enabled = mode[0]
+     topp_enabled = mode[1]
+@@ -1047,6 +1051,10 @@ def _topp_split_stats_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+@@ -1336,6 +1344,10 @@ def _topp_split_step_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+@@ -1518,6 +1530,10 @@ def _topp_split_mask_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+     vocab_size = vllm_config.model_config.get_vocab_size()
+     num_sm = num_compute_units()
+     logits_stride: Any = WarmupChoices(16, 2)
++    # Logits rows are the vocab-parallel head's padded rows (a multiple of 64) or a
++    # contiguous copy (the vocab size): unaligned only for a vocab size that is
++    # not a multiple of 16, so only then is the unaligned variant reachable.
++    _when(logits_stride == 16 or vocab_size % 16 != 0)
+     batch_size: Any = WarmupIntRange(
+         1, min(_max_sampler_batch_size(vllm_config), _SPLIT_MAX_BATCH) + 1
+     )
+-- 
+2.54.0 (Apple Git-157)
+

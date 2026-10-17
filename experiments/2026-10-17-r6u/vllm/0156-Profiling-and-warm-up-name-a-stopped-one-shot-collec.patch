@@ -1,0 +1,88 @@
+From 13be23fb971a88d689e5700711df279ec2b0fcad Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:39:13 +0200
+Subject: [PATCH 156/169] Profiling and warm-up name a stopped one-shot
+ collective
+
+Memory profiling and warm-up run the model outside execute_model and
+sample_tokens, so a CUDA error there was re-raised without the stopped
+collective's report: profile_run calls the model runner directly. Both now
+re-raise it as the collective's failure, as a serving step does.
+
+Reported-by: huxiaofengtiger (NVIDIA Developer Forums, DeepSeek 4.1 Flash recipe thread, post 24)
+---
+ tests/v1/worker/test_b12x_roce_health.py | 22 ++++++++++++++++++++++
+ vllm/v1/worker/gpu_worker.py             | 13 +++++++++++--
+ 2 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/tests/v1/worker/test_b12x_roce_health.py b/tests/v1/worker/test_b12x_roce_health.py
+index abac53410..042c772fd 100644
+--- a/tests/v1/worker/test_b12x_roce_health.py
++++ b/tests/v1/worker/test_b12x_roce_health.py
+@@ -8,6 +8,7 @@ completion: immediately for a synchronous output (or ``None``), and only after
+ ``get_output()`` for an asynchronous output.
+ """
+ 
++import contextlib
+ from types import SimpleNamespace
+ from unittest.mock import Mock
+ 
+@@ -139,3 +140,24 @@ def test_errors_without_a_stopped_collective_pass_unchanged(monkeypatch):
+     ):
+         raise error
+     assert raised.value is error
++
++
++def test_profiling_and_warm_up_name_a_stopped_collective(monkeypatch):
++    """Memory profiling and warm-up run the model outside execute_model; a
++    collective that stops the GPU there is named as the cause too."""
++    worker = _worker_with_failure(monkeypatch, REPORT)
++
++    def stopped(*args, **kwargs):
++        raise RuntimeError("CUDA error: unspecified launch failure")
++
++    monkeypatch.setattr(Worker, "_determine_available_memory", stopped)
++    with pytest.raises(RuntimeError, match="saw nothing from rank 2") as raised:
++        worker.determine_available_memory()
++    assert "unspecified launch failure" in str(raised.value.__cause__)
++    monkeypatch.setattr(Worker, "_compile_or_warm_up_model_after_preparation", stopped)
++    monkeypatch.setattr(
++        gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
++    )
++    worker.vllm_config = None
++    with pytest.raises(RuntimeError, match="saw nothing from rank 2"):
++        worker.compile_or_warm_up_model()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2092c4c3f..6f2796846 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -652,7 +652,13 @@ class Worker(WorkerBase):
+ 
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+-        """Profile model memory through the ordinary vLLM admission path."""
++        """Profile model memory through the ordinary vLLM admission path; a
++        one-shot collective that stops the GPU while profiling is named as the
++        error's cause, as in a serving step."""
++        with _collective_cause(self._roce_failure):
++            return self._determine_available_memory()
++
++    def _determine_available_memory(self) -> int:
+         maybe_apply_startup_plan(self)
+         # Loading compiled each rank's kernels for as long as its cache needed.
+         self._startup_rendezvous("memory profiling")
+@@ -959,7 +965,10 @@ class Worker(WorkerBase):
+ 
+     @instrument(span_name="Warmup (GPU)")
+     def compile_or_warm_up_model(self) -> CompilationTimes:
+-        with set_current_vllm_config(self.vllm_config):
++        with (
++            set_current_vllm_config(self.vllm_config),
++            _collective_cause(self._roce_failure),
++        ):
+             return self._compile_or_warm_up_model_after_preparation()
+ 
+     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
+-- 
+2.54.0 (Apple Git-157)
+
