@@ -1,0 +1,244 @@
+From e357be58e2380cec96cfc2cf62e6036f27aae874 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:38:15 +0200
+Subject: [PATCH] JIT: prepare call forms ahead of their calls; a frozen kernel
+ cache refuses the rest
+
+tilelang.prepare(calls) compiles lazy-mode JIT functions' call forms in one
+thread pool (lowering releases the GIL and nvcc is a subprocess) and keeps
+each kernel under the key __call__ computes for the same call, so the call is
+a cache hit. Calls are (function, args, kwargs) exactly as the call site
+passes them; progress(done, total) reports as kernels finish.
+JITImpl.prepare(calls) is the same for one function.
+
+tilelang.cache.freeze(reason) refuses every kernel not already in memory: a
+request that would load from the disk cache or compile raises
+KernelNotPreparedError, naming the kernel and, through JITImpl, the call. A
+program that runs on several processes prepares its kernels, then freezes, so a
+missing kernel fails by name in every process alike, whatever each process's
+disk cache holds, instead of compiling at an arbitrary point while the other
+processes wait. thaw() undoes it.
+---
+ tilelang/__init__.py           |  2 +-
+ tilelang/cache/__init__.py     |  1 +
+ tilelang/cache/kernel_cache.py | 43 ++++++++++++++++
+ tilelang/jit/__init__.py       | 89 +++++++++++++++++++++++++++++++++-
+ 4 files changed, 132 insertions(+), 3 deletions(-)
+
+diff --git a/tilelang/__init__.py b/tilelang/__init__.py
+index 70ea266c..b9de6a43 100644
+--- a/tilelang/__init__.py
++++ b/tilelang/__init__.py
+@@ -197,7 +197,7 @@ if not env.is_light_import():
+         if env.SKIP_LOADING_TILELANG_SO == "0":
+             _LIB, _LIB_PATH = _load_tile_lang_lib()
+ 
+-    from .jit import jit, JITKernel, compile, par_compile  # noqa: F401
++    from .jit import jit, JITKernel, compile, par_compile, prepare  # noqa: F401
+     from .profiler import Profiler  # noqa: F401
+     from .utils import (
+         TensorSupplyType,  # noqa: F401
+diff --git a/tilelang/cache/__init__.py b/tilelang/cache/__init__.py
+index d69b90ac..9e79bfec 100644
+--- a/tilelang/cache/__init__.py
++++ b/tilelang/cache/__init__.py
+@@ -8,6 +8,7 @@ from tvm.target import Target as TVMTarget
+ from tvm.tirx import PrimFunc
+ from tilelang.jit import JITKernel
+ from tilelang import env
++from tilelang.cache.kernel_cache import KernelNotPreparedError, freeze, frozen, thaw  # noqa: F401
+ from tilelang.jit.adapter.cutedsl.kernel_cache import CuTeDSLKernelCache
+ from tilelang.jit.adapter.cython.kernel_cache import CythonKernelCache
+ from tilelang.jit.adapter.nvrtc.kernel_cache import NVRTCKernelCache
+diff --git a/tilelang/cache/kernel_cache.py b/tilelang/cache/kernel_cache.py
+index 92a07099..547252f8 100644
+--- a/tilelang/cache/kernel_cache.py
++++ b/tilelang/cache/kernel_cache.py
+@@ -32,6 +32,47 @@ from tilelang.contrib.hip_resource_info import dump_to_file, load_from_file
+ from tilelang import __version__
+ 
+ 
++class KernelNotPreparedError(RuntimeError):
++    """A kernel was requested after the kernel cache was frozen, and it is not in memory."""
++
++
++_freeze_lock = threading.Lock()
++_frozen_reason: str | None = None
++
++
++def freeze(reason: str) -> None:
++    """Refuse every kernel that is not already in memory, from now on.
++
++    A request that would load a kernel from the disk cache or compile it raises
++    ``KernelNotPreparedError`` instead. Prepare the kernels a program needs, then freeze:
++    a missing one then fails by name in every process alike, whatever each process's
++    disk cache holds, instead of compiling at an arbitrary point.
++    """
++    global _frozen_reason
++    with _freeze_lock:
++        _frozen_reason = reason
++
++
++def thaw() -> None:
++    """Allow loading and compiling again (tests, and re-preparation)."""
++    global _frozen_reason
++    with _freeze_lock:
++        _frozen_reason = None
++
++
++def frozen() -> str | None:
++    """Why the cache is frozen, or None while it is not."""
++    return _frozen_reason
++
++
++def _refuse_if_frozen(func) -> None:
++    reason = _frozen_reason
++    if reason is not None:
++        raise KernelNotPreparedError(
++            f"TileLang kernel {get_prim_func_name(func, '<unknown>')!r} was not prepared: the kernel cache is frozen ({reason})"
++        )
++
++
+ class KernelCache:
+     """
+     Caches compiled kernels using a class and database persistence to avoid redundant compilation.
+@@ -345,6 +386,7 @@ class KernelCache:
+         execution_backend = backend_context.execution_backend.name
+ 
+         if not env.is_cache_enabled():
++            _refuse_if_frozen(func)
+             if verbose:
+                 self.logger.info("Cache is disabled; compiling kernel without caching.")
+             return JITKernel(
+@@ -381,6 +423,7 @@ class KernelCache:
+                     kernel_name,
+                 )
+                 return self._memory_cache[key]
++        _refuse_if_frozen(func)
+ 
+         if verbose:
+             self.logger.debug(f"Checking disk cache for kernel {get_prim_func_name(func, '<unknown>')}")
+diff --git a/tilelang/jit/__init__.py b/tilelang/jit/__init__.py
+index 656516a5..8b9acdb4 100644
+--- a/tilelang/jit/__init__.py
++++ b/tilelang/jit/__init__.py
+@@ -25,7 +25,7 @@ from tvm.target import Target
+ from contextlib import nullcontext
+ 
+ from tilelang.jit.kernel import JITKernel
+-from tilelang.cache import cached
++from tilelang.cache import KernelNotPreparedError, cached
+ from tilelang.utils.device import get_available_cpu_count
+ from os import path, makedirs
+ from logging import getLogger
+@@ -463,6 +463,19 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
+             ignore_error=ignore_error,
+         )
+ 
++    def prepare(
++        self,
++        calls: Iterable[tuple[tuple[Any, ...], dict[str, Any]]],
++        num_workers: int | None = None,
++        progress: Callable[[int, int], None] | None = None,
++    ) -> list[JITKernel[_KP, _T]]:
++        """Compile this function's call forms ahead of their calls (see ``tilelang.jit.prepare``).
++
++        Each call is ``(args, kwargs)``, exactly as the call site passes them; returns
++        the kernel of each call, in order.
++        """
++        return prepare([(self, args, kwargs) for args, kwargs in calls], num_workers, progress)
++
+     def compile(self, *args: _P.args, **kwargs: _P.kwargs) -> _Ret:
+         prim_func = self.get_tir(*args, **kwargs)
+         kernel_result = compile(
+@@ -550,7 +563,12 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
+         key, kernel_args = self.func.parse_args(*args, **kwargs)
+         kernel = self._kernel_cache.get(key, None)
+         if kernel is None:
+-            kernel = self.compile(*args, **kwargs)
++            try:
++                kernel = self.compile(*args, **kwargs)
++            except KernelNotPreparedError as error:
++                name = getattr(self.func, "__name__", repr(self.func))
++                call = ", ".join([*map(repr, args), *(f"{k}={v!r}" for k, v in kwargs.items())])
++                raise KernelNotPreparedError(f"{error}; requested as {name}({call})") from None
+             self._kernel_cache[key] = kernel
+ 
+         if call_form_key is not None and self.is_lazy_mode() and not kernel_args:
+@@ -564,6 +582,73 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
+             return kernel
+ 
+ 
++
++def prepare(
++    calls: Iterable[tuple[JITImpl, tuple[Any, ...], dict[str, Any]]],
++    num_workers: int | None = None,
++    progress: Callable[[int, int], None] | None = None,
++) -> list[JITKernel]:
++    """Compile lazy-mode JIT functions' call forms ahead of their calls, in one thread pool.
++
++    Each call is ``(jit_function, args, kwargs)``, with the arguments exactly as the call
++    site passes them. Every distinct call is elaborated, then compiled (or loaded from the
++    disk cache) on a shared thread pool (lowering releases the GIL and nvcc is a
++    subprocess), and its kernel is kept under the key ``__call__`` computes for the same
++    call, so the call itself is a cache hit. ``progress(done, total)`` is called as
++    kernels finish.
++
++    Parameters
++    ----------
++    calls : Iterable[tuple[JITImpl, tuple, dict]]
++        The function, positional arguments and keyword arguments of each call.
++    num_workers : int, optional
++        Compile threads; defaults to the available CPUs, capped at the kernel count.
++    progress : Callable[[int, int], None], optional
++        Called with (kernels done, kernels to prepare).
++
++    Returns
++    -------
++    List[JITKernel]
++        The kernel of each call, in order.
++    """
++    calls = [(impl, tuple(args), dict(kwargs)) for impl, args, kwargs in calls]
++    keys = []
++    pending: dict[tuple[int, Any], tuple[JITImpl, Any, PrimFunc]] = {}
++    for impl, args, kwargs in calls:
++        impl.initialize_jit_mode(*args, **kwargs)
++        if not impl.is_lazy_mode():
++            raise ValueError("prepare() compiles lazy-mode kernels (functions that return a PrimFunc)")
++        key = impl.func.parse_args(*args, **kwargs)[0]
++        keys.append((impl, key))
++        if key not in impl._kernel_cache and (id(impl), key) not in pending:
++            pending[(id(impl), key)] = (impl, key, impl.get_tir(*args, **kwargs))
++    total = len(pending)
++    if progress is not None:
++        progress(0, total)
++    if pending:
++        workers = num_workers or min(total, get_available_cpu_count())
++        with concurrent.futures.ThreadPoolExecutor(workers, "tl-prepare") as executor:
++            futures = {
++                executor.submit(
++                    compile,
++                    func=func,
++                    out_idx=impl.out_idx,
++                    execution_backend=impl.execution_backend,
++                    target=impl.target,
++                    target_host=impl.target_host,
++                    verbose=impl.verbose,
++                    pass_configs=impl.pass_configs,
++                    compile_flags=impl.compile_flags,
++                ): (impl, key)
++                for impl, key, func in pending.values()
++            }
++            for done, future in enumerate(concurrent.futures.as_completed(futures), 1):
++                impl, key = futures[future]
++                impl._kernel_cache[key] = future.result()
++                if progress is not None:
++                    progress(done, total)
++    return [impl._kernel_cache[key] for impl, key in keys]
++
+ ExecutionBackend = Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "pto"]
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
