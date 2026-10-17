@@ -56,7 +56,15 @@ def main(repo: str, base: str, head: str, tilelang_tree: str, tag: str, monitor:
     recipe = json.loads((ROOT / "config/cluster.json").read_text())
     mounts = recipe["container"]["mounts"] + [
         [f"{{home}}/projects/spark-ds41f/{JITTRACE}", "/opt/spark3/jittrace", "ro"]] + mounts
-    serve = list(recipe["serve_args"])
+    # The shape's resolved arguments (the recipe's carry ${...} placeholders).
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin/spark"))
+    spec = importlib.util.spec_from_loader("spark", loader)
+    spark = importlib.util.module_from_spec(spec)
+    sys.modules["spark"] = spark
+    loader.exec_module(spark)
+    serve = list(spark.read_cluster("config/cluster.json", "tp3-triangle")["serve_args"])
     serve[serve.index("--jit-monitor-mode") + 1] = monitor
     pythonpath = "/opt/spark3/jittrace:" + recipe["environment"]["PYTHONPATH"]
     for kind, cache in (("cold", f"/cache/kkref/jit-r6u/{tag}-cold"),
