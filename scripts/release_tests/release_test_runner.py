@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 CHUNK, CHUNK_TIMEOUT, FILE_TIMEOUT = 10, 1800, 600
+BASETEMP = "/c/pytest-tmp-release"
 
 
 def pytest(paths, out: Path, tag: str, timeout: int) -> tuple[object, Path, float, str]:
@@ -26,7 +27,7 @@ def pytest(paths, out: Path, tag: str, timeout: int) -> tuple[object, Path, floa
     command = [sys.executable, "-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider",
                "-p", "tblib_stub", "--continue-on-collection-errors",
                "-o", "junit_family=xunit1", "-o", "faulthandler_timeout=300",
-               "--junitxml", str(report), "--basetemp", f"/c/pytest-tmp-release/{tag}", *paths]
+               "--junitxml", str(report), "--basetemp", f"{BASETEMP}/{tag}", *paths]
     started = time.time()
     try:
         process = subprocess.run(command, timeout=timeout, stdout=subprocess.PIPE,
@@ -69,6 +70,8 @@ def main(manifest_path: str, out_dir: str) -> int:
     files = sorted(json.loads(Path(manifest_path).read_text())["files"])
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # pytest creates --basetemp itself but not its parent.
+    Path(BASETEMP).mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
     for start in range(0, len(files), CHUNK):
         chunk = [f for f in files[start:start + CHUNK] if Path(f).exists()]

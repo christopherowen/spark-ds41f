@@ -95,9 +95,10 @@ def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
         "description": f"Release tests ({label}): the manifest's vLLM test files in the image, "
                        "chunked with timeouts; per-test outcomes under /c/release-tests.",
         "image": image,
+        # Tests set what they need: the deployment's environment (the kernel family,
+        # DSpark cost curves, carve-out) changes what modules do at import.
         "env": {"HF_HUB_OFFLINE": "1", "PYTHONPATH": "/b",
-                "TILELANG_CACHE_DIR": "/c/tilelang-release-tests",
-                "VLLM_DS41_KERNEL_BACKEND": "tilelang"},
+                "TILELANG_CACHE_DIR": "/c/tilelang-release-tests"},
         "workdir": "/opt/spark3/candidate/vllm",
         "argv": ["/b/release_test_runner.py", "/b/manifest.json", f"/c/release-tests/{label}"],
         "verdict": "exit",
