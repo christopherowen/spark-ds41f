@@ -1,0 +1,392 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+    TritonWarmupTensor,
+    triton_kernel_dispatcher_with_warmup,
+    triton_warmup_inputs,
+)
+from vllm.models.deepseek_v4_1.ced import (
+    CED_WINDOW,
+    CEDState,
+    ced_decoder_start,
+    gather_rows,
+)
+from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+from vllm.triton_utils import tl, triton
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.states import RequestState
+from vllm.v1.worker.utils import AttentionGroup
+
+
+@triton.jit(do_not_specialize=["num_reqs"])
+def _gather_lookback_kernel(
+    lookback_ptr,
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    num_reqs,
+    DEPTH: tl.constexpr,
+    BLOCK_DEPTH: tl.constexpr,
+):
+    # One program per lookback row; rows past the batch are filled with -1.
+    batch_idx = tl.program_id(0)
+    in_batch = batch_idx < num_reqs
+    req_state_idx = tl.load(idx_mapping_ptr + batch_idx, mask=in_batch, other=0)
+    num_computed = tl.load(
+        num_computed_tokens_ptr + req_state_idx, mask=in_batch, other=0
+    )
+
+    offs = tl.arange(0, BLOCK_DEPTH)
+    pos = num_computed - DEPTH + offs
+    valid = in_batch & (offs < DEPTH) & (pos >= 0)
+    ids = tl.load(
+        all_token_ids_ptr
+        + req_state_idx.to(tl.int64) * all_token_ids_stride
+        + pos.to(tl.int64),
+        mask=valid,
+        other=-1,
+    )
+    tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
+
+
+def _gather_lookback_warmup_inputs(
+    *, depth: int, all_token_ids_stride: int
+) -> dict[str, Any]:
+    return triton_warmup_inputs(
+        _gather_lookback_kernel,
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int64),
+        TritonWarmupTensor(torch.int32),
+        TritonWarmupTensor(torch.int32),
+        all_token_ids_stride,
+        1,
+        grid=(1,),
+        DEPTH=depth,
+        BLOCK_DEPTH=triton.next_power_of_2(depth),
+    )
+
+
+_gather_lookback_launcher = triton_kernel_dispatcher_with_warmup(
+    warmup_inputs=_gather_lookback_warmup_inputs
+)(_gather_lookback_kernel)
+
+
+class DeepseekV41ModelState(DefaultModelState):
+    """DefaultModelState plus the engram lookback window.
+
+    The engram n-gram hash needs the ids of the ``depth`` tokens preceding
+    each request's chunk start (see ``common/engram.py``). The runner keeps
+    the full token history on device, so the window is gathered there every
+    step: exact for prompt and generated tokens alike, whatever instance
+    produced their KV.
+
+    With disk Engram tables, the host also keeps each request's prefill tokens
+    and hashes the rows of a step's prefill chunks when it prepares the step,
+    a step before the GPU runs it, so the reader can read them while the
+    previous step computes (``engram_rows/host_hash.py``). Rows of tokens the
+    GPU samples are hashed on the GPU as before; one step can hold both.
+    """
+
+    _ced_streaming_prefix_start: tuple[str, int] | None = None
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+    ):
+        super().__init__(vllm_config, model, encoder_cache, device)
+        self.ced_state: CEDState | None = None
+        self._ced_prompt_logprobs: set[str] = set()
+        self._ced_prefix_start: dict[str, int] = {}
+        self._ced_batch: InputBatch | None = None
+        self.max_cudagraph_query_len: int | None = None
+        if ced_decoder_start(self.model_config.hf_config) is not None:
+            compact_max = min(self.max_num_tokens, self.max_num_reqs * CED_WINDOW)
+            # Compaction changes the model's optional-input branch; FULL graphs
+            # remain valid for every short/varlen decode split, never long chunks.
+            self.max_cudagraph_query_len = CED_WINDOW
+            capacities = tuple(
+                sorted(
+                    {
+                        self.max_num_tokens,
+                        compact_max,
+                        *range(CED_WINDOW, compact_max + 1, CED_WINDOW),
+                        *(
+                            size
+                            for size in (
+                                vllm_config.compilation_config.cudagraph_capture_sizes
+                                or ()
+                            )
+                            if 0 < size <= self.max_num_tokens
+                        ),
+                    }
+                )
+            )
+            self.ced_state = CEDState(
+                self.max_num_reqs, self.max_num_tokens, capacities, device
+            )
+            hf = self.model_config.hf_config
+            self.ced_state.warmup(hf.hidden_size, hf.hc_mult)
+            parallel = vllm_config.parallel_config
+            if (
+                is_breakable_cudagraph_enabled()
+                and self.max_num_tokens == 4096
+                and parallel.decode_context_parallel_size == 1
+                and parallel.pipeline_parallel_size == 1
+                and parallel.data_parallel_size == 1
+                and vllm_config.lora_config is None
+            ):
+                self.single_request_prefill_cudagraph_tokens = 4096
+        depth = model.token_lookback_depth
+        self.lookback_token_ids: torch.Tensor | None = None
+        if depth > 0:
+            # Persistent so a captured graph can read it on replay.
+            self.lookback_token_ids = torch.full(
+                (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
+            )
+            # The runner's token history is [max_num_reqs, max_model_len].
+            _gather_lookback_launcher.register_warmup(
+                depth=depth, all_token_ids_stride=self.max_model_len
+            )
+        from .model import DeepseekV4Model
+
+        self.disk_engram_models = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, DeepseekV4Model) and module.disk_engram
+        )
+        # Disk Engram: each live request's prefill tokens (prompt, and on resumption
+        # the outputs it recomputes), for the host's hash of its prefill chunks.
+        self._prefill_tokens: dict[str, np.ndarray] = {}
+        self._host_engram_hash = None
+
+    def prepare_streaming_update(self, req_id: str) -> None:
+        """Keep decoder history when the runner refreshes a live request."""
+        self._ced_streaming_prefix_start = (
+            req_id,
+            self._ced_prefix_start.get(req_id, 0),
+        )
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self.disk_engram_models and new_req_data.prefill_token_ids is not None:
+            self._prefill_tokens[new_req_data.req_id] = np.asarray(
+                new_req_data.prefill_token_ids, dtype=np.int32
+            )
+        sampling = new_req_data.sampling_params
+        if sampling is not None and sampling.prompt_logprobs is not None:
+            self._ced_prompt_logprobs.add(new_req_data.req_id)
+        else:
+            self._ced_prompt_logprobs.discard(new_req_data.req_id)
+        # Fresh decoder pages lack cached history; streaming updates retain
+        # the live request's private pages and therefore its original boundary.
+        pending = self._ced_streaming_prefix_start
+        prefix_start = (
+            pending[1]
+            if pending is not None and pending[0] == new_req_data.req_id
+            else new_req_data.num_computed_tokens
+        )
+        self._ced_streaming_prefix_start = None
+        self._ced_prefix_start[new_req_data.req_id] = prefix_start
+
+    def remove_request(self, req_id: str) -> None:
+        super().remove_request(req_id)
+        self._prefill_tokens.pop(req_id, None)
+        self._ced_prompt_logprobs.discard(req_id)
+        self._ced_prefix_start.pop(req_id, None)
+
+    def can_use_single_request_prefill_graph(self, num_reqs, num_tokens, req_ids):
+        return (
+            self.single_request_prefill_cudagraph_tokens > 0
+            and num_reqs == 1
+            and num_tokens == self.single_request_prefill_cudagraph_tokens
+            and not any(req in self._ced_prompt_logprobs for req in req_ids)
+        )
+
+    def finalize_cudagraph_inputs(self, model_inputs, cg_mode):
+        if cg_mode == CUDAGraphMode.PIECEWISE:
+            # prepare_attn stages CED after prepare_dummy_inputs. Capture the
+            # same compact branch and persistent index buffer used by serving.
+            model_inputs["ced_indices"] = self.get_ced_indices()
+
+    def get_ced_indices(self) -> torch.Tensor | None:
+        return None if self.ced_state is None else self.ced_state.get_indices()
+
+    def _stage_ced(self, input_batch: InputBatch, *, force_full: bool = False) -> None:
+        state = self.ced_state
+        if state is None:
+            return
+        nr = input_batch.num_reqs
+        state.stage(
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            input_batch.num_scheduled_tokens[:nr],
+            [True] * nr
+            if force_full
+            else [
+                req_id in self._ced_prompt_logprobs for req_id in input_batch.req_ids
+            ],
+            [0] * nr
+            if force_full
+            else [
+                self._ced_prefix_start.get(req_id, 0) for req_id in input_batch.req_ids
+            ],
+        )
+        self._ced_batch = input_batch
+
+    def prepare_attn(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
+        # Runtime prepares attention before model inputs. Capture does the reverse;
+        # both paths populate the same persistent packing buffers.
+        self._stage_ced(input_batch, force_full=for_capture)
+        metadata = super().prepare_attn(
+            input_batch,
+            cudagraph_mode,
+            block_tables,
+            slot_mappings,
+            attn_groups,
+            kv_cache_config,
+            for_capture,
+        )
+        state = self.ced_state
+        if state is not None:
+            # The decoder's rows are the step's rows gathered by CED's indices.
+            # Adaptive verification marks dead rows inside the batch, and the
+            # plan's CPU upper bound leaves -1 indices at its end, so the
+            # step's padding mask is gathered, not truncated. The mask is a new
+            # tensor each step: CED steps must not replay a CUDA graph.
+            indices = state.get_indices()
+            routing_mask = None
+            if indices is not None:
+                if cudagraph_mode != CUDAGraphMode.NONE:
+                    raise RuntimeError("CED decoder routing requires eager execution")
+                routing_mask = (indices >= 0) & ~gather_rows(
+                    input_batch.is_padding, indices
+                )
+            seen: set[int] = set()
+            for value in metadata.values():
+                if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
+                    seen.add(id(value))
+                    value.swa_replay_start = state.replay_start
+                    if state.plan is not None:
+                        value.decoder = state.decoder_metadata(value)
+                        value.decoder.routing_mask = routing_mask
+        return metadata
+
+    def prepare_inputs(
+        self, input_batch: InputBatch, req_states: RequestState
+    ) -> dict[str, torch.Tensor | None]:
+        model_inputs = super().prepare_inputs(input_batch, req_states)
+        if self.ced_state is not None:
+            if self._ced_batch is not input_batch:
+                self._stage_ced(input_batch)
+            model_inputs["ced_indices"] = self.get_ced_indices()
+        window = self.lookback_token_ids
+        if window is None:
+            return model_inputs
+        all_token_ids = req_states.all_token_ids.gpu
+        depth = window.shape[1]
+        _gather_lookback_launcher[(window.shape[0],)](
+            window,
+            input_batch.idx_mapping,
+            req_states.num_computed_tokens.gpu,
+            all_token_ids,
+            all_token_ids.stride(0),
+            input_batch.idx_mapping.shape[0],
+            DEPTH=depth,
+            BLOCK_DEPTH=triton.next_power_of_2(depth),
+        )
+        model_inputs["lookback_token_ids"] = window
+        for model in self.disk_engram_models:
+            model.prepare_disk_engram(
+                input_batch.input_ids,
+                input_batch.query_start_loc,
+                window,
+                self._early_engram_ids(model, input_batch),
+            )
+        return model_inputs
+
+    def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
+        """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
+        (``host_hash.UNKNOWN`` for rows of tokens the GPU samples, -1 for padding),
+        or None when the step has no prefill chunk to hash."""
+        if not input_batch.has_prefill:
+            return None
+        from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
+
+        if self._host_engram_hash is None:
+            layout = model.engram_hash.layout
+            geometry = layout.geometry
+            self._host_engram_hash = HostEngramHash(
+                layout.token_map,
+                geometry.multipliers,
+                geometry.primes,
+                geometry.offsets,
+            )
+        starts = input_batch.query_start_loc_np
+        requests = []
+        for i, req_id in enumerate(input_batch.req_ids):
+            first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
+            tokens = self._prefill_tokens.get(req_id)
+            positions = np.empty(0, dtype=np.int64)
+            if tokens is not None and input_batch.is_prefilling_np[i]:
+                start = int(input_batch.num_computed_prefill_tokens_np[i])
+                positions = np.arange(
+                    start, min(start + rows, len(tokens)), dtype=np.int64
+                )
+            requests.append((first, rows, tokens, positions))
+        hashed = [i for i, (*_, positions) in enumerate(requests) if len(positions)]
+        if not hashed:
+            return None
+        # Adaptive verification gives verifying requests row counts the GPU chooses,
+        # but keeps them at the front of the batch with the host's total, so every
+        # later request starts at the same row on the host and the GPU.
+        drafts = input_batch.num_draft_tokens_per_req
+        if drafts is not None and drafts[hashed[0] :].any():
+            raise RuntimeError(
+                "Engram host hash: a verifying request follows a prefill chunk, so "
+                "the chunk's rows are placed by the GPU"
+            )
+        return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
+
+    def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+        model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+        if self.ced_state is not None:
+            # FULL descriptors may pad a short request far beyond128 rows.
+            # Capture their noncompact branch, regardless of dummy split;
+            # long real queries are forced off FULL graphs by the runner.
+            self.ced_state.plan = None
+            self.ced_state.replay_start.zero_()
+            self._ced_batch = None
+            model_inputs["ced_indices"] = None
+        if self.lookback_token_ids is not None:
+            # The captured graph reads this buffer; replays refill it in place.
+            self.lookback_token_ids.fill_(-1)
+            model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        for model in self.disk_engram_models:
+            model.prepare_dummy_engram(num_tokens)
+        return model_inputs

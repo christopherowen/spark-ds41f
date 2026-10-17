@@ -694,6 +694,18 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             self.model.markov_head.markov_w2, markov_embed, skip_gather=True
         )
 
+    @property
+    def draft_logits_local_layout(self) -> tuple[torch.dtype, int, int]:
+        """(dtype, draft logits row width, Markov bias row width) of the fresh
+        tensors ``compute_draft_logits_local`` and ``markov_bias_local`` return:
+        both heads write the head dtype, one padded vocabulary shard per row."""
+        assert self.lm_head is not None
+        return (
+            self.logits_processor.head_dtype,
+            self.lm_head.num_embeddings_per_partition,
+            self.model.markov_head.markov_w2.num_embeddings_per_partition,
+        )
+
     def apply_markov_bias_gathered(
         self,
         markov_embed: torch.Tensor,
