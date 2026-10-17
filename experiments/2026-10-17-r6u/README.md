@@ -42,7 +42,8 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
 1. Overlay iterations on the r6s image (changed Python files mounted): boots with every
    TileLang cache empty and with one rank's empty, freeze on, until no kernel is missing.
 2. `image.json`: r6u built on dgx2, copied over the CX7 links.
-3. `tests.json`: the prepare, rendezvous, worker and kernel tests in the image.
+3. `tests.json`: the release-test gate in the image (`config/release-tests.json`: the 58
+   DS4.1 Flash gate files, [testing](../../docs/testing.md)).
 4. `gate.json`: temperature-0 determinism and distinct streams, identical to r6s.
    `release-tests-discovery.json`: every test file `scripts/release_tests.py` selects
    (the stack's, the series', and those importing a module the series changes: 326)
@@ -80,3 +81,8 @@ collective for a rank that was compiling, and the 10 s wait stopped the GPU (for
   slower at 13 of 20 TP3/TP4 decode row counts (+0.07% to +0.48%), so it is not included.
   The script exited 0; the queue reports FAIL because the exit verdict also expects a
   pytest summary line, which the script does not print.
+- Release tests (2026-10-17): the DS4.1 Flash deployment's 115 selected test files classified
+  (58 gate, 57 excluded, 6 tests deselected); nine test files fixed (0173-0176: stale hand-built
+  objects, the deployment environment, TileLang coverage, DS4.1's config tests in their own file).
+  The gate over the image with the fixed files mounted: 58 files, 1,350 passed, 41 skipped
+  (39 need offline Hugging Face configs, the indexer's NaN contract, two GPUs), none failing, 6.2 min.

@@ -1,0 +1,187 @@
+From e432d0595fdf46cde91f95f2a3308c70b32f9ed0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:26:25 +0200
+Subject: [PATCH 176/176] Tests: DS4.1's configuration tests in their own file
+
+Kernel-family routing and TP3 head padding were the only DeepSeek V4.1 tests in
+the B12X sparse-MLA API file, whose other ~215 cover GLM, V3.2 and DeepSeek V4;
+the release tests run the DS4.1 file and leave the other models' file out.
+---
+ tests/models/test_deepseek_v4_1_config.py     | 72 +++++++++++++++++++
+ .../v1/attention/test_b12x_sparse_mla_api.py  | 65 -----------------
+ 2 files changed, 72 insertions(+), 65 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_config.py
+
+diff --git a/tests/models/test_deepseek_v4_1_config.py b/tests/models/test_deepseek_v4_1_config.py
+new file mode 100644
+index 000000000..78b9519d5
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_config.py
+@@ -0,0 +1,72 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 configuration on GB10: kernel-family routing and TP3 head padding."""
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.config import ModelConfig
++from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
++from vllm.models.deepseek_v4_1.nvidia.b12x_attention import DeepseekV41B12xAttention
++from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
++from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++from vllm.v1.attention.backends.registry import AttentionBackendEnum
++
++
++@pytest.mark.parametrize("family", ["b12x", "tilelang"])
++def test_kernel_family_routes_deepseek_v41(monkeypatch, family) -> None:
++    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
++    attention backend and class, and (TileLang) the linear and MoE backends."""
++    from vllm import envs
++    from vllm.models.deepseek_v4_1.tilelang.attention import (
++        DeepseekV41TileLangAttention,
++    )
++
++    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False)
++    backend, attention_cls = {
++        "b12x": (AttentionBackendEnum.B12X, DeepseekV41B12xAttention),
++        "tilelang": (AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention),
++    }[family]
++    kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
++    config = SimpleNamespace(
++        attention_config=SimpleNamespace(backend=None),
++        kernel_config=kernel,
++        speculative_config=None,
++    )
++
++    DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
++
++    assert config.attention_config.backend is backend
++    assert _select_dsv4_attn_cls(config) is attention_cls
++    if family == "tilelang":
++        assert kernel.linear_backend == kernel.moe_backend == "tilelang"
++    else:
++        assert DeepseekV41B12xBackend.get_name() == "B12X"
++
++    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
++    with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
++        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
++
++
++def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
++    text_config = SimpleNamespace(num_attention_heads=64, o_groups=8)
++    model_config = SimpleNamespace(
++        architecture="DSparkV41DraftModel",
++        hf_config=text_config,
++        hf_text_config=text_config,
++        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
++    )
++    model_config.get_model_arch_config = lambda: SimpleNamespace(
++        total_num_attention_heads=text_config.num_attention_heads
++    )
++    parallel_config = SimpleNamespace(tensor_parallel_size=3)
++
++    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
++    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
++
++    assert text_config.original_num_attention_heads == 64
++    assert text_config.original_o_groups == 8
++    assert text_config.num_attention_heads == 72
++    assert text_config.o_groups == 9
++    assert model_config.model_arch_config.total_num_attention_heads == 72
+diff --git a/tests/v1/attention/test_b12x_sparse_mla_api.py b/tests/v1/attention/test_b12x_sparse_mla_api.py
+index 720980607..4d51602d0 100644
+--- a/tests/v1/attention/test_b12x_sparse_mla_api.py
++++ b/tests/v1/attention/test_b12x_sparse_mla_api.py
+@@ -13,7 +13,6 @@ import torch
+ 
+ from vllm.config import (
+     AttentionConfig,
+-    ModelConfig,
+     VllmConfig,
+     set_current_vllm_config,
+ )
+@@ -25,14 +24,8 @@ from vllm.model_executor.layers.attention.mla_attention import (
+ from vllm.model_executor.layers.attention.sparse_mla_attention import (
+     SparseMLACommonMetadataBuilder,
+ )
+-from vllm.model_executor.models.config import DeepseekV41ForCausalLMConfig
+ from vllm.models.deepseek_v4.nvidia import b12x as b12x_mla
+ from vllm.models.deepseek_v4.nvidia import b12x_indexer
+-from vllm.models.deepseek_v4_1.nvidia.b12x_attention import (
+-    DeepseekV41B12xAttention,
+-)
+-from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
+ from vllm.models.deepseek_v32.nvidia.b12x import (
+     B12xDSAIndexer,
+     DeepseekV32B12xAttention,
+@@ -222,64 +215,6 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
+     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
+ 
+ 
+-@pytest.mark.parametrize("family", ["b12x", "tilelang"])
+-def test_kernel_family_routes_deepseek_v41(monkeypatch, family) -> None:
+-    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
+-    attention backend and class, and (TileLang) the linear and MoE backends."""
+-    from vllm import envs
+-    from vllm.models.deepseek_v4_1.tilelang.attention import (
+-        DeepseekV41TileLangAttention,
+-    )
+-
+-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False)
+-    backend, attention_cls = {
+-        "b12x": (AttentionBackendEnum.B12X, DeepseekV41B12xAttention),
+-        "tilelang": (AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention),
+-    }[family]
+-    kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
+-    config = SimpleNamespace(
+-        attention_config=SimpleNamespace(backend=None),
+-        kernel_config=kernel,
+-        speculative_config=None,
+-    )
+-
+-    DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+-
+-    assert config.attention_config.backend is backend
+-    assert _select_dsv4_attn_cls(config) is attention_cls
+-    if family == "tilelang":
+-        assert kernel.linear_backend == kernel.moe_backend == "tilelang"
+-    else:
+-        assert DeepseekV41B12xBackend.get_name() == "B12X"
+-
+-    config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+-    with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
+-        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+-
+-
+-def test_deepseek_v41_tp3_padding_uses_generic_parallel_hook() -> None:
+-    text_config = SimpleNamespace(num_attention_heads=64, o_groups=8)
+-    model_config = SimpleNamespace(
+-        architecture="DSparkV41DraftModel",
+-        hf_config=text_config,
+-        hf_text_config=text_config,
+-        model_arch_config=SimpleNamespace(total_num_attention_heads=64),
+-    )
+-    model_config.get_model_arch_config = lambda: SimpleNamespace(
+-        total_num_attention_heads=text_config.num_attention_heads
+-    )
+-    parallel_config = SimpleNamespace(tensor_parallel_size=3)
+-
+-    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+-    ModelConfig._update_model_config_for_parallelism(model_config, parallel_config)
+-
+-    assert text_config.original_num_attention_heads == 64
+-    assert text_config.original_o_groups == 8
+-    assert text_config.num_attention_heads == 72
+-    assert text_config.o_groups == 9
+-    assert model_config.model_arch_config.total_num_attention_heads == 72
+-
+-
+ def test_b12x_sparse_mla_accepts_glm_dsa_contract(monkeypatch) -> None:
+     monkeypatch.setattr(b12x_mla_sparse, "get_b12x_sparse_mla", lambda: object())
+     config = SimpleNamespace(
+-- 
+2.54.0 (Apple Git-157)
+

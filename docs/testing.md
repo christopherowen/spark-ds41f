@@ -112,6 +112,9 @@ into `tests/models/test_deepseek_v4_1_config.py`.
 
 ### Gaps still open
 
+- 39 tests of `test_kv_cache_utils.py` skip for want of offline Hugging Face configs; the
+  DS4.1-relevant ones (null blocks, packing with real configs) should build their
+  `ModelConfig` from a local config.
 - No DS4.1 DSpark end-to-end acceptance test (acceptance is measured only by the bench).
 - The JIT monitor's TileLang hook is tested only against fakes of TileLang internals; one test
   should compile a real kernel.
