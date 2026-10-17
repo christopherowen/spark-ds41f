@@ -48,10 +48,12 @@ def main(repo: str, base: str, head: str, tilelang_tree: str, tag: str, monitor:
         mounts.append([f"{{home}}/projects/spark-ds41f/{EXP}/overlay/vllm/{path}",
                        f"{VLLM_SITE}/{path}", "ro"])
     for path in TILELANG_FILES:
-        target = overlay / "tilelang" / path
+        # Flat names: the repository ignores directories named cache.
+        flat = path.replace("/", ".")
+        target = overlay / "tilelang" / flat
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(Path(tilelang_tree) / path, target)
-        mounts.append([f"{{home}}/projects/spark-ds41f/{EXP}/overlay/tilelang/{path}",
+        mounts.append([f"{{home}}/projects/spark-ds41f/{EXP}/overlay/tilelang/{flat}",
                        f"{TILELANG_SITE}/{path}", "ro"])
     recipe = json.loads((ROOT / "config/cluster.json").read_text())
     mounts = recipe["container"]["mounts"] + [
