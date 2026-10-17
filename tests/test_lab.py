@@ -535,6 +535,31 @@ class PlanProblemsTest(unittest.TestCase):
         self.assertEqual(problems, ["suite screen times the engine grid, but experiments/2026-10-15-r6n/r6n-release.json "
                                     "lacks VLLM_SERVER_DEV_MODE=1 (the dev-mode collective RPC)"])
 
+    def test_suite_job_with_a_companion_suite(self) -> None:
+        """A list of suites: the release suite first, a companion (single-stream) on the same
+        boot in its own run directory and table; the release suite's outputs are unchanged."""
+        spec = {"experiment": "experiments/2026-10-14-servebench", "run": "s", "jobs": [
+            {"kind": "measure", "suite": ["screen", "single-stream"],
+             "arms": [{"config": "experiments/2026-10-14-servebench/engine-r6k.json", "label": "cand"},
+                      {"config": "experiments/2026-10-14-servebench/engine-r6h.json", "label": "base"}]}]}
+        with mock.patch.object(lab, "head_url", return_value="http://h:8000"):
+            steps = lab.plan(spec)
+            self.assertEqual(lab.plan_problems(steps), [])
+        self.assertEqual([s["kind"] for s in steps],
+                         ["boot", "curves", "cli", "cli", "boot", "curves", "cli", "cli", "table", "table"])
+        benches = [s for s in steps if s["kind"] == "cli"]
+        self.assertEqual([b["suite"] for b in benches], ["screen", "single-stream"] * 2)
+        self.assertEqual(benches[0]["argv"][-4:], ["--output", "results/private/suites/s/cand", "--label", "cand"])
+        self.assertEqual(benches[1]["argv"][-4:],
+                         ["--output", "results/private/suites/s-single-stream/cand", "--label", "cand"])
+        self.assertEqual(benches[2]["argv"][-2:], ["--corpus", "results/private/suites/s/cand/model.json.gz"])
+        self.assertNotIn("--corpus", benches[3]["argv"])
+        self.assertEqual(benches[3]["telemetry_out"], "results/private/determinism/s/suite-base-single-stream")
+        tables = [s for s in steps if s["kind"] == "table"]
+        self.assertEqual([t["argv"][1] for t in tables], ["s", "s-single-stream"])
+        self.assertEqual([t["out"] for t in tables],
+                         ["results/private/lab/s-table.txt", "results/private/lab/s-single-stream-table.txt"])
+
     def test_bad_arguments_missing_files_and_configs(self) -> None:
         spec = self.measure([["scripts/servebench_run.py", ["--mode", "sideways"], "c16"],
                              ["no_such_script.py", [], "x"]])

@@ -808,8 +808,17 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
     bin/spark bench --suite (cooled nodes, the fan performance curve, the memory and
     temperature watch, the arm's identity in the run) into results/private/suites/<run>/<label>;
     arms after the first score the first arm's text in model steps; the table compares the
-    arms' suite runs. A failed step leaves the other arms to run; a refused bench ends the job."""
+    arms' suite runs. A failed step leaves the other arms to run; a refused bench ends the job.
+
+    "suite" may also be a list: the release suite first, then companion suites (such as
+    single-stream) on the same boot, each in results/private/suites/<run>-<suite>/<label> with
+    its own table, so the release suite and its recorded references stay unchanged."""
     experiment, run = spec["experiment"], spec["run"]
+    suites = [job["suite"]] if isinstance(job["suite"], str) else list(job["suite"])
+
+    def run_of(name: str) -> str:
+        return run if name == suites[0] else f"{run}-{name}"
+
     first = f"results/private/suites/{run}/{arms[0]['label']}/model.json.gz"
     steps = []
     for index, arm in enumerate(arms):
@@ -817,15 +826,19 @@ def suite_steps(spec: dict, job: dict, arms: list[dict]) -> list[dict]:
         steps.append(boot_step(run, arm, config))
         steps.append({"kind": "curves", "label": label, "config": config,
                       "out": f"results/private/determinism/{run}/curves-{label}.json"})
-        argv = ["--cluster-config", config, "bench", "--suite", job["suite"], "--compare", "none",
-                "--output", f"results/private/suites/{run}/{label}", "--label", label]
-        if index:
-            argv += ["--corpus", first]
-        steps.append({"kind": "cli", "label": label, "argv": argv, "suite": job["suite"],
-                      "telemetry_out": f"results/private/determinism/{run}/suite-{label}"})
-    steps.append({"kind": "table", "argv": ["scripts/servebench_suite_table.py", run, *[a["label"] for a in arms]],
-                  "out": f"results/private/lab/{run}-table.txt",
-                  "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms]})
+        for name in suites:
+            argv = ["--cluster-config", config, "bench", "--suite", name, "--compare", "none",
+                    "--output", f"results/private/suites/{run_of(name)}/{label}", "--label", label]
+            if index and name == suites[0]:
+                argv += ["--corpus", first]
+            suffix = "" if name == suites[0] else f"-{name}"
+            steps.append({"kind": "cli", "label": label, "argv": argv, "suite": name,
+                          "telemetry_out": f"results/private/determinism/{run}/suite-{label}{suffix}"})
+    for name in suites:
+        steps.append({"kind": "table",
+                      "argv": ["scripts/servebench_suite_table.py", run_of(name), *[a["label"] for a in arms]],
+                      "out": f"results/private/lab/{run_of(name)}-table.txt",
+                      "curves": [f"results/private/determinism/{run}/curves-{a['label']}.json" for a in arms]})
     return steps
 
 

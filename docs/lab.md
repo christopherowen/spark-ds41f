@@ -161,6 +161,15 @@ before the first boot. `run --dry-run` prints the problems.
   (`scripts/servebench_suite_table.py`) compares the second arm, the reference, with
   every other arm, and the first arm with the last as the run's own repeat. Order arms
   candidate, reference, candidate again.
+- **Companion suites:** `"suite": ["release-tp3", "single-stream"]` runs the release suite,
+  then each further suite on the same boot of each arm, into
+  `results/private/suites/<run>-<suite>/<label>` with its own table
+  (`results/private/lab/<run>-<suite>-table.txt`). A changed suite is a new suite (servebench
+  compares only runs of the same definition), so measurements added to every release go in a
+  companion suite and the release suite and its recorded references stay unchanged. Every
+  release runs `single-stream` (one conversation at a time, concurrency 1 on distinct prompts):
+  the speed one user sees, which draft acceptance on the generated text moves, beside the
+  release suite's engine grid, the text-independent verdict on a single stream's step cost.
 - **Telemetry:** every bench and script step of a `measure` job samples, on each node:
   - GPU SM and memory clocks, power, temperature and clock-event reasons, once a second
     (`nvidia-smi` over SSH);

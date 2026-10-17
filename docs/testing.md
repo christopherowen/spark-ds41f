@@ -11,7 +11,7 @@ layer below (see [methodology](methodology.md#promotion)).
 | vLLM release tests (`config/release-tests.json`) | the serving code paths: TileLang kernels against DeepSeek's reference math, preparation, startup, scheduling, sampling, verification, collectives, parsers | the release image, one GB10, lab window | every release candidate image |
 | Determinism gate (`gate.json`) | temperature-0 and greedy outputs identical to the previous release | the cluster, recipe shape | every candidate image |
 | Cold boots (`coldboots.json`) | boot with one rank's, every rank's and every JIT cache empty; nothing compiles after preparation | the cluster | every candidate whose startup or kernels change |
-| Release bench (`release.json`) | no slower than the previous release, on distinct prompts | the cluster | every candidate, on the weights that will be served |
+| Release bench (`release.json`: the shape's release suite and `single-stream`) | no slower than the previous release, on distinct prompts; the single-stream speed users see | the cluster | every candidate, on the weights that will be served |
 
 Each layer catches what the others cannot: the bench and determinism gate see only the
 paths the workload takes; the release tests reach edge cases (null blocks, padding rows,
