@@ -54,12 +54,47 @@ class RecipeTest(unittest.TestCase):
                          {k: v for k, v in released.items() if k not in naming})
 
     def test_tp3_triangle_is_the_released_r6s_arm(self):
-        """tp3-triangle resolves to r6s's release arm, apart from the names."""
+        """tp3-triangle resolves to r6s's release arm, apart from the names (the model
+        profiles, which r6s's recipe predates, resolve to the same mounts)."""
         resolved = recipe.resolve(self.recipe, "tp3-triangle")
         released = load_spark().read_cluster("experiments/2026-10-16-r6s/r6s-tp3.json")
-        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes",
+                  "model", "models")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
+
+    def test_the_model_profile_mounts_the_selected_checkpoint(self):
+        """Every shape mounts the recipe's model at /models and /blobs; an arm that sets
+        another model serves it, whatever mounts it lists."""
+        for shape in ("tp3-triangle", "tp4-ring"):
+            resolved = recipe.resolve(self.recipe, shape)
+            profile = self.recipe["models"][self.recipe["model"]]
+            self.assertEqual(resolved["container"]["mounts"][:2],
+                             [[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]])
+        base = recipe.resolve(self.recipe, "tp3-triangle")
+        other = next(name for name in self.recipe["models"] if name != self.recipe["model"])
+        arm = recipe.overlay({"extends": {}, "set": {"model": other}}, base)
+        profile = self.recipe["models"][other]
+        mounts = arm["container"]["mounts"]
+        self.assertEqual(mounts[:2], [[profile["snapshot"], "/models", "ro"], [profile["blobs"], "/blobs", "ro"]])
+        self.assertEqual(mounts[2:], base["container"]["mounts"][2:])
+        with self.assertRaises(SystemExit):
+            recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
+
+    def test_generation_defaults_render_as_override_generation_config(self):
+        base = recipe.resolve(self.recipe, "tp3-triangle")
+        self.assertNotIn("--override-generation-config", base["serve_args"])
+        arm = recipe.overlay(
+            {"extends": {}, "set": {"generation_defaults": {"top_p": 1.0, "temperature": 1.0}}}, base)
+        args = arm["serve_args"]
+        at = args.index("--generation-config")
+        self.assertEqual(args[at + 2 : at + 4],
+                         ["--override-generation-config", '{"temperature":1.0,"top_p":1.0}'])
+        # An arm over that one merges its values (as every overlay merges a dictionary)
+        # and replaces the flag rather than repeating it.
+        again = recipe.overlay({"extends": {}, "set": {"generation_defaults": {"temperature": 0.6}}}, arm)
+        self.assertEqual(again["serve_args"].count("--override-generation-config"), 1)
+        self.assertIn('{"temperature":0.6,"top_p":1.0}', again["serve_args"])
 
     def test_tp3_keeps_its_cabling_and_sizing(self):
         """TP3 keeps what the triangle and its memory need, and nothing else of r6h."""

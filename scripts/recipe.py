@@ -15,7 +15,10 @@ really changes:
 A shape may ``extend`` another (the 4 KiB-page variant of TP3 changes the host
 kernel and the sizing only). An experiment arm is an overlay: ``extends`` names
 a configuration (the recipe at a shape, or another arm) and ``set``/``unset``
-hold only what the arm changes, so arms cannot drift from what they compare to. The site names the shape it is cabled as in
+hold only what the arm changes, so arms cannot drift from what they compare to. ``models``
+names each checkpoint the recipe serves (its snapshot and blob store) and ``model`` the one
+mounted at /models and /blobs; ``generation_defaults`` is the sampling a request that sets none
+gets (vLLM's ``--override-generation-config``). An arm may set either. The site names the shape it is cabled as in
 ``config/site.json``; ``--shape`` overrides it for planning.
 
 ``resolve`` returns the same concrete cluster configuration a per-shape file
@@ -33,6 +36,8 @@ import string
 from pathlib import Path
 
 SITE_FILE = "config/site.json"
+# Where every shape mounts the selected model's snapshot and blob store.
+MODEL_MOUNTS = ("/models", "/blobs")
 SIZING_KEYS = ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "kv_cache_memory_bytes",
                "prefix_cache_retention_interval")
 # Keys a shape may set beside its sizing; anything else belongs to every shape.
@@ -82,6 +87,37 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
+def model_mounts(cluster: dict) -> list[list[str]]:
+    """The mounts of the selected model (``model``, one of ``models``): its snapshot at
+    /models and its blob store at /blobs, both read-only."""
+    name, models = cluster.get("model"), cluster.get("models", {})
+    if name not in models:
+        raise SystemExit(f"unknown model {name!r}; the recipe defines {', '.join(sorted(models))}")
+    return [[models[name]["snapshot"], MODEL_MOUNTS[0], "ro"],
+            [models[name]["blobs"], MODEL_MOUNTS[1], "ro"]]
+
+
+def _with_model_mounts(cluster: dict) -> None:
+    mounts = cluster["container"].get("mounts", [])
+    cluster["container"]["mounts"] = model_mounts(cluster) + [
+        mount for mount in mounts if mount[1] not in MODEL_MOUNTS]
+
+
+def _with_generation_defaults(cluster: dict) -> None:
+    """Render ``generation_defaults`` (the sampling a request that sets none gets) as
+    vLLM's ``--override-generation-config``, beside ``--generation-config``."""
+    args = list(cluster["serve_args"])
+    if "--override-generation-config" in args:
+        at = args.index("--override-generation-config")
+        del args[at : at + 2]
+    defaults = cluster.get("generation_defaults")
+    if defaults:
+        flag = ["--override-generation-config", json.dumps(defaults, separators=(",", ":"), sort_keys=True)]
+        at = args.index("--generation-config") + 2 if "--generation-config" in args else len(args)
+        args[at:at] = flag
+    cluster["serve_args"] = args
+
+
 def values(recipe: dict, shape: dict) -> dict[str, str]:
     """The placeholders of ``serve_args`` for one shape."""
     sizing = shape["sizing"]
@@ -121,6 +157,10 @@ def resolve(recipe: dict, name: str) -> dict:
         cluster["nodes_config"] = shape["nodes_config"]
     if "benchmark_reference" in shape:
         cluster["benchmark_reference"] = shape["benchmark_reference"]
+    if "models" in recipe:
+        _with_model_mounts(cluster)
+    if "generation_defaults" in recipe:
+        _with_generation_defaults(cluster)
     return cluster
 
 
@@ -140,6 +180,11 @@ def overlay(arm: dict, base: dict) -> dict:
     if unknown:
         raise SystemExit(f"an arm overlay holds extends, set, unset and notes; not {', '.join(sorted(unknown))}")
     cluster = _merge(base, arm.get("set", {}))
+    if "model" in arm.get("set", {}):
+        # The arm serves another of the recipe's models, whatever mounts it lists.
+        _with_model_mounts(cluster)
+    if "generation_defaults" in arm.get("set", {}):
+        _with_generation_defaults(cluster)
     for key in ("shape", "benchmark_reference"):
         cluster.pop(key, None)
     for dotted in arm.get("unset", []):
