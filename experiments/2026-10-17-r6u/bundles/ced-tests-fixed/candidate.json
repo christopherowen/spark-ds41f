@@ -1,0 +1,26 @@
+{
+  "description": "The CED metadata tests with their fix (hand-built model state and drafter given the attributes they now read), mounted over the r6u image, before the fix goes into the series.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6u",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-r6u-tests",
+    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'prepare_fixtures', '-o', 'faulthandler_timeout=600', '--basetemp', '/c/pytest-tmp-r6u-ced', 'tests/v1/attention/test_b12x_v41_ced_metadata.py']\nsys.exit(subprocess.run(cmd, timeout=3000).returncode)\n"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ],
+    [
+      "test_b12x_v41_ced_metadata.py",
+      "/opt/spark3/candidate/vllm/tests/v1/attention/test_b12x_v41_ced_metadata.py"
+    ]
+  ]
+}
