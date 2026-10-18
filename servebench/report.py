@@ -54,26 +54,19 @@ def summarize(raw: dict, *, slo_ttft_s: float | None = None, slo_tpot_ms: float 
     return summary
 
 
-FOREIGN_SLACK_S = 0.5
-
-
 def _foreign(raw: dict) -> int | None:
     """Requests the server finished during the run that were not the run's own: someone
     else's load on the server (a production client reaching a lab arm, 2026-10-18), so the
-    run's speeds are not the build's. The first and last scrapes bound the count; the run's
-    own requests are those that ended within them, or within FOREIGN_SLACK_S after the
-    last (the server counts a request finished just before its last chunk reaches the
-    client). The run's own requests still in flight at the last scrape that finish within
-    the slack are counted as its own, so the count can fall short by up to the run's
-    concurrency, never above. None when the server exports no counter."""
-    pairs = [(t, s) for t, s in zip(raw["scrape_times"], raw["scrapes"])
-             if t is not None and s and "requests_finished" in s]
-    if len(pairs) < 2:
+    run's speeds are not the build's. The run's fences (one scrape before its first request,
+    one after its last drained) contain every own request, so the count is the server's
+    finished requests between them less the run's own successful ones, exactly. None when
+    the run has no fences or the server exports no counter."""
+    fences = raw.get("fences") or {}
+    scrapes = fences.get("scrapes") or []
+    if len(scrapes) != 2 or not all(s and "requests_finished" in s for s in scrapes):
         return None
-    (t0, first), (t1, last) = pairs[0], pairs[-1]
-    finished = last["requests_finished"] - first["requests_finished"]
-    own = sum(1 for r in raw["records"]
-              if r["end"] is not None and t0 <= r["end"] <= t1 + FOREIGN_SLACK_S)
+    finished = scrapes[1]["requests_finished"] - scrapes[0]["requests_finished"]
+    own = sum(1 for r in raw["records"] if r["end"] is not None and not r["error"])
     return max(0, round(finished - own))
 
 

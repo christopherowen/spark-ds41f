@@ -11,7 +11,9 @@
 Closed and Poisson runs warm up first, then measure for a fixed duration split into
 equal sub-windows (batch means: each sub-window is one sample for the intervals), then
 stop issuing and let the in-flight requests drain outside the window. Server counters
-are read at every sub-window boundary.
+are read at every sub-window boundary, and once more just before the run's first request
+and after its last has drained: between those two fences the server finished every one of
+the run's requests, so anything else it finished there was someone else's.
 
 With ``context_tokens`` (closed mode) each stream owns a long document and asks every
 question after it, under one cache salt per stream. Each document is prefilled once
@@ -148,6 +150,12 @@ def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: boo
             records.append(record)
 
     documents_meta = [{key: doc[key] for key in ("slot", "tokens", "prime_s", "prime_error")} for doc in docs]
+    fences = {"times": [clock()], "scrapes": [prom.scrape(base_url, metrics)]}
+
+    def close_fence() -> None:
+        fences["times"].append(clock())
+        fences["scrapes"].append(prom.scrape(base_url, metrics))
+
     start = clock()
     if load.mode == "burst":
         threads = [threading.Thread(target=send, args=(slot,)) for slot in range(load.concurrency)]
@@ -157,9 +165,10 @@ def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: boo
         for thread in threads:
             thread.join()
         after = prom.scrape(base_url, metrics)
+        close_fence()
         return {"records": records, "start": start, "window": None,
                 "boundaries": [], "scrapes": [before, after], "scrape_times": [start, clock()],
-                "rejected": 0}
+                "rejected": 0, "fences": fences}
 
     w0 = start + load.warmup_s
     w1 = w0 + load.duration_s
@@ -209,6 +218,7 @@ def run(base_url: str, model: str, prompts: list[dict], load: Load, *, vllm: boo
     for thread in workers:
         thread.join()
     scraping.join()
+    close_fence()
     return {"records": records, "start": start, "window": [w0, w1], "boundaries": boundaries,
             "scrapes": scrapes, "scrape_times": scrape_times, "rejected": rejected[0],
-            "documents": documents_meta}
+            "documents": documents_meta, "fences": fences}

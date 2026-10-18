@@ -323,9 +323,7 @@ class LiveTest(unittest.TestCase):
 
         threading.Thread(target=visitor, daemon=True).start()
         raw = load.run(self.fake.url, "fake-model", prompts.default_prompts(), spec, log=lambda m: None)
-        foreign = report.summarize(raw)["requests"]["foreign"]
-        # Short of 5 by at most the run's own requests finishing just after the last scrape.
-        self.assertTrue(5 - spec.concurrency <= foreign <= 5, foreign)
+        self.assertEqual(report.summarize(raw)["requests"]["foreign"], 5)
 
     def test_context_streams_keep_their_documents(self):
         server = FakeServer()
