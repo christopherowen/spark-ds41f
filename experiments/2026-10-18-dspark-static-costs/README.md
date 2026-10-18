@@ -26,3 +26,25 @@ throughput: row cost 0.02 verified 8-12% more tokens a step at the same output r
 slower steps and later first tokens. So the question left is whether the cost model's full
 shape (graph buckets, the drafter's cost by request count) beats one linear constant at the
 same aggressiveness, which scale 2.0 against row cost 0.035 answers.
+
+## Result, from earlier runs: the full shape adds nothing over one constant
+
+The sweep was stopped for r6x's deployment (owner, 2026-10-19: promote without waiting)
+after its first arm, the static table at scale 2.0, ran the screen and single-stream suites
+(sampled was cut short). Its same-session reference never ran, so the comparison below is
+against the linear and r6v arms of experiments/2026-10-18-dspark-linear-budget, an earlier
+session the same day: indicative, not a verdict. The engine grid, which no draft budget
+touches, moved +0.79% and -0.36% between these sessions, which bounds the resolution.
+
+| Static table, scale 2.0, against | c16 tok/s | c16 tokens a step | c1 tok/s |
+| --- | ---: | ---: | ---: |
+| linear row cost 0.035 | +0.27% (same) | -1.63% | -0.34% (same) |
+| r6v's timed curves (scale 2.0) | -0.28% (same) | -0.86% | -0.10% (same) |
+
+Every budget measured that day sits within about 0.3% on throughput: linear 0.02 and 0.035,
+r6v's boot-timed curves and the full static shape. Throughput is flat across this range of
+budgets, so the cost model's shape (graph buckets, the drafter's cost by request count)
+buys nothing a single constant does not; r6x keeps the constant. The owner chose this
+answer from the runs already made over a 2.7-hour same-session run with production down
+(2026-10-19); the spec stays in the lab queue's skipped/ folder should a formal verdict ever
+be wanted.
