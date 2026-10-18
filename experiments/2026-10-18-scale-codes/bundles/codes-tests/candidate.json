@@ -1,0 +1,34 @@
+{
+ "description": "The TileLang MoE tests with the coded weight scales (pack_scale_codes, coded_scales) mounted over the r6v image: the experts, the SwiGLU kernel, the codes' round trip and the coded GEMM's bits.",
+ "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-scale-codes",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b"
+ },
+ "workdir": "/opt/spark3/candidate/vllm",
+ "argv": [
+  "-c",
+  "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'prepare_fixtures', '-o', 'faulthandler_timeout=600', '--basetemp', '/c/pytest-tmp-scale-codes', 'tests/kernels/moe/test_deepseek_v41_tilelang_moe.py']\nsys.exit(subprocess.run(cmd, timeout=3000).returncode)\n"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "test_deepseek_v41_tilelang_moe.py",
+   "/opt/spark3/candidate/vllm/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"
+  ],
+  [
+   "moe.py",
+   "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/moe.py"
+  ],
+  [
+   "gemm.py",
+   "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/gemm.py"
+  ]
+ ]
+}
