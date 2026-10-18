@@ -47,8 +47,9 @@ Gate: outputs identical to r6v's; no metric worse than r6v.
 ## Promotion (the owner's decision)
 
 - `config/cluster.json`: the r6x image and lock; `adaptive_verification_row_cost` 0.02 in
-  place of the cost scale. The speculative config is one template for both shapes, and
-  r6u (TP3) rejects the row cost, so until TP3 runs r6x the ring's shape carries its own.
+  place of the cost scale in the speculative config. The recipe has one image for both
+  shapes: r6v serves the triangle on r6u's TP3 path, while 0181-0184 change TP3's path too
+  (its kernel bits are tested; its serving is not).
 - `bin/spark` stops deriving `SPARK3_DSPARK_COST_DIR`, with its tests and docs, once no
   production shape runs an image that reads it (TP3 still serves r6u's).
 - TP3: `tp3-triangle` needs the triangle cabling to qualify r6x there.
