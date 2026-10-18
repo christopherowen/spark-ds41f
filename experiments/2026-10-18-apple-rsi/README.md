@@ -97,3 +97,42 @@ server that is the running deployment instead of a launch at the task's B200 rec
 [run_rsi.py](run_rsi.py) runs every step in a container of the serving image against the
 booted arm; `run.json` boots each arm and runs it. Full outputs land in
 `results/private/apple-rsi/<run>-<label>/`.
+
+## Results (2026-10-18, the ring, the original checkpoint dba1be0a)
+
+Both builds pass every check the task scores from a running server, and the indexer's
+component checks.
+
+| Check | r6n | r6v | Bar |
+| --- | --- | --- | --- |
+| `test_fidelity_kl`, per-band median k3 (512 / 2,048 / 8,192 / 20,480) | 0.025 / 0.015 / 0.042 / 0.028 | 0.039 / 0.025 / 0.034 / 0.024 | 0.121 / 0.103 / 0.120 / 0.090 |
+| `test_text_history_fidelity` (fresh, after an unrelated request, decode vs prefill) | 0.0120 / 0.0120 / 0.00001 | 0.0110 / 0.0110 / 0.0002 | 0.090 |
+| `test_chat_streaming_and_isolation` | pass | pass | |
+| `test_gsm8k_hidden` | 181 / 200 | 180 / 200 | 174 |
+| API examples | 0 problems | 0 problems | |
+| Generation judge against the build's own speculation-off server: J1 tokens off top-1, J2 z | 0 of 8,192, -1.32 | 0 of 8,192, -1.07 | excess 41, \|z\| 5 |
+| Sparse indexer: public check; held-out cases | 0 discrepancies; 41 / 41 | 0 discrepancies; 41 / 41 | |
+| Serving client: one stream / sixteen (tok/s, no bar here) | 81.5 / 180.5 | 84.4 / 181.5 | |
+
+r6v, which follows DeepSeek's later reference, still passes against an oracle that
+predates it: its median k3 is a little higher in the two short bands and lower in the two
+long ones. The indexer's logits are within 0.0045 (99th percentile) and 0.0057 (maximum)
+of the FP32 mathematics, against allowances of 0.01 and 0.02; its component times are
+3.48 ms a packed step of 128 rows at 20,480 positions and 0.58 ms a paged step of 16 rows
+(four consumers, no bar here).
+
+The API examples and the chat check pass only on arms without the reasoning parser (the
+task's reference server passes none): with ours, a 32-token chat at temperature 0 is all
+thinking and its content is empty. That is our serving configuration, not the model.
+
+**Single positions far from the reference.** Fidelity is gated on medians; the means of
+some bands are dominated by one position each (`outliers_rsi.py`): `code-20480-0` position
+1,340 (k3 19,546 on r6n, 95 on r6v), `math-8192-0` position 6,222 (1,762 / 59) and
+`code-8192-1` position 7,197 (30 / 26,800). At each, both builds put almost all the mass
+on the same other token (` the` against ` should`, ` differences` against ` ordinary`,
+` to` against ` at`) and give the reference's token far less than the reference does
+(-14.0 and -8.7 against -4.1 at the first). Readings repeat exactly; prompt-log-probability
+requests run every row through every layer (no CED); and which build is further off
+changes from position to position, the signature of a discontinuity (top-k expert routing,
+or the consumers' top-512 selection) rather than a systematic error. Settling it would take
+DeepSeek's `inference/` code at those positions.
