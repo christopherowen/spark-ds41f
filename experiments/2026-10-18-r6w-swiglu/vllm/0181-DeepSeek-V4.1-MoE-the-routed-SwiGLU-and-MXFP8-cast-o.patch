@@ -1,0 +1,434 @@
+From 81e55ffcd0ef45ebb505fd890873551fa928afe0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 01:39:29 +0200
+Subject: [PATCH] DeepSeek V4.1 MoE: the routed SwiGLU and MXFP8 cast over the
+ live tiles
+
+TileKernels' swiglu_forward_and_per_token_cast takes about 22 us a call at
+every decode size: each of its 1,024-thread CTAs walks all 384 experts'
+boundaries, one at a time, before it reaches a row. moe_swiglu_cast reads the
+dispatch layout instead: a CTA takes 4 rows of one 32-row tile (2 when a row
+has fewer than four warps, TP3's 768 columns), issues all of their loads
+before any arithmetic, and the CTAs of tiles past num_tiles stop at once, so
+a step pays for its live rows only.
+
+The arithmetic is TileKernels', element for element: route weights, the clamp
+by compare and select (spark-ds41f's TileKernels patch 0001: a NaN passes, as
+through torch.clamp), the fast __expf/__fdividef product with its certificate
+and precise fallback, the same vector width and get_sf_and_inv. A warp takes
+the same 32 * vec consecutive columns of one row as a TileKernels 32-thread
+group, so the certificate's warp vote covers the same elements and every byte
+and scale equals TileKernels'.
+
+On GB10 (spark-ds41f experiments/2026-10-18-r6w-swiglu): 1.5-12.8 us against
+21.8-23.5 us at 1-96 rows (TP4, warm), and no size slower, warm or cold, at
+TP4, TP3 or the drafter's shapes, up to 8,192 rows.
+
+Test: every live row's E4M3 bytes and UE8M0 scales against TileKernels' kernel
+on real dispatch layouts (576, 768 and 256 columns; 1 to 700 tokens), with
+gates past the fast exp's domain and the smallest scales, and a NaN gate value
+reaching its row.
+---
+ .../moe/test_deepseek_v41_tilelang_moe.py     |  99 ++++++++
+ vllm/models/deepseek_v4_1/tilelang/moe.py     | 223 +++++++++++++++---
+ 2 files changed, 285 insertions(+), 37 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index ca9b68de9..0716520ec 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -20,8 +20,13 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+     assert_other_rows_equal,
+     assert_rows_nan,
+ )
++from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang.linear import _calls  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
++    MoeDispatchV41Plan,
+     MoeExpertsV41Plan,
++    carve,
++    moe_swiglu_cast,
+     workspace_bytes,
+ )
+ 
+@@ -347,3 +352,97 @@ def test_moe_reference_separates_defects(rows):
+     print(f"rows={rows}: {table}")
+     for d, e in defects.items():
+         assert 4 * kernel < e, f"{d} is within 4x of the kernel: {table}"
++
++
++def _tile_kernels_swiglu(intermediate, num_experts, block_M):
++    """TileKernels' ``swiglu_forward_and_per_token_cast`` kernel as vLLM called it
++    until ``moe_swiglu_cast`` (the image's TileKernels carries spark-ds41f's patch
++    0001: the clamp keeps a NaN)."""
++    from tile_kernels.quant.common import get_cast_output_config
++    from tile_kernels.quant.swiglu_forward_cuda import (
++        get_swiglu_forward_and_per_token_cast_kernel_cuda,
++    )
++    from tilelang import language as T
++
++    tile_kernels.config.set_token_alignment(block_M)
++    return get_swiglu_forward_and_per_token_cast_kernel_cuda(
++        intermediate,
++        num_experts,
++        block_M,
++        True,
++        False,
++        LIMIT,
++        False,
++        in_dtype=T.dtype(torch.bfloat16),
++        out_config=get_cast_output_config("e4m3", (1, 32), False, True, True),
++        num_sms=tile_kernels.config.get_num_sms(),
++        use_pdl=False,
++    )
++
++
++def _swiglu_case(rows, intermediate, num_experts, topk, block_M=32):
++    """A real dispatch layout of ``rows`` tokens and a gate/up output over it whose
++    values reach the clamp, the certificate's fallback (gates below -16) and the
++    smallest scales."""
++    dispatch = MoeDispatchV41Plan(
++        num_experts, topk, block_M, 512, torch.int32, torch.bfloat16
++    )
++    prepare.declare(lambda: _calls(dispatch.kernels()), bind=dispatch.bind)
++    ids, weights = _routes(rows, num_experts, topk, 11, torch.int32)
++    specs = dispatch.workspace_specs(rows)
++    layout = dispatch.dispatch(
++        ids,
++        weights,
++        carve(
++            torch.empty(workspace_bytes(specs), dtype=torch.uint8, device=DEVICE), specs
++        ),
++    )
++    layout_rows = layout["order"].shape[0]
++    gen = _gen(12)
++    h = torch.randn((layout_rows, 2 * intermediate), generator=gen, device=DEVICE) * 6
++    h[::7, : intermediate // 4] = -20.0  # gates below the fast exp's domain
++    h[3::11, 64:96] *= 1e-30  # blocks at the smallest scales
++    return layout, h.bfloat16().contiguous()
++
++
++def _swiglu_outputs(layout_rows, intermediate):
++    out = torch.zeros(
++        (layout_rows, intermediate), dtype=torch.float8_e4m3fn, device=DEVICE
++    )
++    sf = torch.zeros(
++        (layout_rows, (intermediate // 32 + 3) // 4 * 4),
++        dtype=torch.uint8,
++        device=DEVICE,
++    )
++    return out, sf
++
++
++@pytest.mark.parametrize("intermediate", [576, 768, 256])
++@pytest.mark.parametrize("rows", [1, 6, 16, 96, 700])
++def test_moe_swiglu_cast_equals_tile_kernels(
++    rows, intermediate, num_experts=384, topk=6
++):
++    """Every live row's E4M3 bytes and UE8M0 scales equal TileKernels' (TP4's 576 and
++    TP3's 768 columns a rank, decode and prefill sizes), and a NaN gate value reaches
++    its row's output in both."""
++    layout, h = _swiglu_case(rows, intermediate, num_experts, topk)
++    live = layout["order"] >= 0
++    ours, theirs = (
++        moe_swiglu_cast(intermediate, 32, LIMIT),
++        _tile_kernels_swiglu(intermediate, num_experts, 32),
++    )
++    for case in ("finite", "nan"):
++        if case == "nan":
++            first = int(torch.nonzero(live)[0])
++            h[first, 5] = NAN
++        a, a_sf = _swiglu_outputs(h.shape[0], intermediate)
++        b, b_sf = _swiglu_outputs(h.shape[0], intermediate)
++        ours(
++            h, a, a_sf, layout["order"], layout["layout_weights"], layout["tile_expert"]
++        )
++        theirs(h, b, b_sf, layout["psum"], layout["layout_weights"], 1.0, None)
++        cols = intermediate // 32
++        assert torch.equal(a[live].view(torch.uint8), b[live].view(torch.uint8)), case
++        assert torch.equal(a_sf[live, :cols], b_sf[live, :cols]), case
++        if case == "nan":
++            assert a[first].float().isnan().any()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index b809191c6..95512ef9e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -30,9 +30,10 @@ A route's rank within its expert is its position among that expert's routes
+ in route order, computed with warp match masks and per-warp counts. The
+ layout is therefore a pure function of ``topk_idx``.
+ 
+-DeepSeek applies each route's weight before the down projection: TileKernels'
+-``swiglu_forward_and_per_token_cast`` takes ``layout_weights`` and fuses the
+-weight, the SwiGLU clamp and the MXFP8 cast of the down projection's input.
++DeepSeek applies each route's weight before the down projection:
++``moe_swiglu_cast`` reads ``layout_weights`` and fuses the weight, the SwiGLU
++clamp and the MXFP8 cast of the down projection's input, with the arithmetic of
++TileKernels' ``swiglu_forward_and_per_token_cast``, over the live tiles only.
+ ``moe_combine_v41`` then sums each token's expert outputs, read from the
+ layout through ``route_pos``, in slot order in FP32, and optionally adds the
+ shared expert's output. With ``weighted=True`` it applies the weights itself
+@@ -40,6 +41,8 @@ with explicit ``T.fma``. Neither kernel uses atomics on
+ results, so a token's output does not depend on the rest of the batch.
+ """
+ 
++import math
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+@@ -830,6 +833,181 @@ def tile_expert_weights(b_packed, block_N):
+     return tiles, tails.contiguous().view(torch.uint8)
+ 
+ 
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC: True,
++    },
++)
++def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
++    """The routed experts' SwiGLU, route weight and MXFP8 cast over the live tiles.
++
++    ``H[L, 2I]`` (the gate/up GEMM's BF16 output, gate columns first) becomes
++    ``Out[L, I]`` E4M3 with ``OutSF[L, *]`` UE8M0 bytes, one per 32 columns, for
++    every layout row with ``Order[row] >= 0``; padding rows are not written, as the
++    down GEMM's padding outputs are never read. A CTA takes ``rows_per_cta`` rows of
++    one tile, loading all of them before computing any, and the CTAs of tiles past
++    ``num_tiles`` (``TileExpert < 0``) stop there, so a decode step pays for its
++    live rows only.
++
++    The arithmetic is TileKernels' ``swiglu_forward_and_per_token_cast`` (route
++    weights, the clamp at ``limit`` by compare and select, as spark-ds41f's TileKernels
++    patch 0001 applies it, so a NaN passes as through ``torch.clamp``), element for
++    element: the fast ``__expf``/``__fdividef`` product, its certificate and the
++    precise fallback for a warp that fails it, TileKernels' vector width and
++    ``get_sf_and_inv``. A warp takes the same ``32 * vec`` consecutive columns of one
++    row as TileKernels' 32-thread groups do, so the certificate's warp vote covers
++    the same elements and every output byte and scale equals TileKernels'. That
++    kernel walks every expert's boundary in each of its 1,024-thread CTAs, one
++    expert at a time, about 22 us a call at any decode size (spark-ds41f
++    ``experiments/2026-10-14-moe-swiglu``).
++    """
++    from tile_kernels.quant.common import (
++        get_best_vectorize_size,
++        get_cast_output_config,
++        get_sf_and_inv,
++    )
++
++    in_dtype = T.bfloat16
++    out_config = get_cast_output_config("e4m3", (1, SF_BLOCK), False, True, True)
++    warp = 32
++    vec = max(
++        math.gcd(intermediate, get_best_vectorize_size(in_dtype) * warp) // warp, 1
++    )
++    chunk = warp * vec
++    assert intermediate % chunk == 0, "a warp's columns must tile the row"
++    assert SF_BLOCK % vec == 0, "a scale block spans whole thread vectors"
++    warps = intermediate // chunk  # one row's warps
++    if rows_per_cta is None:
++        # Fewer warps a row (TP3's 768 columns: 3) want fewer rows a CTA in flight
++        # (GB10 bench, experiments/2026-10-18-r6w-swiglu).
++        rows_per_cta = 4 if warps >= 4 else 2
++    assert block_M % rows_per_cta == 0
++    threads = warp * warps
++    reduce_rounds = (SF_BLOCK // vec).bit_length() - 1
++    sf_lanes = SF_BLOCK // vec
++    sf_width = 4 * scale_words(intermediate)
++    cert_e = 32  # TileKernels' certificate margin with route weights
++    tiles = T.dynamic("tiles")
++    rows = tiles * block_M
++
++    @T.prim_func
++    def moe_swiglu_cast_kernel(
++        H: T.Tensor((rows, 2 * intermediate), in_dtype),
++        Out: T.Tensor((rows, intermediate), T.float8_e4m3fn),
++        OutSF: T.Tensor((rows, sf_width), T.uint8),
++        Order: T.Tensor((rows,), T.int32),
++        Weights: T.Tensor((rows,), T.float32),
++        TileExpert: T.Tensor((tiles,), T.int32),
++    ):
++        with T.Kernel(block_M // rows_per_cta, tiles, threads=threads) as (slab, t):
++            tid = T.get_thread_binding()
++            col = (tid // warp) * chunk + (tid % warp) * vec
++            orders = T.alloc_local((rows_per_cta,), T.int32)
++            weights = T.alloc_local((rows_per_cta,), T.float32)
++            xl = T.alloc_local((rows_per_cta, vec), in_dtype)
++            xr = T.alloc_local((rows_per_cta, vec), in_dtype)
++            xl_f = T.alloc_local((vec,), T.float32)
++            xr_f = T.alloc_local((vec,), T.float32)
++            x = T.alloc_local((vec,), T.float32)
++            stored = T.alloc_local((vec,), T.float8_e4m3fn)
++            amax = T.alloc_local((2,), T.float32)
++            cert_min_l = T.alloc_local((2,), T.float32)
++            weight = T.alloc_var(T.float32)
++            base = t * block_M + slab * rows_per_cta
++            # Every row's loads issue before any row's arithmetic, so a cold call
++            # waits once for the layout words and once for its rows. ``Order`` is
++            # read in bounds for unused tiles too; their stale words are not used.
++            for r in T.unroll(rows_per_cta):
++                orders[r] = Order[base + r]
++            if TileExpert[t] >= 0:
++                for r in T.unroll(rows_per_cta):
++                    if orders[r] >= 0:
++                        weights[r] = Weights[base + r]
++                        for j in T.vectorized(vec):
++                            xl[r, j] = H[base + r, col + j]
++                        for j in T.vectorized(vec):
++                            xr[r, j] = H[base + r, intermediate + col + j]
++                for r in T.unroll(rows_per_cta):
++                    row = base + r
++                    if orders[r] >= 0:
++                        weight = weights[r]
++                        for j in T.vectorized(vec):
++                            xl_f[j] = T.float32(xl[r, j])
++                            xr_f[j] = T.float32(xr[r, j])
++                        for j in T.unroll(vec):
++                            val_l = T.alloc_var(T.float32, init=xl_f[j])
++                            val_r = T.alloc_var(T.float32, init=xr_f[j])
++                            if limit is not None:
++                                val_l = T.Select(val_l > limit, limit, val_l)
++                                val_r = T.Select(val_r > limit, limit, val_r)
++                                val_r = T.Select(val_r < -limit, -limit, val_r)
++                            val = T.alloc_var(
++                                T.float32,
++                                init=T.call_extern(
++                                    T.float32,
++                                    "__fdividef",
++                                    val_l,
++                                    1 + T.call_extern(T.float32, "__expf", -val_l),
++                                )
++                                * val_r,
++                            )
++                            val = val * weight
++                            x[j] = val
++                        # TileKernels' certificate: the fast product lands in the
++                        # precise product's E4M3/scale cell, or the warp recomputes.
++                        cert_min_metric = T.alloc_var(T.uint32, init=0xFFFFFFFF)
++                        cert_max_metric = T.alloc_var(T.uint32, init=0)
++                        for j in T.vectorized(2):
++                            cert_min_l[j] = T.float32(0)
++                        for j in T.vectorized(vec):
++                            cert_min_l[j % 2] = T.min(cert_min_l[j % 2], xl_f[j])
++                        cert_min_l[0] = T.min(cert_min_l[0], cert_min_l[1])
++                        for j in T.unroll(vec):
++                            cert_t = T.reinterpret(x[j], T.uint32) & T.uint32(0x7FFFF)
++                            cert_min_metric = T.min(cert_min_metric, cert_t)
++                            cert_max_metric = T.max(cert_max_metric, cert_t)
++                        if (
++                            T.all_sync(
++                                (cert_min_l[0] > -16.0)
++                                and (cert_min_metric > cert_e)
++                                and (cert_max_metric < 0x80000 - cert_e)
++                            )
++                            == 0
++                        ):
++                            for j in T.unroll(vec):
++                                val_l = T.alloc_var(T.float32, init=xl_f[j])
++                                val_r = T.alloc_var(T.float32, init=xr_f[j])
++                                if limit is not None:
++                                    val_l = T.Select(val_l > limit, limit, val_l)
++                                    val_r = T.Select(val_r > limit, limit, val_r)
++                                    val_r = T.Select(val_r < -limit, -limit, val_r)
++                                val = T.alloc_var(
++                                    T.float32,
++                                    init=(val_l / (1 + T.exp(-val_l))) * val_r,
++                                )
++                                val = val * weight
++                                x[j] = val
++                        for j in T.vectorized(2):
++                            amax[j] = 0
++                        for j in T.vectorized(vec):
++                            amax[j % 2] = T.max(amax[j % 2], T.abs(x[j]))
++                        amax[0] = T.max(amax[0], amax[1])
++                        for j in T.unroll(reduce_rounds):
++                            amax[0] = T.max(amax[0], T.shfl_xor(amax[0], 1 << j))
++                        sf, sf_inv = get_sf_and_inv(amax[0], out_config)
++                        if (tid % warp) % sf_lanes == 0:
++                            OutSF[row, col // SF_BLOCK] = sf
++                        for j in T.vectorized(vec):
++                            x[j] *= sf_inv
++                        for j in T.vectorized(vec):
++                            stored[j] = T.cast(x[j], T.float8_e4m3fn)
++                        for j in T.vectorized(vec):
++                            Out[row, col + j] = stored[j]
++
++    return moe_swiglu_cast_kernel
++
++
+ def _spans(specs):
+     """Byte offset and size of each spec laid out back to back, 256-byte aligned."""
+     spans, offset = [], 0
+@@ -860,8 +1038,8 @@ class MoeExpertsV41Plan:
+ 
+     Expert weights come from ``prepare_weights``: ``w13`` (``[E, 2I, H / 2]``
+     packed E2M1, gate rows first) and ``w2`` (``[E, H, I / 2]``), each with
+-    its UE8M0 bytes, become tile-major. The TileKernels MXFP8 cast and fused
+-    SwiGLU (DeepSeek's clamp, route weight before the down projection) run
++    its UE8M0 bytes, become tile-major. The fused SwiGLU (``moe_swiglu_cast``:
++    DeepSeek's clamp, route weight before the down projection, MXFP8 cast) runs
+     between the GEMMs. The plan holds no buffers; ``workspace_specs(rows)``
+     lists one call's scratch. Its owner calls ``declare_kernels()`` when
+     preparing kernels; ``run`` launches the kernels it binds.
+@@ -900,8 +1078,7 @@ class MoeExpertsV41Plan:
+         self.tk = _tile_kernels(block_M)
+ 
+     def kernels(self) -> dict:
+-        """The grouped GEMMs and TileKernels' fused SwiGLU, as the calls ``bind``
+-        makes."""
++        """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
+         config = dict(block_N=self.block_N, num_stages=self.num_stages)
+         num_experts, topk, hidden, inter = (
+             self.num_experts,
+@@ -931,7 +1108,7 @@ class MoeExpertsV41Plan:
+                 block_M,
+                 **config,
+             ),
+-            "swiglu": _swiglu_call(self.tk, inter, num_experts, self.swiglu_limit),
++            "swiglu": prepare.call(moe_swiglu_cast, inter, block_M, self.swiglu_limit),
+         }
+ 
+     def declare_kernels(self) -> None:
+@@ -1007,7 +1184,7 @@ class MoeExpertsV41Plan:
+         order, tile_expert = layout["order"], layout["tile_expert"]
+         x_words, h_words = x_sf.view(torch.uint32), h_sf.view(torch.uint32)
+         self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
+-        self.swiglu(h, hq, h_sf, layout["psum"], layout["layout_weights"], 1.0, None)
++        self.swiglu(h, hq, h_sf, order, layout["layout_weights"], tile_expert)
+         self.down(hq, h_words, *_present(down), order, tile_expert, y)
+         if callable(shared):
+             shared = shared()
+@@ -1025,31 +1202,3 @@ def _tile_kernels(block_M):
+     # Expert segments in the dispatch layout start on block_M rows.
+     tile_kernels.config.set_token_alignment(block_M)
+     return tile_kernels
+-
+-
+-def _swiglu_call(tk, intermediate, num_experts, limit) -> prepare.TileLangCall:
+-    """TileKernels' fused SwiGLU, route weight and MXFP8 cast, into caller buffers.
+-
+-    ``swiglu_forward_and_per_token_cast`` allocates its outputs; its kernel
+-    writes into ours. The kernel's ``@tilelang.jit`` factory is called here with
+-    every key, so it is declared like the plan's own kernels.
+-    """
+-    from tile_kernels.quant.common import get_cast_output_config
+-    from tile_kernels.quant.swiglu_forward_cuda import (
+-        get_swiglu_forward_and_per_token_cast_kernel_cuda,
+-    )
+-
+-    return prepare.call(
+-        get_swiglu_forward_and_per_token_cast_kernel_cuda,
+-        intermediate,
+-        num_experts,
+-        tk.config.get_token_alignment(),
+-        True,  # route weights
+-        False,  # routed scaling factor
+-        limit,
+-        False,  # clamped count
+-        in_dtype=T.dtype(torch.bfloat16),
+-        out_config=get_cast_output_config("e4m3", (1, SF_BLOCK), False, True, True),
+-        num_sms=tk.config.get_num_sms(),
+-        use_pdl=tk.config.get_pdl(),
+-    )
+-- 
+2.54.0 (Apple Git-157)
+

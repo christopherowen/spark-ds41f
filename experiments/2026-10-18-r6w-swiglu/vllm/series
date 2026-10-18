@@ -1,0 +1,198 @@
+# r6w: r6v's series (experiments/2026-10-17-r6v) with 0181, the routed SwiGLU and MXFP8 cast over
+# the live tiles of the dispatch layout (TileKernels' arithmetic, no expert-boundary walk)
+# r6v: r6u's series (experiments/2026-10-17-r6u) with 0180, the row all-to-all over a four-node ring
+# r6s: r6r's series (experiments/2026-10-16-r6r) with 0154, disk Engram shards' hash columns
+# interleaved across ranks (every tp-th) so each rank reads heads of every n-gram order,
+# and the debug timeline's per-step planning time; 0155 the whole-table disk test
+# expecting only the rank's hash columns.
+# r6r: r6q's series (experiments/2026-10-16-r6q) with 0153, disk Engram shards on whole
+# hash columns so the ranks' rows are joined by an all-gather of bands, not summed.
+# r6q: r6p's series (experiments/2026-10-16-r6p) with 0152, Engram's exchanged wkv
+# blocks read in place by the TileLang gate (no padding or packing copies).
+# r6p: r6o's series (experiments/2026-10-16-r6o) with 0149 the SP tests' fixtures for
+# the unreduced mode and the MoE input dtype, and 0150 Engram's wkv product exchanged
+# all-to-all under prefill sequence parallelism instead of all-gathered, 0151 a debug
+# timeline of each step's Engram rows (SPARK3_ENGRAM_TIMELINE, off in serving).
+# r6o: r6n's series (experiments/2026-10-15-r6n) with the reporter of r6h's TP3 startup
+# failures credited in 0143, 0146 the Engram model test's settled reader counters, 0147
+# checkpoint copies through anonymous memory (R580 on the 64 KiB kernel hangs in a
+# pageable copy from untouched mmap pages) and 0148 the step-aware Engram reader (early host-hashed rows).
+# r6l: r6k's series (experiments/2026-10-13-r6k) and vLLM branch r6l (kernel-contracts):
+# 0134 the non-finite contracts, 0135 DeepSeek-derived compression and Engram hash
+# oracles, 0136 the calibrated MoE check, 0137 the shared SwiGLU clamps and 0138 the
+# Engram gate floor keeping a NaN, 0139-0140 the engine cost grid (dev-mode RPC),
+# 0141 the routed experts' NaN contract required (TileKernels clamp patch) and the
+# indexer's held as an expected failure until its fix keeps r6k's speed.
+../../2026-10-08-lil-rebase/vllm/0001-engram-projection-tp-padding.patch
+../../2026-10-08-lil-rebase/vllm/0002-engram-async-disk-rows.patch
+../../2026-10-08-lil-rebase/vllm/0004-mm-block-hash-window.patch
+../../2026-10-08-lil-rebase/vllm/0005-dspark-pinned-cost-curves.patch
+../../2026-10-08-lil-rebase/vllm/0007-dspark-v41-gathered-markov-bias.patch
+../../2026-10-08-lil-rebase/vllm/0010-dspark-dead-verification-rows.patch
+../../2026-10-08-lil-rebase/vllm/0012-dspark-vocab-parallel-greedy.patch
+../../2026-10-08-lil-rebase/vllm/0013-dspark-main-proj-column-parallel.patch
+../../2026-10-08-lil-rebase/vllm/0014-deepseek-v41-prefill-sp-state.patch
+../../2026-10-08-lil-rebase/vllm/0015-deepseek-v41-prefill-sp-dataflow.patch
+../../2026-10-08-lil-rebase/vllm/0016-deepseek-v41-prefill-sp-ced-encoder.patch
+../../2026-10-08-lil-rebase/vllm/0017-deepseek-v41-prefill-sp-local-attention-front.patch
+../../2026-10-08-lil-rebase/vllm/0018-deepseek-v41-prefill-sp-transport-threshold.patch
+../../2026-10-08-lil-rebase/vllm/0019-custom-op-fill-defaults-one-read.patch
+../../2026-10-08-lil-rebase/vllm/0020-spec-decode-dead-row-kernel-warmup.patch
+../../2026-10-08-lil-rebase/vllm/0021-worker-display-carveout-weights.patch
+../../2026-10-08-lil-rebase/vllm/0024-deepseek-v41-compressor-ring-decode.patch
+../../2026-10-08-lil-rebase/vllm/0025-deepseek-v41-indexer-sp-split.patch
+../../2026-10-08-lil-rebase/vllm/0026-worker-display-carveout-integrity.patch
+../../2026-10-08-lil-rebase/vllm/0027-explicit-collective-policy.patch
+../../2026-10-08-lil-rebase/vllm/0028-deepseek-v41-packed-bf16-lm-head.patch
+../../2026-10-08-lil-rebase/vllm/0030-worker-display-carveout-streamed-weights.patch
+../../2026-10-08-lil-rebase/vllm/0029-deepseek-v41-tilelang-kernels.patch
+../../2026-10-08-lil-rebase/vllm/0032-deepseek-v41-tilekernels-router.patch
+../../2026-10-08-lil-rebase/vllm/0033-tilelang-splitk-row-tiles.patch
+../../2026-10-08-lil-rebase/vllm/0034-tilelang-fused-gate-router.patch
+../../2026-10-08-lil-rebase/vllm/0035-tilelang-routing-skips-padding.patch
+../../2026-10-08-lil-rebase/vllm/0036-tilelang-vocab-heads.patch
+../../2026-10-08-lil-rebase/vllm/0037-tilelang-tilekernels-mhc.patch
+../../2026-10-08-lil-rebase/vllm/0038-tilelang-sparknet-collectives.patch
+../../2026-10-08-lil-rebase/vllm/0039-dummy-context-disjoint-blocks.patch
+../../2026-10-08-lil-rebase/vllm/0040-tilelang-mhc-register-fold.patch
+../../2026-10-08-lil-rebase/vllm/0041-dummy-blocks-per-group.patch
+../../2026-10-08-lil-rebase/vllm/0042-dspark-drafter-padding-rows.patch
+../../2026-10-08-lil-rebase/vllm/0043-tilelang-decode-tiles.patch
+../../2026-10-08-lil-rebase/vllm/0044-tilelang-prefetch-scale-words.patch
+../../2026-10-05-ced-decoder-routing-mask/vllm/0045-tilelang-ced-decoder-routing-mask.patch
+../../2026-10-08-lil-rebase/vllm/0046-tilelang-router-test-forward-context.patch
+../../2026-10-08-lil-rebase/vllm/0047-deepseek-v41-head-dtype-env.patch
+../../2026-10-10-r6d-deterministic/vllm/0048-tilelang-l2-prefetch-family.patch
+../../2026-10-10-r6d-deterministic/vllm/0049-tilelang-split-bf16-linear.patch
+../../2026-10-10-r6d-deterministic/vllm/0050-tilelang-block32-row-gemm.patch
+../../2026-10-10-r6d-deterministic/vllm/0051-tilelang-engram-gate-kernel.patch
+../../2026-10-10-r6d-deterministic/vllm/0052-tilelang-rope-kernel.patch
+../../2026-10-10-r6d-deterministic/vllm/0053-tilelang-engram-hash-kernel.patch
+../../2026-10-10-r6d-deterministic/vllm/0054-tilelang-wo-projection-kernels.patch
+../../2026-10-10-r6d-deterministic/vllm/0055-tilelang-scaled-linear.patch
+../../2026-10-10-r6d-deterministic/vllm/0056-tilelang-splitk-narrow-projections.patch
+../../2026-10-10-r6d-deterministic/vllm/0057-tilelang-splitk-one-launch.patch
+../../2026-10-10-r6d-deterministic/vllm/0058-tilelang-rope-one-head-blocks.patch
+../../2026-10-10-r6d-deterministic/vllm/0059-tilelang-wide-decode-rows.patch
+../../2026-10-10-r6d-deterministic/vllm/0060-tilelang-rank-order-reduce-scatter.patch
+../../2026-10-10-r6d-deterministic/vllm/0061-tilelang-split-bf16-decode-tiles.patch
+../../2026-10-10-r6d-deterministic/vllm/0062-tilelang-context-kv-tiles.patch
+../../2026-10-10-r6d-deterministic/vllm/0063-scheduler-aligned-prefill-chunks.patch
+../../2026-10-10-r6d-deterministic/vllm/0064-tilelang-engram-hash-int32-history.patch
+../../2026-10-10-r6d-deterministic/vllm/0065-tilelang-wo-decode-tiles.patch
+../../2026-10-10-r6d-deterministic/vllm/0066-tilelang-compressor-decode-tiles.patch
+../../2026-10-10-r6d-deterministic/vllm/0067-tilelang-kv-cache-writers.patch
+../../2026-10-10-r6d-deterministic/vllm/0068-deepseek-v41-cache-write-helper.patch
+../../2026-10-10-r6d-deterministic/vllm/0069-tilelang-rank-order-exchange.patch
+../../2026-10-10-r6d-deterministic/vllm/0070-tilelang-kv-cache-writers-coalesced.patch
+../../2026-10-10-r6d-deterministic/vllm/0071-scheduler-aligned-chunks-fit.patch
+../../2026-10-10-r6d-deterministic/vllm/0072-tilelang-router-text-mask-rows.patch
+../../2026-10-10-r6d-deterministic/vllm/0073-tilelang-compressor-projection.patch
+../../2026-10-10-r6d-deterministic/vllm/0074-tilelang-engram-gate.patch
+../../2026-10-10-r6d-deterministic/vllm/0075-tilelang-rope.patch
+../../2026-10-10-r6d-deterministic/vllm/0076-tilelang-engram-hash.patch
+../../2026-10-10-r6d-deterministic/vllm/0077-tilelang-index-weights-scale.patch
+../../2026-10-10-r6d-deterministic/vllm/0078-tilelang-decode-rows.patch
+../../2026-10-10-r6d-deterministic/vllm/0079-tilelang-rank-order-collectives.patch
+../../2026-10-10-r6d-deterministic/vllm/0080-tilelang-aligned-prefill-chunks.patch
+../../2026-10-11-r6f/vllm/0081-DeepSeek-V4.1-prefill-SP-a-projection-reduce-scatter.patch
+../../2026-10-11-r6f/vllm/0082-Attention-the-SP-WO-projection-reduce-scattered-in-t.patch
+../../2026-10-11-r6f/vllm/0083-DeepSeek-V4.1-prefill-SP-unreduced-results-that-Tile.patch
+../../2026-10-11-r6f/vllm/0084-TileLang-V4.1-rank-order-sum-the-torch-path-no-longe.patch
+../../2026-10-11-r6f/vllm/0085-DeepSeek-V4.1-prefill-SP-one-projection-for-a-single.patch
+../../2026-10-11-r6f/vllm/0086-Prefill-SP-TileLang-mHC-adds-the-rank-order-parts-of.patch
+../../2026-10-11-r6f/vllm/0087-TileLang-V4.1-collectives-a-rank-order-all-reduce-of.patch
+../../2026-10-11-r6f/vllm/0088-Collectives-all-reduces-past-the-one-shot-limit-add-.patch
+../../2026-10-11-r6f/vllm/0089-TileLang-V4.1-MoE-one-rounding-of-each-rank-s-partia.patch
+../../2026-10-11-r6f/vllm/0090-MoE-FP32-combine-on-under-the-TileLang-kernel-backen.patch
+../../2026-10-11-r6f/vllm/0091-TileLang-V4.1-vocabulary-heads-FP32-logits-when-the-.patch
+../../2026-10-11-r6f/vllm/0092-TileLang-V4.1-mHC-the-stream-projection-at-FP32-prec.patch
+../../2026-10-11-r6f/vllm/0093-TileLang-V4.1-the-shared-expert-s-clamped-SwiGLU-at-.patch
+../../2026-10-11-r6f/vllm/0094-Shared-experts-the-reference-precision-SwiGLU-under-.patch
+../../2026-10-11-r6f/vllm/0095-TileLang-V4.1-cache-writers-whole-word-payload-store.patch
+../../2026-10-11-r6f/vllm/0096-TileLang-V4.1-cache-writers-four-lanes-per-indexed-g.patch
+../../2026-10-11-r6f/vllm/0097-TileLang-V4.1-cache-writers-hardware-E2M1-conversion.patch
+../../2026-10-11-r6f/vllm/0098-TileLang-V4.1-cache-writers-paired-E4M3-conversion-f.patch
+../../2026-10-11-r6f/vllm/0099-Cache-writes-TileLang-under-the-TileLang-kernel-back.patch
+../../2026-10-11-r6f/vllm/0100-TileLang-V4.1-CSA-compression-pooling-rounding-and-R.patch
+../../2026-10-11-r6f/vllm/0101-Compressor-TileLang-compression-under-the-TileLang-k.patch
+../../2026-10-11-r6f/vllm/0102-TileLang-V4.1-compression-tests-distinct-ring-blocks.patch
+../../2026-10-11-r6f/vllm/0103-TileLang-V4.1-compression-the-state-ring-as-a-stride.patch
+../../2026-10-11-r6f/vllm/0104-TileLang-V4.1-sparse-MLA-metadata-the-four-Triton-me.patch
+../../2026-10-11-r6f/vllm/0105-Sparse-MLA-metadata-TileLang-under-the-TileLang-kern.patch
+../../2026-10-11-r6f/vllm/0106-Sparse-MLA-metadata-the-window-metadata-and-main-pag.patch
+../../2026-10-11-r6f/vllm/0107-Sparse-MLA-metadata-two-blocks-a-row-in-the-fused-de.patch
+../../2026-10-11-r6f/vllm/0108-Sparse-MLA-metadata-fused-blocks-as-wide-as-the-wind.patch
+../../2026-10-11-r6f/vllm/0109-TileLang-V4.1-MoE-the-combine-adds-the-shared-expert.patch
+../../2026-10-11-r6f/vllm/0110-DeepSeek-V4.1-attention-a-mixed-step-s-decode-reques.patch
+../../2026-10-12-r6g/vllm/0111-MoE-fold-the-aux-stream-shared-expert-into-the-TileL.patch
+../../2026-10-12-r6g/vllm/0112-Spec-decode-greedy-verification-from-vocabulary-shar.patch
+../../2026-10-12-r6g/vllm/0113-Greedy-verification-compile-its-kernels-in-the-dummy.patch
+../../2026-10-12-r6g/vllm/0114-Greedy-verification-find-the-LM-head-through-a-multi.patch
+../../2026-10-12-r6h/vllm/0115-TileLang-V4.1-mHC-split-fn-into-its-TF32-parts-while.patch
+../../2026-10-12-r6h/vllm/0116-TileLang-V4.1-MoE-request-the-shared-row-before-the-.patch
+../../2026-10-12-r6h/vllm/0117-TileLang-V4.1-vocabulary-heads-token-tiles-vary-fast.patch
+../../2026-10-13-kernel-names/vllm/0118-TileLang-V4.1-name-every-kernel-after-its-file-and-w.patch
+../../2026-10-13-kernel-names/vllm/0119-L2-prefetch-refuse-to-run-without-the-TileLang-kerne.patch
+../../2026-10-13-r6k/vllm/0120-TileLang-V4.1-WO-WO-A-on-BF16-activations-as-DeepSee.patch
+../../2026-10-13-r6k/vllm/0121-TileLang-V4.1-WO-decode-each-tile-s-UE8M0-scales-onc.patch
+../../2026-10-13-r6k/vllm/0122-TileLang-V4.1-WO-the-W8A16-GEMM-without-warp-special.patch
+../../2026-10-13-r6k/vllm/0123-TileLang-V4.1-WO-WO-A-tiles-from-the-sweep.patch
+../../2026-10-13-r6k/vllm/0124-TileLang-V4.1-WO-WO-A-in-four-K-shards-split-over-CT.patch
+../../2026-10-13-r6k/vllm/0125-TileLang-V4.1-WO-WO-A-path-and-tile-per-bucket-from-.patch
+../../2026-10-13-r6k/vllm/0126-WO-projection-TileLang-under-the-TileLang-kernel-bac.patch
+../../2026-10-13-r6k/vllm/0127-TileLang-V4.1-WO-sequence-parallel-steps-through-the.patch
+../../2026-10-13-r6k/vllm/0128-TileLang-V4.1-the-W8A16-GEMM-s-kernels-follow-the-na.patch
+../../2026-10-13-r6k/vllm/0129-TileLang-V4.1-WO-B-s-decode-tiles-to-96-rows.patch
+../../2026-10-13-r6k/vllm/0130-TileLang-V4.1-WO-WO-A-tiles-as-tall-as-the-bucket-fr.patch
+../../2026-10-13-r6k/vllm/0131-DSpark-context-KV-TileLang-under-the-TileLang-kernel.patch
+../../2026-10-13-r6k/vllm/0132-TileLang-V4.1-sparse-MLA-every-route-folds-a-segment.patch
+../../2026-10-13-r6k/vllm/0133-TileLang-V4.1-WO-WO-A-hands-WO-B-the-reference-s-MXF.patch
+../../2026-10-16-r6r/vllm/0134-TileLang-V4.1-tests-non-finite-contracts.patch
+../../2026-10-16-r6r/vllm/0135-TileLang-V4.1-tests-DeepSeek-s-arithmetic-for-compre.patch
+../../2026-10-16-r6r/vllm/0136-TileLang-V4.1-MoE-test-calibrate-the-reference-again.patch
+../../2026-10-16-r6r/vllm/0137-TileLang-V4.1-shared-SwiGLU-the-clamps-keep-a-NaN.patch
+../../2026-10-16-r6r/vllm/0138-TileLang-V4.1-Engram-gate-the-magnitude-floor-keeps-.patch
+../../2026-10-16-r6r/vllm/0139-Engine-cost-grid-time-the-cost-profile-s-dummy-steps.patch
+../../2026-10-16-r6r/vllm/0140-Engine-grid-settle-each-timed-step-with-an-untimed-r.patch
+../../2026-10-16-r6r/vllm/0141-TileLang-V4.1-tests-the-routed-experts-keep-a-NaN-Ti.patch
+../../2026-10-16-r6r/vllm/0142-RoCE-policy-no-fallback-in-any-collective.patch
+../../2026-10-16-r6r/vllm/0143-One-shot-collectives-name-a-stopped-collective-rende.patch
+../../2026-10-16-r6r/vllm/0144-Adaptive-verification-run-the-draft-budget-eagerly-r.patch
+../../2026-10-16-r6r/vllm/0145-DeepSeek-V4.1-Engram-read-disk-rows-with-a-native-wo.patch
+../../2026-10-16-r6r/vllm/0146-DeepSeek-V4.1-Engram-model-test-compare-the-disk-rea.patch
+../../2026-10-16-r6r/vllm/0147-Weight-transfer-copy-pageable-checkpoint-tensors-thr.patch
+../../2026-10-16-r6r/vllm/0148-DeepSeek-V4.1-Engram-read-the-rows-the-host-can-hash.patch
+../../2026-10-16-r6r/vllm/0149-DeepSeek-V4.1-SP-tests-fixtures-for-the-unreduced-mo.patch
+../../2026-10-16-r6r/vllm/0150-DeepSeek-V4.1-prefill-SP-Engram-s-wkv-product-exchan.patch
+../../2026-10-16-r6r/vllm/0151-DeepSeek-V4.1-Engram-a-debug-timeline-of-each-step-s.patch
+../../2026-10-16-r6r/vllm/0152-DeepSeek-V4.1-prefill-SP-Engram-s-exchanged-blocks-r.patch
+../../2026-10-16-r6r/vllm/0153-DeepSeek-V4.1-Engram-disk-shards-on-whole-hash-colum.patch
+../../2026-10-16-r6s/vllm/0154-DeepSeek-V4.1-Engram-interleave-disk-shards-hash-col.patch
+../../2026-10-16-r6s/vllm/0155-DeepSeek-V4.1-Engram-tests-a-disk-rank-gathers-only-.patch
+../../2026-10-17-r6u/vllm/0156-Profiling-and-warm-up-name-a-stopped-one-shot-collec.patch
+../../2026-10-17-r6u/vllm/0157-Kernel-preparation-compile-declared-kernels-before-a.patch
+../../2026-10-17-r6u/vllm/0158-Kernel-preparation-owners-declare-from-a-walk-of-the.patch
+../../2026-10-17-r6u/vllm/0159-Sampler-warmup-compile-the-unaligned-stride-variants.patch
+../../2026-10-17-r6u/vllm/0160-Kernel-preparation-the-JIT-monitor-watches-from-the-.patch
+../../2026-10-17-r6u/vllm/0161-TileLang-linear-tests-declare-the-layer-s-kernels-st.patch
+../../2026-10-17-r6u/vllm/0162-Kernel-preparation-WO-vocabulary-heads-and-DSpark-co.patch
+../../2026-10-17-r6u/vllm/0163-Kernel-preparation-TileLang-MoE-experts-and-mHC-decl.patch
+../../2026-10-17-r6u/vllm/0164-Kernel-preparation-the-V4.1-attention-layer-declares.patch
+../../2026-10-17-r6u/vllm/0165-V4.1-TileLang-attention-plans-exist-only-once-bound-.patch
+../../2026-10-17-r6u/vllm/0166-Kernel-preparation-routing-activation-norm-Engram-co.patch
+../../2026-10-17-r6u/vllm/0167-Kernel-preparation-runs-under-the-worker-s-vLLM-conf.patch
+../../2026-10-17-r6u/vllm/0168-Kernel-preparation-compile-with-the-deployment-s-com.patch
+../../2026-10-17-r6u/vllm/0169-Kernel-preparation-a-step-s-Triton-kernels-compile-w.patch
+../../2026-10-17-r6u/vllm/0170-Kernel-preparation-register-a-step-s-Triton-kernels-.patch
+../../2026-10-17-r6u/vllm/0171-Test-that-the-worker-registers-a-step-s-kernels-whil.patch
+../../2026-10-17-r6u/vllm/0172-Kernel-preparation-the-TileLang-compressor-offers-no.patch
+../../2026-10-17-r6u/vllm/0173-CED-metadata-tests-give-the-hand-built-model-state-a.patch
+../../2026-10-17-r6u/vllm/0174-Tests-hand-built-drafter-and-model-stubs-read-what-t.patch
+../../2026-10-17-r6u/vllm/0175-Tests-cover-the-TileLang-kernel-family-where-only-B1.patch
+../../2026-10-17-r6u/vllm/0176-Tests-DS4.1-s-configuration-tests-in-their-own-file.patch
+../../2026-10-17-r6u/vllm/0177-DeepSeek-V4.1-WO-A-quantizes-its-input-as-the-refere.patch
+../../2026-10-17-r6u/vllm/0178-DeepSeek-V4.1-encoding-current-turn-thinking-across-.patch
+../../2026-10-17-r6u/vllm/0179-DeepSeek-V4.1-WO-A-s-input-is-prepared-once-in-the-a.patch
+../../2026-10-17-r6v/vllm/0180-PyNCCL-row-all-to-all-over-a-four-node-ring-the-far-.patch
+0181-DeepSeek-V4.1-MoE-the-routed-SwiGLU-and-MXFP8-cast-o.patch
