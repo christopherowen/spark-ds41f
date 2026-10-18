@@ -698,7 +698,7 @@ def grouped_fp8_fp4_gemm(
                     T.access_ptr(
                         SFB[(expert * n_blocks + bx) * k_blocks + ko, tx * 8], "r", 8
                     ),
-                    16,
+                    8,  # elements: eight 2-byte codes, one 16-byte copy
                 )
         else:
             for c in T.unroll(sfb_copies):
