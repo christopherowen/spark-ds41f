@@ -1,0 +1,48 @@
+{
+ "description": "The DSpark adaptive verification, config, warm-up and B12X preparation tests with the draft budget by a fixed survival threshold (vLLM dspark-heuristic-budget 1462c99fc) mounted over the r6v image.",
+ "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "PYTHONPATH": "/b"
+ },
+ "workdir": "/opt/spark3/candidate/vllm",
+ "argv": [
+  "-c",
+  "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'prepare_fixtures', '--basetemp', '/c/pytest-tmp-budget-rule', 'tests/v1/spec_decode/test_adaptive_verification.py', 'tests/v1/worker/test_mixed_warmup_gate.py', 'tests/test_config.py::test_adaptive_verification_threshold_is_a_probability', 'tests/test_config.py::test_adaptive_verification_threshold_requires_adaptive_dspark', 'tests/model_executor/test_b12x_warmup.py::test_workload_prepares_every_adaptive_verification_profile_shape']\nsys.exit(subprocess.run(cmd, timeout=1800).returncode)\n"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_adaptive_verification.py",
+   "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_model_runner.py",
+   "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "vllm_config_speculative.py",
+   "/opt/spark3/candidate/vllm/vllm/config/speculative.py"
+  ],
+  [
+   "tests_v1_spec_decode_test_adaptive_verification.py",
+   "/opt/spark3/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py"
+  ],
+  [
+   "tests_test_config.py",
+   "/opt/spark3/candidate/vllm/tests/test_config.py"
+  ],
+  [
+   "tests_v1_worker_test_mixed_warmup_gate.py",
+   "/opt/spark3/candidate/vllm/tests/v1/worker/test_mixed_warmup_gate.py"
+  ],
+  [
+   "tests_model_executor_test_b12x_warmup.py",
+   "/opt/spark3/candidate/vllm/tests/model_executor/test_b12x_warmup.py"
+  ]
+ ]
+}
