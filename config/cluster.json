@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "promoted_baseline": "2026-10-17-karmic-kraken-r6v",
+  "promoted_baseline": "2026-10-19-karmic-kraken-r6x",
   "model": "v41-flash-1017",
   "models": {
     "v41-flash": {
@@ -20,9 +20,9 @@
   },
   "container": {
     "name": "dsv41-karmic-kraken",
-    "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v",
+    "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
     "expected_labels": {
-      "local.spark3.vllm.tree": "d11e9836e61bc2b763d6805d3324ec8fb5376360",
+      "local.spark3.vllm.tree": "4d6851c8bb1397a55254ba88905a87d9785b98dc",
       "local.spark3.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark3.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark3.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
@@ -178,7 +178,7 @@
     "--moe-backend",
     "tilelang",
     "--speculative-config",
-    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_cost_scale\":2.0}",
+    "{\"method\":\"dspark\",\"num_speculative_tokens\":${drafts},\"draft_tensor_parallel_size\":${tensor_parallel_size},\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
     "--jit-monitor-mode",
     "warn",
     "--compilation-config",
@@ -220,7 +220,7 @@
   "default_shape": "tp4-ring",
   "shapes": {
     "tp4-ring": {
-      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. It schedules on its build's own DSpark cost curves, as TP3 does (since r6v). The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12).",
+      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12).",
       "nodes": 4,
       "nodes_config": "config/nodes-ring4.local.json",
       "fabric": {
@@ -272,10 +272,10 @@
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "0",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152"
       },
-      "benchmark_reference": "manifests/suites/2026-10-17-karmic-kraken-r6v-tp4"
+      "benchmark_reference": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4"
     },
     "tp3-triangle": {
-      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md).",
+      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Unqualified on r6x (its routed SwiGLU, expert scale codes and draft budget change TP3's path; r6u's TP3 run no longer covers it): starting it needs --unqualified-shape until a triangle release run.",
       "nodes": 3,
       "nodes_config": "config/nodes.json",
       "fabric": {
@@ -313,8 +313,7 @@
         "NCCL_SOCKET_IFNAME": "enP7s7",
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "1",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
-      },
-      "benchmark_reference": "manifests/suites/2026-10-17-karmic-kraken-r6u-tp3"
+      }
     },
     "tp3-triangle-4k": {
       "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md).",

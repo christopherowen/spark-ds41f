@@ -315,7 +315,8 @@ What the rules guard against (each found the hard way, 2026-10-11):
   1048576 on a 1M profile is skipped silently. The profile uses 1,000,000.
 - **Repeats.** With two repeats a t interval spans tens of percent. The report uses
   1.96 sd / sqrt(n) for prefill, with three repeats.
-- **Cost curves.** Arms run on pinned DSpark cost curves (`SPARK3_DSPARK_COST_DIR`).
-  To compare step costs, boot each arm with an empty cost directory and
-  `SPARK3_DSPARK_PROFILE_TOKENS=random`. The boot pins its real-row curves there
+- **Draft budget.** Since r6x the DSpark budget is a rule of the inputs (row cost 0.035)
+  and nothing is timed at boot, so arms of r6x and later draft identically. Arms of earlier
+  builds run on pinned DSpark cost curves (`SPARK3_DSPARK_COST_DIR`); to compare their step
+  costs, boot each with an empty cost directory and `SPARK3_DSPARK_PROFILE_TOKENS=random`
   (experiments/2026-10-11-c16-cost).

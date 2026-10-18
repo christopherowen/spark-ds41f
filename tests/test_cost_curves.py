@@ -48,11 +48,17 @@ class CostCurveDirectoryTest(unittest.TestCase):
         dev["environment"]["VLLM_SERVER_DEV_MODE"] = "1"
         self.assertEqual(self.directory(dev), self.directory(self.tp3))
         # The ring's release arm (dev mode) and the recipe are the same build, and so are the
-        # triangle's r6v arm and the recipe.
-        arm = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp4-dev-1017.json")
+        # triangle's r6x arm and the recipe. (r6x reads no curves; the directory still names
+        # the build.)
+        arm = spark.read_cluster("experiments/2026-10-18-r6x/r6x-tp4-dev-1017.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp4))
-        arm = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp3-1017.json")
+        arm = spark.read_cluster("experiments/2026-10-18-r6x/r6x-tp3-1017.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp3))
+        # r6v's arms keep the curves its production ran on, so it stays a fixed reference.
+        r6v = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp4-dev-1017.json")
+        self.assertEqual(self.directory(r6v), "/cache/kkref/dspark-costs/build-2a95f7780992adb4")
+        r6v = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp3-1017.json")
+        self.assertEqual(self.directory(r6v), "/cache/kkref/dspark-costs/build-452635dc54559431")
         # r6u's TP3 release arm keeps r6u's curves, the ones its production ran on.
         r6u = spark.read_cluster("experiments/2026-10-17-r6u/r6u-tp3-dev-1017.json")
         self.assertEqual(self.directory(r6u), "/cache/kkref/dspark-costs/build-111f0abb94a12639")

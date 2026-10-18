@@ -46,17 +46,21 @@ is headroom for a later KV change.
 
 Gate: outputs identical to r6v's; no metric worse than r6v.
 
-## Promotion (the owner's decision)
+## Promotion (owner, 2026-10-19: "I would like to promote but don't want to wait")
 
-- `config/cluster.json`: the r6x image and lock; `adaptive_verification_row_cost` 0.035 in
-  place of the cost scale in the speculative config. The recipe has one image for both
-  shapes: r6v serves the triangle on r6u's TP3 path, while 0181-0184 change TP3's path too
-  (its kernel bits are tested; its serving is not).
-- The README's Benchmarking section loses its note that boots differ by about 3% from the
-  startup cost profile, and docs/lab.md its pinned-curves rule.
-- `bin/spark` stops deriving `SPARK3_DSPARK_COST_DIR`, with its tests and docs, once no
-  production shape runs an image that reads it (TP3 still serves r6u's).
-- TP3: `tp3-triangle` needs the triangle cabling to qualify r6x there.
+- `config/cluster.json`: the r6x image and vLLM tree; `adaptive_verification_row_cost` 0.035
+  in place of the cost scale; `tp4-ring`'s `benchmark_reference` is this release's r6x run
+  (`manifests/suites/2026-10-19-karmic-kraken-r6x-tp4`, with its single-stream and sampled
+  companions). The recipe has one image for both shapes and 0181-0184 change TP3's path too,
+  so `tp3-triangle` loses r6u's reference: it is unqualified until a triangle release run
+  (`r6x-tp3-1017.json` is its arm; start it with `--unqualified-shape` meanwhile).
+- r6v's recipe and lock are frozen under `r6v/` as the rollback; the r6x arms extend them.
+  Root lock and source manifest move to r6x; baseline
+  `manifests/baselines/2026-10-19-karmic-kraken-r6x.json`.
+- The production recipe renders identically to the measured r6x arm.
+- Left for later: `bin/spark` still derives `SPARK3_DSPARK_COST_DIR` (r6x reads none; r6v's
+  reference arms still load their production curves through it), and the static-table sweep
+  (experiments/2026-10-18-dspark-static-costs) was stopped for the deployment.
 
 ## Results (2026-10-18, the ring, 1017)
 

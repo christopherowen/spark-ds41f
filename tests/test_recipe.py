@@ -21,14 +21,28 @@ def load(relative: str) -> dict:
     return json.loads((ROOT / relative).read_text())
 
 
+BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
+
+
 def serving_arguments(cluster: dict) -> list[str]:
-    """``serve_args`` without what selects the checkpoint and its sampling defaults: the
-    model path and ``--override-generation-config``."""
+    """``serve_args`` without what selects the checkpoint and its sampling defaults (the
+    model path and ``--override-generation-config``) and without the draft budget's
+    constant (r6x replaced the boot-timed cost model's scale with a row cost)."""
     args = cluster["serve_args"][1:]
     if "--override-generation-config" in args:
         at = args.index("--override-generation-config")
         del args[at : at + 2]
+    if "--speculative-config" in args:
+        at = args.index("--speculative-config") + 1
+        speculative = json.loads(args[at])
+        args[at] = json.dumps({k: v for k, v in speculative.items() if k not in BUDGET_KEYS})
     return args
+
+
+def draft_budget(cluster: dict) -> dict:
+    args = cluster["serve_args"]
+    speculative = json.loads(args[args.index("--speculative-config") + 1])
+    return {k: v for k, v in speculative.items() if k in BUDGET_KEYS}
 
 
 def load_spark():
@@ -64,14 +78,14 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_each_shape_is_its_released_r6v_arm(self):
-        """tp4-ring resolves to r6v's release arm on the ring, tp3-triangle to r6v's arm on the
-        triangle (r6u's TP3 path), apart from the names (the arms extend the frozen r6u recipe
-        and name r6v's lock)."""
+    def test_each_shape_is_its_r6x_arm(self):
+        """tp4-ring resolves to r6x's release arm on the ring, tp3-triangle to r6x's arm on the
+        triangle (unqualified), apart from the names (the arms extend the frozen r6v recipe
+        and name r6x's lock)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
-        for shape, arm in (("tp4-ring", "r6v-tp4-1017.json"), ("tp3-triangle", "r6v-tp3-1017.json")):
+        for shape, arm in (("tp4-ring", "r6x-tp4-1017.json"), ("tp3-triangle", "r6x-tp3-1017.json")):
             resolved = recipe.resolve(self.recipe, shape)
-            released = load_spark().read_cluster(f"experiments/2026-10-17-r6v/{arm}")
+            released = load_spark().read_cluster(f"experiments/2026-10-18-r6x/{arm}")
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
 
@@ -142,9 +156,13 @@ class RecipeTest(unittest.TestCase):
         self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
-        # TP3 keeps r6u's release run (r6v's TP3 path is r6u's); the ring has r6v's own.
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-17-karmic-kraken-r6u-tp3")
-        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-17-karmic-kraken-r6v-tp4")
+        # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
+        self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
+        self.assertEqual(draft_budget(tp4), draft_budget(resolved))
+        # r6x changes TP3's path, so the triangle has no reference until its own release run;
+        # the ring has r6x's.
+        self.assertNotIn("benchmark_reference", resolved)
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):

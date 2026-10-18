@@ -1,19 +1,34 @@
 # Current state
 
 Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**r6v**, serving DeepSeek-V4.1-Flash-1017, promoted 2026-10-17 as
+**r6x**, serving DeepSeek-V4.1-Flash-1017, promoted 2026-10-19 as
+[`2026-10-19-karmic-kraken-r6x`](../manifests/baselines/2026-10-19-karmic-kraken-r6x.json)
+([promotion record](../experiments/2026-10-18-r6x/README.md)): image
+`vllm-ds41f-kkref:19f2c20ed4d6-r6x` on dgx1-dgx4, r6v's sources with vLLM 0181-0184 (patch head
+`7316c7f9`, tree `4d6851c8`). 0181 runs the routed experts' SwiGLU and MXFP8 cast over the
+dispatch layout's live tiles only; 0182-0183 keep the routed experts' weight scales as a row
+base exponent and 4-bit codes (exact, half the scale bytes, about 2.1 GiB a rank freed); 0184
+budgets DSpark's drafts by a rule of the inputs, a fixed linear step cost (row cost 0.035), so
+nothing is timed at boot and every build drafts the same way. Outputs are identical to r6v's.
+Against r6v on the `release` suite: decode steps 2.5% faster, 16 and 8 streams 3.6% and 3.8%
+faster (sampled 3.0% and 4.5%), prefill level, one conversation at a time 74.1 tok/s.
+`tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-19-karmic-kraken-r6x-tp4](../manifests/suites/2026-10-19-karmic-kraken-r6x-tp4/).
+`tp3-triangle` is unqualified on r6x (its path changed too): it needs a triangle release run,
+and until then `cluster start --unqualified-shape`. r6v's recipe and lock are frozen in
+`experiments/2026-10-18-r6x/r6v` as the rollback.
+
+Before r6x the ring ran **r6v**, promoted 2026-10-17 as
 [`2026-10-17-karmic-kraken-r6v`](../manifests/baselines/2026-10-17-karmic-kraken-r6v.json)
 ([promotion record](../experiments/2026-10-17-r6v/README.md)): image
-`vllm-ds41f-kkref:19f2c20ed4d6-r6v` on dgx1-dgx4, r6u's sources with vLLM 0180 (patch head
+`vllm-ds41f-kkref:19f2c20ed4d6-r6v`, r6u's sources with vLLM 0180 (patch head
 `c001cc4e`, tree `d11e9836`). 0180 relays Engram's sequence-parallel row all-to-all through the
 neighbours at four ranks: on the switchless ring ranks two apart share no cable, and r6u's
 direct exchange (r6s's, released on the triangle only) timed out there in memory profiling.
 Against r6n on the `release` suite: prefill 3.2-4.2% faster at 32K-1M, decode level, one
-conversation at a time 71.1 tok/s. `tp4-ring`'s `benchmark_reference` is
-[manifests/suites/2026-10-17-karmic-kraken-r6v-tp4](../manifests/suites/2026-10-17-karmic-kraken-r6v-tp4/);
-the ring now schedules on its build's own DSpark cost curves (`build-2a95f7780992adb4`), as the
-triangle does. The triangle runs the same image on r6u's TP3 path (below, its reference r6u's
-run). r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u` as the rollback.
+conversation at a time 71.1 tok/s. It scheduled on its build's own DSpark cost curves
+(`build-2a95f7780992adb4`). The triangle ran the same image on r6u's TP3 path (below, its
+reference r6u's run). r6u's recipe and lock are frozen in `experiments/2026-10-17-r6v/r6u`.
 
 On the triangle, r6v's TP3 path is **r6u**'s, serving DeepSeek-V4.1-Flash-1017 (revision `1bae0e10`), promoted 2026-10-17 as
 [`2026-10-17-karmic-kraken-r6u`](../manifests/baselines/2026-10-17-karmic-kraken-r6u.json)
@@ -107,8 +122,9 @@ Since 2026-10-14 the TP4 profile pins serving to the GB10's ten fast cores
 four threads busy per node, so the slow cores are never needed. `doctor --live` checks the
 pin on every node.
 
-DSpark's verifier schedules on cost curves timed on a boot. A profile without a pinned
-directory gets its build's own (`bin/spark` derives `SPARK3_DSPARK_COST_DIR` from the
+Since r6x DSpark's verifier budgets drafts by a fixed linear step cost and times nothing.
+Before it, the verifier scheduled on cost curves timed on a boot. A profile without a pinned
+directory got its build's own (`bin/spark` derives `SPARK3_DSPARK_COST_DIR` from the
 image's source trees, code overlays, environment and serve arguments, all but the
 dev-mode RPC switch): a new build profiles itself on its first boot and reuses its curves
 after. `tp3-triangle` does so since 2026-10-15; `tp4-ring` still pins r6h's until its
@@ -155,7 +171,7 @@ B12X is the alternative backend in the same image.
 | Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
 | Image input | vision tower loaded, up to 4 images per request, no host preprocessing cache |
-| DSpark | 5 draft tokens, draft TP 3, adaptive verification (cost scale 2.0), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
+| DSpark | 5 draft tokens, draft TP 3, adaptive verification (r6u's TP3 path: cost scale 2.0; r6x: the row cost 0.035, nothing timed), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
 | Collectives | sparknet one-shot all-reduce (up to 2 MiB) and all-gather over the triangle (`oneshot-direct`), larger all-reduces summed in rank order in FP32; the requested policy is enforced and a declined or lost backend fails startup (vLLM 0027, 0038) |
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
 | CUDA graphs | full, capture sizes 1-48 |
