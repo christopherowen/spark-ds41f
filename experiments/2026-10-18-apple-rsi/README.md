@@ -75,9 +75,11 @@ and r6n (dgx2); the kernels are the same in both.
 
 ## Two adapter fixes (2026-10-18, after the first run)
 
-- The verifier asserts that `config.json`'s model id is the grading recipe's `MODEL`;
-  `prepare.py` now rewrites both to the served name (the first run's verifier failed at
-  collection).
+- The verifier compares the task's model id across its records (`config.json`, the grading
+  recipe, the efficiency recipe's launch argv); rewriting it to our served name broke those
+  checks at collection. `prepare.py` now leaves the task's records as they are, and the
+  plain arms serve the task's model id as their first model name (ours as an alias);
+  `verifier2.json` runs the verifier on them from `~/spark-lab/apple-rsi-plain2`.
 - The task's reference server passes no reasoning parser, so a chat reply's thinking is its
   text content; ours splits it into `reasoning_content`, and the API example's 32-token
   chat at temperature 0 (thinking on by default) came back with empty content.
