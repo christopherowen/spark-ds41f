@@ -25,3 +25,35 @@ build and boot, and the boot is about 11 s shorter.
 
 Gate: no metric worse than r6v; the constant then goes into the recipe and the timed cost
 model is deleted.
+
+## Results: both constants level with the timed budget; 0.035 keeps r6v's operating point
+
+Tests (`tests.json`, with the stub fix of #398): pass. Outputs identical in every arm (greedy
+responses 128/128, teacher-forced distributions identical). Verdicts against the run's own
+repeat (row cost 0.02 matched itself within 0.0-0.4% on every throughput metric):
+
+| Suite | Metric | r6v | Row cost 0.02 | 0.02 again | Row cost 0.035 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| screen | c16 tok/s | 241.6 | 242.5 (+0.35%) | 241.9 | 240.3 (-0.55%) |
+| screen | c16 tokens a step | 30.5 | 33.0 | 32.9 | 30.8 |
+| screen | c16 TTFT p50 | 408 ms | 437 ms | 432 ms | 413 ms |
+| screen | engine grid (step time) | | -0.49% | -1.77% | -1.14% |
+| single-stream | c1 tok/s | 70.9 | 71.2 | 71.3 | 71.1 |
+| sampled | c16 tok/s | 237.2 | 237.0 | 236.7 | 236.0 (-0.48%) |
+| sampled | c8 tok/s | 179.9 | 180.2 | 180.2 | 180.7 (+0.44%) |
+| sampled | c8 TTFT p50 | 284 ms | 312 ms | 313 ms | 301 ms |
+| sampled | c1 tok/s | 68.4 | 68.35 | 68.4 | 68.4 |
+
+Every throughput verdict is same; no arm is slower. The grid (a fixed-row step cost the
+budget does not touch) drifted over the run (the repeat -1.29%); prefill 256K read -0.43%
+in the 0.02 repeat against its own first run, also drift.
+
+Throughput is flat across this range of budgets: row cost 0.02 verifies about 10% more
+drafts per draft (1.90 against 1.73) and commits 8-12% more tokens a step, but its steps
+run 7-11% slower, so the output rate is the same while each step does more work and first
+tokens arrive 6-10% later. Row cost 0.035 reproduces r6v's operating point at sixteen
+streams (30.8 tokens a step against 30.5, first tokens level) and drafts somewhat more at
+eight. With throughput equal, less verification for the same tokens and level latency
+decide: **row cost 0.035 goes into the recipe** (r6x, experiments/2026-10-18-r6x). Whether
+the cost model's full shape beats one linear constant at that aggressiveness is
+experiments/2026-10-18-dspark-static-costs.

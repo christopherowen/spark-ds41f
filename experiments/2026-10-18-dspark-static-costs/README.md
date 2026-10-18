@@ -15,6 +15,14 @@ of the recipe and the boot profile deleted.
 
 ## Runs
 
-`screen.json`: the screen, single-stream and sampled suites: static table at cost scale 1.5,
-r6v (its own pin, scale 2.0), static table at scale 1.0, scale 1.5 again. Outputs are
-unchanged by any draft budget (verification is exact).
+`screen.json`: the screen, single-stream and sampled suites: the static table at cost scale
+2.0 (r6v's scale on r6v's shape, nothing timed), the linear rule at row cost 0.035 (the
+reference), the static table at scale 1.5, scale 2.0 again. Outputs are unchanged by any
+draft budget (verification is exact).
+
+The sweep first planned scales 1.5 and 1.0 against r6v. The linear screen
+(experiments/2026-10-18-dspark-linear-budget) showed that drafting more than r6v buys no
+throughput: row cost 0.02 verified 8-12% more tokens a step at the same output rate, with
+slower steps and later first tokens. So the question left is whether the cost model's full
+shape (graph buckets, the drafter's cost by request count) beats one linear constant at the
+same aggressiveness, which scale 2.0 against row cost 0.035 answers.
