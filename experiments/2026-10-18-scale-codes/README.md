@@ -139,3 +139,34 @@ GEMM's only slower cells are one and two warm rows.
 settings; each node's MemAvailable once serving, and vLLM's own load and KV lines. Whether
 the plan's conversion after loading (rather than in the loader) gives the saved scale bytes
 back is measured here, not assumed.
+
+**Single stream** (`single-stream.json`: codes, r6w, codes again): 74.3 / 74.2 against 72.8
+tok/s, +2.09% (interval 4.0%, verdict same), engine steps a second +1.2%. The one- and
+two-row cells the kernel bench marked slower do not show at one stream.
+
+**Memory** (`memory.json`, TP4, same KV settings; MemAvailable once serving):
+
+| Node | r6w | codes | r6w again | codes - mean(r6w) |
+| --- | ---: | ---: | ---: | ---: |
+| dgx1 | 20.03 GiB | 22.12 GiB | 19.57 GiB | +2.32 GiB |
+| dgx2 | 21.51 GiB | 23.59 GiB | 21.49 GiB | +2.08 GiB |
+| dgx3 | 21.33 GiB | 23.80 GiB | 21.96 GiB | +2.15 GiB |
+| dgx4 | 21.64 GiB | 23.47 GiB | 21.59 GiB | +1.86 GiB |
+
+About 2.1 GiB a rank back at TP4 (r6w's repeat moved up to 0.6 GiB), the 2.0 GiB the scale
+bytes predicted: converting after loading does give the words' memory back, so the
+loader needs no change. At TP3 the same codes free about 2.7 GiB a rank (5.4 GiB of
+scales, halved).
+
+**TP3 at 1M: not run.** `tp3-triangle` needs the three nodes fully cabled; the site is
+cabled as the four-node ring (ranks two apart share no cable), so the triangle cannot boot
+until it is re-cabled. The arm to run then is the triangle recipe with these codes and
+`--max-model-len 1048576`, its KV pool raised by up to the freed 2.7 GiB within the memory
+guard's 3 GiB margin, gated by a 1M prefill and the release-tp3 suite.
+
+### Verdict
+
+Correct: every output identical, the coded GEMM's bits the uncoded GEMM's. Never slower:
+c16 +3.75% (better), prefill 32K +0.56% (better), c1 +2.1%, c4/c8 distinct +2.5-2.7%, grid
+-0.75%; memory 2.1 GiB a rank freed at TP4. For the owner's promotion decision (with r6w,
+on which it is built).
