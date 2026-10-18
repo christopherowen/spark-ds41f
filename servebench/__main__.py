@@ -75,8 +75,13 @@ def command_run(args: argparse.Namespace) -> int:
             "prefix_cache_hit_rate": summary.get("server", {}).get("prefix_cache_hit_rate", {}).get("mean"),
             "ttft_p50_s": summary["latency"]["ttft_s"].get("p50"),
             "tpot_p50_ms": summary["latency"]["tpot_ms"].get("p50"),
-            "failed": summary["requests"]["failed"], "output": args.output}
+            "failed": summary["requests"]["failed"],
+            "foreign_requests": summary["requests"]["foreign"], "output": args.output}
     print(json.dumps(line), flush=True)
+    if summary["requests"]["foreign"]:
+        print(f"servebench: {summary['requests']['foreign']} foreign requests finished during the run: "
+              "the server was not serving this run alone", file=sys.stderr, flush=True)
+        return 3
     return 1 if summary["requests"]["failed"] else 0
 
 

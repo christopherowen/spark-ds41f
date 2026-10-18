@@ -101,6 +101,19 @@ class DistinctStreamsTest(unittest.TestCase):
         self.assertEqual(len(set(streams_module.PROMPTS)), len(streams_module.PROMPTS))
         self.assertGreaterEqual(len(streams_module.PROMPTS), 16)
 
+    def test_requests_beyond_the_samples_own_are_foreign(self) -> None:
+        """A sample counts the server's finished requests: its own streams are expected,
+        anything more was someone else's load on the server (2026-10-18: a production
+        client on a lab arm made a gate read 3-4x slow)."""
+        def fake_stream(base, model, prompt, tokens, out):
+            out.update(start=0.0, first=1.0, last=3.0, tokens=tokens, offset=0.0)
+
+        for counts, foreign in (([10.0, 14.0], 0), ([10.0, 21.0], 7), ([None, 14.0], None)):
+            with mock.patch.object(streams_module, "stream", fake_stream), \
+                    mock.patch.object(streams_module, "finished_requests", side_effect=counts):
+                result = streams_module.sample("http://x", "m", streams_module.PROMPTS[:4], 16)
+            self.assertEqual(result["foreign_requests"], foreign)
+
 
 if __name__ == "__main__":
     unittest.main()

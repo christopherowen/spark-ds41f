@@ -20,6 +20,7 @@ VLLM = {
     "preemptions": "vllm:num_preemptions_total",
     "prefix_cache_queries": "vllm:prefix_cache_queries_total",
     "prefix_cache_hits": "vllm:prefix_cache_hits_total",
+    "requests_finished": "vllm:request_success_total",
     "requests_running": "vllm:num_requests_running",
     "requests_waiting": "vllm:num_requests_waiting",
 }

@@ -52,7 +52,7 @@ class FakeServer:
         self.seen: list[tuple[str, int]] = []  # (cache salt, prompt characters) per streamed request
         self.lock = threading.Lock()
         self.counters = {"generation": 0, "steps": 0, "step_tokens": 0, "drafts": 0, "accepted": 0,
-                         "pos0": 0, "pos1": 0}
+                         "pos0": 0, "pos1": 0, "finished": 0}
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -76,6 +76,7 @@ class FakeServer:
                         f'vllm:spec_decode_num_draft_tokens_per_pos_total{{engine="0",position="1"}} {c["drafts"]}\n'
                         f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="0"}} {c["pos0"]}\n'
                         f'vllm:spec_decode_num_accepted_tokens_per_pos_total{{engine="0",position="1"}} {c["pos1"]}\n'
+                        f'vllm:request_success_total{{finished_reason="length"}} {c["finished"]}\n'
                         'vllm:kv_cache_usage_perc{engine="0"} NaN\n').encode()
                 else:
                     self.send_error(404)
@@ -150,6 +151,8 @@ class FakeServer:
                     if per_chunk:
                         event["usage"] = {"prompt_tokens": 7, "completion_tokens": produced}
                     send(event)
+                with fake.lock:
+                    fake.counters["finished"] += 1
                 send({"choices": [{"delta": {}, "finish_reason": "length"}],
                       "usage": {"prompt_tokens": 7, "completion_tokens": produced}})
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -305,6 +308,24 @@ class LiveTest(unittest.TestCase):
         self.assertAlmostEqual(summary["server"]["output_tokens_per_step"]["mean"], CHUNK_TOKENS, places=6)
         self.assertAlmostEqual(summary["server"]["accepted_per_draft"]["mean"], CHUNK_TOKENS - 1, places=6)
         self.assertGreater(summary["latency"]["tpot_ms"]["p50"], 0)
+        self.assertEqual(summary["requests"]["foreign"], 0)
+
+    def test_someone_elses_requests_are_foreign(self):
+        """Requests the server finishes beyond the run's own (another client on the same
+        server) are counted, so the run's speeds are not taken for the build's."""
+        spec = load.Load(mode="closed", concurrency=2, warmup_s=0.2, duration_s=0.6, batches=2,
+                         max_tokens=8)
+
+        def visitor():
+            time.sleep(0.4)
+            with self.fake.lock:
+                self.fake.counters["finished"] += 5
+
+        threading.Thread(target=visitor, daemon=True).start()
+        raw = load.run(self.fake.url, "fake-model", prompts.default_prompts(), spec, log=lambda m: None)
+        foreign = report.summarize(raw)["requests"]["foreign"]
+        # Short of 5 by at most the run's own requests finishing just after the last scrape.
+        self.assertTrue(5 - spec.concurrency <= foreign <= 5, foreign)
 
     def test_context_streams_keep_their_documents(self):
         server = FakeServer()

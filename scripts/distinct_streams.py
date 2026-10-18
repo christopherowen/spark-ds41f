@@ -11,10 +11,16 @@ tokens over the window from the first stream's first token to the last stream's 
 token, the per-stream decode rate, time to first token, and that window in wall-clock
 seconds ("wall"), so external power or clock logs can be aligned with it. The last line
 is the summary that lab.py's tables read.
+
+Each sample also reads the server's finished-request counter before and after: requests
+that finished beyond the sample's own streams ("foreign_requests") were someone else's
+load, such as a production client reaching a lab arm, and the sample's speeds are not this
+build's. Any foreign request makes the script exit 3 after printing everything.
 """
 import argparse
 import json
 import statistics
+import sys
 import threading
 import time
 import urllib.request
@@ -38,6 +44,21 @@ PROMPTS = [
     "Write a dialogue between a chess grandmaster and a curious child.",
     "Explain the water cycle and how climate change affects it.",
 ]
+
+
+def finished_requests(base: str) -> float | None:
+    """The server's finished requests (vLLM's request_success_total over every label set),
+    or None if its /metrics cannot be read."""
+    try:
+        with urllib.request.urlopen(base + "/metrics", timeout=30) as response:
+            text = response.read().decode()
+    except OSError:
+        return None
+    total = None
+    for line in text.splitlines():
+        if line.startswith("vllm:request_success_total"):
+            total = (total or 0.0) + float(line.rsplit(" ", 1)[1])
+    return total
 
 
 def model_id(base: str) -> str:
@@ -71,6 +92,7 @@ def stream(base: str, model: str, prompt: str, tokens: int, out: dict) -> None:
 
 
 def sample(base: str, model: str, prompts: list[str], tokens: int) -> dict:
+    before = finished_requests(base)
     results = [{} for _ in prompts]
     threads = [threading.Thread(target=stream, args=(base, model, p, tokens, r)) for p, r in zip(prompts, results)]
     for thread in threads:
@@ -83,9 +105,12 @@ def sample(base: str, model: str, prompts: list[str], tokens: int) -> dict:
     total = sum(r["tokens"] for r in results)
     per_stream = [(r["tokens"] - 1) / (r["last"] - r["first"]) for r in results if r["last"] > r["first"]]
     wall = (min(r["first"] + r["offset"] for r in results), max(r["last"] + r["offset"] for r in results))
+    after = finished_requests(base)
+    foreign = None if before is None or after is None else int(after - before) - len(prompts)
     return {"tps": round(total / window, 2), "tokens": total, "wall": [round(w, 3) for w in wall],
             "per_stream_tps": round(statistics.mean(per_stream), 2) if per_stream else None,
-            "ttft_s": round(statistics.mean(r["first"] - r["start"] for r in results), 3)}
+            "ttft_s": round(statistics.mean(r["first"] - r["start"] for r in results), 3),
+            "foreign_requests": foreign}
 
 
 def summary(streams: int, rates: list[float]) -> dict:
@@ -106,12 +131,17 @@ def main() -> None:
         parser.error(f"--streams must be between 1 and {len(PROMPTS)}")
     base = args.base_url.rstrip("/")
     model = model_id(base)
-    rates = []
+    rates, foreign = [], 0
     for index in range(args.samples):
         result = sample(base, model, PROMPTS[: args.streams], args.tokens)
         rates.append(result["tps"])
+        foreign += max(result["foreign_requests"] or 0, 0)
         print(json.dumps({"sample": index, "streams": args.streams, **result}), flush=True)
-    print(json.dumps(summary(args.streams, rates)), flush=True)
+    print(json.dumps({**summary(args.streams, rates), "foreign_requests": foreign}), flush=True)
+    if foreign:
+        print(f"{foreign} foreign requests finished during the samples: not this build's speed",
+              file=sys.stderr, flush=True)
+        sys.exit(3)
 
 
 if __name__ == "__main__":
