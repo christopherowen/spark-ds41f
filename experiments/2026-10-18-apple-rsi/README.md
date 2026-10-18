@@ -32,6 +32,36 @@ max(0.005 n, 4 sqrt(c + p + 1))); J2 compares the sampled sets' top-1 calibratio
 the sense that they repeat; this asks whether speculation shifts the sampled distribution,
 which DeepSeek's sampling defaults (temperature 1.0 on 1017) now make the common case.
 
+## The sparse-indexer checks
+
+The task also grades the model's two-level sparse indexer as a component: the candidate
+source (layer 20) publishes up to 2,048 blocks of 8 positions by block maximum, the newest
+block always kept, and each candidate-consuming indexer (layers 24, 28, 32, 36) selects its
+own top 512 within that pool. Its checks compare against FP32 mathematics with explicit
+allowances (logits: per-row error over the row's largest score, 99th percentile below 0.01
+and maximum below 0.02; selections: no excluded position more than 2 x 0.02 x the row's
+largest score above the smallest selected one; structure exact), on held-out inputs:
+
+- `two_level` (13 cases): the source's pool (newest kept, a strictly lowest block excluded,
+  its size) and the consumers within it, packed and paged; exact ties;
+- `packed` (15): unaligned row starts (residues 0/1/5/7), 1-512 rows, 0-32,768 visible
+  positions, strided candidate views, empty rows and batches, guarded buffers, and the
+  logits operations directly;
+- `paged` (2): the fused page layout at page sizes 64 and 128, permuted pages with holes and
+  a wider page stride;
+- `replay_spec` (11): verification groups of 1-6 rows, accepted drafts with a poisoned
+  rejected tail, reordered rows, a reused slot, and CUDA-graph replay with changed inputs.
+
+[bundles/indexer-checks/rsi_indexer_shim.py](bundles/indexer-checks/rsi_indexer_shim.py)
+puts serving's kernels behind the names the checks import (the reindex layers'
+`IndexerV41Plan(16384, page, candidates=True)` in serving's row chunks, and the source's
+`IndexerTopK(width, 2048, 8)`), adapting only argument layout: a pool of block ids becomes
+the candidate positions the source publishes; packed keys become index-cache pages
+addressed by absolute position; the source's FP32 logits are rounded to BF16, the dtype
+our source scores in. `indexer.json` runs the public check, the four families and the
+component measurement (times only; its bar is a share of a B200 reference) on r6v (dgx1)
+and r6n (dgx2); the kernels are the same in both.
+
 ## Arms
 
 - `r6n-tp4-dba1.json`: r6n on the ring with the original checkpoint, as it served in
