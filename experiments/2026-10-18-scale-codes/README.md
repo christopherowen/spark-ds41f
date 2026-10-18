@@ -112,3 +112,30 @@ serving screen decides.
 Tried and reverted: expanding every K block's words once per CTA into a shared table that
 the MMAs read directly. Its words reached the MMA wrong (bits differed at every size) and
 the one- and two-row calls were still 2.5-6% slower warm.
+
+### Serving (2026-10-18, the ring, 1017; overlay arms over r6v with r6w's 0181)
+
+**Determinism:** temperature-0 and greedy outputs identical to r6v's and r6w's
+(3eab5112 / db25fde3, c9cf9dbe); the screen's model step: greedy responses identical
+128/128, teacher-forced distributions identical over 32,768 positions (KL 0).
+
+**Distinct streams** (against r6w's from the same night, other boots): c16 250.1 against
+241.7 tok/s (+3.5%), c8 188.2 against 183.2 (+2.7%), c4 141.4 against 138.0 (+2.5%).
+
+**Screen suite** (codes, r6w, codes again; verdicts against the run's own repeat):
+
+| Metric | r6w | codes | codes again | Change | ±95% | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| c16 output tok/s | 241.2 | 250.3 | 249.9 | +3.75% | 0.74% | better |
+| c16 engine steps/s | 8.22 | 8.44 | 8.42 | +2.6% | 1.9% | better |
+| Engine grid, geometric mean (step time) | | | | -0.75% | 0.15% | same (repeat +0.89%) |
+| Prefill 32K tok/s | | | | +0.56% | 0.30% | better |
+| Prefill 256K tok/s | | | | +0.61% | 0.45% | same |
+
+No metric is slower. `single-stream.json` brackets one stream as well, since the coded
+GEMM's only slower cells are one and two warm rows.
+
+**Memory** (`memory.json`, `mem_snapshot.py`): r6w, codes, r6w again at the same KV
+settings; each node's MemAvailable once serving, and vLLM's own load and KV lines. Whether
+the plan's conversion after loading (rather than in the loader) gives the saved scale bytes
+back is measured here, not assumed.
