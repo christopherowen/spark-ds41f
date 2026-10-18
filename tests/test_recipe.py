@@ -101,6 +101,15 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(back["serve_args"], base["serve_args"])
         with self.assertRaises(SystemExit):
             recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
+        # An arm that lists its own mounts (an overlay of changed files) still serves its
+        # model: the list replaces the base's, so the model's mounts are put back first.
+        extra = ["{home}/overlay/moe.py", "/opt/spark3/candidate/vllm/moe.py", "ro"]
+        listed = recipe.overlay({"extends": {}, "set": {"container": {"mounts": [
+            ["{home}/projects/spark-ds41f/cache", "/cache", "rw"], extra]}}}, base)
+        self.assertEqual(listed["container"]["mounts"],
+                         [[profile["hub"], "/hub", "ro"], ["{home}/projects/spark-ds41f/cache", "/cache", "rw"],
+                          extra])
+        self.assertEqual(listed["serve_args"], base["serve_args"])
 
     def test_generation_defaults_render_as_override_generation_config(self):
         """The recipe's sampling defaults (DeepSeek's for 1017) render once, beside

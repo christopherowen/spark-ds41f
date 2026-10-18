@@ -89,3 +89,22 @@ How the schedule was chosen, all at identical bits:
 - Every row's loads first: the drafter and TP4 within the floor at 4 and 8 rows; TP3's 512
   rows needed 2 rows a CTA (its rows have 3 warps, TP4's 9)
   ([results/bench-rows-sweep-loads-first.txt](results/bench-rows-sweep-loads-first.txt)).
+
+### The next step, judged by its ceiling: not built
+
+The 2026-10-14 plan's second step folds the SwiGLU into the gate/up GEMM's epilogue. With
+this kernel's measured times its ceiling is small:
+- **Decode:** the whole kernel is 1.9 us (one stream, 3 rows, about 18 live tiles) to
+  12.8 us (16 streams, 96 rows) a layer, so 40 target layers and the drafter's give
+  about 0.08 ms of a 19.2 ms one-stream step (0.4%) and about 0.5 ms of a 51 ms
+  16-stream step (1.0%).
+- **Prefill:** about 615 us a sequence-parallel layer at 8,192 rows, about 12 ms of a
+  1.4 s chunk (0.9%).
+- **Risk:** in a GEMM epilogue a warp holds an MMA fragment, not 32 * vec consecutive
+  columns of one row, so the certificate's warp vote would cover different elements;
+  bits would then depend on the certificate's soundness, which this kernel does not
+  rely on. Gate and up columns would also have to share a tile (a weight repack).
+
+At or under the bench noise floor (about 1%), with a bit-identity risk: not built. Each
+idea is bounded from measurements before it is built, and this one does not clear the
+floor.

@@ -200,8 +200,11 @@ def overlay(arm: dict, base: dict) -> dict:
     if unknown:
         raise SystemExit(f"an arm overlay holds extends, set, unset and notes; not {', '.join(sorted(unknown))}")
     cluster = _merge(base, arm.get("set", {}))
-    if "model" in arm.get("set", {}):
-        # The arm serves another of the recipe's models, whatever mounts it lists.
+    sets = arm.get("set", {})
+    if "models" in cluster and ("model" in sets or "mounts" in sets.get("container", {})):
+        # The arm serves its model (another of the recipe's, or the one it extends)
+        # whatever mounts it lists: a mount list replaces the base's, which held the
+        # model's mounts.
         _with_model_mounts(cluster)
     if "generation_defaults" in arm.get("set", {}):
         _with_generation_defaults(cluster)
