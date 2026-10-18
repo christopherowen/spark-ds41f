@@ -62,3 +62,22 @@ rework.
 
 **First boot:** ready in 113.0 / 125.5 / 125.3 s with 25 replays against 107.8 / 108.7 /
 110.8 s with 5, about 5-15 s more on a build's first boot; later boots read the pin.
+
+**Screen** (`screen.json`: 25 replays, r6v on its 5-replay pin, 25 replays again; verdicts
+against the run's own repeat):
+
+| Metric | r6v | 25 replays | again | Change | ±95% | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Engine grid, geometric mean (step time) | | | | -0.31% | 0.16% | better |
+| c16 output tok/s | 242.3 | 240.9 | 241.3 | -0.55% | 0.63% | same |
+| c16 engine steps/s | 7.94 | 8.06 | 8.07 | +1.6% | 1.7% | same |
+| c16 output tokens/step | 30.53 | 29.90 | 29.90 | -2.1% | 1.9% | worse |
+| Prefill 32K / 256K | | | | +0.35% / +0.16% | | same |
+
+Greedy responses identical (128/128). No top-level metric is worse. The steadier curves make
+r6v draft 2% less at sixteen streams (its 5-replay pin happened to put 48 to 96 rows at
+13.9 ms, the 25-replay profiles at about 14.5 ms), and its throughput is level rather than
+better: with accurate costs the budget's cost model (extra rows priced at 2.0 times their
+cost) drafts less than pays. The noise was hiding that bias. Which budget pays is measured
+in experiments/2026-10-18-dspark-budget-rule (a fixed survival threshold, no timings,
+against r6v's budget and against adaptive verification off).
