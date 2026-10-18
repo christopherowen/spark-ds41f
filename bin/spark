@@ -91,7 +91,7 @@ def configuration(
     if cluster_recipe.is_overlay(cluster):
         cluster = read_cluster(canonical)
     elif cluster_recipe.is_recipe(cluster):
-        shape = getattr(args, "shape", None) or cluster_recipe.site_shape(ROOT)
+        shape = cluster_recipe.chosen_shape(cluster, ROOT, getattr(args, "shape", None))
         if shape is None:
             raise SystemExit(
                 f"{canonical} serves {', '.join(sorted(cluster['shapes']))}; name this site's cabling with "
@@ -122,7 +122,7 @@ def read_cluster(relative: str, shape: str | None = None) -> dict:
         return cluster_recipe.overlay(cluster, read_cluster(base["config"], base.get("shape")))
     if not cluster_recipe.is_recipe(cluster):
         return cluster
-    name = shape or cluster_recipe.site_shape(ROOT)
+    name = cluster_recipe.chosen_shape(cluster, ROOT, shape)
     if name is None:
         raise SystemExit(f"{relative} is a recipe: name a shape (this site names none in {cluster_recipe.SITE_FILE})")
     return cluster_recipe.resolve(cluster, name)
@@ -1337,7 +1337,13 @@ def command_site_shape(args: argparse.Namespace) -> int:
     recipe = read_json(DEFAULT_CLUSTER_CONFIG)
     current = cluster_recipe.site_shape(ROOT)
     if args.name is None:
-        print(current or f"no shape named ({cluster_recipe.SITE_FILE} is missing)")
+        default = recipe.get("default_shape")
+        if current:
+            print(current)
+        elif default:
+            print(f"{default} (the recipe's default; {cluster_recipe.SITE_FILE} is missing)")
+        else:
+            print(f"no shape named ({cluster_recipe.SITE_FILE} is missing)")
         return 0
     entry = cluster_recipe.shape_entry(recipe, args.name)
     if not args.apply:

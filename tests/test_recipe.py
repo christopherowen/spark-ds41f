@@ -4,6 +4,7 @@ the cabling or the memory per rank differs."""
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -175,6 +176,27 @@ class RecipeTest(unittest.TestCase):
         qualified["shapes"] = dict(self.recipe["shapes"])
         qualified["shapes"]["tp3-triangle"] = dict(self.recipe["shapes"]["tp3-triangle"], benchmark_reference="x.json")
         self.assertNotIn("benchmark_reference", recipe.resolve(qualified, "tp3-triangle-4k"))
+
+    def test_a_site_that_names_no_shape_gets_the_recipes_default(self):
+        """tp4-ring is the default; the site's config/site.json, then --shape, override it."""
+        self.assertEqual(self.recipe["default_shape"], "tp4-ring")
+        self.assertIn(self.recipe["default_shape"], self.recipe["shapes"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(recipe.chosen_shape(self.recipe, root), "tp4-ring")
+            (root / "config").mkdir()
+            (root / recipe.SITE_FILE).write_text(json.dumps({"shape": "tp3-triangle"}))
+            self.assertEqual(recipe.chosen_shape(self.recipe, root), "tp3-triangle")
+            self.assertEqual(recipe.chosen_shape(self.recipe, root, "tp3-triangle-4k"), "tp3-triangle-4k")
+
+    def test_the_helper_resolves_the_default_shape_when_the_site_names_none(self):
+        spark = load_spark()
+        with mock.patch.object(spark.cluster_recipe, "site_shape", return_value=None):
+            self.assertEqual(spark.read_cluster("config/cluster.json")["shape"], "tp4-ring")
+
+    def test_the_default_is_not_part_of_a_resolved_configuration(self):
+        for name in self.recipe["shapes"]:
+            self.assertNotIn("default_shape", recipe.resolve(self.recipe, name))
 
     def test_shapes_hold_only_shape_settings(self):
         bad = dict(self.recipe)

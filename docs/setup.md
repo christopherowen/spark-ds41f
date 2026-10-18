@@ -421,7 +421,8 @@ Two files describe your site and stay out of git:
 - **The shape.** Name your cabling once: `bin/spark site shape tp3-triangle
   --apply` (or `tp3-triangle-4k`, `tp4-ring`) writes the git-ignored
   `config/site.json`, which `cluster sync` copies to every node. Every command
-  then resolves the recipe at that shape; `--shape NAME` overrides it.
+  then resolves the recipe at that shape; `--shape NAME` overrides it. A site
+  that names none gets the recipe's `default_shape`, `tp4-ring`.
 - **The recipe.** In `config/cluster.json`, set `distributed.master_addr` to the head's management IP, `host.home`,
   `deployment.repository` if you use a fork (the launch checks every node's
   `origin` against it), and the interface names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`,

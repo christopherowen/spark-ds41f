@@ -19,7 +19,8 @@ hold only what the arm changes, so arms cannot drift from what they compare to. 
 names each checkpoint the recipe serves (a snapshot and its blob store, or a hub cache and the
 snapshot within it) and ``model`` the one mounted and served; ``generation_defaults`` is the sampling a request that sets none
 gets (vLLM's ``--override-generation-config``). An arm may set either. The site names the shape it is cabled as in
-``config/site.json``; ``--shape`` overrides it for planning.
+``config/site.json``; a site that names none gets the recipe's ``default_shape``,
+and ``--shape`` overrides either for planning.
 
 ``resolve`` returns the same concrete cluster configuration a per-shape file
 used to be, so everything downstream reads one form. Derived values are not
@@ -159,7 +160,8 @@ def values(recipe: dict, shape: dict) -> dict[str, str]:
 def resolve(recipe: dict, name: str) -> dict:
     """The concrete cluster configuration of shape ``name``."""
     shape = shape_entry(recipe, name)
-    cluster = {key: copy.deepcopy(value) for key, value in recipe.items() if key not in ("shapes", "drafts")}
+    cluster = {key: copy.deepcopy(value) for key, value in recipe.items()
+               if key not in ("shapes", "drafts", "default_shape")}
     cluster["schema_version"] = 1
     cluster["shape"] = name
     fill = values(recipe, shape)
@@ -227,6 +229,12 @@ def site_shape(root: Path) -> str | None:
     if not path.is_file():
         return None
     return json.loads(path.read_text(encoding="utf-8"))["shape"]
+
+
+def chosen_shape(recipe: dict, root: Path, override: str | None = None) -> str | None:
+    """The shape to resolve ``recipe`` at: ``override`` (``--shape``), else the one this
+    site is cabled as (``config/site.json``), else the recipe's ``default_shape``."""
+    return override or site_shape(root) or recipe.get("default_shape")
 
 
 def node_map_problems(shape: dict, nodes: dict) -> list[str]:

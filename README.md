@@ -92,7 +92,8 @@ undo it.
 | 4 | `tp4-ring` | 1,048,576 | 64 KiB | required |
 
 Name your cabling once with `bin/spark site shape NAME --apply`; every command
-then resolves the recipe at that shape (`--shape NAME` overrides it). The 4 KiB
+then resolves the recipe at that shape (`--shape NAME` overrides it). A site that
+names none gets the recipe's default, `tp4-ring`. The 4 KiB
 shape needs no kernel change, so it is the shortest path to a running service.
 A shape starts only once a release benchmark has qualified the recipe's image
 on it (`benchmark_reference`); `cluster start --unqualified-shape` overrides that.
