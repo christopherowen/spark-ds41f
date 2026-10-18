@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "status": "promoted-baseline",
-  "captured_at": "20261019T000000Z",
+  "captured_at": "20261018T225841Z",
   "container_name": "dsv41-karmic-kraken",
   "shape": "tp4-ring",
   "image_tag": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
@@ -129,8 +129,8 @@
     "max_model_len": 1048576,
     "max_num_seqs": 16,
     "reported_full_context_concurrency": 8.18,
-    "graph_capture_gib": 1.91,
-    "note": "the ring: the same KV pool as r6v (--kv-cache-memory-bytes 11274289152, 8,580,566 tokens, 8.18x for 1,048,576); the scale codes leave about 2.1 GiB more MemAvailable a rank (experiments/2026-10-18-scale-codes), headroom not yet given to KV. The triangle is unqualified on r6x."
+    "graph_capture_gib": 1.97,
+    "note": "the ring, read from r6x's first production boot on 2026-10-18 (GPU KV cache 8,580,566 tokens, 8.18x for 1,048,576, the same KV pool as r6v; rank 0 graph capture 1.97 GiB; model load 72.19 GiB against r6v's 74.2: the expert scale codes, about 2 GiB a rank, not yet given to KV). The triangle is unqualified on r6x."
   },
   "change_from_previous": "r6v plus vLLM 0181 (the routed SwiGLU and MXFP8 cast over the live tiles), 0182-0183 (the routed experts' scales as row bases and 4-bit codes) and 0184 (the DSpark draft budget by a fixed linear step cost, row cost 0.035; the boot-timed cost curves deleted). Promoted for TP4 against r6v; outputs identical to r6v's. TP3's path changes too, so tp3-triangle is unqualified until a triangle release run.",
   "evidence": {
@@ -174,7 +174,7 @@
     },
     "nvme_power": "APST on with 2 s / 60 s idle thresholds (applied 2026-10-16 12:48 UTC)"
   },
-  "deployment": "pending: filled in when TP4 production starts on r6x",
+  "deployment": "TP4 production on the ring since 2026-10-18 22:58 UTC from fc3ee36 (cluster sync --revision origin/main --apply, then the lab window's close started config/cluster.json: cluster start --replace --change-shape --apply; API ready in 88 s); doctor --live OK; 187 TileLang calls prepared in 5.5 s; one image ID on dgx1-dgx4 (sha256:6339bda18247); nothing timed at boot (row cost 0.035). The static-table sweep that held the window was stopped for the deployment.",
   "benchmark_reference_tp3": "none: tp3-triangle is unqualified on r6x (start with --unqualified-shape until a triangle release run)",
   "single_stream": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4-single-stream",
   "sampled": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4-sampled"
