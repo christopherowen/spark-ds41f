@@ -606,10 +606,12 @@ def grouped_fp8_fp4_gemm(
 
     With ``coded_scales`` the weights' scales come from ``pack_scale_codes`` in
     ``tile_codes`` layout: ``SFB`` holds each tile's ``block_N`` 4-bit-delta codes
-    per K block contiguously (one 16-byte ``cp.async`` per 8 rows) and ``SFBase``
-    each row's base exponent. Every thread expands its row's code into the scale
-    word the MMA reads, after the stage lands; the words, and so every output bit,
-    are the uncoded ones, from half the scale bytes.
+    per K block contiguously and ``SFBase`` each row's base exponent. While the
+    first stages load, every thread reads its rows' codes for all K blocks (2-byte
+    loads, coalesced across a warp) and expands them into a CTA table of scale
+    words, which the MMAs read in place of a staged word: the main loop does no
+    expansion and copies no scales. The words, and so every output bit, are the
+    uncoded ones, from half the scale bytes.
     """
     block_K = FP4_TMA_K
     tail = K % block_K
@@ -633,8 +635,6 @@ def grouped_fp8_fp4_gemm(
     n_blocks = N // block_N
     b_shape = (num_experts * n_blocks * k_full, block_N, block_K)
     bt_shape = (num_experts * n_blocks, block_N, tail // 2)
-    code_chunks = block_N * 2 // 16  # 16-byte copies of one stage's codes
-    assert not coded_scales or (block_N % 8 == 0 and code_chunks <= threads)
 
     @T.macro
     def load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared, SFB_shared,
@@ -690,17 +690,8 @@ def grouped_fp8_fp4_gemm(
                     1,
                     sfa_row[c] >= 0,
                 )
-        if coded_scales:
-            # SFB_shared is this stage's codes here; the words are expanded later.
-            if tx < code_chunks:
-                T.ptx_cp_async(
-                    T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
-                    T.access_ptr(
-                        SFB[(expert * n_blocks + bx) * k_blocks + ko, tx * 8], "r", 8
-                    ),
-                    8,  # elements: eight 2-byte codes, one 16-byte copy
-                )
-        else:
+        # Coded scales are expanded once per CTA (body); only words are copied here.
+        if not coded_scales:
             for c in T.unroll(sfb_copies):
                 j = c * threads + tx
                 if j < block_N:
@@ -721,13 +712,12 @@ def grouped_fp8_fp4_gemm(
             )
             SFA_shared = T.alloc_shared((stages, block_M, 1), T.uint32)
             SFB_shared = T.alloc_shared((stages, block_N, 1), T.uint32)
-            # The coded path's codes and per-row base words; the uncoded path
-            # allocates neither.
-            SFC_shared = (
-                T.alloc_shared((stages, block_N), T.uint16) if coded_scales else None
-            )
-            base_words = (
-                T.alloc_local((sfb_copies,), T.uint32) if coded_scales else None
+            # The coded path's scale words for every K block of this CTA's rows,
+            # expanded once before the main loop; the uncoded path has none.
+            SFW_shared = (
+                T.alloc_shared((k_blocks, block_N, 1), T.uint32)
+                if coded_scales
+                else None
             )
             rows_shared = T.alloc_shared((block_M,), T.int32)
             a_row = T.alloc_local((a_copies,), T.int32)
@@ -752,55 +742,58 @@ def grouped_fp8_fp4_gemm(
                 ]
             for c in T.unroll(sfa_copies):
                 sfa_row[c] = rows_shared[T.min(c * threads + tx, block_M - 1)]
-            if coded_scales:
-                for c in T.unroll(sfb_copies):
-                    j = c * threads + tx
-                    if j < block_N:
-                        base_words[c] = T.cast(
-                            SFBase[expert, bx * block_N + j], T.uint32
-                        ) * T.uint32(0x01010101)
-            sf_dest = SFC_shared if coded_scales else SFB_shared
 
             T.clear(C_local)
             for p in T.unroll(stages - 1):
                 if p < k_blocks:
                     load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
-                         sf_dest, a_row, sfa_row, loaded, expert, bx, tx, p,
+                         SFB_shared, a_row, sfa_row, loaded, expert, bx, tx, p,
                          p)  # fmt: skip
                 else:
                     T.ptx_commit_group()
+            if coded_scales:
+                # While the first stages load: every K block's word for this
+                # thread's rows, from the row's base and its codes (one coalesced
+                # 2-byte load a row and K block, all issued before any is used).
+                for c in T.unroll(sfb_copies):
+                    j = c * threads + tx
+                    if j < block_N:
+                        base = T.cast(
+                            SFBase[expert, bx * block_N + j], T.uint32
+                        ) * T.uint32(0x01010101)
+                        for k in T.unroll(k_blocks):
+                            code = T.cast(
+                                SFB[(expert * n_blocks + bx) * k_blocks + k, j],
+                                T.uint32,
+                            )
+                            SFW_shared[k, j, 0] = (
+                                (code & T.uint32(0xF))
+                                | ((code >> 4) & T.uint32(0xF)) << 8
+                                | ((code >> 8) & T.uint32(0xF)) << 16
+                                | ((code >> 12) & T.uint32(0xF)) << 24
+                            ) + base
             for ko in T.serial(k_blocks):
                 # The stage loaded next was last read by iteration ko - 1.
                 T.sync_threads()
                 nxt = ko + stages - 1
                 if nxt < k_blocks:
                     load(A, SFA, B, BT, SFB, A_shared, B_shared, SFA_shared,
-                         sf_dest, a_row, sfa_row, loaded, expert, bx, tx, nxt,
+                         SFB_shared, a_row, sfa_row, loaded, expert, bx, tx, nxt,
                          nxt % stages)  # fmt: skip
                 else:
                     T.ptx_commit_group()
                 T.ptx_wait_group(stages - 1)
                 T.barrier_wait(loaded[ko % stages], (ko // stages) % 2)
                 s = ko % stages
-                if coded_scales:
-                    for c in T.unroll(sfb_copies):
-                        j = c * threads + tx
-                        if j < block_N:
-                            code = T.cast(SFC_shared[s, j], T.uint32)
-                            SFB_shared[s, j, 0] = (
-                                (code & T.uint32(0xF))
-                                | ((code >> 4) & T.uint32(0xF)) << 8
-                                | ((code >> 8) & T.uint32(0xF)) << 16
-                                | ((code >> 12) & T.uint32(0xF)) << 24
-                            ) + base_words[c]
                 T.sync_threads()
+                sfb = SFW_shared[ko, :, :] if coded_scales else SFB_shared[s, :, :]
                 if ko < k_full:
                     T.mma_gemm_blockscaled(
                         A_shared[s, :, :],
                         B_shared[s, :, :],
                         C_local,
                         SFA_shared[s, :, :],
-                        SFB_shared[s, :, :],
+                        sfb,
                         transpose_B=True,
                         k_start=0,
                         sf_a_granularity_k=SF_BLOCK,
@@ -813,7 +806,7 @@ def grouped_fp8_fp4_gemm(
                             B_shared[s, :, 0:tail],
                             C_local,
                             SFA_shared[s, :, :],
-                            SFB_shared[s, :, :],
+                            sfb,
                             transpose_B=True,
                             k_start=0,
                             sf_a_granularity_k=SF_BLOCK,
@@ -1097,7 +1090,7 @@ def moe_swiglu_cast(intermediate, block_M, limit, rows_per_cta=None):
 def tile_codes(codes: torch.Tensor, block_N: int) -> torch.Tensor:
     """``pack_scale_codes``' ``[E, N, words]`` codes in the coded GEMM's layout:
     ``[E * N / block_N * words, block_N]``, each tile's codes for one K block
-    contiguous, so a stage loads them in 16-byte copies."""
+    contiguous, so a warp's rows read them in one coalesced load."""
     E, N, words = codes.shape
     return (
         codes.view(torch.int16)
