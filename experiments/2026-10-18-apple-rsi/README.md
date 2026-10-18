@@ -12,7 +12,7 @@ only a running server are run here, attached to our deployment:
 
 | Check | What it compares | Its bar |
 | --- | --- | --- |
-| `test_fidelity_kl` | teacher-forced log-probabilities of 32 held-out sequences (prose, math, code, structured; 512-20,480 tokens) against the author's | per-band mean k3: 0.121 / 0.103 / 0.120 / 0.090 |
+| `test_fidelity_kl` | teacher-forced log-probabilities of 32 held-out sequences (prose, math, code, structured; 512-20,480 tokens) against the author's | every band's median of the per-sequence mean k3 at most 0.121 / 0.103 / 0.120 / 0.090 |
 | `test_text_history_fidelity` | 4 records at 8,192 and 20,480 tokens: fresh; after an unrelated request; 512 generated tokens' decode log-probabilities against the server's own prefill rescoring | the 20,480 band's bar |
 | `test_chat_streaming_and_isolation` | chat, a streamed chat, a second turn, and concurrent teacher-forced readings against the same readings alone, under a running companion stream | each band's bar |
 | `test_gsm8k_hidden` | GSM8K, the held-out 200-question slice, vLLM's evaluator, 5-shot, greedy | 174 of 200 |
