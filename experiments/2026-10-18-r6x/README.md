@@ -94,6 +94,20 @@ against 30.5), single stream steps/s +4.1% (interval 1.7%) with tokens a step le
 two one-stream throughputs read same only because the unpaired interval over windows of
 different prompts is 4.5-5.7%; each repeat matched itself within 0.1%.
 
+**One stream, paired by window.** Each run keeps its ten window throughputs, and every arm
+walks the same seeded prompt order, so window k of one arm and window k of another cover
+nearly the same prompts. Paired window by window (t interval over the ten differences):
+
+| One stream | r6v to r6x | r6v to r6x again | r6x to r6x again |
+| --- | ---: | ---: | ---: |
+| single-stream (greedy) | +4.62% ±2.89% | +4.69% ±2.93% | +0.06% ±0.07% |
+| sampled | +4.30% ±2.59% | +4.43% ±2.59% | +0.12% ±0.18% |
+
+Both gains clear their paired intervals plus the repeat: better. The same build repeats
+within 0.1% window for window (identical text, identical drafting, aligned windows); against
+r6v the windows drift apart as the faster build moves ahead in the prompt order, which is
+what is left in that interval.
+
 Latency (percentiles, no interval): Poisson first token p50 -5.7% and p99 -11.8%, time per
 token p50 -7.7%; c8 time per token p50 -4.3%; single stream first token p50 -5.0%. The one
 "worse" row, sampled one-stream first token p50 (95 to 100 ms, both r6x arms), is a median
