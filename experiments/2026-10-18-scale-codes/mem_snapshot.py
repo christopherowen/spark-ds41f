@@ -31,7 +31,7 @@ def main() -> int:
     args = ap.parse_args()
     for node in NODES:
         meminfo = run(node, "grep -E '^(MemAvailable|MemTotal):' /proc/meminfo")
-        kib = {k: int(v) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", meminfo, re.M)}
+        kib = {k: int(v) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", meminfo, re.MULTILINE)}
         logs = run(node, f"docker logs {CONTAINER} 2>&1 | grep -E 'Model loading took|KV cache|CUDA graph' | tail -6")
         print(json.dumps({
             "label": args.label, "node": node,
