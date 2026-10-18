@@ -57,6 +57,7 @@ TILELANG_EXPERIMENTS = (
     "experiments/2026-10-17-r6v",
     "experiments/2026-10-18-r6w-swiglu",
     "experiments/2026-10-18-apple-rsi",
+    "experiments/2026-10-18-r6x",
 )
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that
