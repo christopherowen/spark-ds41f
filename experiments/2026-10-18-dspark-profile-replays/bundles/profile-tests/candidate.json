@@ -1,0 +1,28 @@
+{
+ "description": "The DSpark adaptive verification tests with 25 timed replays per graph-captured shape and 5 per eager tail shape (vLLM dspark-profile-replays) mounted over the r6v image.",
+ "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "PYTHONPATH": "/b"
+ },
+ "workdir": "/opt/spark3/candidate/vllm",
+ "argv": [
+  "-c",
+  "import subprocess, sys\ncmd = [sys.executable, '-m', 'pytest', '-q', '-rfEs', '-p', 'no:cacheprovider', '--noconftest', '-p', 'prepare_fixtures', '--basetemp', '/c/pytest-tmp-profile-replays', 'tests/v1/spec_decode/test_adaptive_verification.py']\nsys.exit(subprocess.run(cmd, timeout=1800).returncode)\n"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "test_adaptive_verification.py",
+   "/opt/spark3/candidate/vllm/tests/v1/spec_decode/test_adaptive_verification.py"
+  ],
+  [
+   "adaptive_verification.py",
+   "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py"
+  ]
+ ]
+}
