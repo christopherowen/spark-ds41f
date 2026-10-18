@@ -64,6 +64,12 @@ def main(source: str, snapshot: str, dest: str) -> None:
     config["infb"]["model_id"] = SERVED
     config["infb"]["dataset_root"] = "/out/datasets"
     (tests / "config.json").write_text(json.dumps(config, indent=1))
+    # The verifier asserts config.json's model id is the grading recipe's MODEL; both name
+    # the served model.
+    recipe = tests / "eval" / "deepseek_v41_flash" / "recipe.py"
+    text = recipe.read_text()
+    model_line = next(line for line in text.splitlines() if line.startswith("MODEL = "))
+    recipe.write_text(text.replace(model_line, f'MODEL = "{SERVED}"', 1))
     (tests / "infb_verify" / "conftest.py").write_text(CONFTEST)
     hidden = json.loads((tests / "hidden" / "fidelity.json").read_text())
     (tests / "hidden-as-examples.json").write_text(json.dumps(

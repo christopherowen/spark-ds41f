@@ -73,6 +73,18 @@ and r6n (dgx2); the kernels are the same in both.
   measures what following DeepSeek's current reference costs against an oracle that
   predates it.
 
+## Two adapter fixes (2026-10-18, after the first run)
+
+- The verifier asserts that `config.json`'s model id is the grading recipe's `MODEL`;
+  `prepare.py` now rewrites both to the served name (the first run's verifier failed at
+  collection).
+- The task's reference server passes no reasoning parser, so a chat reply's thinking is its
+  text content; ours splits it into `reasoning_content`, and the API example's 32-token
+  chat at temperature 0 (thinking on by default) came back with empty content.
+  `r6n-tp4-dba1-plain.json` and `r6v-tp4-dba1-plain.json` serve without the reasoning
+  parser, and `verifier.json` reruns the API examples and the verifier on them, from a copy
+  prepared in `~/spark-lab/apple-rsi-plain`.
+
 ## Running
 
 The task's files stay outside this repository (Apple Sample Code License): a local copy of
