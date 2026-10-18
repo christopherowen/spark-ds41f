@@ -52,6 +52,8 @@ Gate: outputs identical to r6v's; no metric worse than r6v.
   place of the cost scale in the speculative config. The recipe has one image for both
   shapes: r6v serves the triangle on r6u's TP3 path, while 0181-0184 change TP3's path too
   (its kernel bits are tested; its serving is not).
+- The README's Benchmarking section loses its note that boots differ by about 3% from the
+  startup cost profile, and docs/lab.md its pinned-curves rule.
 - `bin/spark` stops deriving `SPARK3_DSPARK_COST_DIR`, with its tests and docs, once no
   production shape runs an image that reads it (TP3 still serves r6u's).
 - TP3: `tp3-triangle` needs the triangle cabling to qualify r6x there.

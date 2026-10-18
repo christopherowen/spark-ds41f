@@ -1,7 +1,8 @@
 # Testing
 
 What proves a release is correct, where each proof runs, and when. Promotion requires every
-layer below (see [methodology](methodology.md#promotion)).
+layer below (see [methodology](methodology.md#promotion)); [release-benchmark.md](release-benchmark.md)
+has the commands for each.
 
 ## Layers
 

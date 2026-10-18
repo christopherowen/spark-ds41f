@@ -274,7 +274,9 @@ Compile caches persist per node in `~/.cache/spark-lab/compile`.
 ## Release comparison
 
 Measure a candidate against the previous release the same way every time, so a
-change in the numbers means a change in the release, not in the method:
+change in the numbers means a change in the release, not in the method. The commands for
+the whole release benchmark (release tests, determinism gate, this comparison) are in
+[release-benchmark.md](release-benchmark.md).
 
 ```json
 {"kind": "measure", "profile": "release", "bracket": false,

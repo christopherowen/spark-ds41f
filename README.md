@@ -611,7 +611,9 @@ policy boundary are documented in [docs/recovery.md](docs/recovery.md).
 
 ## Benchmarking
 
-`bin/spark bench` measures the live service from the head node and writes one
+A release is benchmarked against the previous one with servebench suites in a lab session:
+[docs/release-benchmark.md](docs/release-benchmark.md) has the commands. `bin/spark bench`
+measures the live service from the head node and writes one
 self-contained report to `results/private/bench/<UTC time>/bench.json`
 (`--output` to change). By default it is a quick check of about six minutes:
 the quality gate and every decode point with three or four samples each.
