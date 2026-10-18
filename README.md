@@ -619,6 +619,38 @@ threshold), which moves acceptance from sample to sample. Report:
 [decode, prefill, prefix cache, and admission](manifests/benchmarks/2026-09-29-karmic-kraken-r5l.json).
 See [Benchmarking](#benchmarking) to reproduce them.
 
+## GLP steering (optional, off by default)
+
+The promoted vLLM series carries patch `0181`
+(`experiments/2026-10-17-r6v/vllm/0181-DeepSeek-V4.1-weightless-GLP-projective-steering-o.patch`),
+which serves an optional [weightless](https://github.com/msuiche/weightless) GLP control vector: a small GGUF
+sidecar of per-layer unit directions (`glp.mode=project`, hook `residual_stream_post_layer`; the format spec is
+[`docs/spec/GLP.md`](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md) there), projected off the
+residual stream after every steered decoder layer, prefill and decode. The published vector for the 1017
+checkpoint is
+[`msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75`](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75)
+(39 layers, alpha_default 0.75, width 5120). With `WEIGHTLESS_STEER_PATH` unset the patch is inert: the loader
+never runs, and the traced graphs and numerics are stock.
+
+To serve steered, place the same file at the same path on every node and add to `config/cluster.json`
+(site-local copies are git-ignored, as for the node map):
+
+```json
+"environment": { "WEIGHTLESS_STEER_PATH": "/cache/vectors/glp-1017.gguf" },
+"mounts": [["/path/on/every/node/vectors", "/cache/vectors", "ro"]]
+```
+
+`WEIGHTLESS_STEER_ALPHA` overrides the file's `glp.alpha_default`; `WEIGHTLESS_STEER_LAYERS` restricts to a
+comma list of zero-based layer ids. The apply site on this tree is the model loop's pending FFN write — the only
+hidden-width post-layer surface, since the mHC fold is deferred to the next layer's fused post/pre call and is
+linear in the write (the same anchor the published vLLM-lane DSV4 numbers were measured at). Fail-closed: a
+missing file, or a vector the engine cannot apply exactly (wrong mode, hook, width or layer range; rank > 1;
+alpha multipliers), refuses the boot instead of serving unsteered. The DSpark drafter is not steered; the
+verifier is, so acceptance can dip. Validate a file without booting:
+`WEIGHTLESS_STEER_PATH=<file> python3 scripts/hotfix-dsv41-steering.py --check` (the same loader the engine
+runs; needs torch). No steered benchmark numbers exist yet; steering changes the replies — that is its point —
+so a steered candidate would be measured as its own experiment, not promoted by default.
+
 ## Names
 
 The project was `spark3-vllm-ds41f` until 2026-10-05. The former GitHub name
@@ -874,6 +906,31 @@ Canonical vLLM main is parked; the serving sources are Local Inference Lab's
 `integration/karmic-kraken-beta` vLLM and B12X, TileLang, DeepSeek's
 TileKernels and sparknet, with the local patch series
 ([docs/upstreams.md](docs/upstreams.md)).
+
+## Acknowledgements
+
+The GLP steering patch rides on, and thanks:
+
+- [Local Inference Lab](https://github.com/local-inference-lab): the
+  `integration/karmic-kraken-beta` vLLM branch and the B12X kernel and RoCE
+  collective stack the serving image is built from, including the
+  compressed-sparse-MLA attention kernels. B12X's RoCEnante one-shot
+  collectives are by [@original-el8](https://github.com/original-el8) and
+  [@lukealonso](https://github.com/lukealonso); B12X is archived and
+  continues in [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
+  (`flashinfer/experimental/b12x`).
+- [christopherowen/dgx-spark-networking](https://github.com/christopherowen/dgx-spark-networking)
+  (sparknet): the one-shot collectives the TileLang kernel family uses — a
+  vendored derivative of B12X's RoCEnante with switchless-routing extensions.
+- TileLang, TileKernels, FlashInfer, NCCL and CUTLASS: the pinned kernel
+  stack in `upstreams.lock.json`.
+- DeepSeek-AI: DeepSeek-V4.1-Flash-1017 and its Engram tables (MIT).
+- [weightless](https://github.com/msuiche/weightless) by Matt Suiche: the GLP
+  (GGUF Layer Projection) format and fail-closed reader discipline
+  ([`docs/spec/GLP.md`](https://github.com/msuiche/weightless/blob/main/docs/spec/GLP.md)),
+  the hotfix lineage the patch is ported from, and the published
+  [GLP-39 vector](https://huggingface.co/msuiche/DeepSeek-V4.1-Flash-1017-abliterated-cyber-GLP-39-L1-39-a0.75)
+  for the 1017 checkpoint (MIT, distributed separately).
 
 ## License
 
