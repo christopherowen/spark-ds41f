@@ -36,3 +36,29 @@ be reworked with the acceptance work; this change only takes the noise out of it
    Gate: the 25-replay spread is well under the 5-replay spread; first-boot cost recorded.
 3. `screen.json`: the screen suite, 25 replays against r6v and 25 replays again (the first
    arm profiles, the repeat reads its pinned curves, as production would): no metric worse.
+
+## Results
+
+**Tests:** 28 passed (the two-GPU TP test skipped in a one-GPU container).
+
+**Repeatability** (2026-10-18, `stability.json`: three fresh profiles of the r6v build with
+25 replays and three with 5, each into its own cost directory; `compare_profiles.py`). The
+spread of each slope across the three profiles, (max - min) / mean:
+
+| Slope | 5 replays | 25 replays |
+| --- | ---: | ---: |
+| 1-6 rows | 7.4% | 10.0% |
+| 6-16 rows | 2.2% | 2.9% |
+| 16-48 rows | 13.4% | 2.9% |
+| 48-96 rows | 10.0% | 2.6% |
+
+From 16 to 96 rows, where the budget decides how much to draft at eight and sixteen
+streams (and where r6w's 48-to-96 slope misled it), the noise falls four to five times.
+The 1-6-row slope does not improve: there the profiles differ from boot to boot (the
+one-row cost itself moves about 0.2 ms between boots), which more samples of one boot
+cannot average away; at one stream extra rows are cheap and the budget drafts deep either
+way. A fit across neighbouring shapes is the tool for that part, with the cost model's
+rework.
+
+**First boot:** ready in 113.0 / 125.5 / 125.3 s with 25 replays against 107.8 / 108.7 /
+110.8 s with 5, about 5-15 s more on a build's first boot; later boots read the pin.
