@@ -1,0 +1,20 @@
+{
+ "notes": "r6v on the triangle with sparknet 0.5.0: no GID slot for NCCL or sparknet; each HCA's GID found by address (NCCL scans by NCCL_IB_ADDR_FAMILY and NCCL_IB_ROCE_VERSION_NUM, sparknet in each HCA's SPARKNET_ROCE_SUBNETS network, rendered from roce_subnets).",
+ "extends": {
+  "config": "config/cluster.json",
+  "shape": "tp3-triangle"
+ },
+ "set": {
+  "container": {
+   "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6v-gid",
+   "expected_labels": {
+    "local.spark3.sparknet.tree": "dae2ca2f8ef04a7faadc7cc9ef1d4417306be2b9"
+   }
+  },
+  "upstreams_config": "experiments/2026-10-18-roce-gid-by-address/upstreams.lock.json"
+ },
+ "unset": [
+  "environment.NCCL_IB_GID_INDEX",
+  "environment.SPARKNET_ROCE_GID_INDEX"
+ ]
+}

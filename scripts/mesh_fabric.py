@@ -110,6 +110,17 @@ def capture(command):
     return p.stdout
 
 
+def gid_table(port):
+    """A port's populated GID slots as [index, type, gid]; an empty slot's type cannot be read."""
+    table = []
+    for path in sorted((port/'gids').iterdir(), key=lambda path: int(path.name)):
+        try:
+            table.append([int(path.name), (port/'gid_attrs/types'/path.name).read_text().strip(), path.read_text().strip()])
+        except OSError:
+            continue
+    return table
+
+
 def inventory(node):
     """Read settings; never create a flow, change an interface or reload a driver."""
     result = {'ports': {}, 'errors': []}
@@ -128,15 +139,12 @@ def inventory(node):
                 entries = raw['param']['pci/'+pci][0]['values']
                 values[key] = next(v['value'] for v in entries if v['cmode'] == cmode)
             eswitch = json.loads(capture(['sudo', '-n', 'devlink', '-j', 'dev', 'eswitch', 'show', 'pci/'+pci]))['dev']['pci/'+pci]
-            gid_dir = device/'ports/1'
-            gid_index = str(node.get('roce_gid_index', 3))
             result['ports'][hca] = dict(pci=pci, netdev=netdev, mac=link['address'],
                 mtu=link['mtu'], up=link.get('operstate') == 'UP',
                 addresses=[f"{a['local']}/{a['prefixlen']}" for a in link['addr_info'] if a['family']=='inet'],
                 parameters=values, eswitch=eswitch,
                 hw_tc=bool(re.search(r'^hw-tc-offload: on$', capture(['ethtool','-k',netdev]),re.M)),
-                gid=(gid_dir/'gids'/gid_index).read_text().strip(),
-                gid_type=(gid_dir/'gid_attrs/types'/gid_index).read_text().strip(),
+                gids=gid_table(device/'ports/1'),
                 rdma_mtu=re.search(r'active_mtu:\s+(\d+)', capture(['ibv_devinfo','-d',hca,'-i','1'])).group(1))
         except (OSError, ValueError, KeyError, IndexError, AttributeError, StopIteration, subprocess.TimeoutExpired) as e:
             result['errors'].append(str(e))
@@ -158,10 +166,13 @@ def findings(node, facts):
         if not actual.get('hw_tc'): errors.append(label+': hardware TC offload is disabled')
         if actual.get('eswitch') != {'mode':'legacy','inline-mode':'none','encap-mode':'basic'}:
             errors.append(label+': requires legacy eswitch, inline none, encapsulation basic')
+        # The cable address as one RoCE v2 GID, at whatever index the kernel filed it.
         try:
-            if actual.get('gid_type') != 'RoCE v2' or ipaddress.IPv6Address(actual['gid']).ipv4_mapped != ipaddress.IPv4Interface(p['address']).ip:
-                raise ValueError()
-        except (KeyError, ValueError): errors.append(label+': selected GID must be RoCE v2 for the configured cable IP')
+            cable = ipaddress.IPv4Interface(p['address']).ip
+            slots = [i for i, kind, gid in actual.get('gids', [])
+                     if kind == 'RoCE v2' and ipaddress.IPv6Address(gid).ipv4_mapped == cable]
+        except (KeyError, ValueError): slots = []
+        if len(slots) != 1: errors.append(label+': the port needs exactly one RoCE v2 GID for the configured cable IP')
         if actual.get('rdma_mtu') != '4096': errors.append(label+': active RDMA MTU must be 4096')
         for key, (cmode, value) in PARAMETERS.items():
             if key == 'hairpin_queue_size':

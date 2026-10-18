@@ -5,6 +5,12 @@ neighbour ring, or one-shot collectives over a relay ring or NIC-forwarded
 mesh, with NCCL for larger operations. The one-shot collectives are B12X's
 RoCEnante (``rocenante-*``) or sparknet's (``oneshot-*``, under sparknet's own
 ``SPARKNET_ROCE_*`` names).
+
+Each port's source GID is its one IPv4 RoCE v2 GID in the cable's subnet. A
+configuration either finds it by address wherever the kernel filed it (NCCL with
+``NCCL_IB_GID_INDEX`` unset, sparknet 0.5.0 in each HCA's
+``SPARKNET_ROCE_SUBNETS`` network) or pins a slot (``gid_pinned``): B12X's
+RoCEnante always does, and so do configurations of a sparknet before 0.5.0.
 """
 
 from __future__ import annotations
@@ -62,6 +68,22 @@ ONE_SHOT = {
 TRANSPORTS = (*ONE_SHOT, "nccl-ring")
 # vLLM settings of B12X's one-shot collectives, which sparknet does not read.
 B12X_VLLM_SETTINGS = ("VLLM_ENABLE_ROCE_ALLREDUCE", "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "VLLM_ROCE_ALLGATHER_MAX_SIZE")
+
+
+# Settings that fix a library to one GID slot. sparknet 0.5.0 refuses its own.
+GID_PINS = ("NCCL_IB_GID_INDEX", "SPARKNET_ROCE_GID_INDEX", "B12X_ROCE_GID_INDEX")
+
+
+def gid_pinned(cluster: dict) -> bool:
+    """Whether a library of this configuration uses a fixed GID slot rather than finding the GID by address.
+
+    The slot moves when a link flaps under live RDMA (the kernel re-adds the
+    address in the next free slot), so only configurations that must pin one
+    do: B12X's transports, and archived configurations of a sparknet before
+    0.5.0. Their nodes may set ``roce_gid_index``; elsewhere it is refused.
+    """
+    env = cluster.get("environment", {})
+    return transport(cluster).startswith("rocenante-") or any(env.get(key) for key in GID_PINS)
 
 
 def one_shot_topology(mode: str) -> str | None:
@@ -133,9 +155,17 @@ def node_environment(cluster: dict, node: dict) -> dict[str, str]:
         env[f"{prefix}_PEER_HCAS"] = json.dumps(logical_peer_hcas(cluster, node), separators=(",", ":"))
     if is_sparknet(mode):
         env["SPARKNET_ROCE_TOPOLOGY"] = one_shot_topology(mode)
-    if "roce_gid_index" in node:
-        env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
-        env[f"{prefix}_GID_INDEX"] = str(node["roce_gid_index"])
+    if gid_pinned(cluster):
+        if "roce_gid_index" in node:
+            env["NCCL_IB_GID_INDEX"] = str(node["roce_gid_index"])
+            env[f"{prefix}_GID_INDEX"] = str(node["roce_gid_index"])
+    elif is_sparknet(mode):
+        # Each one-shot HCA's cable subnet, in which sparknet finds the HCA's GID.
+        hcas = sorted({h for route in node["roce_peer_hcas"].values() for h in route})
+        declared = node.get("roce_subnets", {})
+        subnets = {h: declared[h] for h in hcas if h in declared}
+        if subnets:
+            env["SPARKNET_ROCE_SUBNETS"] = json.dumps(subnets, separators=(",", ":"))
     return env
 
 
@@ -231,6 +261,10 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
                 errors.append(f"{mode} cannot override topology/algorithm through {key}")
     networks = {}
     for rank, node in by_rank.items():
+        if "roce_gid_index" in node and not gid_pinned(cluster):
+            errors.append(f"{node.get('name')}: roce_gid_index is not read by a configuration that finds GIDs by "
+                          "address (NCCL and sparknet take each HCA's IPv4 RoCE v2 GID in its roce_subnets network); "
+                          "delete the field")
         expected = {(rank - 1) % count, (rank + 1) % count} if neighbour_ring(mode) else set(ranks) - {rank}
         routes = node.get("roce_peer_hcas")
         if not isinstance(routes, dict) or set(routes) != {str(p) for p in expected}:
@@ -278,21 +312,52 @@ def problems(cluster: dict, nodes: dict) -> list[str]:
     return errors
 
 
-def gid_subnet_problems(node: dict, index: int, output: str) -> list[str]:
-    """Compare configured cable subnets with the actual selected RoCE GIDs."""
-    actual = {}
+def ipv4_roce_v2_gids(output: str) -> dict[str, list[tuple[int, ipaddress.IPv4Address]]]:
+    """Each HCA's IPv4 RoCE v2 GIDs, (index, address) by index, from ``hca index type gid ndev`` lines."""
+    found: dict[str, list[tuple[int, ipaddress.IPv4Address]]] = {}
     for line in output.splitlines():
         fields = line.split()
-        if len(fields) >= 4 and fields[1] == str(index) and fields[2] == "RoCEv2":
-            try:
-                actual[fields[0]] = ipaddress.IPv6Address(fields[3]).ipv4_mapped
-            except ipaddress.AddressValueError:
-                pass
+        if len(fields) < 4 or not fields[1].isdigit():
+            continue
+        found.setdefault(fields[0], [])
+        if fields[2] != "RoCEv2":
+            continue
+        try:
+            address = ipaddress.IPv6Address(fields[3]).ipv4_mapped
+        except ipaddress.AddressValueError:
+            continue
+        if address is not None:
+            found[fields[0]].append((int(fields[1]), address))
+    return {hca: sorted(gids) for hca, gids in found.items()}
+
+
+def gid_subnet_problems(node: dict, output: str) -> list[str]:
+    """Each cable HCA's port must carry exactly one IPv4 RoCE v2 GID, in its cable's subnet, at any index.
+
+    sparknet needs one in the subnet. NCCL scans without a per-port range and
+    takes the lowest-index IPv4 RoCE v2 GID, so a second one on the port could
+    become NCCL's source address.
+    """
+    gids = ipv4_roce_v2_gids(output)
+    missing = {line.split()[0] for line in output.splitlines() if line.split()[1:] == ["missing"]}
     errors = []
     for hca, subnet in node.get("roce_subnets", {}).items():
-        ip = actual.get(hca)
-        if ip is None or ip not in ipaddress.IPv4Network(subnet):
-            errors.append(f"{node['name']}: {hca} GID {index} is {ip}, expected cable subnet {subnet}; check the link's address and GID index")
+        if hca in missing:
+            continue  # reported with the devices
+        network = ipaddress.IPv4Network(subnet)
+        present = gids.get(hca, [])
+        inside = [(i, a) for i, a in present if a in network]
+        outside = ", ".join(f"{a} at index {i}" for i, a in present if a not in network)
+        label = f"{node['name']}: {hca}"
+        if not inside:
+            errors.append(f"{label} has no IPv4 RoCE v2 GID in its cable subnet {subnet}"
+                          + (f" (it has {outside})" if outside else "") + "; check the link's address and cable")
+        elif len(inside) > 1:
+            errors.append(f"{label} has {len(inside)} IPv4 RoCE v2 GIDs in {subnet} (indices "
+                          f"{', '.join(str(i) for i, _ in inside)}); its port needs one address there")
+        elif outside:
+            errors.append(f"{label} also has an IPv4 RoCE v2 GID outside {subnet} ({outside}); NCCL takes the "
+                          "lowest-index one, so give the port only its cable's address")
     return errors
 
 

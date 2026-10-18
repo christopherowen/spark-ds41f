@@ -126,7 +126,8 @@ class MeshTest(unittest.TestCase):
                 addresses=[p['address']], mtu=9000,up=True,hw_tc=True,
                 parameters={k:v for k,(_,v) in fabric.PARAMETERS.items()},
                 eswitch={'mode':'legacy','inline-mode':'none','encap-mode':'basic'},
-                gid='::ffff:'+addr,gid_type='RoCE v2',rdma_mtu='4096')
+                gids=[[1,'RoCE v2','fe80::4ebb:47ff:fee9:7f2b'],[2,'IB/RoCE v1','::ffff:'+addr],[4,'RoCE v2','::ffff:'+addr]],
+                rdma_mtu='4096')
         return result
 
     def test_doctor_is_read_only_and_separates_correction_commands(self):
@@ -139,8 +140,27 @@ class MeshTest(unittest.TestCase):
         selected = dict(node, mesh_hairpin_queue_size=1024)
         self.assertEqual(fabric.findings(selected, facts), ([], []))
         self.assertTrue(all('value 8192 cmode driverinit' in c for c in commands))
+        port = next(iter(facts['ports'].values()))
+        port['gids'] = port['gids'][:2]  # only the RoCE v1 entry carries the cable address
+        self.assertTrue(any('exactly one RoCE v2 GID' in e for e in fabric.findings(selected, facts)[0]))
         facts['ports'].clear()
         self.assertEqual(len(fabric.findings(node,facts)[0]),4)
+
+    def test_gid_table_reads_populated_slots_only(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            port = Path(tmp)
+            (port/'gids').mkdir(); (port/'gid_attrs/types').mkdir(parents=True)
+            for i in range(12):
+                (port/'gids'/str(i)).write_text('0000:0000:0000:0000:0000:0000:0000:0000\n')
+            # Slot 3 emptied by a flap under live RDMA, the address re-added at 4;
+            # an empty slot has no readable type file (sysfs answers EINVAL).
+            for i, kind in ((0, 'IB/RoCE v1'), (1, 'RoCE v2'), (2, 'IB/RoCE v1'), (4, 'RoCE v2')):
+                (port/'gid_attrs/types'/str(i)).write_text(kind + '\n')
+            (port/'gids'/'4').write_text('0000:0000:0000:0000:0000:ffff:0a0c:0101\n')
+            table = fabric.gid_table(port)
+        self.assertEqual([row[0] for row in table], [0, 1, 2, 4])
+        self.assertEqual(table[3], [4, 'RoCE v2', '0000:0000:0000:0000:0000:ffff:0a0c:0101'])
 
     def test_unrelated_or_software_tc_filter_cannot_pass(self):
         rule = fabric.build_plan(self.nodes)[0]['rules'][0]
