@@ -59,7 +59,7 @@ is what the 1M-context goal would want.
   code into the scale word after the stage lands, before the barrier the MMA already waits
   on. The words, and so the output bits, are the uncoded ones.
 
-Serving them (vLLM branch moe-scale-codes-plan, e2eec7c2c): the plan's two GEMMs read the
+Serving them (vLLM branch moe-scale-codes-plan, cbe4acb8f): the plan's two GEMMs read the
 codes, and the TileLang experts layer keeps the codes in place of the scale words, with each
 GEMM's row bases beside its K tails. `overlay/` holds the three changed files over r6v
 (with r6w's 0181); `codes-tp4-overlay-1017.json` serves them on the ring.
@@ -70,9 +70,9 @@ GEMM's row bases beside its K tails. `overlay/` holds the three changed files ov
 2. `kernel.json`: `bundles/codes-bench`, the coded GEMM against the uncoded one at TP4 and TP3
    gate/up and down shapes, decode captures and prefill chunks: bits, then time.
 
-3. `screen.json`, only if the coded GEMM is never slower and faster at decode: determinism
-   (the bits must equal r6w's), distinct-stream decode speed, then the release and
-   single-stream suites, codes against r6w and codes again.
+3. `screen.json`: determinism (the bits must equal r6w's), distinct-stream decode speed,
+   then the screen suite (model, engine grid, c16, prefill), codes against r6w and codes
+   again.
 
 Codes made while loading (the memory half, then the TP3 1M sizing) follow only a serving
 gain.
@@ -87,3 +87,28 @@ holds 5-11 distinct exponents (117-127), the drafter 14 (111-124)
 ([results/scan-1017.txt](results/scan-1017.txt), `scale_dist.py` one layer at a time). The
 4-bit codes are exact for the whole checkpoint, with half their range to spare; 3 bits
 would be exact too.
+
+### Kernel (2026-10-18, dgx3 bench, dgx4 tests; r6v image with the plan's moe.py)
+
+Tests: 57 passed, among them the experts end to end on coded scales and the coded GEMM's
+bits against the uncoded one. Bench: every row count's output bits equal the uncoded
+GEMM's. Time per call, coded / uncoded, warm and cold:
+
+| Shape | 1-2 rows | 3-96 rows | 512-2,048 rows | 8,192 rows |
+| --- | --- | --- | --- | --- |
+| TP4 gate/up (N 1,152, K 5,120) | 1.068 / 0.967, 0.954 / 0.956 | 0.941-0.945 | 0.942-0.948 | 0.999 / 0.997 |
+| TP4 down (N 5,120, K 576) | 1.037 / 0.999, 1.069 / 1.004 | 0.955-0.984 | 0.975-0.980 | 1.000 |
+| TP3 gate/up (N 1,536, K 5,120) | 0.845 / 0.947, 0.960 / 0.943 | 0.941-0.952 | 0.942-0.954 | 0.978 / 0.977 |
+| TP3 down (N 5,120, K 768) | 1.038 / 0.986, 0.996 / 0.979 | 0.970-0.976 | 0.973-0.976 | 1.000 |
+
+From three rows up the coded GEMM is 2-6% faster, prefill chunks included; one and two
+rows with the weights in L2 cost up to 2.2 us a call more (the expansion sits between the
+stage barrier and the MMA's sync, 40 times a call; cold, the same calls are level or
+faster). A one-stream verification step has 3-4 rows: there gate/up saves about 5.5% and
+down 3% a call, about 0.6 ms of an 18 ms step over 40 layers; the warm one- and two-row
+calls (the drafter's MoE layer, once a draft step) give back a few microseconds a step. The
+serving screen decides.
+
+Tried and reverted: expanding every K block's words once per CTA into a shared table that
+the MMAs read directly. Its words reached the MMA wrong (bits differed at every size) and
+the one- and two-row calls were still 2.5-6% slower warm.
