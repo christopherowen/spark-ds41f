@@ -37,3 +37,27 @@ accept more and only adds its per-step cost: tokens a step unchanged (c16 30.56 
 about 30.5; c1 2.245 against 2.24-2.26), engine steps a second -3.4% at c16 and -1% at c1,
 so throughput fell by the same. `sampled.json` measures the case it targets, at the recipe's
 temperature 1 (the new `sampled` suite: c16, c8, c1, fixed seed).
+
+## Results and verdict: not adopted
+
+Verdicts against each run's own repeat (probabilistic, greedy, probabilistic again):
+
+| Suite (traffic) | Metric | Greedy drafting | Probabilistic | Change | Verdict |
+| --- | --- | ---: | ---: | ---: | --- |
+| sampled (temperature 1) | c16 tok/s | 237.2 | 230.2 / 230.2 | -2.93% | worse |
+| sampled | c8 tok/s | 180.7 | 176.1 / 176.3 | -2.55% | worse |
+| sampled | c1 tok/s | 68.6 | 68.1 / 68.1 | -0.76% | same |
+| screen (greedy) | engine grid, step time | | | +9.15% | worse |
+| screen (greedy) | c16 tok/s | 241.8 | 234.2 / 234.4 | -3.17% | worse |
+| single-stream (greedy) | c1 tok/s | 70.8 | 69.9 / 70.1 | -1.38% | same |
+
+Where it was meant to pay, sampled traffic, it raised tokens a step by 0.1-0.5% (c16 29.86
+and 29.96 against 29.72; c1 2.18 against 2.17) while its per-step cost (caching the draft
+logits over the whole vocabulary for every draft row, and the ratio test) made a decode step
+about 9% slower. Block verification of greedy drafts already accepts nearly as much under
+sampling, and the drafter's distributions are confident enough that sampling from them
+changes little. Greedy drafting stays.
+
+Also measured here: on the same build, sampled traffic runs 2-3% slower than greedy traffic
+(c16 237.2 against 241.8 tok/s, c1 68.6 against 70.8) because fewer drafts are accepted; the
+greedy suites never saw that gap, which the `sampled` suite now records.
