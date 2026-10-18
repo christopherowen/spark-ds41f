@@ -39,7 +39,9 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     runner = SimpleNamespace(
         adaptive_verification=manager,
         rejection_sampler=rejection_sampler,
-        batch_sharder=None,
+        # A sharded runner skips the dead-row kernel warmup, which needs a real
+        # runner's buffers; this test is about restoring the adaptive manager.
+        batch_sharder=object(),
     )
 
     def run_steps(model_runner, execute, sample):
