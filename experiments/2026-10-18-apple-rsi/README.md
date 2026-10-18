@@ -22,11 +22,23 @@ Beside them: the task's API examples, the public fidelity checker on the four pu
 stream and 16), whose numbers have no bar here (the task's bar is a share of a B200
 reference).
 
+Beside them, the benchmark's generation judge from its DSpark optimization task
+([judge_rsi.py](judge_rsi.py)): each DSpark arm's server generates 32 prompts x 256 tokens,
+greedy and sampled (temperature 1, seeded); a server of the same model with speculation off
+teacher-forces every arm's tokens. J1 counts greedy tokens more than 0.5 nats below the
+target's top-1 (a candidate fails beyond the pristine arm's count by
+max(0.005 n, 4 sqrt(c + p + 1))); J2 compares the sampled sets' top-1 calibration
+(|z| > 5 fails). Our determinism gates prove greedy outputs unchanged by DSpark only in
+the sense that they repeat; this asks whether speculation shifts the sampled distribution,
+which DeepSeek's sampling defaults (temperature 1.0 on 1017) now make the common case.
+
 ## Arms
 
 - `r6n-tp4-dba1.json`: r6n on the ring with the original checkpoint, as it served in
   production. Its arithmetic and chat encoding predate both revisions, so it is the
   comparison the reference outputs were made for: a failure here is ours.
+- `r6n-tp4-dba1-nospec.json`: r6n with speculation off, the judge's pristine arm and judge
+  server.
 - `r6v-tp4-dba1.json`: production r6v with the original checkpoint. A difference from r6n
   measures what following DeepSeek's current reference costs against an oracle that
   predates it.
