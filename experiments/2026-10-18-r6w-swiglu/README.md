@@ -90,6 +90,37 @@ How the schedule was chosen, all at identical bits:
   rows needed 2 rows a CTA (its rows have 3 warps, TP4's 9)
   ([results/bench-rows-sweep-loads-first.txt](results/bench-rows-sweep-loads-first.txt)).
 
+### Serving (2026-10-18, the ring, 1017; overlay arms)
+
+**Determinism:** temperature-0 and greedy outputs identical to r6v's (3eab5112 / db25fde3,
+c9cf9dbe; 0 token and 0 log-probability differences in every scenario); the release suite's
+model step: greedy responses identical 256/256, teacher-forced distributions identical over
+65,536 positions (KL 0).
+
+**Release comparison** (r6w, r6v, r6w again; verdicts against the run's own repeat):
+
+| Metric | r6w | r6v | r6w again | Change | ±95% | Verdict |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Engine grid, geometric mean of 20 decode shapes (step time) | | | | -2.17% | 0.15% | better |
+| c16 output tok/s | 241.6 | 242.3 | 241.7 | -0.29% | 0.87% | same |
+| c8 output tok/s | 186.1 | 184.8 | 185.9 | +0.72% | 1.14% | same |
+| Poisson output tok/s | 180.4 | 180.4 | 180.4 | 0.00% | 16.9% | same |
+| Single stream (c1) tok/s | 72.7 | 70.9 | | +2.6% | | |
+| Prefill 32K-1M tok/s | | | | +0.1-0.3% | | |
+
+The grid is faster at 19 of 20 shapes (1-3.5%; 12x72 rows -0.7%, within its interval).
+No metric is slower.
+
+**Why c16 is level although its steps are faster:** at sixteen streams r6w ran 3.65% more
+engine steps a second but committed 3.8% fewer tokens a step, because its draft budget
+verified fewer drafts (1.72 against 1.78 draft tokens a draft). The budget prices drafts
+from cost curves each build profiles once at its first boot (5 replays a shape, median) and
+then pins. r6w's pinned curve makes 48 to 96 rows 5.9% steeper than r6v's, while the
+100-replay grid puts the two slopes within 0.3-1.7% of each other: profile noise, plus a
+real but small steepening (TileKernels' kernel cost the same at every row count, this one
+grows with rows), makes r6w draft less. `samecosts.json` runs r6w on r6v's pinned curves,
+so both builds make the same draft choices.
+
 ### The next step, judged by its ceiling: not built
 
 The 2026-10-14 plan's second step folds the SwiGLU into the gate/up GEMM's epilogue. With
