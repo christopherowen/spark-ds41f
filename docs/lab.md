@@ -179,6 +179,9 @@ before the first boot. `run --dry-run` prints the problems.
   release runs `single-stream` (one conversation at a time, concurrency 1 on distinct prompts):
   the speed one user sees, which draft acceptance on the generated text moves, beside the
   release suite's engine grid, the text-independent verdict on a single stream's step cost.
+  Every other suite decodes greedily (temperature 0); `sampled` runs closed loops at 16, 8
+  and 1 streams at the recipe's temperature 1 with a fixed seed, so a change to draft
+  acceptance under sampling (probabilistic drafting, the draft budget) is measured there.
 - **Telemetry:** every bench and script step of a `measure` job samples, on each node:
   - GPU SM and memory clocks, power, temperature and clock-event reasons, once a second
     (`nvidia-smi` over SSH);

@@ -28,3 +28,12 @@ samples its argmax and verification accepts exact matches.
    pinned cost curves, so the comparison is the sampling method alone.
 
 Gate: no metric worse; acceptance and sampled throughput better to adopt it.
+
+## First results (screen, single-stream)
+
+Determinism identical (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e). But servebench's suites
+decode greedily (`"temperature": 0` in every request), where probabilistic drafting cannot
+accept more and only adds its per-step cost: tokens a step unchanged (c16 30.56 against
+about 30.5; c1 2.245 against 2.24-2.26), engine steps a second -3.4% at c16 and -1% at c1,
+so throughput fell by the same. `sampled.json` measures the case it targets, at the recipe's
+temperature 1 (the new `sampled` suite: c16, c8, c1, fixed seed).
