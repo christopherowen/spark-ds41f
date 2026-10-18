@@ -63,10 +63,10 @@ def test_resolve_adaptive_cudagraph_mode(mode, piecewise_capture_available, expe
 def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
     monkeypatch, world_size, expected_budget
 ):
-    # One FP32 ULP across a utility threshold changes the graph's token count.
+    # One FP32 ULP across the survival threshold changes the graph's token count.
     local = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(0.0))]])
     leader = torch.tensor([[np.nextafter(np.float32(0.5), np.float32(1.0))]])
-    manager = make_manager(local.numpy().copy())
+    manager = make_manager(local.numpy().copy(), threshold=0.5)
     manager.req_states.device = torch.device("cpu")
     manager._confidence_probs = torch.empty_like(local)
     manager._pending_resets = []

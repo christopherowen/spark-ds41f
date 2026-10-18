@@ -39,6 +39,7 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     runner = SimpleNamespace(
         adaptive_verification=manager,
         rejection_sampler=rejection_sampler,
+        batch_sharder=None,
     )
 
     def run_steps(model_runner, execute, sample):

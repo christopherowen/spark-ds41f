@@ -440,7 +440,7 @@ def maybe_create_adaptive_verification_manager(
     num_bonus_tokens: int,
     max_total_logits: int,
     vllm_config: "VllmConfig",
-    adaptive_verification_threshold: float,
+    adaptive_verification_threshold: float = 0.2,
     target_layer_names: set[str] | None = None,
     additional_attn_cg_support: tuple[AttentionCGSupport, str | None] | None = None,
 ) -> AdaptiveVerificationManager | None:
