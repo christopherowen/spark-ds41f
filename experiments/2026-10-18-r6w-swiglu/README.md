@@ -121,6 +121,35 @@ real but small steepening (TileKernels' kernel cost the same at every row count,
 grows with rows), makes r6w draft less. `samecosts.json` runs r6w on r6v's pinned curves,
 so both builds make the same draft choices.
 
+**Profile** (`profile.json`: r6w, r6v, r6w again under the torch profiler, every arm on r6v's
+pinned cost curves so all three verify the same shapes; every rank's trace):
+
+| Workload | r6w span/step | r6v | r6w again | r6w vs r6v |
+| --- | ---: | ---: | ---: | ---: |
+| One stream, 26 steps | 37.68 ms | 38.54 ms | 37.60 ms | -2.2% |
+| Sixteen code streams, 110 steps | 58.25 ms | 58.63 ms | 57.98 ms | -0.65% to -1.1% |
+
+The same on all four ranks. TileKernels' SwiGLU costs 0.94 ms a step at one stream and
+1.11 ms at sixteen; `moe_swiglu_cast` 0.13 and about 0.43 ms. At sixteen streams r6v's
+shared-expert MXFP8 GEMM (it overlaps the routed experts) also takes 0.86 ms a step against
+0.56 ms beside the new kernel: TileKernels' 48 1,024-thread CTAs held the SMs it shares.
+Every other kernel is level. With the same draft choices, r6w's step is faster at both
+loads; the level c16 throughput above is the draft budget's, not the step's.
+
+**Same cost curves** (`samecosts.json`, the screen suite: r6w on r6v's pinned curves, r6v,
+r6w again): with equal drafting (30.52 against 30.50 tokens a step), c16 is 243.4 and 243.2
+tok/s against r6v's 242.2 (+0.49%, verdict same; repeat -0.08%), engine steps a second
++0.42%, the grid -2.03% (better), prefill level, greedy responses identical 128/128.
+
+### Verdict (for the owner; the owner decides promotion)
+
+Correct: every output identical to r6v's. Never slower: no metric of the release
+comparison is worse; the decode step is faster at every load (grid -2.2%, profile -2.2% at
+one stream and -0.65 to -1.1% at sixteen); c1 +2.6%; with equal drafting c16 +0.5%. On its
+own first-boot cost profile r6w drafts less at sixteen streams and c16 is level (-0.29%).
+An image build (`build.json`), its release tests and the built gate (`gate-tp4-1017.json`)
+follow a promotion decision; the built image profiles its own curves at its first boot.
+
 ### The next step, judged by its ceiling: not built
 
 The 2026-10-14 plan's second step folds the SwiGLU into the gate/up GEMM's epilogue. With
