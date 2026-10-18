@@ -34,3 +34,28 @@ their kernels compile there.
 
 Gate: no metric worse than r6v. Whichever rule is no worse wins, since it is deterministic
 and simpler; if adaptive verification off is no worse, the feature goes.
+
+## Results: no fixed threshold matches the timed budget; the feature itself is worth 9-19%
+
+Determinism: outputs identical (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e). Boots without the
+profile: 76 s against 87-90 s. Tests: the first run's seven failures were the tests' (a
+required argument the old calls lacked, one expectation of the cost model, a warm-up stub
+missing `batch_sharder` since an earlier commit), fixed in #394.
+
+Throughput against r6v's timed budget (change, verdict against the run's repeat; the 0.2
+repeat matched itself to 0.0-0.4%):
+
+| Arm | screen c16 | single-stream c1 | sampled c16 | sampled c8 | sampled c1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| threshold 0.2 | -0.7% | -4.0% | -1.4% (worse) | -1.1% | -3.1% |
+| threshold 0.3 | -0.1% | -7.2% (worse) | -0.4% | -0.3% | -6.4% |
+| adaptive verification off | -17% | -8.6% (worse) | -18% | -19% | -9% |
+
+A fixed threshold drafts too little at one stream (rows there are nearly free: 2.0-2.1 tokens
+a step against r6v's 2.26) and, at 0.2, too much at sixteen (35.4 tokens a step against 30.4,
+steps 15% slower). Turning adaptive verification off (five drafts always verified) costs
+9-19%: the budget pays at every load, so the feature stays. What a draft is worth depends on
+what a row costs relative to the whole step at that load, which a threshold ignores:
+experiments/2026-10-18-dspark-linear-budget (one constant) and
+experiments/2026-10-18-dspark-static-costs (the full cost shape from a static table) keep
+that, with nothing timed.
