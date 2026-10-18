@@ -51,3 +51,14 @@ also be exact in the sample, and 2 bits would need exceptions for 0.0035% of sca
 
 Only if the coded GEMM is never slower and faster at decode does the next step (codes made
 while loading, then the TP3 1M sizing) follow.
+
+## Results
+
+### Full scan (2026-10-18, dgx1, the 1017 checkpoint)
+
+Every layer's routed-expert scales (40 layers, 1,152 tensors and 3.7 million rows each) and
+the drafter's (384 tensors): in every one, 100% of rows span 8 exponents or fewer; a layer
+holds 5-11 distinct exponents (117-127), the drafter 14 (111-124)
+([results/scan-1017.txt](results/scan-1017.txt), `scale_dist.py` one layer at a time). The
+4-bit codes are exact for the whole checkpoint, with half their range to spare; 3 bits
+would be exact too.

@@ -14,7 +14,10 @@ import sys
 
 import numpy as np
 
-snap, layers = sys.argv[1], [int(x) for x in sys.argv[2].split(",")]
+snap = sys.argv[1]
+layers = [x for x in sys.argv[2].split(",") if x != "mtp"]
+layers = [int(x) for x in layers]
+with_mtp = "mtp" in sys.argv[2].split(",")
 want = re.compile(r"^(layers\.(\d+)|mtp\.0)\.ffn\.experts\.\d+\.(w[123])\.scale$")
 
 index = {}
@@ -27,7 +30,7 @@ for f in sorted(glob.glob(os.path.join(snap, "*.safetensors"))):
         if not m:
             continue
         layer = "mtp" if m.group(1) == "mtp.0" else int(m.group(2))
-        if layer != "mtp" and layer not in layers:
+        if (layer == "mtp" and not with_mtp) or (layer != "mtp" and layer not in layers):
             continue
         index.setdefault(f, []).append((k, layer, m.group(3), 8 + n + v["data_offsets"][0], v["shape"]))
 
@@ -61,7 +64,7 @@ for f, items in index.items():
     finally:
         os.close(fd)
 
-print(f"sampled layers {layers} + mtp.0: {sum(len(v) for v in index.values())} tensors, "
+print(f"sampled layers {layers}{' + mtp.0' if with_mtp else ''}: {sum(len(v) for v in index.values())} tensors, "
       f"{rows:,} rows, {values:,} scales ({values / 2**30:.2f} GiB)")
 nz = np.nonzero(hist)[0]
 print("exponent values present:", nz.min(), "..", nz.max(), f"({len(nz)} distinct)")
