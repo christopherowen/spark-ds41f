@@ -753,3 +753,13 @@ Canonical vLLM main is parked; the serving sources are Local Inference Lab's
 `integration/karmic-kraken-beta` vLLM and B12X, TileLang, DeepSeek's
 TileKernels and sparknet, with the local patch series
 ([docs/upstreams.md](docs/upstreams.md)).
+
+## License
+
+spark-ds41f is licensed under the [Apache License 2.0](LICENSE).
+
+Files copied from upstream projects keep their own copyright and license
+headers. These are the vLLM and B12X sources in experiment overlays and bundles,
+and in `docs/serving-audit-2026-10-01/sources`. Each patch series changes its
+upstream's code under that project's license. The upstreams are listed in
+[docs/upstreams.md](docs/upstreams.md).
