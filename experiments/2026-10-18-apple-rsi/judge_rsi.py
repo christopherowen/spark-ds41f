@@ -49,10 +49,11 @@ def main() -> int:
     task = "~/spark-lab/apple-rsi-src/optimize_dsv4_flash_4xh100_dspark_sglang_open/tests"
     ap.add_argument("--lib", default=f"{task}/_verifier_lib/generation_judge.py")
     ap.add_argument("--prompts", default=f"{task}/correctness_prompts.json")
+    ap.add_argument("--port", type=int, help="the arm's port, when it is not the URL's (lab passes :8000)")
     args = ap.parse_args()
     os.environ.update({k: os.environ.get(k, v) for k, v in THRESHOLDS.items()})
     gj = library(Path(os.path.expanduser(args.lib)))
-    port = urlparse(args.url).port or 80
+    port = args.port or urlparse(args.url).port or 80
     OUT.mkdir(parents=True, exist_ok=True)
     prompts = gj.load_prompts(Path(os.path.expanduser(args.prompts)))
     seed_side = "pristine" if args.judge else "cand"

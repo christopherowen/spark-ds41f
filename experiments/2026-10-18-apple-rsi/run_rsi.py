@@ -69,11 +69,14 @@ def main() -> int:
     ap.add_argument("--root", default="~/spark-lab/apple-rsi")
     ap.add_argument("--image", default="vllm-ds41f-kkref:19f2c20ed4d6-r6v")
     ap.add_argument("--steps", default=",".join(STEPS))
+    ap.add_argument("--port", type=int, help="the arm's port, when it is not the URL's (lab passes :8000)")
     args = ap.parse_args()
     root = Path(os.path.expanduser(args.root))
     out = ROOT / "results" / "private" / "apple-rsi" / args.label
     out.mkdir(parents=True, exist_ok=True)
     url = args.url.rstrip("/")
+    if args.port:
+        url = f"{url.rsplit(':', 1)[0]}:{args.port}"
     worst = 0
     for step in args.steps.split(","):
         command = ["docker", "run", "--rm", "--network", "host", "--entrypoint", "bash",

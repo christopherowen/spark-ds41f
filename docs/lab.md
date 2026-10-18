@@ -82,6 +82,15 @@ must name its shape. `set` merges into the base, `unset` removes dotted paths (a
 the base does not have is an error). An arm never carries the recipe's shape or
 qualifying benchmark. Older experiments keep their complete files.
 
+A window never opens while production serves requests (`queue run` refuses a busy cluster).
+To queue work for when the production agent finishes, start
+`scripts/lab_idle_start.sh [MINUTES] [LOG_NAME]` detached on the head node: it starts the
+queue runner only after MINUTES (default 10) consecutive idle minutes (no running or
+waiting request and no request finished), so a window never takes the cluster in a pause
+between an agent's requests. An arm that is not production's model (another checkpoint,
+speculation off) should serve on another port (`serve_args` and `deployment.ready_url`),
+so an agent returning mid-window cannot reach it.
+
 Over ssh, detach a long `run` or `queue run` from the session: use `setsid -f` with every
 stream redirected, or run it inside tmux. `lab.py` logs to stdout. If stdout is the session's
 pipe and the session ends, the next log line fails with a broken pipe and the runner exits.
