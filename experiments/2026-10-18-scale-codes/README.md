@@ -32,6 +32,22 @@ also be exact in the sample, and 2 bits would need exceptions for 0.0035% of sca
   shapes). Today's 3.5 GiB pool already holds 2.7 full 1M contexts; with the scales coded
   it would hold about 4.8, the per-sequence headroom TP4 has at 1M.
 
+## Prior art: B12X's MXFP4-CSF
+
+Upstream B12X (lil) already serves a lossless compressed form of these scales,
+MXFP4-CSF (`docs/lossless-scale-compression.md` there): a byte base per row, one selector
+bit per scale (base or base + 1), exception records for the rest and a raw copy of any
+tile with too many exceptions, 23.4 MiB against 101.2 MiB of native words on a synthetic
+E384/H5120/I576 layer (4.3x; our 4-bit codes are 2x). Its "inline" variant
+(b64cb9c5, f7beda3b) rebuilds each thread's scale words in registers after the stage
+barrier, as `coded_scales` does. Measured on a DS4.1 TP4 MoE layer against expanding the
+CSF scales before every call, inline was 7-10% faster up to 1,024 tokens but 2.5-6.3%
+slower at 2,048 and 4,096, so plans above 1,536 tokens expand once (61 us a layer) and run
+the native kernel. No comparison with plain native words, which never pay an expansion,
+is published, nor a serving run. What it predicts here: a decode gain is possible, the
+prefill chunks are where the codes can lose, and a denser format (1 bit with exceptions)
+is what the 1M-context goal would want.
+
 ## Change (vLLM branch moe-scale-codes, on r6w's 0181)
 
 - `pack_scale_codes(exponents)` (gemm.py): a base exponent per row and four 4-bit deltas per
