@@ -51,7 +51,7 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 
 from .gemm import (
     SF_BLOCK,
-    pack_scale_words,
+    pack_scale_codes,
     scale_words,
 )
 from .linear import _calls, _launch, _warm_casts
@@ -1180,7 +1180,9 @@ class MoeExpertsV41Plan:
 
     def kernels(self) -> dict:
         """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
-        config = dict(block_N=self.block_N, num_stages=self.num_stages)
+        config = dict(
+            block_N=self.block_N, num_stages=self.num_stages, coded_scales=True
+        )
         num_experts, topk, hidden, inter = (
             self.num_experts,
             self.topk,
@@ -1232,16 +1234,25 @@ class MoeExpertsV41Plan:
         prepare.declare(calls, bind=bind, warm=lambda: _warm_casts(self.hidden))
 
     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
-        """Per GEMM ``(tiles, tails, scale words)`` from E2M1 weights and UE8M0.
+        """Per GEMM ``(tiles, tails, scale codes, row bases)`` from E2M1 weights and
+        UE8M0 scales.
 
         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
-        down projection of TP4's 576-wide expert rows).
+        down projection of TP4's 576-wide expert rows). The scales are kept as
+        ``pack_scale_codes``' row bases and 4-bit codes in ``tile_codes`` layout,
+        half the bytes of their words; the GEMMs expand them to the same words.
         """
-        return tuple(
-            (*tile_expert_weights(w.view(torch.int8), self.block_N),
-             pack_scale_words(scale))
-            for w, scale in ((w13, w13_scale), (w2, w2_scale))
-        )  # fmt: skip
+        prepared = []
+        for w, scale in ((w13, w13_scale), (w2, w2_scale)):
+            codes, base = pack_scale_codes(scale)
+            prepared.append(
+                (
+                    *tile_expert_weights(w.view(torch.int8), self.block_N),
+                    tile_codes(codes, self.block_N),
+                    base,
+                )
+            )
+        return tuple(prepared)
 
     def workspace_specs(self, rows, idx_dtype=torch.int64):
         dispatch = self.dispatch[idx_dtype]
@@ -1293,7 +1304,8 @@ class MoeExpertsV41Plan:
 
 
 def _present(weights):
-    """A GEMM's weight arguments: the tiles, the K tails when it has them, the words."""
+    """A GEMM's weight arguments: the tiles, the K tails when it has them, the scale
+    codes and the row bases."""
     return tuple(w for w in weights if w is not None)
 
 

@@ -59,14 +59,23 @@ is what the 1M-context goal would want.
   code into the scale word after the stage lands, before the barrier the MMA already waits
   on. The words, and so the output bits, are the uncoded ones.
 
+Serving them (vLLM branch moe-scale-codes-plan, 6216e0a2b): the plan's two GEMMs read the
+codes, and the TileLang experts layer keeps the codes in place of the scale words, with each
+GEMM's row bases beside its K tails. `overlay/` holds the three changed files over r6v
+(with r6w's 0181); `codes-tp4-overlay-1017.json` serves them on the ring.
+
 ## Runs
 
 1. The full scan of every layer's scales (read-only, CPU), to confirm no row exceeds 16.
 2. `kernel.json`: `bundles/codes-bench`, the coded GEMM against the uncoded one at TP4 and TP3
    gate/up and down shapes, decode captures and prefill chunks: bits, then time.
 
-Only if the coded GEMM is never slower and faster at decode does the next step (codes made
-while loading, then the TP3 1M sizing) follow.
+3. `screen.json`, only if the coded GEMM is never slower and faster at decode: determinism
+   (the bits must equal r6w's), distinct-stream decode speed, then the release and
+   single-stream suites, codes against r6w and codes again.
+
+Codes made while loading (the memory half, then the TP3 1M sizing) follow only a serving
+gain.
 
 ## Results
 
