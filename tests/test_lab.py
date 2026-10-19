@@ -439,6 +439,21 @@ class ProfilePlanTest(unittest.TestCase):
         self.assertEqual(profiles[0]["argv"][-2:], ["--tokens", "128"])
         self.assertEqual(profiles[1]["argv"][-2:], ["--tokens", "131072"])
 
+    def test_failed_profile_stops_before_collecting_or_running_another_workload(self) -> None:
+        step = {"config": "profile.json", "label": "candidate", "workload": "prefill",
+                "argv": ["profile.py"], "out": "trace"}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "ROOT", Path(directory)), \
+                mock.patch.object(lab, "profiler_dir", return_value="/cache/profile"), \
+                mock.patch.object(lab, "nodes_config", return_value={"nodes": [{"name": "dgx1"}]}), \
+                mock.patch.object(lab, "production_configuration", return_value=({}, {}, {})), \
+                mock.patch.object(lab.spark, "repository_path", return_value="/repo"), \
+                mock.patch.object(lab.spark, "run_ssh", return_value=mock.Mock(returncode=0)), \
+                mock.patch.object(lab.subprocess, "run", return_value=mock.Mock(returncode=1)) as run:
+            with self.assertRaisesRegex(RuntimeError, "prefill failed with exit 1"):
+                lab.profile_workload(step)
+            self.assertEqual(run.call_count, 1)
+
 
 class QueueTest(unittest.TestCase):
     def test_add_validates_and_orders_specs(self) -> None:

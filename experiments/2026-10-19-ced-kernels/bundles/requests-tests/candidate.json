@@ -1,0 +1,30 @@
+{
+  "description": "Isolated candidate tests on r6x; source base f3b58ed9d, candidate 304bd84a1. Production files stay in the image.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-postlaunch",
+    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess,sys\nsys.exit(subprocess.run([sys.executable,'-m','pytest','-q','-s','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-requests-tests','tests/kernels/test_deepseek_v41_tilelang_metadata.py','-k','ced_requests'],timeout=2400).returncode)"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ],
+    [
+      "vllm_models_deepseek_v4_1_tilelang_ced.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/ced.py"
+    ],
+    [
+      "tests_kernels_test_deepseek_v41_tilelang_metadata.py",
+      "/opt/spark3/candidate/vllm/tests/kernels/test_deepseek_v41_tilelang_metadata.py"
+    ]
+  ]
+}

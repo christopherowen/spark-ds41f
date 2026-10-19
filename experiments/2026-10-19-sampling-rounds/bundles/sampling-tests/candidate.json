@@ -1,0 +1,42 @@
+{
+  "description": "Isolated candidate tests on r6x; source base f3b58ed9d, candidate fd1b57e06. Production files stay in the image.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-postlaunch",
+    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-c",
+    "import subprocess,sys\nsys.exit(subprocess.run([sys.executable,'-m','pytest','-q','-s','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-sampling-tests','tests/v1/spec_decode/test_rejection_sampler_utils.py','tests/v1/spec_decode/test_dspark_topk.py'],timeout=2400).returncode)"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_sample_gumbel.py",
+      "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/sample/gumbel.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_spec_decode_rejection_sampler_utils.py",
+      "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_spec_decode_dflash2_speculator.py",
+      "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py"
+    ],
+    [
+      "tests_v1_spec_decode_test_rejection_sampler_utils.py",
+      "/opt/spark3/candidate/vllm/tests/v1/spec_decode/test_rejection_sampler_utils.py"
+    ],
+    [
+      "tests_v1_spec_decode_test_dspark_topk.py",
+      "/opt/spark3/candidate/vllm/tests/v1/spec_decode/test_dspark_topk.py"
+    ]
+  ]
+}

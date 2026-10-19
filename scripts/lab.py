@@ -1148,6 +1148,8 @@ def profile_workload(step: dict) -> None:
         code = subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
     log(f"profile {step['label']} {workload} exit {code}")
+    if code:
+        raise RuntimeError(f"profile {step['label']} {workload} failed with exit {code}; see {out / (workload + '.json')}")
 
     def trace_bytes(node: dict) -> int:
         result = spark.run_ssh(nodes, node, "sh", "-c",
