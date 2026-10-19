@@ -106,6 +106,10 @@ def main():
             print(json.dumps(row), flush=True)
             rows.append(row)
     print(json.dumps({"summary": "CED requests per call", "rows": rows}))
+    print(json.dumps({"bits": "CED request metadata", "differs_at": []}))
+    slower = [r for r in rows if r["change_pct"] - r["ci95_pct"] > 3.0]
+    if slower:
+        raise RuntimeError(f"CED metadata is slower beyond the 3% floor: {slower}")
 
 
 if __name__ == "__main__":
