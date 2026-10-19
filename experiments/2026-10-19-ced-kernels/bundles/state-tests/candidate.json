@@ -1,0 +1,45 @@
+{
+  "description": "Isolated r6x CED qualification; exact source input digests are recorded in the kernel-lab verdict.",
+  "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-postlaunch",
+    "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+    "PYTHONPATH": "/b"
+  },
+  "workdir": "/opt/spark3/candidate/vllm",
+  "argv": [
+    "-m",
+    "pytest",
+    "-q",
+    "-s",
+    "-rfEs",
+    "-p",
+    "no:cacheprovider",
+    "--noconftest",
+    "-p",
+    "prepare_fixtures",
+    "--basetemp",
+    "/c/pytest-ced-state",
+    "tests/v1/attention/test_b12x_v41_ced_metadata.py"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "kernels.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/ced.py"
+    ],
+    [
+      "state.py",
+      "/opt/spark3/candidate/vllm/vllm/models/deepseek_v4_1/ced.py"
+    ],
+    [
+      "test_state.py",
+      "/opt/spark3/candidate/vllm/tests/v1/attention/test_b12x_v41_ced_metadata.py"
+    ],
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ]
+  ]
+}

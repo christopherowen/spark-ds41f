@@ -223,8 +223,6 @@ def copy_rows_kernel(
     for dim in tail:
         width *= dim
 
-    layout = T.Fragment((512,), forward_fn=lambda i: (i // 4, i % 4))
-
     def column_offset(col):
         # Build the strided address at specialization time; a TIR loop variable
         # cannot index Python's layout tuples.
@@ -235,6 +233,11 @@ def copy_rows_kernel(
             divisor *= dim
         return result
 
+    tile = 1024 if width >= 32 else 512
+    layout = T.Fragment(
+        (tile,), forward_fn=lambda i: (i // (tile // 128), i % (tile // 128))
+    )
+
     @T.prim_func
     def ced_copy_rows(
         source: T.Tensor((source_span,), dtype),
@@ -244,30 +247,36 @@ def copy_rows_kernel(
         output_rows: T.int64,
     ):
         with T.Kernel(
-            T.ceildiv((source_rows if scatter else output_rows) * width, 512),
+            T.ceildiv(width, tile)
+            if width >= 32
+            else T.ceildiv((source_rows if scatter else output_rows) * width, tile),
+            (source_rows if scatter else output_rows) if width >= 32 else 1,
             threads=128,
-        ) as bx:
-            source_offset = T.alloc_var(T.int64)
-            for i in T.Parallel(512, loop_layout=layout):
-                offset = T.cast(bx * 512 + i, T.int64)
-                row = offset // width
-                col = offset % width
+        ) as (bx, by):
+            for i in T.Parallel(tile, loop_layout=layout):
+                row = (
+                    T.cast(by, T.int64)
+                    if width >= 32
+                    else T.cast(bx * tile + i, T.int64) // width
+                )
+                col = bx * tile + i if width >= 32 else (bx * tile + i) % width
                 limit = source_rows if scatter else output_rows
-                if row < limit:
+                if (row < limit) & (col < width):
                     index = row_indices[row]
                     valid = (index >= 0) & (
                         index < (output_rows if scatter else source_rows)
                     )
-                    if valid:
-                        source_offset = (row if scatter else index) * strides[
-                            0
-                        ] + column_offset(col)
-                        if scatter:
-                            output[index * width + col] = source[source_offset]
-                        else:
-                            output[offset] = source[source_offset]
-                    elif not scatter:
-                        output[offset] = T.cast(0, dtype)
+                    if scatter:
+                        if valid:
+                            output[index * width + col] = source[
+                                row * strides[0] + column_offset(col)
+                            ]
+                    else:
+                        output[row * width + col] = T.if_then_else(
+                            valid,
+                            source[index * strides[0] + column_offset(col)],
+                            T.cast(0, dtype),
+                        )
 
     return ced_copy_rows
 

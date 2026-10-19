@@ -24,7 +24,7 @@ from vllm.triton_utils import triton  # noqa: E402
 @pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
 def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
     """Per-request limits preserve the old 128/full-row metadata, including padding."""
-    from vllm.models.deepseek_v4_1.ced import _decoder_requests
+    from benchmarks.kernels.ced_reference import _decoder_requests
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     nr = min(nr, max_requests)
@@ -129,7 +129,7 @@ def test_ced_row_copy_serving_widths(rows, tail):
 @pytest.mark.parametrize("padding", [0, 1, 127])
 def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
     """Compacted rows map to each request's suffix; padded rows map to -1."""
-    from vllm.models.deepseek_v4_1.ced import _decoder_indices
+    from benchmarks.kernels.ced_reference import _decoder_indices
     from vllm.models.deepseek_v4_1.tilelang import ced
 
     nr = len(lengths)

@@ -11,7 +11,7 @@ import statistics
 
 import torch
 
-from vllm.models.deepseek_v4_1.ced import (
+from benchmarks.kernels.ced_reference import (
     _copy_rows,
     _decoder_indices,
     _decoder_requests,
