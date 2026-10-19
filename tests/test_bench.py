@@ -667,9 +667,8 @@ class ReferenceShapeTest(unittest.TestCase):
                     ([], []),
                 )
                 self.assertEqual(spark.benchmark_reference_problems(cluster, nodes), [])
-        # r6x was released on the ring; it changes TP3's path too, so the triangle has no
-        # reference until a triangle release run.
-        self.assertNotIn("benchmark_reference", recipe["shapes"]["tp3-triangle"])
+        # r6x was released on the ring, then on the triangle at 1M: each shape has its own run.
+        self.assertIn("benchmark_reference", recipe["shapes"]["tp3-triangle"])
         self.assertIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
 
     def test_tp4_profile_compares_with_the_tp4_run(self) -> None:

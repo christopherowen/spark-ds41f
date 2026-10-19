@@ -130,18 +130,28 @@
     "max_num_seqs": 16,
     "reported_full_context_concurrency": 8.18,
     "graph_capture_gib": 1.97,
-    "note": "the ring, read from r6x's first production boot on 2026-10-18 (GPU KV cache 8,580,566 tokens, 8.18x for 1,048,576, the same KV pool as r6v; rank 0 graph capture 1.97 GiB; model load 72.19 GiB against r6v's 74.2: the expert scale codes, about 2 GiB a rank, not yet given to KV). The triangle is unqualified on r6x."
+    "note": "the ring, read from r6x's first production boot on 2026-10-18 (GPU KV cache 8,580,566 tokens, 8.18x for 1,048,576, the same KV pool as r6v; rank 0 graph capture 1.97 GiB; model load 72.19 GiB against r6v's 74.2: the expert scale codes, about 2 GiB a rank, not yet given to KV). The triangle: capacity.tp3.",
+    "tp3": {
+      "kv_cache_tokens": 4765898,
+      "max_model_len": 1048576,
+      "max_num_seqs": 8,
+      "reported_full_context_concurrency": 4.55,
+      "kv_cache_memory_bytes": 5268045824,
+      "note": "the triangle since 2026-10-19: a 4.90625 GiB pool (r6v's TP3: 3.5 GiB, 2,845,543 tokens, 5.43x 524,288); model load 94.26 GiB a rank; dgx1 6.70 GiB available serving, 5.93 GiB at its lowest during a cold 1M prefill; 5.875 GiB ended below dgx1's 5 GiB startup guard"
+    }
   },
-  "change_from_previous": "r6v plus vLLM 0181 (the routed SwiGLU and MXFP8 cast over the live tiles), 0182-0183 (the routed experts' scales as row bases and 4-bit codes) and 0184 (the DSpark draft budget by a fixed linear step cost, row cost 0.035; the boot-timed cost curves deleted). Promoted for TP4 against r6v; outputs identical to r6v's. TP3's path changes too, so tp3-triangle is unqualified until a triangle release run.",
+  "change_from_previous": "r6v plus vLLM 0181 (the routed SwiGLU and MXFP8 cast over the live tiles), 0182-0183 (the routed experts' scales as row bases and 4-bit codes) and 0184 (the DSpark draft budget by a fixed linear step cost, row cost 0.035; the boot-timed cost curves deleted). Promoted for TP4 against r6v; outputs identical to r6v's. TP3's path changes too; on 2026-10-19 the triangle was qualified at 1M (max_model_len 1048576, a 4.90625 GiB KV pool) against r6v's TP3.",
   "evidence": {
     "experiments": [
       "experiments/2026-10-18-r6x/",
       "experiments/2026-10-18-r6w-swiglu/",
       "experiments/2026-10-18-scale-codes/",
       "experiments/2026-10-18-dspark-linear-budget/",
-      "experiments/2026-10-18-dspark-budget-rule/"
+      "experiments/2026-10-18-dspark-budget-rule/",
+      "experiments/2026-10-19-r6x-tp3-1m/"
     ],
-    "summary": "On the ring, on 1017 (release suite with single-stream and sampled, one session, 2026-10-18 18:55-22:31 UTC, r6x / r6v / r6x again, verdicts against the repeat): engine grid -2.53% (all 20 shapes faster), 16 streams +3.55%, 8 streams +3.84%, sampled 16 / 8 streams +2.96% / +4.49%, all better; prefill 32K-1M level; Poisson level (first token p50 -5.7%, p99 -11.8%); one stream +4.49% greedy and +4.23% sampled (same on the unpaired interval; engine steps/s +4.1%, better). No verdict worse. Determinism gate identical to r6v (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e); release model step: greedy 256/256 identical, KL 0. Release tests: 60 gate files, 1,680 passed, 158 skipped. Boot 76 s (no cost profile)."
+    "summary": "On the ring, on 1017 (release suite with single-stream and sampled, one session, 2026-10-18 18:55-22:31 UTC, r6x / r6v / r6x again, verdicts against the repeat): engine grid -2.53% (all 20 shapes faster), 16 streams +3.55%, 8 streams +3.84%, sampled 16 / 8 streams +2.96% / +4.49%, all better; prefill 32K-1M level; Poisson level (first token p50 -5.7%, p99 -11.8%); one stream +4.49% greedy and +4.23% sampled (same on the unpaired interval; engine steps/s +4.1%, better). No verdict worse. Determinism gate identical to r6v (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e); release model step: greedy 256/256 identical, KL 0. Release tests: 60 gate files, 1,680 passed, 158 skipped. Boot 76 s (no cost profile).",
+    "summary_tp3": "On the triangle at 1M, on 1017 (release-tp3 with single-stream and sampled, one session, 2026-10-19 00:21-03:41 UTC, r6x / r6v's TP3 at 512K / r6x again): engine grid -1.30%, 8 and 4 streams +3.8% and +4.0%, sampled 16 / 8 streams +3.8% / +3.5%, all better; one stream +4.7% (paired by window, better); prefill +0.7-0.9% (better at 256K and 500K); Poisson first token p99 -16%, goodput +6.5%. Outputs identical to r6u's TP3 path (62313cb5 / 9742ac2c, 4d143977 / 12fd8257; greedy 256/256). A cold 1,000,000-token prefill at 3,227 tok/s."
   },
   "build": {
     "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
@@ -175,7 +185,9 @@
     "nvme_power": "APST on with 2 s / 60 s idle thresholds (applied 2026-10-16 12:48 UTC)"
   },
   "deployment": "TP4 production on the ring since 2026-10-18 22:58 UTC from fc3ee36 (cluster sync --revision origin/main --apply, then the lab window's close started config/cluster.json: cluster start --replace --change-shape --apply; API ready in 88 s); doctor --live OK; 187 TileLang calls prepared in 5.5 s; one image ID on dgx1-dgx4 (sha256:6339bda18247); nothing timed at boot (row cost 0.035). The static-table sweep that held the window was stopped for the deployment.",
-  "benchmark_reference_tp3": "none: tp3-triangle is unqualified on r6x (start with --unqualified-shape until a triangle release run)",
+  "benchmark_reference_tp3": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3 (r6x at 1M on the triangle)",
   "single_stream": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4-single-stream",
-  "sampled": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4-sampled"
+  "sampled": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4-sampled",
+  "single_stream_tp3": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3-single-stream",
+  "sampled_tp3": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3-sampled"
 }

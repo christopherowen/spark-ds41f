@@ -11,8 +11,9 @@ experts' SwiGLU over the dispatch layout's live tiles, the routed experts' weigh
 kept as row bases and 4-bit codes (exact, about 2.1 GiB a rank freed), and a DSpark draft
 budget that is a rule of the inputs (row cost 0.035), so nothing is timed at boot. Outputs
 are identical to r6v's; against r6v decode steps are 2.5% faster and 16 and 8 streams 3.6%
-and 3.8% faster, prefill level. The three-node TP3 512K profile is unqualified on r6x
-until a triangle release run; r6v served it on r6u's path. r6v's recipe and lock are frozen
+and 3.8% faster, prefill level. The three-node TP3 profile serves r6x at 1M context since
+2026-10-19 (4.55 full 1M contexts of KV, from the memory the scale codes freed;
+[experiments/2026-10-19-r6x-tp3-1m](experiments/2026-10-19-r6x-tp3-1m/README.md)). r6v's recipe and lock are frozen
 in `experiments/2026-10-18-r6x/r6v`.
 
 Before r6x, production was **r6v** on both profiles: the

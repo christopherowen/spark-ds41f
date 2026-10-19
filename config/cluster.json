@@ -275,17 +275,17 @@
       "benchmark_reference": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4"
     },
     "tp3-triangle": {
-      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Unqualified on r6x (its routed SwiGLU, expert scale codes and draft budget change TP3's path; r6u's TP3 run no longer covers it): starting it needs --unqualified-shape until a triangle release run.",
+      "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m).",
       "nodes": 3,
       "nodes_config": "config/nodes.json",
       "fabric": {
         "transport": "oneshot-direct"
       },
       "sizing": {
-        "max_model_len": 524288,
+        "max_model_len": 1048576,
         "max_num_seqs": 8,
         "max_num_batched_tokens": 4096,
-        "kv_cache_memory_bytes": 3758096384,
+        "kv_cache_memory_bytes": 5268045824,
         "prefix_cache_retention_interval": 512
       },
       "environment": {
@@ -313,7 +313,8 @@
         "NCCL_SOCKET_IFNAME": "enP7s7",
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "1",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
-      }
+      },
+      "benchmark_reference": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3"
     },
     "tp3-triangle-4k": {
       "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md).",

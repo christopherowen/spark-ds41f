@@ -1,0 +1,201 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "sampled",
+  "version": 1,
+  "description": "Sampled traffic, as the recipe serves it: closed loops at sixteen, eight and one stream over the default prompts at temperature 1 and top-p 1 (DeepSeek's 1017 defaults, the recipe's override-generation-config) with a fixed per-request seed, thinking off, 60 s warm-up and 300 s measured each. The other suites decode greedily, so draft acceptance under sampling (and anything that changes it, such as probabilistic drafting) is measured only here.",
+  "steps": [
+   {
+    "id": "c16",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 16,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "seed": 0,
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c8",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 8,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "seed": 0,
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c1",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 1,
+     "warmup": 60,
+     "duration": 300,
+     "extra_body": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "seed": 0,
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   }
+  ]
+ },
+ "suite_sha256": "ab647d3850241f3f49fb40fe9ba0408871dc705aea75e46cc1e99be82162a1cc",
+ "label": "r6x-tp3-1m",
+ "corpus": null,
+ "started_utc": "2026-10-19T01:09:12+00:00",
+ "steps": [
+  {
+   "id": "c16",
+   "command": "run",
+   "output": "c16.json",
+   "exit": 0,
+   "seconds": 383.3
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "output": "c8.json",
+   "exit": 0,
+   "seconds": 369.0
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "output": "c1.json",
+   "exit": 0,
+   "seconds": 364.1
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-dev-1017.json",
+   "cluster_config_sha256": "6fdebf3a276ef5c89eecff905a742a094397e84b05a2d82c58ce40a3115f902c",
+   "nodes_config": "config/nodes.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "swank",
+    "nodes": [
+     {
+      "name": "dgx1",
+      "rank": 0,
+      "management_ip": "10.0.1.71",
+      "head": true,
+      "roce_peer_hcas": {
+       "1": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "2": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.12.1.0/24",
+       "roceP2p1s0f0": "10.12.2.0/24",
+       "rocep1s0f1": "10.13.1.0/24",
+       "roceP2p1s0f1": "10.13.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx2",
+      "rank": 1,
+      "management_ip": "10.0.1.72",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ],
+       "2": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.23.1.0/24",
+       "roceP2p1s0f0": "10.23.2.0/24",
+       "rocep1s0f1": "10.12.1.0/24",
+       "roceP2p1s0f1": "10.12.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx3",
+      "rank": 2,
+      "management_ip": "10.0.1.73",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "1": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.13.1.0/24",
+       "roceP2p1s0f0": "10.13.2.0/24",
+       "rocep1s0f1": "10.23.1.0/24",
+       "roceP2p1s0f1": "10.23.2.0/24"
+      },
+      "roce_gid_index": 3
+     }
+    ]
+   },
+   "transport": "oneshot-direct",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-19-karmic-kraken-r6x",
+   "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
+   "dspark_cost_dir": "/cache/kkref/dspark-costs/build-f928631003b7b9b8",
+   "client_commit": "df1cd76ef68fb8563fd29b0a363bf0c64980158e",
+   "client_dirty": false,
+   "client_host": "dgx1",
+   "nodes": {
+    "dgx1": {
+     "image_id": "sha256:6339bda1824733cba3c35f648f952e40c119e4fb3d8ce8c0d40a3c74db4224d8",
+     "container_started_at": "2026-10-19T00:21:40.763543971Z",
+     "checkout": "df1cd76ef68fb8563fd29b0a363bf0c64980158e"
+    },
+    "dgx2": {
+     "image_id": "sha256:6339bda1824733cba3c35f648f952e40c119e4fb3d8ce8c0d40a3c74db4224d8",
+     "container_started_at": "2026-10-19T00:21:39.998957712Z",
+     "checkout": "df1cd76ef68fb8563fd29b0a363bf0c64980158e"
+    },
+    "dgx3": {
+     "image_id": "sha256:6339bda1824733cba3c35f648f952e40c119e4fb3d8ce8c0d40a3c74db4224d8",
+     "container_started_at": "2026-10-19T00:21:40.37232748Z",
+     "checkout": "df1cd76ef68fb8563fd29b0a363bf0c64980158e"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": []
+  }
+ },
+ "finished_utc": "2026-10-19T01:27:48+00:00"
+}

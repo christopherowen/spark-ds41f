@@ -39,6 +39,24 @@ def serving_arguments(cluster: dict) -> list[str]:
     return args
 
 
+CONTEXT_ARGS = ("--max-model-len", "--kv-cache-memory-bytes")
+
+
+def argument(cluster: dict, flag: str) -> str:
+    args = cluster["serve_args"]
+    return args[args.index(flag) + 1]
+
+
+def without_context(args: list[str]) -> list[str]:
+    """``args`` without the context length and KV pool, the sizing r6x's TP3 1M changed."""
+    out = list(args)
+    for flag in CONTEXT_ARGS:
+        if flag in out:
+            at = out.index(flag)
+            del out[at : at + 2]
+    return out
+
+
 def draft_budget(cluster: dict) -> dict:
     args = cluster["serve_args"]
     speculative = json.loads(args[args.index("--speculative-config") + 1])
@@ -79,13 +97,14 @@ class RecipeTest(unittest.TestCase):
                          {k: v for k, v in released.items() if k not in naming})
 
     def test_each_shape_is_its_r6x_arm(self):
-        """tp4-ring resolves to r6x's release arm on the ring, tp3-triangle to r6x's arm on the
-        triangle (unqualified), apart from the names (the arms extend the frozen r6v recipe
-        and name r6x's lock)."""
+        """tp4-ring resolves to r6x's release arm on the ring, tp3-triangle to r6x's 1M arm on
+        the triangle, apart from the names (the arms extend the frozen r6v recipe, or the
+        recipe itself, and name r6x's lock)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
-        for shape, arm in (("tp4-ring", "r6x-tp4-1017.json"), ("tp3-triangle", "r6x-tp3-1017.json")):
+        for shape, arm in (("tp4-ring", "experiments/2026-10-18-r6x/r6x-tp4-1017.json"),
+                           ("tp3-triangle", "experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-1017.json")):
             resolved = recipe.resolve(self.recipe, shape)
-            released = load_spark().read_cluster(f"experiments/2026-10-18-r6x/{arm}")
+            released = load_spark().read_cluster(arm)
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
 
@@ -146,8 +165,11 @@ class RecipeTest(unittest.TestCase):
         """TP3 keeps what the triangle and its memory need, and nothing else of r6h."""
         resolved = recipe.resolve(self.recipe, "tp3-triangle")
         old = load("experiments/2026-10-14-one-recipe/tp3-r6h-production.json")
-        # Sizing, drafts and capture ladder (r6u serves another checkpoint with sampling defaults).
-        self.assertEqual(serving_arguments(resolved), serving_arguments(old))
+        # Since r6x the triangle serves 1M with a 4.90625 GiB pool (the expert scale codes freed
+        # the memory); everything else of r6h's sizing, drafts and capture ladder stays.
+        self.assertEqual(argument(resolved, "--max-model-len"), "1048576")
+        self.assertEqual(argument(resolved, "--kv-cache-memory-bytes"), "5268045824")
+        self.assertEqual(without_context(serving_arguments(resolved)), without_context(serving_arguments(old)))
         self.assertEqual(resolved["fabric"], old["fabric"])
         for key, value in old["environment"].items():
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
@@ -159,9 +181,8 @@ class RecipeTest(unittest.TestCase):
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # r6x changes TP3's path, so the triangle has no reference until its own release run;
-        # the ring has r6x's.
-        self.assertNotIn("benchmark_reference", resolved)
+        # Each shape has r6x's own release run.
+        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3")
         self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 

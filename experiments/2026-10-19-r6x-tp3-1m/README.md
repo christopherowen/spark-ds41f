@@ -58,3 +58,31 @@ during which every other stream waits, is not yet measured (servebench has no mi
 
 **Decision (owner, 2026-10-19):** TP3 promotes at 4,096; 8,192 is revisited after the CED
 skip (the prefill follow-ups' items 1 and 5), with the stall measured.
+
+## Release comparison (2026-10-19 00:21-03:41 UTC; tables in [results/](results/))
+
+r6x at 1M, r6v's TP3 at 512K (production's TP3 before), r6x again; verdicts against the repeat:
+
+| Suite | Metric | r6v TP3 | r6x TP3 1M | Change | ±95% | Repeat | Verdict |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| release-tp3 | engine grid, 14 shared shapes (step time) | | | -1.30% | 0.14% | -0.02% | better |
+| release-tp3 | c8 tok/s | 147.1 | 152.7 | +3.82% | 1.49% | -0.18% | better |
+| release-tp3 | c4 tok/s | 111.5 | 116.0 | +4.03% | 1.87% | -0.03% | better |
+| release-tp3 | Poisson tok/s (the offered load) | 117.6 | 118.3 | +0.65% | 21.7% | +0.21% | same |
+| release-tp3 | prefill 32K / 128K | 4,425 / 4,357 | 4,465 / 4,390 | +0.91% / +0.76% | 0.92% / 0.72% | | same |
+| release-tp3 | prefill 256K / 500K | 4,167 / 3,810 | 4,196 / 3,835 | +0.69% / +0.66% | 0.31% / 0.27% | | better |
+| single-stream | c1 tok/s | 57.0 | 59.7 | +4.73% | 6.32% | +0.13% | same (unpaired) |
+| sampled | c16 / c8 tok/s | 143.5 / 143.4 | 149.0 / 148.4 | +3.84% / +3.49% | 1.35% / 1.37% | | better |
+| sampled | c1 tok/s | 56.3 | 58.5 | +3.80% | 4.58% | +0.17% | same |
+
+No verdict is worse. The release table's headline omits the grid because its 1M shape exists
+only in r6x's grid; over the 14 shapes both run it is -1.30% (repeat -0.02%). One stream paired
+by window: +4.74% (±4.57%) and +4.89% (±4.41%) against r6v's TP3, the repeat +0.15% (±0.28%):
+better. Poisson (no interval): first token p50 -6%, p99 -16%, time per token -4.4%, goodput +6.5%.
+
+Model behaviour: greedy responses identical 256/256. r6x verifies fewer drafts per draft on the
+triangle than r6v's TP3 curves did (1.95 against 2.36) at level acceptance (2.25 against 2.26) and
+level tokens a step: the gain is the engine.
+
+**Verdict:** correct (outputs identical to TP3 production's) and faster, at twice the context with
+4.55 full 1M contexts of KV. Promoted on the owner's list ("validate, bench, promote").

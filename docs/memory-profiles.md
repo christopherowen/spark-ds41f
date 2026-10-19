@@ -9,13 +9,16 @@ shapes; `tp4-ring` is the four-node ring's TP4 1M shape, with 16 sequences
 | Shape | CPU pages | KV allocation per rank | Per-request token limit |
 | --- | ---: | ---: | ---: |
 | `tp3-triangle-4k` | 4 KiB | 2.2 GiB | 262,144 |
-| `tp3-triangle` | 64 KiB, memory-saver enabled | 3.5 GiB | 524,288 |
+| `tp3-triangle` | 64 KiB, memory-saver enabled | 4.91 GiB | 1,048,576 |
 | `tp4-ring` (four nodes) | 64 KiB, memory-saver enabled | 10.5 GiB | 1,048,576 |
 
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV
 capacity and admission are measured at startup and under load. The selected
-profile reports 2,845,543 KV tokens, or 5.43 full 524,288-token contexts.
+profile reports 4,765,898 KV tokens, or 4.55 full 1,048,576-token contexts (since r6x,
+whose expert scale codes freed the memory; r6v's 3.5 GiB pool held 2,845,543 tokens, 5.43
+full 524,288-token contexts). dgx1's 5 GiB startup guard bounds the pool: 5.875 GiB ended
+below it at graph capture (experiments/2026-10-19-r6x-tp3-1m).
 
 For simultaneous long-context admission checks, use
 `bench --admission-tokens 500000 --admission-output-tokens 4096 --admission-force-length`.
@@ -26,8 +29,9 @@ The report records the output budget and whether generation was forced.
 
 The 64 KiB allocation spends 1.3 GiB of the previously measured 1.78–1.86 GiB
 memory gain, retaining 0.48–0.56 GiB for additional workspace and variation.
-The checkpoint's native limit is 1,048,576 tokens. This profile increases the
-configured limit to 524,288 and validates that range without changing RoPE.
+The checkpoint's native limit is 1,048,576 tokens. Since r6x this profile serves the
+full range without changing RoPE; a cold 1,000,000-token prefill completes with dgx1 at
+5.93 GiB available, above its 3 GiB steady guard.
 
 Select the variant with `bin/spark site shape tp3-triangle-4k --apply` or
 `tp3-triangle` (the 64 KiB shape, also the normal GRUB boot default on all
