@@ -898,7 +898,8 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
         steps.append({"kind": "curves", "label": arm["label"], "config": config,
                       "out": f"{out}/curves-{arm['label']}.json"})
         for workload in workloads:
-            script, extra = PROFILE_WORKLOADS[workload]
+            script, defaults = PROFILE_WORKLOADS[workload]
+            extra = job.get("workload_args", {}).get(workload, defaults)
             steps.append({"kind": "profile", "config": config, "label": arm["label"], "workload": workload,
                           "argv": [f"{experiment}/{script}", head_url(), *extra],
                           "out": f"{out}/{arm['label']}"})

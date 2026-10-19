@@ -429,6 +429,16 @@ class ProfilePlanTest(unittest.TestCase):
         self.assertEqual(steps[-1]["labels"], ["r5o", "cand"])
         self.assertEqual(steps[-1]["out"], "results/private/determinism/costs3")
 
+    def test_profile_workload_arguments_replace_defaults_without_changing_other_workloads(self) -> None:
+        spec = {"experiment": "e", "run": "long-prefill", "jobs": [{
+            "kind": "profile", "workloads": ["decode", "prefill"],
+            "workload_args": {"prefill": ["--tokens", "131072"]},
+            "arms": [{"config": "cluster-prof.json", "label": "reference"}]}]}
+        steps = lab.plan(spec)
+        profiles = [step for step in steps if step["kind"] == "profile"]
+        self.assertEqual(profiles[0]["argv"][-2:], ["--tokens", "128"])
+        self.assertEqual(profiles[1]["argv"][-2:], ["--tokens", "131072"])
+
 
 class QueueTest(unittest.TestCase):
     def test_add_validates_and_orders_specs(self) -> None:

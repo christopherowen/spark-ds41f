@@ -219,6 +219,10 @@ stopped containers are kept; the next boot's `cluster start --replace` replaces 
 Set `"remove_stopped": true` on a job to remove them as well (`cluster stop --remove`).
 `run --dry-run` prints the production profile and each stop command.
 
+A `profile` job can replace a workload's default arguments, for example
+`"workload_args": {"prefill": ["--tokens", "131072"]}` for a cold 128K profile.
+Other workloads retain their defaults.
+
 Every arm must use the production profile's node map. `boot` refuses any other
 node set before launch, because a window cannot recable the fabric.
 
