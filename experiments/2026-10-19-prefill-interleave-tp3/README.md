@@ -63,6 +63,11 @@ budget, and load-dependent chunks that need one, wait on lowering that peak. The
 check and the 8,192 interleaving arms are unmeasured.
 
 **Recommendation.** TP3 keeps 4,096 with the skip (+11% prefill, outputs identical, the
-other streams' median step 10% shorter). Interval 2 is the owner's trade: the other
-streams' mean gap -38% and worst wait about 1.0 s, against 11% slower prefill while others
-decode. No promotion or production change.
+other streams' median step 10% shorter). No promotion or production change.
+
+**Interleaving is rejected** (owner, 2026-10-19): a prefill should pause only when other
+work needs the step, not on a fixed cadence. The decoding streams advance in every chunk
+step anyway, so holding a chunk back only speeds them at the long prompt's expense. The
+interval stays at 1. The way to give the other streams shorter steps without holding the
+prompt back is load-dependent chunks (full chunks when nobody else decodes), which wait on
+a larger budget and so on dgx1's startup peak.
