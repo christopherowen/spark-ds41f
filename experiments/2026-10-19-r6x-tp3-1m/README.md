@@ -36,3 +36,25 @@ margin and pays for its longer prefill stall.
 
 Gate: outputs identical; at least 4.5x reported; dgx1 above its guard through a 1M prefill; no
 release verdict worse than r6v's TP3.
+
+## Results so far (2026-10-19, the triangle, 1017)
+
+**Capacity.** vLLM reports 4,765,898 KV tokens, 4.55x for 1,048,576 (r6v's TP3: 2,845,543,
+5.43x for 524,288). Model load 94.26 GiB a rank.
+
+**Gate** (`gate-1017.json`): temperature-0 and greedy outputs identical to r6u's TP3 path
+(62313cb5 / 9742ac2c, 4d143977 / 12fd8257), zero token and log-probability differences in
+every scenario. Distinct streams: c8 147.6 tok/s, c4 112.5 (r6u's TP3 gate, another session:
+141.1 and 107.3). MemAvailable once serving: dgx1 6.70 GiB, dgx2 8.04, dgx3 8.11.
+
+**Cold 1M prefill** (`prefill-1m-1017.json`): 1,000,000 real-text tokens at 3,227 tok/s (310 s),
+none failed; dgx1's lowest MemAvailable during it 5.93 GiB (dgx2 7.36, dgx3 7.51), no swap.
+
+**Prefill budget 8,192** (`batched-8192-1017.json`): it boots past the startup guard; serving
+it leaves dgx1 5.07 GiB (dgx2 6.12, dgx3 6.25), 1.6-1.9 GiB less than 4,096; the cold 1M
+prefill runs at 3,725 tok/s (271 s, about +15%, one sample) with dgx1's lowest MemAvailable
+4.49 GiB, 1.5 GiB above its 3 GiB guard. Its cost, a prefill step of about 2.2 s against 1.3 s
+during which every other stream waits, is not yet measured (servebench has no mixed step).
+
+**Decision (owner, 2026-10-19):** TP3 promotes at 4,096; 8,192 is revisited after the CED
+skip (the prefill follow-ups' items 1 and 5), with the stall measured.
