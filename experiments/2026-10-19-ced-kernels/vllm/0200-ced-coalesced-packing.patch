@@ -1,0 +1,54 @@
+From 6fd6694b8bed71cb2a9efa5ab953755d6c700c47 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:27:06 +0200
+Subject: [PATCH] CED row copy: coalesce four contiguous elements per thread
+
+Upstream base: vLLM 19f2c20ed4d6 plus r6x and previous CED module patches.
+Rationale: remove measured metadata and row-copy regressions.
+Quality: integer metadata and bit-preserving row copies only; no serving path changes.
+Tests: source lint; GPU exactness and paired timing gates remain required.
+Upstream status: local experiment, not submitted.
+
+---
+ vllm/models/deepseek_v4_1/tilelang/ced.py | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 7352857b4..c5ed4574f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -207,7 +207,12 @@ def indices(starts, compact_starts, output, nr, nt):
+     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
+ 
+ 
+-@tilelang.jit(pass_configs=_PASS)
++@tilelang.jit(
++    pass_configs={
++        **_PASS,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
+ def copy_rows_kernel(
+     dtype: str, tail: tuple[int, ...], strides: tuple[int, ...], scatter: bool
+ ):
+@@ -218,6 +223,8 @@ def copy_rows_kernel(
+     for dim in tail:
+         width *= dim
+ 
++    layout = T.Fragment((512,), forward_fn=lambda i: (i // 4, i % 4))
++
+     def column_offset(col):
+         # Build the strided address at specialization time; a TIR loop variable
+         # cannot index Python's layout tuples.
+@@ -241,7 +248,7 @@ def copy_rows_kernel(
+             threads=128,
+         ) as bx:
+             source_offset = T.alloc_var(T.int64)
+-            for i in T.Parallel(512):
++            for i in T.Parallel(512, loop_layout=layout):
+                 offset = T.cast(bx * 512 + i, T.int64)
+                 row = offset // width
+                 col = offset % width
+-- 
+2.54.0 (Apple Git-157)
+

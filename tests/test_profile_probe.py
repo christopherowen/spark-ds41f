@@ -35,3 +35,18 @@ class OneRowTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "forward failed"):
                 profile.one_row("http://server", requests=24)
         self.assertTrue(calls[-1][0].endswith("/stop_profile"))
+
+
+class CedAttributionTest(unittest.TestCase):
+    def test_excludes_encoder_and_draft_and_refuses_partial_groups(self):
+        def routed(layers, tiles, start=0):
+            return [dict(cat='kernel', name='moe_grouped_fp8_fp4_gemm_kernel',
+                         ts=start + i * 1000, dur=100,
+                         args={'grid': [12 if i % 2 == 0 else 40, tiles, 1]})
+                    for i in range(layers * 2)]
+        events = routed(3, 1143) + routed(20, 408, 10000) + routed(3, 15, 60000)
+        self.assertEqual(profile.ced_moe_costs(events, rows=128)[0]['routed_ffn_ms'], 4)
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            profile.ced_moe_costs(events + routed(1, 408, 90000), rows=128)
+        events = routed(40, 6) + [dict(cat='kernel', name='_prepare_dflash_inputs_kernel', ts=90000, dur=1)] + routed(3, 6, 100000)
+        self.assertEqual(profile.ced_moe_costs(events, rows=1)[0]['routed_ffn_ms'], 4)
