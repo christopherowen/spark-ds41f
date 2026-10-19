@@ -20,7 +20,7 @@ from vllm.models.deepseek_v4_1.tilelang import metadata  # noqa: E402
 from vllm.triton_utils import triton  # noqa: E402
 
 
-@pytest.mark.parametrize("max_requests", [1, 8, 16, 32])
+@pytest.mark.parametrize("max_requests", [1, 8, 16, 32, 48, 64])
 @pytest.mark.parametrize("nr", [0, 1, 3])
 def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
     """Per-request limits preserve the old 128/full-row metadata, including padding."""

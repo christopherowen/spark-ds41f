@@ -1,0 +1,89 @@
+From 614873756954cb21210baf27032c68f740793d34 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:02:14 +0200
+Subject: [PATCH] CED requests: scan with lane shuffles without shared-memory
+ barriers
+
+Upstream base: vLLM 19f2c20ed4d6 plus r6x and earlier CED module patches.
+Rationale: remove scan barriers and measure every port at serving shapes.
+Quality: integer-only kernels; serving call sites unchanged.
+Tests: syntax/lint pass, GPU exactness and paired timing remain experimental.
+Upstream status: local experiment, not submitted.
+
+---
+ vllm/models/deepseek_v4_1/tilelang/ced.py | 41 ++++++++++++++---------
+ 1 file changed, 26 insertions(+), 15 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index c2bfa6da4..9de51a18a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -12,7 +12,9 @@ _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
+ def requests_kernel(max_requests: int):
+     starts_len = T.dynamic("starts_len")
+     seq_len = T.dynamic("seq_len")
+-    block = max(32, 1 << max_requests.bit_length())
++    chunks = (max_requests + 31) // 32
++    scan_steps = min(5, (max_requests - 1).bit_length())
++    last_lane = min(max_requests, 32) - 1
+ 
+     @T.prim_func
+     def ced_requests(
+@@ -27,31 +29,40 @@ def requests_kernel(max_requests: int):
+         nr: T.int32,
+     ):
+         with T.Kernel(1, threads=32):
+-            kept = T.alloc_fragment((block,), T.int32)
+-            cumulative = T.alloc_fragment((block,), T.int32)
+-            for r in T.Parallel(block):
+-                kept[r] = T.if_then_else(
++            lane = T.get_thread_binding()
++            kept = T.alloc_var(T.int32)
++            cumulative = T.alloc_var(T.int32)
++            carry = T.alloc_var(T.int32)
++            carry = 0
++            for chunk in T.serial(chunks):
++                r = chunk * 32 + lane
++                kept = T.if_then_else(
+                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
+                 )
+-            T.cumsum(kept, cumulative, dim=0)
+-            for r in T.Parallel(block):
+-                if r <= max_requests:
+-                    out_starts[r] = cumulative[r] - kept[r]
++                cumulative = kept
++                for step in T.unroll(scan_steps):
++                    prior = T.shfl_up(cumulative, 1 << step)
++                    cumulative = cumulative + T.if_then_else(
++                        lane >= 1 << step, prior, 0
++                    )
++                cumulative = cumulative + carry
+                 if r < max_requests:
++                    out_starts[r] = cumulative - kept
+                     if r < nr:
+                         q = starts[r + 1] - starts[r]
+-                        position = T.cast(seq[r], T.int64) - kept[r]
++                        position = T.cast(seq[r], T.int64) - kept
+                         positions[r] = position
+                         replay[r] = T.max(
+-                            prefix[r], T.if_then_else(q > kept[r], position, 0)
++                            prefix[r], T.if_then_else(q > kept, position, 0)
+                         )
+                     else:
+                         positions[r] = -1
+                         replay[r] = 0
+-                if r == block - 1:
+-                    counts[0] = cumulative[r]
+-                if r == 0:
+-                    counts[1] = nr
++                carry = T.shfl_sync(cumulative, last_lane)
++            if lane == 0:
++                out_starts[max_requests] = carry
++                counts[0] = carry
++                counts[1] = nr
+ 
+     return ced_requests
+ 
+-- 
+2.54.0 (Apple Git-157)
+
