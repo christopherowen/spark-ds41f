@@ -27,7 +27,7 @@ def post(path, body=None):
 with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     model = json.load(response)["data"][0]["id"]
 body = {"model": model, "messages": [{"role": "user", "content": PROMPT}], "max_tokens": TOKENS,
-        "temperature": 0, "chat_template_kwargs": {"thinking": False}}
+        "temperature": 0, "ignore_eos": True, "chat_template_kwargs": {"thinking": False}}
 post("/v1/chat/completions", dict(body, cache_salt=uuid.uuid4().hex))
 post("/start_profile")
 result = post("/v1/chat/completions", dict(body, cache_salt=uuid.uuid4().hex))

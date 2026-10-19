@@ -9,3 +9,5 @@ Use the production recipe for restoration. No weights, sampling, sizing, clock s
 Run: `scripts/lab.py run experiments/2026-10-19-prefill-ceiling/profile.json`. The lab restores production when the run ends. TP4 remains unmeasured until the site is cabled as the ring.
 
 First attempt: the full-request, shape-recording profiler completed the cold request but crossed the steady memory floor while exporting at 06:41 UTC. The guard stopped the profiling container at 2.58 GiB available (3 GiB floor); no trace survived. The lab restored production. Keep this failed attempt. The bounded retry records three non-final iterations after 20 wait and one warm-up iteration, with shape retention and aggregate CUDA tables disabled. Sizing and memory guards stay unchanged.
+
+The bounded run saved all three prefill traces (130,567 prompt tokens, warm 29.515 s, profiled 31.267 s). Its decode stopped at EOS after 107 tokens, before the 20-step wait and active window, and produced no decode trace. The v2 run forces 512 decode tokens and adds a tested one-row raw-token workload for the decoder's one-row comparison. Missing rank traces now fail the lab step.

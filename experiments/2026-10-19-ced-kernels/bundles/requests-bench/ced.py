@@ -26,32 +26,32 @@ def requests_kernel(max_requests: int):
         counts: T.Tensor((2,), T.int32),
         nr: T.int32,
     ):
-        with T.Kernel(1, threads=128):
-            kept = T.alloc_shared((block,), T.int32)
-            cumulative = T.alloc_shared((block,), T.int32)
+        with T.Kernel(1, threads=32):
+            kept = T.alloc_fragment((block,), T.int32)
+            cumulative = T.alloc_fragment((block,), T.int32)
             for r in T.Parallel(block):
                 kept[r] = T.if_then_else(
                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
                 )
-            T.copy(kept, cumulative)
-            T.cumsum(cumulative, dim=0)
-            for r in T.Parallel(max_requests + 1):
-                out_starts[r] = T.if_then_else(
-                    r < nr, cumulative[r] - kept[r], cumulative[block - 1]
-                )
-            for r in T.Parallel(max_requests):
-                if r < nr:
-                    q = starts[r + 1] - starts[r]
-                    position = T.cast(seq[r], T.int64) - kept[r]
-                    positions[r] = position
-                    replay[r] = T.max(
-                        prefix[r], T.if_then_else(q > kept[r], position, 0)
-                    )
-                else:
-                    positions[r] = -1
-                    replay[r] = 0
-            for i in T.Parallel(2):
-                counts[i] = T.if_then_else(i == 0, cumulative[block - 1], nr)
+            T.cumsum(kept, cumulative, dim=0)
+            for r in T.Parallel(block):
+                if r <= max_requests:
+                    out_starts[r] = cumulative[r] - kept[r]
+                if r < max_requests:
+                    if r < nr:
+                        q = starts[r + 1] - starts[r]
+                        position = T.cast(seq[r], T.int64) - kept[r]
+                        positions[r] = position
+                        replay[r] = T.max(
+                            prefix[r], T.if_then_else(q > kept[r], position, 0)
+                        )
+                    else:
+                        positions[r] = -1
+                        replay[r] = 0
+                if r == block - 1:
+                    counts[0] = cumulative[r]
+                if r == 0:
+                    counts[1] = nr
 
     return ced_requests
 
@@ -118,6 +118,16 @@ def copy_rows_kernel(
     for dim in tail:
         width *= dim
 
+    def column_offset(col):
+        # Build the strided address at specialization time; a TIR loop variable
+        # cannot index Python's layout tuples.
+        result = 0
+        divisor = 1
+        for dim, stride in zip(reversed(tail), reversed(strides[1:])):
+            result = result + (col // divisor % dim) * stride
+            divisor *= dim
+        return result
+
     @T.prim_func
     def ced_copy_rows(
         source: T.Tensor((source_span,), dtype),
@@ -142,14 +152,7 @@ def copy_rows_kernel(
                     )
                     if valid:
                         source_row = row if scatter else index
-                        source_offset = source_row * strides[0]
-                        remainder = col
-                        for reverse in T.unroll(len(tail)):
-                            axis = len(tail) - 1 - reverse
-                            source_offset += (remainder % tail[axis]) * strides[
-                                axis + 1
-                            ]
-                            remainder = remainder // tail[axis]
+                        source_offset = source_row * strides[0] + column_offset(col)
                         if scatter:
                             output[index * width + col] = source[source_offset]
                         else:
@@ -162,7 +165,11 @@ def copy_rows_kernel(
 
 def copy_rows(source, row_indices, output, scatter: bool):
     """Copy logical rows from a possibly strided source without copying its storage."""
-    span = 1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
+    span = (
+        1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
+        if source.numel()
+        else 0
+    )
     flat_source = source.as_strided((span,), (1,))
     copy_rows_kernel(
         str(source.dtype).removeprefix("torch."),

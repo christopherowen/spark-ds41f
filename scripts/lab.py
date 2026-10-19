@@ -879,6 +879,7 @@ PROFILE_WORKLOADS = {
     "decode": ("profile_decode.py", ["--tokens", "128"]),
     "c8": ("profile_c8.py", ["--case", "json", "--streams", "8", "--tokens", "128"]),
     "prefill": ("profile_prefill.py", ["--tokens", "16384"]),
+    "one_row": ("profile_one_row.py", []),
     # The bench's code point at sixteen streams (the experiment's profile_c8.py needs a
     # code case).
     "code16": ("profile_c8.py", ["--case", "code", "--streams", "16", "--tokens", "256"]),
@@ -890,7 +891,7 @@ def profile_steps(spec: dict, job: dict) -> list[dict]:
     summaries and cost comparisons against the first arm, computed while the cluster is stopped."""
     experiment = spec["experiment"]
     out = f"results/private/determinism/{spec['run']}"
-    workloads = job.get("workloads", list(PROFILE_WORKLOADS))
+    workloads = job.get("workloads", [name for name in PROFILE_WORKLOADS if name != "one_row"])
     steps = []
     for arm in job["arms"]:
         config = arm_config_path(experiment, arm["config"])
@@ -1164,7 +1165,8 @@ def profile_workload(step: dict) -> None:
         before = sizes
         time.sleep(5)
     else:
-        log(f"traces under {host_relative} did not settle: {before}")
+        raise RuntimeError(f"profile {step['label']} {workload}: traces under {host_relative} "
+                           f"did not settle on every rank: {before}")
     each(lambda node: in_container(node, f"mkdir -p {container_dir}/{workload} && "
                                          f"mv {container_dir}/*rank*.json.gz {container_dir}/{workload}/"))
 
