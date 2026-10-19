@@ -108,7 +108,13 @@ def requests_cases():
                     128,
                 ),
                 lambda: ced.requests(
-                    starts, seq, limits, prefix, *outputs[1], requests
+                    starts,
+                    seq,
+                    limits,
+                    prefix,
+                    *outputs[1],
+                    requests,
+                    compact=length > 128,
                 ),
                 lambda: all(torch.equal(a, b) for a, b in zip(*outputs)),
             )

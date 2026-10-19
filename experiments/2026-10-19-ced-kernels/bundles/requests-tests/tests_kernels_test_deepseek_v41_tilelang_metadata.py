@@ -21,7 +21,7 @@ from vllm.triton_utils import triton  # noqa: E402
 
 
 @pytest.mark.parametrize("max_requests", [1, 8, 16, 32, 48, 64])
-@pytest.mark.parametrize("nr", [0, 1, 3])
+@pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
 def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
     """Per-request limits preserve the old 128/full-row metadata, including padding."""
     from vllm.models.deepseek_v4_1.ced import _decoder_requests
@@ -63,6 +63,21 @@ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
                 ced.requests(
                     starts, seq, limits, prefix, out, positions, replay, counts, nr
                 )
+            if implementation == "tilelang" and all(
+                q <= 128 or r % 2 == 0 for r, q in enumerate(lengths)
+            ):
+                ced.requests(
+                    starts,
+                    seq,
+                    limits,
+                    prefix,
+                    out,
+                    positions,
+                    replay,
+                    counts,
+                    nr,
+                    compact=False,
+                )
             outputs.append((out, positions, replay, counts))
         for reference, actual in zip(*outputs):
             assert torch.equal(reference, actual)
@@ -91,6 +106,23 @@ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, trans
     restored = torch.zeros((7, *source.shape[1:]), dtype=dtype, device=DEVICE)
     ced.copy_rows(output, indices, restored, True)
     assert torch.equal(scatter_rows(output, indices, 7), restored)
+
+
+@pytest.mark.parametrize("rows", [1, 48, 4048])
+@pytest.mark.parametrize("tail", [(5120,), (4, 5120)])
+def test_ced_row_copy_serving_widths(rows, tail):
+    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    source = torch.randn((rows, *tail), dtype=torch.bfloat16, device=DEVICE)
+    indices = torch.arange(max(0, rows - 128), rows, dtype=torch.int64, device=DEVICE)
+    expected = gather_rows(source, indices)
+    output = torch.empty_like(expected)
+    ced.copy_rows(source, indices, output, False)
+    assert torch.equal(expected, output)
+    restored = torch.zeros_like(source)
+    ced.copy_rows(output, indices, restored, True)
+    assert torch.equal(scatter_rows(output, indices, rows), restored)
 
 
 @pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])

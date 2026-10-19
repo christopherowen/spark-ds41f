@@ -1,0 +1,43 @@
+From 47fc168a857a3b895ba624e6f3d28d4f39b9b88f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:08:18 +0200
+Subject: [PATCH] CED row copy: use a per-thread address register for wide
+ layouts
+
+Upstream base: vLLM 19f2c20ed4d6 plus r6x and prior CED module patches.
+Rationale: pass exactness and per-call timing at serving shapes.
+Quality: no numerical arithmetic or serving call-site changes.
+Tests: lint and syntax pass; GPU candidate gates remain required.
+Upstream status: local experiment, not submitted.
+
+---
+ vllm/models/deepseek_v4_1/tilelang/ced.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index a4d32d7fe..c808a8d1c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -204,6 +204,7 @@ def copy_rows_kernel(
+             T.ceildiv((source_rows if scatter else output_rows) * width, 512),
+             threads=128,
+         ) as bx:
++            source_offset = T.alloc_var(T.int64)
+             for i in T.Parallel(512):
+                 offset = T.cast(bx * 512 + i, T.int64)
+                 row = offset // width
+@@ -215,8 +216,9 @@ def copy_rows_kernel(
+                         index < (output_rows if scatter else source_rows)
+                     )
+                     if valid:
+-                        source_row = row if scatter else index
+-                        source_offset = source_row * strides[0] + column_offset(col)
++                        source_offset = (row if scatter else index) * strides[
++                            0
++                        ] + column_offset(col)
+                         if scatter:
+                             output[index * width + col] = source[source_offset]
+                         else:
+-- 
+2.54.0 (Apple Git-157)
+

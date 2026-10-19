@@ -8,13 +8,51 @@ import tilelang.language as T
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 
 
-@tilelang.jit(pass_configs=_PASS)
-def requests_kernel(max_requests: int):
+@tilelang.jit(
+    pass_configs={
+        **_PASS,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    }
+)
+def requests_kernel(max_requests: int, compact: bool = True):
     starts_len = T.dynamic("starts_len")
     seq_len = T.dynamic("seq_len")
     chunks = (max_requests + 31) // 32
     scan_steps = min(5, (max_requests - 1).bit_length())
     last_lane = min(max_requests, 32) - 1
+
+    if not compact:
+
+        @T.prim_func
+        def ced_identity(
+            starts: T.Tensor((starts_len,), T.int32),
+            seq: T.Tensor((seq_len,), T.int32),
+            limits: T.Tensor((max_requests,), T.int32),
+            prefix: T.Tensor((max_requests,), T.int64),
+            out_starts: T.Tensor((max_requests + 1,), T.int32),
+            positions: T.Tensor((max_requests,), T.int64),
+            replay: T.Tensor((max_requests,), T.int64),
+            counts: T.Tensor((2,), T.int32),
+            nr: T.int32,
+        ):
+            with T.Kernel(T.ceildiv(max_requests + 1, 128), threads=128) as bx:
+                r = bx * 128 + T.get_thread_binding()
+                if r <= max_requests:
+                    out_starts[r] = starts[T.min(r, nr)]
+                if r < max_requests:
+                    if r < nr:
+                        positions[r] = T.cast(seq[r], T.int64) - (
+                            starts[r + 1] - starts[r]
+                        )
+                        replay[r] = prefix[r]
+                    else:
+                        positions[r] = -1
+                        replay[r] = 0
+                if r == 0:
+                    counts[0] = starts[nr]
+                    counts[1] = nr
+
+        return ced_identity
 
     @T.prim_func
     def ced_requests(
@@ -39,13 +77,16 @@ def requests_kernel(max_requests: int):
                 kept = T.if_then_else(
                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
                 )
-                cumulative = kept
-                for step in T.unroll(scan_steps):
-                    prior = T.shfl_up(cumulative, 1 << step)
-                    cumulative = cumulative + T.if_then_else(
-                        lane >= 1 << step, prior, 0
-                    )
-                cumulative = cumulative + carry
+                if nr <= 1:
+                    cumulative = T.shfl_sync(kept, 0) + carry
+                else:
+                    cumulative = kept
+                    for step in T.unroll(scan_steps):
+                        prior = T.shfl_up(cumulative, 1 << step)
+                        cumulative = cumulative + T.if_then_else(
+                            lane >= 1 << step, prior, 0
+                        )
+                    cumulative = cumulative + carry
                 if r < max_requests:
                     out_starts[r] = cumulative - kept
                     if r < nr:
@@ -67,8 +108,20 @@ def requests_kernel(max_requests: int):
     return ced_requests
 
 
-def requests(starts, seq, limits, prefix, out_starts, positions, replay, counts, nr):
-    requests_kernel(positions.shape[0])(
+def requests(
+    starts,
+    seq,
+    limits,
+    prefix,
+    out_starts,
+    positions,
+    replay,
+    counts,
+    nr,
+    *,
+    compact=True,
+):
+    requests_kernel(positions.shape[0], compact)(
         starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
     )
 
@@ -151,6 +204,7 @@ def copy_rows_kernel(
             T.ceildiv((source_rows if scatter else output_rows) * width, 512),
             threads=128,
         ) as bx:
+            source_offset = T.alloc_var(T.int64)
             for i in T.Parallel(512):
                 offset = T.cast(bx * 512 + i, T.int64)
                 row = offset // width
@@ -162,8 +216,9 @@ def copy_rows_kernel(
                         index < (output_rows if scatter else source_rows)
                     )
                     if valid:
-                        source_row = row if scatter else index
-                        source_offset = source_row * strides[0] + column_offset(col)
+                        source_offset = (row if scatter else index) * strides[
+                            0
+                        ] + column_offset(col)
                         if scatter:
                             output[index * width + col] = source[source_offset]
                         else:
