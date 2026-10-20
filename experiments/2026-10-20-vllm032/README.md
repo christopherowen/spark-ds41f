@@ -32,6 +32,11 @@ It does not apply the separate broadcast or rejection-sink experiments.
   attention config. Use V2, compilation mode `NONE` and `FULL_DECODE_ONLY` graphs.
 - Remove obsolete prefill, graph-size and JIT-monitor flags and AOT environment
   settings. Enable the native minimum-token constraint mask explicitly.
+- Count the intersection of adaptively verified and grammar-valid draft
+  prefixes once for global and per-request statistics. This prevents a negative
+  Prometheus counter increment from stopping the API output handler. Preserve
+  batch statistics when a later request has no valid drafts. Generated tokens,
+  inference kernels and rejection rollback are unchanged.
 
 Normal per-node checkpoint mounts and upstream fabric/host guards are retained.
 There are no shared-weight services, site-local Engram plans, external NCCL
@@ -71,6 +76,13 @@ tests, with the existing nonfinite-indexer-query-scale contract marked as an
 expected failure. It covers checkpoint routing, stock file offsets,
 configuration rejection, greedy verification, DFlash inputs, dead rows,
 rejection chunking, preparation, attention, MoE and vocabulary kernels.
+
+The draft-accounting regression runs the real scheduler on CPU across 54 cases:
+the original code fails 24 and passes 30; the corrected code passes all 54.
+Coverage includes verified/grammar prefix overlap, missing verification counts,
+zero valid drafts, batch accumulation, rejection rollback and all per-request
+metric levels with global logging enabled or disabled. These checks use the
+candidate scheduler and test helpers in a compatible vLLM 0.32 environment.
 
 These source tests used a compatible ARM64 CUDA environment with B12X 1.5.1,
 FlashInfer 0.7.1 and the patched TileLang compiler. The public Docker recipe

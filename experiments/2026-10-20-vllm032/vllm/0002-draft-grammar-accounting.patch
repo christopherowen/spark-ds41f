@@ -1,0 +1,164 @@
+From e23660b3a3837316594af18370aa4a9be97cdd21 Mon Sep 17 00:00:00 2001
+From: Herlon Aguiar <3419441+mxfp0@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:18:54 +0200
+Subject: [PATCH] Fix draft statistics after adaptive grammar filtering
+
+Upstream base: vllm-project/vllm v0.32.0, 5df63a7203cdb9328d824a27b682e77c7b9928be, after 0001-native-tilelang-vllm032.patch.
+
+Rationale: adaptive verification and grammar validation retain prefixes of the same scheduled draft. Count their intersection once for global and per-request statistics. Subtracting the full grammar-invalid suffix from the shortened verification count can produce a negative Prometheus counter and stop the API output handler. Preserve earlier batch statistics when a later request has no valid drafts.
+
+Quality implications: inference tokens, kernels and rejection rollback are unchanged.
+
+Tests: 54 real Scheduler schedule/update_from_output CPU cases cover verification and grammar overlap, absent verification counts, zero valid drafts, batch accumulation, rollback and all per-request metric levels with global logging enabled or disabled.
+
+Upstream status: included in spark-ds41f PR #450; not submitted separately to vllm-project/vllm.
+---
+ .../test_spec_decode_grammar_accounting.py    | 79 +++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py               | 24 ++----
+ 2 files changed, 87 insertions(+), 16 deletions(-)
+ create mode 100644 tests/v1/core/test_spec_decode_grammar_accounting.py
+
+diff --git a/tests/v1/core/test_spec_decode_grammar_accounting.py b/tests/v1/core/test_spec_decode_grammar_accounting.py
+new file mode 100644
+index 0000000..f61376b
+--- /dev/null
++++ b/tests/v1/core/test_spec_decode_grammar_accounting.py
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import pytest
++
++from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
++
++from .utils import create_requests, create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.mark.parametrize("level", ["none", "summary", "detailed"])
++@pytest.mark.parametrize("log_stats", [False, True])
++@pytest.mark.parametrize(
++    "cases",
++    [
++        [(1, 4, 0, 1)],
++        [(4, 4, 1, 1)],
++        [(5, 4, 1, 1)],
++        [(1, 0, 1, 1)],
++        [(5, 0, 5, 5)],
++        [(1, 5, 0, 0)],
++        [(0, 4, 0, 0)],
++        [(None, 4, 1, 1)],
++        [(1, 0, 0, 1), (1, 5, 0, 0)],
++    ],
++)
++def test_verified_grammar_draft_accounting(cases, log_stats, level):
++    scheduler = create_scheduler(
++        num_speculative_tokens=5,
++        per_request_spec_decode_metrics=level,
++    )
++    scheduler.log_stats = log_stats
++    requests = create_requests(num_requests=len(cases), num_tokens=1)
++    for request in requests:
++        scheduler.add_request(request)
++    ids = [request.request_id for request in requests]
++
++    def model_output(sampled, verified=None):
++        return ModelRunnerOutput(
++            req_ids=ids,
++            req_id_to_index={rid: i for i, rid in enumerate(ids)},
++            sampled_token_ids=sampled,
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++            num_verified_draft_tokens=verified,
++        )
++
++    scheduler.update_from_output(
++        scheduler.schedule(), model_output([[0] for _ in cases])
++    )
++    scheduler.update_draft_token_ids(DraftTokenIds(ids, [[1, 2, 3, 4, 5] for _ in cases]))
++    scheduled = scheduler.schedule()
++    scheduled.num_invalid_spec_tokens = {
++        rid: case[1] for rid, case in zip(ids, cases) if case[1]
++    }
++    before = [request.num_computed_tokens for request in requests]
++    verified = None if cases[0][0] is None else [case[0] for case in cases]
++    outputs = scheduler.update_from_output(
++        scheduled,
++        model_output([list(range(1, case[2] + 2)) for case in cases], verified),
++    )
++    expected = sum(case[3] for case in cases)
++    if log_stats:
++        stats = outputs[0].scheduler_stats.spec_decoding_stats
++        if expected:
++            assert stats.num_draft_tokens == expected
++            assert stats.num_accepted_tokens == sum(case[2] for case in cases)
++        else:
++            assert stats is None
++    for request, computed, case in zip(requests, before, cases):
++        assert request.num_computed_tokens == computed - (5 - case[2])
++        if level == "none":
++            assert request.spec_decode_metrics is None
++        else:
++            metrics = request.spec_decode_metrics.to_dict()
++            assert metrics["num_draft_tokens"] == case[3]
++            assert metrics["num_accepted_draft_tokens"] == case[2]
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 33fc3e4..a6f8c97 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2120,6 +2120,12 @@ class Scheduler(SchedulerInterface):
+                         req_index
+                     ]
+                     assert 0 <= num_draft_tokens <= num_scheduled_draft_tokens
++                if scheduler_output.num_invalid_spec_tokens:
++                    num_draft_tokens = min(
++                        num_draft_tokens,
++                        num_scheduled_draft_tokens
++                        - scheduler_output.num_invalid_spec_tokens.get(req_id, 0),
++                    )
+                 num_sampled = self.num_sampled_tokens_per_step
+                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                 assert num_accepted <= num_draft_tokens
+@@ -2137,20 +2143,10 @@ class Scheduler(SchedulerInterface):
+                     spec_decoding_stats,
+                     num_draft_tokens=num_draft_tokens,
+                     num_accepted_tokens=num_accepted,
+-                    num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+-                    request_id=req_id,
+                 )
+                 if request.spec_decode_metrics is not None:
+-                    # Exclude grammar-invalidated drafts from the proposed
+-                    # count, mirroring make_spec_decoding_stats; the accepted
+-                    # bucket (j) is unaffected.
+-                    adj_draft_tokens = num_draft_tokens
+-                    if scheduler_output.num_invalid_spec_tokens:
+-                        adj_draft_tokens -= (
+-                            scheduler_output.num_invalid_spec_tokens.get(req_id, 0)
+-                        )
+                     request.spec_decode_metrics.observe(
+-                        num_draft_tokens=adj_draft_tokens,
++                        num_draft_tokens=num_draft_tokens,
+                         num_accepted=num_accepted,
+                         detailed=self.spec_decode_metrics_level == "detailed",
+                     )
+@@ -2970,15 +2966,11 @@ class Scheduler(SchedulerInterface):
+         spec_decoding_stats: SpecDecodingStats | None,
+         num_draft_tokens: int,
+         num_accepted_tokens: int,
+-        num_invalid_spec_tokens: dict[str, int] | None,
+-        request_id: str,
+     ) -> SpecDecodingStats | None:
+         if not self.log_stats or not num_draft_tokens:
+-            return None
++            return spec_decoding_stats
+         if spec_decoding_stats is None:
+             spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
+-        if num_invalid_spec_tokens:
+-            num_draft_tokens -= num_invalid_spec_tokens.get(request_id, 0)
+         spec_decoding_stats.observe_draft(
+             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+         )
+-- 
+2.43.0
+
