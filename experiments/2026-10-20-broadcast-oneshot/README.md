@@ -5,8 +5,10 @@ Owner, 2026-10-20: "we should move the broadcast over because it's a relatively 
 **Status:** vLLM branch `broadcast-oneshot`, one commit on r6x's patch head 7316c7f9f
 (d5bfe0203, tree 15a206a6), in ~/projects/vllm-ds41-broadcast-oneshot; the series patch
 [vllm/0185-RoCE-policy-the-TP-group-s-broadcast-on-the-policy-s.patch](vllm/0185-RoCE-policy-the-TP-group-s-broadcast-on-the-policy-s.patch)
-(provisional number 0185). CPU tests pass on dgx4 ([runs/tests.txt](runs/tests.txt)). The gate
-and the release comparison wait for a window.
+(provisional number 0185). CPU tests pass on dgx4 ([runs/tests.txt](runs/tests.txt)).
+**Gated on the TP3 triangle on 2026-10-20 ([Results](#results-tp3-2026-10-20)): outputs
+identical to r6x's, no release metric changed, about 0.1 GiB a rank freed.** The release tests
+(`scripts/release_tests.py gate`) and the ring have not run; promotion is the owner's call.
 
 ## What production does today
 
@@ -76,3 +78,40 @@ overlay.
 Outputs identical to r6x's, release tests and the policy suite pass, no release metric worse than
 r6x's. Rollback: the arms mount files over the promoted image, so restoring production is the
 window's close.
+
+## Results (TP3, 2026-10-20)
+
+Shared lab queue on the triangle, r6x image with the overlay (vLLM d5bfe0203).
+
+**Gate** ([gate-tp3.json](gate-tp3.json), 10:57-11:07 UTC,
+[runs/broadcast-tp3-gate-table.txt](runs/broadcast-tp3-gate-table.txt)):
+temperature-0 (62313cb5 / 9742ac2c, log probabilities included) and greedy (4d143977 / 12fd8257)
+outputs equal r6x's triangle references, zero token and log-probability differences in every
+scenario. Distinct streams: c8 146.3 tok/s, c4 112.2 (r6x's TP3 gate on 2026-10-19: 147.6 and
+112.5).
+
+**Memory:** MemAvailable once serving, dgx1/dgx2/dgx3: 6.77 / 8.16 / 8.23 GiB against r6x's gate
+6.70 / 8.04 / 8.11 (another day), so the PyTorch NCCL communicator the broadcast created cost
+about 0.1 GiB a rank on this path, not 0142's "about 3.4 GB".
+
+**Release comparison** ([release-tp3.json](release-tp3.json), 11:07-13:30 UTC; candidate, r6x,
+candidate again; [runs/broadcast-tp3-release-table.txt](runs/broadcast-tp3-release-table.txt),
+[runs/broadcast-tp3-release-single-stream-table.txt](runs/broadcast-tp3-release-single-stream-table.txt)):
+
+| Metric | Change | ±95% | Repeat | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| decode geometric mean (15 shapes) | +0.29% | 0.14% | +0.44% | same |
+| c8 output tok/s | -0.11% | 1.12% | -0.05% | same |
+| c4 output tok/s | -0.29% | 1.83% | +0.16% | same |
+| Poisson output tok/s | +0.07% | 22.16% | -0.05% | same |
+| prefill 32K / 131K / 262K / 500K | -0.37 / -0.24 / -0.20 / -0.17% | 0.21-0.95% | +0.32-0.43% | same |
+| c1 output tok/s (single-stream) | +0.09% | 7.12% | -0.03% | same |
+
+Model behaviour: greedy responses identical 256/256, teacher-forced distributions identical
+over 65,536 positions (KL 0), perplexity 1.31340 both.
+
+**Reading:** as expected, no speed effect. What the change buys is structural: the TP group's
+broadcast now obeys the RoCE policy (no PyTorch process group, no second NCCL communicator
+with its own stream and 600 s watchdog), runs in the model stream under the one-shot runtime's
+timeout and fail-stop, and raises instead of reaching NCCL for a tensor the all-gather cannot
+take.
