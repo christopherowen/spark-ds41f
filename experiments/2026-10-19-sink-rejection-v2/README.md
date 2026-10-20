@@ -6,16 +6,17 @@ token, with the forward pass untouched. v1 of the candidate (record on the local
 rollback. A read-only review the same day found the rollback unsafe. This record rebuilds the
 correction on the speculative-decoding machinery.
 
-**Status:** vLLM branch `sink-rejection-v2`, one commit on `r6x-candidate` f3b58ed9d (5ac8364ec), in
+**Status: the full GPU gate passed** (2026-10-20 13:31-18:50 UTC, [GPU gate](#gpu-gate-owner-2026-10-20-run-the-full-gate-the-grid-settles-the-step-cost)).
+vLLM branch `sink-rejection-v2`, one commit on `r6x-candidate` f3b58ed9d (5ac8364ec), in
 ~/projects/vllm-ds41-sink-rejection; the series patch
 [vllm/0221-Sink-detector-and-draft-zero-rejection.patch](vllm/0221-Sink-detector-and-draft-zero-rejection.patch)
-(provisional number 0221, replacing v1's 0221; one patch onto `r6x-candidate` f3b58ed9d). CPU tests and
-dgx4's own GPU pass ([runs/tests.txt](runs/tests.txt)). Screened twice on the TP3 triangle. The first
-screen (threshold 50,000) changed 2 of 128 greedy responses at number tokens; a 358,785-token survey
-set the threshold to 85,000; the second screen gives 128/128 greedy responses identical to r6x, still
-cleans `Say hi.`, `Thanks!` and `ok` with every rank flagging the same rows, keeps throughput level,
-and adds one decode step to time to first token. Open before the gate: the second screen's engine grid
-read +1.13% / +0.47% against r6x (the first's +0.17% / -0.21%), which a dedicated A/B should settle.
+(provisional number 0221). Threshold 85,000. On the TP3 triangle against r6x: 256/256 greedy release
+responses identical (KL 0) with zero flags on the release suites; engine grid, throughput, sampled,
+single-stream, logprobs and prefill level; time to first token one decode step longer; `Say hi.`,
+`Thanks!` and `ok` cleaned with every rank agreeing, alone, in a staggered eight-stream batch and
+without speculation; 144/144 greedy replies identical with and without speculation. Not exercised: no
+long context (64K, 512K) collapses on r6x, so no rejection deep in the caches was seen. Not promoted;
+no recipe change.
 
 ## What v1 got wrong, and what v2 does instead
 
@@ -451,6 +452,50 @@ Threshold 85,000, vLLM 5ac8364ec (each `Sink:` line names its row). Three specs,
   on port 8001 so returning agent traffic cannot reach it; [analysis/gate_identity.py](analysis/gate_identity.py)
   compares its tokens with the speculative correction arm's.
 
+### Gate results (2026-10-20 13:31-18:50 UTC, vLLM 5ac8364ec)
+
+Tables, probe outputs and the watcher's sink lines: [runs/gate/](runs/gate). Release verdicts are
+against the run's own repeat (correction, then correction again).
+
+| | correction vs r6x | detector vs r6x | correction again vs r6x | repeat | verdict |
+|---|---|---|---|---|---|
+| greedy release responses (256) | identical, KL 0 | identical | identical | | same text |
+| engine grid, geometric mean of 15 shapes | -0.28% | +0.00% | -0.65% | -0.37% | same |
+| 8 / 4 streams | +0.14% / -0.12% | -0.08% / -0.04% | +0.18% / -0.12% | +0.04% / +0.00% | same |
+| Poisson arrivals | +0.06% | +0.01% | +0.12% | +0.06% | same |
+| prefill 32K / 128K / 256K / 500K | -0.13% / -0.28% / -0.18% / -0.24% | | | -0.06% to +0.11% | same |
+| one stream | -1.26% (±6.9%) | | | -0.24% | same |
+| sampled, 16 / 8 / 1 streams | +0.37% / +0.21% / -0.77% | -0.49% / -0.11% / -0.35% | | | same |
+| logprobs (5), 1 / 8 streams | -1.56% / -0.18% | | | -0.39% / +0.38% | same |
+| time to first token p50, 1 / 4 / 8 streams | 0.124 -> 0.162 / 0.256 -> 0.331 / 0.358 -> 0.470 s | unchanged | as correction | | one decode step |
+
+1. **Release prompts, zero flags: pass.** All arms' release text equals r6x's; the watcher read
+   `vllm:sink_*` 1,686 times on the correction arms and 840 on the detector arm during the release
+   suites: every counter stayed at 0, and no `Sink:` line came from them.
+2. **The collapse: pass.** Correction arm (rank check on): `Say hi.`, `Thanks!`, `ok` flagged and clean,
+   the other 13 byte-identical to r6x; the detector arm flags the same three and decodes as r6x
+   (`Thanks!` collapsed, `Say hi.` stops at `How can\n`).
+3. **Concurrent batch: pass** (eight streams, TP3's limit): on every arm the 16 answers and their flags at
+   eight streams with staggered arrivals equal the one-stream answers; the correction arm stays clean.
+4. **Long context: not exercised.** After a 64K- (60,756 tokens) and a 512K- (494,952 tokens)
+   conversation, `Say hi.` and `Thanks!` answer normally on r6x (`Hi!`, `You're welcome! ...`), with
+   no flag on any arm: the collapse needs its short context, so no rejection deep in the compressed and
+   sliding-window caches was seen.
+5. **Time to first token: pass.** +38 ms at one stream (26.6 steps/s), +75 ms at four, +112 ms at
+   eight: one decode step each.
+6. **Ranks agree: pass.** `VLLM_SINK_DETECTOR_CHECK_RANKS=1` ran through the probes, the batch, the
+   long contexts and the identity run without raising; every rank's log read the same counts
+   (correction 8 rows, detector 5, no speculation 6).
+7. **Speculation does not change greedy tokens: pass.** [analysis/gate_identity.py](analysis/gate_identity.py):
+   144/144 replies (128 screen prompts, 16 probes) identical with and without `--speculative-config`.
+   Without speculation the collapse is cleaned by draft-zero rejections alone (`Say hi.`: 2 rejections;
+   with speculation 1 rejection and 1 draft cut): the first serving run of that path.
+8. **Logprobs: within the noise.** One stream -1.56% (±7.7%), eight -0.18% (±2.5%).
+
+**The held optimizations are not applied** (owner's rule: only if the grid shows their cost outside the
+release noise): the correction arm's step cost is level with r6x (-0.28%, -0.65% again), and the logprobs
+companion is level too. The second screen's +1.13% / +0.47% grid reading was session noise.
+
 The items as first planned:
 
 
@@ -503,9 +548,8 @@ column is part of the compile cache key.
   collapse rows is a small sample of the sink side, and served sink values on number rows wander ±60%
   from the reference's (row attribution); a sink row past the window reading 0.6x would sit near the
   threshold.
-- **Step cost.** The second screen's engine grid read +1.13% / +0.47% against r6x (the first's +0.17% /
-  -0.21%). A same-session A/B of the detector arm against r6x on the grid alone, repeated, should say
-  whether the sink path costs about 0.2 ms a step.
+- **Long context.** No 64K or 512K context collapsed on r6x, so a rejection deep in the compressed and
+  sliding-window caches has unit tests behind it but no serving run.
 - **Served decode against reference prefill.** The sink column of served decode rows differs from the
   reference's prefill rows by up to ±60% on number rows while predictions agree; a served prefill of
   the same rows (a debug read of the column for every prompt row) would split decode from prefill.
