@@ -67,9 +67,15 @@ Failure semantics (fail-closed where it matters):
   no layers matched, direction layers out of range) re-raise: the boot
   dies rather than serving unsteered.
 
-Patches the named model.py in place (WEIGHTLESS_STEERING_MODEL_PY overrides
-the target path for out-of-tree application; in this repository the patch
-ships as a git-am patch in the promoted vLLM series instead).
+Patches the named model.py in place, ONLY when a GLP vector is configured
+(WEIGHTLESS_STEER_PATH). With no vector configured, nothing is injected:
+the model.py is left byte-identical to stock — zero extra kernels, zero
+extra launches, same traced graph. Steering is a build-time configuration
+in this repository, not a runtime toggle: an image built without it pays
+nothing. (WEIGHTLESS_STEERING_MODEL_PY overrides the target path for
+out-of-tree application; in this repository the patch ships as a git-am
+patch in the promoted vLLM series instead — the steering apply enters the
+series output only when the launch configures it.)
 ``--status`` reports state; ``--check`` validates the vector named by
 WEIGHTLESS_STEER_PATH without touching model.py.
 """
@@ -513,9 +519,11 @@ INIT_BLOCK = '''\
 
 # Per-layer apply in the forward loop.
 FORWARD_BLOCK = '''\
-            # Unconditional per-layer projection: h <- h - alpha (h.d) d. Rows
-            # are zero for layers we do not steer, so this is a numeric no-op
-            # there while the traced graph stays identical for every layer set.
+            # Per-layer projection: h <- h - alpha (h.d) d. The apply is
+            # injected only when the build configures steering (see the
+            # hotfix docstring): an unconfigured image carries none of this,
+            # so off is byte-identical to stock — no extra kernels, no
+            # extra launches, same IR.
             # hidden_states at this anchor is the layer's PENDING FFN WRITE,
             # shape (tokens, hidden_size) — the mHC fold of that write into the
             # hyper-connection streams is deferred to the next layer's fused
@@ -573,16 +581,23 @@ REPLACEMENT_FORWARD = (
     + "            if boundary_indices is not None:"
 )
 
+# Off is stock: when no GLP vector is configured, NOTHING is injected —
+# not the loader, not the buffers, not the apply. The patched model.py is
+# byte-identical to the unpatched one, so an image built without steering
+# carries zero overhead in the traced graph and zero extra launches per step.
+# Steering is therefore a build-time configuration, not a runtime toggle:
+# re-run the hotfix (or bin/spark build prepare with WEIGHTLESS_STEER_PATH
+# exported) to produce the steered image.
+def steer_requested() -> bool:
+    return bool(os.environ.get("WEIGHTLESS_STEER_PATH", "").strip())
+
+
 PATCHES = (
     ("import os", ANCHOR_IMPORT, REPLACEMENT_IMPORT),
     ("module steering block", ANCHOR_MODULE, REPLACEMENT_MODULE),
     ("__init__/_load_steering", ANCHOR_INIT, REPLACEMENT_INIT),
     ("forward apply", ANCHOR_FORWARD, REPLACEMENT_FORWARD),
-)
-
-
-def steer_requested() -> bool:
-    return bool(os.environ.get("WEIGHTLESS_STEER_PATH", "").strip())
+) if steer_requested() else ()
 
 
 def check_vector() -> int:

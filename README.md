@@ -632,8 +632,12 @@ checkpoint is
 (39 layers, alpha_default 0.75, width 5120). With `WEIGHTLESS_STEER_PATH` unset the patch is inert: the loader
 never runs, and the traced graphs and numerics are stock.
 
-To serve steered, place the same file at the same path on every node and add to `config/cluster.json`
-(site-local copies are git-ignored, as for the node map):
+Steering is a **build-time configuration**, not a runtime toggle: the patch enters the
+prepared vLLM source only when a vector is configured at `build prepare`/launch time.
+An image built without steering is byte-identical to stock — zero extra kernels, zero
+extra launches, same traced graph. To serve steered, place the same file at the same
+path on every node and add to `config/cluster.json` (site-local copies are
+git-ignored, as for the node map):
 
 ```json
 "environment": { "WEIGHTLESS_STEER_PATH": "/cache/vectors/glp-1017.gguf" },
