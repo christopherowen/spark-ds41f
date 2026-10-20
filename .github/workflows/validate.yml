@@ -111,6 +111,17 @@ jobs:
       - name: Apply the local series and check the recorded patch head and tree
         run: bin/spark build prepare --only "${{ matrix.source }}"
 
+  vllm032-patch-stack:
+    needs: changes
+    if: needs.changes.outputs.patches == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: scripts/example_site.py
+      - run: bin/spark --cluster-config experiments/2026-10-20-vllm032/cluster.json doctor
+      - name: Replay the vLLM 0.32 port and check its commit and tree
+        run: bin/spark --cluster-config experiments/2026-10-20-vllm032/cluster.json build prepare --only vllm
+
   # Production applies this experiment's adaptive NCCL series.
   nccl-adaptive-plans:
     needs: changes

@@ -2475,8 +2475,8 @@ def tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def expected_wheel_hashes() -> dict[str, str]:
-    lock = ROOT / "requirements/cutlass-dsl-aarch64.txt"
+def expected_wheel_hashes(lockfile: str = "requirements/cutlass-dsl-aarch64.txt") -> dict[str, str]:
+    lock = ROOT / lockfile
     expected: dict[str, str] = {}
     package = ""
     for raw_line in lock.read_text(encoding="utf-8").splitlines():
@@ -2556,14 +2556,23 @@ print("GPU import smoke passed")
 
 
 def build_projects(sources: dict) -> tuple[str, ...]:
-    """The required projects, then each optional one the lock or inputs list."""
-    return BUILD_PROJECTS + tuple(
+    """Git projects declared by the selected lock or prepared inputs."""
+    required = tuple(name for name in BUILD_PROJECTS
+                     if name != "b12x" or sources.get(name, {}).get("kind") != "pypi-wheel-set")
+    for name in required:
+        if name not in sources:
+            raise SystemExit(f"required build source {name} is missing")
+    return required + tuple(
         name for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in sources
     )
 
 
 def build_contexts(inputs: dict) -> tuple[str, ...]:
-    return BUILD_CONTEXTS + tuple(
+    contexts = tuple(name for name in BUILD_CONTEXTS
+                     if name != "b12x-source" or "b12x" in build_projects(inputs))
+    if inputs.get("b12x", {}).get("kind") == "pypi-wheel-set":
+        contexts += ("runtime-wheels",)
+    return contexts + tuple(
         f"{name}-source" for name in (*OPTIONAL_BUILD_PROJECTS, *INDEPENDENT_BUILD_PROJECTS) if name in inputs
     )
 
@@ -2594,10 +2603,22 @@ def missing_patches(source: dict) -> list[str]:
 
 def smoke_script(upstreams: dict) -> str:
     """The GPU import smoke, extended for an image with the TileLang sources."""
+    script = SMOKE_SCRIPT
+    if upstreams["sources"]["b12x"].get("kind") == "pypi-wheel-set":
+        script = "import os\nos.environ['VLLM_DS41_KERNEL_BACKEND'] = 'tilelang'\n" + "\n".join(
+            line for line in script.splitlines()
+            if "b12x_roce_all_reduce" not in line and "b12x_mla_sparse" not in line
+        ) + "\n"
+        script += (
+            "from vllm.model_executor.model_loader import get_model_loader\n"
+            "from vllm.config import LoadConfig\n"
+            "from vllm.models.deepseek_v4_1.checkpoint_loader import NativeB12xModelLoader\n"
+            "assert isinstance(get_model_loader(LoadConfig(load_format=\"native_b12x\")), NativeB12xModelLoader)\n"
+        )
     if "tilelang" not in upstreams["sources"]:
-        return SMOKE_SCRIPT
+        return script
     version = upstreams["sources"]["tilelang"]["version"]
-    script = SMOKE_SCRIPT + (
+    script += (
         "import importlib.metadata\n\n"
         "import tilelang\n"
         "import tile_kernels  # noqa: F401\n\n"
@@ -2643,7 +2664,7 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
         "base_image": f"{base['upstream']}@{base['recorded_base_digest']}",
         "base_source_revision": base["source_revision"],
         "cutlass": {key: sources["cutlass"][key] for key in ("upstream", "revision", "release_tag")},
-        "cutlass_dsl_wheels": expected_wheel_hashes(),
+        "cutlass_dsl_wheels": expected_wheel_hashes(sources["cutlass_dsl"]["lockfile"]),
     }
     for name in build_projects(sources):
         source = sources[name]
@@ -2688,6 +2709,27 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
             if not isinstance(record.get("submodules"), dict):
                 raise SystemExit(f"{name}: record its submodule commits in {upstreams['source_manifest']}")
             inputs[name]["submodules"] = record["submodules"]
+    if sources["b12x"].get("kind") == "pypi-wheel-set":
+        source = sources["b12x"]
+        lockfile = source["lockfile"]
+        pinned = f"b12x=={source['version']}"
+        lines = (ROOT / lockfile).read_text().splitlines()
+        if not any(line.strip().partition(" ")[0] == pinned for line in lines):
+            raise SystemExit("b12x: wheel lock must pin the recorded version")
+        if manifest.get("b12x", {}).get("version") != source["version"]:
+            raise SystemExit("b12x: wheel version differs from the source manifest")
+        inputs["b12x"] = {
+            "kind": "pypi-wheel-set", "version": source["version"],
+            "lockfile": lockfile, "lock_sha256": sha256(ROOT / lockfile),
+            "wheel_hashes": expected_wheel_hashes(lockfile),
+        }
+    if upstreams.get("build"):
+        path = upstreams["build"]["dockerfile"]
+        dockerfile = (ROOT / path).resolve()
+        if Path(path).is_absolute() or not dockerfile.is_relative_to(ROOT.resolve()):
+            raise SystemExit("build Dockerfile must remain inside the repository")
+        inputs["dockerfile"] = dockerfile.relative_to(ROOT.resolve()).as_posix()
+        inputs["dockerfile_sha256"] = sha256(dockerfile)
     if sources["vllm"].get("canonical_base"):
         inputs["vllm"]["canonical_upstream"] = sources["vllm"]["canonical_base"]["upstream"]
     return inputs
@@ -2696,8 +2738,10 @@ def build_inputs(upstreams: dict, parts: list[str] | None = None) -> dict:
 def build_directory(inputs: dict) -> Path:
     """One directory per set of build inputs: same lock, same directory."""
     digest = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+    b12x = inputs["b12x"]
+    revision = b12x.get("revision", b12x.get("version", ""))
     return BUILD_ROOT / (
-        f"vllm-{inputs['vllm']['revision'][:12]}-b12x-{inputs['b12x']['revision'][:12]}-{digest[:8]}"
+        f"vllm-{inputs['vllm']['revision'][:12]}-b12x-{revision[:12]}-{digest[:8]}"
     )
 
 
@@ -2807,11 +2851,11 @@ def prepare_cutlass(directory: Path, record: dict) -> None:
     print(f"cutlass: prepared {record['release_tag']} ({record['revision'][:12]})")
 
 
-def wheel_problems(wheel_dir: Path) -> list[str]:
+def wheel_problems(wheel_dir: Path, expected: dict[str, str] | None = None) -> list[str]:
     if not wheel_dir.is_dir():
-        return ["cutlass-dsl-wheels: missing"]
+        return [f"{wheel_dir.name}: missing"]
     problems = []
-    expected = expected_wheel_hashes()
+    expected = expected_wheel_hashes() if expected is None else expected
     found: set[str] = set()
     for wheel in sorted(wheel_dir.iterdir()):
         normalized = wheel.name.replace("-", "_").lower()
@@ -2821,20 +2865,23 @@ def wheel_problems(wheel_dir: Path) -> list[str]:
             None,
         )
         if package is None or not wheel.name.endswith(".whl"):
-            problems.append(f"cutlass-dsl-wheels: unlocked file {wheel.name}")
+            problems.append(f"{wheel_dir.name}: unlocked file {wheel.name}")
             continue
         found.add(package)
         if sha256(wheel) != expected[package]:
-            problems.append(f"cutlass-dsl-wheels: {wheel.name} differs from the lock hash")
+            problems.append(f"{wheel_dir.name}: {wheel.name} differs from the lock hash")
     for package in sorted(set(expected) - found):
-        problems.append(f"cutlass-dsl-wheels: missing {package}")
+        problems.append(f"{wheel_dir.name}: missing {package}")
     return problems
 
 
-def prepare_wheels(directory: Path, upstreams: dict) -> None:
-    destination = directory / "context/cutlass-dsl-wheels"
-    if not wheel_problems(destination):
-        print("cutlass-dsl wheels: reusing verified wheels")
+def prepare_wheels(directory: Path, upstreams: dict, *, runtime: bool = False) -> None:
+    name = "runtime-wheels" if runtime else "cutlass-dsl-wheels"
+    lockfile = upstreams["sources"]["b12x" if runtime else "cutlass_dsl"]["lockfile"]
+    expected = expected_wheel_hashes(lockfile)
+    destination = directory / "context" / name
+    if not wheel_problems(destination, expected):
+        print(f"{name}: reusing verified wheels")
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=".wheels.", dir=destination.parent))
@@ -2843,17 +2890,17 @@ def prepare_wheels(directory: Path, upstreams: dict) -> None:
             sys.executable, "-m", "pip", "download", "--quiet", "--dest", str(temporary),
             "--require-hashes", "--no-deps", "--only-binary=:all:",
             "--platform", "manylinux_2_28_aarch64", "--implementation", "cp",
-            "--python-version", "3.12", "--abi", "cp312",
-            "--requirement", str(ROOT / upstreams["sources"]["cutlass_dsl"]["lockfile"]),
+            "--python-version", "3.12", "--abi", "cp312", "--abi", "abi3", "--abi", "none",
+            "--requirement", str(ROOT / lockfile),
         ])
-        problems = wheel_problems(temporary)
+        problems = wheel_problems(temporary, expected)
         if problems:
             raise SystemExit("; ".join(problems))
         replace_directory(temporary, destination)
     except BaseException:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
-    print("cutlass-dsl wheels: downloaded and verified")
+    print(f"{name}: downloaded and verified")
 
 
 def export_source(source: Path, destination: Path) -> None:
@@ -2914,7 +2961,9 @@ def build_problems(directory: Path, inputs: dict) -> list[str]:
             problems.append(f"{name}: context changed since it was prepared")
     if sorted(record.get("contexts", {})) != sorted(build_contexts(inputs)):
         problems.append("inputs.json does not record every build context")
-    problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels"))
+    problems.extend(wheel_problems(directory / "context/cutlass-dsl-wheels", inputs["cutlass_dsl_wheels"]))
+    if inputs.get("b12x", {}).get("kind") == "pypi-wheel-set":
+        problems.extend(wheel_problems(directory / "context/runtime-wheels", inputs["b12x"]["wheel_hashes"]))
     if not (directory / "context/cutlass-source/include/cutlass/cutlass.h").is_file():
         problems.append("cutlass-source: include/cutlass/cutlass.h is missing")
     return problems
@@ -2947,6 +2996,8 @@ def command_build_prepare(args: argparse.Namespace) -> int:
         prepare_cutlass(directory, inputs["cutlass"])
     if "wheels" in parts:
         prepare_wheels(directory, upstreams)
+    if inputs.get("b12x", {}).get("kind") == "pypi-wheel-set" and ("b12x" in parts or "wheels" in parts):
+        prepare_wheels(directory, upstreams, runtime=True)
     if args.only:
         print("partial preparation; run bin/spark build prepare for the complete inputs")
         return 0
@@ -3114,7 +3165,7 @@ def command_build_image(args: argparse.Namespace) -> int:
     def command(jobs: int | str) -> list[str]:
         rendered = [
             "docker", "buildx", "build", "--platform", "linux/arm64", "--network", "host", "--load",
-            "--file", str(ROOT / "docker/Dockerfile"), "--tag", tag,
+            "--file", str(ROOT / inputs.get("dockerfile", "docker/Dockerfile")), "--tag", tag,
         ]
         for name in build_contexts(inputs):
             rendered += ["--build-context", f"{name}={context / name}"]

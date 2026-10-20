@@ -88,6 +88,10 @@ into its only operational source of truth. Until the transition checklist is
 complete, files are explicit about whether they describe observed state, desired
 state, or an experiment.
 
+An opt-in [vLLM 0.32 native TileLang candidate](experiments/2026-10-20-vllm032/README.md)
+ports the existing kernels and DSpark path to the official release. It has its own
+build recipe and source lock; r6x remains the promoted default.
+
 ## Quick start
 
 You need three DGX Sparks cabled as a triangle, or four cabled as a ring, on

@@ -21,6 +21,14 @@ bin/spark build image --apply  # build and smoke-test on an idle host
 bin/spark build smoke          # rerun the GPU import smoke
 ```
 
+## vLLM 0.32 candidate
+
+The [native TileLang port](../experiments/2026-10-20-vllm032/README.md) selects
+`docker/Dockerfile.vllm032` through its own lock. It uses the official v0.32.0
+image and native extensions, with hash-locked B12X 1.5.1, FlashInfer 0.7.1 and
+CuTe DSL 4.8.0 wheels. Its wheel and Dockerfile hashes participate in build
+identity. The promoted Dockerfile and source lock stay unchanged.
+
 ## Build directory
 
 `upstreams.lock.json` and the source manifest it names determine every build

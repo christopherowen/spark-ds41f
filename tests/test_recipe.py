@@ -289,6 +289,20 @@ class OverlayTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             recipe.overlay({"extends": {}, "container": {}}, base)
 
+    def test_unset_removes_literal_dotted_labels_and_nested_keys(self):
+        labels = {"local.spark3.b12x.tree": "old", "local.spark3.vllm.tree": "new"}
+        base = {"container": {"expected_labels": labels}, "nested": {"value": 1}}
+        arm = {"extends": {}, "unset": [
+            "container.expected_labels.local.spark3.b12x.tree", "nested.value"]}
+        resolved = recipe.overlay(arm, base)
+        self.assertEqual(resolved["container"]["expected_labels"], {"local.spark3.vllm.tree": "new"})
+        self.assertEqual(resolved["nested"], {})
+        self.assertEqual(base["container"]["expected_labels"]["local.spark3.b12x.tree"], "old")
+        self.assertEqual(base["nested"], {"value": 1})
+        with self.assertRaisesRegex(SystemExit, "which its base does not set"):
+            recipe.overlay({"extends": {}, "unset": [
+                "container.expected_labels.local.spark3.missing.tree"]}, base)
+
     def test_r6m_changes_only_its_own_settings_over_r6l(self):
         spark = load_spark()
         r6l = load("experiments/2026-10-14-r6l/r6l-release.json")

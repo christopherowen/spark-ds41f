@@ -213,13 +213,16 @@ def overlay(arm: dict, base: dict) -> dict:
     for key in ("shape", "benchmark_reference"):
         cluster.pop(key, None)
     for dotted in arm.get("unset", []):
-        *parents, last = dotted.split(".")
+        parts = dotted.split(".")
         node = cluster
-        for part in parents:
+        for index, part in enumerate(parts):
+            remaining = ".".join(parts[index:])
+            if isinstance(node, dict) and remaining in node:
+                del node[remaining]
+                break
             node = node.get(part, {}) if isinstance(node, dict) else {}
-        if not isinstance(node, dict) or last not in node:
+        else:
             raise SystemExit(f"the arm unsets {dotted}, which its base does not set")
-        del node[last]
     return cluster
 
 

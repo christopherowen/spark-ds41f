@@ -1,0 +1,191 @@
+# syntax=docker/dockerfile:1.7
+ARG BASE_IMAGE=docker.io/vllm/vllm-openai@sha256:6ff5ff0ddf3658d2c2d677dac5ca2d4726ce0156b4371166d918181b210bd4bc
+ARG RUNTIME_STAGE=runtime-tilelang-sparknet
+
+FROM ${BASE_IMAGE} AS nccl-builder
+
+USER root
+
+COPY --from=nccl-source . /workspace/nccl/
+ARG NCCL_COMPILE_JOBS=4
+RUN set -eux; \
+    make -C /workspace/nccl -j${NCCL_COMPILE_JOBS} src.build \
+      CUDA_HOME=/usr/local/cuda \
+      NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121"; \
+    mkdir -p /opt/nccl; \
+    cp -L /workspace/nccl/build/lib/libnccl.so.2 /opt/nccl/libnccl.so.2; \
+    sha256sum /opt/nccl/libnccl.so.2 | cut -d" " -f1 > /opt/nccl/libnccl.so.2.sha256
+
+# TileLang 0.1.15 from tile-ai/tilelang with patches/tilelang and its pinned
+# submodules, and DeepSeek's TileKernels, as wheels for the TileLang kernel
+# backend. TileLang's CUDA stubs leave kernel compilation to run time, so no
+# GPU architecture is fixed here. The isolated build environment is held to
+# the base image's z3-solver, which TileLang links and loads at run time.
+# TileKernels takes its version from setuptools-scm, which an export without
+# Git metadata cannot supply.
+FROM ${BASE_IMAGE} AS tilelang-builder
+
+USER root
+
+COPY --from=tilelang-source . /workspace/tilelang/
+COPY --from=tile_kernels-source . /workspace/tile_kernels/
+ARG TILELANG_COMPILE_JOBS=4
+ARG TILE_KERNELS_VERSION=unrecorded
+RUN set -eux; \
+    z3=$(python3 -c 'import importlib.metadata as m; print(m.version("z3-solver"))'); \
+    printf 'z3-solver==%s\n' "$z3" > /tmp/tilelang-build-constraints.txt; \
+    export PIP_CONSTRAINT=/tmp/tilelang-build-constraints.txt; \
+    export PIP_BUILD_CONSTRAINT=/tmp/tilelang-build-constraints.txt; \
+    CMAKE_BUILD_PARALLEL_LEVEL=${TILELANG_COMPILE_JOBS} \
+    CMAKE_ARGS="-DUSE_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc" \
+    NO_VERSION_LABEL=1 \
+      python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/tilelang \
+        /workspace/tilelang; \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_TILE_KERNELS=${TILE_KERNELS_VERSION} \
+      python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/tilelang \
+        /workspace/tile_kernels; \
+    ls /opt/tilelang/tilelang-*.whl /opt/tilelang/tile_kernels-*.whl
+
+# sparknet (christopherowen/dgx-spark-networking): the one-shot RoCE
+# collectives vendored from B12X with spark's patches 0001-0011, used by the
+# TileLang family instead of b12x.comm.roce. Pure Python plus a C proxy.
+FROM ${BASE_IMAGE} AS sparknet-builder
+
+COPY --from=sparknet-source . /workspace/sparknet/
+RUN python3 -m pip wheel --no-cache-dir --no-deps --wheel-dir /opt/sparknet /workspace/sparknet && \
+    ls /opt/sparknet/dgx_spark_networking-*.whl
+
+FROM ${BASE_IMAGE} AS runtime-tilelang-sparknet
+USER root
+
+ARG BASE_IMAGE_NAME=unrecorded
+ARG BASE_IMAGE_DIGEST=unrecorded
+ARG DEPLOYMENT_COMMIT=unrecorded
+ARG VLLM_UPSTREAM=unrecorded
+ARG VLLM_REF=unrecorded
+ARG VLLM_REVISION=unrecorded
+ARG VLLM_PATCH_HEAD=unrecorded
+ARG VLLM_TREE=unrecorded
+ARG NCCL_UPSTREAM=unrecorded
+ARG NCCL_REF=unrecorded
+ARG NCCL_REVISION=unrecorded
+ARG NCCL_PATCH_HEAD=unrecorded
+ARG NCCL_TREE=unrecorded
+ARG TILELANG_UPSTREAM=unrecorded
+ARG TILELANG_REF=unrecorded
+ARG TILELANG_REVISION=unrecorded
+ARG TILELANG_PATCH_HEAD=unrecorded
+ARG TILELANG_TREE=unrecorded
+ARG TILE_KERNELS_UPSTREAM=unrecorded
+ARG TILE_KERNELS_REF=unrecorded
+ARG TILE_KERNELS_REVISION=unrecorded
+ARG TILE_KERNELS_PATCH_HEAD=unrecorded
+ARG TILE_KERNELS_TREE=unrecorded
+ARG SPARKNET_UPSTREAM=unrecorded
+ARG SPARKNET_REF=unrecorded
+ARG SPARKNET_REVISION=unrecorded
+ARG SPARKNET_PATCH_HEAD=unrecorded
+ARG SPARKNET_TREE=unrecorded
+LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-ds41f" \
+      org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
+      org.opencontainers.image.base.name="${BASE_IMAGE_NAME}" \
+      org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
+      local.spark3.vllm.upstream="${VLLM_UPSTREAM}" \
+      local.spark3.vllm.ref="${VLLM_REF}" \
+      local.spark3.vllm.revision="${VLLM_REVISION}" \
+      local.spark3.vllm.patch-head="${VLLM_PATCH_HEAD}" \
+      local.spark3.vllm.tree="${VLLM_TREE}" \
+      local.spark3.nccl.upstream="${NCCL_UPSTREAM}" \
+      local.spark3.nccl.ref="${NCCL_REF}" \
+      local.spark3.nccl.revision="${NCCL_REVISION}" \
+      local.spark3.nccl.patch-head="${NCCL_PATCH_HEAD}" \
+      local.spark3.nccl.tree="${NCCL_TREE}" \
+      local.spark3.tilelang.upstream="${TILELANG_UPSTREAM}" \
+      local.spark3.tilelang.ref="${TILELANG_REF}" \
+      local.spark3.tilelang.revision="${TILELANG_REVISION}" \
+      local.spark3.tilelang.patch-head="${TILELANG_PATCH_HEAD}" \
+      local.spark3.tilelang.tree="${TILELANG_TREE}" \
+      local.spark3.tile_kernels.upstream="${TILE_KERNELS_UPSTREAM}" \
+      local.spark3.tile_kernels.ref="${TILE_KERNELS_REF}" \
+      local.spark3.tile_kernels.revision="${TILE_KERNELS_REVISION}" \
+      local.spark3.tile_kernels.patch-head="${TILE_KERNELS_PATCH_HEAD}" \
+      local.spark3.tile_kernels.tree="${TILE_KERNELS_TREE}" \
+      local.spark3.sparknet.upstream="${SPARKNET_UPSTREAM}" \
+      local.spark3.sparknet.ref="${SPARKNET_REF}" \
+      local.spark3.sparknet.revision="${SPARKNET_REVISION}" \
+      local.spark3.sparknet.patch-head="${SPARKNET_PATCH_HEAD}" \
+      local.spark3.sparknet.tree="${SPARKNET_TREE}"
+
+LABEL local.spark3.b12x.version="1.5.1" local.spark3.flashinfer.version="0.7.1"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc liburing-dev pkg-config python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=vllm-source . /opt/spark3/candidate/vllm/
+COPY --from=vllm-deletions deleted.txt /tmp/vllm-deleted.txt
+RUN set -eu; \
+    installed=$(python3 -c 'from pathlib import Path; import vllm; print(Path(vllm.__file__).parent)'); \
+    cp -a --no-clobber "$installed"/. /opt/spark3/candidate/vllm/vllm/; \
+    while read -r relative; do \
+      [ -n "$relative" ] || continue; \
+      rm -f "/opt/spark3/candidate/vllm/vllm/$relative"; \
+    done < /tmp/vllm-deleted.txt; \
+    rm /tmp/vllm-deleted.txt
+
+COPY --from=cutlass-dsl-wheels . /tmp/cutlass-dsl-wheels/
+COPY --from=runtime-wheels . /tmp/runtime-wheels/
+RUN uv pip uninstall --system tilelang flashinfer-jit-cache \
+        flashinfer-jit-cache-sm80 flashinfer-jit-cache-sm89 flashinfer-jit-cache-sm90a \
+        flashinfer-jit-cache-sm100a flashinfer-jit-cache-sm103a flashinfer-jit-cache-sm110a \
+    && uv pip install --system --no-deps --no-index /tmp/cutlass-dsl-wheels/*.whl /tmp/runtime-wheels/*.whl \
+    && rm -rf /tmp/cutlass-dsl-wheels /tmp/runtime-wheels
+RUN --mount=type=bind,from=tilelang-builder,source=/opt/tilelang,target=/tmp/tilelang-wheels \
+    uv pip install --system --no-deps --no-index /tmp/tilelang-wheels/*.whl
+RUN --mount=type=bind,from=sparknet-builder,source=/opt/sparknet,target=/tmp/sparknet-wheels \
+    uv pip install --system --no-deps --no-index /tmp/sparknet-wheels/*.whl
+
+COPY --from=nccl-builder /opt/nccl/ /opt/spark3/nccl/
+RUN install -m 0755 /opt/spark3/nccl/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
+    && rm /opt/spark3/nccl/libnccl.so.2
+
+ENV PYTHONPATH=/opt/spark3/candidate/vllm
+ENV SPARKNET_ROCE_CACHE_DIR=/opt/sparknet/roce
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs VLLM_PLUGINS='' python3 - <<'PY_CHECK'
+import ctypes
+import hashlib
+import importlib.metadata as metadata
+from pathlib import Path
+from packaging.requirements import Requirement
+
+expected = {
+    "nvidia-cutlass-dsl": "4.8.0",
+    "b12x": "1.5.1", "flashinfer-python": "0.7.1", "flashinfer-cubin": "0.7.1",
+    "flashinfer-jit-cache": "0.7.1+cu130", "flashinfer-jit-cache-sm120f": "0.7.1+cu130",
+    "flashinfer-jit-cache-sm121a": "0.7.1+cu130", "tilelang": "0.1.15",
+    "tile-kernels": "2.0.0", "dgx-spark-networking": "0.3.0",
+}
+for name, version in expected.items():
+    assert metadata.version(name) == version, name
+for name in (*expected, "quack-kernels", "nvidia-cudnn-frontend"):
+    for raw in metadata.requires(name) or ():
+        requirement = Requirement(raw)
+        if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+            continue
+        if requirement.name in {"nvidia-cutlass-dsl", "apache-tvm-ffi", "tilelang"}:
+            assert metadata.version(requirement.name) in requirement.specifier, (name, raw)
+from sparknet.oneshot._proxy import load
+from b12x.loader._native import _build
+from vllm.models.deepseek_v4_1.engram_rows._native import load as load_reader
+print("sparknet proxy ABI", load().roce_abi_version())
+print("B12X checkpoint reader", _build())
+load_reader()
+path = Path("/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2")
+assert hashlib.sha256(path.read_bytes()).hexdigest() == Path("/opt/spark3/nccl/libnccl.so.2.sha256").read_text().strip()
+version = ctypes.c_int()
+assert ctypes.CDLL(str(path)).ncclGetVersion(ctypes.byref(version)) == 0
+assert version.value == 23007
+print("vLLM0.32 native build checks passed")
+PY_CHECK
+
+FROM ${RUNTIME_STAGE}
