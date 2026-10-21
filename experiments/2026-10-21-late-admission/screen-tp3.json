@@ -1,0 +1,104 @@
+{
+ "experiment": "experiments/2026-10-21-late-admission",
+ "run": "late-admission-l30-screen",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-20-ttft-gap/ttft_trace.py",
+     [
+      "--repo",
+      ".",
+      "--output",
+      "experiments/2026-10-21-late-admission/trace-{run}-{label}.json",
+      "--analyze"
+     ],
+     "trace"
+    ],
+    [
+     "scripts/servebench_run.py",
+     [
+      "--mode",
+      "closed",
+      "--concurrency",
+      "4",
+      "--warmup",
+      "30",
+      "--duration",
+      "120",
+      "--extra-body",
+      "{\"chat_template_kwargs\": {\"thinking\": false}}",
+      "--label",
+      "{label}",
+      "--output",
+      "experiments/2026-10-21-late-admission/c4-{run}-{label}.json"
+     ],
+     "c4"
+    ],
+    [
+     "scripts/servebench_run.py",
+     [
+      "--mode",
+      "closed",
+      "--concurrency",
+      "8",
+      "--warmup",
+      "30",
+      "--duration",
+      "120",
+      "--extra-body",
+      "{\"chat_template_kwargs\": {\"thinking\": false}}",
+      "--label",
+      "{label}",
+      "--output",
+      "experiments/2026-10-21-late-admission/c8-{run}-{label}.json"
+     ],
+     "c8"
+    ],
+    [
+     "scripts/servebench_suite.py",
+     [
+      "--suite",
+      "experiments/2026-10-21-late-admission/screen-suite.json",
+      "--out",
+      "experiments/2026-10-21-late-admission/suite-{run}-{label}",
+      "--label",
+      "{label}"
+     ],
+     "suite"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "late-tp3.json",
+     "label": "late-l30"
+    },
+    {
+     "config": "r6x-tp3.json",
+     "label": "r6x"
+    },
+    {
+     "config": "experiments/2026-10-20-ttft-gap/lab/async-off.json",
+     "label": "async-off"
+    }
+   ]
+  }
+ ]
+}

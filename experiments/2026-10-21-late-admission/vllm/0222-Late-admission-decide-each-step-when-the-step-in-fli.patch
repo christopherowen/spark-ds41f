@@ -1,0 +1,651 @@
+From 91eaaa59e1ba5d66516e2db6269be58d733c3692 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 10:11:47 +0200
+Subject: [PATCH] Late admission: decide each step when the step in flight
+ reaches a decoder layer
+
+With async scheduling the engine core decides step N+1 as soon as step N is
+under way and launches it behind N. A request that arrives while N runs is
+read only after N's output, when N+1 is already fixed, so it joins N+2 and
+waits one whole step for nothing. On DS4.1 TP3 (r6x) a traced replay shows
+every short request waiting exactly one such step: 62 ms of a 258 ms time to
+first token at four streams, 97 of 352 ms at eight.
+
+VLLM_LATE_ADMISSION_LAYER=K moves the decision later without giving up what
+async scheduling hides. A forward pre-hook on decoder layer K records one CUDA
+event; in a full CUDA graph the record is captured as an external event node,
+so every replay records it as it reaches the layer. The V2 runner's
+execute_model returns an asynchronous reply that waits on that event, so the
+output rank's reply reaches the engine core when the step reaches layer K, in
+order before the step's sampled output. The engine core waits for the reply
+of the step in flight, takes the requests that arrived meanwhile, and only then
+decides the next step. Layers K and later, sampling and drafting still hide
+the decision and the next step's preparation. An idle engine decides at once;
+a step without a forward replies at once. The default, -1, keeps today's
+behaviour. Requires async scheduling without pipeline parallelism (startup
+error otherwise).
+
+Base: local-inference-lab integration/karmic-kraken-beta 19f2c20e + the r6x
+series (7316c7f9f).
+
+Quality: no tensor is read or written; the event only orders the host's
+decision. Which requests share a step changes, which batch invariance already
+covers (temperature-0 outputs identical in any batch).
+
+Tests: tests/v1/engine/test_late_admission.py (an arrival during a step joins
+the next step with late admission and the one after without; no wait with
+nothing in flight; startup checks; the engine process admits every queued
+request without blocking) and tests/v1/worker/test_late_admission.py (the
+event is recorded as layer K starts, for a causal LM and DS4.1's vision
+wrapper; refused layers; the reply waits for the event and carries nothing;
+WorkerProc sends it once the event completes; on a GPU, a captured graph
+records the event at the layer on every replay while later layers still run).
+
+Upstream status: local; not proposed.
+---
+ tests/v1/engine/test_late_admission.py | 176 +++++++++++++++++++++++++
+ tests/v1/worker/test_late_admission.py | 152 +++++++++++++++++++++
+ vllm/envs.py                           |   9 ++
+ vllm/v1/engine/core.py                 |  41 ++++++
+ vllm/v1/worker/gpu/late_admission.py   |  85 ++++++++++++
+ vllm/v1/worker/gpu/model_runner.py     |  12 ++
+ 6 files changed, 475 insertions(+)
+ create mode 100644 tests/v1/engine/test_late_admission.py
+ create mode 100644 tests/v1/worker/test_late_admission.py
+ create mode 100644 vllm/v1/worker/gpu/late_admission.py
+
+diff --git a/tests/v1/engine/test_late_admission.py b/tests/v1/engine/test_late_admission.py
+new file mode 100644
+index 000000000..019431eef
+--- /dev/null
++++ b/tests/v1/engine/test_late_admission.py
+@@ -0,0 +1,176 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Late admission: with async scheduling a request that arrives while a step runs
++joins the next step, not the one after it.
++
++The engine core decides step N+1 when step N's execute_model reply arrives (under
++late admission, when N's GPU work reaches VLLM_LATE_ADMISSION_LAYER), after taking
++the requests that arrived meanwhile. Without it, N+1 is decided as soon as N is under
++way and an arrival during N can only join N+2.
++"""
++
++import queue
++from collections import deque
++from concurrent.futures import Future
++from contextlib import nullcontext
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++from vllm.v1.engine.core import EngineCore, EngineCoreProc, late_admission_enabled
++from vllm.v1.outputs import ModelRunnerOutput
++
++from ..core.utils import create_requests, create_scheduler
++
++pytestmark = pytest.mark.cpu_test
++
++
++class ReachedLayer(Future):
++    """An execute_model reply; reading it means the step reached the layer."""
++
++    def __init__(self, log: list, batch: int):
++        super().__init__()
++        self.log, self.batch = log, batch
++
++    def result(self, timeout=None):
++        if not self.done():
++            self.log.append(("reached layer", self.batch))
++            self.set_result(None)
++        return super().result()
++
++
++class FakeExecutor:
++    """Records each batch's requests; every request samples one token a step."""
++
++    def __init__(self, log: list):
++        self.log = log
++        self.batches: list[list[str]] = []
++        self.pending = None
++
++    def execute_model(self, scheduler_output, non_block=False):
++        self.batches.append(sorted(scheduler_output.num_scheduled_tokens))
++        self.log.append(("execute", len(self.batches)))
++        self.pending = scheduler_output
++        return ReachedLayer(self.log, len(self.batches))
++
++    def sample_tokens(self, grammar_output, non_block=False):
++        req_ids = list(self.pending.num_scheduled_tokens)
++        future: Future = Future()
++        future.set_result(
++            ModelRunnerOutput(
++                req_ids=req_ids,
++                req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
++                sampled_token_ids=[[7] for _ in req_ids],
++                logprobs=None,
++                prompt_logprobs_dict={},
++                pooler_output=[],
++            )
++        )
++        return future
++
++
++@pytest.fixture
++def opt_model_path(tmp_path):
++    (tmp_path / "config.json").write_text(
++        '{"architectures":["OPTForCausalLM"],"model_type":"opt",'
++        '"max_position_embeddings":32768}'
++    )
++    return str(tmp_path)
++
++
++def _engine(model: str, late_admission: bool):
++    log: list = []
++    arrivals: list = []
++    scheduler = create_scheduler(
++        model=model,
++        skip_tokenizer_init=True,
++        device="cpu",
++        async_scheduling=True,
++        max_model_len=256,
++    )
++    engine = object.__new__(EngineCore)
++    engine.scheduler = scheduler
++    engine.model_executor = FakeExecutor(log)
++    engine.batch_queue_size = 2
++    engine.batch_queue = deque(maxlen=2)
++    engine.late_admission = late_admission
++    engine.is_ec_consumer = True
++    engine.is_pooling_model = False
++    engine.check_for_draft_tokens = False
++    engine._last_model_completion_time = None
++    engine._should_throttle_prefills = Mock(return_value=False)
++    engine.log_error_detail = lambda _: nullcontext()
++    engine.capture_iteration_details = lambda _: nullcontext()
++    engine._wait_for_boundary_checkpoint_copies = Mock()
++    engine._process_aborts_queue = Mock()
++    engine._attach_iteration_details = Mock()
++
++    def admit():
++        log.append(("admit", [r.request_id for r in arrivals]))
++        for request in arrivals:
++            scheduler.add_request(request)
++        arrivals.clear()
++
++    engine._admit_arrivals = admit
++    return engine, log, arrivals
++
++
++@pytest.mark.parametrize("late_admission", [True, False])
++def test_an_arrival_joins_the_next_step(opt_model_path, late_admission):
++    engine, log, arrivals = _engine(opt_model_path, late_admission)
++    first, second = create_requests(2, num_tokens=8, max_tokens=8, req_ids=["a", "b"])
++    engine.scheduler.add_request(first)
++
++    # Idle engine: the first step is decided at once, nothing to wait for.
++    assert engine.step_with_batch_queue() == (None, True)
++    assert log == [("execute", 1)]
++
++    # "b" arrives while step 1 runs.
++    arrivals.append(second)
++    engine.step_with_batch_queue()
++    batches = engine.model_executor.batches
++    if late_admission:
++        # Step 2 is decided once step 1 reaches the layer, with "b" in it.
++        assert log[1:4] == [("reached layer", 1), ("admit", ["b"]), ("execute", 2)]
++        assert batches[1] == ["a", "b"]
++    else:
++        # Step 2 was decided without waiting; "b" waits for step 3.
++        assert log[1] == ("execute", 2)
++        assert batches[1] == ["a"]
++
++
++def test_no_wait_when_nothing_is_in_flight(opt_model_path):
++    engine, log, _ = _engine(opt_model_path, late_admission=True)
++    engine.scheduler.add_request(create_requests(1, num_tokens=8, req_ids=["a"])[0])
++    engine.step_with_batch_queue()
++    assert ("reached layer", 1) not in log
++    assert not any(entry[0] == "admit" for entry in log)
++
++
++def test_enabled_only_with_the_batch_queue_and_no_pipeline(monkeypatch):
++    config = SimpleNamespace(parallel_config=SimpleNamespace(pipeline_parallel_size=1))
++    monkeypatch.delenv("VLLM_LATE_ADMISSION_LAYER", raising=False)
++    assert not late_admission_enabled(config, batch_queue=True)
++    monkeypatch.setenv("VLLM_LATE_ADMISSION_LAYER", "28")
++    assert late_admission_enabled(config, batch_queue=True)
++    with pytest.raises(ValueError, match="async scheduling"):
++        late_admission_enabled(config, batch_queue=False)
++    config.parallel_config.pipeline_parallel_size = 2
++    with pytest.raises(ValueError, match="pipeline"):
++        late_admission_enabled(config, batch_queue=True)
++
++
++def test_the_engine_process_admits_every_queued_request_without_blocking():
++    engine = object.__new__(EngineCoreProc)
++    engine.input_queue = queue.Queue()
++    engine.input_queue.put(("add", 1))
++    engine.input_queue.put(("abort", 2))
++    engine._handle_client_request = Mock()
++    engine._admit_arrivals()
++    assert [c.args for c in engine._handle_client_request.call_args_list] == [
++        ("add", 1),
++        ("abort", 2),
++    ]
++    engine._admit_arrivals()  # an empty queue returns at once
++    assert engine._handle_client_request.call_count == 2
+diff --git a/tests/v1/worker/test_late_admission.py b/tests/v1/worker/test_late_admission.py
+new file mode 100644
+index 000000000..199f437d5
+--- /dev/null
++++ b/tests/v1/worker/test_late_admission.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Late admission on the worker: the step records an event when it reaches the
++admission layer, and its execute_model reply waits for that event."""
++
++import time
++from unittest.mock import Mock
++
++import pytest
++import torch
++from torch import nn
++
++from vllm.v1.executor.multiproc_executor import WorkerProc
++from vllm.v1.outputs import AsyncModelRunnerOutput
++from vllm.v1.worker.gpu.late_admission import LayerProgress, StepReachedLayer
++
++
++class FakeEvent:
++    def __init__(self):
++        self.records = 0
++        self.synchronized = 0
++
++    def record(self):
++        self.records += 1
++
++    def synchronize(self):
++        self.synchronized += 1
++
++
++class Layer(nn.Module):
++    def __init__(self, trace: list, index: int):
++        super().__init__()
++        self.trace, self.index = trace, index
++
++    def forward(self, x):
++        self.trace.append(self.index)
++        return x + 1
++
++
++class Inner(nn.Module):
++    def __init__(self, trace: list, n: int):
++        super().__init__()
++        self.layers = nn.ModuleList(Layer(trace, i) for i in range(n))
++
++    def forward(self, x):
++        for layer in self.layers:
++            x = layer(x)
++        return x
++
++
++class CausalLM(nn.Module):
++    def __init__(self, trace: list, n: int = 4):
++        super().__init__()
++        self.model = Inner(trace, n)
++
++    def forward(self, x):
++        return self.model(x)
++
++
++class VisionLanguage(nn.Module):
++    """The language model under ``language_model``, as DS4.1's vision wrapper."""
++
++    def __init__(self, trace: list, n: int = 4):
++        super().__init__()
++        self.language_model = CausalLM(trace, n)
++
++    def forward(self, x):
++        return self.language_model(x)
++
++
++@pytest.mark.cpu_test
++@pytest.mark.parametrize("wrapper", [CausalLM, VisionLanguage])
++def test_the_event_is_recorded_as_the_layer_starts(wrapper):
++    trace: list = []
++    model = wrapper(trace)
++    event = FakeEvent()
++    marks: list = []
++    event.record = lambda: marks.append(len(trace))  # layers run so far
++    progress = LayerProgress(model, 2, event_factory=lambda: event)
++    model(torch.zeros(1))
++    model(torch.zeros(1))
++    assert trace == [0, 1, 2, 3, 0, 1, 2, 3]
++    assert marks == [2, 6]  # before layer 2 of each forward
++    assert progress.layer == 2
++
++
++@pytest.mark.cpu_test
++def test_a_layer_outside_the_model_or_no_layers_is_refused():
++    with pytest.raises(ValueError, match="outside the model's 4 decoder layers"):
++        LayerProgress(CausalLM([]), 4, event_factory=FakeEvent)
++    with pytest.raises(ValueError, match="no `layers` ModuleList"):
++        LayerProgress(nn.Linear(2, 2), 0, event_factory=FakeEvent)
++
++
++@pytest.mark.cpu_test
++def test_the_reply_waits_for_the_event_and_carries_nothing():
++    event = FakeEvent()
++    reply = LayerProgress(CausalLM([]), 1, event_factory=lambda: event).reply()
++    assert isinstance(reply, AsyncModelRunnerOutput)
++    assert reply.get_output() is None
++    assert event.synchronized == 1
++
++
++@pytest.mark.cpu_test
++def test_the_worker_sends_the_reply_once_the_event_completes():
++    """WorkerProc's output thread resolves the reply before enqueueing it, so the
++    engine core receives it when the step reaches the layer."""
++    event = FakeEvent()
++    worker = object.__new__(WorkerProc)
++    worker.worker_response_mq = Mock()
++    worker.enqueue_output(StepReachedLayer(event))
++    assert event.synchronized == 1
++    worker.worker_response_mq.enqueue.assert_called_once_with(
++        (WorkerProc.ResponseStatus.SUCCESS, None)
++    )
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
++def test_a_captured_graph_records_the_event_at_the_layer_on_every_replay():
++    """The record is captured as an external event node: after each replay the
++    reply is ready while the layers after the admission point still run."""
++    a = torch.randn(2048, 2048, device="cuda", dtype=torch.bfloat16)
++
++    class Slow(nn.Module):
++        def forward(self, x):
++            for _ in range(40):
++                x = torch.mm(x, a) * 1e-3
++            return x
++
++    model = CausalLM([])
++    model.model.layers = nn.ModuleList(Slow() for _ in range(4))
++    progress = LayerProgress(model, 1)
++    x = torch.randn(2048, 2048, device="cuda", dtype=torch.bfloat16)
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream):
++        model(x)
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        model(x)
++    torch.cuda.synchronize()
++    for _ in range(3):
++        start = time.perf_counter()
++        graph.replay()
++        progress.reply().get_output()
++        reached = time.perf_counter() - start
++        still_running = not torch.cuda.current_stream().query()
++        torch.cuda.synchronize()
++        total = time.perf_counter() - start
++        assert still_running
++        # Layer 1 starts a quarter of the way through four equal layers.
++        assert 0.1 * total < reached < 0.5 * total
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 2f320dfca..0c1292366 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -179,6 +179,7 @@ if TYPE_CHECKING:
+     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+     VLLM_CHECKPOINT_RESTORE_MAX_WAIT_S: float = 60.0
+     VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS: bool = False
++    VLLM_LATE_ADMISSION_LAYER: int = -1
+     VLLM_MLA_DISABLE: bool = False
+     VLLM_K3_DENSE_MLA_PARTIAL_DTYPE: Literal["bf16", "fp32"] = "bf16"
+     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
+@@ -1564,6 +1565,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS": lambda: (
+         os.getenv("VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS", "0") == "1"
+     ),
++    # Late admission (async scheduling): decide each step when the step in flight
++    # reaches the start of this decoder layer, so requests that arrived meanwhile
++    # join the next step instead of the one after it. -1 decides each step as soon
++    # as the previous one is under way.
++    "VLLM_LATE_ADMISSION_LAYER": lambda: int(
++        os.getenv("VLLM_LATE_ADMISSION_LAYER", "-1")
++    ),
+     # If set, vLLM will disable the MLA attention optimizations.
+     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+     # Keep dense MLA split partials in FP32 until the merge when requested.
+@@ -2727,6 +2735,7 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
+         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
+         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
++        "VLLM_LATE_ADMISSION_LAYER",
+         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",
+         "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH",
+         "VLLM_IMAGE_FETCH_TIMEOUT",
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 49d1f7fe1..3a5bc72ad 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -103,9 +103,31 @@ HANDSHAKE_TIMEOUT_MINS = 5
+ _R = TypeVar("_R")  # Return type for collective_rpc
+ 
+ 
++def late_admission_enabled(vllm_config: VllmConfig, *, batch_queue: bool) -> bool:
++    """Whether each step is decided when the step in flight reaches
++    ``VLLM_LATE_ADMISSION_LAYER`` (the workers' execute_model reply arrives then).
++
++    Raises:
++        ValueError: when it is set without async scheduling's batch queue, or with
++            pipeline parallelism, whose batch queue holds one batch per stage.
++    """
++    if envs.VLLM_LATE_ADMISSION_LAYER < 0:
++        return False
++    if not batch_queue or vllm_config.parallel_config.pipeline_parallel_size > 1:
++        raise ValueError(
++            "VLLM_LATE_ADMISSION_LAYER needs async scheduling without pipeline "
++            "parallelism: it moves the decision of the step that async scheduling "
++            "queues behind the one in flight"
++        )
++    return True
++
++
+ class EngineCore:
+     """Inner loop of vLLM's Engine."""
+ 
++    # Set from VLLM_LATE_ADMISSION_LAYER in __init__ (late_admission_enabled).
++    late_admission: bool = False
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -225,6 +247,9 @@ class EngineCore:
+             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
+             self.batch_queue = deque(maxlen=self.batch_queue_size)
+         self._last_model_completion_time: float | None = None
++        self.late_admission = late_admission_enabled(
++            vllm_config, batch_queue=self.batch_queue is not None
++        )
+ 
+         self.is_ec_consumer = (
+             vllm_config.ec_transfer_config is None
+@@ -592,6 +617,11 @@ class EngineCore:
+         else:
+             eco.scheduler_stats.iteration_details = iteration_details
+ 
++    def _admit_arrivals(self) -> None:
++        """Late admission: take the requests that arrived while the step in flight
++        ran. An in-process engine core receives requests directly, so it has none
++        waiting."""
++
+     def _should_throttle_prefills(self) -> bool:
+         """Defer prefills on non-cadence steps in a non-DP engine.
+ 
+@@ -742,6 +772,13 @@ class EngineCore:
+         deferred_scheduler_output = None
+         deferred_execution_timing = None
+         if self.scheduler.has_requests():
++            if self.late_admission and batch_queue:
++                # Late admission: the step in flight replies to execute_model when
++                # its GPU work reaches the admission layer; the rest of it hides
++                # this decision and the next step's preparation. Requests that
++                # arrived meanwhile join this decision.
++                batch_queue[0][2].result()
++                self._admit_arrivals()
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+             with self.log_error_detail(scheduler_output):
+                 exec_future, execution_timing = self._execute_model(scheduler_output)
+@@ -1604,6 +1641,10 @@ class EngineCoreProc(EngineCore):
+             logger.debug("EngineCore loop active.")
+ 
+         # Handle any more client requests.
++        self._admit_arrivals()
++
++    def _admit_arrivals(self) -> None:
++        """Handle every client request that has arrived, without blocking."""
+         while not self.input_queue.empty():
+             req = self.input_queue.get_nowait()
+             self._handle_client_request(*req)
+diff --git a/vllm/v1/worker/gpu/late_admission.py b/vllm/v1/worker/gpu/late_admission.py
+new file mode 100644
+index 000000000..6ad71083d
+--- /dev/null
++++ b/vllm/v1/worker/gpu/late_admission.py
+@@ -0,0 +1,85 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Late admission: tell the engine core when a step reaches a fixed decoder layer.
++
++With async scheduling the engine core decides step N+1 as soon as step N is under
++way, so a request that arrives while N runs can only join N+2 and waits a whole
++step for nothing. Under late admission (``VLLM_LATE_ADMISSION_LAYER``) the engine
++core decides N+1 when N's GPU work reaches the start of that decoder layer. The
++rest of N (the later layers, sampling and drafting) still hides the host's
++preparation of N+1, and the requests that arrived meanwhile join N+1.
++
++The signal is one CUDA event recorded at the layer by a forward pre-hook. In a
++full CUDA graph the record is captured as an external event node, so every replay
++records it at that point; eager steps record it as they pass. ``execute_model``
++returns an asynchronous output that waits on the event, so the output rank's reply
++to ``execute_model`` reaches the engine core when the step reaches the layer, in
++order before the step's sampled output. No tensor is read or written: outputs
++cannot change.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from vllm.v1.outputs import AsyncModelRunnerOutput
++
++
++class StepReachedLayer(AsyncModelRunnerOutput):
++    """The reply to ``execute_model``: ready when the step reaches the layer."""
++
++    def __init__(self, event: torch.cuda.Event):
++        self._event = event
++
++    def get_output(self) -> None:
++        self._event.synchronize()
++        return None
++
++
++def decoder_layers(model: nn.Module) -> nn.ModuleList:
++    """The target model's decoder layers (``model.layers`` of the language model)."""
++    for candidate in (
++        model,
++        getattr(model, "model", None),
++        getattr(getattr(model, "language_model", None), "model", None),
++    ):
++        layers = getattr(candidate, "layers", None)
++        if isinstance(layers, nn.ModuleList):
++            return layers
++    raise ValueError(
++        f"late admission needs the decoder layers of {type(model).__name__} "
++        "(no `layers` ModuleList on the model or its language model)"
++    )
++
++
++class LayerProgress:
++    """Records an event when the GPU reaches decoder layer ``layer``.
++
++    Args:
++        model: the target model.
++        layer: index of the decoder layer whose start is the admission point.
++        event_factory: builds the event (tests pass a host-side stand-in).
++    """
++
++    def __init__(self, model: nn.Module, layer: int, event_factory=None):
++        layers = decoder_layers(model)
++        if not 0 <= layer < len(layers):
++            raise ValueError(
++                f"VLLM_LATE_ADMISSION_LAYER={layer} is outside the model's "
++                f"{len(layers)} decoder layers"
++            )
++        self.layer = layer
++        self.event = (
++            event_factory()
++            if event_factory is not None
++            else torch.cuda.Event(blocking=True, external=True)
++        )
++        self._handle = layers[layer].register_forward_pre_hook(self._record)
++
++    def _record(self, module: nn.Module, args) -> None:
++        self.event.record()
++
++    def reply(self) -> StepReachedLayer:
++        """The ``execute_model`` reply of a step whose forward was launched."""
++        return StepReachedLayer(self.event)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index f27cb88b7..d56c99943 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -163,6 +163,7 @@ from vllm.v1.worker.gpu.kv_connector import (
+     KVConnector,
+     get_kv_connector,
+ )
++from vllm.v1.worker.gpu.late_admission import LayerProgress
+ from vllm.v1.worker.gpu.lora_utils import (
+     LoraState,
+     create_lora_capture_hook,
+@@ -409,6 +410,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # For transferring state from execute_model to subsequent sample_tokens call.
+         self.execute_model_state: ExecuteModelState | None = None
++        # Late admission: the event each step records at VLLM_LATE_ADMISSION_LAYER.
++        self.layer_progress: LayerProgress | None = None
+ 
+         # Expert parallelism load balancer.
+         self.eplb = EPLBController(self.parallel_config, self.device)
+@@ -497,6 +500,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             time_after_load - time_before_load,
+         )
+ 
++        if envs.VLLM_LATE_ADMISSION_LAYER >= 0:
++            # Before graph capture, so every captured graph records the event.
++            self.layer_progress = LayerProgress(
++                self.model, envs.VLLM_LATE_ADMISSION_LAYER
++            )
++
+         # Initialize the components that require the model. Model states select
+         # input-preparation kernels that need JIT warmup.
+         with self.jit_warmup_registry.activate():
+@@ -2785,6 +2794,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return self.pp_handler.relay_aux_hidden_states(
+                 model_inputs["intermediate_tensors"], output_intermediate_tensors
+             )
++        if self.layer_progress is not None and not dummy_run:
++            # The engine core decides the next step once this one reaches the layer.
++            return self.layer_progress.reply()
+         return None
+ 
+     @torch.inference_mode()
+-- 
+2.54.0 (Apple Git-157)
+

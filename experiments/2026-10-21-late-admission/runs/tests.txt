@@ -1,0 +1,29 @@
+2026-10-21, dgx4 (idle, outside the lab triangle), against vllm-ds41f-kkref:19f2c20ed4d6-r6x
+(sha256:6339bda18247). The image's vLLM tree is 4d6851c8, the tree of r6x 7316c7f9f, the
+candidate's base. Overlay = vLLM 91eaaa59e's changed files.
+
+  run-tests.sh gpu        (overlay/ mounted, --gpus all, --network none)
+    tests/v1/engine/test_late_admission.py              5 passed
+    tests/v1/worker/test_late_admission.py              6 passed (incl. the captured-graph GPU test)
+    tests/v1/engine/test_structured_output_draft_handoff.py,
+    tests/v1/engine/test_compute_fairness_feedback.py,
+    tests/v1/worker/test_draft_tokens_handler.py,
+    tests/v1/worker/test_b12x_roce_health.py            27 passed (13 + 3 + 3 + 8)
+    38 passed, 14 warnings in 7.37s (runs/tests-gpu.log)
+
+  The batch-queue suites first failed 11 tests: they build EngineCore with object.__new__ and
+  had no late_admission attribute; EngineCore now declares the class default (False).
+
+  run-tests.sh regress (tests/v1/engine and tests/v1/worker, candidate against the image) was
+  stopped after 28 minutes at about 5%: modules that need the network or ray fail to collect or
+  time out in both arms. Not used.
+
+  smoke.sh (end to end: a dummy-weight 24-layer Llama-shaped model, DS4.1's tokenizer, V2 runner,
+  async scheduling, multiprocess executor; 30 s of four closed-loop streams per arm; the
+  candidate's late_admission.py was the pre-format copy, identical but for ruff's line wrap):
+
+    late admission off:       greedy d73cddf1, TTFT p50 52.6 ms, waited a step: 108 of 108,
+                              plain step p50 16.6 ms
+    late admission layer 18:  greedy d73cddf1, TTFT p50 35.7 ms, waited a step: 0 of 108,
+                              plain step p50 16.7 ms
+    (runs/smoke-results.txt)
