@@ -148,10 +148,15 @@ Beside three or seven decoding streams, the prompt step's extra over a plain ste
 | second set, 4 streams, 28-48-token prompts | 34.4 | 72 ms | 74 ms |
 | second set, 4 streams, 48-74-token prompts | 55.4 | 107 ms | 108 ms |
 
-What the two terms are:
-- **About 20 ms is the eager path's fixed cost.** The step's decode rows lose their graph too.
-- **About 1.6 ms a prompt token is routed-MoE weight traffic.** A new token's six experts per
-  layer are mostly not yet read in that step.
+**What the extra is: GPU work, not host launches.** Measured with a profile of one four-stream
+step that carries a 23-token prompt (section 6):
+- the eager host launching is hidden behind the previous step;
+- the GPU idles 4.2 ms of that step's 135.9 ms, against about 1.5 ms in a plain step;
+- the step's extra over a plain four-stream step is routed MoE (+40.8 ms, expert weights for the
+  prompt's rows) and dense GEMMs (+7.0 ms).
+
+The fixed 20 ms of the fit is therefore mostly the dense GEMMs and the MoE's first rows, not
+host overhead.
 
 The drafter is small: 3.8-4.1 ms of a step's GPU time. It is on the path, because the first
 token returns with the whole step's output.
@@ -170,17 +175,15 @@ token returns with the whole step's output.
    long as the point leaves more than the host's preparation before N ends. No request waits
    for anything but work, so it fits the owner's rule. It does not help one stream: the step
    after a finished request's last token is decided before the finish is known.
-2. **Graph the steps that carry short prompts.** Ceiling: about 20 ms beside decoding streams
-   (8%), and up to about 36 ms for a prompt alone.
-
-   The runner can already graph mixed steps of up to 48 tokens without torch.compile:
-   breakable piecewise graphs (`VLLM_USE_BREAKABLE_CUDAGRAPH=1` with FULL_AND_PIECEWISE). They
-   keep decode on its full graphs and run the SWA write, compressor, indexer and attention
-   eagerly between pieces. Not tried for this. The 2026-09-23 reference study ran breakable
-   graphs in PIECEWISE mode (decode included) on an older image, for a determinism question.
-
-   Bound it with a profile of one mixed step's host gaps first. Then the flag is a
-   one-variable arm, whose risks are bit identity and dgx1's 5 GiB startup guard (more graphs).
+2. **Graph the steps that carry short prompts.** Measured ceiling: about 3 ms (section 6).
+   - A step carrying a prompt keeps the GPU busy: 4.2 ms idle against about 1.5 ms in a plain
+     step.
+   - The eager host time is hidden behind the step before.
+   - Breakable piecewise graphs (`VLLM_USE_BREAKABLE_CUDAGRAPH=1`) would recover only those idle
+     milliseconds. Not worth an arm.
+   - The L2 weight prefetch barely runs in eager steps (0.9 ms of prefetch kernels against
+     14 ms in graphed steps), and the step's dense GEMMs are 7 ms slower. Running the prefetch
+     in eager steps is a separate few-millisecond lever; it needs its own profile to confirm.
 3. **TP4.** Every step term shrinks with the step: TP4's eight-stream serving step is 0.80x
    TP3's. Needs the ring cabled; not a code change.
 4. **Prompt rows.** 1.58 ms a token: 33 ms (13%) at 20 tokens, 54-87 ms at 34-55 tokens.
@@ -192,8 +195,8 @@ token returns with the whole step's output.
 Not levers:
 - cadence or quota throttles (rejected 2026-10-19);
 - lossy weights;
-- turning async scheduling off in production (every step would wait for the host's
-  preparation);
+- turning async scheduling off in production: level on short prompts at four and eight
+  streams (section 5), but unmeasured at one stream and on long prefills;
 - the rest of the running step. A request cannot join a step that has started; only shorter
   steps shorten this wait.
 
@@ -244,6 +247,40 @@ synchronous scheduling on:
 - cold 32K and 131K prefills;
 - determinism.
 
-The mixed-step profile for lever 2 (`lab/ttft-mixed4-profile.json`, arm `lab/r6x-prof.json`) is
-queued behind the A/B. Its KV pool is 4.5 GiB: at 4.906 GiB the profiler's startup memory took
-dgx1 below its 5 GiB startup guard (08:09 UTC, 4.99 GiB).
+## 6. Profile of a step carrying a prompt (2026-10-21 08:41 UTC)
+
+Spec `lab/ttft-mixed4-profile.json`, arm `lab/r6x-prof.json`:
+- the arm is r6x with the torch profiler recording ten steps after `/start_profile`;
+- its KV pool is 4.5 GiB, because at 4.906 GiB the profiler's startup memory took dgx1 below
+  its 5 GiB startup guard (08:09 UTC, 4.99 GiB);
+- `profile_mixed4.py` lets three streams decode, starts the profiler and sends a 23-token
+  prompt.
+
+Rank 0's trace is on dgx1 at `cache/kkref/profiles/ttft-gap-mixed4/`.
+`analyze_profile.py` gives `runs/mixed4-profile-rank0.txt`:
+
+| Step (rank 0) | Host launch | GPU span | GPU busy | GPU idle |
+| --- | ---: | ---: | ---: | ---: |
+| 3 streams, plain (graph) | 5.8 ms | 63.2 ms | 61.6 ms | 1.6 ms |
+| 3 streams + 23-token prompt (eager) | 102.8 ms | 135.9 ms | 131.7 ms | 4.2 ms |
+| 4 streams, plain (graph) | 7.4 ms | 81.5 ms | 79.9 ms | 1.5 ms |
+
+Kernel time in the prompt step against the plain four-stream step after it:
+
+| Kernels | Prompt step | 4 streams |
+| --- | ---: | ---: |
+| routed MoE | 96.8 ms | 56.0 ms |
+| dense GEMMs | 19.2 ms | 12.1 ms |
+| collectives | 6.4 ms | 5.2 ms |
+| mHC, sparse MLA, rest | 8.9 ms | 9.3 ms |
+| L2 weight prefetch (side stream) | 0.9 ms | 14.0 ms |
+
+What the profile shows:
+- **The host is not the bottleneck.** Async scheduling launched the eager step's kernels while
+  the step before ran, so the GPU idles only about 3 ms more than in a plain step. Graphing
+  these steps has nothing left to win.
+- **The cost is routed MoE.** Its kernel time grows about 2.7 ms per decode row between the
+  three- and four-stream plain steps (39.9 to 56.0 ms), and the prompt's rows add experts the
+  same way. That is native-precision weight traffic; only kernel work or TP4 changes it.
+- **The L2 prefetch barely runs in the eager step,** and the step's dense GEMMs are 7 ms slower.
+  A small, separate lever.
