@@ -1,0 +1,241 @@
+# Short-prompt time to first token: where it goes
+
+Base: promoted r6x (`2026-10-19-karmic-kraken-r6x`, image `vllm-ds41f-kkref:19f2c20ed4d6-r6x`,
+vLLM patch head 7316c7f9), recipe at origin/main 6aed2926, the TP3 triangle at 1M. TP4 figures
+come from r6x's ring release (2026-10-19).
+
+Question: why does a short prompt's time to first token (TTFT) take about a quarter to a third
+of a second at four closed-loop streams on TP3, and which levers could shorten it?
+Constraints: native weights, identical outputs, no cadence throttles (a prefill pauses only
+when other work needs the step).
+
+This is a ceiling study. Nothing was built; no configuration changes.
+
+## 1. TTFT is about three serving steps
+
+From the recorded release suites (servebench closed loops, about 20-token prompts, thinking
+off, greedy, 256 tokens). The serving step is 1 / engine steps per second over the window.
+
+| Shape | Streams | TTFT p50 | Serving step | TTFT / step |
+| --- | ---: | ---: | ---: | ---: |
+| TP3 | 1 | 125 ms | 37.6 ms | 3.32 |
+| TP3 | 4 | 254 ms | 73.9 ms | 3.44 |
+| TP3 | 8 | 359 ms | 108.3 ms | 3.31 |
+| TP4 | 1 | 98 ms | 30.5 ms | 3.21 |
+| TP4 | 8 | 290 ms | 86.5 ms | 3.35 |
+| TP4 | 16 | 400 ms | 122.9 ms | 3.25 |
+
+Sources: `manifests/suites/2026-10-19-karmic-kraken-r6x-tp3{,-single-stream}` and
+`…-r6x-tp4{,-single-stream}` (`summary.latency.ttft_s`, `summary.server.steps_per_s`).
+
+The serving step is not the engine grid's step: the grid replays one token on every row, so
+its rows share experts (TP3 4x12 rows: 27.6 ms). Real text routes each row to its own experts:
+a profiled one-stream serving step spends 23.8 ms in routed MoE and 11.7 ms in dense GEMMs
+(`experiments/2026-10-19-prefill-ceiling` traces, `decode` workload, rank 0).
+
+## 2. Mechanism: the step decided ahead
+
+`--async-scheduling` runs the engine core with a two-batch queue
+(`vllm/v1/engine/core.py`, `step_with_batch_queue`, `max_concurrent_batches` = 2). As soon as
+step N is under way, step N+1 is scheduled, its inputs prepared and its CUDA graphs launched
+behind N. The engine core then blocks on N's output. A request that arrives meanwhile waits in
+the engine core's input queue until N's output is processed. By then N+1 is fixed, so the
+earliest step the request can join is N+2.
+
+The r6x one-stream decode trace shows the lead (`decode` workload, rank 0, launches matched to
+kernels by correlation id). Each step is three graph launches: the target (1,711 kernels), the
+sampler (24) and the drafter (174, 3.8 ms).
+- The worker receives a step's scheduler output at 45.97 ms, 2.7 ms after the previous GPU step
+  ended, and launches its graphs by 55.7 ms.
+- Those graphs run on the GPU from 88.66 to 137.30 ms.
+- So the decision leads the GPU by about 42 ms (one profiled step). Preparing and launching
+  takes about 10 ms of host time under the profiler.
+
+Every step that carries prompt rows runs eagerly, including the other streams' decode rows in
+that step:
+- DS4.1 is not torch-compiled: the serving log says "`torch.compile` is turned on, but the
+  model … does not support it".
+- `VLLM_USE_BREAKABLE_CUDAGRAPH` is 0.
+- So the recipe's FULL_AND_PIECEWISE captures only full graphs of uniform decode batches (24
+  of them, plus DSpark's).
+- A one-token prompt is decode-shaped and replays one. The r6x one-row prefill trace spends
+  28.2 ms in the target and 4.1 ms in the drafter on the GPU, in three graph launches.
+
+## 3. Traced replay (measured, 2026-10-20 20:59-21:06 UTC)
+
+`ttft_trace.py` ran on production (r6x TP3, no hold, the server idle for the
+`bin/spark workload --duration 15` check, no foreign requests in any phase). It sends
+servebench's default prompts as servebench does: fresh cache salts, exactly 256 tokens,
+thinking off, greedy. It keeps every streamed chunk's arrival and reads the server's counters
+around each phase:
+- twelve requests one at a time on an idle engine, counters read around each;
+- four streams for 120 s;
+- eight streams for 60 s.
+
+`analyze_trace.py` rebuilds step ends from the streams' chunks (the step count matches the
+server's: 1,745 and 703). It splits each request's TTFT into:
+- the time until the first step end after it was sent;
+- whole steps that do not carry it;
+- the step that produces its first token.
+
+Requests in each phase's opening burst are excluded from the closed-loop rows below.
+Analysis: `runs/r6x-tp3-servebench-analysis.json`. Raw trace: dgx1
+`~/spark-lab/ttft-gap/r6x-tp3-servebench.json`, sha256 5ca4eae8.
+
+```sh
+scp experiments/2026-10-20-ttft-gap/ttft_trace.py experiments/2026-10-20-ttft-gap/analyze_trace.py dgx1:spark-lab/ttft-gap/
+ssh dgx1 'cd ~/spark-lab/ttft-gap && python3 ttft_trace.py --repo ~/projects/spark-ds41f --output r6x-tp3-servebench.json'
+ssh dgx1 'cd ~/spark-lab/ttft-gap && python3 analyze_trace.py r6x-tp3-servebench.json --json r6x-tp3-servebench-analysis.json'
+```
+
+**Every request waited exactly one step that did not carry it** (53 of 53 at four streams, 33
+of 33 at eight).
+
+Means per request, with the plain step (a step that produces no first token) as the
+reference:
+
+| Part | 4 streams | Share | 8 streams | Share |
+| --- | ---: | ---: | ---: | ---: |
+| rest of the running step | 70.6 ms | 27% | 102.9 ms | 29% |
+| the step decided ahead | 62.0 ms | 24% | 97.2 ms | 28% |
+| its own step | 125.7 ms | 49% | 151.8 ms | 43% |
+| TTFT (client) | 258.4 ms | | 352.4 ms | |
+| TTFT p50 | 254.5 ms | | 339.4 ms | |
+| plain step p50 | 70.8 ms | | 100.2 ms | |
+| prompt tokens (mean) | 20.7 | | 20.2 | |
+
+Notes on the parts:
+- **The rest of the running step** is almost a whole step in a closed loop. A stream's next
+  request is sent about 3 ms after its previous request's last step ended, so it lands near
+  the start of the next step.
+- **The step decided ahead** is shorter than a plain step. The finished stream's rows have
+  already left it.
+- **Its own step** is 55 ms (four streams) and 52 ms (eight) longer than a plain step.
+- **The server's view agrees.** At four streams the queue time is 0.0 ms and the prefill time
+  186.8 ms (the decided step plus its own step). The wait for the running step is spent before
+  the request reaches the scheduler, which is why the queue metric reads zero. Server TTFT is
+  255.8 ms.
+
+**Isolated requests** (idle engine, one at a time, servebench prompts of 17-24 tokens):
+- client TTFT 97-116 ms;
+- the server's first-token latency is 2.3 ms less (delivery);
+- queue time 0;
+- 2.7 ms between the API's arrival stamp and the engine (chat template, tokenization, IPC);
+- the rest is the engine's prefill time, 92-111 ms.
+
+Host and delivery together are about 5 ms (2% at four streams): not a lever.
+
+## 4. The prompt's own step
+
+On an idle engine, prefill time = 68.1 ms + 1.58 ms per prompt token. This is a least-squares
+fit over 24 isolated requests of 17-74 tokens: these twelve, plus twelve from a second prompt
+set run the same way; residual sd 3.6 ms. The second set has prompts of 28-74 tokens, kept
+outside the repository; its trace is dgx1 `~/spark-lab/ttft-gap/r6x-tp3-set2.json`, sha256
+009bea68.
+
+The eager path's fixed cost is the 68 ms intercept against the one-row prefill's 32 ms
+decode-shaped graph. Some of that difference is prefill-only work a graph would still do: CED
+metadata, compressor and indexer prefill, the Engram rows of a prompt nobody hashed a step
+ahead.
+
+Beside three or seven decoding streams, the prompt step's extra over a plain step fits about
+20 ms + 1.58 ms per prompt token:
+
+| Workload | Prompt tokens (mean) | Own step − plain step | 20 ms + 1.58 ms/token |
+| --- | ---: | ---: | ---: |
+| 4 streams | 20.7 | 55 ms | 53 ms |
+| 8 streams | 20.2 | 52 ms | 52 ms |
+| second set, 4 streams, 28-48-token prompts | 34.4 | 72 ms | 74 ms |
+| second set, 4 streams, 48-74-token prompts | 55.4 | 107 ms | 108 ms |
+
+What the two terms are:
+- **About 20 ms is the eager path's fixed cost.** The step's decode rows lose their graph too.
+- **About 1.6 ms a prompt token is routed-MoE weight traffic.** A new token's six experts per
+  layer are mostly not yet read in that step.
+
+The drafter is small: 3.8-4.1 ms of a step's GPU time. It is on the path, because the first
+token returns with the whole step's output.
+
+## Levers by ceiling (TP3, four streams, about 20-token prompts)
+
+1. **Decide the next step later (late admission).** Ceiling: the step decided ahead.
+   - Four streams: −62 ms (−24%). Eight streams: −97 ms (−28%).
+   - With 34-55-token prompts at four streams: −65 to −67 ms (−20 to −22%).
+   - Burst arrivals also gain. The first request of a burst on an idle engine prefills alone,
+     and the rest wait that step plus a decided one (the opening bursts above: 321-336 ms).
+
+   Async scheduling exists to hide the host's preparation (about 10 ms profiled, section 2),
+   not to fix the batch a step early. Deciding step N+1 when step N's GPU work reaches a fixed
+   point would keep the GPU fed and admit every request that arrived before that point, as
+   long as the point leaves more than the host's preparation before N ends. No request waits
+   for anything but work, so it fits the owner's rule. It does not help one stream: the step
+   after a finished request's last token is decided before the finish is known.
+2. **Graph the steps that carry short prompts.** Ceiling: about 20 ms beside decoding streams
+   (8%), and up to about 36 ms for a prompt alone.
+
+   The runner can already graph mixed steps of up to 48 tokens without torch.compile:
+   breakable piecewise graphs (`VLLM_USE_BREAKABLE_CUDAGRAPH=1` with FULL_AND_PIECEWISE). They
+   keep decode on its full graphs and run the SWA write, compressor, indexer and attention
+   eagerly between pieces. Not tried for this. The 2026-09-23 reference study ran breakable
+   graphs in PIECEWISE mode (decode included) on an older image, for a determinism question.
+
+   Bound it with a profile of one mixed step's host gaps first. Then the flag is a
+   one-variable arm, whose risks are bit identity and dgx1's 5 GiB startup guard (more graphs).
+3. **TP4.** Every step term shrinks with the step: TP4's eight-stream serving step is 0.80x
+   TP3's. Needs the ring cabled; not a code change.
+4. **Prompt rows.** 1.58 ms a token: 33 ms (13%) at 20 tokens, 54-87 ms at 34-55 tokens.
+   Native-precision MoE weight traffic, so only kernel work changes it. TP4 cuts per-rank bytes
+   by a quarter.
+5. **Return the first token before the drafter.** At most about 4 ms (2%).
+6. **Host and delivery.** About 5 ms (2%), measured.
+
+Not levers:
+- cadence or quota throttles (rejected 2026-10-19);
+- lossy weights;
+- turning async scheduling off in production (every step would wait for the host's
+  preparation);
+- the rest of the running step. A request cannot join a step that has started; only shorter
+  steps shorten this wait.
+
+## Recommended next experiment
+
+**A ceiling A/B for lever 1** (a lab window; the owner approved the plan on 2026-10-21):
+- **Arms** (`lab/`, generated from the recipe at tp3-triangle so only the named flags differ):
+  - `async-off.json`: r6x TP3 with `--no-async-scheduling` and `--disable-cascade-attn`.
+    Dropping `--async-scheduling` alone is not enough: vLLM turns async scheduling on by
+    default for DSpark. Async speculative decoding also turns cascade attention off by
+    itself, so the arm sets that explicitly and the scheduling is the only difference.
+  - `r6x.json`: production, unchanged.
+  - Order: candidate, reference, candidate again.
+- **Synchronous mode keeps speculation.** The engine core takes each step's drafts from the
+  runner as −1 placeholders (`DraftTokensHandler`); the drafts themselves stay on the GPU.
+- **Measured per arm** (`lab/ttft-async-ab.json`):
+  - this traced replay (`ttft_trace.py --analyze`, lab extra form: URL first);
+  - servebench c4 and c8 (closed loops, 60 s warm-up, 300 s, thinking off), as the release
+    suite runs them;
+  - `token_determinism_text.py --wide`.
+
+Expected:
+- Outputs identical.
+- The decided step disappears from every request: TTFT −62 ms at four streams, −97 ms at
+  eight.
+- Each step lengthens by the host preparation it no longer hides, seen in engine steps per
+  second and TPOT.
+
+The TTFT difference confirms lever 1's ceiling. The step difference is what late admission has
+to keep hidden: it sets how early in a step the decision point must sit. Build late admission
+only if the A/B confirms at least 20% at four streams. It would be one vLLM engine-core patch
+that decides on an event recorded at a fixed layer of the running step, A/B'd against r6x on
+the same measurements.
+
+**Lever 2 without a serving change** (`lab/ttft-mixed4-profile.json`, arm `lab/r6x-prof.json`:
+r6x with the torch profiler recording ten steps after `/start_profile`). `profile_mixed4.py`
+lets three streams decode, starts the profiler and sends a 20-token prompt, so the trace holds
+plain three-stream steps and the step that carries the prompt. Sum that step's GPU idle gaps
+against the plain steps'. The profiler inflates host time, so the result is an upper bound.
+
+To run both on dgx1, after the shared-window checks: copy `lab/*.json` (arms) and the three
+scripts to `results/private/lab/ttft-gap/` (git-ignored), and the two specs to
+`~/spark-lab/specs/`. Then `scripts/lab.py queue add` each spec and start the queue with
+`scripts/lab_idle_start.sh`, or with a copy that passes `--idle-minutes 1` so the window
+closes when the queue empties.
