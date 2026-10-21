@@ -197,45 +197,53 @@ Not levers:
 - the rest of the running step. A request cannot join a step that has started; only shorter
   steps shorten this wait.
 
-## Recommended next experiment
+## 5. Ceiling A/B: synchronous scheduling (2026-10-21 08:10-08:40 UTC)
 
-**A ceiling A/B for lever 1** (a lab window; the owner approved the plan on 2026-10-21):
-- **Arms** (`lab/`, generated from the recipe at tp3-triangle so only the named flags differ):
-  - `async-off.json`: r6x TP3 with `--no-async-scheduling` and `--disable-cascade-attn`.
-    Dropping `--async-scheduling` alone is not enough: vLLM turns async scheduling on by
-    default for DSpark. Async speculative decoding also turns cascade attention off by
-    itself, so the arm sets that explicitly and the scheduling is the only difference.
-  - `r6x.json`: production, unchanged.
-  - Order: candidate, reference, candidate again.
-- **Synchronous mode keeps speculation.** The engine core takes each step's drafts from the
-  runner as −1 placeholders (`DraftTokensHandler`); the drafts themselves stay on the GPU.
-- **Measured per arm** (`lab/ttft-async-ab.json`):
-  - this traced replay (`ttft_trace.py --analyze`, lab extra form: URL first);
-  - servebench c4 and c8 (closed loops, 60 s warm-up, 300 s, thinking off), as the release
-    suite runs them;
-  - `token_determinism_text.py --wide`.
+`lab/ttft-async-ab-fast.json` in the shared lab queue, one session, no foreign requests:
+- **Arms:** `lab/async-off.json` (`--no-async-scheduling --disable-cascade-attn`), then
+  `lab/r6x.json`.
+- **Per arm:** the traced replay, servebench c4 and c8 (30 s warm-up, 120 s) and
+  `token_determinism_text.py --wide`.
+- **Records:** the analyses are in `runs/ab-async-off-analysis.json` and
+  `runs/ab-r6x-analysis.json`; the raw traces are on dgx1 under `results/private/lab/ttft-gap/`.
 
-Expected:
-- Outputs identical.
-- The decided step disappears from every request: TTFT −62 ms at four streams, −97 ms at
-  eight.
-- Each step lengthens by the host preparation it no longer hides, seen in engine steps per
-  second and TPOT.
+| | async off | r6x (async) |
+| --- | ---: | ---: |
+| traced TTFT p50, 4 streams | 189.9 ms | 256.2 ms |
+| traced TTFT p50, 8 streams | 246.6 ms | 349.8 ms |
+| requests that waited a step not carrying them | 0 of 86 | 86 of 86 |
+| servebench TTFT p50, c4 / c8 | 0.188 / 0.259 s | 0.257 / 0.361 s |
+| output tok/s, c4 | 117.1 ± 4.1 | 116.6 ± 4.0 |
+| engine steps/s, c4 | 13.37 ± 0.39 | 13.40 ± 0.39 |
+| output tok/s, c8 | 153.2 ± 3.0 | 151.6 ± 3.4 |
+| engine steps/s, c8 | 9.15 ± 0.28 | 9.12 ± 0.26 |
+| plain step p50, 4 / 8 streams | 71.2 / 99.8 ms | 71.2 / 99.9 ms |
+| determinism | identical, 62313cb5 / 9742ac2c | identical, 62313cb5 / 9742ac2c |
 
-The TTFT difference confirms lever 1's ceiling. The step difference is what late admission has
-to keep hidden: it sets how early in a step the decision point must sit. Build late admission
-only if the A/B confirms at least 20% at four streams. It would be one vLLM engine-core patch
-that decides on an event recorded at a fixed layer of the running step, A/B'd against r6x on
-the same measurements.
+**The ceiling holds.** Without the decided step, TTFT falls 26% at four streams and 30% at
+eight, as section 3 predicted (−62 and −97 ms). The step a request runs in and the rest of the
+running step are unchanged.
 
-**Lever 2 without a serving change** (`lab/ttft-mixed4-profile.json`, arm `lab/r6x-prof.json`:
-r6x with the torch profiler recording ten steps after `/start_profile`). `profile_mixed4.py`
-lets three streams decode, starts the profiler and sends a 20-token prompt, so the trace holds
-plain three-stream steps and the step that carries the prompt. Sum that step's GPU idle gaps
-against the plain steps'. The profiler inflates host time, so the result is an upper bound.
+**What async scheduling buys here is not measurable at four and eight streams.** Step rates
+are within 0.3%, inside their intervals. The host work it hides is small next to a 70-110 ms
+step.
 
-To run both on dgx1, after the shared-window checks: copy `lab/*.json` (arms) and the three
-scripts to `results/private/lab/ttft-gap/` (git-ignored), and the two specs to
-`~/spark-lab/specs/`. Then `scripts/lab.py queue add` each spec and start the queue with
-`scripts/lab_idle_start.sh`, or with a copy that passes `--idle-minutes 1` so the window
-closes when the queue empties.
+The A/B did not measure where async could still pay:
+- one stream, the shortest step;
+- long prefills, where the Engram reader reads a chunk's rows during the step before.
+
+## Next: late admission
+
+Rather than turn async scheduling off, keep it and decide each step late in the step before:
+[2026-10-21-late-admission](../2026-10-21-late-admission/README.md) (vLLM 0222,
+`VLLM_LATE_ADMISSION_LAYER`). Its screen compares late admission with r6x and with
+synchronous scheduling on:
+- this traced replay;
+- servebench c4 and c8;
+- one stream;
+- cold 32K and 131K prefills;
+- determinism.
+
+The mixed-step profile for lever 2 (`lab/ttft-mixed4-profile.json`, arm `lab/r6x-prof.json`) is
+queued behind the A/B. Its KV pool is 4.5 GiB: at 4.906 GiB the profiler's startup memory took
+dgx1 below its 5 GiB startup guard (08:09 UTC, 4.99 GiB).
