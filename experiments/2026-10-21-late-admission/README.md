@@ -80,9 +80,21 @@ about 4 ms before the end of a 16.7 ms step.
 | --- | --- |
 | [overlay/](overlay) | the changed files, mounted over the r6x image (whose vLLM tree is the patch's base) |
 | [make_arms.py](make_arms.py) | writes `late-tp3.json` (candidate), `r6x-tp3.json` (reference), `screen-suite.json` and `screen-tp3.json` for a K; `--staged DIR` writes a copy that mounts from DIR, to run before merging |
-| [late-tp3.json](late-tp3.json), [r6x-tp3.json](r6x-tp3.json), [screen-suite.json](screen-suite.json), [screen-tp3.json](screen-tp3.json) | K = 30, as generated |
+| [late-tp3.json](late-tp3.json), [r6x-tp3.json](r6x-tp3.json), [async-off-tp3.json](async-off-tp3.json), [screen-suite.json](screen-suite.json), [screen-tp3.json](screen-tp3.json) | K = 30 and a 4.5 GiB KV pool for every arm (`make_arms.py 30 --kv-bytes 4831838208`), as generated |
 | [runs/run-tests.sh](runs/run-tests.sh) | CPU and GPU tests in a throwaway container on an idle node |
 | [runs/smoke.sh](runs/smoke.sh), [runs/smoke_client.py](runs/smoke_client.py) | the end-to-end smoke test on one idle node |
+
+## First boot (2026-10-21 08:56-08:59 UTC)
+
+A trimmed copy of the screen with production-sized arms did not boot:
+- dgx1's startup memory guard stopped the late-admission arm at 4.99 GiB MemAvailable, against
+  its 5 GiB floor;
+- that was after model load and every graph capture with `VLLM_LATE_ADMISSION_LAYER=30`;
+- the mixed-step profile arm of the ttft-gap experiment stopped the same way at 08:09.
+
+Production-sized lab boots on the triangle run within tens of MB of the floor. Every arm of the
+screen now uses a 4.5 GiB KV pool, which these measurements do not depend on. The release
+comparison needs the production pool, and so a startup peak below the guard.
 
 ## Gates
 
