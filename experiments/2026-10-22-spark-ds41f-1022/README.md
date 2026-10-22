@@ -6,8 +6,8 @@ production, gates the combination with one focused window, then compares it with
 promotion gate. Named per the release naming adopted for the next release: `spark-ds41f-MMDD`
 (the candidate's own name until the owner promotes it).
 
-**Status:** series built and unit-tested (2026-10-22); sparknet 0.5.0 cut locally, waiting
-for the owner to push; image, gate and release comparison pending.
+**Status:** series built and unit-tested (2026-10-22); sparknet 0.5.0 released (tag `v0.5.0`,
+the owner's word); image, gate and release comparison pending.
 
 ## Contents
 
@@ -18,7 +18,7 @@ for the owner to push; image, gate and release comparison pending.
 | vLLM 0222, late admission at decoder layer 30 | experiments/2026-10-21-late-admission (PR #454; analysis in PR #453) | TP3 screen: TTFT p50 −26% at four streams, −30% at eight; one stream and prefill level; outputs identical |
 | vLLM 0223, sink rejection on by default for DeepSeek V4.1 | this record | the owner's decision of 2026-10-22, below |
 | vLLM 0224, late admission with sink rejection through the engine-core loop | this record | tests only |
-| sparknet 0.5.0, the wider one-shot data phase | dgx-spark-networking main 8618973 and the 0.5.0 release commit | TP3 engine grid decode step −1.6%, outputs identical |
+| sparknet 0.5.0, the wider one-shot data phase | dgx-spark-networking `v0.5.0` (ed6af327): main 8618973, the striping-test fix, the release commit | TP3 engine grid decode step −1.6%, outputs identical |
 
 The gated 0221 is vLLM 5ac8364ec (616d1a28d with each sink event naming its row); its patch
 file is unchanged. 0222 is re-exported on 0221 (same change, new context).
@@ -66,8 +66,10 @@ V2-runner worker:
   19f2c20e; patch head c6a567ada, tree 32ae33c9 (`git am --committer-date-is-author-date` with
   the build's committer reproduces it). Working branch `next-release` in
   ~/projects/vllm-ds41-next (local, as vLLM working branches are).
-- sparknet: 0.5.0, release commit ca660575 on main 8618973 (tree 9d486705); to be pushed and
-  tagged `v0.5.0` on the owner's word.
+- sparknet: 0.5.0, tag `v0.5.0` at ed6af327 (tree f997a594), released 2026-10-22 on the owner's
+  word: main 8618973 (the wide read phase), the GPU striping test for per-peer routes (b00a08e,
+  qualified on the triangle 2026-10-21, applied onto main as 2031687) and the release commit
+  (version, changelog, README serving status). `make check` and the branch's CI passed first.
 - Everything else as r6x: [upstreams.lock.json](upstreams.lock.json),
   [source.json](source.json).
 - Image `vllm-ds41f-kkref:19f2c20ed4d6-1022` (the live-name rename stays a separate step).
