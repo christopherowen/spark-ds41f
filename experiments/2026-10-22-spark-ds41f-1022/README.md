@@ -6,8 +6,10 @@ production, gates the combination with one focused window, then compares it with
 promotion gate. Named per the release naming adopted for the next release: `spark-ds41f-MMDD`
 (the candidate's own name until the owner promotes it).
 
-**Status (2026-10-22 23:10 CET): promoted as `spark-ds41f-1022`, image `-1022-4`, on the triangle at
-1M** (owner: "begin the promotion routine"; [Promotion](#promotion)). The ring is unqualified on
+**Status (2026-10-23 00:35 CET): promoted as `spark-ds41f-1022`, image `-1022-4`, and serving on the
+triangle at 1M** (owner: "begin the promotion routine"; merged as 590786b, #462; [Promotion](#promotion)).
+Deployed 00:33-00:35 CET under a deploy hold: API ready in 94.5 s, `doctor --live` OK, KV 4,765,898
+tokens; the control-spellings probe passes on the live service. The ring is unqualified on
 this image until a ring release run. The paragraphs below record how the candidate got there.
 
 **Image `-1022-2` (2026-10-22):** the focused gate, the release tests (1,781 passed on image `-1022-2`)
