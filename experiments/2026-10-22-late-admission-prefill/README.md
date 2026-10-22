@@ -1,18 +1,12 @@
-# Late admission and the candidate's prefill: the Engram trace, and a fix held for a decision
+# Late admission and the candidate's prefill: the Engram trace and vLLM 0226
 
 Owner, 2026-10-22, on spark-ds41f-1022's prefill (about 1% below r6x): "please fix it".
 
-**Status (2026-10-22 18:50 CET):** the suspected cause (Engram reads) is ruled out. In the
-Engram debug timeline the candidate's prefill chunks wait for their rows exactly as r6x's do.
-The loss is in the cadence of the chunks instead:
-- the second chunk starts 44-49 ms later after every prompt's first chunk;
-- each later chunk takes 7.0 ms longer on average (0.8%).
-
-0222's author identified the mechanism. In a CED prefill chunk, decoder layers 20-39 run on at
-most 128 replayed rows, so layer 30 is reached near the end of a ~0.9 s step. Deciding the next
-step there leaves less lead than the next chunk's eager host launch (about 100 ms) needs.
-vLLM 0226 (below) decides the step after a continuing prompt chunk at once and passes its CPU
-tests. Its A/B is queued on dgx1 (`20261022T164138-ab-tp3.json`, 18:41 CET).
+**Status (2026-10-22 19:40 CET): the A/B passed.** vLLM 0226 restores the candidate's prefill
+to r6x's level: cold 32K and 131K TTFT are 0.8-1.3% shorter than the candidate's, on every one of
+the twelve paired prompts. Time to first token at four and eight streams stays level, and outputs
+are identical, with r6x's hashes. The suspected cause (Engram reads) was ruled out on the way: the
+loss was in the chunks' cadence, from late admission's decision point.
 
 Base: deployment commit 6d8ff8a (main, #457).
 
@@ -100,9 +94,18 @@ What the trace shows:
   trace does not show why.
 
 The suspected mechanism (Engram read-ahead) is ruled out. The late decision after a prompt's
-first chunk is a measured cost, about 45 ms a prompt. The per-chunk 0.8% is not attributed.
+first chunk is a measured cost, about 45 ms a prompt. The trace alone does not attribute the
+per-chunk 0.8%.
 
-## vLLM 0226, prepared and not yet measured
+**The mechanism (0222's author).** In a CED prefill chunk, decoder layers 20-39 run on at most 128
+replayed rows, so layer 30 is reached near the end of a ~0.9 s step. Deciding the next step there
+leaves less lead than the next chunk's eager host launch needs (about 100 ms; the ttft-gap
+profile measured 102.8 ms of host time for one eager step). The chunk then starts late: once
+after the first chunk, by more, and by about 7 ms after every later one. The rows (about 65 ms of
+reads) are ready before that launch, which is why no chunk waits on Engram. The A/B confirms it:
+deciding these steps at once recovers the whole loss.
+
+## vLLM 0226
 
 [vllm/0226-Late-admission-decide-the-step-after-a-continuing-pr.patch](vllm/0226-Late-admission-decide-the-step-after-a-continuing-pr.patch)
 is on the candidate's series (patch head 672231a1b). It is commit 7ec49e2a0, tree 3f23caaf, on
@@ -119,8 +122,8 @@ branch `late-admission-prefill` of the prepared tree on dgx4
 - Nothing is lost for arrivals. Beside a whole chunk the long-prefill threshold (4,048 of 4,096)
   leaves only the decode rows, and a new prompt needs a whole aligned chunk to start.
 
-It removes the measured late dispatch after a prompt's first chunk (about 45 ms a prompt), and
-the per-chunk 0.8% only if that comes from late admission too.
+It removes the late dispatch after each continuing chunk: about 45 ms after a prompt's first
+chunk and about 7 ms after every later one.
 
 ### Tests ([runs/run-tests.sh](runs/run-tests.sh), [runs/tests.txt](runs/tests.txt))
 
@@ -141,28 +144,56 @@ loop and async scheduler with a 16-token budget:
 - an arrival during its last chunk joins the next step, decided late;
 - that step (a decode beside the arrival's first chunk) has its successor decided at once.
 
-## The A/B (queued 2026-10-22 18:41 CET)
+## The A/B (2026-10-22 18:52-19:35 CET)
 
 [make_arms.py](make_arms.py) writes the arms and the spec. `--staged results/private/lab/la-prefill`
-wrote the copy on dgx1, dgx2 and dgx3, with 0226's three files under `overlay/`; the spec passes
+wrote the copy on dgx1, dgx2 and dgx3, with 0226's three files under `overlay/`; the spec passed
 `scripts/lab.py run --dry-run`.
 
-[ab-tp3.json](ab-tp3.json), about 40 min: 0226, the candidate as built, 0226 again. Each arm runs
-cold 32K/131K prefill (3 repeats), the traced TTFT replay
-(`experiments/2026-10-20-ttft-gap/ttft_trace.py`), and `token_determinism_text.py --wide` with
-and without log probabilities.
-- **Pass:** outputs identical (62313cb5 / 9742ac2c and 4d143977 / 12fd8257); prefill at r6x's
-  level; TTFT at four and eight streams level with the candidate's.
-- **Reference:** r6x's prefill on the same prompts is this record's trace (15:53-15:55 CET).
-- **Started by** `scripts/lab_idle_start.sh 10 queue-la-prefill`, with a release watcher
-  (`~/spark-lab/la-prefill-watch/release.sh` on dgx1) that matches the queued file's name.
-- **Verdict lines:** [ab_table.py](ab_table.py).
+Run `la-prefill-ab`, [ab-tp3.json](ab-tp3.json): 0226, the candidate as built (`-1022-2`), 0226
+again, each at the production pool under the unchanged guards. Each arm ran cold 32K/131K prefill
+(3 repeats), `token_determinism_text.py --wide` with and without log probabilities, and the traced
+TTFT replay (`experiments/2026-10-20-ttft-gap/ttft_trace.py`).
+- **Queue:** queued as `20261022T164138-ab-tp3.json` at 18:41 and started by
+  `scripts/lab_idle_start.sh 10 queue-la-prefill`. The window opened at 18:52:34 after ten idle
+  minutes; the release watcher (`~/spark-lab/la-prefill-watch/release.sh` on dgx1) closed it
+  after the job at 19:35. No foreign requests.
+- **Boots:** 0226 ready 18:54:25 (+91.8 s), the candidate 19:08:33 (+92.8 s), 0226 again
+  19:22:39 (+91.9 s).
+- **Memory (min MemAvailable, dgx1 / dgx2 / dgx3):** 0226 5.89 / 7.12 / 7.21 GiB, the candidate
+  5.26 / 7.23 / 7.23 GiB, 0226 again 5.50 / 7.02 / 7.75 GiB. No swap growth, no thermal slowdown.
+
+Verdict lines: [runs/ab-results.txt](runs/ab-results.txt) ([ab_table.py](ab_table.py)). The
+same prompts run in the same order in every arm, so each prompt's TTFT is paired with the
+candidate's. The trace's r6x and candidate arms (15:50-15:55 CET, the same prompts) are listed
+for reference.
+
+| | candidate (`-1022-2`) | 0226 | 0226 again | r6x (trace, 15:53) |
+| --- | ---: | ---: | ---: | ---: |
+| 32K prefill, tok/s | 4538.1 ± 5.4% | 4592.4 ± 5.3% | 4575.2 ± 5.4% | 4583.6 ± 5.5% |
+| 32K TTFT against the candidate, per prompt | | −1.0, −1.2, −1.3% | −0.6, −0.9, −0.9% | −0.8, −1.1, −1.1% |
+| 131K prefill, tok/s | 4433.9 ± 0.4% | 4491.6 ± 0.3% | 4472.6 ± 0.5% | 4460.6 ± 1.8% |
+| 131K TTFT against the candidate, per prompt | | −1.2, −1.4, −1.3% | −0.9, −0.9, −0.8% | +0.4, −1.2, −1.0% |
+| traced TTFT p50, four / eight streams | 276.8 / 350.9 ms | 265.7 / 359.7 ms | 276.9 / 351.6 ms | |
+| isolated TTFT (twelve prompts) | 148.3 ms | 148.9 ms | 148.6 ms | |
+| plain step p50, four / eight streams | 71.4 / 100.2 ms | 71.4 / 100.5 ms | 71.3 / 100.1 ms | |
+| determinism, with and without log probabilities | identical, 62313cb5 / 9742ac2c and 4d143977 / 12fd8257 | identical, the same hashes | identical, the same hashes | |
+
+What the A/B shows:
+- **Prefill.** Every one of the twelve paired prompts is faster with 0226, by 0.6-1.4%. That is
+  the candidate's whole loss against r6x (−0.8% / −0.7% in the trimmed comparison). Both 0226 arms
+  are at or above r6x's prefill on the same prompts. 0226 again is 0.4% behind 0226, the session's
+  drift, and still ahead of the candidate on every prompt.
+- **Time to first token.** Level: four streams 265.7 / 276.9 against 276.8 ms, eight streams
+  359.7 / 351.6 against 350.9 ms, isolated within 0.6 ms. The plain decode step is unchanged.
+  Late admission still decides the step after each prompt's last chunk late, so the gain it
+  buys at four and eight streams (paying for sink rejection's held step) stays.
+- **Outputs** are identical to r6x's in every arm.
 
 A second spec, with arms that switched late admission or sink rejection off, was queued with it
 (`20261022T164143-attribution-tp3.json`). It was withdrawn at 18:46 CET, before the window
 opened, and moved to `queue/skipped/`. Feature-off serving arms are not used for diagnosis here.
-If 0226 recovers only part of the loss, the rest is attributed with a GPU profile of one prefill
-chunk on the candidate (the lab's `profile` job) and offline tests.
+0226 recovered the whole loss, so no further attribution is needed.
 
 ## Files
 
@@ -173,5 +204,5 @@ chunk on the candidate (the lab's `profile` job) and offline tests.
 | [vllm/0226-...patch](vllm/0226-Late-admission-decide-the-step-after-a-continuing-pr.patch) | the prepared fix |
 | [overlay/](overlay) | 0226's changed sources, mounted over image `-1022-2` |
 | [make_arms.py](make_arms.py), `*.json` | the arms (0226, the candidate as built) and the A/B spec |
-| [ab_table.py](ab_table.py) | the A/B's verdict lines: prefill paired by prompt, traced TTFT, determinism hashes |
+| [ab_table.py](ab_table.py), [runs/ab-results.txt](runs/ab-results.txt) | the A/B's verdict lines (prefill paired by prompt, traced TTFT, determinism hashes) and their output |
 | [runs/run-tests.sh](runs/run-tests.sh), [runs/tests.txt](runs/tests.txt) | the CPU tests and their results |
