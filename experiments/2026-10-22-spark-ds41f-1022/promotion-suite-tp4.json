@@ -1,0 +1,67 @@
+{
+ "name": "spark-ds41f-1022-promotion-tp4",
+ "version": 1,
+ "description": "The trimmed promotion comparison of spark-ds41f-1022 at four nodes on the ring (2026-10-23), the TP3 one (promotion-suite.json) at TP4's stream count, about 14 minutes a build: model behaviour on 64 prompts at 16 streams (greedy outputs against the first arm's; it also heat-soaks the GPU), the engine grid up to sixteen requests, sixteen streams and one stream in closed loops (30 s warm-up, 180 s), real-text prefill at 32K and 131K. Its grid needs the dev-mode collective RPC.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "limit": 64,
+    "concurrency": 16,
+    "max_tokens": 256,
+    "top": 20
+   }
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1,
+    "max_requests": 16
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 30,
+    "duration": 180,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 1,
+    "warmup": 30,
+    "duration": 180,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}

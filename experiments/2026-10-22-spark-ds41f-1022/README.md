@@ -308,6 +308,34 @@ measured another image). r6x's recipe and lock are frozen in [r6x/](r6x); r6x's 
 (`experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-1017.json`) now extends that frozen recipe, so it
 stays r6x. Rollback: deploy the previous promoted commit.
 
+## The ring (2026-10-23)
+
+Owner, 00:58 CET: "fix the netplans and begin the tp=4 promotion" after re-cabling the four nodes as
+the ring. `cx7-config.py dgx1 dgx2 dgx3 dgx4` (LLDP) found 1-2, 2-3, 3-4 and 4-1, two paths each; the
+ring netplan went onto dgx1 (port 1 to 10.14) and dgx3 (port 0 to 10.34), equal to the saved
+`~/spark-lab/topology-ring4/40-cx7.yaml` (the triangle's is in `topology-tp3/`); all 16 path directions
+ping and GID index 3 is RoCE v2 IPv4 on every port (fleet repo 077bb3e). `bin/spark site shape
+tp4-ring --apply`, `cluster sync` to efd66bc6. dgx4's checkout held uncommitted CED kernel-lab files
+from 2026-10-19; they are stashed there (`git stash list`), with a tarball and diff in
+`~/spark-lab/checkout-backups/`.
+
+The ring has no benchmark reference for this image, so production serves r6x from the frozen recipe
+([r6x/cluster.json](r6x/cluster.json)) at tp4-ring meanwhile: ready in 78.6 s, `doctor --live` OK, KV
+8,580,566 tokens. The lab windows restore that profile (`--production-config`).
+
+- [gate-1022-4-tp4.json](gate-1022-4-tp4.json): the focused gate at TP4 (no image job: `-1022-4` is on
+  all four nodes). Pass: outputs identical to r6x's on the ring (3eab5112 / db25fde3, c9cf9dbe /
+  c6bb4f4e), control spellings plain text, sink probes corrected on every rank.
+- [promotion-1022-4-tp4.json](promotion-1022-4-tp4.json) with
+  [promotion-suite-tp4.json](promotion-suite-tp4.json): the trimmed comparison the owner chose for the
+  triangle, at TP4's stream count (model at 16 streams, grid up to 16 requests, closed loops at 16 and 1,
+  32K / 131K prefill), candidate, r6x, candidate again in one session. The candidate's first arm becomes
+  tp4-ring's benchmark reference.
+
+Since the promotion the root lock is this release's, so the candidate arms no longer name the
+experiment's lock (its sources are identical; the recipe and lock would otherwise name different
+baselines).
+
 ## Not covered
 
 - The four-node ring: [spark-ds41f-1022-tp4.json](spark-ds41f-1022-tp4.json) is ready, but the
