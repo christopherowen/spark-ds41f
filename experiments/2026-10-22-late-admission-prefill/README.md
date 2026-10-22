@@ -2,17 +2,17 @@
 
 Owner, 2026-10-22, on spark-ds41f-1022's prefill (about 1% below r6x): "please fix it".
 
-**Status (2026-10-22 16:10 CET):** the suspected cause is not confirmed. In the Engram debug
-timeline the candidate's prefill chunks wait for their rows exactly as r6x's do. The loss is in
-the cadence of the chunks instead:
+**Status (2026-10-22 18:50 CET):** the suspected cause (Engram reads) is ruled out. In the
+Engram debug timeline the candidate's prefill chunks wait for their rows exactly as r6x's do.
+The loss is in the cadence of the chunks instead:
 - the second chunk starts 44-49 ms later after every prompt's first chunk;
 - each later chunk takes 7.0 ms longer on average (0.8%).
 
-The first fits the late decision of the next step. Whether the second does is open: it is about
-the whole loss at 131K, and the trace cannot tell late admission from GPU time added by the
-candidate's other pieces. As instructed for a different cause, no A/B window was queued.
-vLLM 0226 (below) is written and passes its CPU tests, and its overlay arm and two run specs are
-staged on dgx1-3, waiting for the owner's choice.
+0222's author identified the mechanism. In a CED prefill chunk, decoder layers 20-39 run on at
+most 128 replayed rows, so layer 30 is reached near the end of a ~0.9 s step. Deciding the next
+step there leaves less lead than the next chunk's eager host launch (about 100 ms) needs.
+vLLM 0226 (below) decides the step after a continuing prompt chunk at once and passes its CPU
+tests. Its A/B is queued on dgx1 (`20261022T164138-ab-tp3.json`, 18:41 CET).
 
 Base: deployment commit 6d8ff8a (main, #457).
 
@@ -141,33 +141,28 @@ loop and async scheduler with a 16-token budget:
 - an arrival during its last chunk joins the next step, decided late;
 - that step (a decode beside the arrival's first chunk) has its successor decided at once.
 
-## Staged next window (not queued)
+## The A/B (queued 2026-10-22 18:41 CET)
 
-[make_arms.py](make_arms.py) writes the arms and specs. `--staged results/private/lab/la-prefill`
-wrote the copy now on dgx1, dgx2 and dgx3, with 0226's three files under `overlay/`. Both specs
-pass `scripts/lab.py run --dry-run`.
+[make_arms.py](make_arms.py) writes the arms and the spec. `--staged results/private/lab/la-prefill`
+wrote the copy on dgx1, dgx2 and dgx3, with 0226's three files under `overlay/`; the spec passes
+`scripts/lab.py run --dry-run`.
 
-1. **[ab-tp3.json](ab-tp3.json)**, about 40 min: 0226, the candidate as built, 0226 again. Each arm
-   runs cold 32K/131K prefill (3 repeats), the traced TTFT replay
-   (`experiments/2026-10-20-ttft-gap/ttft_trace.py`), and `token_determinism_text.py --wide` with
-   and without log probabilities. Pass: outputs identical (62313cb5 / 9742ac2c and
-   4d143977 / 12fd8257), prefill at r6x's level, TTFT at four and eight streams level with the
-   candidate's.
-2. **[attribution-tp3.json](attribution-tp3.json)**, about 12 min behind it in the same window: the
-   same prefill on the candidate with late admission off, with sink rejection off
-   (`VLLM_SINK_REJECTION=0`), and on r6x. It splits the per-chunk 0.8% among late admission,
-   sink rejection and the rest (sparknet 0.5.0, 0185). Run it only if the owner wants the
-   attribution beside the A/B.
+[ab-tp3.json](ab-tp3.json), about 40 min: 0226, the candidate as built, 0226 again. Each arm runs
+cold 32K/131K prefill (3 repeats), the traced TTFT replay
+(`experiments/2026-10-20-ttft-gap/ttft_trace.py`), and `token_determinism_text.py --wide` with
+and without log probabilities.
+- **Pass:** outputs identical (62313cb5 / 9742ac2c and 4d143977 / 12fd8257); prefill at r6x's
+  level; TTFT at four and eight streams level with the candidate's.
+- **Reference:** r6x's prefill on the same prompts is this record's trace (15:53-15:55 CET).
+- **Started by** `scripts/lab_idle_start.sh 10 queue-la-prefill`, with a release watcher
+  (`~/spark-lab/la-prefill-watch/release.sh` on dgx1) that matches the queued file's name.
+- **Verdict lines:** [ab_table.py](ab_table.py).
 
-To queue (after the shared-window checks in AGENTS.md):
-
-```sh
-cd ~/projects/spark-ds41f
-python3 scripts/lab.py queue add results/private/lab/la-prefill/ab-tp3.json
-python3 scripts/lab.py queue add results/private/lab/la-prefill/attribution-tp3.json   # optional
-setsid -f scripts/lab_idle_start.sh 10 queue-la-prefill \
-  > results/private/lab/queue-la-prefill-idle.log 2>&1 < /dev/null
-```
+A second spec, with arms that switched late admission or sink rejection off, was queued with it
+(`20261022T164143-attribution-tp3.json`). It was withdrawn at 18:46 CET, before the window
+opened, and moved to `queue/skipped/`. Feature-off serving arms are not used for diagnosis here.
+If 0226 recovers only part of the loss, the rest is attributed with a GPU profile of one prefill
+chunk on the candidate (the lab's `profile` job) and offline tests.
 
 ## Files
 
@@ -177,5 +172,6 @@ setsid -f scripts/lab_idle_start.sh 10 queue-la-prefill \
 | [runs/trace-chunks.txt](runs/trace-chunks.txt), [runs/trace-chunks.json](runs/trace-chunks.json), [runs/trace-paired.txt](runs/trace-paired.txt) | the trace's analysis: per prompt, then paired |
 | [vllm/0226-...patch](vllm/0226-Late-admission-decide-the-step-after-a-continuing-pr.patch) | the prepared fix |
 | [overlay/](overlay) | 0226's changed sources, mounted over image `-1022-2` |
-| [make_arms.py](make_arms.py), `*.json` | the arms (fix, current, late admission off, sink rejection off, r6x) and the two specs |
+| [make_arms.py](make_arms.py), `*.json` | the arms (0226, the candidate as built) and the A/B spec |
+| [ab_table.py](ab_table.py) | the A/B's verdict lines: prefill paired by prompt, traced TTFT, determinism hashes |
 | [runs/run-tests.sh](runs/run-tests.sh), [runs/tests.txt](runs/tests.txt) | the CPU tests and their results |
