@@ -21,7 +21,25 @@ cause in late admission's decision point, not the Engram reads. vLLM 0226 decide
 continuing prompt chunk at once, and the image `-1022-3` adds it. Its A/B against `-1022-2`
 (18:52-19:35 CET) passed: cold 32K and 131K prefill 0.6-1.4% faster on all twelve paired prompts, at
 or above r6x's; time to first token at four and eight streams level; outputs identical with r6x's
-hashes. The focused gate re-runs on `-1022-3` ([gate-1022-3-tp3.json](gate-1022-3-tp3.json)).
+hashes. The focused gate on `-1022-3` ([gate-1022-3-tp3.json](gate-1022-3-tp3.json), 21:26-21:50 CET)
+passed: outputs identical with those hashes; cold prefill 32K 4460 and 131K 4382 tok/s, 1.1% above
+`-1022-2`'s gate (4413 / 4335) and level with r6x's (4461 / 4386); one stream 56.7 tok/s (r6x 56.7);
+traced TTFT p50 278.2 / 353.1 ms at four and eight streams, isolated 148.1 ms; the sink probes
+corrected `Say hi.` and `Thanks!` on every rank, zero flags on ordinary text. Release tests on
+`-1022-3`: 1,782 passed, 158 skipped, 0 failed. Its promotion suite run was withdrawn when the
+owner took #449 into the release.
+
+**Image `-1022-4` (2026-10-22):** owner, 21:37 CET: "include 449." vLLM 0227 is #449's patch
+([2026-10-20-dsv41-control-spellings](../2026-10-20-dsv41-control-spellings/README.md), merged as
+5e908825, its 0222) renumbered after 0226: control-token spellings in request text stay plain text.
+It applies cleanly; `bin/spark build prepare` reproduces patch head 8fc15c18f, tree e68aa19c on
+dgx4. Its tokenizer and parser tests passed on `-1022-3` with its files mounted (254 passed). Live on
+production r6x, [control_spellings_probe.py](control_spellings_probe.py) finds the injection in all
+eight request locations (four extra control tokens each, two in chat mode), as #446 reports.
+[gate-1022-4-tp3.json](gate-1022-4-tp3.json) copies the image from dgx4 and repeats the focused
+gate with the probe, which passes when every location keeps the neutral request's control
+sequence; [promotion-1022-4-tp3.json](promotion-1022-4-tp3.json) is the one-arm promotion suite
+that becomes the TP3 benchmark reference.
 
 ## Contents
 
@@ -34,6 +52,7 @@ hashes. The focused gate re-runs on `-1022-3` ([gate-1022-3-tp3.json](gate-1022-
 | vLLM 0224, late admission with sink rejection through the engine-core loop | this record | tests only |
 | vLLM 0225, the DS4.1 model tests' stand-ins carry the sink column buffer and the served architecture | this record (the release tests) | tests only |
 | vLLM 0226, late admission decides the step after a continuing prompt chunk at once | [2026-10-22-late-admission-prefill](../2026-10-22-late-admission-prefill/README.md) | A/B against `-1022-2`: cold prefill 0.6-1.4% faster on every paired prompt (r6x's level), TTFT at four and eight streams level, outputs identical |
+| vLLM 0227, control-token spellings in request text stay plain text | [2026-10-20-dsv41-control-spellings](../2026-10-20-dsv41-control-spellings/README.md), merged #449 (Acermax) | tokenizer and parser tests 254 passed; live on TP3 the injected control tokens are gone in all seven locations, prompts without spellings keep their IDs |
 | sparknet 0.5.0, the wider one-shot data phase | dgx-spark-networking `v0.5.0` (ed6af327): main 8618973, the striping-test fix, the release commit | TP3 engine grid decode step −1.6%, outputs identical |
 
 The gated 0221 is vLLM 5ac8364ec (616d1a28d with each sink event naming its row); its patch
