@@ -537,17 +537,17 @@ FORWARD_BLOCK = '''\
             # Steering one rank's partial would edit only that rank's share of
             # every row's bits -- silently wrong. Fold to the summed write
             # (the same bits post_pre consumes), then project.
-            steer_states = (
-                hidden_states.sum() if hasattr(hidden_states, "packed") else hidden_states
-            )
-            steer_coef = torch.einsum("...h,kh->...k", steer_states, steer_dirs)
-            steer_states = steer_states - self._steer_alpha * torch.einsum(
+            if hasattr(hidden_states, "packed"):
+                # RankOrderParts: this rank's partials of the shared sum.
+                # sum() yields THIS RANK'S ROWS of the summed write -- exactly
+                # the rows the next block consumes on this rank. Steer those
+                # rows and pass the plain tensor: the wrapper is not needed
+                # downstream, and re-wrapping would corrupt shapes.
+                hidden_states = hidden_states.sum()
+            steer_coef = torch.einsum("...h,kh->...k", hidden_states, steer_dirs)
+            hidden_states = hidden_states - self._steer_alpha * torch.einsum(
                 "...k,kh->...h", steer_coef, steer_dirs
             )
-            if hasattr(hidden_states, "packed"):
-                hidden_states = type(hidden_states)(steer_states)  # same wrapper, steered parts
-            else:
-                hidden_states = steer_states
 '''
 
 ANCHOR_IMPORT = (

@@ -1,21 +1,20 @@
-From 8a97df73bb9d8f440d3e81e501992c35ae0c8e47 Mon Sep 17 00:00:00 2001
+From a81372ca6f05014eaf2a6cbb4917e39e88ae4ad1 Mon Sep 17 00:00:00 2001
 From: Matt Suiche <msuiche@enidon.com>
-Date: Wed, 21 Oct 2026 21:15:49 -0700
+Date: Thu, 22 Oct 2026 03:10:51 -0700
 Subject: [PATCH] DeepSeek-V4.1: weightless GLP projective steering, off by
  default
 
 h <- h - alpha*(h.d)d at the model loop's per-layer boundary (the pending
-FFN write, this tree's hidden-width post-layer surface; the mHC fold is
-deferred and linear in the write). Injected only when WEIGHTLESS_STEER_PATH
-is configured at build time; unconfigured images are byte-identical to
-stock - zero extra kernels, zero launches, same IR.
+FFN write, this tree's hidden-width post-layer surface). Injected only
+when WEIGHTLESS_STEER_PATH is configured at build time; unconfigured
+images are byte-identical to stock.
 
-r6x fix: the write may arrive as a RankOrderParts (0183 dataflow / SP
-prefill) - this rank's unreduced partial of the MoE sum. Steering a
-partial would edit only that rank's share of every row, silently wrong.
-The apply detects the wrapper, projects the SUMMED write (parts.sum(),
-the same bits the next block's fold consumes), and re-wraps. Plain-Tensor
-path unchanged.
+r6x apply fix (validated on hardware, second iteration): the write may
+arrive as a RankOrderParts (0183 dataflow / SP prefill) - this rank's
+partials of the shared sum. sum() yields THIS RANK'S ROWS of the summed
+write, exactly the rows the next block consumes here. Steer those rows
+and pass the plain tensor; re-wrapping corrupts shapes (caught live:
+shape '[1, 2048, 5120]' invalid for input of size 5120).
 
 Loaded from a GGUF GLP sidecar with fail-closed glp.* gates. Dense
 zero-padded _steer_stack by global layer id; alpha as a registered
@@ -29,7 +28,7 @@ serves the published GLP-39 L1-39 a0.75 vector for the 1017 checkpoint.
  1 file changed, 439 insertions(+)
 
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 61396ebfb..6bcabff9f 100644
+index 61396ebfb..8d856c843 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -1,6 +1,7 @@
@@ -485,17 +484,17 @@ index 61396ebfb..6bcabff9f 100644
 +            # Steering one rank's partial would edit only that rank's share of
 +            # every row's bits -- silently wrong. Fold to the summed write
 +            # (the same bits post_pre consumes), then project.
-+            steer_states = (
-+                hidden_states.sum() if hasattr(hidden_states, "packed") else hidden_states
-+            )
-+            steer_coef = torch.einsum("...h,kh->...k", steer_states, steer_dirs)
-+            steer_states = steer_states - self._steer_alpha * torch.einsum(
++            if hasattr(hidden_states, "packed"):
++                # RankOrderParts: this rank's partials of the shared sum.
++                # sum() yields THIS RANK'S ROWS of the summed write -- exactly
++                # the rows the next block consumes on this rank. Steer those
++                # rows and pass the plain tensor: the wrapper is not needed
++                # downstream, and re-wrapping would corrupt shapes.
++                hidden_states = hidden_states.sum()
++            steer_coef = torch.einsum("...h,kh->...k", hidden_states, steer_dirs)
++            hidden_states = hidden_states - self._steer_alpha * torch.einsum(
 +                "...k,kh->...h", steer_coef, steer_dirs
 +            )
-+            if hasattr(hidden_states, "packed"):
-+                hidden_states = type(hidden_states)(steer_states)  # same wrapper, steered parts
-+            else:
-+                hidden_states = steer_states
              if boundary_indices is not None:
                  positions = gather_rows(positions, ced_indices)
                  if input_ids is not None:
