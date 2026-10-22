@@ -13,6 +13,14 @@ four and eight streams is level with r6x, not below it: late admission pays for 
 held step ([Results](#results)). The release tests found 15 stale test stand-ins, fixed by vLLM 0225
 (tests only), so the release comparison builds image `-1022-2` first. Release comparison pending.
 
+**Image `-1022-3` (2026-10-22):** prefill was about 1% below r6x. The Engram trace of
+[2026-10-22-late-admission-prefill](../2026-10-22-late-admission-prefill/README.md) found the
+cause in late admission's decision point, not the Engram reads. vLLM 0226 decides the step after a
+continuing prompt chunk at once, and the image `-1022-3` adds it. Its A/B against `-1022-2`
+(18:52-19:35 CET) passed: cold 32K and 131K prefill 0.6-1.4% faster on all twelve paired prompts, at
+or above r6x's; time to first token at four and eight streams level; outputs identical with r6x's
+hashes. The focused gate re-runs on `-1022-3` ([gate-1022-3-tp3.json](gate-1022-3-tp3.json)).
+
 ## Contents
 
 | Piece | Where it comes from | What it was shown to do alone |
@@ -23,6 +31,7 @@ held step ([Results](#results)). The release tests found 15 stale test stand-ins
 | vLLM 0223, sink rejection on by default for DeepSeek V4.1 | this record | the owner's decision of 2026-10-22, below |
 | vLLM 0224, late admission with sink rejection through the engine-core loop | this record | tests only |
 | vLLM 0225, the DS4.1 model tests' stand-ins carry the sink column buffer and the served architecture | this record (the release tests) | tests only |
+| vLLM 0226, late admission decides the step after a continuing prompt chunk at once | [2026-10-22-late-admission-prefill](../2026-10-22-late-admission-prefill/README.md) | A/B against `-1022-2`: cold prefill 0.6-1.4% faster on every paired prompt (r6x's level), TTFT at four and eight streams level, outputs identical |
 | sparknet 0.5.0, the wider one-shot data phase | dgx-spark-networking `v0.5.0` (ed6af327): main 8618973, the striping-test fix, the release commit | TP3 engine grid decode step −1.6%, outputs identical |
 
 The gated 0221 is vLLM 5ac8364ec (616d1a28d with each sink event naming its row); its patch
@@ -67,9 +76,10 @@ V2-runner worker:
 
 ## Build inputs
 
-- vLLM: r6x's series ([vllm/series](vllm/series)) plus 0185, 0221, 0222, 0223, 0224, 0225 on
-  base 19f2c20e; patch head 672231a1b, tree c282fa51 (`git am --committer-date-is-author-date`
-  with the build's committer reproduces it). Working branch `next-release` in
+- vLLM: r6x's series ([vllm/series](vllm/series)) plus 0185, 0221, 0222, 0223, 0224, 0225, 0226
+  on base 19f2c20e; patch head 7ec49e2a0, tree 3f23caaf (`git am --committer-date-is-author-date`
+  with the build's committer reproduces it). Image `-1022-2` was the series through 0225 (patch
+  head 672231a1b, tree c282fa51). Working branch `next-release` in
   ~/projects/vllm-ds41-next (local, as vLLM working branches are). The gate ran the series
   without 0225 (patch head c6a567ada, tree 32ae33c9); 0225 changes three test files and nothing
   else.
@@ -79,8 +89,8 @@ V2-runner worker:
   (version, changelog, README serving status). `make check` and the branch's CI passed first.
 - Everything else as r6x: [upstreams.lock.json](upstreams.lock.json),
   [source.json](source.json).
-- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022-2` (the live-name rename stays a separate step). The
-  gate's image was `vllm-ds41f-kkref:19f2c20ed4d6-1022` (sha256:b1bbdea2521c, tree 32ae33c9),
+- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022-3` (the live-name rename stays a separate step), after
+  `-1022-2` (tree c282fa51, the release comparison's). The gate's image was `vllm-ds41f-kkref:19f2c20ed4d6-1022` (sha256:b1bbdea2521c, tree 32ae33c9),
   built 2026-10-22 on dgx2 in 10 min; the new tag keeps the two apart.
 
 ## Unit tests (2026-10-22, dgx4)
