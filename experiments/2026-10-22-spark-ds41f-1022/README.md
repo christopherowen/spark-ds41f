@@ -95,6 +95,13 @@ offline ([../2026-10-19-sink-rejection-v2/runs/offline-failures.txt](../2026-10-
 the same 80 test ids, none added. The sink and combined suites build their scheduler from a local
 OPT config and need no Hugging Face cache or tokenizer, so the release tests (offline) run them.
 
+End-to-end smoke ([runs/smoke.sh](runs/smoke.sh), [runs/smoke-results.txt](runs/smoke-results.txt)):
+a dummy-weight Llama-shaped model served with the series on dgx4, V2 runner, async scheduling,
+multiprocess executor. Llama has no sink entry, so the detector stays off: the series serves
+another model unchanged. Greedy outputs are identical with late admission off and at layer 18
+(d73cddf1, late admission's own smoke hash); at four streams no request waits a step that does
+not carry it (108 of 108 with it off), TTFT p50 54.5 to 35.7 ms.
+
 `scripts/release_tests.py check`: the five new or changed test files are classified as gates
 ([config/release-tests.json](../../config/release-tests.json)); 65 gate files, 0 problems.
 
