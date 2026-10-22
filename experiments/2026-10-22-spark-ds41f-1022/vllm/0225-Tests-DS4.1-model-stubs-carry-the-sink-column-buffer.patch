@@ -1,0 +1,82 @@
+From 672231a1be4b46df6408f4d117c143f056d2a2d8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 09:45:01 +0200
+Subject: [PATCH] Tests: DS4.1 model stubs carry the sink column buffer and the
+ served architecture
+
+The DeepSeek V4.1 forward reads the model's sink column buffer (0221), and the
+model's constructor reads the served architecture to resolve the sink
+detector's settings (0223). Three hand-built model stand-ins predate both: the
+CED and sequence-parallel prefill tests call DeepseekV4Model.forward on a
+namespace without _sink_columns, and the disk Engram test builds the model
+from a config namespace without model_config.architecture. The release tests
+on the candidate image failed all 15 of their cases with AttributeError.
+
+The forward stand-ins carry _sink_columns=None (the detector off, the branch
+they do not test); the Engram config names DeepseekV41ForCausalLM, so the
+constructor resolves the default settings as served (the stand-in is not the
+last pipeline rank, so no buffer is allocated).
+
+Base: local-inference-lab integration/karmic-kraken-beta 19f2c20e + the r6x
+series (7316c7f9f) + 0185, 0221, 0222, 0223, 0224.
+
+Quality: tests only.
+
+Tests: tests/models/test_deepseek_v4_1_ced_model.py,
+test_deepseek_v4_1_sp_prefill.py, test_deepseek_v4_1_engram.py: 114 passed
+through the release runner in the candidate image.
+
+Upstream status: local; not proposed.
+---
+ tests/models/test_deepseek_v4_1_ced_model.py  | 2 ++
+ tests/models/test_deepseek_v4_1_engram.py     | 7 ++++++-
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 2 ++
+ 3 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 9f8577c79..3eea165d9 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -264,6 +264,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         layers=nn.ModuleList(_Layer(i, shared, row_work) for i in range(4)),
+         aux_hidden_state_layers={3, 4},
+         _mtp_hidden_buffer=buffer,
++        # The sink detector's column buffer: none, the detector is off here.
++        _sink_columns=None,
+         norm=lambda hidden: hidden,
+     )
+     output, aux = native.DeepseekV4Model.forward(
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 4ee15db78..d69a788d1 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -977,7 +977,12 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+         num_hidden_layers=0,
+     )
+     vllm_config = SimpleNamespace(
+-        model_config=SimpleNamespace(hf_config=config, dtype=torch.bfloat16),
++        model_config=SimpleNamespace(
++            hf_config=config,
++            dtype=torch.bfloat16,
++            # The sink detector's settings follow the served architecture.
++            architecture="DeepseekV41ForCausalLM",
++        ),
+         quant_config=SimpleNamespace(get_name=lambda: "deepseek_v41_fp8"),
+         parallel_config=SimpleNamespace(use_ubatching=False, tensor_parallel_size=1),
+         scheduler_config=SimpleNamespace(max_num_batched_tokens=13),
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index bc3bd58f3..f54bab381 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -544,6 +544,8 @@ def test_model_forward_matches_full_rows(
+             _mtp_hidden_buffer=buffer,
+             # L2 prefetch is on by default on SM121; its plans are built.
+             _l2pf_ready=True,
++            # The sink detector's column buffer: none, the detector is off here.
++            _sink_columns=None,
+             norm=lambda hidden: hidden * 2,
+         )
+         output, aux = native.DeepseekV4Model.forward(
+-- 
+2.54.0 (Apple Git-157)
+

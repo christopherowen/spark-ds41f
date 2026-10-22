@@ -6,8 +6,12 @@ production, gates the combination with one focused window, then compares it with
 promotion gate. Named per the release naming adopted for the next release: `spark-ds41f-MMDD`
 (the candidate's own name until the owner promotes it).
 
-**Status:** series built and unit-tested (2026-10-22); sparknet 0.5.0 released (tag `v0.5.0`,
-the owner's word); image, gate and release comparison pending.
+**Status (2026-10-22):** the focused gate passed on the TP3 triangle (09:09-09:42 CET): outputs
+identical to r6x, the collapse probes corrected with zero flags on ordinary text, one stream, prefill
+and memory level, booted at the production pool under the unchanged guard. Time to first token at
+four and eight streams is level with r6x, not below it: late admission pays for sink rejection's
+held step ([Results](#results)). The release tests found 15 stale test stand-ins, fixed by vLLM 0225
+(tests only), so the release comparison builds image `-1022-2` first. Release comparison pending.
 
 ## Contents
 
@@ -18,6 +22,7 @@ the owner's word); image, gate and release comparison pending.
 | vLLM 0222, late admission at decoder layer 30 | experiments/2026-10-21-late-admission (PR #454; analysis in PR #453) | TP3 screen: TTFT p50 −26% at four streams, −30% at eight; one stream and prefill level; outputs identical |
 | vLLM 0223, sink rejection on by default for DeepSeek V4.1 | this record | the owner's decision of 2026-10-22, below |
 | vLLM 0224, late admission with sink rejection through the engine-core loop | this record | tests only |
+| vLLM 0225, the DS4.1 model tests' stand-ins carry the sink column buffer and the served architecture | this record (the release tests) | tests only |
 | sparknet 0.5.0, the wider one-shot data phase | dgx-spark-networking `v0.5.0` (ed6af327): main 8618973, the striping-test fix, the release commit | TP3 engine grid decode step −1.6%, outputs identical |
 
 The gated 0221 is vLLM 5ac8364ec (616d1a28d with each sink event naming its row); its patch
@@ -62,17 +67,21 @@ V2-runner worker:
 
 ## Build inputs
 
-- vLLM: r6x's series ([vllm/series](vllm/series)) plus 0185, 0221, 0222, 0223, 0224 on base
-  19f2c20e; patch head c6a567ada, tree 32ae33c9 (`git am --committer-date-is-author-date` with
-  the build's committer reproduces it). Working branch `next-release` in
-  ~/projects/vllm-ds41-next (local, as vLLM working branches are).
+- vLLM: r6x's series ([vllm/series](vllm/series)) plus 0185, 0221, 0222, 0223, 0224, 0225 on
+  base 19f2c20e; patch head 672231a1b, tree c282fa51 (`git am --committer-date-is-author-date`
+  with the build's committer reproduces it). Working branch `next-release` in
+  ~/projects/vllm-ds41-next (local, as vLLM working branches are). The gate ran the series
+  without 0225 (patch head c6a567ada, tree 32ae33c9); 0225 changes three test files and nothing
+  else.
 - sparknet: 0.5.0, tag `v0.5.0` at ed6af327 (tree f997a594), released 2026-10-22 on the owner's
   word: main 8618973 (the wide read phase), the GPU striping test for per-peer routes (b00a08e,
   qualified on the triangle 2026-10-21, applied onto main as 2031687) and the release commit
   (version, changelog, README serving status). `make check` and the branch's CI passed first.
 - Everything else as r6x: [upstreams.lock.json](upstreams.lock.json),
   [source.json](source.json).
-- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022` (the live-name rename stays a separate step).
+- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022-2` (the live-name rename stays a separate step). The
+  gate's image was `vllm-ds41f-kkref:19f2c20ed4d6-1022` (sha256:b1bbdea2521c, tree 32ae33c9),
+  built 2026-10-22 on dgx2 in 10 min; the new tag keeps the two apart.
 
 ## Unit tests (2026-10-22, dgx4)
 
@@ -123,13 +132,56 @@ fabric and to dgx4 over the LAN for the release tests), then one boot of
 | [sink_counters.py](sink_counters.py), after the ordinary text | zero flagged rows |
 | `probes.py --nodes dgx1,dgx2,dgx3` (16 prompts, thinking at effort high, temperature 0) | `Say hi.` and `Thanks!` corrected, no collapse marker, every rank's count equal |
 
-The release tests ([bundles/release-tests](bundles/release-tests), 65 gate files) run on dgx4
-with `scripts/lab.py kernel-local` once the window has copied the image there.
+### Results
+
+[runs/gate-results.txt](runs/gate-results.txt) holds every step's summary line. Window
+09:09-09:42 CET, no foreign requests in the traced phases; the candidate was ready 79 s after
+launch at the production pool, under the 5 GiB startup guard and then the 3 GiB steady guard.
+
+| Step | Result | Verdict |
+| --- | --- | --- |
+| determinism, with and without log probabilities | identical in all six scenarios, 0 token and 0 log-probability differences; hashes 62313cb5 / 9742ac2c and 4d143977 / 12fd8257, r6x's | pass |
+| collapse probes | no collapse marker; `Say hi.` answers "Hi! 👋 How's your day going?"; flagged and corrected: `Say hi.`, `Thanks!`, `ok` (4 draft-zero rejections, 2 drafter cuts, 0 fallthroughs); the other 13 prompts unflagged; every rank 8 flagged rows | pass |
+| sink counters after the ordinary text (determinism, trace, suite) | 0 flagged rows | pass |
+| one stream, 120 s | 56.6 ± 3.2 tok/s (screen's r6x 56.7 ± 3.1) | level |
+| cold prefill, three repeats | 32K 4413 ± 1.0%, 131K 4335 ± 0.6% tok/s (screen's r6x 4461 / 4386, a day earlier) | about −1%, across sessions: the release comparison judges |
+| MemAvailable once serving | dgx1 6.70, dgx2 7.98, dgx3 8.19 GiB (r6x 6.70 / 8.04 / 8.11) | level |
+| traced TTFT p50, four / eight streams | 269.1 / 351.7 ms (screen: r6x 258.8 / 353.9, late admission alone 190.9 / 249.0) | level with r6x; the planned criterion did not hold |
+| isolated TTFT (twelve prompts, one at a time) | 146.9 ms mean (screen: r6x 105.9, late admission alone 107.0) | +41 ms, one decode step: sink rejection's held step |
+
+**Time to first token.** The gate's TTFT criterion was set from late admission's screen alone and
+missed sink rejection's cost: every first token is held one decode step and emitted when the next
+step verifies it as draft zero. The two add as expected: late admission's 190.9 / 249.0 ms plus one
+plain step at four and eight streams (71.3 / 99.6 ms in this trace) predicts 262 / 349 ms;
+measured 269.1 / 351.7. Without late admission the held step would sit on top of r6x's
+258.8 / 353.9 (about 330 / 454 ms). So late admission is working, and its whole gain at two or more
+streams pays for the sink correction; a request alone, which late admission cannot shorten, waits
+about 41 ms (one decode step) longer than on r6x. The trace's decomposition counts the held step as the "lookahead" step
+(every request "waited a step"), because the first token appears one step after the step that
+carried the request.
+
+### Release tests
+
+[bundles/release-tests](bundles/release-tests) (65 gate files) on dgx4 with `scripts/lab.py
+kernel-local`, the gate's image: 1,766 passed, 158 skipped, **15 failed**, all in hand-built
+DS4.1 model stand-ins:
+- `test_deepseek_v4_1_ced_model.py` (2) and `test_deepseek_v4_1_sp_prefill.py` (12) call
+  `DeepseekV4Model.forward` on a namespace without `_sink_columns`, which 0221's forward reads.
+  0221's own record never ran the release bundle, so this is the first run to see it.
+- `test_deepseek_v4_1_engram.py::test_disk_engram_model_allocates_hash_buffer_from_declared_caps`
+  builds the model from a config namespace without `model_config.architecture`, which 0223's
+  `SinkConfig.for_model` reads.
+
+vLLM 0225 gives the stand-ins what the code reads (`_sink_columns=None`; the served architecture).
+The three files then pass, 114 tests through the release runner in the gate's image with the fixed
+files mounted. The bundle now names image `-1022-2`; its full run follows the release window's
+image copy to dgx4.
 
 ## Release comparison (promotion gate)
 
-[release-tp3.json](release-tp3.json): `release-tp3` with `single-stream` and `sampled` as
-companions; arms candidate, r6x, candidate again. The r6x reference arm
+[release-tp3.json](release-tp3.json): the image job for `-1022-2` (build on dgx2, copy to dgx1,
+dgx3 and dgx4), then `release-tp3` with `single-stream` and `sampled` as companions; arms
+candidate, r6x, candidate again. The r6x reference arm
 [r6x-tp3-dev.json](r6x-tp3-dev.json) extends r6x's recipe frozen under [r6x/](r6x/), which is
 also the rollback.
 
