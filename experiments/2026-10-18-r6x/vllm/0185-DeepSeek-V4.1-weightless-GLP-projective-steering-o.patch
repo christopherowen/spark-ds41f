@@ -1,6 +1,6 @@
-From d0c8dde8996fc945fd025b7bc70722bb86171a9d Mon Sep 17 00:00:00 2001
+From 8a97df73bb9d8f440d3e81e501992c35ae0c8e47 Mon Sep 17 00:00:00 2001
 From: Matt Suiche <msuiche@enidon.com>
-Date: Wed, 21 Oct 2026 04:24:42 -0700
+Date: Wed, 21 Oct 2026 21:15:49 -0700
 Subject: [PATCH] DeepSeek-V4.1: weightless GLP projective steering, off by
  default
 
@@ -8,22 +8,28 @@ h <- h - alpha*(h.d)d at the model loop's per-layer boundary (the pending
 FFN write, this tree's hidden-width post-layer surface; the mHC fold is
 deferred and linear in the write). Injected only when WEIGHTLESS_STEER_PATH
 is configured at build time; unconfigured images are byte-identical to
-stock (verified md5) - zero extra kernels, zero launches, same IR.
+stock - zero extra kernels, zero launches, same IR.
 
-Loaded from a GGUF GLP sidecar with fail-closed glp.* gates (mode, hook,
-width, layer map, rank, alpha multipliers). Dense zero-padded _steer_stack
-by global layer id; alpha as a registered tensor buffer; glp.alpha_default
-honoured unless WEIGHTLESS_STEER_ALPHA overrides. scripts/hotfix-dsv41-steering.py
-is the offline validator (--check runs the same loader the engine injects).
+r6x fix: the write may arrive as a RankOrderParts (0183 dataflow / SP
+prefill) - this rank's unreduced partial of the MoE sum. Steering a
+partial would edit only that rank's share of every row, silently wrong.
+The apply detects the wrapper, projects the SUMMED write (parts.sum(),
+the same bits the next block's fold consumes), and re-wraps. Plain-Tensor
+path unchanged.
+
+Loaded from a GGUF GLP sidecar with fail-closed glp.* gates. Dense
+zero-padded _steer_stack by global layer id; alpha as a registered
+tensor buffer; glp.alpha_default honoured unless WEIGHTLESS_STEER_ALPHA
+overrides. scripts/hotfix-dsv41-steering.py is the offline validator.
 
 Port of weightless's hotfix-dsv4-steering-projective.py (docs/spec/GLP.md);
 serves the published GLP-39 L1-39 a0.75 vector for the 1017 checkpoint.
 ---
- vllm/models/deepseek_v4_1/nvidia/model.py | 427 ++++++++++++++++++++++
- 1 file changed, 427 insertions(+)
+ vllm/models/deepseek_v4_1/nvidia/model.py | 439 ++++++++++++++++++++++
+ 1 file changed, 439 insertions(+)
 
 diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
-index 61396ebfb..d1c25cf78 100644
+index 61396ebfb..6bcabff9f 100644
 --- a/vllm/models/deepseek_v4_1/nvidia/model.py
 +++ b/vllm/models/deepseek_v4_1/nvidia/model.py
 @@ -1,6 +1,7 @@
@@ -457,7 +463,7 @@ index 61396ebfb..d1c25cf78 100644
      def prepare_disk_engram(
          self, input_ids, query_start_loc, lookback_token_ids, early=None
      ):
-@@ -795,6 +1205,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+@@ -795,6 +1205,35 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                  ced_indices=boundary_indices,
                  sp_rows=sp,
              )
@@ -474,10 +480,22 @@ index 61396ebfb..d1c25cf78 100644
 +            # return convention, re-verified 2026-10-18 through the 172-patch
 +            # promoted series).
 +            steer_dirs = self._steer_stack[idx]
-+            steer_coef = torch.einsum("...h,kh->...k", hidden_states, steer_dirs)
-+            hidden_states = hidden_states - self._steer_alpha * torch.einsum(
++            # r6x 0183/SP: the pending FFN write may be a RankOrderParts (this
++            # rank's partial of the sum, folded by the next block's post_pre).
++            # Steering one rank's partial would edit only that rank's share of
++            # every row's bits -- silently wrong. Fold to the summed write
++            # (the same bits post_pre consumes), then project.
++            steer_states = (
++                hidden_states.sum() if hasattr(hidden_states, "packed") else hidden_states
++            )
++            steer_coef = torch.einsum("...h,kh->...k", steer_states, steer_dirs)
++            steer_states = steer_states - self._steer_alpha * torch.einsum(
 +                "...k,kh->...h", steer_coef, steer_dirs
 +            )
++            if hasattr(hidden_states, "packed"):
++                hidden_states = type(hidden_states)(steer_states)  # same wrapper, steered parts
++            else:
++                hidden_states = steer_states
              if boundary_indices is not None:
                  positions = gather_rows(positions, ced_indices)
                  if input_ids is not None:
