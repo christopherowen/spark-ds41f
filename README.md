@@ -4,14 +4,29 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **r6x**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
-profile on the ring the site is cabled as (2026-10-19,
-[promotion record](experiments/2026-10-18-r6x/README.md)). r6x is r6v with the routed
+Production is **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the three-node TP3
+1M profile on the triangle the site is cabled as (2026-10-22,
+[promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
+`spark-ds41f-MMDD`. It is r6x with the TP group's broadcast on sparknet's one-shot all-gather
+(serving never touches the PyTorch NCCL process group), sink detection and draft-zero rejection
+on by default for DeepSeek V4.1 (short prompts such as `Say hi.` no longer collapse to an empty
+answer), late admission (the next step is decided at decoder layer 30, so an arrival joins one
+step sooner), control-token spellings in request text kept as plain text (#449), and sparknet
+0.5.0's wider one-shot read phase. Outputs are identical to r6x's. Against r6x in one session on the triangle,
+decode steps are 1.1% faster and eight streams, one stream and prefill level (prefill once
+vLLM 0226 restored it); time to first token is level at four and eight streams, and a request
+alone waits one decode step longer (sink rejection holds its first token one step). The four-node
+ring is unqualified on this image until a ring release run. r6x's recipe and lock are frozen in
+`experiments/2026-10-22-spark-ds41f-1022/r6x`.
+
+Before spark-ds41f-1022, production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring (2026-10-19,
+[promotion record](experiments/2026-10-18-r6x/README.md)), then on the triangle. r6x is r6v with the routed
 experts' SwiGLU over the dispatch layout's live tiles, the routed experts' weight scales
 kept as row bases and 4-bit codes (exact, about 2.1 GiB a rank freed), and a DSpark draft
 budget that is a rule of the inputs (row cost 0.035), so nothing is timed at boot. Outputs
 are identical to r6v's; against r6v decode steps are 2.5% faster and 16 and 8 streams 3.6%
-and 3.8% faster, prefill level. The three-node TP3 profile serves r6x at 1M context since
+and 3.8% faster, prefill level. The three-node TP3 profile served r6x at 1M context from
 2026-10-19 (4.55 full 1M contexts of KV, from the memory the scale codes freed;
 [experiments/2026-10-19-r6x-tp3-1m](experiments/2026-10-19-r6x-tp3-1m/README.md)). r6v's recipe and lock are frozen
 in `experiments/2026-10-18-r6x/r6v`.

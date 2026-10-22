@@ -1,0 +1,221 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "spark-ds41f-1022-promotion-tp3",
+  "version": 1,
+  "description": "The trimmed promotion comparison the owner chose for spark-ds41f-1022 on three nodes (2026-10-22), about 13 minutes a build: model behaviour on 64 prompts at 8 streams (greedy outputs against the first arm's; it also heat-soaks the GPU), the engine grid up to eight requests, eight streams and one stream in closed loops (30 s warm-up, 180 s), real-text prefill at 32K and 131K. Its grid needs the dev-mode collective RPC.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "limit": 64,
+     "concurrency": 8,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1,
+     "max_requests": 8
+    }
+   },
+   {
+    "id": "c8",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 8,
+     "warmup": 30,
+     "duration": 180,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c1",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 1,
+     "warmup": 30,
+     "duration": 180,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "ec16fbdf7934762c1c0c71a6d25dd80b94ec97009205f2730e71569c40a8eeaf",
+ "label": "spark-ds41f-1022-4",
+ "corpus": null,
+ "started_utc": "2026-10-22T20:52:16+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 122.1
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 83.3
+  },
+  {
+   "id": "c8",
+   "command": "run",
+   "output": "c8.json",
+   "exit": 0,
+   "seconds": 219.3
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "output": "c1.json",
+   "exit": 0,
+   "seconds": 211.0
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 114.5
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp3-dev.json",
+   "cluster_config_sha256": "d1ebf0e831a3ad5217d0c69b0f1110bc65671daea6bdf49e154d40e1a343bbb4",
+   "nodes_config": "config/nodes.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "swank",
+    "nodes": [
+     {
+      "name": "dgx1",
+      "rank": 0,
+      "management_ip": "10.0.1.71",
+      "head": true,
+      "roce_peer_hcas": {
+       "1": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "2": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.12.1.0/24",
+       "roceP2p1s0f0": "10.12.2.0/24",
+       "rocep1s0f1": "10.13.1.0/24",
+       "roceP2p1s0f1": "10.13.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx2",
+      "rank": 1,
+      "management_ip": "10.0.1.72",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ],
+       "2": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.23.1.0/24",
+       "roceP2p1s0f0": "10.23.2.0/24",
+       "rocep1s0f1": "10.12.1.0/24",
+       "roceP2p1s0f1": "10.12.2.0/24"
+      },
+      "roce_gid_index": 3
+     },
+     {
+      "name": "dgx3",
+      "rank": 2,
+      "management_ip": "10.0.1.73",
+      "head": false,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "1": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.13.1.0/24",
+       "roceP2p1s0f0": "10.13.2.0/24",
+       "rocep1s0f1": "10.23.1.0/24",
+       "roceP2p1s0f1": "10.23.2.0/24"
+      },
+      "roce_gid_index": 3
+     }
+    ]
+   },
+   "transport": "oneshot-direct",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-19-karmic-kraken-r6x",
+   "image": "vllm-ds41f-kkref:19f2c20ed4d6-1022-4",
+   "dspark_cost_dir": "/cache/kkref/dspark-costs/build-29cde5dc07a07f81",
+   "client_commit": "95bccd0ab1c20e45f29c07764fc18f688b6e8c0c",
+   "client_dirty": false,
+   "client_host": "dgx1",
+   "nodes": {
+    "dgx1": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T20:50:50.423836082Z",
+     "checkout": "95bccd0ab1c20e45f29c07764fc18f688b6e8c0c"
+    },
+    "dgx2": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T20:50:49.644236212Z",
+     "checkout": "95bccd0ab1c20e45f29c07764fc18f688b6e8c0c"
+    },
+    "dgx3": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T20:50:50.033125407Z",
+     "checkout": "95bccd0ab1c20e45f29c07764fc18f688b6e8c0c"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": []
+  }
+ },
+ "finished_utc": "2026-10-22T21:04:46+00:00"
+}

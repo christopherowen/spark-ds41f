@@ -96,14 +96,26 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_each_shape_is_its_r6x_arm(self):
-        """tp4-ring resolves to r6x's release arm on the ring, tp3-triangle to r6x's 1M arm on
-        the triangle, apart from the names (the arms extend the frozen r6v recipe, or the
-        recipe itself, and name r6x's lock)."""
+    def test_each_shape_is_its_1022_arm(self):
+        """Each shape resolves to spark-ds41f-1022's arm at that shape, apart from the names (the
+        arms extend the recipe and name the release's experiment lock)."""
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        for shape in ("tp4-ring", "tp3-triangle"):
+            arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
+            resolved = recipe.resolve(self.recipe, shape)
+            released = load_spark().read_cluster(arm)
+            self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                             {k: v for k, v in released.items() if k not in naming}, shape)
+
+    def test_r6x_frozen_at_1022_is_its_arms(self):
+        """r6x's recipe, frozen at spark-ds41f-1022's promotion, resolves at each shape to r6x's
+        arm there: its release arm on the ring (which extends the frozen r6v recipe) and its 1M
+        arm on the triangle."""
+        frozen = load("experiments/2026-10-22-spark-ds41f-1022/r6x/cluster.json")
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape, arm in (("tp4-ring", "experiments/2026-10-18-r6x/r6x-tp4-1017.json"),
                            ("tp3-triangle", "experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-1017.json")):
-            resolved = recipe.resolve(self.recipe, shape)
+            resolved = recipe.resolve(frozen, shape)
             released = load_spark().read_cluster(arm)
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
@@ -181,9 +193,9 @@ class RecipeTest(unittest.TestCase):
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # Each shape has r6x's own release run.
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3")
-        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4")
+        # spark-ds41f-1022 was released on the triangle; the ring is unqualified until its own run.
+        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
+        self.assertNotIn("benchmark_reference", tp4)
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):

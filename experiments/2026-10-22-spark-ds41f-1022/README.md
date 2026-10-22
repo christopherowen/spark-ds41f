@@ -6,7 +6,11 @@ production, gates the combination with one focused window, then compares it with
 promotion gate. Named per the release naming adopted for the next release: `spark-ds41f-MMDD`
 (the candidate's own name until the owner promotes it).
 
-**Status (2026-10-22):** the focused gate, the release tests (1,781 passed on image `-1022-2`)
+**Status (2026-10-22 23:10 CET): promoted as `spark-ds41f-1022`, image `-1022-4`, on the triangle at
+1M** (owner: "begin the promotion routine"; [Promotion](#promotion)). The ring is unqualified on
+this image until a ring release run. The paragraphs below record how the candidate got there.
+
+**Image `-1022-2` (2026-10-22):** the focused gate, the release tests (1,781 passed on image `-1022-2`)
 and the owner's trimmed promotion comparison against r6x have passed: engine grid −1.1%, eight
 streams, one stream and prefill same against the run's own repeat, outputs identical. Time to
 first token is level with r6x at four and eight streams and one decode step longer alone (late
@@ -40,6 +44,22 @@ eight request locations (four extra control tokens each, two in chat mode), as #
 gate with the probe, which passes when every location keeps the neutral request's control
 sequence; [promotion-1022-4-tp3.json](promotion-1022-4-tp3.json) is the one-arm promotion suite
 that becomes the TP3 benchmark reference.
+
+**`-1022-4`: release tests and gate.** Release tests (dgx4, image `sha256:234b0a791418`, 65 gate
+files, 491 s): **1,801 passed, 158 skipped, 0 failed**; the 19 more than `-1022-3` are 0227's
+tokenizer tests. The gate (window 22:27-22:50 CET, no foreign requests): the image copied from
+dgx4 to dgx1 and on to dgx2 and dgx3, one ID on every node; boot ready in 80.4 s at the
+production pool under the unchanged 5/3 GiB guards.
+
+| Step | `-1022-4` | `-1022-3` | Pass |
+| --- | --- | --- | --- |
+| determinism, with and without log probabilities | identical in all six scenarios; 62313cb5 / 9742ac2c and 4d143977 / 12fd8257 | the same | r6x's hashes |
+| control spellings (`control_spellings_probe.py`) | every location keeps the neutral request's control sequence (user 5 / 5, tool result 29 / 29, chat mode 4 / 4, ...); the spelled prompts are three tokens longer, their spellings now text | not run (production r6x: 4 extra control tokens a location, 2 in chat mode) | pass in all eight |
+| cold prefill 32K / 131K, tok/s | 4460.4 / 4383.7 | 4460.4 / 4382.4 | level |
+| one stream, tok/s | 56.7 ± 5.6% | 56.7 ± 5.5% | level |
+| traced TTFT p50, four / eight streams; isolated mean | 265.8 / 355.2 ms; 147.7 ms | 278.2 / 353.1 ms; 148.1 ms | level |
+| sink counters, ordinary text / probes | 0 flags / `Say hi.`, `Thanks!`, `ok` flagged, no collapse, every rank 8 rows | the same | pass |
+| MemAvailable serving, dgx1 / dgx2 / dgx3 | 6.54 / 7.93 / 8.14 GiB | | above the 3 GiB guard |
 
 ## Contents
 
@@ -110,7 +130,9 @@ V2-runner worker:
   (version, changelog, README serving status). `make check` and the branch's CI passed first.
 - Everything else as r6x: [upstreams.lock.json](upstreams.lock.json),
   [source.json](source.json).
-- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022-3` (the live-name rename stays a separate step), after
+- Image `vllm-ds41f-kkref:19f2c20ed4d6-1022-4` (sha256:234b0a791418, built on dgx4 2026-10-22 20:06 UTC
+  from a61075b7): the series through 0227, patch head 8fc15c18f, tree e68aa19c. Before it
+  `vllm-ds41f-kkref:19f2c20ed4d6-1022-3` (the live-name rename stays a separate step), after
   `-1022-2` (tree c282fa51, the release comparison's). The gate's image was `vllm-ds41f-kkref:19f2c20ed4d6-1022` (sha256:b1bbdea2521c, tree 32ae33c9),
   built 2026-10-22 on dgx2 in 10 min; the new tag keeps the two apart.
 
@@ -245,6 +267,44 @@ Verdicts, r6x to the candidate, against the run's own repeat (candidate to candi
   starting (read-only 0.1 s sampler, the startup-memory experiment): candidate 6.77 and 6.01 GiB,
   r6x 5.83 and 5.68 GiB, against the 5 GiB guard; the candidate's two boots differ by 0.76 GiB,
   more than the candidate against r6x.
+
+## Promotion
+
+Owner, 2026-10-22: "include 449", then "stop the testing on this on storage, take back control, and
+begin the promotion routine". The evidence is the trimmed promotion comparison of `-1022-2` against
+r6x ([above](#promotion-comparison-2026-10-22-1003-1105-cet)), 0226's A/B, which restored prefill,
+and `-1022-4`'s release tests and gate (0227 changes only the tokenizer and renderer). The one-arm
+promotion suite on `-1022-4` ([promotion-1022-4-tp3.json](promotion-1022-4-tp3.json), window 22:52-23:04
+CET, boot ready in 91.9 s, no halts, no thermal slowdown) is the triangle's benchmark reference,
+[manifests/suites/2026-10-22-spark-ds41f-1022-tp3](../../manifests/suites/2026-10-22-spark-ds41f-1022-tp3/).
+Production r6x was restored at 23:06 CET, `doctor --live` OK. A LAN drop of a few minutes around
+22:58 CET (the lab switch) cut SSH from the Mac; the run on dgx1 continued unaffected.
+
+For context only, the reference against the morning session's arms (across sessions, so carrying
+their drift; not verdicts; the full output is the reference's `release-table.txt`):
+
+| Metric | r6x (10:03) | `-1022-2` (10:03) | `-1022-2` again | `-1022-4` (22:52) |
+| --- | ---: | ---: | ---: | ---: |
+| greedy text against `-1022-4` | 64/64 identical, KL 0 | 64/64, KL 0 | 64/64, KL 0 | |
+| engine grid, `-1022-4`'s change | −0.56% (better) | +0.55% | +0.73% | |
+| eight streams, output tok/s | 151.3 | 153.6 | 153.1 | 152.8 |
+| one stream, output tok/s | 59.5 | 59.5 | 59.3 | 59.2 |
+| one stream TTFT p50 | 0.127 s | 0.158 s | 0.159 s | 0.159 s |
+| prefill 32K / 131K tok/s | 4464 / 4385 | 4427 / 4353 | 4397 / 4320 | 4457 / 4377 |
+
+The grid reads 0.6-0.7% slower than the morning's `-1022-2` arms and 0.56% faster than its r6x. Neither
+0226 (the engine core's decision after a continuing prompt chunk) nor 0227 (the tokenizer) runs in a
+decode step, and within one session the step is level: plain step p50 at four streams 71.4 / 71.4 /
+71.3 ms in 0226's A/B, 71.5 ms on `-1022-3` and 71.2 ms on `-1022-4` in their gates. The difference
+is not attributed; the next release comparison against this reference runs in one session with
+its own repeat.
+
+The promotion commit moves `config/cluster.json` to image `-1022-4` (vLLM tree e68aa19c, sparknet
+tree f997a594) with `VLLM_LATE_ADMISSION_LAYER=30`, the root lock and source manifest to this
+release, the triangle's `benchmark_reference` to the run above, and drops the ring's (r6x's TP4 run
+measured another image). r6x's recipe and lock are frozen in [r6x/](r6x); r6x's 1M arm
+(`experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-1017.json`) now extends that frozen recipe, so it
+stays r6x. Rollback: deploy the previous promoted commit.
 
 ## Not covered
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "promoted_baseline": "2026-10-19-karmic-kraken-r6x",
+  "promoted_baseline": "2026-10-22-spark-ds41f-1022",
   "model": "v41-flash-1017",
   "models": {
     "v41-flash": {
@@ -20,14 +20,14 @@
   },
   "container": {
     "name": "dsv41-karmic-kraken",
-    "image": "vllm-ds41f-kkref:19f2c20ed4d6-r6x",
+    "image": "vllm-ds41f-kkref:19f2c20ed4d6-1022-4",
     "expected_labels": {
-      "local.spark3.vllm.tree": "4d6851c8bb1397a55254ba88905a87d9785b98dc",
+      "local.spark3.vllm.tree": "e68aa19c8027c34a3dcfeb3ed203f6d285fc4d67",
       "local.spark3.b12x.tree": "1a647a311ca55d45070ab83d60668d9c8fb8886c",
       "local.spark3.nccl.tree": "6af10aa730a64fcee8781d62340a9c9184e79469",
       "local.spark3.tilelang.tree": "222b895d04ee6cd75179155d06e0c0d450636f51",
       "local.spark3.tile_kernels.tree": "cb2fa41c8af290204c81c547ed678ebf957cca53",
-      "local.spark3.sparknet.tree": "f72599fa212e894d67ee114553e628ab05daf2da"
+      "local.spark3.sparknet.tree": "f997a594f03a696897e6ad8e50bb027ed877ebe9"
     },
     "docker_run_args": [
       "--network=host",
@@ -117,6 +117,7 @@
     "VLLM_ENGINE_READY_TIMEOUT_S": "3600",
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": "900",
     "VLLM_L2_PREFETCH_GRID": "2",
+    "VLLM_LATE_ADMISSION_LAYER": "30",
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
     "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD": "1024",
     "VLLM_PLUGINS": "b12x_loader",
@@ -271,8 +272,7 @@
         "NCCL_THREAD_THRESHOLDS": "-2 -2 -2 1 1 1",
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "0",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "2097152"
-      },
-      "benchmark_reference": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp4"
+      }
     },
     "tp3-triangle": {
       "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m).",
@@ -314,7 +314,7 @@
         "SPARK3_DISPLAY_CARVEOUT_WEIGHTS": "1",
         "SPARKNET_ROCE_ALLGATHER_MAX_BYTES": "4194304"
       },
-      "benchmark_reference": "manifests/suites/2026-10-19-karmic-kraken-r6x-tp3"
+      "benchmark_reference": "manifests/suites/2026-10-22-spark-ds41f-1022-tp3"
     },
     "tp3-triangle-4k": {
       "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md).",

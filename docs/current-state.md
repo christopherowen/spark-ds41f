@@ -1,7 +1,31 @@
 # Current state
 
-Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**r6x**, serving DeepSeek-V4.1-Flash-1017, promoted 2026-10-19 as
+Production is the recipe's `tp3-triangle` shape ([config/cluster.json](../config/cluster.json)) on
+**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx3, promoted
+2026-10-22 as [`2026-10-22-spark-ds41f-1022`](../manifests/baselines/2026-10-22-spark-ds41f-1022.json)
+([promotion record](../experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
+`spark-ds41f-MMDD`: image `vllm-ds41f-kkref:19f2c20ed4d6-1022-4`, r6x's sources with vLLM
+0185 and 0221-0227 (patch head `8fc15c18`, tree `e68aa19c`) and sparknet 0.5.0. 0185 runs the TP
+group's broadcast (DSpark's per-step confidences) on sparknet's one-shot all-gather, so serving
+never touches the PyTorch NCCL process group; 0221 and 0223 detect the model's sink and reject a
+held draft zero that lands on it, on by default for DeepSeek V4.1, so short prompts such as
+`Say hi.` no longer collapse to an empty answer; 0222 and 0226 decide the next step at decoder layer
+30 of the current one (late admission), so an arrival joins one step sooner, while a step that
+continues a prompt chunk decides its successor at once; 0227 keeps control-token spellings in
+request text as plain text (#449); sparknet 0.5.0 widens the one-shot read phase. Outputs are
+identical to r6x's. Against r6x on the trimmed promotion comparison (one session, the owner's choice): decode
+steps 1.1% faster, eight streams, one stream and prefill level once 0226 restored prefill (its A/B:
+0.6-1.4% on every paired prompt); time to first token level at four and eight streams and one decode
+step longer alone (0.127 to 0.159 s at p50). Release tests: 1,801 passed.
+`tp3-triangle`'s `benchmark_reference` is
+[manifests/suites/2026-10-22-spark-ds41f-1022-tp3](../manifests/suites/2026-10-22-spark-ds41f-1022-tp3/).
+`tp4-ring` is unqualified on this image until a ring release run
+([spark-ds41f-1022-tp4.json](../experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4.json) is
+its arm). r6x's recipe and lock are frozen in `experiments/2026-10-22-spark-ds41f-1022/r6x` as the
+rollback.
+
+Before spark-ds41f-1022 production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the recipe's
+`tp4-ring` shape, promoted 2026-10-19 as
 [`2026-10-19-karmic-kraken-r6x`](../manifests/baselines/2026-10-19-karmic-kraken-r6x.json)
 ([promotion record](../experiments/2026-10-18-r6x/README.md)): image
 `vllm-ds41f-kkref:19f2c20ed4d6-r6x` on dgx1-dgx4, r6v's sources with vLLM 0181-0184 (patch head

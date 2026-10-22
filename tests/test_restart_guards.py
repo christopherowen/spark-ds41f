@@ -216,15 +216,14 @@ class UnqualifiedShapeTest(unittest.TestCase):
         return "started"
 
     def test_an_unqualified_shape_is_refused_unless_overridden(self) -> None:
-        # The 4 KiB-page triangle was never benched with the recipe's image.
-        for shape in ("tp3-triangle-4k",):
+        # The 4 KiB-page triangle and the ring were not benched with spark-ds41f-1022's image.
+        for shape in ("tp3-triangle-4k", "tp4-ring"):
             unqualified = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), shape)
             self.assertNotIn("benchmark_reference", unqualified)
             self.assertIn(f"no release benchmark qualifies this recipe's image on {shape}", self.start(unqualified))
             self.assertEqual(self.start(unqualified, unqualified_shape=True), "preflight reached")
-        for shape in ("tp3-triangle", "tp4-ring"):
-            qualified = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), shape)
-            self.assertEqual(self.start(qualified), "preflight reached", shape)
+        qualified = spark.cluster_recipe.resolve(spark.read_json("config/cluster.json"), "tp3-triangle")
+        self.assertEqual(self.start(qualified), "preflight reached")
         # The frozen r6n recipe still starts the ring it was released on.
         frozen = spark.cluster_recipe.resolve(spark.read_json("experiments/2026-10-16-r6s/r6n/cluster.json"), "tp4-ring")
         self.assertEqual(self.start(frozen), "preflight reached")

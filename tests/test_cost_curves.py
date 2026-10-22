@@ -47,12 +47,11 @@ class CostCurveDirectoryTest(unittest.TestCase):
         dev = copy.deepcopy(self.tp3)
         dev["environment"]["VLLM_SERVER_DEV_MODE"] = "1"
         self.assertEqual(self.directory(dev), self.directory(self.tp3))
-        # The ring's release arm (dev mode) and the recipe are the same build, and so are the
-        # triangle's r6x arm and the recipe. (r6x reads no curves; the directory still names
-        # the build.)
-        arm = spark.read_cluster("experiments/2026-10-18-r6x/r6x-tp4-dev-1017.json")
+        # spark-ds41f-1022's arms (dev mode) and the recipe are the same build at each shape.
+        # (Since r6x nothing reads the curves; the directory still names the build.)
+        arm = spark.read_cluster("experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp4))
-        arm = spark.read_cluster("experiments/2026-10-19-r6x-tp3-1m/r6x-tp3-1m-1017.json")
+        arm = spark.read_cluster("experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp3-dev.json")
         self.assertEqual(self.directory(arm), self.directory(self.tp3))
         # r6v's arms keep the curves its production ran on, so it stays a fixed reference.
         r6v = spark.read_cluster("experiments/2026-10-17-r6v/r6v-tp4-dev-1017.json")
