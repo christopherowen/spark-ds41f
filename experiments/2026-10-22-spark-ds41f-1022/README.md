@@ -6,12 +6,14 @@ production, gates the combination with one focused window, then compares it with
 promotion gate. Named per the release naming adopted for the next release: `spark-ds41f-MMDD`
 (the candidate's own name until the owner promotes it).
 
-**Status (2026-10-22):** the focused gate passed on the TP3 triangle (09:09-09:42 CET): outputs
-identical to r6x, the collapse probes corrected with zero flags on ordinary text, one stream, prefill
-and memory level, booted at the production pool under the unchanged guard. Time to first token at
-four and eight streams is level with r6x, not below it: late admission pays for sink rejection's
-held step ([Results](#results)). The release tests found 15 stale test stand-ins, fixed by vLLM 0225
-(tests only), so the release comparison builds image `-1022-2` first. Release comparison pending.
+**Status (2026-10-22):** the focused gate, the release tests (1,781 passed on image `-1022-2`)
+and the owner's trimmed promotion comparison against r6x have passed: engine grid −1.1%, eight
+streams, one stream and prefill same against the run's own repeat, outputs identical. Time to
+first token is level with r6x at four and eight streams and one decode step longer alone (late
+admission pays for sink rejection's held step; [Results](#results)). **Promotion is on hold:**
+prefill reads about 1% lower in every pair and in the gate, and the owner asked for that to be
+fixed before the release. The fix is traced and made in a separate experiment; the candidate takes
+it, then promotion follows.
 
 ## Contents
 
@@ -174,16 +176,46 @@ DS4.1 model stand-ins:
 
 vLLM 0225 gives the stand-ins what the code reads (`_sink_columns=None`; the served architecture).
 The three files then pass, 114 tests through the release runner in the gate's image with the fixed
-files mounted. The bundle now names image `-1022-2`; its full run follows the release window's
-image copy to dgx4.
+files mounted. The bundle names image `-1022-2`; its full run on dgx4 (2026-10-22, 15:29-15:37
+CET, sha256:07143428dc39): **1,781 passed, 158 skipped, 0 failed**.
 
-## Release comparison (promotion gate)
+## Promotion comparison (2026-10-22 10:03-11:05 CET)
 
-[release-tp3.json](release-tp3.json): the image job for `-1022-2` (build on dgx2, copy to dgx1,
-dgx3 and dgx4), then `release-tp3` with `single-stream` and `sampled` as companions; arms
-candidate, r6x, candidate again. The r6x reference arm
-[r6x-tp3-dev.json](r6x-tp3-dev.json) extends r6x's recipe frozen under [r6x/](r6x/), which is
-also the rollback.
+Owner, 2026-10-22: sink rejection on as built, and a trimmed comparison of about an hour as the
+promotion gate instead of the release suites: the engine grid, eight streams, one stream and 32K /
+131K prefill, candidate first, r6x, candidate again. [promotion-suite.json](promotion-suite.json)
+(model behaviour on 64 prompts, the grid, c8 and c1 closed loops of 180 s, prefill three repeats)
+and [promotion-tp3.json](promotion-tp3.json): the image job for `-1022-2` (built on dgx2 in 10
+min, sha256:07143428dc39, one ID on dgx1-3 and dgx4), then the three arms at the production pool
+under the unchanged guard. The run read the suite from a copy staged under
+`results/private/lab/spark-ds41f-1022/` on dgx1-3 (sha256 c6277891, this file). Table:
+[results/promotion-tp3-table.txt](results/promotion-tp3-table.txt).
+
+Verdicts, r6x to the candidate, against the run's own repeat (candidate to candidate again):
+
+| Metric | Change | ±95% | Repeat | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| engine grid, decode geometric mean (15 shapes) | −1.11% | 0.16% | −0.18% | better |
+| eight streams, output tok/s | +1.53% | 2.06% | −0.31% | same |
+| one stream, output tok/s | −0.09% | 9.99% | −0.38% | same |
+| prefill 32K tok/s | −0.82% | 1.22% | −0.69% | same |
+| prefill 131K tok/s | −0.74% | 0.53% | −0.75% | same |
+
+- **Outputs:** greedy responses identical 64/64 in both pairs, teacher-forced distributions
+  identical (KL 0, top-1 agreement 100%).
+- **Engine grid:** better at 12 of 15 shapes in the first pair and 13 in the second, about
+  −1.1 to −1.3%: sparknet 0.5.0's wider read phase (its A/B: −1.6%).
+- **Prefill:** about 1% lower, in both pairs and in the gate. The first pair's 131K change is
+  beyond its own interval, but the repeat moved as much (the candidate's second arm ran last and
+  hottest), so the verdict is same. It is a direction worth tracing: the series adds to every
+  forward only the sink column copy (16 bytes a token) and late admission's one event record.
+- **Time to first token** (latency rows carry no interval): eight streams +2.6% / +3.8%, one
+  stream +25% (0.127 to 0.158 s at p50). Late admission pays for sink rejection's held step at
+  several streams; a request alone waits one decode step longer.
+- **Boots:** ready in 80 / 93 / 93 s (r6x's restore 92 s). dgx1's MemAvailable minimum while
+  starting (read-only 0.1 s sampler, the startup-memory experiment): candidate 6.77 and 6.01 GiB,
+  r6x 5.83 and 5.68 GiB, against the 5 GiB guard; the candidate's two boots differ by 0.76 GiB,
+  more than the candidate against r6x.
 
 ## Not covered
 
