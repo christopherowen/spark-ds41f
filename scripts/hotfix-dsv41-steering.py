@@ -532,10 +532,22 @@ FORWARD_BLOCK = '''\
             # return convention, re-verified 2026-10-18 through the 172-patch
             # promoted series).
             steer_dirs = self._steer_stack[idx]
-            steer_coef = torch.einsum("...h,kh->...k", hidden_states, steer_dirs)
-            hidden_states = hidden_states - self._steer_alpha * torch.einsum(
+            # r6x 0183/SP: the pending FFN write may be a RankOrderParts (this
+            # rank's partial of the sum, folded by the next block's post_pre).
+            # Steering one rank's partial would edit only that rank's share of
+            # every row's bits -- silently wrong. Fold to the summed write
+            # (the same bits post_pre consumes), then project.
+            steer_states = (
+                hidden_states.sum() if hasattr(hidden_states, "packed") else hidden_states
+            )
+            steer_coef = torch.einsum("...h,kh->...k", steer_states, steer_dirs)
+            steer_states = steer_states - self._steer_alpha * torch.einsum(
                 "...k,kh->...h", steer_coef, steer_dirs
             )
+            if hasattr(hidden_states, "packed"):
+                hidden_states = type(hidden_states)(steer_states)  # same wrapper, steered parts
+            else:
+                hidden_states = steer_states
 '''
 
 ANCHOR_IMPORT = (
