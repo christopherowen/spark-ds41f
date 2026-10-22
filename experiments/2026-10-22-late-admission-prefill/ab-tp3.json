@@ -1,0 +1,76 @@
+{
+ "experiment": "experiments/2026-10-22-late-admission-prefill",
+ "run": "la-prefill-ab",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": true,
+   "bench_args": [
+    "--compare",
+    "none",
+    "--suites",
+    "prefill",
+    "--prefill-text",
+    "source",
+    "--prefill-sizes",
+    "32768,131072",
+    "--prefill-repeats",
+    "3"
+   ],
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-20-ttft-gap/ttft_trace.py",
+     [
+      "--repo",
+      ".",
+      "--output",
+      "results/private/lab/{run}-trace-{label}.json",
+      "--analyze"
+     ],
+     "trace"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "fix-1022.json",
+     "label": "fix"
+    },
+    {
+     "config": "cur-1022.json",
+     "label": "cur"
+    },
+    {
+     "config": "fix-1022.json",
+     "label": "fix-again"
+    }
+   ]
+  }
+ ]
+}

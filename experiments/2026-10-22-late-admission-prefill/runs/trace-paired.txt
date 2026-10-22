@@ -1,0 +1,14 @@
+Cold prefill, spark-ds41f-1022 (boot 0) against r6x (boot 1), the same six prompts in the same order.
+Per request: TTFT (bench), the chunk cadence from the Engram timeline (dgx1 layer 1 submissions),
+and the GPU's wait for chunk 2's rows (largest over the three ranks and both Engram layers).
+
+ tokens chunks | TTFT 1022     r6x     diff | c1->c2 diff | chunks 2..N-1 mean diff | c2 wait 1022/r6x | c3..N wait 1022/r6x
+ 120242     30 |    27.033  27.184   -151ms |      -379ms |     +9.3 ms (median  +7.4) |    23.1/28.2    |      0.0/9.7     
+  26289      7 |     5.797   5.766    +30ms |       +44ms |     +4.9 ms (median  +7.1) |    24.5/22.2    |      0.0/0.0     
+ 116715     29 |    26.227  26.018   +209ms |       +44ms |     +7.3 ms (median  +7.3) |    31.4/33.2    |      0.0/0.0     
+  36341      9 |     7.814   7.739    +75ms |       +48ms |     +8.5 ms (median  +6.6) |    25.5/26.4    |      0.0/0.0     
+ 123163     31 |    27.754  27.536   +218ms |       +49ms |     +6.8 ms (median  +6.2) |    29.0/30.8    |      0.0/0.0     
+  29199      8 |     6.545   6.494    +50ms |       +48ms |     +6.5 ms (median  +5.7) |    32.5/34.0    |      0.0/0.0     
+
+The first pair is r6x's first prefill after its boot (c1->c2 1200 ms); it is left out of the pooled figure.
+Pooled chunks 2..N-1, five pairs: mean +7.03 ms, median +6.69 ms, sd 4.86, n=74

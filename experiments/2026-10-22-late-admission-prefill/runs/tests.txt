@@ -1,0 +1,57 @@
+# run-tests.sh cpu (with 0226) and run-tests.sh baseline (the image as built), dgx4, 2026-10-22 15:50-15:56 CET
+# image vllm-ds41f-kkref:19f2c20ed4d6-1022-2 (vLLM tree c282fa51), 0226's files mounted in 'cpu'
+
+## run-tests.sh cpu
+== late admission, engine side, and with sink rejection through the engine-core loop
+24 passed, 14 warnings in 5.43s
+== sink rejection: scheduler, frontend, default
+48 passed, 14 warnings in 9.06s
+== scheduler suites (GPU container), with the fix
+40 failed, 180 passed, 14 warnings in 18.72s
+
+## run-tests.sh baseline
+== scheduler suites (GPU container), the image as built
+40 failed, 180 passed, 14 warnings in 18.70s
+
+## scheduler suites: failed test ids, the same 40 with and without 0226 (diff empty)
+(identical)
+FAILED tests/v1/core/test_scheduler.py::test_async_scheduling_pp_allows_rescheduling_with_output_placeholders
+FAILED tests/v1/core/test_scheduler.py::test_eagle3_mm_encoder_cache_with_shift
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_allocate_encoder_tokens_with_external_load[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_allocate_encoder_tokens_with_external_load[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_cache_hit_external_load[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_cache_hit_external_load[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_cache_miss_computes_locally[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_cache_miss_computes_locally[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_defers_running_request_for_async_reload
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_ensure_cache_available_defers_request[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_ensure_cache_available_defers_request[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[False-connector_only]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[False-local]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[False-no_where]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[True-connector_only]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[True-local]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_schedule_multiple_requests[True-no_where]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_text_only_request[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_text_only_request[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_unable_to_allocate[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_unable_to_allocate[True]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_update_connector_output_called
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_with_partial_cache_hit_multi_round[False]
+FAILED tests/v1/core/test_scheduler.py::test_ec_connector_with_partial_cache_hit_multi_round[True]
+FAILED tests/v1/core/test_scheduler.py::test_encoder_cache_recomputed_when_evicted_during_preemption
+FAILED tests/v1/core/test_scheduler.py::test_encoder_cache_retained_across_preemption_and_resume
+FAILED tests/v1/core/test_scheduler.py::test_free_encoder_inputs_defers_for_eagle_lookahead
+FAILED tests/v1/core/test_scheduler.py::test_free_encoder_inputs_notifies_the_ec_connector
+FAILED tests/v1/core/test_scheduler.py::test_free_encoder_inputs_respects_unconfirmed_placeholders
+FAILED tests/v1/core/test_scheduler.py::test_free_encoder_inputs_unchanged_without_spec_decode
+FAILED tests/v1/core/test_scheduler.py::test_no_mm_input_chunking
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[False-connector_only]
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[False-local]
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[False-no_where]
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[True-connector_only]
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[True-local]
+FAILED tests/v1/core/test_scheduler.py::test_priority_scheduling_ec_connector_preemption_and_resumption[True-no_where]
+FAILED tests/v1/core/test_scheduler.py::test_schedule_multimodal_requests
+FAILED tests/v1/core/test_scheduler.py::test_schedule_partial_requests
+FAILED tests/v1/core/test_scheduler.py::test_unavailable_encoder_input_fails_the_request_as_retryable
