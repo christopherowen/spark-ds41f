@@ -1,0 +1,120 @@
+From ad9d39fc778276876ef3655f9ac5a760d21a8754 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:50:42 +0200
+Subject: [PATCH 251/259] CED row copy: every 1- to 8-byte element type, and
+ the key owners declare
+
+The copy reads elements by size, so it takes every 1-, 2-, 4- and 8-byte type
+the packing ABI can be given (uint8 sources are among its tests).
+copy_rows_key is the kernel's arguments for a source layout, used by the copy
+itself; packed_copy_rows_key is the same for packed rows of a shape, which an
+owner declares for preparation, so the two cannot drift apart.
+---
+ .../test_deepseek_v41_tilelang_metadata.py    | 23 +++++++++++-
+ vllm/models/deepseek_v4_1/tilelang/ced.py     | 35 +++++++++++++++++--
+ 2 files changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index fc03319d2..6002233ff 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -88,7 +88,18 @@ R, CAP, COLS = 16, 1024, 40
+ 
+ 
+ @pytest.mark.parametrize(
+-    "dtype", [torch.int64, torch.int32, torch.float32, torch.bfloat16, torch.bool]
++    "dtype",
++    [
++        torch.int64,
++        torch.int32,
++        torch.float32,
++        torch.bfloat16,
++        torch.bool,
++        torch.uint8,
++        torch.int8,
++        torch.float16,
++        torch.float64,
++    ],
+ )
+ @pytest.mark.parametrize("transpose", [False, True])
+ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
+@@ -198,6 +209,16 @@ def test_ced_row_copy_views_of_wider_rows(dtype, width, columns):
+     assert torch.equal(scatter_rows(output, indices, 300), restored)
+ 
+ 
++def test_ced_row_copy_packed_key_matches_contiguous_sources():
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    for tail in [(), (4,), (4, 4), (4, 5120)]:
++        source = torch.empty((3, *tail), device=DEVICE)
++        assert ced.packed_copy_rows_key("float32", tail, True) == ced.copy_rows_key(
++            "float32", tail, source.stride()[1:], source.stride(0), True
++        )
++
++
+ def test_ced_row_copy_preconditions():
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 090b680d6..b4ac2950c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -220,7 +220,18 @@ def indices(starts, compact_starts, output, nr, nt):
+     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
+ 
+ 
+-_ITEMSIZE = {"bool": 1, "int32": 4, "int64": 8, "float32": 4, "bfloat16": 2}
++_ITEMSIZE = {
++    "bool": 1,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "float16": 2,
++    "bfloat16": 2,
++    "int32": 4,
++    "float32": 4,
++    "int64": 8,
++    "float64": 8,
++}
+ _THREADS = 128
+ 
+ # Predicated global loads for the row copies (zero when off), in the form of
+@@ -406,6 +417,26 @@ def copy_rows_kernel(
+     return ced_copy_rows
+ 
+ 
++def copy_rows_key(dtype: str, tail, tail_strides, row_stride: int, scatter: bool):
++    """``copy_rows_kernel``'s arguments for a source layout: what the copy launches
++    and what an owner declares for preparation."""
++    return (
++        dtype,
++        tuple(tail),
++        tuple(tail_strides),
++        row_stride == math.prod(tail),
++        scatter,
++    )
++
++
++def packed_copy_rows_key(dtype: str, tail, scatter: bool):
++    """``copy_rows_key`` for a source of packed rows of shape ``tail``."""
++    strides = [1]
++    for dim in reversed(tail[1:]):
++        strides.insert(0, strides[0] * dim)
++    return copy_rows_key(dtype, tail, strides[: len(tail)], math.prod(tail), scatter)
++
++
+ def copy_rows(source, row_indices, output, scatter: bool):
+     """Copy logical rows from a possibly strided source without copying its storage.
+ 
+@@ -434,7 +465,7 @@ def copy_rows(source, row_indices, output, scatter: bool):
+         else 0
+     )
+     flat_source = source.as_strided((span,), (1,))
+-    copy_rows_kernel(dtype, tail, tail_strides, row_stride == math.prod(tail), scatter)(
++    copy_rows_kernel(*copy_rows_key(dtype, tail, tail_strides, row_stride, scatter))(
+         flat_source,
+         row_indices,
+         output.view(-1),
+-- 
+2.54.0 (Apple Git-157)
+

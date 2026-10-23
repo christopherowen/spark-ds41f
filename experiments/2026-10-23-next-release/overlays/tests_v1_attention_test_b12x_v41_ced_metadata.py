@@ -664,6 +664,51 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
 
 
 @cuda
+@pytest.mark.parametrize("sink_columns", [True, False])
+def test_startup_warmup_declares_the_sink_columns_scatter(monkeypatch, sink_columns):
+    """A compacted decoder scatters the sink detector's [tokens, hc_mult] float32
+    columns back to every row; the warmup declares that layout when the model
+    keeps them, and the frozen cache refuses it by name otherwise."""
+    import importlib
+
+    import tilelang.cache
+
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1 import ced
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+
+    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+    monkeypatch.setattr(cache_module, "_frozen_reason", None)
+    kernel = ced.ced_kernels.copy_rows_kernel
+    monkeypatch.setattr(kernel, "_kernel_cache", {})
+    monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
+    state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        state.warmup(
+            hidden_size=8, hc_mult=4, pipeline=False, sink_columns=sink_columns
+        )
+    registry.warmup()
+    prepare.warm_declared(registry)
+    prepare.freeze("CED sink-columns warmup test")
+
+    lengths = [4096, 1]
+    starts = torch.tensor(
+        np.r_[0, np.cumsum(lengths)], dtype=torch.int32, device="cuda"
+    )
+    seq = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    state.stage(starts, seq, lengths, [False, False], [0, 0])
+    indices = state.get_indices()
+    columns = torch.ones((indices.numel(), 4), dtype=torch.float32, device="cuda")
+    if sink_columns:
+        full = scatter_rows(columns, indices, sum(lengths))
+        assert full[indices].eq(1).all() and full.sum().item() == 4 * indices.numel()
+    else:
+        with pytest.raises(Exception, match="was not prepared"):
+            scatter_rows(columns, indices, sum(lengths))
+
+
+@cuda
 def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     import importlib
 
@@ -688,7 +733,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
     # The packings compile with the runner's JIT warmup, as under the worker.
     registry = JitWarmupRegistry(None)
     with registry.activate():
-        state.warmup(hidden_size=8, hc_mult=4, pipeline=False)
+        state.warmup(hidden_size=8, hc_mult=4, pipeline=False, sink_columns=False)
     registry.warmup()
     from vllm.models.deepseek_v4_1.tilelang import prepare
 

@@ -161,11 +161,15 @@ class CEDState:
         self.prefix_start = torch.empty_like(self.request_positions)
         self.plan: CEDPlan | None = None
 
-    def warmup(self, hidden_size: int, hc_mult: int, *, pipeline: bool) -> None:
+    def warmup(
+        self, hidden_size: int, hc_mult: int, *, pipeline: bool, sink_columns: bool
+    ) -> None:
         """Resolve the row mapping before graph capture, and declare the metadata
         kernels and the packing layouts the deployment launches for preparation
         (compiled before memory profiling); ``pipeline``: pipeline parallel, whose
-        stages also scatter the pre-mix.
+        stages also scatter the pre-mix; ``sink_columns``: the model keeps the
+        attention-sink detector's columns, which a compacted decoder scatters back
+        to every row in the pre-mix's layout.
         """
         device = self.indices.device
         if torch.cuda.is_current_stream_capturing():
@@ -188,10 +192,11 @@ class CEDState:
             (torch.float32, mixes, False),
             (torch.float32, (hc_mult, hc_mult), False),
             # Scattered back to every row: hidden states (collapsed, or the MTP
-            # buffer's streams or a pipeline stage's), and a stage's pre-mix.
+            # buffer's streams or a pipeline stage's), and a stage's pre-mix or the
+            # sink detector's columns (both [tokens, hc_mult] float32).
             (torch.bfloat16, rows, True),
             (torch.bfloat16, streams, True),
-            *(((torch.float32, mixes, True),) if pipeline else ()),
+            *(((torch.float32, mixes, True),) if pipeline or sink_columns else ()),
         )
 
         def warm_metadata():

@@ -27,6 +27,7 @@ GPU_TESTS = [
     "tests/kernels/moe/test_deepseek_v41_tilelang_router.py",
     "tests/v1/spec_decode/test_rejection_sampler_utils.py",
     "tests/v1/spec_decode/test_dspark_topk.py",
+    "tests/models/test_deepseek_v4_1_glp.py",
 ]
 
 
@@ -112,12 +113,13 @@ def main(checkout: str, base: str = "8fc15c18f") -> None:
                    for extra, name in (([], "determinism"), (["--no-logprobs"], "greedy"))]
     dump(HERE / "screen-tp4.json", {
         "experiment": EXP,
-        "run": "next-release-screen-tp4",
+        "run": "next-release-screen2-tp4",
         "jobs": [
             {"kind": "sync"},
             {"kind": "kernel", "bundles": [{"node": "dgx4", "bundle": f"{EXP}/bundles/gpu-tests"}]},
             {"kind": "measure", "bench": False, "bracket": False, "extras": determinism + [
                 ["experiments/2026-10-22-spark-ds41f-1022/control_spellings_probe.py", [], "control-spellings"],
+                ["controls_probe.py", [], "controls"],
                 ["experiments/2026-10-22-spark-ds41f-1022/sink_counters.py", [], "sink-ordinary"],
                 ["experiments/2026-10-19-sink-rejection-v2/probes.py", ["--nodes", "dgx1,dgx2,dgx3,dgx4"], "probes"],
             ], "arms": [{"config": "candidate-tp4.json", "label": "candidate"}]},

@@ -63,3 +63,53 @@ production restored once at the end:
 
 This is a screen, not the release comparison: the release image, its release tests and the
 comparison follow once the remaining pieces are in.
+
+**First screen (2026-10-23 09:11-09:15 CET): stopped at the candidate's boot.** The GPU tests
+passed on dgx4 (341 passed: CED kernels, metadata and skip, CED model and router, block-verification
+sampling). The candidate then stopped in memory profiling on every rank: "TileLang kernel
+'ced_copy_rows' was not prepared ... copy_rows_kernel('float32', (4,), (1,), True, True)". A
+compacted decoder scatters the sink detector's columns ([tokens, hc_mult] float32, 0221) back to
+every row; the CED ports, qualified on r6x before the detector existed, declared that layout only
+under pipeline parallelism. Kernel preparation stopped the boot by name, as designed; the window
+restored production at 09:15 (`doctor --live` OK). 0259 declares the layout when the model keeps
+the columns, with a test that the frozen cache serves it and refuses it without the declaration.
+Preserved logs: [runs/failed-starts](runs/failed-starts).
+
+The second screen (run `next-release-screen2-tp4`) adds 0259, GLP steering (unset, so the arms
+must equal 1022), the GLP tests in the GPU bundle and [controls_probe.py](controls_probe.py) in
+the gate.
+
+## Release candidate 1 (image `-next-1`)
+
+[vllm/series](vllm/series): 1022's series (184 patches, the local ones by path into the 1022
+record) plus 0228-0259, exported from `release-next`:
+
+| Patches | Change |
+| --- | --- |
+| 0228 | block verification refreshes its random draws across rounds (vllm-project/vllm#61161 backport) |
+| 0229-0254 | CED row selection in TileLang: requests, row map, row copy, their benchmarks and tests |
+| 0255 | the CED nonfinal row skip |
+| 0256 | the V4.1 tokenizer honors `add_generation_prompt` and `continue_final_message` |
+| 0257 | the DeepSeek API's top-level `thinking` switch (#447) |
+| 0258 | GLP steering, off unless `WEIGHTLESS_STEER_PATH` is set (#401, Matt Suiche) |
+| 0259 | CED declares the sink detector's column scatter (found by the first screen, below) |
+
+A clean `git am` of 0228-0259 on 8fc15c18f (the build's committer and dates) gives patch head
+f382f88d, tree 76a3c9ab, the branch's tree ([source.json](source.json),
+[upstreams.lock.json](upstreams.lock.json)). Release tests: `scripts/release_tests.py check`
+selects 126 files, 69 gate (four new: the thinking switch, the TileLang CED kernels, GLP, block
+verification's draws, classified in config/release-tests.json), 0 problems;
+[release-tests-gate-manifest.json](release-tests-gate-manifest.json) and
+[bundles/release-tests](bundles/release-tests) (its `head` is the branch's 2ec043108, same tree).
+
+[rc1-tp4.json](rc1-tp4.json), one window on the ring: the image built on dgx2 and copied over the
+ring's links ([image-rc-dgx2.json](image-rc-dgx2.json)); the release tests on dgx4; the gate on
+[rc-tp4.json](rc-tp4.json) (determinism against 1022's ring hashes, control spellings,
+[controls_probe.py](controls_probe.py) for 0256 and 0257, the TTFT trace, memory, sink counters
+and probes); then the one-session comparison on [screen-suite-tp4.json](screen-suite-tp4.json):
+the candidate, spark-ds41f-1022, the candidate again. [rc-tp3.json](rc-tp3.json) is the triangle's
+arm for when it is cabled.
+
+GLP steering ships off: its gate here is that the unset path leaves outputs identical. Steering on,
+with its projection as a TileLang kernel, is qualified in its own experiment (the migration rule:
+a kernel that does not launch is not ported; this one launches only when configured).

@@ -1,0 +1,176 @@
+From ddf118ed40c8f6be33a108771b37452f0dfc5761 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 08:50:48 +0200
+Subject: [PATCH 257/259] Chat completions: the DeepSeek API's top-level
+ thinking switch
+
+DeepSeek's API turns thinking off with a top-level
+"thinking": {"type": "disabled"}; deepseek-recipe accepts the same field. The
+request dropped it, so DeepSeek-format clients always got reasoning
+(christopherowen/spark-ds41f#447, reported by Acermax).
+
+ChatCompletionRequest takes thinking {"type": "enabled" | "disabled"} and sets
+both template spellings, thinking and enable_thinking, so a reasoning_effort
+beside it cannot turn thinking back on; explicit chat_template_kwargs keep
+precedence. An unknown type is rejected.
+
+Tests: the request mapping, and the V4.1 tokenizer rendering the same prompt
+for thinking {"type": "disabled"} as for chat_template_kwargs thinking false,
+also beside reasoning_effort high.
+---
+ .../openai/test_reasoning_enable_thinking.py  | 37 +++++++++++++++++++
+ tests/tokenizers_/test_deepseek_v41.py        | 30 +++++++++++++--
+ .../openai/chat_completion/protocol.py        | 23 +++++++++++-
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/tests/entrypoints/openai/test_reasoning_enable_thinking.py b/tests/entrypoints/openai/test_reasoning_enable_thinking.py
+index 95606f626..c6eaae1fd 100644
+--- a/tests/entrypoints/openai/test_reasoning_enable_thinking.py
++++ b/tests/entrypoints/openai/test_reasoning_enable_thinking.py
+@@ -68,6 +68,43 @@ class TestChatCompletionReasoningEffort:
+         assert params.chat_template_kwargs["reasoning_effort"] == "high"
+ 
+ 
++class TestChatCompletionThinkingParam:
++    """Chat Completions: the DeepSeek API's top-level thinking switch."""
++
++    @pytest.mark.parametrize("kind, enabled", [("enabled", True), ("disabled", False)])
++    def test_type_sets_both_template_switches(self, kind, enabled):
++        request = _build_chat_request(thinking={"type": kind})
++        params = request.build_chat_params(None, "auto")
++        assert params.chat_template_kwargs["thinking"] is enabled
++        assert params.chat_template_kwargs["enable_thinking"] is enabled
++
++    def test_disabled_wins_over_reasoning_effort(self):
++        request = _build_chat_request(
++            thinking={"type": "disabled"}, reasoning_effort="high"
++        )
++        params = request.build_chat_params(None, "auto")
++        assert params.chat_template_kwargs["thinking"] is False
++        assert params.chat_template_kwargs["enable_thinking"] is False
++
++    @pytest.mark.parametrize("key", ["thinking", "enable_thinking"])
++    def test_explicit_template_kwargs_win(self, key):
++        request = _build_chat_request(
++            thinking={"type": "disabled"}, chat_template_kwargs={key: True}
++        )
++        params = request.build_chat_params(None, "auto")
++        assert params.chat_template_kwargs[key] is True
++        other = "enable_thinking" if key == "thinking" else "thinking"
++        assert other not in params.chat_template_kwargs
++
++    def test_absent_injects_nothing(self):
++        params = _build_chat_request().build_chat_params(None, "auto")
++        assert "thinking" not in params.chat_template_kwargs
++
++    def test_unknown_type_is_rejected(self):
++        with pytest.raises(ValueError):
++            _build_chat_request(thinking={"type": "maybe"})
++
++
+ class TestResponsesReasoningEffort:
+     """Responses API: reasoning.effort -> enable_thinking."""
+ 
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 7d6aed01b..dab658b0b 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -567,6 +567,8 @@ def test_renderer_tokenizes_so_control_spellings_stay_text():
+     messages = [{"role": "user", "content": INJECTED}]
+     ids = renderer._apply_chat_template(messages=messages, tokenize=False)
+     assert ids == renderer.tokenizer.apply_chat_template(messages)
++
++
+ # Generation controls. The chat API passes add_generation_prompt=True and
+ # continue_final_message=False unless the request says otherwise.
+ _API_DEFAULTS = {"add_generation_prompt": True, "continue_final_message": False}
+@@ -579,9 +581,7 @@ _ASSISTANT_TURNS = [
+ 
+ @pytest.mark.parametrize("case", _FIXTURES["cases"], ids=lambda case: case["name"])
+ def test_api_defaults_leave_reference_prompts_unchanged(case):
+-    request = ChatCompletionRequest(
+-        messages=case["messages"], tools=case.get("tools")
+-    )
++    request = ChatCompletionRequest(messages=case["messages"], tools=case.get("tools"))
+     prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
+         request.messages,
+         tools=[tool.model_dump(exclude_none=True) for tool in request.tools]
+@@ -715,3 +715,27 @@ def test_generation_controls_do_not_mutate_messages():
+     messages = copy.deepcopy(_ASSISTANT_TURNS)
+     render(messages, add_generation_prompt=False, continue_final_message=True)
+     assert messages == _ASSISTANT_TURNS
++
++
++def test_deepseek_api_thinking_disabled_renders_chat_mode():
++    """The DeepSeek API's top-level thinking {"type": "disabled"}, through the
++    chat request, renders the same prompt as chat_template_kwargs thinking false
++    (#447), also beside a reasoning_effort."""
++    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
++
++    tokenizer = byte_level_tokenizer()
++    messages = [{"role": "user", "content": "Hola"}]
++
++    def rendered(**request):
++        params = ChatCompletionRequest(
++            model="m", messages=messages, **request
++        ).build_chat_params(None, "auto")
++        return tokenizer.apply_chat_template(
++            messages, tokenize=False, **params.chat_template_kwargs
++        )
++
++    chat = rendered(chat_template_kwargs={"thinking": False})
++    assert rendered(thinking={"type": "disabled"}) == chat
++    assert rendered(thinking={"type": "disabled"}, reasoning_effort="high") == chat
++    assert rendered(thinking={"type": "enabled"}) == rendered()
++    assert rendered() != chat
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index 89ecef017..c821539e6 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -222,6 +222,12 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
+         return normalize_tool_namespace(data)
+ 
+ 
++class ChatCompletionThinkingParam(OpenAIBaseModel):
++    """The DeepSeek API's top-level thinking switch."""
++
++    type: Literal["enabled", "disabled"]
++
++
+ class ChatCompletionRequest(OpenAIBaseModel):
+     # Ordered by official OpenAI API documentation
+     # https://platform.openai.com/docs/api-reference/chat/create
+@@ -267,6 +273,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             "part of the standard OpenAI API specification."
+         ),
+     )
++    thinking: ChatCompletionThinkingParam | None = Field(
++        default=None,
++        description=(
++            "DeepSeek API format: {'type': 'enabled'} or {'type': 'disabled'} "
++            "turns the model's thinking on or off. Explicit chat_template_kwargs "
++            "'thinking' or 'enable_thinking' take precedence."
++        ),
++    )
+     thinking_token_budget: ThinkingTokenBudget = None
+     include_reasoning: bool = True
+     parallel_tool_calls: bool | None = True
+@@ -623,7 +637,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         # enable_thinking to false). For templates that don't declare the
+         # variable, resolve_chat_template_kwargs filters it out harmlessly.
+         user_kwargs = self.chat_template_kwargs or {}
+-        if self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
++        if self.thinking is not None:
++            # The DeepSeek API's top-level switch sets both template spellings,
++            # so a reasoning_effort beside it cannot turn thinking back on.
++            if not {"thinking", "enable_thinking"} & user_kwargs.keys():
++                enabled = self.thinking.type == "enabled"
++                extra_kwargs["thinking"] = enabled
++                extra_kwargs["enable_thinking"] = enabled
++        elif self.reasoning_effort is not None and "enable_thinking" not in user_kwargs:
+             extra_kwargs["enable_thinking"] = self.reasoning_effort != "none"
+ 
+         return ChatParams(
+-- 
+2.54.0 (Apple Git-157)
+

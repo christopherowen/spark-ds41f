@@ -196,6 +196,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 hf.hidden_size,
                 hf.hc_mult,
                 pipeline=parallel.pipeline_parallel_size > 1,
+                sink_columns=model.get_sink_residual_columns() is not None,
             )
             if (
                 is_breakable_cudagraph_enabled()

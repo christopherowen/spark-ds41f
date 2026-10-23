@@ -1,0 +1,118 @@
+From 6077192c6445bca02aad2c329f76d291c95b74b6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:48:14 +0200
+Subject: [PATCH 233/259] TileLang CED: exact gather and scatter for strided
+ row layouts
+
+---
+ .../test_deepseek_v41_tilelang_metadata.py    | 21 ++++++
+ vllm/models/deepseek_v4_1/tilelang/ced.py     | 64 +++++++++++++++++++
+ 2 files changed, 85 insertions(+)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index cacb0e39b..805ad49c0 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -72,6 +72,27 @@ DEVICE = "cuda"
+ R, CAP, COLS = 16, 1024, 40
+ 
+ 
++@pytest.mark.parametrize(
++    "dtype", [torch.int64, torch.int32, torch.float32, torch.bfloat16, torch.bool]
++)
++@pytest.mark.parametrize("transpose", [False, True])
++def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
++    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    source = torch.arange(7 * 3 * 5, device=DEVICE).reshape(7, 3, 5).to(dtype)
++    if transpose:
++        source = source.transpose(1, 2)
++    indices = torch.tensor([6, 1, -1, 3, 99], device=DEVICE)
++    expected = gather_rows(source, indices)
++    output = torch.empty_like(expected)
++    ced.copy_rows(source, indices, output, False)
++    assert torch.equal(expected, output)
++    restored = torch.zeros((7, *source.shape[1:]), dtype=dtype, device=DEVICE)
++    ced.copy_rows(output, indices, restored, True)
++    assert torch.equal(scatter_rows(output, indices, 7), restored)
++
++
+ @pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
+ @pytest.mark.parametrize("padding", [0, 1, 127])
+ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index e03a3f9dc..1a2863b4d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -105,3 +105,67 @@ def indices_kernel(max_requests: int):
+ 
+ def indices(starts, compact_starts, output, nr, nt):
+     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
++
++
++@tilelang.jit(pass_configs=_PASS)
++def copy_rows_kernel(
++    dtype: str, tail: tuple[int, ...], strides: tuple[int, ...], scatter: bool
++):
++    source_span = T.dynamic("source_span")
++    index_rows = T.dynamic("index_rows")
++    output_span = T.dynamic("output_span")
++    width = 1
++    for dim in tail:
++        width *= dim
++
++    @T.prim_func
++    def ced_copy_rows(
++        source: T.Tensor((source_span,), dtype),
++        row_indices: T.Tensor((index_rows,), T.int64),
++        output: T.Tensor((output_span,), dtype),
++        source_rows: T.int64,
++        output_rows: T.int64,
++    ):
++        with T.Kernel(
++            T.ceildiv((source_rows if scatter else output_rows) * width, 512),
++            threads=128,
++        ) as bx:
++            for i in T.Parallel(512):
++                offset = T.cast(bx * 512 + i, T.int64)
++                row = offset // width
++                col = offset % width
++                limit = source_rows if scatter else output_rows
++                if row < limit:
++                    index = row_indices[row]
++                    valid = (index >= 0) & (
++                        index < (output_rows if scatter else source_rows)
++                    )
++                    if valid:
++                        source_row = row if scatter else index
++                        source_offset = source_row * strides[0]
++                        remainder = col
++                        for axis in T.unroll(len(tail) - 1, -1, -1):
++                            source_offset += (remainder % tail[axis]) * strides[
++                                axis + 1
++                            ]
++                            remainder = remainder // tail[axis]
++                        if scatter:
++                            output[index * width + col] = source[source_offset]
++                        else:
++                            output[offset] = source[source_offset]
++                    elif not scatter:
++                        output[offset] = T.cast(0, dtype)
++
++    return ced_copy_rows
++
++
++def copy_rows(source, row_indices, output, scatter: bool):
++    """Copy logical rows from a possibly strided source without copying its storage."""
++    span = 1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
++    flat_source = source.as_strided((span,), (1,))
++    copy_rows_kernel(
++        str(source.dtype).removeprefix("torch."),
++        tuple(source.shape[1:]),
++        tuple(source.stride()),
++        scatter,
++    )(flat_source, row_indices, output.view(-1), source.shape[0], output.shape[0])
+-- 
+2.54.0 (Apple Git-157)
+

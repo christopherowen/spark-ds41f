@@ -1,0 +1,38 @@
+From 362b16b8c9efad80fbf0f3a87f14f36564a71f1d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:50:07 +0200
+Subject: [PATCH 234/259] CED kernels: share the prefix totals across output
+ layouts
+
+---
+ vllm/models/deepseek_v4_1/tilelang/ced.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 1a2863b4d..fb3afd9c3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -27,8 +27,8 @@ def requests_kernel(max_requests: int):
+         nr: T.int32,
+     ):
+         with T.Kernel(1, threads=128):
+-            kept = T.alloc_fragment((block,), T.int32)
+-            cumulative = T.alloc_fragment((block,), T.int32)
++            kept = T.alloc_shared((block,), T.int32)
++            cumulative = T.alloc_shared((block,), T.int32)
+             for r in T.Parallel(block):
+                 kept[r] = T.if_then_else(
+                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
+@@ -144,7 +144,8 @@ def copy_rows_kernel(
+                         source_row = row if scatter else index
+                         source_offset = source_row * strides[0]
+                         remainder = col
+-                        for axis in T.unroll(len(tail) - 1, -1, -1):
++                        for reverse in T.unroll(len(tail)):
++                            axis = len(tail) - 1 - reverse
+                             source_offset += (remainder % tail[axis]) * strides[
+                                 axis + 1
+                             ]
+-- 
+2.54.0 (Apple Git-157)
+
