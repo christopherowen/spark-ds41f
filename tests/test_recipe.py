@@ -120,6 +120,43 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
 
+    def test_1022_frozen_for_the_next_release_is_its_arms(self):
+        """spark-ds41f-1022's recipe, frozen for the next release (which renames the container,
+        labels, paths and variables), resolves at each shape to its release arm, and the
+        previous release's and the next release's arms over image -1022-4 or -next-1 extend
+        the frozen copy, so they keep booting those images under the names they read."""
+        frozen_path = "experiments/2026-10-23-next-release/1022/cluster.json"
+        frozen = load(frozen_path)
+        self.assertEqual(frozen["upstreams_config"], "experiments/2026-10-23-next-release/1022/upstreams.lock.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        spark = load_spark()
+        for shape in ("tp4-ring", "tp3-triangle"):
+            arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
+            resolved = recipe.resolve(frozen, shape)
+            released = spark.read_cluster(arm)
+            self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                             {k: v for k, v in released.items() if k not in naming}, shape)
+        arms = ["experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4.json",
+                "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp3.json",
+                "experiments/2026-10-23-next-release/candidate-tp4.json",
+                "experiments/2026-10-23-next-release/rc-tp4.json",
+                "experiments/2026-10-23-next-release/rc-tp3.json"]
+        for arm in arms:
+            self.assertEqual(load(arm)["extends"]["config"], frozen_path, arm)
+        for path in ("experiments/2026-10-22-spark-ds41f-1022", "experiments/2026-10-23-next-release"):
+            for file in sorted((ROOT / path).rglob("*.json")):
+                data = json.loads(file.read_text())
+                if isinstance(data, dict) and "extends" in data:
+                    self.assertNotEqual(data["extends"].get("config"), "config/cluster.json", file)
+        for arm in arms + ["experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json",
+                           "experiments/2026-10-23-next-release/rc-tp4-dev.json"]:
+            resolved = spark.read_cluster(arm)
+            self.assertEqual(resolved["container"]["name"], "dsv41-karmic-kraken", arm)
+            self.assertIn(resolved["container"]["image"], ("vllm-ds41f-kkref:19f2c20ed4d6-1022-4",
+                                                           "vllm-ds41f-kkref:19f2c20ed4d6-next-1"), arm)
+            self.assertEqual(resolved["environment"]["SPARK3_DSPARK_VOCAB_PARALLEL"], "1", arm)
+            self.assertTrue(all(key.startswith("local.spark3.") for key in resolved["container"]["expected_labels"]))
+
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
         the hub's shared store, the snapshot served from inside it); an arm that sets

@@ -230,3 +230,16 @@ every `def`; an edit tool call whose old_string is a copied function), DSpark's 
 the spec-decode counters, and a suffix drafter simulated on the exact token ids the server
 returns. Queued as [copy-tp4.json](acceptance/copy-tp4.json) in the same window.
 
+### spark-ds41f-1022's recipe frozen ([1022/](1022))
+
+The next release renames the live names (the owner's decision of 2026-10-19): the container
+`dsv41-karmic-kraken` becomes `spark-ds41f`, the image repository `vllm-ds41f-kkref` becomes
+`spark-ds41f`, the labels `local.spark3.*` become `local.spark-ds41f.*`, `/opt/spark3` becomes
+`/opt/spark-ds41f`, the `SPARK3_*` variables become `SPARK_DS41F_*` and `/cache/kkref` becomes
+`/cache/spark-ds41f`. Image -1022-4 and candidate 1 (-next-1) read only the old names, so
+spark-ds41f-1022's recipe is frozen as it was promoted, with its lock, in
+[1022/cluster.json](1022/cluster.json) (verbatim, plus `upstreams_config`), and every arm here and
+in experiments/2026-10-22-spark-ds41f-1022 that extended `config/cluster.json` extends the frozen
+copy instead ([candidate-tp4.json](candidate-tp4.json) through [make_screen.py](make_screen.py)).
+Each resolves exactly as before. The frozen copy is the previous release's arm in the release
+comparison and the rollback.

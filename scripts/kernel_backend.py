@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import PurePosixPath
 
+import source_labels
+
 
 # The backend of a configuration that does not name one (every record before r6).
 DEFAULT = "b12x"
@@ -40,10 +42,6 @@ CAPABILITY = "tilelang-kernels"
 
 def backend(cluster: dict) -> str:
     return cluster.get("kernel_backend", DEFAULT)
-
-
-def label(name: str) -> str:
-    return f"local.spark3.{name}.tree"
 
 
 def argument(cluster: dict, flag: str) -> str | None:
@@ -102,9 +100,9 @@ def source_problems(cluster: dict, upstreams: dict, manifest: dict) -> list[str]
     labels = cluster.get("container", {}).get("expected_labels", {})
     for name in ("vllm", *SOURCES):
         tree = manifest.get(name, {}).get("expected_tree")
-        if tree is None or labels.get(label(name)) != tree:
+        if tree is None or source_labels.get(labels, f"{name}.tree") != tree:
             errors.append(
-                f"kernel_backend tilelang requires container.expected_labels {label(name)} "
-                "to match its source manifest tree"
+                f"kernel_backend tilelang requires container.expected_labels "
+                f"{source_labels.key(labels, f'{name}.tree')} to match its source manifest tree"
             )
     return errors

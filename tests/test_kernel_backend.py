@@ -20,6 +20,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 spark = importlib.util.module_from_spec(spec)
 loader.exec_module(spark)
 kernel_backend = spark.kernel_backend
+source_labels = spark.source_labels
 
 CANDIDATE = "experiments/2026-10-03-tilelang-kernels"
 # Experiments that run the TileLang family and may therefore build its sources.
@@ -210,8 +211,8 @@ class KernelBackendTest(unittest.TestCase):
                 candidate, candidate_lock, base, base_lock, _ = self.twin(name)
                 labels = candidate["container"]["expected_labels"]
                 for source in ("b12x", "nccl"):
-                    self.assertEqual(labels[kernel_backend.label(source)],
-                                     base["container"]["expected_labels"][kernel_backend.label(source)])
+                    self.assertEqual(source_labels.get(labels, f"{source}.tree"),
+                                     source_labels.get(base["container"]["expected_labels"], f"{source}.tree"))
                     self.assertEqual(candidate_lock["sources"][source], base_lock["sources"][source])
                 self.assertEqual(spark.read_json(candidate_lock["source_manifest"])["vllm"]["base_revision"],
                                  spark.read_json(base_lock["source_manifest"])["vllm"]["base_revision"])
@@ -253,7 +254,7 @@ class KernelBackendTest(unittest.TestCase):
                 inputs = spark.build_inputs(lock)
                 manifest = spark.read_json(lock["source_manifest"])
                 self.assertEqual(inputs["vllm"]["expected_tree"], manifest["vllm"]["expected_tree"])
-                self.assertEqual(candidate["container"]["expected_labels"][kernel_backend.label("vllm")],
+                self.assertEqual(source_labels.get(candidate["container"]["expected_labels"], "vllm.tree"),
                                  manifest["vllm"]["expected_tree"])
                 self.assertEqual(manifest["vllm"]["patchset_sha256"], spark.patchset_sha256(lock["sources"]["vllm"]))
                 self.assertEqual(inputs["tilelang"]["expected_tree"], "1697ad52fab8379ce78f9abc547c7b1e02cd9c5e")
@@ -310,17 +311,18 @@ class KernelBackendTest(unittest.TestCase):
 
     def test_missing_or_mismatched_labels_fail(self):
         for name in ("vllm", *kernel_backend.SOURCES):
-            label = kernel_backend.label(name)
             for value in (None, "0" * 40):
-                with self.subTest(label=label, value=value):
+                with self.subTest(name=name, value=value):
                     cluster, lock, _, patch = self.ready()
                     labels = cluster["container"]["expected_labels"]
+                    label = source_labels.key(labels, f"{name}.tree")
                     if value is None:
                         labels.pop(label)
                     else:
                         labels[label] = value
                     with patch:
-                        self.assertTrue(any(label in e for e in self.errors(cluster, lock)))
+                        # A missing label is named as an image built now carries it.
+                        self.assertTrue(any(f".{name}.tree" in e for e in self.errors(cluster, lock)))
 
     def test_lock_without_tilelang_sources_fails(self):
         cluster, _, _, _ = self.ready()
