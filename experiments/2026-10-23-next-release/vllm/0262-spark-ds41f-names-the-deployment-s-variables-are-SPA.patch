@@ -1,0 +1,267 @@
+From 65e0f2d3f7abdab84e961e3cff472cca58c25b66 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:29:23 +0200
+Subject: [PATCH 262/262] spark-ds41f names: the deployment's variables are
+ SPARK_DS41F_*
+
+The deployment is spark-ds41f from the release after spark-ds41f-1022 (the
+owner's decision of 2026-10-19), so the variables it sets for this tree drop
+the old project name: SPARK3_* becomes SPARK_DS41F_*.
+
+- DSpark: SPARK_DS41F_DSPARK_VOCAB_PARALLEL, SPARK_DS41F_DSPARK_MAIN_PROJ_TP,
+  SPARK_DS41F_DSPARK_DEAD_ROWS_TAU;
+- the display carve-out: SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS and
+  SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS;
+- the indexer's split check: SPARK_DS41F_DS41_INDEXER_SPLIT_CHECK;
+- disk Engram rows: SPARK_DS41F_ENGRAM_ROWS_TIMEOUT_MS, _READ_DELAY_MS,
+  _CHECK_EARLY_IDS, _TIMELINE and _TIMELINE_DIR, whose default directory is
+  /cache/spark-ds41f/engram-timeline.
+
+The old names are not read: the recipe that sets the new names ships with the
+image built from this tree, and an older image keeps the recipe it was
+released with.
+
+Tests: the Engram rows timeline test sets SPARK_DS41F_ENGRAM_TIMELINE.
+---
+ tests/kernels/test_deepseek_v41_engram_rows.py   |  2 +-
+ .../device_communicators/cuda_communicator.py    |  2 +-
+ vllm/models/deepseek_v4_1/attention.py           |  2 +-
+ vllm/models/deepseek_v4_1/common/engram.py       | 16 ++++++++++------
+ vllm/models/deepseek_v4_1/nvidia/dspark.py       | 12 ++++++------
+ .../models/deepseek_v4_1/tilelang/engram_rows.py |  4 ++--
+ vllm/v1/worker/display_carveout.py               | 16 +++++++++-------
+ vllm/v1/worker/gpu/model_runner.py               |  2 +-
+ .../gpu/spec_decode/adaptive_verification.py     |  2 +-
+ 9 files changed, 32 insertions(+), 26 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 416cc9804..b27bdd642 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -488,7 +488,7 @@ def test_timeline_records_each_step_and_the_gpu_wait():
+     import subprocess
+     import sys
+ 
+-    env = dict(os.environ, SPARK3_ENGRAM_TIMELINE="1")
++    env = dict(os.environ, SPARK_DS41F_ENGRAM_TIMELINE="1")
+     result = subprocess.run(
+         [sys.executable, "-c", _TIMELINE_CHILD, __file__],
+         env=env, capture_output=True, text=True, timeout=600,
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 227a13512..2a2b71e09 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -216,7 +216,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             # Multi-node DGX Spark one-shot RDMA collectives: sparknet's for
+             # DS4.1's TileLang kernel family (configured by its SPARKNET_ROCE_*
+             # settings), b12x.comm.roce's for B12X. Both carry the same
+-            # protocol (B12X's with spark3's RoCE patches).
++            # protocol (B12X's with spark-ds41f's RoCE patches).
+             roce_options = {}
+             if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+                 from sparknet.integration.vllm import (
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 064e9220a..83e82ea5b 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -63,7 +63,7 @@ logger = init_logger(__name__)
+ 
+ # Validation only: under a sequence-parallel indexer split, every rank also runs
+ # the full-row indexer twice and compares its own rows with the split result.
+-_INDEX_SPLIT_CHECK = os.environ.get("SPARK3_DS41_INDEXER_SPLIT_CHECK") == "1"
++_INDEX_SPLIT_CHECK = os.environ.get("SPARK_DS41F_DS41_INDEXER_SPLIT_CHECK") == "1"
+ 
+ 
+ def _source(prefix, layer):
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index dfda54bfe..ba98234d6 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -80,20 +80,24 @@ DEAD_ID = -1
+ # GPU with a record of the step (a liveness bound; the rows normally arrive
+ # within a millisecond).
+ ENGRAM_ROWS_TIMEOUT_S = (
+-    float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
++    float(os.environ.get("SPARK_DS41F_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
+ )
+ # Tests only: delay every disk read, to show the forward waits for its rows.
+-ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
++ENGRAM_READ_DELAY_S = (
++    float(os.environ.get("SPARK_DS41F_ENGRAM_READ_DELAY_MS", "0")) / 1000
++)
+ # Debug only (off and free in serving): every row ID the host hashed early must equal
+ # the GPU's, or the step fails with both.
+-ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
++ENGRAM_CHECK_EARLY_IDS = (
++    os.environ.get("SPARK_DS41F_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
++)
+ # Debug only (off and free in serving: the wait kernel's timing is compiled in only
+ # when set): every disk table's reader records each step's timeline, and the GPU each
+ # wait's length; a thread appends them every few seconds to JSON lines in
+-# SPARK3_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
+-ENGRAM_TIMELINE = os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
++# SPARK_DS41F_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
++ENGRAM_TIMELINE = os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+ ENGRAM_TIMELINE_DIR = os.environ.get(
+-    "SPARK3_ENGRAM_TIMELINE_DIR", "/cache/kkref/engram-timeline"
++    "SPARK_DS41F_ENGRAM_TIMELINE_DIR", "/cache/spark-ds41f/engram-timeline"
+ )
+ _timeline_tables: list = []
+ 
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 74e1722ab..6447f8069 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -78,10 +78,10 @@ logger = init_logger(__name__)
+ 
+ 
+ def _vocab_parallel_greedy() -> bool:
+-    """SPARK3_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
++    """SPARK_DS41F_DSPARK_VOCAB_PARALLEL=1: shard the Markov projection by
+     vocabulary and reduce greedy drafts across ranks (see
+     DSparkDeepseekV4ForCausalLM.vocab_parallel_greedy)."""
+-    if os.environ.get("SPARK3_DSPARK_VOCAB_PARALLEL", "0") != "1":
++    if os.environ.get("SPARK_DS41F_DSPARK_VOCAB_PARALLEL", "0") != "1":
+         return False
+     return get_tensor_model_parallel_world_size() > 1
+ 
+@@ -360,11 +360,11 @@ class DSparkDeepseekV4Model(nn.Module):
+         # unused vocabulary allocation while loading the draft checkpoint.
+         self.embed_tokens: nn.Module | None = None
+ 
+-        # SPARK3_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
++        # SPARK_DS41F_DSPARK_MAIN_PROJ_TP=1 column-shards the projection of the
+         # target's auxiliary hidden states (replicated otherwise, so every rank
+         # streams the whole weight) and gathers the output: same arithmetic.
+         main_proj_tp = (
+-            os.environ.get("SPARK3_DSPARK_MAIN_PROJ_TP", "0") == "1"
++            os.environ.get("SPARK_DS41F_DSPARK_MAIN_PROJ_TP", "0") == "1"
+             and get_tensor_model_parallel_world_size() > 1
+         )
+         main_proj_cls = (
+@@ -656,7 +656,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
+         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+ 
+-    # --- Vocabulary-parallel greedy drafting (SPARK3_DSPARK_VOCAB_PARALLEL) ---
++    # --- Vocabulary-parallel greedy drafting (SPARK_DS41F_DSPARK_VOCAB_PARALLEL) ---
+     # Each rank keeps its vocabulary shard of the draft logits and Markov bias
+     # and reduces only (max, index) pairs across ranks: exact greedy drafts
+     # without the draft-logits all-gather or a replicated Markov projection.
+@@ -678,7 +678,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         shard = head.org_vocab_start_index, head.num_org_elements
+         if shard != (markov.org_vocab_start_index, markov.num_org_elements):
+             raise RuntimeError(
+-                "SPARK3_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
++                "SPARK_DS41F_DSPARK_VOCAB_PARALLEL needs the draft head and Markov "
+                 f"projection sharded alike: {head} != {markov}"
+             )
+         return shard
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 7cedb9048..685993e63 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -37,10 +37,10 @@ SCALES = ROW // 32
+ CONTROL_WORDS = 64
+ 
+ # Debug only: the wait records each wait's length for the reader's timeline
+-# (SPARK3_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
++# (SPARK_DS41F_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
+ _TIMING = (
+     "#define ENGRAM_TIMING\n"
+-    if os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
++    if os.environ.get("SPARK_DS41F_ENGRAM_TIMELINE", "0") == "1"
+     else ""
+ )
+ 
+diff --git a/vllm/v1/worker/display_carveout.py b/vllm/v1/worker/display_carveout.py
+index f30e09b96..1fc02f7ad 100644
+--- a/vllm/v1/worker/display_carveout.py
++++ b/vllm/v1/worker/display_carveout.py
+@@ -18,7 +18,7 @@ slower. So only data read once per step belongs there. The embedding table
+ prefill's sampled positions) qualify, while the KV cache, which attention
+ gathers and re-reads, does not: holding it there cost 8% at eight streams.
+ 
+-With ``SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
++With ``SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`` those weights are created in the
+ carve-out when the model is built (``allocate``), so the checkpoint streams
+ straight into it and they never occupy ordinary memory: on GB10, memory freed
+ after loading stays charged to the process, so copying them in after loading
+@@ -35,7 +35,7 @@ surfaces, and the scanout heap never hands out a range in use. A driver fault
+ or GPU reset could still leave the mapping on memory that something else
+ reuses, and the result would be wrong embeddings or logits with no error.
+ 
+-For debugging such a fault, ``SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
++For debugging such a fault, ``SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS`` above 0
+ turns on an integrity check; production leaves it unset, which adds no work
+ at all. The worker then checksums every carve-out weight once loading is
+ done and, from the end of graph capture, re-checks it from a background
+@@ -63,8 +63,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
+ 
+ logger = init_logger(__name__)
+ 
+-_REQUIRED = os.environ.get("SPARK3_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
+-_CHECK_SECONDS = float(os.environ.get("SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS", "0"))
++_REQUIRED = os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS", "0") == "1"
++_CHECK_SECONDS = float(
++    os.environ.get("SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS", "0")
++)
+ # 16 MiB of 32-bit words per partial checksum (a 32 MiB int64 transient).
+ _CHECK_CHUNK_WORDS = 1 << 22
+ _DRM_NODE = "/dev/dri/card0"
+@@ -211,7 +213,7 @@ def allocate(
+         carveout = _Carveout(rounded)
+     except OSError as error:
+         raise RuntimeError(
+-            f"SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
++            f"SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the display carve-out cannot "
+             f"hold a {nbytes >> 20} MiB weight ({_DRM_NODE}: {error})"
+         ) from error
+     _carveouts.append(carveout)
+@@ -365,7 +367,7 @@ def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> No
+     weights = streamed_weights(model)
+     if not weights:
+         raise RuntimeError(
+-            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
++            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but the model has no "
+             "vocabulary-sized embedding or output-head weights"
+         )
+     outside = [
+@@ -375,7 +377,7 @@ def confirm_streamed_weights(model: torch.nn.Module, device: torch.device) -> No
+     ]
+     if outside:
+         raise RuntimeError(
+-            "SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
++            "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1 but these vocabulary-sized weights "
+             f"were not created in the display carve-out: {', '.join(outside)}"
+         )
+     orphaned = [
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fdf050f7f..866036608 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1787,7 +1787,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
+-        # Dead verification rows (SPARK3_DSPARK_DEAD_ROWS_TAU) are marked inside
++        # Dead verification rows (SPARK_DS41F_DSPARK_DEAD_ROWS_TAU) are marked inside
+         # the draft combine; sample() clamps committed tokens to live rows.
+         dead_rows = None
+         if adaptive_verification is not None and self.batch_sharder is None:
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 99ac95e0f..5506e8630 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -29,7 +29,7 @@ logger = init_logger(__name__)
+ # as padding, so routed MoE skips them, and the request commits at most one
+ # token past its last live row. Decided on device, inside the draft combine,
+ # from the current drafts' confidences; the batch shape is unchanged. 0 = off.
+-_DEAD_ROWS_TAU = float(os.environ.get("SPARK3_DSPARK_DEAD_ROWS_TAU", "0"))
++_DEAD_ROWS_TAU = float(os.environ.get("SPARK_DS41F_DSPARK_DEAD_ROWS_TAU", "0"))
+ 
+ 
+ def dead_rows_enabled() -> bool:
+-- 
+2.54.0 (Apple Git-157)
+
