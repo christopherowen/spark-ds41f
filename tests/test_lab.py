@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import importlib.machinery
 import importlib.util
@@ -387,6 +388,7 @@ class ProductionProfileTest(unittest.TestCase):
     def test_watchdog_restores_the_recorded_profile(self) -> None:
         self.hold(TP4, heartbeat_at=1_000_000.0)  # stale
         with mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                mock.patch.object(lab, "other_engine", return_value=None), \
                 mock.patch.object(lab, "production_live", side_effect=[False, True]), \
                 mock.patch.object(lab.subprocess, "run", side_effect=no_subprocesses), \
                 mock.patch.object(lab.subprocess, "Popen", side_effect=no_subprocesses):
@@ -445,6 +447,7 @@ class ProfilePlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(lab, "ROOT", Path(directory)), \
                 mock.patch.object(lab, "profiler_dir", return_value="/cache/profile"), \
+                mock.patch.object(lab, "container_name", return_value="spark-ds41f"), \
                 mock.patch.object(lab, "nodes_config", return_value={"nodes": [{"name": "dgx1"}]}), \
                 mock.patch.object(lab, "production_configuration", return_value=({}, {}, {})), \
                 mock.patch.object(lab.spark, "repository_path", return_value="/repo"), \
@@ -461,6 +464,7 @@ class ProfilePlanTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(lab, "ROOT", Path(directory)), \
                 mock.patch.object(lab, "profiler_dir", return_value="/cache/profile"), \
+                mock.patch.object(lab, "container_name", return_value="spark-ds41f"), \
                 mock.patch.object(lab, "nodes_config", return_value={"nodes": [{"name": "dgx1"}]}), \
                 mock.patch.object(lab, "production_configuration", return_value=({}, {}, {})), \
                 mock.patch.object(lab.spark, "repository_path", return_value="/repo"), \
@@ -996,7 +1000,7 @@ class OverlayTest(unittest.TestCase):
 
 class KernelLabTest(unittest.TestCase):
     CANDIDATE = {"image": "img:tag", "env": {"B12X_AUTOTUNE": "0"}, "argv": ["/r/replay.py", "/cap"],
-                 "mounts": [["~/captures", "/cap"]]}
+                 "mounts": [["~/captures", "/cap"]], "source_root": "/opt/spark3/candidate"}
 
     def test_overlay_files_mount_at_the_candidate_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1179,7 +1183,7 @@ class StepFailureTest(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             code = lab.execute(spec, dry=False, keep_open=True)
         self.assertEqual(code, 1)
-        saved.assert_called_once_with("results/private/lab/t2/boot-a")
+        saved.assert_called_once_with("results/private/lab/t2/boot-a", config="experiments/x/a.json")
         self.assertIn("boot of experiments/x/a.json failed", close.call_args.args[0])
 
     def test_the_lean_bench_does_not_override_its_live_check(self) -> None:
@@ -1368,3 +1372,158 @@ class OverlayArmTest(unittest.TestCase):
                 "set": {"serve_args": [*arm["serve_args"], "--profiler-config",
                                        json.dumps({"torch_profiler_dir": "/cache/profile"})]}}
             self.assertEqual(lab.profiler_dir("profiled.json"), "/cache/profile")
+
+
+class ServingNameTest(unittest.TestCase):
+    """The serving container is named by its profile: dsv41-karmic-kraken before the rename to
+    spark-ds41f, spark-ds41f after it. The lab reads the name from the profile it acts on, and
+    a boot or a stop never leaves an engine serving under the other name."""
+
+    PREVIOUS = "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json"
+    HEAD = {"ssh_user": "u", "nodes": [{"name": "dgx1", "head": True, "rank": 0}]}
+
+    def setUp(self) -> None:
+        lab.PRODUCTION_CONFIG = lab.spark.DEFAULT_CLUSTER_CONFIG
+        read = lab.spark.read_json
+        renamed = {"extends": {"config": self.PREVIOUS}, "set": {"container": {"name": "spark-ds41f"}}}
+        self.read = mock.patch.object(lab.spark, "read_json",
+                                      lambda path: copy.deepcopy(renamed) if path == "renamed.json" else read(path))
+        self.read.start()
+        self.addCleanup(self.read.stop)
+
+    def test_the_name_comes_from_the_profile(self) -> None:
+        self.assertEqual(lab.container_name(), lab.spark.read_cluster("config/cluster.json")["container"]["name"])
+        self.assertEqual(lab.container_name(self.PREVIOUS), "dsv41-karmic-kraken")
+        self.assertEqual(lab.container_name("renamed.json"), "spark-ds41f")
+
+    def test_the_gpu_guard_sees_every_serving_name(self) -> None:
+        with mock.patch.object(lab.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "abc\n", "")) as run:
+            self.assertTrue(lab.container_running())
+        command = run.call_args.args[0]
+        configured = lab.container_name()
+        for pattern in (f"name=^{configured}$", "name=^spark-ds41f$", "name=^dsv41-"):
+            self.assertIn(pattern, command)
+        with mock.patch.object(lab.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            self.assertFalse(lab.container_running())
+
+    def ps(self, output: str):
+        return mock.patch.object(lab.spark, "run_ssh", return_value=subprocess.CompletedProcess([], 0, output, ""))
+
+    def test_a_boot_stops_an_engine_under_the_other_name_with_its_own_profile(self) -> None:
+        with self.ps(f"dsv41-karmic-kraken\t{self.PREVIOUS}\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.HEAD), \
+                mock.patch.object(lab.spark, "configuration", return_value=({}, self.HEAD, {})), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(lab.boot("renamed.json"))
+        self.assertEqual([call.args for call in cli.call_args_list], [
+            ("--cluster-config", self.PREVIOUS, "cluster", "stop", "--apply", "--parallel"),
+            ("--cluster-config", "renamed.json", "cluster", "start", "--replace", "--change-shape", "--apply")])
+
+    def test_its_own_name_is_left_to_replace(self) -> None:
+        with self.ps(f"dsv41-karmic-kraken\t{self.PREVIOUS}\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.HEAD), \
+                mock.patch.object(lab.spark, "configuration", return_value=({}, self.HEAD, {})), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(lab.boot(self.PREVIOUS))
+        self.assertEqual([call.args[3] for call in cli.call_args_list], ["start"])
+
+    def test_an_engine_that_records_no_profile_stops_the_boot(self) -> None:
+        with self.ps("dsv41-karmic-kraken\t\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.HEAD), \
+                mock.patch.object(lab.spark, "configuration", return_value=({}, self.HEAD, {})), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(lab.boot("renamed.json"))
+        cli.assert_not_called()
+        self.assertIn("dsv41-karmic-kraken is serving and records no profile", out.getvalue())
+
+    def test_a_stop_also_stops_an_arm_under_another_name(self) -> None:
+        lab.PRODUCTION_CONFIG = "renamed.json"
+        with self.ps(f"dsv41-karmic-kraken\t{self.PREVIOUS}\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.HEAD), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(lab.stop_cluster(remove=True))
+        self.assertEqual([call.args for call in cli.call_args_list], [
+            ("--cluster-config", "renamed.json", "cluster", "stop", "--remove", "--apply", "--parallel"),
+            ("--cluster-config", self.PREVIOUS, "cluster", "stop", "--remove", "--apply", "--parallel")])
+
+    def test_telemetry_and_logs_follow_the_booted_arm(self) -> None:
+        process = mock.Mock()
+        process.communicate.return_value = ("", "")
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "ROOT", Path(directory)), mock.patch.object(lab, "log"), \
+                mock.patch.object(lab, "GPU_CLOCKS_MARKER", Path(directory) / "none.json"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.HEAD), \
+                mock.patch.object(lab.spark, "ssh_options", return_value=[]), \
+                mock.patch.object(lab.subprocess, "Popen", return_value=process) as popen:
+            with lab.Telemetry("results/n/out.jsonl", "renamed.json"):
+                pass
+            sampler = next(call.args[0] for call in popen.call_args_list if "python3" in call.args[0])
+            self.assertEqual(sampler[-3:], ["-", "spark-ds41f", "21600"])
+            with self.ps("log\n") as ssh:
+                lab.save_engine_logs("results/n/out.jsonl", config=self.PREVIOUS)
+            self.assertEqual(ssh.call_args.args[2:], ("docker", "logs", "--tail", "4000", "dsv41-karmic-kraken"))
+
+    def test_a_validate_job_inventories_its_own_arm(self) -> None:
+        step = next(s for s in lab.plan(SPEC) if s["kind"] == "fresh_inventory")
+        self.assertEqual(step["config"], "experiments/2026-09-29-determinism/cluster-detm-r5o-ref4d-b4144-trace8.json")
+
+
+class SourceRootTest(unittest.TestCase):
+    """Kernel-lab bundles mount over the image's own source root: /opt/spark-ds41f/candidate
+    after the rename, /opt/spark3/candidate in the images before it."""
+
+    def inspect(self, root: str):
+        env = [f"PYTHONPATH={root}/vllm:{root}/b12x", "PATH=/usr/bin"]
+        return mock.patch.object(lab.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], 0, json.dumps(env) + "\n", ""))
+
+    def command(self, candidate: dict, root: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            overlay = bundle / "overlay" / "vllm" / "models" / "x.py"
+            overlay.parent.mkdir(parents=True)
+            overlay.write_text("")
+            with self.inspect(root):
+                return lab.bundle_command(bundle, {"image": "img:tag", "argv": ["t.py"], **candidate}, bundle / "out")
+
+    def test_each_image_gets_its_own_root(self) -> None:
+        for root in lab.SOURCE_ROOTS:
+            with self.subTest(root=root):
+                command = self.command({}, root)
+                self.assertTrue(any(arg.endswith(f":{root}/vllm/vllm/models/x.py:ro") for arg in command))
+                self.assertEqual(command[command.index("-w") + 1], f"{root}/b12x")
+                relative = self.command({"workdir": "vllm"}, root)
+                self.assertEqual(relative[relative.index("-w") + 1], f"{root}/vllm")
+        # A bundle recorded with an absolute directory keeps it.
+        fixed = self.command({"workdir": "/opt/spark3/candidate/vllm"}, "/opt/spark-ds41f/candidate")
+        self.assertEqual(fixed[fixed.index("-w") + 1], "/opt/spark3/candidate/vllm")
+
+    def test_an_image_without_a_known_root_is_refused(self) -> None:
+        with self.inspect("/opt/other"), self.assertRaises(SystemExit):
+            lab.image_source_root("img:tag")
+
+    def test_release_test_bundles_run_in_the_image_s_vllm_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / "manifest.json"
+            manifest.write_text(json.dumps({"files": {}}))
+            loader = importlib.machinery.SourceFileLoader("release_tests", str(ROOT / "scripts" / "release_tests.py"))
+            module = importlib.util.module_from_spec(importlib.util.spec_from_loader("release_tests", loader))
+            loader.exec_module(module)
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.bundle(str(manifest), "img:tag", str(Path(directory) / "b"), "x")
+            candidate = json.loads((Path(directory) / "b" / "candidate.json").read_text())
+        self.assertEqual(candidate["workdir"], "vllm")
+
+    def test_the_fence_check_reads_overlays_under_either_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / "stale.py"
+            stale.write_text("x = 1\n")
+            image = Path(directory) / "image.py"
+            image.write_text("cute.arch.fence_proxy('async.shared')\n")
+            mounts = [[str(stale), f"{root}/b12x/b12x/gemm/a.py", "ro"] for root in lab.SOURCE_ROOTS]
+            problems = lab.fence_problems(mounts, "img", "/home/x", read_image=lambda path: image)
+        self.assertEqual(len(problems), 2)

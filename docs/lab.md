@@ -116,6 +116,10 @@ before the first boot. `run --dry-run` prints the problems.
 - **`measure`:** boots each arm with `cluster start --replace --change-shape`, with no
   stop in between, and measures it. The arm's node map must equal production's (below),
   so an arm can change context or KV size but never the node set.
+  - `--replace` replaces only a container of the arm's own name, and `cluster start`
+    refuses to run beside an engine serving under another (`dsv41-karmic-kraken` before
+    the rename to `spark-ds41f`, `spark-ds41f` after it). Before such a boot the lab stops
+    that engine with the profile that started it (its `spark.cluster-config` label).
   - The bench checks the live engine against the arm before it measures. A bench that
     exits non-zero (a cluster that differs from the arm, a failed quality gate, failed
     requests, an aborted run) ends the job before its scripts run.
@@ -214,8 +218,10 @@ before the first boot. `run --dry-run` prints the problems.
     the clocks first, so production never serves locked.
 
 Jobs that stop the cluster (`validate`, `profile`, `kernel`) run
-`bin/spark --cluster-config <production profile> cluster stop --apply --parallel`. The
-stopped containers are kept; the next boot's `cluster start --replace` replaces them.
+`bin/spark --cluster-config <production profile> cluster stop --apply --parallel`, and an
+arm serving under another container name than production's is stopped with its own
+profile. The stopped containers are kept; the next boot's `cluster start --replace`
+replaces them.
 Set `"remove_stopped": true` on a job to remove them as well (`cluster stop --remove`).
 `run --dry-run` prints the production profile and each stop command.
 
@@ -234,7 +240,10 @@ fail this check. The overlay hashes of each run go to
 ## Kernel-lab bundles
 
 A bundle is a directory holding `candidate.json` and `overlay/{vllm,b12x}/<package path>`.
-Overlay files are mounted over `/opt/spark3/candidate/<package>/<package>/...`.
+Overlay files are mounted over `<root>/<package>/<package>/...`, where `<root>` is the
+image's source root: the parent of the vLLM tree on its `PYTHONPATH`
+(`/opt/spark-ds41f/candidate` from the release after spark-ds41f-1022,
+`/opt/spark3/candidate` in the images before it), or the bundle's `source_root`.
 
 `candidate.json` holds:
 - `image`, `env`, `argv` (the harness command inside the container);
@@ -242,9 +251,10 @@ Overlay files are mounted over `/opt/spark3/candidate/<package>/<package>/...`.
   from `~/spark-lab/inputs`, then from the node's checkout;
 - `sync`: inputs that are not in Git, copied to `~/spark-lab/inputs` on the other nodes;
 - `variant_configs`: configurations allowed more than one row group, such as production;
-- `workdir`: the container working directory (default `/opt/spark3/candidate/b12x`);
+- `workdir`: the container working directory, relative to the source root (default `b12x`);
+  a bundle recorded with an absolute directory keeps it;
 - `verdict`: `"exit"` for a test-suite bundle, such as pytest over the image's own
-  `/opt/spark3/candidate/vllm/tests`. It passes on exit status 0 with tests passed and none
+  `<root>/vllm/tests`. It passes on exit status 0 with tests passed and none
   failed, and records the failed test ids, which the nodes must agree on.
 
 Before replaying, a kernel job brings its nodes below the bench's cooling threshold

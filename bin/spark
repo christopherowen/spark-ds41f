@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 import mesh_fabric
+import source_labels
 import kernel_backend
 import kernel_readiness
 import topology
@@ -580,7 +581,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         record = source_manifest["b12x"]
         if mode not in record.get("capabilities", []):
             problems.append(f"{mode} requires a source manifest with its transport patch")
-        label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.b12x.tree")
+        label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "b12x.tree")
         if label != record["expected_tree"]:
             problems.append(f"{mode} image tree does not match its source manifest")
     # sparknet's transports run only on an image built with sparknet's
@@ -590,7 +591,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         if not sparknet_image or "sparknet" not in upstreams["sources"] or "sparknet" not in source_manifest:
             problems.append(f"{topology.transport(cluster)} requires an image with {SPARKNET_CAPABILITY} and the lock's sparknet source")
         else:
-            label = cluster.get("container", {}).get("expected_labels", {}).get("local.spark3.sparknet.tree")
+            label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "sparknet.tree")
             if label != source_manifest["sparknet"]["expected_tree"]:
                 problems.append("sparknet image tree does not match its source manifest")
     elif sparknet_image and topology.one_shot_topology(topology.transport(cluster)) is not None:
@@ -1739,6 +1740,17 @@ def node_runtime_problems(
         problems.append(
             f"{node['name']}: container {name} already exists; use --replace explicitly"
         )
+    # --replace replaces only a container of this profile's name: an engine serving under
+    # another (an arm from before the rename to spark-ds41f, or after it) would keep the GPU.
+    others = run_ssh(nodes, node, "docker", "ps", *serving_filters(cluster),
+                     "--format", f'{{{{.Names}}}}\t{{{{.Label "{PROFILE_LABEL}"}}}}')
+    for line in others.stdout.splitlines():
+        other, _, profile = line.partition("\t")
+        if other and other != name:
+            problems.append(
+                f"{node['name']}: {other} is serving; stop it with its own profile before starting {name}: "
+                f"{stop_own_profile({'profile': profile or None})}"
+            )
     sudo = run_ssh(nodes, node, "sudo", "-n", "true")
     if sudo.returncode:
         problems.append(f"{node['name']}: passwordless sudo is unavailable for memguard")
@@ -3066,12 +3078,30 @@ def run_memory_guarded(command: list[str], reserve_gib: float) -> float:
         raise
 
 
+# Serving containers. A profile names its own (container.name): spark-ds41f from the release
+# after spark-ds41f-1022, dsv41-<name> before it (dsv41-karmic-kraken). A guard that keeps the
+# GPU from serving, and a start that must not run beside another engine, recognise every such
+# name, whatever the profile at hand calls its own.
+SERVING_CONTAINER = "spark-ds41f"
+LEGACY_SERVING_PREFIX = "dsv41-"
+
+
+def serving_container(name: str, cluster: dict) -> bool:
+    return name in (cluster["container"]["name"], SERVING_CONTAINER) or name.startswith(LEGACY_SERVING_PREFIX)
+
+
+def serving_filters(cluster: dict) -> list[str]:
+    """``docker ps`` filters matching every serving container's name (filters on one key are ORed)."""
+    patterns = dict.fromkeys((f"^{cluster['container']['name']}$", f"^{SERVING_CONTAINER}$",
+                              f"^{LEGACY_SERVING_PREFIX}"))
+    return [part for pattern in patterns for part in ("--filter", f"name={pattern}")]
+
+
 def require_idle_build_host(cluster: dict) -> None:
     running = subprocess.run(
         ["docker", "ps", "--format", "{{.Names}}"], check=True, text=True, stdout=subprocess.PIPE
     ).stdout.split()
-    service = cluster["container"]["name"]
-    if any(name == service or name.startswith("dsv41-") for name in running):
+    if any(serving_container(name, cluster) for name in running):
         raise SystemExit("a DS4.1 service is running on this host; stop it before building")
 
 
@@ -3185,9 +3215,9 @@ def command_build_image(args: argparse.Namespace) -> int:
     if image is None:
         raise SystemExit(f"the build finished but {tag} is not present")
     for name in build_projects(inputs):
-        label = image["labels"].get(f"local.spark3.{name}.tree")
+        label = source_labels.get(image["labels"], f"{name}.tree")
         if label != inputs[name]["expected_tree"]:
-            raise SystemExit(f"{tag}: label local.spark3.{name}.tree is {label!r}")
+            raise SystemExit(f"{tag}: label {source_labels.key(image['labels'], f'{name}.tree')} is {label!r}")
     print(f"built {tag} {image['id']} in {elapsed:.0f}s; lowest MemAvailable {minimum:.1f} GiB", flush=True)
     smoke_image(cluster, tag, smoke_script(upstreams))
     receipts = directory / "images"

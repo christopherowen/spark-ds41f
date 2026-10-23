@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 
+import source_labels
 import topology
 
 
@@ -72,7 +73,7 @@ def describe(root: Path, cluster: dict, capacity_bytes: int) -> dict:
     raw = (root / LAYOUT_PATH).read_bytes()
     audit = json.loads(raw)
     labels = cluster["container"]["expected_labels"]
-    pair = {key: labels.get(f"local.spark3.{key}.tree") for key in ("vllm", "b12x")}
+    pair = {key: source_labels.get(labels, f"{key}.tree") for key in ("vllm", "b12x")}
     if pair not in audit["source_pairs"]:
         raise ValueError("model layout needs a source audit for these vLLM/B12X trees")
     if not any(Path(mount[0]).name == audit["model_snapshot"] and mount[1] == "/models"

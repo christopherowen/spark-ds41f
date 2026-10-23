@@ -157,7 +157,8 @@ def bundle(manifest: str, image: str, bundle_dir: str, label: str) -> None:
                 "TILELANG_CACHE_DIR": "/c/tilelang-release-tests",
                 # Disk Engram rows need O_DIRECT on a real filesystem.
                 "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test"},
-        "workdir": "/opt/spark3/candidate/vllm",
+        # Under the image's own source root (scripts/lab.py, image_source_root).
+        "workdir": "vllm",
         # The disk Engram reader and the direct loader use io_uring, which Docker's
         # default seccomp profile refuses; serving allows it.
         "io_uring": True,

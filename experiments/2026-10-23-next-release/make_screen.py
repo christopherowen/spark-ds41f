@@ -59,7 +59,7 @@ def main(checkout: str, base: str = "8fc15c18f") -> None:
                  "(image -1022-4) at the recipe's tp4-ring: the CED TileLang ports and nonfinal skip, the "
                  "block-verification draw refresh, generation controls and the DeepSeek API thinking "
                  "switch. No test code.",
-        "extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
+        "extends": {"config": f"{EXP}/1022/cluster.json", "shape": "tp4-ring"},
         "set": {"container": {"mounts": mounts}},
     })
     dump(HERE / "candidate-tp4-dev.json", {
