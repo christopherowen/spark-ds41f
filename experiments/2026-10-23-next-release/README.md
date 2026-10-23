@@ -82,7 +82,7 @@ the gate.
 ## Release candidate 1 (image `-next-1`)
 
 [vllm/series](vllm/series): 1022's series (184 patches, the local ones by path into the 1022
-record) plus 0228-0259, exported from `release-next`:
+record) plus 0228-0260, exported from `release-next`:
 
 | Patches | Change |
 | --- | --- |
@@ -93,14 +93,15 @@ record) plus 0228-0259, exported from `release-next`:
 | 0257 | the DeepSeek API's top-level `thinking` switch (#447) |
 | 0258 | GLP steering, off unless `WEIGHTLESS_STEER_PATH` is set (#401, Matt Suiche) |
 | 0259 | CED declares the sink detector's column scatter (found by the first screen, below) |
+| 0260 | the DS4.1 model test stubs carry the GLP steering attribute (found by the second screen's GPU tests) |
 
-A clean `git am` of 0228-0259 on 8fc15c18f (the build's committer and dates) gives patch head
-f382f88d, tree 76a3c9ab, the branch's tree ([source.json](source.json),
+A clean `git am` of 0228-0260 on 8fc15c18f (the build's committer and dates) gives patch head
+2ed0a422, tree 1232558d, the branch's tree ([source.json](source.json),
 [upstreams.lock.json](upstreams.lock.json)). Release tests: `scripts/release_tests.py check`
 selects 126 files, 69 gate (four new: the thinking switch, the TileLang CED kernels, GLP, block
 verification's draws, classified in config/release-tests.json), 0 problems;
 [release-tests-gate-manifest.json](release-tests-gate-manifest.json) and
-[bundles/release-tests](bundles/release-tests) (its `head` is the branch's 2ec043108, same tree).
+[bundles/release-tests](bundles/release-tests) (its `head` is the branch's 1fa3028ec, same tree).
 
 [rc1-tp4.json](rc1-tp4.json), one window on the ring: the image built on dgx2 and copied over the
 ring's links ([image-rc-dgx2.json](image-rc-dgx2.json)); the release tests on dgx4; the gate on
