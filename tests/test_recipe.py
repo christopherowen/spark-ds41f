@@ -22,13 +22,16 @@ def load(relative: str) -> dict:
 
 
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
+# Flags that change only what a response reports, added after the archived records.
+REPORTING_ARGS = ("--enable-prompt-tokens-details",)
 
 
 def serving_arguments(cluster: dict) -> list[str]:
     """``serve_args`` without what selects the checkpoint and its sampling defaults (the
-    model path and ``--override-generation-config``) and without the draft budget's
-    constant (r6x replaced the boot-timed cost model's scale with a row cost)."""
-    args = cluster["serve_args"][1:]
+    model path and ``--override-generation-config``), without the draft budget's
+    constant (r6x replaced the boot-timed cost model's scale with a row cost) and
+    without the reporting flags (#455 added the prompt-cache report)."""
+    args = [arg for arg in cluster["serve_args"][1:] if arg not in REPORTING_ARGS]
     if "--override-generation-config" in args:
         at = args.index("--override-generation-config")
         del args[at : at + 2]
@@ -119,9 +122,10 @@ class RecipeTest(unittest.TestCase):
         label prefix, variables and cache paths are renamed, PYTHONPATH is left to the image
         (which sets it to the same trees) and the boot-profile variable nothing reads since
         vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it. The release
-        also changes two things on purpose: the ring's long-prefill budget is 16,384 (the owner,
-        2026-10-23, "do 16"; experiments/2026-10-23-next-release, budget sweeps) and glibc malloc
-        keeps two arenas and a fixed 1 MiB mmap threshold (#439's growth; the memory window)."""
+        also changes three things on purpose: the ring's long-prefill budget is 16,384 (the owner,
+        2026-10-23, "do 16"; experiments/2026-10-23-next-release, budget sweeps), glibc malloc
+        keeps two arenas and a fixed 1 MiB mmap threshold (#439's growth; the memory window), and
+        every response reports its prompt-cache hits (#469)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
@@ -129,8 +133,11 @@ class RecipeTest(unittest.TestCase):
             released = renamed(load_spark().read_cluster(arm))
             released["environment"] = {**released["environment"], "MALLOC_ARENA_MAX": "2",
                                        "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            # The prompt-cache report (#469), where the recipe renders it.
+            args = released["serve_args"] = list(released["serve_args"])
+            args.insert(resolved["serve_args"].index("--enable-prompt-tokens-details"),
+                        "--enable-prompt-tokens-details")
             if shape == "tp4-ring":
-                args = released["serve_args"] = list(released["serve_args"])
                 for flag, value in (("--max-num-batched-tokens", "16384"),
                                     ("--long-prefill-token-threshold", "16288")):
                     args[args.index(flag) + 1] = value
@@ -275,6 +282,15 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
         self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
+
+    def test_every_shape_reports_prompt_cache_hits(self):
+        """Prefix caching reuses cached blocks; --enable-prompt-tokens-details reports the reuse
+        in every response's usage.prompt_tokens_details (cached_tokens). They are separate
+        switches: without the second the cache works and the key is absent (#455)."""
+        for name in self.recipe["shapes"]:
+            args = recipe.resolve(self.recipe, name)["serve_args"]
+            self.assertEqual(args.count("--enable-prefix-caching"), 1, name)
+            self.assertEqual(args.count("--enable-prompt-tokens-details"), 1, name)
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
