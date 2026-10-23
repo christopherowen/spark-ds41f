@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The memory window's dgx1 watcher (from experiments/2026-10-21-startup-memory/watch.sh, for
 # the four-node ring):
-#  1. when a queue runner starts <UTC>-next-memory-tp4.json (queued after this watcher
+#  1. when a queue runner starts <UTC>-memory-tp4.json (queued after this watcher
 #     started), arm the read-only samplers on dgx1-4;
 #  2. when the queue idles after that job, ask for the window back (the runner restores
 #     production);
@@ -10,12 +10,12 @@
 # Reads only queue-log bytes written after it started. Run it from ~/spark-lab/next-memory,
 # where sampler.py was copied on every node.
 set -uo pipefail
-spec=next-memory-tp4
+spec=memory-tp4
 dir=$HOME/spark-lab/next-memory
 logs=$HOME/projects/spark-ds41f/results/private/lab
 me="next-memory (soak and start-up memory, dgx1 watcher): queue idle after my spec, releasing"
 settle=${SETTLE_SECONDS:-240}
-since=$(date -u +%Y%m%dT%H%M%S)
+since=${SINCE:-$(date -u +%Y%m%dT%H%M%S)}
 say() { echo "$(date -u +%FT%TZ) $*"; }
 declare -A off
 for f in "$logs"/*.log; do off[$f]=$(stat -c %s "$f"); done

@@ -201,3 +201,13 @@ unchanged; from experiments/2026-10-21-startup-memory):
 heap, CPython arenas, glibc thread arenas, large single mappings, files), which separates
 allocator high-water from live objects. Each arm's two boots also give the start-up peak's
 attribution by phase (allocator trace against the engine log) on four nodes.
+
+### A 24,576 budget ([budget24-tp4.json](budget24-tp4.json))
+
+Suggested to the owner on 2026-10-23: try 24K. [budget-24576-tp4.json](budget-24576-tp4.json) is
+candidate 1 at 24,576 (threshold 24,480); the sweep is the 16,384 one's suite, 24,576 against
+16,384 (24,576 first and again), queued behind the memory window in the same window. Expected:
+a smaller step than 8K -> 16K (the per-step overhead is already amortized over twice the tokens,
+and the CED skip trims fewer nonfinal chunks), about three times 8K's stall step, and about
+3 GiB more peak memory.
+
