@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # bin/spark passes the settings from the resolved configuration (an arm overlay or a
 # recipe has no container or host fields of its own).
-if (($# != 6)); then
-  echo "usage: $0 <container> <startup|steady> <threshold-gib> <interval-seconds> <wait-seconds> <running|prelaunch>" >&2
+if (($# != 6 && $# != 7)); then
+  echo "usage: $0 <container> <startup|steady> <threshold-gib> <interval-seconds> <wait-seconds> <running|prelaunch> [warn-gib]" >&2
   exit 2
 fi
 name=$1
@@ -14,6 +14,7 @@ guard_gib=$3
 interval=$4
 wait_seconds=$5
 mode=$6
+warn_gib=${7:-0}
 number='^[0-9]+([.][0-9]+)?$'
 if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
   echo "memguard container name is not a container name: $name" >&2
@@ -32,6 +33,16 @@ for value in "$guard_gib" "$interval" "$wait_seconds"; do
     exit 2
   fi
 done
+if [[ ! "$warn_gib" =~ ^[0-9]+$ ]]; then
+  echo "memguard warn line must be a non-negative integer: $warn_gib" >&2
+  exit 2
+fi
+# The startup guard runs at the launch line, above the steady one: a warn line belongs
+# to the steady guard only.
+if ((warn_gib > 0)) && [[ "$phase" != "steady" ]]; then
+  echo "the memguard warn line is valid only for the steady memguard" >&2
+  exit 2
+fi
 unit="${name}-memguard.service"
 
 case "$mode" in
@@ -78,13 +89,16 @@ sudo -n systemd-run --quiet \
   --setenv="CONTAINER_NAME=$name" \
   --setenv="MEMGUARD_PHASE=$phase" \
   --setenv="WAIT_FOR_CONTAINER_SECONDS=$wait_seconds" \
+  --setenv="MEMGUARD_WARN_GIB=$warn_gib" \
   --setenv="READY_FILE=$ready_file" \
   "$repo_root/scripts/memguard.sh"
 
 for _ in {1..50}; do
   if [[ -f "$ready_file" ]]; then
     rm -f -- "$ready_file"
-    echo "$phase memguard active for $name (threshold ${guard_gib} GiB, interval ${interval}s, mode $mode)"
+    warn_text="warn line ${warn_gib} GiB"
+    ((warn_gib > 0)) || warn_text="no warn line"
+    echo "$phase memguard active for $name (threshold ${guard_gib} GiB, interval ${interval}s, $warn_text, mode $mode)"
     exit 0
   fi
   if ! sudo -n systemctl is-active --quiet "$unit"; then

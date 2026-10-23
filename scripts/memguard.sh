@@ -6,6 +6,7 @@ set -euo pipefail
 : "${INTERVAL:?INTERVAL is required}"
 : "${MEMGUARD_PHASE:=steady}"
 : "${WAIT_FOR_CONTAINER_SECONDS:=0}"
+: "${MEMGUARD_WARN_GIB:=0}"
 : "${READY_FILE:=}"
 
 if ! [[ "$THRESHOLD_GIB" =~ ^[1-9][0-9]*$ ]]; then
@@ -20,11 +21,22 @@ if ! [[ "$WAIT_FOR_CONTAINER_SECONDS" =~ ^[0-9]+$ ]]; then
   echo "WAIT_FOR_CONTAINER_SECONDS must be a non-negative integer" >&2
   exit 2
 fi
+# The warn line only reports: it never delays or replaces the kill below THRESHOLD_GIB.
+if ! [[ "$MEMGUARD_WARN_GIB" =~ ^[0-9]+$ ]]; then
+  echo "MEMGUARD_WARN_GIB must be a non-negative integer" >&2
+  exit 2
+fi
+if ((MEMGUARD_WARN_GIB > 0 && MEMGUARD_WARN_GIB <= THRESHOLD_GIB)); then
+  echo "MEMGUARD_WARN_GIB must exceed THRESHOLD_GIB" >&2
+  exit 2
+fi
 
 threshold_kib=$((THRESHOLD_GIB * 1024 * 1024))
+warn_kib=$((MEMGUARD_WARN_GIB * 1024 * 1024))
 deadline=$((SECONDS + WAIT_FOR_CONTAINER_SECONDS))
 observed_running=false
 ready=false
+warned=false
 
 while true; do
   inspectable=true
@@ -67,6 +79,16 @@ while true; do
         "refusing to wait for $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below ${threshold_kib} KiB"
     fi
     exit 1
+  fi
+  if ((warn_kib > 0 && available_kib < warn_kib)); then
+    if [[ "$warned" == "false" ]]; then
+      logger -t spark-memguard \
+        "low headroom on $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below the ${warn_kib} KiB warn line (kill line ${threshold_kib} KiB)" ||
+        true
+      warned=true
+    fi
+  else
+    warned=false
   fi
 
   if [[ "$ready" == "false" ]]; then

@@ -496,6 +496,11 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
         value = host.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             problems.append(f"host.{key} must be a positive integer")
+    warn_gib = host.get("memguard_warn_gib", 0)
+    if not isinstance(warn_gib, int) or isinstance(warn_gib, bool) or warn_gib < 0:
+        problems.append("host.memguard_warn_gib must be a non-negative integer")
+    elif warn_gib and isinstance(host.get("memguard_gib"), int) and warn_gib <= host["memguard_gib"]:
+        problems.append("host.memguard_warn_gib must exceed host.memguard_gib")
     if not isinstance(host.get("fan_control", True), bool):
         problems.append("host.fan_control must be a boolean")
     for key in ("memguard_interval_seconds", "startup_memguard_interval_seconds"):
@@ -1951,10 +1956,12 @@ def wait_for_api(cluster: dict, nodes: dict) -> None:
     raise RuntimeError(f"API did not become ready within {timeout}s{suffix}")
 
 
-def memguard_settings(cluster: dict, phase: str) -> list[str]:
-    """The guard's container, phase, threshold (GiB), interval and container wait
-    (seconds), from the resolved configuration: an arm overlay or a recipe has no
-    such fields of its own, so the guard never reads the file."""
+def memguard_settings(cluster: dict, phase: str, mode: str = "running") -> list[str]:
+    """The guard's container, phase, threshold (GiB), interval, container wait
+    (seconds), mode and warn line (GiB, 0 for none), from the resolved configuration:
+    an arm overlay or a recipe has no such fields of its own, so the guard never reads
+    the file. The warn line belongs to the steady guard: the startup guard runs at the
+    launch line, above it."""
     host = cluster["host"]
     if phase == "startup":
         values = (host["startup_memguard_gib"], host["startup_memguard_interval_seconds"],
@@ -1963,7 +1970,8 @@ def memguard_settings(cluster: dict, phase: str) -> list[str]:
         values = (host["memguard_gib"], host["memguard_interval_seconds"], 0)
     else:
         raise ValueError(f"memguard phase must be startup or steady, not {phase!r}")
-    return [cluster["container"]["name"], phase, *(str(value) for value in values)]
+    warn_gib = host.get("memguard_warn_gib", 0) if phase == "steady" else 0
+    return [cluster["container"]["name"], phase, *(str(value) for value in values), mode, str(warn_gib)]
 
 
 def start_memguard(
@@ -1975,7 +1983,7 @@ def start_memguard(
     prelaunch: bool = False,
 ) -> None:
     script = f"{repository_path(cluster)}/scripts/memguard-start.sh"
-    arguments = [script, *memguard_settings(cluster, phase), "prelaunch" if prelaunch else "running"]
+    arguments = [script, *memguard_settings(cluster, phase, "prelaunch" if prelaunch else "running")]
     result = run_ssh(nodes, node, *arguments)
     if result.returncode:
         detail = result.stderr.strip() or result.stdout.strip()
