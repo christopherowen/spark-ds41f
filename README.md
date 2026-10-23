@@ -4,8 +4,9 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the three-node TP3
-1M profile on the triangle the site is cabled as (2026-10-22,
+Production is **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4
+1M profile on the ring the site is cabled as (2026-10-23; the three-node TP3 1M profile on the
+triangle since 2026-10-22,
 [promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
 `spark-ds41f-MMDD`. It is r6x with the TP group's broadcast on sparknet's one-shot all-gather
 (serving never touches the PyTorch NCCL process group), sink detection and draft-zero rejection
@@ -15,8 +16,9 @@ step sooner), control-token spellings in request text kept as plain text (#449),
 0.5.0's wider one-shot read phase. Outputs are identical to r6x's. Against r6x in one session on the triangle,
 decode steps are 1.1% faster and eight streams, one stream and prefill level (prefill once
 vLLM 0226 restored it); time to first token is level at four and eight streams, and a request
-alone waits one decode step longer (sink rejection holds its first token one step). The four-node
-ring is unqualified on this image until a ring release run. r6x's recipe and lock are frozen in
+alone waits one decode step longer (sink rejection holds its first token one step). On the ring,
+against r6x in one session, decode steps are 1.7% faster and sixteen streams, one stream and
+prefill level, outputs identical. r6x's recipe and lock are frozen in
 `experiments/2026-10-22-spark-ds41f-1022/r6x`.
 
 Before spark-ds41f-1022, production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M

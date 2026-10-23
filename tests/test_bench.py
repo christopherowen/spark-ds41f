@@ -667,9 +667,9 @@ class ReferenceShapeTest(unittest.TestCase):
                     ([], []),
                 )
                 self.assertEqual(spark.benchmark_reference_problems(cluster, nodes), [])
-        # spark-ds41f-1022 was released on the triangle at 1M; the ring waits for its own run.
+        # spark-ds41f-1022 was released on the triangle at 1M, then on the ring: each shape has its own run.
         self.assertIn("benchmark_reference", recipe["shapes"]["tp3-triangle"])
-        self.assertNotIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
+        self.assertIn("benchmark_reference", recipe["shapes"]["tp4-ring"])
 
     def test_tp4_profile_compares_with_the_tp4_run(self) -> None:
         cluster, nodes = self.profile(self.TP4_RECIPE, "tp4-ring")

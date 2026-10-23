@@ -1,0 +1,359 @@
+{
+ "schema": "servebench-suite/1",
+ "suite": {
+  "name": "spark-ds41f-1022-promotion-tp4",
+  "version": 1,
+  "description": "The trimmed promotion comparison of spark-ds41f-1022 at four nodes on the ring (2026-10-23), the TP3 one (promotion-suite.json) at TP4's stream count, about 14 minutes a build: model behaviour on 64 prompts at 16 streams (greedy outputs against the first arm's; it also heat-soaks the GPU), the engine grid up to sixteen requests, sixteen streams and one stream in closed loops (30 s warm-up, 180 s), real-text prefill at 32K and 131K. Its grid needs the dev-mode collective RPC.",
+  "steps": [
+   {
+    "id": "model",
+    "command": "model",
+    "args": {
+     "limit": 64,
+     "concurrency": 16,
+     "max_tokens": 256,
+     "top": 20
+    }
+   },
+   {
+    "id": "grid",
+    "command": "engine",
+    "args": {
+     "replays": 100,
+     "settle": 1,
+     "max_requests": 16
+    }
+   },
+   {
+    "id": "c16",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 16,
+     "warmup": 30,
+     "duration": 180,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "c1",
+    "command": "run",
+    "args": {
+     "mode": "closed",
+     "concurrency": 1,
+     "warmup": 30,
+     "duration": 180,
+     "extra_body": {
+      "chat_template_kwargs": {
+       "thinking": false
+      }
+     }
+    }
+   },
+   {
+    "id": "prefill",
+    "command": "prefill",
+    "args": {
+     "sizes": [
+      32768,
+      131072
+     ],
+     "repeats": 3
+    }
+   }
+  ]
+ },
+ "suite_sha256": "b1e45ae042bf198789c011eb67442a068606e05bd621b542d44bc815f5d3c1c4",
+ "label": "spark-ds41f-1022-4",
+ "corpus": null,
+ "started_utc": "2026-10-22T23:19:20+00:00",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "output": "model.json.gz",
+   "exit": 0,
+   "seconds": 75.1
+  },
+  {
+   "id": "grid",
+   "command": "engine",
+   "output": "grid.json",
+   "exit": 0,
+   "seconds": 111.1
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "output": "c16.json",
+   "exit": 0,
+   "seconds": 221.2
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "output": "c1.json",
+   "exit": 0,
+   "seconds": 213.2
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "output": "prefill.json",
+   "exit": 0,
+   "seconds": 84.3
+  }
+ ],
+ "metadata": {
+  "identity": {
+   "cluster_config": "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json",
+   "cluster_config_sha256": "a90c887636ccff1ba1aaf1ba4e3a2dff7872d20262758b35305e64ed6dbdda0f",
+   "nodes_config": "config/nodes-ring4.local.json",
+   "topology": {
+    "schema_version": 1,
+    "ssh_user": "swank",
+    "nodes": [
+     {
+      "name": "dgx1",
+      "rank": 0,
+      "head": true,
+      "management_ip": "10.0.1.71",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "1": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "3": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.12.1.0/24",
+       "roceP2p1s0f0": "10.12.2.0/24",
+       "rocep1s0f1": "10.14.1.0/24",
+       "roceP2p1s0f1": "10.14.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:7e:80:91",
+        "address": "10.12.1.1/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:7e:80:95",
+        "address": "10.12.2.1/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:7e:80:92",
+        "address": "10.14.1.1/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:7e:80:96",
+        "address": "10.14.2.1/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024
+     },
+     {
+      "name": "dgx2",
+      "rank": 1,
+      "head": false,
+      "management_ip": "10.0.1.72",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "2": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "0": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.23.1.0/24",
+       "roceP2p1s0f0": "10.23.2.0/24",
+       "rocep1s0f1": "10.12.1.0/24",
+       "roceP2p1s0f1": "10.12.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:2e:bc:c3",
+        "address": "10.23.1.2/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:2e:bc:c7",
+        "address": "10.23.2.2/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:2e:bc:c4",
+        "address": "10.12.1.2/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:2e:bc:c8",
+        "address": "10.12.2.2/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024,
+      "transfer_host": "dgx2-internal"
+     },
+     {
+      "name": "dgx3",
+      "rank": 2,
+      "head": false,
+      "management_ip": "10.0.1.73",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "3": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "1": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.34.1.0/24",
+       "roceP2p1s0f0": "10.34.2.0/24",
+       "rocep1s0f1": "10.23.1.0/24",
+       "roceP2p1s0f1": "10.23.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:e9:7f:2b",
+        "address": "10.34.1.3/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:e9:7f:2f",
+        "address": "10.34.2.3/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:e9:7f:2c",
+        "address": "10.23.1.3/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:e9:7f:30",
+        "address": "10.23.2.3/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024
+     },
+     {
+      "name": "dgx4",
+      "rank": 3,
+      "head": false,
+      "management_ip": "10.0.1.74",
+      "roce_gid_index": 3,
+      "roce_peer_hcas": {
+       "0": [
+        "rocep1s0f0",
+        "roceP2p1s0f0"
+       ],
+       "2": [
+        "rocep1s0f1",
+        "roceP2p1s0f1"
+       ]
+      },
+      "roce_subnets": {
+       "rocep1s0f0": "10.14.1.0/24",
+       "roceP2p1s0f0": "10.14.2.0/24",
+       "rocep1s0f1": "10.34.1.0/24",
+       "roceP2p1s0f1": "10.34.2.0/24"
+      },
+      "mesh_ports": {
+       "rocep1s0f0": {
+        "netdev": "enp1s0f0np0",
+        "pci": "0000:01:00.0",
+        "mac": "4c:bb:47:eb:1e:0d",
+        "address": "10.14.1.4/24"
+       },
+       "roceP2p1s0f0": {
+        "netdev": "enP2p1s0f0np0",
+        "pci": "0002:01:00.0",
+        "mac": "4c:bb:47:eb:1e:11",
+        "address": "10.14.2.4/24"
+       },
+       "rocep1s0f1": {
+        "netdev": "enp1s0f1np1",
+        "pci": "0000:01:00.1",
+        "mac": "4c:bb:47:eb:1e:0e",
+        "address": "10.34.1.4/24"
+       },
+       "roceP2p1s0f1": {
+        "netdev": "enP2p1s0f1np1",
+        "pci": "0002:01:00.1",
+        "mac": "4c:bb:47:eb:1e:12",
+        "address": "10.34.2.4/24"
+       }
+      },
+      "mesh_hairpin_queue_size": 1024,
+      "transfer_host": "dgx4-internal"
+     }
+    ]
+   },
+   "transport": "oneshot-ring4",
+   "kernel_backend": "tilelang",
+   "promoted_baseline": "2026-10-22-spark-ds41f-1022",
+   "image": "vllm-ds41f-kkref:19f2c20ed4d6-1022-4",
+   "dspark_cost_dir": "/cache/kkref/dspark-costs/build-95e46b90044f5170",
+   "client_commit": "0026b316b86edcc9adf38bbf3b403c4bf20d41ed",
+   "client_dirty": false,
+   "client_host": "dgx1",
+   "nodes": {
+    "dgx1": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T23:17:56.946004945Z",
+     "checkout": "0026b316b86edcc9adf38bbf3b403c4bf20d41ed"
+    },
+    "dgx2": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T23:17:55.820292957Z",
+     "checkout": "0026b316b86edcc9adf38bbf3b403c4bf20d41ed"
+    },
+    "dgx3": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T23:17:56.218110584Z",
+     "checkout": "0026b316b86edcc9adf38bbf3b403c4bf20d41ed"
+    },
+    "dgx4": {
+     "image_id": "sha256:234b0a7914180b5be0ddb63d46c8c9225b0aa968e0350144873a07ab669e6d8d",
+     "container_started_at": "2026-10-22T23:17:56.589825956Z",
+     "checkout": "0026b316b86edcc9adf38bbf3b403c4bf20d41ed"
+    }
+   },
+   "live_problems": [],
+   "live_warnings": []
+  }
+ },
+ "finished_utc": "2026-10-22T23:31:05+00:00"
+}

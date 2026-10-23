@@ -193,9 +193,9 @@ class RecipeTest(unittest.TestCase):
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # spark-ds41f-1022 was released on the triangle; the ring is unqualified until its own run.
+        # spark-ds41f-1022 was released on the triangle, then on the ring: each shape has its own run.
         self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
-        self.assertNotIn("benchmark_reference", tp4)
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):

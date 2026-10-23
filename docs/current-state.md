@@ -1,7 +1,8 @@
 # Current state
 
-Production is the recipe's `tp3-triangle` shape ([config/cluster.json](../config/cluster.json)) on
-**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx3, promoted
+Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
+**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
+2026-10-23 (the `tp3-triangle` shape on dgx1-dgx3 from 2026-10-22), promoted
 2026-10-22 as [`2026-10-22-spark-ds41f-1022`](../manifests/baselines/2026-10-22-spark-ds41f-1022.json)
 ([promotion record](../experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
 `spark-ds41f-MMDD`: image `vllm-ds41f-kkref:19f2c20ed4d6-1022-4`, r6x's sources with vLLM
@@ -19,9 +20,10 @@ steps 1.1% faster, eight streams, one stream and prefill level once 0226 restore
 step longer alone (0.127 to 0.159 s at p50). Release tests: 1,801 passed.
 `tp3-triangle`'s `benchmark_reference` is
 [manifests/suites/2026-10-22-spark-ds41f-1022-tp3](../manifests/suites/2026-10-22-spark-ds41f-1022-tp3/).
-`tp4-ring` is unqualified on this image until a ring release run
-([spark-ds41f-1022-tp4.json](../experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4.json) is
-its arm). r6x's recipe and lock are frozen in `experiments/2026-10-22-spark-ds41f-1022/r6x` as the
+On the ring (2026-10-23, trimmed comparison against r6x in one session): decode steps 1.7%
+faster, sixteen streams, one stream and prefill level, outputs identical to r6x's ring hashes;
+`tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-22-spark-ds41f-1022-tp4](../manifests/suites/2026-10-22-spark-ds41f-1022-tp4/). r6x's recipe and lock are frozen in `experiments/2026-10-22-spark-ds41f-1022/r6x` as the
 rollback.
 
 Before spark-ds41f-1022 production was **r6x**, serving DeepSeek-V4.1-Flash-1017 on the recipe's

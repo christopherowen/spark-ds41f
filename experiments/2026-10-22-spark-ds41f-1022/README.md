@@ -7,7 +7,8 @@ promotion gate. Named per the release naming adopted for the next release: `spar
 (the candidate's own name until the owner promotes it).
 
 **Status (2026-10-23 00:35 CET): promoted as `spark-ds41f-1022`, image `-1022-4`, and serving on the
-triangle at 1M** (owner: "begin the promotion routine"; merged as 590786b, #462; [Promotion](#promotion)).
+triangle at 1M** (owner: "begin the promotion routine"; merged as 590786b, #462; [Promotion](#promotion)), and
+on the ring since 2026-10-23 ([The ring](#the-ring-2026-10-23)).
 Deployed 00:33-00:35 CET under a deploy hold: API ready in 94.5 s, `doctor --live` OK, KV 4,765,898
 tokens; the control-spellings probe passes on the live service. The ring is unqualified on
 this image until a ring release run. The paragraphs below record how the candidate got there.
@@ -331,6 +332,39 @@ The ring has no benchmark reference for this image, so production serves r6x fro
   triangle, at TP4's stream count (model at 16 streams, grid up to 16 requests, closed loops at 16 and 1,
   32K / 131K prefill), candidate, r6x, candidate again in one session. The candidate's first arm becomes
   tp4-ring's benchmark reference.
+
+**TP4 gate (window 01:02-01:17 CET, no foreign requests):** boot ready in 93.6 s at the ring's
+production pool under the unchanged 5/3 GiB guards.
+
+| Step | `-1022-4` on the ring | Pass |
+| --- | --- | --- |
+| determinism, with and without log probabilities | identical in all six scenarios; 3eab5112 / db25fde3 and c9cf9dbe / c6bb4f4e | r6x's ring hashes |
+| control spellings | every location keeps the neutral request's control sequence (user 5 / 5, tool result 29 / 29, chat mode 4 / 4, ...) | pass in all eight |
+| cold prefill 32K / 131K | 6022.4 / 5986.1 tok/s | first look; the comparison judges |
+| one stream | 72.3 tok/s ± 5.1% | first look |
+| traced TTFT p50, four / eight streams; isolated mean | 213.6 / 281.4 ms (plain step 56.0 / 79.7 ms); 121.7 ms | |
+| sink counters, ordinary text / probes | 0 flags / `Say hi.`, `Thanks!`, `ok` flagged, no collapse, every rank 10 rows | pass |
+| MemAvailable serving, dgx1 / dgx2 / dgx3 / dgx4 | 22.99 / 24.23 / 24.27 / 24.23 GiB | above the 3 GiB guard |
+
+**TP4 comparison (01:17-01:58 CET, one session, `-1022-4` / r6x / `-1022-4` again; boots 87.1 / 90.4 /
+88.2 s; no halts, no thermal slowdown):** table
+[results/promotion-tp4-table.txt](results/promotion-tp4-table.txt). Verdicts, r6x to `-1022-4`, against
+the run's own repeat:
+
+| Metric | Change | ±95% | Repeat | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| engine grid, decode geometric mean (20 shapes) | −1.72% | 0.16% | +0.21% | better |
+| sixteen streams, output tok/s | +1.33% | 0.80% | −0.53% | same |
+| one stream, output tok/s | −0.02% | 8.25% | −0.28% | same |
+| prefill 32K tok/s | −0.06% | 0.48% | −0.18% | same |
+| prefill 131K tok/s | +0.05% | 0.56% | −0.03% | same |
+
+- **Outputs:** greedy 64/64 identical in both pairs, teacher-forced distributions identical (KL 0).
+- **Time to first token** (no interval): sixteen streams p50 0.396 to 0.400 s; one stream 0.100 to
+  0.129 s, sink rejection's held token, as on the triangle.
+- The candidate's first arm is tp4-ring's benchmark reference,
+  [manifests/suites/2026-10-22-spark-ds41f-1022-tp4](../../manifests/suites/2026-10-22-spark-ds41f-1022-tp4/).
+  The window restored r6x at 02:00 CET (`doctor --live` OK) until the deploy.
 
 Since the promotion the root lock is this release's, so the candidate arms no longer name the
 experiment's lock (its sources are identical; the recipe and lock would otherwise name different
