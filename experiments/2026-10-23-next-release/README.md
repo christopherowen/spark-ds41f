@@ -114,3 +114,16 @@ arm for when it is cabled.
 GLP steering ships off: its gate here is that the unset path leaves outputs identical. Steering on,
 with its projection as a TileLang kernel, is qualified in its own experiment (the migration rule:
 a kernel that does not launch is not ported; this one launches only when configured).
+
+## The ring's long-prefill budget with the skip ([budget-tp4.json](budget-tp4.json))
+
+Owner, 2026-10-23 11:45 CET: "measure a 16384 prefill budget on the ring too". On four Sparks the
+skip measured prefill +5.6-6.0% (32K-1M) in the second screen, half the triangle's +11%: the ring's
+chunks are 8,192 tokens, so a long prompt has half as many nonfinal chunks to trim.
+[budget-16384-tp4.json](budget-16384-tp4.json) is candidate 1 at a 16,384-token budget (threshold
+16,384 - 16 x 6 = 16,288), everything else as [rc-tp4.json](rc-tp4.json).
+[budget-suite-tp4.json](budget-suite-tp4.json) is the TP3 sweep's suite at TP4: cold prefill at 32K,
+131K and 524K (three repeats), the stall step (what fifteen decoding streams wait during a cold 131K
+prefill), and one cold 1M prefill; the run's memory watch records every node's lowest MemAvailable.
+One session on image `-next-1`: 8,192, 16,384, 8,192 again. Queued behind candidate 1 in the same
+window. The budget is the owner's choice; the recipe does not change here.
