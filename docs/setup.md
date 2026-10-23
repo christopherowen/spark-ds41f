@@ -449,16 +449,19 @@ list, including the recipe's per-prompt image cap:
 --limit-mm-per-prompt '{"image":4}'
 ```
 
-A site that serves more than four images in one prompt gets, on every such
-request:
+Four is the recipe's per-request memory budget, not a limit of the model, and
+it counts the images a chat client resends with its history. A site that
+serves more than four images in one prompt gets, on every such request:
 
 ```
 400: At most 4 image(s) may be provided in one prompt (parameter=image)
 ```
 
-Remove both list entries from the site profile to lift the cap; `bin/spark
-doctor` compares the running command against the profile, so the change is
-visible in its report before the next start.
+Write another count in that entry to raise the cap, or remove both list
+entries to lift it (vLLM's default is 999 per prompt);
+[current-state.md](current-state.md#images-per-request) describes the memory
+trade-off. `bin/spark doctor` compares the running command against the
+profile, so the change is visible in its report before the next start.
 
 ### Check
 

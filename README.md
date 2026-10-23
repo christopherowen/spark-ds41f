@@ -200,7 +200,9 @@ differs only in cabling, transport and memory sizing):
   switchless ring patches (bidirectional rings, balanced channels);
 - DeepSeek V4.1 Flash native FP8/FP4/BF16 weights, every served weight bit as
   the checkpoint stores it, with the vision tower loaded (up to four images
-  per request); the output head is stored in an exact 12-bit packed form of
+  per request, history included: the recipe's memory-budget limit, not the
+  model's; see [images per request](docs/current-state.md#images-per-request));
+  the output head is stored in an exact 12-bit packed form of
   its BF16 weights, and the embedding and output head live in the GB10
   display carve-out, loaded there directly from the checkpoint while the
   text console keeps its framebuffer;

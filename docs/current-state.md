@@ -198,7 +198,7 @@ B12X is the alternative backend in the same image.
 | Reference precision | the mHC stream projection in FP32 (three exact TF32 parts per weight), the shared expert's SwiGLU in FP32 with one rounding, MoE partials rounded once per rank; WO-A's FP8 activations are the known deviation left |
 | Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
-| Image input | vision tower loaded, up to 4 images per request, no host preprocessing cache |
+| Image input | vision tower loaded; up to 4 images per request, the recipe's memory-budget limit, not the model's ([below](#images-per-request)); no host preprocessing cache |
 | DSpark | 5 draft tokens, draft TP 3, adaptive verification (r6u's TP3 path: cost scale 2.0; r6x: the row cost 0.035, nothing timed), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
 | Collectives | sparknet one-shot all-reduce (up to 2 MiB) and all-gather over the triangle (`oneshot-direct`), larger all-reduces summed in rank order in FP32; the requested policy is enforced and a declined or lost backend fails startup (vLLM 0027, 0038) |
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
@@ -221,6 +221,39 @@ shape) is in the
 [memory-saver deployment](../experiments/2026-10-02-memory-saver-capacity/README.md).
 Against r5p, the kernels change family; the weights, the TP3 shape and the
 memory guards are unchanged.
+
+## Images per request
+
+`--limit-mm-per-prompt {"image":4}` in the recipe's `serve_args` is the recipe's chosen
+per-request limit, a memory budget set when the vision tower was enabled
+([experiments/2026-09-25-vision](../experiments/2026-09-25-vision/README.md)). It is not a
+limit of the model. vLLM counts every image in a request, and a chat client resends its
+history, so the images retained in earlier turns count too: once a conversation holds a
+fifth image, every later turn fails with
+`400: At most 4 image(s) may be provided in one prompt`.
+
+A site profile raises the limit by writing another count in that entry (`{"image":8}`), or
+omits both entries to take vLLM's default of 999 per prompt. `{"image":0}` (or
+`--language-model-only`) skips the vision tower and its 0.9 GiB of weights on every rank.
+A profile's `serve_args` is the complete command, so the change is made in the profile's
+own list ([setup.md](setup.md#a-site-profile-replaces-serve_args-wholesale)).
+
+The trade-off is memory per request, not at startup. The tower's weights load whenever
+images are allowed at all, and vLLM encodes a request's images within a per-step budget
+derived from the batched-token budget (4,096 tokens on the triangle, 8,192 on the ring), so
+the encoder's working memory per step does not grow with the count. The request does: every
+image becomes prompt tokens that hold blocks of the fixed KV pool (`kv_cache_memory_bytes`)
+for the life of the request, beside every other stream's context, and lengthen its
+prefill; and the head's API server decodes and preprocesses every image in host memory,
+which on GB10 is the unified memory dgx1's steady guard watches. No count above four is
+qualified here.
+
+Externally reported, not qualified here: a three-node TP3 site with the limit removed (r6
+image, 524,288-token context, eight sequences) completed a chat-history request with 13
+images and 104,615 prompt tokens, cold and warm, and three overlapping replays of it
+([#30](https://github.com/christopherowen/spark-ds41f/issues/30)). That shows more than four
+working on that site, not that a given count is safe for every image size, workload or
+shape.
 
 The previous state
 (2026-09-20, 498,145 KV tokens in 3 GiB, incoherent code output) is retained in
