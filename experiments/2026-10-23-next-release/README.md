@@ -316,3 +316,54 @@ in experiments/2026-10-22-spark-ds41f-1022 that extended `config/cluster.json` e
 copy instead ([candidate-tp4.json](candidate-tp4.json) through [make_screen.py](make_screen.py)).
 Each resolves exactly as before. The frozen copy is the previous release's arm in the release
 comparison and the rollback.
+
+### Deploying the renamed names (with the promotion)
+
+The rename (branch `next-release-rename`) goes live with the promotion commit, which also moves
+`container.image` to the new image and its `expected_labels` trees: an image built from a commit
+that contains the rename (labels `local.spark-ds41f.*`, trees under `/opt/spark-ds41f/candidate`,
+vLLM reading `SPARK_DS41F_*`), tagged `spark-ds41f:19f2c20ed4d6-MMDD`, with one image ID on every
+node. The renamed recipe refuses image -1022-4 (its labels are `local.spark3.*`), so it cannot
+serve an old image under the new variable names. From dgx1, under a deploy hold:
+
+1. Stop spark-ds41f-1022 with its frozen recipe, which names the running container
+   (`dsv41-karmic-kraken` and its memory guard):
+   `bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster stop --apply --parallel`.
+   The stopped container is kept for the rollback.
+2. Sync every node to the promotion commit:
+   `bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster sync --revision <commit> --apply`.
+3. On every node, move the cache and leave a relative link under the old name, so the frozen
+   recipes (1022 and earlier, the release comparison's previous-release arm included) stay warm
+   and Triton's group files, which hold absolute `/cache/kkref/...` paths, keep resolving:
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do
+     ssh "$host" 'cd ~/projects/spark-ds41f/cache && test -d kkref && test ! -L kkref &&
+       test ! -e spark-ds41f && mv kkref spark-ds41f && ln -s spark-ds41f kkref; ls -ld kkref spark-ds41f'
+   done
+   ```
+
+   Nothing is deleted: `jit/vllm-r5o` stays for the old recipes (the new one compiles into
+   `jit/vllm`), and B12X recompiles once because its compile key includes
+   `B12X_CUTE_COMPILE_CACHE_DIR` (the first boot warms it).
+4. On every node, replace the boot memory service (`spark3-kernel-memory` becomes
+   `spark-ds41f-kernel-memory`, its backup moves to `/var/lib/spark-ds41f`); the installer does
+   not reboot or touch swap, and starting the service applies the values already in force:
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do
+     ssh "$host" 'cd ~/projects/spark-ds41f && sudo -n experiments/2026-10-02-kernel-64k/install-boot-support.sh &&
+       sudo -n systemctl start spark-ds41f-kernel-memory.service && systemctl is-active spark-ds41f-kernel-memory.service'
+   done
+   ```
+5. Start the promoted recipe: `bin/spark --cluster-config config/cluster.json cluster start` (plan:
+   `live:` names no engine, since the stopped container has the old name; `shape:` new engine),
+   then the same with `--apply`. The first boot compiles what the moved caches do not cover.
+6. `bin/spark --cluster-config config/cluster.json doctor --live` must report the live cluster
+   matching (`spark-ds41f`, `spark-ds41f-memguard`), with no kernel memory service warning.
+
+Rollback: `bin/spark --cluster-config config/cluster.json cluster stop --apply --parallel`, then
+`bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster start --replace --apply`
+and `doctor --live` with that profile; it reads its caches through `cache/kkref`. Remove the kept
+`dsv41-karmic-kraken` containers (`docker rm`) only once the rollback is no longer wanted, and
+keep the `cache/kkref` link while any recipe names it.

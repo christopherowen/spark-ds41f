@@ -63,6 +63,23 @@ def draft_budget(cluster: dict) -> dict:
     return {k: v for k, v in speculative.items() if k in BUDGET_KEYS}
 
 
+def renamed(cluster: dict) -> dict:
+    """A resolved profile of spark-ds41f-1022 under the names of the release after it."""
+    out = json.loads(json.dumps(cluster))
+    out["container"]["name"] = {"dsv41-karmic-kraken": "spark-ds41f"}[out["container"]["name"]]
+    out["container"]["expected_labels"] = {
+        key.replace("local.spark3.", "local.spark-ds41f.", 1): value
+        for key, value in out["container"]["expected_labels"].items()}
+    environment = {}
+    for key, value in out["environment"].items():
+        if key in ("PYTHONPATH", "SPARK3_DSPARK_PROFILE_TOKENS"):
+            continue
+        value = value.replace("/cache/kkref/jit/vllm-r5o", "/cache/spark-ds41f/jit/vllm")
+        environment[key.replace("SPARK3_", "SPARK_DS41F_", 1)] = value.replace("/cache/kkref", "/cache/spark-ds41f")
+    out["environment"] = environment
+    return out
+
+
 def load_spark():
     import importlib.machinery
     import importlib.util
@@ -96,16 +113,30 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_each_shape_is_its_1022_arm(self):
-        """Each shape resolves to spark-ds41f-1022's arm at that shape, apart from the names (the
-        arms extend the recipe and name the release's experiment lock)."""
+    def test_each_shape_is_its_1022_arm_renamed(self):
+        """Each shape resolves to spark-ds41f-1022's arm at that shape under the names of the
+        release after it (the owner's decision of 2026-10-19), and nothing else: the container,
+        label prefix, variables and cache paths are renamed, PYTHONPATH is left to the image
+        (which sets it to the same trees) and the boot-profile variable nothing reads since
+        vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
             resolved = recipe.resolve(self.recipe, shape)
-            released = load_spark().read_cluster(arm)
+            released = renamed(load_spark().read_cluster(arm))
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
+        self.assertEqual(self.recipe["container"]["image"], "vllm-ds41f-kkref:19f2c20ed4d6-1022-4")
+
+    def test_the_recipe_keeps_no_old_live_name(self):
+        """Apart from the image tag (the promotion's image moves it), no old name is left."""
+        recipe_ = json.loads(json.dumps(self.recipe))
+        del recipe_["container"]["image"]
+        text = json.dumps(recipe_)
+        for old in ("spark3", "SPARK3_", "kkref", "karmic", "dsv41-", "vllm-r5o", "PYTHONPATH"):
+            self.assertNotIn(old, text)
+        self.assertEqual(self.recipe["container"]["name"], "spark-ds41f")
+        self.assertTrue(all(key.startswith("local.spark-ds41f.") for key in self.recipe["container"]["expected_labels"]))
 
     def test_r6x_frozen_at_1022_is_its_arms(self):
         """r6x's recipe, frozen at spark-ds41f-1022's promotion, resolves at each shape to r6x's
@@ -186,7 +217,7 @@ class RecipeTest(unittest.TestCase):
             recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
         # An arm that lists its own mounts (an overlay of changed files) still serves its
         # model: the list replaces the base's, so the model's mounts are put back first.
-        extra = ["{home}/overlay/moe.py", "/opt/spark3/candidate/vllm/moe.py", "ro"]
+        extra = ["{home}/overlay/moe.py", "/opt/spark-ds41f/candidate/vllm/moe.py", "ro"]
         listed = recipe.overlay({"extends": {}, "set": {"container": {"mounts": [
             ["{home}/projects/spark-ds41f/cache", "/cache", "rw"], extra]}}}, base)
         self.assertEqual(listed["container"]["mounts"],
@@ -222,9 +253,7 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolved["fabric"], old["fabric"])
         for key, value in old["environment"].items():
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
-                self.assertEqual(resolved["environment"].get(key), value, key)
-        # TP3 schedules on its build's own cost curves (bin/spark derives the directory).
-        self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
+                self.assertEqual(resolved["environment"].get(key.replace("SPARK3_", "SPARK_DS41F_", 1)), value, key)
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
@@ -239,9 +268,8 @@ class RecipeTest(unittest.TestCase):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
         different = {key for key in set(tp3["environment"]) | set(tp4["environment"])
                      if tp3["environment"].get(key) != tp4["environment"].get(key)}
-        # Since r6v both shapes derive their DSpark cost curves per build: no pinned directory.
         allowed = {key for key in different if key.startswith("NCCL_")} | {
-            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"}
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"}
         self.assertEqual(different, allowed)
         for name, entry in self.recipe["shapes"].items():
             self.assertTrue(entry.get("notes"), f"shape {name} says why it differs")

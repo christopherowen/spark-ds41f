@@ -156,39 +156,39 @@ LABEL org.opencontainers.image.source="https://github.com/christopherowen/spark-
       org.opencontainers.image.revision="${DEPLOYMENT_COMMIT}" \
       org.opencontainers.image.base.name="${BASE_IMAGE_NAME}" \
       org.opencontainers.image.base.digest="${BASE_IMAGE_DIGEST}" \
-      local.spark3.vllm.upstream="${VLLM_UPSTREAM}" \
-      local.spark3.vllm.ref="${VLLM_REF}" \
-      local.spark3.vllm.revision="${VLLM_REVISION}" \
-      local.spark3.vllm.patch-head="${VLLM_PATCH_HEAD}" \
-      local.spark3.vllm.tree="${VLLM_TREE}" \
-      local.spark3.b12x.upstream="${B12X_UPSTREAM}" \
-      local.spark3.b12x.ref="${B12X_REF}" \
-      local.spark3.b12x.revision="${B12X_REVISION}" \
-      local.spark3.b12x.patch-head="${B12X_PATCH_HEAD}" \
-      local.spark3.b12x.tree="${B12X_TREE}" \
-      local.spark3.nccl.upstream="${NCCL_UPSTREAM}" \
-      local.spark3.nccl.ref="${NCCL_REF}" \
-      local.spark3.nccl.revision="${NCCL_REVISION}" \
-      local.spark3.nccl.patch-head="${NCCL_PATCH_HEAD}" \
-      local.spark3.nccl.tree="${NCCL_TREE}"
+      local.spark-ds41f.vllm.upstream="${VLLM_UPSTREAM}" \
+      local.spark-ds41f.vllm.ref="${VLLM_REF}" \
+      local.spark-ds41f.vllm.revision="${VLLM_REVISION}" \
+      local.spark-ds41f.vllm.patch-head="${VLLM_PATCH_HEAD}" \
+      local.spark-ds41f.vllm.tree="${VLLM_TREE}" \
+      local.spark-ds41f.b12x.upstream="${B12X_UPSTREAM}" \
+      local.spark-ds41f.b12x.ref="${B12X_REF}" \
+      local.spark-ds41f.b12x.revision="${B12X_REVISION}" \
+      local.spark-ds41f.b12x.patch-head="${B12X_PATCH_HEAD}" \
+      local.spark-ds41f.b12x.tree="${B12X_TREE}" \
+      local.spark-ds41f.nccl.upstream="${NCCL_UPSTREAM}" \
+      local.spark-ds41f.nccl.ref="${NCCL_REF}" \
+      local.spark-ds41f.nccl.revision="${NCCL_REVISION}" \
+      local.spark-ds41f.nccl.patch-head="${NCCL_PATCH_HEAD}" \
+      local.spark-ds41f.nccl.tree="${NCCL_TREE}"
 
 USER root
 
-COPY --from=vllm-source . /opt/spark3/candidate/vllm/
-COPY --from=b12x-source . /opt/spark3/candidate/b12x/
+COPY --from=vllm-source . /opt/spark-ds41f/candidate/vllm/
+COPY --from=b12x-source . /opt/spark-ds41f/candidate/b12x/
 COPY --from=vllm-native-builder \
   /opt/vllm-native/vllm/_C_stable_libtorch.abi3.so \
-  /opt/spark3/candidate/vllm/vllm/_C_stable_libtorch.abi3.so
+  /opt/spark-ds41f/candidate/vllm/vllm/_C_stable_libtorch.abi3.so
 COPY --from=vllm-native-builder \
   /opt/vllm-native/vllm/_moe_C_stable_libtorch.abi3.so \
-  /opt/spark3/candidate/vllm/vllm/_moe_C_stable_libtorch.abi3.so
+  /opt/spark-ds41f/candidate/vllm/vllm/_moe_C_stable_libtorch.abi3.so
 COPY --from=cutlass-dsl-wheels . /tmp/cutlass-dsl-wheels/
-COPY --from=nccl-builder /opt/nccl/ /opt/spark3/nccl/
+COPY --from=nccl-builder /opt/nccl/ /opt/spark-ds41f/nccl/
 RUN set -eux; \
     target=/usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2; \
     test -f "$target"; \
-    install -m 0755 /opt/spark3/nccl/libnccl.so.2 "$target"; \
-    rm /opt/spark3/nccl/libnccl.so.2
+    install -m 0755 /opt/spark-ds41f/nccl/libnccl.so.2 "$target"; \
+    rm /opt/spark-ds41f/nccl/libnccl.so.2
 
 # B12X builds its io_uring disk row reader at first use; it needs the header.
 RUN apt-get update \
@@ -204,14 +204,14 @@ COPY --from=vllm-deletions deleted.txt /tmp/vllm-deleted.txt
 RUN set -eux; \
     installed=$(python3 -c \
       'from pathlib import Path; import vllm; print(Path(vllm.__file__).parent)'); \
-    cp -a --no-clobber "$installed"/. /opt/spark3/candidate/vllm/vllm/; \
+    cp -a --no-clobber "$installed"/. /opt/spark-ds41f/candidate/vllm/vllm/; \
     while read -r relative; do \
       [ -n "$relative" ] || continue; \
-      rm -f "/opt/spark3/candidate/vllm/vllm/$relative"; \
+      rm -f "/opt/spark-ds41f/candidate/vllm/vllm/$relative"; \
       echo "kept deletion: $relative"; \
     done < /tmp/vllm-deleted.txt; \
     rm -f /tmp/vllm-deleted.txt; \
-    test -f /opt/spark3/candidate/vllm/vllm/third_party/flashmla/flash_mla_interface.py
+    test -f /opt/spark-ds41f/candidate/vllm/vllm/third_party/flashmla/flash_mla_interface.py
 
 # The nightly base installs CuTe DSL 4.7.1, which vLLM and quack-kernels require;
 # patches/b12x moves B12X's exact pin to it. Reinstall the hash-locked wheel set
@@ -221,7 +221,7 @@ RUN set -eux; \
       /tmp/cutlass-dsl-wheels/*.whl; \
     rm -rf /tmp/cutlass-dsl-wheels; \
     python3 -m pip install --no-cache-dir --no-build-isolation --no-deps \
-      /opt/spark3/candidate/b12x
+      /opt/spark-ds41f/candidate/b12x
 RUN python3 - <<'PY'
 import importlib.metadata as metadata
 
@@ -255,7 +255,7 @@ for consumer in ("vllm", "quack-kernels", "flashinfer-python", "nvidia-cudnn-fro
             raise RuntimeError(f"{consumer} requires {requirement}, but {installed} is installed")
 PY
 
-ENV PYTHONPATH=/opt/spark3/candidate/vllm:/opt/spark3/candidate/b12x
+ENV PYTHONPATH=/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x
 
 RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs python3 - <<'PY'
 import importlib.metadata as metadata
@@ -284,10 +284,10 @@ version = ctypes.c_int()
 assert ctypes.CDLL(nccl).ncclGetVersion(ctypes.byref(version)) == 0
 assert version.value == 23007, version.value
 with open(nccl, "rb") as handle:
-    built = open("/opt/spark3/nccl/libnccl.so.2.sha256").read().strip()
+    built = open("/opt/spark-ds41f/nccl/libnccl.so.2.sha256").read().strip()
     assert hashlib.sha256(handle.read()).hexdigest() == built, "NCCL is not the patched build"
 for name in ("_C_stable_libtorch", "_moe_C_stable_libtorch"):
-    with open(f"/opt/spark3/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
+    with open(f"/opt/spark-ds41f/candidate/vllm/vllm/{name}.abi3.so", "rb") as handle:
         assert handle.read(4) == b"\x7fELF"
 print("B12X build checks passed")
 PY
@@ -311,16 +311,16 @@ ARG TILE_KERNELS_PATCH_HEAD=unrecorded
 ARG TILE_KERNELS_TREE=unrecorded
 ARG TILE_KERNELS_VERSION=unrecorded
 
-LABEL local.spark3.tilelang.upstream="${TILELANG_UPSTREAM}" \
-      local.spark3.tilelang.ref="${TILELANG_REF}" \
-      local.spark3.tilelang.revision="${TILELANG_REVISION}" \
-      local.spark3.tilelang.patch-head="${TILELANG_PATCH_HEAD}" \
-      local.spark3.tilelang.tree="${TILELANG_TREE}" \
-      local.spark3.tile_kernels.upstream="${TILE_KERNELS_UPSTREAM}" \
-      local.spark3.tile_kernels.ref="${TILE_KERNELS_REF}" \
-      local.spark3.tile_kernels.revision="${TILE_KERNELS_REVISION}" \
-      local.spark3.tile_kernels.patch-head="${TILE_KERNELS_PATCH_HEAD}" \
-      local.spark3.tile_kernels.tree="${TILE_KERNELS_TREE}"
+LABEL local.spark-ds41f.tilelang.upstream="${TILELANG_UPSTREAM}" \
+      local.spark-ds41f.tilelang.ref="${TILELANG_REF}" \
+      local.spark-ds41f.tilelang.revision="${TILELANG_REVISION}" \
+      local.spark-ds41f.tilelang.patch-head="${TILELANG_PATCH_HEAD}" \
+      local.spark-ds41f.tilelang.tree="${TILELANG_TREE}" \
+      local.spark-ds41f.tile_kernels.upstream="${TILE_KERNELS_UPSTREAM}" \
+      local.spark-ds41f.tile_kernels.ref="${TILE_KERNELS_REF}" \
+      local.spark-ds41f.tile_kernels.revision="${TILE_KERNELS_REVISION}" \
+      local.spark-ds41f.tile_kernels.patch-head="${TILE_KERNELS_PATCH_HEAD}" \
+      local.spark-ds41f.tile_kernels.tree="${TILE_KERNELS_TREE}"
 
 RUN --mount=type=bind,from=tilelang-builder,source=/opt/tilelang,target=/tmp/tilelang-wheels \
     python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
@@ -393,7 +393,7 @@ for dist in metadata.distributions():
     if consumer != "vllm":
         for raw in dist.requires or ():
             check(consumer, raw, SHARED)
-for line in Path("/opt/spark3/candidate/vllm/requirements/cuda.txt").read_text().splitlines():
+for line in Path("/opt/spark-ds41f/candidate/vllm/requirements/cuda.txt").read_text().splitlines():
     line = line.split("#", 1)[0].strip()
     if line and not line.startswith("-"):
         check("vllm (requirements/cuda.txt)", line, SHARED)
@@ -413,11 +413,11 @@ ARG SPARKNET_PATCH_HEAD=unrecorded
 ARG SPARKNET_TREE=unrecorded
 ARG SPARKNET_VERSION=unrecorded
 
-LABEL local.spark3.sparknet.upstream="${SPARKNET_UPSTREAM}" \
-      local.spark3.sparknet.ref="${SPARKNET_REF}" \
-      local.spark3.sparknet.revision="${SPARKNET_REVISION}" \
-      local.spark3.sparknet.patch-head="${SPARKNET_PATCH_HEAD}" \
-      local.spark3.sparknet.tree="${SPARKNET_TREE}"
+LABEL local.spark-ds41f.sparknet.upstream="${SPARKNET_UPSTREAM}" \
+      local.spark-ds41f.sparknet.ref="${SPARKNET_REF}" \
+      local.spark-ds41f.sparknet.revision="${SPARKNET_REVISION}" \
+      local.spark-ds41f.sparknet.patch-head="${SPARKNET_PATCH_HEAD}" \
+      local.spark-ds41f.sparknet.tree="${SPARKNET_TREE}"
 
 ENV SPARKNET_ROCE_CACHE_DIR=/opt/sparknet/roce
 RUN --mount=type=bind,from=sparknet-builder,source=/opt/sparknet,target=/tmp/sparknet-wheels \

@@ -11,7 +11,9 @@ the wheel's `libnccl.so.2`; the image build checks the installed library's
 version and checksum. FlashInfer 0.6.18.post1 comes from the base image. The r1
 and r2 images came from the same recipe in
 `experiments/2026-09-23-karmic-kraken-reference/`; r3 was the first built by
-`bin/spark build`, and the promoted image is `vllm-ds41f-kkref:04c30fa98e79-r6`.
+`bin/spark build`. Images are tagged `spark-ds41f:<vLLM base>-<release>` (for example
+`spark-ds41f:19f2c20ed4d6-MMDD`); images before the release after spark-ds41f-1022 were
+tagged `vllm-ds41f-kkref:*`, and their tags stay as built.
 
 ```sh
 bin/spark build prepare        # create or repair the build directory
@@ -92,7 +94,7 @@ head, tree and version), the compile jobs as `TILELANG_COMPILE_JOBS`, and
 stage, builds wheels of both, replaces the base image's `tilelang` 0.1.12,
 installs TileKernels without dependencies, and checks the installed files,
 versions and every shared `apache-tvm-ffi` and `tilelang` requirement. The
-image gains `local.spark3.tilelang.*` and `local.spark3.tile_kernels.*`
+image gains `local.spark-ds41f.tilelang.*` and `local.spark-ds41f.tile_kernels.*`
 labels, and the GPU smoke imports both packages.
 
 Without those sources the command has no new argument, BuildKit skips the
