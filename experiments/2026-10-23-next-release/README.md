@@ -283,3 +283,22 @@ every `def`; an edit tool call whose old_string is a copied function), DSpark's 
 the spec-decode counters, and a suffix drafter simulated on the exact token ids the server
 returns. Queued as [copy-tp4.json](acceptance/copy-tp4.json) in the same window.
 
+**Result (2026-10-23 20:29-20:37 CET, run `next-copy-tp4`, candidate 1).** Twelve requests a category,
+no errors; DSpark's tokens a step from the counters, a suffix drafter simulated on the same token ids:
+
+| Category | Output tokens | DSpark | Suffix, 8-token match, up to 16 | 16-token match | 8-token match, up to 8 |
+| --- | --- | --- | --- | --- | --- |
+| prose | 4,464 | 2.24 | 2.24 | 2.24 | 2.24 |
+| reproduce a file | 18,177 | 4.96 | 15.9 | 16.3 | 8.4 |
+| the file with comments added | 18,310 | 5.10 | 14.9 | 14.9 | 8.2 |
+| an edit tool call | 2,122 | 5.41 | 7.1 | 7.3 | 6.1 |
+
+DSpark already takes about 5 of its 6 possible tokens a step on copied text: the transcripts
+study's flat 2.25 overstated the gap. What a suffix drafter adds is length: 16 tokens instead of
+DSpark's block of 5, three times the tokens a step on long copies, a third more on tool calls,
+nothing on prose. Weighted by the agent proxy's copy share (38% of output tokens, 19% if hidden
+reasoning copies like prose), with DSpark at about 5 on copies and 2.25 elsewhere, that is
+roughly +7-17% tokens a step at one stream, before the cost of verifying 17-row blocks. Building
+it is a hybrid drafter (per request, a suffix proposal when one matches, DSpark otherwise),
+variable-length block verification and graphs for the wider blocks: the next release's work, not
+this one's.
