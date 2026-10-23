@@ -210,6 +210,7 @@ B12X is the alternative backend in the same image.
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |
 | Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s); hosts set `vm.watermark_boost_factor=0` |
 | Async scheduling | enabled |
+| Prefix caching | enabled, 256-token blocks; cache reuse (`--enable-prefix-caching`) and cache reporting (`--enable-prompt-tokens-details`, `usage.prompt_tokens_details.cached_tokens` in every response) are separate switches, and without the second the key is absent while the cache still works |
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 
 The release comparison against r6d is in the

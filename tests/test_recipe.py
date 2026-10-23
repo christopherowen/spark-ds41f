@@ -22,13 +22,16 @@ def load(relative: str) -> dict:
 
 
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
+# Flags that change only what a response reports, added after the archived records.
+REPORTING_ARGS = ("--enable-prompt-tokens-details",)
 
 
 def serving_arguments(cluster: dict) -> list[str]:
     """``serve_args`` without what selects the checkpoint and its sampling defaults (the
-    model path and ``--override-generation-config``) and without the draft budget's
-    constant (r6x replaced the boot-timed cost model's scale with a row cost)."""
-    args = cluster["serve_args"][1:]
+    model path and ``--override-generation-config``), without the draft budget's
+    constant (r6x replaced the boot-timed cost model's scale with a row cost) and
+    without the reporting flags (#455 added the prompt-cache report)."""
+    args = [arg for arg in cluster["serve_args"][1:] if arg not in REPORTING_ARGS]
     if "--override-generation-config" in args:
         at = args.index("--override-generation-config")
         del args[at : at + 2]
@@ -197,6 +200,15 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
         self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
+
+    def test_every_shape_reports_prompt_cache_hits(self):
+        """Prefix caching reuses cached blocks; --enable-prompt-tokens-details reports the reuse
+        in every response's usage.prompt_tokens_details (cached_tokens). They are separate
+        switches: without the second the cache works and the key is absent (#455)."""
+        for name in self.recipe["shapes"]:
+            args = recipe.resolve(self.recipe, name)["serve_args"]
+            self.assertEqual(args.count("--enable-prefix-caching"), 1, name)
+            self.assertEqual(args.count("--enable-prompt-tokens-details"), 1, name)
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
