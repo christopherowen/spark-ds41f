@@ -3,7 +3,15 @@
 set -euo pipefail
 test "$(id -u)" = 0
 root=$(cd "$(dirname "$0")/../.." && pwd)
-backup=/var/lib/spark3/kernel-64k-boot
+backup=/var/lib/spark-ds41f/kernel-64k-boot
+# Until the release after spark-ds41f-1022 the service was spark3-kernel-memory and its
+# fstab backup lived under /var/lib/spark3: keep that backup, the one taken before the trial.
+legacy=/var/lib/spark3/kernel-64k-boot
+if [ -d "$legacy" ] && [ ! -e "$backup" ]; then
+  mkdir -p "$(dirname "$backup")"
+  mv "$legacy" "$backup"
+  rmdir /var/lib/spark3 2>/dev/null || true
+fi
 mkdir -p "$backup"
 test -e "$backup/fstab.before" || cp -a /etc/fstab "$backup/fstab.before"
 if [ ! -e /swap-64k.img ]; then
@@ -29,9 +37,16 @@ for i, line in enumerate(lines):
 assert found == 1, 'expected exactly one existing swap entry'
 p.write_text('\n'.join(lines) + '\n')
 PY
-install -m 0755 "$root/host/kernel-memory/spark3-kernel-memory" /usr/local/sbin/spark-kernel-memory
-install -m 0644 "$root/host/kernel-memory/spark3-kernel-memory.service" /etc/systemd/system/spark3-kernel-memory.service
+install -m 0755 "$root/host/kernel-memory/spark-ds41f-kernel-memory" /usr/local/sbin/spark-ds41f-kernel-memory
+install -m 0644 "$root/host/kernel-memory/spark-ds41f-kernel-memory.service" /etc/systemd/system/spark-ds41f-kernel-memory.service
+# The service it replaces, and the copy installed as spark-kernel-memory, which that
+# service's ExecStart never named.
+if [ -e /etc/systemd/system/spark3-kernel-memory.service ]; then
+  systemctl disable spark3-kernel-memory.service
+  rm /etc/systemd/system/spark3-kernel-memory.service
+fi
+rm -f /usr/local/sbin/spark3-kernel-memory /usr/local/sbin/spark-kernel-memory
 systemctl daemon-reload
-systemctl enable spark3-kernel-memory.service
-systemd-analyze verify /etc/systemd/system/spark3-kernel-memory.service
+systemctl enable spark-ds41f-kernel-memory.service
+systemd-analyze verify /etc/systemd/system/spark-ds41f-kernel-memory.service
 echo 'Boot memory support installed; current swap and running memory policy unchanged.'

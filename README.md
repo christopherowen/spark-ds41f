@@ -632,12 +632,26 @@ now holds a pointer, and deployment checks accept configurations that name
 it. The command is `bin/spark`, and experiment scripts call it; dated
 experiment records keep `bin/spark3` as they ran it.
 
-Names built into images or installed on the hosts keep `spark3` until they
-are rebuilt or reinstalled:
-- the `SPARK3_*` environment variables that the vLLM patches read;
-- the `local.spark3.*` image labels and the `/opt/spark3` paths inside the
-  image;
-- the hosts' `spark3-kernel-memory` service and RoCE marker.
+From the release after spark-ds41f-1022 (the owner's decision of 2026-10-19)
+the live names are spark-ds41f's too:
+- the serving container is `spark-ds41f` (its memory guard
+  `spark-ds41f-memguard`), and images are tagged `spark-ds41f:<vLLM base>-<release>`;
+- the image labels are `local.spark-ds41f.*` and its source trees live under
+  `/opt/spark-ds41f/candidate`;
+- the variables the vLLM patches read are `SPARK_DS41F_*`;
+- the caches are under `cache/spark-ds41f` (`/cache/spark-ds41f` in the container);
+- the hosts' boot memory policy is `spark-ds41f-kernel-memory.service`.
+
+Earlier releases keep the names they were built and recorded with: images
+tagged `vllm-ds41f-kkref:*` with `local.spark3.*` labels and `/opt/spark3`
+trees read `SPARK3_*`, serve as `dsv41-karmic-kraken` and are booted from their
+frozen recipes (spark-ds41f-1022's is `experiments/2026-10-23-next-release/1022`).
+The tools read either label prefix and source root, and their guards recognise
+either container. Each node keeps `cache/kkref` as a link to `cache/spark-ds41f`,
+so those recipes keep their warm caches. Experiments, manifests and patches are
+records and keep their names, as do the hosts' RoCE marker
+(`/usr/local/libexec/spark3-roce-marker`) and Local Inference Lab's
+`integration/karmic-kraken-beta` branch.
 
 Lab windows also honour holds and requests written as `~/spark3-hold.json`
 and `~/spark3-request.json`.

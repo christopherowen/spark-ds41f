@@ -158,7 +158,7 @@ services as warnings; serving still starts, with less memory margin.
 
 DGX OS ships `nvidia-drm-options-modeset0`, which turns `nvidia-drm` mode
 setting off. The promoted profiles load the embedding and output head into
-the GB10 display carve-out (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`), which needs
+the GB10 display carve-out (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`), which needs
 mode setting, and a display attached after boot stays dark without it:
 
 ```sh
@@ -299,7 +299,7 @@ yours to run, as root, with the service stopped:
 2. **Swap and memory policy.** Run
    `sudo experiments/2026-10-02-kernel-64k/install-boot-support.sh`. It adds a
    16 GiB `/swap-64k.img` with a 64 KiB header, marks the original
-   `/swap.img` `noauto`, and enables `spark3-kernel-memory.service`, which at
+   `/swap.img` `noauto`, and enables `spark-ds41f-kernel-memory.service`, which at
    boot activates the swap file that matches the running page size and, on
    64 KiB only, sets THP to `never` and `vm.min_free_kbytes=45166`
    ([host/kernel-memory](../host/kernel-memory/README.md)). It does not
@@ -354,8 +354,8 @@ run `sudo update-grub` and reboot. The memory service activates the original swa
 and the memory saver is not built for the 4 KiB kernel, so stock UVM loads.
 Serve the `tp3-triangle-4k` shape (`bin/spark site shape tp3-triangle-4k --apply`). To remove everything,
 follow the memory saver's [removal guide](https://github.com/christopherowen/dgx-spark-memory-saver/blob/main/docs/maintenance.md),
-disable `spark3-kernel-memory.service`, restore
-`/var/lib/spark3/kernel-64k-boot/fstab.before`, and delete `/swap-64k.img`
+disable `spark-ds41f-kernel-memory.service`, restore
+`/var/lib/spark-ds41f/kernel-64k-boot/fstab.before`, and delete `/swap-64k.img`
 once it is inactive ([host/kernel-memory](../host/kernel-memory/README.md)).
 Never remove an active swap file.
 
@@ -516,11 +516,12 @@ longer because it builds TileLang and TileKernels. More detail is in
 Copy the image to the other nodes and confirm the same image everywhere, by its layers:
 
 ```sh
+image=$(python3 -c 'import json; print(json.load(open("config/cluster.json"))["container"]["image"])')
 for host in dgx2 dgx3; do            # add dgx4 for TP4
-  docker save vllm-ds41f-kkref:04c30fa98e79-r6 | ssh "$host" docker load
+  docker save "$image" | ssh "$host" docker load
 done
 for host in dgx1 dgx2 dgx3; do       # add dgx4 for TP4
-  ssh "$host" docker image inspect vllm-ds41f-kkref:04c30fa98e79-r6 --format '{{json .RootFS.Layers}}' | sha256sum
+  ssh "$host" docker image inspect "$image" --format '{{json .RootFS.Layers}}' | sha256sum
 done
 ```
 
@@ -531,17 +532,17 @@ Your image differs from ours because the image records the deployment
 commit. The source-tree labels must match the profile's `expected_labels`;
 `doctor --live` and the launch preflight check them.
 
-Revert: `docker image rm vllm-ds41f-kkref:04c30fa98e79-r6` on each node.
+Revert: `docker image rm "$image"` on each node.
 
 ## 7. First start
 
-The first start JIT-compiles kernels into `cache/kkref/jit/`, so it takes
+The first start JIT-compiles kernels into `cache/spark-ds41f/jit/`, so it takes
 longer than later ones. Prebuild FlashInfer's sampling module on each node so
 that compile happens outside the memory-guarded startup:
 
 ```sh
 experiments/2026-09-23-canonical-minimal/prebuild_flashinfer.sh \
-  vllm-ds41f-kkref:04c30fa98e79-r6 kkref/flashinfer
+  "$image" spark-ds41f/flashinfer
 ```
 
 Then, from the head node, with a clean checkout of a published commit:

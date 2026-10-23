@@ -91,7 +91,7 @@ DEFAULT_MINUTES = 0  # no time cap: a window ends when its work is done or it is
 HEARTBEAT_MAX_AGE = 900
 # The profile a window restores; main() sets it from --production-config or the open window's hold.
 PRODUCTION_CONFIG = spark.DEFAULT_CLUSTER_CONFIG
-TRACE_LOG_DIR = "/cache/kkref/moe-checksums"
+TRACE_LOG_DIR = "/cache/spark-ds41f/moe-checksums"
 # Present while a gpu_clocks job has the SM clocks locked; restoring production resets them.
 GPU_CLOCKS_MARKER = LAB_HOME / "gpu-clocks-locked.json"
 
@@ -1355,9 +1355,8 @@ def save_engine_logs(out: str, lines: int = 4000, config: str | None = None) -> 
 def save_curves(step: dict) -> None:
     """The boot's measured DSpark step costs (vllm-0048 log line), if the arm logs them.
 
-    The profile runs on padding rows, which the MoE routers skip, unless the arm sets
-    SPARK3_DSPARK_PROFILE_TOKENS=random (real rows, routed experts included); the file
-    records which, since padded-row costs leave out a real step's largest part."""
+    Only images before vLLM 0184 time a boot profile; it runs on padding rows, which the
+    MoE routers skip, so padded-row costs leave out a real step's largest part."""
     logs = subprocess.run(["docker", "logs", container_name(step.get("config"))], text=True, capture_output=True)
     lines = [l for l in (logs.stdout + logs.stderr).splitlines() if "Profiled DSpark step costs" in l]
     if not lines:
@@ -1367,12 +1366,7 @@ def save_curves(step: dict) -> None:
         return
     out = ROOT / step["out"]
     out.parent.mkdir(parents=True, exist_ok=True)
-    rows = "padded"
-    if step.get("config"):
-        environment = spark.read_cluster(step["config"]).get("environment", {})
-        if environment.get("SPARK3_DSPARK_PROFILE_TOKENS") == "random":
-            rows = "real"
-    write_json_atomic(out, {"rows": rows, "verify": json.loads(found.group(1)),
+    write_json_atomic(out, {"rows": "padded", "verify": json.loads(found.group(1)),
                             "draft": json.loads(found.group(2))})
 
 
