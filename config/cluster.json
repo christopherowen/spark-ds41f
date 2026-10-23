@@ -86,6 +86,8 @@
     "GLOO_SOCKET_IFNAME": "enP7s7",
     "HF_HOME": "/cache/huggingface",
     "HF_HUB_OFFLINE": "1",
+    "MALLOC_ARENA_MAX": "2",
+    "MALLOC_MMAP_THRESHOLD_": "1048576",
     "MAX_JOBS": "2",
     "OMP_NUM_THREADS": "8",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,garbage_collection_threshold:0.6",
@@ -219,7 +221,7 @@
   "default_shape": "tp4-ring",
   "shapes": {
     "tp4-ring": {
-      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12).",
+      "notes": "Four nodes in a cable ring (two ConnectX-7 paths per neighbour); NCCL settings are sparknet's tp4-ring profile. Its DSpark draft budget is a rule of the inputs (row cost 0.035, since r6x): nothing is timed at boot. The embedding and head stay in regular memory: in the carve-out the head lost its L2 reuse (2026-10-12). Its long-prefill budget is 16,384 from the release after spark-ds41f-1022: with the CED skip, +5.4-6.3% prefill over 8,192 for decode steps beside a long prompt about twice as long (experiments/2026-10-23-next-release).",
       "nodes": 4,
       "nodes_config": "config/nodes-ring4.local.json",
       "fabric": {
@@ -228,7 +230,7 @@
       "sizing": {
         "max_model_len": 1048576,
         "max_num_seqs": 16,
-        "max_num_batched_tokens": 8192,
+        "max_num_batched_tokens": 16384,
         "kv_cache_memory_bytes": 11274289152,
         "prefix_cache_retention_interval": 8192
       },
