@@ -484,6 +484,9 @@ def fan_control_enabled(cluster: dict) -> bool:
 def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     problems: list[str] = topology.problems(cluster, nodes)
     problems.extend(kernel_backend.problems(cluster))
+    capture_errors, capture_warnings = cluster_recipe.capture_problems(cluster)
+    problems.extend(capture_errors)
+    problems.extend(Warn(warning) for warning in capture_warnings)
     problems.extend(benchmark_reference_problems(cluster, nodes))
     if cluster.get("promoted_baseline") != upstreams.get("generated_from_baseline"):
         problems.append("cluster and upstream locks name different baselines")

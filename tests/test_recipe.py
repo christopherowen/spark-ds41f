@@ -217,6 +217,101 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(values["long_prefill_token_threshold"], "8096")
         self.assertEqual(values["tensor_parallel_size"], "4")
 
+    def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
+        """The capture ladder ends at streams x (1 + drafts) even when that falls between two of
+        its steps (#434). Every shape's rows were a step already (96 on the ring, 48 on the
+        triangles), so each shape renders exactly what it rendered before."""
+        def previous_ladder(max_size):  # the ladder before #434, which could stop below max_size
+            ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, max_size + 1, 8)]
+            return [size for size in ladder if size <= max_size]
+
+        triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
+        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "8096"),
+                    "tp3-triangle": ("8", "48", triangle, "4048"),
+                    "tp3-triangle-4k": ("8", "48", triangle, "4048")}
+        self.assertEqual(set(self.recipe["shapes"]), set(expected))
+        for name, (streams, largest, ladder, threshold) in expected.items():
+            resolved = recipe.resolve(self.recipe, name)
+            with mock.patch.object(recipe, "capture_sizes", previous_ladder):
+                self.assertEqual(resolved, recipe.resolve(self.recipe, name), name)
+            self.assertEqual(argument(resolved, "--max-num-seqs"), streams, name)
+            self.assertEqual(argument(resolved, "--max-cudagraph-capture-size"), largest, name)
+            self.assertEqual(argument(resolved, "--compilation-config"),
+                             '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],'
+                             f'"cudagraph_capture_sizes":{json.dumps(ladder, separators=(",", ":"))}}}', name)
+            self.assertEqual(argument(resolved, "--long-prefill-token-threshold"), threshold, name)
+            self.assertEqual(recipe.capture_problems(resolved), ([], []), name)
+
+    def test_a_stream_count_between_ladder_steps_renders_a_consistent_pair(self):
+        """Six streams of 1 + 5 rows are 36, between the ladder's 32 and 40: the ladder ends at
+        36, as --max-cudagraph-capture-size does (#434 booted into vLLM's 36-versus-32 refusal)."""
+        six = json.loads(json.dumps(self.recipe))
+        six["shapes"]["tp3-triangle"]["sizing"]["max_num_seqs"] = 6
+        for name in ("tp3-triangle", "tp3-triangle-4k"):
+            resolved = recipe.resolve(six, name)
+            ladder = json.loads(argument(resolved, "--compilation-config"))["cudagraph_capture_sizes"]
+            self.assertEqual(argument(resolved, "--max-num-seqs"), "6", name)
+            self.assertEqual(argument(resolved, "--max-cudagraph-capture-size"), "36", name)
+            self.assertEqual(ladder, [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 36], name)
+            self.assertEqual(argument(resolved, "--long-prefill-token-threshold"), "4060", name)
+            self.assertEqual(recipe.capture_problems(resolved), ([], []), name)
+        # Every stream count from 1 to 32, at every draft count up to 7, ends where it should.
+        for drafts in range(8):
+            for streams in range(1, 33):
+                rows = streams * (1 + drafts)
+                ladder = recipe.capture_sizes(rows)
+                self.assertEqual(ladder[-1], rows)
+                self.assertEqual(ladder, sorted(set(ladder)))
+
+    def test_doctor_names_the_stream_count_when_a_profile_overrides_the_ladder(self):
+        """A profile that writes its own serve_args can change --max-num-seqs and leave the
+        ladder behind. A ladder that does not end at --max-cudagraph-capture-size is an error
+        (vLLM refuses it); one that ends below streams x (1 + drafts) is a warning, and one
+        that ends above it is fine (mixed prefill steps use its larger graphs)."""
+        spark = load_spark()
+        base = recipe.resolve(self.recipe, "tp3-triangle")
+
+        def profile(streams, largest, ladder):
+            cluster = json.loads(json.dumps(base))
+            args = cluster["serve_args"]
+            args[args.index("--max-num-seqs") + 1] = str(streams)
+            args[args.index("--max-cudagraph-capture-size") + 1] = str(largest)
+            at = args.index("--compilation-config") + 1
+            compilation = json.loads(args[at])
+            compilation["cudagraph_capture_sizes"] = ladder
+            args[at] = json.dumps(compilation)
+            return cluster
+
+        def capture_findings(cluster):
+            nodes = load("config/nodes.example.json")
+            with mock.patch.object(spark, "tracked_secret_problems", return_value=[]):
+                findings = spark.local_doctor(cluster, nodes, load("upstreams.lock.json"))
+            return [f for f in findings if "sizing.max_num_seqs" in f]
+
+        to_32 = recipe.capture_sizes(32)
+        # #434: six streams' maximum (36) over a ladder that stops at 32.
+        refused = profile(6, 36, to_32)
+        errors, warnings = recipe.capture_problems(refused)
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("sizing.max_num_seqs (6) x (1 + 5 drafts) = 36 rows", errors[0])
+        self.assertIn("end at 32 and --max-cudagraph-capture-size is 36", errors[0])
+        (finding,) = capture_findings(refused)
+        self.assertNotIsInstance(finding, spark.Warn)
+        # Ten streams (60 rows) under eight streams' ladder boot, and their full decode steps
+        # run without a graph.
+        stale = profile(10, 48, recipe.capture_sizes(48))
+        errors, warnings = recipe.capture_problems(stale)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("up to 48 rows, below sizing.max_num_seqs (10) x (1 + 5 drafts) = 60 rows", warnings[0])
+        (finding,) = capture_findings(stale)
+        self.assertIsInstance(finding, spark.Warn)
+        # Six streams under eight streams' ladder are consistent: vLLM boots and every step fits.
+        self.assertEqual(recipe.capture_problems(profile(6, 48, recipe.capture_sizes(48))), ([], []))
+        # The recipe's own rendering is consistent.
+        self.assertEqual(capture_findings(base), [])
+
     def test_each_shape_pins_its_prefill_budget(self):
         """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
         third of the model, so its headroom differs): changing one must not move another.

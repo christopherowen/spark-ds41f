@@ -53,9 +53,55 @@ def is_recipe(cluster: dict) -> bool:
 
 
 def capture_sizes(max_size: int) -> list[int]:
-    """The CUDA-graph capture ladder up to ``max_size``: 1-4, 6, 8, then every 4th to 32, then every 8th."""
+    """The CUDA-graph capture ladder up to ``max_size``: 1-4, 6, 8, then every 4th to 32, then
+    every 8th, ending at ``max_size`` itself. vLLM refuses a ladder whose largest size is not
+    ``--max-cudagraph-capture-size``, so a stream count whose rows fall between two steps
+    (6 streams x 6 rows = 36) adds its own last step (#434)."""
     ladder = [1, 2, 3, 4, 6, 8, *range(12, 33, 4), *range(40, max_size + 1, 8)]
-    return [size for size in ladder if size <= max_size]
+    return [*(size for size in ladder if size < max_size), max_size]
+
+
+def _argument(args: list[str], flag: str) -> str | None:
+    if flag not in args:
+        return None
+    at = args.index(flag) + 1
+    return args[at] if at < len(args) else None
+
+
+def capture_problems(cluster: dict) -> tuple[list[str], list[str]]:
+    """Errors and warnings when a configuration's CUDA-graph capture sizes disagree with its
+    sizing. The recipe derives both from ``sizing.max_num_seqs`` x (1 + drafts); a profile
+    that writes its own ``serve_args`` can leave the ladder behind when it changes the
+    stream count. vLLM refuses to start when the ladder does not end at
+    ``--max-cudagraph-capture-size`` (an error); a ladder that ends below the rows a full
+    decode step holds boots, but runs those steps without a CUDA graph (a warning). A
+    ladder above the rows is not flagged: its larger sizes still serve mixed prefill
+    steps as piecewise graphs."""
+    args = cluster.get("serve_args", [])
+    if "--enforce-eager" in args:
+        return [], []
+    try:
+        compilation = json.loads(_argument(args, "--compilation-config") or "{}")
+        speculative = json.loads(_argument(args, "--speculative-config") or "{}")
+    except ValueError:
+        return ["--compilation-config and --speculative-config must be JSON"], []
+    sizes = compilation.get("cudagraph_capture_sizes")
+    maximum = _argument(args, "--max-cudagraph-capture-size") or compilation.get("max_cudagraph_capture_size")
+    streams = _argument(args, "--max-num-seqs")
+    if not sizes or maximum is None or streams is None:
+        return [], []
+    drafts = int(speculative.get("num_speculative_tokens", 0)) if speculative else 0
+    rows = int(streams) * (1 + drafts)
+    rule = f"sizing.max_num_seqs ({streams}) x (1 + {drafts} drafts) = {rows} rows"
+    largest, maximum = max(sizes), int(maximum)
+    if largest != maximum:
+        return [f"the CUDA-graph capture sizes end at {largest} and --max-cudagraph-capture-size is "
+                f"{maximum}, which vLLM refuses at startup; both follow {rule}: a profile that writes "
+                "its own serve_args changes all three together"], []
+    if largest < rows:
+        return [], [f"CUDA graphs are captured up to {largest} rows, below {rule}: "
+                    "decode steps above it run without a CUDA graph"]
+    return [], []
 
 
 def shape_entry(recipe: dict, name: str) -> dict:
