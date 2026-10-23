@@ -211,3 +211,22 @@ a smaller step than 8K -> 16K (the per-step overhead is already amortized over t
 and the CED skip trims fewer nonfinal chunks), about three times 8K's stall step, and about
 3 GiB more peak memory.
 
+### Draft acceptance ([acceptance/](acceptance))
+
+The ceiling first (experiments/2026-10-18-dspark-acceptance, candidate 2: copy-aware drafting).
+On a local proxy for agent traffic (634 coding-agent sessions, 71,030 assistant turns, 26.4M
+output tokens rebuilt in DS4.1's prompt format and tokenized with its tokenizer; only counts
+kept), a suffix drafter (propose up to 16 tokens after the latest earlier occurrence of the last
+8) would cover 38% of output tokens. Taking its proposal whenever there is one and DSpark's flat
+2.25 tokens a step elsewhere gives 3.27 tokens a step (+45%); +28% at a 16-token match, +37%
+without DSML tool-call markup. The transcripts hide reasoning (about half the output); if it
+copies like prose, the figure is +14-23%. Most of the gain is in tool-call arguments (Bash +49%,
+edits +31%); prose gains 6%.
+
+What that leaves open is DSpark itself on those spans: it may already accept most of a copy.
+[copy_probe.py](acceptance/copy_probe.py) measures both on the same output: one stream,
+temperature 0, four categories (prose; reproduce a source file; the file with a comment above
+every `def`; an edit tool call whose old_string is a copied function), DSpark's tokens a step from
+the spec-decode counters, and a suffix drafter simulated on the exact token ids the server
+returns. Queued as [copy-tp4.json](acceptance/copy-tp4.json) in the same window.
+
