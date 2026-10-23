@@ -198,7 +198,7 @@ B12X is the alternative backend in the same image.
 | Reference precision | the mHC stream projection in FP32 (three exact TF32 parts per weight), the shared expert's SwiGLU in FP32 with one rounding, MoE partials rounded once per rank; WO-A's FP8 activations are the known deviation left |
 | Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
-| Image input | vision tower loaded; up to 4 images per request, the recipe's memory-budget limit, not the model's ([below](#images-per-request)); no host preprocessing cache |
+| Image input | vision tower loaded; up to 4 images per request, the recipe's chosen limit, not the model's ([below](#images-per-request)); no host preprocessing cache |
 | DSpark | 5 draft tokens, draft TP 3, adaptive verification (r6u's TP3 path: cost scale 2.0; r6x: the row cost 0.035, nothing timed), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
 | Collectives | sparknet one-shot all-reduce (up to 2 MiB) and all-gather over the triangle (`oneshot-direct`), larger all-reduces summed in rank order in FP32; the requested policy is enforced and a declined or lost backend fails startup (vLLM 0027, 0038) |
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
@@ -225,7 +225,7 @@ memory guards are unchanged.
 ## Images per request
 
 `--limit-mm-per-prompt {"image":4}` in the recipe's `serve_args` is the recipe's chosen
-per-request limit, a memory budget set when the vision tower was enabled
+per-request limit, set when the vision tower was enabled
 ([experiments/2026-09-25-vision](../experiments/2026-09-25-vision/README.md)). It is not a
 limit of the model. vLLM counts every image in a request, and a chat client resends its
 history, so the images retained in earlier turns count too: once a conversation holds a

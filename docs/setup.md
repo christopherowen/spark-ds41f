@@ -449,7 +449,7 @@ list, including the recipe's per-prompt image cap:
 --limit-mm-per-prompt '{"image":4}'
 ```
 
-Four is the recipe's per-request memory budget, not a limit of the model, and
+Four is the recipe's chosen per-request limit, not a limit of the model, and
 it counts the images a chat client resends with its history. A site that
 serves more than four images in one prompt gets, on every such request:
 
