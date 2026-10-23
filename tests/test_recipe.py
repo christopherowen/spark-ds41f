@@ -118,12 +118,22 @@ class RecipeTest(unittest.TestCase):
         release after it (the owner's decision of 2026-10-19), and nothing else: the container,
         label prefix, variables and cache paths are renamed, PYTHONPATH is left to the image
         (which sets it to the same trees) and the boot-profile variable nothing reads since
-        vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it."""
+        vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it. The release
+        also changes two things on purpose: the ring's long-prefill budget is 16,384 (the owner,
+        2026-10-23, "do 16"; experiments/2026-10-23-next-release, budget sweeps) and glibc malloc
+        keeps two arenas and a fixed 1 MiB mmap threshold (#439's growth; the memory window)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
             resolved = recipe.resolve(self.recipe, shape)
             released = renamed(load_spark().read_cluster(arm))
+            released["environment"] = {**released["environment"], "MALLOC_ARENA_MAX": "2",
+                                       "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            if shape == "tp4-ring":
+                args = released["serve_args"] = list(released["serve_args"])
+                for flag, value in (("--max-num-batched-tokens", "16384"),
+                                    ("--long-prefill-token-threshold", "16288")):
+                    args[args.index(flag) + 1] = value
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
         self.assertEqual(self.recipe["container"]["image"], "vllm-ds41f-kkref:19f2c20ed4d6-1022-4")
@@ -176,6 +186,8 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual(load(arm)["extends"]["config"], frozen_path, arm)
         for path in ("experiments/2026-10-22-spark-ds41f-1022", "experiments/2026-10-23-next-release"):
             for file in sorted((ROOT / path).rglob("*.json")):
+                if file.is_relative_to(ROOT / "experiments/2026-10-23-next-release/rc2"):
+                    continue  # candidate 2 runs the renamed recipe on its own image
                 data = json.loads(file.read_text())
                 if isinstance(data, dict) and "extends" in data:
                     self.assertNotEqual(data["extends"].get("config"), "config/cluster.json", file)
@@ -279,7 +291,7 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(recipe.capture_sizes(96)[-6:], [56, 64, 72, 80, 88, 96])
         values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, "tp4-ring"))
         self.assertEqual(values["max_cudagraph_capture_size"], "96")
-        self.assertEqual(values["long_prefill_token_threshold"], "8096")
+        self.assertEqual(values["long_prefill_token_threshold"], "16288")
         self.assertEqual(values["tensor_parallel_size"], "4")
 
     def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
@@ -291,7 +303,7 @@ class RecipeTest(unittest.TestCase):
             return [size for size in ladder if size <= max_size]
 
         triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
-        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "8096"),
+        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
                     "tp3-triangle": ("8", "48", triangle, "4048"),
                     "tp3-triangle-4k": ("8", "48", triangle, "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
@@ -381,7 +393,7 @@ class RecipeTest(unittest.TestCase):
         """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
         third of the model, so its headroom differs): changing one must not move another.
         The threshold is the budget less streams x (1 + drafts)."""
-        expected = {"tp4-ring": ("8192", "8096"), "tp3-triangle": ("4096", "4048"),
+        expected = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("4096", "4048"),
                     "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
