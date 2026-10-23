@@ -168,3 +168,36 @@ for that prompt's duration. Memory stays 13.7 GiB above dgx1's 5 GiB guard. With
 16,384 would put prefill at +12.2% (32K), +12.7% (131K) and +10.9% (1M) over spark-ds41f-1022
 (the 8,192 arms of the two sessions agree to 0.01% at 32K).
 
+
+## Before promotion: the remaining items
+
+Owner, 2026-10-23: "we won't promote until we address the 'other items' at least" (the live-name
+rename, the start-up memory peak, draft acceptance, GLP steering on, and #439's memory growth),
+then "do 16 and work through the rest": the ring's long-prefill budget becomes 16,384 in the
+release (candidate 2 carries it; its gate and comparison qualify it).
+
+### Memory: #439's growth and the start-up peak ([memory/](memory))
+
+#439 (JordiPosthumus) measured, on two TP3 rings at 1M, about 1.2 GiB lost over three hours of
+ordinary use: the API server 1.68 -> 2.44 GiB and the engine core 1.43 -> 1.97 GiB, never
+returned; the GPU worker flat. Production here has served nothing since its 14:20 CET restore
+(API server 1.69 GiB, engine core 1.49 GiB, worker 4.86 GiB at 16:44), so the growth is
+reproduced under load in a window, not waited for.
+
+[memory-tp4.json](memory/memory-tp4.json), one window on the ring, two arms of candidate 1 at
+16,384 with the start-up allocator trace (a diagnostic overlay of `gpu_worker.py`, behaviour
+unchanged; from experiments/2026-10-21-startup-memory):
+
+1. [soak.py](memory/soak.py) for 75 minutes: four agent sessions resend their whole history
+   every turn, growing by a 16-48K-token real-text tool result until they pass 960K tokens and
+   start over, beside eight short chat streams. Every turn makes the API server parse, render
+   and tokenize up to a million tokens again and the engine core hash and schedule them.
+2. The same with glibc malloc's growth sources pinned (`MALLOC_ARENA_MAX=2`, a fixed 1 MiB
+   `MALLOC_MMAP_THRESHOLD_`), as a hypothesis test.
+
+[sampler.py](memory/sampler.py) runs on every node through the window (armed by
+[watch.sh](memory/watch.sh)): MemAvailable every 0.1 s, every container process's RSS every
+0.5 s, and every 30 s the API server's and engine core's resident memory by mapping kind (brk
+heap, CPython arenas, glibc thread arenas, large single mappings, files), which separates
+allocator high-water from live objects. Each arm's two boots also give the start-up peak's
+attribution by phase (allocator trace against the engine log) on four nodes.

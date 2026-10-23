@@ -1,0 +1,26 @@
+{
+ "notes": "Candidate 1 at the 16,384 long-prefill budget (budget-16384-tp4.json) with a diagnostic-only overlay of vllm/v1/worker/gpu_worker.py (release-next 1fa3028ec plus the start-up allocator trace of experiments/2026-10-21-startup-memory): SPARK3_STARTUP_MEMORY_TRACE logs each rank's caching-allocator totals every 0.1 s for the first 900 s. Behaviour unchanged.",
+ "extends": {
+  "config": "experiments/2026-10-23-next-release/budget-16384-tp4.json"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-23-next-release/memory/overlays/vllm_v1_worker_gpu_worker.py",
+     "/opt/spark3/candidate/vllm/vllm/v1/worker/gpu_worker.py",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "SPARK3_STARTUP_MEMORY_TRACE": "/cache/next-memory/soak",
+   "SPARK3_STARTUP_MEMORY_TRACE_SECONDS": "900"
+  }
+ }
+}
