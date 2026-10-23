@@ -1,0 +1,90 @@
+{
+ "experiment": "experiments/2026-10-23-next-release",
+ "run": "next-release-screen-tp4",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "kernel",
+   "bundles": [
+    {
+     "node": "dgx4",
+     "bundle": "experiments/2026-10-23-next-release/bundles/gpu-tests"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-22-spark-ds41f-1022/control_spellings_probe.py",
+     [],
+     "control-spellings"
+    ],
+    [
+     "experiments/2026-10-22-spark-ds41f-1022/sink_counters.py",
+     [],
+     "sink-ordinary"
+    ],
+    [
+     "experiments/2026-10-19-sink-rejection-v2/probes.py",
+     [
+      "--nodes",
+      "dgx1,dgx2,dgx3,dgx4"
+     ],
+     "probes"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "candidate-tp4.json",
+     "label": "candidate"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "suite": "experiments/2026-10-23-next-release/screen-suite-tp4.json",
+   "arms": [
+    {
+     "config": "candidate-tp4-dev.json",
+     "label": "candidate"
+    },
+    {
+     "config": "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json",
+     "label": "spark-ds41f-1022"
+    },
+    {
+     "config": "candidate-tp4-dev.json",
+     "label": "candidate-again"
+    }
+   ]
+  }
+ ]
+}
