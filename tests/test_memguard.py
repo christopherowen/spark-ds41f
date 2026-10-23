@@ -130,6 +130,7 @@ fi
         available_gib: int,
         wait_seconds: int,
         phase: str = "startup",
+        available_kib: int | None = None,
         warn_gib: int | None = None,
         mem_sequence: list[int] | None = None,
         sleep_limit: int | None = None,
@@ -149,7 +150,8 @@ fi
                 "READY_FILE": str(self.ready),
                 "FAKE_STATE": str(self.state),
                 "FAKE_ACTIONS": str(self.actions),
-                "FAKE_MEM_AVAILABLE_KIB": str(available_gib * 1024 * 1024),
+                "FAKE_MEM_AVAILABLE_KIB": str(available_kib if available_kib is not None
+                                              else available_gib * 1024 * 1024),
             }
         )
         if warn_gib is not None:
@@ -182,6 +184,40 @@ fi
         self.assertEqual(result.returncode, 1)
         self.assertFalse(self.ready.exists())
         self.assertIn("kill kill --signal KILL candidate", self.actions.read_text())
+
+    def test_a_sample_short_by_1344_kib_kills_at_once(self) -> None:
+        # A fixed line: one sample, however close, kills (#410's 1.3 MiB miss still kills).
+        result = self._run(state="true", available_gib=0, available_kib=5 * 1024 * 1024 - 1344,
+                           wait_seconds=0, phase="steady")
+
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertIn("kill kill --signal KILL candidate", actions)
+        self.assertIn("killing candidate during steady: MemAvailable 5241536 KiB below 5242880 KiB "
+                      "(short by 1344 KiB)", actions)
+
+    def test_the_warn_line_never_delays_the_kill(self) -> None:
+        # Warned at 6 GiB, then the first sample below 5 GiB kills: no second sample is read.
+        result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady",
+                           warn_gib=8, mem_sequence=[6, 4, 16, 16], sleep_limit=10)
+
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertEqual(actions.count("kill kill --signal KILL candidate"), 1)
+        self.assertEqual(actions.count("low headroom on candidate during steady"), 1)
+        self.assertIn("killing candidate during steady: MemAvailable 4194304 KiB below 5242880 KiB "
+                      "(short by 1048576 KiB); warn line 8388608 KiB", actions)
+        self.assertEqual(Path(f"{self.state}.calls").read_text(encoding="utf-8").strip(), "2")
+        # A first sample below the kill line kills before any warning.
+        self.actions.unlink()
+        Path(f"{self.state}.calls").unlink()
+        Path(f"{self.state}.sleeps").unlink()
+        result = self._run(state="true", available_gib=16, wait_seconds=0, phase="steady",
+                           warn_gib=8, mem_sequence=[4, 16], sleep_limit=10)
+        self.assertEqual(result.returncode, 1)
+        actions = self.actions.read_text(encoding="utf-8")
+        self.assertIn("kill kill --signal KILL candidate", actions)
+        self.assertNotIn("low headroom", actions)
 
     def test_prelaunch_guard_rejects_low_memory_without_starting_container(
         self,

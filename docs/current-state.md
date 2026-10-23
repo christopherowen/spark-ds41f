@@ -208,7 +208,7 @@ B12X is the alternative backend in the same image.
 | L2 weight prefetch | on (base default on SM121); TileLang scale words prefetched with each weight (vLLM 0044) |
 | B12X autotune | disabled |
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |
-| Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s); hosts set `vm.watermark_boost_factor=0` |
+| Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s), each killing on its first sample below; an optional steady warn line (`host.memguard_warn_gib`, off) only logs; hosts set `vm.watermark_boost_factor=0` |
 | Async scheduling | enabled |
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 

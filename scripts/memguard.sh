@@ -69,14 +69,17 @@ while true; do
     fi
     exit 1
   fi
+  # The guard is a fixed line: the first sample below it ends the container.
   if ((available_kib < threshold_kib)); then
+    breach="MemAvailable ${available_kib} KiB below ${threshold_kib} KiB (short by $((threshold_kib - available_kib)) KiB)"
+    if ((warn_kib > 0)); then
+      breach+="; warn line ${warn_kib} KiB"
+    fi
     if [[ "$running" == "true" ]]; then
-      logger -t spark-memguard \
-        "killing $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below ${threshold_kib} KiB"
+      logger -t spark-memguard "killing $CONTAINER_NAME during $MEMGUARD_PHASE: $breach"
       docker kill --signal KILL "$CONTAINER_NAME" >/dev/null
     else
-      logger -t spark-memguard \
-        "refusing to wait for $CONTAINER_NAME during $MEMGUARD_PHASE: MemAvailable ${available_kib} KiB below ${threshold_kib} KiB"
+      logger -t spark-memguard "refusing to wait for $CONTAINER_NAME during $MEMGUARD_PHASE: $breach"
     fi
     exit 1
   fi
