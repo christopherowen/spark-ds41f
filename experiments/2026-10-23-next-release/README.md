@@ -202,6 +202,41 @@ heap, CPython arenas, glibc thread arenas, large single mappings, files), which 
 allocator high-water from live objects. Each arm's two boots also give the start-up peak's
 attribution by phase (allocator trace against the engine log) on four nodes.
 
+**Result (2026-10-23 17:15-19:50 CET, run `next-memory-tp4`).** Both arms served the same load
+without an error: 554 agent turns (20 restarts of a session, prompts up to 966,014 tokens, 270M
+prompt tokens) and about 310 chat requests. dgx1, where the API server and engine core run:
+
+| Process | Plain: soak start -> 10 min -> 75 min (high) | Malloc pinned |
+| --- | --- | --- |
+| API server | 1.76 -> 2.84 -> 2.92 GiB (3.19) | 1.67 -> 1.95 -> 2.02 GiB (2.28) |
+| engine core | 1.51 -> 1.64 -> 1.67 GiB | 1.44 -> 1.55 -> 1.61 GiB |
+| lowest MemAvailable during the soak | 17.10 GiB | 18.11 GiB |
+
+By mapping kind, the plain API server's growth is glibc's per-thread arenas: 79 MiB in 19 arena
+mappings at the start, 1,158 MiB in 36 at the end (+1,078 of its +1,159 MiB); the brk heap, CPython's
+arenas and file mappings barely move. It is a high-water mark, not a leak: the API server reaches
+it within ten minutes and holds it (2.72-2.99 GiB from 20 to 75 minutes). Each request thread that
+parses, renders and tokenizes a million-token conversation frees its buffers into its own arena,
+and glibc keeps an arena's freed memory; glibc also raises its mmap threshold after a large free,
+so later large buffers come from the arenas instead of mmap. With two arenas and a fixed 1 MiB
+threshold the API server grows 0.35 GiB, nearly all in the first ten minutes (1.95 GiB at 10
+minutes, 2.02 at 75). The engine core's smaller growth (+0.16 GiB) is the same in both arms.
+#439's three hours of ordinary use (API server +0.76 GiB, engine core +0.54 GiB) fit this.
+
+The fix is the two settings in the recipe's environment (`MALLOC_ARENA_MAX=2`,
+`MALLOC_MMAP_THRESHOLD_=1048576`), for every process of the container; candidate 2 carries them and
+its release comparison checks that they cost nothing.
+
+**Start-up on the ring: nothing to cut.** Each arm's boot was traced (allocator totals every
+0.1 s against the engine log; [analyze_startup.py](memory/analyze_startup.py)). dgx1 reaches API
+readiness with 19.15 and 19.32 GiB available, 14 GiB above the 5 GiB guard; the lows after that
+(18.93, 18.69 GiB) come with the soak's first minute, not the boot. torch's reserve only grows
+through the boot (72.9 GiB weights, 77.7 with the KV pool, 88.1 after preparation, 91.0 after graph
+capture; nothing is released and reallocated), and MemAvailable falls as the page cache gives way
+to the GPU's memory. The 0.5-1.2 GiB released late after TP3 boots (2026-10-22, four boots) does
+not occur at TP4; attributing it needs the triangle cabled. What TP3's guard was short of in #439 is
+steady headroom on the head node, which the arena fix returns (about 1 GiB at the soak's load).
+
 ### A 24,576 budget ([budget24-tp4.json](budget24-tp4.json))
 
 Suggested to the owner on 2026-10-23: try 24K. [budget-24576-tp4.json](budget-24576-tp4.json) is
