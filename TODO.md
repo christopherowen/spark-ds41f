@@ -285,7 +285,8 @@ and eight streams for every decode change, and sixteen on TP4.
   at eight streams.
 - **Python-only vLLM changes need no image build to screen.** Bind-mount the
   changed files from the checked patch branch over the last candidate image via
-  `container.mounts` (the image imports vLLM from `/opt/spark3/candidate/vllm`).
+  `container.mounts` (the image imports vLLM from `/opt/spark-ds41f/candidate/vllm`;
+  images before the release after spark-ds41f-1022 from `/opt/spark3/candidate/vllm`).
   Build only for promotion.
 - **Queue arms unattended** with a `setsid -f` chain, `ssh -n` and logs in
   `~/tl-logs`. Keep other GPU work off the nodes while an arm is timing, and
@@ -324,7 +325,7 @@ and eight streams for every decode change, and sixteen on TP4.
   service before rebooting a node, and don't restart inference while it is in
   use.
 - **Carve-out integrity check is a debug mode.** Patch 0026's
-  `SPARK3_DISPLAY_CARVEOUT_CHECK_SECONDS` stays unset in production; set it
+  `SPARK_DS41F_DISPLAY_CARVEOUT_CHECK_SECONDS` stays unset in production; set it
   (for example to 60) only to chase a suspected carve-out fault. It costs
   about 20 ms per check and nothing when unset. Serving-path changes for
   quality must not add computation.
