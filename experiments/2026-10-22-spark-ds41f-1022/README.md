@@ -8,7 +8,8 @@ promotion gate. Named per the release naming adopted for the next release: `spar
 
 **Status (2026-10-23 00:35 CET): promoted as `spark-ds41f-1022`, image `-1022-4`, and serving on the
 triangle at 1M** (owner: "begin the promotion routine"; merged as 590786b, #462; [Promotion](#promotion)), and
-on the ring since 2026-10-23 ([The ring](#the-ring-2026-10-23)).
+on the ring since 2026-10-23 02:10 CET ([The ring](#the-ring-2026-10-23); merged as 8a8b4525, #465;
+API ready in 86.2 s, `doctor --live` OK, KV 8,580,566 tokens, the control-spellings probe passes live).
 Deployed 00:33-00:35 CET under a deploy hold: API ready in 94.5 s, `doctor --live` OK, KV 4,765,898
 tokens; the control-spellings probe passes on the live service. The ring is unqualified on
 this image until a ring release run. The paragraphs below record how the candidate got there.

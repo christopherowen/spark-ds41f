@@ -131,7 +131,14 @@
       "kv_cache_memory_bytes": 5268045824,
       "note": "the triangle, read from spark-ds41f-1022's gate and promotion boots on 2026-10-22 (the same 4.90625 GiB pool as r6x: GPU KV cache 4,765,898 tokens, 4.55x for 1,048,576; model load 94.26 GiB a rank; 186 TileLang calls prepared in 5.2 s); dgx1 / dgx2 / dgx3 6.54 / 7.93 / 8.14 GiB available serving"
     },
-    "note": "the triangle: capacity.tp3; the ring runs r6x's TP4 pool (10.5 GiB, 8,580,566 tokens, 8.18x 1M), recorded at deployment"
+    "note": "the triangle: capacity.tp3; the ring: capacity.tp4",
+    "tp4": {
+      "kv_cache_tokens": 8580566,
+      "max_model_len": 1048576,
+      "max_num_seqs": 16,
+      "reported_full_context_concurrency": 8.18,
+      "note": "the ring, read from the TP4 production boot on 2026-10-23 (r6x's pool, 10.5 GiB); model load 72.19 GiB a rank; MemAvailable 23.0-24.3 GiB serving in the gate"
+    }
   },
   "change_from_previous": "r6x plus vLLM 0185 (the TP group's broadcast on the RoCE policy), 0221 and 0223 (sink detection and draft-zero rejection, on by default for DeepSeek V4.1), 0222 and 0226 (late admission), 0224 and 0225 (tests), 0227 (control-token spellings in request text stay plain text, #449) and sparknet 0.5.0 (the wider one-shot data phase). Promoted on the triangle at 1M against r6x; outputs identical to r6x's. Qualified on the ring on 2026-10-23 against r6x's TP4 path (trimmed comparison, one session); outputs identical to r6x's on the ring.",
   "evidence": {
@@ -180,5 +187,5 @@
   },
   "deployment": "TP3 production on the triangle at 1M since 2026-10-22 22:35 UTC (00:35 CET) from 590786b (#462): cluster sync --revision origin/main --apply, cluster start --replace --apply under a deploy hold (shape unchanged; API ready in 94.5 s); doctor --live OK (live cluster matches; its only warnings are the weight shards' extent counts on dgx1-dgx3, which the deploy does not touch); one image ID on dgx1-dgx3 (sha256:234b0a791418); 186 TileLang calls prepared in 5.4 s; GPU KV cache 4,765,898 tokens (4.55x 1M); model load 94.26 GiB a rank. The control-spellings probe passes on the live service in all eight request locations; sink counters zero on ordinary traffic.",
   "benchmark_reference_tp4": "manifests/suites/2026-10-22-spark-ds41f-1022-tp4 (on the ring at 1M)",
-  "deployment_tp4": "pending: deployed after this commit merges"
+  "deployment_tp4": "TP4 production on the ring at 1M since 2026-10-23 00:10 UTC (02:10 CET) from 8a8b4525 (#465): the owner re-cabled the ring (LLDP 1-2, 2-3, 3-4, 4-1; dgx1 and dgx3 netplans to 10.14 / 10.34, fleet 077bb3e); site shape tp4-ring; r6x from the frozen recipe served the ring while -1022-4 was qualified; then cluster sync --revision origin/main --apply, cluster start --replace --apply under a deploy hold (shape unchanged; API ready in 86.2 s); doctor --live OK (warnings: weight shards' extent counts only); one image ID on dgx1-dgx4 (sha256:234b0a791418); 187 TileLang calls prepared in 5.5 s; GPU KV cache 8,580,566 tokens (8.18x 1M); model load 72.19 GiB a rank. The control-spellings probe passes on the live service."
 }
