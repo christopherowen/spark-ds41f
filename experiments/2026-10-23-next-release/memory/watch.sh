@@ -46,7 +46,7 @@ say "queue started $name ($log); arming samplers"
 nodes "sudo -n setsid -f python3 $dir/sampler.py --out $dir/out --node \$(hostname -s) --stop $dir/STOP \
   --max-seconds 18000 --rollup-seconds 5 --worker-seconds 60 --maps-seconds 30 < /dev/null >> $dir/sampler.log 2>&1"
 sleep 2
-nodes "echo \$(hostname -s): \$(pgrep -fc '[n]ext-memory/sampler.py --out') sampler process(es)"
+nodes "echo \$(hostname -s): \$(pgrep -fc '[n]ext-memory/sampler.py --out') sampler processes"
 
 until new_lines | grep -qE "QUEUE job $name (done|failed)"; do sleep 5; done
 say "$(new_lines | grep -E "QUEUE job $name (done|failed)" | tail -1 | cut -f2)"
