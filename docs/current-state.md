@@ -152,14 +152,14 @@ pin on every node.
 
 Since r6x DSpark's verifier budgets drafts by a fixed linear step cost and times nothing,
 on both shapes. Before it, the verifier scheduled on cost curves timed on a boot. A profile
-without a pinned directory got its build's own (`bin/spark` derives `SPARK3_DSPARK_COST_DIR`
+without a pinned directory got its build's own (`bin/spark` derived `SPARK3_DSPARK_COST_DIR`
 from the image's source trees, code overlays, environment and serve arguments, all but the
 dev-mode RPC switch): a new build profiled itself on its first boot and reused its curves
 after. `tp3-triangle` did so from 2026-10-15; `tp4-ring` pinned r6h's curves
 (`ring4-r6h-headout-20261012`) through r6n and ran on its build's own from r6v.
 
 TP4 keeps the embedding and head in regular memory
-(`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`); TP3 keeps them in
+(`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`); TP3 keeps them in
 the display carve-out, which its KV budget needs. TP4's temperature-0 and greedy references
 are r6v's (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e), which r6x reproduces; TP3's are r6u's
 TP3 path (62313cb5 / 9742ac2c, 4d143977 / 12fd8257), which r6x at 1M reproduces.
@@ -196,7 +196,7 @@ B12X is the alternative backend in the same image.
 | Page-size profiles | 64 KiB selected; 4 KiB retains 2.2 GiB KV and a 262,144-token limit |
 | Output head | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`; B12X 0012, vLLM 0028), bit-identical to the checkpoint; FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`, the reference's `head_dtype`) |
 | Reference precision | the mHC stream projection in FP32 (three exact TF32 parts per weight), the shared expert's SwiGLU in FP32 with one rounding, MoE partials rounded once per rank; WO-A's FP8 activations are the known deviation left |
-| Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
+| Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
 | Image input | vision tower loaded; up to 4 images per request, the recipe's chosen limit, not the model's ([below](#images-per-request)); no host preprocessing cache |
 | DSpark | 5 draft tokens, draft TP 3, adaptive verification (r6u's TP3 path: cost scale 2.0; r6x: the row cost 0.035, nothing timed), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
@@ -204,7 +204,7 @@ B12X is the alternative backend in the same image.
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
 | CUDA graphs | full, capture sizes 1-48 |
 | Engram projection | sharded across ranks (`projection_tp`) |
-| Engram rows | one native reader thread, rows of host-known tokens read before the step; disk shards on interleaved whole hash columns, joined by an all-gather; one bounded wait per table (`SPARK3_ENGRAM_ROWS_TIMEOUT_MS`, 10 s) |
+| Engram rows | one native reader thread, rows of host-known tokens read before the step; disk shards on interleaved whole hash columns, joined by an all-gather; one bounded wait per table (`SPARK_DS41F_ENGRAM_ROWS_TIMEOUT_MS`, 10 s) |
 | L2 weight prefetch | on (base default on SM121); TileLang scale words prefetched with each weight (vLLM 0044) |
 | B12X autotune | disabled |
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |
