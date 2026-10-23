@@ -12,6 +12,14 @@ shapes; `tp4-ring` is the four-node ring's TP4 1M shape, with 16 sequences
 | `tp3-triangle` | 64 KiB, memory-saver enabled | 4.91 GiB | 1,048,576 |
 | `tp4-ring` (four nodes) | 64 KiB, memory-saver enabled | 10.5 GiB | 1,048,576 |
 
+The startup guard is not the only bound on pool size. On a 128 GB node the
+steady guard binds about 1 GiB earlier: a TP3 ring on the promoted 4.90625 GiB
+pool boots with roughly 4.8 GiB available and loses ~1.2 GiB over three hours of
+ordinary use (`vllm`'s API server and the engine core both grow; the TP worker
+does not), which reaches a 3 GiB steady guard and stops the ring. Dropping the
+pool to 4.0 GiB leaves ~6.8 GiB at boot and the same work is survivable. Size the
+pool against the lowest guard the site runs, not only the startup floor.
+
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV
 capacity and admission are measured at startup and under load. The selected
