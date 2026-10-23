@@ -144,55 +144,8 @@ def node_by_name(nodes: dict, name: str) -> dict:
     raise SystemExit(f"unknown node {name!r}")
 
 
-# DSpark's verifier prices its steps from cost curves it times on a boot and pins in
-# SPARK3_DSPARK_COST_DIR under a key of the shape set (TP size, limits, shapes). A profile
-# that names no directory gets one per build (build_fingerprint), so a new build profiles
-# itself on its first boot, reuses its curves after, and never schedules on another build's.
-# A profile that names one pins curves across builds (an A/B on shared curves).
-DSPARK_COST_ROOT = "/cache/kkref/dspark-costs"
-
-
-def content_digest(path: Path) -> str:
-    """A file's SHA-256, or a directory's over its files' relative paths and digests."""
-    if not path.is_dir():
-        return sha256(path)
-    files = sorted(p for p in path.rglob("*") if p.is_file())
-    return hashlib.sha256(json.dumps([[str(f.relative_to(path)), sha256(f)] for f in files]).encode()).hexdigest()
-
-
-# Settings that change no step's timing, so a release's dev-mode arm and production share curves.
-NOT_TIMING = ("SPARK3_DSPARK_COST_DIR", "VLLM_SERVER_DEV_MODE")
-
-
-def build_fingerprint(cluster: dict) -> str:
-    """What a profile's step times depend on: its image's expected source trees, the code
-    mounted into /opt over it (the repository's files by content, anything else by path),
-    its environment and its serve arguments. A traced or delayed arm therefore never pins
-    curves for the production build."""
-    home = cluster["host"]["home"]
-    checkout = repository_path(cluster).rstrip("/") + "/" if "deployment" in cluster else None
-    overlays = []
-    for source, destination, _ in sorted(cluster["container"]["mounts"]):
-        if not destination.startswith("/opt/"):
-            continue
-        path = source.format(home=home)
-        inside = checkout is not None and path.startswith(checkout)
-        overlays.append([destination, content_digest(ROOT / path[len(checkout):]) if inside else path])
-    identity = {"labels": cluster["container"].get("expected_labels", {}), "overlays": overlays,
-                "environment": {k: str(v) for k, v in cluster["environment"].items() if k not in NOT_TIMING},
-                "serve_args": cluster["serve_args"]}
-    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
-
-
-def dspark_cost_dir(cluster: dict) -> str:
-    """The profile's pinned-curve directory: its own setting, else its build's."""
-    return cluster["environment"].get("SPARK3_DSPARK_COST_DIR") or f"{DSPARK_COST_ROOT}/build-{build_fingerprint(cluster)}"
-
-
 def expected_environment(cluster: dict, node: dict) -> dict[str, str]:
-    env = topology.node_environment(cluster, node)
-    env["SPARK3_DSPARK_COST_DIR"] = dspark_cost_dir(cluster)
-    return env
+    return topology.node_environment(cluster, node)
 
 
 def expected_command(cluster: dict, node: dict) -> list[str]:
@@ -5239,7 +5192,6 @@ def bench_identity(cluster: dict, nodes: dict, config_name: str, config_path: Pa
         "kernel_backend": kernel_backend.backend(cluster),
         "promoted_baseline": cluster.get("promoted_baseline"),
         "image": cluster["container"]["image"],
-        "dspark_cost_dir": dspark_cost_dir(cluster),
         "client_commit": repository_revision(),
         "client_dirty": bool(repository_dirty()),
         "client_host": socket.gethostname(),
