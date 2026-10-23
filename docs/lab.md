@@ -72,7 +72,7 @@ changes, so it cannot drift from what it is compared with:
 ```json
 {
   "extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
-  "set": {"container": {"image": "vllm-ds41f-kkref:...-r6m"}, "environment": {"NAME": "value"}},
+  "set": {"container": {"image": "spark-ds41f:...-MMDD"}, "environment": {"NAME": "value"}},
   "unset": ["environment.OLD_NAME"]
 }
 ```
@@ -330,7 +330,8 @@ What the rules guard against (each found the hard way, 2026-10-11):
 - **Repeats.** With two repeats a t interval spans tens of percent. The report uses
   1.96 sd / sqrt(n) for prefill, with three repeats.
 - **Draft budget.** Since r6x the DSpark budget is a rule of the inputs (row cost 0.035)
-  and nothing is timed at boot, so arms of r6x and later draft identically. Arms of earlier
-  builds run on pinned DSpark cost curves (`SPARK3_DSPARK_COST_DIR`); to compare their step
-  costs, boot each with an empty cost directory and `SPARK3_DSPARK_PROFILE_TOKENS=random`
+  and nothing is timed at boot, so arms of r6x and later draft identically. Images of earlier
+  builds read DSpark cost curves from `SPARK3_DSPARK_COST_DIR`, which `bin/spark` no longer
+  derives: an arm of one sets the directory it ran with; to compare their step costs, boot
+  each with an empty cost directory and `SPARK3_DSPARK_PROFILE_TOKENS=random`
   (experiments/2026-10-11-c16-cost).

@@ -1369,11 +1369,11 @@ class OverlayArmTest(unittest.TestCase):
 
     def test_the_lab_reads_overlay_arms_resolved(self) -> None:
         files = {"arm.json": {"extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
-                              "set": {"container": {"image": "vllm-ds41f-kkref:overlay"}}}}
+                              "set": {"container": {"image": "spark-ds41f:overlay"}}}}
         read = lab.spark.read_json
         with mock.patch.object(lab.spark, "read_json", lambda path: files[path] if path in files else read(path)):
             arm = lab.spark.read_cluster("arm.json")
-            self.assertEqual(arm["container"]["image"], "vllm-ds41f-kkref:overlay")
+            self.assertEqual(arm["container"]["image"], "spark-ds41f:overlay")
             self.assertTrue(arm["container"]["mounts"])
             files["profiled.json"] = {
                 "extends": {"config": "arm.json"},
@@ -1459,7 +1459,7 @@ class ServingNameTest(unittest.TestCase):
         return mock.patch.object(lab.spark, "run_ssh", side_effect=run)
 
     def test_a_dead_arms_ranks_are_stopped_before_production_starts(self) -> None:
-        with self.ranks(f"spark-ds41f\t{self.PREVIOUS}\n"), \
+        with self.ranks(f"dsv41-karmic-kraken\t{self.PREVIOUS}\n"), \
                 mock.patch.object(lab, "nodes_config", return_value=self.RING), \
                 mock.patch.object(lab.spark, "configuration", return_value=({}, self.RING, {})), \
                 mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
@@ -1469,17 +1469,17 @@ class ServingNameTest(unittest.TestCase):
             ("--cluster-config", self.PREVIOUS, "cluster", "stop", "--apply", "--parallel"),
             ("--cluster-config", lab.spark.DEFAULT_CLUSTER_CONFIG, "cluster", "start", "--replace",
              "--change-shape", "--apply")])
-        self.assertIn(f"spark-ds41f is serving (started from {self.PREVIOUS})", out.getvalue())
+        self.assertIn(f"dsv41-karmic-kraken is serving (started from {self.PREVIOUS})", out.getvalue())
 
     def test_a_rank_that_records_no_profile_still_stops_the_boot(self) -> None:
-        with self.ranks("spark-ds41f\t\n"), \
+        with self.ranks("dsv41-karmic-kraken\t\n"), \
                 mock.patch.object(lab, "nodes_config", return_value=self.RING), \
                 mock.patch.object(lab.spark, "configuration", return_value=({}, self.RING, {})), \
                 mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             self.assertFalse(lab.boot(lab.spark.DEFAULT_CLUSTER_CONFIG))
         cli.assert_not_called()
-        self.assertIn("spark-ds41f is serving and records no profile", out.getvalue())
+        self.assertIn("dsv41-karmic-kraken is serving and records no profile", out.getvalue())
 
     def test_a_stop_also_stops_an_arm_under_another_name(self) -> None:
         lab.PRODUCTION_CONFIG = "renamed.json"

@@ -31,7 +31,7 @@ configuration OK; live cluster matches with 1 warning
 and never block a start or a benchmark. They mark something that costs memory
 or latency, or that could fail later.
 
-Before the first start, `--live` reports `cannot inspect dsv41-karmic-kraken`
+Before the first start, `--live` reports `cannot inspect spark-ds41f`
 on every node, and with the service stopped it reports `container is not
 running`. Those two are expected until the service runs; read the rest of the
 output for setup problems.
@@ -99,7 +99,7 @@ These compare each node with the kernel policy in
 | `cpupower` for the 64 KiB kernel and the `performance` CPU governor | warn |
 | NVIDIA, ConnectX and fan-control modules built for the 64 KiB kernel; fan-control DKMS installed for it; with Secure Boot, a signed fan module and an enrolled key | warn |
 | A GRUB entry for the 64 KiB kernel, normal boot pinned to the policy's default, and no pending one-shot or recovery override | warn |
-| On 64 KiB: THP `never`, `vm.min_free_kbytes=45166`, `/swap-64k.img` active and `spark3-kernel-memory.service` active | warn |
+| On 64 KiB: THP `never`, `vm.min_free_kbytes=45166`, `/swap-64k.img` active and `spark-ds41f-kernel-memory.service` active | warn |
 | Memory-saver DKMS installed for the 64 KiB kernel and selected for UVM; with Secure Boot, signed; on 64 KiB, loaded with leaf-table packing on | warn |
 | **The selected profile's kernel requirements**: the running kernel and page size equal the profile's `host.kernel`; for a profile with `memory_saver_required`, the memory saver is loaded with packing on and the driver is 580.178.04 | error |
 | All nodes agree on kernel, page size, driver, loaded NVIDIA module sources, packing, THP, free-memory reserve, Secure Boot state and CPU governors | error |

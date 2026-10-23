@@ -122,7 +122,7 @@ def collect(policy):
     swaps = read("active swap", "cat", "/proc/swaps")
     data["active_swap"] = [line.split()[0] for line in swaps.splitlines()[1:] if line.split()]
     if data["page_size"] == 65536:
-        data["memory_service"] = read("kernel memory service", "systemctl", "is-active", "spark3-kernel-memory.service")
+        data["memory_service"] = read("kernel memory service", "systemctl", "is-active", "spark-ds41f-kernel-memory.service")
     return data
 
 
@@ -191,7 +191,7 @@ def findings(name, data, policy):
         if data.get("active_swap") != ["/swap-64k.img"] or data.get("memory_service") != "active":
             issues.append(f"{name}: 64 KiB swap or boot memory service is not active")
         if any("64 KiB THP" in x or "64 KiB swap" in x for x in issues):
-            fixes.append(f"{name}: inspect journalctl -u spark3-kernel-memory.service; after correcting its inputs, sudo systemctl restart spark3-kernel-memory.service")
+            fixes.append(f"{name}: inspect journalctl -u spark-ds41f-kernel-memory.service; after correcting its inputs, sudo systemctl restart spark-ds41f-kernel-memory.service")
     saver_issues = memory_saver_problems(name, data, policy)
     issues.extend(saver_issues)
     if saver_issues:
