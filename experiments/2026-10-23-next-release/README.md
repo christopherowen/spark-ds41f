@@ -115,6 +115,26 @@ GLP steering ships off: its gate here is that the unset path leaves outputs iden
 with its projection as a TileLang kernel, is qualified in its own experiment (the migration rule:
 a kernel that does not launch is not ported; this one launches only when configured).
 
+**Candidate 1 on the ring (2026-10-23 10:47-14:20 CET, run `next-rc1-tp4`): passed.** Release
+tests on dgx4: 2,081 passed, 159 skipped, none failed. Gate: temperature-0 outputs identical to
+1022's ring hashes (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e), control spellings and the controls
+probe pass, no ordinary sink counts and no collapsed probes on any rank; TTFT trace p50 217.4 ms at
+4 streams, 286.3 ms at 8, 122.9 ms isolated. Comparison, verdicts against the run's own repeat:
+
+| Metric | spark-ds41f-1022 | candidate 1 | Change | Verdict |
+| --- | --- | --- | --- | --- |
+| decode step, grid geometric mean (20 shapes) | | | -1.05% ±0.17% | better |
+| 16 streams, output tok/s | 254.05 | 253.64 | -0.16% | same |
+| 1 stream, output tok/s | 73.39 | 73.31 | -0.11% | same |
+| prefill 32,768, tok/s | 6,009 | 6,364 | +5.90% ±0.49% | better |
+| prefill 131,072, tok/s | 5,971 | 6,329 | +5.99% ±0.66% | better |
+| prefill 1,000,000 (one cold run), tok/s | 4,417 | 4,670 | +5.7% | (no interval) |
+| sampled, 16 streams, output tok/s | | | -0.28% | same |
+
+Greedy responses 64/64 identical, teacher-forced KL 0, acceptance unchanged; TTFT level (16
+streams p50 0.404 -> 0.403 s, 1 stream 0.129 -> 0.129 s). Lowest MemAvailable 21.0-23.4 GiB per
+node in every arm.
+
 ## The ring's long-prefill budget with the skip ([budget-tp4.json](budget-tp4.json))
 
 Owner, 2026-10-23 11:45 CET: "measure a 16384 prefill budget on the ring too". On four Sparks the
@@ -127,3 +147,24 @@ chunks are 8,192 tokens, so a long prompt has half as many nonfinal chunks to tr
 prefill), and one cold 1M prefill; the run's memory watch records every node's lowest MemAvailable.
 One session on image `-next-1`: 8,192, 16,384, 8,192 again. Queued behind candidate 1 in the same
 window. The budget is the owner's choice; the recipe does not change here.
+
+**Result (same window, 14:20 CET, run `next-budget-tp4`).** Verdicts 16,384 -> 8,192 against the
+8,192 repeat:
+
+| Metric | 8,192 | 16,384 | 16,384 vs 8,192 |
+| --- | --- | --- | --- |
+| prefill 32,768, tok/s | 6,364 | 6,742 | +5.9% |
+| prefill 131,072, tok/s | 6,334 | 6,730 | +6.3% |
+| prefill 524,288, tok/s | 5,506 | 5,805 | +5.4% |
+| prefill 1,000,000 (one cold run), tok/s; TTFT | 4,673; 214.0 s | 4,900; 204.1 s | +4.8% |
+| prefill 131,072 under 15 decoding streams, tok/s | 5,759 | 6,308 | +9.5% |
+| those streams' decode step during it, p50 / p99 | 1.33 / 1.42 s | 2.36 / 2.61 s | +78% / +84% |
+| their worst wait | 2.69 s | 3.37 s | same (±95%) |
+| lowest MemAvailable (dgx1, the tightest node) | 22.0 GiB | 18.7 GiB | -3.3 GiB |
+
+The trade is the chunk: twice the tokens per long-prefill step, so the prompt finishes 5-6% sooner
+(9.5% under decode load) while every stream decoding beside it waits about twice as long per step
+for that prompt's duration. Memory stays 13.7 GiB above dgx1's 5 GiB guard. With candidate 1,
+16,384 would put prefill at +12.2% (32K), +12.7% (131K) and +10.9% (1M) over spark-ds41f-1022
+(the 8,192 arms of the two sessions agree to 0.01% at 32K).
+
