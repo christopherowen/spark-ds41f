@@ -151,11 +151,11 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The baseline is
-[manifests/baselines/2026-10-19-karmic-kraken-r6x.json](manifests/baselines/2026-10-19-karmic-kraken-r6x.json)
-([promotion record](experiments/2026-10-18-r6x/README.md)), since 2026-10-19, on the ring
-and the triangle (the triangle at 1M context:
-[experiments/2026-10-19-r6x-tp3-1m](experiments/2026-10-19-r6x-tp3-1m/README.md)); see
-[docs/current-state.md](docs/current-state.md). The three-node deployment:
+[manifests/baselines/2026-10-22-spark-ds41f-1022.json](manifests/baselines/2026-10-22-spark-ds41f-1022.json)
+([promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), on the triangle since
+2026-10-22 and on the ring since 2026-10-23, both at 1M context; see
+[docs/current-state.md](docs/current-state.md). The three-node deployment (the four-node ring
+differs only in cabling, transport and memory sizing):
 
 - three DGX Spark nodes using tensor parallelism 3, on DGX Spark 26.09.2 with
   kernel `7.0.0-1019-nvidia-64k` (`kho=off`), signed memory-saver DKMS
@@ -182,8 +182,10 @@ and the triangle (the triangle at 1M context:
     cache writers, the Engram gate, hash and row gather, the index-head weight
     scale, the sparse-MLA metadata (the first port off Triton), the WO
     projection and the drafter's context-KV projection;
-  - sparknet's one-shot RoCE all-reduce and all-gather, explicit and
-    fail-stop;
+  - sparknet 0.5.0's one-shot RoCE all-reduce and all-gather, explicit and
+    fail-stop, for every TP collective including DSpark's per-step broadcast
+    (serving never uses the PyTorch NCCL process group); its data phase reads
+    one 16-byte pack a thread with a single poller;
   - L2 weight prefetch during decode (the next layer's weights and scale
     words stream into L2 while latency-bound kernels run);
   - B12X's vision tower kernels, which the family does not replace yet, and
@@ -223,6 +225,17 @@ and the triangle (the triangle at 1M context:
   whose drafts are unlikely to survive skip the routed experts, the drafter
   marks its padding rows for the MoE routers, and greedy drafts stay sharded
   by vocabulary over the checkpoint's BF16 drafter head and Markov projection;
+- late admission: the asynchronous engine decides each step when the step in
+  flight reaches decoder layer 30, so a request that arrives meanwhile joins
+  the next step; a step that continues a prompt chunk decides its successor at
+  once, which keeps chunked prefill's pace;
+- sink detection and draft-zero rejection for DeepSeek V4.1, on by default
+  (`VLLM_SINK_REJECTION=0` turns it off): a sampled token that becomes the
+  model's attention sink (residual column 2455) is drawn again, so short
+  prompts such as `Say hi.` no longer collapse; a request's first token waits
+  one decode step for it;
+- control-token spellings written in request text stay plain text, as
+  DeepSeek's encoder treats them;
 - the fabricated context of startup profiling gives each KV cache group its
   own blocks;
 - sequence-parallel prefill once a prompt chunk's reduce-scatter outgrows
@@ -251,6 +264,33 @@ To reproduce the deployment on your own Sparks, follow
 [docs/setup.md](docs/setup.md).
 
 ## Performance
+
+spark-ds41f-1022 against r6x on four nodes, both serving DeepSeek-V4.1-Flash-1017
+(2026-10-23), measured with the trimmed promotion suite in one session (spark-ds41f-1022,
+r6x, spark-ds41f-1022 again; [results](experiments/2026-10-22-spark-ds41f-1022/README.md#the-ring-2026-10-23);
+[suite run](manifests/suites/2026-10-22-spark-ds41f-1022-tp4/)). Bold changes exceed their 95%
+interval and the run's own repeat.
+
+| Workload | TP4 r6x | TP4 spark-ds41f-1022 |
+| --- | ---: | ---: |
+| Decode step time, geometric mean of 20 shapes | | **-1.7%** ±0.16 |
+| Decode, 16 streams (tok/s) | 253.1 | 256.5 (+1.3% ±0.8) |
+| One conversation at a time (tok/s) | 74.1 | 74.1 (0.0% ±8.3) |
+| Source-text prefill, 32K (tok/s) | 6,034 | 6,030 (-0.1% ±0.5) |
+| Prefill, 131K | 5,982 | 5,985 (+0.1% ±0.6) |
+| Time to first token p50, 16 streams / one stream (s) | 0.396 / 0.100 | 0.400 / 0.129 |
+
+All 64 greedy responses are identical to r6x's. A request alone waits one decode step
+longer for its first token: sink rejection verifies it before it is sent.
+
+spark-ds41f-1022 on three nodes at 1M (2026-10-22): the same comparison on its image
+`-1022-2` (one session; [results](experiments/2026-10-22-spark-ds41f-1022/README.md#promotion-comparison-2026-10-22-1003-1105-cet))
+measured the decode step **1.1%** faster (±0.16), eight streams 151.3 to 153.6 tok/s (same), one
+stream level and prefill 0.7-0.8% lower; vLLM 0226 then restored prefill (its A/B: 0.6-1.4%
+faster on every paired prompt), and the promoted image measured 4,460 / 4,384 tok/s at
+32K / 131K against r6x's 4,461 / 4,386. Time to first token at four and eight streams is level
+with r6x's, and one stream is one decode step longer. Reference run:
+[manifests/suites/2026-10-22-spark-ds41f-1022-tp3](manifests/suites/2026-10-22-spark-ds41f-1022-tp3/).
 
 r6x against r6v on four nodes, both serving DeepSeek-V4.1-Flash-1017 (2026-10-18),
 measured with the `release` suite in one session (r6x, r6v, r6x again;
