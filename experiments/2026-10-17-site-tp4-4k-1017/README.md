@@ -16,6 +16,8 @@ the same client battery. It is a receipt from another site, not a promotion requ
 | Arm | [`candidate-arm.json`](candidate-arm.json): `config/cluster.json` at `tp4-ring` with the host kernel at 4 KiB / no memory saver, a snapshot+blobs model profile, per-build DSpark curves, and r6v 0180's `pynccl.py` mounted read-only (sha256 `e3990cd5...4bbc`); started with `--unqualified-shape` |
 | Sizing | unchanged from the recipe: 1,048,576 context, 16 sequences, 8,192 batched tokens, KV 10.5 GiB |
 
+The mounted `r6v-0180/.../pynccl.py` is site-local and not in this repository; r6v and later images include vLLM [0180](../2026-10-17-r6v/vllm/0180-PyNCCL-row-all-to-all-over-a-four-node-ring-the-far-.patch) (its series builds the same file, sha256 `e3990cd5...4bbc`), so on them the arm needs no such mount.
+
 ## Findings worth knowing upstream
 
 1. **r6u alone does not boot on this ring; r6v's 0180 fixes it.** The first boot loaded the weights and prepared 188

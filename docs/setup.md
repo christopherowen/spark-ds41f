@@ -24,6 +24,16 @@ A shape is qualified for the recipe's image when the recipe names its release
 benchmark (`benchmark_reference`); `cluster start` refuses an unqualified one
 unless given `--unqualified-shape`. Two Sparks are not supported.
 
+**Externally reported, not qualified here.** Another site ran `tp4-ring` at
+the recipe's sizing (1,048,576 context, 16 sequences, KV 10.5 GiB) on the
+stock 4 KiB kernel of DGX OS 7.5.0 (`6.17.0-1032-nvidia`), with no memory saver
+and Secure Boot on. MemAvailable stayed at 18-21 GiB per node, including
+through a 993K-token prefill. That run used the r6u image plus r6v's vLLM 0180
+and was started with `--unqualified-shape`
+([receipt](../experiments/2026-10-17-site-tp4-4k-1017/README.md)). The
+qualified recipe is unchanged: `tp4-ring` requires the 64 KiB kernel and the
+memory saver.
+
 **Two Sparks** cannot hold this model with useful context. At three Sparks,
 the head node already runs within about 3 GiB of its memory guard during a
 1M prefill, and two would each hold half as much again of the weights.

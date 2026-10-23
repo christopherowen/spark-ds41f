@@ -12,6 +12,13 @@ shapes; `tp4-ring` is the four-node ring's TP4 1M shape, with 16 sequences
 | `tp3-triangle` | 64 KiB, memory-saver enabled | 4.91 GiB | 1,048,576 |
 | `tp4-ring` (four nodes) | 64 KiB, memory-saver enabled | 10.5 GiB | 1,048,576 |
 
+**Externally reported, not qualified here:** another site served `tp4-ring` at
+this sizing on DGX OS 7.5.0's stock 4 KiB kernel (`6.17.0-1032-nvidia`) without
+the memory saver, keeping 18-21 GiB of MemAvailable per node through a 993K-token prefill
+([receipt](../experiments/2026-10-17-site-tp4-4k-1017/README.md): one boot, the
+site's own battery rather than `bin/spark bench`, no soak). The qualified
+`tp4-ring` row above is unchanged.
+
 The limit includes prompt and generated tokens. Eight sequences remain admitted;
 the token limit does not promise eight simultaneous full-length contexts. KV
 capacity and admission are measured at startup and under load. The selected
