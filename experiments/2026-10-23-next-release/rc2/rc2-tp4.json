@@ -1,0 +1,179 @@
+{
+ "experiment": "experiments/2026-10-23-next-release/rc2",
+ "run": "next-rc2-tp4",
+ "jobs": [
+  {
+   "kind": "image",
+   "config": "image-dgx2.json",
+   "node": "dgx2",
+   "copies": [
+    [
+     "dgx2",
+     "dgx1-internal"
+    ],
+    [
+     "dgx2",
+     "dgx3-internal"
+    ],
+    [
+     "dgx1",
+     "dgx4-internal"
+    ]
+   ]
+  },
+  {
+   "kind": "kernel",
+   "bundles": [
+    {
+     "node": "dgx4",
+     "bundle": "experiments/2026-10-23-next-release/rc2/bundles/release-tests"
+    },
+    {
+     "node": "dgx4",
+     "bundle": "experiments/2026-10-23-next-release/rc2/bundles/glp-bench"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-22-spark-ds41f-1022/control_spellings_probe.py",
+     [],
+     "control-spellings"
+    ],
+    [
+     "experiments/2026-10-23-next-release/controls_probe.py",
+     [],
+     "controls"
+    ],
+    [
+     "experiments/2026-10-20-ttft-gap/ttft_trace.py",
+     [
+      "--repo",
+      ".",
+      "--output",
+      "results/private/lab/{run}-trace-{label}.json",
+      "--analyze"
+     ],
+     "trace"
+    ],
+    [
+     "experiments/2026-10-18-scale-codes/mem_snapshot.py",
+     [
+      "--label",
+      "{label}"
+     ],
+     "memory"
+    ],
+    [
+     "experiments/2026-10-22-spark-ds41f-1022/sink_counters.py",
+     [],
+     "sink-ordinary"
+    ],
+    [
+     "experiments/2026-10-19-sink-rejection-v2/probes.py",
+     [
+      "--nodes",
+      "dgx1,dgx2,dgx3,dgx4"
+     ],
+     "probes"
+    ],
+    [
+     "experiments/2026-10-22-spark-ds41f-1022/sink_counters.py",
+     [],
+     "sink-after-probes"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "rc-tp4.json",
+     "label": "next-rc2"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "rc-tp4-8k.json",
+     "label": "next-rc2-8k"
+    },
+    {
+     "config": "glp-tp4.json",
+     "label": "glp-on"
+    }
+   ]
+  },
+  {
+   "kind": "measure",
+   "suite": "experiments/2026-10-23-next-release/screen-suite-tp4.json",
+   "arms": [
+    {
+     "config": "rc-tp4-dev.json",
+     "label": "next-rc2"
+    },
+    {
+     "config": "experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-tp4-dev.json",
+     "label": "spark-ds41f-1022"
+    },
+    {
+     "config": "rc-tp4-dev.json",
+     "label": "next-rc2-again"
+    }
+   ]
+  }
+ ]
+}

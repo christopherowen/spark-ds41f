@@ -367,3 +367,37 @@ Rollback: `bin/spark --cluster-config config/cluster.json cluster stop --apply -
 and `doctor --live` with that profile; it reads its caches through `cache/kkref`. Remove the kept
 `dsv41-karmic-kraken` containers (`docker rm`) only once the rollback is no longer wanted, and
 keep the `cache/kkref` link while any recipe names it.
+
+## Release candidate 2 ([rc2/](rc2))
+
+Candidate 1 plus the remaining items: vLLM 0261 (GLP steering's projection as one TileLang
+launch, `tilelang/glp.py`, with its kernel tests against FP64 and a paired benchmark against the
+compiled torch projection) and 0262 (the deployment's variables are `SPARK_DS41F_*`), on this
+branch's recipe: the spark-ds41f names (#484), the ring's 16,384 budget and glibc malloc pinned
+(#439). [rc2/vllm/series](rc2/vllm/series) is candidate 1's series plus 0261-0262; a clean `git am`
+on candidate 1's patch head gives patch head 42c0e8f6, tree 6720401c, the branch's tree
+([rc2/source.json](rc2/source.json), [rc2/upstreams.lock.json](rc2/upstreams.lock.json)).
+`release_tests.py check` selects 127 files, 70 gate (the GLP kernel tests added), 0 problems.
+
+Image `spark-ds41f:19f2c20ed4d6-next-2`. One window on the ring ([rc2/rc2-tp4.json](rc2/rc2-tp4.json)),
+production restored from the frozen 1022 recipe:
+
+1. the image, built on dgx2 and copied over the ring;
+2. the release tests and the GLP benchmark (gate: not slower at a decode step of 16 streams or a
+   16K prefill chunk) on dgx4;
+3. the gate on [rc2/rc-tp4.json](rc2/rc-tp4.json) (16,384): determinism, control spellings, the
+   controls probe, the TTFT trace, memory, sink counters and probes;
+4. determinism at 8,192 ([rc2/rc-tp4-8k.json](rc2/rc-tp4-8k.json)), which must equal 1022's ring
+   hashes bit for bit (the long prompt is two chunks there, one at 16,384), and with GLP steering on
+   ([rc2/glp-tp4.json](rc2/glp-tp4.json), a synthetic file of seeded random directions,
+   [glp/make_glp.py](glp/make_glp.py)): repeatable, and different from off;
+5. the release comparison, candidate 2 / spark-ds41f-1022 (frozen) / candidate 2, on
+   [screen-suite-tp4.json](screen-suite-tp4.json).
+
+Then [rc2/rc2-glp-tp4.json](rc2/rc2-glp-tp4.json): what steering on costs (grid, 16 and 1 streams,
+prefill; on / off / on).
+
+At the window's start, with serving stopped, each node's `cache/kkref` moves to
+`cache/spark-ds41f` with a relative link `kkref -> spark-ds41f` (the frozen recipes keep their
+paths and warm caches), and the node checkouts move to this branch.
+

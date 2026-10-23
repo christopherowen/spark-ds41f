@@ -1,0 +1,57 @@
+{
+ "name": "next-release-glp-tp4",
+ "version": 1,
+ "description": "What GLP steering on costs: the engine grid (20 decode shapes), closed loops at 16 and 1 streams and 32K/131K prefill, from the release screen; steering changes the text, so no model-behaviour step. The grid needs the dev-mode collective RPC.",
+ "steps": [
+  {
+   "id": "grid",
+   "command": "engine",
+   "args": {
+    "replays": 100,
+    "settle": 1,
+    "max_requests": 16
+   }
+  },
+  {
+   "id": "c16",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 16,
+    "warmup": 30,
+    "duration": 180,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 1,
+    "warmup": 30,
+    "duration": 180,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  },
+  {
+   "id": "prefill",
+   "command": "prefill",
+   "args": {
+    "sizes": [
+     32768,
+     131072
+    ],
+    "repeats": 3
+   }
+  }
+ ]
+}
