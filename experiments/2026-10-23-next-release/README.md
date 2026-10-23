@@ -352,3 +352,17 @@ prefill; on / off / on).
 At the window's start, with serving stopped, each node's `cache/kkref` moves to
 `cache/spark-ds41f` with a relative link `kkref -> spark-ds41f` (the frozen recipes keep their
 paths and warm caches).
+
+**GLP projection speed (candidate 2's window, 2026-10-23 21:35 CET).** The kernel benchmark failed its
+gate: 0261's projection matches the compiled torch projection at decode (one stream 2.3 against
+2.5 us, sixteen streams 7.4 against 7.3 us, level) but is 1.2-1.4% slower on long-prefill chunks
+(8K tokens 2,872 against 2,826 us; 16K 5,694 against 5,609 us, +77 us, 95% interval +40 to +114),
+where both run near the memory's bandwidth (about 236 against 239 GB/s). A port must meet or
+exceed what it replaces, so [rc2/bundles/glp-variants](rc2/bundles/glp-variants) times ten
+variants of the kernel (threads per row, values a load, the direction held in registers or
+re-read from L1 in the write pass) against the same torch projection, each checked against FP64
+and across batch sizes first ([rc2/glp-variants-tp4.json](rc2/glp-variants-tp4.json), a
+kernel-only window after candidate 2's). The release tests' one failure (2,104 passed) was the
+GLP kernel test's own bound on what alpha 1 leaves along the direction (0.037 against a 0.02
+limit): BF16 rounding of rows with a large component leaves that much; the FP64 test (every
+element within one rounding) passed. The bound is now what correctly rounded BF16 leaves.
