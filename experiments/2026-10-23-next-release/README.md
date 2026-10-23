@@ -246,6 +246,24 @@ a smaller step than 8K -> 16K (the per-step overhead is already amortized over t
 and the CED skip trims fewer nonfinal chunks), about three times 8K's stall step, and about
 3 GiB more peak memory.
 
+**Result (2026-10-23 19:50-20:29 CET, run `next-budget24-tp4`).** Verdicts 16,384 -> 24,576
+against the 24,576 repeat:
+
+| Metric | 16,384 | 24,576 | Change |
+| --- | --- | --- | --- |
+| prefill 32,768, tok/s | 6,733 | 6,907 | +2.6% |
+| prefill 131,072, tok/s | 6,733 | 6,865 | +2.0% |
+| prefill 524,288, tok/s | 5,805 | 5,902 | +1.7% |
+| prefill 1,000,000 (one cold run), tok/s | 4,893 | 4,962 / 4,981 | +1.4-1.8% |
+| prefill 131,072 under 15 decoding streams, tok/s | 6,311 | 6,531 | +3.5% |
+| those streams' decode step during it, p50 / p99 | 2.36 / 2.61 s | 1.63 / 3.74 s | -31% / +43% |
+| their worst wait | 4.10 s | 6.04 s | same (interval ±100%) |
+| lowest MemAvailable (dgx1) | 18.0 GiB | 15.4 GiB | -2.6 GiB |
+
+The second step is a third of the first (8,192 -> 16,384 gave +5.4-6.3%): 2% more prefill for
+steps up to 43% longer at p99 beside a long prompt and 2.6 GiB less headroom. The release stays at
+16,384 (owner, 2026-10-23: "do 16").
+
 ### Draft acceptance ([acceptance/](acceptance))
 
 The ceiling first (experiments/2026-10-18-dspark-acceptance, candidate 2: copy-aware drafting).
