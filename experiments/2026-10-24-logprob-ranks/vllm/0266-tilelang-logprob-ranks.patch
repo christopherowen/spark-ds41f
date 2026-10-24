@@ -1,0 +1,479 @@
+From 57b48408fd39ea933c8d7d52d8ce9b69fafc70c0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:06:31 +0200
+Subject: [PATCH] V2 runner: compute selected-token ranks in TileLang
+
+Replace the selected-token rank launch with a TileLang vocabulary scan that
+accumulates counts per thread and reduces once per row, rather than once
+per 8192-element chunk. Prepare its dtype/stride and token-ID variants at
+startup through the existing TileLang registry. The Triton kernel remains
+only as the test and benchmark reference; remove its dispatcher and warmup.
+
+Base: release-next 174a746f4577579841e5aa3e94c8a4964b0aa326 (candidate 4).
+Rank semantics, including ties, NaNs and the old -inf padding behaviour,
+are unchanged. This reports integer ranks and changes no model arithmetic,
+probabilities or sampled tokens. No runtime fallback or new backend flag.
+Upstream status: local DS41F fork experiment; not submitted upstream.
+
+Validation on DGX Spark/GB10, candidate-4 image: 24 focused GPU tests pass,
+24 pass under compute-sanitizer with 0 memory errors. Two paired 15-shape
+performance runs at vocabulary 129280 pass without a slower case. FP32 at
+one row: ~7.7 us vs ~16.9 us; at 16 rows: ~8.3 us vs ~17.3 us. The 96-row
+FP32 case is bandwidth-bound and level (about 168 us). 256 threads for FP32,
+512 for FP16/BF16, chosen by the recorded 128/256/512-thread sweep. Lowered
+and nvcc-compiled offline for sm_121a; Ruff and diff checks pass.
+
+---
+ benchmarks/kernels/benchmark_logprob_ranks.py | 129 ++++++++++++++++++
+ tests/v1/worker/test_gpu_logprob_ranks.py     | 125 +++++++++++++++++
+ vllm/v1/worker/gpu/sample/logprob.py          |  37 +----
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 100 ++++++++++++++
+ 4 files changed, 360 insertions(+), 31 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_logprob_ranks.py
+ create mode 100644 tests/v1/worker/test_gpu_logprob_ranks.py
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_logprob.py
+
+diff --git a/benchmarks/kernels/benchmark_logprob_ranks.py b/benchmarks/kernels/benchmark_logprob_ranks.py
+new file mode 100644
+index 000000000..1fec54f95
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_logprob_ranks.py
+@@ -0,0 +1,129 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired rank timings against Triton: the same inputs and output, alternating order.
++
++Eight fresh allocations per shape, warmed CUDA graphs of 100 calls, and a 95%
++interval over paired differences. --gate rejects any supported serving shape
++whose interval shows a slowdown. --threads compares fixed kernel configurations.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.v1.worker.gpu.sample import logprob, tilelang_logprob
++
++
++def graph(call):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            call()
++    torch.cuda.current_stream().wait_stream(side)
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            call()
++    capture.replay()
++    torch.cuda.synchronize()
++    return capture
++
++
++def elapsed(capture):
++    begin, end = (
++        torch.cuda.Event(enable_timing=True),
++        torch.cuda.Event(enable_timing=True),
++    )
++    begin.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 10
++
++
++def measure(rows, vocab, dtype, threads, seed):
++    ours, theirs, differences = [], [], []
++    for sample in range(8):
++        torch.manual_seed(seed + sample)
++        # Change allocation placement without changing the values each side reads.
++        spacer = torch.empty((sample * 513 + 17) * 256, device="cuda")
++        logits = torch.randn(rows, vocab, dtype=dtype, device="cuda")
++        ids = torch.randint(vocab, (rows,), device="cuda", dtype=torch.int64)
++        output = torch.empty(rows, device="cuda", dtype=torch.int64)
++        kernel = tilelang_logprob.ranks_kernel(
++            vocab, vocab, tilelang_logprob._DTYPES[dtype], "int64", threads
++        )
++
++        def original(output=output, logits=logits, ids=ids):
++            logprob._ranks_kernel[(rows,)](
++                output, logits, logits.stride(0), ids, vocab, BLOCK_SIZE=8192
++            )
++
++        def candidate(kernel=kernel, logits=logits, ids=ids, output=output):
++            kernel(logits, ids, output)
++
++        original()
++        expected = output.clone()
++        candidate()
++        if not torch.equal(output, expected):
++            raise RuntimeError(f"ranks differ: rows={rows}, dtype={dtype}")
++        a, b = graph(candidate), graph(original)
++        pair = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(c): elapsed(c) for c in pair}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        differences.append(times[id(a)] - times[id(b)])
++        del a, b, pair, spacer
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    result = {
++        "rows": rows,
++        "vocab": vocab,
++        "dtype": str(dtype),
++        "threads": threads,
++        "tilelang_us": statistics.median(ours),
++        "triton_us": statistics.median(theirs),
++        "change_pct": 100 * mean / statistics.fmean(theirs),
++        "interval_us": [mean - half, mean + half],
++        "slower": mean - half > 0,
++        "tilelang_samples_us": ours,
++        "triton_samples_us": theirs,
++    }
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--threads", default="auto")
++    parser.add_argument("--seed", type=int, default=4100)
++    parser.add_argument("--rows", default="1,8,16,48,96")
++    parser.add_argument("--dtypes", default="float32,bfloat16,float16")
++    args = parser.parse_args()
++    results = [
++        measure(
++            rows,
++            129280,
++            getattr(torch, dtype),
++            tilelang_logprob.rank_threads(getattr(torch, dtype))
++            if threads == "auto"
++            else int(threads),
++            args.seed,
++        )
++        for threads in args.threads.split(",")
++        for dtype in args.dtypes.split(",")
++        for rows in map(int, args.rows.split(","))
++    ]
++    slower = [[r["dtype"], r["rows"], r["threads"]] for r in results if r["slower"]]
++    print(json.dumps({"summary": "rank benchmark", "slower": slower}), flush=True)
++    if args.gate and slower:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_logprob_ranks.py b/tests/v1/worker/test_gpu_logprob_ranks.py
+new file mode 100644
+index 000000000..3c6ce9e92
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_logprob_ranks.py
+@@ -0,0 +1,125 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Reported ranks must preserve the previous kernel's ties, padding and NaNs."""
++
++import pytest
++import torch
++
++pytest.importorskip("tilelang")
++pytest.importorskip("triton")
++if not torch.cuda.is_available():
++    pytest.skip("CUDA rank kernels", allow_module_level=True)
++
++from vllm.v1.worker.gpu.sample import logprob, tilelang_logprob
++
++DTYPES = (torch.float32, torch.float16, torch.bfloat16)
++
++
++def reference(logits, ids):
++    output = torch.empty(logits.shape[0], device="cuda", dtype=torch.int64)
++    logprob._ranks_kernel[(logits.shape[0],)](
++        output, logits, logits.stride(0), ids, logits.shape[1], BLOCK_SIZE=8192
++    )
++    return output
++
++
++@pytest.mark.parametrize("dtype", DTYPES)
++@pytest.mark.parametrize(
++    "rows,vocab,padding",
++    [(1, 257, 0), (17, 8192, 0), (3, 8193, 13), (16, 32320, 0), (96, 129280, 0)],
++)
++def test_ranks_match_triton(dtype, rows, vocab, padding):
++    torch.manual_seed(27)
++    backing = torch.randn(rows, vocab + padding, device="cuda", dtype=dtype)
++    logits = backing[:, :vocab]
++    before = backing.clone()
++    ids = torch.randint(vocab, (rows,), device="cuda", dtype=torch.int64)
++    output = torch.full((rows,), -1, device="cuda", dtype=torch.int64)
++    tilelang_logprob.token_ranks(logits, ids, output)
++    assert torch.equal(output, reference(logits, ids))
++    selected = logits.gather(1, ids[:, None])
++    assert torch.equal(output, (logits >= selected).sum(-1))
++    assert torch.equal(backing, before)
++
++
++@pytest.mark.parametrize("dtype", DTYPES)
++def test_ranks_keep_ties_nonfinite_and_padding(dtype):
++    logits = torch.zeros(6, 8193, device="cuda", dtype=dtype)
++    logits[0, 0] = -torch.inf
++    logits[1, 0] = torch.inf
++    logits[2, 0] = torch.nan
++    logits[3, 1] = torch.nan
++    logits[4] = -torch.inf
++    logits[5, :2] = torch.tensor([0.0, -0.0], device="cuda", dtype=dtype)
++    ids = torch.zeros(6, device="cuda", dtype=torch.int32)
++    output = torch.empty(6, device="cuda", dtype=torch.int64)
++    tilelang_logprob.token_ranks(logits, ids, output)
++    assert torch.equal(output, reference(logits, ids))
++    assert output.tolist() == [16384, 1, 0, 8192, 16384, 8193]
++
++
++def test_rank_is_independent_of_batch_and_graph_replay():
++    logits = torch.randn(17, 129280, device="cuda")
++    ids = torch.randint(129280, (17,), device="cuda", dtype=torch.int64)
++    output = torch.empty(17, device="cuda", dtype=torch.int64)
++    tilelang_logprob.token_ranks(logits, ids, output)
++    expected = output.clone()
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            tilelang_logprob.token_ranks(logits, ids, output)
++    torch.cuda.current_stream().wait_stream(side)
++    output.fill_(-1)
++    graph.replay()
++    assert torch.equal(output, expected)
++    single = torch.empty(1, device="cuda", dtype=torch.int64)
++    tilelang_logprob.token_ranks(logits[:1], ids[:1], single)
++    assert torch.equal(single, expected[:1])
++
++
++@pytest.mark.parametrize("logits_mode", [False, True])
++def test_reported_topk_scores_keep_original_ranks(logits_mode):
++    logits = torch.randn(3, 8193, device="cuda")
++    ids = torch.tensor([0, 8192, 17], device="cuda")
++    expected = reference(logits, ids)
++    result = logprob.compute_topk_scores(logits, 5, ids, logits_mode=logits_mode)
++    assert torch.equal(result.selected_token_ranks, expected)
++
++
++def test_empty_batch():
++    logits = torch.empty(0, 129280, device="cuda")
++    ids = torch.empty(0, device="cuda", dtype=torch.int64)
++    output = torch.empty_like(ids)
++    tilelang_logprob.token_ranks(logits, ids, output)
++    assert output.numel() == 0
++
++
++def test_ranks_preserve_subnormal_comparisons():
++    tiny = torch.finfo(torch.float32).smallest_normal / 8
++    logits = torch.tensor([[-tiny, 0.0, tiny, -0.0, tiny * 2]] * 5, device="cuda")
++    ids = torch.arange(5, device="cuda", dtype=torch.int64)
++    output = torch.empty(5, device="cuda", dtype=torch.int64)
++    tilelang_logprob.token_ranks(logits, ids, output)
++    assert torch.equal(output, reference(logits, ids))
++
++
++def test_rank_calls_are_prepared_for_both_token_id_types():
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        logprob.register_topk_scores_warmup(
++            logits=[(torch.float32, 129280)], vocab_size=129280, logits_mode=True
++        )
++    calls = prepare.declared_calls(registry)
++    assert len(calls) == 2
++    prepare.prepare_declared(registry)
++    logits = torch.randn(3, 129280, device="cuda")
++    output = torch.empty(3, device="cuda", dtype=torch.int64)
++    for dtype in (torch.int32, torch.int64):
++        ids = torch.zeros(3, device="cuda", dtype=dtype)
++        tilelang_logprob.token_ranks(logits, ids, output)
++        assert torch.equal(output, reference(logits, ids))
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index a948f53e7..0361eade0 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -105,27 +105,9 @@ def _topk_log_softmax_warmup_inputs(
+     )
+ 
+ 
+-def _ranks_warmup_inputs(
+-    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
+-) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _ranks_kernel,
+-        TritonWarmupTensor(torch.int64),
+-        TritonWarmupTensor(logits_dtype),
+-        logits_stride,
+-        TritonWarmupTensor(torch.int64),
+-        vocab_size,
+-        grid=(1,),
+-        BLOCK_SIZE=8192,
+-    )
+-
+-
+ _topk_log_softmax_launcher = triton_kernel_dispatcher_with_warmup(
+     warmup_inputs=_topk_log_softmax_warmup_inputs
+ )(_topk_log_softmax_kernel)
+-_ranks_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_ranks_warmup_inputs
+-)(_ranks_kernel)
+ 
+ 
+ def register_topk_scores_warmup(
+@@ -134,6 +116,9 @@ def register_topk_scores_warmup(
+     """Register ``compute_topk_scores`` (without per-request token ids) for
+     ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
+     selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
++    from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
++
++    register_ranks(logits, vocab_size)
+     for logits_dtype, logits_stride in logits:
+         if not logits_mode:
+             _topk_log_softmax_launcher.register_warmup(
+@@ -141,11 +126,6 @@ def register_topk_scores_warmup(
+                 logits_stride=logits_stride,
+                 vocab_size=vocab_size,
+             )
+-        _ranks_launcher.register_warmup(
+-            logits_dtype=logits_dtype,
+-            logits_stride=logits_stride,
+-            vocab_size=vocab_size,
+-        )
+ 
+ 
+ def compute_token_logprobs(
+@@ -237,14 +217,9 @@ def compute_topk_scores(
+         scores = scores.masked_fill(~valid_mask, float("-inf"))
+ 
+     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
+-    _ranks_launcher[(batch_size,)](
+-        token_ranks,
+-        logits,
+-        logits.stride(0),
+-        sampled_token_ids,
+-        vocab_size,
+-        BLOCK_SIZE=8192,  # type: ignore
+-    )
++    from vllm.v1.worker.gpu.sample.tilelang_logprob import token_ranks as fill_ranks
++
++    fill_ranks(logits, sampled_token_ids, token_ranks)
+     is_tensor = isinstance(cu_num_logits, torch.Tensor)
+     return LogprobsTensors(
+         logprob_token_ids=logprob_token_ids,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+new file mode 100644
+index 000000000..fef0cda7c
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -0,0 +1,100 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Selected-token ranks, with the V2 runner's Triton rank semantics."""
++
++from collections.abc import Sequence
++
++import tilelang
++import tilelang.language as T
++import torch
++
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++}
++_DTYPES = {
++    torch.float32: "float32",
++    torch.float16: "float16",
++    torch.bfloat16: "bfloat16",
++    torch.int32: "int32",
++    torch.int64: "int64",
++}
++_BLOCK = 8192
++
++
++@tilelang.jit(pass_configs=_PASS)
++def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: int):
++    rows = T.symbolic("rows")
++
++    @T.prim_func
++    def token_ranks(
++        logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
++        token_ids: T.Tensor((rows,), id_dtype),
++        output: T.Tensor((rows,), "int64"),
++    ):
++        with T.Kernel(rows, threads=threads) as row:
++            counts = T.alloc_fragment((_BLOCK,), "int32")
++            total = T.alloc_fragment((1,), "int32")
++            selected = T.alloc_local((1,), "float32")
++            selected[0] = T.cast(
++                logits[T.cast(row, "int64"), token_ids[row]], "float32"
++            )
++            T.clear(counts)
++            for block in T.serial(T.ceildiv(vocab, _BLOCK)):
++                for col in T.Parallel(_BLOCK):
++                    index = block * _BLOCK + col
++                    value = T.if_then_else(
++                        index < vocab,
++                        T.cast(logits[T.cast(row, "int64"), index], "float32"),
++                        -T.infinity("float32"),
++                    )
++                    # Triton counts its -inf padding when the selected logit
++                    # is -inf; keep that behaviour as well as ties and NaNs.
++                    counts[col] += T.cast(value >= selected[0], "int32")
++            T.reduce_sum(counts, total, dim=0)
++            output[row] = T.cast(total[0], "int64")
++
++    return token_ranks
++
++
++def rank_call(dtype: torch.dtype, stride: int, vocab: int, id_dtype: torch.dtype):
++    from vllm.models.deepseek_v4_1.tilelang.prepare import call
++
++    return call(
++        ranks_kernel,
++        vocab,
++        stride,
++        _DTYPES[dtype],
++        _DTYPES[id_dtype],
++        rank_threads(dtype),
++    )
++
++
++def rank_threads(dtype: torch.dtype) -> int:
++    return 256 if dtype == torch.float32 else 512
++
++
++def register_ranks(logits: Sequence[tuple[torch.dtype, int]], vocab_size: int) -> None:
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++
++    if JitWarmupRegistry.active() is None:
++        return
++    from vllm.models.deepseek_v4_1.tilelang.prepare import declare
++
++    declare(
++        lambda: [
++            rank_call(dtype, stride, vocab_size, id_dtype)
++            for dtype, stride in logits
++            for id_dtype in (torch.int32, torch.int64)
++        ]
++    )
++
++
++def token_ranks(
++    logits: torch.Tensor, token_ids: torch.Tensor, output: torch.Tensor
++) -> None:
++    if logits.shape[0] == 0:
++        return
++    _, args, kwargs = rank_call(
++        logits.dtype, logits.stride(0), logits.shape[1], token_ids.dtype
++    )
++    ranks_kernel(*args, **kwargs)(logits, token_ids, output)
