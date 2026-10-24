@@ -1,0 +1,40 @@
+........................................................................ [ 57%]
+.....................................................                    [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_thinking_budget.py::test_v2_greedy_sampling_applies_thinking_budget[triton]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+125 passed, 15 warnings in 23.20s
+========= COMPUTE-SANITIZER
+........................................                                 [100%]
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_thinking_budget.py::test_v2_greedy_sampling_applies_thinking_budget[tilelang]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+40 passed, 85 deselected, 15 warnings in 6.00s
+========= ERROR SUMMARY: 0 errors
+2026-10-24 17:18:26  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `min_p` with `out_idx=None`
+2026-10-24 17:18:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `min_p`
+{"kernel": "min_p", "rows": 1, "width": 129280, "tilelang_us": 64.50200080871582, "triton_us": 66.36800244450569, "interval_us": [-2.1483068804863055, -1.366696368562881], "slower": false, "tilelang_samples_us": [65.06399810314178, 63.975997269153595, 64.34399634599686, 64.36000019311905, 64.84399735927582, 64.43200260400772, 64.751997590065, 64.57199901342392], "triton_samples_us": [65.97200036048889, 66.29999727010727, 65.8160001039505, 66.55199825763702, 66.38000160455704, 66.52799993753433, 66.35600328445435, 66.50000065565109]}
+{"kernel": "min_p", "rows": 16, "width": 129280, "tilelang_us": 111.68000102043152, "triton_us": 114.69200253486633, "interval_us": [-21.813065407938367, 1.9260650855964485], "slower": false, "tilelang_samples_us": [107.66000300645828, 109.0560033917427, 111.7440015077591, 124.89199638366699, 112.01599985361099, 111.61600053310394, 114.56400156021118, 108.8080033659935], "triton_samples_us": [110.59200018644333, 111.50000244379044, 114.69200253486633, 143.12000572681427, 114.69200253486633, 115.1999980211258, 157.0879966020584, 113.02000284194946]}
+Traceback (most recent call last):
+  File "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_sampling_controls.py", line 221, in <module>
+    main()
+  File "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_sampling_controls.py", line 213, in main
+    results = [measure(*case, args.seed) for case in cases]
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_sampling_controls.py", line 166, in measure
+    raise RuntimeError(f"outputs differ: {kind} rows={rows} width={width}")
+RuntimeError: outputs differ: min_p rows=96 width=129280
