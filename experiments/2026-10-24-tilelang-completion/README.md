@@ -726,3 +726,21 @@ vLLM `tilelang-ports` 0c0c0bb35:
   loaded before any is stored); below 512 a row stays spread over five blocks. Both
   layouts are declared.
 - **the greedy partial argmax** loads every run before combining.
+
+## The serving check ([serving-ports.json](serving-ports.json))
+
+Every port of the branch, served. [ports-tp4.json](ports-tp4.json) mounts the branch's 29
+package files (bundles/serving/overlay, written by `make_integration_bundles.py
+--serving`) over candidate 4 at tp4-ring. It is measured beside candidate 4 itself
+(rc4/rc-tp4.json), ports first. Each arm runs:
+- the lean bench;
+- `token_determinism.py --wide`: temperature 0, alone, eight at once, staggered, mixed with
+  a long prefill, fifteen at once, cached, again;
+- [sampled_digest.py](sampled_digest.py): seeded temperature 1, alone, eight at once,
+  again, with speculative decoding's sampled drafts, verification and resampling;
+- distinct prompts at one and eight streams.
+
+[tables_arms.py](tables_arms.py) compares the arms' reference digests. The ports pass when
+both arms are identical within themselves, their temperature-0 and seeded temperature-1
+digests are equal, and the ports boot and serve with no undeclared kernel
+(`KernelNotPreparedError` would fail the requests).

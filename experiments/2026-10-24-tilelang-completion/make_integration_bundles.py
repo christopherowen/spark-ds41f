@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the kernel-lab bundles that run every TileLang port together.
 
-usage: make_integration_bundles.py VLLM_REPO BASE HEAD [--overlay BUNDLE...]
+usage: make_integration_bundles.py VLLM_REPO BASE HEAD [--overlay BUNDLE... | --serving]
 
 Every file the vLLM branch changes between BASE (candidate 4's source, which image
 -next-4 holds) and HEAD goes into each bundle: package files under overlay/vllm (the lab
@@ -9,7 +9,9 @@ mounts them over the image's tree), tests and benchmarks as mounts. Each bundle 
 one share of the ports' GPU tests and gated benchmarks (bundles/integration-*), so each
 family is tested with all the other ports in place. With ``--overlay``, only the package
 files are written, as the overlay of each named bundle (a variant sweep that times the
-branch's production kernels).
+branch's production kernels). With ``--serving``, the package files go to
+bundles/serving/overlay and ports-tp4.json is the serving arm that mounts them over
+candidate 4 (rc4/rc-tp4.json, image -next-4).
 """
 import json
 import shutil
@@ -143,6 +145,23 @@ def main() -> None:
     status = git(repo, "diff", "--name-status", base, head).split("\n")
     changed = [line.split("\t")[-1] for line in status if line]
     assert all(line.split("\t")[0] in ("A", "M") for line in status if line), status
+    if sys.argv[4:5] == ["--serving"]:
+        write_overlay(repo, head, changed, HERE / "bundles" / "serving")
+        experiment = "{home}/projects/spark-ds41f/experiments/2026-10-24-tilelang-completion"
+        mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]]
+        mounts += [[f"{experiment}/bundles/serving/overlay/{path}", f"{ROOT}/{path}", "ro"]
+                   for path in changed if path.startswith("vllm/")]
+        arm = {
+            "notes": (f"Every TileLang port (vLLM branch tilelang-ports {head_commit}) mounted "
+                      "over candidate 4 at tp4-ring: the serving check (outputs identical to "
+                      "candidate 4 at temperature 0 and seeded temperature 1, no undeclared "
+                      "kernel)."),
+            "extends": {"config": "experiments/2026-10-23-next-release/rc4/rc-tp4.json"},
+            "set": {"container": {"mounts": mounts}},
+        }
+        (HERE / "ports-tp4.json").write_text(json.dumps(arm, indent=1) + "\n")
+        print(f"serving: {len(mounts) - 1} package files of {head_commit}")
+        return
     if sys.argv[4:5] == ["--overlay"]:
         for name in sys.argv[5:]:
             write_overlay(repo, head, changed, HERE / "bundles" / name)
