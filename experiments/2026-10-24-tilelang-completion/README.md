@@ -650,3 +650,15 @@ which confirms the seed fix.
 prepare_dflash_inputs pads the query slots from eight extra blocks (`baf8ce86c`). Before,
 the last request's first block wrote all 16,384 of them alone, the kernel's longest path at
 decode.
+
+## Sixth integrated run (run `tilelang-integration-kernels-6`)
+
+On top of the fifth (vLLM `tilelang-ports` 649dde962):
+- **combine** reads each request's scalars, draft row and confidence row up front.
+  With dead rows each request takes a block of its own (round 3's fastest form). The
+  key carries the drafts' width.
+- **The greedy finish** loads `ceil(parts / 32)` parts a lane before combining (Triton's
+  masked values past the end), keyed by that count (1 or 2, both declared), instead of a
+  loop of runtime length.
+- **Temperature** divides 2048 columns a block instead of Triton's 8192. It is
+  element-wise, so the split is free, and one token gets 64 blocks instead of 16.

@@ -54,8 +54,10 @@ GUMBEL_BLOCK = 1024
 _THREADS = 128
 _WARPS = _THREADS // 32
 _PASSES = GUMBEL_BLOCK // _THREADS
-# gumbel._TEMPERATURE_BLOCK_SIZE.
-_TEMPERATURE_BLOCK = 8192
+# Columns a temperature block divides. Element-wise, so the split is free: a quarter
+# of Triton's 8192 (gumbel._temperature_kernel's BLOCK_SIZE) gives one token 64
+# blocks instead of 16 for GB10's 48 SMs.
+_TEMPERATURE_BLOCK = 2048
 # Temperature's threads a block: fewer serial runs a thread than at 128, the shape
 # Triton reaches with its loads all issued up front.
 _TEMPERATURE_THREADS = 256
@@ -1313,28 +1315,25 @@ def partial_argmax_kernel(
     return partial_argmax
 
 
+# Parts a lane of the finish reads: ``ceil(parts / 32)``, declared for each value here
+# (vocabularies of up to 32 * 2 * GREEDY_BLOCK columns).
+_FINISH_LANES = (1, 2)
+
+
 @tilelang.jit(pass_configs=_PASS)
-def finish_argmax_kernel(output: str, rows_per_block: int = 0):
+def finish_argmax_kernel(output: str, per_lane: int = 1):
     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
     maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
     ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
-    out_stride]``), from the parts' scratch: one warp per row, or with
-    ``rows_per_block`` one thread per row, the parts in order."""
+    out_stride]``), from the parts' scratch, a warp a row. As Triton's, every part
+    is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
+    (``per_lane`` of them, Triton's masked values past ``parts``), then the lanes
+    reduce; the combine is a total order, so the pairing does not matter."""
     rows, values_len, indices_len, out_len = T.dynamic(
         "rows, values_len, indices_len, out_len"
     )
     pair = output == "pair"
     out_dtype = "float32" if pair else output
-
-    @T.macro
-    def _finish_store(out, best, best_index, row, out_stride, vocab_start):
-        if pair:
-            out[T.cast(row, T.int64) * 2] = best[0]
-            out[T.cast(row, T.int64) * 2 + 1] = T.cast(
-                best_index[0] + vocab_start, T.float32
-            )
-        else:
-            out[T.cast(row, T.int64) * out_stride] = T.cast(best_index[0], out_dtype)
 
     @T.prim_func
     def finish_argmax(
@@ -1346,39 +1345,37 @@ def finish_argmax_kernel(output: str, rows_per_block: int = 0):
         out_stride: T.int64,
         vocab_start: T.int32,
     ):
-        if rows_per_block:
-            with T.Kernel(
-                T.ceildiv(out_rows, rows_per_block), threads=rows_per_block
-            ) as bx:
-                T.import_source(_HEADER)
-                row = bx * rows_per_block + T.get_thread_binding()
-                best = T.alloc_local((1,), T.float32)
-                best_index = T.alloc_local((1,), T.int32)
-                best[0] = -T.infinity(T.float32)
-                best_index[0] = _INT32_MAX
-                if row < out_rows:
-                    for k in T.serial(parts):
-                        slot = T.cast(row, T.int64) * parts + k
-                        _first_keep_or_take(
-                            best, best_index, values[slot], indices[slot]
-                        )
-                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
-        else:
-            with T.Kernel(out_rows, threads=32) as row:
-                T.import_source(_HEADER)
-                tx = T.get_thread_binding()
-                best = T.alloc_local((1,), T.float32)
-                best_index = T.alloc_local((1,), T.int32)
-                other = T.alloc_local((1,), T.float32)
-                other_index = T.alloc_local((1,), T.int32)
-                best[0] = -T.infinity(T.float32)
-                best_index[0] = _INT32_MAX
-                for k in T.serial(T.ceildiv(parts - tx, 32)):
-                    slot = T.cast(row, T.int64) * parts + tx + k * 32
-                    _first_keep_or_take(best, best_index, values[slot], indices[slot])
-                _warp_first_argmax(best, best_index, other, other_index)
-                if tx == 0:
-                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
+        with T.Kernel(out_rows, threads=32) as row:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            v = T.alloc_local((per_lane,), T.float32)
+            ix = T.alloc_local((per_lane,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            for k in T.unroll(per_lane):
+                part = tx + k * 32
+                slot = T.cast(row, T.int64) * parts + T.min(part, parts - 1)
+                v[k] = T.if_then_else(
+                    part < parts, values[slot], -T.infinity(T.float32)
+                )
+                ix[k] = T.if_then_else(part < parts, indices[slot], _INT32_MAX)
+            best[0] = v[0]
+            best_index[0] = ix[0]
+            for k in T.unroll(1, per_lane):
+                _first_keep_or_take(best, best_index, v[k], ix[k])
+            _warp_first_argmax(best, best_index, other, other_index)
+            if tx == 0:
+                if pair:
+                    out[T.cast(row, T.int64) * 2] = best[0]
+                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
+                        best_index[0] + vocab_start, T.float32
+                    )
+                else:
+                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+                        best_index[0], out_dtype
+                    )
 
     return finish_argmax
 
@@ -1499,7 +1496,13 @@ def _finish(
 ) -> None:
     if rows == 0:
         return
-    kernel = _kernel(finish_argmax_kernel, output)
+    per_lane = -(-parts // 32)
+    if per_lane not in _FINISH_LANES:
+        raise ValueError(
+            f"{parts} vocabulary parts exceed the greedy finish's "
+            f"{32 * _FINISH_LANES[-1]} (_FINISH_LANES)"
+        )
+    kernel = _kernel(finish_argmax_kernel, output, per_lane)
     kernel(
         partial_values.view(-1),
         partial_indices.view(-1),
@@ -1694,13 +1697,13 @@ def greedy_rejection_sample(
 def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THREADS):
     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
-    alone; a block of ``threads`` per ``(token, 8192 columns)``, each thread's
-    elements in runs of ``run`` (``_triton_run``), one vector load and store each
-    when aligned. As in Triton, the thread's runs are all loaded, then divided,
-    then stored: the logits are read and written through one pointer, so a run
-    stored before the next run's load would make every load wait for a store. As
-    in Triton, the temperature is read at the mapped index without a validity
-    check."""
+    alone; a block of ``threads`` per token and ``_TEMPERATURE_BLOCK`` columns,
+    each thread's elements in runs of ``run`` (``_triton_run``), one vector load
+    and store each when aligned. As in Triton, the thread's runs are all loaded,
+    then divided, then stored: the logits are read and written through one pointer,
+    so a run stored before the next run's load would make every load wait for a
+    store. As in Triton, the temperature is read at the mapped index without a
+    validity check."""
     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
     logits_stride = T.dynamic("logits_stride", "int64")
     runs = _TEMPERATURE_BLOCK // (threads * run)
@@ -1909,8 +1912,12 @@ def greedy_calls(
         for vector in (True, False)
     ]
     if markov or logits:
-        calls.append(_call(finish_argmax_kernel, "pair"))
-    calls += [_call(finish_argmax_kernel, _DTYPES[dtype]) for dtype in finish_outputs]
+        calls += [_call(finish_argmax_kernel, "pair", lanes) for lanes in _FINISH_LANES]
+    calls += [
+        _call(finish_argmax_kernel, _DTYPES[dtype], lanes)
+        for dtype in finish_outputs
+        for lanes in _FINISH_LANES
+    ]
     calls += [
         _call(select_first_argmax_kernel, _DTYPES[dtype], ranks)
         for dtype, ranks in select
