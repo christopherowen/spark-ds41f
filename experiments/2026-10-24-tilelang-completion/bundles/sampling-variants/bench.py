@@ -27,6 +27,7 @@ from vllm.v1.worker.gpu.sample import gumbel, sink
 from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
 from vllm.v1.worker.gpu.spec_decode.dspark import greedy
 
+import plain_loads
 import sampling_tile
 
 DEVICE = torch.device("cuda")
@@ -98,19 +99,25 @@ def kernel_times(function, calls: int = 50) -> dict:
 
 
 BINDS_OFF = {"tl.if_stmt_binding_inline_replayable_binds": False}
+# Not a pass config: the kernel's read-only buffers loaded by ordinary loads (plain_loads).
+PLAIN = {"plain": True}
 _COMPILED: dict = {}
 
 
 def build(factory, *key, extra=None):
-    """``factory(*key)``, or its source compiled with ``extra`` pass configs."""
+    """``factory(*key)``, or its source compiled with ``extra`` pass configs (with
+    ``PLAIN``, its read-only buffers not ``__restrict__``)."""
     if not extra:
         return tls._kernel(factory, *key)
     slot = (id(factory), key, tuple(sorted(extra.items())))
     if slot not in _COMPILED:
+        configs = dict(extra)
+        plain = configs.pop("plain", False)
         config = {getattr(k, "value", k): v for k, v in tls._PASS.items()}
-        _COMPILED[slot] = tilelang.compile(
-            factory.get_tir(*key), pass_configs={**config, **extra}
-        )
+        prim = factory.get_tir(*key)
+        if plain:
+            prim = plain_loads.plain(prim)
+        _COMPILED[slot] = tilelang.compile(prim, pass_configs={**config, **configs})
     return _COMPILED[slot]
 
 
@@ -200,7 +207,7 @@ def select_case(rows, mode, extra=None, tile=False):
         kernel = (
             build(sampling_tile.select_tile_kernel, "int64", 4)
             if tile
-            else build(tls.select_first_argmax_kernel, "int64", mode, extra=extra)
+            else build(tls.select_first_argmax_kernel, "int64", 4, extra=extra)
         )
 
         def ours():
@@ -421,8 +428,62 @@ def round4a() -> None:
               "triton": kernel_times(theirs)})
 
 
+def temperature_triton_pair(tokens):
+    """Triton against itself on the two buffers temperature_case uses (the logits and
+    their clone): whether the 96-token gap is the buffers'."""
+
+    def make(sample):
+        g = generator(sample)
+        first = torch.randn(tokens, VOCAB, generator=g, device=DEVICE)
+        second = first.clone()
+        mapping = torch.arange(tokens, device=DEVICE)
+        temperature = torch.full((tokens,), 0.7, device=DEVICE)
+
+        def launch(logits):
+            gumbel._temperature_kernel[(tokens, triton.cdiv(VOCAB, 8192))](
+                logits, logits.stride(0), mapping, temperature, VOCAB, BLOCK_SIZE=8192
+            )
+
+        return (lambda: launch(first)), (lambda: launch(second))
+
+    return make
+
+
+def round4b() -> None:
+    """The production kernels of the integration branch (overlay/), as built and with
+    ordinary loads, each against Triton; and Triton's temperature against itself."""
+    cases = {
+        "gumbel bf16 16 tokens": lambda extra: lambda s: gumbel_inputs(16, torch.bfloat16, extra, s),
+        "gumbel bf16 96 tokens": lambda extra: lambda s: gumbel_inputs(96, torch.bfloat16, extra, s),
+        "gumbel f32 16 tokens": lambda extra: lambda s: gumbel_inputs(16, torch.float32, extra, s),
+        "candidates 1 request t=0": lambda extra: lambda s: candidates_inputs(1, 0.0, extra, s),
+        "candidates 16 requests t=1": lambda extra: lambda s: candidates_inputs(16, 1.0, extra, s),
+        "temperature 1 token": lambda extra: temperature_case(1, 256, extra),
+        "temperature 16 tokens": lambda extra: temperature_case(16, 256, extra),
+        "temperature 96 tokens": lambda extra: temperature_case(96, 256, extra),
+        "markov pair 1 row": lambda extra: pair_case(1, True, 128, 0, extra),
+        "markov pair 16 rows": lambda extra: pair_case(16, True, 128, 0, extra),
+        "markov pair 96 rows": lambda extra: pair_case(96, True, 128, 0, extra),
+        "shard pair 6 rows": lambda extra: pair_case(6, False, 128, 0, extra),
+        "select 1 row": lambda extra: select_case(1, 0, extra),
+        "select 16 rows": lambda extra: select_case(16, 0, extra),
+    }
+    for name, make in cases.items():
+        for label, extra in (("prod", None), ("plain", PLAIN)):
+            row = {"case": name, "build": label}
+            try:
+                row.update(paired(make(extra)))
+            except Exception as error:  # noqa: BLE001 (report the case, go on)
+                row["error"] = f"{type(error).__name__}: {error}"[:2000]
+            emit(row)
+    for tokens in (16, 96):
+        row = {"case": f"temperature {tokens} tokens", "build": "triton against triton"}
+        row.update(paired(temperature_triton_pair(tokens)))
+        emit(row)
+
+
 def main() -> None:
-    rounds = {"3": round3, "4a": round4a}
+    rounds = {"3": round3, "4a": round4a, "4b": round4b}
     for name in sys.argv[1:] or ["4a"]:
         rounds[name]()
 

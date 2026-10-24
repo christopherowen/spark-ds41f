@@ -183,6 +183,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
     all_to_all_logits,
     gather_sampler_output,
 )
+from vllm.v1.worker.gpu.sample.gumbel import register_drafting_warmups
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -2191,6 +2192,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if isinstance(self.speculator, DFlashSpeculator):
             self.speculator.register_warmups(
                 self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
+            )
+        draft_logits = getattr(self.speculator, "draft_logits", None)
+        if draft_logits is not None:
+            # Probabilistic drafting samples the draft logits with the logits
+            # cache: the head's dtype, or the cache's when it scatters into it.
+            head_dtype = getattr(processor, "head_dtype", None)
+            register_drafting_warmups(
+                logits_dtypes=tuple(
+                    dtype
+                    for dtype in (head_dtype, draft_logits.dtype, torch.float32)
+                    if dtype is not None
+                ),
+                cache_dtype=draft_logits.dtype,
+                use_fp64=self.model_config.use_fp64_gumbel,
             )
 
     def _register_kv_cache_warmups(

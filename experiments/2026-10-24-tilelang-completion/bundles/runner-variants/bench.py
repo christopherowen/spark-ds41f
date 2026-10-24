@@ -44,6 +44,7 @@ import sys
 import traceback
 from types import SimpleNamespace
 
+import plain_loads
 import runner_input_tests as rt
 import tilelang
 import torch
@@ -1054,8 +1055,31 @@ def zero_kernel() -> Kernel:
 # --- Driver -----------------------------------------------------------------------
 
 
+_PLAIN_INPUTS = plain_loads.Plain(tli, tli._PASS)
+_PLAIN_LOOKBACK = plain_loads.Plain(
+    lookback,
+    {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    },
+    "_bound",
+    lookback.gather_lookback_kernel,
+)
+
+
+def plain_variant(prod):
+    """The production launch with every kernel's read-only buffers loaded by
+    ordinary loads (plain_loads)."""
+
+    def launch(ns):
+        with _PLAIN_INPUTS.active(), _PLAIN_LOOKBACK.active():
+            prod(ns)
+
+    return launch
+
+
 def kernels() -> list[Kernel]:
-    return [
+    found = [
         combine_kernel(dead=True),
         combine_kernel(dead=False),
         expand_kernel(),
@@ -1065,6 +1089,9 @@ def kernels() -> list[Kernel]:
         lookback_kernel(),
         zero_kernel(),
     ]
+    for kernel in found:
+        kernel.variants["prod-plain"] = plain_variant(kernel.variants["prod"])
+    return found
 
 
 def check(kernel: Kernel, name: str, launch) -> dict:

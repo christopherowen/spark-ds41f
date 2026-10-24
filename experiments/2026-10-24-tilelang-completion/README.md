@@ -427,3 +427,20 @@ in place. Each runs one share of the ports' GPU tests and gated benchmarks:
   drafting tests in their own step: the unchanged image fails eight of them;
 - mHC (dgx3);
 - sampling (dgx4).
+
+## Round 4b: ordinary loads ([plain-loads-kernels.json](plain-loads-kernels.json))
+
+The sampling and runner variant bundles now overlay the integration branch, so "prod" is
+the branch's kernels. [plain_loads.py](plain_loads.py) recompiles a production kernel with
+every buffer it never stores to listed in `tl.non_restrict_params`, which is what
+`T.annotate_restrict_buffers` sets. Those buffers' loads become ordinary loads, as
+Triton's are.
+
+Both forms of every production kernel are timed against Triton per call:
+- sampling `4b` (dgx4): Gumbel, candidates, temperature (1, 16 and 96 tokens), greedy
+  pairs, select;
+- runner `--variants prod` (dgx1): every runner kernel as built, with bind replay off, and
+  with ordinary loads.
+
+Triton's temperature is also timed against itself on the two 96-token buffers, to test
+whether that gap belongs to the buffers.

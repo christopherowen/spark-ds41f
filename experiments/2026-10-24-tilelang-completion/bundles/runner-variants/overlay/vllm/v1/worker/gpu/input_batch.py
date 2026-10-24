@@ -2,16 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.triton_utils import tl, triton
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
@@ -624,17 +619,17 @@ def get_num_sampled_and_rejected(
     prefill_len: torch.Tensor,
     dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
-    _get_num_sampled_and_rejected_launcher[(num_reqs,)](
+    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
+
+    count_tokens(
         num_sampled,
         num_rejected,
         seq_lens,
         cu_num_logits,
         idx_mapping,
         prefill_len,
-        dead_row_cut if dead_row_cut is not None else num_sampled,
-        DEAD_ROWS=dead_row_cut is not None,
+        dead_row_cut,
     )
     return num_sampled, num_rejected
 
@@ -853,33 +848,12 @@ def expand_idx_mapping(
     return expanded_idx_mapping, expanded_local_pos
 
 
-def _get_num_sampled_and_rejected_warmup_inputs(*, dead_rows: bool) -> dict[str, Any]:
-    int32 = TritonWarmupTensor(torch.int32)
-    return triton_warmup_inputs(
-        _get_num_sampled_and_rejected_kernel,
-        int32,
-        int32,
-        int32,
-        int32,
-        TritonWarmupTensor(torch.int64),
-        int32,
-        int32,
-        grid=(1,),
-        DEAD_ROWS=dead_rows,
-    )
-
-
-_get_num_sampled_and_rejected_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_get_num_sampled_and_rejected_warmup_inputs
-)(_get_num_sampled_and_rejected_kernel)
-
-
 def register_input_batch_warmups(*, dead_rows: bool) -> None:
-    """Register the Triton count of a step's sampled and rejected tokens (the
-    sampler family's), with its dead-row variant when adaptive verification marks
-    dead rows."""
+    """Declare sampled/rejected counts with each enabled dead-row variant."""
+    from vllm.v1.worker.gpu.tilelang_token_counts import register_counts
+
     for dead in (False, True) if dead_rows else (False,):
-        _get_num_sampled_and_rejected_launcher.register_warmup(dead_rows=dead)
+        register_counts(dead_rows=dead)
 
 
 def declare_input_batch_kernels(

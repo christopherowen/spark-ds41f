@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Write the kernel-lab bundles that run every TileLang port together.
 
-usage: make_integration_bundles.py VLLM_REPO BASE HEAD
+usage: make_integration_bundles.py VLLM_REPO BASE HEAD [--overlay BUNDLE...]
 
 Every file the vLLM branch changes between BASE (candidate 4's source, which image
 -next-4 holds) and HEAD goes into each bundle: package files under overlay/vllm (the lab
 mounts them over the image's tree), tests and benchmarks as mounts. Each bundle then runs
 one share of the ports' GPU tests and gated benchmarks (bundles/integration-*), so each
-family is tested with all the other ports in place.
+family is tested with all the other ports in place. With ``--overlay``, only the package
+files are written, as the overlay of each named bundle (a variant sweep that times the
+branch's production kernels).
 """
 import json
 import shutil
@@ -123,12 +125,29 @@ def git(repo: str, *args: str) -> str:
                           text=True).stdout
 
 
+def write_overlay(repo: str, head: str, changed: list[str], bundle: Path) -> None:
+    overlay = bundle / "overlay"
+    if overlay.exists():
+        shutil.rmtree(overlay)
+    for path in changed:
+        if path.startswith("vllm/"):
+            target = overlay / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(subprocess.run(["git", "-C", repo, "show", f"{head}:{path}"],
+                                              check=True, capture_output=True).stdout)
+
+
 def main() -> None:
     repo, base, head = sys.argv[1:4]
     head_commit = git(repo, "rev-parse", "--short=9", head).strip()
     status = git(repo, "diff", "--name-status", base, head).split("\n")
     changed = [line.split("\t")[-1] for line in status if line]
     assert all(line.split("\t")[0] in ("A", "M") for line in status if line), status
+    if sys.argv[4:5] == ["--overlay"]:
+        for name in sys.argv[5:]:
+            write_overlay(repo, head, changed, HERE / "bundles" / name)
+            print(f"{name}: overlay of {head_commit}")
+        return
     fixtures = HERE / "bundles/sampling/prepare_fixtures.py"
     for part, (what, steps) in PARTS.items():
         bundle = HERE / "bundles" / f"integration-{part}"
