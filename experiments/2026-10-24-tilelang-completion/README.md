@@ -1248,3 +1248,31 @@ At vLLM `tilelang-ports` 54facd853:
 - `tilelang-integration-kernels-16`;
 - [serving-ports-3.json](serving-ports-3.json): the second serving check's arms and
   workloads, now with every runner change and the custom-logprob-ids scenario.
+
+### Sixteenth run and the third serving check (2026-10-24 23:41 CET)
+
+**Run 16** (vLLM 54facd853):
+- Every test passes.
+- Every gate passes except expand_idx_mapping at sixteen requests, +0.03 µs. Its flag
+  comes and goes between runs.
+- prepare_prefill is level at decode (+0.006 / +0.012 µs) and faster on a 16K chunk
+  (-0.47 µs).
+
+**The third serving check** (`tilelang-ports-serving-3`): the branch at 54facd853 beside
+candidate 4, four alternating arms.
+- **Outputs, equal across all four arms:**
+  - temperature 0, identical in every scenario within every arm;
+  - seeded temperature 1;
+  - the controls digests: penalties (temperature 0, and seeded alone), forbidden
+    sequences, the thinking budget, and the two rejections.
+- **Speed: level.**
+  - One stream: ports 93.50 and 93.19 tok/s, candidate 4 93.25 and 93.25.
+  - Eight streams: ports 191.35 and 190.65, candidate 4 191.46 and 190.17, in the same two
+    modes as before.
+- **Custom logprob ids return HTTP 500 in both builds.**
+  - The API server's `_create_chat_logprobs` fails with an IndexError: fewer logprob
+    entries came back than tokens. The engine survives.
+  - Under speculative decoding the rejection sampler computes logprobs without the custom
+    ids' state.
+  - Like the prompt-logprobs crash, this is candidate 4's bug, and it is followed up with
+    that fix.
