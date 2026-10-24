@@ -613,3 +613,40 @@ TileLang embeds in `executable.so`):
 
 The branch with the replay-free runner kernels and the restructured Gumbel and candidates
 kernels (`ea3492d9f`).
+
+### Third and fourth integrated runs (2026-10-24 18:20 and 18:33 CET)
+
+Every test passes in both runs, the vocabulary-parallel drafting tests included (12 of 12),
+which confirms the seed fix.
+
+- **Branch-free combines (run 3):**
+  - greedy Markov pairs: from +18-42% to +9% (1 row), +8% (6), level at 16 and 96;
+  - greedy shard pairs: +5% at 6 rows, level at 36 and 384, -6% at 96;
+  - sample_greedy_markov: +4% at one row, level at 16;
+  - select: +1-2%;
+  - sink candidates at t=0: -3% at 16 and 64 requests.
+- **Gumbel and candidates draws outside the bound checks (run 4):**
+  - the Gumbel sampler is now 3-5% faster than Triton in BF16 and 2-10% in FP32, at every
+    size;
+  - sink candidates are level or faster everywhere. One request at t=0 reads +12%, but
+    its interval includes zero.
+- **Runner without bind replay (run 4):**
+  - combine with dead rows: from +0.69 to +0.44 µs;
+  - post_update: faster than Triton at every shape;
+  - combine: level.
+- **Still slower:**
+  - temperature at one token (+0.2 µs);
+  - greedy pairs at 1-6 rows (+0.2-0.3 µs);
+  - combine with dead rows (+0.3-0.4 µs);
+  - prepare_dflash_inputs at decode (+0.5 µs);
+  - prepare_prefill_inputs at c16 (+0.3 µs);
+  - gather_lookback (+0.07 µs);
+  - zero_kv_blocks (+0.1 µs at c1, +0.7% at 16K);
+  - the embedding's 8K cold prefill (+3 to +4 µs of 488, +0.6-0.8%, the same in every
+    run; first significant in run 4).
+
+## Fifth integrated run (run `tilelang-integration-kernels-5`)
+
+prepare_dflash_inputs pads the query slots from eight extra blocks (`baf8ce86c`). Before,
+the last request's first block wrote all 16,384 of them alone, the kernel's longest path at
+decode.
