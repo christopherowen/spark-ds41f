@@ -620,6 +620,15 @@ def prefill_variant(threads, per, index):
     return launch
 
 
+def prefill_tile_variant(threads, per, groups, hoist):
+    def launch(ns):
+        key = tli.prepare_prefill_inputs_key(ns.next_tokens.shape[0], "int64")
+        kernel = compiled(rv.prefill_tile_kernel, key[0], threads, per, groups, hoist)
+        kernel(ns.ids, ns.next_tokens, ns.idx, ns.starts, ns.history, ns.prefill_len, ns.computed)
+
+    return launch
+
+
 def prefill_kernel() -> Kernel:
     variants = {
         "prod": prod_prefill,
@@ -634,6 +643,10 @@ def prefill_kernel() -> Kernel:
         variants[f"hoist-t{threads}-p{per}"] = prefill_variant(threads, per, "int64")
     variants["hoist-t32-p1-i32"] = prefill_variant(32, 1, "int32")
     variants["hoist-t256-p4-i32"] = prefill_variant(256, 4, "int32")
+    for threads, per, groups in ((128, 8, 1), (256, 4, 1), (256, 4, 4), (128, 8, 4), (128, 4, 2)):
+        for hoist in (False, True):
+            name = f"tile-t{threads}-p{per}-g{groups}" + ("-hoist" if hoist else "")
+            variants[name] = prefill_tile_variant(threads, per, groups, hoist)
     return Kernel(
         name="prepare_prefill_inputs",
         shapes={s: prefill_bench(n, p) for s, (n, p) in SHAPES.items()},

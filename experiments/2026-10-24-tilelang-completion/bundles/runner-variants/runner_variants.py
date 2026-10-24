@@ -1003,3 +1003,100 @@ def zero_kv_tile_kernel(threads: int, per: int, vector: bool):
                                       T.address_of(segment[base + col]), 0, col < page)  # fmt: skip
 
     return zero_kv_blocks
+
+
+# --- prepare_prefill_inputs in tile form (round 6) -------------------------------
+
+LOAD_STORE_B32 = r"""
+__device__ __forceinline__ int rv_load_b32_if(const void* p, int other, bool ok) {
+  int v = other;
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q ld.global.b32 %0, [%1];\n}"
+               : "+r"(v) : "l"(p), "r"((int)ok));
+  return v;
+}
+__device__ __forceinline__ void rv_store_b32_if(void* p, int v, bool ok) {
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q st.global.b32 [%0], %1;\n}"
+               :: "l"(p), "r"(v), "r"((int)ok) : "memory");
+}
+"""
+
+
+@tilelang.jit(pass_configs=PASS)
+def prefill_tile_kernel(lookahead_block: int, threads: int, per: int, groups: int, hoist: bool):
+    """``prepare_prefill_inputs`` with predicated loads and stores: ``threads`` a block,
+    ``per`` tokens a thread a group, ``groups`` groups a pass (each skipped when the
+    chunk does not reach it), and the lookahead token loaded with the first pass
+    (``hoist``) or after the chunk's stores."""
+    group = threads * per
+    tile = group * groups
+    ids_len = T.dynamic("ids_len")
+    lookahead = T.dynamic("lookahead")
+    lookahead_cols = T.dynamic("lookahead_cols")
+    lookahead_stride = T.dynamic("lookahead_stride")
+    num_reqs = T.dynamic("num_reqs")
+    starts_len = T.dynamic("starts_len")
+    history_rows = T.dynamic("history_rows")
+    history_cols = T.dynamic("history_cols")
+    history_stride = T.dynamic("history_stride")
+    prefill_rows = T.dynamic("prefill_rows")
+    counts_len = T.dynamic("counts_len")
+
+    @T.prim_func
+    def prepare_prefill_inputs(
+        input_ids: T.Tensor((ids_len,), T.int32),
+        next_prefill_tokens: T.StridedTensor(
+            (lookahead, lookahead_cols), (lookahead_stride, 1), T.int32
+        ),
+        idx_mapping: T.Tensor((num_reqs,), T.int64),
+        query_start_loc: T.Tensor((starts_len,), T.int32),
+        all_token_ids: T.StridedTensor((history_rows, history_cols), (history_stride, 1), T.int32),
+        prefill_len: T.Tensor((prefill_rows,), T.int32),
+        num_computed_tokens: T.Tensor((counts_len,), T.int32),
+    ):
+        with T.Kernel(num_reqs, threads=threads) as b:
+            T.import_source(LOAD_STORE_B32)
+            tx = T.get_thread_binding()
+            req = T.cast(idx_mapping[b], T.int64)
+            prefill = prefill_len[req]
+            computed = num_computed_tokens[req]
+            if computed < prefill:
+                start = T.alloc_var(T.int32, init=query_start_loc[b])
+                length = T.alloc_var(T.int32, init=query_start_loc[b + 1] - start)
+                ahead = (tx < lookahead_block) & (tx < lookahead)
+                position = computed + length + tx
+                next_token = T.alloc_var(T.int32, init=0)
+                if hoist:
+                    next_token = T.call_extern(
+                        "int32", "rv_load_b32_if", T.address_of(all_token_ids[req, position]),
+                        0, ahead & (position < prefill),
+                    )  # fmt: skip
+                tokens = T.alloc_local((per * groups,), T.int32)
+                for it in T.serial(T.ceildiv(length, tile)):
+                    for g in T.unroll(groups):
+                        if it * tile + g * group < length:
+                            for k in T.unroll(per):
+                                j = it * tile + g * group + k * threads + tx
+                                tokens[g * per + k] = T.call_extern(
+                                    "int32", "rv_load_b32_if",
+                                    T.address_of(all_token_ids[req, computed + j]), 0, j < length,
+                                )  # fmt: skip
+                    for g in T.unroll(groups):
+                        if it * tile + g * group < length:
+                            for k in T.unroll(per):
+                                j = it * tile + g * group + k * threads + tx
+                                T.call_extern(
+                                    "handle", "rv_store_b32_if",
+                                    T.address_of(input_ids[start + j]), tokens[g * per + k],
+                                    j < length,
+                                )  # fmt: skip
+                if not hoist:
+                    next_token = T.call_extern(
+                        "int32", "rv_load_b32_if", T.address_of(all_token_ids[req, position]),
+                        0, ahead & (position < prefill),
+                    )  # fmt: skip
+                T.call_extern(
+                    "handle", "rv_store_b32_if", T.address_of(next_prefill_tokens[tx, req]),
+                    next_token, ahead,
+                )  # fmt: skip
+
+    return prepare_prefill_inputs

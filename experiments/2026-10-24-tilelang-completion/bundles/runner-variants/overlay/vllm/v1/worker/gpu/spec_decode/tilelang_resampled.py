@@ -13,6 +13,33 @@ _PASS = {
 _THREADS = 32
 
 
+@T.macro
+def _take_better(best, best_index, best_id, value, index, value_id, valid):
+    """Take ``(value, index, value_id)`` if it is valid and larger, or equal with
+    a lower index."""
+    take = T.alloc_var(
+        T.int32,
+        init=T.cast(
+            valid
+            & ((value > best[0]) | ((value == best[0]) & (index < best_index[0]))),
+            T.int32,
+        ),
+    )
+    best_id[0] = T.if_then_else(take != 0, value_id, best_id[0])
+    best_index[0] = T.if_then_else(take != 0, index, best_index[0])
+    best[0] = T.if_then_else(take != 0, value, best[0])
+
+
+@T.macro
+def _exchange(best, best_index, best_id, distance):
+    """Combine with the lane at XOR ``distance``."""
+    _take_better(
+        best, best_index, best_id,
+        T.shfl_xor(best[0], distance), T.shfl_xor(best_index[0], distance),
+        T.shfl_xor(best_id[0], distance), T.bool(True),
+    )  # fmt: skip
+
+
 @tilelang.jit(pass_configs=_PASS)
 def insert_kernel(
     blocks: int,
@@ -28,6 +55,9 @@ def insert_kernel(
     mapping_len = T.dynamic("mapping_len")
     state_len = T.dynamic("state_len")
     padded = 1 << (blocks - 1).bit_length()
+    per = (blocks + 31) // 32
+    if blocks > 4 and threads != 32:
+        raise ValueError("more than four blocks take a warp a row")
 
     @T.prim_func
     def insert(
@@ -60,43 +90,51 @@ def insert_kernel(
                                 winner = i
                         sampled[row, count] = local_ids[row, winner]
             else:
-                if threads == 32:
-                    count_local = T.alloc_var(T.int32, init=0)
-                    if thread == 0:
-                        count_local = counts[row]
-                        counts[row] = count_local + 1
-                    count = T.shfl_sync(count_local, 0)
-                else:
-                    count = counts[row]
-                position = cu[row] + count
+                # A warp a row. Every block's maximum and id is loaded first (they
+                # depend only on the row), then the count, the request's state and
+                # its temperature; the reduction carries each candidate's id, so no
+                # load waits on the winner. As before: NaN counts as -inf, and the
+                # lowest block index wins a tie.
+                values = T.alloc_local((per,), value_dtype)
+                ids = T.alloc_local((per,), T.int64)
+                for k in T.unroll(per):
+                    i = T.min(k * 32 + thread, blocks - 1)
+                    values[k] = local_max[row, i]
+                    ids[k] = local_ids[row, i]
+                first = T.alloc_var(T.int32, init=cu[row])
+                last = T.alloc_var(T.int32, init=cu[row + 1] - 1)
+                count_local = T.alloc_var(T.int32, init=0)
+                if thread == 0:
+                    count_local = counts[row]
+                    counts[row] = count_local + 1
+                count = T.shfl_sync(count_local, 0)
+                position = first + count
                 state = mapping[position]
                 if (
                     T.cast(temperature[state] != 0, T.int32)
-                    | T.cast(position == cu[row + 1] - 1, T.int32)
+                    | T.cast(position == last, T.int32)
                 ) != 0:
-                    values = T.alloc_fragment((padded,), value_dtype)
-                    maximum = T.alloc_fragment((1,), value_dtype)
-                    indices = T.alloc_fragment((padded,), T.int32)
-                    winner = T.alloc_fragment((1,), T.int32)
-                    for i in T.Parallel(padded):
-                        values[i] = -T.infinity(value_dtype)
-                        if i < blocks:
-                            value = local_max[row, i]
-                            values[i] = T.if_then_else(
-                                T.isnan(value), -T.infinity(value_dtype), value
-                            )
-                    T.reduce_max(values, maximum, dim=0)
-                    for i in T.Parallel(padded):
-                        indices[i] = T.if_then_else(
-                            i < blocks and values[i] == maximum[0], i, padded
-                        )
-                    T.reduce_min(indices, winner, dim=0)
+                    best = T.alloc_local((1,), value_dtype)
+                    best_index = T.alloc_local((1,), T.int32)
+                    best_id = T.alloc_local((1,), T.int64)
+                    best[0] = -T.infinity(value_dtype)
+                    best_index[0] = padded
+                    best_id[0] = 0
+                    for k in T.unroll(per):
+                        _take_better(
+                            best, best_index, best_id,
+                            T.if_then_else(
+                                T.isnan(values[k]), -T.infinity(value_dtype), values[k]
+                            ),
+                            k * 32 + thread, ids[k], k * 32 + thread < blocks,
+                        )  # fmt: skip
+                    _exchange(best, best_index, best_id, 16)
+                    _exchange(best, best_index, best_id, 8)
+                    _exchange(best, best_index, best_id, 4)
+                    _exchange(best, best_index, best_id, 2)
+                    _exchange(best, best_index, best_id, 1)
                     if thread == 0:
-                        sampled[row, count] = local_ids[row, winner[0]]
-                if threads != 32:
-                    T.sync_threads()
-                    if thread == 0:
-                        counts[row] = count + 1
+                        sampled[row, count] = best_id[0]
 
     return insert
 

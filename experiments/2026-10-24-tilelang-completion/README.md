@@ -1198,3 +1198,30 @@ probably has it too, but was not tested, since one request would take it down.
 - The fix, and the lab's handling of a dead arm, are their own work.
 - The scenario is out of [controls_digest.py](controls_digest.py) until then.
 - Custom logprob ids, which came after it, are still to be served.
+
+### Fifteenth integrated run (2026-10-24 22:46 CET)
+
+Every test passes. The mHC, misc and sampling gates pass, including all of the generation
+controls.
+
+prepare_prefill_inputs:
+- On the 16K chunk it is now **twice as fast as Triton**: 4.36 against 8.98 µs.
+- At decode it is slower: +0.27 µs at one stream and +0.57 at sixteen (an interval that
+  crosses zero).
+
+Its decode gap has moved between runs as the shape changed:
+
+| Run | Shape | One stream | Sixteen |
+| --- | --- | --- | --- |
+| 13 | 256 threads, branchy | +0.10 µs | +0.30 µs |
+| 14 | 128 threads, tile form | +0.10 µs | +0.27 µs |
+| 15 | 256 threads, four groups a pass, lookahead hoisted | +0.27 µs | +0.57 µs |
+
+expand_idx_mapping is +0.03 µs at one stream.
+
+**Runner round 6** (`runner-round6-kernels.json`) times the shapes head to head, paired
+against Triton:
+- threads 128 or 256;
+- 4 or 8 tokens a thread;
+- 1, 2 or 4 groups a pass;
+- the lookahead token loaded with the first pass or after the stores.
