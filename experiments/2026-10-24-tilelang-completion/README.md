@@ -662,3 +662,18 @@ On top of the fifth (vLLM `tilelang-ports` 649dde962):
   loop of runtime length.
 - **Temperature** divides 2048 columns a block instead of Triton's 8192. It is
   element-wise, so the split is free, and one token gets 64 blocks instead of 16.
+
+### Fifth integrated run (2026-10-24 18:41 CET)
+
+- Every test passes.
+- prepare_dflash_inputs is unchanged at +0.45 to +0.52 µs, so spreading the padding was
+  not the cure. In SASS, Triton's kernel issues its nine loads together at the top and
+  stores under masks. Ours issues them in rounds behind branches: the request index, then
+  the positions, then the block table, each in its own conditional block.
+- The resampled token's one-request mixed-temperature case read +8% (+0.06 µs), the case
+  its experiment left inconclusive. Every other size is 1-6% faster than Triton.
+
+## Seventh integrated run (run `tilelang-integration-kernels-7`)
+
+prepare_dflash_inputs in Triton's tile form (vLLM `e4729693c`): every load up front at an
+index that exists whatever the masks say, masks as selects, stores predicated.
