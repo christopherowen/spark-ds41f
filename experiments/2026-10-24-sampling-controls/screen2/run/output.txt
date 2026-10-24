@@ -1,0 +1,3227 @@
+....................FFFFFFFFFFFFFFFF..................................FF [ 68%]
+FFFFFFF..........................                                        [100%]
+=================================== FAILURES ===================================
+______ test_penalties_count_only_preceding_drafts[False-33-index_dtype0] _______
+
+index_dtype = torch.int32, vocab = 33, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:14  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:14] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+______ test_penalties_count_only_preceding_drafts[False-33-index_dtype1] _______
+
+index_dtype = torch.int64, vocab = 33, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:16  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:17] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[False-8191-index_dtype0] ______
+
+index_dtype = torch.int32, vocab = 8191, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:17  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:18] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[False-8191-index_dtype1] ______
+
+index_dtype = torch.int64, vocab = 8191, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:19  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:20] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[False-8193-index_dtype0] ______
+
+index_dtype = torch.int32, vocab = 8193, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:20  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:21] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[False-8193-index_dtype1] ______
+
+index_dtype = torch.int64, vocab = 8193, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:21  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:22] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+____ test_penalties_count_only_preceding_drafts[False-129280-index_dtype0] _____
+
+index_dtype = torch.int32, vocab = 129280, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:22  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:23] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+____ test_penalties_count_only_preceding_drafts[False-129280-index_dtype1] _____
+
+index_dtype = torch.int64, vocab = 129280, nonfinite = False
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:24  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:25] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_______ test_penalties_count_only_preceding_drafts[True-33-index_dtype0] _______
+
+index_dtype = torch.int32, vocab = 33, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:25  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:26] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_______ test_penalties_count_only_preceding_drafts[True-33-index_dtype1] _______
+
+index_dtype = torch.int64, vocab = 33, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:26  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:26] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+______ test_penalties_count_only_preceding_drafts[True-8191-index_dtype0] ______
+
+index_dtype = torch.int32, vocab = 8191, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:27] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+______ test_penalties_count_only_preceding_drafts[True-8191-index_dtype1] ______
+
+index_dtype = torch.int64, vocab = 8191, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:27  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:28] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+______ test_penalties_count_only_preceding_drafts[True-8193-index_dtype0] ______
+
+index_dtype = torch.int32, vocab = 8193, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:28  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:29] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+______ test_penalties_count_only_preceding_drafts[True-8193-index_dtype1] ______
+
+index_dtype = torch.int64, vocab = 8193, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:30] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[True-129280-index_dtype0] _____
+
+index_dtype = torch.int32, vocab = 129280, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:30  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:31] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_____ test_penalties_count_only_preceding_drafts[True-129280-index_dtype1] _____
+
+index_dtype = torch.int64, vocab = 129280, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+        args = penalties_case(17, vocab, index_dtype, padded=True)
+        logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
+        if nonfinite:
+            logits[:, :8] = torch.tensor(
+                [
+                    -float("inf"),
+                    float("inf"),
+                    float("nan"),
+                    0.0,
+                    -0.0,
+                    1.17549435e-38,
+                    1.40129846e-45,
+                    -1.40129846e-45,
+                ],
+                device="cuda",
+            )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _penalties_kernel[(17, (vocab + 8191) // 8192)](
+            expected,
+            expected.stride(0),
+            mapping,
+            tokens,
+            pos,
+            rep,
+            freq,
+            pres,
+            mask,
+            mask.stride(0),
+            counts,
+            counts.stride(0),
+            vocab,
+            BLOCK_SIZE=8192,
+        )
+>       candidate.apply_penalties(*args)
+
+tests/v1/worker/test_gpu_sampling_controls.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_controls.py:227: in apply_penalties
+    _launch(
+vllm/v1/worker/gpu/sample/tilelang_controls.py:35: in _launch
+    factory(*key)(*tensors)
+    ^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:190: in _lower_with_context_impl
+    codegen_mod = device_codegen(device_mod, context) if enable_device_compile else device_codegen_without_compile(device_mod, context)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:101: in device_codegen
+    return context.codegen_device(device_mod, compile_device=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:221: in codegen_device
+    return self.module.codegen_device(mod, self.target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:126: in codegen_device
+    return self.get_device_codegen(target).lower(mod, target, compile_device=compile_device)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:44: in lower
+    return build_func(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:21: in build
+    return run_codegen_with_instrumentation(
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:261: in run_codegen_with_instrumentation
+    return session.run_codegen(CodegenEvent(name=name, mod=mod, target=target), call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/instrumentation/session.py:110: in run_codegen
+    return wrapped()
+           ^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/device_codegen.py:25: in <lambda>
+    lambda: tvm.ffi.get_global_func(global_func_name)(mod, target),
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::codegen::BuildTileLangCUDA(tvm::IRModule, tvm::Target)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::AddFunction(tvm::GlobalVar const&, tvm::tirx::PrimFunc const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::SeqStmtNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitStmt_(tvm::tirx::IfThenElseNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::ForNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitStmt_(tvm::tirx::BufferStoreNode const*)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::AddNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::VisitExpr_(tvm::tirx::CastNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::PrintExpr[abi:cxx11](tvm::PrimExpr const&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenC::VisitExpr_(tvm::tirx::EQNode const*, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintVecBinaryOp(std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, tvm::runtime::DataType, tvm::PrimExpr, tvm::PrimExpr, std::ostream&)
+    ???
+<unknown>:0: in tvm::codegen::CodeGenTileLangCUDA::PrintType(tvm::runtime::DataType, std::ostream&)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Cannot convert type boolx8 to CUDA type
+
+<unknown>:0: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:08:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `penalties` with `out_idx=None`
+----------------------------- Captured stderr call -----------------------------
+[17:08:32] /workspace/tilelang/src/cuda/codegen/codegen_cuda.cc:1106: Fatal: Cannot convert type boolx8 to CUDA type
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `penalties` with `out_idx=None`
+_______________ test_nan_count_ignores_padded_columns[33-dtype0] _______________
+
+dtype = torch.float32, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_______________ test_nan_count_ignores_padded_columns[33-dtype1] _______________
+
+dtype = torch.bfloat16, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_______________ test_nan_count_ignores_padded_columns[33-dtype2] _______________
+
+dtype = torch.float16, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype0] ______________
+
+dtype = torch.float32, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype1] ______________
+
+dtype = torch.bfloat16, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype2] ______________
+
+dtype = torch.float16, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:05  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype0] _____________
+
+dtype = torch.float32, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:06  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype1] _____________
+
+dtype = torch.bfloat16, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:06  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype2] _____________
+
+dtype = torch.float16, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:217: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:09:06  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_thinking_budget.py::test_v2_greedy_sampling_applies_thinking_budget[triton]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-33-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-33-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-8191-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-8191-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-8193-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-8193-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-129280-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[False-129280-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-33-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-33-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-8191-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-8191-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-8193-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-8193-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-129280-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_penalties_count_only_preceding_drafts[True-129280-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype2]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype2]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype2]
+25 failed, 80 passed, 15 warnings in 74.07s (0:01:14)
