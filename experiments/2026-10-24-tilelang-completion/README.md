@@ -23,7 +23,7 @@ side stream, about 10 ms at one stream):
 | TileLang (ours and TileKernels) | 48 | 46.8 | 78.3 | done |
 | Triton (vLLM's runner, sampler, speculative decoding, sink detector) | 20 | 0.071 | 0.177 | port |
 | TileKernels CUDA (`mhc_post_fwd`, `mhc_pre_apply_mix_fwd`) | 2 | 0.062 | 0.121 | port |
-| NCCL (the ring's row all-to-all, all-gather) | 2 | 0 | 0.821 | move into sparknet's TileLang collectives |
+| NCCL (sequence-parallel prefill's exchanges and gathers; none in a decode forward) | 2 | 0 | 0.821 | see below |
 | cuBLAS (gemv, dot) | 3 | 0.004 | 0.005 | port |
 | vLLM CUDA (vocabulary embedding) | 1 | 0.005 | 0.009 | port |
 | ATen (copies, fills, top-k, sorts, scans, index ops) | 93 | 0.40 | 0.50 | fold into their neighbours or port |
@@ -54,8 +54,16 @@ inventory: one window, every request type the deployment serves.
 3. **mHC post and pre-mix** in TileLang, from TileKernels' CUDA kernels; bit-identical against
    them, and the first fusion candidate (the post with the next layer's pre, the sink detector's
    column with the residual it reads).
-4. **The ring's collectives**: the row all-to-all and the remaining NCCL all-gather as sparknet
-   TileLang collectives, so NCCL leaves the decode step.
+4. **The ring's collectives** (corrected 2026-10-24): a decode forward makes no NCCL call. The
+   sixteen-stream profile's NCCL kernels belong to the prefill of its sixteen fresh prompts (one
+   sequence-parallel forward of about 1,000 tokens): 83 exchanges a rank (the attention and MoE
+   reduce-scatters, the embedding's, the Engram row all-to-all) and 52 all-gathers above the
+   one-shot 2 MiB limit. A one-shot all-to-all for ring4 (sparknet branch `ring-alltoall` 4932e13,
+   vLLM `ring-alltoall-sparknet` 3a785ee1e; offline only: `make check`, the simulator, the vLLM
+   policy tests) estimates about 18 ms less a forward at 1,000 tokens but 10-25% slower than NCCL
+   for 20 MiB blocks, because staging does not overlap the wire. Parked until a third slot overlaps
+   them (wire ABI 12); then the fabric probe, the GPU suite on ring and triangle, and a
+   prefill-weighted serving A/B.
 5. **The ATen glue**: each launch traced to its source and folded into the kernel beside it.
 6. **Prefill and the vision tower** after their inventory; then B12X retires with its loader.
 
