@@ -118,13 +118,14 @@ class RecipeTest(unittest.TestCase):
 
     def test_each_shape_is_its_1022_arm_renamed(self):
         """Each shape resolves to spark-ds41f-1022's arm at that shape under the names of the
-        release after it (the owner's decision of 2026-10-19), and nothing else: the container,
-        label prefix, variables and cache paths are renamed, PYTHONPATH is left to the image
-        (which sets it to the same trees) and the boot-profile variable nothing reads since
-        vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it. The release
-        also changes two things on purpose: the ring's long-prefill budget is 16,384 (the owner,
-        2026-10-23, "do 16"; experiments/2026-10-23-next-release, budget sweeps) and glibc malloc
-        keeps two arenas and a fixed 1 MiB mmap threshold (#439's growth; the memory window)."""
+        release after it (the owner's decision of 2026-10-19), on spark-ds41f-1024's image, and
+        nothing else: the container, label prefix, variables and cache paths are renamed,
+        PYTHONPATH is left to the image (which sets it to the same trees) and the boot-profile
+        variable nothing reads since vLLM 0184 is gone. The release also changes two things on
+        purpose: the ring's long-prefill budget is 16,384 (the owner, 2026-10-23, "do 16";
+        experiments/2026-10-23-next-release, budget sweeps), glibc malloc keeps two arenas and a
+        fixed 1 MiB mmap threshold (#439's growth; the memory window), and every response
+        reports its prompt-cache hits (#469)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
@@ -132,20 +133,33 @@ class RecipeTest(unittest.TestCase):
             released = renamed(load_spark().read_cluster(arm))
             released["environment"] = {**released["environment"], "MALLOC_ARENA_MAX": "2",
                                        "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            released["container"]["image"] = "spark-ds41f:19f2c20ed4d6-next-4"
+            released["container"]["expected_labels"]["local.spark-ds41f.vllm.tree"] = (
+                "97fc3579def4ffc32eec88c9149c560559af59d4")
+            # The prompt-cache report (#469), where the recipe renders it.
+            args = released["serve_args"] = list(released["serve_args"])
+            args.insert(resolved["serve_args"].index("--enable-prompt-tokens-details"),
+                        "--enable-prompt-tokens-details")
             if shape == "tp4-ring":
-                args = released["serve_args"] = list(released["serve_args"])
                 for flag, value in (("--max-num-batched-tokens", "16384"),
                                     ("--long-prefill-token-threshold", "16288")):
                     args[args.index(flag) + 1] = value
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
-        self.assertEqual(self.recipe["container"]["image"], "vllm-ds41f-kkref:19f2c20ed4d6-1022-4")
+        self.assertEqual(self.recipe["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-4")
+
+    def test_the_ring_is_candidate_4s_arm(self):
+        """Promotion runs what the release measured: tp4-ring resolves to candidate 4's gate
+        arm, apart from the baseline, lock and reference that name it."""
+        resolved = recipe.resolve(self.recipe, "tp4-ring")
+        released = load_spark().read_cluster("experiments/2026-10-23-next-release/rc4/rc-tp4.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                         {k: v for k, v in released.items() if k not in naming})
 
     def test_the_recipe_keeps_no_old_live_name(self):
-        """Apart from the image tag (the promotion's image moves it), no old name is left."""
-        recipe_ = json.loads(json.dumps(self.recipe))
-        del recipe_["container"]["image"]
-        text = json.dumps(recipe_)
+        """No old name is left."""
+        text = json.dumps(self.recipe)
         for old in ("spark3", "SPARK3_", "kkref", "karmic", "dsv41-", "vllm-r5o", "PYTHONPATH"):
             self.assertNotIn(old, text)
         self.assertEqual(self.recipe["container"]["name"], "spark-ds41f")
@@ -274,9 +288,9 @@ class RecipeTest(unittest.TestCase):
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # spark-ds41f-1022 was released on the triangle, then on the ring: each shape has its own run.
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
-        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
+        # spark-ds41f-1024 was released on the ring; the triangle waits for its own run.
+        self.assertNotIn("benchmark_reference", resolved)
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-24-spark-ds41f-1024-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_every_shape_reports_prompt_cache_hits(self):

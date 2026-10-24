@@ -1,7 +1,25 @@
 # Current state
 
 Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
+**spark-ds41f-1024**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4, promoted
+2026-10-24 as [`2026-10-24-spark-ds41f-1024`](../manifests/baselines/2026-10-24-spark-ds41f-1024.json)
+([release record](../experiments/2026-10-23-next-release/README.md)): image
+`spark-ds41f:19f2c20ed4d6-next-4` (sha256:1ae57dac1017), spark-ds41f-1022's sources with vLLM
+0228-0265 (patch head `4cd21d89`, tree `97fc3579`). 0228 draws fresh random numbers in each
+block-verification round (vllm-project/vllm#61161); 0229-0254 move the CED row selection to
+TileLang and 0255 skips its nonfinal rows; 0256-0257 are the tokenizer's generation controls and
+the API's `thinking` switch (#447); 0258, 0261, 0263 and 0265 add GLP steering, off unless
+configured; 0262 reads `SPARK_DS41F_*` variables; 0264 scopes the sink log (#489). The recipe moves
+to the spark-ds41f names (container, image, labels, `/opt/spark-ds41f`, `/cache/spark-ds41f`,
+`spark-ds41f-kernel-memory`), sets the ring's long-prefill budget to 16,384, pins glibc malloc
+(#439) and reports prompt-cache hits (#469). Outputs are identical to spark-ds41f-1022's. Against
+spark-ds41f-1022 in one session: prefill +11.4% at 32K and +12.3% at 131K, decode and sampled
+streams level. Release tests: 2,105 passed. `tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-24-spark-ds41f-1024-tp4](../manifests/suites/2026-10-24-spark-ds41f-1024-tp4/);
+the triangle is not qualified on this image. spark-ds41f-1022's recipe and lock are frozen in
+`experiments/2026-10-23-next-release/1022` as the rollback.
+
+Before spark-ds41f-1024 production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
 2026-10-23 (the `tp3-triangle` shape on dgx1-dgx3 from 2026-10-22), promoted
 2026-10-22 as [`2026-10-22-spark-ds41f-1022`](../manifests/baselines/2026-10-22-spark-ds41f-1022.json)
 ([promotion record](../experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
