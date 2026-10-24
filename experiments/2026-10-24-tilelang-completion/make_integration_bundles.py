@@ -40,7 +40,11 @@ PARTS = {
                 "tests/v1/worker/test_gpu_input_batch_v2.py",
                 "tests/v1/worker/test_gpu_sink.py",
                 "tests/v1/spec_decode/test_dflash_prepare_inputs.py",
-                "tests/v1/worker/test_prepare_kernels.py"], 3600),
+                "tests/v1/worker/test_prepare_kernels.py",
+                # Prompt logprobs under sink rejection (0266, experiments/2026-10-24-prompt-logprobs-sink).
+                "tests/v1/core/test_sink_draft_zero.py",
+                # The grammar bitmask in TileLang (structured output).
+                "tests/v1/worker/test_gpu_tilelang_structured.py"], 3600),
             ("runner benchmark", ["benchmarks/kernels/benchmark_runner_inputs_tilelang.py",
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",
@@ -75,6 +79,10 @@ PARTS = {
              ["benchmarks/kernels/benchmark_sampling_controls.py", "--gate"], 1800),
             ("sampling-controls auxiliary benchmark",
              ["benchmarks/kernels/benchmark_sampling_auxiliary.py", "--gate"], 1800),
+            # The sink detector's flags, cut and greedy alternates, and the grammar
+            # bitmask, against the torch chains and the Triton kernel they replace.
+            ("sink glue and grammar bitmask benchmark",
+             ["benchmarks/kernels/benchmark_sink_glue.py", "--gate"], 1800),
         ],
     ),
     "mhc": (
@@ -94,7 +102,11 @@ PARTS = {
                 "tests/kernels/test_deepseek_v41_tilelang_embedding.py",
                 "tests/kernels/test_deepseek_v41_tilelang_confidence.py",
                 "tests/v1/worker/test_gpu_logprob_ranks.py",
-                "tests/v1/spec_decode/test_rejection_sampler_utils.py"], 3600),
+                "tests/v1/spec_decode/test_rejection_sampler_utils.py",
+                # The RMSNorm on the fused projection's halves, in place (vLLM 1e62f7ea6).
+                "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py::test_rmsnorm",
+                "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
+                "::test_rmsnorm_of_a_fused_projections_half"], 3600),
             # The unchanged image fails eight of these (vocabulary-parallel draft seeds;
             # experiments/2026-10-24-resampled-token): their own step, so they are told
             # apart from the ports'.

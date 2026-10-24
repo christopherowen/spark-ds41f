@@ -1276,3 +1276,23 @@ candidate 4, four alternating arms.
     ids' state.
   - Like the prompt-logprobs crash, this is candidate 4's bug, and it is followed up with
     that fix.
+
+## Seventeenth integrated run (run `tilelang-integration-kernels-17`)
+
+Owner, 2026-10-25: complete the TileLang port and include the night's fixes before blessing
+another candidate. vLLM `tilelang-ports` cb9ed45bd adds:
+- **The prompt-logprobs fix**, 0266 (1537606b0), with its 15 scheduler tests.
+- **The q/kv norm copies are gone** (1e62f7ea6). TileKernels' norm reads rows by their
+  stride, so the halves of `fused_wqa_wkv`'s output are normalized where they lie. That
+  removes the two copies a layer, 83 kernels a decode step.
+- **The sink detector's glue in TileLang:**
+  - the flags in one kernel instead of about twelve (e0fe10065);
+  - the drafter-row cut and its restore (02acdd471);
+  - the greedy step's shard candidates and the merge (732c3b6ca). These replace
+    `torch.topk`'s 20 kernels, the cat, and the merge's sort and gathers.
+  - Shard candidates order equal values by column, the order the full-logits path and
+    the merge already assume. `torch.topk` left that order undefined, so an exact tie at
+    a sink event is the only place outputs can differ.
+- **The grammar bitmask in TileLang** (structured output, 1fd8cae32).
+- **`benchmark_sink_glue.py --gate`:** the sink kernels against the torch chains, and the
+  bitmask against Triton.
