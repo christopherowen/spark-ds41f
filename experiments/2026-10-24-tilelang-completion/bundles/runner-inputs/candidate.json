@@ -1,0 +1,70 @@
+{
+ "description": "The V2 runner's input-preparation kernels as TileLang (vLLM branch tilelang-runner-inputs, 047f017b2) on image -next-3: each port bit-identical to the Triton kernel it replaces, the runner's existing tests, and the paired benchmark (--gate: not slower at a serving shape).",
+ "image": "spark-ds41f:19f2c20ed4d6-next-3",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-runner-inputs",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b"
+ },
+ "workdir": "vllm",
+ "argv": [
+  "-c",
+  "import subprocess,sys\na=subprocess.run([sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-runner-inputs','tests/v1/worker/test_gpu_tilelang_inputs.py','tests/v1/worker/test_gpu_block_table.py','tests/v1/worker/test_kv_block_zeroer.py','tests/v1/worker/test_dead_rows.py','tests/v1/worker/test_gpu_input_batch_v2.py','tests/v1/worker/test_gpu_sink.py','tests/v1/spec_decode/test_dflash_prepare_inputs.py','tests/v1/worker/test_prepare_kernels.py'],timeout=3600).returncode\nb=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_runner_inputs_tilelang.py','--gate'],timeout=3600).returncode\nprint('pytest exit',a,'gate exit',b)\nsys.exit(a or b)"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "benchmarks_kernels_benchmark_runner_inputs_tilelang.py",
+   "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_runner_inputs_tilelang.py"
+  ],
+  [
+   "tests_v1_worker_test_gpu_tilelang_inputs.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_tilelang_inputs.py"
+  ],
+  [
+   "tests_v1_worker_test_kv_block_zeroer.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_kv_block_zeroer.py"
+  ],
+  [
+   "vllm_models_deepseek_v4_1_nvidia_model_state.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py"
+  ],
+  [
+   "vllm_models_deepseek_v4_1_tilelang_lookback.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/lookback.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_block_table.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/block_table.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_buffer_utils.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/buffer_utils.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_input_batch.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/input_batch.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_model_runner.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_dflash_speculator.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_tilelang_inputs.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py"
+  ],
+  [
+   "vllm_v1_worker_utils.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/utils.py"
+  ]
+ ]
+}
