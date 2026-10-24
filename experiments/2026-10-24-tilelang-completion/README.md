@@ -905,3 +905,10 @@ Eight distinct prompts, three samples an arm, no bench:
 - **zero_kv_blocks:** only the page size before the exit, and every store predicated. The
   stores are either int32s in Triton's layout or 16-byte stores when the segment's address,
   stride and page allow.
+- **Combine** (vLLM `tilelang-ports` 742eb9bf5, in the overlay):
+  - Triton loads a request's drafts and confidences only when it has drafts.
+  - Ours hoisted them into the first round of loads, so a 16K prefill chunk's request
+    waited on rows it never used (+0.08 µs).
+  - They are now predicated loads (`_LOAD_IF`) on the draft count, which arrives in that
+    same first round. Decode keeps its single round, and the prefill chunk issues none.
+  - The production kernel is timed with and without dead rows.
