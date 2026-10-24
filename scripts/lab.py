@@ -1487,6 +1487,15 @@ def run_image(step: dict) -> str | None:
         process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format", "{{.Id}}")
         return process.stdout.strip() if process.returncode == 0 else ""
 
+    def image_layers(node: dict) -> str:
+        """The image's layers (uncompressed content digests, in order): one image on every
+        node has the same, whatever each node's storage. The image ID is not that: Docker's
+        containerd image store names an image by its manifest, the overlay2 driver by its
+        config, so a faithful copy between the two changes the ID (#488)."""
+        process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format",
+                                "{{json .RootFS.Layers}}")
+        return process.stdout.strip() if process.returncode == 0 else ""
+
     def tree(node: dict) -> str:
         process = spark.run_ssh(nodes, node, "docker", "image", "inspect", image, "--format",
                                 "{{json .Config.Labels}}")
@@ -1525,10 +1534,13 @@ def run_image(step: dict) -> str | None:
         if process.returncode:
             return f"copy {source} -> {target} failed: {process.stderr.strip()[-300:]}"
         log(f"image copied {source} -> {target} in {time.time() - started:.0f} s")
-    ids = {node["name"]: image_id(node) for node in nodes["nodes"]}
-    if len(set(ids.values())) != 1 or not all(ids.values()):
-        return f"image IDs differ: {ids}"
-    log(f"image {image}: one ID on every node ({next(iter(ids.values()))[:19]})")
+    layers = {node["name"]: image_layers(node) for node in nodes["nodes"]}
+    if len(set(layers.values())) != 1 or not all(layers.values()):
+        differing = {name: value[:80] for name, value in layers.items()}
+        return f"{image} differs between nodes (layers): {differing}"
+    ids = {node["name"]: image_id(node)[:19] for node in nodes["nodes"]}
+    log(f"image {image}: the same {len(json.loads(next(iter(layers.values()))))} layers on every node "
+        f"(IDs {', '.join(sorted(set(ids.values())))})")
     return None
 
 

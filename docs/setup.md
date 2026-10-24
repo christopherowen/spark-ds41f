@@ -89,7 +89,7 @@ Do the stages in order on every node, and keep the nodes identical:
 | 3 | [Fabric](#3-fabric-cabling-and-addressing) | 9000-byte pings on every path; GID index 3 is IPv4 |
 | 4 | [Site configuration](#4-site-configuration) | `bin/spark doctor` |
 | 5 | [Model](#5-model) | the pinned revision on every node |
-| 6 | [Image](#6-image) | the same image ID on every node |
+| 6 | [Image](#6-image) | the same image (its layers) on every node |
 | 7 | [First start](#7-first-start) | `bin/spark doctor --live` |
 | 8 | [Verify](#8-verify) | `bin/spark bench` |
 
@@ -513,18 +513,21 @@ an existing tag, and runs a GPU import smoke test. The first build takes
 longer because it builds TileLang and TileKernels. More detail is in
 [docker/README.md](../docker/README.md).
 
-Copy the image to the other nodes and confirm one image ID everywhere:
+Copy the image to the other nodes and confirm the same image everywhere, by its layers:
 
 ```sh
 for host in dgx2 dgx3; do            # add dgx4 for TP4
   docker save vllm-ds41f-kkref:04c30fa98e79-r6 | ssh "$host" docker load
 done
 for host in dgx1 dgx2 dgx3; do       # add dgx4 for TP4
-  ssh "$host" docker image inspect vllm-ds41f-kkref:04c30fa98e79-r6 --format '{{.Id}}'
+  ssh "$host" docker image inspect vllm-ds41f-kkref:04c30fa98e79-r6 --format '{{json .RootFS.Layers}}' | sha256sum
 done
 ```
 
-Your image ID differs from ours because the image records the deployment
+Compare the layers, not the image ID: a node on Docker's containerd image store names an image
+by its manifest and an `overlay2` node by its config, so a faithful copy between the two shows
+a different ID (#488). The layers are the same on every node whatever its storage.
+Your image differs from ours because the image records the deployment
 commit. The source-tree labels must match the profile's `expected_labels`;
 `doctor --live` and the launch preflight check them.
 

@@ -235,7 +235,11 @@ differs only in cabling, transport and memory sizing):
   (`VLLM_SINK_REJECTION=0` turns it off): a sampled token that becomes the
   model's attention sink (residual column 2455) is drawn again, so short
   prompts such as `Say hi.` no longer collapse; a request's first token waits
-  one decode step for it;
+  one decode step for it. `vllm:sink_*` counts the flags in the outputs the
+  scheduler commits; each rank's `Sink detector, rank N` log line counts every
+  flagged row its GPU executed, including steps whose output is discarded (the
+  step in flight when a request finishes or is aborted, stale output after a
+  preemption), so the log reads at least the metric (#489);
 - control-token spellings written in request text stay plain text, as
   DeepSeek's encoder treats them;
 - the fabricated context of startup profiling gives each KV cache group its
