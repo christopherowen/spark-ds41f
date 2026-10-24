@@ -1,0 +1,41 @@
+{
+  "description": "Equivalent bonus-first insertion condition: early end-offset read and no temperature lookup for bonus tokens.",
+  "image": "spark-ds41f:19f2c20ed4d6-next-4",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-resampled-token",
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+  },
+  "workdir": "vllm",
+  "argv": [
+    "-c",
+    "import subprocess,sys\nc=subprocess.run(['/opt/compute-sanitizer/compute-sanitizer','--tool','memcheck','--error-exitcode','91',sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-resampled-memcheck','tests/v1/spec_decode/test_rejection_sampler_utils.py','-k','insert_resampled or ds41f_verification'],timeout=900).returncode\nb=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_resampled_token.py','--gate','--seed','17421'],timeout=600).returncode\nd=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_resampled_token.py','--gate','--seed','94563','--mixed'],timeout=600).returncode\na=subprocess.run([sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-resampled-full','tests/v1/spec_decode/test_rejection_sampler_utils.py','tests/v1/spec_decode/test_vocab_parallel_drafting.py','tests/v1/worker/test_gpu_sink.py','tests/v1/worker/test_prepare_kernels.py','-k','not test_vocab_parallel_draft_matches_full_vocab'],timeout=1200).returncode\nsys.exit(a or b or c or d)\n"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm_v1_worker_gpu_spec_decode_tilelang_resampled.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_spec_decode_rejection_sampler_utils.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
+    ],
+    [
+      "tests_v1_spec_decode_test_rejection_sampler_utils.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_rejection_sampler_utils.py"
+    ],
+    [
+      "benchmarks_kernels_benchmark_resampled_token.py",
+      "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_resampled_token.py"
+    ],
+    [
+      "/usr/local/cuda-13.0/compute-sanitizer",
+      "/opt/compute-sanitizer"
+    ],
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ]
+  ]
+}
