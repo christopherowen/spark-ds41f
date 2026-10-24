@@ -33,6 +33,7 @@ first, as benchmark_deepseek_v41_mhc_post.py does. One JSON line per variant and
 exit status 1 if any variant fails its checks or does not build.
 """
 
+import argparse
 import json
 import math
 import statistics
@@ -415,10 +416,15 @@ def main() -> None:
         ),
         flush=True,
     )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--variants", nargs="*", help="exact variant names (default: all)")
+    parser.add_argument("--repeat", type=int, default=1, help="passes over the variants")
+    args = parser.parse_args()
+    chosen = [v for v in VARIANTS if not args.variants or v.name in args.variants]
     failed = False
-    for variant in VARIANTS:
+    for repeat, variant in ((r, v) for r in range(args.repeat) for v in chosen):
         config = {k: v for k, v in asdict(variant).items() if k != "note"}
-        head = {"variant": variant.name, "config": config, "note": variant.note}
+        head = {"variant": variant.name, "config": config, "note": variant.note, "pass": repeat}
         try:
             kernel = build(variant, sms)
             problem = correctness(kernel)

@@ -381,6 +381,60 @@ def expand_kernel(block: int, threads: int, spread: bool):
     return expand
 
 
+# Triton stores under a mask as predicated instructions. A guarded store that is a
+# branch instead lets ptxas sink the loads feeding it below the branch, behind the
+# loads the guard waits for: two round trips to memory where Triton has one. The
+# ``tile`` variants store through these helpers, so nothing is branched over.
+STORE_IF = r"""
+__device__ __forceinline__ void vllm_store_if_b64(void* p, long long v, bool ok) {
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q st.global.b64 [%0], %1;\n}"
+               :: "l"(p), "l"(v), "r"((int)ok) : "memory");
+}
+__device__ __forceinline__ void vllm_store_if_b32(void* p, int v, bool ok) {
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q st.global.b32 [%0], %1;\n}"
+               :: "l"(p), "r"(v), "r"((int)ok) : "memory");
+}
+"""
+
+
+@tilelang.jit(pass_configs=PASS)
+def expand_tile_kernel(block: int, threads: int):
+    """``expand_kernel`` in Triton's form: the request's starts and state index read
+    up front, the two guarded stores predicated (``STORE_IF``)."""
+    num_reqs = T.dynamic("num_reqs")
+    expanded_len = T.dynamic("expanded_len")
+    local_len = T.dynamic("local_len")
+    cu_len = T.dynamic("cu_len")
+
+    @T.prim_func
+    def expand(
+        idx_mapping: T.Tensor((num_reqs,), T.int64),
+        expanded_idx_mapping: T.Tensor((expanded_len,), T.int64),
+        expanded_local_pos: T.Tensor((local_len,), T.int32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+    ):
+        with T.Kernel(T.ceildiv(num_reqs * block, threads), threads=threads) as bx:
+            T.import_source(STORE_IF)
+            element = bx * threads + T.get_thread_binding()
+            r = element // block
+            j = element % block
+            if r < num_reqs:
+                start = T.alloc_var(T.int32, init=cu_num_logits[r])
+                end = T.alloc_var(T.int32, init=cu_num_logits[r + 1])
+                value = T.alloc_var(T.int64, init=idx_mapping[r])
+                ok = j < end - start
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(expanded_idx_mapping[start + j]), value, ok,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b32",
+                    T.address_of(expanded_local_pos[start + j]), j, ok,
+                )  # fmt: skip
+
+    return expand
+
+
 # --- prepare_prefill_inputs ------------------------------------------------------
 
 

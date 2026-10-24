@@ -17,6 +17,7 @@ and branch. One JSON line per variant and shape.
 import json
 import math
 import statistics
+import sys
 
 import tilelang
 import torch
@@ -25,6 +26,8 @@ import triton
 from vllm.v1.worker.gpu.sample import gumbel, sink
 from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
 from vllm.v1.worker.gpu.spec_decode.dspark import greedy
+
+import sampling_tile
 
 DEVICE = torch.device("cuda")
 VOCAB = 129280
@@ -186,7 +189,7 @@ def pair_case(rows, biased, threads, mode, extra=None):
     return make
 
 
-def select_case(rows, mode, extra=None):
+def select_case(rows, mode, extra=None, tile=False):
     def make(sample):
         g = generator(sample)
         values = torch.randn(rows, 4, generator=g, device=DEVICE)
@@ -194,9 +197,14 @@ def select_case(rows, mode, extra=None):
         pairs = torch.stack([values, index], dim=-1).view(rows, 8)
         o1 = torch.empty(rows, dtype=torch.int64, device=DEVICE)
         o2 = torch.empty_like(o1)
+        kernel = (
+            build(sampling_tile.select_tile_kernel, "int64", 4)
+            if tile
+            else build(tls.select_first_argmax_kernel, "int64", mode, extra=extra)
+        )
 
         def ours():
-            build(tls.select_first_argmax_kernel, "int64", mode, extra=extra)(pairs, o1, 1)
+            kernel(pairs, o1, 1)
 
         def theirs():
             greedy._select_first_argmax[(rows,)](pairs, o2, 1, 4, 4)
@@ -211,7 +219,7 @@ def select_case(rows, mode, extra=None):
     return make
 
 
-def temperature_case(tokens, threads, extra=None):
+def temperature_case(tokens, threads, extra=None, factory=None):
     def make(sample):
         g = generator(sample)
         logits = torch.randn(tokens, VOCAB, generator=g, device=DEVICE)
@@ -219,7 +227,8 @@ def temperature_case(tokens, threads, extra=None):
         mapping = torch.arange(tokens, device=DEVICE)
         temperature = torch.full((tokens,), 0.7, device=DEVICE)
         kernel = build(
-            tls.temperature_kernel, "int64", tls._triton_run(logits), threads, extra=extra
+            factory or tls.temperature_kernel, "int64", tls._triton_run(logits), threads,
+            extra=extra,
         )
 
         def ours():
@@ -326,7 +335,7 @@ def emit(row: dict) -> None:
     print(json.dumps(row), flush=True)
 
 
-def main() -> None:
+def round3() -> None:
     # Production kernels as built, and with bound loads not replayed, against Triton.
     fixed = {
         "gumbel bf16 16 tokens": lambda extra: lambda s: gumbel_inputs(16, torch.bfloat16, extra, s),
@@ -385,6 +394,37 @@ def main() -> None:
                                                 run_finish(v, i, pairs.view(-1), rows, parts, 2,
                                                            SHARD, "pair", 0))),
               "triton": kernel_times(lambda: triton_pair(base, bias, SHARD, pairs, v, i))})
+
+
+def round4a() -> None:
+    """Temperature and select in Triton's tile form (sampling_tile) against the
+    production kernels, each against Triton; then each one's device time."""
+    for tokens in (1, 16, 96):
+        for threads in (128, 256):
+            for form, factory in (("prod", None), ("tile", sampling_tile.temperature_tile_kernel)):
+                row = {"kernel": "temperature", "form": form, "tokens": tokens, "threads": threads}
+                row.update(paired(temperature_case(tokens, threads, factory=factory)))
+                emit(row)
+    for rows in (1, 16, 96):
+        for form in ("prod", "tile"):
+            row = {"kernel": "select_first_argmax", "form": form, "rows": rows}
+            row.update(paired(select_case(rows, 0, tile=form == "tile")))
+            emit(row)
+    for tokens in (1, 96):
+        for form, factory in (("prod", None), ("tile", sampling_tile.temperature_tile_kernel)):
+            ours, theirs = temperature_case(tokens, 256, factory=factory)(0)
+            emit({"profile": f"temperature {form} {tokens} tokens 256 threads",
+                  "tilelang": kernel_times(ours), "triton": kernel_times(theirs)})
+    for form in ("prod", "tile"):
+        ours, theirs = select_case(1, 0, tile=form == "tile")(0)
+        emit({"profile": f"select {form} 1 row", "tilelang": kernel_times(ours),
+              "triton": kernel_times(theirs)})
+
+
+def main() -> None:
+    rounds = {"3": round3, "4a": round4a}
+    for name in sys.argv[1:] or ["4a"]:
+        rounds[name]()
 
 
 if __name__ == "__main__":

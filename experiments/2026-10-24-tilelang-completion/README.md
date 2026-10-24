@@ -305,3 +305,79 @@ against that kernel per call (eight fresh inputs, paired CUDA graphs, order alte
   - Triton's lane layout, a block per request;
   - int32 indices, static strides;
   - threads and work a thread.
+
+### Round 3 results (2026-10-24 16:41 CET; all variants bit-exact)
+
+Ratios are per call against the kernel replaced (paired CUDA graphs); "device" is the kernel's
+own time (CUPTI).
+
+- **Sampling** (dgx4):
+  - Bind replay off changes nothing in this family.
+  - Temperature is best at 256 threads: +18% at one token (+70% at 128), +10% at 16 (not
+    significant), +17-18% at 96 at any thread count.
+  - Greedy shard pairs are best with a warp per row in the finish: +27-31% at 1-6 rows (256
+    threads), +22-25% at 16 (128), +15-22% at 96 (64-128). A thread per row is always
+    slower.
+  - Select is +20-33% (about 0.3 µs) in every mode.
+  - Device time: Gumbel bf16 +3.9% at 16 tokens and +5.8% at 96, f32 +0.9%; candidates +16%
+    at one request and +8% at 16; greedy Markov pair at one row: partial 2.24 vs 1.29 µs,
+    finish 1.25 vs 0.85 µs.
+- **mHC collapse** (dgx3), against TileKernels at decode c1 / c16 / 8K / 16K:
+  - Round 1's: -5.5% / -10.7% / +1.6% / +1.5%.
+  - Capped at 16 KiB of reserved shared memory a block: -4.9% / -7.6% / -1.7% / -2.2%,
+    faster at every shape.
+  - Capped at 24 KiB: -0.8% / -6.0% / -2.4% / -2.6%.
+  - Persistent grids, column-major grids and more rows a block are slower.
+- **Runner** (dgx1):
+  - Pass:
+    - post_update with hoisted scalars at 32 threads: -9 to -16% at every shape.
+    - combine at 128 threads: -9 to -12% at decode, +5% (0.08 µs) at the 16K prefill.
+  - Bind replay off: device time -8 to -13% for combine and post_update, nothing elsewhere.
+  - int32 indices and static strides gain nothing anywhere.
+  - Still slower in every variant:
+    - expand_idx_mapping: +10-13% (device +0.25 µs on 0.81).
+    - gather_lookback: +1-7%.
+    - prepare_dflash_inputs at decode: +11-17%.
+    - prepare_prefill_inputs at decode c16: +14%.
+    - combine with dead rows at the 16K prefill: +4%.
+
+### Why the small kernels lose (SASS for sm_121a, compiled locally)
+
+Triton writes a block's loads as one masked tile, issued before anything uses them, and its
+masked stores are predicated instructions. The ports are written a thread at a time with
+branches, and two things follow:
+
+- **expand_idx_mapping:** the TileLang kernel loads the request's two starts, branches on
+  them, and only then loads its state index: two round trips to memory where Triton has one.
+  ptxas moves that load below the branch even when the source reads it first (round 3's
+  hoisted variant), and even as a volatile asm load. With the guarded stores written as
+  predicated PTX there is no branch to sink into, and the three loads issue together, as
+  Triton's do.
+- **Temperature:** each run's load, division and store come before the next run's load, and
+  the logits are read and written through one pointer, so every load waits for the store
+  before it: a round trip per run, 16 per thread. Triton loads the block, divides, then stores.
+- **Select:** a loop of dynamic length, unrolled by four with a remainder (252
+  instructions). Triton fixes the number of ranks. In tile form the kernel is 66
+  instructions: one load per lane, then the shuffles.
+
+## Round 4a: Triton's tile form ([tileform-kernels.json](tileform-kernels.json))
+
+- [bundles/sampling-variants](bundles/sampling-variants) `4a` (dgx4):
+  - temperature at 1, 16 and 96 tokens and 128 or 256 threads, production against
+    [sampling_tile.py](bundles/sampling-variants/sampling_tile.py) (every run loaded, then
+    divided, then stored);
+  - select at 1, 16 and 96 rows, production against tile form (ranks fixed when built);
+  - device times.
+- [bundles/runner-variants](bundles/runner-variants) (dgx1): expand_idx_mapping in production,
+  hoisted and tile form (`expand_tile_kernel`, predicated stores), at 32 and 128 threads.
+- [bundles/mhc-variants](bundles/mhc-variants) (dgx3): round 1's collapse and the 8, 16 and
+  24 KiB caps, three passes each, to see whether the prefill gain repeats.
+
+If tile form closes the gaps, it becomes the port convention:
+- predicated store and masked load helpers in the shared header;
+- loads first, then compute, then stores;
+- trip counts fixed in the kernel key.
+
+Every port that still loses at a serving shape gets rewritten that way. The compiler pass
+that would do this automatically (turning guarded stores into predicated ones) is TileLang
+work that comes after.

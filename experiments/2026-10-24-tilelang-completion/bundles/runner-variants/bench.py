@@ -510,6 +510,14 @@ def expand_variant(threads, spread):
     return launch
 
 
+def expand_tile_variant(threads):
+    def launch(ns):
+        kernel = compiled(rv.expand_tile_kernel, rv.pow2(ROWS), threads)
+        kernel(ns.idx, ns.expanded, ns.local, ns.cu)
+
+    return launch
+
+
 def expand_kernel() -> Kernel:
     variants = {
         "prod": prod_expand,
@@ -523,6 +531,8 @@ def expand_kernel() -> Kernel:
     for threads in (32, 64, 128, 256):
         variants[f"hoist-t{threads}"] = expand_variant(threads, False)
     variants["hoist-spread"] = expand_variant(32, True)
+    for threads in (32, 128):
+        variants[f"tile-t{threads}"] = expand_tile_variant(threads)
     return Kernel(
         name="expand_idx_mapping",
         shapes={s: expand_bench(n, p) for s, (n, p) in SHAPES.items()},
