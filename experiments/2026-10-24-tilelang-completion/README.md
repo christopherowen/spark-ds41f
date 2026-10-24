@@ -236,3 +236,41 @@ was restored at 14:12.
   addresses without keeping the tensors alive. The graph capture's `empty_cache` returned them to
   the driver, and the Triton warm-up read through freed addresses. The cases now keep the
   tensors. Under Triton's CPU interpreter every case's launches stay in bounds.
+
+## Round 2 (2026-10-24 14:55 CET): every test passes; speed is the work left
+
+- **Bits:** every test passes in all four bundles.
+  - Sampling: 639 passed, the NaN blocks at both strides included; Triton 3.7.1's layout rule
+    holds.
+  - mHC: 60 passed. Runner inputs: 507 passed. Embedding and confidence: 85 passed, and its
+    gate passes.
+- **Speed: three gates fail.** Ratios are TileLang to Triton (or to TileKernels) per call;
+  every one is outside its 95% interval.
+  - **Sampling.**
+
+    | Kernel | Faster or level | Slower |
+    | --- | --- | --- |
+    | Sink policy | -28 to -30% | |
+    | Greedy verification | level | |
+    | Gumbel sampler, FP32 | level | |
+    | Gumbel sampler, bf16 | | +3.6% and +3.0% at 16 and 96 tokens |
+    | Temperature | | +70% at one token, +12% at 16 |
+    | Sink candidates | | +13% at one request (greedy), +9% and +7% at 16 and 64 (sampled) |
+    | Greedy shard pairs | | +17 to +42% |
+    | Full-vocabulary greedy draft | | +20 to +37% |
+    | Select | | +25 to +32% (0.3 us on 1.3 us) |
+
+  - **mHC.** The post is faster at every shape (-37% to -4.7%). The collapse is faster at
+    decode, but TileKernels' block shape made long prefill worse: +2.4% and +2.6% at 8K and
+    16K (round 1: +1.2% and +1.1%).
+  - **Runner inputs.**
+    - Faster, by large margins: block tables -22 to -59%, slot mappings -24 to -86%, staged
+      writes -7 to -57%, post update at decode, prefill inputs at 16K.
+    - Slower, the tiny kernels (1-3 us): dead-row draft combine +27 to +34%, index expansion
+      +14 to +16%, DFlash inputs at decode +18 to +21%, prefill inputs at decode +5 to +16%,
+      lookback +4%, the KV zeroing at one stream +2%.
+- **Next:** measure before tuning again; the offline reasoning about speed missed twice.
+  - A profiler mode gives each kernel's own GPU time, since some calls launch two kernels.
+  - Variant sweeps measure the shapes that do not change the bits: threads and rows a block,
+    and a sequential finish against the warp's for the tiny reductions. Layouts that decide a
+    NaN block's index stay Triton's.
