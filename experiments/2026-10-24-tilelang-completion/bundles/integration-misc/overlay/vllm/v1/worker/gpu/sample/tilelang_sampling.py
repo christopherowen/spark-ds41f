@@ -663,13 +663,12 @@ def sink_candidates_kernel(
     )
 
     @T.macro
-    def passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx, noisy):
-        """The thread's scores; with ``noisy`` each element's Philox word is drawn
-        unconditionally, ahead of its bound check (the Gumbel sampler's
-        ``passes``)."""
+    def passes(raw, scores, rejected, verified, word_seed, blk, tx, noisy):
+        """The thread's scores from its loaded runs; with ``noisy`` each element's
+        Philox word is drawn unconditionally, ahead of its bound check (the Gumbel
+        sampler's ``passes``)."""
         for r in T.unroll(_PASSES // run):
             col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
-            _load_run(logits, raw, row[0], col0, vocab, run)
             for k in T.unroll(run):
                 index = col0 + k
                 if noisy:
@@ -681,7 +680,7 @@ def sink_candidates_kernel(
                     )
                 scores[r * run + k] = -T.infinity(T.float32)
                 if index < vocab:
-                    scores[r * run + k] = T.cast(raw[k], T.float32)
+                    scores[r * run + k] = T.cast(raw[r * run + k], T.float32)
                     if (rejected[0] != 0) & (index == verified[0]):
                         scores[r * run + k] = -T.infinity(T.float32)
                     if noisy:
@@ -717,7 +716,7 @@ def sink_candidates_kernel(
             rejected = T.alloc_local((1,), T.int32)
             verified = T.alloc_local((1,), T.int32)
             word_seed = T.alloc_local((1,), T.uint32)
-            raw = T.alloc_local((run,), logits_dtype)
+            raw = T.alloc_local((_PASSES,), logits_dtype)
             scores = T.alloc_local((_PASSES,), T.float32)
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
@@ -730,32 +729,47 @@ def sink_candidates_kernel(
                 # The launch checked it: a 16-byte base and a stride of 16 elements.
                 T.assume(logits_stride % 16 == 0)
 
+            # As Triton's kernel: every load issued as soon as its index is known,
+            # none behind a test of another's value (the draft at an index that
+            # exists whatever the row), and the block's logits before the
+            # temperature's test.
             local[0] = T.max(num_sampled[req] - 1, 0)
             # The row that produced the request's last sampled token.
             row[0] = T.cast(cu_num_logits[req] + local[0], T.int64)
+            end = T.alloc_var(T.int64, init=T.cast(cu_num_logits[req + 1], T.int64))
             state[0] = T.cast(idx_mapping[req], T.int64)
             temp[0] = temperature[state[0]]
+            seed = T.alloc_var(T.int64, init=seeds[state[0]])
+            position = T.alloc_var(pos_dtype, init=pos[row[0]])
+            for r in T.unroll(_PASSES // run):
+                col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
+                _load_run_at(logits, raw, r * run, row[0], col0, vocab, run)
             rejected[0] = 0
             verified[0] = -1
-            if mask_rejected_draft:  # noqa: SIM102
+            if mask_rejected_draft:
                 # A random row that rejected its draft resampled the residual,
                 # which for one-hot drafts is the target without the draft.
-                if row[0] != T.cast(cu_num_logits[req + 1] - 1, T.int64):
-                    verified[0] = drafts[row[0] + 1]
-                    if (
-                        (verified[0] >= 0)
-                        & (T.cast(verified[0], T.int64) != sampled[req, local[0]])
-                        & (temp[0] != T.float32(0))
-                    ):
-                        rejected[0] = 1
-            word_seed[0] = _randint_at(seeds[state[0]], pos[row[0]], pos_dtype, False)
+                draft = T.alloc_var(
+                    T.int32,
+                    init=drafts[T.min(row[0] + 1, T.cast(drafts_len - 1, T.int64))],
+                )
+                emitted = T.alloc_var(T.int64, init=sampled[req, local[0]])
+                live = row[0] != end - 1
+                verified[0] = T.if_then_else(live, draft, -1)
+                rejected[0] = T.if_then_else(
+                    live
+                    & (draft >= 0)
+                    & (T.cast(draft, T.int64) != emitted)
+                    & (temp[0] != T.float32(0)),
+                    1,
+                    0,
+                )
+            word_seed[0] = _randint_at(seed, position, pos_dtype, False)
             # One test of the temperature for the whole block, as the Gumbel sampler.
             if temp[0] != T.float32(0):
-                passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
-                       True)  # fmt: skip
+                passes(raw, scores, rejected, verified, word_seed, blk, tx, True)
             else:
-                passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
-                       False)  # fmt: skip
+                passes(raw, scores, rejected, verified, word_seed, blk, tx, False)
             for i in T.unroll(num_candidates):
                 best[0] = scores[0]
                 best_index[0] = _element(0, tx, run)

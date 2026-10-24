@@ -777,3 +777,26 @@ The ports booted and served with no undeclared kernel.
     profiles ports, candidate 4 and ports again on the c8 JSON case and single-stream
     decode.
   - Prefill at 1K and 16K: within its intervals (±20-40% at two repeats).
+
+## Tenth integrated run (run `tilelang-integration-kernels-10`)
+
+vLLM `tilelang-ports` 1ac412cc7:
+- **Sink candidates** issue every load once its index is known, the logits before the
+  temperature's test and the rejection by selects (`9c696482b`).
+- **The generation controls' TileLang candidates** (#524,
+  experiments/2026-10-24-sampling-controls): its fourteen vLLM commits (patches 0261-0274),
+  rebased onto this branch with their trailers dropped. The candidates are penalties,
+  histogram accumulation, min-p, logit bias, forbidden sequences, the thinking marker cache
+  and budget, prompt token ids, custom logprob ids and NaN counting. They are prepared
+  and declared, but the existing kernels stay dispatched.
+  - The sampling bundle now also runs their tests (`test_gpu_sampling_controls.py`,
+    `test_gpu_thinking_budget.py`, `test_gpu_logit_bias.py`) and
+    `benchmark_sampling_controls.py --gate`.
+  - Open, from #524:
+    - min-p is unqualified (568 against 539 µs at 96 rows), and its threshold equality
+      with the reference logarithm must be kept;
+    - seven candidates have no timing yet;
+    - histogram callers keep their selected-row zeroing.
+
+  The reference-logprob investigation stays separate from these behavior-preserving
+  translations.
