@@ -870,3 +870,38 @@ the threads a block (128, 256) and the tile width (1024, 2048, 4096):
 - each variant is first compared with Triton bit for bit (threshold seeds 48291-48298 at 96
   rows, and non-finite rows);
 - then it is timed against Triton at 1, 16 and 96 rows.
+
+### The eight-stream bracket (2026-10-24 20:42 CET, run `tilelang-ports-c8-bracket`)
+
+Eight distinct prompts, three samples an arm, no bench:
+
+| Arm | tok/s | Samples |
+| --- | --- | --- |
+| ports | 189.47 | 189.35, 189.72, 189.34 |
+| candidate 4 | 190.79 | 192.96, 189.43, 189.98 |
+| ports again | 189.16 | 189.21, 188.64, 189.63 |
+
+- The gap is 0.7%, down from the serving check's 1.7%.
+- Two of candidate 4's three samples fall inside the ports' range. Its first is the outlier.
+- One stream is level: 93.57, 93.18 and 93.35 tok/s.
+
+[serving-c8-abab.json](serving-c8-abab.json) settles it: ports, candidate 4, ports, candidate
+4, eight samples each.
+
+## Runner round 5: gather_lookback and zero_kv_blocks in tile form (run `tilelang-runner-round5`)
+
+- **gather_lookback**, in SASS:
+  - Ours computes the element's row with two 64-bit divisions by three (TileLang widens
+    the index arithmetic) and branches before its first load.
+  - Triton's first load depends only on the block index, and every load is predicated.
+- **zero_kv_blocks:** Triton loads only the page size before its early exit, and stores
+  int32s with predicates.
+
+[runner_variants.py](bundles/runner-variants/runner_variants.py) adds Triton's form of both:
+- **Lookback:** the row and column in int32. The request index, computed count and token
+  are predicated loads (`@p ld`, masked lanes keep 0 or -1), and the store is predicated.
+  - Threads a block: 32 or 128.
+  - A block covers an element range, or a block takes a row.
+- **zero_kv_blocks:** only the page size before the exit, and every store predicated. The
+  stores are either int32s in Triton's layout or 16-byte stores when the segment's address,
+  stride and page allow.

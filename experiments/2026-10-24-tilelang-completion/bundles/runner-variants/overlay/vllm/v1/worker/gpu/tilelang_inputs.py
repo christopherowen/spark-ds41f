@@ -56,6 +56,11 @@ _PASS = {
     # Every access is guarded by the kernel's own masks, as in Triton; buffers
     # reached through pointer tables have no meaningful extent to guard against.
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    # A name bound to a load stays one load: with replay on (TileLang's default),
+    # IfStmtBinding re-substitutes binds under each guarded statement, and the
+    # combine kernel re-read its request's scalars after every store (47 loads where
+    # Triton's has 9).
+    "tl.if_stmt_binding_inline_replayable_binds": False,
 }
 _THREADS = 256
 _PER_THREAD = 4
@@ -519,12 +524,15 @@ def zero_kv_blocks_kernel():
         # Blocks on x (up to 2^31 - 1), as Triton's grid has them.
         with T.Kernel(num_ids, segments, chunks, threads=_THREADS) as (b, s, cx):
             tx = T.get_thread_binding()
-            page = seg_page_sizes[s]
+            # Every scalar up front (its index always exists), so the loads issue
+            # together instead of the rest waiting on the page size's test.
+            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
+            stride = T.alloc_var(T.int64, init=seg_block_strides[s])
+            block_id = T.alloc_var(T.int64, init=block_ids[b])
+            segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
             first = T.cast(cx, T.int64) * _CHUNK
             if first < page:
-                stride = seg_block_strides[s]
-                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
-                base = block_ids[b] * stride
+                base = block_id * stride
                 if T.truncmod(seg_addrs[s], 16) == 0 and T.truncmod(stride, 4) == 0:
                     col = first + tx * _PER_THREAD
                     if col + _PER_THREAD <= page:
@@ -662,14 +670,19 @@ def prepare_pos_seq_lens_kernel(idx_dtype: str):
 # where Triton gives a finite log).
 @tilelang.jit(pass_configs=_PASS)
 def combine_sampled_and_draft_tokens_kernel(
-    block: int, num_new: int, dead_rows: bool, idx_dtype: str
+    drafts: int, num_new: int, dead_rows: bool, idx_dtype: str
 ):
-    """A thread a request: its logits indices, and for a decoding request its last
-    sampled token and its drafts into the input ids. ``block`` is Triton's
-    BLOCK_SIZE (at most ``block`` logits or drafts a request). With dead rows the
-    drafts' survival is the running sum of log confidences in Triton's warp-scan
-    order (Kogge-Stone, strides 1, 2, 4, ...), the cut counts the drafts whose
-    survival is at least ``log_tau``, and rows of drafts past it become padding."""
+    """A request's logits indices, and for a decoding request its last sampled
+    token and its drafts into the input ids; ``drafts`` is the draft tokens' width
+    (Triton's BLOCK_SIZE is the next power of two of ``drafts + num_new``). Every
+    scalar the request needs, its drafts and confidences included, is read up
+    front, so the loads issue together. With dead rows the drafts' survival is the
+    running sum of log confidences in Triton's warp-scan order (Kogge-Stone,
+    strides 1, 2, 4, ...), the cut counts the drafts whose survival is at least
+    ``log_tau``, and rows of drafts past it become padding. Without dead rows a
+    thread takes a request; with them a block does (its first thread), which is
+    how the scan's chain of logs and sums ran fastest."""
+    block = _next_power_of_2(drafts + num_new)
     if dead_rows and block > 32:
         raise ValueError("dead rows scan at most one warp of drafts")
     ids_len = T.dynamic("ids_len")
@@ -679,36 +692,73 @@ def combine_sampled_and_draft_tokens_kernel(
     seq_len = T.dynamic("seq_len")
     prefill_rows = T.dynamic("prefill_rows")
     draft_rows = T.dynamic("draft_rows")
-    draft_cols = T.dynamic("draft_cols")
     draft_stride = T.dynamic("draft_stride")
     cu_len = T.dynamic("cu_len")
     logits_len = T.dynamic("logits_len")
+    conf_rows = T.dynamic("conf_rows")
+    conf_cols = T.dynamic("conf_cols")
+    conf_stride = T.dynamic("conf_stride")
+    padding_len = T.dynamic("padding_len")
+    cut_len = T.dynamic("cut_len")
     scan_strides = tuple(1 << i for i in range(max(block - 1, 0).bit_length()))
 
     @T.macro
-    def combine_request(
-        b, req, input_ids, last_sampled, query_start_loc, seq_lens, prefill_len,
-        draft_tokens, cu_num_logits, logits_indices,
+    def request(
+        b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens, prefill_len,
+        draft_tokens, cu_num_logits, logits_indices, confidence, is_padding, dead_cut,
+        log_tau,
     ):  # fmt: skip
-        first_logit = cu_num_logits[b]
-        num_logits = cu_num_logits[b + 1] - first_logit
+        req = T.alloc_var(T.int64, init=T.cast(idx_mapping[b], T.int64))
+        first = T.alloc_var(T.int32, init=cu_num_logits[b])
+        end = T.alloc_var(T.int32, init=cu_num_logits[b + 1])
+        query_end = T.alloc_var(T.int32, init=query_start_loc[b + 1])
+        seq = T.alloc_var(T.int32, init=seq_lens[b])
+        prefill = T.alloc_var(T.int32, init=prefill_len[req])
+        last = T.alloc_var(T.int64, init=last_sampled[req])
+        tokens = T.alloc_local((drafts,), T.int64)
+        for j in T.unroll(drafts):
+            tokens[j] = draft_tokens[req, j]
+        if dead_rows:
+            confs = T.alloc_local((drafts,), T.float32)
+            for j in T.unroll(drafts):
+                confs[j] = confidence[req, j]
+        num_logits = end - first
         num_drafts = num_logits - num_new
-        query_end = query_start_loc[b + 1]
-        logits_start = query_end - num_logits
         for j in T.unroll(block):
             if j < num_logits:
-                logits_indices[first_logit + j] = T.cast(logits_start + j, T.int64)
-        seq = seq_lens[b]
-        prefill = prefill_len[req]
+                logits_indices[first + j] = T.cast(query_end - num_logits + j, T.int64)
         if seq > prefill:
             # Keep prompt-tail slots; only generated-token slots take it.
             if num_new > 0 and seq - num_logits >= prefill:
-                input_ids[logits_start] = T.cast(last_sampled[req], T.int32)
-            for j in T.unroll(block):
+                input_ids[query_end - num_logits] = T.cast(last, T.int32)
+            for j in T.unroll(drafts):
                 if j < num_drafts:
-                    input_ids[query_end - num_drafts + j] = T.cast(
-                        draft_tokens[req, j], T.int32
-                    )
+                    input_ids[query_end - num_drafts + j] = T.cast(tokens[j], T.int32)
+        if dead_rows:
+            # Requests without drafts are never clamped.
+            cut = T.alloc_var(T.int32, init=block + 1)
+            if seq > prefill and num_drafts > 0:
+                survival = T.alloc_local((block,), T.float32)
+                for j in tuple(range(block)):
+                    if j < drafts:
+                        survival[j] = T.log(
+                            T.if_then_else(j < num_drafts, confs[j], T.float32(1.0))
+                        )
+                    else:
+                        survival[j] = T.log(T.float32(1.0))
+                for stride in scan_strides:
+                    # Descending, so each lane adds its neighbour's sum of the
+                    # previous stage, as the warp's shuffles do.
+                    for j in tuple(range(block - 1, stride - 1, -1)):
+                        survival[j] = survival[j - stride] + survival[j]
+                cut = 0
+                for j in tuple(range(block)):
+                    if survival[j] >= log_tau and j < num_drafts:
+                        cut = cut + 1
+                for j in T.unroll(block):
+                    if j < num_drafts and j >= cut:
+                        is_padding[query_end - num_drafts + j] = T.uint8(1)
+            dead_cut[b] = cut
 
     if not dead_rows:
 
@@ -721,7 +771,7 @@ def combine_sampled_and_draft_tokens_kernel(
             seq_lens: T.Tensor((seq_len,), T.int32),
             prefill_len: T.Tensor((prefill_rows,), T.int32),
             draft_tokens: T.StridedTensor(
-                (draft_rows, draft_cols), (draft_stride, 1), T.int64
+                (draft_rows, drafts), (draft_stride, 1), T.int64
             ),
             cu_num_logits: T.Tensor((cu_len,), T.int32),
             logits_indices: T.Tensor((logits_len,), T.int64),
@@ -729,19 +779,13 @@ def combine_sampled_and_draft_tokens_kernel(
             with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
                 b = bx * _REQUESTS + T.get_thread_binding()
                 if b < num_reqs:
-                    combine_request(
-                        b, T.cast(idx_mapping[b], T.int64), input_ids, last_sampled,
-                        query_start_loc, seq_lens, prefill_len, draft_tokens,
-                        cu_num_logits, logits_indices,
+                    request(
+                        b, input_ids, idx_mapping, last_sampled, query_start_loc,
+                        seq_lens, prefill_len, draft_tokens, cu_num_logits,
+                        logits_indices, None, None, None, None,
                     )  # fmt: skip
 
         return combine_sampled_and_draft_tokens
-
-    conf_rows = T.dynamic("conf_rows")
-    conf_cols = T.dynamic("conf_cols")
-    conf_stride = T.dynamic("conf_stride")
-    padding_len = T.dynamic("padding_len")
-    cut_len = T.dynamic("cut_len")
 
     @T.prim_func
     def combine_sampled_and_draft_tokens(
@@ -751,9 +795,7 @@ def combine_sampled_and_draft_tokens_kernel(
         query_start_loc: T.Tensor((starts_len,), T.int32),
         seq_lens: T.Tensor((seq_len,), T.int32),
         prefill_len: T.Tensor((prefill_rows,), T.int32),
-        draft_tokens: T.StridedTensor(
-            (draft_rows, draft_cols), (draft_stride, 1), T.int64
-        ),
+        draft_tokens: T.StridedTensor((draft_rows, drafts), (draft_stride, 1), T.int64),
         cu_num_logits: T.Tensor((cu_len,), T.int32),
         logits_indices: T.Tensor((logits_len,), T.int64),
         confidence: T.StridedTensor(
@@ -763,39 +805,13 @@ def combine_sampled_and_draft_tokens_kernel(
         dead_cut: T.Tensor((cut_len,), T.int32),
         log_tau: T.float32,
     ):
-        with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
-            b = bx * _REQUESTS + T.get_thread_binding()
-            if b < num_reqs:
-                req = T.cast(idx_mapping[b], T.int64)
-                # Requests without drafts are never clamped.
-                dead_cut[b] = block + 1
-                combine_request(
-                    b, req, input_ids, last_sampled, query_start_loc, seq_lens,
+        with T.Kernel(num_reqs, threads=32) as b:
+            if T.get_thread_binding() == 0:
+                request(
+                    b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
                     prefill_len, draft_tokens, cu_num_logits, logits_indices,
+                    confidence, is_padding, dead_cut, log_tau,
                 )  # fmt: skip
-                num_drafts = cu_num_logits[b + 1] - cu_num_logits[b] - num_new
-                query_end = query_start_loc[b + 1]
-                if seq_lens[b] > prefill_len[req] and num_drafts > 0:
-                    survival = T.alloc_local((block,), T.float32)
-                    for j in tuple(range(block)):
-                        survival[j] = T.log(
-                            T.if_then_else(
-                                j < num_drafts, confidence[req, j], T.float32(1.0)
-                            )
-                        )
-                    for stride in scan_strides:
-                        # Descending, so each lane adds its neighbour's sum of
-                        # the previous stage, as the warp's shuffles do.
-                        for j in tuple(range(block - 1, stride - 1, -1)):
-                            survival[j] = survival[j - stride] + survival[j]
-                    cut = T.alloc_var(T.int32, init=0)
-                    for j in tuple(range(block)):
-                        if survival[j] >= log_tau and j < num_drafts:
-                            cut = cut + 1
-                    dead_cut[b] = cut
-                    for j in T.unroll(block):
-                        if j < num_drafts and j >= cut:
-                            is_padding[query_end - num_drafts + j] = T.uint8(1)
 
     return combine_sampled_and_draft_tokens
 
@@ -814,6 +830,11 @@ __device__ __forceinline__ void vllm_store_if_b32(void* p, int v, bool ok) {
   asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
                " @q st.global.b32 [%0], %1;\n}"
                :: "l"(p), "r"(v), "r"((int)ok) : "memory");
+}
+__device__ __forceinline__ void vllm_store_if_f32(void* p, float v, bool ok) {
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
+               " @q st.global.f32 [%0], %1;\n}"
+               :: "l"(p), "f"(v), "r"((int)ok) : "memory");
 }
 """
 
@@ -1151,9 +1172,8 @@ def combine_key(
     dead_rows: bool,
     idx_dtype: str,
 ) -> tuple:
-    # Triton's BLOCK_SIZE covers the last sampled token and every draft.
-    block = _next_power_of_2(num_speculative_steps + num_new_sampled_tokens)
-    return (block, num_new_sampled_tokens, dead_rows, idx_dtype)
+    # The kernel's Triton BLOCK_SIZE covers the last sampled token and every draft.
+    return (num_speculative_steps, num_new_sampled_tokens, dead_rows, idx_dtype)
 
 
 def expand_idx_mapping_key(max_expand_len: int, idx_dtype: str) -> tuple:
@@ -1329,6 +1349,8 @@ def post_update(
 # --- DFlash drafting ----------------------------------------------------------
 
 _DFLASH_THREADS = 256  # Triton's BLOCK_SIZE: a thread a context or query row
+# Blocks a step (in the last request's row) that pad the query slots past the batch.
+_DFLASH_PAD_BLOCKS = 8
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -1403,122 +1425,200 @@ def prepare_dflash_inputs_kernel(
         num_reqs: T.int32,
         num_blocks: T.int32,
     ):
-        with T.Kernel(num_blocks, num_reqs, threads=_DFLASH_THREADS) as (bk, r):
+        with T.Kernel(
+            num_blocks + _DFLASH_PAD_BLOCKS, num_reqs, threads=_DFLASH_THREADS
+        ) as (bk, r):
+            T.import_source(_STORE_IF)
             tx = T.get_thread_binding()
-            req = T.cast(idx_mapping[r], T.int64)
-            context_start = target_query_start_loc[r]
-            context_end = target_query_start_loc[r + 1]
-            valid_end = context_end - num_rejected[r]
-            num_valid = valid_end - context_start
-            # No valid row: every row was rejected, the first one included (sink
-            # rejection replaced draft zero). The anchor takes draft zero's
-            # position; the context before it is in the cache already.
-            last_valid = T.if_then_else(
-                num_valid > 0,
-                target_positions[T.max(valid_end - 1, context_start)],
-                target_positions[context_start] - 1,
-            )
-            span = block_size * cp_size
-            last_column = T.cast(table_stride - 1, T.int64)
-            j = bk * _DFLASH_THREADS + tx
-            if j < context_end - context_start:
-                live = j < num_valid
-                position = T.if_then_else(
-                    live, target_positions[context_start + j], T.int64(0)
+            if bk >= num_blocks:
+                # The last request's extra blocks pad the query slots past the
+                # batch, a slice each: a captured graph replayed at a larger size
+                # writes no KV for them. (One block writing all of them was the
+                # kernel's longest path at decode.)
+                if r == num_reqs - 1:
+                    query_end = num_reqs * num_query_per_req
+                    chunk = T.ceildiv(max_num_tokens - query_end, _DFLASH_PAD_BLOCKS)
+                    first = query_end + (bk - num_blocks) * chunk
+                    for it in T.serial(T.ceildiv(chunk, _DFLASH_THREADS)):
+                        i = first + it * _DFLASH_THREADS + tx
+                        if (i < first + chunk) and (i < max_num_tokens):
+                            out_query_slot_mapping[i] = T.int64(_PAD)
+            else:
+                # Triton's form: every load the thread needs is issued up front, at
+                # an index that exists whatever the masks say; the masks are
+                # selects and the stores predicated (_STORE_IF), so no load waits
+                # behind a branch for another.
+                req = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+                context_start = T.alloc_var(T.int32, init=target_query_start_loc[r])
+                context_end = T.alloc_var(T.int32, init=target_query_start_loc[r + 1])
+                rejected = T.alloc_var(T.int32, init=num_rejected[r])
+                sampled = T.alloc_var(T.int32, init=num_sampled[r])
+                j = bk * _DFLASH_THREADS + tx
+                rows = context_end - context_start
+                valid_end = context_end - rejected
+                num_valid = valid_end - context_start
+                anchor = T.alloc_var(
+                    T.int64,
+                    init=target_positions[T.max(valid_end - 1, context_start)],
                 )
-                block_id = T.if_then_else(
-                    live,
-                    T.cast(
+                first = T.alloc_var(T.int64, init=target_positions[context_start])
+                row_position = T.alloc_var(
+                    T.int64,
+                    init=target_positions[context_start + T.min(j, T.max(rows - 1, 0))],
+                )
+                last_token = T.alloc_var(T.int64, init=last_sampled[req])
+                next_token = T.alloc_var(T.int32, init=next_prefill_tokens[req])
+                temp = T.alloc_var(T.float32, init=temperature[req])
+                seed = T.alloc_var(T.int64, init=seeds[req])
+                # No valid row: every row was rejected, the first one included (sink
+                # rejection replaced draft zero). The anchor takes draft zero's
+                # position; the context before it is in the cache already.
+                last_valid = T.if_then_else(num_valid > 0, anchor, first - 1)
+                span = block_size * cp_size
+                last_column = T.cast(table_stride - 1, T.int64)
+                in_context = j < rows
+                live = j < num_valid
+                position = T.if_then_else(live, row_position, T.int64(0))
+                offset = j - num_valid
+                is_query = (j >= num_valid) & (j < num_valid + num_query_per_req)
+                query_position = last_valid + 1 + offset
+                context_block = T.alloc_var(
+                    T.int64,
+                    init=T.cast(
                         block_table[r, T.min(T.truncdiv(position, span), last_column)],
                         T.int64,
                     ),
-                    T.int64(0),
+                )
+                query_block = T.alloc_var(
+                    T.int64,
+                    init=T.cast(
+                        block_table[
+                            r,
+                            T.min(
+                                T.truncdiv(T.max(query_position, T.int64(0)), span),
+                                last_column,
+                            ),
+                        ],
+                        T.int64,
+                    ),
                 )
                 # Block 0 is the null block: evicted sliding-window positions and
                 # rejected rows write no draft KV.
-                out_context_positions[context_start + j] = position
-                out_context_slot_mapping[context_start + j] = T.if_then_else(
-                    live and block_id != 0,
+                context_slot = T.if_then_else(
+                    live and context_block != 0,
                     _local_slot(
-                        position, block_id, block_size, cp_rank, cp_size,
+                        position, context_block, block_size, cp_rank, cp_size,
                         cp_interleave,
                     ),
                     T.int64(_PAD),
                 )  # fmt: skip
-            if j >= num_valid and j < num_valid + num_query_per_req:
-                offset = j - num_valid
-                position = last_valid + 1 + offset
-                block_id = T.cast(
-                    block_table[r, T.min(T.truncdiv(position, span), last_column)],
-                    T.int64,
-                )
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_context_positions[context_start + j]), position,
+                    in_context,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_context_slot_mapping[context_start + j]),
+                    context_slot, in_context,
+                )  # fmt: skip
                 query = r * num_query_per_req + offset
-                out_input_ids[query] = T.if_then_else(
+                input_id = T.if_then_else(
                     offset == 0,
                     T.if_then_else(
-                        num_sampled[r] > 0,
-                        T.cast(last_sampled[req], T.int32),
-                        next_prefill_tokens[req],
+                        sampled > 0, T.cast(last_token, T.int32), next_token
                     ),
                     parallel_drafting_token_id,
                 )
-                out_query_positions[query] = T.min(
-                    position, T.cast(max_model_len - 1, T.int64)
-                )
-                out_query_slot_mapping[query] = T.if_then_else(
-                    block_id != 0,
+                query_slot = T.if_then_else(
+                    query_block != 0,
                     _local_slot(
-                        position, block_id, block_size, cp_rank, cp_size,
+                        query_position, query_block, block_size, cp_rank, cp_size,
                         cp_interleave,
                     ),
                     T.int64(_PAD),
                 )  # fmt: skip
-                if offset >= sample_offset:
-                    sample = r * num_speculative_steps + offset - sample_offset
-                    out_sample_indices[sample] = T.cast(query, T.int64)
-                    out_sample_pos[sample] = position + 1 - sample_offset
-                    out_sample_idx_mapping[sample] = T.cast(req, T.int32)
-            if bk == 0:
-                if tx == 0:
-                    out_query_start_loc[r] = r * num_query_per_req
+                T.call_extern(
+                    "handle", "vllm_store_if_b32",
+                    T.address_of(out_input_ids[query]), input_id, is_query,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_query_positions[query]),
+                    T.min(query_position, T.cast(max_model_len - 1, T.int64)), is_query,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_query_slot_mapping[query]), query_slot, is_query,
+                )  # fmt: skip
+                is_sample = is_query and offset >= sample_offset
+                sample = r * num_speculative_steps + offset - sample_offset
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_sample_indices[sample]), T.cast(query, T.int64),
+                    is_sample,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b64",
+                    T.address_of(out_sample_pos[sample]),
+                    query_position + 1 - sample_offset, is_sample,
+                )  # fmt: skip
+                T.call_extern(
+                    "handle", "vllm_store_if_b32",
+                    T.address_of(out_sample_idx_mapping[sample]), T.cast(req, T.int32),
+                    is_sample,
+                )  # fmt: skip
+                if bk == 0:
+                    lead = tx == 0
+                    T.call_extern(
+                        "handle", "vllm_store_if_b32",
+                        T.address_of(out_query_start_loc[r]), r * num_query_per_req,
+                        lead,
+                    )  # fmt: skip
                     # The absolute length the draft attention reads up to.
-                    out_seq_lens[r] = T.cast(
-                        T.min(
-                            last_valid + 1 + num_query_per_req,
-                            T.cast(max_model_len, T.int64),
+                    T.call_extern(
+                        "handle", "vllm_store_if_b32",
+                        T.address_of(out_seq_lens[r]),
+                        T.cast(
+                            T.min(
+                                last_valid + 1 + num_query_per_req,
+                                T.cast(max_model_len, T.int64),
+                            ),
+                            T.int32,
                         ),
-                        T.int32,
-                    )
-                    out_temperature[req] = temperature[req]
-                    out_seeds[req] = seeds[req]
-                if r == num_reqs - 1:
-                    # Pad the per-request buffers to max_num_reqs for graph replay.
-                    last_query_end = num_reqs * num_query_per_req
-                    for it in T.serial(
-                        T.ceildiv(max_num_reqs + 1 - num_reqs, _DFLASH_THREADS)
-                    ):
-                        i = num_reqs + it * _DFLASH_THREADS + tx
-                        if i < max_num_reqs + 1:
-                            out_query_start_loc[i] = last_query_end
-                        if i < max_num_reqs:
-                            out_seq_lens[i] = 0
-                    # Padded sample rows read query row 0 and scatter nowhere.
-                    pad_start = num_reqs * num_speculative_steps
-                    pad_end = max_num_reqs * num_speculative_steps
-                    for it in T.serial(T.ceildiv(pad_end - pad_start, _DFLASH_THREADS)):
-                        i = pad_start + it * _DFLASH_THREADS + tx
-                        if i < pad_end:
-                            out_sample_indices[i] = T.int64(0)
-                            out_sample_pos[i] = T.int64(0)
-                            out_sample_idx_mapping[i] = -1
-                    # Query slots past the batch write no KV in a replayed graph.
-                    query_end = num_reqs * num_query_per_req
-                    for it in T.serial(
-                        T.ceildiv(max_num_tokens - query_end, _DFLASH_THREADS)
-                    ):
-                        i = query_end + it * _DFLASH_THREADS + tx
-                        if i < max_num_tokens:
-                            out_query_slot_mapping[i] = T.int64(_PAD)
+                        lead,
+                    )  # fmt: skip
+                    T.call_extern(
+                        "handle", "vllm_store_if_f32",
+                        T.address_of(out_temperature[req]), temp, lead,
+                    )  # fmt: skip
+                    T.call_extern(
+                        "handle", "vllm_store_if_b64",
+                        T.address_of(out_seeds[req]), seed, lead,
+                    )  # fmt: skip
+                    if r == num_reqs - 1:
+                        # Pad the per-request buffers to max_num_reqs for graph replay.
+                        last_query_end = num_reqs * num_query_per_req
+                        for it in T.serial(
+                            T.ceildiv(max_num_reqs + 1 - num_reqs, _DFLASH_THREADS)
+                        ):
+                            i = num_reqs + it * _DFLASH_THREADS + tx
+                            if i < max_num_reqs + 1:
+                                out_query_start_loc[i] = last_query_end
+                            if i < max_num_reqs:
+                                out_seq_lens[i] = 0
+                        # Padded sample rows read query row 0 and scatter nowhere.
+                        pad_start = num_reqs * num_speculative_steps
+                        pad_end = max_num_reqs * num_speculative_steps
+                        for it in T.serial(
+                            T.ceildiv(pad_end - pad_start, _DFLASH_THREADS)
+                        ):
+                            i = pad_start + it * _DFLASH_THREADS + tx
+                            if i < pad_end:
+                                out_sample_indices[i] = T.int64(0)
+                                out_sample_pos[i] = T.int64(0)
+                                out_sample_idx_mapping[i] = -1
+                        # The query slots past the batch: the extra blocks above.
 
     return prepare_dflash_inputs
 

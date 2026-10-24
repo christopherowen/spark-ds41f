@@ -951,12 +951,23 @@ def lookback_variant(threads, spread, index):
     return launch
 
 
+def lookback_tile_variant(threads, spread):
+    def launch(ns):
+        kernel = compiled(rv.lookback_tile_kernel, DEPTH, threads, spread)
+        kernel(ns.window, ns.idx, ns.computed, ns.history)
+
+    return launch
+
+
 def lookback_kernel() -> Kernel:
     variants = {"prod": prod_lookback, "prod-binds": lookback_binds}
     for threads in (32, 64, 128):
         variants[f"hoist-t{threads}"] = lookback_variant(threads, False, "int64")
     variants["hoist-spread"] = lookback_variant(32, True, "int64")
     variants["hoist-t128-i32"] = lookback_variant(128, False, "int32")
+    for threads in (32, 128):
+        variants[f"tile-t{threads}"] = lookback_tile_variant(threads, False)
+        variants[f"tile-spread-t{threads}"] = lookback_tile_variant(threads, True)
     return Kernel(
         name="gather_lookback",
         shapes={s: lookback_bench(n, p) for s, (n, p) in SHAPES.items()},
@@ -1033,6 +1044,15 @@ def zero_variant(threads, per):
     return launch
 
 
+def zero_tile_variant(threads, per, vector):
+    def launch(ns):
+        kernel = compiled(rv.zero_kv_tile_kernel, threads, per, vector)
+        kernel(ns.addrs.view(torch.int64), ns.strides, ns.pages, ns.ids,
+               -(-ns.max_page // (threads * per)))  # fmt: skip
+
+    return launch
+
+
 def zero_kernel() -> Kernel:
     variants = {
         "prod": prod_zero,
@@ -1042,6 +1062,9 @@ def zero_kernel() -> Kernel:
     }
     for threads, per in ((128, 4), (256, 4), (512, 4), (128, 8), (256, 8)):
         variants[f"hoist-t{threads}-p{per}"] = zero_variant(threads, per)
+    for threads, per, vector in ((128, 8, False), (128, 8, True), (256, 4, True)):
+        name = f"tile-{'vec-' if vector else ''}t{threads}-p{per}"
+        variants[name] = zero_tile_variant(threads, per, vector)
     return Kernel(
         name="zero_kv_blocks",
         shapes={s: zero_bench(n, p) for s, (n, p) in SHAPES.items()},

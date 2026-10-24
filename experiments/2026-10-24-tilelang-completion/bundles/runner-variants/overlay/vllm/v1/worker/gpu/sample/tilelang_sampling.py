@@ -54,8 +54,13 @@ GUMBEL_BLOCK = 1024
 _THREADS = 128
 _WARPS = _THREADS // 32
 _PASSES = GUMBEL_BLOCK // _THREADS
-# gumbel._TEMPERATURE_BLOCK_SIZE.
-_TEMPERATURE_BLOCK = 8192
+# Columns a temperature block divides, by the step's token count. Element-wise, so
+# the split is free: below _TEMPERATURE_SMALL tokens a quarter of Triton's 8192
+# (gumbel._temperature_kernel's BLOCK_SIZE) gives a token 64 blocks instead of 16
+# for GB10's 48 SMs (one token: -15% against Triton, +7% at 8192); from it on,
+# Triton's 8192 (sixteen tokens: -13% to -19%, +5% at 2048).
+_TEMPERATURE_BLOCKS = (2048, 8192)
+_TEMPERATURE_SMALL = 8
 # Temperature's threads a block: fewer serial runs a thread than at 128, the shape
 # Triton reaches with its loads all issued up front.
 _TEMPERATURE_THREADS = 256
@@ -97,6 +102,14 @@ __device__ __forceinline__ unsigned int vllm_randint64(long long seed,
   const unsigned long long key = (unsigned long long)seed;
   return vllm_philox((unsigned int)offset, (unsigned int)(offset >> 32), 0u, 0u,
                      (unsigned int)key, (unsigned int)(key >> 32));
+}
+
+// tl.randint(seed, offset) for an int64 seed and an int32 offset: Triton gives a
+// 32-bit offset no high word.
+__device__ __forceinline__ unsigned int vllm_randint64_offset32(long long seed,
+                                                               unsigned int offset) {
+  const unsigned long long key = (unsigned long long)seed;
+  return vllm_philox(offset, 0u, 0u, 0u, (unsigned int)key, (unsigned int)(key >> 32));
 }
 
 // tl.randint(seed, offset) for a uint32 seed (tl.randint's own result, widened
@@ -205,20 +218,23 @@ __device__ __forceinline__ float vllm_div_full(float x, float y) {
 
 // dspark.greedy._first_argmax: keep (av, ai) over (bv, bi) when av is NaN and bv
 // is not or has a higher index, or neither is NaN and av > bv, or av == bv with
-// ai < bi: torch.argmax's first maximum, NaN above everything.
+// ai < bi: torch.argmax's first maximum, NaN above everything. Bitwise, not
+// short-circuit, operators: every comparison is evaluated and combined in
+// predicates, as Triton's tl.where combine is, instead of a branch for each.
 __device__ __forceinline__ int vllm_first_argmax_keep(float av, int ai, float bv,
                                                       int bi) {
   const bool a_nan = av != av;
   const bool b_nan = bv != bv;
-  return (a_nan && (!b_nan || ai < bi)) ||
-         (!a_nan && !b_nan && (av > bv || (av == bv && ai < bi)));
+  return (a_nan & (!b_nan | (ai < bi))) |
+         (!a_nan & !b_nan & ((av > bv) | ((av == bv) & (ai < bi))));
 }
 
 // tl.max(..., return_indices=True)'s combine (tie break to the left): keep
 // (v, i) over (w, j) when v > w, or v == w and i < j. Comparisons with NaN are
-// false. Compiled here, out of the TileLang simplifier's reach.
+// false. Compiled here, out of the TileLang simplifier's reach; bitwise
+// operators, as above.
 __device__ __forceinline__ int vllm_argmax_keep(float v, int i, float w, int j) {
-  return (v > w) || ((v == w) && (i < j));
+  return (v > w) | ((v == w) & (i < j));
 }
 """
 
@@ -318,13 +334,16 @@ def _store_run_at(dst, raw, base, row, col0, vocab, run):
 @T.macro
 def _keep_or_take(best, best_index, value, index):
     """``(best, best_index)`` = Triton's argmax combine of itself and ``(value,
-    index)``."""
-    if (
-        T.call_extern("int32", "vllm_argmax_keep", best[0], best_index[0], value, index)
-        == 0
-    ):
-        best[0] = value
-        best_index[0] = index
+    index)``, by selects (Triton's tl.where), the decision held in a register so
+    both selects read the pair as it was."""
+    keep = T.alloc_var(
+        T.int32,
+        init=T.call_extern(
+            "int32", "vllm_argmax_keep", best[0], best_index[0], value, index
+        ),
+    )
+    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
+    best[0] = T.if_then_else(keep != 0, best[0], value)
 
 
 @T.macro
@@ -360,6 +379,19 @@ def _block_argmax(best, best_index, other, other_index, partial, partial_index, 
 # --- Gumbel-max sampling ------------------------------------------------------
 
 
+def _randint_at(seed, position, pos_dtype: str, salted: bool):
+    """``tl.randint(seed, position)`` (``position + _DRAFT_NOISE_SALT`` when
+    ``salted``) for an int64 seed and a position of ``pos_dtype``: an int64 offset
+    gives its two words, an int32 one its own word, the salt added in 32 bits."""
+    if pos_dtype == "int64":
+        offset = position + T.int64(_DRAFT_NOISE_SALT) if salted else position
+        return T.call_extern("uint32", "vllm_randint64", seed, offset)
+    word = T.cast(position, "uint32")
+    if salted:
+        word = word + T.uint32(_DRAFT_NOISE_SALT)
+    return T.call_extern("uint32", "vllm_randint64_offset32", seed, word)
+
+
 @tilelang.jit(pass_configs=_PASS)
 def gumbel_sample_kernel(
     logits_dtype: str,
@@ -370,13 +402,16 @@ def gumbel_sample_kernel(
     col_dtype: str | None,
     per_token_col: bool,
     run: int,
+    pos_dtype: str = "int64",
 ):
     """``gumbel._gumbel_sample_kernel``: one block of 128 threads per
     ``(token, vocabulary block of 1024)``; each block's argmax index (global, int64)
     and score, a thread's elements in runs of ``run`` (``_triton_run``). With a
     logits cache (``cache_dtype``), the logits before the temperature are stored at
     the step's column (``col_dtype``, one per token with ``per_token_col``) and the
-    seed takes the column in its high word."""
+    seed takes the column in its high word. Positions of ``pos_dtype`` place the
+    draw as Triton's ``tl.randint`` does: an int32 position (salted in 32 bits when
+    drafting) is the offset's only word."""
     tokens, vocab, blocks = T.dynamic("tokens, vocab, blocks")
     # Inputs may be longer than the batch: each has its own length.
     idx_len, pos_len, seed_len, temp_len = T.dynamic(
@@ -396,6 +431,47 @@ def gumbel_sample_kernel(
         # Placeholders the variant never reads.
         cache_dtype, col_dtype = "float32", "int64"
 
+    @T.macro
+    def passes(logits, raw, score, best, best_index, cache, req, col, word_seed, temp,
+               t, blk, tx, noisy):  # fmt: skip
+        """The thread's elements, combined into ``(best, best_index)``. With
+        ``noisy`` (the token's temperature is not 0) each element's Philox word is
+        drawn unconditionally, ahead of its bound check, as Triton draws a whole
+        block: the key schedule, the same for every element of the token, is then
+        computed once a thread instead of once an element."""
+        for r in T.unroll(_PASSES // run):
+            col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
+            _load_run(logits, raw, t, col0, vocab, run)
+            for k in T.unroll(run):
+                local = r * (_THREADS * run) + run * tx + k
+                index = col0 + k
+                if noisy:
+                    word = T.alloc_var(
+                        T.uint32,
+                        init=T.call_extern(
+                            "uint32", "vllm_randint32", word_seed[0], index
+                        ),
+                    )
+                score[0] = -T.infinity(T.float32)
+                if index < vocab:
+                    score[0] = T.cast(raw[k], T.float32)
+                    if cached:  # noqa: SIM102
+                        if req[0] >= 0:
+                            cache[req[0], col[0], index] = T.cast(score[0], cache_dtype)
+                    if noisy:
+                        if apply_temperature:
+                            score[0] = T.call_extern(
+                                "float32", "vllm_div_full", score[0], temp[0]
+                            )
+                        score[0] = T.call_extern(
+                            "float32", "vllm_gumbel_score", score[0], word
+                        )
+                if r * run + k == 0:
+                    best[0] = score[0]
+                    best_index[0] = local
+                else:
+                    _keep_or_take(best, best_index, score[0], local)
+
     @T.prim_func
     def gumbel_sample(
         local_argmax: T.StridedTensor((tokens, blocks), (argmax_stride, 1), T.int64),
@@ -403,7 +479,7 @@ def gumbel_sample_kernel(
         logits: T.StridedTensor((tokens, vocab), (logits_stride, 1), logits_dtype),
         idx_mapping: T.Tensor((idx_len,), idx_dtype),
         seeds: T.Tensor((seed_len,), T.int64),
-        pos: T.Tensor((pos_len,), T.int64),
+        pos: T.Tensor((pos_len,), pos_dtype),
         temperature: T.Tensor((temp_len,), T.float32),
         cache: T.StridedTensor(
             (cache_reqs, cache_cols, cache_vocab),
@@ -445,49 +521,14 @@ def gumbel_sample_kernel(
                     col[0] = T.cast(cache_col[0], T.int64)
                 # gumbel.spec_step_seed
                 seed[0] = seed[0] ^ T.shift_left(col[0], T.int64(32))
-            if is_drafting:
-                word_seed[0] = T.call_extern(
-                    "uint32",
-                    "vllm_randint64",
-                    seed[0],
-                    pos[t] + T.int64(_DRAFT_NOISE_SALT),
-                )
+            word_seed[0] = _randint_at(seed[0], pos[t], pos_dtype, is_drafting)
+            # One test of the temperature for the whole block, as Triton's kernel.
+            if temp[0] != T.float32(0):
+                passes(logits, raw, score, best, best_index, cache, req, col, word_seed,
+                       temp, t, blk, tx, True)  # fmt: skip
             else:
-                word_seed[0] = T.call_extern(
-                    "uint32", "vllm_randint64", seed[0], pos[t]
-                )
-            for r in T.unroll(_PASSES // run):
-                col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
-                _load_run(logits, raw, t, col0, vocab, run)
-                for k in T.unroll(run):
-                    local = r * (_THREADS * run) + run * tx + k
-                    index = col0 + k
-                    score[0] = -T.infinity(T.float32)
-                    if index < vocab:
-                        score[0] = T.cast(raw[k], T.float32)
-                        if cached:  # noqa: SIM102
-                            if req[0] >= 0:
-                                cache[req[0], col[0], index] = T.cast(
-                                    score[0], cache_dtype
-                                )
-                        if temp[0] != T.float32(0):
-                            if apply_temperature:
-                                score[0] = T.call_extern(
-                                    "float32", "vllm_div_full", score[0], temp[0]
-                                )
-                            score[0] = T.call_extern(
-                                "float32",
-                                "vllm_gumbel_score",
-                                score[0],
-                                T.call_extern(
-                                    "uint32", "vllm_randint32", word_seed[0], index
-                                ),
-                            )
-                    if r * run + k == 0:
-                        best[0] = score[0]
-                        best_index[0] = local
-                    else:
-                        _keep_or_take(best, best_index, score[0], local)
+                passes(logits, raw, score, best, best_index, cache, req, col, word_seed,
+                       temp, t, blk, tx, False)  # fmt: skip
             _block_argmax(
                 best, best_index, other, other_index, partial, partial_index, tx
             )
@@ -509,6 +550,7 @@ def gumbel_sample_key(
     col_dtype: torch.dtype | None = None,
     per_token_col: bool = False,
     run: int = 1,
+    pos_dtype: torch.dtype = torch.int64,
 ) -> tuple:
     cached = cache_dtype is not None
     return (
@@ -520,6 +562,7 @@ def gumbel_sample_key(
         _DTYPES[col_dtype] if cached else None,
         per_token_col and cached,
         run,
+        _DTYPES[pos_dtype],
     )
 
 
@@ -566,6 +609,7 @@ def gumbel_sample(
                 logits_cache_col.dtype if cached else None,
                 per_token_col,
                 _triton_run(logits),
+                pos.dtype,
             ),
         )
         kernel(
@@ -578,7 +622,7 @@ def gumbel_sample(
             temperature,
             # Placeholders of the declared types when there is no cache.
             logits_cache if cached else local_max.unsqueeze(1),
-            logits_cache_col.view(-1) if cached else pos,
+            logits_cache_col.view(-1) if cached else local_argmax.view(-1),
         )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
@@ -598,6 +642,7 @@ def sink_candidates_kernel(
     num_candidates: int,
     mask_rejected_draft: bool,
     run: int,
+    pos_dtype: str = "int64",
 ):
     """``sink._sink_candidates_kernel``: one block of 128 threads per ``(request,
     vocabulary block of 1024)``, a thread's elements in runs of ``run``
@@ -617,6 +662,32 @@ def sink_candidates_kernel(
         "logits_stride, candidates_stride, sampled_stride", "int64"
     )
 
+    @T.macro
+    def passes(raw, scores, rejected, verified, word_seed, blk, tx, noisy):
+        """The thread's scores from its loaded runs; with ``noisy`` each element's
+        Philox word is drawn unconditionally, ahead of its bound check (the Gumbel
+        sampler's ``passes``)."""
+        for r in T.unroll(_PASSES // run):
+            col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
+            for k in T.unroll(run):
+                index = col0 + k
+                if noisy:
+                    word = T.alloc_var(
+                        T.uint32,
+                        init=T.call_extern(
+                            "uint32", "vllm_randint32", word_seed[0], index
+                        ),
+                    )
+                scores[r * run + k] = -T.infinity(T.float32)
+                if index < vocab:
+                    scores[r * run + k] = T.cast(raw[r * run + k], T.float32)
+                    if (rejected[0] != 0) & (index == verified[0]):
+                        scores[r * run + k] = -T.infinity(T.float32)
+                    if noisy:
+                        scores[r * run + k] = T.call_extern(
+                            "float32", "vllm_gumbel_score", scores[r * run + k], word
+                        )
+
     @T.prim_func
     def sink_candidates(
         values: T.StridedTensor((reqs, candidates), (candidates_stride, 1), T.float32),
@@ -631,7 +702,7 @@ def sink_candidates_kernel(
         idx_mapping: T.Tensor((idx_len,), idx_dtype),
         temperature: T.Tensor((temp_len,), T.float32),
         seeds: T.Tensor((seed_len,), T.int64),
-        pos: T.Tensor((pos_len,), T.int64),
+        pos: T.Tensor((pos_len,), pos_dtype),
     ):
         with T.Kernel(
             reqs, T.ceildiv(vocab, SINK_CANDIDATE_BLOCK), threads=_THREADS
@@ -645,7 +716,7 @@ def sink_candidates_kernel(
             rejected = T.alloc_local((1,), T.int32)
             verified = T.alloc_local((1,), T.int32)
             word_seed = T.alloc_local((1,), T.uint32)
-            raw = T.alloc_local((run,), logits_dtype)
+            raw = T.alloc_local((_PASSES,), logits_dtype)
             scores = T.alloc_local((_PASSES,), T.float32)
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
@@ -658,47 +729,48 @@ def sink_candidates_kernel(
                 # The launch checked it: a 16-byte base and a stride of 16 elements.
                 T.assume(logits_stride % 16 == 0)
 
+            # As Triton's kernel: every load issued as soon as its index is known,
+            # none behind a test of another's value (the draft at an index that
+            # exists whatever the row), and the block's logits before the
+            # temperature's test.
             local[0] = T.max(num_sampled[req] - 1, 0)
             # The row that produced the request's last sampled token.
             row[0] = T.cast(cu_num_logits[req] + local[0], T.int64)
+            end = T.alloc_var(T.int64, init=T.cast(cu_num_logits[req + 1], T.int64))
             state[0] = T.cast(idx_mapping[req], T.int64)
             temp[0] = temperature[state[0]]
-            rejected[0] = 0
-            verified[0] = -1
-            if mask_rejected_draft:  # noqa: SIM102
-                # A random row that rejected its draft resampled the residual,
-                # which for one-hot drafts is the target without the draft.
-                if row[0] != T.cast(cu_num_logits[req + 1] - 1, T.int64):
-                    verified[0] = drafts[row[0] + 1]
-                    if (
-                        (verified[0] >= 0)
-                        & (T.cast(verified[0], T.int64) != sampled[req, local[0]])
-                        & (temp[0] != T.float32(0))
-                    ):
-                        rejected[0] = 1
-            word_seed[0] = T.call_extern(
-                "uint32", "vllm_randint64", seeds[state[0]], pos[row[0]]
-            )
+            seed = T.alloc_var(T.int64, init=seeds[state[0]])
+            position = T.alloc_var(pos_dtype, init=pos[row[0]])
             for r in T.unroll(_PASSES // run):
                 col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
-                _load_run(logits, raw, row[0], col0, vocab, run)
-                for k in T.unroll(run):
-                    index = col0 + k
-                    scores[r * run + k] = -T.infinity(T.float32)
-                    if index < vocab:
-                        scores[r * run + k] = T.cast(raw[k], T.float32)
-                        if (rejected[0] != 0) & (index == verified[0]):
-                            scores[r * run + k] = -T.infinity(T.float32)
-                        if temp[0] != T.float32(0):
-                            scores[r * run + k] = T.call_extern(
-                                "float32",
-                                "vllm_gumbel_score",
-                                scores[r * run + k],
-                                T.call_extern(
-                                    "uint32", "vllm_randint32", word_seed[0], index
-                                ),
-                            )
-            for i in T.serial(num_candidates):
+                _load_run_at(logits, raw, r * run, row[0], col0, vocab, run)
+            rejected[0] = 0
+            verified[0] = -1
+            if mask_rejected_draft:
+                # A random row that rejected its draft resampled the residual,
+                # which for one-hot drafts is the target without the draft.
+                draft = T.alloc_var(
+                    T.int32,
+                    init=drafts[T.min(row[0] + 1, T.cast(drafts_len - 1, T.int64))],
+                )
+                emitted = T.alloc_var(T.int64, init=sampled[req, local[0]])
+                live = row[0] != end - 1
+                verified[0] = T.if_then_else(live, draft, -1)
+                rejected[0] = T.if_then_else(
+                    live
+                    & (draft >= 0)
+                    & (T.cast(draft, T.int64) != emitted)
+                    & (temp[0] != T.float32(0)),
+                    1,
+                    0,
+                )
+            word_seed[0] = _randint_at(seed, position, pos_dtype, False)
+            # One test of the temperature for the whole block, as the Gumbel sampler.
+            if temp[0] != T.float32(0):
+                passes(raw, scores, rejected, verified, word_seed, blk, tx, True)
+            else:
+                passes(raw, scores, rejected, verified, word_seed, blk, tx, False)
+            for i in T.unroll(num_candidates):
                 best[0] = scores[0]
                 best_index[0] = _element(0, tx, run)
                 for j in T.unroll(1, _PASSES):
@@ -726,6 +798,7 @@ def sink_candidates_key(
     num_candidates: int,
     mask_rejected_draft: bool,
     run: int = 1,
+    pos_dtype: torch.dtype = torch.int64,
 ) -> tuple:
     return (
         _DTYPES[logits_dtype],
@@ -733,6 +806,7 @@ def sink_candidates_key(
         num_candidates,
         mask_rejected_draft,
         run,
+        _DTYPES[pos_dtype],
     )
 
 
@@ -767,6 +841,7 @@ def sink_candidates(
                 num_candidates,
                 mask_rejected_draft,
                 _triton_run(logits),
+                pos.dtype,
             ),
         )
         kernel(
@@ -1130,15 +1205,16 @@ _INT32_MAX = 2147483647
 
 @T.macro
 def _first_keep_or_take(best, best_index, value, index):
-    """``(best, best_index)`` = ``_first_argmax`` of itself and ``(value, index)``."""
-    if (
-        T.call_extern(
+    """``(best, best_index)`` = ``_first_argmax`` of itself and ``(value, index)``,
+    by selects."""
+    keep = T.alloc_var(
+        T.int32,
+        init=T.call_extern(
             "int32", "vllm_first_argmax_keep", best[0], best_index[0], value, index
-        )
-        == 0
-    ):
-        best[0] = value
-        best_index[0] = index
+        ),
+    )
+    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
+    best[0] = T.if_then_else(keep != 0, best[0], value)
 
 
 @T.macro
@@ -1181,16 +1257,6 @@ def partial_argmax_kernel(
     runs = GREEDY_BLOCK // (threads * _VEC)
     passes = GREEDY_BLOCK // threads
 
-    @T.macro
-    def visit(base, bias, best, best_index, row, col):
-        value = T.cast(base[row, col], T.float32)
-        if biased:
-            value = T.cast(
-                T.cast(value + T.cast(bias[row, col], T.float32), base_dtype),
-                T.float32,
-            )
-        _first_keep_or_take(best, best_index, value, col)
-
     @T.prim_func
     def partial_argmax(
         base: T.StridedTensor((rows, vocab), (base_stride, 1), base_dtype),
@@ -1204,8 +1270,8 @@ def partial_argmax_kernel(
         ):
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
-            a = T.alloc_local((_VEC,), base_dtype)
-            b = T.alloc_local((_VEC,), bias_dtype)
+            a = T.alloc_local((passes,), base_dtype)
+            b = T.alloc_local((passes,), bias_dtype)
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
             other = T.alloc_local((1,), T.float32)
@@ -1220,19 +1286,26 @@ def partial_argmax_kernel(
                 T.assume(base_stride % _VEC == 0)
                 T.assume(bias_stride % _VEC == 0)
                 T.assume(vocab % _VEC == 0)
+                # Every run loaded before any is combined, as Triton loads its block.
                 for run in T.unroll(runs):
                     col0 = part * GREEDY_BLOCK + (run * threads + tx) * _VEC
                     if col0 < vocab:
                         for i in T.vectorized(_VEC):
-                            a[i] = base[row, col0 + i]
+                            a[run * _VEC + i] = base[row, col0 + i]
                         if biased:
                             for i in T.vectorized(_VEC):
-                                b[i] = bias[row, col0 + i]
+                                b[run * _VEC + i] = bias[row, col0 + i]
+                for run in T.unroll(runs):
+                    col0 = part * GREEDY_BLOCK + (run * threads + tx) * _VEC
+                    if col0 < vocab:
                         for i in T.unroll(_VEC):
-                            value = T.cast(a[i], T.float32)
+                            value = T.cast(a[run * _VEC + i], T.float32)
                             if biased:
                                 value = T.cast(
-                                    T.cast(value + T.cast(b[i], T.float32), base_dtype),
+                                    T.cast(
+                                        value + T.cast(b[run * _VEC + i], T.float32),
+                                        base_dtype,
+                                    ),
                                     T.float32,
                                 )
                             _first_keep_or_take(best, best_index, value, col0 + i)
@@ -1240,7 +1313,19 @@ def partial_argmax_kernel(
                 for j in T.unroll(passes):
                     col = part * GREEDY_BLOCK + j * threads + tx
                     if col < vocab:
-                        visit(base, bias, best, best_index, row, col)
+                        a[j] = base[row, col]
+                        if biased:
+                            b[j] = bias[row, col]
+                for j in T.unroll(passes):
+                    col = part * GREEDY_BLOCK + j * threads + tx
+                    if col < vocab:
+                        value = T.cast(a[j], T.float32)
+                        if biased:
+                            value = T.cast(
+                                T.cast(value + T.cast(b[j], T.float32), base_dtype),
+                                T.float32,
+                            )
+                        _first_keep_or_take(best, best_index, value, col)
             _warp_first_argmax(best, best_index, other, other_index)
             if tx % 32 == 0:
                 partial[tx // 32] = best[0]
@@ -1256,28 +1341,25 @@ def partial_argmax_kernel(
     return partial_argmax
 
 
+# Parts a lane of the finish reads: ``ceil(parts / 32)``, declared for each value here
+# (vocabularies of up to 32 * 2 * GREEDY_BLOCK columns).
+_FINISH_LANES = (1, 2)
+
+
 @tilelang.jit(pass_configs=_PASS)
-def finish_argmax_kernel(output: str, rows_per_block: int = 0):
+def finish_argmax_kernel(output: str, per_lane: int = 1):
     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
     maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
     ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
-    out_stride]``), from the parts' scratch: one warp per row, or with
-    ``rows_per_block`` one thread per row, the parts in order."""
+    out_stride]``), from the parts' scratch, a warp a row. As Triton's, every part
+    is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
+    (``per_lane`` of them, Triton's masked values past ``parts``), then the lanes
+    reduce; the combine is a total order, so the pairing does not matter."""
     rows, values_len, indices_len, out_len = T.dynamic(
         "rows, values_len, indices_len, out_len"
     )
     pair = output == "pair"
     out_dtype = "float32" if pair else output
-
-    @T.macro
-    def _finish_store(out, best, best_index, row, out_stride, vocab_start):
-        if pair:
-            out[T.cast(row, T.int64) * 2] = best[0]
-            out[T.cast(row, T.int64) * 2 + 1] = T.cast(
-                best_index[0] + vocab_start, T.float32
-            )
-        else:
-            out[T.cast(row, T.int64) * out_stride] = T.cast(best_index[0], out_dtype)
 
     @T.prim_func
     def finish_argmax(
@@ -1289,39 +1371,37 @@ def finish_argmax_kernel(output: str, rows_per_block: int = 0):
         out_stride: T.int64,
         vocab_start: T.int32,
     ):
-        if rows_per_block:
-            with T.Kernel(
-                T.ceildiv(out_rows, rows_per_block), threads=rows_per_block
-            ) as bx:
-                T.import_source(_HEADER)
-                row = bx * rows_per_block + T.get_thread_binding()
-                best = T.alloc_local((1,), T.float32)
-                best_index = T.alloc_local((1,), T.int32)
-                best[0] = -T.infinity(T.float32)
-                best_index[0] = _INT32_MAX
-                if row < out_rows:
-                    for k in T.serial(parts):
-                        slot = T.cast(row, T.int64) * parts + k
-                        _first_keep_or_take(
-                            best, best_index, values[slot], indices[slot]
-                        )
-                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
-        else:
-            with T.Kernel(out_rows, threads=32) as row:
-                T.import_source(_HEADER)
-                tx = T.get_thread_binding()
-                best = T.alloc_local((1,), T.float32)
-                best_index = T.alloc_local((1,), T.int32)
-                other = T.alloc_local((1,), T.float32)
-                other_index = T.alloc_local((1,), T.int32)
-                best[0] = -T.infinity(T.float32)
-                best_index[0] = _INT32_MAX
-                for k in T.serial(T.ceildiv(parts - tx, 32)):
-                    slot = T.cast(row, T.int64) * parts + tx + k * 32
-                    _first_keep_or_take(best, best_index, values[slot], indices[slot])
-                _warp_first_argmax(best, best_index, other, other_index)
-                if tx == 0:
-                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
+        with T.Kernel(out_rows, threads=32) as row:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            v = T.alloc_local((per_lane,), T.float32)
+            ix = T.alloc_local((per_lane,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            for k in T.unroll(per_lane):
+                part = tx + k * 32
+                slot = T.cast(row, T.int64) * parts + T.min(part, parts - 1)
+                v[k] = T.if_then_else(
+                    part < parts, values[slot], -T.infinity(T.float32)
+                )
+                ix[k] = T.if_then_else(part < parts, indices[slot], _INT32_MAX)
+            best[0] = v[0]
+            best_index[0] = ix[0]
+            for k in T.unroll(1, per_lane):
+                _first_keep_or_take(best, best_index, v[k], ix[k])
+            _warp_first_argmax(best, best_index, other, other_index)
+            if tx == 0:
+                if pair:
+                    out[T.cast(row, T.int64) * 2] = best[0]
+                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
+                        best_index[0] + vocab_start, T.float32
+                    )
+                else:
+                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+                        best_index[0], out_dtype
+                    )
 
     return finish_argmax
 
@@ -1442,7 +1522,13 @@ def _finish(
 ) -> None:
     if rows == 0:
         return
-    kernel = _kernel(finish_argmax_kernel, output)
+    per_lane = -(-parts // 32)
+    if per_lane not in _FINISH_LANES:
+        raise ValueError(
+            f"{parts} vocabulary parts exceed the greedy finish's "
+            f"{32 * _FINISH_LANES[-1]} (_FINISH_LANES)"
+        )
+    kernel = _kernel(finish_argmax_kernel, output, per_lane)
     kernel(
         partial_values.view(-1),
         partial_indices.view(-1),
@@ -1634,19 +1720,21 @@ def greedy_rejection_sample(
 
 
 @tilelang.jit(pass_configs=_PASS)
-def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THREADS):
+def temperature_kernel(
+    idx_dtype: str, run: int, block: int, threads: int = _TEMPERATURE_THREADS
+):
     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
-    alone; a block of ``threads`` per ``(token, 8192 columns)``, each thread's
-    elements in runs of ``run`` (``_triton_run``), one vector load and store each
-    when aligned. As in Triton, the thread's runs are all loaded, then divided,
-    then stored: the logits are read and written through one pointer, so a run
-    stored before the next run's load would make every load wait for a store. As
-    in Triton, the temperature is read at the mapped index without a validity
-    check."""
+    alone; a block of ``threads`` per token and ``block`` columns,
+    each thread's elements in runs of ``run`` (``_triton_run``), one vector load
+    and store each when aligned. As in Triton, the thread's runs are all loaded,
+    then divided, then stored: the logits are read and written through one pointer,
+    so a run stored before the next run's load would make every load wait for a
+    store. As in Triton, the temperature is read at the mapped index without a
+    validity check."""
     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
     logits_stride = T.dynamic("logits_stride", "int64")
-    runs = _TEMPERATURE_BLOCK // (threads * run)
+    runs = block // (threads * run)
 
     @T.prim_func
     def temperature(
@@ -1654,9 +1742,7 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THR
         idx_mapping: T.Tensor((idx_len,), idx_dtype),
         temperature: T.Tensor((temp_len,), T.float32),
     ):
-        with T.Kernel(
-            tokens, T.ceildiv(vocab, _TEMPERATURE_BLOCK), threads=threads
-        ) as (t, blk):
+        with T.Kernel(tokens, T.ceildiv(vocab, block), threads=threads) as (t, blk):
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
             temp = T.alloc_local((1,), T.float32)
@@ -1667,12 +1753,12 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THR
             temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
                 for r in T.unroll(runs):
-                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+                    col0 = blk * block + r * (threads * run) + run * tx
                     _load_run_at(logits, raw, r * run, t, col0, vocab, run)
                 for k in T.unroll(runs * run):
                     raw[k] = T.call_extern("float32", "vllm_div_full", raw[k], temp[0])
                 for r in T.unroll(runs):
-                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+                    col0 = blk * block + r * (threads * run) + run * tx
                     _store_run_at(logits, raw, r * run, t, col0, vocab, run)
 
     return temperature
@@ -1686,8 +1772,12 @@ def apply_temperature(
     """``gumbel.apply_temperature``."""
     if logits.shape[0] == 0:
         return
+    block = _TEMPERATURE_BLOCKS[logits.shape[0] >= _TEMPERATURE_SMALL]
     kernel = _kernel(
-        temperature_kernel, _DTYPES[expanded_idx_mapping.dtype], _triton_run(logits)
+        temperature_kernel,
+        _DTYPES[expanded_idx_mapping.dtype],
+        _triton_run(logits),
+        block,
     )
     kernel(logits, expanded_idx_mapping.contiguous(), temperature)
 
@@ -1740,8 +1830,9 @@ def sampling_calls(
     ]
     if temperature:
         calls += [
-            _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run)
+            _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run, block)
             for run in _runs(torch.float32)
+            for block in _TEMPERATURE_BLOCKS
         ]
     return calls
 
@@ -1852,8 +1943,12 @@ def greedy_calls(
         for vector in (True, False)
     ]
     if markov or logits:
-        calls.append(_call(finish_argmax_kernel, "pair"))
-    calls += [_call(finish_argmax_kernel, _DTYPES[dtype]) for dtype in finish_outputs]
+        calls += [_call(finish_argmax_kernel, "pair", lanes) for lanes in _FINISH_LANES]
+    calls += [
+        _call(finish_argmax_kernel, _DTYPES[dtype], lanes)
+        for dtype in finish_outputs
+        for lanes in _FINISH_LANES
+    ]
     calls += [
         _call(select_first_argmax_kernel, _DTYPES[dtype], ranks)
         for dtype, ranks in select

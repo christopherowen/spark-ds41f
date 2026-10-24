@@ -882,3 +882,121 @@ def zero_kv_kernel(threads: int, per: int):
                             segment[base + col] = 0
 
     return zero_kv_blocks
+
+
+# --- Tile form for gather_lookback and zero_kv_blocks (round 5) -------------------------
+
+LOAD_IF = r"""
+__device__ __forceinline__ long long rv_load_if_b64(const void* p, long long other, bool ok) {
+  long long v = other;
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q ld.global.b64 %0, [%1];\n}"
+               : "+l"(v) : "l"(p), "r"((int)ok));
+  return v;
+}
+__device__ __forceinline__ int rv_load_if_b32(const void* p, int other, bool ok) {
+  int v = other;
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n @q ld.global.b32 %0, [%1];\n}"
+               : "+r"(v) : "l"(p), "r"((int)ok));
+  return v;
+}
+__device__ __forceinline__ void rv_zero_if_v4(void* p, bool ok) {
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %1, 0;\n"
+               " @q st.global.v4.b32 [%0], {%2, %2, %2, %2};\n}"
+               :: "l"(p), "r"((int)ok), "r"(0) : "memory");
+}
+"""
+
+
+@tilelang.jit(pass_configs=PASS)
+def lookback_tile_kernel(depth: int, threads: int, spread: bool):
+    """``lookback_kernel`` in Triton's form: the element's row and column in int32,
+    then the request index, its computed count and the token as predicated loads
+    (``@p ld``, the masked lanes keeping 0 / -1), and the store predicated: no
+    branch, so each load issues as soon as its address is known."""
+    rows = T.dynamic("rows")
+    num_reqs = T.dynamic("num_reqs")
+    counts_len = T.dynamic("counts_len")
+    history_rows = T.dynamic("history_rows")
+    history_cols = T.dynamic("history_cols")
+    history_stride = T.dynamic("history_stride")
+    grid = rows if spread else T.ceildiv(rows * depth, threads)
+
+    @T.prim_func
+    def gather_lookback(
+        lookback: T.Tensor((rows, depth), T.int32),
+        idx_mapping: T.Tensor((num_reqs,), T.int64),
+        num_computed_tokens: T.Tensor((counts_len,), T.int32),
+        all_token_ids: T.StridedTensor((history_rows, history_cols), (history_stride, 1), T.int32),
+    ):
+        with T.Kernel(grid, threads=threads) as bx:
+            T.import_source(STORE_IF + LOAD_IF)
+            tx = T.get_thread_binding()
+            element = T.alloc_var(T.int32, init=bx * threads + tx)
+            b = T.alloc_var(T.int32, init=bx if spread else element // depth)
+            j = T.alloc_var(T.int32, init=tx if spread else element - b * depth)
+            inside = (b < rows) & (j < depth)
+            live = inside & (b < num_reqs)
+            req = T.alloc_var(T.int64, init=T.call_extern(
+                "int64", "rv_load_if_b64", T.address_of(idx_mapping[b]), T.int64(0), live))
+            computed = T.alloc_var(T.int32, init=T.call_extern(
+                "int32", "rv_load_if_b32", T.address_of(num_computed_tokens[req]), 0, live))
+            position = T.alloc_var(T.int32, init=computed - depth + j)
+            token = T.alloc_var(T.int32, init=T.call_extern(
+                "int32", "rv_load_if_b32", T.address_of(all_token_ids[req, position]), -1,
+                live & (position >= 0)))
+            T.call_extern("handle", "vllm_store_if_b32", T.address_of(lookback[b, j]), token, inside)
+
+    return gather_lookback
+
+
+@tilelang.jit(pass_configs=PASS)
+def zero_kv_tile_kernel(threads: int, per: int, vector: bool):
+    """``zero_kv_kernel`` in Triton's form: only the page size before the early exit,
+    then the block id, stride and address together, and every store predicated (no
+    branch). ``vector``: 16-byte stores (``per`` / 4 a thread, block-strided) when the
+    segment's address, block stride and page allow, else ``per`` int32 stores a
+    thread, ``threads`` apart (Triton's layout)."""
+    chunk = threads * per
+    segments = T.dynamic("segments")
+    stride_len = T.dynamic("stride_len")
+    page_len = T.dynamic("page_len")
+    num_ids = T.dynamic("num_ids")
+
+    @T.prim_func
+    def zero_kv_blocks(
+        seg_addrs: T.Tensor((segments,), T.ptr),
+        seg_block_strides: T.Tensor((stride_len,), T.int64),
+        seg_page_sizes: T.Tensor((page_len,), T.int64),
+        block_ids: T.Tensor((num_ids,), T.int64),
+        chunks: T.int32,
+    ):
+        with T.Kernel(num_ids, segments, chunks, threads=threads) as (b, s, cx):
+            T.import_source(STORE_IF + LOAD_IF)
+            tx = T.get_thread_binding()
+            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
+            first = T.cast(cx, T.int64) * chunk
+            if first < page:
+                stride = T.alloc_var(T.int64, init=seg_block_strides[s])
+                block_id = T.alloc_var(T.int64, init=block_ids[b])
+                segment = T.make_tensor(seg_addrs[s], (SPAN,), T.int32)
+                base = block_id * stride
+                if vector:
+                    # Whole 16-byte runs only: the page too a multiple of four.
+                    if (T.truncmod(seg_addrs[s], 16) == 0 and T.truncmod(stride, 4) == 0
+                            and T.truncmod(page, 4) == 0):
+                        for k in T.unroll(per // 4):
+                            col = first + (k * threads + tx) * 4
+                            T.call_extern("handle", "rv_zero_if_v4",
+                                          T.address_of(segment[base + col]), col < page)  # fmt: skip
+                    else:
+                        for k in T.unroll(per):
+                            col = first + k * threads + tx
+                            T.call_extern("handle", "vllm_store_if_b32",
+                                          T.address_of(segment[base + col]), 0, col < page)  # fmt: skip
+                else:
+                    for k in T.unroll(per):
+                        col = first + k * threads + tx
+                        T.call_extern("handle", "vllm_store_if_b32",
+                                      T.address_of(segment[base + col]), 0, col < page)  # fmt: skip
+
+    return zero_kv_blocks

@@ -13,12 +13,15 @@ does this in one pass; this kernel does the same thing, for the same arguments:
   DeepSeek-V4.1) reads row ``id + added_offset``;
 - any other id, another rank's or none at all (negative, padding), writes zeros.
 
-A row is copied as 32-bit words, sixteen bytes a thread, whatever the table's dtype,
-so the output carries the table's bits exactly (NaN payloads, signed zeros); rows
-must be sixteen-byte aligned and a multiple of sixteen bytes wide, as DS4.1's
-10240-byte BF16 rows are. A token's row is spread over ``ceil(width / (16 *
-threads))`` blocks (five for DS4.1 at 128 threads), one block per piece of the row,
-so a decode step's few tokens still put every load of their rows in flight at once.
+A row is copied as 32-bit words, sixteen bytes a thread a piece, whatever the
+table's dtype, so the output carries the table's bits exactly (NaN payloads, signed
+zeros); rows must be sixteen-byte aligned and a multiple of sixteen bytes wide, as
+DS4.1's 10240-byte BF16 rows are. Below ``_PREFILL_TOKENS`` tokens a token's row is
+spread over ``ceil(width / (16 * threads))`` blocks (five for DS4.1 at 128 threads),
+a piece a thread, so a decode step's few tokens still put every load of their rows
+in flight at once; from it on a row is one block, every piece of a thread loaded
+before any is stored, so a long prefill chunk is a block a token instead of five
+blocks of one load each.
 The table and the ids are not marked restrict: their loads take the coherent path,
 which on GB10 is faster for a load whose address depends on the load before it
 (measured for CED's row copies, ``ced.py``).
@@ -40,6 +43,9 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 
 # 32-bit words in one sixteen-byte piece of a row.
 _WORDS = 4
+# Tokens from which a row is one block instead of a block a piece.
+_PREFILL_TOKENS = 512
+_THREADS = 128
 _ID_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
 
 
@@ -52,16 +58,21 @@ _ID_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
     }
 )
 def vocab_embedding_kernel(
-    words: int, id_dtype: str, threads: int = 128, coherent: bool = True
+    words: int,
+    id_dtype: str,
+    threads: int = _THREADS,
+    coherent: bool = True,
+    per_thread: int = 1,
 ):
-    """``out[t] = table[row(ids[t])]`` or zeros, for rows of ``words`` 32-bit words.
+    """``out[t] = table[row(ids[t])]`` or zeros, for rows of ``words`` 32-bit words,
+    ``per_thread`` pieces a thread.
 
     ``coherent`` leaves the table and the ids unmarked (plain loads); False marks
     them restrict, as the CUDA kernel does (read-only loads). A benchmark variant.
     """
     assert words % _WORDS == 0 and threads % 32 == 0
     pieces = words // _WORDS
-    blocks = -(-pieces // threads)
+    blocks = -(-pieces // (threads * per_thread))
     tokens = T.dynamic("tokens")
     span = T.dynamic("span")
 
@@ -79,8 +90,8 @@ def vocab_embedding_kernel(
         with T.Kernel(tokens, blocks, threads=threads) as (t, bx):
             if coherent:
                 T.annotate_restrict_buffers(ids, table)
-            piece = bx * threads + T.get_thread_binding()
-            data = T.alloc_local((_WORDS,), T.int32)
+            tx = T.get_thread_binding()
+            data = T.alloc_local((per_thread * _WORDS,), T.int32)
             token = T.alloc_var(T.int64, init=T.cast(ids[t], T.int64))
             # The shard row, or -1 for an id this rank does not own.
             row = T.alloc_var(
@@ -95,22 +106,40 @@ def vocab_embedding_kernel(
                     ),
                 ),
             )
-            if piece < pieces:
-                if row >= 0:
+            for k in T.unroll(per_thread):
+                piece = (bx * per_thread + k) * threads + tx
+                if piece < pieces:
+                    if row >= 0:
+                        for i in T.vectorized(_WORDS):
+                            data[k * _WORDS + i] = table[
+                                row * words + piece * _WORDS + i
+                            ]
+                    else:
+                        for i in T.vectorized(_WORDS):
+                            data[k * _WORDS + i] = T.int32(0)
+            for k in T.unroll(per_thread):
+                piece = (bx * per_thread + k) * threads + tx
+                if piece < pieces:
                     for i in T.vectorized(_WORDS):
-                        data[i] = table[row * words + piece * _WORDS + i]
-                else:
-                    for i in T.vectorized(_WORDS):
-                        data[i] = T.int32(0)
-                for i in T.vectorized(_WORDS):
-                    out[t, piece * _WORDS + i] = data[i]
+                        out[t, piece * _WORDS + i] = data[k * _WORDS + i]
 
     return vocab_embedding
 
 
+def _per_thread(words: int, tokens: int) -> int:
+    """Pieces a thread for a lookup of ``tokens`` rows of ``words`` words."""
+    if tokens < _PREFILL_TOKENS:
+        return 1
+    return -(-(words // _WORDS) // _THREADS)
+
+
+def _layouts(words: int) -> tuple[int, ...]:
+    return tuple(dict.fromkeys((1, -(-(words // _WORDS) // _THREADS))))
+
+
 @cache
-def _kernel(words: int, id_dtype: str):
-    return vocab_embedding_kernel(words, id_dtype)
+def _kernel(words: int, id_dtype: str, per_thread: int):
+    return vocab_embedding_kernel(words, id_dtype, per_thread=per_thread)
 
 
 def row_words(weight: torch.Tensor) -> int:
@@ -126,15 +155,21 @@ def row_words(weight: torch.Tensor) -> int:
 
 def kernel_calls(words: int) -> list[prepare.TileLangCall]:
     """The calls ``vocab_embedding`` makes for rows of ``words`` words: int32 ids
-    (the model runner's) and int64 ids."""
-    return [prepare.call(vocab_embedding_kernel, words, d) for d in _ID_DTYPES.values()]
+    (the model runner's) and int64 ids, in both layouts."""
+    return [
+        prepare.call(vocab_embedding_kernel, words, d, per_thread=p)
+        for d in _ID_DTYPES.values()
+        for p in _layouts(words)
+    ]
 
 
 def declare(words: int) -> None:
     """Declare the lookups of rows of ``words`` words, and keep them."""
     prepare.declare(
         lambda: kernel_calls(words),
-        bind=lambda: [_kernel(words, d) for d in _ID_DTYPES.values()],
+        bind=lambda: [
+            _kernel(words, d, p) for d in _ID_DTYPES.values() for p in _layouts(words)
+        ],
     )
 
 
@@ -181,7 +216,7 @@ def vocab_embedding(
         + num_org_vocab_padding
         - added_vocab_start_index
     )
-    _kernel(words, _ID_DTYPES[input_ids.dtype])(
+    _kernel(words, _ID_DTYPES[input_ids.dtype], _per_thread(words, tokens))(
         input_ids,
         weight.view(torch.int32).view(-1),
         out.view(torch.int32),
