@@ -1121,3 +1121,29 @@ comparisons stand.
 [controls_digest.py](controls_digest.py) now records a rejected scenario, with the server's
 message as its digest, and continues. [serving-controls.json](serving-controls.json) runs
 the controls digests alone: ports, candidate 4, then ports again.
+
+### The second serving check (2026-10-24 22:17 CET, run `tilelang-ports-serving-2`)
+
+vLLM `tilelang-ports` 253cb4719 (every port, every generation control dispatched) beside
+candidate 4, in four alternating arms.
+
+**Outputs:**
+- Temperature 0 is identical in every scenario within every arm: eight at once,
+  staggered, mixed with a long prefill, fifteen at once, cached, again.
+- The digests are equal across all four arms.
+- The seeded temperature-1 reference digest is equal across all four arms.
+- The penalties scenarios are equal across all four arms:
+  - at temperature 0, alone and eight at once;
+  - seeded, alone.
+- Seeded penalties eight at once differ between two runs of the same build (ports against
+  ports again), so those depend on how the requests batch, not on the build.
+
+**Speed:** level.
+- One stream: 93.50 and 93.57 tok/s for the ports, against 93.02 and 93.21.
+- Eight streams, eight samples an arm:
+  - ports 191.14 and 190.76 tok/s;
+  - candidate 4 190.95 and 191.56 tok/s;
+  - the samples fall in the same two modes as before.
+
+The remaining controls scenarios (bad words, the thinking budget, prompt logprobs and
+custom logprob ids, plus the two rejections) run in `tilelang-ports-controls`.
