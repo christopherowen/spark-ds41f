@@ -132,7 +132,11 @@ remains blocked. No improvement to draft acceptance is claimed.
 
 An initial metadata screen was not executed because the preceding window's time
 cap had elapsed. Its log is retained separately; the two cases then ran in a fresh
-window. Every executed screen retains its exact source bundle and native receipt,
+window. Native transcripts retain their original bytes, including traceback spacing; only
+these generated output files are excluded from whitespace lint by the local
+`.gitattributes`. Code and patch whitespace checks remain enabled.
+
+Every executed screen retains its exact source bundle and native receipt,
 including errors and unfavorable timings. Window logs record coordinated stops
 and restoration of the promoted service.
 
