@@ -1170,3 +1170,31 @@ line.
 vLLM 04e097902 loads the lookahead token with the first pass, and a pass takes four 1024-token
 groups (those the chunk reaches) at eight warps. It runs as
 `tilelang-integration-kernels-15`.
+
+### The controls-only serving run (2026-10-24 22:38 CET, run `tilelang-ports-controls`)
+
+Ports, candidate 4, then ports again.
+
+**Equal in all three arms:**
+
+| Scenario | Alone | Eight at once |
+| --- | --- | --- |
+| Penalties, temperature 0 | equal | equal |
+| Penalties, seeded | equal | (batching) |
+| Forbidden sequences | equal | equal |
+| Thinking budget | equal | equal |
+
+- Seeded penalties eight at once differ run to run, as before.
+- Min-p and logit bias are rejected (400) with the same message in every arm.
+
+**Prompt logprobs kill the engine in both builds.** The request returns HTTP 500, and
+EngineCore dies at `scheduler.py`'s `assert not prompt_logprobs_tensors` ("EngineCore
+returns no partial prefill outputs"). It is candidate 4's bug, not the ports'. Production
+probably has it too, but was not tested, since one request would take it down.
+- **Collateral:** the last arm's dead engine kept its containers up on dgx2-4, and the
+  lab's restore refused to start production over them. Production was restored by hand
+  (22:41 CET, doctor --live OK): the arm stopped with its own profile, then the lab's
+  window close.
+- The fix, and the lab's handling of a dead arm, are their own work.
+- The scenario is out of [controls_digest.py](controls_digest.py) until then.
+- Custom logprob ids, which came after it, are still to be served.

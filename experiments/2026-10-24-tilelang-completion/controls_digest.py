@@ -6,8 +6,8 @@ usage: controls_digest.py BASE_URL [--tokens T] [--seed S]
 token_determinism.py's eight prompts, thinking off unless a scenario turns it on, fresh
 cache salts, a fixed number of tokens. Each scenario sets one control the default
 requests never use, so the kernels that apply it run (penalties with their token
-histogram, min-p, logit bias, bad words, the thinking budget, prompt logprobs, custom
-logprob token ids):
+histogram, min-p, logit bias, bad words, the thinking budget, custom logprob token
+ids):
 
 - alone: the eight one at a time;
 - c8: all eight at once (the controls' kernels then see a batch of rows, and with
@@ -53,7 +53,9 @@ SCENARIOS = {
     "bad-words": {"temperature": 0.0, "bad_words": [" the", " and", "ing"]},
     "thinking-budget": {"temperature": 0.0, "thinking_token_budget": 48,
                         "chat_template_kwargs": {"thinking": True}},
-    "prompt-logprobs": {"temperature": 0.0, "prompt_logprobs": 2},
+    # "prompt_logprobs" kills the engine in candidate 4 as well (scheduler.py's "no
+    # partial prefill outputs" assertion, 2026-10-24 run tilelang-ports-controls); it
+    # returns here with its fix.
     "logprob-ids": {"temperature": 0.0, "logprob_token_ids": LOGPROB_IDS},
 }
 
