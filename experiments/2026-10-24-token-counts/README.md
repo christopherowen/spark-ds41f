@@ -1,5 +1,10 @@
 # TileLang sampled/rejected-token counts
 
+Latest qualification: the [combined runner integration](integration/README.md)
+passes all **539 tests**, zero focused memcheck errors and all ten paired count
+performance cases. Its full 230-patch source stack replays exactly. The standalone
+port and intermediate experiments below remain as the original evidence.
+
 Port `input_batch._get_num_sampled_and_rejected_kernel`, which runs after both
 ordinary sampling and speculative verification. The profiled DS41F candidate
 launches it every decode step: 104 calls across four ranks in the one-stream
@@ -86,10 +91,10 @@ the promoted production profile, passed `doctor --live` and removed its hold.
 No release image was built, and the candidate remains unpromoted pending full
 release and serving validation.
 
-The concurrent runner-input port changes the warmup API and conflicts with the
-standalone patch's context. An [integration adjustment](integration/README.md)
-is prepared against its pinned commit, preserving identical kernel code and
-count semantics. Its combined tree still needs GPU and full release validation.
+The runner-input port changes the warmup API and conflicts with the standalone
+patch's context. The [integration adjustment](integration/README.md) preserves
+identical kernel code and count semantics and is now GPU-qualified with the full
+runner/sink suite. Full release and serving validation remain required.
 
 [Acceptance opportunities](acceptance-review.md) records the separately requested
 review. They are hypotheses or earlier measured evidence, not changes in this port.
