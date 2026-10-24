@@ -806,3 +806,18 @@ The first profile run stopped at its first workload: a profiled arm must serve w
 and [prof-candidate4.json](profile/prof-candidate4.json) are the two arms with candidate
 4's resolved serve arguments and the torch profiler added. The run is repeated as
 `tilelang-ports-profile-2`.
+
+### Tenth integrated run (2026-10-24 20:10 CET)
+
+- **Tests:** every one passes, the generation controls' 141 included.
+- **The sampling family passes its whole gate:** at every shape each kernel is level with
+  Triton or faster. The sink candidates' loads at one request closed the last gap.
+- **Generation controls** (gated timings: penalties, histogram accumulation, min-p):
+  - Penalties: -30% at one row, -7% at 16, -5% at 96.
+  - Histogram accumulation: -4 to -44% at every width and row count.
+  - Min-p: faster at 1 and 16 rows, **+8% at 96 rows** (572 against 530 µs). Both kernels
+    take a row a block, a max pass then a threshold pass, 1024 columns at a time. At 96
+    rows that is two blocks an SM, and ours issues one block's loads at a time behind a
+    per-element bound check.
+- **Runner, still flagged:** zero_kv_blocks at c1, combine with dead rows at the 16K
+  prefill, gather_lookback.
