@@ -149,8 +149,10 @@ class ReadinessTest(unittest.TestCase):
     def test_64k_boot_requires_its_swap_and_memory_policy(self):
         data = ready()
         data.update(kernel=NEW, page_size=65536)
-        issues, _ = kernel.findings("dgx1", data, POLICY)
+        issues, fixes = kernel.findings("dgx1", data, POLICY)
         self.assertTrue(any("64 KiB swap" in x for x in issues))
+        # The service is spark-ds41f's since the release after spark-ds41f-1022 (host/kernel-memory).
+        self.assertTrue(any("journalctl -u spark-ds41f-kernel-memory.service" in x for x in fixes))
         data.update(thp="always madvise [never]", active_swap=["/swap-64k.img"], memory_service="active")
         data["uvm_leaf_packing"] = "Y"
         data["loaded_nvidia_sources"]["nvidia_uvm"] = POLICY["memory_saver"]["srcversion"]

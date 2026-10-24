@@ -460,3 +460,138 @@ determinism at 8,192 and with steering on; [rc4/rc4-glp-tp4.json](rc4/rc4-glp-tp
 steering on against off. The same window runs the mHC port's GPU tests and benchmark
 (experiments/2026-10-24-tilelang-completion/bundles/mhc-port, vLLM branch tilelang-mhc-post) on
 dgx3 beside the release tests.
+
+## The release comparison (candidate 3, 2026-10-24)
+
+Candidate 3's window (2026-10-24 09:41-12:20 CET, runs `next-rc3-tp4`, `next-rc3-decode-tp4`):
+
+- Release tests: 2,105 passed, 159 skipped, 0 failed. The GLP benchmark failed its gate at 640
+  threads a row (sixteen streams 7.7 against 7.2 us); candidate 4 replaces it.
+- Gate at 16,384: temperature-0 outputs identical to spark-ds41f-1022's ring hashes (3eab5112 /
+  db25fde3, c9cf9dbe / c6bb4f4e), and the same at 8,192. Repeatable with steering on.
+- The controls probe and control spellings pass. The sink probes flag `Say hi.`, `Thanks!` and
+  `ok`, and nothing collapses.
+- The release suite, one session (candidate 3 / spark-ds41f-1022 / candidate 3 again), with
+  verdicts against the run's own repeat
+  ([table](../../manifests/suites/2026-10-24-spark-ds41f-1024-tp4/release-table.txt)):
+
+| Metric | Change | ±95% | Repeat | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| grid: decode geometric mean (20) | +0.16% | 0.17% | -0.02% | same |
+| 16 streams, output tok/s | +0.16% | 0.97% | -0.06% | same |
+| 1 stream, output tok/s | +0.11% | 8.39% | -0.09% | same |
+| prefill 32,768, tok/s | +11.41% | 1.95% | +0.68% | **better** |
+| prefill 131,072, tok/s | +12.29% | 0.66% | +0.19% | **better** |
+| sampled 16 streams, output tok/s | +0.56% | 1.19% | -0.01% | same |
+
+  Greedy 64/64 identical and KL 0. Lowest MemAvailable in the memory probe: 20.4 GiB (dgx4).
+- **Candidate 3 against candidate 1, interleaved** (`next-rc3-decode-tp4`, candidate 3 / candidate 1
+  / candidate 3 / candidate 1):
+  - candidate 3's grid is +0.39% and +0.89% against candidate 1's first arm;
+  - candidate 1's own repeat is -0.32%, and candidate 3 against candidate 1's second arm -0.71%;
+  - sixteen and one streams are level throughout.
+  - So candidate 3 gives back the grid gain candidate 1 showed against 1022 (-1.05% there). It
+    is level with 1022 on the grid and identical in its outputs.
+  - The budget and malloc settings cost nothing (A/B above). What remains between candidates 1
+    and 3 is the rename (0262) and GLP's code, which is off. That gap is the next release's to
+    find; it does not fail this release, whose rule is no verdict worse than the previous
+    release's.
+
+## Candidate 4's window (2026-10-24 12:22 CET)
+
+Runs `next-rc4-tp4` and `next-rc4-glp-tp4`.
+
+- Image `spark-ds41f:19f2c20ed4d6-next-4` (sha256:1ae57dac1017), built on dgx2 at 12:33 CET; one ID
+  and the same 54 layers on dgx1-dgx4.
+- Release tests: 2,105 passed, 159 skipped, 0 failed.
+- **GLP benchmark at 320 threads a row: passes its gate.**
+  - Decode: one stream 2.23 against the torch projection's 2.47 us, sixteen streams 6.87
+    against 7.21 us, both faster.
+  - Prefill 8K +12.7 us (interval -5.7 to +31.0) and 16K -5.0 us (interval -50.4 to +40.3),
+    both level.
+  - The lab marked the bundle FAIL at exit 0: an `exit` verdict needed a pytest summary line.
+    Script bundles now take a `status` verdict.
+- Gate at 16,384: outputs identical to candidate 3's and to spark-ds41f-1022's ring hashes, with
+  and without logprobs. The same holds at 8,192, and with steering on the outputs repeat.
+- The controls probe and control spellings pass. The sink probes flag `Say hi.`, `Thanks!` and
+  `ok`, and nothing collapses.
+- GPU KV cache 8,580,566 tokens (8.18 full 1M contexts, 1022's pool); model load 72.19 GiB a rank;
+  lowest MemAvailable in the memory probe 20.4 GiB (dgx4).
+- The TileLang ports' bundles ran beside the release tests on the other nodes
+  (experiments/2026-10-24-tilelang-completion, their first GPU run).
+- **Steering on against off** ([rc4/rc4-glp-tp4.json](rc4/rc4-glp-tp4.json), 12:52-13:52 CET, the synthetic
+  file, verdicts against the repeat): grid +1.60% (worse), sixteen streams -1.16% (worse), one
+  stream -1.36% (same), prefill 32K -1.31% (same) and 131K -1.53% (worse). Candidate 2's 128-thread
+  projection had cost the grid +2.41%. This is the price of turning steering on; off, the release
+  runs as spark-ds41f-1022 does.
+
+## Promotion: spark-ds41f-1024
+
+`config/cluster.json` becomes candidate 4's recipe:
+- candidate 3's recipe, which is the renamed spark-ds41f-1022 recipe with the ring's 16,384
+  budget, glibc malloc pinned and #469's prompt-cache report;
+- image `spark-ds41f:19f2c20ed4d6-next-4` and vLLM tree `97fc3579`;
+- the lock `upstreams.lock.json` names candidate 4's series ([rc4/vllm/series](rc4/vllm/series),
+  patch head 4cd21d89).
+
+The baseline is
+[manifests/baselines/2026-10-24-spark-ds41f-1024.json](../../manifests/baselines/2026-10-24-spark-ds41f-1024.json).
+`tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-24-spark-ds41f-1024-tp4](../../manifests/suites/2026-10-24-spark-ds41f-1024-tp4):
+candidate 3's arm of the release comparison. Candidate 4 changes only GLP steering's kernel, which
+launches only with steering on. `tp3-triangle` is not qualified on this image (its last release is
+spark-ds41f-1022). spark-ds41f-1022's recipe and lock stay frozen in [1022/](1022) as the
+rollback. The deploy follows the procedure below, under a deploy hold, on the owner's go.
+
+### Deploying the renamed names (with the promotion)
+
+The rename (branch `next-release-rename`) goes live with the promotion commit, which also moves
+`container.image` to the new image and its `expected_labels` trees: candidate 4's image
+`spark-ds41f:19f2c20ed4d6-next-4`, built from a commit that contains the rename (labels
+`local.spark-ds41f.*`, trees under `/opt/spark-ds41f/candidate`, vLLM reading `SPARK_DS41F_*`),
+with one image ID on every node (sha256:1ae57dac1017, already on dgx1-dgx4). The renamed recipe refuses image -1022-4 (its labels are `local.spark3.*`), so it cannot
+serve an old image under the new variable names. From dgx1, under a deploy hold:
+
+1. Stop spark-ds41f-1022 with its frozen recipe, which names the running container
+   (`dsv41-karmic-kraken` and its memory guard):
+   `bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster stop --apply --parallel`.
+   The stopped container is kept for the rollback.
+2. Sync every node to the promotion commit:
+   `bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster sync --revision <commit> --apply`.
+3. On every node, move the cache and leave a relative link under the old name (done on
+   2026-10-23 at 21:09 CET in candidate 2's window, which needed it; the commands below skip a
+   node already linked), so the frozen
+   recipes (1022 and earlier, the release comparison's previous-release arm included) stay warm
+   and Triton's group files, which hold absolute `/cache/kkref/...` paths, keep resolving:
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do
+     ssh "$host" 'cd ~/projects/spark-ds41f/cache && test -d kkref && test ! -L kkref &&
+       test ! -e spark-ds41f && mv kkref spark-ds41f && ln -s spark-ds41f kkref; ls -ld kkref spark-ds41f'
+   done
+   ```
+
+   Nothing is deleted: `jit/vllm-r5o` stays for the old recipes (the new one compiles into
+   `jit/vllm`), and B12X recompiles once because its compile key includes
+   `B12X_CUTE_COMPILE_CACHE_DIR` (the first boot warms it).
+4. On every node, replace the boot memory service (`spark3-kernel-memory` becomes
+   `spark-ds41f-kernel-memory`, its backup moves to `/var/lib/spark-ds41f`); the installer does
+   not reboot or touch swap, and starting the service applies the values already in force:
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do
+     ssh "$host" 'cd ~/projects/spark-ds41f && sudo -n experiments/2026-10-02-kernel-64k/install-boot-support.sh &&
+       sudo -n systemctl start spark-ds41f-kernel-memory.service && systemctl is-active spark-ds41f-kernel-memory.service'
+   done
+   ```
+5. Start the promoted recipe: `bin/spark --cluster-config config/cluster.json cluster start` (plan:
+   `live:` names no engine, since the stopped container has the old name; `shape:` new engine),
+   then the same with `--apply`. The first boot compiles what the moved caches do not cover.
+6. `bin/spark --cluster-config config/cluster.json doctor --live` must report the live cluster
+   matching (`spark-ds41f`, `spark-ds41f-memguard`), with no kernel memory service warning.
+
+Rollback: `bin/spark --cluster-config config/cluster.json cluster stop --apply --parallel`, then
+`bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster start --replace --apply`
+and `doctor --live` with that profile; it reads its caches through `cache/kkref`. Remove the kept
+`dsv41-karmic-kraken` containers (`docker rm`) only once the rollback is no longer wanted, and
+keep the `cache/kkref` link while any recipe names it.

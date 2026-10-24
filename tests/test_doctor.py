@@ -622,10 +622,7 @@ class LiveEnvironmentTest(unittest.TestCase):
         arm["environment"]["VLLM_DS41_L2_PREFETCH_FFN_MB"] = "8"
         live = container_env(spark.expected_environment(arm, self.node))
         problems = spark.environment_problems("dgx1", self.wanted, live, IMAGE_ENV)
-        # The ring derives its cost curves per build, so the arm's curves directory differs too.
-        self.assertEqual(len(problems), 2, problems)
-        self.assertIn("dgx1: extra variable VLLM_DS41_L2_PREFETCH_FFN_MB='8'", problems)
-        self.assertTrue(any(p.startswith("dgx1: SPARK3_DSPARK_COST_DIR=") for p in problems), problems)
+        self.assertEqual(problems, ["dgx1: extra variable VLLM_DS41_L2_PREFETCH_FFN_MB='8'"])
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             status = spark.report_doctor(problems, [], live=True)

@@ -22,13 +22,16 @@ def load(relative: str) -> dict:
 
 
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
+# Flags that change only what a response reports, added after the archived records.
+REPORTING_ARGS = ("--enable-prompt-tokens-details",)
 
 
 def serving_arguments(cluster: dict) -> list[str]:
     """``serve_args`` without what selects the checkpoint and its sampling defaults (the
-    model path and ``--override-generation-config``) and without the draft budget's
-    constant (r6x replaced the boot-timed cost model's scale with a row cost)."""
-    args = cluster["serve_args"][1:]
+    model path and ``--override-generation-config``), without the draft budget's
+    constant (r6x replaced the boot-timed cost model's scale with a row cost) and
+    without the reporting flags (#455 added the prompt-cache report)."""
+    args = [arg for arg in cluster["serve_args"][1:] if arg not in REPORTING_ARGS]
     if "--override-generation-config" in args:
         at = args.index("--override-generation-config")
         del args[at : at + 2]
@@ -61,6 +64,23 @@ def draft_budget(cluster: dict) -> dict:
     args = cluster["serve_args"]
     speculative = json.loads(args[args.index("--speculative-config") + 1])
     return {k: v for k, v in speculative.items() if k in BUDGET_KEYS}
+
+
+def renamed(cluster: dict) -> dict:
+    """A resolved profile of spark-ds41f-1022 under the names of the release after it."""
+    out = json.loads(json.dumps(cluster))
+    out["container"]["name"] = {"dsv41-karmic-kraken": "spark-ds41f"}[out["container"]["name"]]
+    out["container"]["expected_labels"] = {
+        key.replace("local.spark3.", "local.spark-ds41f.", 1): value
+        for key, value in out["container"]["expected_labels"].items()}
+    environment = {}
+    for key, value in out["environment"].items():
+        if key in ("PYTHONPATH", "SPARK3_DSPARK_PROFILE_TOKENS"):
+            continue
+        value = value.replace("/cache/kkref/jit/vllm-r5o", "/cache/spark-ds41f/jit/vllm")
+        environment[key.replace("SPARK3_", "SPARK_DS41F_", 1)] = value.replace("/cache/kkref", "/cache/spark-ds41f")
+    out["environment"] = environment
+    return out
 
 
 def load_spark():
@@ -96,16 +116,54 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
-    def test_each_shape_is_its_1022_arm(self):
-        """Each shape resolves to spark-ds41f-1022's arm at that shape, apart from the names (the
-        arms extend the recipe and name the release's experiment lock)."""
+    def test_each_shape_is_its_1022_arm_renamed(self):
+        """Each shape resolves to spark-ds41f-1022's arm at that shape under the names of the
+        release after it (the owner's decision of 2026-10-19), on spark-ds41f-1024's image, and
+        nothing else: the container, label prefix, variables and cache paths are renamed,
+        PYTHONPATH is left to the image (which sets it to the same trees) and the boot-profile
+        variable nothing reads since vLLM 0184 is gone. The release also changes two things on
+        purpose: the ring's long-prefill budget is 16,384 (the owner, 2026-10-23, "do 16";
+        experiments/2026-10-23-next-release, budget sweeps), glibc malloc keeps two arenas and a
+        fixed 1 MiB mmap threshold (#439's growth; the memory window), and every response
+        reports its prompt-cache hits (#469)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
             resolved = recipe.resolve(self.recipe, shape)
-            released = load_spark().read_cluster(arm)
+            released = renamed(load_spark().read_cluster(arm))
+            released["environment"] = {**released["environment"], "MALLOC_ARENA_MAX": "2",
+                                       "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            released["container"]["image"] = "spark-ds41f:19f2c20ed4d6-next-4"
+            released["container"]["expected_labels"]["local.spark-ds41f.vllm.tree"] = (
+                "97fc3579def4ffc32eec88c9149c560559af59d4")
+            # The prompt-cache report (#469), where the recipe renders it.
+            args = released["serve_args"] = list(released["serve_args"])
+            args.insert(resolved["serve_args"].index("--enable-prompt-tokens-details"),
+                        "--enable-prompt-tokens-details")
+            if shape == "tp4-ring":
+                for flag, value in (("--max-num-batched-tokens", "16384"),
+                                    ("--long-prefill-token-threshold", "16288")):
+                    args[args.index(flag) + 1] = value
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
+        self.assertEqual(self.recipe["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-4")
+
+    def test_the_ring_is_candidate_4s_arm(self):
+        """Promotion runs what the release measured: tp4-ring resolves to candidate 4's gate
+        arm, apart from the baseline, lock and reference that name it."""
+        resolved = recipe.resolve(self.recipe, "tp4-ring")
+        released = load_spark().read_cluster("experiments/2026-10-23-next-release/rc4/rc-tp4.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                         {k: v for k, v in released.items() if k not in naming})
+
+    def test_the_recipe_keeps_no_old_live_name(self):
+        """No old name is left."""
+        text = json.dumps(self.recipe)
+        for old in ("spark3", "SPARK3_", "kkref", "karmic", "dsv41-", "vllm-r5o", "PYTHONPATH"):
+            self.assertNotIn(old, text)
+        self.assertEqual(self.recipe["container"]["name"], "spark-ds41f")
+        self.assertTrue(all(key.startswith("local.spark-ds41f.") for key in self.recipe["container"]["expected_labels"]))
 
     def test_r6x_frozen_at_1022_is_its_arms(self):
         """r6x's recipe, frozen at spark-ds41f-1022's promotion, resolves at each shape to r6x's
@@ -145,6 +203,8 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual(load(arm)["extends"]["config"], frozen_path, arm)
         for path in ("experiments/2026-10-22-spark-ds41f-1022", "experiments/2026-10-23-next-release"):
             for file in sorted((ROOT / path).rglob("*.json")):
+                if file.is_relative_to(ROOT / "experiments/2026-10-23-next-release/rc2"):
+                    continue  # candidate 2 runs the renamed recipe on its own image
                 data = json.loads(file.read_text())
                 if isinstance(data, dict) and "extends" in data:
                     self.assertNotEqual(data["extends"].get("config"), "config/cluster.json", file)
@@ -186,7 +246,7 @@ class RecipeTest(unittest.TestCase):
             recipe.overlay({"extends": {}, "set": {"model": "nonexistent"}}, base)
         # An arm that lists its own mounts (an overlay of changed files) still serves its
         # model: the list replaces the base's, so the model's mounts are put back first.
-        extra = ["{home}/overlay/moe.py", "/opt/spark3/candidate/vllm/moe.py", "ro"]
+        extra = ["{home}/overlay/moe.py", "/opt/spark-ds41f/candidate/vllm/moe.py", "ro"]
         listed = recipe.overlay({"extends": {}, "set": {"container": {"mounts": [
             ["{home}/projects/spark-ds41f/cache", "/cache", "rw"], extra]}}}, base)
         self.assertEqual(listed["container"]["mounts"],
@@ -222,26 +282,32 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(resolved["fabric"], old["fabric"])
         for key, value in old["environment"].items():
             if key.startswith("NCCL_") or key in ("SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"):
-                self.assertEqual(resolved["environment"].get(key), value, key)
-        # TP3 schedules on its build's own cost curves (bin/spark derives the directory).
-        self.assertNotIn("SPARK3_DSPARK_COST_DIR", resolved["environment"])
+                self.assertEqual(resolved["environment"].get(key.replace("SPARK3_", "SPARK_DS41F_", 1)), value, key)
         tp4 = recipe.resolve(self.recipe, "tp4-ring")
         self.assertEqual(resolved["container"], tp4["container"])  # one image and run arguments for every shape
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # spark-ds41f-1022 was released on the triangle, then on the ring: each shape has its own run.
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
-        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
+        # spark-ds41f-1024 was released on the ring; the triangle waits for its own run.
+        self.assertNotIn("benchmark_reference", resolved)
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-24-spark-ds41f-1024-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
+
+    def test_every_shape_reports_prompt_cache_hits(self):
+        """Prefix caching reuses cached blocks; --enable-prompt-tokens-details reports the reuse
+        in every response's usage.prompt_tokens_details (cached_tokens). They are separate
+        switches: without the second the cache works and the key is absent (#455)."""
+        for name in self.recipe["shapes"]:
+            args = recipe.resolve(self.recipe, name)["serve_args"]
+            self.assertEqual(args.count("--enable-prefix-caching"), 1, name)
+            self.assertEqual(args.count("--enable-prompt-tokens-details"), 1, name)
 
     def test_only_the_cabling_and_memory_differ_between_shapes(self):
         tp3, tp4 = (recipe.resolve(self.recipe, name) for name in ("tp3-triangle", "tp4-ring"))
         different = {key for key in set(tp3["environment"]) | set(tp4["environment"])
                      if tp3["environment"].get(key) != tp4["environment"].get(key)}
-        # Since r6v both shapes derive their DSpark cost curves per build: no pinned directory.
         allowed = {key for key in different if key.startswith("NCCL_")} | {
-            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK3_DISPLAY_CARVEOUT_WEIGHTS"}
+            "SPARKNET_ROCE_ALLGATHER_MAX_BYTES", "SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS"}
         self.assertEqual(different, allowed)
         for name, entry in self.recipe["shapes"].items():
             self.assertTrue(entry.get("notes"), f"shape {name} says why it differs")
@@ -251,7 +317,7 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual(recipe.capture_sizes(96)[-6:], [56, 64, 72, 80, 88, 96])
         values = recipe.values(self.recipe, recipe.shape_entry(self.recipe, "tp4-ring"))
         self.assertEqual(values["max_cudagraph_capture_size"], "96")
-        self.assertEqual(values["long_prefill_token_threshold"], "8096")
+        self.assertEqual(values["long_prefill_token_threshold"], "16288")
         self.assertEqual(values["tensor_parallel_size"], "4")
 
     def test_ending_the_ladder_at_its_rows_keeps_every_shapes_serve_args(self):
@@ -263,7 +329,7 @@ class RecipeTest(unittest.TestCase):
             return [size for size in ladder if size <= max_size]
 
         triangle = [1, 2, 3, 4, 6, 8, 12, 16, 20, 24, 28, 32, 40, 48]
-        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "8096"),
+        expected = {"tp4-ring": ("16", "96", triangle + [56, 64, 72, 80, 88, 96], "16288"),
                     "tp3-triangle": ("8", "48", triangle, "4048"),
                     "tp3-triangle-4k": ("8", "48", triangle, "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
@@ -353,7 +419,7 @@ class RecipeTest(unittest.TestCase):
         """Each shape's long-prefill budget is its own sweep's answer (a TP3 rank holds a
         third of the model, so its headroom differs): changing one must not move another.
         The threshold is the budget less streams x (1 + drafts)."""
-        expected = {"tp4-ring": ("8192", "8096"), "tp3-triangle": ("4096", "4048"),
+        expected = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("4096", "4048"),
                     "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(self.recipe["shapes"]), set(expected))
         for name, budget in expected.items():
