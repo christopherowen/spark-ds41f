@@ -1,0 +1,62 @@
+{
+ "description": "The V2 runner's sampling family as TileLang kernels (vLLM branch tilelang-sampling, 642ee125c) on image -next-4: the Gumbel sampler and temperature, the sink detector's candidates and policy, DSpark's greedy reductions and greedy verification, each against the Triton kernel it replaces bit for bit (the noise on all 2**32 Philox words), the switched call sites under the existing sink, Gumbel and greedy contract tests, then the paired per-call benchmark against Triton (--gate: no shape slower by more than 1%).",
+ "image": "spark-ds41f:19f2c20ed4d6-next-4",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-sampling",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b"
+ },
+ "workdir": "vllm",
+ "argv": [
+  "-c",
+  "import subprocess,sys\nimport triton\nprint('triton', triton.__version__, flush=True)\na=subprocess.run([sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures','--basetemp','/c/pytest-sampling','tests/v1/worker/test_gpu_tilelang_sampling.py','tests/v1/worker/test_gpu_gumbel_sample.py','tests/v1/worker/test_gpu_sink.py','tests/v1/worker/test_dspark_greedy_markov.py','tests/v1/worker/gpu/test_greedy_verification.py','tests/v1/worker/test_gpu_sampler_flags.py','tests/v1/worker/test_prepare_kernels.py'],timeout=5400).returncode\nb=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_tilelang_sampling.py','--gate'],timeout=3600).returncode\nprint('pytest exit',a,'gate exit',b)\nsys.exit(a or b)"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "prepare_fixtures.py",
+   "/b/prepare_fixtures.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_sample_tilelang_sampling.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_sampling.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_sample_gumbel.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/gumbel.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_sample_sink.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/sink.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_dspark_greedy.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_dspark_speculator.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_greedy_verification.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/greedy_verification.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_model_runner.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "tests_v1_worker_test_gpu_tilelang_sampling.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_tilelang_sampling.py"
+  ],
+  [
+   "tests_v1_worker_test_gpu_gumbel_sample.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_gumbel_sample.py"
+  ],
+  [
+   "benchmarks_kernels_benchmark_tilelang_sampling.py",
+   "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_tilelang_sampling.py"
+  ]
+ ]
+}
