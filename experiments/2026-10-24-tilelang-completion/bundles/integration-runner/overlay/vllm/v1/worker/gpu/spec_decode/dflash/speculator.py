@@ -70,7 +70,6 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._is_padding = torch.ones(
             self.max_num_tokens, dtype=torch.bool, device=device
         )
-        self._row_index = torch.arange(self.max_num_tokens, device=device)
 
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
@@ -227,6 +226,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         ]
         tilelang_inputs.declare(
             lambda: tilelang_inputs.dflash_calls(sample_from_anchor, layouts)
+            + tilelang_inputs.padding_rows_calls()
         )
 
     def _setup_vocab_parallel_drafting(self, model: nn.Module) -> None:
@@ -785,10 +785,10 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Rows past the live query rows pad the batch, and a dummy batch is all
         # padding, like the target's. Written eagerly before the graph replays,
         # so the routers skip exactly these rows.
+        from vllm.v1.worker.gpu import tilelang_inputs
+
         live = 0 if dummy_run else num_query_tokens
-        self._is_padding[:num_tokens_padded].copy_(
-            self._row_index[:num_tokens_padded] >= live
-        )
+        tilelang_inputs.padding_rows(self._is_padding, live, num_tokens_padded)
 
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None

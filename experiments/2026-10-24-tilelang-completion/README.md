@@ -1296,3 +1296,31 @@ another candidate. vLLM `tilelang-ports` cb9ed45bd adds:
 - **The grammar bitmask in TileLang** (structured output, 1fd8cae32).
 - **`benchmark_sink_glue.py --gate`:** the sink kernels against the torch chains, and the
   bitmask against Triton.
+
+Before the window opened, the run moved to `tilelang-ports` 575355250. That commit also
+folds the step's remaining eager glue that the request inventory found, and ports the
+rejection sampler:
+- **Adaptive verification's offsets** in one kernel (7f2d09d32). This replaces five torch
+  launches: two zeroes, two add and cumsum pairs, and the tail fill. The kernel also
+  resets the capacities on a step without drafts.
+- **DSpark's context-graph inputs** in one launch (2b6d4613c). This replaces the three
+  strided copies of the target's auxiliary hidden states and the three tail fills, eager
+  before every context-graph replay.
+- **Per-request row scatters** (cd09d7b42): one kernel each for the runner's draft
+  commit and adaptive verification's confidences. The draft commit was a torch scatter
+  and a read-back; the confidences were a third torch index op.
+- **Padding rows** (a30348f82): one launch for the target's two fills, and one for the
+  drafter's comparison and copy.
+- **The logits rows' inputs** once a step (dbd02befb). These were
+  `input_ids[logits_indices]` and `positions[logits_indices]`, gathered by torch up to
+  four times a step.
+- **The rejection sampler's block verification in TileLang** (4c7261200). Production's
+  configuration is one-hot drafts, block verification, FP32 draws and no watermark. The
+  local statistics, a fused verify and the resample are the Triton kernels' contract, bit
+  for bit, read from Triton 3.7's PTX and SASS. Every other configuration stays on
+  Triton.
+- **A declaration test** for the new glue kernels (575355250).
+
+New steps: the DSpark context test, `test_tilelang_rejection.py`, and
+`benchmark_tilelang_rejection.py --gate`, all on dgx2. The runner benchmark gains the
+offsets and DSpark context cases.

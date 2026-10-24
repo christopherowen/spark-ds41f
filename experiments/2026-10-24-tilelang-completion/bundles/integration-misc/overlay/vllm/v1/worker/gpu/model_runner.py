@@ -106,6 +106,7 @@ from vllm.v1.worker import display_carveout
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.async_utils import (
     AsyncOutput,
     AsyncPoolingOutput,
@@ -1680,9 +1681,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if envs.VLLM_MOE_SKIP_PADDING:
             # Mark trailing cudagraph-padding rows so kernels can skip work for
             # them when supported.
-            is_padding = self.input_buffers.is_padding
-            is_padding[:num_tokens].fill_(False)
-            is_padding[num_tokens:num_tokens_after_padding].fill_(True)
+            tilelang_inputs.padding_rows(
+                self.input_buffers.is_padding, num_tokens, num_tokens_after_padding
+            )
 
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
@@ -2116,11 +2117,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
             commits=commits,
         )
+        if self.speculator is not None and self.num_speculative_steps:
+            # The commit of a step's drafts (sample_tokens), and of a boundary
+            # checkpoint's replayed drafts.
+            draft_dtype = self.req_states.draft_tokens.dtype
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.scatter_rows_calls(
+                    torch.int64, draft_dtype, gather=True
+                )
+                + (
+                    tilelang_inputs.scatter_rows_calls(
+                        torch.int64, draft_dtype, gather=False
+                    )
+                    if self.vllm_config.use_request_boundary_checkpoints
+                    else []
+                )
+            )
+        if envs.VLLM_MOE_SKIP_PADDING:
+            # The target's padding rows (prepare_inputs).
+            tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
+        if self.adaptive_verification is not None:
+            tilelang_inputs.declare(
+                lambda: tilelang_inputs.adaptive_offsets_calls()
+                + tilelang_inputs.scatter_rows_calls(
+                    torch.int64, torch.float32, gather=False
+                )
+            )
         self.req_states.register_warmups()
         if not samples:
             return
         assert self.sampler is not None
         register_input_batch_warmups(dead_rows=dead_rows)
+        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
+        # indices are int64, a dummy batch's int32.
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
+            + tilelang_inputs.logits_rows_calls(torch.int32)
+        )
 
         language_model = self._language_model()
         head = getattr(language_model, "lm_head", None)
@@ -2311,7 +2344,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shard = self._language_model().lm_head.shard_indices
         tp_size = get_tensor_model_parallel_world_size()
         local_logits = self.model.compute_logits_local(sample_hidden_states)
-        drafts = input_batch.input_ids[input_batch.logits_indices]
+        drafts = input_batch.logits_rows()[0]
         rejection = self.sink is not None and self.sink.rejection
         if rejection:
             assert self.sink is not None and sink_flags is not None
@@ -2520,7 +2553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self._sink_decoding[:num_reqs],
             sink_flags,
-            input_batch.input_ids[input_batch.logits_indices],
+            input_batch.logits_rows()[0],
             sampler_output.sink_alternates,
             self.req_states.total_len.gpu,
             self.sampler.penalties_state.output_bin_counts,
@@ -3241,9 +3274,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 boundary_aux_block_id,
                 num_speculative_tokens=num_spec_tokens_to_schedule,
             )
-            self.req_states.draft_tokens[
-                input_batch.idx_mapping, :num_spec_tokens_to_schedule
-            ] = draft_tokens_for_next_step
+            tilelang_inputs.scatter_rows(
+                input_batch.idx_mapping,
+                draft_tokens_for_next_step,
+                self.req_states.draft_tokens,
+            )
         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
             if isinstance(self.speculator, DraftModelSpeculator):
@@ -3304,12 +3339,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:
-                self.req_states.draft_tokens[
-                    input_batch.idx_mapping, :num_draft_tokens
-                ] = draft_tokens
-                draft_tokens_for_next_step = self.req_states.draft_tokens[
-                    input_batch.idx_mapping, :num_draft_tokens
-                ]
+                # Into the request states, and read back for the next step.
+                draft_tokens_for_next_step = tilelang_inputs.scatter_rows(
+                    input_batch.idx_mapping,
+                    draft_tokens,
+                    self.req_states.draft_tokens,
+                    gather=True,
+                )
             else:
                 draft_tokens_for_next_step = draft_tokens
             if self.adaptive_verification is not None:

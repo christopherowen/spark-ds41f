@@ -95,7 +95,8 @@ PARTS = {
         ],
     ),
     "misc": (
-        "the embedding, DSpark's confidence head, logprob ranks and the resampled token",
+        "the embedding, DSpark's confidence head and context inputs, logprob ranks, the "
+        "resampled token and the rejection sampler",
         [
             ("embedding, confidence, ranks and verification tests", PYTEST + [
                 "--basetemp", "/c/pytest-integration-misc",
@@ -106,7 +107,13 @@ PARTS = {
                 # The RMSNorm on the fused projection's halves, in place (vLLM 1e62f7ea6).
                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py::test_rmsnorm",
                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"
-                "::test_rmsnorm_of_a_fused_projections_half"], 3600),
+                "::test_rmsnorm_of_a_fused_projections_half",
+                # DSpark's context-graph inputs in one launch (vLLM 2b6d4613c).
+                "tests/kernels/test_deepseek_v41_tilelang_dspark_context.py"], 3600),
+            # The rejection sampler's block verification in TileLang (vLLM 4c7261200).
+            ("rejection-sampler tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-rejection",
+                "tests/v1/spec_decode/test_tilelang_rejection.py"], 3600),
             # The unchanged image fails eight of these (vocabulary-parallel draft seeds;
             # experiments/2026-10-24-resampled-token): their own step, so they are told
             # apart from the ports'.
@@ -122,6 +129,8 @@ PARTS = {
             ("resampled-token benchmark, mixed temperatures",
              ["benchmarks/kernels/benchmark_resampled_token.py", "--gate", "--seed", "18443",
               "--mixed"], 600),
+            ("rejection-sampler benchmark",
+             ["benchmarks/kernels/benchmark_tilelang_rejection.py", "--gate"], 1800),
         ],
     ),
 }

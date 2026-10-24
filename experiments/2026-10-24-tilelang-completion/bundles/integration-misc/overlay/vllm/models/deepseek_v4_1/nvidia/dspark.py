@@ -67,6 +67,7 @@ from .. import kernels, l2_prefetch
 from ..b12x_layers import (
     _execution_capacities,
 )
+from ..tilelang import dspark_context, prepare
 from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
@@ -314,17 +315,18 @@ class DSparkContextCudaGraphs:
             for x in aux_hidden_states
         ):
             raise ValueError("DSpark context auxiliary states have invalid dimensions")
-        for i, source in enumerate(aux_hidden_states):
-            self.aux[:num_tokens, i * self.width : (i + 1) * self.width].copy_(
-                source[:num_tokens]
-            )
-        # Context input preparation initializes rejected rows, but not rows
-        # beyond the target batch. Scrub that tail on EVERY replay, including
-        # transitions from a larger batch to a smaller one.
-        capacity = desc.num_tokens
-        self.aux[num_tokens:capacity].zero_()
-        self.positions[num_tokens:capacity].zero_()
-        self.slot_mappings[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
+        # The sources side by side in aux. Context input preparation initializes
+        # rejected rows, but not rows beyond the target batch: the same launch
+        # scrubs that tail on EVERY replay, including transitions from a larger
+        # batch to a smaller one.
+        dspark_context.context_inputs(
+            self.aux,
+            aux_hidden_states,
+            self.positions,
+            self.slot_mappings,
+            num_tokens,
+            desc.num_tokens,
+        )
         self.manager.run_fullgraph(desc)
 
     def close(self) -> None:
@@ -346,6 +348,13 @@ class DSparkDeepseekV4Model(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.num_hidden_layers = config.num_hidden_layers
         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
+        # The context graphs' input launch (DSparkContextCudaGraphs.run).
+        context_key = dspark_context.context_inputs_key(
+            self.hidden_size, vllm_config.model_config.dtype
+        )
+        prepare.declare(
+            lambda: [prepare.call(dspark_context.context_inputs_kernel, *context_key)]
+        )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
         self._context_kv_projections: list = []

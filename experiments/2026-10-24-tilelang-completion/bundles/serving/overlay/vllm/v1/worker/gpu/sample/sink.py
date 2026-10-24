@@ -290,9 +290,21 @@ class SinkCut:
     logits: torch.Tensor
     saved: torch.Tensor
     cols: torch.Tensor
+    flags: torch.Tensor
+    drafts: torch.Tensor
+    cu_num_logits: torch.Tensor
 
     def restore(self) -> None:
-        self.logits.scatter_(1, self.cols, self.saved)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        tilelang_sampling.sink_restore(
+            self.logits,
+            self.saved,
+            self.cols,
+            self.flags,
+            self.drafts,
+            self.cu_num_logits,
+        )
 
 
 @dataclass
@@ -391,16 +403,17 @@ class SinkSampler:
         watched column of every token's pre-norm residual streams,
         ``[tokens, streams]`` float32. Rows past a request's live drafts
         (``dead_cut``) are never flagged: they skipped routed MoE."""
-        rows = columns[logits_indices].abs()
-        self.row_values = rows.amax(dim=1).nan_to_num(0.0)
-        flags = (rows > self.config.threshold).any(dim=1)
-        if dead_cut is not None:
-            rows = torch.arange(
-                flags.shape[0], dtype=cu_num_logits.dtype, device=self.device
-            )
-            req = torch.searchsorted(cu_num_logits[1 : num_reqs + 1], rows, right=True)
-            flags &= rows - cu_num_logits[req] <= dead_cut[req]
-        return flags.to(torch.int8)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        flags, self.row_values = tilelang_sampling.sink_flags(
+            columns,
+            logits_indices,
+            cu_num_logits,
+            num_reqs,
+            dead_cut,
+            self.config.threshold,
+        )
+        return flags
 
     def cut(
         self,
@@ -416,18 +429,20 @@ class SinkSampler:
         before it, which verifies it. ``logits`` may be this rank's vocabulary
         shard (columns from ``vocab_start``); a draft outside it is left
         alone."""
-        num_logits, num_cols = logits.shape
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        num_cols = logits.shape[1]
         # Row r + 1 holds a draft of row r's request unless it starts one.
-        starts = torch.zeros(num_logits + 1, dtype=torch.bool, device=self.device)
-        starts[cu_num_logits[:num_reqs].long()] = True
-        cols = drafts[1:num_logits].long() - vocab_start
-        cut = flags[1:num_logits].bool() & ~starts[1:num_logits] & (cols >= 0)
-        cut &= cols < (num_cols if vocab_cols is None else vocab_cols)
-        cols = cols.where(cut, 0)[:, None]
-        rows = logits[: num_logits - 1]
-        saved = rows.gather(1, cols)
-        rows.scatter_(1, cols, saved.masked_fill(cut[:, None], float("-inf")))
-        return SinkCut(rows, saved, cols)
+        saved, cols = tilelang_sampling.sink_cut(
+            logits,
+            flags,
+            drafts,
+            cu_num_logits,
+            num_reqs,
+            vocab_start,
+            num_cols if vocab_cols is None else vocab_cols,
+        )
+        return SinkCut(logits, saved, cols, flags, drafts, cu_num_logits)
 
     def alternates_of(
         self,
@@ -461,7 +476,9 @@ class SinkSampler:
             self.num_candidates,
             mask_rejected_draft,
         )
-        return self._merge(values, indices, num_sampled, sampled)
+        return tilelang_sampling.sink_merge(
+            values, indices, sampled, num_sampled, self.num_alternates
+        )
 
     def alternates_of_greedy_shards(
         self,
@@ -477,39 +494,25 @@ class SinkSampler:
         shards: each rank's top candidates of the last sampled rows, gathered
         (as ``(value, index)`` floats, exact for any vocabulary index) and
         merged identically on every rank."""
-        num_reqs = num_sampled.shape[0]
-        rows = cu_num_logits[:num_reqs].to(torch.int64) + (
-            num_sampled.to(torch.int64) - 1
-        ).clamp(min=0)
-        local = local_logits[rows, :vocab_cols].float()
-        values, indices = local.topk(self.num_candidates, dim=-1)
-        values = values.masked_fill(values.isnan(), float("-inf"))
-        packed = torch.cat([values, (indices + vocab_start).float()], dim=1)
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+        packed = tilelang_sampling.sink_shard_top(
+            local_logits,
+            cu_num_logits,
+            num_sampled,
+            vocab_start,
+            vocab_cols,
+            self.num_candidates,
+        )
         if tp_size > 1:
             packed = tensor_model_parallel_all_gather(packed, dim=-1)
-        packed = packed.view(num_reqs, tp_size, 2, self.num_candidates)
-        values = packed[:, :, 0].reshape(num_reqs, -1).contiguous()
-        indices = packed[:, :, 1].reshape(num_reqs, -1).to(torch.int64)
-        return self._merge(values, indices, num_sampled, sampled)
-
-    def _merge(
-        self,
-        values: torch.Tensor,
-        indices: torch.Tensor,
-        num_sampled: torch.Tensor,
-        sampled: torch.Tensor,
-    ) -> torch.Tensor:
-        """The best candidates after each request's last sampled token, ties
-        to the lower token as in the samplers' argmax (candidates come in
-        vocabulary order). The sampled token and NaN scores are no alternates;
-        impossible tokens (-inf) become -1."""
-        last = (num_sampled.long() - 1).clamp(min=0)[:, None]
-        excluded = (indices == sampled.gather(1, last)) | values.isnan()
-        values = values.masked_fill(excluded, float("-inf"))
-        values, order = values.sort(dim=1, descending=True, stable=True)
-        alternates = indices.gather(1, order[:, : self.num_alternates])
-        return alternates.masked_fill(
-            values[:, : self.num_alternates] == float("-inf"), -1
+        return tilelang_sampling.sink_merge(
+            packed,
+            None,
+            sampled,
+            num_sampled,
+            self.num_alternates,
+            self.num_candidates,
         )
 
     def alternate_logprobs_of(

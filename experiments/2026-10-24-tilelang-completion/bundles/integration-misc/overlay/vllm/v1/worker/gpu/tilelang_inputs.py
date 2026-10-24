@@ -565,6 +565,312 @@ def zero_kv_blocks(
     )
 
 
+# --- The logits rows' inputs ------------------------------------------------------
+
+_LOGITS_ROWS_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def logits_rows_kernel(index_dtype: str):
+    """``input_ids[logits_indices]`` and ``positions[logits_indices]``, a thread a
+    logits row, a negative index wrapping as torch's indexing does: the step's
+    drafts and positions at its logits rows, which the samplers, the sink policy
+    and its cut each gathered with torch."""
+    num_tokens, num_logits = T.dynamic("num_tokens, num_logits")
+
+    @T.prim_func
+    def logits_rows(
+        input_ids: T.Tensor((num_tokens,), T.int32),
+        positions: T.Tensor((num_tokens,), T.int64),
+        logits_indices: T.Tensor((num_logits,), index_dtype),
+        ids_out: T.Tensor((num_logits,), T.int32),
+        positions_out: T.Tensor((num_logits,), T.int64),
+    ):
+        with T.Kernel(
+            T.ceildiv(num_logits, _LOGITS_ROWS_THREADS), threads=_LOGITS_ROWS_THREADS
+        ) as b:
+            i = b * _LOGITS_ROWS_THREADS + T.get_thread_binding()
+            index = T.alloc_var(
+                T.int64,
+                init=T.cast(logits_indices[T.min(i, num_logits - 1)], T.int64),
+            )
+            row = T.alloc_var(
+                T.int64, init=T.if_then_else(index < 0, index + num_tokens, index)
+            )
+            token = T.alloc_var(T.int32, init=input_ids[row])
+            position = T.alloc_var(T.int64, init=positions[row])
+            if i < num_logits:
+                ids_out[i] = token
+                positions_out[i] = position
+
+    return logits_rows
+
+
+def logits_rows_key(index_dtype: torch.dtype) -> tuple:
+    return (_DTYPES[index_dtype],)
+
+
+def logits_rows(
+    input_ids: torch.Tensor, positions: torch.Tensor, logits_indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The input ids and positions at the logits rows, as new tensors."""
+    num_logits = logits_indices.shape[0]
+    ids = torch.empty(num_logits, dtype=input_ids.dtype, device=input_ids.device)
+    pos = torch.empty(num_logits, dtype=positions.dtype, device=positions.device)
+    if num_logits:
+        _kernel(logits_rows_kernel, *logits_rows_key(logits_indices.dtype))(
+            input_ids, positions, logits_indices, ids, pos
+        )
+    return ids, pos
+
+
+def logits_rows_calls(index_dtype: torch.dtype) -> list:
+    return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
+
+
+# --- Padding rows -----------------------------------------------------------------
+
+_PADDING_THREADS = 256
+
+
+@tilelang.jit(pass_configs=_PASS)
+def padding_rows_kernel():
+    """``is_padding[i] = i >= live`` for ``i < rows``: the rows the MoE routers skip
+    (``VLLM_MOE_SKIP_PADDING``), the target's before a step and the drafter's before
+    its graph replays, where torch wrote two fills, or a comparison and a copy."""
+    length = T.dynamic("length")
+
+    @T.prim_func
+    def padding_rows(
+        is_padding: T.Tensor((length,), T.bool),
+        live: T.int32,
+        rows: T.int32,
+    ):
+        with T.Kernel(T.ceildiv(rows, _PADDING_THREADS), threads=_PADDING_THREADS) as b:
+            i = b * _PADDING_THREADS + T.get_thread_binding()
+            if i < rows:
+                is_padding[i] = i >= live
+
+    return padding_rows
+
+
+def padding_rows(is_padding: torch.Tensor, live: int, rows: int) -> None:
+    """Rows ``live`` to ``rows`` of ``is_padding`` padding, the rows before them not."""
+    if rows:
+        _kernel(padding_rows_kernel)(is_padding, live, rows)
+
+
+def padding_rows_calls() -> list:
+    return [_call(padding_rows_kernel)]
+
+
+# --- Per-request row scatters ---------------------------------------------------
+
+_SCATTER_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def scatter_rows_kernel(idx_dtype: str, dtype: str, gather: bool):
+    """``state[idx_mapping] = source`` for the batch's ``[num_reqs, width]`` rows, a
+    negative index wrapping as torch's indexing does, and with ``gather`` the rows
+    read back (``out = state[idx_mapping, :width]``, which is ``source``): the
+    runner's commit of a step's drafts, and adaptive verification's confidences. A
+    thread an element, its loads clamped into the batch and issued before its
+    guarded stores."""
+    num_reqs, width, source_rows, source_stride = T.dynamic(
+        "num_reqs, width, source_rows, source_stride"
+    )
+    state_rows, state_cols, state_stride = T.dynamic(
+        "state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(num_reqs * width, _SCATTER_THREADS)
+
+    if gather:
+
+        @T.prim_func
+        def scatter_rows_gather(
+            idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+            source: T.StridedTensor((source_rows, width), (source_stride, 1), dtype),
+            state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+            out: T.Tensor((num_reqs, width), dtype),
+        ):
+            with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+                e = b * _SCATTER_THREADS + T.get_thread_binding()
+                r = T.min(e // width, num_reqs - 1)
+                j = e % width
+                index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+                value = T.alloc_var(dtype, init=source[r, j])
+                if e < num_reqs * width:
+                    state[T.if_then_else(index < 0, index + state_rows, index), j] = (
+                        value
+                    )
+                    out[r, j] = value
+
+        return scatter_rows_gather
+
+    @T.prim_func
+    def scatter_rows(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        source: T.StridedTensor((source_rows, width), (source_stride, 1), dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // width, num_reqs - 1)
+            j = e % width
+            index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            value = T.alloc_var(dtype, init=source[r, j])
+            if e < num_reqs * width:
+                state[T.if_then_else(index < 0, index + state_rows, index), j] = value
+
+    return scatter_rows
+
+
+def scatter_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype, gather: bool) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype], gather)
+
+
+def scatter_rows(
+    idx_mapping: torch.Tensor,
+    source: torch.Tensor,
+    state: torch.Tensor,
+    gather: bool = False,
+) -> torch.Tensor | None:
+    """``state[idx_mapping, :width] = source[:num_reqs]``; with ``gather``, returns
+    the rows read back as a new ``[num_reqs, width]`` tensor."""
+    num_reqs = idx_mapping.shape[0]
+    source = source[:num_reqs]
+    key = scatter_rows_key(idx_mapping.dtype, source.dtype, gather)
+    if num_reqs == 0 or source.shape[1] == 0:
+        return source.clone() if gather else None
+    if not gather:
+        _kernel(scatter_rows_kernel, *key)(idx_mapping, source, state)
+        return None
+    out = torch.empty(source.shape, dtype=source.dtype, device=source.device)
+    _kernel(scatter_rows_kernel, *key)(idx_mapping, source, state, out)
+    return out
+
+
+def scatter_rows_calls(
+    idx_dtype: torch.dtype, dtype: torch.dtype, gather: bool
+) -> list:
+    return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
+
+
+# --- Adaptive verification's offsets ------------------------------------------
+
+_SCAN = 256  # requests a pass of the offsets' scan
+
+
+@T.macro
+def _scan_step(a, b, tx, offset):
+    """One Hillis-Steele step of two inclusive scans in shared memory."""
+    left_a = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, a[tx - offset], 0))
+    left_b = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, b[tx - offset], 0))
+    T.sync_threads()
+    a[tx] = a[tx] + left_a
+    b[tx] = b[tx] + left_b
+    T.sync_threads()
+
+
+@tilelang.jit(pass_configs=_PASS)
+def adaptive_offsets_kernel():
+    """``AdaptiveVerificationManager.reallocate_drafts``' offsets in one block, the
+    torch chain's values: ``cu_num_logits = [0, cumsum(capacities + bonus)]``,
+    ``query_start_loc = [0, cumsum(capacities + non_draft)]``, and every later entry
+    of ``query_start_loc`` ``num_tokens``. A step without drafts (``drafted`` 0)
+    zeroes ``capacities`` first. The scans take 256 requests a pass, each pass
+    carrying the last one's totals."""
+    num_reqs, non_draft_len, cu_len, starts_len = T.dynamic(
+        "num_reqs, non_draft_len, cu_len, starts_len"
+    )
+
+    @T.prim_func
+    def adaptive_offsets(
+        capacities: T.Tensor((num_reqs,), T.int32),
+        non_draft: T.Tensor((non_draft_len,), T.int32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        query_start_loc: T.Tensor((starts_len,), T.int32),
+        bonus: T.int32,
+        num_tokens: T.int32,
+        drafted: T.int32,
+    ):
+        with T.Kernel(1, threads=_SCAN):
+            tx = T.get_thread_binding()
+            a = T.alloc_shared((_SCAN,), T.int32)
+            b = T.alloc_shared((_SCAN,), T.int32)
+            carry_a = T.alloc_var(T.int32, init=0)
+            carry_b = T.alloc_var(T.int32, init=0)
+            if tx == 0:
+                cu_num_logits[0] = 0
+                query_start_loc[0] = 0
+            for chunk in T.serial(T.ceildiv(num_reqs, _SCAN)):
+                req = chunk * _SCAN + tx
+                inside = req < num_reqs
+                capacity = T.alloc_var(
+                    T.int32,
+                    init=T.if_then_else(
+                        inside & (drafted != 0),
+                        capacities[T.min(req, num_reqs - 1)],
+                        0,
+                    ),
+                )
+                if inside & (drafted == 0):
+                    capacities[req] = 0
+                a[tx] = T.if_then_else(inside, capacity + bonus, 0)
+                b[tx] = T.if_then_else(
+                    inside, capacity + non_draft[T.min(req, num_reqs - 1)], 0
+                )
+                T.sync_threads()
+                _scan_step(a, b, tx, 1)
+                _scan_step(a, b, tx, 2)
+                _scan_step(a, b, tx, 4)
+                _scan_step(a, b, tx, 8)
+                _scan_step(a, b, tx, 16)
+                _scan_step(a, b, tx, 32)
+                _scan_step(a, b, tx, 64)
+                _scan_step(a, b, tx, 128)
+                if inside:
+                    cu_num_logits[req + 1] = carry_a + a[tx]
+                    query_start_loc[req + 1] = carry_b + b[tx]
+                carry_a = carry_a + a[_SCAN - 1]
+                carry_b = carry_b + b[_SCAN - 1]
+                T.sync_threads()
+            for chunk in T.serial(T.ceildiv(starts_len, _SCAN)):
+                index = chunk * _SCAN + tx
+                if (index > num_reqs) & (index < starts_len):
+                    query_start_loc[index] = num_tokens
+
+    return adaptive_offsets
+
+
+def adaptive_offsets(
+    capacities: torch.Tensor,
+    non_draft: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    bonus: int,
+    num_tokens: int,
+    drafted: bool,
+) -> None:
+    """``reallocate_drafts``' launch: ``cu_num_logits[: n + 1]`` and all of
+    ``query_start_loc`` for the ``n`` requests of ``capacities``, which a step
+    without drafts zeroes."""
+    _kernel(adaptive_offsets_kernel)(
+        capacities,
+        non_draft,
+        cu_num_logits,
+        query_start_loc,
+        bonus,
+        num_tokens,
+        int(drafted),
+    )
+
+
+def adaptive_offsets_calls() -> list:
+    return [_call(adaptive_offsets_kernel)]
+
+
 # --- Step inputs --------------------------------------------------------------
 
 

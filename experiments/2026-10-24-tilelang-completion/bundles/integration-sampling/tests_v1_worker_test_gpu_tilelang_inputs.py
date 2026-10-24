@@ -653,6 +653,117 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+def test_logits_rows(num_logits, index_dtype):
+    """The logits rows' input ids and positions against torch's indexing,
+    repeated rows and a negative index (which wraps) included."""
+    gen = _gen(num_logits + 5)
+    input_ids = _randint(0, 1 << 17, (MAX_TOKENS,), gen)
+    positions = _randint(0, 1 << 20, (MAX_TOKENS,), gen, torch.int64)
+    indices = _randint(0, MAX_TOKENS, (num_logits,), gen, index_dtype)
+    if num_logits > 2:
+        indices[1] = indices[0]
+        indices[2] = -1
+    ids, pos = tli.logits_rows(input_ids, positions, indices)
+    torch.accelerator.synchronize()
+    assert torch.equal(ids, input_ids[indices])
+    assert torch.equal(pos, positions[indices])
+
+
+@pytest.mark.parametrize(
+    "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
+)
+def test_padding_rows(live, rows):
+    """The routers' padding rows, torch's two fills (the target) and comparison
+    (the drafter): rows past ``rows`` keep their contents."""
+    gen = _gen(live + rows)
+    start = torch.randint(0, 2, (MAX_TOKENS + 5,), generator=gen, device=DEVICE)
+    expected, actual = start.bool(), start.bool()
+    expected[:live].fill_(False)
+    expected[live:rows].fill_(True)
+    tli.padding_rows(actual, live, rows)
+    torch.accelerator.synchronize()
+    assert torch.equal(expected, actual)
+
+
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+@pytest.mark.parametrize("width", [1, 3, DRAFTS])
+@pytest.mark.parametrize("dtype,gather", [(torch.int64, True), (torch.float32, False)])
+def test_scatter_rows(num_reqs, width, dtype, gather):
+    """The runner's commit of a step's drafts (int64, read back) and adaptive
+    verification's confidences (float32): ``state[idx] = source`` against torch's
+    indexing, a filtered row's -1 wrapping to the last row as torch's does, with
+    sources that are column views of wider rows."""
+    gen = _gen(num_reqs * 7 + width)
+    idx = _idx(num_reqs, gen)
+    if 2 < num_reqs < MAX_REQS:
+        # -1 wraps to the last row, which no other request then takes.
+        idx = torch.randperm(MAX_REQS - 1, generator=gen, device=DEVICE)[:num_reqs]
+        idx[1] = -1
+    wide = _garbage((MAX_REQS, DRAFTS + 2), dtype, gen)
+    source = wide[:num_reqs, :width]
+    state = _garbage((MAX_REQS, DRAFTS), dtype, gen)
+    expected = state.clone()
+    expected[idx, :width] = source
+    gathered = expected[idx, :width]
+    out = tli.scatter_rows(idx, source, state, gather=gather)
+    torch.accelerator.synchronize()
+    bits = torch.int32 if dtype == torch.float32 else dtype
+    assert torch.equal(state.view(bits), expected.view(bits))
+    if gather:
+        assert torch.equal(out, gathered)
+    else:
+        assert out is None
+
+
+def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
+    """reallocate_drafts' torch chain before the port."""
+    num_reqs = capacities.shape[0]
+    if not drafted:
+        capacities.zero_()
+    cu[:1].zero_()
+    torch.cumsum(capacities + bonus, dim=0, out=cu[1 : num_reqs + 1])
+    starts[:1].zero_()
+    torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : num_reqs + 1])
+    starts[num_reqs + 1 :].fill_(tokens)
+
+
+# The batch's request counts, and counts at and across the scan's 256-request passes.
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:] + (255, 256, 257, 600))
+@pytest.mark.parametrize("drafted", [True, False])
+def test_adaptive_offsets(num_reqs, drafted):
+    """reallocate_drafts' offsets: both prefix sums, query_start_loc's tail and, on a
+    step without drafts, the zeroed capacities, in buffers longer than the batch."""
+    gen = _gen(num_reqs + 17)
+    size = num_reqs + 7
+    capacities = _randint(0, DRAFTS + 1, (size,), gen)
+    non_draft = _randint(0, MAX_TOKENS, (size,), gen)
+    cu = _garbage((size + 1,), torch.int32, gen)
+    starts = _garbage((size + 1,), torch.int32, gen)
+    bonus, tokens = 1, int(_randint(0, 1 << 20, (1,), gen))
+    results = []
+    for kind in ("ref", "ours"):
+        buffers = [capacities.clone(), cu.clone(), starts.clone()]
+        args = (
+            buffers[0][:num_reqs],
+            non_draft[:num_reqs],
+            buffers[1],
+            buffers[2],
+            bonus,
+            tokens,
+            drafted,
+        )
+        if kind == "ref":
+            _adaptive_offsets_ref(*args)
+        else:
+            tli.adaptive_offsets(*args)
+        results.append(buffers)
+    torch.accelerator.synchronize()
+    for r, o in zip(*results):
+        assert torch.equal(r, o)
+
+
 def _post_update_case(num_reqs, width, gen, vocab=64):
     idx = _idx(num_reqs, gen)
     if num_reqs > 2:
@@ -968,6 +1079,47 @@ def test_gather_lookback(num_reqs, depth):
 
 
 # --- Preparation --------------------------------------------------------------
+
+
+def test_step_glue_declarations_cover_their_launches(monkeypatch):
+    """The step's glue kernels with the runner's dtypes (int64 request indices,
+    int64 drafts, float32 confidences, int64 logits indices and a dummy batch's
+    int32 ones) launch exactly the calls the runner declares for them."""
+    launched = set()
+    original = tli._kernel
+
+    def record(factory, *key):
+        launched.add((id(factory), key))
+        return original(factory, *key)
+
+    monkeypatch.setattr(tli, "_kernel", record)
+    gen = _gen(1)
+    idx = _idx(4, gen)
+    drafts = _randint(0, 1 << 17, (MAX_REQS, DRAFTS), gen, torch.int64)
+    state = torch.zeros_like(drafts)
+    tli.scatter_rows(idx, drafts[:4], state, gather=True)
+    confidences = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
+    tli.scatter_rows(idx, confidences[:4], torch.zeros_like(confidences))
+    capacities = _randint(0, DRAFTS + 1, (4,), gen)
+    starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
+    tli.adaptive_offsets(
+        capacities, _randint(1, 2, (4,), gen), starts.clone(), starts, 1, 24, True
+    )
+    tli.padding_rows(torch.zeros(32, dtype=torch.bool, device=DEVICE), 24, 32)
+    ids = _randint(0, 1 << 17, (64,), gen)
+    positions = _randint(0, 1 << 20, (64,), gen, torch.int64)
+    for index_dtype in (torch.int64, torch.int32):
+        tli.logits_rows(ids, positions, _randint(0, 64, (24,), gen, index_dtype))
+    torch.accelerator.synchronize()
+    declared = (
+        tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+        + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
+        + tli.adaptive_offsets_calls()
+        + tli.padding_rows_calls()
+        + tli.logits_rows_calls(torch.int64)
+        + tli.logits_rows_calls(torch.int32)
+    )
+    assert launched == {(id(function), args) for function, args, _ in declared}
 
 
 def test_declared_calls_cover_the_call_sites(monkeypatch):

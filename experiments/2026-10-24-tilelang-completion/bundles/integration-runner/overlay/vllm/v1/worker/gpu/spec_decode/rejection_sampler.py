@@ -447,8 +447,7 @@ class RejectionSampler:
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
-        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
-        pos = input_batch.positions[input_batch.logits_indices]
+        draft_sampled, pos = input_batch.logits_rows()
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np

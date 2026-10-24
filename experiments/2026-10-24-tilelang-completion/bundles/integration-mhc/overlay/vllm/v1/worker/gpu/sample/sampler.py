@@ -176,8 +176,7 @@ class Sampler:
         idx_mapping_np = input_batch.idx_mapping_np
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
-        pos = input_batch.positions[input_batch.logits_indices]
-        input_ids = input_batch.input_ids[input_batch.logits_indices]
+        input_ids, pos = input_batch.logits_rows()
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.

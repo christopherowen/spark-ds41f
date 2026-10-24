@@ -17,6 +17,10 @@ from vllm.v1.worker.gpu.sample.gumbel import (
     tl_rand32,
 )
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
+from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
+    register_block_verification,
+    verify_and_resample,
+)
 from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import (
     insert_resampled,
     register_insert,
@@ -1250,35 +1254,44 @@ def register_rejection_sample_warmups(
     """Register ``rejection_sample`` without draft logits or watermarking, for
     ``vocab_size``-wide target logits given as ``(dtype, row stride)`` pairs, with
     the input batch's int32 drafts and offsets and int64 indices and positions.
+    Block verification with FP32 draws declares its TileLang kernels; the other
+    configurations register the Triton kernels.
     """
-    for logits_dtype, logits_stride in logits:
-        _compute_local_logits_stats_launcher.register_warmup(
-            logits_dtype=logits_dtype,
-            logits_stride=logits_stride,
-            vocab_size=vocab_size,
-            num_speculative_steps=num_speculative_steps,
+    if use_block_verification and not synthetic_mode and not use_fp64:
+        register_block_verification(
+            [logits_dtype for logits_dtype, _ in logits],
+            vocab_size,
+            num_speculative_steps,
         )
-        if use_block_verification:
-            _compute_cumulative_log_p_launcher.register_warmup(
+    else:
+        for logits_dtype, logits_stride in logits:
+            _compute_local_logits_stats_launcher.register_warmup(
                 logits_dtype=logits_dtype,
                 logits_stride=logits_stride,
                 vocab_size=vocab_size,
+                num_speculative_steps=num_speculative_steps,
             )
-        _rejection_launcher.register_warmup(
-            logits_dtype=logits_dtype,
-            logits_stride=logits_stride,
-            vocab_size=vocab_size,
-            num_speculative_steps=num_speculative_steps,
-            synthetic_mode=synthetic_mode,
-            use_block_verification=use_block_verification,
-        )
-        _resample_launcher.register_warmup(
-            logits_dtype=logits_dtype,
-            logits_stride=logits_stride,
-            vocab_size=vocab_size,
-            use_block_verification=use_block_verification,
-            use_fp64=use_fp64,
-        )
+            if use_block_verification:
+                _compute_cumulative_log_p_launcher.register_warmup(
+                    logits_dtype=logits_dtype,
+                    logits_stride=logits_stride,
+                    vocab_size=vocab_size,
+                )
+            _rejection_launcher.register_warmup(
+                logits_dtype=logits_dtype,
+                logits_stride=logits_stride,
+                vocab_size=vocab_size,
+                num_speculative_steps=num_speculative_steps,
+                synthetic_mode=synthetic_mode,
+                use_block_verification=use_block_verification,
+            )
+            _resample_launcher.register_warmup(
+                logits_dtype=logits_dtype,
+                logits_stride=logits_stride,
+                vocab_size=vocab_size,
+                use_block_verification=use_block_verification,
+                use_fp64=use_fp64,
+            )
     register_insert(
         triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
         use_fp64,
@@ -1327,6 +1340,40 @@ def rejection_sample(
     assert watermark == (watermarking is not None) == (watermark_key is not None), (
         "contexts, watermarking and watermark_key must be set together."
     )
+    if (
+        draft_logits is None
+        and use_block_verification
+        and synthetic_conditional_rates is None
+        and not watermark
+        and not use_fp64
+    ):
+        # One-hot drafts, block verification and FP32 draws, without watermark,
+        # run as TileLang kernels (tilelang_rejection), the contract of the Triton
+        # kernels below, which serve every other configuration.
+        sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
+            verify_and_resample(
+                target_logits,
+                draft_sampled,
+                cu_num_logits,
+                pos,
+                idx_mapping,
+                expanded_idx_mapping,
+                expanded_local_pos,
+                temperature,
+                seed,
+                num_speculative_steps,
+            )
+        )
+        insert_resampled(
+            sampled,
+            num_sampled,
+            resampled_local_argmax,
+            resampled_local_max,
+            cu_num_logits,
+            expanded_idx_mapping,
+            temperature,
+        )
+        return sampled, num_sampled
     contexts_stride = 0
     context_width = 1
     watermarking_bytes: torch.Tensor | None = None

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -130,6 +130,24 @@ class InputBatch:
     # recorded inside a PIECEWISE graph must size their metadata for every
     # replay, not for the dummy sequence lengths.
     cudagraph_capture: bool = False
+
+    # The input ids and positions at the logits rows (logits_rows()), gathered
+    # once a step. Not an init field: a replaced batch gathers its own.
+    _logits_rows: "tuple[torch.Tensor, torch.Tensor] | None" = field(
+        default=None, init=False, repr=False, compare=False
+    )
+
+    def logits_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``input_ids[logits_indices]`` and ``positions[logits_indices]``: one
+        TileLang launch the first time a step asks, shared by every reader (the
+        samplers, the sink policy and its cut read them, never write them)."""
+        if self._logits_rows is None:
+            from vllm.v1.worker.gpu import tilelang_inputs
+
+            self._logits_rows = tilelang_inputs.logits_rows(
+                self.input_ids, self.positions, self.logits_indices
+            )
+        return self._logits_rows
 
     @classmethod
     def make_dummy(
