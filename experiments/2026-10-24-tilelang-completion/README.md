@@ -381,3 +381,49 @@ If tile form closes the gaps, it becomes the port convention:
 Every port that still loses at a serving shape gets rewritten that way. The compiler pass
 that would do this automatically (turning guarded stores into predicated ones) is TileLang
 work that comes after.
+
+### Round 4a results (2026-10-24 17:04 CET; every variant bit-exact)
+
+- **mHC collapse**, three passes against TileKernels at decode c1 / c16 / 8K / 16K:
+  - The 24 KiB cap: -4.3 to -5.8% / -6.0 to -8.2% / -2.2 to -2.4% / -3.0 to -3.1%.
+  - The 16 KiB cap: -5.1 to -5.7% / -7.2 to -9.4% / -0.9 to -1.0% / -2.1 to -2.3%.
+  - Round 1's collapse: +1.0 to +1.7% at prefill.
+
+  The production collapse takes the 24 KiB cap.
+- **Tile form** against Triton, per call:
+  - expand_idx_mapping at 32 threads: +1 to +3%, within noise (production +13 to +19%).
+  - Select: +6 to +8% (production +23 to +33%).
+  - Temperature at 256 threads: +7% at one token (production +17%), level at 16. At 96
+    tokens, +16% in both forms.
+- **Read-only loads:** the remaining tenth of a microsecond is the read-only cache path.
+  TileLang marks inputs `const __restrict__`, so nvcc emits `ld.global.nc`
+  (`LDG.E.CONSTANT`); Triton's are ordinary loads. `T.annotate_restrict_buffers` on the
+  inputs gives Triton's `LDG.E` (seen in SASS).
+
+## Every port together (vLLM branch `tilelang-ports` 1a967a2ec, [integration-kernels.json](integration-kernels.json))
+
+One vLLM branch off candidate 4's source (release-next 174a746f4) carries every TileLang
+port. Codex's trailers are dropped from the picked commits.
+
+The ports:
+- runner inputs (`tilelang-runner-inputs`);
+- token counts (`tilelang-token-counts`, #506);
+- the sampling family;
+- the resampled token (`tilelang-resampled-token`, #509);
+- logprob ranks (`tilelang-logprob-ranks`);
+- mHC post and collapse;
+- the embedding and DSpark's confidence head.
+
+The measured changes on top:
+- the mHC collapse's 24 KiB cap;
+- temperature and select in tile form;
+- expand_idx_mapping in tile form with ordinary loads.
+
+[make_integration_bundles.py](make_integration_bundles.py) writes four bundles. Each
+overlays all 46 changed files on image -next-4, so every family runs with every other port
+in place. Each runs one share of the ports' GPU tests and gated benchmarks:
+- runner and token counts (dgx1);
+- embedding, confidence, ranks and resampled token (dgx2), with the vocabulary-parallel
+  drafting tests in their own step: the unchanged image fails eight of them;
+- mHC (dgx3);
+- sampling (dgx4).

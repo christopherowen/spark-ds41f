@@ -398,9 +398,11 @@ __device__ __forceinline__ void vllm_store_if_b32(void* p, int v, bool ok) {
 
 
 @tilelang.jit(pass_configs=PASS)
-def expand_tile_kernel(block: int, threads: int):
+def expand_tile_kernel(block: int, threads: int, plain: bool = False):
     """``expand_kernel`` in Triton's form: the request's starts and state index read
-    up front, the two guarded stores predicated (``STORE_IF``)."""
+    up front, the two guarded stores predicated (``STORE_IF``). ``plain``: the
+    inputs without ``__restrict__``, so their loads are ordinary global loads, as
+    Triton's, instead of the read-only cache path (``ld.global.nc``)."""
     num_reqs = T.dynamic("num_reqs")
     expanded_len = T.dynamic("expanded_len")
     local_len = T.dynamic("local_len")
@@ -414,6 +416,8 @@ def expand_tile_kernel(block: int, threads: int):
         cu_num_logits: T.Tensor((cu_len,), T.int32),
     ):
         with T.Kernel(T.ceildiv(num_reqs * block, threads), threads=threads) as bx:
+            if plain:
+                T.annotate_restrict_buffers(idx_mapping, cu_num_logits)
             T.import_source(STORE_IF)
             element = bx * threads + T.get_thread_binding()
             r = element // block
