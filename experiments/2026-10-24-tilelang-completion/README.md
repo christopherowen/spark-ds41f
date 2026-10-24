@@ -1147,3 +1147,26 @@ candidate 4, in four alternating arms.
 
 The remaining controls scenarios (bad words, the thinking budget, prompt logprobs and
 custom logprob ids, plus the two rejections) run in `tilelang-ports-controls`.
+
+### Fourteenth integrated run (2026-10-24 22:24 CET)
+
+Every test passes.
+
+**Now level or faster:**
+- zero_kv_blocks, the lookback and combine (both forms; dead rows at the 16K prefill
+  +0.002 µs);
+- the resampled token's mixed case: +0.019 µs, level. It was +0.045.
+
+**Still flagged:** prepare_prefill_inputs at sixteen requests, +0.27 µs. Four warps did
+not change it, and neither did round 4b's ordinary loads.
+
+The benchmark's "decode" requests are in fact all prefilling, six-token chunks: its
+prefill lengths exceed every computed count. So the kernel copies, and every block runs
+four dependent rounds of loads, the last from the pinned host history. Our predicated
+stores order memory, and the lookahead token's load came after the chunk's stores. That
+is one more round than the four, at L2 latency because the lookahead sits in the chunk's
+line.
+
+vLLM 04e097902 loads the lookahead token with the first pass, and a pass takes four 1024-token
+groups (those the chunk reaches) at eight warps. It runs as
+`tilelang-integration-kernels-15`.
