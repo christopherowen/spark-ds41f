@@ -274,3 +274,34 @@ was restored at 14:12.
   - Variant sweeps measure the shapes that do not change the bits: threads and rows a block,
     and a sequential finish against the warp's for the tiny reductions. Layouts that decide a
     NaN block's index stay Triton's.
+
+## Round 3: variant sweeps ([variants-kernels.json](variants-kernels.json))
+
+Each sweep checks every variant bit for bit against the kernel it replaces, then times it
+against that kernel per call (eight fresh inputs, paired CUDA graphs, order alternating).
+
+- **[bundles/sampling-variants](bundles/sampling-variants)** (dgx4):
+  - the greedy partial argmax at 64, 128 and 256 threads a block, with a warp or a thread per
+    row in the finish;
+  - the select kernel likewise;
+  - temperature at 64, 128 and 256 threads;
+  - each production kernel compiled as built and with TileLang's replay of bound loads off
+    (`tl.if_stmt_binding_inline_replayable_binds`), which the runner agent found re-issues
+    loads after every store and branch;
+  - each kernel's own device time (CUPTI).
+
+  The Gumbel sampler and the candidates keep Triton's layout, which decides the bits.
+- **[bundles/mhc-variants](bundles/mhc-variants)** (dgx3): 31 layouts of the mHC collapse with
+  TileKernels' FMA chain:
+  - threads a block, rows a block and columns a thread;
+  - load order and vector width;
+  - blocks a SM capped with unused shared memory, and persistent grids;
+  - round 1's and TileKernels' shapes as references.
+
+  The port's collapse is back to round 1's (`tilelang-mhc-post` c68e5b70f).
+- **[bundles/runner-variants](bundles/runner-variants)** (dgx1): about 68 variants of the runner's
+  tiny kernels:
+  - loads hoisted, binds off;
+  - Triton's lane layout, a block per request;
+  - int32 indices, static strides;
+  - threads and work a thread.

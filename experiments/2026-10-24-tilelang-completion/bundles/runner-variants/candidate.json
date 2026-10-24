@@ -1,0 +1,65 @@
+{
+ "description": "The V2 runner's tiny input-preparation kernels that round 2 left slower than Triton (combine with and without dead rows, expand_idx_mapping, prepare_dflash_inputs, prepare_prefill_inputs, post_update, gather_lookback, zero_kv_blocks; vLLM branch tilelang-runner-inputs 1bc9f13f6) as variants: production, production with TileLang's if-statement bind inlining off, every scalar hoisted into registers, threads a block 32-512, a thread a request against Triton's lanes a request and a block a request, work a thread, int32 against int64 indices, static strides. Each variant is first compared with Triton bit for bit on the port's test cases and the benchmark's inputs, then timed per call against it at decode c1, decode c16 and the 16K prefill (paired CUDA graphs, alternating order), and each kernel's own device time (CUPTI) against Triton's.",
+ "image": "spark-ds41f:19f2c20ed4d6-next-4",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-runner-variants",
+  "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+  "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+ },
+ "workdir": "vllm",
+ "argv": [
+  "/b/bench.py"
+ ],
+ "verdict": "status",
+ "mounts": [
+  [
+   "bench.py",
+   "/b/bench.py"
+  ],
+  [
+   "runner_variants.py",
+   "/b/runner_variants.py"
+  ],
+  [
+   "runner_input_tests.py",
+   "/b/runner_input_tests.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_tilelang_inputs.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_input_batch.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/input_batch.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_block_table.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/block_table.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_buffer_utils.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/buffer_utils.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_model_runner.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/model_runner.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_spec_decode_dflash_speculator.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py"
+  ],
+  [
+   "vllm_v1_worker_utils.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/utils.py"
+  ],
+  [
+   "vllm_models_deepseek_v4_1_nvidia_model_state.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/nvidia/model_state.py"
+  ],
+  [
+   "vllm_models_deepseek_v4_1_tilelang_lookback.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/models/deepseek_v4_1/tilelang/lookback.py"
+  ]
+ ]
+}
