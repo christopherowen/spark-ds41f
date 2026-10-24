@@ -443,3 +443,18 @@ One window on the ring:
 2. [rc3/decode-tp4.json](rc3/decode-tp4.json): the grid and closed loops at 16 and 1 streams,
    candidate 3 / candidate 1 / candidate 3 / candidate 1.
 3. [rc3/rc3-glp-tp4.json](rc3/rc3-glp-tp4.json): steering on against off.
+
+## Release candidate 4 ([rc4/](rc4))
+
+Candidate 3's GLP benchmark failed its gate at sixteen streams (640 threads a row 7.7 against the
+compiled torch projection's 7.2 us, interval +0.1 to +1.2; faster on long prefill: 8K -1.1%, 16K
+-1.5%). In the variant run 640 threads was only level there; 320 threads was faster at every
+serving shape (sixteen streams 6.9 against 7.9 us, 16K -1.3%). A thread count chosen by the step's
+size would make a decode row's result depend on whether a prefill chunk shares its step, so one
+configuration serves every batch: vLLM 0265, 320 threads. Candidate 4 is candidate 3 plus 0265
+(patch head 4cd21d89, tree 97fc3579, image `spark-ds41f:19f2c20ed4d6-next-4`) on candidate 3's
+recipe. Only GLP's kernel changes, and it launches only with steering on, so candidate 3's release
+comparison stands; [rc4/rc4-tp4.json](rc4/rc4-tp4.json) builds the image and runs the release tests,
+the GLP benchmark, the gate (outputs identical to candidate 3's and to spark-ds41f-1022's) and
+determinism at 8,192 and with steering on; [rc4/rc4-glp-tp4.json](rc4/rc4-glp-tp4.json) measures
+steering on against off.
