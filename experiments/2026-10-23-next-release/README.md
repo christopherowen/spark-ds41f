@@ -366,3 +366,38 @@ kernel-only window after candidate 2's). The release tests' one failure (2,104 p
 GLP kernel test's own bound on what alpha 1 leaves along the direction (0.037 against a 0.02
 limit): BF16 rounding of rows with a large component leaves that much; the FP64 test (every
 element within one rounding) passed. The bound is now what correctly rounded BF16 leaves.
+
+**Candidate 2's window (2026-10-23 21:09-23:40 CET, runs `next-rc2-tp4`, `next-rc2-glp-tp4`).**
+- Image `spark-ds41f:19f2c20ed4d6-next-2` (sha256:f82cf24cfd6a), one ID on every node.
+- Release tests: 2,104 passed, 159 skipped, 1 failed (the GLP test bound above).
+- Gate at 16,384: temperature-0 outputs identical to spark-ds41f-1022's ring hashes (3eab5112 /
+  db25fde3, c9cf9dbe / c6bb4f4e), the long prompt included although it now prefills in one chunk
+  instead of two; the same at 8,192. Control spellings, the controls probe and the sink probes
+  pass. GLP steering on (the synthetic file): repeatable, and the outputs move (eight prompts
+  c9cf9dbe -> d58000f3; the long prompt's text unchanged, its logprobs moved).
+- Comparison, verdicts against the repeat:
+
+| Metric | spark-ds41f-1022 | candidate 2 | Change | Verdict |
+| --- | --- | --- | --- | --- |
+| prefill 32,768, tok/s | 6,025 | 6,712 | +11.4% | better |
+| prefill 131,072, tok/s | 5,985 | 6,716 | +12.2% | better |
+| prefill 1,000,000 (one cold run), tok/s | 4,419 | 4,898 / 4,905 | +10.9% | (no interval) |
+| decode step, grid geometric mean | | | +0.79% (repeat +0.53%) | **worse** |
+| 16 streams / 1 stream / sampled 16, output tok/s | | | -0.04% / -0.52% / +0.40% | same |
+
+  Greedy 64/64 identical, KL 0; TTFT level. Candidate 1 measured the grid -1.05% against 1022;
+  candidate 2 adds the 16,384 budget, glibc malloc pinned in every process, the rename and the
+  GLP code (off), so one of the first two costs a decode step about 1.8%. Lowest MemAvailable
+  on dgx1 18.1-18.6 GiB (1022: 20.3).
+- Steering on against off ([rc2/glp-suite-tp4.json](rc2/glp-suite-tp4.json)): grid +2.41%, 16
+  streams -1.2%, prefill -1.9%: the folded residual and the projection on every layer.
+
+**The GLP kernel variants (23:42-23:49 CET, run `next-glp-variants`).** All ten correct (FP64,
+batch independence). One block of 640 threads a row, eight values a thread (the whole row in one
+load) is the fastest at every shape: one stream 2.4 against the torch projection's 2.5 us,
+sixteen streams 7.8 against 8.0 us, 8K prefill 2,789 against 2,864 us (-2.0%), 16K 5,465 against
+5,639 us (-2.5%, 95% interval -77 to -211 us). It replaces 0261's 128 threads in candidate 3.
+
+**Where the decode step went ([rc2/ab-tp4.json](rc2/ab-tp4.json)).** One session on image -next-2,
+the grid and closed loops at 16 and 1 streams: candidate 2 as it is, without the malloc settings,
+without them at 8,192, and as it is again.
