@@ -568,10 +568,18 @@ def zero_kv_blocks(
 # --- Step inputs --------------------------------------------------------------
 
 
+_PREFILL_THREADS = 128
+_PREFILL_PER_THREAD = 8
+_PREFILL_CHUNK = _PREFILL_THREADS * _PREFILL_PER_THREAD  # Triton's BLOCK_SIZE
+
+
 @tilelang.jit(pass_configs=_PASS)
 def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
     """A block a request: a prefilling request's chunk of prompt tokens into the
-    input ids, and its next ``num_lookahead`` prefill tokens (0 past the prompt)."""
+    input ids, and its next ``num_lookahead`` prefill tokens (0 past the prompt).
+    In Triton's shape: four warps, the request's state read before the prefill
+    check and its query starts after it, each pass's eight tokens a thread loaded
+    and stored predicated (``_LOAD_IF``, ``_STORE_IF``)."""
     ids_len = T.dynamic("ids_len")
     lookahead = T.dynamic("lookahead")
     lookahead_cols = T.dynamic("lookahead_cols")
@@ -598,7 +606,8 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
         prefill_len: T.Tensor((prefill_rows,), T.int32),
         num_computed_tokens: T.Tensor((counts_len,), T.int32),
     ):
-        with T.Kernel(num_reqs, threads=_THREADS) as b:
+        with T.Kernel(num_reqs, threads=_PREFILL_THREADS) as b:
+            T.import_source(_LOAD_IF + _STORE_IF)
             tx = T.get_thread_binding()
             req = T.cast(idx_mapping[b], T.int64)
             prefill = prefill_len[req]
@@ -606,11 +615,21 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
             if computed < prefill:
                 start = query_start_loc[b]
                 length = query_start_loc[b + 1] - start
-                for it in T.serial(T.ceildiv(length, _CHUNK)):
-                    for k in T.unroll(_PER_THREAD):
-                        j = it * _CHUNK + k * _THREADS + tx
-                        if j < length:
-                            input_ids[start + j] = all_token_ids[req, computed + j]
+                tokens = T.alloc_local((_PREFILL_PER_THREAD,), T.int32)
+                for it in T.serial(T.ceildiv(length, _PREFILL_CHUNK)):
+                    for k in T.unroll(_PREFILL_PER_THREAD):
+                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
+                        tokens[k] = T.call_extern(
+                            "int32", "vllm_load_if_b32",
+                            T.address_of(all_token_ids[req, computed + j]), 0,
+                            j < length,
+                        )  # fmt: skip
+                    for k in T.unroll(_PREFILL_PER_THREAD):
+                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
+                        T.call_extern(
+                            "handle", "vllm_store_if_b32",
+                            T.address_of(input_ids[start + j]), tokens[k], j < length,
+                        )  # fmt: skip
                 if tx < lookahead_block and tx < lookahead:
                     position = computed + length + tx
                     next_prefill_tokens[tx, req] = T.if_then_else(
@@ -731,16 +750,26 @@ def combine_sampled_and_draft_tokens_kernel(
                     "float32", "vllm_load_if_f32", T.address_of(confidence[req, j]),
                     T.float32(1.0), j < num_drafts,
                 )  # fmt: skip
+        # Every store predicated, as Triton's masked ones: no branch to wait behind.
         for j in T.unroll(block):
-            if j < num_logits:
-                logits_indices[first + j] = T.cast(query_end - num_logits + j, T.int64)
-        if seq > prefill:
+            T.call_extern(
+                "handle", "vllm_store_if_b64", T.address_of(logits_indices[first + j]),
+                T.cast(query_end - num_logits + j, T.int64), j < num_logits,
+            )  # fmt: skip
+        decoding = seq > prefill
+        if num_new > 0:
             # Keep prompt-tail slots; only generated-token slots take it.
-            if num_new > 0 and seq - num_logits >= prefill:
-                input_ids[query_end - num_logits] = T.cast(last, T.int32)
-            for j in T.unroll(drafts):
-                if j < num_drafts:
-                    input_ids[query_end - num_drafts + j] = T.cast(tokens[j], T.int32)
+            T.call_extern(
+                "handle", "vllm_store_if_b32",
+                T.address_of(input_ids[query_end - num_logits]), T.cast(last, T.int32),
+                decoding & (seq - num_logits >= prefill),
+            )  # fmt: skip
+        for j in T.unroll(drafts):
+            T.call_extern(
+                "handle", "vllm_store_if_b32",
+                T.address_of(input_ids[query_end - num_drafts + j]),
+                T.cast(tokens[j], T.int32), decoding & (j < num_drafts),
+            )  # fmt: skip
         if dead_rows:
             # Requests without drafts are never clamped.
             cut = T.alloc_var(T.int32, init=block + 1)
@@ -784,7 +813,7 @@ def combine_sampled_and_draft_tokens_kernel(
             logits_indices: T.Tensor((logits_len,), T.int64),
         ):
             with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
-                T.import_source(_LOAD_IF)
+                T.import_source(_LOAD_IF + _STORE_IF)
                 b = bx * _REQUESTS + T.get_thread_binding()
                 if b < num_reqs:
                     request(
@@ -814,7 +843,7 @@ def combine_sampled_and_draft_tokens_kernel(
         log_tau: T.float32,
     ):
         with T.Kernel(num_reqs, threads=32) as b:
-            T.import_source(_LOAD_IF)
+            T.import_source(_LOAD_IF + _STORE_IF)
             if T.get_thread_binding() == 0:
                 request(
                     b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
@@ -856,6 +885,13 @@ __device__ __forceinline__ long long vllm_load_if_b64(const void* p, long long o
   asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
                " @q ld.global.b64 %0, [%1];\n}"
                : "+l"(v) : "l"(p), "r"((int)ok));
+  return v;
+}
+__device__ __forceinline__ int vllm_load_if_b32(const void* p, int other, bool ok) {
+  int v = other;
+  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
+               " @q ld.global.b32 %0, [%1];\n}"
+               : "+r"(v) : "l"(p), "r"((int)ok));
   return v;
 }
 __device__ __forceinline__ float vllm_load_if_f32(const void* p, float other, bool ok) {
@@ -1186,8 +1222,8 @@ def post_update_kernel(
 
 def prepare_prefill_inputs_key(num_lookahead: int, idx_dtype: str) -> tuple:
     block = _next_power_of_2(num_lookahead)
-    if block > _THREADS:
-        raise ValueError(f"at most {_THREADS} prefill lookahead tokens")
+    if block > _PREFILL_THREADS:
+        raise ValueError(f"at most {_PREFILL_THREADS} prefill lookahead tokens")
     return (block, idx_dtype)
 
 

@@ -1078,3 +1078,35 @@ Still slower:
 
 They go into the thirteenth run (`tilelang-integration-kernels-13`), then the second serving
 check (`tilelang-ports-serving-2`) serves the branch at 253cb4719.
+
+### Thirteenth integrated run (2026-10-24 21:41 CET)
+
+**Tests:** every test passes in every bundle.
+
+**Gates:**
+- **The whole sampling bundle passes**, every generation control included:
+  - logit bias is now level or faster at every shape;
+  - prompt ids too.
+- **Runner:** still flags three small gaps that recur in every run:
+  - prepare_prefill_inputs at decode: +0.1 µs at one stream, +0.3 at sixteen;
+  - combine with dead rows at the 16K prefill: +0.05 µs.
+- **Resampled token**, one request, mixed temperatures: +0.045 µs in all four runs 10-13.
+  It is flagged when the interval's lower bound reaches zero.
+
+## Fourteenth integrated run (run `tilelang-integration-kernels-14`)
+
+vLLM `tilelang-ports` 12d6d2e23:
+- **prepare_prefill_inputs:**
+  - At decode every block exits after three loads, as Triton's does, but ours had eight
+    warps a block where Triton has four. The exit paths match in SASS.
+  - Round 3's thread sweep never tested this alone: its variants also moved the query
+    starts ahead of the exit.
+  - It now takes Triton's shape: four warps, eight tokens a thread, loads and stores
+    predicated.
+- **Combine:** its index and input-id stores are predicated instead of branching.
+- **The resampled token:**
+  - It took five dependent rounds of loads: count, state, temperature, block maxima, and
+    the winner's id.
+  - The maxima and ids depend only on the row, so they now load with it.
+  - The warp reduction carries the winner's id, which leaves three rounds.
+  - Ties and NaN behave as before: the lowest index wins a tie, and NaN counts as -inf.
