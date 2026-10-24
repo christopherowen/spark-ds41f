@@ -152,8 +152,27 @@ points the call sites at them. The Triton kernels stay as the tests' reference.
   the Triton Gumbel functions), vocabulary-parallel drafting, logprobs, penalties, top-k/top-p,
   min-p, the thinking budget and `_get_num_sampled_and_rejected_kernel`.
 
-The bundle `bundles/sampling` (spec `sampling-kernels.json`, one node) runs the bit-equality
+The bundle `bundles/sampling` (in spec `ports-kernels.json` with the other ports' bundles, one node each) runs the bit-equality
 tests, the existing sink, Gumbel and greedy contract tests through the switched call sites,
 and the paired per-call benchmark at DeepSeek V4.1's serving shapes (`--gate`: no shape slower
 than Triton by more than 1%). The full-model gate follows in a serving arm: temperature-0
 outputs and a seeded temperature-1 run identical to the previous release.
+
+## The port bundles' first GPU run (candidate 4's window, 2026-10-24 12:50 CET)
+
+- **Benchmarks never ran.** Every port benchmark failed with `No module named
+  vllm.models.deepseek_v4_1`. The bundles' `PYTHONPATH=/b` replaced the image's
+  `/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x`. Pytest still worked, because
+  `-m pytest` puts the working directory on the path; the scripts did not. The bundles now keep
+  the image's path after `/b`.
+- **Embedding and confidence head:** 85 passed.
+- **Runner inputs:** 48 failed, all from the tests (`tilelang-runner-inputs` 9cb3eb1b9 and 6bda32b34):
+  - the slot-mapping test ran a prefill chunk past the 16384-token positions buffer when the
+    step started past row 0;
+  - the staged-write test staged overlapping writes with different values, which Triton itself
+    applies in no defined order (the same seed gave different winners per dtype);
+  - the boundary-restore test's stand-in model state predates release-next's
+    `get_recurrent_checkpoint_fresh` (efcd03d6a, 2026-09-23), so it fails on release-next too.
+  - The TileLang staged write, lowered, makes exactly Triton's guarded element stores.
+- **mHC:** 18 failed. About 1 in 70,000 values differs from TileKernels in its bits, so the port's
+  arithmetic grouping is not TileKernels' yet; under repair.

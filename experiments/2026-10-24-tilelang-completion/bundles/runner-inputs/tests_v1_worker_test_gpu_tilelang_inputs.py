@@ -72,12 +72,12 @@ def _garbage(shape, dtype, gen):
     return _randint(low, high, shape, gen, dtype)
 
 
-def _query_lens(num_reqs: int, prefill: bool) -> list[int]:
+def _query_lens(num_reqs: int, prefill: bool, first: int = 0) -> list[int]:
     """Decode rows (1 + drafts) a request; with ``prefill``, the middle request
-    is a chunk filling the step to 16384 tokens."""
+    is a chunk filling the step, from row ``first``, to 16384 tokens."""
     lens = [1 + DRAFTS] * num_reqs
     if prefill and num_reqs:
-        lens[num_reqs // 2] = MAX_TOKENS - (num_reqs - 1) * (1 + DRAFTS)
+        lens[num_reqs // 2] = MAX_TOKENS - first - (num_reqs - 1) * (1 + DRAFTS)
     return lens
 
 
@@ -190,9 +190,10 @@ def test_gather_block_tables_into_the_input_tables():
 
 
 def _slot_case(gen, num_reqs, prefill, first):
-    lens = _query_lens(num_reqs, prefill)
+    lens = _query_lens(num_reqs, prefill, first)
     starts = _starts(lens, first)
     total = int(starts[-1])
+    assert total <= MAX_TOKENS
     # Positions past each request's blocks and at block edges, and of a request
     # continuing its sequence.
     positions = _randint(0, 1 << 20, (MAX_TOKENS,), gen, torch.int64)
@@ -223,8 +224,6 @@ def test_compute_slot_mappings(num_reqs, prefill, cp):
         if first and num_reqs == 0:
             continue
         starts, positions = _slot_case(gen, num_reqs, prefill, first)
-        if int(starts[-1]) > MAX_TOKENS:
-            continue
         garbage = _garbage(tables.slot_mappings.shape, torch.int64, gen)
         ref = garbage.clone()
         _compute_slot_mappings_kernel[(tables.num_kv_cache_groups, num_reqs + 1)](
@@ -259,17 +258,24 @@ def test_compute_slot_mappings(num_reqs, prefill, cp):
 
 
 def _stage(tensor: StagedWriteTensor, gen, num_writes: int, long: bool) -> None:
+    """Random writes, several to a row and overlapping one another. Triton
+    applies each write in its own program, in no order, so where two writes
+    overlap neither kernel defines which lands: an element staged again takes
+    the value it was first staged with, and the result is defined."""
     rows = tensor.num_rows
     cols = tensor.gpu.shape[1] if tensor.gpu.dim() == 2 else 1
+    staged: dict[tuple[int, int], int | float] = {}
     for w in range(num_writes):
         row = int(_randint(0, rows, (), gen))
         if cols == 1:
-            tensor.stage_write_elem(row, int(_randint(-100, 100, (), gen)))
+            value = int(_randint(-100, 100, (), gen))
+            tensor.stage_write_elem(row, staged.setdefault((row, 0), value))
             continue
         start = int(_randint(0, cols // 2, (), gen))
         length = cols - start if long and w == 0 else int(_randint(0, 9, (), gen))
         length = min(length, cols - start)
         values = _garbage((length,), tensor.dtype, gen).tolist()
+        values = [staged.setdefault((row, start + j), v) for j, v in enumerate(values)]
         tensor.stage_write(row, start, values)
 
 
