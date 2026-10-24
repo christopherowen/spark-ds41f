@@ -1,0 +1,34 @@
+From 6a60a1c5efa35967b63a46fc6af57dffa50f06e6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:40:48 +0200
+Subject: [PATCH 141/274] DeepSeek V4.1 SP tests: fixtures for the unreduced
+ mode and the MoE input dtype
+
+The model forward reads prefill_sp_unreduced (since the unreduced SP results,
+2026-10-10) and the MoE reduce-scatter reads moe_config.in_dtype (since the one
+rounding of each rank's partial, 2026-10-11); the tests' stand-in objects had
+neither, so 13 tests failed with AttributeError.
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index d4730de48..385eda492 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -269,7 +269,9 @@ def test_moe_reduce_scatter_sums_shared_and_routed_before_the_scatter(monkeypatc
+     )
+     runner = SimpleNamespace(
+         moe_config=SimpleNamespace(
+-            is_sequence_parallel=False, skip_final_all_reduce=False
++            is_sequence_parallel=False,
++            skip_final_all_reduce=False,
++            in_dtype=torch.float32,
+         ),
+         router=object(),
+         _l2_prefetch_pre_reduce_hook=lambda rows: events.append(("hook", rows)),
+@@ -530,6 +532,7 @@ def test_model_forward_matches_full_rows(
+             use_mega_moe=False,
+             use_sequence_parallel=False,
+             prefill_sp_min_rows=min_rows,
++            prefill_sp_unreduced=False,
+             prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
+             disk_engram=False,
+             engram_hash=None,

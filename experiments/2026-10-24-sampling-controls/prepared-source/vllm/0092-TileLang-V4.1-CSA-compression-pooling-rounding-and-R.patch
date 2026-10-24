@@ -1,0 +1,589 @@
+From 33a67e8362162d34aa26cc851d16636b3965c02c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:34:34 +0200
+Subject: [PATCH 092/274] TileLang V4.1 CSA compression: pooling, rounding and
+ RMSNorm in one launch
+
+DeepSeek's compressor arithmetic (ratio 1: norm of each token; ratio 2: the
+odd position pools its pair with a per-channel softmax of the gates, rounds to
+BF16, then the norm) over the step's rows only. B12X's mla_compress launches a
+128-thread block for every token of the batch capacity on every call (8192
+blocks and a full latent buffer written per compressor at decode) plus a
+pending-ring commit vLLM never reads; vLLM's Triton ring save also spans the
+capacity.
+
+- gather_partial_state: vLLM's _load_partial_state, each request's carry.
+- compress: one warp a token, 16 values a lane, warp-shuffle sum of squares,
+  library exp and rsqrt as the reference computes them (B12X used fast
+  approximations); it also saves each live token's ring state, for the rows the
+  metadata gives a ring slot (a request's last ring-size rows), a bound the
+  kernel keeps itself as well.
+
+Tests compare the latents with DeepSeek's arithmetic (B12X's oracle, within one
+BF16 ulp from the reduction order), the carries and short-request ring saves
+bit for bit with vLLM's Triton kernels, batch independence and graph replays.
+
+(cherry picked from commit c1e10dce3b43fee9c2272612273df234c39f306b)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+new file mode 100644
+index 000000000..fda92bb97
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -0,0 +1,240 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic (B12X's
++reference oracle) and vLLM's Triton state-ring kernels."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++pytest.importorskip("b12x")
++
++from b12x.attention.mla_compress.reference import normalized_latent  # noqa: E402
++
++from vllm.models.deepseek_v4_1.compressor import (  # noqa: E402
++    _load_partial_state,
++    _save_partial_states,
++)
++from vllm.models.deepseek_v4_1.tilelang.compress import (  # noqa: E402
++    DIM,
++    STATE,
++    compress,
++    gather_partial_state,
++)
++
++DEVICE = "cuda"
++REQUESTS, CAPACITY, PAGE, BLOCKS = 16, 512, 8, 40
++
++
++def _step(lengths, ratio, seed, padding=3):
++    """A packed step: requests of ``lengths`` tokens (0 = empty), random positions,
++    one ring block each, and ``padding`` rows past the live tokens."""
++    g = torch.Generator(device="cpu").manual_seed(seed)
++    starts = [0]
++    for n in lengths:
++        starts.append(starts[-1] + n)
++    nt, nr = starts[-1], len(lengths)
++    rows = nt + padding
++    positions = torch.randint(0, 50, (REQUESTS,), generator=g)
++    positions[nr:] = -1
++    starts_t = torch.full((REQUESTS + 1,), nt, dtype=torch.int32)
++    starts_t[: nr + 1] = torch.tensor(starts, dtype=torch.int32)
++    vdtype = torch.float32 if ratio == 2 else torch.bfloat16
++    values = (torch.randn(CAPACITY, DIM, generator=g) * 3).to(vdtype)
++    gates = torch.randn(CAPACITY, DIM, generator=g) * 2
++    slots = torch.randint(0, 10**6, (CAPACITY,), generator=g)
++    table = torch.randint(1, BLOCKS, (REQUESTS, 4), generator=g).to(torch.int32)
++    state_slots = torch.full((CAPACITY,), -1, dtype=torch.int64)
++    for r, n in enumerate(lengths):
++        for k in range(n):
++            pos = int(positions[r]) + k
++            state_slots[starts[r] + k] = int(table[r, 0]) * PAGE + pos % PAGE
++    weight = torch.rand(DIM, generator=g) + 0.5
++    counts = torch.tensor([nt, nr], dtype=torch.int32)
++    pool = torch.randn(BLOCKS, PAGE * STATE, generator=g)
++    tensors = dict(
++        starts=starts_t, positions=positions, values=values, gates=gates, slots=slots,
++        table=table, state_slots=state_slots, weight=weight, counts=counts, pool=pool,
++    )  # fmt: skip
++    return {k: v.to(DEVICE) for k, v in tensors.items()}, rows, starts
++
++
++def _ring(step):
++    """Each request's carry, by the Triton kernel and the TileLang one."""
++    out = []
++    for fn in ("triton", "tilelang"):
++        pv = torch.full((REQUESTS, DIM), 9.0, device=DEVICE)
++        pg = torch.full_like(pv, 9.0)
++        tags = torch.full((REQUESTS,), 7, dtype=torch.int64, device=DEVICE)
++        ids = torch.full_like(tags, 7)
++        if fn == "triton":
++            pool = step["pool"]
++            _load_partial_state[(REQUESTS,)](
++                pool, step["table"], step["starts"], step["positions"], pv, pg, tags,
++                ids, step["counts"], pool.stride(0), step["table"].stride(0), PAGE,
++            )  # fmt: skip
++        else:
++            gather_partial_state(
++                step["pool"], step["table"], step["starts"], step["positions"],
++                step["counts"], pv, pg, tags, ids, page=PAGE,
++            )  # fmt: skip
++        out.append((pv, pg, tags, ids))
++    return out
++
++
++@pytest.mark.parametrize("seed", [1, 2, 3])
++def test_gather_equals_triton(seed):
++    step, _, _ = _step([3, 0, 5, 1, 2, 6], 2, seed)
++    triton_ring, tilelang_ring = _ring(step)
++    for a, b in zip(tilelang_ring, triton_ring):
++        assert torch.equal(a, b)
++
++
++def _reference(step, rows, starts, ratio, carry):
++    """DeepSeek's arithmetic, token by token (B12X's oracle for one latent)."""
++    out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
++    emitted = torch.zeros(rows, dtype=torch.bool, device=DEVICE)
++    slots = torch.full((rows,), -1, dtype=torch.int64, device=DEVICE)
++    pv, pg, tags, ids = carry
++    for r in range(len(starts) - 1):
++        for token in range(starts[r], starts[r + 1]):
++            pos = int(step["positions"][r]) + token - starts[r]
++            if ratio == 1:
++                out[token] = normalized_latent(step["values"][token], step["weight"])
++            elif pos % 2 == 0:
++                continue
++            else:
++                if token == starts[r]:
++                    if int(tags[ids[r]]) != pos - 1:
++                        continue
++                    pair_v = torch.stack((pv[ids[r]], step["values"][token]))
++                    pair_g = torch.stack((pg[ids[r]], step["gates"][token]))
++                else:
++                    pair_v = step["values"][token - 1 : token + 1]
++                    pair_g = step["gates"][token - 1 : token + 1]
++                out[token] = normalized_latent(pair_v, step["weight"], pair_g)
++            emitted[token] = True
++            slots[token] = step["slots"][token]
++    return out, emitted, slots
++
++
++def _run(step, rows, ratio, carry):
++    out = torch.full((CAPACITY, DIM), 5.0, dtype=torch.bfloat16, device=DEVICE)
++    emitted = torch.ones(CAPACITY, dtype=torch.bool, device=DEVICE)
++    eslots = torch.full((CAPACITY,), 77, dtype=torch.int64, device=DEVICE)
++    pv, pg, tags, ids = carry
++    state_ids = ids if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
++    kwargs = {}
++    if ratio == 2:
++        kwargs = dict(
++            pending_values=pv, pending_gates=pg, tags=tags, pool=step["pool"],
++            state_slots=step["state_slots"], page=PAGE,
++        )  # fmt: skip
++    compress(
++        rows, ratio, step["values"], step["gates"] if ratio == 2 else None,
++        step["weight"], step["starts"], step["positions"], state_ids, step["slots"],
++        step["counts"], out, emitted, eslots, **kwargs,
++    )  # fmt: skip
++    return out, emitted, eslots
++
++
++def _bf16_ulps(a, b):
++    ia = a.view(torch.int16).int()
++    ib = b.view(torch.int16).int()
++    return (ia - ib).abs()
++
++
++@pytest.mark.parametrize("ratio", [1, 2])
++@pytest.mark.parametrize("lengths", [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [300]])
++def test_compress_matches_reference(ratio, lengths):
++    step, rows, starts = _step(lengths, ratio, seed=len(lengths) * 10 + ratio)
++    carry = _ring(step)[1]
++    want = _reference(step, rows, starts, ratio, carry)
++    pool_before = step["pool"].clone()
++    out, emitted, eslots = _run(step, rows, ratio, carry)
++    assert torch.equal(emitted[:rows], want[1])
++    assert torch.equal(eslots[:rows], want[2])
++    ulps = _bf16_ulps(out[:rows], want[0])
++    assert int(ulps.max()) <= 1 and float((ulps > 0).float().mean()) < 0.01
++    # Rows past the step keep their contents.
++    assert (out[rows:] == 5.0).all() and emitted[rows:].all()
++    assert (eslots[rows:] == 77).all()
++    if ratio == 2:
++        # Each slot holds its latest position's value and gate.
++        latest = pool_before.clone()
++        for r in range(len(starts) - 1):
++            for token in range(max(starts[r], starts[r + 1] - PAGE), starts[r + 1]):
++                slot = int(step["state_slots"][token])
++                base = (slot % PAGE) * STATE
++                latest[slot // PAGE, base : base + DIM] = step["values"][token]
++                latest[slot // PAGE, base + DIM : base + STATE] = step["gates"][token]
++        assert torch.equal(step["pool"], latest)
++        if max(lengths) <= PAGE:
++            # No slot collides: vLLM's Triton save writes the same.
++            triton_pool = pool_before.clone()
++            _save_partial_states[(CAPACITY,)](
++                triton_pool, step["state_slots"], step["values"], step["gates"],
++                step["counts"], triton_pool.stride(0), PAGE,
++            )  # fmt: skip
++            assert torch.equal(step["pool"], triton_pool)
++
++
++@pytest.mark.parametrize("ratio", [1, 2])
++def test_token_independent_of_batch_and_graphs(ratio):
++    lengths = [4, 6, 2]
++    step, rows, starts = _step(lengths, ratio, seed=40 + ratio)
++    carry = _ring(step)[1]
++    together = _run(step, rows, ratio, carry)[0][:rows].clone()
++    # The middle request alone: its rows packed first, the same positions.
++    alone_step = {k: v.clone() for k, v in step.items()}
++    a, b = starts[1], starts[2]
++    for name in ("values", "gates", "slots", "state_slots"):
++        alone_step[name][: b - a] = step[name][a:b]
++    alone_step["starts"][:2] = torch.tensor([0, b - a], device=DEVICE)
++    alone_step["starts"][2:] = b - a
++    alone_step["positions"][0] = step["positions"][1]
++    alone_step["positions"][1:] = -1
++    alone_step["counts"].copy_(torch.tensor([b - a, 1], device=DEVICE))
++    alone_step["table"][0] = step["table"][1]
++    alone_carry = tuple(t.clone() for t in carry)
++    for t, src in zip(alone_carry, carry):
++        t[0] = src[1]
++    alone_carry[3][0] = 0
++    alone = _run(alone_step, b - a, ratio, alone_carry)[0][: b - a]
++    assert torch.equal(alone, together[a:b])
++    # Graph replays give the eager bits.
++    out = torch.zeros(CAPACITY, DIM, dtype=torch.bfloat16, device=DEVICE)
++    emitted = torch.zeros(CAPACITY, dtype=torch.bool, device=DEVICE)
++    eslots = torch.zeros(CAPACITY, dtype=torch.int64, device=DEVICE)
++    state_ids = carry[3] if ratio == 2 else torch.arange(REQUESTS, device=DEVICE)
++    kwargs = {}
++    if ratio == 2:
++        kwargs = dict(
++            pending_values=carry[0], pending_gates=carry[1], tags=carry[2],
++            pool=step["pool"], state_slots=step["state_slots"], page=PAGE,
++        )  # fmt: skip
++
++    def call():
++        compress(
++            rows, ratio, step["values"], step["gates"] if ratio == 2 else None,
++            step["weight"], step["starts"], step["positions"], state_ids,
++            step["slots"], step["counts"], out, emitted, eslots, **kwargs,
++        )  # fmt: skip
++
++    call()
++    torch.cuda.synchronize()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        call()
++    for _ in range(10):
++        out.zero_()
++        graph.replay()
++        torch.cuda.synchronize()
++        assert torch.equal(out[:rows], together)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+new file mode 100644
+index 000000000..5b3e8d203
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -0,0 +1,310 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang CSA compression for DeepSeek-V4.1: pair pooling, BF16 rounding, RMSNorm.
++
++DeepSeek's reference (``inference/model.py``, the compressor) emits one 512-wide
++latent per compressed position. At ratio 1 every token emits ``norm(value)``; at
++ratio 2 only odd positions emit, pooling the pair (the even predecessor and the token)
++with a per-channel softmax of their gates::
++
++    pooled = v0 * e0 / (e0 + e1) + v1 * e1 / (e0 + e1),  e_i = exp(g_i - max(g0, g1))
++    x      = bf16(pooled)                     (rounded BEFORE the RMS, as the reference)
++    out    = bf16(x * rsqrt(mean(x^2) + 1e-20) * weight)
++
++A ratio-2 token's predecessor is the previous token of its request in this step, or,
++for a request's first token, the even position the state ring holds from an earlier
++step (``gather_partial_state``, which must finish before ``compress`` overwrites ring
++slots). ``compress`` also saves each request's latest ``page`` positions of the step
++(value and gate) to their ring slots, so a slot holds its latest position.
++
++This replaces B12X's ``mla_compress`` (one 128-thread block per token of the whole
++batch capacity every call, then a pending-ring commit vLLM never reads) and vLLM's two
++Triton ring kernels (``_load_partial_state``, ``_save_partial_states``, the latter also
++over the whole capacity): two launches sized by the step. One warp owns a token, 16
++values a lane, and reduces its sum of squares with warp shuffles. ``exp`` and
++``rsqrt`` are the FP32 library functions, as the reference computes them (B12X used
++fast approximations).
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
++import torch
++
++DIM = 512
++STATE = 2 * DIM  # a ring slot: the value, then the gate
++EPS = 1e-20
++_VEC = 4  # FP32 per 16-byte access
++_CHUNKS = DIM // (32 * _VEC)  # 16-byte accesses per lane
++_PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++
++
++@tilelang.jit(pass_configs=_PASS)
++def gather_partial_state_kernel(max_requests: int, page: int):
++    """Each live request's ring carry: the even predecessor of an odd first position."""
++    blocks = T.dynamic("blocks")
++    width = T.dynamic("width")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++
++    @T.prim_func
++    def gather_partial_state(
++        pool: T.Tensor((blocks, width), T.float32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        starts: T.Tensor((max_requests + 1,), T.int32),
++        positions: T.Tensor((max_requests,), T.int64),
++        counts: T.Tensor((2,), T.int32),
++        pending_values: T.Tensor((max_requests, DIM), T.float32),
++        pending_gates: T.Tensor((max_requests, DIM), T.float32),
++        tags: T.Tensor((max_requests,), T.int64),
++        local_ids: T.Tensor((max_requests,), T.int64),
++    ):
++        with T.Kernel(max_requests, threads=128) as r:
++            tx = T.get_thread_binding()
++            buf = T.alloc_local((_VEC,), T.float32)
++            nt = counts[0]
++            first = starts[r]
++            end = starts[r + 1]
++            pos = positions[r]
++            live = (
++                (r < counts[1])
++                & (first >= 0)
++                & (first < end)
++                & (end <= nt)
++                & (pos >= 0)
++            )
++            needed = live & (pos > 0) & (pos % 2 == 1)
++            page_id = T.if_then_else(needed, T.Cast(T.int64, table[r, 0]), T.int64(0))
++            valid = needed & (page_id > 0)
++            base = ((pos - 1) % page) * STATE
++            for half in T.serial(2):
++                for i in T.vectorized(_VEC):
++                    buf[i] = T.if_then_else(
++                        valid, pool[page_id, base + half * DIM + tx * _VEC + i], 0.0
++                    )
++                for i in T.vectorized(_VEC):
++                    if half == 0:
++                        pending_values[r, tx * _VEC + i] = buf[i]
++                    else:
++                        pending_gates[r, tx * _VEC + i] = buf[i]
++            if tx == 0:
++                tags[r] = T.if_then_else(valid, pos - 1, T.int64(-1))
++                local_ids[r] = T.if_then_else(live, T.Cast(T.int64, r), T.int64(-1))
++
++    return gather_partial_state
++
++
++@tilelang.jit(pass_configs=_PASS)
++def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
++    """Rows ``[0, rows)`` of the step: latents, emitted flags and slots (zero, false
++    and -1 past the live tokens), and at ratio 2 the live tokens' ring saves."""
++    assert ratio in (1, 2)
++    rows = T.dynamic("rows")
++    gate_rows = T.dynamic("gate_rows")  # rows at ratio 2; any buffer at ratio 1
++    blocks = T.dynamic("blocks")
++    width = T.dynamic("width")
++    value_dtype = T.float32 if ratio == 2 else T.bfloat16
++
++    @T.prim_func
++    def compress(
++        values: T.Tensor((rows, DIM), value_dtype),
++        gates: T.Tensor((gate_rows, DIM), T.float32),
++        weight: T.Tensor((DIM,), T.float32),
++        starts: T.Tensor((max_requests + 1,), T.int32),
++        positions: T.Tensor((max_requests,), T.int64),
++        state_ids: T.Tensor((max_requests,), T.int64),
++        slots: T.Tensor((rows,), T.int64),
++        state_slots: T.Tensor((rows,), T.int64),
++        counts: T.Tensor((2,), T.int32),
++        pending_values: T.Tensor((max_requests, DIM), T.float32),
++        pending_gates: T.Tensor((max_requests, DIM), T.float32),
++        tags: T.Tensor((max_requests,), T.int64),
++        pool: T.Tensor((blocks, width), T.float32),
++        out: T.Tensor((rows, DIM), T.bfloat16),
++        emitted: T.Tensor((rows,), T.bool),
++        emitted_slots: T.Tensor((rows,), T.int64),
++    ):
++        with T.Kernel(T.ceildiv(rows, warps), threads=warps * 32) as bx:
++            tx = T.get_thread_binding()
++            token = bx * warps + tx // 32
++            lane = tx % 32
++            x = T.alloc_local((_CHUNKS * _VEC,), T.float32)
++            v1 = T.alloc_local((_VEC,), value_dtype)
++            g1 = T.alloc_local((_VEC,), T.float32)
++            v0 = T.alloc_local((_VEC,), T.float32)
++            g0 = T.alloc_local((_VEC,), T.float32)
++            w = T.alloc_local((_VEC,), T.float32)
++            y = T.alloc_local((_VEC,), T.bfloat16)
++            # request, first, position, valid, pending carry, request end
++            info = T.alloc_local((6,), T.int64)
++            ss = T.alloc_local((1,), T.float32)
++            if token < rows:
++                nt = counts[0]
++                nr = counts[1]
++                info[0] = T.int64(-1)
++                info[1] = T.int64(0)
++                info[2] = T.int64(-1)
++                info[3] = T.int64(0)
++                info[4] = T.int64(0)
++                info[5] = T.int64(-1)
++                if (nt >= 0) & (nr > 0) & (nr <= max_requests) & (token < nt):
++                    # The request whose rows contain the token: the first whose end
++                    # passes it (empty requests never match).
++                    for q in T.serial(max_requests):
++                        if (info[0] < 0) & (q < nr) & (starts[q + 1] > token):
++                            info[0] = T.Cast(T.int64, q)
++                    if info[0] >= 0:
++                        q = info[0]
++                        first = T.Cast(T.int64, starts[q])
++                        end = T.Cast(T.int64, starts[q + 1])
++                        sid = state_ids[q]
++                        start_pos = positions[q]
++                        info[5] = end
++                        if (
++                            (first >= 0)
++                            & (first <= token)
++                            & (end <= nt)
++                            & (token < end)
++                            & (sid >= 0)
++                            & (sid < max_requests)
++                            & (start_pos >= 0)
++                        ):
++                            info[1] = first
++                            info[2] = start_pos + (token - first)
++                            info[3] = T.int64(1)
++                            if ratio == 2:
++                                if info[2] % 2 == 1:
++                                    if token == first:
++                                        info[4] = T.int64(1)
++                                        if tags[sid] != info[2] - 1:
++                                            info[3] = T.int64(0)
++                                else:
++                                    info[3] = T.int64(0)
++                valid = info[3] == 1
++                ss[0] = T.float32(0)
++                for c in T.serial(_CHUNKS):
++                    col = (c * 32 + lane) * _VEC
++                    for i in T.vectorized(_VEC):
++                        v1[i] = values[token, col + i]
++                    if ratio == 2:
++                        for i in T.vectorized(_VEC):
++                            g1[i] = gates[token, col + i]
++                        if valid:
++                            if info[4] == 1:
++                                sid = state_ids[info[0]]
++                                for i in T.vectorized(_VEC):
++                                    v0[i] = pending_values[sid, col + i]
++                                for i in T.vectorized(_VEC):
++                                    g0[i] = pending_gates[sid, col + i]
++                            else:
++                                for i in T.vectorized(_VEC):
++                                    v0[i] = T.Cast(
++                                        T.float32, values[token - 1, col + i]
++                                    )
++                                for i in T.vectorized(_VEC):
++                                    g0[i] = gates[token - 1, col + i]
++                    for i in T.unroll(_VEC):
++                        if valid:
++                            if ratio == 2:
++                                m = T.max(g0[i], g1[i])
++                                e0 = T.exp(g0[i] - m)
++                                e1 = T.exp(g1[i] - m)
++                                d = e0 + e1
++                                pooled = v0[i] * (e0 / d) + T.Cast(T.float32, v1[i]) * (
++                                    e1 / d
++                                )
++                                x[c * _VEC + i] = T.Cast(
++                                    T.float32, T.Cast(T.bfloat16, pooled)
++                                )
++                            else:
++                                x[c * _VEC + i] = T.Cast(T.float32, v1[i])
++                        else:
++                            x[c * _VEC + i] = T.float32(0)
++                        ss[0] += x[c * _VEC + i] * x[c * _VEC + i]
++                    if ratio == 2:
++                        # The live token's raw value and gate into its ring slot. The
++                        # metadata gives only a request's last ``page`` rows of the step
++                        # a ring slot (earlier rows would share slots); the kernel keeps
++                        # that bound itself as well.
++                        slot = state_slots[token]
++                        if (token < nt) & (slot >= page) & (token >= info[5] - page):
++                            base = (slot % page) * STATE + col
++                            for i in T.vectorized(_VEC):
++                                pool[slot // page, base + i] = v1[i]
++                            for i in T.vectorized(_VEC):
++                                pool[slot // page, base + DIM + i] = g1[i]
++                total = T.warp_reduce_sum(ss[0])
++                inverse = T.rsqrt(total / DIM + EPS)
++                for c in T.serial(_CHUNKS):
++                    col = (c * 32 + lane) * _VEC
++                    for i in T.vectorized(_VEC):
++                        w[i] = weight[col + i]
++                    for i in T.unroll(_VEC):
++                        y[i] = T.Cast(T.bfloat16, x[c * _VEC + i] * inverse * w[i])
++                    for i in T.vectorized(_VEC):
++                        out[token, col + i] = y[i]
++                if lane == 0:
++                    emitted[token] = valid
++                    emitted_slots[token] = T.if_then_else(
++                        valid, slots[token], T.int64(-1)
++                    )
++
++    return compress
++
++
++def gather_partial_state(
++    pool, table, starts, positions, counts, pending_values, pending_gates, tags,
++    local_ids, *, page,
++):  # fmt: skip
++    """vLLM's ``_load_partial_state``: each request's carry from the state ring."""
++    max_requests = positions.shape[0]
++    gather_partial_state_kernel(max_requests, page)(
++        pool, table, starts, positions, counts, pending_values, pending_gates, tags,
++        local_ids,
++    )  # fmt: skip
++
++
++def compress(
++    rows, ratio, values, gates, weight, starts, positions, state_ids, slots, counts,
++    out, emitted, emitted_slots, *, pending_values=None, pending_gates=None,
++    tags=None, pool=None, state_slots=None, page=1,
++):  # fmt: skip
++    """Rows ``[0, rows)`` of one compression call (``out``, ``emitted`` and
++    ``emitted_slots`` keep their contents past them)."""
++    max_requests = positions.shape[0]
++    if ratio == 1:
++        # Ratio 1 reads no gates, ring or carry: a placeholder of the shapes.
++        dummy = placeholder(max_requests, out.device)
++        gates = pending_values = pending_gates = pool = dummy
++        tags, state_slots = state_ids, slots
++    else:
++        gates = gates[:rows]
++    compress_kernel(ratio, max_requests, page)(
++        values[:rows], gates, weight, starts, positions, state_ids, slots[:rows],
++        state_slots[:rows], counts, pending_values, pending_gates, tags, pool,
++        out[:rows], emitted[:rows], emitted_slots[:rows],
++    )  # fmt: skip
++    return out[:rows], emitted_slots[:rows]
++
++
++_PLACEHOLDERS: dict = {}
++
++
++def placeholder(max_requests: int, device: torch.device) -> torch.Tensor:
++    """One FP32 ``[max_requests, 512]`` buffer per device for ratio 1's unused
++    operands, allocated on the first (eager) call, never during graph capture."""
++    key = (max_requests, device)
++    if key not in _PLACEHOLDERS:
++        _PLACEHOLDERS[key] = torch.zeros((max_requests, DIM), device=device)
++    return _PLACEHOLDERS[key]
++
++
++__all__ = [
++    "compress",
++    "compress_kernel",
++    "gather_partial_state",
++    "gather_partial_state_kernel",
++    "placeholder",
++]

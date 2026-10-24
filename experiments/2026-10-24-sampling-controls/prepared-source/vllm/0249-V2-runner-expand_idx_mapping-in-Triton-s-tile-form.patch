@@ -1,0 +1,95 @@
+From 1a967a2ecfc770bb1838b5cd862b7a331d774fcd Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:26:00 +0200
+Subject: [PATCH 249/274] V2 runner: expand_idx_mapping in Triton's tile form
+
+The request's starts and state index are read together as ordinary loads and
+the two guarded stores are predicated. With a branch around the stores, ptxas
+moved the state index load below the branch on the starts: two round trips to
+memory where Triton has one. The inputs lose __restrict__, which put their
+loads on the read-only cache path; Triton's are ordinary loads. Against Triton
+per call: from +13% to level at 32 threads a block.
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index aa7761d3b..582fef4e2 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -800,14 +800,39 @@ def combine_sampled_and_draft_tokens_kernel(
+     return combine_sampled_and_draft_tokens
+ 
+ 
++# Triton stores under a mask with predicated instructions. A guarded store written as
++# a branch lets ptxas sink the loads that feed it below the branch, behind the loads
++# the guard waits for: two round trips to memory where Triton has one. Kernels whose
++# loads must issue together store through these helpers instead of branching.
++_STORE_IF = r"""
++__device__ __forceinline__ void vllm_store_if_b64(void* p, long long v, bool ok) {
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q st.global.b64 [%0], %1;\n}"
++               :: "l"(p), "l"(v), "r"((int)ok) : "memory");
++}
++__device__ __forceinline__ void vllm_store_if_b32(void* p, int v, bool ok) {
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q st.global.b32 [%0], %1;\n}"
++               :: "l"(p), "r"(v), "r"((int)ok) : "memory");
++}
++"""
++
++_STORE_BITS = {"int32": 32, "int64": 64}
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def expand_idx_mapping_kernel(block: int, idx_dtype: str):
+     """A thread an expanded entry: request ``r``'s ``j``-th logit (``j <
+-    min(num_logits, block)``) takes the request's state index and ``j``."""
++    min(num_logits, block)``) takes the request's state index and ``j``. In
++    Triton's form: the request's starts and state index are read together, as
++    ordinary loads (the inputs are not ``__restrict__``, which would route them
++    through the read-only cache path), and the two guarded stores are predicated
++    (``_STORE_IF``)."""
+     num_reqs = T.dynamic("num_reqs")
+     expanded_len = T.dynamic("expanded_len")
+     local_len = T.dynamic("local_len")
+     cu_len = T.dynamic("cu_len")
++    store_state = f"vllm_store_if_b{_STORE_BITS[idx_dtype]}"
+ 
+     @T.prim_func
+     def expand_idx_mapping(
+@@ -816,15 +841,31 @@ def expand_idx_mapping_kernel(block: int, idx_dtype: str):
+         expanded_local_pos: T.Tensor((local_len,), T.int32),
+         cu_num_logits: T.Tensor((cu_len,), T.int32),
+     ):
+-        with T.Kernel(T.ceildiv(num_reqs * block, 128), threads=128) as bx:
+-            element = bx * 128 + T.get_thread_binding()
++        with T.Kernel(T.ceildiv(num_reqs * block, 32), threads=32) as bx:
++            T.annotate_restrict_buffers(idx_mapping, cu_num_logits)
++            T.import_source(_STORE_IF)
++            element = bx * 32 + T.get_thread_binding()
+             r = element // block
+             j = element % block
+             if r < num_reqs:
+-                start = cu_num_logits[r]
+-                if j < cu_num_logits[r + 1] - start:
+-                    expanded_idx_mapping[start + j] = idx_mapping[r]
+-                    expanded_local_pos[start + j] = j
++                start = T.alloc_var(T.int32, init=cu_num_logits[r])
++                end = T.alloc_var(T.int32, init=cu_num_logits[r + 1])
++                state = T.alloc_var(idx_dtype, init=idx_mapping[r])
++                ok = j < end - start
++                T.call_extern(
++                    "handle",
++                    store_state,
++                    T.address_of(expanded_idx_mapping[start + j]),
++                    state,
++                    ok,
++                )
++                T.call_extern(
++                    "handle",
++                    "vllm_store_if_b32",
++                    T.address_of(expanded_local_pos[start + j]),
++                    j,
++                    ok,
++                )
+ 
+     return expand_idx_mapping
+ 

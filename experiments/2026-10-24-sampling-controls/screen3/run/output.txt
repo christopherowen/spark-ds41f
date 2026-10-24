@@ -1,0 +1,843 @@
+......................................................................FF [ 57%]
+FFFFFFF..............................................                    [100%]
+=================================== FAILURES ===================================
+_______________ test_nan_count_ignores_padded_columns[33-dtype0] _______________
+
+dtype = torch.float32, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:31  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_______________ test_nan_count_ignores_padded_columns[33-dtype1] _______________
+
+dtype = torch.bfloat16, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:32  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_______________ test_nan_count_ignores_padded_columns[33-dtype2] _______________
+
+dtype = torch.float16, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:32  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype0] ______________
+
+dtype = torch.float32, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype1] ______________
+
+dtype = torch.bfloat16, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+______________ test_nan_count_ignores_padded_columns[8193-dtype2] ______________
+
+dtype = torch.float16, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype0] _____________
+
+dtype = torch.float32, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype1] _____________
+
+dtype = torch.bfloat16, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+_____________ test_nan_count_ignores_padded_columns[129280-dtype2] _____________
+
+dtype = torch.float16, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:290: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:481: in compile
+    kernel_result = compile(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:164: in compile
+    return cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/__init__.py:92: in cached
+    return cache.cached(
+/usr/local/lib/python3.12/dist-packages/tilelang/cache/kernel_cache.py:470: in cached
+    kernel = JITKernel(
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:140: in __init__
+    adapter = self._compile_and_create_adapter(func, out_idx)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:274: in _compile_and_create_adapter
+    self.artifact = self._compile_artifact(tilelang_func, pass_configs, compile_metadata)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/kernel.py:315: in _compile_artifact
+    artifact = lower_with_context(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:165: in lower_with_context
+    return _lower_with_context_impl(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:184: in _lower_with_context_impl
+    host_mod, device_mod, params, target, target_host = lower_to_host_device_ir(
+/usr/local/lib/python3.12/dist-packages/tilelang/engine/lower.py:136: in lower_to_host_device_ir
+    mod = context.lower(mod)
+          ^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:214: in lower
+    return self.module.lower(mod, self.target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/module.py:115: in lower
+    return self.get_pipeline(target).lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/backend/pass_pipeline/pipeline.py:31: in lower
+    return self._lower(mod, target)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:171: in CUDAPassPipelineBody
+    mod = CUDAPassPipelineBodyPrologue(mod, target)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/cuda/pipeline.py:134: in CUDAPassPipelineBodyPrologue
+    mod = tilelang.transform.LayoutInference()(mod)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/ir/transform.py:171: in __call__
+    return _ffi_transform_api.RunPass(self, mod)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule) const
+    ???
+<unknown>:0: in tvm::transform::Pass::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tirx::transform::PrimFuncPassNode::operator()(tvm::IRModule, tvm::transform::PassContext const&) const
+    ???
+<unknown>:0: in tvm::tl::LayoutInferencer::Substitute(tvm::tirx::PrimFunc)
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Check failed: layout_map.count(buffer) != 0 (0 vs. 0) : The layout for fragment counts can not be inferred correctly.
+E     --> /opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:199:1
+E         |
+E    199 |             counts = T.alloc_fragment((8192,), "int32")
+E         |             ^
+
+/workspace/tilelang/src/transform/layout_inference/layout_inference.cc:666: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:11:33  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `nan_count` with `out_idx=None`
+------------------------------ Captured log call -------------------------------
+INFO     tilelang.jit.kernel:kernel.py:137 TileLang begins to compile kernel `nan_count` with `out_idx=None`
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_thinking_budget.py::test_v2_greedy_sampling_applies_thinking_budget[triton]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype2]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype2]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype2]
+9 failed, 116 passed, 15 warnings in 51.05s

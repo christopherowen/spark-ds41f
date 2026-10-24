@@ -1,0 +1,255 @@
+From e3f2a07647302eddceca20f73d59fbcb4f76d41b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:35:48 +0200
+Subject: [PATCH 202/274] CED indices: switch to the qualified TileLang row map
+ and remove the old runtime kernel
+
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_ced.py b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+index e991126bf..226102b9d 100644
+--- a/benchmarks/kernels/benchmark_deepseek_v41_ced.py
++++ b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+@@ -11,7 +11,7 @@ import statistics
+ 
+ import torch
+ 
+-from vllm.models.deepseek_v4_1.ced import (
++from benchmarks.kernels.ced_reference import (
+     _copy_rows,
+     _decoder_indices,
+     _decoder_requests,
+diff --git a/benchmarks/kernels/ced_reference.py b/benchmarks/kernels/ced_reference.py
+new file mode 100644
+index 000000000..4d02710c2
+--- /dev/null
++++ b/benchmarks/kernels/ced_reference.py
+@@ -0,0 +1,96 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Frozen r6x Triton references for experimental CED port qualification."""
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit(do_not_specialize=["source_rows", "output_rows"])
++def _copy_rows(
++    Source,
++    Indices,
++    Output,
++    source_rows,
++    output_rows,
++    DIMS: tl.constexpr,
++    STRIDES: tl.constexpr,
++    WIDTH: tl.constexpr,
++    SCATTER: tl.constexpr,
++    B: tl.constexpr,
++):
++    offset = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
++    row = offset // WIDTH
++    col = offset % WIDTH
++    limit = source_rows if SCATTER else output_rows
++    index = tl.load(Indices + row, row < limit, other=-1).to(tl.int64)
++    valid = (row < limit) & (index >= 0)
++    valid &= index < (output_rows if SCATTER else source_rows)
++    source_row = row if SCATTER else index
++    source_offset = source_row * STRIDES[0]
++    remainder = col
++    for axis in tl.static_range(len(DIMS) - 1, -1, -1):
++        source_offset += (remainder % DIMS[axis]) * STRIDES[axis + 1]
++        remainder = remainder // DIMS[axis]
++    value = tl.load(Source + source_offset, valid, other=0)
++    if SCATTER:
++        tl.store(Output + index * WIDTH + col, value, valid)
++    else:
++        tl.store(Output + offset, value, row < output_rows)
++
++
++@triton.jit(do_not_specialize=["nr"])
++def _decoder_requests(
++    Starts,
++    Seq,
++    KeepFull,
++    PrefixStart,
++    OutStarts,
++    RequestPositions,
++    ReplayStart,
++    Counts,
++    nr,
++    R: tl.constexpr,
++    B: tl.constexpr,
++    WINDOW: tl.constexpr,
++):
++    r = tl.arange(0, B)
++    valid = r < nr
++    start = tl.load(Starts + r, valid, other=0)
++    end = tl.load(Starts + r + 1, valid, other=0)
++    seq = tl.load(Seq + r, valid, other=0).to(tl.int64)
++    full = tl.load(KeepFull + r, valid, other=0)
++    q = end - start
++    kept = tl.where(full, q, tl.minimum(q, WINDOW))
++    cumulative = tl.cumsum(kept)
++    count = tl.sum(kept)
++    tl.store(OutStarts + r, tl.where(valid, cumulative - kept, count), r <= R)
++    tl.store(OutStarts + nr, count)
++    tl.store(RequestPositions + r, tl.where(valid, seq - kept, -1), r < R)
++    prefix = tl.load(PrefixStart + r, valid, other=0)
++    replay = tl.maximum(prefix, tl.where(q > kept, seq - kept, 0))
++    tl.store(ReplayStart + r, replay, r < R)
++    tl.store(Counts, count)
++    tl.store(Counts + 1, nr)
++
++
++@triton.jit(do_not_specialize=["nr", "nt", "capacity"])
++def _decoder_indices(Starts, CompactStarts, Indices, nr, nt, capacity, B: tl.constexpr):
++    row = tl.program_id(0) * B + tl.arange(0, B)
++    lo = tl.full((B,), 0, tl.int32)
++    hi = tl.full((B,), nr, tl.int32)
++    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
++        mid = (lo + hi) // 2
++        end = tl.load(CompactStarts + mid + 1, mid < nr, other=nt)
++        right = end <= row
++        active = lo < hi
++        lo = tl.where(active & right, mid + 1, lo)
++        hi = tl.where(active & ~right, mid, hi)
++    valid = lo < nr
++    compact_end = tl.load(CompactStarts + lo + 1, valid, other=0)
++    original_end = tl.load(Starts + lo + 1, valid, other=0).to(tl.int64)
++    tl.store(
++        Indices + row,
++        tl.where(valid, original_end - compact_end + row, -1),
++        row < capacity,
++    )
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index ff5af2929..64de8f9ab 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -24,7 +24,7 @@ from vllm.triton_utils import triton  # noqa: E402
+ @pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
+ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
+     """Per-request limits preserve the old 128/full-row metadata, including padding."""
+-    from vllm.models.deepseek_v4_1.ced import _decoder_requests
++    from benchmarks.kernels.ced_reference import _decoder_requests
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     nr = min(nr, max_requests)
+@@ -129,7 +129,7 @@ def test_ced_row_copy_serving_widths(rows, tail):
+ @pytest.mark.parametrize("padding", [0, 1, 127])
+ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
+     """Compacted rows map to each request's suffix; padded rows map to -1."""
+-    from vllm.models.deepseek_v4_1.ced import _decoder_indices
++    from benchmarks.kernels.ced_reference import _decoder_indices
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     nr = len(lengths)
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 76241de27..a0f50ff4c 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -524,7 +524,7 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+     from vllm.models.deepseek_v4_1 import ced
+ 
+     # Isolate compilation state so earlier tests cannot hide a missing warmup.
+-    for kernel in (ced._decoder_requests, ced._decoder_indices, ced._copy_rows):
++    for kernel in (ced._decoder_requests, ced._copy_rows):
+         monkeypatch.setattr(
+             kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
+         )
+@@ -534,6 +534,10 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+     with registry.activate():
+         state.warmup(hidden_size=8, hc_mult=4)
+     registry.warmup()
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    prepare.warm_declared(registry)
++    prepare.freeze("CED index warmup test")
+ 
+     def forbid_compile(**kwargs):
+         raise AssertionError(
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 289561bee..a4d2ec768 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -18,6 +18,9 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+ )
+ from vllm.triton_utils import tl, triton
+ 
++from .tilelang import ced as ced_kernels
++from .tilelang import prepare
++
+ if TYPE_CHECKING:
+     from .sparse_mla import DeepseekV41B12xMetadata
+ 
+@@ -232,28 +235,6 @@ def _decoder_requests(
+     tl.store(Counts + 1, nr)
+ 
+ 
+-@triton.jit(do_not_specialize=["nr", "nt", "capacity"])
+-def _decoder_indices(Starts, CompactStarts, Indices, nr, nt, capacity, B: tl.constexpr):
+-    row = tl.program_id(0) * B + tl.arange(0, B)
+-    lo = tl.full((B,), 0, tl.int32)
+-    hi = tl.full((B,), nr, tl.int32)
+-    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+-        mid = (lo + hi) // 2
+-        end = tl.load(CompactStarts + mid + 1, mid < nr, other=nt)
+-        right = end <= row
+-        active = lo < hi
+-        lo = tl.where(active & right, mid + 1, lo)
+-        hi = tl.where(active & ~right, mid, hi)
+-    valid = lo < nr
+-    compact_end = tl.load(CompactStarts + lo + 1, valid, other=0)
+-    original_end = tl.load(Starts + lo + 1, valid, other=0).to(tl.int64)
+-    tl.store(
+-        Indices + row,
+-        tl.where(valid, original_end - compact_end + row, -1),
+-        row < capacity,
+-    )
+-
+-
+ class CEDState:
+     """Stable per-model staging buffers shared by dummy, capture, and runtime."""
+ 
+@@ -285,7 +266,6 @@ class CEDState:
+         count = CED_WINDOW + 1
+         starts = torch.tensor([0, count], dtype=torch.int32, device=device)
+         seq = torch.tensor([count], dtype=torch.int32, device=device)
+-        self.stage(starts, seq, [count], [False], [0])
+         rows, streams, mixes = (hidden_size,), (hc_mult, hidden_size), (hc_mult,)
+         register_copy_rows_warmup(
+             (
+@@ -306,8 +286,16 @@ class CEDState:
+                 (torch.float32, mixes, True),
+             )
+         )
+-        self.plan = None
+-        self.replay_start.zero_()
++
++        def warm_metadata():
++            self.stage(starts, seq, [count], [False], [0])
++            self.plan = None
++            self.replay_start.zero_()
++
++        prepare.declare(
++            lambda: [prepare.call(ced_kernels.indices_kernel, self.max_requests)],
++            warm=warm_metadata,
++        )
+ 
+     def stage(
+         self,
+@@ -344,14 +332,12 @@ class CEDState:
+             CED_WINDOW,
+         )
+         if self.plan is not None:
+-            _decoder_indices[(triton.cdiv(self.plan.capacity, 128),)](
++            ced_kernels.indices(
+                 starts,
+                 self.starts,
+-                self.indices,
++                self.indices[: self.plan.capacity],
+                 nr,
+                 self.plan.num_tokens,
+-                self.plan.capacity,
+-                128,
+             )
+ 
+     def get_indices(self) -> torch.Tensor | None:

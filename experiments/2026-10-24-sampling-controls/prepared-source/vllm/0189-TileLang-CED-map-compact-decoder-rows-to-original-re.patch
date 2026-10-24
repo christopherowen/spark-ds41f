@@ -1,0 +1,98 @@
+From e4b6fa3a49265bab77f68c41f366782a20a2e271 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:46:33 +0200
+Subject: [PATCH 189/274] TileLang CED: map compact decoder rows to original
+ request suffixes
+
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index d7d559294..cacb0e39b 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -72,6 +72,33 @@ DEVICE = "cuda"
+ R, CAP, COLS = 16, 1024, 40
+ 
+ 
++@pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
++@pytest.mark.parametrize("padding", [0, 1, 127])
++def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
++    """Compacted rows map to each request's suffix; padded rows map to -1."""
++    from vllm.models.deepseek_v4_1.ced import _decoder_indices
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    nr = len(lengths)
++    starts = torch.tensor(
++        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device=DEVICE
++    )
++    kept = [min(n, 128) for n in lengths]
++    nt = sum(kept)
++    compact = torch.full((17,), nt, dtype=torch.int32, device=DEVICE)
++    compact[: nr + 1] = torch.tensor(
++        [0, *torch.tensor(kept).cumsum(0).tolist()], dtype=torch.int32, device=DEVICE
++    )
++    capacity = max(1, nt + padding)
++    reference = torch.full((capacity,), 7, dtype=torch.int64, device=DEVICE)
++    actual = torch.full_like(reference, 7)
++    _decoder_indices[(triton.cdiv(capacity, 128),)](
++        starts, compact, reference, nr, nt, capacity, 128
++    )
++    ced.indices(starts, compact, actual, nr, nt)
++    assert torch.equal(reference, actual)
++
++
+ def _step(lengths, seed, padding=5):
+     g = torch.Generator().manual_seed(seed)
+     starts = [0]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index a53bbe7a4..e03a3f9dc 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -60,3 +60,48 @@ def requests(starts, seq, limits, prefix, out_starts, positions, replay, counts,
+     requests_kernel(positions.shape[0])(
+         starts, seq, limits, prefix, out_starts, positions, replay, counts, nr
+     )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def indices_kernel(max_requests: int):
++    starts_len = T.dynamic("starts_len")
++    capacity = T.dynamic("capacity")
++    steps = max(1, (max_requests + 1).bit_length())
++
++    @T.prim_func
++    def ced_indices(
++        starts: T.Tensor((starts_len,), T.int32),
++        compact_starts: T.Tensor((max_requests + 1,), T.int32),
++        indices: T.Tensor((capacity,), T.int64),
++        nr: T.int32,
++        nt: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(capacity, 128), threads=128) as bx:
++            row = bx * 128 + T.get_thread_binding()
++            bounds = T.alloc_local((2,), T.int32)
++            if row < capacity:
++                bounds[0] = 0
++                bounds[1] = nr
++                for _ in T.serial(steps):
++                    if bounds[0] < bounds[1]:
++                        mid = (bounds[0] + bounds[1]) // 2
++                        end = T.if_then_else(mid < nr, compact_starts[mid + 1], nt)
++                        if end <= row:
++                            bounds[0] = mid + 1
++                        else:
++                            bounds[1] = mid
++                request = bounds[0]
++                if request < nr:
++                    indices[row] = (
++                        T.cast(starts[request + 1], T.int64)
++                        - compact_starts[request + 1]
++                        + row
++                    )
++                else:
++                    indices[row] = -1
++
++    return ced_indices
++
++
++def indices(starts, compact_starts, output, nr, nt):
++    indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)

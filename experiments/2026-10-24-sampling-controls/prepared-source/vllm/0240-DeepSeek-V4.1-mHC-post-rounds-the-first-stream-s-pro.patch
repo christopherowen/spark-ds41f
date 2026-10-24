@@ -1,0 +1,143 @@
+From 06043f2e106797aa099b06448dc00008859d97b3 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:17:22 +0200
+Subject: [PATCH 240/274] DeepSeek-V4.1: mHC post rounds the first stream's
+ product, as TileKernels does
+
+The standalone post differed from TileKernels' mhc_post_fwd in about 1 of
+70,000 values (GB10, image spark-ds41f:19f2c20ed4d6-next-4). TileKernels writes
+x_local = c * d; x_local += a[m] * b[m]. Of the first addition's two products
+nvcc fuses the left one, so its PTX for every output (all 96 chains of a
+thread, lowered with the deployed TileLang's nvcc flags for sm_121a) is
+
+    mul.f32     comb[0, n] * residual[0]
+    fma.rn.f32  post[n], x, .
+    fma.rn.f32  comb[m, n], residual[m], .    m = 1..3
+    cvt.rn.bf16.f32
+
+The port rounded post[n] * x instead (mul.rn.f32) and fused all four stream
+products. post_streams now writes TileKernels' sequence: the first stream's
+product, then T.fma for x and streams 1 to 3. Its PTX is TileKernels' to the
+instruction and operand (mul.f32, four fma.rn.f32, no ftz), with the same
+instruction count and registers as before.
+
+The fused post_pre entry already compiled to that sequence, by the same
+contraction of the same source shape. It now writes it with T.fma as well, so
+the standalone and fused posts no longer depend on nvcc's choice of product;
+its PTX keeps the same operations and register count.
+
+test_post_order_of_operations encoded the port's order: TileKernels gives
+eps, not eps (1 + 2^-7), for token 1's output 0 (5,120 values differed). Its
+docstring and expected values now state TileKernels' arithmetic, and output 1
+of token 1 adds the case that tells a fused post[n] * x from a rounded one.
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index bfb5b7d16..f3db073af 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -365,28 +365,34 @@ def _bf16(values, shape):
+ 
+ def test_post_order_of_operations(mhc):
+     """Inputs on which another order of the terms, another fused product or another
+-    starting value gives other bits. TileKernels' arithmetic per element:
+-    ``p = post[n] * x`` rounded to FP32, then ``p = fma(comb[m, n], residual[m], p)``
+-    for m = 0..3, then one rounding to BF16. The port gives those bits."""
+-    big, eps = 2.0**127, 2.0**-23
++    starting value gives other bits. TileKernels' arithmetic per element (nvcc's
++    contraction of ``post * x + comb[0] * residual[0] + ...``):
++    ``p = comb[0, n] * residual[0]`` rounded to FP32, ``p = fma(post[n], x, p)``,
++    then ``p = fma(comb[m, n], residual[m], p)`` for m = 1..3, then one rounding to
++    BF16. The port gives those bits."""
++    big, eps, u = 2.0**127, 2.0**-23, 2.0**-7
+     x = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+     residual = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+     post = torch.zeros(3, 4, device=DEVICE)
+     comb = torch.zeros(3, 4, 4, device=DEVICE)
+-    # Token 0, output 0: big + big overflows before -big is added; stream 1 first
+-    # would leave big.
++    # Token 0, output 0: big + big overflows before -big is added; stream 1 before
++    # x would leave big.
+     x[0], residual[0, 0], residual[0, 1] = big, big, -big
+     post[0, 0], comb[0, 0, 0], comb[0, 1, 0] = 1.0, 1.0, 1.0
+-    # Token 1, output 0: (1 + eps)(1 + 2^-7) - (1 + 2^-7) is eps (1 + 2^-7) with the
+-    # stream's product fused, eps had the product been rounded first.
+-    x[1], residual[1, 0] = -(1 + 2.0**-7), 1 + 2.0**-7
++    # Token 1, x = -(1 + u) and stream 0 = 1 + u. Output 0: the first stream's
++    # product (1 + eps)(1 + u) rounded to 1 + u + eps, then x added, gives eps; with
++    # that product fused, eps (1 + u). Output 1: x's product (1 + eps) x fused
++    # with the first stream's 1 + u gives -eps (1 + u); rounded first, -eps.
++    x[1], residual[1, 0] = -(1 + u), 1 + u
+     post[1, 0], comb[1, 0, 0] = 1.0, 1 + eps
++    post[1, 1], comb[1, 0, 1] = 1 + eps, 1.0
+     # Token 2: negative zeros from the first product on stay negative.
+     x[2], residual[2] = -0.0, -0.0
+     post[2], comb[2] = 1.0, 1.0
+     expected = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
+     expected[0, 0] = INF
+-    expected[1, 0] = eps * (1 + 2.0**-7)
++    expected[1, 0] = eps
++    expected[1, 1] = -eps * (1 + u)
+     expected[2] = -0.0
+     ours = mhc.post(x, residual, post, comb)
+     _assert_bits_equal(ours, _tk_post(x, residual, post, comb), "TileKernels: ")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index be7c3f248..abc09e079 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -218,12 +218,18 @@ def project_streams(
+             else:
+                 for n in T.unroll(MULT):
+                     if mode == "post_pre":
+-                        # post[n] * x + sum_m comb[m, n] * streams[m], in FP32.
++                        # post[n] * x + sum_m comb[m, n] * streams[m] in FP32, with
++                        # post_streams' (TileKernels') instruction sequence.
+                         for v in T.unroll(COLS):
+-                            av[v] = coef[MULT + n] * T.Cast(T.float32, xv[v])
+-                            for m in T.unroll(MULT):
+-                                av[v] += coef[2 * MULT + m * MULT + n] * T.Cast(
+-                                    T.float32, rv[m * COLS + v]
++                            av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
++                            av[v] = T.fma(
++                                coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
++                            )
++                            for m in T.unroll(1, MULT):
++                                av[v] = T.fma(
++                                    coef[2 * MULT + m * MULT + n],
++                                    T.Cast(T.float32, rv[m * COLS + v]),
++                                    av[v],
+                                 )
+                             nv[v] = T.Cast(T.bfloat16, av[v])
+                         if token < M:
+@@ -400,11 +406,15 @@ def post_streams(hidden_size: int, threads: int = 128):
+     """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
+     to the bit: ``out[n] = bf16(post[n] * x + sum_m comb[m, n] * residual[m])``.
+ 
+-    Per element, as TileKernels' compiled kernel computes it: the product
+-    ``post[n] * x`` rounded to FP32, then each stream's term added by one fused
+-    multiply-add, streams in order, and one rounding to BF16. ``T.fmul`` and
+-    ``T.fma`` fix those instruction boundaries, so no compiler contraction can
+-    move them. The fused ``post_pre`` entry gives the same bits.
++    Per element, as TileKernels' compiled kernel computes it: the first stream's
++    product ``comb[0, n] * residual[0]`` rounded to FP32, ``post[n] * x`` added to
++    it by a fused multiply-add, then streams 1 to 3 likewise, in order, and one
++    rounding to BF16. That is how nvcc contracts TileKernels'
++    ``post * x + comb[0] * residual[0] + ...``: of the first addition's two
++    products it fuses the left one, so the first stream's product is the one
++    rounded (PTX ``mul.f32``, then four ``fma.rn.f32``). Here the ``T.fma`` calls
++    fix that sequence: the rounded product's only use is an FMA's addend, which
++    nothing can contract. The fused ``post_pre`` entry computes the same sequence.
+ 
+     Each thread owns eight contiguous columns of one token: it loads them from
+     ``x`` and every stream (16-byte loads) and its token's mixes before any
+@@ -446,8 +456,9 @@ def post_streams(hidden_size: int, threads: int = 128):
+                     rv[m * VEC + v] = residual[token, m, col + v]
+             for n in T.unroll(MULT):
+                 for v in T.unroll(VEC):
+-                    acc = T.fmul(pm[n], T.Cast(T.float32, xv[v]))
+-                    for m in T.unroll(MULT):
++                    acc = cm[n] * T.Cast(T.float32, rv[v])
++                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
++                    for m in T.unroll(1, MULT):
+                         acc = T.fma(
+                             cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
+                         )

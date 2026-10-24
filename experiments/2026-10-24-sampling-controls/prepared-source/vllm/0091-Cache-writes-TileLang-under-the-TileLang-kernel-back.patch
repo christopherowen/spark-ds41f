@@ -1,0 +1,30 @@
+From 293f129e4804bf85387653495e9fc1d681d113ba Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:24:41 +0200
+Subject: [PATCH 091/274] Cache writes: TileLang under the TileLang kernel
+ backend
+
+The SWA and indexed KV-cache records come from the TileLang writers, the
+same bytes as B12X's write_cache. B12X's writer plans stay declared, as the
+RoPE plans do, until the attention's staging memory has its own
+reservation.
+
+(cherry picked from commit 7251a6f0b953156c700d98760701d81ada6432a8)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 80a0821e2..0f144a80f 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -92,6 +92,12 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
+ 
+ def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
+     """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
++    if kernels.uses_tilelang():
++        # The same bytes as B12X's writer; its plans stay declared.
++        from .tilelang.cache_writer import write_cache
++
++        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
++        return
+     mla.write_cache(
+         x,
+         cache,

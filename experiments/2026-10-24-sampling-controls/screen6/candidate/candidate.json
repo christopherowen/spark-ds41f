@@ -1,0 +1,57 @@
+{
+  "description": "Independent performance screens; min-p failure prints reference PTX, other families still run. No runtime dispatch changes.",
+  "image": "spark-ds41f:19f2c20ed4d6-next-4",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-sampling-controls",
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+  },
+  "workdir": "vllm",
+  "argv": [
+    "-c",
+    "import subprocess,sys\ncodes=[]\nfor k in ['min_p','penalties','bincount,bincount_repeated']:\n print('=== BENCH '+k,flush=True)\n codes.append(subprocess.run([sys.executable,'benchmarks/kernels/benchmark_sampling_controls.py','--gate','--kernels',k],timeout=900).returncode)\nprint('BENCH EXIT CODES',codes,flush=True)\nsys.exit(any(codes))"
+  ],
+  "verdict": "status",
+  "mounts": [
+    [
+      "vllm_v1_worker_gpu_sample_tilelang_controls.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_controls.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_sample_tilelang_auxiliary.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_sample_tilelang_thinking.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_thinking.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_sample_tilelang_bias.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_bias.py"
+    ],
+    [
+      "tests_v1_worker_test_gpu_sampling_controls.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_sampling_controls.py"
+    ],
+    [
+      "tests_v1_worker_test_gpu_thinking_budget.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_thinking_budget.py"
+    ],
+    [
+      "tests_v1_worker_test_gpu_logit_bias.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_logit_bias.py"
+    ],
+    [
+      "benchmarks_kernels_benchmark_sampling_controls.py",
+      "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_sampling_controls.py"
+    ],
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ],
+    [
+      "/usr/local/cuda-13.0/compute-sanitizer",
+      "/opt/compute-sanitizer"
+    ]
+  ]
+}

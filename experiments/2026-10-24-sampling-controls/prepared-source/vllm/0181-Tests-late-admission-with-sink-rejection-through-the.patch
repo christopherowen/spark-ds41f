@@ -1,0 +1,338 @@
+From c6a567adaca9db52a3b6d2fe2610e58cc3adfead Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 07:56:43 +0200
+Subject: [PATCH 181/274] Tests: late admission with sink rejection through the
+ engine-core loop
+
+Late admission (0222) decides step N+1 when step N reaches the admission
+layer, after taking the client requests that arrived meanwhile; sink
+rejection (0221) holds each decoding request's last sampled token and
+schedules it as draft zero of its next step. N's output is unprocessed when
+N+1 is decided either way, so the held tokens and placeholders are the same;
+what the later decision changes is which arrivals and aborts it sees.
+
+tests/v1/engine/test_late_admission_sink.py runs the real
+step_with_batch_queue around the real async scheduler and the sink tests'
+scripted V2-runner worker, on the Say hi. collapse case:
+- an arrival beside a held draft zero joins one step earlier with late
+  admission, and both replies are identical with and without it (0 and 3
+  drafter tokens, arrivals at three points);
+- an abort that arrives while a token is held ends the request without
+  emitting a token it never verified, its neighbour unchanged;
+- a structured-output step sampled through the deferred path back-fills
+  draft zero ahead of the drafts, and the grammar accepts committed tokens
+  only, with late admission waiting on that deferred step.
+
+tests/v1/engine/test_late_admission.py: the engine-core construction becomes
+engine_core(scheduler, executor, late_admission, admit) for both files.
+
+Upstream status: local; not proposed.
+
+diff --git a/tests/v1/engine/test_late_admission.py b/tests/v1/engine/test_late_admission.py
+index 019431eef..a82862a2f 100644
+--- a/tests/v1/engine/test_late_admission.py
++++ b/tests/v1/engine/test_late_admission.py
+@@ -79,19 +79,12 @@ def opt_model_path(tmp_path):
+     return str(tmp_path)
+ 
+ 
+-def _engine(model: str, late_admission: bool):
+-    log: list = []
+-    arrivals: list = []
+-    scheduler = create_scheduler(
+-        model=model,
+-        skip_tokenizer_init=True,
+-        device="cpu",
+-        async_scheduling=True,
+-        max_model_len=256,
+-    )
++def engine_core(scheduler, executor, late_admission: bool, admit) -> EngineCore:
++    """An engine core with async scheduling's batch queue around a test scheduler
++    and executor; ``admit`` plays the arrival of client requests."""
+     engine = object.__new__(EngineCore)
+     engine.scheduler = scheduler
+-    engine.model_executor = FakeExecutor(log)
++    engine.model_executor = executor
+     engine.batch_queue_size = 2
+     engine.batch_queue = deque(maxlen=2)
+     engine.late_admission = late_admission
+@@ -105,6 +98,20 @@ def _engine(model: str, late_admission: bool):
+     engine._wait_for_boundary_checkpoint_copies = Mock()
+     engine._process_aborts_queue = Mock()
+     engine._attach_iteration_details = Mock()
++    engine._admit_arrivals = admit
++    return engine
++
++
++def _engine(model: str, late_admission: bool):
++    log: list = []
++    arrivals: list = []
++    scheduler = create_scheduler(
++        model=model,
++        skip_tokenizer_init=True,
++        device="cpu",
++        async_scheduling=True,
++        max_model_len=256,
++    )
+ 
+     def admit():
+         log.append(("admit", [r.request_id for r in arrivals]))
+@@ -112,7 +119,7 @@ def _engine(model: str, late_admission: bool):
+             scheduler.add_request(request)
+         arrivals.clear()
+ 
+-    engine._admit_arrivals = admit
++    engine = engine_core(scheduler, FakeExecutor(log), late_admission, admit)
+     return engine, log, arrivals
+ 
+ 
+diff --git a/tests/v1/engine/test_late_admission_sink.py b/tests/v1/engine/test_late_admission_sink.py
+new file mode 100644
+index 000000000..de8fed982
+--- /dev/null
++++ b/tests/v1/engine/test_late_admission_sink.py
+@@ -0,0 +1,244 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Late admission with sink rejection: the deferred decision and draft zero.
++
++Under late admission the engine core decides step N+1 when step N reaches the
++admission layer, after taking the client requests that arrived meanwhile. With
++sink rejection each decoding request's last sampled token is held and scheduled
++as draft zero of its next step. N's output is still unprocessed when N+1 is
++decided either way, so the held tokens and the placeholders behind them are the
++same; what changes is which arrivals and aborts the decision sees.
++
++These tests run the real engine-core loop (step_with_batch_queue) around the
++real async scheduler and the scripted V2-runner worker of the sink tests: the
++collapse case ``Say hi.``, whose `` can`` is held, flagged as draft zero and
++replaced.
++"""
++
++from concurrent.futures import Future
++from dataclasses import dataclass, field
++
++import pytest
++
++from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, DraftTokenIds
++from vllm.v1.request import Request, RequestStatus
++
++from ..core.test_sink_draft_zero import (
++    CAN,
++    SAY_HI,
++    ScriptedGrammar,
++    ScriptedGrammarBackend,
++    ScriptedWorker,
++    _make_request,
++    _scheduler,
++    _script,
++    expected_reply,
++)
++from .test_late_admission import ReachedLayer, engine_core
++
++pytestmark = pytest.mark.cpu_test
++
++
++@pytest.fixture(autouse=True)
++def sink_rejection_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    # As in the sink tests: the test model has no entry in SINK_CHANNELS.
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_COLUMN", "2455")
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
++    monkeypatch.setenv("VLLM_SINK_REJECTION", "1")
++    monkeypatch.setenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
++
++
++class ScriptedExecutor:
++    """execute_model replies when the step reaches the admission layer. The
++    scripted worker runs the step as it is launched (its inputs are fixed
++    then), and a deferred step takes back the drafts it consumes, as the V2
++    runner's take_draft_token_ids hands back the drafts of the step before."""
++
++    def __init__(self, worker: ScriptedWorker):
++        self.worker = worker
++        self.log: list = []
++        self.batches: list[list[str]] = []
++        self.pending = None
++        self.outputs: dict[int, object] = {}
++
++    def execute_model(self, scheduler_output, non_block=False):
++        if scheduler_output.total_num_scheduled_tokens == 0:
++            # A step without a forward replies at once.
++            future: Future = Future()
++            future.set_result(EMPTY_MODEL_RUNNER_OUTPUT)
++            return future
++        self.batches.append(sorted(scheduler_output.num_scheduled_tokens))
++        self.pending = scheduler_output
++        self.outputs[id(scheduler_output)] = self.worker.execute(scheduler_output)
++        return ReachedLayer(self.log, len(self.batches))
++
++    def sample_tokens(self, grammar_output, non_block=False):
++        future: Future = Future()
++        future.set_result(self.outputs.pop(id(self.pending)))
++        return future
++
++    def take_draft_token_ids(self) -> DraftTokenIds | None:
++        consumed = self.worker.consumed_drafts[id(self.pending)]
++        if not consumed:
++            return None
++        return DraftTokenIds(list(consumed), [list(d) for d in consumed.values()])
++
++
++@dataclass
++class EngineRun:
++    emitted: dict[str, list[int]] = field(default_factory=dict)
++    finished: dict[str, object] = field(default_factory=dict)
++    # Per request: the index of the first batch that carried it.
++    first_batch: dict[str, int] = field(default_factory=dict)
++    aborted: list[str] = field(default_factory=list)
++    # Steps sampled through the engine core's deferred path.
++    deferred: int = 0
++
++
++def drive_engine(
++    scheduler,
++    worker: ScriptedWorker,
++    *,
++    late_admission: bool,
++    arrivals_at: dict[int, list] | None = None,
++    check_for_draft_tokens: bool = False,
++    max_calls: int = 400,
++) -> EngineRun:
++    """The engine process's busy loop: take the client requests that arrived,
++    then one engine step. ``arrivals_at[k]`` (requests, or ``("abort", id)``)
++    arrive during the k-th step call, after the loop took its queue: late
++    admission takes them inside that call before it decides its step; otherwise
++    the loop takes them before the next call."""
++    run = EngineRun()
++    arrivals_at = dict(arrivals_at or {})
++    arrived: list = []
++
++    def admit() -> None:
++        for item in arrived:
++            if isinstance(item, Request):
++                scheduler.add_request(item)
++            else:
++                _, req_id = item
++                scheduler.finish_requests(req_id, RequestStatus.FINISHED_ABORTED)
++                run.aborted.append(req_id)
++        arrived.clear()
++
++    executor = ScriptedExecutor(worker)
++    engine = engine_core(scheduler, executor, late_admission, admit)
++    engine.check_for_draft_tokens = check_for_draft_tokens
++    sample_deferred = engine._sample_deferred_batch
++
++    def counted(*args) -> None:
++        run.deferred += 1
++        sample_deferred(*args)
++
++    engine._sample_deferred_batch = counted
++    calls = 0
++    while scheduler.has_requests() or engine.batch_queue or arrivals_at or arrived:
++        calls += 1
++        assert calls <= max_calls
++        admit()
++        arrived.extend(arrivals_at.pop(calls, []))
++        if not scheduler.has_requests() and not engine.batch_queue:
++            continue
++        outputs, _ = engine.step_with_batch_queue()
++        for eco in (outputs or {}).values():
++            for out in eco.outputs:
++                run.emitted.setdefault(out.request_id, []).extend(out.new_token_ids)
++                if out.finish_reason is not None:
++                    run.finished[out.request_id] = out
++        for request in scheduler.running:
++            assert request.num_output_placeholders >= 0
++    for index, batch in enumerate(executor.batches):
++        for req_id in batch:
++            run.first_batch.setdefault(req_id, index)
++    return run
++
++
++@pytest.mark.parametrize("num_drafts", [None, 3])
++@pytest.mark.parametrize("arrival_call", [2, 3, 4])
++def test_an_arrival_beside_a_held_draft_zero(num_drafts, arrival_call):
++    """'b' arrives while 'a' decodes ``Say hi.`` around its sunk `` can``.
++    Late admission puts 'b' in the step after the one in flight, one step
++    earlier than without it; 'a''s draft zero is still rejected and replaced,
++    and both replies are identical with and without late admission."""
++    scripts = {"a": SAY_HI, "b": _script(31, 32, 33, 34)}
++
++    def run(late_admission: bool) -> EngineRun:
++        scheduler = _scheduler(True, num_drafts)
++        scheduler.add_request(_make_request("a", max_tokens=24))
++        worker = ScriptedWorker(
++            scheduler, scripts, num_drafts or 0, draft_errors={("a", 1): 999}
++        )
++        return drive_engine(
++            scheduler,
++            worker,
++            late_admission=late_admission,
++            arrivals_at={arrival_call: [_make_request("b", max_tokens=8)]},
++        )
++
++    late, plain = run(True), run(False)
++    assert late.first_batch["b"] == plain.first_batch["b"] - 1
++    for result in (late, plain):
++        assert result.emitted["a"] == expected_reply(SAY_HI, 24)
++        assert result.emitted["b"] == expected_reply(scripts["b"], 8)
++        assert CAN not in result.emitted["a"]
++        assert result.finished["a"].sink_metrics.num_draft_zero_rejections == 1
++        assert result.finished["b"].sink_metrics.num_flagged_rows == 0
++
++
++@pytest.mark.parametrize("late_admission", [True, False])
++@pytest.mark.parametrize("abort_call", [2, 3, 4, 5, 6])
++def test_an_abort_while_a_token_is_held(late_admission, abort_call):
++    """An abort of 'a' arrives while a step runs and 'a' holds a provisional
++    token. Late admission takes it before deciding the next step: 'a' ends
++    without emitting a token it never verified, `` can`` included, and its
++    batch neighbour's reply is unchanged."""
++    scripts = {"a": SAY_HI, "b": _script(31, 32, 33, 34)}
++    scheduler = _scheduler(True, 2)
++    for req_id in scripts:
++        scheduler.add_request(_make_request(req_id, max_tokens=12))
++    worker = ScriptedWorker(scheduler, scripts, 2, draft_errors={("a", 1): 999})
++    result = drive_engine(
++        scheduler,
++        worker,
++        late_admission=late_admission,
++        arrivals_at={abort_call: [("abort", "a")]},
++    )
++    emitted = result.emitted.get("a", [])
++    assert CAN not in emitted
++    assert emitted == expected_reply(SAY_HI, len(emitted))
++    assert result.emitted["b"] == expected_reply(scripts["b"], 12)
++    assert not scheduler.has_requests()
++
++
++@pytest.mark.parametrize("late_admission", [True, False])
++def test_deferred_structured_step_back_fills_draft_zero(late_admission):
++    """A structured request's step waits for its predecessor's output before
++    it is sampled (the engine core's deferred path), then back-fills draft
++    zero, the held token, ahead of the drafts. With late admission the next
++    decision waits on that deferred step. The grammar accepts the committed
++    tokens only, `` can`` never among them."""
++    vocab_size = 1024
++    scheduler = _scheduler(True, 2)
++    grammar = ScriptedGrammar([set(c) for c in SAY_HI], vocab_size)
++    scheduler.structured_output_manager.backend = ScriptedGrammarBackend(vocab_size)
++    request = _make_request("a", max_tokens=10, structured=True)
++    assert request.structured_output_request is not None
++    request.structured_output_request.grammar = grammar
++    scheduler.add_request(request)
++    scripts = {"a": SAY_HI, "b": _script(31, 32, 33, 34)}
++    worker = ScriptedWorker(scheduler, scripts, 2, draft_errors={("a", 1): 999})
++    result = drive_engine(
++        scheduler,
++        worker,
++        late_admission=late_admission,
++        arrivals_at={3: [_make_request("b", max_tokens=8)]},
++        check_for_draft_tokens=True,
++    )
++    assert result.deferred > 0
++    assert result.emitted["a"] == expected_reply(SAY_HI, 10)
++    assert grammar.accepted == result.emitted["a"]
++    assert CAN not in grammar.accepted
++    assert result.emitted["b"] == expected_reply(scripts["b"], 8)
++    assert result.finished["a"].sink_metrics.num_draft_zero_rejections == 1

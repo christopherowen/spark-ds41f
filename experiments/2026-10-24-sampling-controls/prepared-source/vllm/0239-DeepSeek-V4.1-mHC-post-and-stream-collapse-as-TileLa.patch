@@ -1,0 +1,831 @@
+From 291ae03a8ffd60ef581122042f3310831cbca40f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:06:30 +0200
+Subject: [PATCH 239/274] DeepSeek-V4.1: mHC post and stream collapse as
+ TileLang kernels
+
+The standalone mHC post (Engram layers, GLP steering, the last layer) and the
+stream collapse (the head's input, the drafter's auxiliary states) were the two
+TileKernels CUDA kernels the forward still launched (mhc_post_fwd_cuda_kernel,
+mhc_pre_apply_mix_fwd_cuda_kernel; spark-ds41f
+experiments/2026-10-24-tilelang-completion, step 3). They are now TileLang
+kernels in tilelang/mhc.py: post_streams (mhc_post_kernel) and
+collapse_streams (mhc_collapse_kernel), with TileKernels' arithmetic to the
+bit.
+
+Per element, TileKernels' compiled post (tree cb2fa41c) rounds post[n] * x to
+FP32 (FMUL), adds the four terms comb[m, n] * residual[m] in stream order with
+one FFMA each and rounds once to BF16. Its collapse starts from positive zero,
+adds mix[m] * state[m] in stream order with one FMA each (tl::fma2) and rounds
+once. The ports write those boundaries with T.fmul and T.fma, so no compiler
+contraction can move them. Lowered and compiled for sm_121a, every output of
+both ports has TileKernels' chain (post: mul, then four fma.rn; collapse: four
+fma.rn from zero), as does the fused post_pre entry's post.
+
+Each thread owns eight contiguous columns of one token and issues all its
+16-byte loads (x, the four streams, the token's mixes) before any arithmetic:
+one memory round trip a token instead of TileKernels' one CTA a token looping
+over 1,024-column blocks through shared memory. A flat grid keeps a token's
+column blocks adjacent and takes any token count. Rows are independent, so a
+token's result does not depend on the batch.
+
+TileKernelsMHC declares and binds both calls for kernel preparation; the warm
+that ran TileKernels' eager kernels on a zero token is gone. post still sums
+RankOrderParts in rank order before folding. TileKernels stays installed; its
+kernels are the tests' reference.
+
+Tests: at 1, 6, 96, 384, 2,048 and 16,384 tokens the post and the collapse
+(weighted and mean) give TileKernels' bits, signed zeros included; so does the
+post of RankOrderParts from two to four ranks. Inputs on which another term
+order, another fused product or another starting value changes the result
+give TileKernels' bits and the stated values. The standalone post gives the
+fused post_pre entry's streams. Rows do not depend on the batch, results
+repeat, NaNs and infinities in any operand give TileKernels' bits and move no
+other token, and the declared calls are the forward's with nothing left to
+warm. benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py times both ports
+against TileKernels' kernels in paired CUDA graphs after checking their bits;
+--gate fails if either is slower at 96 or 16,384 tokens.
+
+Validation: Ruff 0.16.10 lint and format checks and py_compile; both ports
+and TileKernels' kernels lowered with the deployed TileLang (b95ee4ff with the
+SM120 patches) and compiled with nvcc 13.0 for sm_121a without a GPU, their
+PTX and SASS compared. The GPU tests and the benchmark have not run.
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py b/benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py
+new file mode 100644
+index 000000000..7365d64b8
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of DeepSeek-V4.1's TileLang mHC post and stream collapse
++against the TileKernels CUDA kernels they replace (``mhc_post_fwd``,
++``mhc_pre_apply_mix_fwd``), at serving shapes: four BF16 streams of 5,120.
++
++Each shape is measured on eight fresh inputs; on each, both kernels' outputs are
++first checked bit for bit against each other, then CUDA graphs of 100 calls of both
++run back to back, alternating which goes first, and the case's 95% interval comes
++from the eight per-input differences. The gate (``--gate``) is that neither port is
++slower at a decode step (16 requests of 1 + 5 drafted tokens: 96 tokens) or a
++long-prefill chunk (16,384 tokens).
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import tile_kernels
++import torch
++
++# Registers the ops.
++from vllm.models.deepseek_v4_1.tilelang import mhc  # noqa: F401
++
++STREAMS, HIDDEN = 4, 5120
++SHAPES = {"decode c1": 6, "decode c16": 96, "prefill 8K": 8192, "prefill 16K": 16384}
++GATED = ("decode c16", "prefill 16K")
++
++
++def post_case(tokens: int, seed: int):
++    """The TileLang post and TileKernels' on one fresh input, each with its output."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++
++    def randn(*shape):
++        return torch.randn(
++            *shape, generator=generator, device="cuda", dtype=torch.bfloat16
++        )
++
++    x = randn(tokens, HIDDEN)
++    residual = randn(tokens, STREAMS, HIDDEN)
++    post = 2 * torch.sigmoid(
++        torch.randn(tokens, STREAMS, generator=generator, device="cuda")
++    )
++    comb = torch.softmax(
++        torch.randn(tokens, STREAMS, STREAMS, generator=generator, device="cuda"), -1
++    )
++    ours_out, theirs_out = torch.empty_like(residual), torch.empty_like(residual)
++
++    def ours():
++        torch.ops.vllm.dsv41_tilelang_mhc_post(x, residual, post, comb, ours_out)
++
++    def theirs():
++        tile_kernels.mhc.mhc_post_fwd(
++            x.view(1, tokens, HIDDEN),
++            residual.view(1, tokens, STREAMS, HIDDEN),
++            post.view(1, tokens, STREAMS, 1),
++            comb.view(1, tokens, STREAMS, STREAMS),
++            out=theirs_out.view(1, tokens, STREAMS, HIDDEN),
++        )
++
++    return ours, theirs, ours_out, theirs_out
++
++
++def collapse_case(tokens: int, seed: int):
++    """The TileLang stream collapse and TileKernels' on one fresh input."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    state = torch.randn(tokens, STREAMS, HIDDEN, generator=generator, device="cuda")
++    state = state.bfloat16()
++    mix = torch.randn(tokens, STREAMS, generator=generator, device="cuda").sigmoid()
++    ours_out = torch.empty(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16)
++    theirs_out = torch.empty_like(ours_out)
++
++    def ours():
++        torch.ops.vllm.dsv41_tilelang_mhc_collapse(state, mix, ours_out)
++
++    def theirs():
++        tile_kernels.mhc.mhc_pre_apply_mix_fwd(state, mix, theirs_out)
++
++    return ours, theirs, ours_out, theirs_out
++
++
++CASES = {"post": post_case, "collapse": collapse_case}
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 10  # ms / 100 calls to microseconds
++
++
++def measure(name: str, tokens: int, samples: int = 8) -> dict:
++    ours_us, theirs_us, differences = [], [], []
++    for sample in range(samples):
++        ours_call, theirs_call, ours_out, theirs_out = CASES[name](tokens, sample)
++        ours_call()
++        theirs_call()
++        torch.cuda.synchronize()
++        if not torch.equal(ours_out.view(torch.int16), theirs_out.view(torch.int16)):
++            raise SystemExit(f"{name}, {tokens} tokens: bits differ from TileKernels'")
++        ours, theirs = graph(ours_call), graph(theirs_call)
++        pair = (ours, theirs) if sample % 2 == 0 else (theirs, ours)
++        times = {id(capture): elapsed(capture) for capture in pair}
++        ours_us.append(times[id(ours)])
++        theirs_us.append(times[id(theirs)])
++        differences.append(times[id(ours)] - times[id(theirs)])
++        del ours, theirs, pair
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(samples)  # t(7), 95%
++    return {
++        "tokens": tokens,
++        "tilelang_us": statistics.median(ours_us),
++        "tile_kernels_us": statistics.median(theirs_us),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    results = {
++        name: {shape: measure(name, tokens) for shape, tokens in SHAPES.items()}
++        for name in CASES
++    }
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        slower = [
++            f"{name} {shape}"
++            for name in CASES
++            for shape in GATED
++            if results[name][shape]["interval_us"][0] > 0
++        ]
++        if slower:
++            raise SystemExit(f"TileLang port slower at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index f5bdc9575..bfb5b7d16 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -1,8 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek-V4.1 lagged mHC on TileKernels against the FP32 reference, with
+-results independent of the batch."""
++results independent of the batch; the standalone post and the stream collapse bit
++for bit against TileKernels' CUDA kernels they replace (``mhc_post_fwd``,
++``mhc_pre_apply_mix_fwd``)."""
+ 
++import functools
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -17,13 +20,18 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ pytest.importorskip("tilelang")
+-pytest.importorskip("tile_kernels")
++tile_kernels = pytest.importorskip("tile_kernels")
+ 
+ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
+     NAN,
+     assert_other_rows_equal,
+     assert_rows_nan,
++    assert_same_nonfinite,
+ )
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import mhc as mhc_module  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
+     RankOrderParts,
+ )
+@@ -31,6 +39,8 @@ from vllm.models.deepseek_v4_1.tilelang.mhc import (  # noqa: E402
+     BLOCK_H,
+     MIXES,
+     TileKernelsMHC,
++    collapse_streams,
++    post_streams,
+     project_streams,
+ )
+ 
+@@ -241,3 +251,285 @@ def test_post_and_collapse(mhc):
+     _close_bf16(mhc.collapse(residual, mix), weighted)
+     mean = residual.float().mean(1).bfloat16()
+     _close_bf16(mhc.collapse(residual), mean)
++
++
++# The standalone post and the stream collapse: TileLang ports of TileKernels'
++# CUDA kernels, held to their bits (BF16 bit patterns, so signed zeros count).
++
++SERVING_TOKENS = [1, 6, 96, 384, 2048, 16384]
++
++
++def _bits(t: torch.Tensor) -> torch.Tensor:
++    return t.view(torch.int16)
++
++
++def _assert_bits_equal(actual, expected, what=""):
++    assert actual.shape == expected.shape and actual.dtype == expected.dtype
++    differ = _bits(actual) != _bits(expected)
++    if differ.any():
++        where = differ.nonzero()[:4].tolist()
++        raise AssertionError(
++            f"{what}{int(differ.sum())} of {differ.numel()} values differ in their "
++            f"bits; first at {where}"
++        )
++
++
++def _tk_post(x, residual, post, comb):
++    """TileKernels' ``mhc_post_fwd`` (``mhc_post_fwd_cuda_kernel``), as the forward
++    called it before the port."""
++    tokens, hidden = x.shape
++    out = torch.empty_like(residual)
++    tile_kernels.mhc.mhc_post_fwd(
++        x.view(1, tokens, hidden),
++        residual.view(1, tokens, 4, hidden),
++        post.view(1, tokens, 4, 1),
++        comb.view(1, tokens, 4, 4),
++        out=out.view(1, tokens, 4, hidden),
++    )
++    return out
++
++
++def _tk_collapse(state, mix):
++    """TileKernels' ``mhc_pre_apply_mix_fwd`` (``mhc_pre_apply_mix_fwd_cuda_kernel``),
++    as the forward called it before the port."""
++    out = torch.empty(
++        (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
++    )
++    tile_kernels.mhc.mhc_pre_apply_mix_fwd(state, mix, out)
++    return out
++
++
++def _post_inputs(tokens, seed):
++    """A post's operands at serving magnitudes: the sublayer's BF16 output and
++    streams, the post-mix in (0, 2), combination rows summing to one; the first
++    eight columns are negative zeros (TileKernels keeps the sign)."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(tokens, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16)
++    residual = torch.randn(
++        tokens, 4, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16
++    )
++    post = 2 * torch.sigmoid(torch.randn(tokens, 4, generator=g, device=DEVICE))
++    comb = torch.softmax(torch.randn(tokens, 4, 4, generator=g, device=DEVICE), -1)
++    x[:, :8] = -0.0
++    residual[:, :, :8] = -0.0
++    return x, residual, post, comb
++
++
++def _pre_mix(tokens, seed):
++    """An incoming pre-mix: sigmoid values plus ``hc_eps``."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    return torch.sigmoid(torch.randn(tokens, 4, generator=g, device=DEVICE)) + 1e-6
++
++
++@pytest.mark.parametrize("tokens", SERVING_TOKENS)
++def test_post_bits_match_tile_kernels(mhc, tokens):
++    x, residual, post, comb = _post_inputs(tokens, seed=500 + tokens)
++    _assert_bits_equal(
++        mhc.post(x, residual, post, comb), _tk_post(x, residual, post, comb)
++    )
++
++
++@pytest.mark.parametrize("tokens", SERVING_TOKENS)
++def test_collapse_bits_match_tile_kernels(mhc, tokens):
++    """The weighted collapse and the mean; columns whose streams are all negative
++    zeros collapse to positive zero, as TileKernels' do."""
++    _, state, _, _ = _post_inputs(tokens, seed=600 + tokens)
++    mix = _pre_mix(tokens, seed=700 + tokens)
++    _assert_bits_equal(mhc.collapse(state, mix), _tk_collapse(state, mix), "mix: ")
++    quarter = torch.full((tokens, 4), 0.25, device=DEVICE)
++    _assert_bits_equal(mhc.collapse(state), _tk_collapse(state, quarter), "mean: ")
++    assert (_bits(mhc.collapse(state, mix)[:, :8]) == 0).all()
++
++
++@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
++def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):
++    """The ranks' unreduced partials are summed in rank order first (RankOrderParts),
++    then folded: TileKernels' post of that sum, bit for bit."""
++    _, residual, post, comb = _post_inputs(tokens, seed=800 + tokens)
++    g = torch.Generator(device=DEVICE).manual_seed(world * 1000 + tokens)
++    parts = torch.randn(
++        world, tokens, HIDDEN, generator=g, device=DEVICE, dtype=torch.bfloat16
++    )
++    parts[0, 0, :8] = -0.0  # a signed zero, added to nothing, survives
++    summed = RankOrderParts(parts).sum()
++    _assert_bits_equal(
++        mhc.post(RankOrderParts(parts), residual, post, comb),
++        _tk_post(summed, residual, post, comb),
++    )
++
++
++def _bf16(values, shape):
++    return torch.tensor(values, device=DEVICE).bfloat16().expand(shape).clone()
++
++
++def test_post_order_of_operations(mhc):
++    """Inputs on which another order of the terms, another fused product or another
++    starting value gives other bits. TileKernels' arithmetic per element:
++    ``p = post[n] * x`` rounded to FP32, then ``p = fma(comb[m, n], residual[m], p)``
++    for m = 0..3, then one rounding to BF16. The port gives those bits."""
++    big, eps = 2.0**127, 2.0**-23
++    x = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
++    residual = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
++    post = torch.zeros(3, 4, device=DEVICE)
++    comb = torch.zeros(3, 4, 4, device=DEVICE)
++    # Token 0, output 0: big + big overflows before -big is added; stream 1 first
++    # would leave big.
++    x[0], residual[0, 0], residual[0, 1] = big, big, -big
++    post[0, 0], comb[0, 0, 0], comb[0, 1, 0] = 1.0, 1.0, 1.0
++    # Token 1, output 0: (1 + eps)(1 + 2^-7) - (1 + 2^-7) is eps (1 + 2^-7) with the
++    # stream's product fused, eps had the product been rounded first.
++    x[1], residual[1, 0] = -(1 + 2.0**-7), 1 + 2.0**-7
++    post[1, 0], comb[1, 0, 0] = 1.0, 1 + eps
++    # Token 2: negative zeros from the first product on stay negative.
++    x[2], residual[2] = -0.0, -0.0
++    post[2], comb[2] = 1.0, 1.0
++    expected = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
++    expected[0, 0] = INF
++    expected[1, 0] = eps * (1 + 2.0**-7)
++    expected[2] = -0.0
++    ours = mhc.post(x, residual, post, comb)
++    _assert_bits_equal(ours, _tk_post(x, residual, post, comb), "TileKernels: ")
++    _assert_bits_equal(ours, expected, "expected: ")
++
++
++def test_collapse_order_of_operations(mhc):
++    """TileKernels' collapse per element: ``s = +0``, then ``s = fma(mix[m],
++    state[m], s)`` for m = 0..3, then one rounding to BF16."""
++    big, eps = 2.0**127, 2.0**-23
++    state = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
++    mix = torch.zeros(3, 4, device=DEVICE)
++    # Token 0: big + big overflows before -big is added.
++    state[0, 0], state[0, 1], state[0, 2] = big, big, -big
++    mix[0, :3] = 1.0
++    # Token 1: the second stream's product fused with the first.
++    state[1, 0], state[1, 1] = -(1 + 2.0**-7), 1 + 2.0**-7
++    mix[1, 0], mix[1, 1] = 1.0, 1 + eps
++    # Token 2: four negative-zero products added to the positive zero start.
++    state[2] = -0.0
++    mix[2] = 0.25
++    expected = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
++    expected[0] = INF
++    expected[1] = eps * (1 + 2.0**-7)
++    ours = mhc.collapse(state, mix)
++    _assert_bits_equal(ours, _tk_collapse(state, mix), "TileKernels: ")
++    _assert_bits_equal(ours, expected, "expected: ")
++
++
++def test_post_matches_the_fused_entry(mhc):
++    """The standalone post and a sublayer entry's fused post write the same
++    streams, bit for bit."""
++    for tokens in (1, 96, 300):
++        residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=900 + tokens)
++        x, _, post, comb = _post_inputs(tokens, seed=950 + tokens)
++        fused = mhc.post_pre(x, residual, post, comb, fn, scale, base, weight, incoming)
++        _assert_bits_equal(mhc.post(x, residual, post, comb), fused[0], f"{tokens}: ")
++
++
++def test_post_and_collapse_rows_independent_of_batch(mhc):
++    x, residual, post, comb = _post_inputs(384, seed=31)
++    mix = _pre_mix(384, seed=32)
++    full_post = mhc.post(x, residual, post, comb)
++    full_collapse = mhc.collapse(residual, mix)
++    for rows in (slice(0, 1), slice(0, 6), slice(0, 96), slice(0, 97), slice(200, 201)):
++        _assert_bits_equal(
++            mhc.post(x[rows], residual[rows], post[rows], comb[rows]),
++            full_post[rows],
++            f"post {rows}: ",
++        )
++        _assert_bits_equal(
++            mhc.collapse(residual[rows], mix[rows]),
++            full_collapse[rows],
++            f"collapse {rows}: ",
++        )
++
++
++def test_post_and_collapse_repeatable(mhc):
++    x, residual, post, comb = _post_inputs(2048, seed=41)
++    mix = _pre_mix(2048, seed=42)
++    first_post = mhc.post(x, residual, post, comb)
++    first_collapse = mhc.collapse(residual, mix)
++    for _ in range(3):
++        _assert_bits_equal(mhc.post(x, residual, post, comb), first_post)
++        _assert_bits_equal(mhc.collapse(residual, mix), first_collapse)
++
++
++def test_post_nonfinite_like_tile_kernels(mhc):
++    """NaNs and infinities in any operand reach exactly TileKernels' outputs, with
++    its bits; no other token moves."""
++    tokens = 33
++    x, residual, post, comb = _post_inputs(tokens, seed=51)
++    clean = mhc.post(x, residual, post, comb)
++    x[2, 100] = NAN
++    residual[5, 1, 7] = INF
++    residual[9, 0, 300], residual[9, 3, 300] = INF, -INF  # inf - inf
++    post[12, 2] = NAN
++    comb[17, 3, 1] = -INF
++    residual[20, 2, 4000], comb[20, 2] = INF, 0.0  # inf * 0
++    x[25, 4500] = -INF
++    poisoned = [2, 5, 9, 12, 17, 20, 25]
++    ours = mhc.post(x, residual, post, comb)
++    theirs = _tk_post(x, residual, post, comb)
++    assert_same_nonfinite(ours, theirs)
++    _assert_bits_equal(ours, theirs)
++    assert_other_rows_equal(ours, clean, poisoned)
++
++
++def test_collapse_nonfinite_like_tile_kernels(mhc):
++    tokens = 33
++    _, state, _, _ = _post_inputs(tokens, seed=61)
++    mix = _pre_mix(tokens, seed=62)
++    clean = mhc.collapse(state, mix)
++    state[3, 0, 11] = NAN
++    state[8, 2, 2048] = INF
++    state[14, 1, 77], state[14, 3, 77] = INF, -INF  # inf - inf
++    mix[19, 1] = NAN
++    state[23, 2, 5000], mix[23, 2] = -INF, 0.0  # inf * 0
++    mix[29, 0] = INF
++    poisoned = [3, 8, 14, 19, 23, 29]
++    ours = mhc.collapse(state, mix)
++    theirs = _tk_collapse(state, mix)
++    assert_same_nonfinite(ours, theirs)
++    _assert_bits_equal(ours, theirs)
++    assert_other_rows_equal(ours, clean, poisoned)
++    assert_rows_nan(ours, [19])
++
++
++def test_no_tokens_launch_nothing(mhc):
++    x, residual, post, comb = _post_inputs(0, seed=0)
++    assert mhc.post(x, residual, post, comb).shape == (0, 4, HIDDEN)
++    assert mhc.collapse(residual).shape == (0, HIDDEN)
++
++
++def test_declared_calls_are_the_forwards(mhc, monkeypatch):
++    """The post and the collapse are declared exactly as the forward launches them,
++    and nothing is left to warm: TileKernels' kernels no longer run."""
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        mhc.declare_kernels()
++    declared = prepare.declared_calls(registry)
++    assert prepare.warm_declared(registry) == 0
++    ours = [call for call in declared if call[0] in (post_streams, collapse_streams)]
++    assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
++
++    # The forward's calls, recorded as its cached lookups make them.
++    launched = []
++    for name in ("post_streams", "collapse_streams"):
++        factory = getattr(mhc_module, name)
++
++        def record(*args, _factory=factory, **kwargs):
++            launched.append((_factory, args, kwargs))
++            return _factory(*args, **kwargs)
++
++        monkeypatch.setattr(mhc_module, name, record)
++    for name in ("_post", "_collapse"):
++        lookup = getattr(mhc_module, name)
++        monkeypatch.setattr(mhc_module, name, functools.cache(lookup.__wrapped__))
++    x, residual, post, comb = _post_inputs(6, seed=71)
++    mhc.post(x, residual, post, comb)
++    mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
++    mhc.collapse(residual, _pre_mix(6, seed=72))
++    mhc.collapse(residual)
++    assert sorted(launched, key=lambda call: call[0].__name__) == sorted(
++        ours, key=lambda call: call[0].__name__
++    )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index ea229b519..be7c3f248 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -10,12 +10,20 @@ collapsed with the *incoming* pre-mix, RMS-normalized with the norm weight.
+ The new pre-mix is returned for the next sublayer (the lag). ``post`` folds a
+ sublayer's output back into the streams.
+ 
+-TileKernels provides DeepSeek's mHC kernels. A standalone ``post`` and the
+-final stream collapse use them as they are. A sublayer's entry needs more:
+-DeepSeek moved the projection GEMM to DeepGEMM, which does not run on
+-SM120/SM121, TileKernels' fused pre step applies the mix it has just computed
+-rather than the lagged one, and in prefill the four streams are large enough
+-that reading them once matters. Two TileLang kernels make each entry:
++TileKernels provides DeepSeek's mHC kernels. A standalone ``post`` (where no
++sublayer entry follows to fuse it: Engram layers, GLP steering, the last layer)
++and the stream collapse (the head's input, the drafter's auxiliary states) are
++TileLang ports of TileKernels' ``mhc_post_fwd`` and ``mhc_pre_apply_mix_fwd``
++with their arithmetic to the bit:
++
++- ``post_streams``: ``bf16(post[n] * x + sum_m comb[m, n] * streams[m])``;
++- ``collapse_streams``: ``bf16(sum_m mix[m] * streams[m])``.
++
++A sublayer's entry needs more: DeepSeek moved the projection GEMM to DeepGEMM,
++which does not run on SM120/SM121, TileKernels' fused pre step applies the mix
++it has just computed rather than the lagged one, and in prefill the four streams
++are large enough that reading them once matters. Two TileLang kernels make each
++entry:
+ 
+ - ``project_streams``: per hidden block, the previous sublayer's ``post``
+   (writing the updated streams), the projection's split partials on TF32
+@@ -387,6 +395,114 @@ def finalize(
+     return mhc_finalize
+ 
+ 
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def post_streams(hidden_size: int, threads: int = 128):
++    """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
++    to the bit: ``out[n] = bf16(post[n] * x + sum_m comb[m, n] * residual[m])``.
++
++    Per element, as TileKernels' compiled kernel computes it: the product
++    ``post[n] * x`` rounded to FP32, then each stream's term added by one fused
++    multiply-add, streams in order, and one rounding to BF16. ``T.fmul`` and
++    ``T.fma`` fix those instruction boundaries, so no compiler contraction can
++    move them. The fused ``post_pre`` entry gives the same bits.
++
++    Each thread owns eight contiguous columns of one token: it loads them from
++    ``x`` and every stream (16-byte loads) and its token's mixes before any
++    arithmetic, so a token costs one memory round trip rather than TileKernels'
++    pipelined loop over 1,024-column blocks. The grid is flat, a token's column
++    blocks adjacent, so any token count launches. No element reads another, so a
++    token's result does not depend on the batch.
++    """
++    assert hidden_size % (threads * VEC) == 0
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def mhc_post(
++        x: T.Tensor((M, hidden_size), T.bfloat16),
++        residual: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        post: T.Tensor((M, MULT), T.float32),
++        comb: T.Tensor((M, MULT, MULT), T.float32),
++        out: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            token = pid // blocks
++            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++            xv = T.alloc_local((VEC,), T.bfloat16)
++            rv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            ov = T.alloc_local((MULT * VEC,), T.bfloat16)
++            pm = T.alloc_local((MULT,), T.float32)
++            cm = T.alloc_local((MULT * MULT,), T.float32)
++            acc = T.alloc_var(T.float32)
++            for n in T.vectorized(MULT):
++                pm[n] = post[token, n]
++            for m in T.unroll(MULT):
++                for n in T.vectorized(MULT):
++                    cm[m * MULT + n] = comb[token, m, n]
++            for v in T.vectorized(VEC):
++                xv[v] = x[token, col + v]
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    rv[m * VEC + v] = residual[token, m, col + v]
++            for n in T.unroll(MULT):
++                for v in T.unroll(VEC):
++                    acc = T.fmul(pm[n], T.Cast(T.float32, xv[v]))
++                    for m in T.unroll(MULT):
++                        acc = T.fma(
++                            cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
++                        )
++                    ov[n * VEC + v] = T.Cast(T.bfloat16, acc)
++            for n in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    out[token, n, col + v] = ov[n * VEC + v]
++
++    return mhc_post
++
++
++@tilelang.jit(pass_configs=_PASS_CONFIGS)
++def collapse_streams(hidden_size: int, threads: int = 128):
++    """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
++    ``out = bf16(sum_m mix[m] * state[m])``.
++
++    Per element, as TileKernels' compiled kernel computes it: from a positive
++    zero, each stream's term added by one fused multiply-add, streams in order,
++    and one rounding to BF16. Starting from zero rather than the first product
++    matters only in sign: four negative-zero products sum to positive zero, as
++    TileKernels' do. The thread mapping is ``post_streams``'.
++    """
++    assert hidden_size % (threads * VEC) == 0
++    blocks = hidden_size // (threads * VEC)
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def mhc_collapse(
++        state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++        mix: T.Tensor((M, MULT), T.float32),
++        out: T.Tensor((M, hidden_size), T.bfloat16),
++    ):
++        with T.Kernel(M * blocks, threads=threads) as pid:
++            token = pid // blocks
++            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
++            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++            ov = T.alloc_local((VEC,), T.bfloat16)
++            mv = T.alloc_local((MULT,), T.float32)
++            acc = T.alloc_var(T.float32)
++            for m in T.vectorized(MULT):
++                mv[m] = mix[token, m]
++            for m in T.unroll(MULT):
++                for v in T.vectorized(VEC):
++                    sv[m * VEC + v] = state[token, m, col + v]
++            for v in T.unroll(VEC):
++                acc = T.float32(0)
++                for m in T.unroll(MULT):
++                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++                ov[v] = T.Cast(T.bfloat16, acc)
++            for v in T.vectorized(VEC):
++                out[token, col + v] = ov[v]
++
++    return mhc_collapse
++
++
+ def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
+     """The ``project_streams`` call of a sublayer entry."""
+     return prepare.call(project_streams, hidden, mode, block_M=BLOCK_M, world=world)
+@@ -399,6 +515,16 @@ def _finalize_call(
+     return prepare.call(finalize, hidden, k, rms_eps, hc_eps, iterations, rms_eps)
+ 
+ 
++def _post_call(hidden: int) -> prepare.TileLangCall:
++    """The standalone ``post``'s call."""
++    return prepare.call(post_streams, hidden)
++
++
++def _collapse_call(hidden: int) -> prepare.TileLangCall:
++    """The stream collapse's call."""
++    return prepare.call(collapse_streams, hidden)
++
++
+ def _make(call: prepare.TileLangCall):
+     function, args, kwargs = call
+     return function(*args, **kwargs)
+@@ -414,10 +540,14 @@ def _finalize(hidden: int, k: int, rms_eps: float, hc_eps: float, iterations: in
+     return _make(_finalize_call(hidden, k, rms_eps, hc_eps, iterations))
+ 
+ 
+-def _tile_kernels_mhc():
+-    import tile_kernels
++@cache
++def _post(hidden: int):
++    return _make(_post_call(hidden))
++
+ 
+-    return tile_kernels.mhc
++@cache
++def _collapse(hidden: int):
++    return _make(_collapse_call(hidden))
+ 
+ 
+ @torch.library.custom_op(
+@@ -525,12 +655,12 @@ def _mhc_post(
+     tokens, hidden = int(residual.shape[0]), int(residual.shape[-1])
+     if tokens == 0:
+         return
+-    _tile_kernels_mhc().mhc_post_fwd(
+-        x.view(1, tokens, hidden),
+-        residual.view(1, tokens, MULT, hidden),
+-        post.view(1, tokens, MULT, 1),
+-        comb.view(1, tokens, MULT, MULT),
+-        out=out.view(1, tokens, MULT, hidden),
++    _post(hidden)(
++        x.view(tokens, hidden),
++        residual.view(tokens, MULT, hidden),
++        post.view(tokens, MULT),
++        comb.view(tokens, MULT, MULT),
++        out.view(tokens, MULT, hidden),
+     )
+ 
+ 
+@@ -541,9 +671,14 @@ def _mhc_post_fake(x, residual, post, comb, out):
+ 
+ @torch.library.custom_op("vllm::dsv41_tilelang_mhc_collapse", mutates_args=("out",))
+ def _mhc_collapse(state: torch.Tensor, mix: torch.Tensor, out: torch.Tensor) -> None:
+-    if state.shape[0] == 0:
++    tokens, hidden = int(state.shape[0]), int(state.shape[-1])
++    if tokens == 0:
+         return
+-    _tile_kernels_mhc().mhc_pre_apply_mix_fwd(state, mix, out)
++    _collapse(hidden)(
++        state.view(tokens, MULT, hidden),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++    )
+ 
+ 
+ @_mhc_collapse.register_fake
+@@ -551,19 +686,6 @@ def _mhc_collapse_fake(state, mix, out):
+     return None
+ 
+ 
+-@cache
+-def _warm_post_and_collapse(hidden: int) -> None:
+-    """TileKernels' post and stream collapse, run once on one zero token, so their
+-    eager kernels (keyed by the stream count, the hidden size and TileKernels' PDL
+-    switch) are compiled before the cache freezes."""
+-    x = torch.zeros((1, hidden), dtype=torch.bfloat16, device="cuda")
+-    residual = torch.zeros((1, MULT, hidden), dtype=torch.bfloat16, device="cuda")
+-    mix = torch.zeros((1, MULT), dtype=torch.float32, device="cuda")
+-    comb = torch.zeros((1, MULT, MULT), dtype=torch.float32, device="cuda")
+-    _mhc_post(x, residual, mix, comb, torch.empty_like(residual))
+-    _mhc_collapse(residual, mix, torch.empty_like(x))
+-
+-
+ class TileKernelsMHC(nn.Module):
+     """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
+ 
+@@ -585,8 +707,8 @@ class TileKernelsMHC(nn.Module):
+         return entries
+ 
+     def declare_kernels(self) -> None:
+-        """Declare every sublayer entry's kernels and warm TileKernels' post and
+-        stream collapse, so that no forward (or CUDA graph capture) compiles."""
++        """Declare every sublayer entry's kernels, the standalone post and the stream
++        collapse, so that no forward (or CUDA graph capture) compiles."""
+         hidden = self.hidden_size
+         entries = self._entries()
+         # The broadcast entry projects one stream; the others all four.
+@@ -597,6 +719,8 @@ class TileKernelsMHC(nn.Module):
+             return [
+                 *(_project_call(hidden, mode, world) for mode, world in entries),
+                 *(_finalize_call(hidden, k, *mix) for k in widths),
++                _post_call(hidden),
++                _collapse_call(hidden),
+             ]
+ 
+         def bind() -> None:
+@@ -605,8 +729,10 @@ class TileKernelsMHC(nn.Module):
+                 _project(hidden, mode, world)
+             for k in widths:
+                 _finalize(hidden, k, *mix)
++            _post(hidden)
++            _collapse(hidden)
+ 
+-        prepare.declare(calls, bind=bind, warm=lambda: _warm_post_and_collapse(hidden))
++        prepare.declare(calls, bind=bind)
+ 
+     def pre(
+         self,
+@@ -696,4 +822,10 @@ class TileKernelsMHC(nn.Module):
+         return out
+ 
+ 
+-__all__ = ["TileKernelsMHC", "finalize", "project_streams"]
++__all__ = [
++    "TileKernelsMHC",
++    "collapse_streams",
++    "finalize",
++    "post_streams",
++    "project_streams",
++]

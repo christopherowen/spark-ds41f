@@ -1,0 +1,85 @@
+From 640260885b694011c15071503b72c11b8cdee339 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:08:46 +0200
+Subject: [PATCH 198/274] CED gates: exercise identity plans, large batches and
+ serving row widths
+
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_ced.py b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+index a219fea12..e991126bf 100644
+--- a/benchmarks/kernels/benchmark_deepseek_v41_ced.py
++++ b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+@@ -108,7 +108,13 @@ def requests_cases():
+                     128,
+                 ),
+                 lambda: ced.requests(
+-                    starts, seq, limits, prefix, *outputs[1], requests
++                    starts,
++                    seq,
++                    limits,
++                    prefix,
++                    *outputs[1],
++                    requests,
++                    compact=length > 128,
+                 ),
+                 lambda: all(torch.equal(a, b) for a, b in zip(*outputs)),
+             )
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 5b210158d..ff5af2929 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -21,7 +21,7 @@ from vllm.triton_utils import triton  # noqa: E402
+ 
+ 
+ @pytest.mark.parametrize("max_requests", [1, 8, 16, 32, 48, 64])
+-@pytest.mark.parametrize("nr", [0, 1, 3])
++@pytest.mark.parametrize("nr", [0, 1, 3, 35, 64])
+ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
+     """Per-request limits preserve the old 128/full-row metadata, including padding."""
+     from vllm.models.deepseek_v4_1.ced import _decoder_requests
+@@ -63,6 +63,21 @@ def test_ced_requests_preserves_compaction_and_replay_bounds(max_requests, nr):
+                 ced.requests(
+                     starts, seq, limits, prefix, out, positions, replay, counts, nr
+                 )
++            if implementation == "tilelang" and all(
++                q <= 128 or r % 2 == 0 for r, q in enumerate(lengths)
++            ):
++                ced.requests(
++                    starts,
++                    seq,
++                    limits,
++                    prefix,
++                    out,
++                    positions,
++                    replay,
++                    counts,
++                    nr,
++                    compact=False,
++                )
+             outputs.append((out, positions, replay, counts))
+         for reference, actual in zip(*outputs):
+             assert torch.equal(reference, actual)
+@@ -93,6 +108,23 @@ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, trans
+     assert torch.equal(scatter_rows(output, indices, 7), restored)
+ 
+ 
++@pytest.mark.parametrize("rows", [1, 48, 4048])
++@pytest.mark.parametrize("tail", [(5120,), (4, 5120)])
++def test_ced_row_copy_serving_widths(rows, tail):
++    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    source = torch.randn((rows, *tail), dtype=torch.bfloat16, device=DEVICE)
++    indices = torch.arange(max(0, rows - 128), rows, dtype=torch.int64, device=DEVICE)
++    expected = gather_rows(source, indices)
++    output = torch.empty_like(expected)
++    ced.copy_rows(source, indices, output, False)
++    assert torch.equal(expected, output)
++    restored = torch.zeros_like(source)
++    ced.copy_rows(output, indices, restored, True)
++    assert torch.equal(scatter_rows(output, indices, rows), restored)
++
++
+ @pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
+ @pytest.mark.parametrize("padding", [0, 1, 127])
+ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):

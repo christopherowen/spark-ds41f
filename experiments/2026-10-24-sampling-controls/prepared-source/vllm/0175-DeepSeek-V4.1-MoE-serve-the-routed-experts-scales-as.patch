@@ -1,0 +1,122 @@
+From 160be60f9f4e0a23c4ba7a880c962224dcafe954 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:37:46 +0200
+Subject: [PATCH 175/274] DeepSeek V4.1 MoE: serve the routed experts' scales
+ as row bases and 4-bit codes
+
+The plan's grouped GEMMs read coded scales (half the scale bytes) and the TileLang
+experts layer keeps the codes in place of the scale words, with each GEMM's row bases
+beside its K tails. Output bits are unchanged.
+
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 2b8d8bb4d..6b96eb6cf 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -190,19 +190,22 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             out_dtype=self.output_dtype,
+         )
+         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
+-        # weights and scales are contiguous. A K that ends 64 past a multiple
++        # weights and scale codes are contiguous. A K that ends 64 past a multiple
+         # of 128 (TP4's 576-wide rows) keeps its last 64 columns as compact tails.
+-        (t13, tail13, words13), (t2, tail2, words2) = self._plan.prepare_weights(
+-            w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
++        (t13, tail13, codes13, base13), (t2, tail2, codes2, base2) = (
++            self._plan.prepare_weights(
++                w13, layer.w13_weight_scale, w2, layer.w2_weight_scale
++            )
+         )
+         for name, tensor in (
+             ("w13_weight", t13),
+-            ("w13_weight_scale", words13),
++            ("w13_weight_scale", codes13),
+             ("w2_weight", t2),
+-            ("w2_weight_scale", words2),
++            ("w2_weight_scale", codes2),
+         ):
+             replace_parameter(layer, name, tensor)
+         self._tails = (tail13, tail2)
++        self._bases = (base13, base2)
+         self.quant_config._w1.scale = layer.w13_weight_scale
+         self.quant_config._w2.scale = layer.w2_weight_scale
+ 
+@@ -275,7 +278,11 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         if not topk_ids.is_contiguous():
+             raise TypeError("TileLang MoE topk_ids must be contiguous")
+         tail13, tail2 = self._tails
+-        weights = ((w1, tail13, self.w1_scale), (w2, tail2, self.w2_scale))
++        base13, base2 = self._bases
++        weights = (
++            (w1, tail13, self.w1_scale, base13),
++            (w2, tail2, self.w2_scale, base2),
++        )
+         workspace = workspace2.view(-1).view(torch.uint8)
+         shared = None
+         if self.fold_shared:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index aeafa8857..6145c211d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -51,7 +51,7 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ from .gemm import (
+     SF_BLOCK,
+-    pack_scale_words,
++    pack_scale_codes,
+     scale_words,
+ )
+ from .linear import _calls, _launch, _warm_casts
+@@ -1180,7 +1180,9 @@ class MoeExpertsV41Plan:
+ 
+     def kernels(self) -> dict:
+         """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
+-        config = dict(block_N=self.block_N, num_stages=self.num_stages)
++        config = dict(
++            block_N=self.block_N, num_stages=self.num_stages, coded_scales=True
++        )
+         num_experts, topk, hidden, inter = (
+             self.num_experts,
+             self.topk,
+@@ -1232,16 +1234,25 @@ class MoeExpertsV41Plan:
+         prepare.declare(calls, bind=bind, warm=lambda: _warm_casts(self.hidden))
+ 
+     def prepare_weights(self, w13, w13_scale, w2, w2_scale):
+-        """Per GEMM ``(tiles, tails, scale words)`` from E2M1 weights and UE8M0.
++        """Per GEMM ``(tiles, tails, scale codes, row bases)`` from E2M1 weights and
++        UE8M0 scales.
+ 
+         ``tails`` is None unless the GEMM's K is 64 past a multiple of 128 (the
+-        down projection of TP4's 576-wide expert rows).
++        down projection of TP4's 576-wide expert rows). The scales are kept as
++        ``pack_scale_codes``' row bases and 4-bit codes in ``tile_codes`` layout,
++        half the bytes of their words; the GEMMs expand them to the same words.
+         """
+-        return tuple(
+-            (*tile_expert_weights(w.view(torch.int8), self.block_N),
+-             pack_scale_words(scale))
+-            for w, scale in ((w13, w13_scale), (w2, w2_scale))
+-        )  # fmt: skip
++        prepared = []
++        for w, scale in ((w13, w13_scale), (w2, w2_scale)):
++            codes, base = pack_scale_codes(scale)
++            prepared.append(
++                (
++                    *tile_expert_weights(w.view(torch.int8), self.block_N),
++                    tile_codes(codes, self.block_N),
++                    base,
++                )
++            )
++        return tuple(prepared)
+ 
+     def workspace_specs(self, rows, idx_dtype=torch.int64):
+         dispatch = self.dispatch[idx_dtype]
+@@ -1293,7 +1304,8 @@ class MoeExpertsV41Plan:
+ 
+ 
+ def _present(weights):
+-    """A GEMM's weight arguments: the tiles, the K tails when it has them, the words."""
++    """A GEMM's weight arguments: the tiles, the K tails when it has them, the scale
++    codes and the row bases."""
+     return tuple(w for w in weights if w is not None)
+ 
+ 

@@ -1,0 +1,202 @@
+From c001cc4ed77bef686ddd006be0dd706b9c15d7b7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 20:41:22 +0200
+Subject: [PATCH 172/274] PyNCCL row all-to-all over a four-node ring: the far
+ rank through a neighbour
+
+Engram's sequence-parallel exchange (all_to_all_rows, 0150) sent every peer
+its block directly. On a switchless four-node ring ranks two apart share no
+cable, so NCCL's connection to the opposite rank timed out while r6s and r6u
+profiled memory (r6s was released on the triangle only).
+
+At four ranks, each rank now sends its neighbours their blocks and each half
+of the opposite rank's block through one neighbour, which forwards it in a
+second group, as the rank-order reduce-scatter's exchange does; the four links
+carry equal bytes, blocks keep their real lengths and their bits. Other rank
+counts keep the direct exchange.
+
+Test: PyNcclCommunicator.all_to_all_rows with every rank a thread over a
+simulated fabric: every block arrives bit for bit with short and empty last
+blocks, later rows unwritten, and at four ranks only neighbours exchange (the
+direct exchange fails it, connecting ranks 0-2 and 1-3).
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index d180b568a..8b4f02503 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -2,7 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """A sequence-parallel projection reduce-scattered in slices lands every row where
+ one projection and one reduce-scatter put it (one rank's view, the others'
+-contributions stood in by zeros)."""
++contributions stood in by zeros); the row exchange gives each rank its rows of every
++block, over the cabled pairs only."""
++
++import collections
++import threading
+ 
+ import pytest
+ import torch
+@@ -162,3 +166,84 @@ def test_row_exchange_gives_each_rank_its_rows_of_every_block(
+         assert torch.equal(
+             packed[:real], product[rows.start : rows.start + real, :width]
+         )
++
++
++class _Fabric:
++    """PyNCCL ranks as threads: when every rank has ended a group, each receive takes
++    the next send from its peer to it (NCCL's per-pair order), shapes checked and
++    every send consumed. Records which pairs exchanged."""
++
++    def __init__(self, world: int):
++        self.world = world
++        self.barrier = threading.Barrier(world, timeout=30)
++        self.ops: list[list] = [[] for _ in range(world)]
++        self.pairs: set[frozenset] = set()
++
++    def comm(self, rank: int):
++        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
++
++        comm = PyNcclCommunicator.__new__(PyNcclCommunicator)
++        comm.disabled, comm.world_size, comm.rank = False, self.world, rank
++        comm.group_start = lambda: None
++        comm.send = lambda t, peer, stream: self.ops[rank].append(("send", peer, t))
++        comm.recv = lambda t, peer, stream: self.ops[rank].append(("recv", peer, t))
++        comm.group_end = lambda: self._end(rank)
++        return comm
++
++    def _end(self, rank: int) -> None:
++        self.barrier.wait()
++        if rank == 0:
++            sends = collections.defaultdict(collections.deque)
++            for source, ops in enumerate(self.ops):
++                for kind, peer, tensor in ops:
++                    if kind == "send":
++                        sends[(source, peer)].append(tensor)
++            for destination, ops in enumerate(self.ops):
++                for kind, peer, tensor in ops:
++                    if kind == "recv":
++                        sent = sends[(peer, destination)].popleft()
++                        assert sent.shape == tensor.shape, (peer, destination)
++                        tensor.copy_(sent)
++                        self.pairs.add(frozenset((peer, destination)))
++            assert not any(sends.values()), "a send nobody received"
++            self.ops = [[] for _ in range(self.world)]
++        self.barrier.wait()
++
++
++@pytest.mark.parametrize("world", [3, 4])
++@pytest.mark.parametrize("short", [0, 3, 9, 10, 25])
++def test_row_all_to_all_over_cabled_pairs(world, short, rows=10):
++    """PyNCCL's ``all_to_all_rows``, every rank a thread: each rank receives every
++    rank's block of its real rows bit for bit and later rows stay unwritten, with the
++    last blocks short or empty; at four ranks (the switchless ring) only neighbours
++    exchange, since ranks two apart share no cable."""
++    total = max(1, world * rows - short)
++    fabric = _Fabric(world)
++    inputs = [torch.randn(total, 6) for _ in range(world)]
++    outputs = [torch.full((world, rows, 6), float("nan")) for _ in range(world)]
++    errors = []
++
++    def run(rank: int) -> None:
++        try:
++            fabric.comm(rank).all_to_all_rows(
++                outputs[rank], inputs[rank], rows, stream=object()
++            )
++        except BaseException as error:  # reported below, with the rank
++            errors.append((rank, error))
++            fabric.barrier.abort()
++
++    threads = [threading.Thread(target=run, args=(r,)) for r in range(world)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    assert not errors, errors
++    for me in range(world):
++        real = max(0, min(rows, total - me * rows))
++        for source in range(world):
++            got = outputs[me][source]
++            assert torch.equal(got[:real], inputs[source][me * rows : me * rows + real])
++            assert got[real:].isnan().all(), (me, source)
++    if world == 4:
++        ring = {frozenset((r, (r + 1) % 4)) for r in range(4)}
++        assert fabric.pairs <= ring, sorted(map(sorted, fabric.pairs - ring))
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index aa45fde56..64d16a712 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -568,7 +568,8 @@ class PyNcclCommunicator:
+         ``[r * rows, (r + 1) * rows)``, the last ranks' blocks short or empty when
+         ``input_`` has fewer rows; ``output[s, :n]`` receives rank s's block for this
+         rank (n its real rows, the same from every rank), and later rows are not
+-        written. One grouped send/recv per peer."""
++        written. One grouped send/recv per peer; at four ranks, neighbours only
++        (``_all_to_all_rows_ring``)."""
+         if self.disabled:
+             return
+         world, me, total = self.world_size, self.rank, input_.shape[0]
+@@ -586,6 +587,9 @@ class PyNcclCommunicator:
+         mine = real(me)
+         if mine:
+             output[me, :mine].copy_(input_[me * rows : me * rows + mine])
++        if world == 4:
++            self._all_to_all_rows_ring(output, input_, rows, real, stream)
++            return
+         self.group_start()
+         for peer in range(world):
+             if peer == me:
+@@ -596,6 +600,53 @@ class PyNcclCommunicator:
+                 self.recv(output[peer, :mine], peer, stream)
+         self.group_end()
+ 
++    def _all_to_all_rows_ring(self, output, input_, rows, real, stream) -> None:
++        """``all_to_all_rows`` over a switchless four-node ring (sparknet's ring4
++        cable order): ranks two apart share no cable, so NCCL cannot connect them.
++        Each rank sends its neighbours their blocks and each half of the opposite
++        rank's block through one neighbour, which forwards it in a second group, as
++        the rank-order reduce-scatter does (``deepseek_v4_1.tilelang.collectives.
++        exchange_into``); the four links carry equal bytes. Blocks keep their real
++        lengths, the same on both ends of every transfer."""
++        me = self.rank
++        nxt, prv, opp = (me + 1) % 4, (me + 3) % 4, (me + 2) % 4
++
++        def block(rank: int) -> torch.Tensor:
++            return input_[rank * rows : rank * rows + real(rank)]
++
++        def half(rank: int) -> int:  # rows of a block for ``rank`` that go the next way
++            return -(-real(rank) // 2)
++
++        def send(tensor: torch.Tensor, peer: int) -> None:
++            if tensor.shape[0]:
++                self.send(tensor, peer, stream)
++
++        def recv(tensor: torch.Tensor, peer: int) -> None:
++            if tensor.shape[0]:
++                self.recv(tensor, peer, stream)
++
++        mine, tail = real(me), input_.shape[1:]
++        # In transit: the previous rank's block for the next rank (its first half),
++        # and the next rank's block for the previous rank (its second half).
++        relay_a = input_.new_empty((half(nxt), *tail))
++        relay_b = input_.new_empty((real(prv) - half(prv), *tail))
++        self.group_start()
++        send(block(nxt), nxt)
++        send(block(opp)[: half(opp)], nxt)
++        send(block(prv), prv)
++        send(block(opp)[half(opp) :], prv)
++        recv(output[prv, :mine], prv)
++        recv(relay_a, prv)
++        recv(output[nxt, :mine], nxt)
++        recv(relay_b, nxt)
++        self.group_end()
++        self.group_start()
++        send(relay_a, nxt)
++        send(relay_b, prv)
++        recv(output[opp, : half(me)], prv)
++        recv(output[opp, half(me) : mine], nxt)
++        self.group_end()
++
+     def group_start(self):
+         self.nccl.ncclGroupStart()
+ 

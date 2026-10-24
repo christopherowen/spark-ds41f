@@ -1,0 +1,64 @@
+From d184584f71f4c71725fd713c1223988773fbb8cf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 17:58:10 +0200
+Subject: [PATCH 119/274] TileLang V4.1 WO: sequence-parallel steps through the
+ rank-order projection
+
+The TileLang WO projection finished a sequence-parallel step with a plain
+reduce-scatter. On r6e those steps keep the attention output as unreduced
+rank-order parts (project_reduce_scatter), which the B12X path uses, so a row's
+sum over ranks equals the non-SP step's all-reduce. The plain reduce-scatter
+summed in another order: prompts prefilled sequence-parallel rounded otherwise
+(mixed15 9 of 16 requests differed). The TileLang path now projects through
+project_reduce_scatter in the same slices.
+
+(cherry picked from commit 8e6ac25a6007c37155bd2a0932facb1d0688e4f0)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 06eefc5ac..9957cb734 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -2114,20 +2114,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         return self._wo_plans[key]
+ 
+     def _o_proj_tilelang(self, o, positions, sp_rows):
+-        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place."""
++        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place.
++
++        A sequence-parallel step projects through ``project_reduce_scatter`` as the
++        B12X path does: in slices, and as unreduced rank-order parts when the step
++        keeps them, so a row's sum over ranks is the non-SP step's all-reduce."""
+         rows, hidden = o.shape[0], self.hidden_size
+-        if sp_rows is None:
+-            local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
+-        else:
++        cache = self.rotary_emb.cos_sin_cache
++        if sp_rows is not None:
+             if rows != sp_rows.num_tokens:
+                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+-            # Leading rows of the zero-padded buffer the reduce-scatter reads.
+-            padded = sp_rows.empty_padded((hidden,), torch.bfloat16, o.device)
+-            local = padded[:rows]
+-        self._wo_projection_weights(o, positions, self.rotary_emb.cos_sin_cache, local)
++
++            def project(start, stop, out):
++                self._wo_projection_weights(
++                    o[start:stop], positions[start:stop], cache, out
++                )
++
++            return sp_rows.project_reduce_scatter(
++                project,
++                (hidden,),
++                torch.bfloat16,
++                o.device,
++                slices=sp_prefill.wo_slices(rows),
++                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
++            )
++        local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
++        self._wo_projection_weights(o, positions, cache, local)
+         l2_prefetch.issue(self._l2pf_ffn, rows)
+-        if sp_rows is not None:
+-            return sp_rows.reduce_scatter(padded)
+         if get_tensor_model_parallel_world_size() > 1:
+             local = get_tp_group().all_reduce(local)
+         return local

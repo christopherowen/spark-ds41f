@@ -1,0 +1,794 @@
+From b089768a11ad54ebd88dd38db413f82f7e7617e9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:52:44 +0200
+Subject: [PATCH 150/274] Kernel preparation: owners declare from a walk of the
+ loaded model; TileLang linear methods declare, bind and warm
+
+prepare.declare(calls, bind, warm): calls() lists an owner's own TileLang calls
+(compiled in one pool), warm() runs kernels whose keys their library computes
+(TileKernels) on placeholder inputs, bind() stores the owner's kernels after the
+cache freezes. The worker lets every module (declare_kernels) and every
+module's linear method (declare_layer_kernels) declare after loading, since
+methods are often attached after a layer is built.
+
+The block-32 FP8, BF16, scaled and split linear methods declare their GEMMs
+from the same key tables their binds use and warm TileKernels' per-token cast
+for each small-batch bucket they can launch; weight processing keeps only the
+scale words and the power-of-two fold.
+
+diff --git a/tests/models/test_deepseek_v4_1_prepare.py b/tests/models/test_deepseek_v4_1_prepare.py
+index 73a8e81e2..6919a376f 100644
+--- a/tests/models/test_deepseek_v4_1_prepare.py
++++ b/tests/models/test_deepseek_v4_1_prepare.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek V4.1 TileLang kernels are declared into the runner's JIT registry."""
+ 
++import tilelang
++
+ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+@@ -17,40 +19,45 @@ def _rope(heads, dim):
+ def test_declared_calls_are_collected_once_each():
+     registry = JitWarmupRegistry(vllm_config=None)
+     with registry.activate():
+-        prepare.declare(_gemm, lambda: [prepare.call(1024, 512, block_M=16)])
++        prepare.declare(lambda: [prepare.call(_gemm, 1024, 512, block_M=16)])
+         # A second owner declaring the same call (another layer of the same shape).
+         prepare.declare(
+-            _gemm,
+             lambda: [
+-                prepare.call(1024, 512, block_M=16),
+-                prepare.call(1024, 512, block_M=32),
+-            ],
++                prepare.call(_gemm, 1024, 512, block_M=16),
++                prepare.call(_gemm, 1024, 512, block_M=32),
++                prepare.call(_rope, 8, 512),
++            ]
+         )
+-        prepare.declare(_rope, lambda: [prepare.call(8, 512)])
+-    calls = prepare.declared_calls(registry)
+-    assert sorted(
+-        (fn.__name__, args, tuple(sorted(kw.items()))) for fn, args, kw in calls
+-    ) == [
++    calls = sorted(
++        (fn.__name__, args, tuple(sorted(kw.items())))
++        for fn, args, kw in prepare.declared_calls(registry)
++    )
++    assert calls == [
+         ("_gemm", (1024, 512), (("block_M", 16),)),
+         ("_gemm", (1024, 512), (("block_M", 32),)),
+         ("_rope", (8, 512), ()),
+     ]
+ 
+ 
+-def test_declaring_outside_a_collecting_registry_is_a_no_op():
+-    prepare.declare(_rope, lambda: [prepare.call(8, 512)])  # no active registry
+-
+-
+-def test_calls_are_listed_when_preparing_not_when_declaring():
++def test_calls_are_listed_and_kernels_bound_when_preparing():
+     registry = JitWarmupRegistry(vllm_config=None)
+-    listed = []
++    events = []
+ 
+     def calls():
+-        listed.append(True)
+-        return [prepare.call(4, 128)]
++        events.append("listed")
++        return [prepare.call(_rope, 4, 128)]
+ 
+     with registry.activate():
+-        prepare.declare(_rope, calls)
+-    assert not listed
++        prepare.declare(calls, bind=lambda: events.append("bound"))
++    assert events == []
+     prepare.declared_calls(registry)
+-    assert listed
++    prepare.bind_declared(registry)
++    assert events == ["listed", "bound"]
++
++
++def test_standalone_declaration_prepares_and_binds_now(monkeypatch):
++    prepared = []
++    monkeypatch.setattr(tilelang, "prepare", lambda calls, **kw: prepared.extend(calls))
++    bound = []
++    prepare.declare(lambda: [prepare.call(_rope, 2, 64)], bind=lambda: bound.append(1))
++    assert prepared == [(_rope, (2, 64), {})] and bound == [1]
+diff --git a/vllm/model_executor/warmup/jit_warmup.py b/vllm/model_executor/warmup/jit_warmup.py
+index fc12272ff..749e8ab3a 100644
+--- a/vllm/model_executor/warmup/jit_warmup.py
++++ b/vllm/model_executor/warmup/jit_warmup.py
+@@ -1042,6 +1042,11 @@ class JitWarmupRegistry:
+         finally:
+             self._active.reset(token)
+ 
++    @classmethod
++    def active(cls) -> JitWarmupRegistry | None:
++        """The registry collecting registrations in this context, if any."""
++        return cls._active.get()
++
+     @classmethod
+     def register(
+         cls,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 5f5efcc83..26ebd3a7e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -14,6 +14,7 @@ The kernels run inside custom ops, which keeps them opaque to torch.compile,
+ and borrow activation scratch from vLLM's workspace.
+ """
+ 
++import functools
+ import math
+ from weakref import WeakValueDictionary
+ 
+@@ -22,6 +23,7 @@ from torch import nn
+ 
+ from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+ from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
++from vllm.models.deepseek_v4_1.tilelang import prepare
+ from vllm.v1.worker.workspace import (
+     current_preallocated_workspace,
+     current_workspace_manager,
+@@ -234,59 +236,144 @@ def _bf16_linear_fake(x, out, key, scratch):
+     return None
+ 
+ 
+-def _prepare_block32(layer, groups: int = 1) -> None:
+-    """Compile the GEMMs of ``layer.weight`` (E4M3 ``[N, K]``) and its 32x32 block
+-    scales ``layer.weight_scale_inv``, and register the layer for the custom op.
++def _block32_kernels(n: int, k: int, groups: int = 1) -> dict:
++    """Every kernel of a block-32 FP8 projection of an E4M3 ``[n, k]`` weight, as the
++    calls ``_bind_block32`` makes.
+ 
+-    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``N / groups`` rows,
+-    each applied to its own K columns of ``groups * K``-wide activations.
++    With ``groups`` > 1 the weight stacks ``groups`` blocks of ``n / groups`` rows,
++    each applied to its own K columns of ``groups * k``-wide activations.
+     """
+-    n, k = layer.weight.shape
++    split = SPLIT_FP8.get((n, k)) if groups == 1 else None
++    if split:
++        # A narrow projection: split-K decode rows, and prefill tiles that add the
++        # same shards in the same order.
++        shards = split["shards"]
++        return {
++            "partials": {
++                bucket: prepare.call(
++                    mxfp8_gemm_partials, n, k, shards, block_M=min(bucket, 64), **config
++                )
++                for bucket, config in split["decode"].items()
++            },
++            "reduce": prepare.call(splitk_reduce, n, shards),
++            "prefill": prepare.call(
++                mxfp8_gemm, n, k, **split["prefill"], shards=shards
++            ),
++        }
+     part = n // groups
+-    # The 32x32 block scales become per-row words of four K32 exponents.
+-    layer.tilelang_weight_sf = pack_scale_words(
+-        layer.weight_scale_inv.view(torch.uint8), rows=n
++    wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
++    # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
++    heights = sorted({*DECODE_TILE_ROWS, *wide.values()})
++    return {
++        "decode": {
++            block_M: prepare.call(
++                mxfp8_gemm_decode,
++                part,
++                k,
++                **fp8_decode_config(part, k, block_M, groups),
++                padded_rows=True,
++                groups=groups,
++            )
++            for block_M in heights
++        },
++        "prefill": prepare.call(
++            mxfp8_gemm, part, k, **fp8_prefill_config(part, k, groups), groups=groups
++        ),
++    }
++
++
++def _calls(kernels: dict) -> list[prepare.TileLangCall]:
++    """The calls of a ``*_kernels`` table (values are calls or dicts of calls)."""
++    out = []
++    for value in kernels.values():
++        out.extend(value.values() if isinstance(value, dict) else [value])
++    return out
++
++
++def _launch(kernels: dict) -> dict:
++    """A ``*_kernels`` table with each call made (prepared: cache hits)."""
++
++    def make(entry):
++        function, args, kwargs = entry
++        return function(*args, **kwargs)
++
++    return {
++        name: {key: make(c) for key, c in value.items()}
++        if isinstance(value, dict)
++        else make(value)
++        for name, value in kernels.items()
++    }
++
++
++def _max_rows() -> int:
++    from vllm.config import get_current_vllm_config
++
++    return get_current_vllm_config().scheduler_config.max_num_batched_tokens
++
++
++@functools.cache
++def _warm_cast(k: int, rows: int) -> None:
++    """TileKernels' MXFP8 per-token cast of ``rows`` x ``k`` BF16 activations, run once
++    on zeros, so its kernel (keyed by K, the row stride and the small-batch bucket)
++    is compiled before the cache freezes."""
++    x = torch.zeros((rows, k), dtype=torch.bfloat16, device="cuda")
++    xq, sf = (
++        torch.empty(shape, dtype=dtype, device="cuda")
++        for shape, dtype in _activation_specs(rows, k)
++    )
++    _tile_kernels().quant.per_token_cast(
++        x,
++        "e4m3",
++        SF_BLOCK,
++        round_sf=True,
++        use_packed_ue8m0=True,
++        out=(xq[:rows], sf[:rows]),
+     )
++
++
++# TileKernels' per-token cast compiles a small-batch kernel for calls of at most this
++# many rows (SMALL_BATCH_THRESHOLD, a local of per_token_cast_impl; a test reads it).
++CAST_SMALL_BATCH_ROWS = 4096
++
++
++def _warm_casts(k: int) -> None:
++    """Each of TileKernels' cast buckets the projection can launch: small batches
++    always, large ones when a forward can exceed the small-batch rows."""
++    _warm_cast(k, 1)
++    if _max_rows() > CAST_SMALL_BATCH_ROWS:
++        _warm_cast(k, CAST_SMALL_BATCH_ROWS + 1)
++
++
++def _declare_block32(layer, groups: int = 1) -> None:
++    """Configure a block-32 FP8 projection of ``layer.weight`` (E4M3 ``[N, K]``),
++    register it for the custom op, and declare its kernels."""
++    n, k = layer.weight.shape
++    kernels = _block32_kernels(n, k, groups)
+     layer.tilelang_groups = groups
+     layer.tilelang_wide = WIDE_DECODE.get((n, k), {}) if groups == 1 else {}
+     layer.tilelang_decode_rows = max(layer.tilelang_wide, default=DECODE_ROWS)
+     split = SPLIT_FP8.get((n, k)) if groups == 1 else None
+     layer.tilelang_shards = split["shards"] if split else 1
+     if split:
+-        # A narrow projection: split-K decode rows, and prefill tiles that add the
+-        # same shards in the same order.
+         layer.tilelang_split_rows = split["rows"]
+-        layer.tilelang_partials = {
+-            bucket: mxfp8_gemm_partials(
+-                n, k, split["shards"], block_M=min(bucket, 64), **config
+-            )
+-            for bucket, config in split["decode"].items()
+-        }
+-        layer.tilelang_reduce = splitk_reduce(n, split["shards"])
+-        layer.tilelang_prefill = mxfp8_gemm(
+-            n, k, **split["prefill"], shards=split["shards"]
+-        )
+-        layer.tilelang_key = id(layer)
+-        _LAYERS[layer.tilelang_key] = layer
+-        return
+-    # The wide decode table can name a tile taller than DECODE_ROWS (WO-B's 96).
+-    heights = sorted({*DECODE_TILE_ROWS, *layer.tilelang_wide.values()})
+-    layer.tilelang_decode = {
+-        block_M: mxfp8_gemm_decode(
+-            part,
+-            k,
+-            **fp8_decode_config(part, k, block_M, groups),
+-            padded_rows=True,
+-            groups=groups,
+-        )
+-        for block_M in heights
+-    }
+-    layer.tilelang_prefill = mxfp8_gemm(
+-        part, k, **fp8_prefill_config(part, k, groups), groups=groups
+-    )
+     layer.tilelang_key = id(layer)
+     _LAYERS[layer.tilelang_key] = layer
+ 
++    def bind() -> None:
++        for name, kernel in _launch(kernels).items():
++            setattr(layer, f"tilelang_{name}", kernel)
++
++    prepare.declare(
++        lambda: _calls(kernels), bind=bind, warm=lambda: _warm_casts(k * groups)
++    )
++
++
++def _block32_scale_words(layer) -> None:
++    """The 32x32 block scales become per-row words of four K32 exponents."""
++    layer.tilelang_weight_sf = pack_scale_words(
++        layer.weight_scale_inv.view(torch.uint8), rows=layer.weight.shape[0]
++    )
++
+ 
+ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+     out = torch.empty(
+@@ -304,8 +391,11 @@ def _apply_block32(layer, x: torch.Tensor) -> torch.Tensor:
+ class TileLangFP8LinearMethod(Block32FP8LinearMethod):
+     """Checkpoint block-32 FP8 weights with MXFP8 activations."""
+ 
++    def declare_layer_kernels(self, layer):
++        _declare_block32(layer)
++
+     def process_weights_after_loading(self, layer):
+-        _prepare_block32(layer)
++        _block32_scale_words(layer)
+ 
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+         return _spec_bytes(
+@@ -333,30 +423,57 @@ class TileLangBlock32Rows:
+             raise ValueError(f"rows from {start} do not start on a 32-row scale block")
+         self.weight = layer.weight[start:]
+         self.weight_scale_inv = layer.weight_scale_inv[start // 32 :]
+-        _prepare_block32(self)
++        _block32_scale_words(self)
++
++    def declare_kernels(self) -> None:
++        """Declare the projection's kernels (its owner calls this when preparing)."""
++        _declare_block32(self)
+ 
+     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+         return _apply_block32(self, x)
+ 
+ 
++def _out_dtype(layer: nn.Module) -> str:
++    """The layer's output dtype as the GEMMs name it (set after construction)."""
++    return _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
++
++
++def _bf16_kernels(layer: nn.Module) -> dict:
++    """Every kernel of a BF16 projection of ``layer.weight``, as calls."""
++    n, k = layer.weight.shape
++    out_dtype = _out_dtype(layer)
++    shards = bf16_shards(n, k)
++    kernels = {
++        "gemm": prepare.call(bf16_gemm, n, k, out_dtype=out_dtype, shards=shards)
++    }
++    if shards > 1:
++        kernels["partials"] = {
++            block_M: prepare.call(bf16_gemm_partials, n, k, shards, block_M=block_M)
++            for block_M in PARTIAL_ROW_TILES
++        }
++        kernels["reduce"] = prepare.call(splitk_reduce, n, shards, out_dtype=out_dtype)
++    return kernels
++
++
+ class TileLangLinearMethod(UnquantizedLinearMethod):
+     """BF16 weights, BF16 or FP32 output (``layer.out_dtype``)."""
+ 
+-    def process_weights_after_loading(self, layer: nn.Module) -> None:
++    def declare_layer_kernels(self, layer: nn.Module) -> None:
+         n, k = layer.weight.shape
+-        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+-        shards = layer.tilelang_shards = bf16_shards(n, k)
++        layer.tilelang_shards = bf16_shards(n, k)
+         layer.tilelang_split_rows = BF16_SPLIT_ROWS.get((n, k), DECODE_ROWS)
+-        layer.tilelang_gemm = bf16_gemm(n, k, out_dtype=out_dtype, shards=shards)
+-        if shards > 1:
+-            layer.tilelang_partials = {
+-                block_M: bf16_gemm_partials(n, k, shards, block_M=block_M)
+-                for block_M in PARTIAL_ROW_TILES
+-            }
+-            layer.tilelang_reduce = splitk_reduce(n, shards, out_dtype=out_dtype)
+         layer.tilelang_key = id(layer)
+         _LAYERS[layer.tilelang_key] = layer
+ 
++        def bind() -> None:
++            for name, kernel in _launch(_bf16_kernels(layer)).items():
++                setattr(layer, f"tilelang_{name}", kernel)
++
++        prepare.declare(lambda: _calls(_bf16_kernels(layer)), bind=bind)
++
++    def process_weights_after_loading(self, layer: nn.Module) -> None:
++        """The checkpoint weight is used as loaded."""
++
+     def apply(
+         self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+     ) -> torch.Tensor:
+@@ -395,7 +512,6 @@ class TileLangScaledLinearMethod(TileLangLinearMethod):
+         if not torch.equal(scaled / self.scale, weight):
+             raise ValueError(f"{self.scale} does not scale this weight exactly")
+         weight.copy_(scaled)
+-        super().process_weights_after_loading(layer)
+ 
+ 
+ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+@@ -413,24 +529,39 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+             raise ValueError("the split projection has one or two parts")
+         self.parts = parts
+ 
+-    def process_weights_after_loading(self, layer: nn.Module) -> None:
+-        super().process_weights_after_loading(layer)
++    def _split(self, layer: nn.Module) -> dict:
+         n, k = layer.weight.shape
+-        if n % self.parts:
+-            raise ValueError(f"{n} rows do not split into {self.parts} parts")
+-        out_dtype = _TORCH_TO_TL[getattr(layer, "out_dtype", torch.bfloat16)]
+         split = SPLIT_BF16.get((n, k)) or dict(shards=bf16_shards(n, k), blocked=False)
+-        shards, blocked = split["shards"], split["blocked"]
+         decode = split.get("decode", {})
+         if any("block_K" in config for config in decode.values()):
+             raise ValueError(
+                 "split-K decode tiles keep block_K (it sets the sum order)"
+             )
+-        layer.tilelang_parts = self.parts
+-        layer.tilelang_shards = shards
++        return dict(shards=split["shards"], blocked=split["blocked"], decode=decode)
++
++    def _kernels(self, layer: nn.Module) -> dict:
++        """Every kernel of the split projection, as calls."""
++        n, k = layer.weight.shape
++        out_dtype = _out_dtype(layer)
++        split = self._split(layer)
++        shards, blocked, decode = split["shards"], split["blocked"], split["decode"]
++        if self.parts == 2:
++            gemm = prepare.call(
++                bf16_gemm_two,
++                n // 2,
++                k,
++                out_dtype=out_dtype,
++                shards=shards,
++                blocked=blocked,
++            )
++        else:
++            gemm = prepare.call(
++                bf16_gemm, n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
++            )
+         # Decode rows: one launch per call (the last CTA of a tile adds the shards).
+-        layer.tilelang_splitk = {
+-            block_M: bf16_gemm_splitk(
++        splitk = {
++            block_M: prepare.call(
++                bf16_gemm_splitk,
+                 n,
+                 k,
+                 shards,
+@@ -442,25 +573,34 @@ class TileLangSplitLinearMethod(UnquantizedLinearMethod):
+             )
+             for block_M in PARTIAL_ROW_TILES
+         }
+-        # One zeroed counter per tile of the narrowest decode tile; every call
+-        # leaves them zeroed.
+-        block_N = min(config.get("block_N", 64) for config in (*decode.values(), {}))
+-        layer.tilelang_counters = torch.zeros(
+-            (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
+-            dtype=torch.int32,
+-            device=layer.weight.device,
+-        )
+-        if self.parts == 2:
+-            layer.tilelang_gemm = bf16_gemm_two(
+-                n // 2, k, out_dtype=out_dtype, shards=shards, blocked=blocked
+-            )
+-        else:
+-            layer.tilelang_gemm = bf16_gemm(
+-                n, k, out_dtype=out_dtype, shards=shards, blocked=blocked
+-            )
++        return {"gemm": gemm, "splitk": splitk}
++
++    def declare_layer_kernels(self, layer: nn.Module) -> None:
++        n, k = layer.weight.shape
++        if n % self.parts:
++            raise ValueError(f"{n} rows do not split into {self.parts} parts")
++        layer.tilelang_parts = self.parts
++        layer.tilelang_shards = self._split(layer)["shards"]
+         layer.tilelang_key = id(layer)
+         _LAYERS[layer.tilelang_key] = layer
+ 
++        def bind() -> None:
++            for name, kernel in _launch(self._kernels(layer)).items():
++                setattr(layer, f"tilelang_{name}", kernel)
++            # One zeroed counter per tile of the narrowest decode tile; every
++            # call leaves them zeroed.
++            decode = self._split(layer)["decode"]
++            block_N = min(
++                config.get("block_N", 64) for config in (*decode.values(), {})
++            )
++            layer.tilelang_counters = torch.zeros(
++                (-(-SPLIT_DECODE_ROWS // PARTIAL_ROW_TILES[0])) * (-(-n // block_N)),
++                dtype=torch.int32,
++                device=layer.weight.device,
++            )
++
++        prepare.declare(lambda: _calls(self._kernels(layer)), bind=bind)
++
+     def get_workspace_size(self, layer, num_tokens: int) -> int:
+         rows = min(num_tokens, SPLIT_DECODE_ROWS)
+         n = layer.weight.shape[0]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 12db8fa0c..9bf1cf8b0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -3,18 +3,19 @@
+ """Kernel preparation for DeepSeek V4.1's TileLang kernel family.
+ 
+ Every TileLang kernel the deployment can launch is declared as a call, exactly as its
+-call site makes it, by the module that owns it, while the model is built (``declare``).
+-After loading, the worker compiles every declared call before any distributed work, in
+-one thread pool (``prepare_declared``, through ``tilelang.prepare``), and then freezes
+-TileLang's kernel cache. From then on a call that was not declared raises
++call site makes it, by the object that owns it, when that object is built
++(``declare(calls, bind)``). After loading, the worker compiles every declared call
++before any distributed work, in one thread pool (``prepare_declared``, through
++``tilelang.prepare``), freezes TileLang's kernel cache, and lets each owner store its
++kernels (``bind_declared``). From then on a call that was not declared raises
+ ``KernelNotPreparedError`` on every rank alike, whatever each rank's disk cache holds,
+-instead of compiling inside a distributed forward, where the ranks that already have the
+-kernel would wait in a collective for the one that is compiling.
++instead of compiling inside a distributed forward, where the ranks that already have
++the kernel would wait in a collective for the one that is compiling.
+ 
+-A module declares a function and a callable that lists its calls. The callable runs when
+-the worker prepares, after the weights are loaded, so a call may depend on what loading
+-produced. The call site makes its call through the same key function, so the declared
+-call and the launched call cannot drift apart.
++``calls()`` runs when the worker prepares, after the weights are loaded, so a call may
++depend on what loading produced. The call site makes its call through the same key
++function, so the declared call and the launched call cannot drift apart. Weight
++processing transforms weights only.
+ """
+ 
+ from __future__ import annotations
+@@ -25,45 +26,56 @@ from typing import Any
+ 
+ from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry, VllmJitKernel
+ 
+-# (positional arguments, keyword arguments), exactly as the call site passes them.
+-Call = tuple[tuple[Any, ...], dict[str, Any]]
++# (TileLang JIT function, positional arguments, keyword arguments), exactly as the
++# call site makes the call.
++TileLangCall = tuple[Any, tuple[Any, ...], dict[str, Any]]
+ 
+ 
+-def call(*args: Any, **kwargs: Any) -> Call:
+-    """One declared call."""
+-    return args, kwargs
++def call(function: Any, *args: Any, **kwargs: Any) -> TileLangCall:
++    """One declared call of a ``@tilelang.jit`` function."""
++    return function, args, kwargs
+ 
+ 
+ class _CallKey:
+     """A hashable call (TileLang argument values need not be hashable)."""
+ 
+-    __slots__ = ("args", "kwargs", "_repr")
++    __slots__ = ("function", "args", "kwargs", "_key")
+ 
+-    def __init__(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
++    def __init__(self, function: Any, args: tuple[Any, ...], kwargs: dict) -> None:
++        self.function = function
+         self.args = tuple(args)
+         self.kwargs = dict(kwargs)
+-        self._repr = repr((self.args, sorted(self.kwargs.items())))
++        self._key = (id(function), repr((self.args, sorted(self.kwargs.items()))))
+ 
+     def __hash__(self) -> int:
+-        return hash(self._repr)
++        return hash(self._key)
+ 
+     def __eq__(self, other: object) -> bool:
+-        return isinstance(other, _CallKey) and self._repr == other._repr
++        return isinstance(other, _CallKey) and self._key == other._key
+ 
+     def __repr__(self) -> str:
+-        return self._repr
++        name = getattr(self.function, "__name__", repr(self.function))
++        return f"{name}{self._key[1]}"
+ 
+ 
+-class TileLangCalls(VllmJitKernel[_CallKey]):
+-    """One ``@tilelang.jit`` function's declared calls in the runner's JIT registry."""
++Calls = Callable[[], Iterable[TileLangCall]]
+ 
+-    def __init__(self, function: Any) -> None:
+-        super().__init__()
+-        self.function = function
+-        self.name = getattr(function, "__name__", None) or repr(function)
+ 
+-    def get_warmup_keys(self, calls: Callable[[], Iterable[Call]]) -> list[_CallKey]:
+-        return [_CallKey(args, kwargs) for args, kwargs in calls()]
++class TileLangKernels(VllmJitKernel[_CallKey]):
++    """DeepSeek V4.1's declared TileLang calls in the runner's JIT registry.
++
++    A registration is ``(calls, bind, warm)``: ``calls()`` lists the owner's calls
++    when the worker prepares; ``warm()`` runs third-party kernels whose keys their
++    library computes (TileKernels) once on placeholder inputs; ``bind()`` stores
++    the owner's kernels once the cache is frozen.
++    """
++
++    def get_warmup_keys(
++        self, calls: Calls | None, bind=None, warm=None
++    ) -> list[_CallKey]:
++        if calls is None:
++            return []
++        return [_CallKey(function, args, kwargs) for function, args, kwargs in calls()]
+ 
+     def compile(self, compile_key: _CallKey) -> None:
+         self.compile_many([compile_key])
+@@ -72,26 +84,69 @@ class TileLangCalls(VllmJitKernel[_CallKey]):
+         import tilelang
+ 
+         tilelang.prepare(
+-            [(self.function, key.args, key.kwargs) for key in compile_keys],
++            [(key.function, key.args, key.kwargs) for key in compile_keys],
+             progress=PROGRESS.report,
+         )
+ 
+ 
+-_adapters: dict[int, TileLangCalls] = {}
+-_adapters_lock = threading.Lock()
++TILELANG = TileLangKernels()
+ 
+ 
+-def declare(function: Any, calls: Callable[[], Iterable[Call]]) -> None:
+-    """Declare the calls ``calls()`` lists for the ``@tilelang.jit`` ``function``.
++def declare(
++    calls: Calls | None = None,
++    bind: Callable[[], None] | None = None,
++    warm: Callable[[], None] | None = None,
++) -> None:
++    """Declare an owner's TileLang kernels.
+ 
+-    ``calls`` runs when the worker prepares kernels, after loading. Must be called
+-    while the model runner's JIT registry collects (model construction and loading).
++    ``calls()`` lists the calls of the owner's own ``@tilelang.jit`` functions,
++    exactly as its call sites make them; they compile in one thread pool.
++    ``warm()`` runs kernels whose compile keys their library computes (TileKernels'
++    casts, norms, mHC and routing) once, on placeholder inputs of the shapes the
++    owner launches, on this rank alone. ``bind()`` stores the owner's kernels.
++
++    Under a runner whose JIT registry collects (model construction and loading),
++    ``calls()`` and ``warm()`` run when the worker prepares kernels, after loading,
++    and ``bind()`` once they are prepared and the cache is frozen. Elsewhere
++    (kernel tests) all three run now.
++    """
++    if JitWarmupRegistry.active() is None:
++        if calls is not None:
++            import tilelang
++
++            tilelang.prepare(list(calls()))
++        if warm is not None:
++            warm()
++        if bind is not None:
++            bind()
++        return
++    JitWarmupRegistry.register(TILELANG, calls, bind, warm)
++
++
++def declare_modules(*models: Any) -> None:
++    """Let the modules of ``models`` declare their kernels, after loading.
++
++    Calls ``module.declare_kernels()`` on every module that defines it, and
++    ``quant_method.declare_layer_kernels(module)`` on every module's linear method
++    that does (methods are often attached after a layer is built, so construction
++    is not where they can declare). Must run while the runner's JIT registry
++    collects.
+     """
+-    with _adapters_lock:
+-        adapter = _adapters.get(id(function))
+-        if adapter is None:
+-            adapter = _adapters[id(function)] = TileLangCalls(function)
+-    JitWarmupRegistry.register(adapter, calls)
++    seen: set[int] = set()
++    for model in models:
++        if model is None:
++            continue
++        for module in model.modules():
++            if id(module) in seen:
++                continue
++            seen.add(id(module))
++            method = getattr(module, "quant_method", None)
++            declare_layer = getattr(method, "declare_layer_kernels", None)
++            if declare_layer is not None:
++                declare_layer(module)
++            declare_own = getattr(module, "declare_kernels", None)
++            if declare_own is not None:
++                declare_own()
+ 
+ 
+ class _Progress:
+@@ -120,26 +175,21 @@ class _Progress:
+ PROGRESS = _Progress()
+ 
+ 
+-def declared_calls(registry: JitWarmupRegistry) -> list[tuple[Any, tuple, dict]]:
+-    """Every TileLang call declared in ``registry``, as ``(function, args, kwargs)``."""
+-    calls: dict[tuple[int, _CallKey], tuple[Any, tuple, dict]] = {}
++def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
++    """Every distinct TileLang call declared in ``registry``."""
++    calls: dict[_CallKey, TileLangCall] = {}
+     for kernel, registrations in registry.registrations():
+-        if not isinstance(kernel, TileLangCalls):
++        if kernel is not TILELANG:
+             continue
+         for args, kwargs in registrations:
+             for key in kernel.get_warmup_keys(*args, **kwargs):
+-                calls.setdefault(
+-                    (id(kernel), key), (kernel.function, key.args, key.kwargs)
+-                )
++                calls.setdefault(key, (key.function, key.args, key.kwargs))
+     return list(calls.values())
+ 
+ 
+ def prepare_declared(registry: JitWarmupRegistry) -> int:
+-    """Compile every TileLang call declared in ``registry`` in one thread pool.
+-
+-    Returns the number of distinct calls; kernels already compiled are not counted
+-    again by the progress reports.
+-    """
++    """Compile every TileLang call declared in ``registry`` in one thread pool;
++    return the number of distinct calls."""
+     import tilelang
+ 
+     calls = declared_calls(registry)
+@@ -148,8 +198,35 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+     return len(calls)
+ 
+ 
++def _callbacks(registry: JitWarmupRegistry, index: int) -> list[Callable[[], None]]:
++    found: dict[int, Callable[[], None]] = {}
++    for kernel, registrations in registry.registrations():
++        if kernel is not TILELANG:
++            continue
++        for args, _ in registrations:
++            callback = args[index] if len(args) > index else None
++            if callback is not None:
++                found.setdefault(id(callback), callback)
++    return list(found.values())
++
++
++def warm_declared(registry: JitWarmupRegistry) -> int:
++    """Run every owner's ``warm()`` (before ``freeze``); return how many ran."""
++    callbacks = _callbacks(registry, 2)
++    for warm in callbacks:
++        warm()
++    return len(callbacks)
++
++
+ def freeze(reason: str) -> None:
+     """Refuse every TileLang kernel that is not prepared, from now on."""
+     from tilelang.cache import freeze as freeze_cache
+ 
+     freeze_cache(reason)
++
++
++def bind_declared(registry: JitWarmupRegistry) -> None:
++    """Let every owner store its prepared kernels (after ``freeze``, so a bind that
++    asks for an undeclared call fails by name)."""
++    for bind in _callbacks(registry, 1):
++        bind()
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f1f025041..2681e9a8f 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1438,10 +1438,18 @@ class Worker(WorkerBase):
+         if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+             from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
++            speculator = getattr(self.model_runner, "speculator", None)
++            with registry.activate():
++                prepare.declare_modules(
++                    self.model_runner.model, getattr(speculator, "model", None)
++                )
+             tilelang_calls = prepare.prepare_declared(registry)
++            with torch.inference_mode():
++                prepare.warm_declared(registry)
+         registry.warmup()
+         if tilelang_calls:
+             prepare.freeze("every declared kernel was prepared before memory profiling")
++            prepare.bind_declared(registry)
+         logger.info(
+             "Prepared %d TileLang calls and the registry's other kernels in %.1f s.",
+             tilelang_calls,

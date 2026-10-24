@@ -1,0 +1,145 @@
+From 2ffde55dc9d471fad57ec7e55b7c6d849d536103 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:23:10 +0200
+Subject: [PATCH 271/274] Provide preparation declarations for every control
+ candidate specialization
+
+Keep request row counts, custom logprob widths and top-k counts dynamic. Runtime owner dispatch remains unchanged until qualification.
+
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 45ffb4912..b7bcb38d9 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -5,7 +5,54 @@
+ import torch
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
++from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
++
++
++def register_bad_words(
++    *,
++    logits_stride,
++    bad_word_token_ids_stride,
++    bad_word_offsets_stride,
++    all_token_ids_stride,
++):
++    _declare(
++        bad_words_kernel,
++        [
++            (
++                logits_stride,
++                bad_word_token_ids_stride,
++                bad_word_offsets_stride,
++                all_token_ids_stride,
++                dtype,
++            )
++            for dtype in _DTYPES.values()
++        ],
++    )
++
++
++def register_prompt_ids(*, all_token_ids_stride):
++    _declare(
++        prompt_ids_kernel, [(all_token_ids_stride, dtype) for dtype in _DTYPES.values()]
++    )
++
++
++def register_fill_ids():
++    _declare(
++        fill_ids_kernel,
++        [
++            (mapping, sampled, topk)
++            for mapping in _DTYPES.values()
++            for sampled in _DTYPES.values()
++            for topk in _DTYPES.values()
++        ],
++    )
++
++
++def register_nan_counts(*, logits, vocab_size):
++    _declare(
++        nan_count_kernel,
++        [(vocab_size, stride, str(dtype)[6:]) for dtype, stride in logits],
++    )
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index d68983a87..ced6f4251 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -3,7 +3,40 @@
+ """Allowed-token, sparse-bias and minimum-length candidate."""
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
++from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
++
++
++def register_bias(
++    *,
++    vocab_size,
++    logits_strides,
++    allowed_stride,
++    bias_ids_stride,
++    bias_stride,
++    stop_stride,
++    width,
++):
++    _declare(
++        bias_kernel,
++        [
++            (
++                vocab_size,
++                stride,
++                allowed_stride,
++                bias_ids_stride,
++                bias_stride,
++                stop_stride,
++                width,
++                restore,
++                index_dtype,
++                position_dtype,
++            )
++            for stride in logits_strides
++            for restore in (False, True)
++            for index_dtype in _DTYPES.values()
++            for position_dtype in _DTYPES.values()
++        ],
++    )
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+index 4109976ca..a9aabdce6 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+@@ -3,7 +3,24 @@
+ """Reasoning-marker cache and budget candidates, including draft boundaries."""
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
++from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
++
++
++def register_thinking(
++    *, logits_strides, tokens_stride, start_len, natural_len, end_len
++):
++    _declare(
++        marker_cache_kernel,
++        [(tokens_stride, dtype, start_len, natural_len) for dtype in _DTYPES.values()],
++    )
++    _declare(
++        thinking_kernel,
++        [
++            (stride, tokens_stride, dtype, start_len, natural_len, end_len)
++            for stride in logits_strides
++            for dtype in _DTYPES.values()
++        ],
++    )
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)

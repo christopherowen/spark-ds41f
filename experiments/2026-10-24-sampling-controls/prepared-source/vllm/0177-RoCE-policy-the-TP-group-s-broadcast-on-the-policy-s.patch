@@ -1,0 +1,193 @@
+From d5bfe020369a6072518abaf2367757f273e45604 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 10:16:05 +0200
+Subject: [PATCH 177/274] RoCE policy: the TP group's broadcast on the policy's
+ backends, one-shot on TileLang
+
+GroupCoordinator.broadcast called torch.distributed.broadcast on the device
+group directly, so the policy guard 0142 put on CudaCommunicator.broadcast
+never ran. DSpark's adaptive verification broadcasts its confidences
+(max_num_seqs x drafts FP32, 320 bytes on TP4) every decode step, so every
+step reached the PyTorch NCCL process group: a second NCCL communicator
+beside PyNCCL, created lazily on the first step, with its own stream, events
+and 600 s watchdog (the Poisson crash's ranks sat in it).
+
+- GroupCoordinator.broadcast hands the tensor to a device communicator that
+  owns broadcasts (CudaCommunicator under the RoCE policy); other groups keep
+  the process group's broadcast.
+- On DS4.1's TileLang family the communicator broadcasts through sparknet's
+  one-shot all-gather and keeps the source's slice, byte for byte, in the
+  model stream with the step's other collectives. A tensor the all-gather
+  cannot take raises; nothing reaches NCCL. The B12X family keeps PyNCCL.
+
+Quality: none; every rank receives rank 0's bytes, as before.
+Tests: tests/distributed/test_roce_policy_no_fallback.py (CPU): the group's
+broadcast under the policy never reaches torch.distributed; the TileLang
+broadcast keeps the source's copy of the all-gather, the source keeps its
+own bytes and still takes part, an ineligible tensor raises without PyNCCL;
+a group without a policy keeps the process group.
+Upstream: local; GroupCoordinator.broadcast mirrors StatelessGroupCoordinator,
+which already hands CUDA broadcasts to its device communicator.
+
+diff --git a/tests/distributed/test_roce_policy_no_fallback.py b/tests/distributed/test_roce_policy_no_fallback.py
+index 876ddac77..ac37d59eb 100644
+--- a/tests/distributed/test_roce_policy_no_fallback.py
++++ b/tests/distributed/test_roce_policy_no_fallback.py
+@@ -17,6 +17,7 @@ from vllm.distributed.device_communicators import cuda_communicator
+ from vllm.distributed.device_communicators.base_device_communicator import (
+     DeviceCommunicatorBase,
+ )
++from vllm.distributed.parallel_state import GroupCoordinator
+ 
+ PROCESS_GROUP_COLLECTIVES = (
+     "all_reduce",
+@@ -135,3 +136,86 @@ def test_failure_report_comes_from_the_one_shot_runtime(monkeypatch):
+     assert comm.roce_failure() == "saw nothing from rank 2"
+     comm.b12x_ar_comm.report = None
+     assert comm.roce_failure() is None
++
++
++class _GatheringAdapter(_OneShot):
++    """Sparknet's adapter as a broadcast sees it: rank r's copy is
++    ``arange(n) + 100 * r``, so the kept slice names its rank."""
++
++    def __init__(self, world: int, eligible: bool = True):
++        self.world = world
++        self.eligible = eligible
++        self.gathers = []
++
++    def should_all_gather(self, inp, dim):
++        return self.eligible and inp.is_contiguous() and dim == 0
++
++    def all_gather(self, inp, dim):
++        self.gathers.append((tuple(inp.shape), dim))
++        base = torch.arange(inp.numel(), dtype=inp.dtype)
++        return torch.cat([base + 100 * r for r in range(self.world)])
++
++
++def _tilelang_communicator(monkeypatch, rank, eligible=True):
++    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
++    comm = _policy_communicator()
++    comm.rank_in_group = rank
++    comm.b12x_ar_comm = _GatheringAdapter(comm.world_size, eligible)
++    return comm
++
++
++def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
++    monkeypatch,
++):
++    comm = _tilelang_communicator(monkeypatch, rank=1)
++    tensor = torch.full((2, 3), -1.0)
++    assert comm.broadcast(tensor, src=2) is tensor
++    assert torch.equal(tensor, (torch.arange(6.0) + 200).view(2, 3))
++    assert comm.b12x_ar_comm.gathers == [((6,), 0)]
++    assert comm.pynccl_comm.calls == []
++
++
++def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
++    comm = _tilelang_communicator(monkeypatch, rank=2)
++    tensor = torch.full((2, 3), 7.0)
++    comm.broadcast(tensor, src=2)
++    assert torch.equal(tensor, torch.full((2, 3), 7.0))
++    # The source takes part in the collective like every other rank.
++    assert comm.b12x_ar_comm.gathers == [((6,), 0)]
++
++
++def test_tilelang_broadcast_refuses_what_the_all_gather_cannot_take(monkeypatch):
++    comm = _tilelang_communicator(monkeypatch, rank=1, eligible=False)
++    with pytest.raises(RuntimeError, match="one-shot broadcast cannot take"):
++        comm.broadcast(torch.zeros(4), src=0)
++    assert comm.pynccl_comm.calls == []
++
++
++def _group(device_communicator):
++    group = object.__new__(GroupCoordinator)
++    group.world_size = 4
++    group.ranks = [0, 1, 2, 3]
++    group.device_communicator = device_communicator
++    group.device_group = object()
++    return group
++
++
++def test_group_broadcast_goes_through_the_policy():
++    """The TP group's broadcast (DSpark's per-step confidences) never reaches
++    the PyTorch process group under the policy."""
++    pynccl = _PyNccl()
++    tensor = torch.zeros(4)
++    assert _group(_policy_communicator(pynccl)).broadcast(tensor, src=0) is tensor
++    assert pynccl.calls == [("broadcast", 0)]
++
++
++def test_group_broadcast_without_a_policy_keeps_the_process_group(monkeypatch):
++    calls = []
++    monkeypatch.setattr(
++        torch.distributed,
++        "broadcast",
++        lambda tensor, src, group: calls.append((src, group)),
++    )
++    group = _group(device_communicator=None)
++    group.broadcast(torch.zeros(4), src=1)
++    assert calls == [(1, group.device_group)]
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 9f5470783..227a13512 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -923,12 +923,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             raise RuntimeError("RoCEnante policy has no gather; all-gather instead")
+         return super().gather(input_, dst, dim)
+ 
++    @property
++    def owns_broadcast(self) -> bool:
++        """Whether the group's broadcasts go through this communicator: the RoCE
++        policy never creates the PyTorch NCCL process group's communicator."""
++        return self._roce_policy
++
+     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+         """Broadcast a tensor from source rank to all ranks."""
+         self._require_roce_policy()
+         if self.world_size == 1:
+             return tensor
+ 
++        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++            return self._broadcast_one_shot(tensor, src)
++
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+             pynccl_comm.broadcast(tensor, src)
+@@ -936,6 +945,22 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         else:
+             raise ValueError("No PyNCCL communicator found")
+ 
++    def _broadcast_one_shot(self, tensor: torch.Tensor, src: int) -> torch.Tensor:
++        """Every rank's copy through the one-shot all-gather; the source's is kept,
++        byte for byte. DS4.1 broadcasts only DSpark's per-step confidences (a few
++        hundred bytes), so a tensor the all-gather cannot take raises rather than
++        reach NCCL."""
++        flat = tensor.view(-1)
++        if not self.b12x_ar_comm.should_all_gather(flat, 0):
++            raise RuntimeError(
++                "RoCEnante policy: one-shot broadcast cannot take "
++                f"{tuple(tensor.shape)} {tensor.dtype}"
++            )
++        gathered = self.b12x_ar_comm.all_gather(flat, 0)
++        if self.rank_in_group != src:
++            flat.copy_(gathered.view(self.world_size, -1)[src])
++        return tensor
++
+     def destroy(self):
+         for transport in getattr(self, "b12x_dcp_transports", {}).values():
+             transport.close()
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index e44ec92b2..b4fcdf888 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -954,6 +954,9 @@ class GroupCoordinator:
+         # Bypass the function if we are using only 1 GPU.
+         if self.world_size == 1:
+             return input_
++        if getattr(self.device_communicator, "owns_broadcast", False):
++            # A collective policy keeps serving off the PyTorch process group.
++            return self.device_communicator.broadcast(input_, src)
+         # Broadcast.
+         torch.distributed.broadcast(
+             input_, src=self.ranks[src], group=self.device_group

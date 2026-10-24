@@ -1,0 +1,67 @@
+From c42f70a75d6f6f0cd452f07db2ec26cd52fb427e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 01:02:18 +0100
+Subject: [PATCH 132/274] Engine grid: settle each timed step with an untimed
+ run of the same shape
+
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index ec850bb93..38f651f1b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -863,10 +863,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         """Time dummy steps at fixed shapes: the engine cost grid servebench reads.
+ 
+         ``spec`` holds ``shapes`` (each ``num_tokens``, optional ``num_reqs``,
+-        ``context_len`` and ``prefill`` for a single request's chunk), ``replays``
+-        and ``warmup``. Every shape runs ``warmup`` times untimed, then ``replays``
+-        timed rounds alternate the shape order, as the cost profile does, so drift
+-        and order effects spread over every shape. Returns each shape's whole-step
++        ``context_len`` and ``prefill`` for a single request's chunk), ``replays``,
++        ``warmup`` and ``settle``. Every shape runs ``warmup`` times untimed, then
++        ``replays`` timed rounds alternate the shape order, as the cost profile does,
++        so drift spreads over every shape. Each timed run follows ``settle`` untimed
++        runs of the same shape (default 1): switching shapes rebuilds the dummy
++        metadata (an 11 ms step after a jump between 1M and no context), which is the
++        harness's cost, not the engine's. Returns each shape's whole-step
+         milliseconds (events around the dummy run) and, when every run reached the
+         drafter, the target forward and drafter split, step by step.
+ 
+@@ -877,6 +880,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         shapes = spec["shapes"]
+         replays = int(spec.get("replays", 30))
+         warmup = int(spec.get("warmup", 2))
++        settle = int(spec.get("settle", 1))
+ 
+         def run(shape: dict) -> None:
+             kwargs: dict[str, Any] = {
+@@ -898,6 +902,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             for replay in range(replays):
+                 indices = range(len(shapes))
+                 for index in indices if replay % 2 == 0 else reversed(indices):
++                    for _ in range(settle):
++                        run(shapes[index])
+                     start = torch.cuda.Event(enable_timing=True)
+                     end = torch.cuda.Event(enable_timing=True)
+                     start.record()
+@@ -914,15 +920,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # The whole dummy run on the stream: target, drafter and every gap
+             # between their kernels.
+             results[index]["step_ms"].append(start.elapsed_time(end))
+-        # The target/drafter split exists only when every run reached the drafter.
+-        if len(timings) == len(order):
+-            for index, sample in zip(order, timings):
++        # The target/drafter split exists only when every run reached the drafter;
++        # each timed run's sample follows its settle runs' samples.
++        if len(timings) == len(order) * (settle + 1):
++            for index, sample in zip(order, timings[settle :: settle + 1]):
+                 results[index]["forward_ms"].append(sample.forward_ms)
+                 results[index]["drafter_ms"].append(sample.drafter_ms)
+                 results[index]["modes"].append(
+                     [sample.full_cudagraph, sample.num_target_tokens, sample.num_reqs]
+                 )
+-        return {"replays": replays, "warmup": warmup, "shapes": results}
++        return {"replays": replays, "warmup": warmup, "settle": settle, "shapes": results}
+ 
+     @torch.inference_mode()
+     @step_eplb_after(is_dummy=True)

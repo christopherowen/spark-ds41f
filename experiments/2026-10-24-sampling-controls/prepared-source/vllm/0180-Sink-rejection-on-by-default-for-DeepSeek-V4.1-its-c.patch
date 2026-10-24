@@ -1,0 +1,424 @@
+From 188353939d61ecd61e8d008922846c900bfb5ad6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 07:56:43 +0200
+Subject: [PATCH 180/274] Sink rejection on by default for DeepSeek V4.1, its
+ column and threshold in one table
+
+The attention-sink collapse (a sampled token's residual running away in one
+channel, its next-token distribution turning into document-start noise) is
+DeepSeek V4.1 Flash checkpoint behaviour: DeepSeek's reference reproduces it
+on the 1017 checkpoint. The detector and draft-zero rejection were off unless
+VLLM_SINK_DETECTOR_COLUMN and VLLM_SINK_REJECTION were set. They now default
+on for the architectures listed in vllm.v1.sample.sink.SINK_CHANNELS, which
+holds each one's watched column and threshold (DeepseekV41ForCausalLM: 2455,
+85,000), and stay off for every other model. VLLM_SINK_REJECTION stays the
+switch: 0 turns detector and rejection off. The column and threshold
+settings become overrides with no defaults of their own; with rejection off,
+an explicit column still runs the detector alone (lab surveys).
+
+The switch and the one table mark the code that exists only for these
+checkpoints: a model without the behaviour drops its entry, and a later one
+can remove the sink modules (vllm/v1/sample/sink.py,
+vllm/v1/worker/gpu/sample/sink.py) and the scheduler's draft-zero hook.
+
+SinkConfig.for_model(vllm_config) replaces from_env() at its three call sites
+(scheduler, V2 runner, the SM120 model's column capture). The V1 runner has no
+detector, so the worker refuses to start it while the detector is on, rather
+than letting the scheduler hold tokens for a verification nothing does.
+VLLM_SINK_REJECTION leaves the compile-key exclusions: it now decides whether
+the forward keeps the column.
+
+Base: local-inference-lab integration/karmic-kraken-beta 19f2c20e + the r6x
+series (7316c7f9f) + 0185, 0221 (sink rejection v2, gated on the TP3
+triangle 2026-10-20) and 0222 (late admission).
+
+Quality: on DeepSeek V4.1 the defaults equal the gated settings (column
+2455, threshold 85,000, rejection on, three alternates). No other model
+changes.
+
+Tests: tests/v1/core/test_sink_draft_zero.py (on by default for
+DeepseekV41ForCausalLM; switched off; off for other models and refused when
+forced on without a column; an explicit column runs the detector alone and
+replaces the model's; the scheduler suites name their test model's column
+and build it from a local OPT config, so they run offline without a
+tokenizer, as the release tests do).
+
+Upstream status: local; not proposed.
+
+diff --git a/tests/v1/core/test_sink_draft_zero.py b/tests/v1/core/test_sink_draft_zero.py
+index 6256c0a1a..c763691f0 100644
+--- a/tests/v1/core/test_sink_draft_zero.py
++++ b/tests/v1/core/test_sink_draft_zero.py
+@@ -16,8 +16,11 @@ the next token after it would be document-start noise. Here `` can`` is
+ ``CAN`` and its draw's next candidate ``I_``.
+ """
+ 
++import functools
++import tempfile
+ from collections import deque
+ from dataclasses import dataclass, field
++from pathlib import Path
+ 
+ import numpy as np
+ import pytest
+@@ -53,7 +56,10 @@ SUNK = frozenset({CAN, 9})
+ 
+ @pytest.fixture(autouse=True)
+ def sink_rejection_env(monkeypatch: pytest.MonkeyPatch) -> None:
++    # The test model has no entry in SINK_CHANNELS: name its column and
++    # threshold, and switch rejection on.
+     monkeypatch.setenv("VLLM_SINK_DETECTOR_COLUMN", "2455")
++    monkeypatch.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
+     monkeypatch.setenv("VLLM_SINK_REJECTION", "1")
+     monkeypatch.setenv("VLLM_SINK_REJECTION_MAX_RETRIES", "3")
+ 
+@@ -414,8 +420,21 @@ def drive(
+     return run
+ 
+ 
++@functools.cache
++def _model_dir() -> str:
++    """A local OPT config: the scheduler needs no download or tokenizer."""
++    path = Path(tempfile.mkdtemp(prefix="sink-draft-zero-"))
++    (path / "config.json").write_text(
++        '{"architectures":["OPTForCausalLM"],"model_type":"opt",'
++        '"max_position_embeddings":2048}'
++    )
++    return str(path)
++
++
+ def _scheduler(async_scheduling: bool, num_drafts: int | None, **kwargs):
+     scheduler = create_scheduler(
++        model=_model_dir(),
++        skip_tokenizer_init=True,
+         device="cpu",
+         async_scheduling=async_scheduling,
+         num_speculative_tokens=num_drafts,
+@@ -905,11 +924,55 @@ def test_usage_reports_zero_flags_with_the_detector_on():
+     assert run.finished["a"].sink_metrics == RequestSinkMetrics()
+ 
+ 
+-def test_sink_config_threshold_default():
+-    config = SinkConfig.from_env()
+-    assert config is not None
+-    assert config.threshold == 85000.0
+-    assert config.rejection and config.num_alternates == 3
++def _served(architecture: str):
++    from types import SimpleNamespace
++
++    return SimpleNamespace(model_config=SimpleNamespace(architecture=architecture))
++
++
++@pytest.fixture
++def unset_sink_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
++    for name in (
++        "VLLM_SINK_DETECTOR_COLUMN",
++        "VLLM_SINK_DETECTOR_THRESHOLD",
++        "VLLM_SINK_REJECTION",
++    ):
++        monkeypatch.delenv(name, raising=False)
++    return monkeypatch
++
++
++def test_sink_config_on_by_default_for_deepseek_v41(unset_sink_env):
++    config = SinkConfig.for_model(_served("DeepseekV41ForCausalLM"))
++    assert config == SinkConfig(
++        column=2455, threshold=85000.0, rejection=True, max_retries=3
++    )
++    assert config.num_alternates == 3
++
++
++def test_sink_config_switched_off(unset_sink_env):
++    unset_sink_env.setenv("VLLM_SINK_REJECTION", "0")
++    assert SinkConfig.for_model(_served("DeepseekV41ForCausalLM")) is None
++
++
++def test_sink_config_off_for_other_models(unset_sink_env):
++    assert SinkConfig.for_model(_served("OPTForCausalLM")) is None
++    unset_sink_env.setenv("VLLM_SINK_REJECTION", "1")
++    with pytest.raises(ValueError, match="no sink channel"):
++        SinkConfig.for_model(_served("OPTForCausalLM"))
++
++
++def test_sink_config_explicit_column_runs_the_detector_alone(unset_sink_env):
++    unset_sink_env.setenv("VLLM_SINK_REJECTION", "0")
++    unset_sink_env.setenv("VLLM_SINK_DETECTOR_COLUMN", "17")
++    with pytest.raises(ValueError, match="THRESHOLD"):
++        SinkConfig.for_model(_served("OPTForCausalLM"))
++    unset_sink_env.setenv("VLLM_SINK_DETECTOR_THRESHOLD", "100")
++    assert SinkConfig.for_model(_served("OPTForCausalLM")) == SinkConfig(
++        column=17, threshold=100.0, rejection=False, max_retries=3
++    )
++    # On the model with an entry, the explicit column replaces its own.
++    config = SinkConfig.for_model(_served("DeepseekV41ForCausalLM"))
++    assert config is not None and (config.column, config.rejection) == (17, False)
+ 
+ 
+ @pytest.mark.parametrize("rejection", [False, True])
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5b414bf51..5d06110d0 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -325,9 +325,9 @@ if TYPE_CHECKING:
+     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
+     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
+     VLLM_RAISE_ON_LOGIT_NANS: bool = False
+-    VLLM_SINK_DETECTOR_COLUMN: int = -1
+-    VLLM_SINK_DETECTOR_THRESHOLD: float = 85000.0
+-    VLLM_SINK_REJECTION: bool = False
++    VLLM_SINK_DETECTOR_COLUMN: int | None = None
++    VLLM_SINK_DETECTOR_THRESHOLD: float | None = None
++    VLLM_SINK_REJECTION: bool | None = None
+     VLLM_SINK_REJECTION_MAX_RETRIES: int = 3
+     VLLM_SINK_DETECTOR_CHECK_RANKS: bool = False
+     VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: Literal[
+@@ -2193,24 +2193,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_RAISE_ON_LOGIT_NANS": lambda: bool(
+         int(os.getenv("VLLM_RAISE_ON_LOGIT_NANS", "0"))
+     ),
+-    # Attention-sink detector: the column of the pre-norm residual watched at
+-    # every sampled row (DeepSeek V4.1 Flash: 2455, its BOS sink channel), and
+-    # the magnitude above which the row counts as sunk. -1 keeps the detector
+-    # off. Sunk rows carry 108,032 to 125,440 there on DeepSeek's reference
+-    # and 116,736 to 118,784 served; ordinary text peaked at 62,720 (number
+-    # tokens) over a 358,785-token survey. 85,000 is the geometric midpoint
+-    # (experiments/2026-10-19-sink-rejection-v2 in spark-ds41f).
+-    "VLLM_SINK_DETECTOR_COLUMN": lambda: int(
+-        os.getenv("VLLM_SINK_DETECTOR_COLUMN", "-1")
+-    ),
+-    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: float(
+-        os.getenv("VLLM_SINK_DETECTOR_THRESHOLD", "85000")
++    # Attention-sink detector and rejection (vllm.v1.sample.sink). On by
++    # default for the models in its SINK_CHANNELS table, which holds each
++    # one's watched residual column and threshold; off for every other model.
++    # VLLM_SINK_REJECTION=0 turns both off. The column and threshold settings
++    # replace the model's numbers (lab); with VLLM_SINK_REJECTION=0 an
++    # explicit column runs the detector alone, counting without correcting.
++    "VLLM_SINK_DETECTOR_COLUMN": lambda: maybe_convert_int(
++        os.getenv("VLLM_SINK_DETECTOR_COLUMN", None)
++    ),
++    "VLLM_SINK_DETECTOR_THRESHOLD": lambda: (
++        float(os.environ["VLLM_SINK_DETECTOR_THRESHOLD"])
++        if "VLLM_SINK_DETECTOR_THRESHOLD" in os.environ
++        else None
+     ),
+     # Never commit a token sampled from a sunk row: each step's last sampled
+     # token is verified by the request's next step as draft zero and replaced
+     # by the next alternate of its draw when its own row is sunk; a sunk
+-    # drafter token cuts the verification. Needs the detector column.
+-    "VLLM_SINK_REJECTION": lambda: bool(int(os.getenv("VLLM_SINK_REJECTION", "0"))),
++    # drafter token cuts the verification. Unset: the model's default.
++    "VLLM_SINK_REJECTION": lambda: maybe_convert_bool(
++        os.getenv("VLLM_SINK_REJECTION", None)
++    ),
+     # Alternates kept per provisional token, so rejections per position; past
+     # them the sunk token is committed as it is (counted as a fallthrough).
+     "VLLM_SINK_REJECTION_MAX_RETRIES": lambda: int(
+@@ -2807,9 +2810,9 @@ def compile_factors() -> dict[str, object]:
+         "NO_COLOR",
+         "VLLM_SKIP_VERSION_SUFFIX",
+         # Sampling-only settings of the sink detector: the compiled forward
+-        # depends on its column alone.
++        # depends on whether it keeps the column, which the column and the
++        # switch decide (vllm.v1.sample.sink.SinkConfig.for_model).
+         "VLLM_SINK_DETECTOR_THRESHOLD",
+-        "VLLM_SINK_REJECTION",
+         "VLLM_SINK_REJECTION_MAX_RETRIES",
+         "VLLM_SINK_DETECTOR_CHECK_RANKS",
+     }
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 3109413e9..6301eb55f 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -561,7 +561,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         # The attention-sink detector (vllm.v1.sample.sink) watches one column
+         # of the pre-norm residual: each forward keeps that column of every
+         # residual stream, [tokens, hc_mult] (float32), for every token.
+-        sink_config = SinkConfig.from_env()
++        sink_config = SinkConfig.for_model(vllm_config)
+         self._sink_column = sink_config.column if sink_config is not None else -1
+         self._sink_columns: torch.Tensor | None = None
+         if get_pp_group().is_last_rank and sink_config is not None:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 7a6de6003..00b5adbb7 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -228,7 +228,7 @@ class Scheduler(SchedulerInterface):
+         # rejection on, each step's last sampled token is held back as the
+         # request's provisional token and scheduled as draft zero of its next
+         # step; the worker verifies it there.
+-        self.sink_config = SinkConfig.from_env()
++        self.sink_config = SinkConfig.for_model(vllm_config)
+         self.sink_rejection = (
+             self.sink_config is not None and self.sink_config.rejection
+         )
+diff --git a/vllm/v1/sample/sink.py b/vllm/v1/sample/sink.py
+index 32533820a..99bf5f8d1 100644
+--- a/vllm/v1/sample/sink.py
++++ b/vllm/v1/sample/sink.py
+@@ -3,11 +3,13 @@
+ """Attention-sink detection and rejection: configuration and host-side events.
+ 
+ A generated token can become an attention sink: from a middle layer on, one
+-channel of its residual (DeepSeek V4.1 Flash: column 2455, the BOS sink channel)
+-runs away by orders of magnitude and the row's next-token distribution turns
+-into document-start noise. The forward pass is the model's own, so the remedy is
+-a decoding policy. The detector reads that column of the pre-norm residual at
+-every sampled row (vllm.v1.worker.gpu.sample.sink).
++channel of its residual (DeepSeek V4.1 Flash: its BOS sink channel) runs away by
++orders of magnitude and the row's next-token distribution turns into
++document-start noise. The forward pass is the model's own, so the remedy is a
++decoding policy. The detector reads that column of the pre-norm residual at
++every sampled row (vllm.v1.worker.gpu.sample.sink). It is on by default for the
++models in SINK_CHANNELS and off for every other; ``VLLM_SINK_REJECTION=0`` turns
++it off.
+ 
+ With rejection on, the last token a step samples is not committed when it is
+ sampled: it is the request's provisional token, and the scheduler schedules it
+@@ -24,9 +26,13 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ from enum import IntEnum
++from typing import TYPE_CHECKING
+ 
+ import vllm.envs as envs
+ 
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++
+ # Fields of a request's per-step sink event, as the worker encodes them.
+ NUM_SINK_EVENT_FIELDS = 6
+ 
+@@ -62,6 +68,30 @@ class SinkRow(IntEnum):
+         return self.name.lower()
+ 
+ 
++@dataclass(frozen=True)
++class SinkChannel:
++    """A model's sink channel: the residual column that runs away when a
++    sampled token turns into an attention sink, and the ``|value|`` above
++    which a sampled row counts as sunk."""
++
++    column: int
++    threshold: float
++
++
++# The models the detector and rejection are on for by default, by
++# architecture. Every other model has no entry and runs without them. This
++# table is the only place the numbers live: the code here exists for these
++# checkpoints, and a model without the behaviour drops its entry.
++SINK_CHANNELS: dict[str, SinkChannel] = {
++    # DeepSeek V4.1 Flash (measured on the 1017 checkpoint): column 2455 is its
++    # BOS sink channel. Sunk rows carry 108,032 to 125,440 there on DeepSeek's
++    # reference and 116,736 to 118,784 served; ordinary text peaked at 62,720
++    # (number tokens) over a 358,785-token survey. 85,000 is the geometric
++    # midpoint (experiments/2026-10-19-sink-rejection-v2 in spark-ds41f).
++    "DeepseekV41ForCausalLM": SinkChannel(column=2455, threshold=85_000.0),
++}
++
++
+ @dataclass(frozen=True)
+ class SinkConfig:
+     """The detector's column and threshold, and the rejection policy's switch."""
+@@ -77,25 +107,53 @@ class SinkConfig:
+     max_retries: int
+ 
+     @classmethod
+-    def from_env(cls) -> SinkConfig | None:
++    def for_model(cls, vllm_config: VllmConfig) -> SinkConfig | None:
++        """The settings for the served model, or None when the detector is off.
++
++        On (detector and rejection) for the architectures in SINK_CHANNELS, off
++        for every other model; ``VLLM_SINK_REJECTION`` overrides the default.
++        ``VLLM_SINK_DETECTOR_COLUMN`` and ``_THRESHOLD`` replace the model's
++        numbers; with rejection off, an explicit column runs the detector alone.
++
++        Raises:
++            ValueError: rejection on without a column (a model with no entry),
++                or no threshold for the column.
++        """
++        architecture = vllm_config.model_config.architecture
++        channel = SINK_CHANNELS.get(architecture)
++        rejection = envs.VLLM_SINK_REJECTION
++        if rejection is None:
++            rejection = channel is not None
+         column = envs.VLLM_SINK_DETECTOR_COLUMN
+-        if column < 0:
+-            if envs.VLLM_SINK_REJECTION:
++        if column is None:
++            if not rejection:
++                return None
++            if channel is None:
+                 raise ValueError(
+-                    "VLLM_SINK_REJECTION needs the detector column "
+-                    "(VLLM_SINK_DETECTOR_COLUMN)."
++                    f"VLLM_SINK_REJECTION: {architecture} has no sink channel "
++                    "(vllm.v1.sample.sink.SINK_CHANNELS); set "
++                    "VLLM_SINK_DETECTOR_COLUMN and VLLM_SINK_DETECTOR_THRESHOLD."
+                 )
+-            return None
++            column = channel.column
++        if column < 0:
++            raise ValueError("VLLM_SINK_DETECTOR_COLUMN must not be negative.")
+         threshold = envs.VLLM_SINK_DETECTOR_THRESHOLD
++        if threshold is None:
++            if channel is None:
++                raise ValueError(
++                    f"VLLM_SINK_DETECTOR_COLUMN: {architecture} has no sink "
++                    "channel, so set VLLM_SINK_DETECTOR_THRESHOLD too."
++                )
++            threshold = channel.threshold
+         if threshold <= 0:
+             raise ValueError("VLLM_SINK_DETECTOR_THRESHOLD must be positive.")
+         max_retries = envs.VLLM_SINK_REJECTION_MAX_RETRIES
+-        if envs.VLLM_SINK_REJECTION and max_retries < 1:
++        if rejection and max_retries < 1:
+             raise ValueError("VLLM_SINK_REJECTION_MAX_RETRIES must be at least 1.")
+         return cls(
+             column=column,
+             threshold=threshold,
+-            rejection=bool(envs.VLLM_SINK_REJECTION),
++            rejection=rejection,
+             max_retries=max_retries,
+         )
+ 
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 807915939..fdf050f7f 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -352,7 +352,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # Attention-sink detector and draft-zero rejection
+         # (vllm.v1.sample.sink); its sampling state is built in load_model.
+-        self.sink_config = SinkConfig.from_env()
++        self.sink_config = SinkConfig.for_model(vllm_config)
+         self.sink: SinkSampler | None = None
+         # Per batch index: the request was decoding (with rejection on, its
+         # row 0's input is draft zero).
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index f01346af3..2b217d3e9 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -90,6 +90,7 @@ from vllm.v1.outputs import (
+     DraftTokenIds,
+     ModelRunnerOutput,
+ )
++from vllm.v1.sample.sink import SinkConfig
+ from vllm.v1.utils import compute_iteration_details, report_usage_stats
+ from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
+ from vllm.v1.worker.startup_plan import (
+@@ -556,6 +557,14 @@ class Worker(WorkerBase):
+                 GPUModelRunner as GPUModelRunnerV1,
+             )
+ 
++            if SinkConfig.for_model(self.vllm_config) is not None:
++                # The scheduler would hold each step's last token for a
++                # verification this runner does not do.
++                raise ValueError(
++                    "The sink detector (vllm.v1.sample.sink) runs in the V2 model "
++                    "runner: set VLLM_USE_V2_MODEL_RUNNER=1, or "
++                    "VLLM_SINK_REJECTION=0 to serve without it."
++                )
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
+ 
+         if self.rank == 0:

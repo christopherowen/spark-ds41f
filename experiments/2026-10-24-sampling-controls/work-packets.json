@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "criterion": "Existing dispatch changes only after each relevant correctness, startup, memory and performance gate passes. Pending means untranslated.",
+  "packets": [
+    {
+      "id": "request-controls",
+      "kernels": [
+        "penalties",
+        "min-p",
+        "logit-bias",
+        "bad-words",
+        "thinking-budget",
+        "prompt-logprobs",
+        "nan-metric"
+      ],
+      "state": "ten correctness-tested prototypes; two pass measured speed screens, min-p fails one gate, seven timing screens pending",
+      "tests": [
+        "tests/v1/worker/test_gpu_sampling_controls.py",
+        "tests/v1/worker/test_gpu_thinking_budget.py",
+        "tests/v1/worker/test_gpu_logit_bias.py",
+        "tests/v1/worker/test_gpu_bad_words.py"
+      ],
+      "contracts": [
+        "prior draft tokens only; committed state unchanged by rejected proposals",
+        "request slots and speculative rows kept distinct",
+        "same filtering inequalities, rounding and exceptional values",
+        "cached reasoning markers survive rollback, reuse and multi-token boundaries"
+      ],
+      "integration": "declare each supported dtype/stride/marker shape in the existing owner; then exercise mixed filtered sampling and cache freeze"
+    },
+    {
+      "id": "log-softmax-and-support",
+      "kernels": [
+        "_topk_log_softmax_kernel",
+        "_compact_sampling_mask_kernel"
+      ],
+      "state": "pending translation",
+      "tests": [
+        "tests/v1/worker/test_gpu_logprob_ranks.py",
+        "tests/v1/sample/test_logprobs.py"
+      ],
+      "contracts": [
+        "Triton block reduction and cross-block accumulation order for bitwise FP32 logprobs",
+        "dynamic custom/top-k widths without compiling during a request",
+        "finite support excludes NaN and infinities; ordered compact ids and exact packed bytes; inactive rows empty"
+      ],
+      "integration": "logprob output is externally observable; compare sampled-token and alternate logprobs, plus prompt chunking"
+    },
+    {
+      "id": "stochastic-verification",
+      "kernels": [
+        "_compute_local_logits_stats_kernel",
+        "_compute_cumulative_log_p_kernel",
+        "_compute_local_residual_mass_kernel",
+        "_rejection_kernel",
+        "_resample_kernel"
+      ],
+      "state": "pending translation",
+      "tests": [
+        "tests/v1/spec_decode/test_rejection_sampler_utils.py",
+        "tests/v1/spec_decode/test_synthetic_rejection_sampler_utils.py",
+        "tests/v1/worker/test_gpu_sink.py"
+      ],
+      "contracts": [
+        "same Philox seed, offset words and speculative-step salt",
+        "same FP32 reduction/exp/log semantics and adaptive-verification boundaries",
+        "point-mass and cached-logit proposal distributions; placeholders; bonus rows",
+        "same acceptance decisions, rejection index and residual draw; watermarked variant has a separate dependency"
+      ],
+      "integration": "baseline per-request seeded output equality at temperature 1, rejection unbiasedness tests, greedy equality, measured acceptance by draft position"
+    },
+    {
+      "id": "vocabulary-parallel",
+      "kernels": [
+        "_vp_draft_block_kernel",
+        "_vp_resample_block_kernel"
+      ],
+      "state": "pending translation",
+      "tests": [
+        "tests/v1/spec_decode/test_vocab_parallel_drafting.py",
+        "tests/v1/spec_decode/test_dspark_vocab_parallel.py"
+      ],
+      "contracts": [
+        "preserve the corrected speculative-step seed high word",
+        "global token indices, padded shards and first-index tie breaking",
+        "same per-rank noise words and residual maxima before distributed reduction"
+      ],
+      "integration": "TP3 and TP4, full-vocabulary oracle on the same logits and seed; do not infer coverage from full-vocabulary DSpark"
+    },
+    {
+      "id": "top-k-top-p",
+      "kernels": [
+        "_topk_topp_kernel",
+        "_topp_sb_stats_kernel",
+        "_topp_sb_step_kernel",
+        "_topp_sb_mask_kernel"
+      ],
+      "state": "pending translation",
+      "tests": [
+        "tests/v1/sample/test_topk_topp_sampler.py"
+      ],
+      "contracts": [
+        "same tie handling at k and cumulative probability boundaries",
+        "same split-block pivot, histogram and threshold decisions",
+        "no sort/top-k replacement that silently changes ties or floating-point summation",
+        "mixed per-request k and p, disabled filters, all-masked and extreme logits"
+      ],
+      "integration": "sampled output equality with fixed seeds after the processor; return-sampling-mask agrees byte for byte"
+    },
+    {
+      "id": "optional-features",
+      "kernels": [
+        "_trace_replay_kernel",
+        "_build_shard_plan_kernel",
+        "_pack_sampler_output_kernel",
+        "_unpack_gathered_output_kernel",
+        "_pack_logprobs_kernel",
+        "_unpack_logprobs_kernel",
+        "_repeated_context_mask_kernel",
+        "_philox_gumbel_kernel"
+      ],
+      "state": "pending feature traces and translation",
+      "tests": [
+        "tests/v1/worker/test_gpu_trace_replay.py",
+        "tests/v1/worker/test_gpu_batch_shard.py",
+        "tests/watermarking/test_gumbel.py",
+        "tests/watermarking/test_watermarking.py"
+      ],
+      "contracts": [
+        "trace offsets and length limits; output logprobs score the forced token",
+        "distributed sampler packing layout and permutation invert exactly",
+        "watermark key/context encoding and candidate words preserved bit for bit"
+      ],
+      "integration": "record a trace demonstrating each enabled feature; qualify the actual configured collective plan rather than unused kernels"
+    }
+  ]
+}

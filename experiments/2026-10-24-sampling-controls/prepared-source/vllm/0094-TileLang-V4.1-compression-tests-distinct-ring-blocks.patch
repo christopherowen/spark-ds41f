@@ -1,0 +1,40 @@
+From fad38d8b3fc16478c8c71f13b9bcf1e803686b7f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:06:45 +0200
+Subject: [PATCH 094/274] TileLang V4.1 compression tests: distinct ring
+ blocks, two-ulp tolerance
+
+Random block tables could give two requests one ring block, so their saves
+raced on the test's data (real tables give each request its own); and the
+library exp and the reduction order can each move an FP32 bit, two flips at
+BF16 rounding boundaries making two ulps against the torch arithmetic (the
+bench's FP64 error equals B12X's).
+
+(cherry picked from commit 0157ed22a92baa58042f54905ddf4708338d4283)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index fda92bb97..d8205ebc6 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -51,6 +51,10 @@ def _step(lengths, ratio, seed, padding=3):
+     gates = torch.randn(CAPACITY, DIM, generator=g) * 2
+     slots = torch.randint(0, 10**6, (CAPACITY,), generator=g)
+     table = torch.randint(1, BLOCKS, (REQUESTS, 4), generator=g).to(torch.int32)
++    # Each request owns its ring block, as the block table gives it.
++    table[:, 0] = (torch.randperm(BLOCKS - 1, generator=g)[:REQUESTS] + 1).to(
++        torch.int32
++    )
+     state_slots = torch.full((CAPACITY,), -1, dtype=torch.int64)
+     for r, n in enumerate(lengths):
+         for k in range(n):
+@@ -162,7 +166,9 @@ def test_compress_matches_reference(ratio, lengths):
+     assert torch.equal(emitted[:rows], want[1])
+     assert torch.equal(eslots[:rows], want[2])
+     ulps = _bf16_ulps(out[:rows], want[0])
+-    assert int(ulps.max()) <= 1 and float((ulps > 0).float().mean()) < 0.01
++    # The library exp and the reduction order each move an FP32 bit; two such flips
++    # at BF16 rounding boundaries make two ulps.
++    assert int(ulps.max()) <= 2 and float((ulps > 0).float().mean()) < 0.01
+     # Rows past the step keep their contents.
+     assert (out[rows:] == 5.0).all() and emitted[rows:].all()
+     assert (eslots[rows:] == 77).all()

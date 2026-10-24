@@ -1,0 +1,49 @@
+From b9c61644f535fada9983942b986d67fe6a293996 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 17:11:54 +0100
+Subject: [PATCH 120/274] TileLang V4.1: the W8A16 GEMM's kernels follow the
+ naming scheme
+
+gemm_fp8w_bf16_kernel and gemm_fp8w_bf16_partials_kernel, after the file
+and what they compute, like the other gemm.py kernels.
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 0e23173f1..4ade1adaf 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -409,7 +409,7 @@ def fp8w_bf16_gemm(
+     n_tiles = N // block_N
+ 
+     @T.prim_func
+-    def main(
++    def gemm_fp8w_bf16(
+         A: T.Tensor((M, groups * K), T.bfloat16),
+         W: T.Tensor((groups * N, K), T.float8_e4m3fn),
+         E: T.Tensor((groups * N // 32, K // 32), T.uint8),
+@@ -449,7 +449,7 @@ def fp8w_bf16_gemm(
+             else:
+                 T.copy(C_local, C[by * block_M, n0])
+ 
+-    return main
++    return gemm_fp8w_bf16
+ 
+ 
+ @T.macro
+@@ -496,7 +496,7 @@ def fp8w_bf16_gemm_partials(
+     n_tiles = N // block_N
+ 
+     @T.prim_func
+-    def main(
++    def gemm_fp8w_bf16_partials(
+         A: T.Tensor((M, groups * K), T.bfloat16),
+         W: T.Tensor((groups * N, K), T.float8_e4m3fn),
+         E: T.Tensor((groups * N // 32, K // 32), T.uint8),
+@@ -522,7 +522,7 @@ def fp8w_bf16_gemm_partials(
+                 P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],
+             )
+ 
+-    return main
++    return gemm_fp8w_bf16_partials
+ 
+ 
+ @tilelang.jit

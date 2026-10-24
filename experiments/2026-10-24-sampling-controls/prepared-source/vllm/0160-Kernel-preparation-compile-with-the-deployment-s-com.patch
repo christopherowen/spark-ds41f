@@ -1,0 +1,76 @@
+From ec4f00a922608be38fbbe8518acad4e85fba8678 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:40:53 +0200
+Subject: [PATCH 160/274] Kernel preparation: compile with the deployment's
+ compile parallelism; return the compile threads' heap
+
+Every compile holds host memory, which on GB10 is the GPU's: a cold
+preparation with a thread per CPU left dgx1 below the startup memory guard
+(MemAvailable 4.92 GiB under 5) by the drafter's graph capture. Compile
+threads follow MAX_JOBS (the recipe's 2), and after preparation malloc_trim
+returns the threads' malloc arenas, so memory profiling starts from what
+serving holds.
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/prepare.py b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+index 9bf1cf8b0..29869d116 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/prepare.py
++++ b/vllm/models/deepseek_v4_1/tilelang/prepare.py
+@@ -85,6 +85,7 @@ class TileLangKernels(VllmJitKernel[_CallKey]):
+ 
+         tilelang.prepare(
+             [(key.function, key.args, key.kwargs) for key in compile_keys],
++            num_workers=compile_workers(),
+             progress=PROGRESS.report,
+         )
+ 
+@@ -187,6 +188,15 @@ def declared_calls(registry: JitWarmupRegistry) -> list[TileLangCall]:
+     return list(calls.values())
+ 
+ 
++def compile_workers() -> int | None:
++    """Compile threads: the deployment's compile parallelism (``MAX_JOBS``), since every
++    compile holds host memory, which on unified-memory GPUs is the device's; all CPUs
++    when it is unset."""
++    from vllm import envs
++
++    return int(envs.MAX_JOBS) if envs.MAX_JOBS else None
++
++
+ def prepare_declared(registry: JitWarmupRegistry) -> int:
+     """Compile every TileLang call declared in ``registry`` in one thread pool;
+     return the number of distinct calls."""
+@@ -194,10 +204,20 @@ def prepare_declared(registry: JitWarmupRegistry) -> int:
+ 
+     calls = declared_calls(registry)
+     PROGRESS.start(len(calls))
+-    tilelang.prepare(calls, progress=PROGRESS.report)
++    tilelang.prepare(calls, num_workers=compile_workers(), progress=PROGRESS.report)
+     return len(calls)
+ 
+ 
++def release_host_memory() -> None:
++    """Return the compile threads' freed heap to the system (glibc keeps a malloc
++    arena per thread), so memory profiling starts from what serving holds."""
++    import contextlib
++    import ctypes
++
++    with contextlib.suppress(OSError, AttributeError):
++        ctypes.CDLL("libc.so.6").malloc_trim(0)
++
++
+ def _callbacks(registry: JitWarmupRegistry, index: int) -> list[Callable[[], None]]:
+     found: dict[int, Callable[[], None]] = {}
+     for kernel, registrations in registry.registrations():
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2e814b2cb..2dfebe124 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1449,6 +1449,8 @@ class Worker(WorkerBase):
+                 with torch.inference_mode():
+                     prepare.warm_declared(registry)
+             registry.warmup()
++            if tilelang_calls:
++                prepare.release_host_memory()
+         if tilelang_calls:
+             prepare.freeze("every declared kernel was prepared before memory profiling")
+             with set_current_vllm_config(self.vllm_config):

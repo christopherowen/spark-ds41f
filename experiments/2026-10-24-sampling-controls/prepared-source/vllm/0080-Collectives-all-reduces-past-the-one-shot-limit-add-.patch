@@ -1,0 +1,30 @@
+From 5e854f641cc5e3d65ce95cc51ac7f33a9feb3367 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:04:43 +0200
+Subject: [PATCH 080/274] Collectives: all-reduces past the one-shot limit add
+ in rank order under the TileLang kernel backend
+
+(cherry picked from commit 86b35b41e1d8b684423f6fbd1dd116ab1dd818a7)
+
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 97fff7768..56a9b7073 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -512,6 +512,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 raise RuntimeError("Selected B12X all-reduce returned None")
+             return out
+ 
++        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++            # Past the one-shot dispatch limit (CED decoder steps of 205 rows or
++            # more), keep its arithmetic: NCCL's ring rounds every hop and adds
++            # in another order, so a row's bits would depend on its step's size.
++            from vllm.models.deepseek_v4_1.tilelang.collectives import (
++                all_reduce_rank_order,
++            )
++
++            return all_reduce_rank_order(
++                self.pynccl_comm, input_, self.rank_in_group, self.world_size
++            )
+         if self._roce_policy:
+             out = self.pynccl_comm.all_reduce(input_)
+             if out is None:

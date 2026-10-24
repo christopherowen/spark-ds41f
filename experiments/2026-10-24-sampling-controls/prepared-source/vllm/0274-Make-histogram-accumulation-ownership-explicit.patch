@@ -1,0 +1,73 @@
+From 8decb3e8d5438c9c7126f7e0be03f43b61a0dfcc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:28:00 +0200
+Subject: [PATCH 274/274] Make histogram accumulation ownership explicit
+
+The candidate replaces the atomic histogram kernel, while the existing owner retains selected-row clearing. Cover accumulation into preexisting prompt bits and output counts as well as zeroed buffers.
+
+
+diff --git a/benchmarks/kernels/benchmark_sampling_controls.py b/benchmarks/kernels/benchmark_sampling_controls.py
+index 113f215be..5976b4056 100644
+--- a/benchmarks/kernels/benchmark_sampling_controls.py
++++ b/benchmarks/kernels/benchmark_sampling_controls.py
+@@ -48,7 +48,7 @@ def make_case(kind, rows, width, seed, count):
+         def invoke(index, ours):
+             mask, counts = buffers[index]
+             if ours:
+-                candidate.bincount(
++                candidate.accumulate_bincount(
+                     mapping, tokens, prompt, prefill, mask, counts, width
+                 )
+             else:
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 03194b2b2..ccf644470 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -152,7 +152,10 @@ def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
+ 
+ @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize("length", [1, 1023, 1025, 8192])
+-def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, length):
++@pytest.mark.parametrize("initial", [0, 7])
++def test_bincount_distinguishes_prompt_bits_and_output_counts(
++    index_dtype, length, initial
++):
+     torch.manual_seed(29401)
+     states, rows, vocab = 9, 4, 129280
+     tokens = torch.randint(
+@@ -164,6 +167,8 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
+     prefill = torch.full((states,), length, dtype=torch.int32, device="cuda")
+     mask = torch.zeros((states, (vocab + 31) // 32), dtype=torch.int32, device="cuda")
+     counts = torch.zeros((states, vocab), dtype=torch.int32, device="cuda")
++    mask.fill_(initial)
++    counts.fill_(initial)
+     expected_mask, expected_counts = mask.clone(), counts.clone()
+     _bincount_kernel[(rows, (length + 1023) // 1024)](
+         mapping,
+@@ -177,7 +182,9 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
+         counts.stride(0),
+         BLOCK_SIZE=1024,
+     )
+-    candidate.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
++    candidate.accumulate_bincount(
++        mapping, tokens, prompt, prefill, mask, counts, length
++    )
+     assert_bits(mask, expected_mask)
+     assert_bits(counts, expected_counts)
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 348c818c7..4f8083062 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -332,7 +332,10 @@ def register_bincount(
+     )
+ 
+ 
+-def bincount(mapping, tokens, prompt, prefill, mask, counts, max_prefill_len):
++def accumulate_bincount(
++    mapping, tokens, prompt, prefill, mask, counts, max_prefill_len
++):
++    """Kernel portion only; the owner still clears selected rows before accumulation."""
+     if mapping.numel() and max_prefill_len:
+         _launch(
+             bincount_kernel,

@@ -1,0 +1,31 @@
+From e39cd9da9938f4f0c7191d235662aa83d25c948b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 07:34:13 +0200
+Subject: [PATCH 109/274] TileLang V4.1 vocabulary heads: token tiles vary
+ fastest in the grid
+
+Past 64 rows a head call has two token tiles. With vocabulary blocks varying
+fastest, every block's packed weights were read for the first tile, then the
+whole shard again from DRAM for the second (about 2.2 ms a 96-row call on TP4's
+248 MB shard). Token tiles now vary fastest, so the second tile reads the block
+from L2. Each block computes the same as before.
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index ac3dc4a89..f3c02e967 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -127,9 +127,12 @@ def packed_vocab_projection(
+         row_offsets: T.Tensor((N + 1,), T.int32),
+         C: T.Tensor((M, N), out_dtype),
+     ):
++        # Token tiles vary fastest: both tiles of a 96-row step read a vocabulary
++        # block's packed weights back to back, the second from L2, instead of the
++        # whole shard twice from DRAM. Each block computes the same as before.
+         with T.Kernel(
+-            T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+-        ) as (bx, by):
++            T.ceildiv(M, block_M), T.ceildiv(N, block_N), threads=threads
++        ) as (by, bx):
+             A_shared = T.alloc_shared((block_M, STEP), T.bfloat16)
+             low_shared = T.alloc_shared((block_N, STEP), T.uint8)
+             code_shared = T.alloc_shared((block_N, STEP // 2), T.uint8)

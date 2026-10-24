@@ -1,0 +1,80 @@
+From fbb56b9688914bdc9564d23b9468291ee0a35ac9 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:21:41 +0200
+Subject: [PATCH 166/274] Tests: hand-built drafter and model stubs read what
+ the code now reads; no deployment environment
+
+- test_dflash_dcp: the DSpark drafter's persistent padding mask (_is_padding,
+  _row_index), read by propose since the drafter marks its padding rows.
+- test_dspark_greedy_markov: the speculator's _vocab_parallel_greedy, which
+  _sample_sequential calls unconditionally.
+- test_adaptive_verification: the cold-run profiling test measures; with a
+  deployment's SPARK3_DSPARK_COST_DIR set it loaded pinned curves instead.
+- test_deepseek_v4_1_ced_model: L2 prefetch is on by default on GB10 and the
+  stand-in model has no prefetcher.
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 9cde45c28..9f8577c79 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -242,6 +242,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+     )
+     monkeypatch.setattr(native, "gather_rows", _gather)
+     monkeypatch.setattr(native, "scatter_rows", _scatter)
++    # L2 prefetch is on by default on GB10; this stand-in model has no prefetcher.
++    monkeypatch.setattr(native.l2_prefetch, "ENABLED", False)
+     ids = torch.arange(8)
+     positions = torch.arange(100, 108)
+     inputs = torch.arange(16, dtype=torch.float32).reshape(8, 2) / 8
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 66ceee8fa..d3e3db171 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -323,8 +323,10 @@ def test_budget_uses_request_specific_full_graph_costs():
+     assert manager._batch_budget[2] == 2
+ 
+ 
+-def test_profile_costs_excludes_each_shapes_cold_run():
++def test_profile_costs_excludes_each_shapes_cold_run(monkeypatch):
+     """One-time preparation must not inflate the adaptive verifier's costs."""
++    # Measure, rather than load pinned curves from a deployment's cost directory.
++    monkeypatch.setattr(adaptive_module, "_COST_DIR", None)
+     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+     manager.req_states = SimpleNamespace(max_num_batched_tokens=16)
+     curves: dict[str, object] = {}
+diff --git a/tests/v1/spec_decode/test_dflash_dcp.py b/tests/v1/spec_decode/test_dflash_dcp.py
+index 51cbca33b..0953d363f 100644
+--- a/tests/v1/spec_decode/test_dflash_dcp.py
++++ b/tests/v1/spec_decode/test_dflash_dcp.py
+@@ -158,6 +158,8 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(
+         max_model_len=128,
+         max_num_reqs=1,
+         max_num_tokens=1,
++        _is_padding=torch.ones(1, dtype=torch.bool),
++        _row_index=torch.arange(1),
+         hidden_states=torch.full((1, 1), -99.0),
+         context_positions=torch.zeros(1, dtype=torch.int64),
+         sample_indices=torch.zeros(1, dtype=torch.int64),
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index 2dbc9d892..eb70579dd 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Exact full-vocabulary DSpark greedy tokens, including graph replay."""
+ 
+-from types import SimpleNamespace
++from types import MethodType, SimpleNamespace
+ from unittest.mock import Mock
+ 
+ import pytest
+@@ -53,6 +53,9 @@ def test_sequential_sharded_sampling_preserves_each_token(needs_distribution):
+         acceptance_estimator=None,
+         _sample_logits=Mock(side_effect=lambda logits, *args: logits.argmax(-1)),
+     )
++    spec._vocab_parallel_greedy = MethodType(
++        DSparkSpeculator._vocab_parallel_greedy, spec
++    )
+     DSparkSpeculator._sample_sequential(spec, 2, torch.zeros(4, 8))
+     assert spec.draft_tokens.tolist() == [[0, 1], [0, 1]]
+     assert [ids.tolist() for ids in seen_anchors] == [[5, 9], [0, 0]]

@@ -1,0 +1,209 @@
+From 58ea178e81f1daa38e55e3792f1938dc7d6a7691 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 18:23:30 +0200
+Subject: [PATCH 102/274] DeepSeek V4.1 attention: a mixed step's decode
+ requests keep the decode plan
+
+The sparse-MLA plan and the index mode were chosen per step: a step holding any
+prefill ran every row on the extend plan and the prefill index modes, decode
+requests' rows included, while the same rows of a decode-only step ran on the
+decode plan. The plans accumulate differently, so a decode row's attention
+(and, near ties, its selected positions) depended on whether a prefill shared
+its step: the last temperature-0 difference left (r6e bisect, row trace).
+
+The metadata now records the leading rows of decode requests (the batch is
+reordered decode-first; requests of up to the decode threshold, as is_decode
+counts them). In a mixed step those rows take the decode index mode and the
+decode plan, the rest the prefill modes and the extend plan. Mixed steps run
+eagerly: their per-row metadata is an ordinary allocation and each plan
+borrows the workspace in turn, so the locked workspace does not grow.
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 961cb2df1..13ef8e1f3 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1550,6 +1550,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         mode = "decode" if swa.is_decode else "extend"
+         rows = q.shape[0]
+         self._check_attention_rows(mode, rows)
++        # A mixed step's decode requests, its leading rows (the batch is reordered
++        # decode-first), keep the decode plan and the decode index mode: a row's
++        # arithmetic must not depend on whether a prefill shares its step.
++        decode_rows = 0
++        if mode == "extend":
++            decode_rows = min(getattr(swa, "num_decode_tokens", 0), rows)
++            if decode_rows:
++                self._check_attention_rows("decode", decode_rows)
+         owner = (
+             self._context[_source(self.prefix, self.index_source_layer_id)]
+             if self.compress_ratio
+@@ -1583,11 +1591,26 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 index_mode = "prefill_short"
+                 chunk_rows = self._short_index_shape[0]
+                 index_pages = self._short_index_pages
+-            index_width = index_pages.shape[1]
++            rest = (index_mode, chunk_rows, index_pages, score_width)
++            decode = ("decode", self.DECODE_CHUNK, self._index_pages, None)
++
++            def select(query, first, selected):
++                # Decode requests' rows (global rows below decode_rows) take the
++                # decode index mode, as in a step of decode requests alone.
++                count = query[0].shape[0]
++                cut = min(max(decode_rows - first, 0), count)
++                if cut:
++                    select_rows([t[:cut] for t in query], first, selected[:cut], decode)
++                if cut < count:
++                    select_rows(
++                        [t[cut:] for t in query], first + cut, selected[cut:], rest
++                    )
+ 
+-            def select_rows(query, first, selected):
++            def select_rows(query, first, selected, params):
+                 # Query rows start at global row `first`; metadata and
+                 # candidates are indexed by global row, `selected` by query row.
++                index_mode, chunk_rows, index_pages, score_width = params
++                index_width = index_pages.shape[1]
+                 iq_data, iq_scale, iw = query
+                 index_rows = iq_data.shape[0]
+                 for offset in range(0, index_rows, chunk_rows):
+@@ -1646,7 +1669,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     )
+ 
+             if split is None:
+-                select_rows(query, 0, self.topk_indices_buffer)
++                select(query, 0, self.topk_indices_buffer)
+             else:
+                 real = split.real_rows
+                 local = slice(split.start, split.start + real)
+@@ -1661,7 +1684,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     if owns_candidates:
+                         self._candidates[:rows].fill_(-2)
+                         self._candidate_lens[:rows].fill_(-2)
+-                    select_rows(reference, 0, self.topk_indices_buffer)
++                    select(reference, 0, self.topk_indices_buffer)
+                     expected = self.topk_indices_buffer[local].clone()
+                     if owns_candidates:
+                         expected_candidates = (
+@@ -1672,19 +1695,22 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     repeat = torch.full(
+                         (rows, 512), -2, dtype=torch.int32, device=q.device
+                     )
+-                    select_rows(reference, 0, repeat)
++                    select(reference, 0, repeat)
+                     repeat = repeat[local]
+                     selected.fill_(-2)
+                     if owns_candidates:
+                         self._candidates[local].fill_(-2)
+                         self._candidate_lens[local].fill_(-2)
+-                select_rows(query, split.start, selected)
++                select(query, split.start, selected)
+                 if reference is not None:
+                     self._check_index_split(
+                         split, selected, expected, repeat, expected_candidates
+                     )
+                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
++        if decode_rows:
++            self._attend_split(q, output, swa, main, owner, rows, decode_rows)
++            return
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+         metadata_specs = self._attention_workspace_specs[mode]
+@@ -1739,6 +1765,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             **kwargs,
+         )
+ 
++    def _attend_split(self, q, output, swa, main, owner, rows, decode_rows):
++        """A mixed step's attention: its decode requests' rows on the decode plan,
++        the rest on the extend plan. Mixed steps run eagerly, so the per-row
++        metadata is an ordinary allocation and each plan borrows the workspace in
++        turn (stream order keeps the second from overwriting the first's scratch
++        while it runs)."""
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("V4.1 mixed-step attention is never captured")
++        metadata = tuple(
++            torch.empty((rows, *shape[1:]), dtype=dtype, device=q.device)
++            for shape, dtype in self._attention_workspace_specs["extend"]
++        )
++        self._write_decode_metadata(metadata, swa, main, rows)
++        swa_indices, swa_lengths, top_lengths = metadata[:3]
++        for mode, lo, hi in (("decode", 0, decode_rows), ("extend", decode_rows, rows)):
++            if hi == lo:
++                continue
++            scratch = current_workspace_manager().get_simultaneous(
++                *self._attention_scratch_specs(mode, hi - lo)
++            )
++            kwargs = {}
++            if main is not None:
++                kwargs = dict(
++                    indexed_indices=owner.topk_indices_buffer[lo:hi],
++                    indexed_lengths=top_lengths[lo:hi],
++                    indexed_page_table=metadata[3][lo:hi],
++                )
++            self._attend(
++                mode,
++                q[lo:hi],
++                output[lo:hi],
++                scratch=list(scratch),
++                swa_indices=swa_indices[lo:hi],
++                swa_lengths=swa_lengths[lo:hi],
++                **kwargs,
++            )
++
+     def _quantize_index_query(self, mode: str, iq, iq_data, iq_scale) -> None:
+         """MXFP4-quantize ``[rows, heads, 128]`` index queries into the outputs."""
+         chunk_rows = self.DECODE_CHUNK if mode == "decode" else self.INDEX_CHUNK
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 9f7e6af14..e26a3c81b 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -17,6 +17,7 @@ from vllm.v1.attention.backend import (
+     CommonAttentionMetadata,
+     MultipleOf,
+ )
++from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheLayout
+ 
+ 
+@@ -171,6 +172,10 @@ class DeepseekV41B12xMetadata:
+     swa_replay_start: torch.Tensor | None = None
+     # Rows the CED decoder's MoE routes (False for padding), in its compact layout.
+     routing_mask: torch.Tensor | None = None
++    # The leading rows of decode requests (the batch is reordered decode-first):
++    # every row of a decode step; in a mixed step, the rows attention keeps on the
++    # decode plan so their arithmetic does not depend on the step.
++    num_decode_tokens: int = 0
+ 
+ 
+ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+@@ -280,6 +285,18 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         )
+ 
+     def _metadata(self, cm, table):
++        is_decode = (
++            self.reorder_batch_threshold is not None
++            and cm.max_query_len <= self.reorder_batch_threshold
++        )
++        if is_decode:
++            decode_tokens = cm.num_actual_tokens
++        elif self.reorder_batch_threshold is not None:
++            decode_tokens = split_decodes_and_prefills(
++                cm, decode_threshold=self.reorder_batch_threshold
++            )[2]
++        else:
++            decode_tokens = 0
+         return DeepseekV41B12xMetadata(
+             cm.num_actual_tokens,
+             cm.num_reqs,
+@@ -293,9 +310,9 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             self.reqs,
+             self.slots,
+             self.lengths,
+-            self.reorder_batch_threshold is not None
+-            and cm.max_query_len <= self.reorder_batch_threshold,
++            is_decode,
+             cm.max_seq_len,
++            num_decode_tokens=decode_tokens,
+         )
+ 
+ 

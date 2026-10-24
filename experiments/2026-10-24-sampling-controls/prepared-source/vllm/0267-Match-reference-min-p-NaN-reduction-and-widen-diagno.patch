@@ -1,0 +1,109 @@
+From a82811789bbee88240782b0af786aa8e7b1188d0 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:16:27 +0200
+Subject: [PATCH 267/274] Match reference min-p NaN reduction and widen
+ diagnostic comparisons
+
+Preserve stronger non-finite coverage, including fully NaN blocks. CUDA isnan requires BF16 inputs converted to FP32.
+
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 560da388e..d3ba5e991 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -20,9 +20,12 @@ def assert_bits(actual, expected):
+         # NaN payloads are not part of the logits-processor contract.
+         assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+         valid = ~torch.isnan(expected)
+-        assert torch.equal(
+-            actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+-        )
++        mismatch = (actual.view(torch.int32) != expected.view(torch.int32)) & valid
++        examples = mismatch.nonzero()[:8]
++        assert not mismatch.any(), [
++            (index.tolist(), actual[tuple(index)].item(), expected[tuple(index)].item())
++            for index in examples
++        ]
+     else:
+         assert torch.equal(actual, expected)
+ 
+@@ -42,6 +45,10 @@ def min_p_case(rows, vocab, index_dtype, *, padded=False, nonfinite=False):
+             logits[1, 0] = float("nan")
+         if rows > 2:
+             logits[2, -1] = float("inf")
++        if rows > 3:
++            logits[3].fill_(float("nan"))
++        if rows > 4 and vocab > 1024:
++            logits[4, :1024] = float("nan")
+     return logits, mapping, thresholds
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 7ad030458..45ffb4912 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -205,7 +205,7 @@ def nan_count_kernel(vocab: int, stride: int, dtype: str):
+                     value = T.if_then_else(
+                         index < vocab, logits[T.cast(row, "int64"), index], 0
+                     )
+-                    counts[col] += T.cast(T.isnan(value), "int32")
++                    counts[col] += T.cast(T.isnan(T.cast(value, "float32")), "int32")
+             T.reduce_sum(counts, total, dim=0)
+             output[row] = total[0]
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index da941ec04..6ba31c931 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -59,15 +59,12 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
+         with T.Kernel(rows, threads=threads) as row:
+             T.import_source(_HEADER)
+             maximum = T.alloc_fragment((block,), "float32")
+-            invalid = T.alloc_fragment((block,), "int32")
+             reduced = T.alloc_fragment((1,), "float32")
+-            any_nan = T.alloc_fragment((1,), "int32")
+             value = T.alloc_local((1,), "float32")
+             minimum = T.alloc_local((1,), "float32")
+             minimum[0] = thresholds[mapping[row]]
+             if minimum[0] != 0:
+                 T.fill(maximum, -T.infinity("float32"))
+-                T.clear(invalid)
+                 for start in T.serial(T.ceildiv(vocab, block)):
+                     for col in T.Parallel(block):
+                         index = start * block + col
+@@ -75,24 +72,21 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
+                         if index < vocab:
+                             value[0] = logits[T.cast(row, "int64"), index]
+                         maximum[col] = T.max(maximum[col], value[0])
+-                        invalid[col] |= T.cast(T.isnan(value[0]), "int32")
+                 T.reduce_max(maximum, reduced, dim=0)
+-                T.reduce_max(invalid, any_nan, dim=0)
+                 minimum[0] = reduced[0] + T.call_extern(
+                     "float32", "vllm_control_log", minimum[0]
+                 )
+-                # Triton's maximum propagates NaNs. A NaN threshold filters nothing.
+-                if any_nan[0] == 0:
+-                    for start in T.serial(T.ceildiv(vocab, block)):
+-                        for col in T.Parallel(block):
+-                            index = start * block + col
+-                            if index < vocab:
+-                                value[0] = logits[T.cast(row, "int64"), index]
+-                                logits[T.cast(row, "int64"), index] = T.if_then_else(
+-                                    value[0] < minimum[0],
+-                                    -T.infinity("float32"),
+-                                    value[0],
+-                                )
++                # The maximum reduction ignores isolated NaNs, as Triton does.
++                for start in T.serial(T.ceildiv(vocab, block)):
++                    for col in T.Parallel(block):
++                        index = start * block + col
++                        if index < vocab:
++                            value[0] = logits[T.cast(row, "int64"), index]
++                            logits[T.cast(row, "int64"), index] = T.if_then_else(
++                                value[0] < minimum[0],
++                                -T.infinity("float32"),
++                                value[0],
++                            )
+ 
+     return min_p
+ 

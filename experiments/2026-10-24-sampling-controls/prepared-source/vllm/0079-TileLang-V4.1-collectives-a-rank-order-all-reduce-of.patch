@@ -1,0 +1,111 @@
+From 60f94b6950e4f852f48d8ff0433c01e0176a3688 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:04:43 +0200
+Subject: [PATCH 079/274] TileLang V4.1 collectives: a rank-order all-reduce of
+ any size
+
+The rank-order reduce-scatter of the rows (zero-padded to a multiple of the
+world size) followed by an all-gather, which only moves bits: every row is
+the FP32 rank-order sum with one rounding that sparknet's one-shot all-reduce
+computes, whatever the message size.
+
+(cherry picked from commit 95fa3ac658ccaf22a630ec30bf727b433788f3fc)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 7c2766f06..540fd8a28 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -11,6 +11,7 @@ import torch
+ 
+ from vllm.models.deepseek_v4_1.tilelang.collectives import (
+     RankOrderParts,
++    all_reduce_rank_order,
+     exchange_into,
+     rank_order_sum,
+     reduce_scatter_rank_order,
+@@ -25,6 +26,7 @@ class _Fabric:
+         self.world = world
+         self.barrier = threading.Barrier(world)
+         self.queues = defaultdict(deque)
++        self.gathered = {}
+         self.lock = threading.Lock()
+ 
+ 
+@@ -47,6 +49,15 @@ class _Comm:
+     def recv(self, tensor, peer):
+         self.recvs.append((peer, tensor))
+ 
++    def all_gather(self, output, tensor):
++        """Every rank's ``tensor`` into ``output`` in rank order (data movement only)."""
++        fabric = self.fabric
++        with fabric.lock:
++            fabric.gathered[self.rank] = tensor.clone()
++        fabric.barrier.wait()
++        output.copy_(torch.cat([fabric.gathered[r] for r in range(fabric.world)]))
++        fabric.barrier.wait()
++
+     def group_end(self):
+         fabric = self.fabric
+         with fabric.lock:
+@@ -139,6 +150,21 @@ def test_sliced_exchange_into_parts_sums_alike(world, bounds):
+         assert torch.equal(sliced[rank].sum(), whole[rank])
+ 
+ 
++@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("rows", [1, 5, 8, 13])
++def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
++    # Every rank gets every row, each summed in rank order with one rounding,
++    # whatever the row count (padding rows are dropped).
++    torch.manual_seed(world * 100 + rows)
++    width = 24
++    inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
++    out = _run(inputs, all_reduce_rank_order)
++    want = _reference(inputs)
++    for rank in range(world):
++        assert out[rank].shape == (rows, width)
++        assert torch.equal(out[rank], want)
++
++
+ def test_row_bits_do_not_depend_on_owner_or_batch():
+     # One row's partials at every position of batches of two sizes: the reduced
+     # row has the same bits wherever it lands and whichever rank owns it.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index ae87c8667..41ec12364 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -221,6 +221,27 @@ def reduce_scatter_rank_order(
+     return rank_order_sum(exchange_rank_order(comm, input_tensor, rank, world))
+ 
+ 
++def all_reduce_rank_order(
++    comm, input_tensor: torch.Tensor, rank: int, world: int
++) -> torch.Tensor:
++    """The sum over ranks of ``input_tensor`` at any size, with the one-shot
++    all-reduce's arithmetic: its rows (zero-padded to a multiple of ``world``) are
++    reduce-scattered in rank order, then all-gathered, which moves bits without
++    arithmetic. A row has the same bits as the one-shot path would give it."""
++    rows = input_tensor.shape[0]
++    flat = input_tensor.reshape(rows, -1)
++    padded = -(-rows // world) * world
++    if padded != rows or not flat.is_contiguous():
++        buffer = flat.new_zeros((padded, flat.shape[1]))
++        buffer[:rows].copy_(flat)
++    else:
++        buffer = flat
++    own = reduce_scatter_rank_order(comm, buffer, rank, world)
++    gathered = torch.empty_like(buffer)
++    comm.all_gather(gathered, own)
++    return gathered[:rows].view(input_tensor.shape)
++
++
+ def _send(comm, tensor: torch.Tensor, peer: int) -> None:
+     if tensor.numel():
+         comm.send(tensor, peer)
+@@ -233,6 +254,7 @@ def _recv(comm, tensor: torch.Tensor, peer: int) -> None:
+ 
+ __all__ = [
+     "RankOrderParts",
++    "all_reduce_rank_order",
+     "exchange_into",
+     "exchange_rank_order",
+     "rank_order_sum",

@@ -1,0 +1,28 @@
+From 0441ba1be2f8bcd93d37ea4b21f7838de0770b74 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:19:48 +0200
+Subject: [PATCH 253/274] V2 runner inputs: bound loads are not replayed under
+ guarded statements
+
+TileLang's IfStmtBinding re-substitutes binds under each guarded statement, so
+the combine kernel re-read its request's scalars after every store: 47 loads
+where Triton's kernel has 9, and +0.4 to +0.7 us a call with dead rows. With
+replay off the runner's kernels give the same bytes (round 3 checked every one)
+and combine and post_update take 8-13% less device time.
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 582fef4e2..2392c9935 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -56,6 +56,11 @@ _PASS = {
+     # Every access is guarded by the kernel's own masks, as in Triton; buffers
+     # reached through pointer tables have no meaningful extent to guard against.
+     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    # A name bound to a load stays one load: with replay on (TileLang's default),
++    # IfStmtBinding re-substitutes binds under each guarded statement, and the
++    # combine kernel re-read its request's scalars after every store (47 loads where
++    # Triton's has 9).
++    "tl.if_stmt_binding_inline_replayable_binds": False,
+ }
+ _THREADS = 256
+ _PER_THREAD = 4

@@ -1,0 +1,530 @@
+From d41e7aa32818beaf05a3feb60023496aafa72e95 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:04:31 +0200
+Subject: [PATCH 170/274] DeepSeek V4.1 encoding: current-turn thinking across
+ tool results, tool images in prompt order
+
+DeepSeek's encoding fix of 2026-10-16 (both V4.1 Flash checkpoints):
+- A user message holding only tool results no longer starts a turn: the
+  current turn's reasoning is kept across its tool results and dropped once a
+  new user message completes the turn.
+- Media is collected after tool results take the order the assistant called
+  them. vLLM collects media from the request's messages before encoding, so
+  the DS4.1 renderer now applies order_tool_results first: it permutes each
+  merged turn's tool messages exactly as merge_tool_messages and
+  sort_tool_results_by_call_order arrange their blocks, and the encoder then
+  reorders nothing; each image follows its own placeholder.
+- Image tokens in text (content, text parts, reasoning) are rejected, for every
+  role.
+
+The fixtures follow the new reference (the 1017 encoder; all earlier cases
+are unchanged under it) and add its current-turn and tool-image cases.
+
+diff --git a/tests/tokenizers_/fixtures/deepseek_v41/encoding.json b/tests/tokenizers_/fixtures/deepseek_v41/encoding.json
+index 532e842e9..a62c750d0 100644
+--- a/tests/tokenizers_/fixtures/deepseek_v41/encoding.json
++++ b/tests/tokenizers_/fixtures/deepseek_v41/encoding.json
+@@ -1,5 +1,5 @@
+ {
+-  "reference": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/raw/dba1be0a40aa45a94ad051997016db3960a90277/encoding/encoding.py",
++  "reference": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/raw/1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/encoding.py",
+   "reference_author": "DeepSeek; namespace contract by Qizhou Guo",
+   "cases": [
+     {
+@@ -405,6 +405,165 @@
+         "thinking": false
+       },
+       "expected": "<｜begin▁of▁sentence｜><｜User｜>Hello.<｜Assistant｜></think>Hi.<｜end▁of▁sentence｜><｜title｜>"
++    },
++    {
++      "name": "current_turn_tool_thinking",
++      "kwargs": {
++        "thinking": true
++      },
++      "messages": [
++        {
++          "role": "user",
++          "content": "q1"
++        },
++        {
++          "role": "assistant",
++          "content": "a1",
++          "reasoning_content": "r1"
++        },
++        {
++          "role": "user",
++          "content": "q2"
++        },
++        {
++          "role": "assistant",
++          "reasoning_content": "r2",
++          "tool_calls": [
++            {
++              "id": "c1",
++              "type": "function",
++              "function": {
++                "name": "lookup",
++                "arguments": "{}"
++              }
++            }
++          ]
++        },
++        {
++          "role": "tool",
++          "tool_call_id": "c1",
++          "content": "value"
++        }
++      ],
++      "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜><think>r2</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>value</tool_result><｜Assistant｜><think>"
++    },
++    {
++      "name": "completed_tool_turn_thinking",
++      "kwargs": {
++        "thinking": true
++      },
++      "messages": [
++        {
++          "role": "user",
++          "content": "q1"
++        },
++        {
++          "role": "assistant",
++          "content": "a1",
++          "reasoning_content": "r1"
++        },
++        {
++          "role": "user",
++          "content": "q2"
++        },
++        {
++          "role": "assistant",
++          "reasoning_content": "r2",
++          "tool_calls": [
++            {
++              "id": "c1",
++              "type": "function",
++              "function": {
++                "name": "lookup",
++                "arguments": "{}"
++              }
++            }
++          ]
++        },
++        {
++          "role": "tool",
++          "tool_call_id": "c1",
++          "content": "value"
++        },
++        {
++          "role": "user",
++          "content": "q3"
++        }
++      ],
++      "expected": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜><｜User｜>q2<｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>value</tool_result>\n\nq3<｜Assistant｜><think>"
++    },
++    {
++      "name": "tool_result_images_call_order",
++      "kwargs": {
++        "thinking": false
++      },
++      "messages": [
++        {
++          "role": "user",
++          "content": [
++            {
++              "type": "image_url",
++              "image_url": {
++                "url": "history.png"
++              }
++            }
++          ]
++        },
++        {
++          "role": "assistant",
++          "tool_calls": [
++            {
++              "id": "a",
++              "type": "function",
++              "function": {
++                "name": "a",
++                "arguments": "{}"
++              }
++            },
++            {
++              "id": "b",
++              "type": "function",
++              "function": {
++                "name": "b",
++                "arguments": "{}"
++              }
++            }
++          ]
++        },
++        {
++          "role": "tool",
++          "tool_call_id": "b",
++          "content": [
++            {
++              "type": "text",
++              "text": "result b"
++            },
++            {
++              "type": "image_url",
++              "image_url": {
++                "url": "b.png"
++              }
++            }
++          ]
++        },
++        {
++          "role": "tool",
++          "tool_call_id": "a",
++          "content": [
++            {
++              "type": "text",
++              "text": "result a"
++            },
++            {
++              "type": "image_url",
++              "image_url": {
++                "url": "a.png"
++              }
++            }
++          ]
++        }
++      ],
++      "expected": "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜><｜Assistant｜></think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"a\">\n\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"b\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>result a\n\n<｜deepseek_image｜></tool_result>\n\n<tool_result>result b\n\n<｜deepseek_image｜></tool_result><｜Assistant｜></think>"
+     }
+   ]
+ }
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 5035a7e71..42117b7b1 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -11,7 +11,11 @@ import pytest
+ from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
+ from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+ from vllm.tokenizers.deepseek_v41 import get_deepseek_v41_tokenizer
+-from vllm.tokenizers.deepseek_v41_encoding import encode_messages
++from vllm.tokenizers.deepseek_v41_encoding import (
++    IMAGE_PLACEHOLDER,
++    encode_messages,
++    order_tool_results,
++)
+ 
+ FIXTURES = Path(__file__).parent / "fixtures"
+ 
+@@ -251,3 +255,140 @@ def test_reminder_does_not_enable_arbitrary_message_roles():
+             [{"role": "SYSTEM", "content": "Hello"}],
+             tokenize=False,
+         )
++
++
++@pytest.mark.parametrize("role", ["user", "tool", "assistant"])
++def test_image_token_in_text_is_a_request_error(role):
++    """Image tokens come only from image parts, in string content, text parts and
++    reasoning alike (DeepSeek's reference rejects them before merging)."""
++    message = {"role": role, "content": f"hi {IMAGE_PLACEHOLDER}"}
++    if role == "tool":
++        message["tool_call_id"] = "c1"
++    with pytest.raises(ValueError, match="image special token"):
++        render([message])
++    with pytest.raises(ValueError, match="image placeholder"):
++        render(
++            [{"role": "user", "content": [{"type": "text", "text": IMAGE_PLACEHOLDER}]}]
++        )
++    with pytest.raises(ValueError, match="reasoning_content contains image"):
++        render(
++            [
++                {"role": "user", "content": "q"},
++                {
++                    "role": "assistant",
++                    "content": "a",
++                    "reasoning_content": IMAGE_PLACEHOLDER,
++                },
++                {"role": "user", "content": "q2"},
++            ]
++        )
++
++
++def _call(name):
++    return {
++        "id": name,
++        "type": "function",
++        "function": {"name": name, "arguments": "{}"},
++    }
++
++
++def _tool(name, *, image=False):
++    content = [{"type": "text", "text": f"result {name}"}]
++    if image:
++        content.append({"type": "image_url", "image_url": {"url": f"{name}.png"}})
++    return {"role": "tool", "tool_call_id": name, "content": content}
++
++
++def test_tool_messages_take_call_order_within_their_merged_turn():
++    """order_tool_results permutes a merged turn's tool messages into the calls'
++    order and leaves everything else in place, so the encoder reorders nothing."""
++    user = {"role": "user", "content": "also look at this"}
++    messages = [
++        {"role": "user", "content": "q"},
++        {"role": "assistant", "tool_calls": [_call("a"), _call("b"), _call("c")]},
++        _tool("c"),
++        user,
++        _tool("a"),
++        _tool("unknown"),
++        _tool("b"),
++    ]
++    original = copy.deepcopy(messages)
++    ordered = order_tool_results(messages)
++    assert [m.get("tool_call_id") for m in ordered] == [
++        None, None, "a", None, "unknown", "b", "c"
++    ]  # fmt: skip
++    assert ordered[3] is user
++    assert messages == original
++    assert render(ordered) == render(messages)
++    # A completed turn is untouched, and a single result has nothing to order.
++    single = [{"role": "user", "content": "q"}, _tool("x")]
++    assert order_tool_results(single) == single
++
++
++def test_tool_result_images_follow_prompt_order(monkeypatch):
++    """Tool results answered out of call order render in call order, and the
++    renderer hands media collection the messages in that order, so each image
++    follows its own placeholder (DeepSeek's 2026-10-16 encoding fix)."""
++    from vllm.renderers import deepseek_v41
++    from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
++
++    messages = [
++        {
++            "role": "user",
++            "content": [{"type": "image_url", "image_url": {"url": "h.png"}}],
++        },
++        {"role": "assistant", "tool_calls": [_call("a"), _call("b")]},
++        _tool("b", image=True),
++        _tool("a", image=True),
++    ]
++    assert render(messages, thinking=False).endswith(
++        f"<｜User｜><tool_result>result a\n\n{IMAGE_PLACEHOLDER}</tool_result>\n\n"
++        f"<tool_result>result b\n\n{IMAGE_PLACEHOLDER}</tool_result>"
++        "<｜Assistant｜></think>"
++    )
++    seen = []
++    monkeypatch.setattr(
++        DeepseekV4Renderer, "render_messages", lambda self, m, params: seen.append(m)
++    )
++    renderer = deepseek_v41.DeepseekV41Renderer.__new__(
++        deepseek_v41.DeepseekV41Renderer
++    )
++    renderer.render_messages(messages, None)
++    urls = [
++        part["image_url"]["url"]
++        for message in seen[0]
++        if isinstance(message.get("content"), list)
++        for part in message["content"]
++        if part.get("type") == "image_url"
++    ]
++    assert urls == ["h.png", "a.png", "b.png"]
++
++
++def test_current_turn_reasoning_survives_tool_results():
++    """Reasoning is dropped for completed turns but kept across the current turn's
++    tool results; the next user message completes the turn."""
++    messages = [
++        {"role": "user", "content": "q1"},
++        {"role": "assistant", "content": "a1", "reasoning_content": "r1"},
++        {"role": "user", "content": "q2"},
++        {
++            "role": "assistant",
++            "reasoning_content": "r2",
++            "tool_calls": [
++                {
++                    "id": "c1",
++                    "type": "function",
++                    "function": {"name": "lookup", "arguments": "{}"},
++                }
++            ],
++        },
++        {"role": "tool", "tool_call_id": "c1", "content": "value"},
++    ]
++    prompt = render(messages)
++    assert "<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>" in prompt
++    assert "r1" not in prompt
++    assert "<think>r2</think>" in prompt
++    assert prompt.endswith("<tool_result>value</tool_result><｜Assistant｜><think>")
++    next_turn = render(messages + [{"role": "user", "content": "q3"}])
++    assert "r2" not in next_turn
++    assert next_turn.endswith("q3<｜Assistant｜><think>")
+diff --git a/vllm/renderers/deepseek_v41.py b/vllm/renderers/deepseek_v41.py
+new file mode 100644
+index 000000000..2decbb841
+--- /dev/null
++++ b/vllm/renderers/deepseek_v41.py
+@@ -0,0 +1,35 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from vllm.entrypoints.chat_utils import (
++    ChatCompletionMessageParam,
++    ConversationMessage,
++)
++from vllm.tokenizers.deepseek_v41_encoding import order_tool_results
++
++from .deepseek_v4 import DeepseekV4Renderer
++from .inputs import DictPrompt
++from .params import ChatParams
++
++
++class DeepseekV41Renderer(DeepseekV4Renderer):
++    """The V4 renderer with tool messages in V4.1's prompt order first.
++
++    The encoder sorts a turn's tool results by the order the assistant called
++    them; media is collected from the messages before encoding, so the messages
++    are put in that order first and images follow their placeholders.
++    """
++
++    def render_messages(
++        self,
++        messages: list[ChatCompletionMessageParam],
++        params: ChatParams,
++    ) -> tuple[list[ConversationMessage], DictPrompt]:
++        return super().render_messages(order_tool_results(messages), params)
++
++    async def render_messages_async(
++        self,
++        messages: list[ChatCompletionMessageParam],
++        params: ChatParams,
++    ) -> tuple[list[ConversationMessage], DictPrompt]:
++        return await super().render_messages_async(order_tool_results(messages), params)
+diff --git a/vllm/renderers/registry.py b/vllm/renderers/registry.py
+index 740c2023b..a21c59933 100644
+--- a/vllm/renderers/registry.py
++++ b/vllm/renderers/registry.py
+@@ -23,7 +23,7 @@ _VLLM_RENDERERS = {
+     "cohere": ("cohere", "CohereRenderer"),
+     "deepseek_v32": ("deepseek_v32", "DeepseekV32Renderer"),
+     "deepseek_v4": ("deepseek_v4", "DeepseekV4Renderer"),
+-    "deepseek_v41": ("deepseek_v4", "DeepseekV4Renderer"),
++    "deepseek_v41": ("deepseek_v41", "DeepseekV41Renderer"),
+     "hf": ("hf", "HfRenderer"),
+     "kimi_audio": ("hf", "HfRenderer"),
+     "kimi_k3": ("kimi_k3", "KimiK3Renderer"),
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 68ba93e5e..c423c3c49 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -37,12 +37,30 @@ def _normalize_messages(
+         if "reasoning" in message:
+             message["reasoning_content"] = message["reasoning"]
+         content = message.get("content")
++        # Image tokens come only from image parts, as the reference requires.
++        if isinstance(content, str) and IMAGE_PLACEHOLDER in content:
++            raise ValueError(
++                f"Message content contains image special token '{IMAGE_PLACEHOLDER}'. "
++                "Images should be provided as image content blocks."
++            )
++        reasoning = message.get("reasoning_content")
++        if isinstance(reasoning, str) and IMAGE_PLACEHOLDER in reasoning:
++            raise ValueError(
++                f"reasoning_content contains image special token '{IMAGE_PLACEHOLDER}'"
++            )
+         if isinstance(content, list):
+             parts = []
+             for block in content:
+                 part_type = block.get("type")
+                 if part_type in ("text", "input_text", "output_text"):
+-                    parts.append(block.get("text", ""))
++                    text = block.get("text", "")
++                    if IMAGE_PLACEHOLDER in text:
++                        raise ValueError(
++                            "Text block contains image placeholder "
++                            f"'{IMAGE_PLACEHOLDER}'. Images should be separate "
++                            "content blocks."
++                        )
++                    parts.append(text)
+                 elif part_type in ("image_url", "input_image", "image_pil"):
+                     parts.append(IMAGE_PLACEHOLDER)
+                 else:
+diff --git a/vllm/tokenizers/deepseek_v41_encoding.py b/vllm/tokenizers/deepseek_v41_encoding.py
+index 89907d152..b9af8a75e 100644
+--- a/vllm/tokenizers/deepseek_v41_encoding.py
++++ b/vllm/tokenizers/deepseek_v41_encoding.py
+@@ -168,6 +168,59 @@ def sort_tool_results_by_call_order(
+     return messages
+ 
+ 
++def order_tool_results(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """
++    Reorder OpenAI-format tool messages as merge_tool_messages and
++    sort_tool_results_by_call_order arrange their tool_result blocks.
++
++    Messages that merge into one user message form a group; the group's tool
++    messages take its tool positions in the order the preceding assistant called
++    them (stably, unknown ids first), and every other message keeps its place.
++    Encoding the result reorders nothing, so media collected from it is in prompt
++    order, as the reference collects images only after sorting tool results.
++    """
++    order: List[Dict[str, Any]] = list(messages)
++    call_order: Dict[str, int] = {}
++    groups: List[tuple] = []  # (message indices, call order when the group closes)
++    group: List[int] = []
++    group_task = None
++    for idx, msg in enumerate(order):
++        role = msg.get("role")
++        if role == "tool" and group:
++            group.append(idx)
++        elif role == "tool":
++            group, group_task = [idx], None
++        elif role == "user" and group and group_task is None:
++            group.append(idx)
++        elif role == "user":
++            if group:
++                groups.append((group, dict(call_order)))
++            group, group_task = [idx], msg.get("task")
++        else:
++            if group:
++                groups.append((group, dict(call_order)))
++            group, group_task = [], None
++            if role == "assistant" and msg.get("tool_calls"):
++                call_order = {}
++                for position, call in enumerate(msg["tool_calls"]):
++                    call_id = call.get("id") or call.get("function", {}).get("id", "")
++                    if call_id:
++                        call_order[call_id] = position
++    if group:
++        groups.append((group, dict(call_order)))
++    for indices, calls in groups:
++        tool_positions = [i for i in indices if order[i].get("role") == "tool"]
++        if len(tool_positions) < 2 or not calls:
++            continue
++        tools = sorted(
++            (order[i] for i in tool_positions),
++            key=lambda m: calls.get(m.get("tool_call_id", ""), 0),
++        )
++        for position, msg in zip(tool_positions, tools):
++            order[position] = msg
++    return order
++
++
+ SYSTEM_SP_TOKEN = "<｜System｜>"
+ 
+ tool_calls_block_name: str = " calls"
+@@ -300,11 +353,18 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+ 
+     V4.1 supports mid-conversation system messages, which count as user
+     messages for the purposes of the assistant generation header.
++    User messages containing only tool results do not start a new turn.
+     """
+     last_user_index = -1
+     for idx in range(len(messages) - 1, -1, -1):
+         role = messages[idx].get("role")
+         if role == "user" or (role == "system" and idx > 0):
++            content_blocks = messages[idx].get("content_blocks")
++            if content_blocks and not any(
++                block.get("type") in ("text", "image", "image_url")
++                for block in content_blocks
++            ):
++                continue
+             last_user_index = idx
+             break
+     return last_user_index

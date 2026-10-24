@@ -1,0 +1,69 @@
+From d3bc0946c41a1030c8ed7570b81de96351975669 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:53:54 +0200
+Subject: [PATCH 115/274] TileLang V4.1 WO: WO-A tiles from the sweep
+
+The W8A16 sweep (bits identical across tiles, replays repeatable): 32-column
+tiles with two stages up to 128 rows and 64-column tiles past them, 0.6-0.9x the
+previous tiles' time at 48 rows and beyond (399 against 548 us at 2048 rows).
+A 16-column tile had no 32-row scale block and read out of bounds; it is
+rejected.
+
+(cherry picked from commit 50f6f886dc70d8b873ca5dd000a4056e989f1c86)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index e5c3124e3..0dd55678e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -396,7 +396,9 @@ def fp8w_bf16_gemm(
+ 
+     Every M tile runs the same K loop, so a row's bits do not depend on its batch.
+     """
++    # Whole 32x32 scale blocks per tile (a 16-wide tile had no scale rows).
+     assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
++    assert block_N % 32 == 0
+     M = T.dynamic("M")
+     k_blocks = K // block_K
+     n_tiles = N // block_N
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 1093fc74e..407664fff 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -26,11 +26,14 @@ from .linear import _block32_linear, _prepare_block32
+ from .rope import rope_
+ 
+ # WO-A row tiles: every tile runs the same K loop, so the bits do not depend on it.
++# WO-A's W8A16 tiles by row bucket, from the WO window-2 sweep (bits do not depend on
++# the tile): 32 columns up to 128 rows, 64 past them; two stages throughout.
+ _WO_A_TILES = {
+-    16: dict(block_N=32, num_stages=2),
+-    32: dict(block_N=32, num_stages=2),
+-    64: dict(block_N=64, num_stages=2),
+-    128: dict(block_N=64, num_stages=3),
++    16: dict(block_M=16, block_N=32, num_stages=2),
++    32: dict(block_M=32, block_N=32, num_stages=2),
++    64: dict(block_M=64, block_N=32, num_stages=2),
++    128: dict(block_M=128, block_N=32, num_stages=2),
++    None: dict(block_M=128, block_N=64, num_stages=2),
+ }
+ 
+ 
+@@ -54,14 +57,14 @@ class _GroupedBF16:
+         self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
+         n, k = self.weight.shape
+         self.kernels = {
+-            rows: fp8w_bf16_gemm(n // groups, k, groups, block_M=rows, **config)
+-            for rows, config in _WO_A_TILES.items()
++            bucket: fp8w_bf16_gemm(n // groups, k, groups, **config)
++            for bucket, config in _WO_A_TILES.items()
+         }
+ 
+     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
+         rows = x.shape[0]
+-        tile = next((t for t in _WO_A_TILES if rows <= t), max(_WO_A_TILES))
+-        self.kernels[tile](x, self.weight, self.tilelang_weight_sf, out)
++        bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
++        self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
+ 
+ 
+ class TileLangWOProjection:

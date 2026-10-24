@@ -1,0 +1,35 @@
+From a447af0809fc8850695b6c6757955d8f9144acbf Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 01:06:18 +0200
+Subject: [PATCH 105/274] Greedy verification: compile its kernels in the dummy
+ sampler run
+
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 7897258aa..9f8697671 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1033,6 +1033,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # during actual execution.
+         assert self.sampler is not None
+         self.sampler(logits, dummy_input_batch)
++        if self._greedy_verification_available():
++            # Compile the greedy verification kernels before readiness, with the
++            # live path's dtypes and strides.
++            assert self.rejection_sampler is not None
++            shard = self.model.lm_head.shard_indices
++            target_ids = vocab_parallel_argmax(
++                self.model.compute_logits_local(hidden_states),
++                shard.num_org_elements,
++                shard.org_vocab_start_index,
++                get_tensor_model_parallel_world_size(),
++            )
++            greedy_rejection_sample(
++                target_ids,
++                self.input_buffers.input_ids[:num_reqs],
++                dummy_input_batch.cu_num_logits,
++                self.rejection_sampler.num_speculative_steps,
++            )
+ 
+     @torch.inference_mode()
+     def _dummy_pooler_run(self, hidden_states: torch.Tensor) -> None:

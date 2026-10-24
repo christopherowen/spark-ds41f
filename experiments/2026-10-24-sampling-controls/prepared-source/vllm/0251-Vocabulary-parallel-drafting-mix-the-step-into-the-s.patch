@@ -1,0 +1,36 @@
+From f7cf505494e5041d7c9dd6940f1f18c049eee59c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:55:56 +0200
+Subject: [PATCH 251/274] Vocabulary-parallel drafting: mix the step into the
+ seed, as the full-vocab draft does
+
+The backport of vllm-project/vllm#61161 (ad6c55362) puts the draft step in the
+seed's high word in the full-vocab draft sampler, DFlash2 and the rejection
+sampler, so block-verification rounds draw fresh noise; the vocabulary-parallel
+draft kernel kept the bare seed. Its drafts after step 0 therefore differed from
+the full-vocab path, which test_vocab_parallel_draft_matches_full_vocab checks.
+DSpark samples its drafts over the full vocabulary and is unaffected.
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py b/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
+index db0fbc14c..5ad268d52 100644
+--- a/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
++++ b/vllm/v1/worker/gpu/spec_decode/vocab_parallel.py
+@@ -25,7 +25,7 @@ from __future__ import annotations
+ import torch
+ 
+ from vllm.triton_utils import tl, tldevice, triton
+-from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
+ 
+ BLOCK = 1024
+ 
+@@ -104,6 +104,9 @@ def _vp_draft_block_kernel(
+         mask=mask & valid,
+     )
+     seed = tl.load(seeds_ptr + req, mask=valid, other=0)
++    # As the full-vocab draft (gumbel._gumbel_sample_kernel with a logits cache):
++    # the step column in the seed's high word, so each step draws fresh noise.
++    seed = spec_step_seed(seed, col)
+     pos = tl.load(pos_ptr + row)
+     keys = vocab_start + offs
+     value, idx = gumbel_noised_argmax(

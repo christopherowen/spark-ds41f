@@ -1,0 +1,56 @@
+From 857cec5d86d4367b3c357f20cf437244dbf5dc95 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:12:53 +0200
+Subject: [PATCH 266/274] Use explicit NaN intrinsics and retain supported
+ 128-bit penalty vectors
+
+A self-comparison can be simplified away by the IR analyzer; use isnan for diagnostics and min-p propagation. Limit penalty vectors to supported widths instead of disabling vectorization entirely.
+
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 3db1db3b7..560da388e 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -36,6 +36,7 @@ def min_p_case(rows, vocab, index_dtype, *, padded=False, nonfinite=False):
+         [0.0, 0.01, 0.1, 0.7, 1.0] * ((rows + 11) // 5), device="cuda"
+     )[: rows + 7]
+     if nonfinite:
++        thresholds.fill_(0.1)
+         logits[0].fill_(-float("inf"))
+         if rows > 1:
+             logits[1, 0] = float("nan")
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 70858a855..7ad030458 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -205,7 +205,7 @@ def nan_count_kernel(vocab: int, stride: int, dtype: str):
+                     value = T.if_then_else(
+                         index < vocab, logits[T.cast(row, "int64"), index], 0
+                     )
+-                    counts[col] += T.cast(value != value, "int32")
++                    counts[col] += T.cast(T.isnan(value), "int32")
+             T.reduce_sum(counts, total, dim=0)
+             output[row] = total[0]
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 67ed6cdfc..da941ec04 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -75,7 +75,7 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
+                         if index < vocab:
+                             value[0] = logits[T.cast(row, "int64"), index]
+                         maximum[col] = T.max(maximum[col], value[0])
+-                        invalid[col] |= T.cast(value[0] != value[0], "int32")
++                        invalid[col] |= T.cast(T.isnan(value[0]), "int32")
+                 T.reduce_max(maximum, reduced, dim=0)
+                 T.reduce_max(invalid, any_nan, dim=0)
+                 minimum[0] = reduced[0] + T.call_extern(
+@@ -116,7 +116,7 @@ def apply_min_p(logits, mapping, thresholds):
+ 
+ 
+ @tilelang.jit(
+-    pass_configs={**_PASS, tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True}
++    pass_configs={**_PASS, tilelang.PassConfigKey.TL_DISABLE_VECTORIZE_256: True}
+ )
+ def penalties_kernel(
+     vocab: int,

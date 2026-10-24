@@ -1,0 +1,203 @@
+From d114eced2ad67917dcb14eea98c3cf476ac28fd2 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:41:20 +0200
+Subject: [PATCH 085/274] TileLang V4.1: the shared expert's clamped SwiGLU at
+ the reference's precision
+
+DeepSeek's reference widens gate and up to FP32, clamps them, multiplies
+silu(gate) by up in FP32 and rounds once; vLLM's SiluAndMulWithClamp rounds
+silu(gate) to BF16 first. A one-launch TileLang kernel follows the reference;
+kernels.shared_expert_activation selects it behind SHARED_SWIGLU_FP32 (off).
+
+(cherry picked from commit bba9f2ab2c5b8c80d50ef42277030bfe9d2b8daa)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_activation.py b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+new file mode 100644
+index 000000000..b1ab75a5d
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+@@ -0,0 +1,51 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The shared expert's clamped SwiGLU against DeepSeek's reference arithmetic."""
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm.models.deepseek_v4_1.tilelang.activation import (  # noqa: E402
++    SiluAndMulClampFP32,
++)
++
++
++def _reference(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
++    """``Expert.forward`` of DeepSeek's inference/model.py, between w1/w3 and w2."""
++    n = gate_up.shape[-1] // 2
++    gate, up = gate_up[..., :n].float(), gate_up[..., n:].float()
++    up = torch.clamp(up, min=-limit, max=limit)
++    gate = torch.clamp(gate, max=limit)
++    return (F.silu(gate) * up).to(gate_up.dtype)
++
++
++@pytest.mark.parametrize("rows", [1, 6, 96, 2024])
++@pytest.mark.parametrize("n", [512, 576])
++def test_matches_the_reference(rows, n):
++    limit = 10.0
++    generator = torch.Generator(device="cuda").manual_seed(rows + n)
++    gate_up = (
++        torch.randn(rows, 2 * n, generator=generator, device="cuda") * 6
++    ).bfloat16()
++    out = SiluAndMulClampFP32(limit)(gate_up)
++    assert out.shape == (rows, n) and out.dtype == torch.bfloat16
++    assert torch.equal(out, _reference(gate_up, limit))
++
++
++def test_rows_independent_of_batch():
++    limit, n = 10.0, 512
++    gate_up = (torch.randn(130, 2 * n, device="cuda") * 6).bfloat16()
++    act = SiluAndMulClampFP32(limit)
++    full = act(gate_up)
++    for rows in (1, 7, 64, 129):
++        assert torch.equal(act(gate_up[:rows]), full[:rows]), rows
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 28665af64..91559f9db 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -64,6 +64,26 @@ def moe_output_dtype() -> torch.dtype:
+ MOE_FP32_COMBINE = True
+ 
+ 
++def shared_expert_activation(act_fn: nn.Module) -> nn.Module:
++    """The shared expert's clamped SwiGLU; TileLang's keeps the reference's FP32
++    product (one BF16 rounding) where vLLM's rounds ``silu(gate)`` first."""
++    from vllm.model_executor.layers.activation import SiluAndMulWithClamp
++
++    if (
++        SHARED_SWIGLU_FP32
++        and uses_tilelang()
++        and isinstance(act_fn, SiluAndMulWithClamp)
++    ):
++        from .tilelang.activation import SiluAndMulClampFP32
++
++        return SiluAndMulClampFP32(act_fn.swiglu_limit)
++    return act_fn
++
++
++# The shared expert's SwiGLU at the reference's precision under the TileLang family.
++SHARED_SWIGLU_FP32 = False
++
++
+ def moe_router_class():
+     """Router class for the MoE layers; None keeps vLLM's for the config."""
+     if uses_tilelang():
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index ce47cf7ca..97ea3a5dd 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -166,6 +166,10 @@ class DeepseekV4DecoderLayer(nn.Module):
+             router_cls=kernels.moe_router_class(),
+         )
+ 
++        shared = getattr(self.ffn, "shared_experts", None)
++        if shared is not None:
++            shared.act_fn = kernels.shared_expert_activation(shared.act_fn)
++
+         # A CED decoder layer routes the compact decoder rows, whose padding
+         # mask differs from the step's. Tag its router by layer, never by the
+         # row count, which an encoder forward can share.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+new file mode 100644
+index 000000000..6699d1abb
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -0,0 +1,81 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The shared expert's clamped SwiGLU at DeepSeek's reference precision.
++
++DeepSeek's reference (``Expert.forward``) widens the gate and up projections to FP32,
++clamps the gate from above and the up projection on both sides at ``swiglu_limit``,
++multiplies ``silu(gate)`` by ``up`` in FP32 and rounds the product to BF16 once.
++vLLM's ``SiluAndMulWithClamp`` rounds ``silu(gate)`` to BF16 before the multiply.
++This kernel follows the reference: one launch, eight values a thread.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++from torch import nn
++
++_VEC = 8
++
++
++@tilelang.jit
++def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
++    """``Y[m, j] = bf16(silu(min(G, limit)) * clamp(U, -limit, limit))`` in FP32, for
++    ``X = [G | U]`` of shape ``[M, 2n]`` (BF16)."""
++    assert n % _VEC == 0
++    M = T.dynamic("M")
++    per_block = threads * _VEC
++
++    @T.prim_func
++    def main(
++        X: T.Tensor((M, 2 * n), T.bfloat16),
++        Y: T.Tensor((M, n), T.bfloat16),
++    ):
++        with T.Kernel(T.ceildiv(n, per_block), M, threads=threads) as (bx, by):
++            col = (bx * threads + T.get_thread_binding()) * _VEC
++            gate = T.alloc_local((_VEC,), T.bfloat16)
++            up = T.alloc_local((_VEC,), T.bfloat16)
++            out = T.alloc_local((_VEC,), T.bfloat16)
++            if col < n:
++                for v in T.vectorized(_VEC):
++                    gate[v] = X[by, col + v]
++                for v in T.vectorized(_VEC):
++                    up[v] = X[by, n + col + v]
++                for v in T.unroll(_VEC):
++                    g = T.min(T.Cast(T.float32, gate[v]), T.float32(limit))
++                    u = T.max(
++                        T.min(T.Cast(T.float32, up[v]), T.float32(limit)),
++                        T.float32(-limit),
++                    )
++                    out[v] = T.Cast(T.bfloat16, g / (1.0 + T.exp(-g)) * u)
++                for v in T.vectorized(_VEC):
++                    Y[by, col + v] = out[v]
++
++    return main
++
++
++@cache
++def _kernel(n: int, limit: float):
++    return swiglu_clamp_kernel(n, limit)
++
++
++class SiluAndMulClampFP32(nn.Module):
++    """Drop-in for ``SiluAndMulWithClamp`` with the reference's FP32 product."""
++
++    def __init__(self, swiglu_limit: float):
++        super().__init__()
++        self.limit = float(swiglu_limit)
++
++    def forward(self, gate_up: torch.Tensor) -> torch.Tensor:
++        n = gate_up.shape[-1] // 2
++        x = gate_up.reshape(-1, 2 * n).contiguous()
++        out = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
++        if x.shape[0]:
++            _kernel(n, self.limit)(x, out)
++        return out.view(*gate_up.shape[:-1], n)
++
++
++__all__ = ["SiluAndMulClampFP32", "swiglu_clamp_kernel"]

@@ -1,0 +1,693 @@
+From 60d8c7713727fb6224b84d158d32bd1d206d9c24 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:23:48 +0200
+Subject: [PATCH 233/274] V2 runner sampling: Triton 3.7's block layout, by the
+ load's alignment
+
+The image runs Triton 3.7.1, whose coalescing pass lays a block out by the
+logits load's specialization: when the base and the row stride are
+divisible by 16, a thread holds 16-byte runs (four FP32 or eight 16-bit
+values, runs 512 or 1024 apart), else one element 128 apart. The argmax
+combines a thread's elements in that order, which decides the index a
+block with NaN reports, so the Gumbel sampler and the sink candidates take
+the run from the same rule and load each whole run as one vector, as
+Triton does; so does the temperature kernel. The candidates and policy
+kernels give every input its own length (the drafts may be longer than the
+rows), and greedy verification takes int32 or int64 drafts.
+
+The tests compare both strides at every vocabulary, partial runs at the
+tail included.
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_sampling.py b/benchmarks/kernels/benchmark_tilelang_sampling.py
+index cdc63f9bf..7d34b580c 100644
+--- a/benchmarks/kernels/benchmark_tilelang_sampling.py
++++ b/benchmarks/kernels/benchmark_tilelang_sampling.py
+@@ -176,7 +176,9 @@ def gumbel_case(tokens: int, dtype: torch.dtype):
+         best = torch.empty(tokens, blocks, device=DEVICE)
+         kernel = tls._kernel(
+             tls.gumbel_sample_kernel,
+-            *tls.gumbel_sample_key(dtype, torch.int64, False, False),
++            *tls.gumbel_sample_key(
++                dtype, torch.int64, False, False, run=tls._triton_run(logits)
++            ),
+         )
+ 
+         def ours():
+@@ -269,7 +271,9 @@ def candidates_case(reqs: int, temperature: float):
+         )
+         kernel = tls._kernel(
+             tls.sink_candidates_kernel,
+-            *tls.sink_candidates_key(torch.bfloat16, torch.int64, candidates, True),
++            *tls.sink_candidates_key(
++                torch.bfloat16, torch.int64, candidates, True, tls._triton_run(logits)
++            ),
+         )
+ 
+         def ours():
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index c806b0772..9cc0be91b 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -186,6 +186,13 @@ def _logits(rows: int, vocab: int, dtype: torch.dtype, case: str, seed: int):
+ 
+ 
+ CASES = ("random", "ties", "special")
++# Row strides: a multiple of 16 (Triton lays the block out in 16-byte runs) or odd
++# (one element a thread); each vocabulary is tested with both.
++STRIDES = ("aligned", "odd")
++
++
++def _stride(vocab: int, stride: str) -> int:
++    return (vocab + 64 + 15) // 16 * 16 if stride == "aligned" else vocab + 3
+ 
+ 
+ # --- Gumbel sampling ----------------------------------------------------------
+@@ -219,6 +226,7 @@ def _gumbel_both(
+                 None if cache is None else cache.dtype,
+                 None if col is None else col.dtype,
+                 col is not None and col.dim() > 0,
++                tls._triton_run(logits),
+             )
+             tls._kernel(tls.gumbel_sample_kernel, *key)(
+                 argmax,
+@@ -280,15 +288,17 @@ def _sampling_inputs(tokens: int, slots: int, temps: str, seed: int):
+ 
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049])
++@pytest.mark.parametrize("stride", STRIDES)
+ @pytest.mark.parametrize("case", CASES)
+ @pytest.mark.parametrize("temps", ["zero", "one", "mixed"])
+ @pytest.mark.parametrize(
+     "apply_temperature,is_drafting", [(False, False), (True, False), (True, True)]
+ )
+-def test_gumbel_sample(dtype, vocab, case, temps, apply_temperature, is_drafting):
++def test_gumbel_sample(
++    dtype, vocab, stride, case, temps, apply_temperature, is_drafting
++):
+     tokens, slots = 37, 48
+-    padded = vocab + 64
+-    logits = _logits(tokens, padded, dtype, case, vocab)[:, :vocab]
++    logits = _logits(tokens, _stride(vocab, stride), dtype, case, vocab)[:, :vocab]
+     mapping, temperature, seeds, pos = _sampling_inputs(tokens, slots, temps, vocab)
+     (a, b, _), (c, d, _) = _gumbel_both(
+         logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
+@@ -341,10 +351,11 @@ def test_gumbel_rows_do_not_depend_on_the_batch():
+ 
+ 
+ @pytest.mark.parametrize("vocab", [VOCAB, 100, 8193])
++@pytest.mark.parametrize("stride", STRIDES)
+ @pytest.mark.parametrize("case", CASES)
+-def test_temperature(vocab, case):
++def test_temperature(vocab, stride, case):
+     tokens, slots = 19, 24
+-    logits = _logits(tokens, vocab + 8, torch.float32, case, 5)[:, :vocab]
++    logits = _logits(tokens, _stride(vocab, stride), torch.float32, case, 5)[:, :vocab]
+     mapping, temperature, _, _ = _sampling_inputs(tokens, slots, "mixed", 5)
+     mapping[1] = 4  # Triton reads the temperature without a validity check
+     ours, theirs = logits.clone(), logits.clone()
+@@ -383,15 +394,19 @@ def _batch(counts, sampled_width, slots, seed):
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000])
++@pytest.mark.parametrize("stride", STRIDES)
+ @pytest.mark.parametrize("case", CASES)
+ @pytest.mark.parametrize("num_candidates", [4, 2])
+ @pytest.mark.parametrize("mask_rejected_draft", [True, False])
+-def test_sink_candidates(dtype, case, num_candidates, mask_rejected_draft):
++def test_sink_candidates(
++    dtype, vocab, stride, case, num_candidates, mask_rejected_draft
++):
+     counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
+-    width, slots, vocab = 6, 16, VOCAB
++    width, slots = 6, 16
+     cu, num_sampled, drafts, sampled, mapping = _batch(counts, width, slots, 2)
+     rows = int(cu[-1])
+-    logits = _logits(rows, vocab + 128, dtype, case, 2)
++    logits = _logits(rows, _stride(vocab, stride), dtype, case, 2)
+     _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 2)
+     pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
+     ours = tls.sink_candidates(
+@@ -690,7 +705,8 @@ def test_sample_greedy_markov(dtype, case):
+ 
+ 
+ @pytest.mark.parametrize("steps", [5, 1])
+-def test_greedy_rejection(steps):
++@pytest.mark.parametrize("drafts_dtype", [torch.int32, torch.int64])
++def test_greedy_rejection(steps, drafts_dtype):
+     g = torch.Generator(device=DEVICE).manual_seed(steps)
+     counts = [steps + 1 if i % 3 else 1 for i in range(37)]
+     cu = torch.tensor(
+@@ -699,9 +715,9 @@ def test_greedy_rejection(steps):
+     rows = int(cu[-1])
+     target = torch.randint(0, 6, (rows,), generator=g, device=DEVICE)
+     drafts = torch.randint(-1, 6, (rows + 1,), generator=g, device=DEVICE).to(
+-        torch.int32
++        drafts_dtype
+     )
+-    drafts[1::2] = target[: drafts[1::2].numel()].to(torch.int32)
++    drafts[1::2] = target[: drafts[1::2].numel()].to(drafts_dtype)
+     ours = tls.greedy_rejection_sample(target, drafts, cu, steps)
+     theirs = _triton_greedy_rejection(target, drafts, cu, steps)
+     _assert_same(ours[1], theirs[1], "num_sampled")
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 902a81981..827af9d93 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -19,12 +19,16 @@ implementation. Each branch of theirs becomes a select, which computes the same
+ value. The FP32 division by the temperature is Triton's ``/``, ``div.full.f32``.
+ 
+ A block's argmax is ``tl.max(..., return_indices=True)`` in Triton's order at four
+-warps: thread ``t`` holds elements ``t + 128 j`` and keeps its running pair while it
+-is ``>=`` the next element; lanes then exchange pairs at XOR distances 16, 8, 4, 2
+-and 1, each keeping its own pair while it is greater, or equal with the lower
+-index; lane 0 of each warp publishes, and threads 0-3 finish at distances 2 and 1.
+-A comparison with NaN is false, so a NaN score gives way to whatever it meets
+-first, and the order decides which index a block with NaN reports.
++warps. Triton 3.7 (the image's) lays the block out by the load's alignment: when the
++logits' base and row stride are divisible by 16 (its argument specialization), each
++thread holds runs of one 16-byte vector (four FP32 or eight 16-bit values), runs 512
++or 1024 apart; otherwise one element, 128 apart. A thread keeps its running pair
++while it is ``>=`` the next of its elements, in order; lanes then exchange pairs at
++XOR distances 16, 8, 4, 2 and 1, each keeping its own pair while it is greater, or
++equal with the lower index; lane 0 of each warp publishes, and threads 0-3 finish at
++distances 2 and 1. A comparison with NaN is false, so a NaN score gives way to
++whatever it meets first, and the order decides which index a block with NaN
++reports: the launch picks the layout by Triton's rule (``_triton_run``).
+ 
+ The draw is FP32 only: the TileLang sampler does not implement
+ ``use_fp64_gumbel``, which the runner rejects.
+@@ -228,6 +232,54 @@ def _kernel(factory: Any, *key: Any) -> Any:
+     return kernel
+ 
+ 
++def _triton_run(rows: torch.Tensor) -> int:
++    """Elements a thread holds contiguously in Triton 3.7's layout for a load from
++    ``rows``: one 16-byte vector when the base address and the row stride are both
++    divisible by 16 (the specialization its coalescing pass reads), else one."""
++    if rows.data_ptr() % 16 == 0 and rows.stride(0) % 16 == 0:
++        return 16 // rows.element_size()
++    return 1
++
++
++def _element(j, tx, run: int):
++    """The block-local index of thread ``tx``'s ``j``-th element: runs of ``run``
++    elements, ``128 * run`` apart."""
++    return (j // run) * (_THREADS * run) + run * tx + j % run
++
++
++@T.macro
++def _load_run(src, raw, row, col0, vocab, run):
++    """``raw[k] = src[row, col0 + k]`` for the run's columns below ``vocab``: one
++    vector load when the run is whole (the launch guaranteed its alignment)."""
++    if run == 1:
++        if col0 < vocab:
++            raw[0] = src[row, col0]
++    else:
++        if col0 + run <= vocab:
++            for k in T.vectorized(run):
++                raw[k] = src[row, col0 + k]
++        else:
++            for k in T.unroll(run):
++                if col0 + k < vocab:
++                    raw[k] = src[row, col0 + k]
++
++
++@T.macro
++def _store_run(dst, raw, row, col0, vocab, run):
++    """``_load_run``'s store."""
++    if run == 1:
++        if col0 < vocab:
++            dst[row, col0] = raw[0]
++    else:
++        if col0 + run <= vocab:
++            for k in T.vectorized(run):
++                dst[row, col0 + k] = raw[k]
++        else:
++            for k in T.unroll(run):
++                if col0 + k < vocab:
++                    dst[row, col0 + k] = raw[k]
++
++
+ @T.macro
+ def _keep_or_take(best, best_index, value, index):
+     """``(best, best_index)`` = Triton's argmax combine of itself and ``(value,
+@@ -282,12 +334,14 @@ def gumbel_sample_kernel(
+     cache_dtype: str | None,
+     col_dtype: str | None,
+     per_token_col: bool,
++    run: int,
+ ):
+     """``gumbel._gumbel_sample_kernel``: one block of 128 threads per
+     ``(token, vocabulary block of 1024)``; each block's argmax index (global, int64)
+-    and score. With a logits cache (``cache_dtype``), the logits before the
+-    temperature are stored at the step's column (``col_dtype``, one per token with
+-    ``per_token_col``) and the seed takes the column in its high word."""
++    and score, a thread's elements in runs of ``run`` (``_triton_run``). With a
++    logits cache (``cache_dtype``), the logits before the temperature are stored at
++    the step's column (``col_dtype``, one per token with ``per_token_col``) and the
++    seed takes the column in its high word."""
+     tokens, vocab, blocks = T.dynamic("tokens, vocab, blocks")
+     # Inputs may be longer than the batch: each has its own length.
+     idx_len, pos_len, seed_len, temp_len = T.dynamic(
+@@ -331,6 +385,7 @@ def gumbel_sample_kernel(
+             seed = T.alloc_local((1,), T.int64)
+             col = T.alloc_local((1,), T.int64)
+             word_seed = T.alloc_local((1,), T.uint32)
++            raw = T.alloc_local((run,), logits_dtype)
+             score = T.alloc_local((1,), T.float32)
+             best = T.alloc_local((1,), T.float32)
+             best_index = T.alloc_local((1,), T.int32)
+@@ -338,6 +393,9 @@ def gumbel_sample_kernel(
+             other_index = T.alloc_local((1,), T.int32)
+             partial = T.alloc_shared((_WARPS,), T.float32)
+             partial_index = T.alloc_shared((_WARPS,), T.int32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
+ 
+             req[0] = T.cast(idx_mapping[t], T.int64)
+             temp[0] = T.float32(0)
+@@ -363,33 +421,38 @@ def gumbel_sample_kernel(
+                 word_seed[0] = T.call_extern(
+                     "uint32", "vllm_randint64", seed[0], pos[t]
+                 )
+-            for j in T.unroll(_PASSES):
+-                local = j * _THREADS + tx
+-                index = blk * GUMBEL_BLOCK + local
+-                score[0] = -T.infinity(T.float32)
+-                if index < vocab:
+-                    score[0] = T.cast(logits[t, index], T.float32)
+-                    if cached:  # noqa: SIM102
+-                        if req[0] >= 0:
+-                            cache[req[0], col[0], index] = T.cast(score[0], cache_dtype)
+-                    if temp[0] != T.float32(0):
+-                        if apply_temperature:
++            for r in T.unroll(_PASSES // run):
++                col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
++                _load_run(logits, raw, t, col0, vocab, run)
++                for k in T.unroll(run):
++                    local = r * (_THREADS * run) + run * tx + k
++                    index = col0 + k
++                    score[0] = -T.infinity(T.float32)
++                    if index < vocab:
++                        score[0] = T.cast(raw[k], T.float32)
++                        if cached:  # noqa: SIM102
++                            if req[0] >= 0:
++                                cache[req[0], col[0], index] = T.cast(
++                                    score[0], cache_dtype
++                                )
++                        if temp[0] != T.float32(0):
++                            if apply_temperature:
++                                score[0] = T.call_extern(
++                                    "float32", "vllm_div_full", score[0], temp[0]
++                                )
+                             score[0] = T.call_extern(
+-                                "float32", "vllm_div_full", score[0], temp[0]
++                                "float32",
++                                "vllm_gumbel_score",
++                                score[0],
++                                T.call_extern(
++                                    "uint32", "vllm_randint32", word_seed[0], index
++                                ),
+                             )
+-                        score[0] = T.call_extern(
+-                            "float32",
+-                            "vllm_gumbel_score",
+-                            score[0],
+-                            T.call_extern(
+-                                "uint32", "vllm_randint32", word_seed[0], index
+-                            ),
+-                        )
+-                if j == 0:
+-                    best[0] = score[0]
+-                    best_index[0] = local
+-                else:
+-                    _keep_or_take(best, best_index, score[0], local)
++                    if r * run + k == 0:
++                        best[0] = score[0]
++                        best_index[0] = local
++                    else:
++                        _keep_or_take(best, best_index, score[0], local)
+             _block_argmax(
+                 best, best_index, other, other_index, partial, partial_index, tx
+             )
+@@ -410,6 +473,7 @@ def gumbel_sample_key(
+     cache_dtype: torch.dtype | None = None,
+     col_dtype: torch.dtype | None = None,
+     per_token_col: bool = False,
++    run: int = 1,
+ ) -> tuple:
+     cached = cache_dtype is not None
+     return (
+@@ -420,6 +484,7 @@ def gumbel_sample_key(
+         _DTYPES[cache_dtype] if cached else None,
+         _DTYPES[col_dtype] if cached else None,
+         per_token_col and cached,
++        run,
+     )
+ 
+ 
+@@ -465,6 +530,7 @@ def gumbel_sample(
+                 logits_cache.dtype if cached else None,
+                 logits_cache_col.dtype if cached else None,
+                 per_token_col,
++                _triton_run(logits),
+             ),
+         )
+         kernel(
+@@ -492,13 +558,18 @@ SINK_CANDIDATE_BLOCK = 1024
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def sink_candidates_kernel(
+-    logits_dtype: str, idx_dtype: str, num_candidates: int, mask_rejected_draft: bool
++    logits_dtype: str,
++    idx_dtype: str,
++    num_candidates: int,
++    mask_rejected_draft: bool,
++    run: int,
+ ):
+     """``sink._sink_candidates_kernel``: one block of 128 threads per ``(request,
+-    vocabulary block of 1024)``. The scores are the request's last sampled row's
+-    logits (with a rejected one-hot draft masked when ``mask_rejected_draft``) plus
+-    the draw's noise; the block's ``num_candidates`` best, in descending order,
+-    each found by Triton's argmax and then masked."""
++    vocabulary block of 1024)``, a thread's elements in runs of ``run``
++    (``_triton_run``). The scores are the request's last sampled row's logits (with a
++    rejected one-hot draft masked when ``mask_rejected_draft``) plus the draw's
++    noise; the block's ``num_candidates`` best, in descending order, each found by
++    Triton's argmax and then masked."""
+     reqs, rows, vocab, candidates = T.dynamic("reqs, rows, vocab, candidates")
+     # Inputs may be longer than the batch: each has its own length.
+     cu_len, num_len, sampled_rows, sampled_width = T.dynamic(
+@@ -539,6 +610,7 @@ def sink_candidates_kernel(
+             rejected = T.alloc_local((1,), T.int32)
+             verified = T.alloc_local((1,), T.int32)
+             word_seed = T.alloc_local((1,), T.uint32)
++            raw = T.alloc_local((run,), logits_dtype)
+             scores = T.alloc_local((_PASSES,), T.float32)
+             best = T.alloc_local((1,), T.float32)
+             best_index = T.alloc_local((1,), T.int32)
+@@ -547,6 +619,9 @@ def sink_candidates_kernel(
+             partial = T.alloc_shared((_WARPS,), T.float32)
+             partial_index = T.alloc_shared((_WARPS,), T.int32)
+             chosen = T.alloc_shared((1,), T.int32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
+ 
+             local[0] = T.max(num_sampled[req] - 1, 0)
+             # The row that produced the request's last sampled token.
+@@ -569,27 +644,30 @@ def sink_candidates_kernel(
+             word_seed[0] = T.call_extern(
+                 "uint32", "vllm_randint64", seeds[state[0]], pos[row[0]]
+             )
+-            for j in T.unroll(_PASSES):
+-                index = blk * SINK_CANDIDATE_BLOCK + j * _THREADS + tx
+-                scores[j] = -T.infinity(T.float32)
+-                if index < vocab:
+-                    scores[j] = T.cast(logits[row[0], index], T.float32)
+-                    if (rejected[0] != 0) & (index == verified[0]):
+-                        scores[j] = -T.infinity(T.float32)
+-                    if temp[0] != T.float32(0):
+-                        scores[j] = T.call_extern(
+-                            "float32",
+-                            "vllm_gumbel_score",
+-                            scores[j],
+-                            T.call_extern(
+-                                "uint32", "vllm_randint32", word_seed[0], index
+-                            ),
+-                        )
++            for r in T.unroll(_PASSES // run):
++                col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
++                _load_run(logits, raw, row[0], col0, vocab, run)
++                for k in T.unroll(run):
++                    index = col0 + k
++                    scores[r * run + k] = -T.infinity(T.float32)
++                    if index < vocab:
++                        scores[r * run + k] = T.cast(raw[k], T.float32)
++                        if (rejected[0] != 0) & (index == verified[0]):
++                            scores[r * run + k] = -T.infinity(T.float32)
++                        if temp[0] != T.float32(0):
++                            scores[r * run + k] = T.call_extern(
++                                "float32",
++                                "vllm_gumbel_score",
++                                scores[r * run + k],
++                                T.call_extern(
++                                    "uint32", "vllm_randint32", word_seed[0], index
++                                ),
++                            )
+             for i in T.serial(num_candidates):
+                 best[0] = scores[0]
+-                best_index[0] = tx
++                best_index[0] = _element(0, tx, run)
+                 for j in T.unroll(1, _PASSES):
+-                    _keep_or_take(best, best_index, scores[j], j * _THREADS + tx)
++                    _keep_or_take(best, best_index, scores[j], _element(j, tx, run))
+                 _block_argmax(
+                     best, best_index, other, other_index, partial, partial_index, tx
+                 )
+@@ -601,7 +679,7 @@ def sink_candidates_kernel(
+                     chosen[0] = best_index[0]
+                 T.sync_threads()
+                 for j in T.unroll(_PASSES):
+-                    if j * _THREADS + tx == chosen[0]:
++                    if _element(j, tx, run) == chosen[0]:
+                         scores[j] = -T.infinity(T.float32)
+ 
+     return sink_candidates
+@@ -612,12 +690,14 @@ def sink_candidates_key(
+     idx_dtype: torch.dtype,
+     num_candidates: int,
+     mask_rejected_draft: bool,
++    run: int = 1,
+ ) -> tuple:
+     return (
+         _DTYPES[logits_dtype],
+         _DTYPES[idx_dtype],
+         num_candidates,
+         mask_rejected_draft,
++        run,
+     )
+ 
+ 
+@@ -647,7 +727,11 @@ def sink_candidates(
+         kernel = _kernel(
+             sink_candidates_kernel,
+             *sink_candidates_key(
+-                logits.dtype, idx_mapping.dtype, num_candidates, mask_rejected_draft
++                logits.dtype,
++                idx_mapping.dtype,
++                num_candidates,
++                mask_rejected_draft,
++                _triton_run(logits),
+             ),
+         )
+         kernel(
+@@ -688,12 +772,18 @@ def sink_policy_kernel(
+     alts = num_alternates
+     width = sampled_width
+     padded = _next_power_of_2(width + 1)
+-    reqs, cu_len, logits_len = T.dynamic("reqs, cu_len, logits_len")
++    reqs, cu_len, flags_len, values_len, drafts_len = T.dynamic(
++        "reqs, cu_len, flags_len, values_len, drafts_len"
++    )
+     num_len, rejected_len, decoding_len = T.dynamic(
+         "num_len, rejected_len, decoding_len"
+     )
+-    out_len, num_out_len, recovered_len, new_len, state_len = T.dynamic(
+-        "out_len, num_out_len, recovered_len, new_len, state_len"
++    out_len, num_out_len, lp_len, rank_len = T.dynamic(
++        "out_len, num_out_len, lp_len, rank_len"
++    )
++    new_len, new_lp_len, new_rank_len = T.dynamic("new_len, new_lp_len, new_rank_len")
++    state_len, state_lp_len, state_rank_len = T.dynamic(
++        "state_len, state_lp_len, state_rank_len"
+     )
+     idx_len, tries_len, total_len_len, count_rows, count_cols = T.dynamic(
+         "idx_len, tries_len, total_len_len, count_rows, count_cols"
+@@ -708,20 +798,20 @@ def sink_policy_kernel(
+         out_tokens: T.Tensor((out_len,), T.int64),
+         num_out: T.Tensor((num_out_len,), T.int32),
+         events: T.Tensor((reqs, num_event_fields), T.int32),
+-        recovered_logprobs: T.Tensor((recovered_len,), T.float32),
+-        recovered_ranks: T.Tensor((recovered_len,), T.int64),
++        recovered_logprobs: T.Tensor((lp_len,), T.float32),
++        recovered_ranks: T.Tensor((rank_len,), T.int64),
+         cu_num_logits: T.Tensor((cu_len,), T.int32),
+         idx_mapping: T.Tensor((idx_len,), idx_dtype),
+         decoding: T.Tensor((decoding_len,), T.int8),
+-        flags: T.Tensor((logits_len,), T.int8),
+-        row_values: T.Tensor((logits_len,), T.float32),
+-        drafts: T.Tensor((logits_len,), T.int32),
++        flags: T.Tensor((flags_len,), T.int8),
++        row_values: T.Tensor((values_len,), T.float32),
++        drafts: T.Tensor((drafts_len,), T.int32),
+         new_alternates: T.Tensor((new_len,), T.int64),
+-        new_alternate_logprobs: T.Tensor((new_len,), T.float32),
+-        new_alternate_ranks: T.Tensor((new_len,), T.int64),
++        new_alternate_logprobs: T.Tensor((new_lp_len,), T.float32),
++        new_alternate_ranks: T.Tensor((new_rank_len,), T.int64),
+         alternates: T.Tensor((state_len,), T.int64),
+-        alternate_logprobs: T.Tensor((state_len,), T.float32),
+-        alternate_ranks: T.Tensor((state_len,), T.int64),
++        alternate_logprobs: T.Tensor((state_lp_len,), T.float32),
++        alternate_ranks: T.Tensor((state_rank_len,), T.int64),
+         tries: T.Tensor((tries_len,), T.int32),
+         total_len: T.Tensor((total_len_len,), T.int32),
+         bin_counts: T.StridedTensor(
+@@ -1396,7 +1486,7 @@ def sample_greedy_markov(
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def greedy_rejection_kernel(width: int):
++def greedy_rejection_kernel(width: int, drafts_dtype: str):
+     """``greedy_verification._greedy_rejection_kernel``: per request, drafts are
+     accepted while they equal the target's argmax (a -1 draft never is); the first
+     mismatch commits the argmax, and a fully accepted block commits the bonus
+@@ -1410,7 +1500,7 @@ def greedy_rejection_kernel(width: int):
+         sampled: T.Tensor((reqs, width), T.int64),
+         num_sampled: T.Tensor((reqs,), T.int32),
+         target_ids: T.Tensor((targets_len,), T.int64),
+-        draft_sampled: T.Tensor((drafts_len,), T.int32),
++        draft_sampled: T.Tensor((drafts_len,), drafts_dtype),
+         cu_num_logits: T.Tensor((cu_len,), T.int32),
+     ):
+         with T.Kernel(reqs, threads=32) as req:
+@@ -1458,7 +1548,11 @@ def greedy_rejection_sample(
+     )
+     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+     if num_reqs > 0:
+-        kernel = _kernel(greedy_rejection_kernel, num_speculative_steps + 1)
++        kernel = _kernel(
++            greedy_rejection_kernel,
++            num_speculative_steps + 1,
++            _DTYPES[draft_sampled.dtype],
++        )
+         kernel(sampled, num_sampled, target_ids, draft_sampled, cu_num_logits)
+     return sampled, num_sampled
+ 
+@@ -1467,14 +1561,16 @@ def greedy_rejection_sample(
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def temperature_kernel(idx_dtype: str):
++def temperature_kernel(idx_dtype: str, run: int):
+     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
+     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
+-    alone; a block of 128 threads per ``(token, 8192 columns)``. As in Triton, the
+-    temperature is read at the mapped index without a validity check."""
++    alone; a block of 128 threads per ``(token, 8192 columns)``, each thread's
++    elements in runs of ``run`` (``_triton_run``), one vector load and store each
++    when aligned. As in Triton, the temperature is read at the mapped index without
++    a validity check."""
+     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
+     logits_stride = T.dynamic("logits_stride", "int64")
+-    passes = _TEMPERATURE_BLOCK // _THREADS
++    runs = _TEMPERATURE_BLOCK // (_THREADS * run)
+ 
+     @T.prim_func
+     def temperature(
+@@ -1488,14 +1584,20 @@ def temperature_kernel(idx_dtype: str):
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+             temp = T.alloc_local((1,), T.float32)
++            raw = T.alloc_local((run,), T.float32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
+             temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
+             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
+-                for j in T.unroll(passes):
+-                    index = blk * _TEMPERATURE_BLOCK + j * _THREADS + tx
+-                    if index < vocab:
+-                        logits[t, index] = T.call_extern(
+-                            "float32", "vllm_div_full", logits[t, index], temp[0]
++                for r in T.unroll(runs):
++                    col0 = blk * _TEMPERATURE_BLOCK + r * (_THREADS * run) + run * tx
++                    _load_run(logits, raw, t, col0, vocab, run)
++                    for k in T.unroll(run):
++                        raw[k] = T.call_extern(
++                            "float32", "vllm_div_full", raw[k], temp[0]
+                         )
++                    _store_run(logits, raw, t, col0, vocab, run)
+ 
+     return temperature
+ 
+@@ -1508,7 +1610,9 @@ def apply_temperature(
+     """``gumbel.apply_temperature``."""
+     if logits.shape[0] == 0:
+         return
+-    kernel = _kernel(temperature_kernel, _DTYPES[expanded_idx_mapping.dtype])
++    kernel = _kernel(
++        temperature_kernel, _DTYPES[expanded_idx_mapping.dtype], _triton_run(logits)
++    )
+     kernel(logits, expanded_idx_mapping.contiguous(), temperature)
+ 
+ 
+@@ -1518,6 +1622,11 @@ def apply_temperature(
+ RUNNER_IDX_DTYPE = torch.int64
+ 
+ 
++def _runs(dtype: torch.dtype) -> tuple[int, int]:
++    """Both layouts a launch may take for logits of ``dtype`` (``_triton_run``)."""
++    return 1, 16 // torch.empty((), dtype=dtype).element_size()
++
++
+ def _call(factory: Any, *key: Any) -> tuple:
+     from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+@@ -1548,12 +1657,16 @@ def sampling_calls(
+     calls = [
+         _call(
+             gumbel_sample_kernel,
+-            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, False, False),
++            *gumbel_sample_key(dtype, RUNNER_IDX_DTYPE, False, False, run=run),
+         )
+         for dtype in dict.fromkeys(logits_dtypes)
++        for run in _runs(dtype)
+     ]
+     if temperature:
+-        calls.append(_call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE]))
++        calls += [
++            _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run)
++            for run in _runs(torch.float32)
++        ]
+     return calls
+ 
+ 
+@@ -1576,8 +1689,10 @@ def drafting_calls(
+                 cache_dtype,
+                 col_dtype,
+                 per_token_col,
++                run,
+             ),
+         )
++        for run in _runs(logits_dtype)
+     ]
+ 
+ 
+@@ -1625,10 +1740,11 @@ def sink_calls(
+             _call(
+                 sink_candidates_kernel,
+                 *sink_candidates_key(
+-                    dtype, RUNNER_IDX_DTYPE, num_alternates + 1, width > 1
++                    dtype, RUNNER_IDX_DTYPE, num_alternates + 1, width > 1, run
+                 ),
+             )
+             for dtype in logits_dtypes
++            for run in _runs(dtype)
+             for width in sampled_widths
+         ]
+     return _unique(calls)
+@@ -1663,5 +1779,9 @@ def greedy_calls(
+         calls.append(_call(finish_argmax_kernel, "pair"))
+     calls += [_call(finish_argmax_kernel, _DTYPES[dtype]) for dtype in finish_outputs]
+     calls += [_call(select_first_argmax_kernel, _DTYPES[dtype]) for dtype in select]
+-    calls += [_call(greedy_rejection_kernel, width) for width in rejection_widths]
++    calls += [
++        _call(greedy_rejection_kernel, width, _DTYPES[dtype])
++        for width in rejection_widths
++        for dtype in (torch.int32, torch.int64)
++    ]
+     return _unique(calls)

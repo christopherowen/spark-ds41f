@@ -1,0 +1,293 @@
+From a1a1a92e8e8d060a20cf6e22ad3a47a411191873 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:25:05 +0200
+Subject: [PATCH 081/274] TileLang V4.1 MoE: one rounding of each rank's
+ partial (switch off)
+
+Under tensor parallelism the TileLang MoE rounded a rank's partial twice before
+the cross-rank sum: the combine wrote BF16, then the runner added the shared
+expert's partial in BF16. DeepSeek's reference rounds a row-parallel partial
+once (RowParallelLinear: the linear's BF16 output, then an FP32 all-reduce and
+one rounding).
+
+- moe_combine_v41 and the MoE plans take an output dtype; FP32 keeps the
+  routes' slot-order sum unrounded. Without a shared input the combine's unread
+  Shared operand is any BF16 rows (it was the output, which an FP32 output
+  cannot be).
+- TileLangExperts reports its output dtype from kernels.moe_output_dtype() and
+  the MoE method reports a modular kernel's experts' dtype.
+- The runner adds the shared expert to a routed output wider than the layer's
+  dtype in FP32 and rounds the rank's partial once before the all-reduce or
+  into the reduce-scatter buffer, so the reduction stays BF16 (an FP32
+  reduction measured twice the prefill reduce-scatter time on the fabric).
+
+MOE_FP32_COMBINE is off.
+
+(cherry picked from commit 33ef3db6abe5b91eda89d6467c42da1f5e21ef80)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 73da08ea5..1a01e5e3c 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -119,3 +119,37 @@ def test_moe_experts(rows, idx_dtype, hidden, intermediate, num_experts=32, topk
+         solo = torch.empty_like(x[r : r + 1])
+         plan.run(x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo)
+         assert torch.equal(solo[0], out[r]), f"row {r} changed with batch composition"
++
++
++@pytest.mark.parametrize("rows", [1, 12, 300])
++def test_moe_experts_fp32_output(
++    rows, hidden=384, intermediate=576, num_experts=32, topk=6
++):
++    """An FP32 combine keeps the slot-order FP32 sum the BF16 combine rounds: the
++    same sum, unrounded, and as independent of the batch."""
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
++    plans = {
++        dtype: MoeExpertsV41Plan(
++            num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT, out_dtype=dtype
++        )
++        for dtype in (torch.bfloat16, torch.float32)
++    }
++    weights = plans[torch.bfloat16].prepare_weights(
++        w13_packed, w13_sf, w2_packed, w2_sf
++    )
++    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++    outs = {}
++    for dtype, plan in plans.items():
++        assert plan.out_dtype == dtype
++        outs[dtype] = torch.empty((rows, hidden), dtype=dtype, device=DEVICE)
++        plan.run(x, ids, route_weights, weights, outs[dtype])
++    assert torch.equal(outs[torch.float32].bfloat16(), outs[torch.bfloat16])
++    assert not torch.equal(outs[torch.float32], outs[torch.bfloat16].float())
++    for r in {0, rows - 1}:
++        solo = torch.empty((1, hidden), dtype=torch.float32, device=DEVICE)
++        plans[torch.float32].run(
++            x[r : r + 1], ids[r : r + 1], route_weights[r : r + 1], weights, solo
++        )
++        assert torch.equal(solo[0], outs[torch.float32][r])
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+index d380bc73a..e8de7897d 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe_method_base.py
+@@ -62,7 +62,10 @@ class FusedMoEMethodBase(QuantizeMethodBase):
+ 
+     @property
+     def output_dtype(self) -> torch.dtype:
+-        """Dtype produced by the routed experts."""
++        """Dtype produced by the routed experts: a modular kernel's experts say."""
++        impl = getattr(self.moe_kernel, "impl", None)
++        if isinstance(impl, mk.FusedMoEKernelModularImpl):
++            return impl.fused_experts.output_dtype
+         return self.moe.in_dtype
+ 
+     @abstractmethod
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index e6550021b..44024beda 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -556,11 +556,15 @@ class MoERunner(MoERunnerInterface):
+         ):
+             raise NotImplementedError("MoE reduce-scatter needs an unreduced output")
+         rows = fused_output.shape[0]
++        # A routed output wider than the layer's dtype (TileLang's FP32 combine)
++        # is added to the shared expert in FP32 and rounds once into the buffer.
+         dtype = (
+             fused_output.dtype
+             if shared_output is None
+             else torch.result_type(shared_output, fused_output)
+         )
++        if dtype != self.moe_config.in_dtype:
++            dtype = self.moe_config.in_dtype
+         # The same model-installed callback the all-reduce path fires.
+         _hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+         # A model-installed replacement for the buffer and reduce-scatter below:
+@@ -951,6 +955,11 @@ class MoERunner(MoERunnerInterface):
+             )
+         else:
+             result = fused_output
++        if result.dtype != self.moe_config.in_dtype and not fused_output_is_reduced:
++            # A TP partial kept unrounded through its combine (TileLang MoE): the
++            # rank's partial, shared expert included, rounds once before the
++            # reduction, as a row-parallel linear rounds its partial.
++            result = result.to(self.moe_config.in_dtype)
+ 
+         if reuse_output:
+             result = self._maybe_reduce_final_output(
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index ad9191026..709f772d2 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -49,6 +49,12 @@ def _kernels():
+     return moe
+ 
+ 
++def _output_dtype() -> torch.dtype:
++    from vllm.models.deepseek_v4_1.kernels import moe_output_dtype
++
++    return moe_output_dtype()
++
++
+ class TileLangExperts(mk.FusedMoEExpertsModular):
+     """MXFP4 experts with MXFP8 activations, in TileLang and TileKernels."""
+ 
+@@ -139,6 +145,12 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+         return TopKWeightAndReduceNoOP()
+ 
++    @property
++    def output_dtype(self) -> torch.dtype:
++        """FP32 under the MoE FP32 combine switch: the runner adds the shared
++        expert in FP32 and rounds the rank's partial once before the reduction."""
++        return _output_dtype()
++
+     # -- weights ----------------------------------------------------------
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+@@ -153,6 +165,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+             w2.shape[1],
+             w2.shape[2] * 2,
+             swiglu_limit=self.moe_config.swiglu_limit if limit is None else limit,
++            out_dtype=self.output_dtype,
+         )
+         # Tile-major copies replace the checkpoint layout, so each GEMM tile's
+         # weights and scales are contiguous. A K that ends 64 past a multiple
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index fcb0d7a18..803f12f39 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -8,6 +8,7 @@ linear and MoE backends agree with it. Model code asks this module for the
+ implementation of each component instead of naming a family.
+ """
+ 
++import torch
+ from torch import nn
+ 
+ from vllm import envs
+@@ -51,6 +52,18 @@ def embedding_method():
+     return B12xEmbeddingMethod()
+ 
+ 
++def moe_output_dtype() -> torch.dtype:
++    """The routed experts' output. FP32 keeps the routes' combined sum unrounded,
++    so the rank's partial (shared expert added in FP32) rounds once before the
++    cross-rank sum, as DeepSeek's row-parallel linears round theirs; BF16 rounds
++    at the combine and again at the shared add."""
++    return torch.float32 if MOE_FP32_COMBINE and uses_tilelang() else torch.bfloat16
++
++
++# The MoE combine stays FP32 until the rank's partial rounds, under the TileLang family.
++MOE_FP32_COMBINE = False
++
++
+ def moe_router_class():
+     """Router class for the MoE layers; None keeps vLLM's for the config."""
+     if uses_tilelang():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index 082ed739b..c4d799c63 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -336,12 +336,15 @@ def moe_combine_v41(
+     weighted: bool = False,
+     block_D: int = 1024,
+     threads: int = 128,
++    out_dtype: T.dtype = T.bfloat16,
+ ):
+     """``Out[t] = sum_k [Weights[t, k] *] Y[RoutePos[t, k]] (+ Shared[t])``.
+ 
+-    FP32 in slot order, BF16 out.
++    FP32 in slot order; ``out_dtype`` out (FP32 keeps the routes' sum unrounded
++    until the rank's partial, shared expert included, rounds once).
+     """
+     rows, layout_rows = T.dynamic("rows, layout_rows")
++    shared_rows = T.dynamic("shared_rows")  # rows with a shared input; any otherwise
+     while hidden % block_D:
+         block_D //= 2
+     assert block_D >= 8, f"hidden={hidden} must be a multiple of 8"
+@@ -351,8 +354,8 @@ def moe_combine_v41(
+         Y: T.Tensor([layout_rows, hidden], T.bfloat16),
+         RoutePos: T.Tensor([rows, topk], T.int32),
+         Weights: T.Tensor([rows, topk], T.float32),
+-        Shared: T.Tensor([rows, hidden], T.bfloat16),
+-        Out: T.Tensor([rows, hidden], T.bfloat16),
++        Shared: T.Tensor([shared_rows, hidden], T.bfloat16),
++        Out: T.Tensor([rows, hidden], out_dtype),
+     ):
+         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
+             acc = T.alloc_fragment([block_D], T.float32)
+@@ -375,10 +378,10 @@ def moe_combine_v41(
+                 if shared:
+                     Out[row, bd * block_D + d] = T.cast(
+                         acc[d] + T.cast(Shared[row, bd * block_D + d], T.float32),
+-                        T.bfloat16,
++                        out_dtype,
+                     )
+                 else:
+-                    Out[row, bd * block_D + d] = T.cast(acc[d], T.bfloat16)
++                    Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)
+ 
+     return main
+ 
+@@ -412,7 +415,15 @@ class MoeDispatchV41Plan:
+         "num_tiles",
+     )
+ 
+-    def __init__(self, num_experts, topk, block_M, hidden, idx_dtype=torch.int64):
++    def __init__(
++        self,
++        num_experts,
++        topk,
++        block_M,
++        hidden,
++        idx_dtype=torch.int64,
++        out_dtype=torch.bfloat16,
++    ):
+         self.num_experts, self.topk, self.block_M, self.hidden = (
+             num_experts,
+             topk,
+@@ -424,8 +435,10 @@ class MoeDispatchV41Plan:
+         self.count = moe_dispatch_v41(num_experts, topk, block_M, "count", tl_idx)
+         self.layout = moe_dispatch_v41(num_experts, topk, block_M, "layout", tl_idx)
+         self.scatter = moe_dispatch_v41(num_experts, topk, block_M, "scatter", tl_idx)
++        tl_out = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}[out_dtype]
++        self.out_dtype = out_dtype
+         self.combine_kernels = {
+-            (s, w): moe_combine_v41(hidden, topk, s, w)
++            (s, w): moe_combine_v41(hidden, topk, s, w, out_dtype=tl_out)
+             for s in (False, True)
+             for w in (False, True)
+         }
+@@ -498,7 +511,8 @@ class MoeDispatchV41Plan:
+             else topk_weights
+         )
+         kernel = self.combine_kernels[(shared is not None, topk_weights is not None)]
+-        kernel(y, layout["route_pos"], weights, out if shared is None else shared, out)
++        # Without a shared input the kernel never reads it: any BF16 rows do.
++        kernel(y, layout["route_pos"], weights, y if shared is None else shared, out)
+         return out
+ 
+ 
+@@ -813,6 +827,7 @@ class MoeExpertsV41Plan:
+         block_M=32,
+         block_N=128,
+         num_stages=3,
++        out_dtype=torch.bfloat16,
+     ):
+         self.num_experts, self.topk, self.hidden, self.intermediate = (
+             num_experts,
+@@ -828,9 +843,12 @@ class MoeExpertsV41Plan:
+         self.down = grouped_fp8_fp4_gemm(
+             num_experts, hidden, intermediate, topk, False, block_M, **config
+         )
+-        # Routers emit int32 or int64 expert ids.
++        # Routers emit int32 or int64 expert ids. The combine writes ``out_dtype``.
++        self.out_dtype = out_dtype
+         self.dispatch = {
+-            dtype: MoeDispatchV41Plan(num_experts, topk, block_M, hidden, dtype)
++            dtype: MoeDispatchV41Plan(
++                num_experts, topk, block_M, hidden, dtype, out_dtype
++            )
+             for dtype in (torch.int32, torch.int64)
+         }
+         self.tk = _tile_kernels(block_M)

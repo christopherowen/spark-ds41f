@@ -1,0 +1,39 @@
+From 0a30f0e984f67dc283a8566994f94770cd7a738a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:17:23 +0200
+Subject: [PATCH 241/274] DeepSeek-V4.1: the mHC declared-calls test orders
+ calls by factory
+
+TileLang's JITImpl has no __name__, so sorting the launched calls by it raised
+AttributeError. The test orders them by the factory object instead and still
+requires them to equal the declared post and collapse calls.
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index f3db073af..111a670ca 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -515,9 +515,15 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+         mhc.declare_kernels()
+     declared = prepare.declared_calls(registry)
+     assert prepare.warm_declared(registry) == 0
+-    ours = [call for call in declared if call[0] in (post_streams, collapse_streams)]
++    factories = (post_streams, collapse_streams)
++    ours = [call for call in declared if call[0] in factories]
+     assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
+ 
++    def by_factory(call):
++        # TileLang's JIT objects have no __name__; order by the factory itself.
++        found = (i for i, factory in enumerate(factories) if factory is call[0])
++        return next(found, len(factories))
++
+     # The forward's calls, recorded as its cached lookups make them.
+     launched = []
+     for name in ("post_streams", "collapse_streams"):
+@@ -536,6 +542,4 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
+     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
+     mhc.collapse(residual, _pre_mix(6, seed=72))
+     mhc.collapse(residual)
+-    assert sorted(launched, key=lambda call: call[0].__name__) == sorted(
+-        ours, key=lambda call: call[0].__name__
+-    )
++    assert sorted(launched, key=by_factory) == ours
