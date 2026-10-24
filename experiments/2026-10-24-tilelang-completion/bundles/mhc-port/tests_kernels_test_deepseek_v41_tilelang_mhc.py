@@ -365,28 +365,34 @@ def _bf16(values, shape):
 
 def test_post_order_of_operations(mhc):
     """Inputs on which another order of the terms, another fused product or another
-    starting value gives other bits. TileKernels' arithmetic per element:
-    ``p = post[n] * x`` rounded to FP32, then ``p = fma(comb[m, n], residual[m], p)``
-    for m = 0..3, then one rounding to BF16. The port gives those bits."""
-    big, eps = 2.0**127, 2.0**-23
+    starting value gives other bits. TileKernels' arithmetic per element (nvcc's
+    contraction of ``post * x + comb[0] * residual[0] + ...``):
+    ``p = comb[0, n] * residual[0]`` rounded to FP32, ``p = fma(post[n], x, p)``,
+    then ``p = fma(comb[m, n], residual[m], p)`` for m = 1..3, then one rounding to
+    BF16. The port gives those bits."""
+    big, eps, u = 2.0**127, 2.0**-23, 2.0**-7
     x = torch.zeros(3, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
     residual = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
     post = torch.zeros(3, 4, device=DEVICE)
     comb = torch.zeros(3, 4, 4, device=DEVICE)
-    # Token 0, output 0: big + big overflows before -big is added; stream 1 first
-    # would leave big.
+    # Token 0, output 0: big + big overflows before -big is added; stream 1 before
+    # x would leave big.
     x[0], residual[0, 0], residual[0, 1] = big, big, -big
     post[0, 0], comb[0, 0, 0], comb[0, 1, 0] = 1.0, 1.0, 1.0
-    # Token 1, output 0: (1 + eps)(1 + 2^-7) - (1 + 2^-7) is eps (1 + 2^-7) with the
-    # stream's product fused, eps had the product been rounded first.
-    x[1], residual[1, 0] = -(1 + 2.0**-7), 1 + 2.0**-7
+    # Token 1, x = -(1 + u) and stream 0 = 1 + u. Output 0: the first stream's
+    # product (1 + eps)(1 + u) rounded to 1 + u + eps, then x added, gives eps; with
+    # that product fused, eps (1 + u). Output 1: x's product (1 + eps) x fused
+    # with the first stream's 1 + u gives -eps (1 + u); rounded first, -eps.
+    x[1], residual[1, 0] = -(1 + u), 1 + u
     post[1, 0], comb[1, 0, 0] = 1.0, 1 + eps
+    post[1, 1], comb[1, 0, 1] = 1 + eps, 1.0
     # Token 2: negative zeros from the first product on stay negative.
     x[2], residual[2] = -0.0, -0.0
     post[2], comb[2] = 1.0, 1.0
     expected = torch.zeros(3, 4, HIDDEN, dtype=torch.bfloat16, device=DEVICE)
     expected[0, 0] = INF
-    expected[1, 0] = eps * (1 + 2.0**-7)
+    expected[1, 0] = eps
+    expected[1, 1] = -eps * (1 + u)
     expected[2] = -0.0
     ours = mhc.post(x, residual, post, comb)
     _assert_bits_equal(ours, _tk_post(x, residual, post, comb), "TileKernels: ")
@@ -509,8 +515,14 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
         mhc.declare_kernels()
     declared = prepare.declared_calls(registry)
     assert prepare.warm_declared(registry) == 0
-    ours = [call for call in declared if call[0] in (post_streams, collapse_streams)]
+    factories = (post_streams, collapse_streams)
+    ours = [call for call in declared if call[0] in factories]
     assert ours == [(post_streams, (HIDDEN,), {}), (collapse_streams, (HIDDEN,), {})]
+
+    def by_factory(call):
+        # TileLang's JIT objects have no __name__; order by the factory itself.
+        found = (i for i, factory in enumerate(factories) if factory is call[0])
+        return next(found, len(factories))
 
     # The forward's calls, recorded as its cached lookups make them.
     launched = []
@@ -530,6 +542,4 @@ def test_declared_calls_are_the_forwards(mhc, monkeypatch):
     mhc.post(RankOrderParts(torch.stack((x, x))), residual, post, comb)
     mhc.collapse(residual, _pre_mix(6, seed=72))
     mhc.collapse(residual)
-    assert sorted(launched, key=lambda call: call[0].__name__) == sorted(
-        ours, key=lambda call: call[0].__name__
-    )
+    assert sorted(launched, key=by_factory) == ours

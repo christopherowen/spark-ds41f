@@ -174,5 +174,15 @@ outputs and a seeded temperature-1 run identical to the previous release.
   - the boundary-restore test's stand-in model state predates release-next's
     `get_recurrent_checkpoint_fresh` (efcd03d6a, 2026-09-23), so it fails on release-next too.
   - The TileLang staged write, lowered, makes exactly Triton's guarded element stores.
-- **mHC:** 18 failed. About 1 in 70,000 values differs from TileKernels in its bits, so the port's
-  arithmetic grouping is not TileKernels' yet; under repair.
+- **mHC:** 18 failed. About 1 in 70,000 values differed from TileKernels in its bits.
+  - TileKernels writes `post * x + comb[0] * r[0] + ...`. Of the first addition's two products,
+    nvcc fuses the left one, so TileKernels rounds stream 0's product, not `post * x`. In PTX that
+    is `mul.f32 comb[0,n]*r0`, then `fma post[n],x`, then streams 1-3 by `fma`, then
+    `cvt.rn.bf16`.
+  - The port rounded `post * x` instead. It now spells TileKernels' sequence out with explicit
+    FMAs (`tilelang-mhc-post` 08c6ce4e7), so nvcc's choice no longer decides it.
+  - A dataflow trace matches every output's chain to TileKernels', operand for operand, and an
+    exact emulation reproduces the GPU's 0x3400 vs 0x3401. The collapse already matched.
+  - The order-of-operations test's expected values had assumed the wrong order; they are
+    corrected, with a case that tells the two apart (83b073cec also sorts the declared-calls
+    test by factory).

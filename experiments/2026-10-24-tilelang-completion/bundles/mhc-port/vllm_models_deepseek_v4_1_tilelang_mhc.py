@@ -218,12 +218,18 @@ def project_streams(
             else:
                 for n in T.unroll(MULT):
                     if mode == "post_pre":
-                        # post[n] * x + sum_m comb[m, n] * streams[m], in FP32.
+                        # post[n] * x + sum_m comb[m, n] * streams[m] in FP32, with
+                        # post_streams' (TileKernels') instruction sequence.
                         for v in T.unroll(COLS):
-                            av[v] = coef[MULT + n] * T.Cast(T.float32, xv[v])
-                            for m in T.unroll(MULT):
-                                av[v] += coef[2 * MULT + m * MULT + n] * T.Cast(
-                                    T.float32, rv[m * COLS + v]
+                            av[v] = coef[2 * MULT + n] * T.Cast(T.float32, rv[v])
+                            av[v] = T.fma(
+                                coef[MULT + n], T.Cast(T.float32, xv[v]), av[v]
+                            )
+                            for m in T.unroll(1, MULT):
+                                av[v] = T.fma(
+                                    coef[2 * MULT + m * MULT + n],
+                                    T.Cast(T.float32, rv[m * COLS + v]),
+                                    av[v],
                                 )
                             nv[v] = T.Cast(T.bfloat16, av[v])
                         if token < M:
@@ -400,11 +406,15 @@ def post_streams(hidden_size: int, threads: int = 128):
     """A sublayer's output ``x`` folded into the streams, TileKernels' ``mhc_post_fwd``
     to the bit: ``out[n] = bf16(post[n] * x + sum_m comb[m, n] * residual[m])``.
 
-    Per element, as TileKernels' compiled kernel computes it: the product
-    ``post[n] * x`` rounded to FP32, then each stream's term added by one fused
-    multiply-add, streams in order, and one rounding to BF16. ``T.fmul`` and
-    ``T.fma`` fix those instruction boundaries, so no compiler contraction can
-    move them. The fused ``post_pre`` entry gives the same bits.
+    Per element, as TileKernels' compiled kernel computes it: the first stream's
+    product ``comb[0, n] * residual[0]`` rounded to FP32, ``post[n] * x`` added to
+    it by a fused multiply-add, then streams 1 to 3 likewise, in order, and one
+    rounding to BF16. That is how nvcc contracts TileKernels'
+    ``post * x + comb[0] * residual[0] + ...``: of the first addition's two
+    products it fuses the left one, so the first stream's product is the one
+    rounded (PTX ``mul.f32``, then four ``fma.rn.f32``). Here the ``T.fma`` calls
+    fix that sequence: the rounded product's only use is an FMA's addend, which
+    nothing can contract. The fused ``post_pre`` entry computes the same sequence.
 
     Each thread owns eight contiguous columns of one token: it loads them from
     ``x`` and every stream (16-byte loads) and its token's mixes before any
@@ -446,8 +456,9 @@ def post_streams(hidden_size: int, threads: int = 128):
                     rv[m * VEC + v] = residual[token, m, col + v]
             for n in T.unroll(MULT):
                 for v in T.unroll(VEC):
-                    acc = T.fmul(pm[n], T.Cast(T.float32, xv[v]))
-                    for m in T.unroll(MULT):
+                    acc = cm[n] * T.Cast(T.float32, rv[v])
+                    acc = T.fma(pm[n], T.Cast(T.float32, xv[v]), acc)
+                    for m in T.unroll(1, MULT):
                         acc = T.fma(
                             cm[m * MULT + n], T.Cast(T.float32, rv[m * VEC + v]), acc
                         )
