@@ -471,7 +471,7 @@ def post_streams(hidden_size: int, threads: int = 128):
 
 
 @tilelang.jit(pass_configs=_PASS_CONFIGS)
-def collapse_streams(hidden_size: int, threads: int = 128):
+def collapse_streams(hidden_size: int, threads: int = 64, chunks: int = 2):
     """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
     ``out = bf16(sum_m mix[m] * state[m])``.
 
@@ -479,10 +479,19 @@ def collapse_streams(hidden_size: int, threads: int = 128):
     zero, each stream's term added by one fused multiply-add, streams in order,
     and one rounding to BF16. Starting from zero rather than the first product
     matters only in sign: four negative-zero products sum to positive zero, as
-    TileKernels' do. The thread mapping is ``post_streams``'.
+    TileKernels' do.
+
+    The memory access is TileKernels' too: a CTA of 64 threads per 1,024 columns
+    of one token, each thread two 8-column chunks 512 columns apart, loaded
+    (16 bytes each) stream by stream, chunk by chunk, and stored as two 16-byte
+    writes. TileKernels also stages the streams and the output through shared
+    memory, which its compiled kernel never reads back; here they stay in
+    registers. No element reads another, so a token's result does not depend on
+    the batch.
     """
-    assert hidden_size % (threads * VEC) == 0
-    blocks = hidden_size // (threads * VEC)
+    span = threads * VEC  # columns of one chunk across the CTA
+    assert hidden_size % (span * chunks) == 0
+    blocks = hidden_size // (span * chunks)
     M = T.dynamic("M")
 
     @T.prim_func
@@ -493,23 +502,32 @@ def collapse_streams(hidden_size: int, threads: int = 128):
     ):
         with T.Kernel(M * blocks, threads=threads) as pid:
             token = pid // blocks
-            col = (pid % blocks * threads + T.get_thread_binding()) * VEC
-            sv = T.alloc_local((MULT * VEC,), T.bfloat16)
-            ov = T.alloc_local((VEC,), T.bfloat16)
+            col = pid % blocks * span * chunks + T.get_thread_binding() * VEC
+            sv = T.alloc_local((MULT * chunks * VEC,), T.bfloat16)
+            ov = T.alloc_local((chunks * VEC,), T.bfloat16)
             mv = T.alloc_local((MULT,), T.float32)
             acc = T.alloc_var(T.float32)
             for m in T.vectorized(MULT):
                 mv[m] = mix[token, m]
             for m in T.unroll(MULT):
+                for c in T.unroll(chunks):
+                    for v in T.vectorized(VEC):
+                        sv[(m * chunks + c) * VEC + v] = state[
+                            token, m, col + c * span + v
+                        ]
+            for c in T.unroll(chunks):
+                for v in T.unroll(VEC):
+                    acc = T.float32(0)
+                    for m in T.unroll(MULT):
+                        acc = T.fma(
+                            mv[m],
+                            T.Cast(T.float32, sv[(m * chunks + c) * VEC + v]),
+                            acc,
+                        )
+                    ov[c * VEC + v] = T.Cast(T.bfloat16, acc)
+            for c in T.unroll(chunks):
                 for v in T.vectorized(VEC):
-                    sv[m * VEC + v] = state[token, m, col + v]
-            for v in T.unroll(VEC):
-                acc = T.float32(0)
-                for m in T.unroll(MULT):
-                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
-                ov[v] = T.Cast(T.bfloat16, acc)
-            for v in T.vectorized(VEC):
-                out[token, col + v] = ov[v]
+                    out[token, col + c * span + v] = ov[c * VEC + v]
 
     return mhc_collapse
 
