@@ -952,3 +952,21 @@ controls. Each scenario sets one control the default requests never use: penalti
 temperature 0 and seeded 1, min-p, logit bias, bad words, a thinking budget, prompt logprobs
 and custom logprob ids. It takes digests of the eight prompts alone and eight at once. A
 build with the controls switched must print candidate 4's digests.
+
+### The alternating eight-stream re-measure (2026-10-24 21:06 CET, run `tilelang-ports-c8-abab`)
+
+Eight distinct prompts, eight samples an arm, in the order ports, candidate 4, ports,
+candidate 4:
+
+| Arm | tok/s | ±95% |
+| --- | --- | --- |
+| ports | 191.40 | 0.73% |
+| candidate 4 | 190.70 | 0.57% |
+| ports again | 191.65 | 0.58% |
+| candidate 4 again | 190.16 | 0.38% |
+
+**The ports are not slower at eight streams.** They are level, or +0.6% on the means.
+
+Every arm's samples fall in two modes, about 189.5 and 192.8 tok/s, and both builds land in
+both. The serving check's -1.7% and the bracket's -0.7% came from which mode their two or
+three samples hit. This agrees with the profile, which shows equal step times.
