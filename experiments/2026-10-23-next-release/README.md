@@ -410,3 +410,36 @@ a decode step about 0.7%. 16 and 1 streams are level throughout. A decode step d
 long-prefill budget, so something in it scales with `max_num_batched_tokens`:
 [profile/profile-tp4.json](profile/profile-tp4.json) profiles decode at one and sixteen streams at
 16,384, 8,192 and 16,384 again (torch profiler, every rank), and compares the kernels' costs.
+
+**The decode profile (2026-10-24 06:58-07:09 CET, run `next-budget-decode-profile`).** Served decode
+under the torch profiler on image -next-2, every rank, in run order 16,384 / 8,192 / 16,384:
+one stream 38.98 / 39.03 / 38.82 ms a step, sixteen streams (code) 68.29 / 69.01 / 68.91 ms. The
+budget costs a served decode step nothing; no kernel's time moves with it beyond the
+collectives' run-to-run spread. Read per shape, the A/B agrees: the 8,192 arm and the 16,384
+repeat beside it differ by 0.14%, inside the interval; its -0.93% came from a step between the
+session's second and third boots, not from the budget. So neither the budget nor the malloc
+settings explain candidate 2's grid, and nothing else candidate 2 changed reads differently:
+the image holds no reader of an old `SPARK3_*` name, the `SPARK_DS41F_*` names it reads are the
+ones the recipe sets, and the variable dropped as dead is read by neither 1022 nor candidate 2.
+Against spark-ds41f-1022 the candidates' grids were, first run and repeat: candidate 1's
+overlay screen -1.12 / -0.87%, candidate 1's image -1.05 / -1.88%, candidate 2 +0.79 / +1.33%.
+Candidate 3's window settles it in one session, alternating candidate 3 with candidate 1's image
+([rc3/decode-tp4.json](rc3/decode-tp4.json)).
+
+## Release candidate 3 ([rc3/](rc3))
+
+Candidate 2 plus vLLM 0263 (GLP steering's projection at 640 threads a row: the fastest of the ten
+variants at every shape) and 0264 (the sink detector's rank log says its count covers every
+executed step, including the steps whose output the scheduler discards; #489), on
+[rc3/cluster.json](rc3/cluster.json): candidate 2's recipe with #469's prompt-cache report
+(`--enable-prompt-tokens-details`). [rc3/vllm/series](rc3/vllm/series): candidate 2's plus
+0263-0264; patch head 599011be, tree 4b241dcc ([rc3/source.json](rc3/source.json)); image
+`spark-ds41f:19f2c20ed4d6-next-3`. `release_tests.py check`: 127 files, 70 gate, 0 problems.
+
+One window on the ring:
+1. [rc3/rc3-tp4.json](rc3/rc3-tp4.json): the image; the release tests and the GLP benchmark;
+   the gate at 16,384; determinism at 8,192 and with steering on; the release comparison
+   (candidate 3 / spark-ds41f-1022 / candidate 3).
+2. [rc3/decode-tp4.json](rc3/decode-tp4.json): the grid and closed loops at 16 and 1 streams,
+   candidate 3 / candidate 1 / candidate 3 / candidate 1.
+3. [rc3/rc3-glp-tp4.json](rc3/rc3-glp-tp4.json): steering on against off.
