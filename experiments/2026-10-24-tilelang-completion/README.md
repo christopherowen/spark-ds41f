@@ -800,3 +800,9 @@ vLLM `tilelang-ports` 1ac412cc7:
 
   The reference-logprob investigation stays separate from these behavior-preserving
   translations.
+
+The first profile run stopped at its first workload: a profiled arm must serve with
+`--profiler-config`, and the serving arms do not. [prof-ports.json](profile/prof-ports.json)
+and [prof-candidate4.json](profile/prof-candidate4.json) are the two arms with candidate
+4's resolved serve arguments and the torch profiler added. The run is repeated as
+`tilelang-ports-profile-2`.
