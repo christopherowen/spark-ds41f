@@ -220,7 +220,9 @@ def test_declared_as_the_lookup_calls_it():
         embedding.TileLangEmbeddingMethod().declare_layer_kernels(layer)
     calls = list(prepare.declared_calls(registry))
     words = HIDDEN * 2 // 4
+    full = -(-(words // 4) // 128)
     assert calls == [
-        (embedding.vocab_embedding_kernel, (words, "int32"), {}),
-        (embedding.vocab_embedding_kernel, (words, "int64"), {}),
+        (embedding.vocab_embedding_kernel, (words, d), {"per_thread": p})
+        for d in ("int32", "int64")
+        for p in (1, full)
     ]

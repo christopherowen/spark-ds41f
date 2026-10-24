@@ -1243,16 +1243,6 @@ def partial_argmax_kernel(
     runs = GREEDY_BLOCK // (threads * _VEC)
     passes = GREEDY_BLOCK // threads
 
-    @T.macro
-    def visit(base, bias, best, best_index, row, col):
-        value = T.cast(base[row, col], T.float32)
-        if biased:
-            value = T.cast(
-                T.cast(value + T.cast(bias[row, col], T.float32), base_dtype),
-                T.float32,
-            )
-        _first_keep_or_take(best, best_index, value, col)
-
     @T.prim_func
     def partial_argmax(
         base: T.StridedTensor((rows, vocab), (base_stride, 1), base_dtype),
@@ -1266,8 +1256,8 @@ def partial_argmax_kernel(
         ):
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
-            a = T.alloc_local((_VEC,), base_dtype)
-            b = T.alloc_local((_VEC,), bias_dtype)
+            a = T.alloc_local((passes,), base_dtype)
+            b = T.alloc_local((passes,), bias_dtype)
             best = T.alloc_local((1,), T.float32)
             best_index = T.alloc_local((1,), T.int32)
             other = T.alloc_local((1,), T.float32)
@@ -1282,19 +1272,26 @@ def partial_argmax_kernel(
                 T.assume(base_stride % _VEC == 0)
                 T.assume(bias_stride % _VEC == 0)
                 T.assume(vocab % _VEC == 0)
+                # Every run loaded before any is combined, as Triton loads its block.
                 for run in T.unroll(runs):
                     col0 = part * GREEDY_BLOCK + (run * threads + tx) * _VEC
                     if col0 < vocab:
                         for i in T.vectorized(_VEC):
-                            a[i] = base[row, col0 + i]
+                            a[run * _VEC + i] = base[row, col0 + i]
                         if biased:
                             for i in T.vectorized(_VEC):
-                                b[i] = bias[row, col0 + i]
+                                b[run * _VEC + i] = bias[row, col0 + i]
+                for run in T.unroll(runs):
+                    col0 = part * GREEDY_BLOCK + (run * threads + tx) * _VEC
+                    if col0 < vocab:
                         for i in T.unroll(_VEC):
-                            value = T.cast(a[i], T.float32)
+                            value = T.cast(a[run * _VEC + i], T.float32)
                             if biased:
                                 value = T.cast(
-                                    T.cast(value + T.cast(b[i], T.float32), base_dtype),
+                                    T.cast(
+                                        value + T.cast(b[run * _VEC + i], T.float32),
+                                        base_dtype,
+                                    ),
                                     T.float32,
                                 )
                             _first_keep_or_take(best, best_index, value, col0 + i)
@@ -1302,7 +1299,19 @@ def partial_argmax_kernel(
                 for j in T.unroll(passes):
                     col = part * GREEDY_BLOCK + j * threads + tx
                     if col < vocab:
-                        visit(base, bias, best, best_index, row, col)
+                        a[j] = base[row, col]
+                        if biased:
+                            b[j] = bias[row, col]
+                for j in T.unroll(passes):
+                    col = part * GREEDY_BLOCK + j * threads + tx
+                    if col < vocab:
+                        value = T.cast(a[j], T.float32)
+                        if biased:
+                            value = T.cast(
+                                T.cast(value + T.cast(b[j], T.float32), base_dtype),
+                                T.float32,
+                            )
+                        _first_keep_or_take(best, best_index, value, col)
             _warp_first_argmax(best, best_index, other, other_index)
             if tx % 32 == 0:
                 partial[tx // 32] = best[0]

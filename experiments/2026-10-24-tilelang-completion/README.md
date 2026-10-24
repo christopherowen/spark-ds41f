@@ -704,3 +704,25 @@ vLLM `tilelang-ports` 5c819fba5:
 - temperature's block width by the step's token count (2048 below eight tokens, Triton's
   8192 from eight), both declared and both tested;
 - zero_kv_blocks reads its segment's scalars before the page test.
+
+### Eighth integrated run (2026-10-24 19:05 CET)
+
+Every test passes. Sampling has 661 tests now, with temperature at both block widths.
+- **Temperature** is faster than Triton at every size: -16% at one token, -14% at
+  sixteen, -1% at 96.
+- **Sink candidates**, with their rounds unrolled: faster everywhere but one request at
+  t=0, which went from +13% to +8%.
+- **Unchanged:**
+  - zero_kv_blocks, +0.1 µs at c1 and +0.4% at 16K. Reading the scalars before the page
+    test did not move it.
+  - prepare_prefill_inputs at decode, +0.1 to +0.3 µs.
+  - gather_lookback, +0.06 to +0.09 µs.
+  - the greedy pair at one row, +6%.
+
+## Ninth integrated run (run `tilelang-integration-kernels-9`)
+
+vLLM `tilelang-ports` 0c0c0bb35:
+- **the embedding** takes a row a block from 512 tokens (each thread's five pieces
+  loaded before any is stored); below 512 a row stays spread over five blocks. Both
+  layouts are declared.
+- **the greedy partial argmax** loads every run before combining.
