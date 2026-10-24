@@ -1996,10 +1996,19 @@ def suite_verdict(lines: list[str]) -> dict:
     }
 
 
+def status_verdict() -> dict:
+    """A script bundle ("verdict": "status", e.g. a benchmark with its own gate): its exit status
+    is the verdict, which kernel_local applies."""
+    return {"passed": True, "summary": "", "failed": [], "batch_variant": [], "bits_unequal": [],
+            "errors": [], "groups": [], "bits": [], "timings": []}
+
+
 def verdict_from_lines(lines: list[str], candidate: dict) -> dict:
     """Pass when every invariant configuration has one row group and every expected-equal pair matches."""
     if candidate.get("verdict") == "exit":
         return suite_verdict(lines)
+    if candidate.get("verdict") == "status":
+        return status_verdict()
     exempt = tuple(candidate.get("variant_configs", ["production", "ref2"]))
     groups, bits, timings, errors = [], [], [], []
     for line in lines:

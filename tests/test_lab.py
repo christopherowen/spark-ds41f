@@ -1074,6 +1074,14 @@ class KernelLabTest(unittest.TestCase):
         self.assertFalse(lab.verdicts_agree([a, dict(lab.verdict_from_lines(good, suite), bundle="b")]))
         self.assertTrue(lab.verdicts_agree([a, dict(a, node="dgx4")]))
 
+    def test_status_bundles_pass_on_their_exit_status(self) -> None:
+        # A gated benchmark prints no pytest summary; kernel_local fails it on a non-zero exit.
+        script = dict(self.CANDIDATE, verdict="status")
+        self.assertTrue(lab.verdict_from_lines(['{"decode c1": {"tokens": 6}}'], script)["passed"])
+        self.assertTrue(lab.verdict_from_lines([], script)["passed"])
+        self.assertFalse(lab.verdict_from_lines(['{"decode c1": {"tokens": 6}}'],
+                                                dict(script, verdict="exit"))["passed"])
+
     def test_nodes_must_agree_on_groups_and_bits(self) -> None:
         a = {"bundle": "b", "groups": [{"op": "x", "groups": 1}], "bits": [{"bits": "p", "differs_at": []}]}
         b = dict(a, node="dgx2")
