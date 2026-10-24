@@ -77,3 +77,28 @@ bandwidth against GB10's roofline at one and sixteen streams (where the MoE GEMM
 most); the draft-tree acceptance ceiling from logged drafter distributions. The target is the
 release suite's single stream on the ring at temperature 0, tracked at temperature 1 and on an
 agent-traffic suite as well.
+
+## The sampling family: what bit-exact means
+
+The sink detector's alternates are the sampler's own draw in descending order, so the sink
+kernels, the Gumbel sampler and the greedy argmax kernels move together. Their noise must stay
+the stream Triton produces today, or every seeded sampled output changes. From the PTX Triton
+compiled for `_gumbel_sample_kernel` in the image's cache (`.target sm_121a`):
+
+- **Philox-4x32, ten rounds**, Triton's `randint4x`: multipliers 0xD2511F53 and 0xCD9E8D57, key
+  increments 0x9E3779B9 and 0xBB67AE85, the 64-bit seed split into the key, the offset as the
+  first counter word. The per-row seed is `tl.randint(seed, pos)` (with the draft salt 2^30
+  added to `pos` while drafting), the draw `tl.rand(row_seed, token_id)`.
+- **uint32 to float**: `x ^ (x >> 31)` (Triton's `uint_to_uniform_float`), `cvt.rn.f32.s32`, a
+  multiply by 0f2FFFFFFF (4.6566127342e-10), and the clamp to that same minimum.
+- **The noise**: `-log(-log1p(-u))` through libdevice's `__nv_log1pf` and `__nv_logf`, inlined
+  with flush-to-zero FMAs (`fma.rn.ftz.f32`, `add.rz.ftz.f32`).
+- **Temperature**: `logits / temp` compiles to `div.full.f32`, the approximate divide (CUDA's
+  `__fdividef`), not IEEE `div.rn`.
+
+The TileLang kernels share one CUDA header with these device functions, compiled with the same
+flush-to-zero and fast-divide semantics, so the noise is a function of (seed, position, token) and
+nothing else. The gate: the TileLang sampler's per-block maxima and argmaxes equal Triton's bit for
+bit across seeds, positions, temperatures (0, 1, 0.6, 1.3), FP32 and FP64 draws, drafting and
+target streams, and logits with ties, infinities and NaN; then the full-model determinism gate at
+temperature 0 and a seeded temperature-1 run identical to the previous release.
