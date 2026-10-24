@@ -227,6 +227,7 @@ def _gumbel_both(
                 None if col is None else col.dtype,
                 col is not None and col.dim() > 0,
                 tls._triton_run(logits),
+                pos.dtype,
             )
             tls._kernel(tls.gumbel_sample_kernel, *key)(
                 argmax,
@@ -237,7 +238,7 @@ def _gumbel_both(
                 pos,
                 temperature,
                 best.unsqueeze(1) if cache is None else cache_copy,
-                pos if col is None else col.view(-1),
+                argmax.view(-1) if col is None else col.view(-1),
             )
         else:
             gumbel._gumbel_sample_kernel[(tokens, blocks)](
@@ -309,6 +310,37 @@ def test_gumbel_sample(
         logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
     )
     # gumbel.gumbel_sample's finish on Triton's per-block outputs.
+    theirs = c.gather(dim=-1, index=d.argmax(dim=-1, keepdim=True)).view(-1)
+    _assert_same(ours, theirs, "sampled tokens")
+
+
+def _int32_positions(pos: torch.Tensor) -> torch.Tensor:
+    """``pos`` as int32 positions, two of them where the draft salt (2**30) reaches
+    and passes 2**31 in 32 bits."""
+    pos = (pos % (1 << 30)).to(torch.int32)
+    pos[1] = (1 << 30) - 1
+    pos[2] = (1 << 31) - 5
+    return pos
+
+
+@pytest.mark.parametrize(
+    "apply_temperature,is_drafting", [(False, False), (True, False), (True, True)]
+)
+def test_gumbel_sample_int32_positions(apply_temperature, is_drafting):
+    """Triton takes an int32 position as the Philox offset's only word and salts a
+    draft's in 32 bits."""
+    tokens, slots, vocab = 37, 48, 5000
+    logits = _logits(tokens, vocab, torch.float32, "special", 5)
+    mapping, temperature, seeds, pos = _sampling_inputs(tokens, slots, "mixed", 5)
+    pos = _int32_positions(pos)
+    (a, b, _), (c, d, _) = _gumbel_both(
+        logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
+    )
+    _assert_same(a, c, "block argmax")
+    _assert_same(b, d, "block maximum")
+    ours = tls.gumbel_sample(
+        logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
+    )
     theirs = c.gather(dim=-1, index=d.argmax(dim=-1, keepdim=True)).view(-1)
     _assert_same(ours, theirs, "sampled tokens")
 
@@ -402,6 +434,20 @@ def _batch(counts, sampled_width, slots, seed):
 def test_sink_candidates(
     dtype, vocab, stride, case, num_candidates, mask_rejected_draft
 ):
+    _check_sink_candidates(
+        dtype, vocab, stride, case, num_candidates, mask_rejected_draft, torch.int64
+    )
+
+
+def test_sink_candidates_int32_positions():
+    _check_sink_candidates(
+        torch.bfloat16, VOCAB, STRIDES[0], CASES[0], 4, True, torch.int32
+    )
+
+
+def _check_sink_candidates(
+    dtype, vocab, stride, case, num_candidates, mask_rejected_draft, pos_dtype
+):
     counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
     width, slots = 6, 16
     cu, num_sampled, drafts, sampled, mapping = _batch(counts, width, slots, 2)
@@ -409,6 +455,8 @@ def test_sink_candidates(
     logits = _logits(rows, _stride(vocab, stride), dtype, case, 2)
     _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 2)
     pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
+    if pos_dtype == torch.int32:
+        pos = _int32_positions(pos)
     ours = tls.sink_candidates(
         logits,
         vocab,

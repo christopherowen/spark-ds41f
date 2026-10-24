@@ -444,3 +444,39 @@ Both forms of every production kernel are timed against Triton per call:
 
 Triton's temperature is also timed against itself on the two 96-token buffers, to test
 whether that gap belongs to the buffers.
+
+### The first integrated run (2026-10-24 17:33 CET, run `tilelang-integration-kernels`)
+
+- **Tests:**
+  - Runner and token counts: 539 passed.
+  - Sampling: 639 passed.
+  - mHC: 60 passed.
+  - Embedding, confidence, ranks and verification: 203 passed, 8 failed. The 8 are all
+    `test_gumbel_drafted_rejection_sample_is_unbiased`. Its proposals are drawn by
+    `gumbel_sample` with int32 positions, which Triton's kernel takes (`tl.randint` uses an
+    int32 offset as its only word and salts a draft's in 32 bits). The TileLang sampler
+    and sink candidates required int64. Fixed on the branch: the positions' dtype is in
+    both kernels' keys (serving's are int64, as declared), and int32 positions have their
+    own tests against Triton.
+  - The vocabulary-parallel drafting tests fail 8, as on the unchanged image.
+- **Gates:**
+  - mHC: passes.
+  - Token counts: -9 to -12%. Embedding and confidence, logprob ranks and the resampled
+    token pass their own gates.
+  - Runner, still slower:
+    - combine with dead rows: +0.4 to +0.7 µs;
+    - prepare_dflash_inputs at decode: +0.5 µs;
+    - prepare_prefill_inputs at c16: +0.26 µs;
+    - post_update and combine at the 16K prefill: about +0.12 µs;
+    - gather_lookback: +0.06 to +0.10 µs;
+    - zero_kv_blocks at c1: +0.09 µs, and +0.6% at 16K.
+
+    expand_idx_mapping is +0.01 to +0.04 µs.
+  - Sampling:
+    - Temperature is level at every size, 96 tokens included (389.0 against 389.4 µs).
+      Round 4a's +16% was its own benchmark's.
+    - Still slower: the Gumbel sampler in BF16 (+2 to +3.5%), sink candidates (+2 to
+      +12%), select (+7%, under 0.1 µs), and the greedy shard pairs and Markov sampling
+      (+18 to +42%, 0.8 to 1.7 µs).
+
+The second integrated run repeats every bundle on the fixed branch.
