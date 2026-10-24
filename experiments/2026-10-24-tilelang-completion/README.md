@@ -1039,3 +1039,42 @@ in alternating arms with eight eight-stream samples each. It checks:
 **The next fusion target.** At eight streams the step still launches about 220 PyTorch
 kernels: copies, top-k, sorts and scans, 0.4-0.45 ms a step. There is no Triton kernel
 left on the temperature-0 path.
+
+### Twelfth integrated run (2026-10-24 21:33 CET)
+
+**Tests:** every test passes:
+- runner 539;
+- misc 211, plus vocabulary-parallel 12;
+- mHC 60;
+- sampling 661;
+- controls and switched states 158.
+
+**Gates:**
+- **Pass:** mHC, misc, token counts, sampling, the controls (min-p, penalties,
+  histogram).
+- **The runner** flags prepare_prefill at one stream, combine with dead rows at the 16K
+  prefill and expand at one stream. Each is under 0.1 µs, and the set changes from run to
+  run. zero_kv and the lookback are no longer flagged.
+
+**The other controls**, after the tile-form rewrites (5845b392f):
+
+| Kernel | Change against Triton |
+| --- | --- |
+| Logit bias | -12 to -36% at most shapes |
+| Prompt ids, one 16K chunk | -38% |
+| Forbidden sequences, thinking, NaN count | level or faster |
+
+Still slower:
+- logit bias with min_tokens under structured output, 96 rows: +1.4%. Its row scan read
+  scalars where Triton reads 16-byte vectors.
+- prompt ids at 16 rows × 1024 tokens: +0.15 µs. Each pass issued 32 predicated loads a
+  thread even for a 1024-token chunk.
+
+**Fixes** (vLLM 253cb4719):
+- the bias kernel fills and scans whole row tiles as vectors when the rows are aligned (a
+  `run` key, as min-p's);
+- the prompt-id gather skips the 1024-token groups a chunk does not reach, on its length
+  alone.
+
+They go into the thirteenth run (`tilelang-integration-kernels-13`), then the second serving
+check (`tilelang-ports-serving-2`) serves the branch at 253cb4719.

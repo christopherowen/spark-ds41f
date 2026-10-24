@@ -35,11 +35,13 @@ def register_bias(
                 restore,
                 index_dtype,
                 position_dtype,
+                run,
             )
             for stride in logits_strides
             for restore in (False, True)
             for index_dtype in _DTYPES.values()
             for position_dtype in _DTYPES.values()
+            for run in (1, 4)
         ],
     )
 
@@ -62,13 +64,16 @@ def bias_kernel(
     restore: bool,
     index_dtype: str,
     position_dtype: str,
+    run: int,
 ):
     """``_bias_kernel`` in its tile form: a block a row, each list's ids and values
     loaded (predicated on the list's length) before the gathered logits, and those
     before any store, every masked store predicated. The row's -inf fill and the
     all-masked scan take 8192 columns a tile; only the last, partial tile clamps
-    its loads and predicates its stores. As Triton's maximum, the scan ignores NaN:
-    a row is alive when some logit is above -inf."""
+    its loads and predicates its stores; with ``run`` 4 (16-byte aligned rows, the
+    launch checked) the whole tiles are filled and read as vectors in Triton's
+    layout. As Triton's maximum, the scan ignores NaN: a row is alive when some
+    logit is above -inf."""
     rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
         "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
     )
@@ -91,10 +96,10 @@ def bias_kernel(
     @T.macro
     def fill_row(logits, row, tx):
         for tile in T.serial(full):
-            for j in T.unroll(row_per):
-                logits[row, tile * _ROW_TILE + j * _THREADS + tx] = -T.infinity(
-                    "float32"
-                )
+            for r in T.unroll(row_per // run):
+                col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
+                for k in T.vectorized(run):
+                    logits[row, col0 + k] = -T.infinity("float32")
         if vocab % _ROW_TILE:
             for j in T.unroll(row_per):
                 col = full * _ROW_TILE + j * _THREADS + tx
@@ -105,8 +110,10 @@ def bias_kernel(
     @T.macro
     def scan_row(logits, row, tx, row_values, alive):
         for tile in T.serial(full):
-            for j in T.unroll(row_per):
-                row_values[j] = logits[row, tile * _ROW_TILE + j * _THREADS + tx]
+            for r in T.unroll(row_per // run):
+                col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
+                for k in T.vectorized(run):
+                    row_values[r * run + k] = logits[row, col0 + k]
             for j in T.unroll(row_per):
                 alive[0] = alive[0] | T.cast(
                     row_values[j] > -T.infinity("float32"), "int32"
@@ -254,6 +261,11 @@ def bias_kernel(
     return bias
 
 
+def _run(logits) -> int:
+    """4 when every row starts 16-byte aligned, else 1."""
+    return 4 if logits.data_ptr() % 16 == 0 and logits.stride(0) % 4 == 0 else 1
+
+
 def apply_logit_bias(
     logits,
     mapping,
@@ -287,6 +299,7 @@ def apply_logit_bias(
             check_all_masked_rows,
             _DTYPES[mapping.dtype],
             _DTYPES[positions.dtype],
+            _run(logits),
         )(
             logits,
             mapping,

@@ -155,19 +155,21 @@ def apply_bad_words(
 
 
 _PROMPT_THREADS = 128
-_PROMPT_PER_THREAD = 32  # 4096 tokens a pass: a 16K chunk in four
+_PROMPT_GROUP = 1024  # tokens a group: eight a thread
+_PROMPT_GROUPS = 4  # groups a pass: a 16K chunk in four passes
 
 
 @tilelang.jit(pass_configs=_PASS)
 def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
-    """A block a request: the token after each of its chunk's positions. Each pass
-    issues all of its loads before its stores (both predicated on the chunk's
-    length), so a long chunk waits on memory once a pass, not once a thread's
-    element."""
+    """A block a request: the token after each of its chunk's positions. A pass
+    covers four 1024-token groups and issues all of its loads before its stores
+    (both predicated on the chunk's length), so a long chunk waits on memory once a
+    pass; a group the chunk does not reach is skipped, on the length alone."""
     rows, output_len, states, token_cols = T.dynamic(
         "rows, output_len, states, token_cols"
     )
-    tile = _PROMPT_THREADS * _PROMPT_PER_THREAD
+    per = _PROMPT_GROUP // _PROMPT_THREADS
+    tile = _PROMPT_GROUP * _PROMPT_GROUPS
 
     @T.prim_func
     def prompt_ids(
@@ -184,26 +186,36 @@ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
             start = T.alloc_var(T.int32, init=query_starts[row])
             length = T.alloc_var(T.int32, init=query_starts[row + 1] - start)
             first = T.alloc_var(T.int32, init=computed[req] + 1)
-            values = T.alloc_local((_PROMPT_PER_THREAD,), "int32")
+            values = T.alloc_local((per * _PROMPT_GROUPS,), "int32")
             for block in T.serial(T.ceildiv(length, tile)):
-                for k in T.unroll(_PROMPT_PER_THREAD):
-                    pos = block * tile + k * _PROMPT_THREADS + tx
-                    values[k] = T.call_extern(
-                        "int32",
-                        "vllm_control_load_if_b32",
-                        T.address_of(tokens[req, first + pos]),
-                        0,
-                        pos < length,
-                    )
-                for k in T.unroll(_PROMPT_PER_THREAD):
-                    pos = block * tile + k * _PROMPT_THREADS + tx
-                    T.call_extern(
-                        "handle",
-                        "vllm_control_store_if_b64",
-                        T.address_of(output[start + pos]),
-                        T.cast(values[k], "int64"),
-                        pos < length,
-                    )
+                for g in T.unroll(_PROMPT_GROUPS):
+                    if block * tile + g * _PROMPT_GROUP < length:
+                        for k in T.unroll(per):
+                            pos = (
+                                block * tile + g * _PROMPT_GROUP
+                                + k * _PROMPT_THREADS + tx
+                            )  # fmt: skip
+                            values[g * per + k] = T.call_extern(
+                                "int32",
+                                "vllm_control_load_if_b32",
+                                T.address_of(tokens[req, first + pos]),
+                                0,
+                                pos < length,
+                            )
+                for g in T.unroll(_PROMPT_GROUPS):
+                    if block * tile + g * _PROMPT_GROUP < length:
+                        for k in T.unroll(per):
+                            pos = (
+                                block * tile + g * _PROMPT_GROUP
+                                + k * _PROMPT_THREADS + tx
+                            )  # fmt: skip
+                            T.call_extern(
+                                "handle",
+                                "vllm_control_store_if_b64",
+                                T.address_of(output[start + pos]),
+                                T.cast(values[g * per + k], "int64"),
+                                pos < length,
+                            )
 
     return prompt_ids
 
