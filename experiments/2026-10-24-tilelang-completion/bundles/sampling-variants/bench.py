@@ -128,16 +128,22 @@ def generator(seed: int) -> torch.Generator:
 # --- Greedy reductions --------------------------------------------------------
 
 
-def run_partial(base, bias, values, indices, threads, extra=None):
+def run_partial(base, bias, values, indices, threads, extra=None, tile=False):
     vector = tls._vector_rows(base) if bias is None else tls._vector_rows(base, bias)
     key = tls.partial_argmax_key(base.dtype, None if bias is None else bias.dtype, vector)
-    build(tls.partial_argmax_kernel, *key, threads, extra=extra)(
+    factory = sampling_tile.partial_tile_kernel if tile else tls.partial_argmax_kernel
+    build(factory, *key, threads, extra=extra)(
         base, base if bias is None else bias, values.view(-1), indices.view(-1)
     )
 
 
 def run_finish(values, indices, out, rows, parts, out_stride, vocab_start, output, mode,
-               extra=None):
+               extra=None, tile=False):
+    if tile:
+        build(sampling_tile.finish_tile_kernel, output, parts)(
+            values.view(-1), indices.view(-1), out, rows, out_stride, vocab_start
+        )
+        return
     build(tls.finish_argmax_kernel, output, mode, extra=extra)(
         values.view(-1), indices.view(-1), out, parts, rows, out_stride, vocab_start
     )
@@ -168,7 +174,8 @@ def pair_inputs(rows, biased, sample):
     return base, bias, shape
 
 
-def pair_case(rows, biased, threads, mode, extra=None):
+def pair_case(rows, biased, threads, mode, extra=None, tile_partial=False,
+              tile_finish=False):
     parts = triton.cdiv(SHARD, greedy._BLOCK)
 
     def make(sample):
@@ -179,8 +186,9 @@ def pair_case(rows, biased, threads, mode, extra=None):
         v2, i2 = torch.empty(shape, device=DEVICE), torch.empty(shape, dtype=torch.int32, device=DEVICE)
 
         def ours():
-            run_partial(base, bias, v1, i1, threads, extra)
-            run_finish(v1, i1, ours_pairs.view(-1), rows, parts, 2, SHARD, "pair", mode, extra)
+            run_partial(base, bias, v1, i1, threads, extra, tile_partial)
+            run_finish(v1, i1, ours_pairs.view(-1), rows, parts, 2, SHARD, "pair", mode, extra,
+                       tile_finish)
 
         def theirs():
             triton_pair(base, bias, SHARD, theirs_pairs, v2, i2)
@@ -482,8 +490,43 @@ def round4b() -> None:
         emit(row)
 
 
+def round4c() -> None:
+    """The greedy shard pairs with the partial argmax and the finish in Triton's tile
+    form (sampling_tile), each against Triton; then each kernel's device time."""
+    forms = {
+        "prod": (False, False),
+        "tile partial": (True, False),
+        "tile finish": (False, True),
+        "tile both": (True, True),
+    }
+    for biased in (True, False):
+        name = "greedy_markov_shard_pair" if biased else "greedy_shard_pair"
+        for rows in (1, 6, 16, 96):
+            for threads in (128, 256):
+                for form, (tp, tf) in forms.items():
+                    row = {"kernel": name, "rows": rows, "partial_threads": threads,
+                           "form": form}
+                    try:
+                        row.update(paired(pair_case(rows, biased, threads, 0, None, tp, tf)))
+                    except Exception as error:  # noqa: BLE001 (report the case, go on)
+                        row["error"] = f"{type(error).__name__}: {error}"[:2000]
+                    emit(row)
+    parts = triton.cdiv(SHARD, greedy._BLOCK)
+    for rows in (1, 16):
+        base, bias, shape = pair_inputs(rows, True, 0)
+        pairs = torch.empty(rows, 2, device=DEVICE)
+        v, i = torch.empty(shape, device=DEVICE), torch.empty(shape, dtype=torch.int32, device=DEVICE)
+        for form, (tp, tf) in forms.items():
+            emit({"profile": f"greedy markov pair {rows} rows, {form}",
+                  "tilelang": kernel_times(lambda tp=tp, tf=tf: (
+                      run_partial(base, bias, v, i, 128, None, tp),
+                      run_finish(v, i, pairs.view(-1), rows, parts, 2, SHARD, "pair", 0, None,
+                                 tf))),
+                  "triton": kernel_times(lambda: triton_pair(base, bias, SHARD, pairs, v, i))})
+
+
 def main() -> None:
-    rounds = {"3": round3, "4a": round4a, "4b": round4b}
+    rounds = {"3": round3, "4a": round4a, "4b": round4b, "4c": round4c}
     for name in sys.argv[1:] or ["4a"]:
         rounds[name]()
 

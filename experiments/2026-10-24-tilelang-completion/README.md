@@ -480,3 +480,37 @@ whether that gap belongs to the buffers.
       (+18 to +42%, 0.8 to 1.7 µs).
 
 The second integrated run repeats every bundle on the fixed branch.
+
+### Round 4b results (2026-10-24 17:43 CET)
+
+- **Ordinary loads gain nothing.** Every production kernel, sampling and runner, takes the
+  same time with its read-only buffers off the read-only cache path, within noise. The
+  read-only path is not what slows the small kernels. expand_idx_mapping's last 0.13 to
+  0.15 µs of device time remains with ordinary loads and Triton's instruction shape.
+- **The 96-token temperature gap is the buffers.** Triton's own kernel takes 458.8 µs on
+  the first of the two buffers and 387.8 µs on its clone (+18%), the same gap as round 4a's
+  "+16%".
+
+  Two same-size buffers allocated one after the other stream at different speeds on GB10.
+  If that holds for serving's weights, KV cache or logits, it is a decode-speed lever
+  that leaves the bits unchanged. The placement bundle looks for the cause.
+- The TileLang launch is an ordinary `cuLaunchKernel` (TVM's runtime adds programmatic
+  dependent launch only for kernels with a grid sync), so the launch is not the fixed
+  cost either.
+
+## Round 4c and placement ([greedy-placement-kernels.json](greedy-placement-kernels.json))
+
+- **Greedy reductions** (sampling-variants `4c`, dgx4). The greedy shard pairs at 1, 6, 16
+  and 96 rows are timed four ways: production, the partial argmax in tile form (every
+  run loaded before any is combined), the finish in tile form (parts fixed when built,
+  each lane's parts loaded up front), and both. Each is checked bit for bit and timed
+  against Triton, then the kernels' device times.
+- **Placement** ([bundles/placement](bundles/placement), dgx2). The same in-place
+  streaming pass runs over 49.6 MB buffers allocated in different ways:
+  - round 4b's pair (randn, then a clone), and the reverse order;
+  - eight buffers in a row;
+  - sizes rounded to whole 2 MiB pages;
+  - slices of one allocation;
+  - a block reused from the cache.
+
+  Each buffer's time is printed with its address.
