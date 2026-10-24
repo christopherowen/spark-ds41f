@@ -426,6 +426,47 @@ def gumbel_sample_kernel(
         # Placeholders the variant never reads.
         cache_dtype, col_dtype = "float32", "int64"
 
+    @T.macro
+    def passes(logits, raw, score, best, best_index, cache, req, col, word_seed, temp,
+               t, blk, tx, noisy):  # fmt: skip
+        """The thread's elements, combined into ``(best, best_index)``. With
+        ``noisy`` (the token's temperature is not 0) each element's Philox word is
+        drawn unconditionally, ahead of its bound check, as Triton draws a whole
+        block: the key schedule, the same for every element of the token, is then
+        computed once a thread instead of once an element."""
+        for r in T.unroll(_PASSES // run):
+            col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
+            _load_run(logits, raw, t, col0, vocab, run)
+            for k in T.unroll(run):
+                local = r * (_THREADS * run) + run * tx + k
+                index = col0 + k
+                if noisy:
+                    word = T.alloc_var(
+                        T.uint32,
+                        init=T.call_extern(
+                            "uint32", "vllm_randint32", word_seed[0], index
+                        ),
+                    )
+                score[0] = -T.infinity(T.float32)
+                if index < vocab:
+                    score[0] = T.cast(raw[k], T.float32)
+                    if cached:  # noqa: SIM102
+                        if req[0] >= 0:
+                            cache[req[0], col[0], index] = T.cast(score[0], cache_dtype)
+                    if noisy:
+                        if apply_temperature:
+                            score[0] = T.call_extern(
+                                "float32", "vllm_div_full", score[0], temp[0]
+                            )
+                        score[0] = T.call_extern(
+                            "float32", "vllm_gumbel_score", score[0], word
+                        )
+                if r * run + k == 0:
+                    best[0] = score[0]
+                    best_index[0] = local
+                else:
+                    _keep_or_take(best, best_index, score[0], local)
+
     @T.prim_func
     def gumbel_sample(
         local_argmax: T.StridedTensor((tokens, blocks), (argmax_stride, 1), T.int64),
@@ -476,38 +517,13 @@ def gumbel_sample_kernel(
                 # gumbel.spec_step_seed
                 seed[0] = seed[0] ^ T.shift_left(col[0], T.int64(32))
             word_seed[0] = _randint_at(seed[0], pos[t], pos_dtype, is_drafting)
-            for r in T.unroll(_PASSES // run):
-                col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
-                _load_run(logits, raw, t, col0, vocab, run)
-                for k in T.unroll(run):
-                    local = r * (_THREADS * run) + run * tx + k
-                    index = col0 + k
-                    score[0] = -T.infinity(T.float32)
-                    if index < vocab:
-                        score[0] = T.cast(raw[k], T.float32)
-                        if cached:  # noqa: SIM102
-                            if req[0] >= 0:
-                                cache[req[0], col[0], index] = T.cast(
-                                    score[0], cache_dtype
-                                )
-                        if temp[0] != T.float32(0):
-                            if apply_temperature:
-                                score[0] = T.call_extern(
-                                    "float32", "vllm_div_full", score[0], temp[0]
-                                )
-                            score[0] = T.call_extern(
-                                "float32",
-                                "vllm_gumbel_score",
-                                score[0],
-                                T.call_extern(
-                                    "uint32", "vllm_randint32", word_seed[0], index
-                                ),
-                            )
-                    if r * run + k == 0:
-                        best[0] = score[0]
-                        best_index[0] = local
-                    else:
-                        _keep_or_take(best, best_index, score[0], local)
+            # One test of the temperature for the whole block, as Triton's kernel.
+            if temp[0] != T.float32(0):
+                passes(logits, raw, score, best, best_index, cache, req, col, word_seed,
+                       temp, t, blk, tx, True)  # fmt: skip
+            else:
+                passes(logits, raw, score, best, best_index, cache, req, col, word_seed,
+                       temp, t, blk, tx, False)  # fmt: skip
             _block_argmax(
                 best, best_index, other, other_index, partial, partial_index, tx
             )
@@ -641,6 +657,33 @@ def sink_candidates_kernel(
         "logits_stride, candidates_stride, sampled_stride", "int64"
     )
 
+    @T.macro
+    def passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx, noisy):
+        """The thread's scores; with ``noisy`` each element's Philox word is drawn
+        unconditionally, ahead of its bound check (the Gumbel sampler's
+        ``passes``)."""
+        for r in T.unroll(_PASSES // run):
+            col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
+            _load_run(logits, raw, row[0], col0, vocab, run)
+            for k in T.unroll(run):
+                index = col0 + k
+                if noisy:
+                    word = T.alloc_var(
+                        T.uint32,
+                        init=T.call_extern(
+                            "uint32", "vllm_randint32", word_seed[0], index
+                        ),
+                    )
+                scores[r * run + k] = -T.infinity(T.float32)
+                if index < vocab:
+                    scores[r * run + k] = T.cast(raw[k], T.float32)
+                    if (rejected[0] != 0) & (index == verified[0]):
+                        scores[r * run + k] = -T.infinity(T.float32)
+                    if noisy:
+                        scores[r * run + k] = T.call_extern(
+                            "float32", "vllm_gumbel_score", scores[r * run + k], word
+                        )
+
     @T.prim_func
     def sink_candidates(
         values: T.StridedTensor((reqs, candidates), (candidates_stride, 1), T.float32),
@@ -701,25 +744,13 @@ def sink_candidates_kernel(
                     ):
                         rejected[0] = 1
             word_seed[0] = _randint_at(seeds[state[0]], pos[row[0]], pos_dtype, False)
-            for r in T.unroll(_PASSES // run):
-                col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
-                _load_run(logits, raw, row[0], col0, vocab, run)
-                for k in T.unroll(run):
-                    index = col0 + k
-                    scores[r * run + k] = -T.infinity(T.float32)
-                    if index < vocab:
-                        scores[r * run + k] = T.cast(raw[k], T.float32)
-                        if (rejected[0] != 0) & (index == verified[0]):
-                            scores[r * run + k] = -T.infinity(T.float32)
-                        if temp[0] != T.float32(0):
-                            scores[r * run + k] = T.call_extern(
-                                "float32",
-                                "vllm_gumbel_score",
-                                scores[r * run + k],
-                                T.call_extern(
-                                    "uint32", "vllm_randint32", word_seed[0], index
-                                ),
-                            )
+            # One test of the temperature for the whole block, as the Gumbel sampler.
+            if temp[0] != T.float32(0):
+                passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
+                       True)  # fmt: skip
+            else:
+                passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
+                       False)  # fmt: skip
             for i in T.serial(num_candidates):
                 best[0] = scores[0]
                 best_index[0] = _element(0, tx, run)

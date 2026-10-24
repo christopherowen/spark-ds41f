@@ -56,6 +56,11 @@ _PASS = {
     # Every access is guarded by the kernel's own masks, as in Triton; buffers
     # reached through pointer tables have no meaningful extent to guard against.
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    # A name bound to a load stays one load: with replay on (TileLang's default),
+    # IfStmtBinding re-substitutes binds under each guarded statement, and the
+    # combine kernel re-read its request's scalars after every store (47 loads where
+    # Triton's has 9).
+    "tl.if_stmt_binding_inline_replayable_binds": False,
 }
 _THREADS = 256
 _PER_THREAD = 4

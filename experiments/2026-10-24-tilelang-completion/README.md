@@ -590,3 +590,26 @@ and is unaffected. Fixed on the branch (`f7cf50549`), to go into the release ser
 
 The branch with the branch-free combines and the vocabulary-parallel seed fix (47 files),
 every bundle again: tests, then the gated benchmarks.
+
+### What the instruction counts showed next (SASS from the nodes' compile caches)
+
+TileLang's kernels against Triton's, counted on dgx1 and dgx4 (`nvdisasm` on the cubin
+TileLang embeds in `executable.so`):
+- **combine with dead rows:** 636 instructions and 47 loads against Triton's 159 and 9.
+  TileLang's IfStmtBinding replays bound loads under each guarded statement. The runner
+  module now turns replay off (`0441ba1be`). Round 3 measured -8 to -13% device time on
+  combine and post_update, with the same bytes everywhere.
+- **The Gumbel sampler:** 1,288 instructions against Triton's 1,163, of which +72 are
+  integer adds. Every element's Philox draw sat inside its own bound and temperature
+  checks, so nvcc recomputed the key schedule (the same for every element of a token)
+  for each one.
+
+  The branch now tests the temperature once around the block's elements, as Triton
+  does, and draws each word before the element's bound check (`ea3492d9f`). The sink
+  candidates kernel is restructured the same way.
+- **prepare_dflash_inputs:** 44 to 47 branches against Triton's 24. Not yet addressed.
+
+## Fourth integrated run (run `tilelang-integration-kernels-4`)
+
+The branch with the replay-free runner kernels and the restructured Gumbel and candidates
+kernels (`ea3492d9f`).
