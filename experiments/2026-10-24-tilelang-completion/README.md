@@ -821,3 +821,32 @@ and [prof-candidate4.json](profile/prof-candidate4.json) are the two arms with c
     per-element bound check.
 - **Runner, still flagged:** zero_kv_blocks at c1, combine with dead rows at the 16K
   prefill, gather_lookback.
+
+### The profile (2026-10-24 20:24 CET, run `tilelang-ports-profile-2`)
+
+Torch-profiled, with three arms: ports, candidate 4, then ports again.
+- **Eight JSON streams:**
+  - Step span, in ms a step on dgx1:
+    - ports 73.13;
+    - candidate 4 73.25;
+    - ports again 73.11.
+  - The other ranks are the same to within 0.1 ms.
+  - The window's rate, in tok/s:
+    - ports 263.3;
+    - candidate 4 262.9;
+    - ports again 263.4.
+  - Drafts and acceptance are identical in all three arms (292 draft events, 687 accepted).
+- **One stream:** step span 39.53, 39.33 and 39.43 ms.
+- **By kernel family:** the two ports arms differ from each other by as much as either
+  differs from candidate 4.
+  - The one-shot all-reduce and the L2 prefetch move by 0.3-1.1 ms a step between arms.
+  - The families the ports replace (mHC, sampling, the runner's "other") move by under
+    0.06 ms.
+
+The profile finds no cost of the ports at eight streams, so the serving check's -1.7% at
+eight distinct prompts looks like boot-to-boot variation. A bracketed re-measure without
+the profiler settles it:
+- [serving-c8-bracket.json](serving-c8-bracket.json) measures ports, candidate 4, then
+  ports again;
+- the workloads are eight distinct prompts (three samples) and one distinct stream; there
+  is no bench.
