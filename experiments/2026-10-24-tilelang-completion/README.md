@@ -850,3 +850,23 @@ the profiler settles it:
   ports again;
 - the workloads are eight distinct prompts (three samples) and one distinct stream; there
   is no bench.
+
+## Min-p in tile form (run `tilelang-controls-variants`)
+
+In SASS, #524's min-p takes its 1024-column tiles in small groups of scalar loads. Each
+group sits between branches on the bound check, so few bytes are in flight. Triton keeps
+two 16-byte vectors a thread in flight and stores them as vectors.
+
+vLLM `tilelang-ports` 08c1383c3 rewrites the kernel in tile form:
+- every load of a tile is issued before any value is used;
+- when the rows are 16-byte aligned (`run` 4, the launch checks), loads and stores are
+  vectors in Triton's layout;
+- only the last, partial tile clamps its columns to the row and predicates its stores.
+
+The threshold is still `maximum + vllm_control_log(min_p)`, the exact reference logarithm.
+
+[bundles/controls-variants](bundles/controls-variants) sweeps the run (vectors or scalars),
+the threads a block (128, 256) and the tile width (1024, 2048, 4096):
+- each variant is first compared with Triton bit for bit (threshold seeds 48291-48298 at 96
+  rows, and non-finite rows);
+- then it is timed against Triton at 1, 16 and 96 rows.
