@@ -225,3 +225,14 @@ was restored at 14:12.
     - the sink candidates were 4-46% slower.
 
     Triton's 16-byte loads account for most of it; the next run measures the vector port.
+
+**Round 2's fixes** (the same spec, `run` tilelang-ports-kernels again):
+- **mHC collapse** (`tilelang-mhc-post` d781f2a04). Both kernels already used 16-byte loads
+  and stores on the same grid; TileKernels runs 64 threads a block, each 16 columns in two chunks
+  512 apart. The collapse now reads and writes in TileKernels' order and block shape, without its
+  shared-memory stores that are never read back. It has the same FMA chain, and 232 SASS
+  instructions a thread in both.
+- **Runner benchmark** (`tilelang-runner-inputs` 1bc9f13f6). Three cases passed tables of raw
+  addresses without keeping the tensors alive. The graph capture's `empty_cache` returned them to
+  the driver, and the Triton warm-up read through freed addresses. The cases now keep the
+  tensors. Under Triton's CPU interpreter every case's launches stay in bounds.

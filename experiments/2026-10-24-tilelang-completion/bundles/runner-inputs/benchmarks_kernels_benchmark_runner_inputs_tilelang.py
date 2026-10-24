@@ -111,6 +111,8 @@ def _tables(gen, widths):
 
 
 # --- Cases: (Triton call, TileLang call) on one fresh input --------------------
+# A case that hands the kernels a pointer table also returns the tensors it
+# points at: nothing else holds them once the case returns.
 
 
 def case_gather_block_tables(gen, num_reqs, prefill, widths):
@@ -131,7 +133,7 @@ def case_gather_block_tables(gen, num_reqs, prefill, widths):
     def tilelang_call():
         tli.gather_block_tables(idx, src64, dst64, strides, counts, chunks, rows)
 
-    return triton_call, tilelang_call
+    return triton_call, tilelang_call, tables, out
 
 
 def case_compute_slot_mappings(gen, num_reqs, prefill, widths):
@@ -169,7 +171,7 @@ def case_compute_slot_mappings(gen, num_reqs, prefill, widths):
             kernel_block_sizes, enabled, circular, group_cp, out, 0, 1, 1,
         )  # fmt: skip
 
-    return triton_call, tilelang_call
+    return triton_call, tilelang_call, tables
 
 
 def case_apply_write(gen, num_reqs, prefill, widths):
@@ -229,7 +231,7 @@ def case_zero_kv_blocks(gen, num_reqs, prefill, widths):
     def tilelang_call():
         tli.zero_kv_blocks(addrs64, strides, sizes, ids, max(pages))
 
-    return triton_call, tilelang_call
+    return triton_call, tilelang_call, storage
 
 
 def case_prepare_prefill_inputs(gen, num_reqs, prefill, widths):
@@ -482,7 +484,10 @@ def measure(case, num_reqs: int, prefill: bool, widths, samples: int = 8) -> dic
     ours_us, triton_us, differences = [], [], []
     for sample in range(samples):
         gen = torch.Generator(device=DEVICE).manual_seed(sample)
-        triton_call, tilelang_call = case(gen, num_reqs, prefill, widths)
+        # The tensors behind the case's pointer tables live as long as its calls:
+        # graph capture empties the allocator's cache, so a kernel reaching a
+        # dropped one through its pointer reads unmapped memory.
+        triton_call, tilelang_call, *pointed_at = case(gen, num_reqs, prefill, widths)
         ours = graph(tilelang_call)
         theirs = graph(triton_call)
         pair = (ours, theirs) if sample % 2 == 0 else (theirs, ours)
