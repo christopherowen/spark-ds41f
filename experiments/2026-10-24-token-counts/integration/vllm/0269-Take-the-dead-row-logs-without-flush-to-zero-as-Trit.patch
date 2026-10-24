@@ -1,0 +1,67 @@
+From 047f017b2f60b4a5b69c44282df54acfc6956f6c Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:59:18 +0200
+Subject: [PATCH 4/8] Take the dead-row logs without flush-to-zero, as Triton
+ does
+
+The dead-row combine compiled with -ftz=true on the assumption that
+Triton's libdevice logf takes its flush-to-zero path. Its PTX for this
+kernel (Triton 3.5, sm_121a, compiled offline) shows otherwise: the
+subnormal test and the 2^23 scaling before the reduction are plain
+setp.lt.f32 and mul.f32, as are the reduction's add and mul and the
+log(0) test; only the polynomial FMAs carry .ftz. Under -ftz=true nvcc
+flushes every one of them, so a subnormal confidence became log(0) =
+-inf where Triton takes a finite log.
+
+Under nvcc's default flags the kernel's logf is Triton's sequence step
+for step: the same operations in the same order with the same constants.
+Three differences cannot change a value. The twelve FMAs lack .ftz, and
+no FMA operand or result in that sequence is subnormal for any positive
+finite float32 input (checked over all of them: the smallest nonzero
+magnitude is 2^-25); for zero, negative, infinite and NaN inputs the
+selects discard the FMA results. Triton loads constants into registers
+(swapping the first FMA's multiplicands); nvcc uses immediates. Triton
+branches around the inf/NaN result; nvcc selects it. The survival scan's
+adds (the warp's Kogge-Stone order, strides 1, 2 and 4) and the
+threshold comparison are plain f32 in both.
+
+Integration base: pinned vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate 4's ordered local stack and the preceding integration patches.
+Quality: exact runner contracts; no draft or verification policy changes.
+Validation commands and native receipts: integration/bundle/candidate.json and
+integration/run in the token-count experiment. Full release validation pending.
+Upstream status: local DS41F integration, not submitted upstream.
+
+---
+ vllm/v1/worker/gpu/tilelang_inputs.py | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index e428b5932..aa7761d3b 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -653,13 +653,14 @@ def prepare_pos_seq_lens_kernel(idx_dtype: str):
+     return prepare_pos_seq_lens
+ 
+ 
+-# The dead-row survival takes logf of the drafts' confidences. Triton links
+-# libdevice with flush-to-zero selected (nvvm-reflect-ftz), so its __nv_logf takes
+-# the FTZ path; nvcc selects the same path with -ftz=true.
+-_FTZ_PASS = {**_PASS, tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: ["-ftz=true"]}
+-
+-
+-@tilelang.jit(pass_configs=_FTZ_PASS)
++# The dead-row survival takes logf of the drafts' confidences under nvcc's default
++# (non-flush-to-zero) flags: the same libdevice logf, instruction for instruction,
++# as Triton's PTX for this kernel (sm_121a, Triton 3.5), subnormal inputs scaled
++# by 2^23 before the reduction alike. Triton's polynomial FMAs carry .ftz, nvcc's
++# do not; no operand or result of those FMAs is subnormal for any float32 input,
++# so the bits agree. -ftz=true would flush subnormal confidences to zero (-inf
++# where Triton gives a finite log).
++@tilelang.jit(pass_configs=_PASS)
+ def combine_sampled_and_draft_tokens_kernel(
+     block: int, num_new: int, dead_rows: bool, idx_dtype: str
+ ):
+-- 
+2.54.0 (Apple Git-157)
+

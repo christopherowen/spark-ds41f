@@ -1,0 +1,33 @@
+{
+ "description": "Post-verification token counts with explicit row bounds: exact DS41F commit/reject semantics and a paired launch-layout screen.",
+ "image": "spark-ds41f:19f2c20ed4d6-next-4",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-token-counts",
+  "PYTHONPATH": "/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+ },
+ "workdir": "vllm",
+ "argv": [
+  "-c",
+  "import subprocess,sys\na=subprocess.run([sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','--basetemp','/c/pytest-token-counts','tests/v1/worker/test_gpu_input_batch_v2.py','-k','token_counts'],timeout=600).returncode\nb=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_token_counts.py','--threads','32,64,128,256'],timeout=1200).returncode\nsys.exit(a or b)\n"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "vllm_v1_worker_gpu_tilelang_token_counts.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_token_counts.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_input_batch.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/input_batch.py"
+  ],
+  [
+   "tests_v1_worker_test_gpu_input_batch_v2.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_input_batch_v2.py"
+  ],
+  [
+   "benchmarks_kernels_benchmark_token_counts.py",
+   "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_token_counts.py"
+  ]
+ ]
+}

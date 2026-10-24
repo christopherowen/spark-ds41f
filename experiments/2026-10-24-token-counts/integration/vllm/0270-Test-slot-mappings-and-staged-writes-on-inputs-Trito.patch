@@ -1,0 +1,101 @@
+From 9cb3eb1b9b6c773609a984aad24174ee6f71f781 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:11:33 +0200
+Subject: [PATCH 5/8] Test slot mappings and staged writes on inputs Triton
+ defines
+
+compute_slot_mappings: with a prefill chunk filling 16384 tokens from row 0,
+a step starting at row 5 ran to token 16389, past the positions buffer, and
+the slice assignment raised before the skip meant for it. The chunk now
+fills the step from its first row to 16384 tokens, so the 16384-token step is
+also compared with rows before it left alone.
+
+Staged writes: the helper staged writes that overlap (17 element writes into
+16 rows; short writes inside a row's long one) with different values. Triton
+applies each write in its own program, in no order, so which value lands was
+undefined in the reference itself: the same seed gave row 0 -12 from Triton
+and -29 from TileLang for int32, and the reverse for int64. An element staged
+again now takes the value it was first staged with. Writes still overlap; the
+whole buffer is still compared byte for byte.
+
+Integration base: pinned vLLM 19f2c20ed4d64ae22bd009ceacadd85e2a81e354
+with candidate 4's ordered local stack and the preceding integration patches.
+Quality: exact runner contracts; no draft or verification policy changes.
+Validation commands and native receipts: integration/bundle/candidate.json and
+integration/run in the token-count experiment. Full release validation pending.
+Upstream status: local DS41F integration, not submitted upstream.
+
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 4fe5f73a5..031b4fb19 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -72,12 +72,12 @@ def _garbage(shape, dtype, gen):
+     return _randint(low, high, shape, gen, dtype)
+ 
+ 
+-def _query_lens(num_reqs: int, prefill: bool) -> list[int]:
++def _query_lens(num_reqs: int, prefill: bool, first: int = 0) -> list[int]:
+     """Decode rows (1 + drafts) a request; with ``prefill``, the middle request
+-    is a chunk filling the step to 16384 tokens."""
++    is a chunk filling the step, from row ``first``, to 16384 tokens."""
+     lens = [1 + DRAFTS] * num_reqs
+     if prefill and num_reqs:
+-        lens[num_reqs // 2] = MAX_TOKENS - (num_reqs - 1) * (1 + DRAFTS)
++        lens[num_reqs // 2] = MAX_TOKENS - first - (num_reqs - 1) * (1 + DRAFTS)
+     return lens
+ 
+ 
+@@ -190,9 +190,10 @@ def test_gather_block_tables_into_the_input_tables():
+ 
+ 
+ def _slot_case(gen, num_reqs, prefill, first):
+-    lens = _query_lens(num_reqs, prefill)
++    lens = _query_lens(num_reqs, prefill, first)
+     starts = _starts(lens, first)
+     total = int(starts[-1])
++    assert total <= MAX_TOKENS
+     # Positions past each request's blocks and at block edges, and of a request
+     # continuing its sequence.
+     positions = _randint(0, 1 << 20, (MAX_TOKENS,), gen, torch.int64)
+@@ -223,8 +224,6 @@ def test_compute_slot_mappings(num_reqs, prefill, cp):
+         if first and num_reqs == 0:
+             continue
+         starts, positions = _slot_case(gen, num_reqs, prefill, first)
+-        if int(starts[-1]) > MAX_TOKENS:
+-            continue
+         garbage = _garbage(tables.slot_mappings.shape, torch.int64, gen)
+         ref = garbage.clone()
+         _compute_slot_mappings_kernel[(tables.num_kv_cache_groups, num_reqs + 1)](
+@@ -259,17 +258,24 @@ def test_compute_slot_mappings(num_reqs, prefill, cp):
+ 
+ 
+ def _stage(tensor: StagedWriteTensor, gen, num_writes: int, long: bool) -> None:
++    """Random writes, several to a row and overlapping one another. Triton
++    applies each write in its own program, in no order, so where two writes
++    overlap neither kernel defines which lands: an element staged again takes
++    the value it was first staged with, and the result is defined."""
+     rows = tensor.num_rows
+     cols = tensor.gpu.shape[1] if tensor.gpu.dim() == 2 else 1
++    staged: dict[tuple[int, int], int | float] = {}
+     for w in range(num_writes):
+         row = int(_randint(0, rows, (), gen))
+         if cols == 1:
+-            tensor.stage_write_elem(row, int(_randint(-100, 100, (), gen)))
++            value = int(_randint(-100, 100, (), gen))
++            tensor.stage_write_elem(row, staged.setdefault((row, 0), value))
+             continue
+         start = int(_randint(0, cols // 2, (), gen))
+         length = cols - start if long and w == 0 else int(_randint(0, 9, (), gen))
+         length = min(length, cols - start)
+         values = _garbage((length,), tensor.dtype, gen).tolist()
++        values = [staged.setdefault((row, start + j), v) for j, v in enumerate(values)]
+         tensor.stage_write(row, start, values)
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+
