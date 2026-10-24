@@ -737,6 +737,76 @@ def test_select_first_argmax(ranks, out_dtype, strided):
     _assert_same(outs[0], outs[1], "selected index")
 
 
+@pytest.mark.parametrize("case", CASES)
+def test_greedy_pairs_in_sixteen_byte_rows(case):
+    """The drafter's and the greedy verification's 16-byte pair rows ([rows, 4],
+    which the one-shot all-gather writes in place): the shard pair lands in each
+    row's first two columns, the others untouched, and the selection over the
+    gathered rows equals Triton's over the packed [rows, 2 * ranks] pairs."""
+    rows, vocab, ranks = 13, 32320, 4
+    base = _logits(rows, vocab, torch.bfloat16, case, 6)
+    bias = _logits(rows, vocab, torch.bfloat16, case, 7)
+    packed, wide = [], []
+    for rank in range(ranks):
+        narrow = torch.full((rows, 2), -3.0, device=DEVICE)
+        values, indices = _scratch(rows, vocab)
+        _triton_markov_pair(
+            base.roll(rank, 1), bias, rank * vocab, narrow, values, indices
+        )
+        rows4 = torch.full((rows, 4), -3.0, device=DEVICE)
+        tls.greedy_markov_shard_pair(
+            base.roll(rank, 1), bias, rank * vocab, rows4, values, indices
+        )
+        _assert_same(rows4[:, :2], narrow, "pair")
+        assert (rows4[:, 2:] == -3.0).all()
+        packed.append(narrow)
+        wide.append(rows4)
+    outs = []
+    for fn, pairs, kwargs in (
+        (tls.select_first_argmax, torch.cat(wide, dim=-1), {"pair_width": 4}),
+        (_triton_select, torch.cat(packed, dim=-1), {}),
+    ):
+        out = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
+        fn(pairs, out, **kwargs)
+        outs.append(out)
+    _assert_same(outs[0], outs[1], "selected index")
+
+
+@pytest.mark.parametrize("ranks", [1, 3, 4])
+def test_select_first_argmax_embeds_the_next_token(ranks):
+    """The drafter's selection with the next step's Markov embedding: the same
+    index as without it, and the selected tokens' W1 rows (``nn.Embedding``) in
+    the step buffer and in the (request, step) buffer's column; the anchor
+    lookup likewise from ``ids[index]``."""
+    rows, vocab, width, steps = 13, 1 << 17, 256, 5
+    g = torch.Generator(device=DEVICE).manual_seed(ranks + 40)
+    values = torch.round(torch.randn(rows, ranks, generator=g, device=DEVICE))
+    index = torch.randint(0, vocab, (rows, ranks), generator=g, device=DEVICE)
+    pairs = torch.zeros(rows, ranks, 4, device=DEVICE)
+    pairs[:, :, 0], pairs[:, :, 1] = values, index.float()
+    pairs = pairs.view(rows, 4 * ranks)
+    table = torch.randn(vocab, width, generator=g, device=DEVICE).bfloat16()
+    plain = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
+    tls.select_first_argmax(pairs, plain, pair_width=4)
+    out = torch.full((rows, steps), -2, dtype=torch.int64, device=DEVICE)
+    step = torch.zeros(rows + 3, width, dtype=torch.bfloat16, device=DEVICE)
+    confidence = torch.zeros(rows, steps, width, dtype=torch.bfloat16, device=DEVICE)
+    tls.select_first_argmax(
+        pairs, out[:, 2], pair_width=4, embed=(table, step[:rows], confidence[:, 3])
+    )
+    _assert_same(out[:, 2], plain, "selected index")
+    expected = torch.nn.functional.embedding(plain, table)
+    _assert_same(step[:rows], expected, "step rows")
+    _assert_same(confidence[:, 3], expected, "confidence rows")
+    assert (step[rows:] == 0).all() and (confidence[:, :3] == 0).all()
+    ids = torch.randint(0, vocab, (64,), generator=g, device=DEVICE).int()
+    anchors = torch.arange(rows, device=DEVICE) * 4
+    tls.markov_anchor_embed(ids, anchors, table, step[:rows], confidence[:, 0])
+    expected = torch.nn.functional.embedding(ids[anchors].long(), table)
+    _assert_same(step[:rows], expected, "anchor step rows")
+    _assert_same(confidence[:, 0], expected, "anchor confidence rows")
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("case", CASES)
 def test_sample_greedy_markov(dtype, case):

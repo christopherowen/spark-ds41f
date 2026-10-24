@@ -86,10 +86,17 @@ PARTS = {
         ],
     ),
     "mhc": (
-        "the mHC post and stream collapse",
+        "the mHC post and stream collapse, the fused decode router and the model forward",
         [
-            ("mHC tests", PYTEST + ["--basetemp", "/c/pytest-integration-mhc",
-                                    "tests/kernels/test_deepseek_v41_tilelang_mhc.py"], 3600),
+            ("mHC, router and model-forward tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-mhc",
+                "tests/kernels/test_deepseek_v41_tilelang_mhc.py",
+                # The fused decode router reads the padding mask and the input ids
+                # (vLLM 23ae46804); the model forward without the MTP buffer and
+                # with the sink column from the last collapse (58a492841, 5998c7916).
+                "tests/kernels/moe/test_deepseek_v41_tilelang_router.py",
+                "tests/models/test_deepseek_v4_1_ced_model.py",
+                "tests/models/test_deepseek_v4_1_sp_prefill.py"], 3600),
             ("mHC benchmark", ["benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py",
                                "--gate"], 3600),
         ],

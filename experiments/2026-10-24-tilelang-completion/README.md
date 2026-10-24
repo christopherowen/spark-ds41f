@@ -1297,8 +1297,8 @@ another candidate. vLLM `tilelang-ports` cb9ed45bd adds:
 - **`benchmark_sink_glue.py --gate`:** the sink kernels against the torch chains, and the
   bitmask against Triton.
 
-Before the window opened, the run moved to `tilelang-ports` 575355250. That commit also
-folds the step's remaining eager glue that the request inventory found, and ports the
+Before the window opened, the run moved to `tilelang-ports` 23ae46804. That build also
+folds the step's remaining glue that the request inventory found, and ports the
 rejection sampler:
 - **Adaptive verification's offsets** in one kernel (7f2d09d32). This replaces five torch
   launches: two zeroes, two add and cumsum pairs, and the tail fill. The kernel also
@@ -1320,7 +1320,28 @@ rejection sampler:
   for bit, read from Triton 3.7's PTX and SASS. Every other configuration stays on
   Triton.
 - **A declaration test** for the new glue kernels (575355250).
+- **mHC's constant mixes, built once** (feda4871c). Before, five fills a target step built
+  the first sublayer's pre-mix and the collapses' mean.
+- **The target's MTP hidden-state buffer is gone** (58a492841). Nothing in DS4.1 reads
+  it: no DS4.1 model defines `get_mtp_target_hidden_states`. Every forward copied the
+  four residual streams into it: 3.9 MB a c16 decode step, up to 655 MB a 16K prefill
+  chunk outside sequence-parallel prefill. Removing it frees
+  `max_num_batched_tokens × 40 KiB` a rank: 671 MB at 16384 tokens.
+- **The sink detector's column comes from the last collapse** (5998c7916). Before, a
+  strided cast copy and a copy produced it.
+- **Greedy shard pairs in 16-byte rows** (955975341). The one-shot all-gather now
+  writes them in place. Before, it staged and reshaped them on its padded path: ten
+  graph kernels a decode step in the drafter and two eager ones in verification.
+- **The drafter's Markov embeddings in its own kernels** (650227336). The anchor
+  lookup, and each step's selection writing the next token's W1 row, replace seven
+  torch kernels a step: the gather, the lookups and the stack.
+- **The fused decode router reads the padding mask and the input ids** (23ae46804).
+  Before, torch negated the mask and compared the image sentinels once a forward, in
+  both the target's and the drafter's graphs.
 
-New steps: the DSpark context test, `test_tilelang_rejection.py`, and
-`benchmark_tilelang_rejection.py --gate`, all on dgx2. The runner benchmark gains the
-offsets and DSpark context cases.
+New steps:
+- dgx2: the DSpark context test, `test_tilelang_rejection.py`, and
+  `benchmark_tilelang_rejection.py --gate`;
+- dgx3: the router tests and the CED and sequence-parallel model-forward tests.
+
+The runner benchmark gains the offsets and DSpark context cases.

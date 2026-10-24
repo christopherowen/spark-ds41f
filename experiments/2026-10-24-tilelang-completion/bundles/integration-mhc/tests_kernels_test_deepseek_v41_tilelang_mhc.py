@@ -341,6 +341,21 @@ def test_collapse_bits_match_tile_kernels(mhc, tokens):
     assert (_bits(mhc.collapse(state, mix)[:, :8]) == 0).all()
 
 
+@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+@pytest.mark.parametrize("column", [0, 7, 1029, HIDDEN - 1])
+def test_collapse_writes_the_sink_column(mhc, tokens, column):
+    """The last collapse's sink-column variant: the same collapse, bit for bit, and
+    each stream's ``column`` as FP32 (the detector's buffer, written whole)."""
+    _, state, _, _ = _post_inputs(tokens, seed=800 + tokens)
+    state[0, 2, column] = float("nan")
+    state[-1, 1, column] = -0.0
+    mix = _pre_mix(tokens, seed=900 + tokens)
+    columns = torch.full((tokens, 4), -7.0, device=DEVICE)
+    out = mhc.collapse(state, mix, columns=columns, column=column)
+    _assert_bits_equal(out, mhc.collapse(state, mix), "collapse: ")
+    _assert_bits_equal(columns, state[:, :, column].float(), "columns: ")
+
+
 @pytest.mark.parametrize("world", [2, 3, 4])
 @pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
 def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):

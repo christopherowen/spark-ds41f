@@ -36,12 +36,13 @@ def vocab_parallel_argmax(
     shape = scratch_shape(rows, vocab)
     values = torch.empty(shape, dtype=torch.float32, device=local_logits.device)
     indices = torch.empty(shape, dtype=torch.int32, device=local_logits.device)
-    pairs = torch.empty((rows, 2), dtype=torch.float32, device=local_logits.device)
+    # 16-byte rows: the one-shot all-gather writes them in place.
+    pairs = torch.empty((rows, 4), dtype=torch.float32, device=local_logits.device)
     greedy_shard_pair(local_logits, vocab, vocab_start, pairs, values, indices)
     if tp_size > 1:
         pairs = tensor_model_parallel_all_gather(pairs, dim=-1)
     ids = torch.empty(rows, dtype=torch.int64, device=local_logits.device)
-    select_first_argmax(pairs, ids)
+    select_first_argmax(pairs, ids, pair_width=4)
     return ids
 
 

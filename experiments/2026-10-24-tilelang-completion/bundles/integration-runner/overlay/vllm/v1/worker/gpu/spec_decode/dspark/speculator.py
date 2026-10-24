@@ -42,6 +42,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
     greedy_markov_shard_pair,
+    markov_anchor_embed,
     register_greedy_markov_shard_pair_warmup,
     register_sample_greedy_markov_warmup,
     register_select_first_argmax_warmup,
@@ -110,8 +111,23 @@ class DSparkSpeculator(DFlashSpeculator):
         )
         # Per-request (max, global index) of this rank's vocabulary shard,
         # for vocabulary-parallel greedy drafts.
+        # (value, index) and two unused columns: 16-byte rows, which the
+        # one-shot all-gather writes in place (no staging or reshape copies).
         self._greedy_shard_pairs = torch.empty(
-            (self.max_num_reqs, 2), dtype=torch.float32, device=device
+            (self.max_num_reqs, 4), dtype=torch.float32, device=device
+        )
+        # The vocabulary-parallel greedy steps' Markov embeddings, which the
+        # anchor lookup and each step's selection write (with a replicated BF16
+        # W1): the next step's rows, and every step's in the (request, step)
+        # order the confidence head reads.
+        rank = getattr(self.draft_model_config.hf_config, "dspark_markov_rank", 0)
+        self._markov_step_embed = torch.empty(
+            (self.max_num_reqs, rank), dtype=torch.bfloat16, device=device
+        )
+        self._markov_confidence_embeds = torch.empty(
+            (self.max_num_reqs, self.num_speculative_steps, rank),
+            dtype=torch.bfloat16,
+            device=device,
         )
 
     @property
@@ -267,6 +283,32 @@ class DSparkSpeculator(DFlashSpeculator):
                 output_stride=self.draft_tokens.stride(0),
                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
             )
+        table = self._markov_table()
+        if table is not None:
+            from vllm.v1.worker.gpu.sample import tilelang_sampling
+
+            ids_dtype = self.input_buffers.input_ids.dtype
+            tilelang_sampling.declare(
+                lambda: tilelang_sampling.markov_embed_calls(
+                    ids_dtype,
+                    self._anchor_idx.dtype,
+                    self.draft_tokens.dtype,
+                    get_tensor_model_parallel_world_size(),
+                    table.shape[1],
+                )
+            )
+
+    def _markov_table(self) -> torch.Tensor | None:
+        """The Markov W1 the vocabulary-parallel greedy steps look up in their own
+        kernels: the model's replicated BF16 table, or None (``markov_embed``)."""
+        table = getattr(self.model, "markov_embed_table", lambda: None)()
+        if (
+            table is None
+            or table.dtype != torch.bfloat16
+            or table.shape[1] != self._markov_step_embed.shape[1]
+        ):
+            return None
+        return table
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
@@ -297,13 +339,30 @@ class DSparkSpeculator(DFlashSpeculator):
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # read via the precomputed persistent index (fixed buffer for capture).
-        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        # The vocabulary-parallel greedy steps embed it, and each step's selection
+        # the next step's token, in their own kernels.
+        table = self._markov_table() if vocab_parallel else None
+        if table is not None:
+            step_embed = self._markov_step_embed[:num_reqs]
+            confidence_embeds = self._markov_confidence_embeds[:num_reqs]
+            markov_anchor_embed(
+                self.input_buffers.input_ids,
+                self._anchor_idx[:num_reqs],
+                table,
+                step_embed,
+                confidence_embeds[:, 0],
+            )
+        else:
+            prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
-            markov_embed = self.model.markov_embed(prev)
-            if self.use_confidence_head:
-                confidence_markov_embeds.append(markov_embed)
+            if table is not None:
+                markov_embed = step_embed
+            else:
+                markov_embed = self.model.markov_embed(prev)
+                if self.use_confidence_head:
+                    confidence_markov_embeds.append(markov_embed)
             if local_head:
                 bias = self.model.compute_local_markov_bias(markov_embed)
                 if self.draft_logits is None and self.acceptance_estimator is None:
@@ -333,7 +392,14 @@ class DSparkSpeculator(DFlashSpeculator):
                 )
                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
                 select_first_argmax(
-                    tensor_model_parallel_all_gather(pairs, dim=-1), draft_sampled_i
+                    tensor_model_parallel_all_gather(pairs, dim=-1),
+                    draft_sampled_i,
+                    pair_width=4,
+                    embed=(
+                        (table, step_embed, confidence_embeds[:, i + 1])
+                        if table is not None and i + 1 < n_spec
+                        else None
+                    ),
                 )
                 prev = draft_sampled_i
                 continue
@@ -363,7 +429,9 @@ class DSparkSpeculator(DFlashSpeculator):
         if self.use_confidence_head:
             confidence = self.model.compute_confidence(
                 sample_hidden,
-                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+                confidence_embeds.flatten(0, 1)
+                if table is not None
+                else torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec

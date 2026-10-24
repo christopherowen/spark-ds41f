@@ -1804,9 +1804,10 @@ _FINISH_LANES = (1, 2)
 @tilelang.jit(pass_configs=_PASS)
 def finish_argmax_kernel(output: str, per_lane: int = 1):
     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
-    maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
-    ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
-    out_stride]``), from the parts' scratch, a warp a row. As Triton's, every part
+    maximum and its global index ``+ vocab_start`` as FP32 into ``out[row *
+    out_stride]`` and the element after it) and ``_finish_argmax`` ("int32" /
+    "int64": the index into ``out[row * out_stride]``), from the parts' scratch, a
+    warp a row. As Triton's, every part
     is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
     (``per_lane`` of them, Triton's masked values past ``parts``), then the lanes
     reduce; the combine is a total order, so the pairing does not matter."""
@@ -1849,8 +1850,8 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
             _warp_first_argmax(best, best_index, other, other_index)
             if tx == 0:
                 if pair:
-                    out[T.cast(row, T.int64) * 2] = best[0]
-                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
+                    out[T.cast(row, T.int64) * out_stride] = best[0]
+                    out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
                         best_index[0] + vocab_start, T.float32
                     )
                 else:
@@ -1861,25 +1862,104 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
     return finish_argmax
 
 
+@T.macro
+def _select_pairs(
+    pairs, best, best_index, other, other_index, row, tx, ranks, span, pair_width
+):
+    """Every lane's first maximum over the row's ranks' pairs, in lanes below
+    ``span`` (lanes past ``ranks`` hold Triton's masked values)."""
+    lane = T.min(tx, ranks - 1)
+    value = pairs[row, pair_width * lane]
+    index = pairs[row, pair_width * lane + 1]
+    best[0] = T.if_then_else(tx < ranks, value, -T.infinity(T.float32))
+    best_index[0] = T.if_then_else(tx < ranks, T.cast(index, T.int32), T.int32(1 << 30))
+    if span >= 32:
+        _first_exchange(best, best_index, other, other_index, 16)
+    if span >= 16:
+        _first_exchange(best, best_index, other, other_index, 8)
+    if span >= 8:
+        _first_exchange(best, best_index, other, other_index, 4)
+    if span >= 4:
+        _first_exchange(best, best_index, other, other_index, 2)
+    if span >= 2:
+        _first_exchange(best, best_index, other, other_index, 1)
+
+
+@T.macro
+def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_rows):
+    """Row ``token`` of the Markov embedding ``table`` into both outputs' ``row``,
+    ``per_lane`` elements a lane (``torch.nn.Embedding``'s lookup)."""
+    source = T.max(T.min(token, table_rows - 1), 0)
+    for v in T.vectorized(per_lane):
+        step_out[row, tx * per_lane + v] = table[source, tx * per_lane + v]
+    for v in T.vectorized(per_lane):
+        confidence_out[row, tx * per_lane + v] = table[source, tx * per_lane + v]
+
+
 @tilelang.jit(pass_configs=_PASS)
-def select_first_argmax_kernel(output_dtype: str, ranks: int):
+def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int = 0):
     """``dspark.greedy._select_first_argmax``: the first maximum's global index
-    over the all-gathered ``(value, index)`` pairs of each row ([rows, 2 * ranks]
-    FP32; indices exact in FP32), into ``out[row * out_stride]``, a warp a row.
+    over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
+    ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
+    exact in FP32), into ``out[row * out_stride]``, a warp a row.
     As in Triton, the number of ranks is fixed when the kernel is built and every
     load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
     the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
-    over the next power of two (the combine is a total order)."""
+    over the next power of two (the combine is a total order).
+
+    With ``embed_width``, the drafter's next step: the selected token's row of the
+    Markov embedding ``table`` ([vocab, embed_width] BF16) into ``step_out[row]``
+    and ``confidence_out[row]``, which ``nn.Embedding`` and a stack wrote."""
     assert 1 <= ranks <= 32
+    assert embed_width % 32 == 0
     rows, width, out_len = T.dynamic("rows, width, out_len")
     pairs_stride = T.dynamic("pairs_stride", "int64")
     span = 1 << max(ranks - 1, 0).bit_length()
 
+    if not embed_width:
+
+        @T.prim_func
+        def select_first_argmax(
+            pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+            out: T.Tensor((out_len,), output_dtype),
+            out_stride: T.int64,
+            pair_width: T.int32,
+        ):
+            with T.Kernel(rows, threads=32) as row:
+                T.import_source(_HEADER)
+                tx = T.get_thread_binding()
+                best = T.alloc_local((1,), T.float32)
+                best_index = T.alloc_local((1,), T.int32)
+                other = T.alloc_local((1,), T.float32)
+                other_index = T.alloc_local((1,), T.int32)
+                _select_pairs(
+                    pairs, best, best_index, other, other_index, row, tx, ranks,
+                    span, pair_width,
+                )  # fmt: skip
+                if tx == 0:
+                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+                        best_index[0], output_dtype
+                    )
+
+        return select_first_argmax
+
+    table_rows = T.dynamic("table_rows")
+    step_stride, confidence_stride = T.dynamic(
+        "step_stride, confidence_stride", "int64"
+    )
+    per_lane = embed_width // 32
+
     @T.prim_func
-    def select_first_argmax(
+    def select_first_argmax_embed(
         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
         out: T.Tensor((out_len,), output_dtype),
         out_stride: T.int64,
+        pair_width: T.int32,
+        table: T.Tensor((table_rows, embed_width), T.bfloat16),
+        step_out: T.StridedTensor((rows, embed_width), (step_stride, 1), T.bfloat16),
+        confidence_out: T.StridedTensor(
+            (rows, embed_width), (confidence_stride, 1), T.bfloat16
+        ),
     ):
         with T.Kernel(rows, threads=32) as row:
             T.import_source(_HEADER)
@@ -1888,29 +1968,56 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int):
             best_index = T.alloc_local((1,), T.int32)
             other = T.alloc_local((1,), T.float32)
             other_index = T.alloc_local((1,), T.int32)
-            lane = T.min(tx, ranks - 1)
-            value = pairs[row, 2 * lane]
-            index = pairs[row, 2 * lane + 1]
-            best[0] = T.if_then_else(tx < ranks, value, -T.infinity(T.float32))
-            best_index[0] = T.if_then_else(
-                tx < ranks, T.cast(index, T.int32), T.int32(1 << 30)
-            )
-            if span >= 32:
-                _first_exchange(best, best_index, other, other_index, 16)
-            if span >= 16:
-                _first_exchange(best, best_index, other, other_index, 8)
-            if span >= 8:
-                _first_exchange(best, best_index, other, other_index, 4)
-            if span >= 4:
-                _first_exchange(best, best_index, other, other_index, 2)
-            if span >= 2:
-                _first_exchange(best, best_index, other, other_index, 1)
+            selected = T.alloc_shared((1,), T.int32)
+            _select_pairs(
+                pairs, best, best_index, other, other_index, row, tx, ranks,
+                span, pair_width,
+            )  # fmt: skip
             if tx == 0:
                 out[T.cast(row, T.int64) * out_stride] = T.cast(
                     best_index[0], output_dtype
                 )
+                selected[0] = best_index[0]
+            T.sync_threads()
+            _embed_row(
+                table, selected[0], step_out, confidence_out, row, tx, per_lane,
+                table_rows,
+            )  # fmt: skip
 
-    return select_first_argmax
+    return select_first_argmax_embed
+
+
+@tilelang.jit(pass_configs=_PASS)
+def markov_anchor_embed_kernel(ids_dtype: str, index_dtype: str, embed_width: int):
+    """The drafter's first step: each request's anchor token (``ids[index[row]]``,
+    which a torch gather read) and its row of the Markov embedding ``table`` into
+    ``step_out[row]`` and ``confidence_out[row]`` (``nn.Embedding`` and a stack), a
+    warp a row."""
+    assert embed_width % 32 == 0
+    rows, ids_len, table_rows = T.dynamic("rows, ids_len, table_rows")
+    step_stride, confidence_stride = T.dynamic(
+        "step_stride, confidence_stride", "int64"
+    )
+    per_lane = embed_width // 32
+
+    @T.prim_func
+    def markov_anchor_embed(
+        ids: T.Tensor((ids_len,), ids_dtype),
+        index: T.Tensor((rows,), index_dtype),
+        table: T.Tensor((table_rows, embed_width), T.bfloat16),
+        step_out: T.StridedTensor((rows, embed_width), (step_stride, 1), T.bfloat16),
+        confidence_out: T.StridedTensor(
+            (rows, embed_width), (confidence_stride, 1), T.bfloat16
+        ),
+    ):
+        with T.Kernel(rows, threads=32) as row:
+            tx = T.get_thread_binding()
+            token = T.alloc_var(T.int64, init=T.cast(ids[index[row]], T.int64))
+            _embed_row(
+                table, token, step_out, confidence_out, row, tx, per_lane, table_rows
+            )
+
+    return markov_anchor_embed
 
 
 def _flat(column: torch.Tensor) -> torch.Tensor:
@@ -2022,7 +2129,7 @@ def greedy_markov_shard_pair(
         pairs.view(-1),
         rows,
         parts,
-        2,
+        pairs.stride(0),
         vocab_start,
         "pair",
     )
@@ -2052,21 +2159,80 @@ def greedy_shard_pair(
         pairs.view(-1),
         rows,
         parts,
-        2,
+        pairs.stride(0),
         vocab_start,
         "pair",
     )
 
 
-def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
-    """``dspark.greedy.select_first_argmax``."""
+def select_first_argmax(
+    pairs: torch.Tensor,
+    output: torch.Tensor,
+    pair_width: int = 2,
+    embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """``dspark.greedy.select_first_argmax``; with ``embed`` (table, step rows,
+    confidence rows), also the selected tokens' Markov embeddings."""
     rows = pairs.shape[0]
     if rows == 0:
         return
+    ranks = pairs.shape[1] // pair_width
+    if embed is None:
+        kernel = _kernel(select_first_argmax_kernel, _DTYPES[output.dtype], ranks)
+        kernel(pairs, _flat(output), output.stride(0), pair_width)
+        return
+    table, step_out, confidence_out = embed
     kernel = _kernel(
-        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // 2
+        select_first_argmax_kernel, _DTYPES[output.dtype], ranks, table.shape[1]
     )
-    kernel(pairs, _flat(output), output.stride(0))
+    kernel(
+        pairs,
+        _flat(output),
+        output.stride(0),
+        pair_width,
+        table,
+        step_out,
+        confidence_out,
+    )
+
+
+def markov_anchor_embed(
+    ids: torch.Tensor,
+    index: torch.Tensor,
+    table: torch.Tensor,
+    step_out: torch.Tensor,
+    confidence_out: torch.Tensor,
+) -> None:
+    """``table[ids[index]]`` into ``step_out`` and ``confidence_out``."""
+    if index.shape[0] == 0:
+        return
+    kernel = _kernel(
+        markov_anchor_embed_kernel,
+        _DTYPES[ids.dtype],
+        _DTYPES[index.dtype],
+        table.shape[1],
+    )
+    kernel(ids, index, table, step_out, confidence_out)
+
+
+def markov_embed_calls(
+    ids_dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    ranks: int,
+    embed_width: int,
+) -> list:
+    """The drafter's Markov embeddings: the anchor's, and the selection that also
+    embeds the next step's token."""
+    return [
+        _call(
+            markov_anchor_embed_kernel,
+            _DTYPES[ids_dtype],
+            _DTYPES[index_dtype],
+            embed_width,
+        ),
+        _call(select_first_argmax_kernel, _DTYPES[output_dtype], ranks, embed_width),
+    ]
 
 
 def sample_greedy_markov(

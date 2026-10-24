@@ -663,6 +663,12 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.embed(token_ids)
 
+    def markov_embed_table(self) -> torch.Tensor | None:
+        """``markov_embed``'s table when W1 is a replicated ``nn.Embedding`` (the
+        speculator's kernels then look rows up themselves), else None."""
+        w1 = self.model.markov_head.markov_w1
+        return w1.weight if type(w1) is nn.Embedding else None
+
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
 
