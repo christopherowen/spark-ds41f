@@ -1,0 +1,64 @@
+From bbf443159004be23fc14e75c6d9d36143fd56eac Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:19:53 +0200
+Subject: [PATCH 074/274] Attention: the SP WO projection reduce-scattered in
+ two slices
+
+Under DS4.1's TileLang family, sequence-parallel steps of 2048 tokens or
+more project WO in two slices of every rank's block and reduce-scatter
+each on a side stream while the next is projected, so half the
+reduce-scatter runs under the other half's projection. B12X's WO rows and
+the rank-order sum are row-independent, so the bits do not change; the
+B12X family keeps one projection and NCCL's reduce-scatter.
+
+(cherry picked from commit 0cd9a8d9c9e0856ed5ae3162772ea14325be376d)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index fe4ff972f..80a0821e2 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -1982,6 +1982,44 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             nope_dim=self.head_dim - self.rope_head_dim,
+             rope_dim=self.rope_head_dim,
+         )
++        if sp_rows is not None:
++            if rows != sp_rows.num_tokens:
++                raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
++            hidden = weights.hidden
++
++            def project(start, stop, out):
++                part = replace(
++                    wo_projection.bind_inv_rope(
++                        plan,
++                        scratch=scratch,
++                        o=o[start:stop],
++                        positions=positions[start:stop],
++                        cos_sin_cache=self.rotary_emb.cos_sin_cache,
++                        weights=weights,
++                        heads_per_group=self.n_local_heads // self.n_local_groups,
++                        nope_dim=self.head_dim - self.rope_head_dim,
++                        rope_dim=self.rope_head_dim,
++                    ),
++                    output=out.as_strided(
++                        (stop - start, hidden, 1), (hidden, 1, (stop - start) * hidden)
++                    ),
++                )
++                done = wo_projection.run_inv_rope(
++                    binding=part, plan=plan, stream=current_stream().cuda_stream
++                )
++                if done.data_ptr() != out.data_ptr():
++                    raise RuntimeError("V4.1 WO projection ignored its output")
++
++            retain_cuda_graph_capture_resource(scratch)
++            return sp_rows.project_reduce_scatter(
++                project,
++                (hidden,),
++                torch.bfloat16,
++                o.device,
++                # Slicing keeps the bits only with the rank-order reduce-scatter.
++                slices=sp_prefill.wo_slices(rows) if kernels.uses_tilelang() else 1,
++                then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
++            )
+         # The custom attention result must outlive reuse of the workspace arena.
+         if sp_rows is None:
+             output = torch.empty_strided(

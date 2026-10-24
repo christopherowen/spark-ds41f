@@ -1,0 +1,909 @@
+From 3800ff84c3ee8337b558fa380687f1e757d9a703 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 05:52:17 +0200
+Subject: [PATCH 110/274] TileLang V4.1: name every kernel after its file and
+ what it computes
+
+TileLang names a CUDA kernel after its prim_func, and most of ours were
+called main, so every profile and SASS dump showed main_kernel and kernels
+had to be told apart by grid. Each prim_func is now <file>_<what>, or the
+file's own name for a file's single kernel (gemm_bf16_splitk_kernel,
+mhc_project_streams_kernel, moe_combine_kernel, vocab_packed_projection_kernel,
+metadata_decode_kernel, ...), so a profile line names the module that holds
+it. Variants a factory builds share its name.
+
+The TileLang L2 prefetch moves from glm5next/nvidia/l2_prefetch_tilelang.py
+to glm5next/nvidia/tilelang/l2_prefetch.py (kernel l2_prefetch), the same
+family-directory layout as deepseek_v4_1/tilelang/; its test follows. Only
+symbols and that path change; the generated code and the results are the
+same.
+
+diff --git a/tests/models/test_glm5next_l2_prefetch_tilelang.py b/tests/models/test_glm5next_tilelang_l2_prefetch.py
+similarity index 93%
+rename from tests/models/test_glm5next_l2_prefetch_tilelang.py
+rename to tests/models/test_glm5next_tilelang_l2_prefetch.py
+index dbd3affa2..dc73eced8 100644
+--- a/tests/models/test_glm5next_l2_prefetch_tilelang.py
++++ b/tests/models/test_glm5next_tilelang_l2_prefetch.py
+@@ -17,7 +17,7 @@ def _plan(*tensors):
+ 
+ 
+ def test_tilelang_prefetch_leaves_data_unchanged():
+-    from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
++    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
+ 
+     launch = compile_launcher(grid=2, block=128, chunk=4096)
+     # Sizes that end mid-chunk and below the 16-byte granule.
+@@ -36,7 +36,7 @@ def test_tilelang_prefetch_leaves_data_unchanged():
+ 
+ 
+ def test_tilelang_prefetch_captures_in_a_graph():
+-    from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
++    from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
+ 
+     launch = compile_launcher(grid=2, block=128, chunk=4096)
+     w = torch.randn(8 * 1024 * 1024, device="cuda")
+diff --git a/vllm/models/deepseek_v4_1/tilelang/activation.py b/vllm/models/deepseek_v4_1/tilelang/activation.py
+index 6699d1abb..92d7ebdd8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/activation.py
++++ b/vllm/models/deepseek_v4_1/tilelang/activation.py
+@@ -30,7 +30,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+     per_block = threads * _VEC
+ 
+     @T.prim_func
+-    def main(
++    def activation_swiglu_clamp(
+         X: T.Tensor((M, 2 * n), T.bfloat16),
+         Y: T.Tensor((M, n), T.bfloat16),
+     ):
+@@ -54,7 +54,7 @@ def swiglu_clamp_kernel(n: int, limit: float, threads: int = 128):
+                 for v in T.vectorized(_VEC):
+                     Y[by, col + v] = out[v]
+ 
+-    return main
++    return activation_swiglu_clamp
+ 
+ 
+ @cache
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+index 2f18f3914..335abeaaa 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -91,7 +91,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+     page_words, word_stride = T.dynamic("page_words, word_stride")
+ 
+     @T.prim_func
+-    def write(
++    def cache_writer(
+         kv: T.StridedTensor((tokens, DIM), (kv_stride, 1), T.bfloat16),
+         cache: T.StridedTensor((pages, page_bytes), (page_stride, 1), T.uint8),
+         words: T.StridedTensor((pages, page_words), (word_stride, 1), word_dtype),
+@@ -167,7 +167,7 @@ def cache_writer_kernel(cache_kind: str, page_size: int, slot_dtype: str = "int6
+                                 scale_code, T.uint8
+                             )
+ 
+-    return write
++    return cache_writer
+ 
+ 
+ def write_cache(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 41ec12364..ab431ecfe 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -54,7 +54,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+     if world == 2:
+ 
+         @T.prim_func
+-        def rank_order_sum(
++        def collectives_rank_order_sum(
+             s0: T.Tensor((m, _VEC), T.bfloat16),
+             s1: T.Tensor((m, _VEC), T.bfloat16),
+             out: T.Tensor((m, _VEC), T.bfloat16),
+@@ -71,7 +71,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+     elif world == 3:
+ 
+         @T.prim_func
+-        def rank_order_sum(
++        def collectives_rank_order_sum(
+             s0: T.Tensor((m, _VEC), T.bfloat16),
+             s1: T.Tensor((m, _VEC), T.bfloat16),
+             s2: T.Tensor((m, _VEC), T.bfloat16),
+@@ -90,7 +90,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+     else:
+ 
+         @T.prim_func
+-        def rank_order_sum(
++        def collectives_rank_order_sum(
+             s0: T.Tensor((m, _VEC), T.bfloat16),
+             s1: T.Tensor((m, _VEC), T.bfloat16),
+             s2: T.Tensor((m, _VEC), T.bfloat16),
+@@ -108,7 +108,7 @@ def rank_order_sum_kernel(world: int, threads: int = 256):
+                     load(s3, xs, total, row, False)
+                     store(out, xs, total, row)
+ 
+-    return rank_order_sum
++    return collectives_rank_order_sum
+ 
+ 
+ def rank_order_sum(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index 7b3b18dd3..eff5735f1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -51,7 +51,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+     table_stride = T.dynamic("table_stride")
+ 
+     @T.prim_func
+-    def gather_partial_state(
++    def compress_gather_partial_state(
+         pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+         starts: T.Tensor((max_requests + 1,), T.int32),
+@@ -94,7 +94,7 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+                 tags[r] = T.if_then_else(valid, pos - 1, T.int64(-1))
+                 local_ids[r] = T.if_then_else(live, T.Cast(T.int64, r), T.int64(-1))
+ 
+-    return gather_partial_state
++    return compress_gather_partial_state
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 0a3b66278..d91ac4711 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -107,7 +107,7 @@ def _mxfp8_gemm(
+     total_N = groups * N
+ 
+     @T.prim_func
+-    def main(
++    def gemm_mxfp8(
+         A: T.Tensor((Mp, groups * K), in_dtype),
+         B: T.Tensor((total_N, K), in_dtype),
+         SFA: T.Tensor((Mp, groups * sf_words), T.uint32),
+@@ -176,7 +176,7 @@ def _mxfp8_gemm(
+             else:
+                 T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+-    return main
++    return gemm_mxfp8
+ 
+ 
+ # Prefill tiles use TileLang's warp-specialized pipeline (TMA producer warps,
+@@ -208,7 +208,7 @@ def _mxfp8_gemm_partials(
+     block_words = block_scale_words(block_K)
+ 
+     @T.prim_func
+-    def main(
++    def gemm_mxfp8_partials(
+         A: T.Tensor((Mp, K), in_dtype),
+         B: T.Tensor((N, K), in_dtype),
+         SFA: T.Tensor((Mp, sf_words), T.uint32),
+@@ -252,7 +252,7 @@ def _mxfp8_gemm_partials(
+                 )
+             T.copy(C_local, P[s, by * block_M, bx * block_N])
+ 
+-    return main
++    return gemm_mxfp8_partials
+ 
+ 
+ mxfp8_gemm = tilelang.jit(_mxfp8_gemm)
+@@ -281,7 +281,7 @@ def splitk_reduce(
+     M = T.dynamic("M")
+ 
+     @T.prim_func
+-    def main(P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)):
++    def gemm_splitk_reduce(P: T.Tensor((shards, M, N), T.float32), C: T.Tensor((M, N), out_dtype)):
+         with T.Kernel(T.ceildiv(N, block_N), M, threads=threads) as (bx, m):
+             acc = T.alloc_fragment((block_N,), T.float32)
+             # Columns past N (a narrow projection's last block) are skipped.
+@@ -296,7 +296,7 @@ def splitk_reduce(
+                 if bx * block_N + j < N:
+                     C[m, bx * block_N + j] = acc[j]
+ 
+-    return main
++    return gemm_splitk_reduce
+ 
+ 
+ @tilelang.jit
+@@ -325,7 +325,7 @@ def bf16_gemm(
+     shard_blocks = k_blocks // shards
+ 
+     @T.prim_func
+-    def main(
++    def gemm_bf16(
+         A: T.Tensor((M, K), dtype),
+         B: T.Tensor((N, K), dtype),
+         C: T.Tensor((M, N), out_dtype),
+@@ -370,7 +370,7 @@ def bf16_gemm(
+             else:
+                 T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+-    return main
++    return gemm_bf16
+ 
+ 
+ @tilelang.jit
+@@ -388,7 +388,7 @@ def splitk_reduce_two(
+     tiles = N // block_N
+ 
+     @T.prim_func
+-    def main(
++    def gemm_splitk_reduce_two(
+         P: T.Tensor((shards, M, 2 * N), T.float32),
+         C0: T.Tensor((M, N), out_dtype),
+         C1: T.Tensor((M, N), out_dtype),
+@@ -407,7 +407,7 @@ def splitk_reduce_two(
+                 for j in T.Parallel(block_N):
+                     C1[m, (bx - tiles) * block_N + j] = acc[j]
+ 
+-    return main
++    return gemm_splitk_reduce_two
+ 
+ 
+ @tilelang.jit
+@@ -436,7 +436,7 @@ def bf16_gemm_two(
+     tiles = N // block_N
+ 
+     @T.prim_func
+-    def main(
++    def gemm_bf16_two(
+         A: T.Tensor((M, K), dtype),
+         B: T.Tensor((2 * N, K), dtype),
+         C0: T.Tensor((M, N), out_dtype),
+@@ -486,7 +486,7 @@ def bf16_gemm_two(
+                 else:
+                     T.copy(C_local, C1[by * block_M, (bx - tiles) * block_N])
+ 
+-    return main
++    return gemm_bf16_two
+ 
+ 
+ @tilelang.jit
+@@ -508,7 +508,7 @@ def bf16_gemm_partials(
+     shard_blocks = K // block_K // shards
+ 
+     @T.prim_func
+-    def main(
++    def gemm_bf16_partials(
+         A: T.Tensor((M, K), dtype),
+         B: T.Tensor((N, K), dtype),
+         P: T.Tensor((shards, M, N), T.float32),
+@@ -544,7 +544,7 @@ def bf16_gemm_partials(
+                 ],
+             )
+ 
+-    return main
++    return gemm_bf16_partials
+ 
+ 
+ # The last CTA to finish a split-K tile adds the shards. Every CTA publishes its
+@@ -650,7 +650,7 @@ def bf16_gemm_splitk(
+     if parts == 2:
+ 
+         @T.prim_func
+-        def main(
++        def gemm_bf16_splitk(
+             A: T.Tensor((M, K), dtype),
+             B: T.Tensor((N, K), dtype),
+             P: T.Tensor((shards, M, N), T.float32),
+@@ -663,7 +663,7 @@ def bf16_gemm_splitk(
+     else:
+ 
+         @T.prim_func
+-        def main(
++        def gemm_bf16_splitk(
+             A: T.Tensor((M, K), dtype),
+             B: T.Tensor((N, K), dtype),
+             P: T.Tensor((shards, M, N), T.float32),
+@@ -672,7 +672,7 @@ def bf16_gemm_splitk(
+         ):
+             body(A, B, P, counters, C0, None)
+ 
+-    return main
++    return gemm_bf16_splitk
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 973feca5b..d12b37e8c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -190,7 +190,7 @@ def indexer_score_v41(
+     if not candidates:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_score(
+             Q: T.Tensor([rows, heads, D], fp4),
+             QScale: T.Tensor([rows, heads], T.uint32),
+             Weights: T.Tensor([rows, heads], T.bfloat16),
+@@ -220,10 +220,10 @@ def indexer_score_v41(
+                     Scores,
+                 )
+ 
+-        return main
++        return indexer_score
+ 
+     @T.prim_func
+-    def main(
++    def indexer_score(
+         Q: T.Tensor([rows, heads, D], fp4),
+         QScale: T.Tensor([rows, heads], T.uint32),
+         Weights: T.Tensor([rows, heads], T.bfloat16),
+@@ -253,7 +253,7 @@ def indexer_score_v41(
+                 Scores,
+             )
+ 
+-    return main
++    return indexer_score
+ 
+ 
+ def _e2m1_code(x):
+@@ -337,7 +337,7 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+     if paged:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_mxfp4_quantize(
+             X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+             Slots: T.Tensor([rows], T.int64),
+             Pool: T.StridedTensor(
+@@ -346,17 +346,17 @@ def mxfp4_quantize_v41(paged: bool = False, page_size: int = 64, threads: int =
+         ):
+             body(X, None, None, Slots, Pool)
+ 
+-        return main
++        return indexer_mxfp4_quantize
+ 
+     @T.prim_func
+-    def main(
++    def indexer_mxfp4_quantize(
+         X: T.Tensor([rows, INDEX_DIM], T.bfloat16),
+         Q: T.Tensor([rows, INDEX_DIM // 2], T.uint8),
+         S: T.Tensor([rows, groups], T.uint8),
+     ):
+         body(X, Q, S, None, None)
+ 
+-    return main
++    return indexer_mxfp4_quantize
+ 
+ 
+ def quantize_mxfp4(x, q, scales):
+@@ -698,7 +698,7 @@ def indexer_topk_segment_v41(
+         if candidates:
+ 
+             @T.prim_func
+-            def main(
++            def indexer_topk_segment(
+                 Scores: T.Tensor([rows, width], T.bfloat16),
+                 Lengths: T.Tensor([rows], T.int32),
+                 WorkValues: T.Tensor([rows, segments * topk], T.bfloat16),
+@@ -716,10 +716,10 @@ def indexer_topk_segment_v41(
+                     WorkEntries,
+                 )
+ 
+-            return main
++            return indexer_topk_segment
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_segment(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+             Active: T.Tensor([1], T.int32),
+@@ -730,12 +730,12 @@ def indexer_topk_segment_v41(
+                 Scores, Lengths, Active, None, None, None, None, WorkValues, WorkEntries
+             )
+ 
+-        return main
++        return indexer_topk_segment
+ 
+     if candidates:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_segment(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+             Gather: T.Tensor([rows, width], T.int32),
+@@ -744,12 +744,12 @@ def indexer_topk_segment_v41(
+         ):
+             body(Scores, Lengths, None, Gather, Indices, Values, None, None, None)
+ 
+-        return main
++        return indexer_topk_segment
+ 
+     if group > 1:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_segment(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+             Active: T.Tensor([1], T.int32),
+@@ -759,10 +759,10 @@ def indexer_topk_segment_v41(
+         ):
+             body(Scores, Lengths, Active, None, Indices, Values, Counts, None, None)
+ 
+-        return main
++        return indexer_topk_segment
+ 
+     @T.prim_func
+-    def main(
++    def indexer_topk_segment(
+         Scores: T.Tensor([rows, width], T.bfloat16),
+         Lengths: T.Tensor([rows], T.int32),
+         Active: T.Tensor([1], T.int32),
+@@ -771,7 +771,7 @@ def indexer_topk_segment_v41(
+     ):
+         body(Scores, Lengths, Active, None, Indices, Values, None, None, None)
+ 
+-    return main
++    return indexer_topk_segment
+ 
+ 
+ @tilelang.jit(
+@@ -872,7 +872,7 @@ def indexer_topk_merge_v41(
+         if candidates:
+ 
+             @T.prim_func
+-            def main(
++            def indexer_topk_merge(
+                 WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+                 WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+                 Lengths: T.Tensor([rows], T.int32),
+@@ -890,10 +890,10 @@ def indexer_topk_merge_v41(
+                     None,
+                 )
+ 
+-            return main
++            return indexer_topk_merge
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_merge(
+             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+             Lengths: T.Tensor([rows], T.int32),
+@@ -912,12 +912,12 @@ def indexer_topk_merge_v41(
+                 None,
+             )
+ 
+-        return main
++        return indexer_topk_merge
+ 
+     if candidates:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_merge(
+             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+             Lengths: T.Tensor([rows], T.int32),
+@@ -927,12 +927,12 @@ def indexer_topk_merge_v41(
+         ):
+             body(WorkValues, WorkEntries, Lengths, None, Gather, Indices, Values, None)
+ 
+-        return main
++        return indexer_topk_merge
+ 
+     if group > 1:
+ 
+         @T.prim_func
+-        def main(
++        def indexer_topk_merge(
+             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+             Lengths: T.Tensor([rows], T.int32),
+@@ -945,10 +945,10 @@ def indexer_topk_merge_v41(
+                 WorkValues, WorkEntries, Lengths, Active, None, Indices, Values, Counts
+             )
+ 
+-        return main
++        return indexer_topk_merge
+ 
+     @T.prim_func
+-    def main(
++    def indexer_topk_merge(
+         WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+         WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+         Lengths: T.Tensor([rows], T.int32),
+@@ -958,7 +958,7 @@ def indexer_topk_merge_v41(
+     ):
+         body(WorkValues, WorkEntries, Lengths, Active, None, Indices, Values, None)
+ 
+-    return main
++    return indexer_topk_merge
+ 
+ 
+ _MERGE_KEYS = 8192  # keys one merge CTA holds in shared memory (32 KiB)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index d03c58b1d..332cd731a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -38,7 +38,7 @@ def requests_kernel(max_requests: int):
+     seq_len = T.dynamic("seq_len")
+ 
+     @T.prim_func
+-    def requests(
++    def metadata_requests(
+         starts: T.Tensor((starts_len,), T.int32),
+         seq: T.Tensor((seq_len,), T.int32),
+         out_starts: T.Tensor((max_requests + 1,), T.int32),
+@@ -63,7 +63,7 @@ def requests_kernel(max_requests: int):
+                 counts[0] = nt
+                 counts[1] = nr
+ 
+-    return requests
++    return metadata_requests
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -78,7 +78,7 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+     steps = _search_steps(max_requests)
+ 
+     @T.prim_func
+-    def tokens(
++    def metadata_tokens(
+         starts: T.Tensor((starts_len,), T.int32),
+         seq: T.Tensor((seq_len,), T.int32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+@@ -136,7 +136,7 @@ def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
+                     valid, T.Cast(T.int32, T.truncdiv(pos + 1, ratio)), 0
+                 )
+ 
+-    return tokens
++    return metadata_tokens
+ 
+ 
+ def _window_macro(page, window, width, draft, replay, threads, per_thread):
+@@ -211,7 +211,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+ 
+     @T.prim_func
+-    def chunk(
++    def metadata_chunk(
+         positions: T.Tensor((src_rows,), T.int64),
+         reqs: T.Tensor((src_rows,), T.int32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+@@ -232,7 +232,7 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+                 visible, starts, request_positions, replay_start, offset,
+             )  # fmt: skip
+ 
+-    return chunk
++    return metadata_chunk
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -261,7 +261,7 @@ def decode_metadata_kernel(
+     main_per_thread = (main_width + threads - 1) // threads
+ 
+     @T.prim_func
+-    def decode_metadata(
++    def metadata_decode(
+         positions: T.Tensor((src_rows,), T.int64),
+         reqs: T.Tensor((src_rows,), T.int32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+@@ -299,7 +299,7 @@ def decode_metadata_kernel(
+                         )
+                         main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+ 
+-    return decode_metadata
++    return metadata_decode
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+@@ -311,7 +311,7 @@ def pages_kernel(width: int):
+     table_stride = T.dynamic("table_stride")
+ 
+     @T.prim_func
+-    def pages(
++    def metadata_pages(
+         reqs: T.Tensor((src_rows,), T.int32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+         out: T.Tensor((rows, width), T.int32),
+@@ -328,7 +328,7 @@ def pages_kernel(width: int):
+                 # vLLM reserves physical block zero; page tables use -1 for holes.
+                 out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+ 
+-    return pages
++    return metadata_pages
+ 
+ 
+ def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 82196427e..1add03124 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -119,7 +119,7 @@ def project_streams(
+             F_low[i, j] = rest - middle
+ 
+     @T.prim_func
+-    def main(
++    def mhc_project_streams(
+         X: T.Tensor((world, M, H), T.bfloat16),
+         R: T.Tensor((M, MULT * H), T.bfloat16),
+         post: T.Tensor((M, MULT), T.float32),
+@@ -261,7 +261,7 @@ def project_streams(
+                 if by * block_M + i < M:
+                     P[sp, by * block_M + i, 0, j] = C_local[i, j]
+ 
+-    return main
++    return mhc_project_streams
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS_CONFIGS)
+@@ -286,7 +286,7 @@ def finalize(
+     M = T.dynamic("M")
+ 
+     @T.prim_func
+-    def main(
++    def mhc_finalize(
+         P: T.Tensor((splits, M, 1, MIXES), T.float32),
+         S: T.Tensor((splits, M, 1), T.float32),
+         C: T.Tensor((M, hidden_size), T.bfloat16),
+@@ -383,7 +383,7 @@ def finalize(
+                         for v in T.vectorized(VEC):
+                             y[pid, chunk * VEC + v] = xv[v]
+ 
+-    return main
++    return mhc_finalize
+ 
+ 
+ @cache
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index eaae68674..c1408ad82 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -183,7 +183,7 @@ def moe_dispatch_v41(
+     if part == "fused":
+ 
+         @T.prim_func
+-        def main(
++        def moe_dispatch(
+             TopkIdx: T.Tensor([rows, topk], idx_dtype),
+             TopkWeights: T.Tensor([rows, topk], T.float32),
+             Order: T.Tensor([tiles * block_M], T.int32),
+@@ -233,12 +233,12 @@ def moe_dispatch_v41(
+                     else:
+                         RoutePos[tx // topk, tx % topk] = -1
+ 
+-        return main
++        return moe_dispatch
+ 
+     if part == "count":
+ 
+         @T.prim_func
+-        def main(
++        def moe_dispatch(
+             TopkIdx: T.Tensor([rows, topk], idx_dtype),
+             ChunkCount: T.Tensor([chunks, num_experts], T.int32),
+             Rank: T.Tensor([rows * topk], T.int32),
+@@ -254,12 +254,12 @@ def moe_dispatch_v41(
+                 if c * threads + tx < rows * topk:
+                     Rank[c * threads + tx] = rank
+ 
+-        return main
++        return moe_dispatch
+ 
+     if part == "layout":
+ 
+         @T.prim_func
+-        def main(
++        def moe_dispatch(
+             ChunkCount: T.Tensor([chunks, num_experts], T.int32),
+             Order: T.Tensor([tiles * block_M], T.int32),
+             LayoutWeights: T.Tensor([tiles * block_M], T.float32),
+@@ -296,12 +296,12 @@ def moe_dispatch_v41(
+                     tiles,
+                 )
+ 
+-        return main
++        return moe_dispatch
+ 
+     assert part == "scatter", part
+ 
+     @T.prim_func
+-    def main(
++    def moe_dispatch(
+         TopkIdx: T.Tensor([rows, topk], idx_dtype),
+         TopkWeights: T.Tensor([rows, topk], T.float32),
+         ChunkCount: T.Tensor([chunks, num_experts], T.int32),
+@@ -325,7 +325,7 @@ def moe_dispatch_v41(
+                 else:
+                     RoutePos[r // topk, r % topk] = -1
+ 
+-    return main
++    return moe_dispatch
+ 
+ 
+ @tilelang.jit
+@@ -350,7 +350,7 @@ def moe_combine_v41(
+     assert block_D >= 8, f"hidden={hidden} must be a multiple of 8"
+ 
+     @T.prim_func
+-    def main(
++    def moe_combine(
+         Y: T.Tensor([layout_rows, hidden], T.bfloat16),
+         RoutePos: T.Tensor([rows, topk], T.int32),
+         Weights: T.Tensor([rows, topk], T.float32),
+@@ -388,7 +388,7 @@ def moe_combine_v41(
+                 else:
+                     Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)
+ 
+-    return main
++    return moe_combine
+ 
+ 
+ def layout_tiles(rows: int, topk: int, block_M: int, num_experts: int) -> int:
+@@ -751,7 +751,7 @@ def grouped_fp8_fp4_gemm(
+     if tail:
+ 
+         @T.prim_func
+-        def main(
++        def moe_grouped_fp8_fp4_gemm(
+             A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+             SFA: T.Tensor((a_rows, sf_words), T.uint32),
+             B: T.Tensor(b_shape, T.float4_e2m1fn),
+@@ -766,7 +766,7 @@ def grouped_fp8_fp4_gemm(
+     else:
+ 
+         @T.prim_func
+-        def main(
++        def moe_grouped_fp8_fp4_gemm(
+             A: T.Tensor((a_rows, K), T.float8_e4m3fn),
+             SFA: T.Tensor((a_rows, sf_words), T.uint32),
+             B: T.Tensor(b_shape, T.float4_e2m1fn),
+@@ -777,7 +777,7 @@ def grouped_fp8_fp4_gemm(
+         ):
+             body(A, SFA, B, None, SFB, Order, TileExpert, C)
+ 
+-    return main
++    return moe_grouped_fp8_fp4_gemm
+ 
+ 
+ def tile_expert_weights(b_packed, block_N):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 59eba3079..2ad97ce57 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -173,7 +173,7 @@ def route_partials(
+     rows = T.dynamic("rows")
+ 
+     @T.prim_func
+-    def main(
++    def router_partials(
+         P: T.Tensor((shards, rows, num_experts), T.float32),
+         bias: T.Tensor((num_experts,), T.float32),
+         image_bias: T.Tensor((num_experts,), T.float32),
+@@ -278,7 +278,7 @@ def route_partials(
+                 topk_idx[row, lane] = chosen_idx
+                 topk_weights[row, lane] = chosen_score / total * routed_scaling_factor
+ 
+-    return main
++    return router_partials
+ 
+ 
+ class TileLangGateRouter(TileKernelsRouter):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 885de55c0..9b10cf5d7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -566,7 +566,7 @@ def sparse_mla_fwd_v41(
+         if idx_blocks:
+ 
+             @T.prim_func
+-            def main(
++            def sparse_mla(
+                 Q: T.Tensor([rows, heads, D], dtype),
+                 SwaRecords: T.StridedTensor(
+                     [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
+@@ -595,10 +595,10 @@ def sparse_mla_fwd_v41(
+                     Output,
+                 )
+ 
+-            return main
++            return sparse_mla
+ 
+         @T.prim_func
+-        def main(
++        def sparse_mla(
+             Q: T.Tensor([rows, heads, D], dtype),
+             SwaRecords: T.StridedTensor(
+                 [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
+@@ -621,12 +621,12 @@ def sparse_mla_fwd_v41(
+                 Output,
+             )
+ 
+-        return main
++        return sparse_mla
+ 
+     if idx_blocks:
+ 
+         @T.prim_func
+-        def main(
++        def sparse_mla(
+             Q: T.Tensor([rows, heads, D], dtype),
+             SwaRecords: T.StridedTensor(
+                 [swa_pool, swa_bytes], [swa_stride, 1], T.uint8
+@@ -659,10 +659,10 @@ def sparse_mla_fwd_v41(
+                 Output,
+             )
+ 
+-        return main
++        return sparse_mla
+ 
+     @T.prim_func
+-    def main(
++    def sparse_mla(
+         Q: T.Tensor([rows, heads, D], dtype),
+         SwaRecords: T.StridedTensor([swa_pool, swa_bytes], [swa_stride, 1], T.uint8),
+         SwaIndices: T.Tensor([rows, swa_width], T.int32),
+@@ -687,7 +687,7 @@ def sparse_mla_fwd_v41(
+             Output,
+         )
+ 
+-    return main
++    return sparse_mla
+ 
+ 
+ class SparseMlaV41Plan:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index f3c02e967..7f5cc8403 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -119,7 +119,7 @@ def packed_vocab_projection(
+     E = T.dynamic("E")
+ 
+     @T.prim_func
+-    def main(
++    def vocab_packed_projection(
+         A: T.Tensor((M, K), T.bfloat16),
+         W: T.Tensor((N, row_bytes), T.uint8),
+         exception_rows: T.Tensor((E,), T.int32),
+@@ -200,7 +200,7 @@ def packed_vocab_projection(
+                     )
+             T.copy(C_local, C[by * block_M, bx * block_N])
+ 
+-    return main
++    return vocab_packed_projection
+ 
+ 
+ _OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
+diff --git a/vllm/models/glm5next/nvidia/l2_prefetch.py b/vllm/models/glm5next/nvidia/l2_prefetch.py
+index 2f246bff2..4a19dec8a 100644
+--- a/vllm/models/glm5next/nvidia/l2_prefetch.py
++++ b/vllm/models/glm5next/nvidia/l2_prefetch.py
+@@ -247,7 +247,7 @@ _compile_failed = False
+ 
+ 
+ # Kernel family: "cute" (CuTe DSL, the default) or "tilelang"
+-# (l2_prefetch_tilelang.py: same work split and PTX).
++# (tilelang/l2_prefetch.py: same work split and PTX).
+ _KERNELS = os.environ.get("VLLM_L2_PREFETCH_KERNELS", "cute").strip().lower()
+ 
+ 
+@@ -261,7 +261,7 @@ def _get_launcher():
+         return None
+     if _KERNELS == "tilelang":
+         try:
+-            from vllm.models.glm5next.nvidia.l2_prefetch_tilelang import compile_launcher
++            from vllm.models.glm5next.nvidia.tilelang.l2_prefetch import compile_launcher
+ 
+             _compiled = compile_launcher(_GRID, _BLOCK, _CHUNK_BYTES)
+             logger.info(
+diff --git a/vllm/models/glm5next/nvidia/tilelang/__init__.py b/vllm/models/glm5next/nvidia/tilelang/__init__.py
+new file mode 100644
+index 000000000..65f836b53
+--- /dev/null
++++ b/vllm/models/glm5next/nvidia/tilelang/__init__.py
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang kernels for the GLM-5 Next NVIDIA paths (beside the CuTe DSL ones)."""
+diff --git a/vllm/models/glm5next/nvidia/l2_prefetch_tilelang.py b/vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py
+similarity index 100%
+rename from vllm/models/glm5next/nvidia/l2_prefetch_tilelang.py
+rename to vllm/models/glm5next/nvidia/tilelang/l2_prefetch.py

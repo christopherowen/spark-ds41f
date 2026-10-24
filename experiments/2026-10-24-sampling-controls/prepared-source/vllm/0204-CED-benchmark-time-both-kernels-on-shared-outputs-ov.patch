@@ -1,0 +1,414 @@
+From 04a4d9aa20974e86e443c128c47b03f7ad8a6157 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:44:50 +0200
+Subject: [PATCH 204/274] CED benchmark: time both kernels on shared outputs
+ over eight placed graph pairs
+
+Triton against itself showed the old design's intervals too narrow: about one
+row in five read faster or slower by chance. Two graphs of the same kernel
+differ by up to a percent, the first replay of a graph is slow and the
+reference always replayed first, and a large copy's time depends on where its
+inputs land (one Triton copy took 9.7 to 24 us across placements).
+
+Each case now checks exactness on separate outputs, then times both kernels
+writing the same outputs, over eight instances: fresh inputs after a spacer of
+seeded random size, both graphs replayed untimed first, and which graph comes
+first alternating. The 95% interval comes from the eight instance differences.
+A gated case that reads slower is measured again on fresh placements and fails
+only if it reads slower twice. Triton against itself on the gated copies is
+reported with every run as the interval's check.
+
+The gate is serving shapes: the metadata kernels run on every step, decode
+included; the row copies run only under a CED plan, which keeps at least 128
+rows, so their smaller cases are reported without gating. The copies cover
+every layout CEDState registers and a plan padded with -1 rows.
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_ced.py b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+index 226102b9d..6f19f3a36 100644
+--- a/benchmarks/kernels/benchmark_deepseek_v41_ced.py
++++ b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+@@ -1,12 +1,26 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Exactness and paired per-call timing of each CED port at serving shapes."""
++"""Exactness and paired per-call timing of each CED port at serving shapes.
+ 
+-# Callbacks are consumed synchronously by paired(), before the loop advances.
+-# ruff: noqa: B023
++Each case checks the port's outputs against Triton's on separate buffers, then
++times both kernels writing the same buffers, so neither gains from where its
++output happens to land. Two graphs of the same kernel still differ by up to
++about one percent (Triton against itself, 2026-10-19), more than one pair of
++graphs' samples can show, and a large copy's time depends on where its inputs
++land. So each case is measured on eight fresh inputs, placed apart, and graph
++pairs, alternating which comes first, and its 95% interval comes from those
++eight differences; Triton against itself on the gated copies checks the
++interval. With dozens of gated cases some read slower by chance, so a case that
++reads slower is measured again on fresh placements and fails only if it reads
++slower twice. The gate is serving shapes: the metadata kernels run on every
++step, decode included; the row copies run only under a CED plan, which keeps at
++least 128 rows, so their smaller cases are reported but do not gate.
++"""
+ 
++import functools
+ import json
+ import math
++import random
+ import statistics
+ 
+ import torch
+@@ -45,27 +59,107 @@ def elapsed(capture):
+     return start.elapsed_time(end) * 10  # ms / 100 calls to microseconds
+ 
+ 
+-def paired(kernel, shape, reference, candidate, equal):
+-    captures = [graph(reference), graph(candidate)]
+-    assert equal(), (kernel, shape)
++INSTANCES = 8
++PAIRS = 16
++T_975 = 2.365  # Student t, 7 degrees of freedom
++PLACEMENT = random.Random(1019)
++
++
++def instance(build, order, candidate_is_reference=False):
++    """One fresh input set and pair of graphs: the candidate's mean per-call
++    change against the reference. Both graphs replay untimed first: a graph's
++    first replay is slow, and one cold sample in sixteen pairs moves the mean by
++    about a percent. ``order`` picks which graph is captured and replayed first,
++    alternating between instances. A spacer of random size first moves where
++    the inputs land: a large copy's time depends on placement (9.7 to 24 us for
++    one Triton copy), and successive instances otherwise reuse the same blocks."""
++    spacer = torch.empty(
++        PLACEMENT.randrange(1, 64 << 20), dtype=torch.uint8, device="cuda"
++    )
++    reference, candidate, outputs, equal = build()
++    if candidate_is_reference:
++        candidate = reference
++    theirs, ours = outputs(), outputs()
++    for capture in (graph(reference(theirs)), graph(candidate(ours))):
++        capture.replay()
++    torch.cuda.synchronize()
++    if not equal(theirs, ours):
++        raise AssertionError("outputs differ")
++    functions = [reference(theirs), candidate(theirs)]
++    first = (0, 1) if order == 0 else (1, 0)
++    captures = [None, None]
++    for i in first:
++        captures[i] = graph(functions[i])
++    for _ in range(3):
++        for i in first:
++            elapsed(captures[i])
+     samples = [[], []]
+-    for repeat in range(30):
+-        for i in (0, 1) if repeat % 2 == 0 else (1, 0):
++    for repeat in range(PAIRS):
++        for i in first if repeat % 2 == 0 else first[::-1]:
+             samples[i].append(elapsed(captures[i]))
+-    differences = [b / a - 1 for a, b in zip(*samples)]
++    del spacer
++    return samples, statistics.mean(b / a - 1 for a, b in zip(*samples))
++
++
++def paired(kernel, shape, build, candidate_is_reference=False, attempt=1):
++    """``build()`` makes fresh inputs and returns (reference, candidate, outputs,
++    equal): the kernels as functions of an output set, a factory for output
++    sets, and their comparison."""
++    runs = [instance(build, i % 2, candidate_is_reference) for i in range(INSTANCES)]
++    changes = [change for _, change in runs]
+     row = dict(
+         kernel=kernel,
+         **shape,
+-        reference_us=statistics.mean(samples[0]),
+-        candidate_us=statistics.mean(samples[1]),
+-        change_pct=100 * statistics.mean(differences),
+-        ci95_pct=100 * 2.045 * statistics.stdev(differences) / math.sqrt(30),
+-        samples_us=samples,
++        attempt=attempt,
++        reference_us=statistics.mean(t for s, _ in runs for t in s[0]),
++        candidate_us=statistics.mean(t for s, _ in runs for t in s[1]),
++        change_pct=100 * statistics.mean(changes),
++        ci95_pct=100 * T_975 * statistics.stdev(changes) / math.sqrt(INSTANCES),
++        instance_changes_pct=[100 * c for c in changes],
+     )
+     print(json.dumps(row), flush=True)
+     return row
+ 
+ 
++def slower(row):
++    return row["change_pct"] - row["ci95_pct"] > 0.0
++
++
++def requests_case(maximum, requests, length):
++    starts = torch.arange(requests + 1, dtype=torch.int32, device="cuda") * length
++    seq = torch.full((maximum,), 100000, dtype=torch.int32, device="cuda")
++    full = torch.arange(maximum, device="cuda") % 2 == 1
++    limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
++    prefix = torch.zeros(maximum, dtype=torch.int64, device="cuda")
++
++    def outputs():
++        return (
++            torch.empty(maximum + 1, dtype=torch.int32, device="cuda"),
++            torch.empty(maximum, dtype=torch.int64, device="cuda"),
++            torch.empty(maximum, dtype=torch.int64, device="cuda"),
++            torch.empty(2, dtype=torch.int32, device="cuda"),
++        )
++
++    return (
++        lambda out: lambda: _decoder_requests[(1,)](
++            starts,
++            seq,
++            full,
++            prefix,
++            *out,
++            requests,
++            maximum,
++            triton.next_power_of_2(maximum + 1),
++            128,
++        ),
++        lambda out: lambda: ced.requests(
++            starts, seq, limits, prefix, *out, requests, compact=length > 128
++        ),
++        outputs,
++        lambda a, b: all(torch.equal(x, y) for x, y in zip(a, b)),
++    )
++
++
+ def requests_cases():
+     for maximum, requests in (
+         (1, 1),
+@@ -77,133 +171,144 @@ def requests_cases():
+         (32, 32),
+     ):
+         for length in (1, 6, 129, 4096):
+-            starts = (
+-                torch.arange(requests + 1, dtype=torch.int32, device="cuda") * length
+-            )
+-            seq = torch.full((maximum,), 100000, dtype=torch.int32, device="cuda")
+-            full = torch.arange(maximum, device="cuda") % 2 == 1
+-            limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
+-            prefix = torch.zeros(maximum, dtype=torch.int64, device="cuda")
+-            outputs = [
+-                (
+-                    torch.empty(maximum + 1, dtype=torch.int32, device="cuda"),
+-                    torch.empty(maximum, dtype=torch.int64, device="cuda"),
+-                    torch.empty(maximum, dtype=torch.int64, device="cuda"),
+-                    torch.empty(2, dtype=torch.int32, device="cuda"),
+-                )
+-                for _ in range(2)
+-            ]
+-            yield paired(
++            yield (
+                 "requests",
+                 dict(max_requests=maximum, requests=requests, query_rows=length),
+-                lambda: _decoder_requests[(1,)](
+-                    starts,
+-                    seq,
+-                    full,
+-                    prefix,
+-                    *outputs[0],
+-                    requests,
+-                    maximum,
+-                    triton.next_power_of_2(maximum + 1),
+-                    128,
+-                ),
+-                lambda: ced.requests(
+-                    starts,
+-                    seq,
+-                    limits,
+-                    prefix,
+-                    *outputs[1],
+-                    requests,
+-                    compact=length > 128,
+-                ),
+-                lambda: all(torch.equal(a, b) for a, b in zip(*outputs)),
++                functools.partial(requests_case, maximum, requests, length),
+             )
+ 
+ 
++def indices_case(requests, length):
++    starts = torch.arange(requests + 1, dtype=torch.int32, device="cuda") * 4096
++    compact = torch.arange(requests + 1, dtype=torch.int32, device="cuda") * length
++    nt = requests * length
++    capacity = max(128, triton.next_power_of_2(nt))
++    return (
++        lambda out: lambda: _decoder_indices[(triton.cdiv(capacity, 128),)](
++            starts, compact, out, requests, nt, capacity, 128
++        ),
++        lambda out: lambda: ced.indices(starts, compact, out, requests, nt),
++        lambda: torch.empty(capacity, dtype=torch.int64, device="cuda"),
++        torch.equal,
++    )
++
++
+ def indices_cases():
+     for requests in (1, 8, 16):
+         for length in (1, 6, 128):
+-            starts = torch.arange(requests + 1, dtype=torch.int32, device="cuda") * 4096
+-            compact = (
+-                torch.arange(requests + 1, dtype=torch.int32, device="cuda") * length
+-            )
+-            nt = requests * length
+-            capacity = max(128, triton.next_power_of_2(nt))
+-            outputs = [
+-                torch.empty(capacity, dtype=torch.int64, device="cuda")
+-                for _ in range(2)
+-            ]
+-            yield paired(
++            capacity = max(128, triton.next_power_of_2(requests * length))
++            yield (
+                 "indices",
+                 dict(requests=requests, kept_rows=length, capacity=capacity),
+-                lambda: _decoder_indices[(triton.cdiv(capacity, 128),)](
+-                    starts, compact, outputs[0], requests, nt, capacity, 128
+-                ),
+-                lambda: ced.indices(starts, compact, outputs[1], requests, nt),
+-                lambda: torch.equal(*outputs),
++                functools.partial(indices_case, requests, length),
+             )
+ 
+ 
++def copy_case(length, retained, padding, dtype, tail, scatter):
++    source_rows = retained + padding if scatter else length
++    output_rows = length if scatter else retained + padding
++    source = torch.ones((source_rows, *tail), dtype=dtype, device="cuda")
++    indices = torch.cat(
++        [
++            torch.arange(length - retained, length, device="cuda"),
++            torch.full((padding,), -1, device="cuda"),
++        ]
++    )
++    width = math.prod(tail)
++    return (
++        lambda out: lambda: _copy_rows[
++            (triton.cdiv((source_rows if scatter else output_rows) * width, 512),)
++        ](
++            source,
++            indices,
++            out,
++            source_rows,
++            output_rows,
++            tail,
++            source.stride(),
++            width,
++            scatter,
++            512,
++        ),
++        lambda out: lambda: ced.copy_rows(source, indices, out, scatter),
++        lambda: torch.zeros((output_rows, *tail), dtype=dtype, device="cuda"),
++        torch.equal,
++    )
++
++
+ def copy_cases():
+-    for length, retained in ((1, 1), (48, 48), (4048, 128)):
++    # The serving layouts (CEDState.warmup), and a plan padded with -1 rows.
++    for length, retained, padding in (
++        (1, 1, 0),
++        (48, 48, 0),
++        (4048, 128, 0),
++        (4048, 128, 64),
++    ):
++        serving = retained >= 128
+         for dtype, tail in (
++            (torch.int32, ()),
+             (torch.int64, ()),
+             (torch.bool, ()),
+             (torch.float32, (4,)),
++            (torch.float32, (4, 4)),
+             (torch.bfloat16, (5120,)),
+             (torch.bfloat16, (4, 5120)),
+         ):
+             for scatter in (False, True):
+-                source_rows = retained if scatter else length
+-                output_rows = length if scatter else retained
+-                source = torch.ones((source_rows, *tail), dtype=dtype, device="cuda")
+-                indices = torch.arange(
+-                    length - retained, length, dtype=torch.int64, device="cuda"
+-                )
+-                outputs = [
+-                    torch.zeros((output_rows, *tail), dtype=dtype, device="cuda")
+-                    for _ in range(2)
+-                ]
+-                width = math.prod(tail)
+-                yield paired(
++                yield (
+                     "copy",
+                     dict(
+                         rows=length,
+                         retained=retained,
++                        padding=padding,
+                         dtype=str(dtype),
+                         tail=tail,
+                         scatter=scatter,
++                        serving=serving,
+                     ),
+-                    lambda: _copy_rows[
+-                        (
+-                            triton.cdiv(
+-                                (source_rows if scatter else output_rows) * width, 512
+-                            ),
+-                        )
+-                    ](
+-                        source,
+-                        indices,
+-                        outputs[0],
+-                        source_rows,
+-                        output_rows,
+-                        tail,
+-                        source.stride(),
+-                        width,
+-                        scatter,
+-                        512,
++                    functools.partial(
++                        copy_case, length, retained, padding, dtype, tail, scatter
+                     ),
+-                    lambda: ced.copy_rows(source, indices, outputs[1], scatter),
+-                    lambda: torch.equal(*outputs),
+                 )
+ 
+ 
++def confirmed(cases, rows, candidate_is_reference=False):
++    """Rows slower on fresh placements again, of those that read slower."""
++    again = [
++        paired(*case, candidate_is_reference, attempt=2)
++        for case, row in zip(cases, rows)
++        if slower(row)
++    ]
++    return again, [row for row in again if slower(row)]
++
++
+ def main():
+-    rows = [*requests_cases(), *indices_cases(), *copy_cases()]
+-    print(json.dumps({"summary": "CED ports per call", "rows": rows}))
++    cases = [*requests_cases(), *indices_cases(), *copy_cases()]
++    rows = [paired(*case) for case in cases]
++    gated = [(c, r) for c, r in zip(cases, rows) if r.get("serving", True)]
++    again, failed = confirmed(*zip(*gated))
++    checks = [
++        (kernel, {**shape, "calibration": True}, build)
++        for kernel, shape, build in copy_cases()
++        if shape["serving"]
++    ]
++    calibration = [paired(*case, True) for case in checks]
++    calibration_again, calibration_failed = confirmed(checks, calibration, True)
++    print(json.dumps({"summary": "CED ports per call", "rows": rows + again}))
+     print(json.dumps({"bits": "CED metadata and packing", "differs_at": []}))
+-    slower = [r for r in rows if r["change_pct"] - r["ci95_pct"] > 0.0]
+-    if slower:
+-        raise RuntimeError(f"CED ports are slower (95% paired intervals): {slower}")
++    print(
++        json.dumps(
++            {
++                "calibration": "Triton against itself, gated copies",
++                "cases": len(calibration),
++                "slower": sum(map(slower, calibration)),
++                "slower_twice": len(calibration_failed),
++                "faster": sum(r["change_pct"] + r["ci95_pct"] < 0 for r in calibration),
++            }
++        )
++    )
++    if failed:
++        raise RuntimeError(f"CED ports are slower twice (95% intervals): {failed}")
+ 
+ 
+ if __name__ == "__main__":

@@ -1,0 +1,205 @@
+From 9fd98827b979bc20088486205529203520905bc1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:44:40 +0200
+Subject: [PATCH 097/274] Sparse-MLA metadata: TileLang under the TileLang
+ kernel backend
+
+The metadata builder's request and token metadata and the attention layer's
+window pages, main pages and index pages come from the TileLang kernels
+instead of vLLM's four Triton kernels. They compile with the builder and at
+the attention declaration, never during graph capture.
+
+(cherry picked from commit 21b416dc7a16cbbb507f7071b06976fc75628b78)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 0f144a80f..4dda5ea0e 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -742,6 +742,32 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self._short_index_shape = (short_rows, short_width)
+             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
+         self._staging_specs = tuple(specs)
++        if kernels.uses_tilelang():
++            self._compile_tilelang_metadata()
++
++    def _compile_tilelang_metadata(self) -> None:
++        """Compile this layer's TileLang metadata kernels at preparation, never
++        during graph capture."""
++        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++        replays = (
++            (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
++        )
++        for replay in replays:
++            tl_metadata.chunk_kernel(
++                self.swa_cache_layer.block_size,
++                self.window_size,
++                self.swa_width,
++                self.is_draft,
++                replay,
++            )
++        widths = {self._main_width} if self.compress_ratio else set()
++        if self.indexer is not None:
++            widths.add(self._index_width)
++        if self._short_index_shape is not None:
++            widths.add(self._short_index_shape[1])
++        for width in widths:
++            tl_metadata.pages_kernel(width)
+ 
+     def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
+         """Declare the native sparse-MLA plan for one mode, beside its metadata."""
+@@ -1564,16 +1590,30 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                     end = min(offset + chunk_rows, index_rows)
+                     count = end - offset
+                     row, row_end = first + offset, first + end
+-                    _pages[(count, triton.cdiv(index_width, 128))](
+-                        im.req_id_per_token,
+-                        im.block_table,
+-                        index_pages,
+-                        row,
+-                        im.block_table.stride(0),
+-                        min(im.block_table.shape[1], index_width),
+-                        index_width,
+-                        128,
+-                    )
++                    if kernels.uses_tilelang():
++                        from vllm.models.deepseek_v4_1.tilelang import (
++                            metadata as tl_metadata,
++                        )
++
++                        tl_metadata.pages(
++                            im.req_id_per_token,
++                            im.block_table,
++                            index_pages,
++                            row,
++                            count,
++                            min(im.block_table.shape[1], index_width),
++                        )
++                    else:
++                        _pages[(count, triton.cdiv(index_width, 128))](
++                            im.req_id_per_token,
++                            im.block_table,
++                            index_pages,
++                            row,
++                            im.block_table.stride(0),
++                            min(im.block_table.shape[1], index_width),
++                            index_width,
++                            128,
++                        )
+                     candidate_args = {}
+                     if self.layer_id == self.candidate_source_layer:
+                         candidate_args = dict(
+@@ -1785,6 +1825,36 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+         visible = main.cache_lengths if main is not None else swa.cache_lengths
++        if kernels.uses_tilelang():
++            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++            tl_metadata.chunk(
++                swa.positions,
++                swa.req_id_per_token,
++                swa.block_table,
++                swa_indices,
++                swa_lengths,
++                top_lengths,
++                visible,
++                swa.query_start_loc,
++                swa.request_positions,
++                0,
++                rows,
++                page=self.swa_cache_layer.block_size,
++                window=self.window_size,
++                draft=self.is_draft,
++                replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
++            )
++            if main is not None:
++                tl_metadata.pages(
++                    main.req_id_per_token,
++                    main.block_table,
++                    buffers[3],
++                    0,
++                    rows,
++                    main.block_table.shape[1],
++                )
++            return
+         _chunk[(rows,)](
+             swa.positions,
+             swa.req_id_per_token,
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 249d3761a..9f7e6af14 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -8,6 +8,7 @@ from typing import ClassVar
+ import torch
+ 
+ from vllm.config import CacheConfig
++from vllm.models.deepseek_v4_1 import kernels
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backend import (
+     AttentionBackend,
+@@ -194,6 +195,14 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         self.reqs = alloc((self.tokens,), torch.int32)
+         self.slots = alloc((self.tokens,), torch.int64)
+         self.lengths = alloc((self.tokens,), torch.int32)
++        if kernels.uses_tilelang():
++            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++            # Compiled with the builder, never during graph capture.
++            tl_metadata.requests_kernel(self.requests)
++            tl_metadata.tokens_kernel(
++                self.requests, self.page, self.ratio, self.circular
++            )
+ 
+     def build(
+         self,
+@@ -203,6 +212,9 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+     ):
+         cm = common_attn_metadata
+         table = cm.block_table_tensor
++        if kernels.uses_tilelang():
++            self._build_tilelang(cm, table)
++            return self._metadata(cm, table)
+         _requests[(triton.cdiv(self.requests + 1, 128),)](
+             cm.query_start_loc,
+             cm.seq_lens,
+@@ -235,6 +247,39 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+             128,
+             self.circular,
+         )
++        return self._metadata(cm, table)
++
++    def _build_tilelang(self, cm, table) -> None:
++        """``_requests`` and ``_tokens`` as the TileLang metadata kernels."""
++        from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++
++        tl_metadata.requests(
++            cm.query_start_loc,
++            cm.seq_lens,
++            self.starts,
++            self.request_positions,
++            self.counts,
++            cm.num_reqs,
++            cm.num_actual_tokens,
++        )
++        tl_metadata.tokens(
++            cm.query_start_loc,
++            cm.seq_lens,
++            table,
++            cm.slot_mapping,
++            self.positions,
++            self.reqs,
++            self.slots,
++            self.lengths,
++            cm.num_reqs,
++            cm.num_actual_tokens,
++            max_requests=self.requests,
++            page=self.page,
++            ratio=self.ratio,
++            circular=self.circular,
++        )
++
++    def _metadata(self, cm, table):
+         return DeepseekV41B12xMetadata(
+             cm.num_actual_tokens,
+             cm.num_reqs,

@@ -1,0 +1,24 @@
+From 46cdb38aa983c24d5536b2b8ceec7d9eb8ea7701 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 19:34:30 +0200
+Subject: [PATCH 078/274] Prefill SP: TileLang mHC adds the rank-order parts of
+ SP results
+
+(cherry picked from commit b19c623d5e174e308a38ad095164856e6a27af36)
+
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index ca41fd448..c1e794bbe 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -350,8 +350,9 @@ def wo_slices(num_tokens: int) -> int:
+ 
+ 
+ # Results of sequence-parallel steps stay unreduced where the TP group's
+-# reduce-scatter is the rank-order one (see "Unreduced results").
+-UNREDUCED = False
++# reduce-scatter is the rank-order one (see "Unreduced results"): the TileLang
++# family on the RoCE policy.
++UNREDUCED = True
+ 
+ 
+ def unreduced_enabled() -> bool:

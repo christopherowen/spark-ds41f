@@ -1,0 +1,23 @@
+From 47176036f1f9c0e5c81315fb7afbb799ae7867ef Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:50:30 +0200
+Subject: [PATCH 260/274] V2 runner sampling: the sink candidates' rounds
+ unrolled
+
+At one request the candidates kernel is latency-bound (127 blocks), and its
+rounds ran as a rolled loop (T.serial) with two barriers each; their count is
+fixed when the kernel is built, so they unroll.
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 21aabbe0e..2403dff89 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -753,7 +753,7 @@ def sink_candidates_kernel(
+             else:
+                 passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
+                        False)  # fmt: skip
+-            for i in T.serial(num_candidates):
++            for i in T.unroll(num_candidates):
+                 best[0] = scores[0]
+                 best_index[0] = _element(0, tx, run)
+                 for j in T.unroll(1, _PASSES):

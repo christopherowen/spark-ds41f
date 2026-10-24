@@ -1,0 +1,69 @@
+From 756c5f0b6e752085aa2336b2554ca8a932638999 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:25:29 +0200
+Subject: [PATCH 099/274] Sparse-MLA metadata: two blocks a row in the fused
+ decode metadata
+
+The fused kernel beat Triton's pair warm everywhere but lost cold at prefill
+(14.1 against 12.1 us at 2048 rows): one block a row did both parts, half the
+parallelism of Triton's two kernels. Each row now has a block for its window
+metadata and one for its page table, still one launch.
+
+(cherry picked from commit f23f050fc42b62a8b7611d9d6c2ae6cfe3dc4aba)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index bb97d1423..ef89655f9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -239,8 +239,9 @@ def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
+ def decode_metadata_kernel(
+     page: int, window: int, width: int, draft: bool, replay: bool, main_width: int
+ ):
+-    """``chunk`` and ``pages`` of the main cache in one launch: each row's window
+-    metadata, then its main page table (block 0 and holes as -1)."""
++    """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
++    of each row: the window metadata and the main page table (block 0 and holes as
++    -1)."""
+     rows = T.dynamic("rows")
+     src_rows = T.dynamic("src_rows")
+     table_rows = T.dynamic("table_rows")
+@@ -275,21 +276,26 @@ def decode_metadata_kernel(
+         offset: T.int32,
+         main_read_width: T.int32,
+     ):
+-        with T.Kernel(rows, threads=threads) as row:
++        # Two blocks a row, one launch: the window metadata, then the page table.
++        with T.Kernel(rows, 2, threads=threads) as (row, part):
+             tx = T.get_thread_binding()
+             info = T.alloc_local((2,), T.int64)  # window start, clamped length
+-            window_row(
+-                row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+-                visible, starts, request_positions, replay_start, offset,
+-            )  # fmt: skip
+-            req = main_reqs[offset + row]
+-            for k in T.serial(main_per_thread):
+-                col = k * threads + tx
+-                if col < main_width:
+-                    page_id = T.if_then_else(
+-                        (req >= 0) & (col < main_read_width), main_table[req, col], -1
+-                    )
+-                    main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++            if part == 0:
++                window_row(
++                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
++                    visible, starts, request_positions, replay_start, offset,
++                )  # fmt: skip
++            else:
++                req = main_reqs[offset + row]
++                for k in T.serial(main_per_thread):
++                    col = k * threads + tx
++                    if col < main_width:
++                        page_id = T.if_then_else(
++                            (req >= 0) & (col < main_read_width),
++                            main_table[req, col],
++                            -1,
++                        )
++                        main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+ 
+     return decode_metadata
+ 

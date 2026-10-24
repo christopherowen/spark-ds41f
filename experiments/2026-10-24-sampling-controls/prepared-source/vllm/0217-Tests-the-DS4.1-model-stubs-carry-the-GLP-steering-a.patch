@@ -1,0 +1,34 @@
+From 1fa3028ec11d1a755c5968bc09424bfbdb5f49ee Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 11:11:33 +0200
+Subject: [PATCH 217/274] Tests: the DS4.1 model stubs carry the GLP steering
+ attribute
+
+The CED model and SP-prefill tests run DeepseekV4Model.forward on hand-built stubs, which now need the model's glp attribute (None: steering unset), as they carry the sink column buffer (0225).
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 3eea165d9..c0a743de9 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -266,6 +266,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         _mtp_hidden_buffer=buffer,
+         # The sink detector's column buffer: none, the detector is off here.
+         _sink_columns=None,
++        # GLP steering: none, unset here.
++        glp=None,
+         norm=lambda hidden: hidden,
+     )
+     output, aux = native.DeepseekV4Model.forward(
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index f54bab381..15a235eb6 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -546,6 +546,8 @@ def test_model_forward_matches_full_rows(
+             _l2pf_ready=True,
+             # The sink detector's column buffer: none, the detector is off here.
+             _sink_columns=None,
++            # GLP steering: none, unset here.
++            glp=None,
+             norm=lambda hidden: hidden * 2,
+         )
+         output, aux = native.DeepseekV4Model.forward(

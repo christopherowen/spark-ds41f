@@ -1,0 +1,114 @@
+From 509d1dc88d8f4006d08a1d3db789286e494c821b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 23:55:57 +0100
+Subject: [PATCH 131/274] Engine cost grid: time the cost profile's dummy steps
+ on demand
+
+GPUModelRunner.engine_grid runs fixed shapes (verify rows, request counts,
+context lengths, single-request prefill chunks) warmed then timed in rounds of
+alternating order, as the cost profile does, and returns every step's time,
+with the target/drafter split where the step timer has it. Worker.engine_grid
+exposes it to the dev-mode collective RPC (JSON spec), so a benchmark can time
+identical work on any build of a running server, free of text, acceptance and
+scheduling. Run it idle and reset the prefix cache afterwards.
+
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c53ec3e2e..ec850bb93 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -858,6 +858,72 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_blocks=self.kv_cache_config.num_blocks,
+         )
+ 
++    @torch.inference_mode()
++    def engine_grid(self, spec: dict) -> dict:
++        """Time dummy steps at fixed shapes: the engine cost grid servebench reads.
++
++        ``spec`` holds ``shapes`` (each ``num_tokens``, optional ``num_reqs``,
++        ``context_len`` and ``prefill`` for a single request's chunk), ``replays``
++        and ``warmup``. Every shape runs ``warmup`` times untimed, then ``replays``
++        timed rounds alternate the shape order, as the cost profile does, so drift
++        and order effects spread over every shape. Returns each shape's whole-step
++        milliseconds (events around the dummy run) and, when every run reached the
++        drafter, the target forward and drafter split, step by step.
++
++        The steps are the cost profile's dummy runs: identical work on every build,
++        with no text, acceptance or scheduling in them. Run only on an idle server,
++        and reset the prefix cache afterwards, since dummy steps write KV slots.
++        """
++        shapes = spec["shapes"]
++        replays = int(spec.get("replays", 30))
++        warmup = int(spec.get("warmup", 2))
++
++        def run(shape: dict) -> None:
++            kwargs: dict[str, Any] = {
++                "num_tokens": int(shape["num_tokens"]),
++                "context_len": int(shape.get("context_len", 0)),
++            }
++            if shape.get("prefill"):
++                kwargs["single_request_prefill"] = True
++            elif shape.get("num_reqs") is not None:
++                kwargs["profile_num_reqs"] = int(shape["num_reqs"])
++            self._dummy_run(**kwargs)
++
++        for shape in shapes:
++            for _ in range(warmup):
++                run(shape)
++        order: list[int] = []
++        events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
++        with self.step_timing.collect() as timings:
++            for replay in range(replays):
++                indices = range(len(shapes))
++                for index in indices if replay % 2 == 0 else reversed(indices):
++                    start = torch.cuda.Event(enable_timing=True)
++                    end = torch.cuda.Event(enable_timing=True)
++                    start.record()
++                    run(shapes[index])
++                    end.record()
++                    events.append((start, end))
++                    order.append(index)
++        torch.cuda.synchronize()
++        results = [
++            {"shape": shape, "step_ms": [], "forward_ms": [], "drafter_ms": [], "modes": []}
++            for shape in shapes
++        ]
++        for index, (start, end) in zip(order, events):
++            # The whole dummy run on the stream: target, drafter and every gap
++            # between their kernels.
++            results[index]["step_ms"].append(start.elapsed_time(end))
++        # The target/drafter split exists only when every run reached the drafter.
++        if len(timings) == len(order):
++            for index, sample in zip(order, timings):
++                results[index]["forward_ms"].append(sample.forward_ms)
++                results[index]["drafter_ms"].append(sample.drafter_ms)
++                results[index]["modes"].append(
++                    [sample.full_cudagraph, sample.num_target_tokens, sample.num_reqs]
++                )
++        return {"replays": replays, "warmup": warmup, "shapes": results}
++
+     @torch.inference_mode()
+     @step_eplb_after(is_dummy=True)
+     def _dummy_run(
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 9edbfb98a..95d214270 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1552,6 +1552,18 @@ class Worker(WorkerBase):
+                     # Recreate it so the next profile_prefix is honored.
+                     self.profiler = None
+ 
++    def engine_grid(self, spec: str) -> dict:
++        """The engine cost grid (``GPUModelRunner.engine_grid``) for the dev-mode
++        collective RPC, whose arguments arrive as strings: ``spec`` is JSON."""
++        import json
++
++        grid = getattr(self.model_runner, "engine_grid", None)
++        if grid is None:
++            raise NotImplementedError("engine_grid needs the V2 GPU model runner")
++        result = grid(json.loads(spec))
++        result["rank"] = self.rank
++        return result
++
+     def execute_dummy_batch(self) -> None:
+         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
+         self.model_runner._dummy_run(num_tokens, uniform_decode=True)

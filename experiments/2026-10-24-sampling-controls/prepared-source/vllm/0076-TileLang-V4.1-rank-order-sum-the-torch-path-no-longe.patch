@@ -1,0 +1,44 @@
+From 0aa99af0897181ffd3bd9123934d3f3ad0206406 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 19:43:29 +0200
+Subject: [PATCH 076/274] TileLang V4.1 rank-order sum: the torch path no
+ longer adds into its first input
+
+For FP32 parts, .float() returned the first part itself, so the fallback summed
+into it. Serving's BF16 CUDA parts take the kernel and were never affected.
+
+(cherry picked from commit 52f23588b5b510a85c9e1ff1844d0afbbcb1cc86)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 4c31f8309..7c2766f06 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -159,6 +159,15 @@ def test_row_bits_do_not_depend_on_owner_or_batch():
+     assert len(results) == 1
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_torch_sum_leaves_its_inputs(dtype):
++    parts = [torch.randn(3, 8).to(dtype) for _ in range(4)]
++    before = [p.clone() for p in parts]
++    first = rank_order_sum(parts)
++    assert all(torch.equal(p, b) for p, b in zip(parts, before))
++    assert torch.equal(rank_order_sum(parts), first)
++
++
+ def test_one_rounding_differs_from_rounding_each_add():
+     # FP32 accumulation is observable: rounding after each BF16 add (as NCCL does
+     # per hop) gives other bits, so the tests above would catch it.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index 97992669d..ae87c8667 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -133,7 +133,7 @@ def rank_order_sum(
+                 *(p.view(-1, _VEC) for p in parts), out.view(-1, _VEC)
+             )
+         return out
+-    total = parts[0].float()
++    total = parts[0].to(torch.float32, copy=True)  # never add into an input
+     for part in parts[1:]:
+         total += part.float()
+     return out.copy_(total)

@@ -1,0 +1,468 @@
+From a0519bf586669c6f51395688e3ea87adcfe4e72d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 12:27:01 +0200
+Subject: [PATCH 143/274] DeepSeek-V4.1 Engram: a debug timeline of each step's
+ rows
+
+Decode steps at eight streams wait 7-8 ms for table 0's rows in about half
+the steps of a profiled window (on r6n as on the step-aware reader), with
+the hash 3 ms ahead of the wait: the reader publishes about 10 ms after the
+GPU's IDs, for a few hundred lookups a rank. To see why without the
+profiler, SPARK3_ENGRAM_TIMELINE=1 (debug; off and free in serving) makes
+each disk table's reader record, per served step, when the host queued it,
+when the worker began it, saw the previous step gathered (early rows), saw
+the GPU's IDs, read the rows and published them; the GPU's wait records its
+length (globaltimer, compiled into the wait kernel only with the flag set)
+in two control words that the next step's service picks up. A thread
+appends the records every 5 s as JSON lines under
+SPARK3_ENGRAM_TIMELINE_DIR, one file per host, rank and Engram layer.
+
+Tests: three delayed steps recorded in order with ordered times, and the
+GPU's wait for the second; the timeline is off by default.
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index d031c0214..ac6299b4c 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -446,3 +446,53 @@ def test_a_mismatched_early_id_is_named():
+     while rows.failure() is None and time.monotonic() < deadline:
+         time.sleep(0.01)
+     assert "lookup 29: the host hashed row 11, the GPU row 10" in rows.failure()
++
++
++_TIMELINE_CHILD = """
++import os, sys, torch
++sys.path.insert(0, os.path.dirname(sys.argv[1]))
++import test_deepseek_v41_engram_rows as t
++_, _, paths = t._write_table(t._table_dir(), seed=27)
++rows = t._rows(paths, tokens=4, timeline=True, delay_s=0.05)
++first = torch.randint(0, t.TABLE_ROWS, (4, t.HEADS)).cuda()
++for _ in range(3):
++    t._step(rows, first, 4)
++torch.cuda.synchronize()
++records = rows.timeline()
++assert [r["sequence"] for r in records] == [1, 2, 3], records
++for r in records:
++    assert r["submitted"] <= r["started"] <= r["ids"] <= r["read"] <= r["published"], r
++    assert r["count"] == 4 * t.HEADS and r["early"] == 0
++# Step 1's kernels compile on the host while its rows are read, so its wait is short;
++# the GPU waited for step 2's delayed rows, and step 3's service saw that wait.
++assert records[1]["gpu_sequence"] == 1, records[1]
++third = records[2]
++assert third["gpu_sequence"] == 2 and third["gpu_wait_ns"] > 10_000_000, third
++assert rows.timeline() == []
++rows.close()
++"""
++
++
++def test_timeline_records_each_step_and_the_gpu_wait():
++    """Debug: with the timeline on, the reader records each served step in order and the
++    GPU each wait's length (the timing is compiled into the wait only with the flag set,
++    so this runs in a child process)."""
++    import subprocess
++    import sys
++
++    env = dict(os.environ, SPARK3_ENGRAM_TIMELINE="1")
++    result = subprocess.run(
++        [sys.executable, "-c", _TIMELINE_CHILD, __file__],
++        env=env, capture_output=True, text=True, timeout=600,
++    )
++    assert result.returncode == 0, result.stderr[-3000:]
++
++
++def test_timeline_is_off_by_default():
++    _, _, paths = _write_table(_table_dir(), seed=28)
++    rows = _rows(paths, tokens=4)
++    ids = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
++    _step(rows, ids, 4)
++    torch.cuda.synchronize()
++    assert not rows.timeline_enabled and rows.timeline() == []
++    rows.close()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 63928aba0..058ee019a 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -84,6 +84,43 @@ ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0"))
+ # Debug only (off and free in serving): every row ID the host hashed early must equal
+ # the GPU's, or the step fails with both.
+ ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
++# Debug only (off and free in serving: the wait kernel's timing is compiled in only
++# when set): every disk table's reader records each step's timeline, and the GPU each
++# wait's length; a thread appends them every few seconds to JSON lines in
++# SPARK3_ENGRAM_TIMELINE_DIR (<host>-tp<rank>-layer<id>.jsonl).
++ENGRAM_TIMELINE = os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
++ENGRAM_TIMELINE_DIR = os.environ.get(
++    "SPARK3_ENGRAM_TIMELINE_DIR", "/cache/kkref/engram-timeline"
++)
++_timeline_tables: list = []
++
++
++def _dump_timelines() -> None:
++    import json
++    import socket
++    import time
++
++    os.makedirs(ENGRAM_TIMELINE_DIR, exist_ok=True)
++    host = socket.gethostname()
++    while True:
++        time.sleep(5)
++        for rows, rank, layer in list(_timeline_tables):
++            records = rows.timeline()
++            if records:
++                name = f"{host}-tp{rank}-layer{layer}.jsonl"
++                path = os.path.join(ENGRAM_TIMELINE_DIR, name)
++                with open(path, "a") as out:
++                    out.writelines(json.dumps(record) + "\n" for record in records)
++
++
++def _record_timeline(rows, rank: int, layer: int) -> None:
++    if not _timeline_tables:
++        import threading
++
++        threading.Thread(
++            target=_dump_timelines, name="engram-timeline", daemon=True
++        ).start()
++    _timeline_tables.append((rows, rank, layer))
+ 
+ 
+ @lru_cache(maxsize=2)
+@@ -647,10 +684,13 @@ class ParallelEngramEmbedding(nn.Module):
+             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
+             delay_s=ENGRAM_READ_DELAY_S,
+             check_early=ENGRAM_CHECK_EARLY_IDS,
++            timeline=ENGRAM_TIMELINE,
+         )
+         for path, offset, scale in self._disk_sources:
+             rows.add_source(path, offset, scale=scale)
+         self.disk_rows = rows
++        if ENGRAM_TIMELINE:
++            _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
+ 
+     def stage_rows(self, indices, num_tokens, stream, early=None):
+         """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_native.py b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+index c1f99966c..7a60ed1cf 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_native.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+@@ -25,7 +25,7 @@ from pathlib import Path
+ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_reader.c")
+ _NAME = "_engram_rows_reader"
+-ABI_VERSION = 3
++ABI_VERSION = 4
+ 
+ 
+ def _pkg_config(*args: str) -> str:
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index c06b7a9c0..5505ca352 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -56,7 +56,7 @@ static void system_error(failure_t *failure, const char *operation) {
+ #include "_row_plan.h"
+ 
+ #define READER_CAPSULE "vllm.engram_rows.reader"
+-#define ABI_VERSION 3
++#define ABI_VERSION 4
+ 
+ /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
+ #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
+@@ -65,6 +65,8 @@ static void system_error(failure_t *failure, const char *operation) {
+ #define CTRL_TIMEOUT_US 32  /* the host: how long the GPU waits for a step's rows */
+ #define CTRL_WAITED_US 33   /* the GPU: how long a timed-out wait waited */
+ #define CTRL_FAILED_SEQ 34  /* the GPU: the step a timed-out wait was for */
++#define CTRL_GPU_WAIT_SEQ 40 /* debug (timeline): the step the GPU last waited for */
++#define CTRL_GPU_WAIT_NS 41  /* debug (timeline): how long that wait took, ns */
+ #define CTRL_PHASE 48       /* the worker: PHASE_* */
+ #define CTRL_PHASE_SEQ 49   /* the worker: the step it is on */
+ #define CTRL_WORDS 64
+@@ -87,8 +89,17 @@ typedef struct {
+     uint32_t count;
+     int64_t *early;   /* the host's IDs (UNKNOWN_ID where only the GPU knows), or NULL */
+     bool has_unknown; /* some lookup needs the GPU's ID */
++    uint64_t submitted; /* when the host queued the step (CLOCK_MONOTONIC ns) */
+ } step_t;
+ 
++/* Debug (timeline): one record per served step, times in CLOCK_MONOTONIC ns. The GPU's
++ * wait is the last one it recorded when the step's service began: the previous step's. */
++typedef struct {
++    uint32_t sequence, count, early, gpu_sequence, gpu_wait_ns;
++    uint64_t submitted, started, consumed, ids, read, published;
++} record_t;
++#define TIMELINE 8192
++
+ typedef struct {
+     ple_plan_t plan;
+     bool poisoned;
+@@ -107,6 +118,8 @@ typedef struct {
+     uint32_t *control;
+     int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
+     bool check_early; /* debug: an early ID must equal the GPU's */
++    record_t *timeline; /* debug: the last TIMELINE served steps (mutex), or NULL */
++    uint64_t timeline_next, timeline_read;
+     /* Serving: started (sources fixed) and closing are set once; pending (steps
+      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
+     bool started, closing;
+@@ -397,6 +410,12 @@ static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
+ 
+ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
++    uint64_t started = now_ns();
++    uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
++    if (reader->timeline) {
++        gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
++        gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
++    }
+     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
+     uint64_t early_count = 0;
+     double consumed_wait = 0.0, early_read = 0.0;
+@@ -435,6 +454,14 @@ static void serve(reader_t *reader, step_t step) {
+     /* The rows are in place before the GPU can see the step. */
+     __atomic_store_n(&reader->control[CTRL_ROWS_SEQ], step.sequence, __ATOMIC_RELEASE);
+     control_store(reader, CTRL_PHASE, PHASE_IDLE);
++    if (reader->timeline) {
++        record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
++                           step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
++                           ids_at, read_at, now_ns()};
++        pthread_mutex_lock(&reader->mutex);
++        reader->timeline[reader->timeline_next++ % TIMELINE] = record;
++        pthread_mutex_unlock(&reader->mutex);
++    }
+ }
+ 
+ /* The process's one worker and its queue of (reader, step) jobs. */
+@@ -496,6 +523,7 @@ static void release(reader_t *reader) {
+     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
+     free(reader->iovecs);
+     free(reader->late);
++    free(reader->timeline);
+     free(reader->free_slots);
+     free(reader->registered_fds);
+     ple_plan_release(&reader->plan);
+@@ -521,18 +549,19 @@ static reader_t *get_reader(PyObject *capsule) {
+ }
+ 
+ /* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
+- *        scales, control, ids_timeout_s, delay_s, check_early): the four buffers are
+- * addresses of host memory that outlives the reader; check_early (debug) fails a step
+- * whose early ID differs from the GPU's. */
++ *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the four buffers
++ * are addresses of host memory that outlives the reader; check_early (debug) fails a step
++ * whose early ID differs from the GPU's; timeline (debug) records each served step. */
+ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     (void)self;
+     long long table_rows, shard_start, shard_end, max_lookups;
+     int depth;
+     unsigned long long ids, weights, scales, control;
+     double ids_timeout, delay;
+-    int check_early;
+-    if (!PyArg_ParseTuple(args, "LLLLiKKKKddp", &table_rows, &shard_start, &shard_end, &max_lookups,
+-                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early))
++    int check_early, timeline;
++    if (!PyArg_ParseTuple(args, "LLLLiKKKKddpp", &table_rows, &shard_start, &shard_end, &max_lookups,
++                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
++                          &timeline))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
+@@ -556,6 +585,10 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     reader->ids_timeout_ns = (uint64_t)(ids_timeout * 1e9);
+     reader->delay_ns = (uint64_t)(delay * 1e9);
+     reader->check_early = check_early != 0;
++    if (timeline && !(reader->timeline = calloc(TIMELINE, sizeof(*reader->timeline)))) {
++        release(reader);
++        return PyErr_NoMemory();
++    }
+     reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
+     if (!reader->late) {
+         release(reader);
+@@ -640,6 +673,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+     PyObject *capsule, *early_object = Py_None;
+     unsigned int sequence, count;
+     double wait;
++    uint64_t submitted = now_ns();
+     if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+@@ -697,7 +731,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+         }
+         if (!problem) {
+             __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
+-            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown}};
++            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown, submitted}};
+             early = NULL;
+             queue.tail++;
+             reader->pending++;
+@@ -746,11 +780,51 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     return result;
+ }
+ 
++/* timeline(reader) (debug): the records of the steps served since the last call (at most
++ * the last TIMELINE), oldest first, as tuples in record_t's field order; [] when off. */
++static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
++    (void)self;
++    reader_t *reader = get_reader(capsule);
++    if (!reader) return NULL;
++    PyObject *result = PyList_New(0);
++    if (!result || !reader->timeline) return result;
++    record_t *copy = malloc(TIMELINE * sizeof(*copy));
++    if (!copy) {
++        Py_DECREF(result);
++        return PyErr_NoMemory();
++    }
++    uint64_t first, last;
++    pthread_mutex_lock(&reader->mutex);
++    last = reader->timeline_next;
++    first = reader->timeline_read + TIMELINE < last ? last - TIMELINE : reader->timeline_read;
++    for (uint64_t i = first; i < last; i++) copy[i - first] = reader->timeline[i % TIMELINE];
++    reader->timeline_read = last;
++    pthread_mutex_unlock(&reader->mutex);
++    for (uint64_t i = 0; i < last - first; i++) {
++        record_t *r = &copy[i];
++        PyObject *row = Py_BuildValue("(IIIIIKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
++                                      r->gpu_wait_ns, (unsigned long long)r->submitted,
++                                      (unsigned long long)r->started, (unsigned long long)r->consumed,
++                                      (unsigned long long)r->ids, (unsigned long long)r->read,
++                                      (unsigned long long)r->published);
++        if (!row || PyList_Append(result, row) < 0) {
++            Py_XDECREF(row);
++            Py_DECREF(result);
++            free(copy);
++            return NULL;
++        }
++        Py_DECREF(row);
++    }
++    free(copy);
++    return result;
++}
++
+ static PyMethodDef methods[] = {
+     {"reader", py_reader, METH_VARARGS, NULL},
+     {"add", py_add, METH_VARARGS, NULL},
+     {"submit", py_submit, METH_VARARGS, NULL},
+     {"status", py_status, METH_O, NULL},
++    {"timeline", py_timeline, METH_O, NULL},
+     {NULL, NULL, 0, NULL},
+ };
+ 
+@@ -769,6 +843,8 @@ PyMODINIT_FUNC PyInit__engram_rows_reader(void) {
+         PyModule_AddIntConstant(result, "CTRL_TIMEOUT_US", CTRL_TIMEOUT_US) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_WAITED_US", CTRL_WAITED_US) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_FAILED_SEQ", CTRL_FAILED_SEQ) < 0 ||
++        PyModule_AddIntConstant(result, "CTRL_GPU_WAIT_SEQ", CTRL_GPU_WAIT_SEQ) < 0 ||
++        PyModule_AddIntConstant(result, "CTRL_GPU_WAIT_NS", CTRL_GPU_WAIT_NS) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_PHASE", CTRL_PHASE) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_PHASE_SEQ", CTRL_PHASE_SEQ) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_WORDS", CTRL_WORDS) < 0) {
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index b5c5fbd30..2c5e57e25 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -110,12 +110,13 @@ class EngramDiskRows:
+     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                  max_lookups: int, queue_depth: int = 128, ids_timeout_s: float = 20.0,
+                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+-                 check_early: bool = False):
++                 check_early: bool = False, timeline: bool = False):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+         self.max_lookups = int(max_lookups)
+         self.check_early = bool(check_early)
++        self.timeline_enabled = bool(timeline)
+         self._allocations = []
+         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+@@ -129,6 +130,7 @@ class EngramDiskRows:
+             table_rows, self.shard_start, self.shard_end, self.max_lookups, queue_depth,
+             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+             float(ids_timeout_s), float(delay_s), self.check_early,
++            self.timeline_enabled,
+         )
+         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+         self._sequence = 0
+@@ -208,6 +210,18 @@ class EngramDiskRows:
+     def stats(self) -> dict:
+         return self.native.status(self._reader)
+ 
++    TIMELINE_FIELDS = ("sequence", "count", "early", "gpu_sequence", "gpu_wait_ns",
++                       "submitted", "started", "consumed", "ids", "read", "published")
++
++    def timeline(self) -> list[dict]:
++        """Debug: the steps served since the last call, oldest first (``timeline`` on).
++        Times are CLOCK_MONOTONIC ns: the host queued the step (submitted), the worker
++        began it (started), saw the previous step gathered (consumed, early rows only),
++        saw the GPU's IDs (ids), read the rows (read) and published them (published).
++        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one."""
++        rows = self.native.timeline(self._reader)
++        return [dict(zip(self.TIMELINE_FIELDS, row)) for row in rows]
++
+     def close(self) -> None:
+         """Stop the reader, then free the buffers; the GPU must be done with them."""
+         self._reader = None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index ae6f14895..64d5a807f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -23,6 +23,8 @@ stream:
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+ # annotations eagerly, and the symbolic shape must resolve.
++import os
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+@@ -32,8 +34,16 @@ ROW = 256
+ SCALES = ROW // 32
+ CONTROL_WORDS = 64
+ 
++# Debug only: the wait records each wait's length for the reader's timeline
++# (SPARK3_ENGRAM_TIMELINE, common/engram.py); compiled in only when set.
++_TIMING = (
++    "#define ENGRAM_TIMING\n"
++    if os.environ.get("SPARK3_ENGRAM_TIMELINE", "0") == "1"
++    else ""
++)
++
+ # Control-block word offsets, as in engram_rows/_reader.c.
+-_HEADER = r"""
++_HEADER = _TIMING + r"""
+ // Engram rows: the reader publishes a step by writing its sequence number into the
+ // control block in mapped host memory; this stream wrote the step it staged there.
+ #define ENGRAM_CTRL_IDS_SEQ 0
+@@ -42,6 +52,8 @@ _HEADER = r"""
+ #define ENGRAM_CTRL_TIMEOUT_US 32
+ #define ENGRAM_CTRL_WAITED_US 33
+ #define ENGRAM_CTRL_FAILED_SEQ 34
++#define ENGRAM_CTRL_GPU_WAIT_SEQ 40
++#define ENGRAM_CTRL_GPU_WAIT_NS 41
+ #define ENGRAM_CTRL_PHASE 48
+ #define ENGRAM_PHASE_FAILED 3
+ 
+@@ -55,10 +67,26 @@ __device__ __forceinline__ void engram_wait_rows(void *control) {
+     unsigned target;
+     asm volatile("ld.relaxed.sys.global.u32 %0, [%1];" : "=r"(target) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
+     unsigned long long start = 0ull, limit = 0ull;
++#ifdef ENGRAM_TIMING
++    unsigned long long entered;
++    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(entered));
++#endif
+     for (unsigned polls = 1u;; polls++) {
+         unsigned seen;
+         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(seen) : "l"(ctrl + ENGRAM_CTRL_ROWS_SEQ) : "memory");
+         if ((int)(seen - target) >= 0) {
++#ifdef ENGRAM_TIMING
++            unsigned long long left;
++            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(left));
++            unsigned long long ns = left - entered;
++            unsigned waited = ns > 0xffffffffull ? 0xffffffffu : (unsigned)ns;
++            asm volatile("st.relaxed.sys.global.u32 [%0], %1;"
++                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_NS), "r"(waited)
++                         : "memory");
++            asm volatile("st.release.sys.global.u32 [%0], %1;"
++                         :: "l"(ctrl + ENGRAM_CTRL_GPU_WAIT_SEQ), "r"(target)
++                         : "memory");
++#endif
+             return;
+         }
+         if ((polls & 63u) == 0u) {

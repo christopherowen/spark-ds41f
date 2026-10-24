@@ -1,0 +1,147 @@
+From 146769ffe89e51a99e052cff32b8ad892172edb5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:21:41 +0200
+Subject: [PATCH 167/274] Tests: cover the TileLang kernel family where only
+ B12X was covered
+
+- DS4.1 kernel-family routing: both families' attention backend and class, and
+  TileLang's linear and MoE backends (the B12X-only test also no longer matched
+  the error message).
+- Kernel preparation: the TileLang order (declare, compile, warm, step kernels,
+  registry, heap release, freeze, bind, JIT monitor).
+- The custom-op boundary lint reads the TileLang modules that define custom ops.
+
+diff --git a/tests/model_executor/test_b12x_op_boundary.py b/tests/model_executor/test_b12x_op_boundary.py
+index 360150abf..6344c66ea 100644
+--- a/tests/model_executor/test_b12x_op_boundary.py
++++ b/tests/model_executor/test_b12x_op_boundary.py
+@@ -83,7 +83,7 @@ def op_boundary_violations(root=PACKAGE):
+     violations = []
+     for path in sorted(root.rglob("*.py")):
+         text = path.read_text()
+-        if "b12x" not in text:
++        if "b12x" not in text and "tilelang" not in text:
+             continue
+         tree = ast.parse(text, filename=str(path))
+         for function in _op_functions(tree):
+diff --git a/tests/v1/attention/test_b12x_sparse_mla_api.py b/tests/v1/attention/test_b12x_sparse_mla_api.py
+index 43dff070a..720980607 100644
+--- a/tests/v1/attention/test_b12x_sparse_mla_api.py
++++ b/tests/v1/attention/test_b12x_sparse_mla_api.py
+@@ -222,17 +222,38 @@ def test_b12x_selector_routes_supported_attention_families() -> None:
+     assert _get_sparse_mla_backend(config) is B12xGLMDSAMLASparseBackend
+ 
+ 
+-def test_b12x_selector_routes_deepseek_v41() -> None:
+-    config = SimpleNamespace(attention_config=SimpleNamespace(backend=None))
++@pytest.mark.parametrize("family", ["b12x", "tilelang"])
++def test_kernel_family_routes_deepseek_v41(monkeypatch, family) -> None:
++    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
++    attention backend and class, and (TileLang) the linear and MoE backends."""
++    from vllm import envs
++    from vllm.models.deepseek_v4_1.tilelang.attention import (
++        DeepseekV41TileLangAttention,
++    )
++
++    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False)
++    backend, attention_cls = {
++        "b12x": (AttentionBackendEnum.B12X, DeepseekV41B12xAttention),
++        "tilelang": (AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention),
++    }[family]
++    kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
++    config = SimpleNamespace(
++        attention_config=SimpleNamespace(backend=None),
++        kernel_config=kernel,
++        speculative_config=None,
++    )
+ 
+     DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+ 
+-    assert config.attention_config.backend is AttentionBackendEnum.B12X
+-    assert _select_dsv4_attn_cls(config) is DeepseekV41B12xAttention
+-    assert DeepseekV41B12xBackend.get_name() == "B12X"
++    assert config.attention_config.backend is backend
++    assert _select_dsv4_attn_cls(config) is attention_cls
++    if family == "tilelang":
++        assert kernel.linear_backend == kernel.moe_backend == "tilelang"
++    else:
++        assert DeepseekV41B12xBackend.get_name() == "B12X"
+ 
+     config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+-    with pytest.raises(ValueError, match="requires B12X"):
++    with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
+         DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+ 
+ 
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 49d24b956..1c83da23e 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -30,16 +30,19 @@ class _Registry:
+         self._trace.append("compile")
+ 
+ 
+-def _worker(monkeypatch, runner) -> Worker:
++def _worker(monkeypatch, runner, family: str = "b12x") -> Worker:
+     worker = Worker.__new__(Worker)  # no GPU, no init: only preparation is used
+     worker.model_runner = runner
+     worker.vllm_config = None
+     worker._startup_heartbeat = None
++    worker.observability_config = SimpleNamespace(
++        jit_monitor_mode="warn", jit_monitor_verbose=False
++    )
+     monkeypatch.setattr(
+         gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
+     )
+     monkeypatch.setattr(
+-        gpu_worker_module.envs, "VLLM_DS41_KERNEL_BACKEND", "b12x", raising=False
++        gpu_worker_module.envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False
+     )
+     return worker
+ 
+@@ -61,3 +64,45 @@ def test_a_runner_without_step_kernels_still_compiles_its_registry(monkeypatch):
+     runner = SimpleNamespace(jit_warmup_registry=_Registry(trace))
+     _worker(monkeypatch, runner)._prepare_kernels()
+     assert trace == ["compile"]
++
++
++def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
++    """TileLang: declare from the loaded model, compile, warm, add the step's
++    kernels, compile the registry, return the compile heap, freeze, bind, and
++    only then watch for compiles."""
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.utils import jit_monitor
++
++    trace: list[str] = []
++    registry = _Registry(trace)
++    target, drafter = object(), object()
++
++    def declare_modules(model, draft):
++        assert (model, draft) == (target, drafter)
++        trace.append("declare")
++
++    def prepare_declared(active):
++        assert active is registry
++        trace.append("prepare")
++        return 3
++
++    record = lambda name: lambda *args, **kwargs: trace.append(name)  # noqa: E731
++    monkeypatch.setattr(prepare, "declare_modules", declare_modules)
++    monkeypatch.setattr(prepare, "prepare_declared", prepare_declared)
++    monkeypatch.setattr(prepare, "warm_declared", record("warm"))
++    monkeypatch.setattr(prepare, "release_host_memory", record("release"))
++    monkeypatch.setattr(prepare, "freeze", record("freeze"))
++    monkeypatch.setattr(prepare, "bind_declared", record("bind"))
++    monkeypatch.setattr(jit_monitor, "activate", record("monitor"))
++    runner = SimpleNamespace(
++        jit_warmup_registry=registry,
++        model=target,
++        speculator=SimpleNamespace(model=drafter),
++        declare_step_kernels=lambda: trace.append("step kernels"),
++    )
++    _worker(monkeypatch, runner, "tilelang")._prepare_kernels()
++    assert trace == [
++        "collect", "declare", "collected", "prepare", "warm",
++        "collect", "step kernels", "collected", "compile",
++        "release", "freeze", "bind", "monitor",
++    ]  # fmt: skip

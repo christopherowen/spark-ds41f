@@ -1,0 +1,188 @@
+From 9dbc4aecbf6b34eb24221278b7a909d925f1460d Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:43:12 +0100
+Subject: [PATCH 127/274] TileLang V4.1 tests: DeepSeek's arithmetic for
+ compression and the Engram hash
+
+The compression and Engram hash tests imported their oracles from B12X.
+Port them from the checkpoint's inference code instead, so they keep
+checking the kernels once B12X leaves the image:
+
+- the compressed latent: Compressor's softmax-gated pool in FP32, rounded
+  to BF16, then its RMSNorm with norm_eps 1e-20;
+- the Engram geometry: EngramLayout's primes from engram_vocab_size, never
+  reused, their running offsets, and compute_hash_multipliers;
+- the hash: NgramHashState.forward over packed requests with history.
+
+On the CPU, both agree with B12X's oracles exactly: the latent over random
+inputs, the geometry for layers 1 and 14, and the hash over 20 random
+packed batches.
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index 3f10cb76f..96b6cb89e 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic (B12X's
+-reference oracle) and vLLM's Triton state-ring kernels."""
++"""DeepSeek-V4.1 TileLang CSA compression against DeepSeek's arithmetic and vLLM's
++Triton state-ring kernels."""
+ 
+ import pytest
+ import torch
+@@ -14,9 +14,6 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ pytest.importorskip("tilelang")
+-pytest.importorskip("b12x")
+-
+-from b12x.attention.mla_compress.reference import normalized_latent  # noqa: E402
+ 
+ from vllm.models.deepseek_v4_1.compressor import (  # noqa: E402
+     _load_partial_state,
+@@ -108,8 +105,22 @@ def test_gather_equals_triton(seed):
+         assert torch.equal(a, b)
+ 
+ 
++def normalized_latent(values, weight, gates=None):
++    """One latent of DeepSeek's ``Compressor``: the softmax-gated pool in FP32,
++    rounded to BF16 (``kv.to(dtype)``), then its ``RMSNorm`` in FP32 with the
++    checkpoint's ``norm_eps`` of 1e-20."""
++    pooled = (
++        values
++        if gates is None
++        else (values.float() * gates.float().softmax(dim=0)).sum(dim=0)
++    )
++    rounded = pooled.to(torch.bfloat16).float()
++    rstd = torch.rsqrt(rounded.square().mean(dim=-1, keepdim=True) + 1e-20)
++    return (rounded * rstd * weight.float()).to(torch.bfloat16)
++
++
+ def _reference(step, rows, starts, ratio, carry):
+-    """DeepSeek's arithmetic, token by token (B12X's oracle for one latent)."""
++    """DeepSeek's arithmetic, token by token."""
+     out = torch.zeros(rows, DIM, dtype=torch.bfloat16, device=DEVICE)
+     emitted = torch.zeros(rows, dtype=torch.bool, device=DEVICE)
+     slots = torch.full((rows,), -1, dtype=torch.int64, device=DEVICE)
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+index 2d4195404..1ae6ef373 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+@@ -1,9 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang Engram hash against B12X's integer oracle."""
++"""DeepSeek-V4.1 TileLang Engram hash against DeepSeek's integer arithmetic."""
+ 
++from types import SimpleNamespace
++
++import numpy as np
+ import pytest
+ import torch
++from sympy import isprime
+ 
+ from vllm.platforms import current_platform
+ 
+@@ -13,10 +17,6 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ pytest.importorskip("tilelang")
+-pytest.importorskip("b12x")
+-
+-from b12x.sequence.engram.geometry import build_geometry  # noqa: E402
+-from b12x.sequence.engram.reference import hash_reference  # noqa: E402
+ 
+ from vllm.models.deepseek_v4_1.tilelang.engram_hash import (  # noqa: E402
+     IMAGE_SENTINEL,
+@@ -29,6 +29,56 @@ VOCAB, COMPRESSED = 129280, 99092
+ LAYERS = (1, 14)
+ 
+ 
++def _geometry(layer_ids, table_size=16_000_000, ngrams=4, heads=8):
++    """DeepSeek's inference/engram.py geometry: ``EngramLayout``'s primes, drawn in
++    order from ``engram_vocab_size`` and never reused, their running offsets, and
++    ``compute_hash_multipliers``."""
++    seen, primes, offsets, multipliers = set(), [], [], []
++    bound = max(1, (np.iinfo(np.int64).max // COMPRESSED) // 2)
++    for layer in layer_ids:
++        sizes = []
++        for _ in range(ngrams - 1):
++            current = table_size - 1
++            for _ in range(heads):
++                current += 1
++                while not isprime(current) or current in seen:
++                    current += 1
++                seen.add(current)
++                sizes.append(current)
++        primes.append(sizes)
++        offsets.append(np.cumsum([0, *sizes[:-1]]).tolist())
++        values = np.random.default_rng(10007 * layer).integers(
++            0, bound, size=(ngrams,), dtype=np.int64
++        )
++        multipliers.append((values * 2 + 1).tolist())
++    return SimpleNamespace(primes=primes, offsets=offsets, multipliers=multipliers)
++
++
++def _hash_reference(tokens, mask, starts, history, token_map, geometry, layer):
++    """``NgramHashState.forward`` of DeepSeek's inference/engram.py over packed
++    requests: each request's three history ids, then its compressed ids (``-1``
++    where masked). Look-back stops at a dead id and pads with the pad token's id;
++    each running XOR of id times multiplier lands at its prime plus its offset."""
++    pad = token_map[2]  # engram_pad_id
++    multipliers = geometry.multipliers[layer]
++    primes, offsets = geometry.primes[layer], geometry.offsets[layer]
++    compressed = [token_map[t] if keep else -1 for t, keep in zip(tokens, mask)]
++    rows = []
++    for request, (begin, end) in enumerate(zip(starts[:-1], starts[1:])):
++        cache = list(history[request]) + compressed[begin:end]
++        for position in range(3, len(cache)):
++            rolling, blocked, result = 0, False, []
++            for lag in range(4):
++                source = cache[position - lag]
++                blocked |= source == -1
++                rolling ^= (pad if blocked else source) * multipliers[lag]
++                if lag:
++                    for head in range((lag - 1) * 8, lag * 8):
++                        result.append(rolling % primes[head] + offsets[head])
++            rows.append(result)
++    return torch.tensor(rows, dtype=torch.int64).reshape(-1, 24)
++
++
+ def _case(lengths, padding, seed):
+     gen = torch.Generator().manual_seed(seed)
+     token_map = torch.randint(0, COMPRESSED, (VOCAB,), generator=gen)
+@@ -51,19 +101,17 @@ def _expected(token_map, ids, history, starts, geometry):
+     # vLLM's metadata compresses history: out of vocabulary and the sentinel drop.
+     valid = (history >= 0) & (history < VOCAB) & (history != IMAGE_SENTINEL)
+     compressed = torch.where(valid, token_map[history.clamp(0, VOCAB - 1)], -1)
+-    slots = list(range(len(starts) - 1))
+     rows = [
+-        hash_reference(
++        _hash_reference(
+             tokens,
+             keep,
+             starts.tolist(),
+-            slots,
+             compressed.tolist(),
+             token_map.tolist(),
+             geometry,
+             layer,
+         )
+-        for layer in LAYERS
++        for layer in range(len(LAYERS))
+     ]
+     return torch.stack(rows, dim=1), image
+ 
+@@ -75,9 +123,7 @@ def _expected(token_map, ids, history, starts, geometry):
+     [((1,), 0), ((6, 1, 3, 6), 5), ((700, 1, 2, 1300), 0), ((0, 4, 0, 2), 3)],
+ )
+ def test_engram_hash(lengths, padding, ids_dtype, history_dtype):
+-    geometry = build_geometry(
+-        layer_ids=LAYERS, base_table_size=16_000_000, compressed_vocab_size=COMPRESSED
+-    )
++    geometry = _geometry(LAYERS)
+     token_map, ids, history, starts = _case(lengths, padding, sum(lengths) + padding)
+     expected, image = _expected(token_map, ids, history, starts, geometry)
+     out = torch.full((ids.numel() + 2, len(LAYERS), 24), 7, dtype=torch.int64)

@@ -1,0 +1,81 @@
+From 39d0e1a235dfb63316036ce7020faf1b24f15ebc Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 16:30:26 +0200
+Subject: [PATCH 117/274] TileLang V4.1 WO: WO-A path and tile per bucket from
+ the split sweep
+
+(cherry picked from commit 726be43656df7c584ba4196061d4c3de562c969b)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index 83571cf07..f031de1bb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -26,20 +26,21 @@ from .linear import _block32_linear, _prepare_block32, _scratch
+ from .rope import rope_
+ 
+ # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
+-# added in shard order, so a row's bits do not depend on the path. Decode rows (up to
+-# _WO_A_SPLIT_ROWS) split the shards over CTAs, FP32 partials then splitk_reduce, for
+-# the SMs a 64-tile grid leaves idle; longer steps add the shards inside the kernel.
+-# Tiles from the WO sweep (bits do not depend on the tile): 32 columns up to 128 rows,
+-# 64 past them; two stages throughout.
++# added in shard order, so a row's bits do not depend on the path. A bucket either
++# splits the shards over CTAs (FP32 partials, then splitk_reduce: the SMs a narrow grid
++# leaves idle at decode) or adds them inside the kernel (no partials to write and read
++# back). Path and tile per bucket from the split sweep (bits depend on neither): 64
++# columns and two stages throughout; four shards beat two at decode.
+ _WO_A_SHARDS = 4
+-_WO_A_SPLIT_ROWS = 128
+ _WO_A_TILES = {
+-    16: dict(block_M=16, block_N=32, num_stages=2),
+-    32: dict(block_M=32, block_N=32, num_stages=2),
+-    64: dict(block_M=64, block_N=32, num_stages=2),
+-    128: dict(block_M=128, block_N=32, num_stages=2),
+-    None: dict(block_M=128, block_N=64, num_stages=2),
++    16: dict(split=True, block_M=16),
++    32: dict(split=True, block_M=32),
++    64: dict(split=True, block_M=64),
++    96: dict(split=False, block_M=32),
++    128: dict(split=True, block_M=64),
++    None: dict(split=False, block_M=64),
+ }
++_WO_A_COMMON = dict(block_N=64, num_stages=2)
+ 
+ 
+ class _Weight:
+@@ -64,18 +65,30 @@ class _GroupedBF16:
+         self.columns = n
+         self.kernels = {
+             bucket: fp8w_bf16_gemm_partials(
+-                n // groups, k, groups, _WO_A_SHARDS, **config
++                n // groups,
++                k,
++                groups,
++                _WO_A_SHARDS,
++                block_M=tile["block_M"],
++                **_WO_A_COMMON,
+             )
+-            if bucket is not None and bucket <= _WO_A_SPLIT_ROWS
+-            else fp8w_bf16_gemm(n // groups, k, groups, shards=_WO_A_SHARDS, **config)
+-            for bucket, config in _WO_A_TILES.items()
++            if tile["split"]
++            else fp8w_bf16_gemm(
++                n // groups,
++                k,
++                groups,
++                shards=_WO_A_SHARDS,
++                block_M=tile["block_M"],
++                **_WO_A_COMMON,
++            )
++            for bucket, tile in _WO_A_TILES.items()
+         }
+         self.reduce = splitk_reduce(n, _WO_A_SHARDS)
+ 
+     def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
+         rows = x.shape[0]
+         bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
+-        if bucket is None or bucket > _WO_A_SPLIT_ROWS:
++        if not _WO_A_TILES[bucket]["split"]:
+             self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
+             return
+         (partials,) = _scratch(

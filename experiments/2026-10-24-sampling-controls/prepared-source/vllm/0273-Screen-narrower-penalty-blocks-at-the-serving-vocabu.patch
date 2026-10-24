@@ -1,0 +1,32 @@
+From 3d3ceee22ebea2a5aafb343b93fc10d0aa802447 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:27:08 +0200
+Subject: [PATCH 273/274] Screen narrower penalty blocks at the serving
+ vocabulary
+
+The 8192-column candidate is slower at one and 96 rows. Elementwise arithmetic permits a 2048-column partition without changing results; this creates 64 blocks at one request instead of 16.
+
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 9c48b3c5d..348c818c7 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -40,8 +40,7 @@ __device__ __forceinline__ float vllm_control_log(float x) {
+       "mul.rn.f32 q, r, p;\n"
+       "fma.rn.ftz.f32 q, q, r, r;\n"
+       "fma.rn.ftz.f32 l, f, 0f3F317218, q;\n"
+-      // Not finite non-negative: fma(z, inf, inf). The noise is 0 - logf(y), or
+-      // +inf where z is zero.
++      // Preserve the bundled libdevice exceptional-value handling.
+       "setp.lt.u32 fin, z, 2139095040;\n"
+       "fma.rn.ftz.f32 w, z, 0f7F800000, 0f7F800000;\n"
+       "selp.f32 l, l, w, fin;\n"
+@@ -157,7 +156,7 @@ def penalties_kernel(
+     rows, states, mask_rows, count_rows = T.dynamic(
+         "rows, states, mask_rows, count_rows"
+     )
+-    block = 8192
++    block = 2048
+ 
+     @T.prim_func
+     def penalties(

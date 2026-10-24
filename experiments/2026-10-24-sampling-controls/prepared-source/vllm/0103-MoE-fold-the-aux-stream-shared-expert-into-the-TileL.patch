@@ -1,0 +1,260 @@
+From 978d97437e87a8f97d00c31459941c0f12cf4d75 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:38:58 +0200
+Subject: [PATCH 103/274] MoE: fold the aux-stream shared expert into the
+ TileLang combine
+
+At decode the shared expert runs on the aux stream (multi-stream overlap), so
+the combine wrote an FP32 partial and the runner added the shared output and
+rounded in a separate pass at every layer. The runner now launches the shared
+expert on the aux stream before the routed experts, and the plan waits for it
+just before its combine, which adds the output and rounds once, as the
+no-overlap fold does: the same bits, one pass fewer, half the combine's output
+bytes. The runner waits again after the experts, so the aux stream stays joined
+under CUDA graph capture.
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index c769a791b..57dd87a08 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -183,3 +183,41 @@ def test_moe_experts_fold_shared(
+     assert torch.equal(folded, buffer)
+     with pytest.raises(AssertionError):
+         plan.run(x, ids, route_weights, weights, folded)  # BF16 out needs the shared
++
++
++@pytest.mark.parametrize("rows", [1, 12, 96])
++def test_moe_experts_fold_deferred_shared(
++    rows, hidden=384, intermediate=576, num_experts=32, topk=6
++):
++    """A callable shared addend, as the runner passes for a shared expert on the aux
++    stream: the plan calls it once, just before its combine, and the folded output
++    has the bits of the shared rows passed directly."""
++    w13_packed, w13_sf, _ = _experts(num_experts, 2 * intermediate, hidden, 1)
++    w2_packed, w2_sf, _ = _experts(num_experts, hidden, intermediate, 2)
++    plan = MoeExpertsV41Plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT,
++        out_dtype=torch.float32,
++    )  # fmt: skip
++    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
++    source = torch.randn((rows, hidden), generator=_gen(5), device=DEVICE)
++    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++    direct = torch.empty((rows, hidden), dtype=torch.bfloat16, device=DEVICE)
++    plan.run(x, ids, route_weights, weights, direct, shared=source.bfloat16())
++
++    side, ready = torch.cuda.Stream(), torch.cuda.Event()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        shared = source.bfloat16()
++        ready.record(side)
++    calls = []
++
++    def resolve():
++        calls.append(1)
++        ready.wait(torch.cuda.current_stream())
++        return shared
++
++    deferred = torch.empty_like(direct)
++    plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
++    assert calls == [1]
++    assert torch.equal(deferred, direct)
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index 2901b5fcf..c4eea9ff9 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -433,10 +433,12 @@ class MoERunner(MoERunnerInterface):
+     ) -> "mk.FusedMoEExperts | None":
+         """The routed experts whose combine adds the shared expert's output, or None.
+ 
+-        Only when the shared expert runs before the routed experts on this stream
+-        (no overlap), nothing scales, trims or transforms the routed output before
+-        the add, and the experts would otherwise write a wider partial for the add
+-        and one rounding here: they do both in the combine, with the same bits.
++        When the shared expert runs before the routed experts on this stream (no
++        overlap), or on the aux stream (multi-stream overlap) and the experts can
++        wait for it just before their combine, nothing scales, trims or transforms
++        the routed output before the add, and the experts would otherwise write a
++        wider partial for the add and one rounding here: they do both in the
++        combine, with the same bits.
+         """
+         if (
+             self._shared_experts is None
+@@ -444,13 +446,18 @@ class MoERunner(MoERunnerInterface):
+             or self.routed_scaling_factor != 1.0
+             or self.routed_output_transform is not None
+             or self._fused_output_is_reduced
+-            or self._shared_experts._determine_shared_experts_order(
+-                shared_experts_input
+-            )
+-            != SharedExpertsOrder.NO_OVERLAP
+         ):
+             return None
+         experts = self._quant_method.modular_experts
++        order = self._shared_experts._determine_shared_experts_order(
++            shared_experts_input
++        )
++        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
++            supported = getattr(experts, "folds_deferred_shared_output", False)
++        else:
++            supported = order == SharedExpertsOrder.NO_OVERLAP
++        if not supported:
++            return None
+         return experts if getattr(experts, "folds_shared_output", False) else None
+ 
+     @property
+@@ -748,10 +755,28 @@ class MoERunner(MoERunnerInterface):
+             shared_experts_input, SharedExpertsOrder.NO_OVERLAP, shared_workspace
+         )
+         experts = self._quant_method.modular_experts
++        overlap_fold = False
+         if getattr(experts, "fold_shared", False):
+-            # The shared expert ran first: the combine adds its output (forward).
+             assert self._shared_experts is not None
+-            experts.combine_addend = self._shared_experts.peek_output()
++            assert shared_experts_input is not None
++            overlap_fold = (
++                self._shared_experts._determine_shared_experts_order(
++                    shared_experts_input
++                )
++                == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
++            )
++            if not overlap_fold:
++                # The shared expert ran first: the combine adds its output (forward).
++                experts.combine_addend = self._shared_experts.peek_output()
++            else:
++                # The shared expert runs on the aux stream beside the routed
++                # experts; their combine waits for it, then adds its output.
++                if not shared_experts_overlapping:
++                    launched = self._shared_experts.maybe_forward_async(
++                        shared_experts_input, shared_workspace
++                    )
++                    assert launched
++                experts.combine_addend = self._shared_experts.wait_output
+ 
+         if self.routed_experts.quant_method.is_monolithic:
+             # Monolithic kernels: pass router_logits to routed_experts
+@@ -787,7 +812,12 @@ class MoERunner(MoERunnerInterface):
+                     workspace=workspace,
+                 )
+ 
+-        if shared_experts_overlapping:
++        if overlap_fold:
++            # The combine already waited; waiting again on the same event keeps
++            # the aux stream joined (CUDA graph capture needs it) at no cost.
++            assert self._shared_experts is not None
++            self._shared_experts.wait()
++        elif shared_experts_overlapping:
+             assert self._shared_experts is not None
+             self._shared_experts.wait()
+         else:
+diff --git a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+index ba93c6b01..b7c9aa401 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
++++ b/vllm/model_executor/layers/fused_moe/runner/shared_experts.py
+@@ -140,11 +140,16 @@ class SharedExperts(torch.nn.Module):
+         else:
+             return SharedExpertsOrder.NO_OVERLAP
+ 
+-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
++    def maybe_forward_async(
++        self,
++        shared_experts_input: torch.Tensor,
++        workspace: torch.Tensor | None = None,
++    ) -> bool:
+         """Enqueue shared experts on the aux stream without waiting for them.
+ 
+         Returns true if the shared experts were enqueued, false otherwise. Call
+         `wait` to wait for the shared experts to finish if this returns true.
++        ``workspace`` binds an arena-backed MLP's scratch, as ``forward`` does.
+         """
+         if (
+             self._determine_shared_experts_order(shared_experts_input)
+@@ -156,7 +161,7 @@ class SharedExperts(torch.nn.Module):
+         assert self._output[idx] is None
+         shared_experts_input.record_stream(self._stream)
+         self._input_ready_event[idx].record(current_stream())
+-        with torch.cuda.stream(self._stream):
++        with torch.cuda.stream(self._stream), use_preallocated_workspace(workspace):
+             self._input_ready_event[idx].wait(self._stream)
+             self._output[idx] = self._layer(shared_experts_input)
+             self._output_ready_event[idx].record(self._stream)
+@@ -204,6 +209,13 @@ class SharedExperts(torch.nn.Module):
+         assert output is not None
+         output.record_stream(current_stream())
+ 
++    def wait_output(self) -> torch.Tensor:
++        """``wait``, then the finished output, left in place for ``output``."""
++        self.wait()
++        output = self.peek_output()
++        assert output is not None
++        return output
++
+     @property
+     def _output_idx(self) -> int:
+         return dbo_current_ubatch_id() if self.enable_dbo else 0
+diff --git a/vllm/model_executor/layers/fused_moe/tilelang.py b/vllm/model_executor/layers/fused_moe/tilelang.py
+index 544ab3824..8425d1872 100644
+--- a/vllm/model_executor/layers/fused_moe/tilelang.py
++++ b/vllm/model_executor/layers/fused_moe/tilelang.py
+@@ -18,6 +18,8 @@ step uses atomics on results, so a token's output does not depend on the
+ rest of the batch.
+ """
+ 
++from collections.abc import Callable
++
+ import torch
+ 
+ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+@@ -146,10 +148,15 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         return TopKWeightAndReduceNoOP()
+ 
+     # Set by the MoE runner around one call whose shared expert runs before the
+-    # routed experts: the combine adds ``combine_addend`` (the shared expert's
+-    # output) to the FP32 sum and rounds the rank's partial once, in BF16 out.
++    # routed experts, or beside them on the aux stream: the combine adds
++    # ``combine_addend`` (the shared expert's output, or a callable that waits for
++    # it and returns it) to the FP32 sum and rounds the rank's partial once, in
++    # BF16 out.
+     fold_shared: bool = False
+-    combine_addend: torch.Tensor | None = None
++    combine_addend: torch.Tensor | Callable[[], torch.Tensor] | None = None
++    # The plan resolves a callable addend just before its combine launch, so an
++    # aux-stream shared expert overlaps the routed experts' GEMMs.
++    folds_deferred_shared_output: bool = True
+ 
+     @property
+     def folds_shared_output(self) -> bool:
+@@ -265,7 +272,7 @@ class TileLangExperts(mk.FusedMoEExpertsModular):
+         workspace = workspace2.view(-1).view(torch.uint8)
+         shared = None
+         if self.fold_shared:
+-            assert self.combine_addend is not None, "the shared output must be ready"
++            assert self.combine_addend is not None, "the shared output must be given"
+             shared = self.combine_addend
+         self._plan.run(
+             hidden_states, topk_ids, topk_weights, weights, output, workspace, shared
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index dd1723645..d0bd712d1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -906,7 +906,9 @@ class MoeExpertsV41Plan:
+         ``e`` is the token's k-th expert. ``weights`` comes from
+         ``prepare_weights``; ``workspace`` is a byte buffer of at least
+         ``workspace_bytes(workspace_specs(rows))``. ``shared`` (BF16 rows) is added
+-        to the FP32 sum before the one rounding to ``out``'s dtype.
++        to the FP32 sum before the one rounding to ``out``'s dtype; a callable
++        ``shared`` is called just before the combine launch (it may wait for
++        another stream) and returns those rows.
+         """
+         rows = x.shape[0]
+         dispatch = self.dispatch[topk_ids.dtype]
+@@ -928,6 +930,8 @@ class MoeExpertsV41Plan:
+         self.gate_up(xq, x_words, *_present(gate_up), order, tile_expert, h)
+         self.swiglu(h, hq, h_sf, layout["psum"], layout["layout_weights"], 1.0, None)
+         self.down(hq, h_words, *_present(down), order, tile_expert, y)
++        if callable(shared):
++            shared = shared()
+         return dispatch.combine(y, layout, out, shared=shared)
+ 
+ 

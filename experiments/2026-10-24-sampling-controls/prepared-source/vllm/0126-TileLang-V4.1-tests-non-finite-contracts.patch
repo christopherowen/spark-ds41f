@@ -1,0 +1,746 @@
+From 65225604b00c1db806a05fbc5e6cd027557486cb Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 08:43:12 +0100
+Subject: [PATCH 126/274] TileLang V4.1 tests: non-finite contracts
+
+DeepSeek's reference lets a NaN or an infinity through (torch.clamp, relu_,
+softmax), so the error that produced it stays visible. Add tolerance-free
+checks that the kernels do the same and that a poisoned row moves no other
+row:
+
+- exact NaN and signed-infinity positions against the reference for the
+  shared SwiGLU, the Engram gate, RoPE, the indexer scores, the BF16 GEMM
+  (split-K decode rows included) and sparse MLA;
+- a NaN row becomes an all-NaN row with every other row's bits unchanged
+  for the block-32 rows GEMM, the WO projection, mHC pre and the routed
+  experts;
+- sparse MLA reads no record it does not select: every unselected record,
+  record 0, the padding and the entries past each list's length hold 0xFF
+  bytes, and every route keeps the clean bits.
+
+The routed experts' NaN propagation is a strict xfail: TileKernels' fused
+SwiGLU clamps with T.min/T.max, which return the limit for a NaN.
+
+Sparse MLA's setup moves into _mla_case, with the generator calls in the
+same order, so test_sparse_mla draws the same inputs.
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index ce721f323..558b3bc2e 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -18,6 +18,11 @@ if not (
+ 
+ tilelang = pytest.importorskip("tilelang")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    assert_other_rows_equal,
++    assert_rows_nan,
++    assert_same_nonfinite,
++)
+ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
+     CANDIDATE_BLOCK,
+     CANDIDATE_BLOCKS,
+@@ -307,6 +312,41 @@ def test_indexer_dense(context, page_size=64, rows=4):
+     assert torch.equal(out, expected)
+ 
+ 
++def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
++    """An infinite index query quantizes to the UE8M0 scale ``0xFF``, which makes its
++    head's dot NaN. DeepSeek's indexer takes ``relu_`` of the score and keeps the
++    NaN; ``max(dot, 0)`` would drop the head silently. The other rows keep their
++    bits."""
++    inp = _index_inputs(rows, context, page_size)
++    width = (context + page_size - 1) // page_size * page_size
++    plan = IndexerV41Plan(width, page_size)
++    names = (
++        "q_packed",
++        "q_scales",
++        "weights",
++        "pool",
++        "page_table",
++        "lengths",
++        "active",
++    )
++    _, scores = plan.run(*(inp[k] for k in names))
++    clean = scores.clone()
++    r, h = 1, 3
++    inp["q_scales"][r, h, 0] = 0xFF
++    inp["q_packed"][r, h, 0] = 0  # a zero code: 0 x inf is NaN in any order
++    inp["q_values"] = _decode_mxfp4(inp["q_packed"], inp["q_scales"])
++    _, scores = plan.run(*(inp[k] for k in names))
++    extent = _dense_extent(inp, width)
++    ref = _ref_scores(
++        inp, page_size, extent, lambda i: torch.arange(extent[i], device=DEVICE)
++    )
++    assert ref[r].isnan().all()
++    assert_same_nonfinite(scores[r, : extent[r]], ref[r], f"row {r}: ")
++    for i in range(rows):
++        if i != r:
++            assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
++
++
+ def test_indexer_candidates(page_size=64, rows=3, context=8192):
+     inp = _index_inputs(rows, context, page_size)
+     width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+@@ -492,12 +532,8 @@ def _ref_mla(q, swa, swa_idx, swa_len, sinks, idx=None, idx_slots=None, idx_len=
+     return out.bfloat16()
+ 
+ 
+-@pytest.mark.parametrize("idx_width", [0, 512])
+-# Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
+-@pytest.mark.parametrize("heads", [16, 24, 64])
+-def test_sparse_mla(
+-    idx_width, heads, rows=6, swa_width=128, swa_page=128, idx_page=128
+-):
++def _mla_case(idx_width, heads, rows, swa_width=128, swa_page=128, idx_page=128):
++    """Random queries, sinks, packed caches and selection lists for ``rows`` rows."""
+     gen = _gen(1)
+     swa_pages, idx_pages, idx_context = 24, 40, 4096
+     q = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+@@ -524,7 +560,10 @@ def test_sparse_mla(
+         heads, swa_width, idx_width, idx_page, swa_page_size=swa_page,
+         max_rows=rows, decode_max_rows=rows, split_max_rows=rows,
+     )  # fmt: skip
+-    indexed, ref_indexed = {}, {}
++    case = dict(
++        plan=plan, q=q, sinks=sinks, swa=swa, swa_idx=swa_idx, swa_len=swa_len,
++        swa_page=swa_page, idx_page=idx_page, idx=None,
++    )  # fmt: skip
+     if idx_width:
+         idx = _pack_idx(
+             torch.randn((idx_pages * idx_page, HEAD_DIM), generator=gen, device=DEVICE)
+@@ -538,24 +577,70 @@ def test_sparse_mla(
+                 for _ in range(rows)
+             ]
+         ).to(torch.int32)
+-        pages = table.long().gather(1, idx_logical.long().clamp_min(0) // idx_page)
+-        idx_slots = torch.where(
+-            idx_logical >= 0, pages * idx_page + idx_logical.long() % idx_page, -1
+-        )
++        case.update(idx=idx, idx_logical=idx_logical, idx_len=idx_len, table=table)
++    return case
++
++
++def _idx_slots(case, logical):
++    page = case["idx_page"]
++    pages = case["table"].long().gather(1, logical.long().clamp_min(0) // page)
++    return torch.where(logical >= 0, pages * page + logical.long() % page, -1)
++
++
++def _mla_run(case, swa_pool=None, idx_pool=None, swa_idx=None, idx_logical=None):
++    """Every route's output, from the case's caches unless pools are given."""
++    plan, rows = case["plan"], case["q"].shape[0]
++    indexed = {}
++    if case["idx"] is not None:
+         indexed = dict(
+-            idx_cache=_paged(idx, idx_page),
+-            idx_indices=idx_logical,
+-            idx_lengths=idx_len,
+-            idx_page_table=table,
++            idx_cache=_paged(case["idx"], case["idx_page"])
++            if idx_pool is None
++            else idx_pool,
++            idx_indices=case["idx_logical"] if idx_logical is None else idx_logical,
++            idx_lengths=case["idx_len"],
++            idx_page_table=case["table"],
+         )
+-        ref_indexed = dict(idx=idx, idx_slots=idx_slots, idx_len=idx_len)
+-    swa_pool = _paged(swa, swa_page)
++    pool = _paged(case["swa"], case["swa_page"]) if swa_pool is None else swa_pool
+     outs = {}
+     for kernel in plan.kernels:
+-        out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
+-        plan.run(q, swa_pool, swa_idx, swa_len, sinks, out, kernel=kernel, **indexed)
++        out = torch.empty(
++            (rows, case["q"].shape[1], HEAD_DIM), dtype=torch.bfloat16, device=DEVICE
++        )
++        plan.run(
++            case["q"],
++            pool,
++            case["swa_idx"] if swa_idx is None else swa_idx,
++            case["swa_len"],
++            case["sinks"],
++            out,
++            kernel=kernel,
++            **indexed,
++        )
+         outs[kernel] = out
+-    ref = _ref_mla(q, swa, swa_idx, swa_len, sinks, **ref_indexed)
++    return outs
++
++
++def _mla_ref(case, swa=None):
++    ref_indexed = {}
++    if case["idx"] is not None:
++        ref_indexed = dict(
++            idx=case["idx"],
++            idx_slots=_idx_slots(case, case["idx_logical"]),
++            idx_len=case["idx_len"],
++        )
++    swa = case["swa"] if swa is None else swa
++    return _ref_mla(
++        case["q"], swa, case["swa_idx"], case["swa_len"], case["sinks"], **ref_indexed
++    )
++
++
++@pytest.mark.parametrize("idx_width", [0, 512])
++# Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
++@pytest.mark.parametrize("heads", [16, 24, 64])
++def test_sparse_mla(idx_width, heads, rows=6):
++    case = _mla_case(idx_width, heads, rows)
++    outs = _mla_run(case)
++    ref = _mla_ref(case)
+     torch.testing.assert_close(
+         outs["extend"].float(), ref.float(), rtol=2e-2, atol=2e-2
+     )
+@@ -563,6 +648,88 @@ def test_sparse_mla(
+         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+ 
+ 
++def _selected(slots, lengths):
++    """The slots any row selects within its length."""
++    keep = torch.arange(slots.shape[1], device=DEVICE) < lengths[:, None].long()
++    return torch.unique(slots[keep & (slots >= 0)].long())
++
++
++def _poisoned_pool(records, page_size):
++    """``_paged`` with the padding and the other layers' pages all ``0xFF``."""
++    slots, record_bytes = records.shape
++    pages = slots // page_size
++    pool = _page_buffer(pages, page_size * record_bytes, fill=0xFF)
++    pool[:, : page_size * record_bytes] = records.view(pages, -1)
++    return pool
++
++
++@pytest.mark.parametrize("idx_width", [0, 512])
++def test_sparse_mla_reads_only_selected_records(idx_width, heads=16, rows=6):
++    """DeepSeek's ``sparse_attn`` loads zeros for slots it does not select. Here every
++    record no row selects is poisoned (``0xFF`` bytes: NaN payloads and the largest
++    scale), page 0, the padding and the other layers' pages included, and each list
++    points past its length at poisoned records: every route keeps the clean bits.
++    A masked record that reached the arithmetic would turn its row NaN, since a zero
++    weight times NaN is NaN."""
++    case = _mla_case(idx_width, heads, rows)
++    # Masked slots clamp to record 0, so no row may select it.
++    case["swa_idx"][case["swa_idx"] == 0] = -1
++    if idx_width:
++        case["idx_logical"][_idx_slots(case, case["idx_logical"]) == 0] = -1
++    clean = _mla_run(case)
++
++    def poison(records, used):
++        records = records.clone()
++        unused = torch.ones(records.shape[0], dtype=torch.bool, device=DEVICE)
++        unused[used] = False
++        assert unused[0]
++        records[unused] = 0xFF
++        return records, unused.nonzero().flatten()
++
++    swa, swa_unused = poison(case["swa"], _selected(case["swa_idx"], case["swa_len"]))
++    swa_idx = case["swa_idx"].clone()
++    past = torch.arange(swa_idx.shape[1], device=DEVICE) >= case["swa_len"][:, None]
++    swa_idx[past] = int(swa_unused[-1])
++    kwargs = dict(swa_pool=_poisoned_pool(swa, case["swa_page"]), swa_idx=swa_idx)
++    if idx_width:
++        used = _selected(_idx_slots(case, case["idx_logical"]), case["idx_len"])
++        idx, idx_unused = poison(case["idx"], used)
++        logical = case["idx_logical"].clone()
++        everything = torch.arange(
++            case["table"].shape[1] * case["idx_page"], device=DEVICE
++        )
++        physical = _idx_slots(case, everything.expand(rows, -1))
++        for r in range(rows):
++            # A logical position of this row whose record is poisoned.
++            spare = everything[torch.isin(physical[r], idx_unused[1:])][-1]
++            logical[r, int(case["idx_len"][r]) :] = int(spare)
++        kwargs.update(
++            idx_pool=_poisoned_pool(idx, case["idx_page"]), idx_logical=logical
++        )
++    for kernel, out in _mla_run(case, **kwargs).items():
++        assert torch.equal(out, clean[kernel]), f"{kernel} read an unselected record"
++
++
++def test_sparse_mla_selected_nan_reaches_its_rows(heads=16, rows=6):
++    """A NaN in a selected key makes every head of each row that selects it NaN, as
++    in the reference's softmax, and leaves the other rows' bits alone."""
++    case = _mla_case(0, heads, rows)
++    clean = _mla_run(case)
++    slot = int(case["swa_idx"][0, 0])
++    swa = case["swa"].clone()
++    swa[slot, 0] = 0x7F  # E4M3 NaN
++    keep = (
++        torch.arange(case["swa_idx"].shape[1], device=DEVICE) < case["swa_len"][:, None]
++    )
++    hit = ((case["swa_idx"] == slot) & keep).any(1).nonzero().flatten().tolist()
++    assert 0 in hit
++    ref = _mla_ref(case, swa)
++    for kernel, out in _mla_run(case, swa_pool=_paged(swa, case["swa_page"])).items():
++        assert_same_nonfinite(out, ref, f"{kernel}: ")
++        assert_rows_nan(out, hit, f"{kernel}: ")
++        assert_other_rows_equal(out, clean[kernel], hit, f"{kernel}: ")
++
++
+ # Heads per rank: TP4 (16), TP3 (24 of 72 padded).
+ @pytest.mark.parametrize("heads", [16, 24])
+ @pytest.mark.parametrize("keys", [1, 2, 3, 8])
+diff --git a/tests/kernels/deepseek_v41_contracts.py b/tests/kernels/deepseek_v41_contracts.py
+new file mode 100644
+index 000000000..95dc37345
+--- /dev/null
++++ b/tests/kernels/deepseek_v41_contracts.py
+@@ -0,0 +1,58 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Tolerance-free contracts for the DeepSeek-V4.1 kernels: non-finite values.
++
++DeepSeek's reference lets a NaN or an infinity through (``torch.clamp``, ``relu_``,
++``softmax``), so the error that produced it stays visible. A kernel that turns one
++into an ordinary number hides that error; among generated kernels that a loose
++``allclose`` accepted, it is the most common defect (Shah and Shrestha, "A
++Contract-Grade Verifier for LLM-Generated GPU Kernels", arXiv 2608.12700). These
++checks compare positions and bits, so no tolerance can explain a failure away:
++
++- a non-finite input gives non-finite outputs in exactly the reference's positions,
++  NaN for NaN and each infinity with its sign;
++- a poisoned row changes no other row's bits.
++"""
++
++import torch
++
++NAN, INF = float("nan"), float("inf")
++
++_KINDS = (("NaN", torch.isnan), ("+inf", torch.isposinf), ("-inf", torch.isneginf))
++
++
++def assert_same_nonfinite(got: torch.Tensor, want: torch.Tensor, what: str = ""):
++    """NaNs and signed infinities in exactly ``want``'s positions."""
++    assert got.shape == want.shape, (got.shape, want.shape)
++    got, want = got.float(), want.float()
++    for name, test in _KINDS:
++        g, w = test(got), test(want)
++        if not torch.equal(g, w):
++            where = (g != w).nonzero()[:4].tolist()
++            raise AssertionError(
++                f"{what}{name} in {int(g.sum())} positions, the reference in "
++                f"{int(w.sum())}; first differences at {where}"
++            )
++
++
++def assert_finite_equal(got: torch.Tensor, want: torch.Tensor, what: str = ""):
++    """Equal wherever ``want`` is finite (bit equality, as ``torch.equal``)."""
++    finite = torch.isfinite(want.float())
++    assert torch.equal(got[finite], want[finite]), f"{what}finite values differ"
++
++
++def assert_rows_nan(out: torch.Tensor, rows, what: str = ""):
++    """Every value of ``out[rows]`` is NaN."""
++    block = out[rows].float()
++    bad = int((~block.isnan()).sum())
++    assert bad == 0, f"{what}rows {rows}: {bad} of {block.numel()} values are not NaN"
++
++
++def assert_other_rows_equal(out: torch.Tensor, clean: torch.Tensor, rows, what=""):
++    """Rows outside ``rows`` keep the bits of the unpoisoned run."""
++    keep = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
++    keep[rows] = False
++    if not torch.equal(out[keep], clean[keep]):
++        changed = (out[keep] != clean[keep]).flatten(1).any(1).nonzero().flatten()
++        others = keep.nonzero().flatten()[changed][:8].tolist()
++        raise AssertionError(f"{what}poisoning rows {rows} changed rows {others}")
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+index 57dd87a08..510ebe3c6 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_moe.py
+@@ -15,6 +15,11 @@ if not (
+ pytest.importorskip("tilelang")
+ tile_kernels = pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    NAN,
++    assert_other_rows_equal,
++    assert_rows_nan,
++)
+ from vllm.models.deepseek_v4_1.tilelang.moe import (  # noqa: E402
+     MoeExpertsV41Plan,
+     workspace_bytes,
+@@ -71,14 +76,19 @@ def _routes(rows, num_experts, topk, seed, dtype):
+     return ids.contiguous(), weights.float().contiguous()
+ 
+ 
+-def _reference(x, ids, weights, w13, w2, intermediate):
+-    """FP32 experts over the kernels' MXFP8 tokens; the down input stays unquantized."""
++def _mxfp8_values(x):
++    """TileKernels' MXFP8 cast (a UE8M0 scale per 32 values), dequantized."""
+     xq, sf = tile_kernels.quant.per_token_cast(
+         x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+     )
+     # Rows of packed exponents are padded to whole words.
+     exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32]
+-    xd = xq.float() * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
++    return xq.float() * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
++
++
++def _reference(x, ids, weights, w13, w2, intermediate):
++    """FP32 experts over the kernels' MXFP8 tokens; the down input stays unquantized."""
++    xd = _mxfp8_values(x)
+     out = torch.zeros(x.shape, dtype=torch.float32, device=DEVICE)
+     for slot in range(ids.shape[1]):
+         e = ids[:, slot].long()
+@@ -221,3 +231,47 @@ def test_moe_experts_fold_deferred_shared(
+     plan.run(x, ids, route_weights, weights, deferred, shared=resolve)
+     assert calls == [1]
+     assert torch.equal(deferred, direct)
++
++
++def _case(rows, hidden=384, intermediate=576, num_experts=32, topk=6):
++    w13_packed, w13_sf, w13 = _experts(num_experts, 2 * intermediate, hidden, 1)
++    w2_packed, w2_sf, w2 = _experts(num_experts, hidden, intermediate, 2)
++    plan = MoeExpertsV41Plan(
++        num_experts, topk, hidden, intermediate, swiglu_limit=LIMIT
++    )
++    weights = plan.prepare_weights(w13_packed, w13_sf, w2_packed, w2_sf)
++    x = (torch.randn((rows, hidden), generator=_gen(3), device=DEVICE) * 0.5).bfloat16()
++    ids, route_weights = _routes(rows, num_experts, topk, 4, torch.int32)
++
++    def run(tokens):
++        out = torch.empty_like(tokens)
++        plan.run(tokens, ids, route_weights, weights, out)
++        return out
++
++    return run, x, ids, route_weights, w13, w2, intermediate
++
++
++@pytest.mark.parametrize("rows", [12, 300])
++def test_moe_experts_nan_token_stays_in_its_row(rows):
++    """A NaN in one token's input changes no other token's bits, though the expert
++    tiles mix tokens."""
++    run, x, *_ = _case(rows)
++    clean = run(x)
++    x[5, 17] = NAN
++    assert_other_rows_equal(run(x), clean, [5])
++
++
++@pytest.mark.xfail(
++    strict=True,
++    raises=AssertionError,
++    reason="TileKernels' fused SwiGLU (66258df, quant/swiglu_forward_cuda.py "
++    "210-211 and 264-265) clamps with T.min/T.max, which return the limit for a "
++    "NaN; DeepSeek's Expert.forward uses torch.clamp, which keeps it",
++)
++def test_moe_experts_nan_token_is_nan(rows=12):
++    """A NaN in a token's input reaches every output of that token, as in DeepSeek's
++    ``Expert.forward``."""
++    run, x, *_ = _case(rows)
++    x[5, 17] = NAN
++    assert_rows_nan(run(x), [5])
++
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 8c8692e76..fd5f6f3ac 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -15,6 +15,13 @@ if not (
+ pytest.importorskip("tilelang")
+ tile_kernels = pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_other_rows_equal,
++    assert_rows_nan,
++    assert_same_nonfinite,
++)
+ from vllm.models.deepseek_v4_1.tilelang.gemm import (  # noqa: E402
+     DECODE_ROWS,
+     DECODE_TILE_ROWS,
+@@ -283,6 +290,59 @@ def test_block32_rows(n=1792, k=5120, start=1280):
+         TileLangBlock32Rows(layer, start + 16)
+ 
+ 
++# The router splits K eight ways; (100, 200) cannot split.
++@pytest.mark.parametrize("n, k", [(384, 5120), (100, 200)])
++@pytest.mark.parametrize("rows", [7, 65])
++def test_bf16_gemm_nonfinite(n, k, rows):
++    """NaNs and signed infinities land where the FP32 product puts them, through the
++    split-K partials of decode rows too, and the other rows keep their bits."""
++    gen = _gen(9)
++    weight = torch.randn((n, k), generator=gen, device=DEVICE).bfloat16()
++    x = torch.randn((rows, k), generator=gen, device=DEVICE).bfloat16()
++    shards = bf16_shards(n, k)
++
++    def project(a):
++        out = torch.empty((rows, n), dtype=torch.float32, device=DEVICE)
++        if shards > 1 and rows <= DECODE_ROWS:
++            p = torch.empty((shards, rows, n), dtype=torch.float32, device=DEVICE)
++            bf16_gemm_partials(n, k, shards, block_M=16)(a, weight, p)
++            splitk_reduce(n, shards, out_dtype="float32")(p, out)
++        else:
++            bf16_gemm(n, k, out_dtype="float32", shards=shards)(a, weight, out)
++        return out
++
++    clean = project(x)
++    poisoned = [1, 3, 4]
++    x[1, 5], x[3, 7], x[4, 9] = NAN, INF, -INF
++    out = project(x)
++    assert_same_nonfinite(out, x.float() @ weight.float().T)
++    assert_other_rows_equal(out, clean, poisoned)
++
++
++def test_block32_rows_nan_row(n=1792, k=5120, start=1280):
++    """A NaN in one row's activations survives the MXFP8 cast and reaches every output
++    of that row, at split-K decode sizes and in the prefill GEMM, and no other row
++    moves."""
++    from torch import nn
++
++    from vllm.models.deepseek_v4_1.tilelang.linear import TileLangBlock32Rows
++    from vllm.v1.worker.workspace import use_preallocated_workspace
++
++    weight, exps, _ = _block32_weight(n, k, 6)
++    layer = nn.Module()
++    layer.weight, layer.weight_scale_inv = weight, exps
++    rows = TileLangBlock32Rows(layer, start)
++    scratch = torch.empty(16 << 20, dtype=torch.uint8, device=DEVICE)
++    for count in (7, 300):
++        x = torch.randn((count, k), generator=_gen(count), device=DEVICE).bfloat16()
++        with use_preallocated_workspace(scratch):
++            clean = rows(x).clone()
++            x[2, 11] = NAN
++            out = rows(x)
++        assert_rows_nan(out, [2], f"rows={count}: ")
++        assert_other_rows_equal(out, clean, [2], f"rows={count}: ")
++
++
+ @pytest.mark.parametrize("hidden", [128, 512, 4096])
+ def test_rmsnorm(hidden, rows=33, eps=1e-6):
+     gen = _gen(4)
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index 2b103f1d2..8f06c99f5 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -16,6 +16,11 @@ if not (
+ pytest.importorskip("tilelang")
+ tile_kernels = pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    NAN,
++    assert_other_rows_equal,
++    assert_rows_nan,
++)
+ from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
+     _block32_linear,
+     _prepare_block32,
+@@ -110,6 +115,34 @@ def test_wo_projection():
+         assert torch.equal(project(count), full[:count]), f"rows={count}"
+ 
+ 
++@pytest.mark.parametrize("count", [7, 97])
++def test_wo_projection_nan_row(count):
++    """A NaN in one head of one row's attention output makes that row's whole
++    projection NaN (WO-B mixes both groups) and leaves the other rows' bits."""
++    wo = TileLangWOProjection(
++        _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1),
++        _block32(HIDDEN, GROUPS * RANK, 2),
++        groups=GROUPS,
++    )
++    gen = _gen(13)
++    o = torch.randn((count, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
++    positions = torch.randint(0, 4096, (count,), generator=gen, device=DEVICE)
++    table = _table()
++    scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
++
++    def project(values):
++        out = torch.empty((count, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
++        with use_preallocated_workspace(scratch):
++            wo(values.clone(), positions, table, out)
++        return out
++
++    clean = project(o)
++    o[3, 5, 17] = NAN
++    out = project(o)
++    assert_rows_nan(out, [3])
++    assert_other_rows_equal(out, clean, [3])
++
++
+ @pytest.mark.parametrize("count", ROWS)
+ def test_grouped_gemm_equals_groups(count):
+     """One grouped launch gives each group's ordinary GEMM bit for bit."""
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_activation.py b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+index b1ab75a5d..80b5cd735 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_activation.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_activation.py
+@@ -15,6 +15,12 @@ if not (
+ 
+ pytest.importorskip("tilelang")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_finite_equal,
++    assert_same_nonfinite,
++)
+ from vllm.models.deepseek_v4_1.tilelang.activation import (  # noqa: E402
+     SiluAndMulClampFP32,
+ )
+@@ -49,3 +55,24 @@ def test_rows_independent_of_batch():
+     full = act(gate_up)
+     for rows in (1, 7, 64, 129):
+         assert torch.equal(act(gate_up[:rows]), full[:rows]), rows
++
++
++def test_nonfinite_like_the_reference():
++    """``torch.clamp`` passes a NaN through and saturates the infinities; a clamp
++    built on ``fminf``/``fmaxf`` would return the limit for a NaN and hide it."""
++    limit, n = 10.0, 512
++    generator = torch.Generator(device="cuda").manual_seed(5)
++    gate_up = (torch.randn(8, 2 * n, generator=generator, device="cuda") * 6).bfloat16()
++    for row, col, value in (
++        (0, 3, NAN),  # gate
++        (1, n + 5, NAN),  # up
++        (2, 7, INF),  # gate: silu(limit)
++        (3, 9, -INF),  # gate: silu(-inf) is NaN
++        (4, n + 11, INF),  # up saturates at the limit
++        (5, n + 13, -INF),
++    ):
++        gate_up[row, col] = value
++    out = SiluAndMulClampFP32(limit)(gate_up)
++    ref = _reference(gate_up, limit)
++    assert_same_nonfinite(out, ref)
++    assert_finite_equal(out, ref)
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram.py b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+index 8e8ad2dba..5248b3831 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+@@ -15,6 +15,11 @@ if not (
+ pytest.importorskip("tilelang")
+ tile_kernels = pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    NAN,
++    assert_other_rows_equal,
++    assert_same_nonfinite,
++)
+ from vllm.models.deepseek_v4_1.tilelang.engram import CLAMP, engram_gate  # noqa: E402
+ 
+ DEVICE = "cuda"
+@@ -79,3 +84,25 @@ def test_engram_gate(masked):
+         )
+         assert torch.equal(out[:rows], full[:rows]), f"rows={rows}"
+         assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
++
++
++@pytest.mark.parametrize("where", ["residual", "key", "value"])
++def test_nonfinite_like_the_reference(where):
++    """A NaN in a stream's residual or key makes its gate NaN, so the reference's
++    whole stream is NaN (``clamp_min`` passes it, unlike ``max(|dot|, CLAMP)``);
++    a NaN in the shared value reaches every stream at that channel."""
++    rows, t, h, d = 17, 5, 2, 100
++    x, kv, weight, _ = _inputs(rows, seed=5)
++    clean = torch.empty_like(x)
++    engram_gate(x, kv, weight, None, clean, EPS, HC)
++    if where == "residual":
++        x[t, h * DIM + d] = NAN
++    elif where == "key":
++        kv[t, h * DIM + d] = NAN
++    else:
++        kv[t, HC * DIM + d] = NAN
++    out = torch.empty_like(x)
++    engram_gate(x, kv, weight, None, out, EPS, HC)
++    ref = _reference(x, kv, weight, torch.zeros(rows, dtype=torch.bool, device=DEVICE))
++    assert_same_nonfinite(out, ref)
++    assert_other_rows_equal(out, clean, [t])
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 1922bea47..f5bdc9575 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -19,6 +19,11 @@ if not (
+ pytest.importorskip("tilelang")
+ pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    NAN,
++    assert_other_rows_equal,
++    assert_rows_nan,
++)
+ from vllm.models.deepseek_v4_1.tilelang.collectives import (  # noqa: E402
+     RankOrderParts,
+ )
+@@ -180,6 +185,21 @@ def test_rows_independent_of_batch(mhc):
+         assert torch.equal(a, b[70:71])
+ 
+ 
++def test_pre_nan_token(mhc):
++    """A NaN in one token's residual makes all of that token's mixes and its y NaN,
++    as the FP32 reference's softmax, Sinkhorn and norm do, and moves no other
++    token."""
++    tokens, t = 33, 7
++    residual, fn, scale, base, weight, incoming = _inputs(tokens, seed=11)
++    clean = [a.clone() for a in mhc.pre(residual, fn, scale, base, weight, incoming)]
++    residual = residual.clone()
++    residual[t, 2, 100] = NAN
++    actual = mhc.pre(residual, fn, scale, base, weight, incoming)
++    for name, got, before in zip(("post", "comb", "y", "pre"), actual[1:], clean[1:]):
++        assert_rows_nan(got, [t], f"{name}: ")
++        assert_other_rows_equal(got, before, [t], f"{name}: ")
++
++
+ @pytest.mark.parametrize("block_M", [16, 32])
+ def test_project_streams_partials(block_M):
+     tokens, k, splits = 37, 4 * HIDDEN, HIDDEN // BLOCK_H
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_rope.py b/tests/kernels/test_deepseek_v41_tilelang_rope.py
+index 8bf4fa6a1..e0bf09bff 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_rope.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_rope.py
+@@ -15,6 +15,13 @@ if not (
+ pytest.importorskip("tilelang")
+ tile_kernels = pytest.importorskip("tile_kernels")
+ 
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_finite_equal,
++    assert_other_rows_equal,
++    assert_same_nonfinite,
++)
+ from vllm.models.deepseek_v4_1.tilelang.rope import rope_  # noqa: E402
+ 
+ DEVICE = "cuda"
+@@ -65,3 +72,41 @@ def test_rope(heads, dim, ratio, inverse, rows=97):
+     part = x[:5].clone()
+     rope_(part, positions[:5], table, ratio, inverse)
+     assert torch.equal(part, out[:5])
++
++
++@pytest.mark.parametrize("heads, dim, ratio", [(16, 512, 1), (1, 128, 4)])
++@pytest.mark.parametrize("inverse", [False, True])
++def test_rope_nonfinite(heads, dim, ratio, inverse, rows=9):
++    """A NaN or an infinity in a rotated pair reaches both outputs of that pair as
++    the FP64 rotation's, a non-finite leading column stays put, and no other row
++    moves."""
++    gen = torch.Generator(device=DEVICE).manual_seed(heads + dim)
++    x = torch.randn((rows, heads, dim), generator=gen, device=DEVICE).bfloat16()
++    positions = torch.randint(1, POSITIONS, (rows,), generator=gen, device=DEVICE)
++    table = _table()
++
++    def rotate(values):
++        out = values.clone()
++        flat = out if heads > 1 else out.view(rows, dim)
++        rope_(flat, positions, table, ratio, inverse)
++        return out
++
++    clean = rotate(x)
++    poisoned = [2, 5, 6, 7]
++    x[2, 0, dim - ROPE + 4] = NAN
++    x[5, -1, dim - ROPE + 9] = INF
++    x[6, 0, dim - 1] = -INF
++    x[7, 0, 3] = NAN  # a leading column
++    out = rotate(x)
++    cos, sin = table.double()[positions // ratio * ratio].chunk(2, dim=-1)
++    sin = -sin if inverse else sin
++    pairs = x[..., -ROPE:].double().unflatten(-1, (ROPE // 2, 2))
++    first, second = pairs[..., 0], pairs[..., 1]
++    cos, sin = cos[:, None], sin[:, None]
++    ref = x.double()
++    ref[..., -ROPE:] = torch.stack(
++        (first * cos - second * sin, first * sin + second * cos), -1
++    ).flatten(-2)
++    assert_same_nonfinite(out, ref)
++    assert_finite_equal(out[..., :-ROPE], x[..., :-ROPE])
++    assert_other_rows_equal(out, clean, poisoned)

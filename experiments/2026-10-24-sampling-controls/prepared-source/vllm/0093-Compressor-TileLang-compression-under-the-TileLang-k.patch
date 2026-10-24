@@ -1,0 +1,87 @@
+From 3338964b3e971b5457a57f7440601c19453960d7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:34:34 +0200
+Subject: [PATCH 093/274] Compressor: TileLang compression under the TileLang
+ kernel backend
+
+The compressor's carry gather, pooling, norm and ring save run the two TileLang
+launches instead of vLLM's two Triton ring kernels and B12X's mla_compress; the
+kernels compile at preparation. B12X's preparation still allocates the
+compressor's buffers.
+
+(cherry picked from commit fa7be7d637517622d79110b987649bbe7c87fb7c)
+
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 07ecf5294..ae2da9ec5 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -380,6 +380,8 @@ class DeepseekCompressor(nn.Module):
+ 
+         def make_call(state):
+             self._ensure_capacity_buffers(state.caps)
++            if kernels.uses_tilelang():
++                self._prepare_tilelang(state.caps.device)
+             binding = self._primer_binding(state)
+             return PreparedCall(
+                 run=lambda: state.run(binding),
+@@ -424,6 +426,50 @@ class DeepseekCompressor(nn.Module):
+             ),
+         )
+ 
++    def _prepare_tilelang(self, device) -> None:
++        """Compile the TileLang compression kernels (and ratio 1's placeholder)
++        at preparation, never during graph capture."""
++        from vllm.models.deepseek_v4_1.tilelang import compress as tl
++
++        if self.compress_ratio == 2:
++            page = self.state_cache.block_size
++            tl.compress_kernel(2, self.requests, page)
++            tl.gather_partial_state_kernel(self.requests, page)
++        else:
++            tl.compress_kernel(1, self.requests, 1)
++            tl.placeholder(self.requests, device)
++
++    def _forward_tilelang(self, rows, metadata, state_metadata):
++        """The TileLang compression: at ratio 2 the requests' carries from the state
++        ring, then one launch over the step's rows that also saves the ring."""
++        from vllm.models.deepseek_v4_1.tilelang import compress as tl
++
++        if self.compress_ratio == 1:
++            tl.compress(
++                rows, 1, self._values, None, self.norm.weight,
++                metadata.query_start_loc, metadata.request_positions, self._row_ids,
++                metadata.slot_mapping, metadata.live_counts, self._latent,
++                self._emitted, self._slots,
++            )  # fmt: skip
++            return
++        if state_metadata is None:
++            raise RuntimeError("ratio2 compression requires request-state metadata")
++        pool, page = self.state_cache.kv_cache, state_metadata.block_size
++        tl.gather_partial_state(
++            pool, state_metadata.block_table, state_metadata.query_start_loc,
++            state_metadata.request_positions, state_metadata.live_counts,
++            self._pending_values, self._pending_gates, self._pending_tags,
++            self._local_ids, page=page,
++        )  # fmt: skip
++        tl.compress(
++            rows, 2, self._values, self._gates, self.norm.weight,
++            metadata.query_start_loc, metadata.request_positions, self._local_ids,
++            metadata.slot_mapping, metadata.live_counts, self._latent, self._emitted,
++            self._slots, pending_values=self._pending_values,
++            pending_gates=self._pending_gates, tags=self._pending_tags, pool=pool,
++            state_slots=state_metadata.slot_mapping, page=page,
++        )  # fmt: skip
++
+     def forward(self, hidden_states, metadata, state_metadata=None):
+         if self._plan is None or self._plan.prepared is None:
+             raise PreparationResourceUnavailableError(
+@@ -431,6 +477,9 @@ class DeepseekCompressor(nn.Module):
+             )
+         rows = hidden_states.shape[0]
+         self._project(hidden_states)
++        if kernels.uses_tilelang():
++            self._forward_tilelang(rows, metadata, state_metadata)
++            return self._latent[:rows], self._slots[:rows]
+         if self.compress_ratio == 2:
+             if state_metadata is None:
+                 raise RuntimeError("ratio2 compression requires request-state metadata")

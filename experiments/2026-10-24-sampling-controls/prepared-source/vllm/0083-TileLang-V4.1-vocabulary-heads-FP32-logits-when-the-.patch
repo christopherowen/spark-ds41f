@@ -1,0 +1,211 @@
+From 187df876314f67b4c57e48b3915b2697b90a4301 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 09:15:55 +0200
+Subject: [PATCH 083/274] TileLang V4.1 vocabulary heads: FP32 logits when the
+ head dtype is FP32
+
+The packed and BF16 TileLang heads accumulate in FP32; with an FP32 head dtype
+(DeepSeek's reference head, upstream's default) they now write FP32 logits
+instead of the logits processor widening BF16 ones from another path. Heads
+compile for the model config's head dtype; the model dtype keeps BF16 logits.
+
+(cherry picked from commit 93eb6686ca524eaaf631b2ffb7f4346b909d73ef)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+index 7a857ff6b..65602b7e5 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_vocab.py
+@@ -180,3 +180,54 @@ def test_logits_processor_projects_prepared_heads():
+     logits = processor._apply_head(layer, hidden, None)
+     expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
+     assert torch.equal(logits, expected)
++
++
++@pytest.mark.parametrize("rows", [1, 6, 48, 130])
++def test_packed_head_writes_fp32_logits(rows):
++    """FP32 logits are the BF16 head's accumulator unrounded: rounding them gives the
++    BF16 head's bits, and they sit closer to an FP64 reference."""
++    n, k = 1000, 512
++    weight = _head(n, k, seed=5)
++    bf16, fp32 = _packed_layer(weight), _packed_layer(weight)
++    prepare_packed_head(bf16)
++    prepare_packed_head(fp32, torch.float32)
++    x = (torch.randn(rows, k, device=DEVICE) * 0.5).bfloat16()
++    low, full = project_head(bf16, x), project_head(fp32, x)
++    assert full.dtype == torch.float32 and full.shape == (rows, n)
++    assert torch.equal(full.bfloat16(), low)
++    reference = x.double() @ weight.double().T
++    assert (full.double() - reference).abs().max() <= (
++        low.double() - reference
++    ).abs().max()
++
++
++def test_bf16_head_writes_fp32_logits_batch_invariant():
++    n, k = 32320, 256
++    generator = torch.Generator(device=DEVICE).manual_seed(9)
++    weight = (torch.randn(n, k, generator=generator, device=DEVICE) * 0.05).bfloat16()
++    bf16, fp32 = SimpleNamespace(weight=weight), SimpleNamespace(weight=weight)
++    prepare_bf16_head(bf16)
++    prepare_bf16_head(fp32, torch.float32)
++    x = torch.randn(130, k, device=DEVICE).bfloat16()
++    full = project_head(fp32, x)
++    assert full.dtype == torch.float32
++    assert torch.equal(full.bfloat16(), project_head(bf16, x))
++    for rows in (1, 5, 16, 17, 33, 64):
++        assert torch.equal(project_head(fp32, x[:rows]), full[:rows]), rows
++
++
++def test_logits_processor_projects_fp32_heads():
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
++
++    processor = LogitsProcessor.__new__(LogitsProcessor)
++    torch.nn.Module.__init__(processor)
++    processor.head_dtype = torch.float32
++    processor.use_tilelang_vocab_projection = True
++    n, k = 1000, 512
++    layer = _packed_layer(_head(n, k, seed=13))
++    prepare_packed_head(layer, torch.float32)
++    hidden = (torch.randn(2, 3, k, device=DEVICE) * 0.5).bfloat16()
++    logits = processor._apply_head(layer, hidden, None)
++    assert logits.dtype == torch.float32
++    expected = project_head(layer, hidden.reshape(-1, k)).reshape(2, 3, n)
++    assert torch.equal(logits, expected)
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index 6f8dd0a35..30634cd78 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -162,7 +162,7 @@ class LogitsProcessor(PluggableLayer):
+             ):
+                 from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_bf16_head
+ 
+-                prepare_bf16_head(lm_head)
++                prepare_bf16_head(lm_head, self.head_dtype or lm_head.weight.dtype)
+             return
+         if _is_packed_head(lm_head):
+             if (
+@@ -365,6 +365,20 @@ class LogitsProcessor(PluggableLayer):
+         embedding_bias: torch.Tensor | None,
+     ) -> torch.Tensor:
+         """Project hidden states through the lm_head, honoring head_dtype."""
++        if (
++            self.use_tilelang_vocab_projection
++            and embedding_bias is None
++            and hasattr(lm_head, "tilelang_vocab")
++            and getattr(lm_head, "tilelang_vocab_dtype", hidden_states.dtype)
++            == (self.head_dtype or hidden_states.dtype)
++        ):
++            # TileLang heads accumulate in FP32 and write the head dtype directly:
++            # FP32 logits from the exact packed or BF16 weights, not widened BF16.
++            from vllm.models.deepseek_v4_1.tilelang.vocab import project_head
++
++            flat = hidden_states.reshape(-1, hidden_states.shape[-1])
++            logits = project_head(lm_head, flat)
++            return logits.reshape(*hidden_states.shape[:-1], -1)
+         if self.head_dtype is None or self.head_dtype == hidden_states.dtype:
+             if (
+                 self.use_tilelang_vocab_projection
+diff --git a/vllm/model_executor/layers/quantization/online/packed_bf16.py b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+index c82d64785..73433aecb 100644
+--- a/vllm/model_executor/layers/quantization/online/packed_bf16.py
++++ b/vllm/model_executor/layers/quantization/online/packed_bf16.py
+@@ -94,7 +94,12 @@ class PackedBf16LmHeadMethod(QuantizeMethodBase):
+         if self.tilelang:
+             from vllm.models.deepseek_v4_1.tilelang.vocab import prepare_packed_head
+ 
+-            prepare_packed_head(layer)
++            # The model's head dtype: FP32 logits as DeepSeek's reference head, or
++            # the model dtype.
++            model_config = get_current_vllm_config().model_config
++            prepare_packed_head(
++                layer, model_config.head_dtype if model_config else torch.bfloat16
++            )
+         logger.info_once(
+             "Packed the BF16 LM head exactly into 12 bits per weight: "
+             "exponents %d..%d, %d out-of-window values kept exactly per shard.",
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vocab.py b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+index eef0fd8d0..ac3dc4a89 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/vocab.py
++++ b/vllm/models/deepseek_v4_1/tilelang/vocab.py
+@@ -97,8 +97,10 @@ def packed_vocab_projection(
+     num_stages: int = 3,
+     threads: int = 128,
+     step_groups: int = 1,
++    out_dtype: T.dtype = T.bfloat16,
+ ):
+-    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and the packed ``W``.
++    """``C[M, N] = A @ W^T`` for BF16 ``A[M, K]`` and the packed ``W``, accumulated
++    in FP32 and written as ``out_dtype`` (FP32 keeps the reference head's logits).
+ 
+     Each pipeline step loads ``step_groups`` consecutive groups: longer
+     contiguous runs of each row's bytes and codes.
+@@ -123,7 +125,7 @@ def packed_vocab_projection(
+         exception_rows: T.Tensor((E,), T.int32),
+         exception_entries: T.Tensor((E,), T.int32),
+         row_offsets: T.Tensor((N + 1,), T.int32),
+-        C: T.Tensor((M, N), T.bfloat16),
++        C: T.Tensor((M, N), out_dtype),
+     ):
+         with T.Kernel(
+             T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads
+@@ -198,39 +200,54 @@ def packed_vocab_projection(
+     return main
+ 
+ 
+-def prepare_packed_head(layer: nn.Module) -> None:
+-    """Compile a packed head's projection for every token tile."""
++_OUT = {torch.bfloat16: T.bfloat16, torch.float32: T.float32}
++
++
++def prepare_packed_head(
++    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
++) -> None:
++    """Compile a packed head's projection for every token tile, writing ``out_dtype``
++    logits (BF16, or FP32 as DeepSeek's reference head computes them)."""
+     n, k = int(layer.weight.shape[0]), layer.packed_bf16_in_features
++    layer.tilelang_vocab_dtype = out_dtype
+     layer.tilelang_vocab = {
+         block_M: packed_vocab_projection(
+             n,
+             k,
+             layer.packed_bf16_exponent_base,
+             block_M=block_M,
++            out_dtype=_OUT[out_dtype],
+             **tile_config(block_M, k),
+         )
+         for block_M in ROW_TILES
+     }
+ 
+ 
+-def prepare_bf16_head(layer: nn.Module) -> None:
+-    """Compile a BF16 head's projection for every token tile."""
++def prepare_bf16_head(
++    layer: nn.Module, out_dtype: torch.dtype = torch.bfloat16
++) -> None:
++    """Compile a BF16 head's projection for every token tile, writing ``out_dtype``."""
+     n, k = map(int, layer.weight.shape)
+     kernels = {}
+     for block_M in ROW_TILES:
+         config = dict(BF16_HEAD_CONFIGS[block_M])
+         if k % config["block_K"]:
+             config["block_K"] = 64
+-        kernels[block_M] = bf16_gemm(n, k, block_M=block_M, num_stages=2, **config)
++        kernels[block_M] = bf16_gemm(
++            n, k, block_M=block_M, num_stages=2, out_dtype=_OUT[out_dtype], **config
++        )
++    layer.tilelang_vocab_dtype = out_dtype
+     layer.tilelang_vocab = kernels
+ 
+ 
+ def project_head(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
+-    """BF16 logits of ``x[rows, K]`` through a prepared head."""
++    """Logits of ``x[rows, K]`` through a prepared head, in its prepared dtype."""
+     x = x.contiguous()
+     rows = x.shape[0]
+     out = torch.empty(
+-        (rows, layer.weight.shape[0]), dtype=torch.bfloat16, device=x.device
++        (rows, layer.weight.shape[0]),
++        dtype=getattr(layer, "tilelang_vocab_dtype", torch.bfloat16),
++        device=x.device,
+     )
+     kernel = layer.tilelang_vocab[row_tile(rows)]
+     if hasattr(layer, "packed_bf16_exponent_base"):

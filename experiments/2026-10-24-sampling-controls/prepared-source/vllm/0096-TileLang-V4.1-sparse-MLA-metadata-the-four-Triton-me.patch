@@ -1,0 +1,488 @@
+From 3cf39adaa94453125306adb9b71ab5557816c379 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 12:44:40 +0200
+Subject: [PATCH 096/274] TileLang V4.1 sparse-MLA metadata: the four Triton
+ metadata kernels, exact
+
+sparse_mla._requests and _tokens and attention._chunk and _pages as TileLang
+kernels with the same contracts element for element: request starts,
+positions and counts; per-token request, position, slot (ring rows bounded to
+a request's last ring-size rows) and visible length over the first
+ceil(nt / 128) blocks; sliding-window pages, lengths and top-k lengths;
+page tables with block 0 and holes as -1. Integer arithmetic only, with
+Triton's truncating division. Tests compare every output with the Triton
+kernels over packed steps with empty and negative-position requests,
+padding, holes, ring and paged groups, draft and replay windows.
+
+(cherry picked from commit 6fdb42e28014ad2bfdcef418c51f2c3246cca673)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+new file mode 100644
+index 000000000..9c45e58a1
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -0,0 +1,161 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1 TileLang sparse-MLA metadata against the Triton kernels, exactly."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm.models.deepseek_v4_1.attention import _chunk, _pages  # noqa: E402
++from vllm.models.deepseek_v4_1.sparse_mla import _requests, _tokens  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import metadata  # noqa: E402
++from vllm.triton_utils import triton  # noqa: E402
++
++DEVICE = "cuda"
++R, CAP, COLS = 16, 1024, 40
++
++
++def _step(lengths, seed, padding=5):
++    g = torch.Generator().manual_seed(seed)
++    starts = [0]
++    for n in lengths:
++        starts.append(starts[-1] + n)
++    nr, nt = len(lengths), starts[-1] + padding
++    qsl = torch.full((R + 1,), starts[-1], dtype=torch.int32)
++    qsl[: nr + 1] = torch.tensor(starts, dtype=torch.int32)
++    seq = torch.zeros(R, dtype=torch.int32)
++    seq[:nr] = torch.tensor([n + int(torch.randint(0, 900, (1,), generator=g))
++                             for n in lengths], dtype=torch.int32)  # fmt: skip
++    seq[1 % max(nr, 1)] = 0 if nr > 1 else seq[0]  # a negative first position
++    table = torch.randint(0, 500, (R, COLS + 8), generator=g, dtype=torch.int32)
++    table[:, 3] = 0  # holes
++    slots = torch.randint(-1, 10**6, (CAP,), generator=g)
++    tensors = dict(qsl=qsl, seq=seq, table=table[:, :COLS], slots=slots)
++    return {k: v.to(DEVICE) for k, v in tensors.items()}, nr, nt
++
++
++STEPS = [[1], [6] * 16, [3, 0, 5, 1, 2, 6], [700], [200, 1, 300]]
++
++
++@pytest.mark.parametrize("lengths", STEPS)
++def test_requests(lengths):
++    s, nr, nt = _step(lengths, seed=len(lengths))
++    outs = []
++    for impl in ("triton", "tilelang"):
++        out_starts = torch.full((R + 1,), 7, dtype=torch.int32, device=DEVICE)
++        pos = torch.full((R,), 7, dtype=torch.int64, device=DEVICE)
++        counts = torch.full((2,), 7, dtype=torch.int32, device=DEVICE)
++        if impl == "triton":
++            _requests[(triton.cdiv(R + 1, 128),)](
++                s["qsl"], s["seq"], out_starts, pos, counts, nr, nt, R, 128
++            )
++        else:
++            metadata.requests(s["qsl"], s["seq"], out_starts, pos, counts, nr, nt)
++        outs.append((out_starts, pos, counts))
++    for a, b in zip(*outs):
++        assert torch.equal(a, b)
++
++
++TOKEN_CASES = [(64, 1, False), (64, 4, False), (32, 2, False), (8, 2, True)]
++
++
++@pytest.mark.parametrize("lengths", STEPS)
++@pytest.mark.parametrize("page, ratio, circular", TOKEN_CASES)
++def test_tokens(lengths, page, ratio, circular):
++    s, nr, nt = _step(lengths, seed=page + ratio + len(lengths))
++    outs = []
++    for impl in ("triton", "tilelang"):
++        pos = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
++        reqs = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++        slots = torch.full((CAP,), 7, dtype=torch.int64, device=DEVICE)
++        visible = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++        if impl == "triton":
++            _tokens[(max(1, triton.cdiv(nt, 128)),)](
++                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
++                nr, nt, s["table"].stride(0), s["table"].shape[1], CAP, page, ratio,
++                128, circular,
++            )  # fmt: skip
++        else:
++            metadata.tokens(
++                s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible,
++                nr, nt, max_requests=R, page=page, ratio=ratio, circular=circular,
++            )  # fmt: skip
++        outs.append((pos, reqs, slots, visible))
++    for a, b in zip(*outs):
++        assert torch.equal(a, b)
++
++
++def _token_metadata(s, nr, nt, page):
++    pos = torch.empty(CAP, dtype=torch.int64, device=DEVICE)
++    reqs = torch.empty(CAP, dtype=torch.int32, device=DEVICE)
++    slots = torch.empty(CAP, dtype=torch.int64, device=DEVICE)
++    visible = torch.empty(CAP, dtype=torch.int32, device=DEVICE)
++    metadata.tokens(
++        s["qsl"], s["seq"], s["table"], s["slots"], pos, reqs, slots, visible, nr, nt,
++        max_requests=R, page=page, ratio=1, circular=False,
++    )  # fmt: skip
++    return pos, reqs, visible
++
++
++@pytest.mark.parametrize("lengths", STEPS)
++@pytest.mark.parametrize(
++    "draft, replay", [(False, False), (False, True), (True, False)]
++)
++@pytest.mark.parametrize("width", [128, 136])
++def test_chunk(lengths, draft, replay, width):
++    page, window = 64, 128
++    s, nr, nt = _step(lengths, seed=width + 3 * draft + replay)
++    pos, reqs, visible = _token_metadata(s, nr, nt, page)
++    request_positions = torch.randint(-5, 900, (R,), device=DEVICE)
++    replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
++    rows, offset = min(nt, 600), 3 if nt > 10 else 0
++    rows = min(rows, nt - offset)
++    outs = []
++    for impl in ("triton", "tilelang"):
++        swa = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
++        lengths_out = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++        top = torch.full((CAP,), 7, dtype=torch.int32, device=DEVICE)
++        if impl == "triton":
++            _chunk[(rows,)](
++                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
++                request_positions, offset, s["table"].stride(0), page, window, width,
++                draft, triton.next_power_of_2(width), swa_replay_start=replay_start,
++            )  # fmt: skip
++        else:
++            metadata.chunk(
++                pos, reqs, s["table"], swa, lengths_out, top, visible, s["qsl"],
++                request_positions, offset, rows, page=page, window=window, draft=draft,
++                replay_start=replay_start,
++            )  # fmt: skip
++        outs.append((swa, lengths_out, top))
++    for a, b in zip(*outs):
++        assert torch.equal(a, b)
++
++
++@pytest.mark.parametrize("lengths", STEPS)
++@pytest.mark.parametrize("width, read_width", [(128, COLS), (256, 30), (40, 40)])
++def test_pages(lengths, width, read_width):
++    s, nr, nt = _step(lengths, seed=width + read_width)
++    _, reqs, _ = _token_metadata(s, nr, nt, 64)
++    rows, offset = min(nt, 500), 2 if nt > 4 else 0
++    rows = min(rows, nt - offset)
++    outs = []
++    for impl in ("triton", "tilelang"):
++        out = torch.full((CAP, width), 7, dtype=torch.int32, device=DEVICE)
++        if impl == "triton":
++            _pages[(rows, triton.cdiv(width, 128))](
++                reqs, s["table"], out, offset, s["table"].stride(0), read_width,
++                width, 128,
++            )  # fmt: skip
++        else:
++            metadata.pages(reqs, s["table"], out, offset, rows, read_width)
++        outs.append(out)
++    assert torch.equal(outs[0], outs[1])
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+new file mode 100644
+index 000000000..228986641
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -0,0 +1,297 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang sparse-MLA metadata for DeepSeek-V4.1: integer kernels, exact.
++
++The same contracts as the Triton kernels they replace (``sparse_mla._requests``,
++``_tokens``, ``attention._chunk`` and ``_pages``), element for element, including
++which rows each launch writes:
++
++- ``requests``: request starts (``nt`` past the live requests), each request's first
++  position (``seq - query``, -1 past them) and the live counts ``[nt, nr]``.
++- ``tokens``: per token its request, position, ring or paged slot (-1 unless the
++  state is emitted) and visible compressed length, over the rows of the first
++  ``ceil(nt / 128)`` blocks of 128 (the readable domain; capacity rows past it keep
++  their contents).
++- ``chunk``: per row its sliding-window page indices (-1 holes), window length and
++  top-k length.
++- ``pages``: per row its request's page table, block 0 and holes as -1.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++import tilelang
++import tilelang.language as T
++
++_PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
++_BLOCK = 128
++_TOP = 512  # top-k length cap
++
++
++def _search_steps(requests: int) -> int:
++    """Binary-search iterations over ``requests`` (+1 for the empty tail)."""
++    return max(1, (requests + 1).bit_length())
++
++
++@tilelang.jit(pass_configs=_PASS)
++def requests_kernel(max_requests: int):
++    starts_len = T.dynamic("starts_len")
++    seq_len = T.dynamic("seq_len")
++
++    @T.prim_func
++    def requests(
++        starts: T.Tensor((starts_len,), T.int32),
++        seq: T.Tensor((seq_len,), T.int32),
++        out_starts: T.Tensor((max_requests + 1,), T.int32),
++        positions: T.Tensor((max_requests,), T.int64),
++        counts: T.Tensor((2,), T.int32),
++        nr: T.int32,
++        nt: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(max_requests + 1, _BLOCK), threads=_BLOCK) as bx:
++            r = bx * _BLOCK + T.get_thread_binding()
++            if r <= max_requests:
++                start = T.if_then_else(r <= nr, starts[r], nt)
++                end = T.if_then_else(r < nr, starts[r + 1], nt)
++                out_starts[r] = start
++                if r < max_requests:
++                    positions[r] = T.if_then_else(
++                        r < nr,
++                        T.Cast(T.int64, seq[r] - (end - start)),
++                        T.int64(-1),
++                    )
++            if r == 0:
++                counts[0] = nt
++                counts[1] = nr
++
++    return requests
++
++
++@tilelang.jit(pass_configs=_PASS)
++def tokens_kernel(max_requests: int, page: int, ratio: int, circular: bool):
++    cover = T.dynamic("cover")  # rows written: the first ceil(nt / 128) blocks
++    starts_len = T.dynamic("starts_len")
++    seq_len = T.dynamic("seq_len")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++    slot_rows = T.dynamic("slot_rows")
++    steps = _search_steps(max_requests)
++
++    @T.prim_func
++    def tokens(
++        starts: T.Tensor((starts_len,), T.int32),
++        seq: T.Tensor((seq_len,), T.int32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        input_slots: T.Tensor((slot_rows,), T.int64),
++        positions: T.Tensor((cover,), T.int64),
++        reqs: T.Tensor((cover,), T.int32),
++        slots: T.Tensor((cover,), T.int64),
++        visible: T.Tensor((cover,), T.int32),
++        nr: T.int32,
++        nt: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(cover, _BLOCK), threads=_BLOCK) as bx:
++            t = bx * _BLOCK + T.get_thread_binding()
++            bounds = T.alloc_local((2,), T.int32)
++            if t < cover:
++                # The request whose rows contain t (Triton's upper-bound search).
++                bounds[0] = 0
++                bounds[1] = nr
++                for _ in T.serial(steps):
++                    if bounds[0] < bounds[1]:
++                        mid = (bounds[0] + bounds[1]) // 2
++                        end_mid = T.if_then_else(mid < nr, starts[mid + 1], nt)
++                        if end_mid <= t:
++                            bounds[0] = mid + 1
++                        else:
++                            bounds[1] = mid
++                lo = bounds[0]
++                live = (t < nt) & (lo < nr)
++                start = T.if_then_else(live, starts[lo], 0)
++                end = T.if_then_else(live, starts[lo + 1], 0)
++                sq = T.if_then_else(live, seq[lo], 0)
++                pos = T.Cast(T.int64, sq) - T.Cast(T.int64, end - start) + (t - start)
++                input_slot = T.if_then_else(t < nt, input_slots[t], T.int64(-1))
++                if circular:
++                    valid0 = live & (pos >= 0)
++                else:
++                    valid0 = live & (pos >= 0) & (input_slot >= 0)
++                logical = T.truncdiv(pos, ratio)
++                page_col = T.int64(0) if circular else T.truncdiv(logical, page)
++                valid1 = valid0 & (page_col < table_cols)
++                block = T.if_then_else(
++                    valid1, T.Cast(T.int64, table[lo, page_col]), T.int64(0)
++                )
++                valid = valid1 & (block > 0)
++                slot = block * page + T.truncmod(logical, page)
++                emit = valid & (T.truncmod(pos + 1, ratio) == 0)
++                if circular:
++                    # Only a request's last ring-size rows take a ring slot: the
++                    # earlier rows of a long chunk would share them.
++                    emit = emit & (t >= end - page)
++                positions[t] = T.if_then_else(valid, pos, T.int64(-1))
++                reqs[t] = T.if_then_else(valid, lo, -1)
++                slots[t] = T.if_then_else(emit, slot, T.int64(-1))
++                visible[t] = T.if_then_else(
++                    valid, T.Cast(T.int32, T.truncdiv(pos + 1, ratio)), 0
++                )
++
++    return tokens
++
++
++@tilelang.jit(pass_configs=_PASS)
++def chunk_kernel(page: int, window: int, width: int, draft: bool, replay: bool):
++    rows = T.dynamic("rows")
++    src_rows = T.dynamic("src_rows")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++    req_count = T.dynamic("req_count")
++    starts_len = T.dynamic("starts_len")
++    replay_len = T.dynamic("replay_len")
++    threads = min(256, max(32, (width + 31) // 32 * 32))
++    per_thread = (width + threads - 1) // threads
++
++    @T.prim_func
++    def chunk(
++        positions: T.Tensor((src_rows,), T.int64),
++        reqs: T.Tensor((src_rows,), T.int32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        swa: T.Tensor((rows, width), T.int32),
++        lengths: T.Tensor((rows,), T.int32),
++        top_lengths: T.Tensor((rows,), T.int32),
++        visible: T.Tensor((src_rows,), T.int32),
++        starts: T.Tensor((starts_len,), T.int32),
++        request_positions: T.Tensor((req_count,), T.int64),
++        replay_start: T.Tensor((replay_len,), T.int64),
++        offset: T.int32,
++    ):
++        with T.Kernel(rows, threads=threads) as row:
++            tx = T.get_thread_binding()
++            info = T.alloc_local((2,), T.int64)  # window start, clamped length
++            req = reqs[offset + row]
++            pos = positions[offset + row]
++            valid = (req >= 0) & (pos >= 0)
++            if draft:
++                first = T.if_then_else(valid, T.Cast(T.int64, starts[req]), T.int64(0))
++                end = T.if_then_else(
++                    valid, T.Cast(T.int64, starts[req + 1]), T.int64(0)
++                )
++                prefix = T.if_then_else(valid, request_positions[req], T.int64(0))
++                info[0] = T.max(prefix - window, T.int64(0))
++                length = prefix + end - first - info[0]
++            else:
++                info[0] = T.max(pos + 1 - window, T.int64(0))
++                if replay:
++                    info[0] = T.max(
++                        info[0],
++                        T.if_then_else(valid, replay_start[req], T.int64(0)),
++                    )
++                length = pos + 1 - info[0]
++            info[1] = T.if_then_else(
++                valid, T.min(T.max(length, T.int64(0)), T.int64(width)), T.int64(0)
++            )
++            for k in T.serial(per_thread):
++                col = k * threads + tx
++                if col < width:
++                    logical = info[0] + col
++                    inside = valid & (logical >= 0) & (col < info[1])
++                    page_id = T.if_then_else(
++                        inside,
++                        T.Cast(T.int64, table[req, T.truncdiv(logical, page)]),
++                        T.int64(-1),
++                    )
++                    physical = page_id * page + T.truncmod(logical, page)
++                    swa[row, col] = T.if_then_else(
++                        (page_id > 0) & (logical >= 0) & (col < info[1]),
++                        T.Cast(T.int32, physical),
++                        -1,
++                    )
++            if tx == 0:
++                lengths[row] = T.Cast(T.int32, T.max(info[1], T.int64(0)))
++                top_lengths[row] = T.if_then_else(
++                    valid, T.min(T.max(visible[offset + row], 0), _TOP), 0
++                )
++
++    return chunk
++
++
++@tilelang.jit(pass_configs=_PASS)
++def pages_kernel(width: int):
++    rows = T.dynamic("rows")
++    src_rows = T.dynamic("src_rows")
++    table_rows = T.dynamic("table_rows")
++    table_cols = T.dynamic("table_cols")
++    table_stride = T.dynamic("table_stride")
++
++    @T.prim_func
++    def pages(
++        reqs: T.Tensor((src_rows,), T.int32),
++        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
++        out: T.Tensor((rows, width), T.int32),
++        offset: T.int32,
++        read_width: T.int32,
++    ):
++        with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
++            col = cb * _BLOCK + T.get_thread_binding()
++            if col < width:
++                req = reqs[offset + row]
++                page_id = T.if_then_else(
++                    (req >= 0) & (col < read_width), table[req, col], -1
++                )
++                # vLLM reserves physical block zero; page tables use -1 for holes.
++                out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
++
++    return pages
++
++
++def requests(starts, seq, out_starts, positions, counts, nr: int, nt: int) -> None:
++    """``sparse_mla._requests``."""
++    requests_kernel(positions.shape[0])(
++        starts, seq, out_starts, positions, counts, nr, nt
++    )
++
++
++def tokens(
++    starts, seq, table, input_slots, positions, reqs, slots, visible, nr: int,
++    nt: int, *, max_requests: int, page: int, ratio: int, circular: bool,
++) -> None:  # fmt: skip
++    """``sparse_mla._tokens``: rows of the first ``max(1, ceil(nt / 128))`` blocks."""
++    cover = min(positions.shape[0], max(1, -(-nt // _BLOCK)) * _BLOCK)
++    tokens_kernel(max_requests, page, ratio, circular)(
++        starts, seq, table, input_slots, positions[:cover], reqs[:cover],
++        slots[:cover], visible[:cover], nr, nt,
++    )  # fmt: skip
++
++
++def chunk(
++    positions, reqs, table, swa, lengths, top_lengths, visible, starts,
++    request_positions, offset: int, rows: int, *, page: int, window: int,
++    draft: bool, replay_start=None,
++) -> None:  # fmt: skip
++    """``attention._chunk`` for ``rows`` rows from source row ``offset``."""
++    width = swa.shape[1]
++    replay = replay_start is not None and not draft
++    chunk_kernel(page, window, width, draft, replay)(
++        positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
++        visible, starts, request_positions,
++        replay_start if replay_start is not None else request_positions, offset,
++    )  # fmt: skip
++
++
++def pages(reqs, table, out, offset: int, rows: int, read_width: int) -> None:
++    """``attention._pages`` for ``rows`` rows from source row ``offset``; ``out`` is
++    ``[*, width]`` and columns at or past ``read_width`` are -1."""
++    pages_kernel(out.shape[1])(reqs, table, out[:rows], offset, read_width)
++
++
++__all__ = [
++    "chunk",
++    "chunk_kernel",
++    "pages",
++    "pages_kernel",
++    "requests",
++    "requests_kernel",
++    "tokens",
++    "tokens_kernel",
++]

@@ -1,0 +1,33 @@
+From 004b7cb75fdfd98a005d6b4978a1f3691ad83d4e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 11:05:12 +0100
+Subject: [PATCH 111/274] L2 prefetch: refuse to run without the TileLang
+ kernel when it is requested
+
+VLLM_L2_PREFETCH_KERNELS=tilelang is only set on purpose. When its kernel
+failed to import or compile, the launcher logged a warning and served on
+with no prefetch, which costs 5-7% of decode and showed up only as a slower
+benchmark. Raise instead, so the start fails and says why. The CuTe default
+keeps its existing behaviour.
+
+diff --git a/vllm/models/glm5next/nvidia/l2_prefetch.py b/vllm/models/glm5next/nvidia/l2_prefetch.py
+index 4a19dec8a..d4c80f587 100644
+--- a/vllm/models/glm5next/nvidia/l2_prefetch.py
++++ b/vllm/models/glm5next/nvidia/l2_prefetch.py
+@@ -272,9 +272,13 @@ def _get_launcher():
+             )
+             return _compiled
+         except Exception as exc:  # noqa: BLE001
+-            _compile_failed = True
+-            logger.warning("[l2_prefetch] disabled: TileLang kernel compile failed: %s", exc)
+-            return None
++            # The TileLang family is only ever selected explicitly; serving on
++            # without the prefetch would cost several percent of decode with
++            # nothing but a log line to show for it.
++            raise RuntimeError(
++                "VLLM_L2_PREFETCH_KERNELS=tilelang was requested but the TileLang "
++                f"L2 prefetch kernel could not be compiled: {exc}"
++            ) from exc
+     if not _CUTE_OK:
+         _compile_failed = True
+         logger.warning("[l2_prefetch] disabled: CuTe DSL not available")

@@ -1,0 +1,57 @@
+From a65adf7098676360b77e337d936ea39750491c1a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:56:05 +0200
+Subject: [PATCH 193/274] CED row copy: build strided addresses at
+ specialization time
+
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index f3c55f539..c2bfa6da4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -118,6 +118,16 @@ def copy_rows_kernel(
+     for dim in tail:
+         width *= dim
+ 
++    def column_offset(col):
++        # Build the strided address at specialization time; a TIR loop variable
++        # cannot index Python's layout tuples.
++        result = 0
++        divisor = 1
++        for dim, stride in zip(reversed(tail), reversed(strides[1:])):
++            result = result + (col // divisor % dim) * stride
++            divisor *= dim
++        return result
++
+     @T.prim_func
+     def ced_copy_rows(
+         source: T.Tensor((source_span,), dtype),
+@@ -142,14 +152,7 @@ def copy_rows_kernel(
+                     )
+                     if valid:
+                         source_row = row if scatter else index
+-                        source_offset = source_row * strides[0]
+-                        remainder = col
+-                        for reverse in T.unroll(len(tail)):
+-                            axis = len(tail) - 1 - reverse
+-                            source_offset += (remainder % tail[axis]) * strides[
+-                                axis + 1
+-                            ]
+-                            remainder = remainder // tail[axis]
++                        source_offset = source_row * strides[0] + column_offset(col)
+                         if scatter:
+                             output[index * width + col] = source[source_offset]
+                         else:
+@@ -162,7 +165,11 @@ def copy_rows_kernel(
+ 
+ def copy_rows(source, row_indices, output, scatter: bool):
+     """Copy logical rows from a possibly strided source without copying its storage."""
+-    span = 1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
++    span = (
++        1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
++        if source.numel()
++        else 0
++    )
+     flat_source = source.as_strided((span,), (1,))
+     copy_rows_kernel(
+         str(source.dtype).removeprefix("torch."),

@@ -1,0 +1,404 @@
+From aa31eb85c6567e3740222ee51844c21f09f35add Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:36:34 +0100
+Subject: [PATCH 125/274] TileLang V4.1 WO: WO-A hands WO-B the reference's
+ MXFP8 cast directly
+
+WO-A wrote a BF16 a that per_token_cast read back and quantized: two extra trips
+through memory (about 10 MB per 1024-row sequence-parallel slice) and two
+kernels. WO-A's last kernel now rounds to BF16 and applies the same cast itself:
+the in-kernel GEMM in its epilogue (fp8w_bf16_gemm_cast), the split decode path
+in its reduce (splitk_reduce_cast). The bytes equal per_token_cast of the BF16 a
+(test_wo_a_casts_as_per_token_cast), so WO's output is unchanged. WO-B runs its
+GEMM on them (_block32_gemm); everything live is borrowed in one carve.
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index 7c79752c7..2b103f1d2 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -140,28 +140,45 @@ def test_grouped_gemm_equals_groups(count):
+             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
+ 
+ 
++def _wo_a_bf16(layer, x):
++    """WO-A's BF16 output through the unfused kernels with the WO's tile per bucket:
++    the value the fused path rounds to BF16 before its cast."""
++    from vllm.models.deepseek_v4_1.tilelang import gemm
++    from vllm.models.deepseek_v4_1.tilelang.wo import (
++        _WO_A_COMMON,
++        _WO_A_SHARDS,
++        _WO_A_TILES,
++        _GroupedBF16,
++    )
++
++    rows, (n, k) = x.shape[0], layer.weight.shape
++    tile = _WO_A_TILES[_GroupedBF16.bucket(rows)]
++    e = layer.weight_scale_inv.view(torch.uint8)
++    out = torch.empty((rows, n), dtype=torch.bfloat16, device=DEVICE)
++    if tile["split"]:
++        partials = torch.empty((_WO_A_SHARDS, rows, n), dtype=torch.float32, device=DEVICE)
++        gemm.fp8w_bf16_gemm_partials(
++            n // GROUPS, k, GROUPS, _WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
++        )(x, layer.weight, e, partials)
++        gemm.splitk_reduce(n, _WO_A_SHARDS)(partials, out)
++    else:
++        gemm.fp8w_bf16_gemm(
++            n // GROUPS, k, GROUPS, shards=_WO_A_SHARDS, block_M=tile["block_M"], **_WO_A_COMMON
++        )(x, layer.weight, e, out)
++    return out
++
++
+ def test_wo_a_keeps_bf16_activations():
+     """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
+     the exactly dequantized weights, well inside what MXFP8 activations give, with the
+     same bits at every row count: decode rows split the K shards over CTAs and longer
+     steps add them inside the kernel, in the same order."""
+-    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
+-
+     width = HEADS // GROUPS * HEAD_DIM
+     layer = _block32(GROUPS * RANK, width, 7)
+-    wo_a = _GroupedBF16(layer, GROUPS)
+     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
+     w = _dequant(layer)
+ 
+-    scratch = torch.empty(1 << 26, dtype=torch.uint8, device=DEVICE)  # split partials
+-
+-    def project(rows):
+-        out = torch.empty((rows, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
+-        with use_preallocated_workspace(scratch):
+-            wo_a(x[:rows], out)
+-        return out
+-
+-    full = project(300)
++    full = _wo_a_bf16(layer, x)
+     ref = torch.cat(
+         [
+             x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
+@@ -181,4 +198,29 @@ def test_wo_a_keeps_bf16_activations():
+     )
+     assert error.mean() < 0.25 * (quantized - ref).abs().mean()
+     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
+-        assert torch.equal(project(rows), full[:rows]), rows
++        assert torch.equal(_wo_a_bf16(layer, x[:rows]), full[:rows]), rows
++
++
++def test_wo_a_casts_as_per_token_cast():
++    """WO-A's fused output is the reference's activation cast of its BF16 output, byte
++    for byte (E4M3 values and UE8M0 bytes), on the split decode path and the in-kernel
++    path, including blocks below the amax floor."""
++    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
++
++    width = HEADS // GROUPS * HEAD_DIM
++    layer = _block32(GROUPS * RANK, width, 9)
++    wo_a = _GroupedBF16(layer, GROUPS)
++    x = torch.randn((300, GROUPS * width), generator=_gen(10), device=DEVICE).bfloat16()
++    x[::5] *= 1e-7  # some rows' outputs fall below the amax floor
++    for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200, 300):
++        a = _wo_a_bf16(layer, x[:rows])
++        ref_q, ref_sf = tile_kernels.quant.per_token_cast(
++            a, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++        )
++        xq = torch.empty((rows, GROUPS * RANK), dtype=torch.float8_e4m3fn, device=DEVICE)
++        sf = torch.empty((rows, GROUPS * RANK // 32), dtype=torch.uint8, device=DEVICE)
++        specs = wo_a.partial_specs(rows)
++        partials = torch.empty(specs[0][0], dtype=specs[0][1], device=DEVICE) if specs else None
++        wo_a(x[:rows], xq, sf, partials)
++        assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8)), rows
++        assert torch.equal(sf, ref_sf.contiguous().view(torch.uint8)[:, : sf.shape[1]]), rows
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 7fb01fbd9..f73718efb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -299,6 +299,67 @@ def splitk_reduce(
+     return gemm_splitk_reduce
+ 
+ 
++# DeepSeek's act_quant(x, 32, "ue8m0") as TileKernels' per_token_cast computes it
++# (byte-identical: experiments/2026-10-13-tilelang-wo/check_cast_reference.py).
++_FP8_MAX = 448.0
++_FP8_MAX_INV = 1 / _FP8_MAX
++_AMAX_FLOOR = 1e-4
++
++
++@T.macro
++def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
++    """Quantize ``X[r, e]`` (FP32 copies of BF16 values; row ``r`` is 32-element block
++    ``r % blocks`` of output row ``row0 + r // blocks``) as act_quant: amax over the
++    block floored at 1e-4, the exponent ceil(log2(amax / 448)) from ``amax * (1/448)``'s
++    bits, E4M3 of ``x * 2^-e``, and the UE8M0 byte ``e + 127`` into ``S``."""
++    T.reduce_absmax(X, amax, dim=1)
++    for r in T.Parallel(rows * blocks):
++        bits = T.reinterpret(T.max(amax[r], T.float32(_AMAX_FLOOR)) * T.float32(_FP8_MAX_INV), T.uint32)
++        exponent = T.Cast(T.int32, ((bits - T.uint32(1)) >> 23) + T.uint32(1)) - 127
++        inv[r] = T.reinterpret(T.Cast(T.uint32, 127 - exponent) << 23, T.float32)
++        if row0 + r // blocks < M:
++            S[row0 + r // blocks, col0 // 32 + r % blocks] = T.Cast(T.uint8, exponent + 127)
++    for r, e in T.Parallel(rows * blocks, 32):
++        if row0 + r // blocks < M:
++            Q[row0 + r // blocks, col0 + (r % blocks) * 32 + e] = T.Cast(
++                T.float8_e4m3fn, X[r, e] * inv[r]
++            )
++
++
++@tilelang.jit
++def splitk_reduce_cast(N: int, shards: int, block_M: int = 4, threads: int = 128):
++    """``splitk_reduce`` to BF16, then the reference's activation cast: E4M3 ``Q`` and
++    one UE8M0 byte per 32 columns in ``S``, the bytes of BF16 ``C`` through
++    ``per_token_cast``. WO-A's split decode path hands WO-B its MXFP8 input directly."""
++    assert N % 128 == 0
++    M = T.dynamic("M")
++    blocks = 4  # 128 columns per CTA
++
++    @T.prim_func
++    def gemm_splitk_reduce_cast(
++        P: T.Tensor((shards, M, N), T.float32),
++        Q: T.Tensor((M, N), T.float8_e4m3fn),
++        S: T.Tensor((M, N // 32), T.uint8),
++    ):
++        with T.Kernel(N // 128, T.ceildiv(M, block_M), threads=threads) as (bx, by):
++            X = T.alloc_fragment((block_M * blocks, 32), T.float32)
++            amax = T.alloc_fragment((block_M * blocks,), T.float32)
++            inv = T.alloc_fragment((block_M * blocks,), T.float32)
++            for r, e in T.Parallel(block_M * blocks, 32):
++                m = T.min(by * block_M + r // blocks, M - 1)
++                n = bx * 128 + (r % blocks) * 32 + e
++                X[r, e] = P[0, m, n]
++            for s in T.serial(1, shards):
++                for r, e in T.Parallel(block_M * blocks, 32):
++                    m = T.min(by * block_M + r // blocks, M - 1)
++                    X[r, e] += P[s, m, bx * 128 + (r % blocks) * 32 + e]
++            for r, e in T.Parallel(block_M * blocks, 32):
++                X[r, e] = T.Cast(T.float32, T.Cast(T.bfloat16, X[r, e]))
++            _reference_cast(X, amax, inv, Q, S, by * block_M, bx * 128, block_M, blocks, M)
++
++    return gemm_splitk_reduce_cast
++
++
+ @tilelang.jit
+ def bf16_gemm(
+     N: int,
+@@ -452,6 +513,83 @@ def fp8w_bf16_gemm(
+     return gemm_fp8w_bf16
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def fp8w_bf16_gemm_cast(
++    N: int,
++    K: int,
++    groups: int = 1,
++    block_M: int = 16,
++    block_N: int = 32,
++    block_K: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++    shards: int = 1,
++):
++    """``fp8w_bf16_gemm`` whose epilogue rounds each output tile to BF16 and applies
++    the reference's activation cast (``_reference_cast``): E4M3 ``Q`` and UE8M0 bytes
++    ``S``, the bytes ``per_token_cast`` gives the BF16 output, without writing it."""
++    assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
++    assert block_N % 32 == 0
++    k_blocks = K // block_K
++    assert k_blocks % shards == 0
++    shard_blocks = k_blocks // shards
++    M = T.dynamic("M")
++    n_tiles = N // block_N
++    blocks = block_N // 32
++
++    @T.prim_func
++    def gemm_fp8w_bf16_cast(
++        A: T.Tensor((M, groups * K), T.bfloat16),
++        W: T.Tensor((groups * N, K), T.float8_e4m3fn),
++        E: T.Tensor((groups * N // 32, K // 32), T.uint8),
++        Q: T.Tensor((M, groups * N), T.float8_e4m3fn),
++        S: T.Tensor((M, groups * N // 32), T.uint8),
++    ):
++        with T.Kernel(groups * n_tiles, T.ceildiv(M, block_M), threads=threads) as (
++            bx,
++            by,
++        ):
++            g = bx // n_tiles
++            n0 = g * N + (bx % n_tiles) * block_N
++            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
++            W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
++            S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
++            B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
++            C_shared = T.alloc_shared((block_M, block_N), T.bfloat16)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            C_total = T.alloc_fragment(
++                (block_M, block_N) if shards > 1 else (1, 1), T.float32
++            )
++            X = T.alloc_fragment((block_M * blocks, 32), T.float32)
++            amax = T.alloc_fragment((block_M * blocks,), T.float32)
++            inv = T.alloc_fragment((block_M * blocks,), T.float32)
++            T.clear(C_local)
++            if shards > 1:
++                T.clear(C_total)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
++                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
++                if shards > 1:  # noqa: SIM102
++                    if (ko + 1) % shard_blocks == 0:
++                        for i, j in T.Parallel(block_M, block_N):
++                            C_total[i, j] = T.if_then_else(
++                                ko + 1 == shard_blocks,
++                                C_local[i, j],
++                                C_total[i, j] + C_local[i, j],
++                            )
++                        T.clear(C_local)
++            # The BF16 output tile, as fp8w_bf16_gemm would store it.
++            if shards > 1:
++                T.copy(C_total, C_shared)
++            else:
++                T.copy(C_local, C_shared)
++            for r, e in T.Parallel(block_M * blocks, 32):
++                X[r, e] = T.Cast(T.float32, C_shared[r // blocks, (r % blocks) * 32 + e])
++            _reference_cast(X, amax, inv, Q, S, by * block_M, n0, block_M, blocks, M)
++
++    return gemm_fp8w_bf16_cast
++
++
+ @T.macro
+ def _w8a16_step(
+     A, W, E, A_shared, W_shared, S_shared, B_shared, C_local, by, g, n0, ko, K,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/linear.py b/vllm/models/deepseek_v4_1/tilelang/linear.py
+index 750c36c62..5f5efcc83 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/linear.py
++++ b/vllm/models/deepseek_v4_1/tilelang/linear.py
+@@ -162,17 +162,17 @@ def _block32_linear(
+         use_packed_ue8m0=True,
+         out=(xq[:rows], sf[:rows]),
+     )
++    _block32_gemm(layer, xq, sf, out.view(rows, n), rows)
++
++
++def _block32_gemm(layer, xq, sf, out, rows: int) -> None:
++    """The GEMM of a block-32 projection without split-K on its MXFP8 activations
++    (``_activation_specs`` buffers, the first ``rows`` rows live)."""
+     if rows > layer.tilelang_decode_rows:
+         gemm = layer.tilelang_prefill
+     else:
+         gemm = layer.tilelang_decode[decode_tile_rows(rows, layer.tilelang_wide)]
+-    gemm(
+-        xq,
+-        layer.weight,
+-        sf.view(torch.uint32),
+-        layer.tilelang_weight_sf,
+-        out.view(rows, n),
+-    )
++    gemm(xq, layer.weight, sf.view(torch.uint32), layer.tilelang_weight_sf, out)
+ 
+ 
+ @_block32_linear.register_fake
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index e808aa57b..7a5f1c8bf 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -11,8 +11,10 @@ WO-A keeps the BF16 activations, as the reference does (``convert.py`` dequantiz
+ ``wo_a`` to BF16 and the projection is a BF16 einsum): one launch of the grouped
+ W8A16 GEMM expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
+ WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
+-one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. The
+-checkpoint tensors are read in place.
++one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
++kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
++applies that cast itself, so ``a`` never reaches memory in BF16: the bytes are those
++of ``per_token_cast`` on the BF16 ``a``. The checkpoint tensors are read in place.
+ """
+ 
+ import torch
+@@ -21,8 +23,8 @@ from torch import nn
+ from vllm.v1.worker.workspace import current_preallocated_workspace
+ 
+ from .. import l2_prefetch
+-from .gemm import fp8w_bf16_gemm, fp8w_bf16_gemm_partials, splitk_reduce
+-from .linear import _block32_linear, _prepare_block32, _scratch
++from .gemm import fp8w_bf16_gemm_cast, fp8w_bf16_gemm_partials, splitk_reduce_cast
++from .linear import _activation_specs, _block32_gemm, _prepare_block32, _scratch
+ from .rope import rope_
+ 
+ # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
+@@ -76,7 +78,7 @@ class _GroupedBF16:
+                 **_WO_A_COMMON,
+             )
+             if tile["split"]
+-            else fp8w_bf16_gemm(
++            else fp8w_bf16_gemm_cast(
+                 n // groups,
+                 k,
+                 groups,
+@@ -86,25 +88,35 @@ class _GroupedBF16:
+             )
+             for bucket, tile in _WO_A_TILES.items()
+         }
+-        self.reduce = splitk_reduce(n, _WO_A_SHARDS)
+-
+-    def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
+-        rows = x.shape[0]
+-        bucket = next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
++        self.reduce = splitk_reduce_cast(n, _WO_A_SHARDS)
++
++    @staticmethod
++    def bucket(rows: int):
++        return next((b for b in _WO_A_TILES if b is not None and rows <= b), None)
++
++    def partial_specs(self, rows: int):
++        """The split path's FP32 partials (nothing for the in-kernel path)."""
++        if not _WO_A_TILES[self.bucket(rows)]["split"]:
++            return ()
++        return (((_WO_A_SHARDS, rows, self.columns), torch.float32),)
++
++    def __call__(self, x, xq, sf, partials=None) -> None:
++        """WO-A of ``x``, cast as the reference's ``act_quant`` into ``xq`` (E4M3) and
++        ``sf`` (UE8M0 bytes); ``partials`` from ``partial_specs`` on the split path."""
++        bucket = self.bucket(x.shape[0])
+         if not _WO_A_TILES[bucket]["split"]:
+-            self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, out)
++            self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, xq, sf)
+             return
+-        (partials,) = _scratch(
+-            (((_WO_A_SHARDS, rows, self.columns), torch.float32),), None
+-        )
+         self.kernels[bucket](x, self.weight, self.tilelang_weight_sf, partials)
+-        self.reduce(partials, out)
++        self.reduce(partials, xq, sf)
+ 
+ 
+ class TileLangWOProjection:
+     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
+         self.a = _GroupedBF16(wo_a, groups)
+         self.b = _Weight(wo_b, 1)
++        if self.b.tilelang_shards > 1:
++            raise ValueError("WO-B takes WO-A's MXFP8 output: no split-K path")
+         self.hidden = wo_b.weight.shape[0]
+ 
+     def l2_segments(self) -> list:
+@@ -123,16 +135,23 @@ class TileLangWOProjection:
+         """Project ``o`` ([T, heads, head_dim], contiguous BF16; its RoPE columns
+         are overwritten) into ``out`` ([T, hidden] BF16)."""
+         rows = o.shape[0]
++        if not rows:
++            return out
+         rope_(o, positions, cos_sin_cache, 1, True)
+         scratch = (
+             None if torch.compiler.is_compiling() else current_preallocated_workspace()
+         )
+-        a = torch.empty(
+-            (rows, self.a.weight.shape[0]), dtype=torch.bfloat16, device=o.device
++        # One borrow for everything live at once: WO-A's partials, then WO-B's MXFP8
++        # input in whole decode tiles.
++        partial_specs = self.a.partial_specs(rows)
++        views = _scratch(
++            (*partial_specs, *_activation_specs(rows, self.a.columns, self.b.tilelang_decode_rows)),
++            scratch,
+         )
+-        if rows:
+-            self.a(o.view(rows, -1), a)
+-        _block32_linear(a, out, self.b.tilelang_key, scratch)
++        partials = views[0] if partial_specs else None
++        xq, sf = views[-2], views[-1]
++        self.a(o.view(rows, -1), xq[:rows], sf[:rows], partials)
++        _block32_gemm(self.b, xq, sf, out, rows)
+         return out
+ 
+ 

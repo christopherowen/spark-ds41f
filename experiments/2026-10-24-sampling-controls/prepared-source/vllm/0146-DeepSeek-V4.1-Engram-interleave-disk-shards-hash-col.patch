@@ -1,0 +1,617 @@
+From 1fb7552eae636eaa0f13ff1c333ebae9dbed02d5 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 20:59:10 +0200
+Subject: [PATCH 146/274] DeepSeek-V4.1 Engram: interleave disk shards' hash
+ columns across ranks
+
+Heads 0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams, and a longer n-gram
+repeats less, so a step reads more distinct rows of it (1 : 1.35 : 1.54 per
+4096-token chunk of source text). Contiguous columns gave TP3's rank 2 every
+4-gram head and the slowest reads (first prefill chunk 74.8 ms against rank 0's
+51.6). Rank r now reads every tp-th column from r (TP3 3/3/2 heads per order,
+TP4 2/2/2): the reader and the gather take a 24-bit column mask, and the forward
+gathers each rank's columns and puts them back in column order with one
+transpose (exact copies, the same rows). The debug timeline records each step's
+planning time (plan_ns).
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index ac6299b4c..416cc9804 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """The Engram disk reader and its TileLang wait and gather: the old path's bits, fresh
+-rows on every step, other ranks' slots never read, tables read in staging order, rows
++rows on every step, other ranks' slots (rows or hash columns) never read, tables read in staging order, rows
+ that arrive while the main thread holds the GIL, and failures that name themselves (a
+ short read, a reader failure that stops the GPU at once, and a GPU wait that times
+ out)."""
+@@ -21,6 +21,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires
+ 
+ TABLE_ROWS = 4099
+ HEADS = 24
++ALL_COLUMNS = (1 << HEADS) - 1
++TP3_RANK1 = sum(1 << column for column in range(1, HEADS, 3))  # heads 1, 4, ..., 22
+ WEIGHT_OFFSET, SCALE_OFFSET = 4093, 123  # unaligned: the planner aligns the reads
+ 
+ 
+@@ -47,10 +49,11 @@ def _write_table(directory: str, seed: int = 0):
+     return codes, scales, paths
+ 
+ 
+-def _reference(codes, scales, ids, live, start, end):
++def _reference(codes, scales, ids, live, start, end, columns=ALL_COLUMNS):
+     """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16."""
+     rows = ids.cpu().long()
+     local = (rows >= start) & (rows < end)
++    local &= torch.tensor([bool(columns >> h & 1) for h in range(HEADS)])[None, :]
+     local[live:] = False
+     safe = rows.clamp(0, TABLE_ROWS - 1)
+     values = codes[safe].view(torch.float8_e4m3fn).float()
+@@ -84,11 +87,12 @@ def _same(a, b):
+     return torch.equal(a.view(torch.int16).cpu(), b.view(torch.int16).cpu())
+ 
+ 
++@pytest.mark.parametrize("columns", [ALL_COLUMNS, TP3_RANK1])
+ @pytest.mark.parametrize("shard", [(0, TABLE_ROWS), (1000, 3000)])
+-def test_gather_matches_b12x_lookup_bits(shard):
++def test_gather_matches_b12x_lookup_bits(shard, columns):
+     codes, scales, paths = _write_table(_table_dir())
+     start, end = shard
+-    rows = _rows(paths, start, end)
++    rows = _rows(paths, start, end, columns=columns)
+     # Slots of other ranks' rows are never written or read: fill them with E4M3 NaN.
+     rows.weights.host.fill_(0x7F)
+     rows.scales.host.fill_(0xFF)
+@@ -98,8 +102,11 @@ def test_gather_matches_b12x_lookup_bits(shard):
+     ids[5, 4] = -1  # a dead lookup
+     ids = ids.cuda()
+     out, num_tokens = _step(rows, ids, 13)
+-    torch.testing.assert_close(out.cpu(), _reference(codes, scales, ids, 13, start, end),
++    torch.testing.assert_close(out.cpu(), _reference(codes, scales, ids, 13, start, end, columns),
+                                rtol=0, atol=0, equal_nan=True)
++    if columns != ALL_COLUMNS:
++        rows.close()
++        return  # b12x's lookup shards by rows only
+     # The old path: b12x's Triton lookup over the same mapped buffers, compact rows.
+     from b12x.sequence.engram._kernels import _lookup
+ 
+@@ -463,6 +470,7 @@ assert [r["sequence"] for r in records] == [1, 2, 3], records
+ for r in records:
+     assert r["submitted"] <= r["started"] <= r["ids"] <= r["read"] <= r["published"], r
+     assert r["count"] == 4 * t.HEADS and r["early"] == 0
++    assert 0 < r["plan_ns"] <= r["read"] - r["ids"], r
+ # Step 1's kernels compile on the host while its rows are read, so its wait is short;
+ # the GPU waited for step 2's delayed rows, and step 3's service saw that wait.
+ assert records[1]["gpu_sequence"] == 1, records[1]
+@@ -488,6 +496,13 @@ def test_timeline_records_each_step_and_the_gpu_wait():
+     assert result.returncode == 0, result.stderr[-3000:]
+ 
+ 
++@pytest.mark.parametrize("columns", [0, 1 << HEADS])
++def test_a_malformed_column_mask_is_refused(columns):
++    _, _, paths = _write_table(_table_dir(), seed=29)
++    with pytest.raises(ValueError, match="24-bit mask"):
++        _rows(paths, tokens=4, columns=columns)
++
++
+ def test_timeline_is_off_by_default():
+     _, _, paths = _write_table(_table_dir(), seed=28)
+     rows = _rows(paths, tokens=4)
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 4814446c8..465b09bb1 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1079,20 +1079,38 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+ 
+ 
+ @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
+-def test_disk_shards_are_whole_hash_columns(tp_size):
+-    """When the TP size divides the 24 hash columns, every rank's disk shard is whole
+-    columns: the shards tile the table at column offsets and their bands tile the
+-    gathered row's 24 * 256 values in rank order (an all-gather joins them)."""
++def test_disk_shards_interleave_hash_columns(tp_size):
++    """When the TP size divides the 24 hash columns, rank r reads every tp-th column
++    from r: the ranks' columns tile all 24 once, and each rank holds heads of every
++    n-gram order (heads 0-7 2-grams, 8-15 3-grams, 16-23 4-grams) as evenly as the
++    split allows, so no rank reads only the longest n-grams' distinct rows."""
+     from vllm.models.deepseek_v4_1.common.engram import column_shard
+ 
+     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+     for index in range(len(geometry.layer_ids)):
+-        offsets = [int(o) for o in geometry.offsets[index]]
+         shards = [column_shard(geometry, index, tp_size, r) for r in range(tp_size)]
+-        assert shards[0][0] == 0 and shards[-1][1] == geometry.num_embeddings[index]
+-        assert shards[0][2] == 0 and shards[-1][3] == 24 * 256
+-        for (start, end, low, high), following in zip(shards, shards[1:] + [None]):
+-            assert start in offsets and low == offsets.index(start) * 256
+-            if following is not None:
+-                assert (end, high) == (following[0], following[2])
++        assert sorted(c for shard in shards for c in shard) == list(range(24))
++        for rank, shard in enumerate(shards):
++            assert shard == tuple(range(rank, 24, tp_size))
++            orders = [sum(1 for c in shard if c // 8 == order) for order in range(3)]
++            assert max(orders) - min(orders) <= 1, (tp_size, rank, orders)
+     assert column_shard(geometry, 0, 5, 0) is None  # 24 columns do not split five ways
++
++
++@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
++def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
++    """Every rank's columns, all-gathered rank-major, go back to column order exactly."""
++    import vllm.models.deepseek_v4_1.common.engram as engram_module
++
++    tokens = 5
++    full = torch.randn(tokens, 24 * 256).bfloat16()
++    locals_ = [
++        full.view(tokens, 24 // tp_size, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
++        for r in range(tp_size)
++    ]
++    monkeypatch.setattr(
++        engram_module, "tensor_model_parallel_all_gather",
++        lambda local, dim: torch.cat(locals_, dim=dim),
++    )
++    rows = engram_module.interleaved_rows(locals_[0], tp_size)
++    assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 72796645d..bc3bd58f3 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -311,7 +311,7 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
+     staged = torch.randn(tokens, 6)
+     engram = SimpleNamespace(
+-        embed_tokens=SimpleNamespace(table_memory="device", band=None),
++        embed_tokens=SimpleNamespace(table_memory="device", columns=None),
+         overlap_epochs=None,
+         staged_rows=staged,
+         wkv=lambda rows: rows.repeat(1, 2),
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 39883c3d9..01af3aeae 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -532,23 +532,34 @@ def _load_table(param, loaded_weight):
+ 
+ 
+ def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
+-    """A disk table's shard on whole hash columns, or None.
+-
+-    A layer's table is its 24 hash columns' prime-sized ranges back to back, each
+-    just above the Engram vocabulary. When the TP size divides 24, rank r owns
+-    columns [24r/N, 24(r+1)/N): rows ``offsets`` start to end (within a few
+-    thousand rows of an equal split), and in the gathered rows the contiguous band
+-    of those columns' 256 values. Returns (row start, row end, band start, band
+-    end)."""
++    """A disk table's shard on whole hash columns, or None: the columns rank
++    ``tp_rank`` reads, every ``tp_size``-th from ``tp_rank``.
++
++    A layer's table is its 24 hash columns' prime-sized ranges back to back; heads
++    0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams, and a longer n-gram repeats
++    less, so a step reads more distinct rows of it (1 : 1.35 : 1.54 on source text).
++    Interleaving gives every rank columns of each order (TP3: 3/3/2, 3/2/3, 2/3/3;
++    TP4: 2/2/2), where contiguous columns gave one rank every 4-gram head and the
++    slowest reads. A rank's gathered columns are joined by an all-gather and put back
++    in column order (``interleaved_rows``). Requires a TP size that divides 24."""
+     columns = len(geometry.offsets[layer_index])
+     if columns % tp_size:
+         return None
+-    per_rank = columns // tp_size
+-    offsets = [int(o) for o in geometry.offsets[layer_index]]
+-    table_rows = int(geometry.num_embeddings[layer_index])
+-    first, last = tp_rank * per_rank, (tp_rank + 1) * per_rank
+-    end = offsets[last] if last < columns else table_rows
+-    return offsets[first], end, first * 256, last * 256
++    return tuple(range(tp_rank, columns, tp_size))
++
++
++def interleaved_rows(local: torch.Tensor, tp_size: int) -> torch.Tensor:
++    """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
++    this rank's ``[T, (24 / tp_size) * 256]``, columns ``rank, rank + tp, ...``. The
++    all-gather lays them out rank-major, so rank r's k-th block is column k * tp + r;
++    a transpose puts them back. Exact copies: the same values as one reader's rows."""
++    tokens = local.shape[0]
++    gathered = tensor_model_parallel_all_gather(local, dim=-1)
++    return (
++        gathered.view(tokens, tp_size, 24 // tp_size, 256)
++        .transpose(1, 2)
++        .reshape(tokens, 24 * 256)
++    )
+ 
+ 
+ class ParallelEngramEmbedding(nn.Module):
+@@ -562,10 +573,11 @@ class ParallelEngramEmbedding(nn.Module):
+         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
+         self.shard_start = caps.tp_rank * self.shard_rows
+         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
+-        # A disk table's rank reads whole hash columns when the TP size divides
+-        # them, so its gathered rows are one band and the ranks' rows are joined by
+-        # an all-gather of the bands, not summed (resident tables keep equal rows).
+-        self.band = None
++        # A disk table's rank reads whole hash columns (every tp-th) when the TP size
++        # divides them, so the ranks' rows are joined by an all-gather of their
++        # columns, not summed (resident tables keep equal row shards).
++        self.columns = None
++        self.column_mask = (1 << 24) - 1
+         columns = (
+             column_shard(
+                 geometry,
+@@ -577,8 +589,9 @@ class ParallelEngramEmbedding(nn.Module):
+             else None
+         )
+         if columns is not None:
+-            self.shard_start, self.shard_end, *band = columns
+-            self.band = tuple(band)
++            self.shard_start, self.shard_end = 0, self.table_rows
++            self.columns = columns
++            self.column_mask = sum(1 << column for column in columns)
+         self.weight_shape = (self.shard_rows, 256)
+         self.scale_shape = (self.shard_rows, 8)
+         self.tp_size = caps.tp_size
+@@ -718,6 +731,7 @@ class ParallelEngramEmbedding(nn.Module):
+             table_rows=self.table_rows,
+             shard_start=min(self.shard_start, self.table_rows),
+             shard_end=min(self.shard_end, self.table_rows),
++            columns=self.column_mask,
+             max_lookups=self.caps.max_tokens * 24,
+             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
+             delay_s=ENGRAM_READ_DELAY_S,
+@@ -1029,13 +1043,17 @@ class Engram(nn.Module):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
+-        band = self.embed_tokens.band
+-        if band is not None:
+-            # This rank's gathered rows are one band of whole hash columns.
+-            rows = tensor_model_parallel_all_gather(
+-                self.staged_rows[: hash_ids.shape[0], band[0] : band[1]].contiguous(),
+-                dim=-1,
++        columns = self.embed_tokens.columns
++        if columns is not None:
++            # This rank's gathered rows are its hash columns, every tp-th.
++            tp_size = 24 // len(columns)
++            tokens = hash_ids.shape[0]
++            local = (
++                self.staged_rows[:tokens]
++                .view(tokens, len(columns), tp_size, 256)[:, :, columns[0], :]
++                .reshape(tokens, len(columns) * 256)
+             )
++            rows = interleaved_rows(local, tp_size)
+         else:
+             rows = tensor_model_parallel_all_reduce(
+                 self.staged_rows[: hash_ids.shape[0]]
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_native.py b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+index 7a60ed1cf..4131026d0 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_native.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+@@ -25,7 +25,7 @@ from pathlib import Path
+ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_reader.c")
+ _NAME = "_engram_rows_reader"
+-ABI_VERSION = 4
++ABI_VERSION = 5
+ 
+ 
+ def _pkg_config(*args: str) -> str:
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index 5505ca352..110d705d0 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -56,7 +56,7 @@ static void system_error(failure_t *failure, const char *operation) {
+ #include "_row_plan.h"
+ 
+ #define READER_CAPSULE "vllm.engram_rows.reader"
+-#define ABI_VERSION 4
++#define ABI_VERSION 5
+ 
+ /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
+ #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
+@@ -96,7 +96,7 @@ typedef struct {
+  * wait is the last one it recorded when the step's service began: the previous step's. */
+ typedef struct {
+     uint32_t sequence, count, early, gpu_sequence, gpu_wait_ns;
+-    uint64_t submitted, started, consumed, ids, read, published;
++    uint64_t submitted, started, consumed, ids, read, published, plan_ns;
+ } record_t;
+ #define TIMELINE 8192
+ 
+@@ -120,6 +120,7 @@ typedef struct {
+     bool check_early; /* debug: an early ID must equal the GPU's */
+     record_t *timeline; /* debug: the last TIMELINE served steps (mutex), or NULL */
+     uint64_t timeline_next, timeline_read;
++    uint64_t step_plan_ns; /* debug (timeline): the served step's planning time, worker only */
+     /* Serving: started (sources fixed) and closing are set once; pending (steps
+      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
+     bool started, closing;
+@@ -316,12 +317,15 @@ static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
+     reader->plan.lookups = count;
+     reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
+     reader->plan.unique_blocks = reader->plan.coalesced_reads = reader->plan.submit_calls = 0;
+-    if (reader->poisoned)
++    if (reader->poisoned) {
+         snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message),
+                  "Engram reader is unusable after an io_uring submission or completion failure");
+-    else if (ple_plan(&reader->plan, ids, count) &&
+-             reader->plan.job_count)
+-        ple_uring_run(reader);
++        return reader->plan.failure;
++    }
++    uint64_t planning = now_ns();
++    bool planned = ple_plan(&reader->plan, ids, count);
++    reader->step_plan_ns += now_ns() - planning;
++    if (planned && reader->plan.job_count) ple_uring_run(reader);
+     return reader->plan.failure;
+ }
+ 
+@@ -412,6 +416,7 @@ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
+     uint64_t started = now_ns();
+     uint32_t gpu_sequence = 0, gpu_wait_ns = 0;
++    reader->step_plan_ns = 0;
+     if (reader->timeline) {
+         gpu_sequence = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_SEQ], __ATOMIC_ACQUIRE);
+         gpu_wait_ns = __atomic_load_n(&reader->control[CTRL_GPU_WAIT_NS], __ATOMIC_RELAXED);
+@@ -457,7 +462,7 @@ static void serve(reader_t *reader, step_t step) {
+     if (reader->timeline) {
+         record_t record = {step.sequence, step.count, (uint32_t)early_count, gpu_sequence, gpu_wait_ns,
+                            step.submitted, started, started + (uint64_t)(consumed_wait * 1e9),
+-                           ids_at, read_at, now_ns()};
++                           ids_at, read_at, now_ns(), reader->step_plan_ns};
+         pthread_mutex_lock(&reader->mutex);
+         reader->timeline[reader->timeline_next++ % TIMELINE] = record;
+         pthread_mutex_unlock(&reader->mutex);
+@@ -548,22 +553,26 @@ static reader_t *get_reader(PyObject *capsule) {
+     return PyCapsule_GetPointer(capsule, READER_CAPSULE);
+ }
+ 
+-/* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
+- *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the four buffers
++/* reader(table_rows, shard_start, shard_end, columns, max_lookups, queue_depth, ids, weights,
++ *        scales, control, ids_timeout_s, delay_s, check_early, timeline): the rank reads the
++ * rows in [shard_start, shard_end) of the hash columns in the 24-bit mask ``columns``
++ * (lookup i is column i % 24); the four buffers
+  * are addresses of host memory that outlives the reader; check_early (debug) fails a step
+  * whose early ID differs from the GPU's; timeline (debug) records each served step. */
+ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     (void)self;
+     long long table_rows, shard_start, shard_end, max_lookups;
++    unsigned int columns;
+     int depth;
+     unsigned long long ids, weights, scales, control;
+     double ids_timeout, delay;
+     int check_early, timeline;
+-    if (!PyArg_ParseTuple(args, "LLLLiKKKKddpp", &table_rows, &shard_start, &shard_end, &max_lookups,
++    if (!PyArg_ParseTuple(args, "LLLILiKKKKddpp", &table_rows, &shard_start, &shard_end, &columns, &max_lookups,
+                           &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early,
+                           &timeline))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
++        !columns || (columns & ~PLE_ALL_COLUMNS) ||
+         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
+         !weights || !scales || !control || !(ids_timeout > 0) || delay < 0)
+         return PyErr_Format(PyExc_ValueError, "invalid Engram reader geometry, buffers or times");
+@@ -571,7 +580,7 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     if (!reader) return PyErr_NoMemory();
+     pthread_mutex_init(&reader->mutex, NULL);
+     /* One whole-table source per plane: shard 0 spans every row. */
+-    int error = ple_plan_init(&reader->plan, table_rows, table_rows, shard_start, shard_end, 256, 8,
++    int error = ple_plan_init(&reader->plan, table_rows, table_rows, shard_start, shard_end, columns, 256, 8,
+                               max_lookups);
+     if (error) {
+         release(reader);
+@@ -802,11 +811,11 @@ static PyObject *py_timeline(PyObject *self, PyObject *capsule) {
+     pthread_mutex_unlock(&reader->mutex);
+     for (uint64_t i = 0; i < last - first; i++) {
+         record_t *r = &copy[i];
+-        PyObject *row = Py_BuildValue("(IIIIIKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
++        PyObject *row = Py_BuildValue("(IIIIIKKKKKKK)", r->sequence, r->count, r->early, r->gpu_sequence,
+                                       r->gpu_wait_ns, (unsigned long long)r->submitted,
+                                       (unsigned long long)r->started, (unsigned long long)r->consumed,
+                                       (unsigned long long)r->ids, (unsigned long long)r->read,
+-                                      (unsigned long long)r->published);
++                                      (unsigned long long)r->published, (unsigned long long)r->plan_ns);
+         if (!row || PyList_Append(result, row) < 0) {
+             Py_XDECREF(row);
+             Py_DECREF(result);
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+index f104af05c..7e0f8a2eb 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
++++ b/vllm/models/deepseek_v4_1/engram_rows/_row_plan.h
+@@ -2,7 +2,8 @@
+  * Row planning for the Engram disk reader, from b12x's PLE reader
+  * (local-inference-lab/b12x b12x/loader/_row_plan.h, Apache-2.0): immutable source
+  * registration and allocation-free planning of 4 KiB-aligned direct reads. Unlike
+- * b12x's, it leaves the slots of other ranks' rows untouched. */
++ * b12x's, it leaves the slots of other ranks' rows untouched: a rank owns the rows in
++ * [tp_start, tp_end) of the hash columns in its mask (lookup i is column i % 24). */
+ 
+ #ifndef B12X_ROW_PLAN_H
+ #define B12X_ROW_PLAN_H
+@@ -10,6 +11,8 @@
+ #include <time.h>
+ #define PLE_BLOCK 4096u
+ #define PLE_READ_MAX 65536u
++#define PLE_COLUMNS 24u
++#define PLE_ALL_COLUMNS ((1u << PLE_COLUMNS) - 1u)
+ 
+ typedef struct {
+     int fd;
+@@ -41,6 +44,7 @@ typedef struct {
+ 
+ typedef struct {
+     int64_t shard_rows, padded_rows, tp_start, tp_end;
++    uint32_t columns;
+     size_t weight_bytes, scale_bytes, max_lookups, capacity;
+     ple_fragment_t *fragments;
+     ple_job_t *jobs;
+@@ -69,9 +73,10 @@ static inline void ple_plan_release(ple_plan_t *reader) {
+ }
+ 
+ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+-        int64_t padded_rows, int64_t tp_start, int64_t tp_end,
++        int64_t padded_rows, int64_t tp_start, int64_t tp_end, uint32_t columns,
+         int64_t weight_bytes, int64_t scale_bytes, int64_t max_lookups) {
+     if (shard_rows <= 0 || padded_rows <= 0 || tp_start < 0 || tp_end < tp_start ||
++        !columns || (columns & ~PLE_ALL_COLUMNS) ||
+         tp_end > padded_rows || weight_bytes <= 0 || scale_bytes < 0 || max_lookups <= 0 ||
+         weight_bytes > PY_SSIZE_T_MAX / max_lookups ||
+         scale_bytes > PY_SSIZE_T_MAX / max_lookups || max_lookups > PY_SSIZE_T_MAX / 8)
+@@ -85,6 +90,7 @@ static inline int ple_plan_init(ple_plan_t *reader, int64_t shard_rows,
+     reader->padded_rows = padded_rows;
+     reader->tp_start = tp_start;
+     reader->tp_end = tp_end;
++    reader->columns = columns;
+     reader->weight_bytes = weight_bytes;
+     reader->scale_bytes = scale_bytes;
+     reader->max_lookups = max_lookups;
+@@ -235,7 +241,9 @@ static inline bool ple_plan(ple_plan_t *reader, const char *ids, size_t count) {
+         memcpy(&id, ids + i * sizeof(id), sizeof(id));
+         /* Another rank's row (or a dead lookup): its slot is not read; the gather writes
+          * zeros for it without loading the slot. */
+-        if (id < reader->tp_start || id >= reader->tp_end) continue;
++        if (id < reader->tp_start || id >= reader->tp_end ||
++            !((reader->columns >> (i % PLE_COLUMNS)) & 1u))
++            continue;
+         for (int plane = 0; plane < (reader->scale_bytes ? 2 : 1); plane++) {
+             ple_source_t key = {.shard = id / reader->shard_rows, .scale = plane != 0};
+             ple_source_t *source = reader->source_count ? bsearch(&key, reader->sources,
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 2c5e57e25..3d0027784 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -98,8 +98,12 @@ class MappedHostAllocation:
+                 self.close()
+ 
+ 
++ALL_COLUMNS = (1 << 24) - 1
++
++
+ class EngramDiskRows:
+-    """Rows ``[shard_start, shard_end)`` of one Engram table, ``max_lookups`` per step.
++    """Rows ``[shard_start, shard_end)`` of the hash columns in the 24-bit mask ``columns``
++    of one Engram table (lookup i of a step is column i % 24), ``max_lookups`` per step.
+ 
+     ``ids_timeout_s`` bounds the reader's waits for the GPU (a step's row IDs, or its
+     gather of the previous step) and ``rows_timeout_s`` the GPU's wait for its rows;
+@@ -108,12 +112,16 @@ class EngramDiskRows:
+     """
+ 
+     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+-                 max_lookups: int, queue_depth: int = 128, ids_timeout_s: float = 20.0,
++                 max_lookups: int, columns: int = ALL_COLUMNS, queue_depth: int = 128,
++                 ids_timeout_s: float = 20.0,
+                  rows_timeout_s: float = 10.0, delay_s: float = 0.0,
+                  check_early: bool = False, timeline: bool = False):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
++        self.columns = int(columns)
++        if not 0 < self.columns <= ALL_COLUMNS:
++            raise ValueError(f"Engram reader columns must be a nonzero 24-bit mask: {columns:#x}")
+         self.max_lookups = int(max_lookups)
+         self.check_early = bool(check_early)
+         self.timeline_enabled = bool(timeline)
+@@ -127,7 +135,7 @@ class EngramDiskRows:
+         self._control[self.native.CTRL_TIMEOUT_US] = int(rows_timeout_s * 1e6)
+         self.rows_e4m3 = self.weights.device_view.view(torch.float8_e4m3fn)
+         self._reader = self.native.reader(
+-            table_rows, self.shard_start, self.shard_end, self.max_lookups, queue_depth,
++            table_rows, self.shard_start, self.shard_end, self.columns, self.max_lookups, queue_depth,
+             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+             float(ids_timeout_s), float(delay_s), self.check_early,
+             self.timeline_enabled,
+@@ -175,11 +183,12 @@ class EngramDiskRows:
+     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
+         """Wait for the staged step's rows and dequantize the first ``num_tokens``
+         tokens' rows into ``out`` (``[tokens, 24 * 256]`` BF16), zero elsewhere and for
+-        rows outside this rank's shard. Capturable in a CUDA graph."""
++        rows outside this rank's shard or columns. Capturable in a CUDA graph."""
+         from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather
+ 
+         engram_rows_gather(ids, num_tokens, self.rows_e4m3, self.scales.device_view,
+-                           self.control.device_view, out, self.shard_start, self.shard_end)
++                           self.control.device_view, out, self.shard_start, self.shard_end,
++                           self.columns)
+ 
+     def failure(self) -> str | None:
+         """Why the rows stopped, or None: the reader's failure or the GPU's timeout."""
+@@ -211,14 +220,15 @@ class EngramDiskRows:
+         return self.native.status(self._reader)
+ 
+     TIMELINE_FIELDS = ("sequence", "count", "early", "gpu_sequence", "gpu_wait_ns",
+-                       "submitted", "started", "consumed", "ids", "read", "published")
++                       "submitted", "started", "consumed", "ids", "read", "published", "plan_ns")
+ 
+     def timeline(self) -> list[dict]:
+         """Debug: the steps served since the last call, oldest first (``timeline`` on).
+         Times are CLOCK_MONOTONIC ns: the host queued the step (submitted), the worker
+         began it (started), saw the previous step gathered (consumed, early rows only),
+         saw the GPU's IDs (ids), read the rows (read) and published them (published).
+-        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one."""
++        gpu_wait_ns is the GPU's wait for gpu_sequence, the step before this one; plan_ns
++        the time the step's reads spent planning (sorting and merging its lookups)."""
+         rows = self.native.timeline(self._reader)
+         return [dict(zip(self.TIMELINE_FIELDS, row)) for row in rows]
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 64d5a807f..6e83e1833 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -13,9 +13,9 @@ stream:
+   memory from every gather block cost about 0.5 us a block.
+ - the gather: one block per (head, token) dequantizes the row as b12x's Engram
+   lookup does (the value times its E8M0 scale, 2^-127 for byte 0 and NaN for 255,
+-  rounded to BF16) into the token's head slice. A token past the step or a row
+-  outside this rank's shard loads nothing and writes zeros (the reader leaves those
+-  slots untouched).
++  rounded to BF16) into the token's head slice. A token past the step, or a row
++  outside this rank's shard or hash columns, loads nothing and writes zeros (the
++  reader leaves those slots untouched).
+ - the release: one thread writes the step it gathered into the control block, so the
+   reader may now fill the buffers with the next step's early rows (those the host
+   hashed while this step ran).
+@@ -156,6 +156,7 @@ def engram_rows_gather_kernel(
+     max_lookups: int,
+     shard_start: int,
+     shard_end: int,
++    columns: int = (1 << HEADS) - 1,
+     threads: int = 64,
+     vec: int = 4,
+ ):
+@@ -174,7 +175,10 @@ def engram_rows_gather_kernel(
+             tx = T.get_thread_binding()
+             row = ids[t, head]
+             lookup = t * HEADS + head
+-            if (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end):
++            owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
++            if columns != (1 << HEADS) - 1:
++                owned = owned & (T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1)
++            if owned:
+                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
+                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
+@@ -200,19 +204,22 @@ def engram_rows_gather(
+     out: torch.Tensor,
+     shard_start: int,
+     shard_end: int,
++    columns: int = (1 << HEADS) - 1,
+ ) -> None:
+     """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
+     rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
+     reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
+-    ``scales`` and ``control`` are the reader's mapped buffers."""
++    ``scales`` and ``control`` are the reader's mapped buffers; the rank owns the
++    rows in [shard_start, shard_end) of the hash columns in the mask ``columns``."""
+     engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+     if tokens:
+-        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
++        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end, columns)
+         kernel(ids[:tokens], num_tokens, rows, scales, out)
+     engram_rows_release_kernel()(control)
+ 
+ 
+ @engram_rows_gather.register_fake
+-def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end):
++def _engram_rows_gather_fake(ids, num_tokens, rows, scales, control, out, shard_start, shard_end,
++                             columns=(1 << HEADS) - 1):
+     return None

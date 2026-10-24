@@ -1,0 +1,147 @@
+From a4a5222127846da1e3e481a70ca0961e5e241c56 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 14:01:27 +0200
+Subject: [PATCH 145/274] DeepSeek-V4.1 Engram: disk shards on whole hash
+ columns, rows joined by an all-gather
+
+A layer's table is its 24 hash columns' prime-sized ranges back to back,
+each just above the Engram vocabulary. Disk shards split the rows equally,
+so a rank's shard cut a column (by about a thousand of its 16 million
+rows on TP3 and TP4) and the ranks' gathered rows had to be summed: an
+all-reduce of [T, 6144] per Engram layer, 26-30 ms of a TP3 16K prefill on
+the rank that waits for no one.
+
+When the TP size divides the 24 columns, a disk shard is now whole
+columns (rows from offsets[24r/N] to offsets[24(r+1)/N], sizes within
+0.002% of an equal split), so a rank's gathered rows are one contiguous
+band of 24/N * 256 values, and an all-gather of the bands (half the bytes,
+one phase) gives every rank the full rows. Adding zero rows no longer
+turns a -0.0 into +0.0, as the reference never sums them. Resident tables
+keep equal shards and the all-reduce.
+
+Test: column shards tile the table at column offsets and their bands tile
+the row in rank order (TP 1, 2, 3, 4, 6; none for 5).
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 0c5f5437b..4814446c8 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1076,3 +1076,23 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             assert output.data_ptr() == address
+     finally:
+         embed.close()
++
++
++@pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
++def test_disk_shards_are_whole_hash_columns(tp_size):
++    """When the TP size divides the 24 hash columns, every rank's disk shard is whole
++    columns: the shards tile the table at column offsets and their bands tile the
++    gathered row's 24 * 256 values in rank order (an all-gather joins them)."""
++    from vllm.models.deepseek_v4_1.common.engram import column_shard
++
++    geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
++    for index in range(len(geometry.layer_ids)):
++        offsets = [int(o) for o in geometry.offsets[index]]
++        shards = [column_shard(geometry, index, tp_size, r) for r in range(tp_size)]
++        assert shards[0][0] == 0 and shards[-1][1] == geometry.num_embeddings[index]
++        assert shards[0][2] == 0 and shards[-1][3] == 24 * 256
++        for (start, end, low, high), following in zip(shards, shards[1:] + [None]):
++            assert start in offsets and low == offsets.index(start) * 256
++            if following is not None:
++                assert (end, high) == (following[0], following[2])
++    assert column_shard(geometry, 0, 5, 0) is None  # 24 columns do not split five ways
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 385eda492..72796645d 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -311,7 +311,7 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
+     staged = torch.randn(tokens, 6)
+     engram = SimpleNamespace(
+-        embed_tokens=SimpleNamespace(table_memory="device"),
++        embed_tokens=SimpleNamespace(table_memory="device", band=None),
+         overlap_epochs=None,
+         staged_rows=staged,
+         wkv=lambda rows: rows.repeat(1, 2),
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 976e5454f..39883c3d9 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -15,6 +15,7 @@ from vllm.config import get_current_vllm_config
+ from vllm.distributed import (
+     get_tensor_model_parallel_rank,
+     get_tensor_model_parallel_world_size,
++    tensor_model_parallel_all_gather,
+     tensor_model_parallel_all_reduce,
+ )
+ from vllm.logger import init_logger
+@@ -530,6 +531,26 @@ def _load_table(param, loaded_weight):
+             )
+ 
+ 
++def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
++    """A disk table's shard on whole hash columns, or None.
++
++    A layer's table is its 24 hash columns' prime-sized ranges back to back, each
++    just above the Engram vocabulary. When the TP size divides 24, rank r owns
++    columns [24r/N, 24(r+1)/N): rows ``offsets`` start to end (within a few
++    thousand rows of an equal split), and in the gathered rows the contiguous band
++    of those columns' 256 values. Returns (row start, row end, band start, band
++    end)."""
++    columns = len(geometry.offsets[layer_index])
++    if columns % tp_size:
++        return None
++    per_rank = columns // tp_size
++    offsets = [int(o) for o in geometry.offsets[layer_index]]
++    table_rows = int(geometry.num_embeddings[layer_index])
++    first, last = tp_rank * per_rank, (tp_rank + 1) * per_rank
++    end = offsets[last] if last < columns else table_rows
++    return offsets[first], end, first * 256, last * 256
++
++
+ class ParallelEngramEmbedding(nn.Module):
+     def __init__(self, plan, caps, geometry, table_memory="device"):
+         super().__init__()
+@@ -541,6 +562,23 @@ class ParallelEngramEmbedding(nn.Module):
+         self.shard_rows = (self.table_rows + caps.tp_size - 1) // caps.tp_size
+         self.shard_start = caps.tp_rank * self.shard_rows
+         self.shard_end = (caps.tp_rank + 1) * self.shard_rows
++        # A disk table's rank reads whole hash columns when the TP size divides
++        # them, so its gathered rows are one band and the ranks' rows are joined by
++        # an all-gather of the bands, not summed (resident tables keep equal rows).
++        self.band = None
++        columns = (
++            column_shard(
++                geometry,
++                geometry.layer_ids.index(caps.layer_id),
++                caps.tp_size,
++                caps.tp_rank,
++            )
++            if table_memory == "disk"
++            else None
++        )
++        if columns is not None:
++            self.shard_start, self.shard_end, *band = columns
++            self.band = tuple(band)
+         self.weight_shape = (self.shard_rows, 256)
+         self.scale_shape = (self.shard_rows, 8)
+         self.tp_size = caps.tp_size
+@@ -991,7 +1029,17 @@ class Engram(nn.Module):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
+-        rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
++        band = self.embed_tokens.band
++        if band is not None:
++            # This rank's gathered rows are one band of whole hash columns.
++            rows = tensor_model_parallel_all_gather(
++                self.staged_rows[: hash_ids.shape[0], band[0] : band[1]].contiguous(),
++                dim=-1,
++            )
++        else:
++            rows = tensor_model_parallel_all_reduce(
++                self.staged_rows[: hash_ids.shape[0]]
++            )
+         # With SP and a column-parallel projection, kv is every rank's column block
+         # of this rank's rows, [N, L, C]: the TileLang gate reads the blocks in
+         # place, B12X's mix packed rows.

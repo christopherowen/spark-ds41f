@@ -1,0 +1,234 @@
+From d6f5c3c03135206bd63f1ca5803de2d8a901ec7b Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 10:23:49 +0200
+Subject: [PATCH 112/274] TileLang V4.1 WO: WO-A on BF16 activations, as
+ DeepSeek's reference
+
+The reference dequantizes wo_a to BF16 (convert.py) and projects the BF16
+attention output with an einsum; the TileLang WO quantized it to MXFP8 first.
+A grouped W8A16 GEMM (fp8w_bf16_gemm) expands each FP8 weight tile exactly to
+BF16 and accumulates in FP32, one launch for every group; row tiles of 16-128
+share one K loop, so a row's bits do not depend on its batch. WO-B keeps the
+reference's MXFP8 activations.
+
+(cherry picked from commit 78edfe9e0f1736341a402ff1227a04cb00d8120c)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index c9c5892f2..77c87f599 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -82,8 +82,9 @@ def test_wo_projection():
+         return out
+ 
+     full = project(rows)
+-    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs on the
+-    # MXFP8 activations, the intermediate rounded to BF16 as the kernel stores it.
++    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs: WO-A on the
++    # BF16 activations (DeepSeek's dequantized BF16 einsum), WO-B on MXFP8 ones (its
++    # linear), the intermediate rounded to BF16 as the kernel stores it.
+     rotated = o.clone()
+     tile_kernels.transform.apply_rotary(
+         rotated[..., -ROPE:],
+@@ -92,7 +93,7 @@ def test_wo_projection():
+         interleaved=True,
+         conjugate=True,
+     )
+-    x = _mxfp8_values(rotated.view(rows, -1))
++    x = rotated.view(rows, -1).double()
+     w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
+     a = torch.cat(
+         [
+@@ -137,3 +138,43 @@ def test_grouped_gemm_equals_groups(count):
+                 scratch,
+             )
+             assert torch.equal(out[:, g * RANK : (g + 1) * RANK], single), f"group {g}"
++
++
++def test_wo_a_keeps_bf16_activations():
++    """WO-A within one BF16 rounding of the FP64 product of the BF16 activations and
++    the exactly dequantized weights, well inside what MXFP8 activations give, with the
++    same bits at every row count (every row tile runs one K loop)."""
++    from vllm.models.deepseek_v4_1.tilelang.wo import _GroupedBF16
++
++    width = HEADS // GROUPS * HEAD_DIM
++    layer = _block32(GROUPS * RANK, width, 7)
++    wo_a = _GroupedBF16(layer, GROUPS)
++    x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
++    w = _dequant(layer)
++
++    def project(rows):
++        out = torch.empty((rows, GROUPS * RANK), dtype=torch.bfloat16, device=DEVICE)
++        wo_a(x[:rows], out)
++        return out
++
++    full = project(300)
++    ref = torch.cat(
++        [
++            x[:, g * width : (g + 1) * width].double() @ w[g * RANK : (g + 1) * RANK].T
++            for g in range(GROUPS)
++        ],
++        dim=1,
++    )
++    error = (full.double() - ref).abs()
++    assert (error <= ref.abs() * 2**-8 + 1e-3 * ref.abs().max()).all()
++    quantized = torch.cat(
++        [
++            _mxfp8_values(x[:, g * width : (g + 1) * width])
++            @ w[g * RANK : (g + 1) * RANK].T
++            for g in range(GROUPS)
++        ],
++        dim=1,
++    )
++    assert error.mean() < 0.25 * (quantized - ref).abs().mean()
++    for rows in (1, 7, 16, 17, 33, 64, 65, 100, 128, 129, 200):
++        assert torch.equal(project(rows), full[:rows]), rows
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index d91ac4711..f7b6bd5fd 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -373,6 +373,66 @@ def bf16_gemm(
+     return gemm_bf16
+ 
+ 
++@tilelang.jit
++def fp8w_bf16_gemm(
++    N: int,
++    K: int,
++    groups: int = 1,
++    block_M: int = 16,
++    block_N: int = 32,
++    block_K: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++):
++    """``C[:, g*N:(g+1)*N] = A[:, g*K:(g+1)*K] @ W_g^T`` for every group ``g`` in one
++    launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
++    ``W[groups*N, K]`` (E4M3, one UE8M0 exponent per 32x32 block in ``E``), each weight
++    tile expanded exactly to BF16 (an E4M3 value times a power of two fits BF16) and
++    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
++    reference WO-A: BF16 activations on the FP8 weights dequantized by ``convert.py``.
++
++    Every M tile runs the same K loop, so a row's bits do not depend on its batch.
++    """
++    assert K % block_K == 0 and block_K % 32 == 0 and N % block_N == 0
++    M = T.dynamic("M")
++    k_blocks = K // block_K
++    n_tiles = N // block_N
++
++    @T.prim_func
++    def main(
++        A: T.Tensor((M, groups * K), T.bfloat16),
++        W: T.Tensor((groups * N, K), T.float8_e4m3fn),
++        E: T.Tensor((groups * N // 32, K // 32), T.uint8),
++        C: T.Tensor((M, groups * N), T.bfloat16),
++    ):
++        with T.Kernel(groups * n_tiles, T.ceildiv(M, block_M), threads=threads) as (
++            bx,
++            by,
++        ):
++            g = bx // n_tiles
++            n0 = g * N + (bx % n_tiles) * block_N
++            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
++            W_shared = T.alloc_shared((block_N, block_K), T.float8_e4m3fn)
++            B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
++            C_local = T.alloc_fragment((block_M, block_N), T.float32)
++            T.clear(C_local)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
++                T.copy(W[n0, ko * block_K], W_shared)
++                for i, j in T.Parallel(block_N, block_K):
++                    exponent = T.Cast(
++                        T.uint32, E[(n0 + i) // 32, (ko * block_K + j) // 32]
++                    )
++                    scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
++                    B_shared[i, j] = T.Cast(
++                        T.bfloat16, T.Cast(T.float32, W_shared[i, j]) * scale
++                    )
++                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
++            T.copy(C_local, C[by * block_M, n0])
++
++    return main
++
++
+ @tilelang.jit
+ def splitk_reduce_two(
+     N: int,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index e07ab1e81..1093fc74e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -7,9 +7,12 @@ reference computes it::
+     a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
+     out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
+ 
+-with MXFP8 activations (DeepSeek's E4M3 and one UE8M0 scale per 32) for both GEMMs.
+-WO-A runs every group in one launch of the grouped MXFP8 GEMM; WO-B is the
+-ordinary block-32 projection. The checkpoint tensors are read in place.
++WO-A keeps the BF16 activations, as the reference does (``convert.py`` dequantizes
++``wo_a`` to BF16 and the projection is a BF16 einsum): one launch of the grouped
++W8A16 GEMM expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
++WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
++one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. The
++checkpoint tensors are read in place.
+ """
+ 
+ import torch
+@@ -18,9 +21,18 @@ from torch import nn
+ from vllm.v1.worker.workspace import current_preallocated_workspace
+ 
+ from .. import l2_prefetch
++from .gemm import fp8w_bf16_gemm
+ from .linear import _block32_linear, _prepare_block32
+ from .rope import rope_
+ 
++# WO-A row tiles: every tile runs the same K loop, so the bits do not depend on it.
++_WO_A_TILES = {
++    16: dict(block_N=32, num_stages=2),
++    32: dict(block_N=32, num_stages=2),
++    64: dict(block_N=64, num_stages=2),
++    128: dict(block_N=64, num_stages=3),
++}
++
+ 
+ class _Weight:
+     """A block-32 FP8 weight and its scales; weak-referenceable for the custom op."""
+@@ -33,9 +45,28 @@ class _Weight:
+         self.tilelang_decode_rows = 128
+ 
+ 
++class _GroupedBF16:
++    """WO-A for the W8A16 GEMM: the FP8 weight, its UE8M0 exponents (also what the L2
++    prefetch reads beside it, as ``tilelang_weight_sf``) and one kernel per row tile."""
++
++    def __init__(self, layer: nn.Module, groups: int):
++        self.weight = layer.weight.detach()
++        self.tilelang_weight_sf = layer.weight_scale_inv.detach().view(torch.uint8)
++        n, k = self.weight.shape
++        self.kernels = {
++            rows: fp8w_bf16_gemm(n // groups, k, groups, block_M=rows, **config)
++            for rows, config in _WO_A_TILES.items()
++        }
++
++    def __call__(self, x: torch.Tensor, out: torch.Tensor) -> None:
++        rows = x.shape[0]
++        tile = next((t for t in _WO_A_TILES if rows <= t), max(_WO_A_TILES))
++        self.kernels[tile](x, self.weight, self.tilelang_weight_sf, out)
++
++
+ class TileLangWOProjection:
+     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
+-        self.a = _Weight(wo_a, groups)
++        self.a = _GroupedBF16(wo_a, groups)
+         self.b = _Weight(wo_b, 1)
+         self.hidden = wo_b.weight.shape[0]
+ 
+@@ -62,7 +93,8 @@ class TileLangWOProjection:
+         a = torch.empty(
+             (rows, self.a.weight.shape[0]), dtype=torch.bfloat16, device=o.device
+         )
+-        _block32_linear(o.view(rows, -1), a, self.a.tilelang_key, scratch)
++        if rows:
++            self.a(o.view(rows, -1), a)
+         _block32_linear(a, out, self.b.tilelang_key, scratch)
+         return out
+ 

@@ -1,0 +1,899 @@
+From b94bd2c5dcd302d81fda98f88464a4989ae13392 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:15:10 +0200
+Subject: [PATCH 156/274] Kernel preparation: the V4.1 attention layer declares
+ its TileLang kernels; plans build and reserve scratch in bind
+
+DeepseekV4Attention.declare_kernels declares, from configuration, every TileLang
+kernel the shared layer paths launch: the window metadata (chunk, or decode with
+the main page table; replay variants on CED decoders; draft windows on DSpark
+layers), the index page tables, the metadata builders of each cache group the
+layer's caches join (from the caches' own KV-cache specs and max_num_seqs), RoPE
+of every role including WO's inverse rotation, and the SWA and indexed cache
+writers at the builders' slot dtype. It also lets the TileLang WO projection
+declare. _declare_attention (the B12X weights stage) no longer compiles anything;
+the geometry the TileLang paths need comes from _attention_geometry.
+
+The TileLang attention layer adds its sparse-MLA routes, indexer score and top-k
+kernels and MXFP4 quantizers; binding builds the cached plans and reserves their
+workspace before memory profiling, with the same sizes. The plan classes list
+their kernels from the same route functions their constructors make them from.
+
+The metadata builder makes its kernels through the same key function (cache
+hits). The compressor declares its compression kernels as a module, and binding
+allocates ratio 1's placeholder; the B12X state stage no longer compiles them.
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 9957cb734..fd79818af 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -36,10 +36,13 @@ from vllm.models.deepseek_v4_1.ced import CED_WINDOW, ced_decoder_start
+ from vllm.models.deepseek_v4_1.compressor import DeepseekCompressor
+ from vllm.models.deepseek_v4_1.quant_config import Block32FP8LinearMethod
+ from vllm.models.deepseek_v4_1.sparse_mla import (
++    SLOT_DTYPE,
+     DeepseekV41B12xBackend,
+     DeepseekV41B12xMetadata,
+     _chunk,
++    tilelang_builder_kernels,
+ )
++from vllm.models.deepseek_v4_1.tilelang import prepare
+ from vllm.models.deepseek_v41.common.rope import build_deepseek_v4_rope
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.b12x import (
+@@ -669,6 +672,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+     def _declare_attention(self, device):
+         """Describe native code and simultaneous metadata without allocating."""
++        self._attention_geometry()
++        self._attention_declarations = {}
++        for mode, capacity in (
++            ("decode", self._decode_capacity),
++            ("extend", self.capacity),
++        ):
++            declaration = self._declare_mla(
++                mode, capacity, self._attention_workspace_specs[mode], device
++            )
++            if declaration is not None:
++                self._attention_declarations[mode] = declaration
++
++    def _attention_geometry(self) -> None:
++        """The metadata arena of each attention mode and the staging this layer
++        owns, from configuration alone."""
+         # Page geometry stays as computed at construction, from the block size
+         # the caches were allocated with. The engine later lowers
+         # cache_config.block_size to its smallest prefix-cacheable group (the
+@@ -688,7 +706,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.config.compilation_config.max_cudagraph_capture_size or 0,
+         )
+         self._attention_workspace_specs = {}
+-        self._attention_declarations = {}
+         self._decode_capacity = min(self.capacity, decode_rows)
+         for mode, capacity in (
+             ("decode", self._decode_capacity),
+@@ -702,9 +719,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.compress_ratio:
+                 metadata_specs += (((capacity, self._main_width), torch.int32),)
+             self._attention_workspace_specs[mode] = metadata_specs
+-            declaration = self._declare_mla(mode, capacity, metadata_specs, device)
+-            if declaration is not None:
+-                self._attention_declarations[mode] = declaration
+         if not hasattr(self, "_owns_topk_indices"):
+             self._owns_topk_indices = (
+                 self.topk_indices_buffer is None and self.is_index_source
+@@ -742,14 +756,43 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self._short_index_shape = (short_rows, short_width)
+             specs.append(("_short_index_pages", self._short_index_shape, torch.int32))
+         self._staging_specs = tuple(specs)
+-        if kernels.uses_tilelang():
+-            self._compile_tilelang_metadata()
+ 
+-    def _compile_tilelang_metadata(self) -> None:
+-        """Compile this layer's TileLang metadata kernels at preparation, never
+-        during graph capture."""
++    def declare_kernels(self) -> None:
++        """Declare every TileLang kernel this layer can launch, its WO projection's
++        included (the worker calls this after loading, before any distributed
++        work)."""
++        self._attention_geometry()
++        if kernels.uses_tilelang():
++            calls = self._tilelang_calls()
++            prepare.declare(lambda: calls)
++        declare_wo = getattr(self._wo_projection_weights, "declare_kernels", None)
++        if declare_wo is not None:
++            declare_wo()
++
++    def _owned_caches(self) -> list:
++        """The cache layers this layer allocates: one per KV-cache group it joins."""
++        caches = [self.swa_cache_layer]
++        if self.is_kv_source:
++            caches.append(self)
++        if self.indexer is not None and self.indexer.owns_k:
++            caches.append(self.indexer.k_cache)
++        if self.compressor is not None and self.compressor.state_cache is not None:
++            caches.append(self.compressor.state_cache)
++        return caches
++
++    def _tilelang_calls(self) -> list:
++        """The TileLang kernels of the shared layer paths, as ``prepare.call``s:
++        window metadata and index page tables, the metadata builders of the cache
++        groups this layer joins, the RoPE of every role (WO's inverse rotation
++        included) and the cache writers, each in its call site's call form."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++        from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
++        from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+ 
++        calls = []
++        # _write_decode_metadata: the window metadata, with the main page table in
++        # the same launch on compressed layers. A CED decoder's rows start no
++        # earlier than their request's replay start when the step has one.
+         replays = (
+             (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
+         )
+@@ -762,16 +805,50 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 replay,
+             )
+             if self.compress_ratio:
+-                tl_metadata.decode_metadata_kernel(*args, self._main_width)
++                calls.append(
++                    prepare.call(
++                        tl_metadata.decode_metadata_kernel, *args, self._main_width
++                    )
++                )
+             else:
+-                tl_metadata.chunk_kernel(*args)
+-        widths = {self._main_width} if self.compress_ratio else set()
++                calls.append(prepare.call(tl_metadata.chunk_kernel, *args))
++        # forward_mqa: the page tables of the index chunks, full or short.
+         if self.indexer is not None:
+-            widths.add(self._index_width)
+-        if self._short_index_shape is not None:
+-            widths.add(self._short_index_shape[1])
+-        for width in widths:
+-            tl_metadata.pages_kernel(width)
++            widths = {self._index_width}
++            if self._short_index_shape is not None:
++                widths.add(self._short_index_shape[1])
++            calls.extend(
++                prepare.call(tl_metadata.pages_kernel, width) for width in widths
++            )
++        # Each group's metadata builder: its spec as the KV-cache spec code makes
++        # it, for the scheduler's requests.
++        requests = self.config.scheduler_config.max_num_seqs
++        for cache in self._owned_caches():
++            calls.extend(
++                tilelang_builder_kernels(cache.get_kv_cache_spec(self.config), requests)
++            )
++        # _rope (heads, columns, ratio) by role; WO rotates its input back.
++        table_width = self.rotary_emb.cos_sin_cache.shape[1]
++        roles = [
++            (self.n_local_heads, self.head_dim, 1, False),  # q
++            (1, 512, 1, False),  # kv
++            (self.n_local_heads, self.head_dim, 1, True),  # WO's inverse
++        ]
++        if self.indexer is not None:
++            roles.append((self.indexer.heads, 128, 1, False))  # index query
++        if self.compressor is not None:
++            roles.append((1, 128, self.compress_ratio, False))  # index key
++            roles.append((1, 512, self.compress_ratio, False))  # latent
++        calls.extend(
++            rope_call(heads, dim, table_width, ratio, inverse)
++            for heads, dim, ratio, inverse in roles
++        )
++        # _write_v41_cache: SWA records of every layer, indexed records of the
++        # compressor's latents, at the builders' (and compressor's) slot dtype.
++        calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
++        if self.compressor is not None:
++            calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
++        return calls
+ 
+     def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
+         """Declare the native sparse-MLA plan for one mode, beside its metadata."""
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index ae2da9ec5..4836e748a 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -12,7 +12,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+ from vllm.models.deepseek_v4_1 import kernels
+ from vllm.models.deepseek_v4_1.b12x_layers import B12xLinearMethod, B12xRMSNorm
+-from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xBackend
++from vllm.models.deepseek_v4_1.sparse_mla import SLOT_DTYPE, DeepseekV41B12xBackend
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.b12x import (
+     B12xPreparationUnit,
+@@ -198,7 +198,7 @@ class DeepseekCompressor(nn.Module):
+         )
+         self._latent = alloc((t, 512), torch.bfloat16)
+         self._emitted = alloc((t,), torch.bool)
+-        self._slots = alloc((t,), torch.int64)
++        self._slots = alloc((t,), SLOT_DTYPE)
+         self._row_ids = torch.arange(r, dtype=torch.int64, device=device)
+         self._primer_starts = torch.empty((r + 1,), dtype=torch.int32, device=device)
+         self._primer_positions = torch.empty((r,), dtype=torch.int64, device=device)
+@@ -380,8 +380,6 @@ class DeepseekCompressor(nn.Module):
+ 
+         def make_call(state):
+             self._ensure_capacity_buffers(state.caps)
+-            if kernels.uses_tilelang():
+-                self._prepare_tilelang(state.caps.device)
+             binding = self._primer_binding(state)
+             return PreparedCall(
+                 run=lambda: state.run(binding),
+@@ -426,18 +424,36 @@ class DeepseekCompressor(nn.Module):
+             ),
+         )
+ 
+-    def _prepare_tilelang(self, device) -> None:
+-        """Compile the TileLang compression kernels (and ratio 1's placeholder)
+-        at preparation, never during graph capture."""
++    def _tilelang_calls(self) -> list:
++        """The TileLang compression kernels ``_forward_tilelang`` launches, as
++        ``prepare.call``s, for the step metadata's ``max_num_seqs`` requests."""
+         from vllm.models.deepseek_v4_1.tilelang import compress as tl
++        from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+-        if self.compress_ratio == 2:
+-            page = self.state_cache.block_size
+-            tl.compress_kernel(2, self.requests, page)
+-            tl.gather_partial_state_kernel(self.requests, page)
+-        else:
+-            tl.compress_kernel(1, self.requests, 1)
+-            tl.placeholder(self.requests, device)
++        if self.compress_ratio == 1:
++            return [prepare.call(tl.compress_kernel, 1, self.requests, 1)]
++        # The ring holds one state per token, so its metadata's page
++        # (``state_metadata.block_size``) is its block size.
++        page = self.state_cache.block_size
++        return [
++            prepare.call(tl.gather_partial_state_kernel, self.requests, page),
++            prepare.call(tl.compress_kernel, 2, self.requests, page),
++        ]
++
++    def declare_kernels(self) -> None:
++        """Declare the TileLang compression kernels (the worker calls this after
++        loading); binding allocates ratio 1's placeholder operands, so the first
++        call, possibly under graph capture, allocates nothing."""
++        if not kernels.uses_tilelang():
++            return
++        from vllm.models.deepseek_v4_1.tilelang import compress as tl
++        from vllm.models.deepseek_v4_1.tilelang import prepare
++
++        def bind() -> None:
++            if self.compress_ratio == 1:
++                tl.placeholder(self.requests, self.fused_wkv_wgate.weight.device)
++
++        prepare.declare(self._tilelang_calls, bind=bind)
+ 
+     def _forward_tilelang(self, rows, metadata, state_metadata):
+         """The TileLang compression: at ratio 2 the requests' carries from the state
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index e26a3c81b..0a855352c 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -178,6 +178,33 @@ class DeepseekV41B12xMetadata:
+     num_decode_tokens: int = 0
+ 
+ 
++def _group_geometry(kv_cache_spec) -> tuple[int, int, bool]:
++    """A cache group's ``(tokens per state, states per page, request ring)``."""
++    return (
++        int(kv_cache_spec.tokens_per_state),
++        int(kv_cache_spec.num_states),
++        isinstance(kv_cache_spec, CircularBufferSpec),
++    )
++
++
++def tilelang_builder_kernels(kv_cache_spec, max_requests: int) -> list:
++    """The TileLang metadata kernels a builder of ``kv_cache_spec``'s group launches
++    for ``max_requests`` requests, as ``prepare.call``s. The attention layers that
++    own the group's caches declare them; the builder finds them prepared."""
++    from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    ratio, page, circular = _group_geometry(kv_cache_spec)
++    return [
++        prepare.call(tl_metadata.requests_kernel, max_requests),
++        prepare.call(tl_metadata.tokens_kernel, max_requests, page, ratio, circular),
++    ]
++
++
++# The slot-mapping rows a builder publishes: the cache writers' slot dtype.
++SLOT_DTYPE = torch.int64
++
++
+ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+ 
+@@ -186,9 +213,7 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+         self.tokens = vllm_config.scheduler_config.max_num_batched_tokens
+         self.requests = vllm_config.scheduler_config.max_num_seqs
+-        self.ratio = int(kv_cache_spec.tokens_per_state)
+-        self.page = int(kv_cache_spec.num_states)
+-        self.circular = isinstance(kv_cache_spec, CircularBufferSpec)
++        self.ratio, self.page, self.circular = _group_geometry(kv_cache_spec)
+ 
+         def alloc(shape, dtype):
+             return torch.empty(shape, dtype=dtype, device=device)
+@@ -198,16 +223,15 @@ class DeepseekV41B12xMetadataBuilder(AttentionMetadataBuilder):
+         self.counts = alloc((2,), torch.int32)
+         self.positions = alloc((self.tokens,), torch.int64)
+         self.reqs = alloc((self.tokens,), torch.int32)
+-        self.slots = alloc((self.tokens,), torch.int64)
++        self.slots = alloc((self.tokens,), SLOT_DTYPE)
+         self.lengths = alloc((self.tokens,), torch.int32)
+         if kernels.uses_tilelang():
+-            from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+-
+-            # Compiled with the builder, never during graph capture.
+-            tl_metadata.requests_kernel(self.requests)
+-            tl_metadata.tokens_kernel(
+-                self.requests, self.page, self.ratio, self.circular
+-            )
++            # The attention layers owning this group's caches declare these
++            # kernels; here, and at every rebuild, they are cache hits.
++            for function, args, kwargs in tilelang_builder_kernels(
++                kv_cache_spec, self.requests
++            ):
++                function(*args, **kwargs)
+ 
+     def build(
+         self,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 5a3aed28e..e4f867835 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -24,11 +24,13 @@ from vllm.v1.worker.workspace import (
+     retain_cuda_graph_capture_resource,
+ )
+ 
++from . import prepare
+ from .indexer import (
+     CANDIDATE_BLOCK,
+     CANDIDATE_BLOCKS,
+     IndexerV41Plan,
+     page_bytes,
++    quantize_call,
+     quantize_mxfp4,
+     write_index_keys,
+ )
+@@ -43,18 +45,24 @@ class DeepseekV41TileLangBackend(DeepseekV41B12xBackend):
+         return "TILELANG"
+ 
+ 
++def _mla_options(heads, swa_width, idx_width, idx_page, swa_page, max_rows, device):
++    """``SparseMlaV41Plan``'s arguments for one layer shape."""
++    return (heads, swa_width, idx_width, idx_page), dict(
++        swa_page_size=swa_page, max_rows=max_rows, device=device
++    )
++
++
+ # Plans are kernels only, so layers of one shape share them.
+ @functools.cache
+-def _mla_plan(heads, swa_width, idx_width, idx_page, swa_page, max_rows, device):
+-    return SparseMlaV41Plan(
+-        heads,
+-        swa_width,
+-        idx_width,
+-        idx_page,
+-        swa_page_size=swa_page,
+-        max_rows=max_rows,
+-        device=device,
+-    )
++def _mla_plan(*shape):
++    args, kwargs = _mla_options(*shape)
++    return SparseMlaV41Plan(*args, **kwargs)
++
++
++def _mla_calls(*shape) -> list:
++    """The kernel calls ``_mla_plan(*shape)`` makes."""
++    args, kwargs = _mla_options(*shape)
++    return SparseMlaV41Plan.calls(*args, **kwargs)
+ 
+ 
+ @functools.cache
+@@ -64,6 +72,13 @@ def _index_plan(width, page_size, candidates, candidate_blocks):
+     )
+ 
+ 
++def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
++    """The kernel calls ``_index_plan`` of these arguments makes."""
++    return IndexerV41Plan.calls(
++        width, page_size, candidates=candidates, candidate_blocks=candidate_blocks
++    )
++
++
+ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     backend_cls = DeepseekV41TileLangBackend
+ 
+@@ -75,8 +90,73 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         # which this layer never launches.
+         return ()
+ 
++    def declare_kernels(self) -> None:
++        """Also declare the sparse MLA, indexer and MXFP4 quantizer kernels; binding
++        builds the plans and reserves their scratch, before memory profiling."""
++        super().declare_kernels()
++        calls = self._plan_calls()
++        prepare.declare(lambda: calls, bind=self._bind_plans)
++
++    def _plan_args(self) -> tuple[tuple, dict, dict]:
++        """``_mla_plan``'s arguments, and per index mode ``_index_plan``'s
++        arguments and the chunk rows its scratch covers."""
++        self._attention_geometry()
++        mla = (
++            self.n_local_heads,
++            self.swa_width,
++            512 if self.compress_ratio else 0,
++            self._main_page,
++            self.swa_cache_layer.block_size,
++            self.capacity,
++            self.rotary_emb.cos_sin_cache.device,
++        )
++        index, chunks = {}, {}
++        if self.indexer is not None:
++            reindex = self.layer_id > self.candidate_source_layer
++            width = (
++                CANDIDATE_BLOCKS * CANDIDATE_BLOCK
++                if reindex
++                else self._index_width * self._index_page
++            )
++            full = (
++                width,
++                self._index_page,
++                reindex,
++                self.layer_id == self.candidate_source_layer,
++            )
++            index = {"decode": full, "prefill": full}
++            chunks = {"decode": self.DECODE_CHUNK, "prefill": self.INDEX_CHUNK}
++            if self._short_index_shape is not None:
++                rows, pages = self._short_index_shape
++                index["prefill_short"] = (
++                    pages * self._index_page,
++                    self._index_page,
++                    False,
++                    False,
++                )
++                chunks["prefill_short"] = rows
++        return mla, index, chunks
++
++    def _plan_calls(self) -> list:
++        """The kernels this layer's plans make (``_build_tilelang_plans``) and its
++        MXFP4 quantizers launch, as ``prepare.call``s."""
++        mla, index, _ = self._plan_args()
++        calls = _mla_calls(*mla)
++        # Decode and prefill share one plan.
++        for args in dict.fromkeys(index.values()):
++            calls.extend(_index_calls(*args))
++        if self.indexer is not None:
++            calls.append(quantize_call())  # _quantize_index_query
++        if self.compressor is not None:
++            calls.append(quantize_call(self._index_page))  # _write_index_keys
++        return calls
++
++    def _bind_plans(self) -> None:
++        self._tilelang_plans = self._build_tilelang_plans()
++
+     def _tilelang(self) -> SimpleNamespace:
+-        """This layer's plans, built and their scratch reserved on first use."""
++        """This layer's plans (built when its kernels are bound; the cache pages
++        are checked on first use)."""
+         plans = self.__dict__.get("_tilelang_plans")
+         if plans is None:
+             if torch.cuda.is_current_stream_capturing():
+@@ -84,6 +164,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                     "V4.1 TileLang kernels must be built before CUDA graph capture"
+                 )
+             plans = self._tilelang_plans = self._build_tilelang_plans()
++        if not self.__dict__.get("_cache_pages_checked"):
++            self._check_cache_pages()
++            self._cache_pages_checked = True
+         return plans
+ 
+     def _check_cache_pages(self) -> None:
+@@ -114,39 +197,9 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+                 )
+ 
+     def _build_tilelang_plans(self) -> SimpleNamespace:
+-        self._check_cache_pages()
+-        device = self.rotary_emb.cos_sin_cache.device
+-        mla = _mla_plan(
+-            self.n_local_heads,
+-            self.swa_width,
+-            512 if self.compress_ratio else 0,
+-            self._main_page,
+-            self.swa_cache_layer.block_size,
+-            self.capacity,
+-            device,
+-        )
+-        index, chunks = {}, {}
+-        if self.indexer is not None:
+-            reindex = self.layer_id > self.candidate_source_layer
+-            width = (
+-                CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+-                if reindex
+-                else self._index_width * self._index_page
+-            )
+-            full = _index_plan(
+-                width,
+-                self._index_page,
+-                reindex,
+-                self.layer_id == self.candidate_source_layer,
+-            )
+-            index = {"decode": full, "prefill": full}
+-            chunks = {"decode": self.DECODE_CHUNK, "prefill": self.INDEX_CHUNK}
+-            if self._short_index_shape is not None:
+-                rows, pages = self._short_index_shape
+-                index["prefill_short"] = _index_plan(
+-                    pages * self._index_page, self._index_page, False, False
+-                )
+-                chunks["prefill_short"] = rows
++        mla_args, index_args, chunks = self._plan_args()
++        mla = _mla_plan(*mla_args)
++        index = {mode: _index_plan(*args) for mode, args in index_args.items()}
+         # Reserve the largest scratch each phase borrows: indexing, then the
+         # attention metadata arena with the decode route's segment workspace.
+         workspace = current_workspace_manager()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+index 335abeaaa..6dd8a6353 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/cache_writer.py
+@@ -26,6 +26,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import prepare
++
+ DIM = 512
+ RECORD_BYTES = {"swa": 528, "indexed": 288}
+ _GROUP = {"swa": 32, "indexed": 16}
+@@ -195,10 +197,20 @@ def write_cache(
+     word_bytes, _, word_torch = _WORD[cache_kind]
+     if pages.stride(0) % word_bytes or pages.shape[1] % word_bytes:
+         raise ValueError(f"cache pages are not whole {word_bytes}-byte words")
+-    kernel = cache_writer_kernel(
+-        cache_kind, page_size, str(slot_mapping.dtype).removeprefix("torch.")
+-    )
++    function, args, kwargs = writer_call(cache_kind, page_size, slot_mapping.dtype)
++    kernel = function(*args, **kwargs)
+     kernel(kv, pages, pages.view(word_torch), slot_mapping)
+ 
+ 
+-__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache"]
++def writer_call(cache_kind: str, page_size: int, slot_dtype: torch.dtype):
++    """The kernel ``write_cache`` launches for ``slot_dtype`` slots, as a
++    ``prepare.call``."""
++    return prepare.call(
++        cache_writer_kernel,
++        cache_kind,
++        page_size,
++        str(slot_dtype).removeprefix("torch."),
++    )
++
++
++__all__ = ["RECORD_BYTES", "cache_writer_kernel", "write_cache", "writer_call"]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index d12b37e8c..19d0c3971 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -41,6 +41,7 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import prepare
+ from .gemm import SF_BLOCK
+ 
+ INDEX_HEADS = 32
+@@ -57,6 +58,24 @@ def page_bytes(page_size: int) -> int:
+     return page_size * (INDEX_DIM // 2 + INDEX_DIM // SF_BLOCK)
+ 
+ 
++def _make(kernel_call):
++    """The kernel of a ``prepare.call`` (a cache hit once it is prepared)."""
++    function, args, kwargs = kernel_call
++    return function(*args, **kwargs)
++
++
++def _score_call(width, page_size, candidates):
++    return prepare.call(indexer_score_v41, width, page_size, candidates)
++
++
++def quantize_call(page_size=None):
++    """The MXFP4 quantizer ``quantize_mxfp4`` launches, or with ``page_size`` the
++    index-key writer ``write_index_keys`` launches, as a ``prepare.call``."""
++    if page_size is None:
++        return prepare.call(mxfp4_quantize_v41)
++    return prepare.call(mxfp4_quantize_v41, True, page_size)
++
++
+ def _row_extent(Lengths, Active, row, width):
+     """Positions a row selects from: ``min(Lengths, Active, width)``, at least zero.
+ 
+@@ -364,7 +383,7 @@ def quantize_mxfp4(x, q, scales):
+ 
+     ``q`` is ``[..., 64]`` packed E2M1; ``scales`` is ``[..., 4]`` UE8M0.
+     """
+-    mxfp4_quantize_v41()(
++    _make(quantize_call())(
+         x.reshape(-1, INDEX_DIM),
+         q.view(-1, INDEX_DIM // 2),
+         scales.view(-1, INDEX_DIM // SF_BLOCK),
+@@ -374,7 +393,7 @@ def quantize_mxfp4(x, q, scales):
+ 
+ def write_index_keys(keys, pool, slots, page_size):
+     """Quantize ``[rows, 128]`` keys into index-cache pages at ``slots`` (-1 skips)."""
+-    kernel = mxfp4_quantize_v41(True, page_size)
++    kernel = _make(quantize_call(page_size))
+     kernel(keys, slots.to(torch.int64), pool[:, : page_bytes(page_size)])
+ 
+ 
+@@ -990,24 +1009,56 @@ class IndexerTopK:
+ 
+     def __init__(self, width, topk=INDEX_TOPK, group=1, candidates=False):
+         self.topk, self.group, self.candidates = topk, group, candidates
+-        entries = tilelang.cdiv(width, group)
+-        self.segments = tilelang.cdiv(entries, _SEGMENT_ENTRIES)
+-        self.levels = []  # (kernel, input lists, output lists)
++        self.segments, first, levels = self.routes(width, topk, group, candidates)
+         if self.segments == 1:
+-            self.single = indexer_topk_segment_v41(width, topk, group, True, candidates)
+-            return
+-        self.stage1 = indexer_topk_segment_v41(width, topk, group, False, candidates)
++            self.single = _make(first)
++        else:
++            self.stage1 = _make(first)
++        # (kernel, input lists, output lists)
++        self.levels = [(_make(kernel), lists, out) for kernel, lists, out in levels]
++
++    @staticmethod
++    def routes(width, topk=INDEX_TOPK, group=1, candidates=False):
++        """``(segments, first, levels)``: the segment count, the first kernel (the
++        final segment kernel of a one-segment row, else stage 1) and the merge
++        levels ``(kernel, input lists, output lists)``, kernels as
++        ``prepare.call``s."""
++        entries = tilelang.cdiv(width, group)
++        segments = tilelang.cdiv(entries, _SEGMENT_ENTRIES)
++        levels = []
++        if segments == 1:
++            first = prepare.call(
++                indexer_topk_segment_v41, width, topk, group, True, candidates
++            )
++            return segments, first, levels
++        first = prepare.call(
++            indexer_topk_segment_v41, width, topk, group, False, candidates
++        )
+         fan_in = max(2, _MERGE_KEYS // topk)
+-        lists, span = self.segments, _SEGMENT_ENTRIES
++        lists, span = segments, _SEGMENT_ENTRIES
+         while True:
+             outputs = tilelang.cdiv(lists, fan_in)
+-            kernel = indexer_topk_merge_v41(
+-                width, topk, group, lists, span, fan_in, candidates
++            kernel = prepare.call(
++                indexer_topk_merge_v41,
++                width,
++                topk,
++                group,
++                lists,
++                span,
++                fan_in,
++                candidates,
+             )
+-            self.levels.append((kernel, lists, outputs))
++            levels.append((kernel, lists, outputs))
+             if outputs == 1:
+                 break
+             lists, span = outputs, span * fan_in
++        return segments, first, levels
++
++    @classmethod
++    def calls(cls, width, topk=INDEX_TOPK, group=1, candidates=False) -> list:
++        """The kernel calls ``IndexerTopK(width, topk, group, candidates)`` makes."""
++        _, first, levels = cls.routes(width, topk, group, candidates)
++        return [first, *(kernel for kernel, _, _ in levels)]
+ 
+     def scratch_specs(self, rows):
+         """Two ping-pong winner buffers (values, entries) for the merge levels."""
+@@ -1095,7 +1146,7 @@ class IndexerV41Plan:
+         )
+         self.width, self.page_size, self.topk = width, page_size, topk
+         self.candidates, self.candidate_blocks = candidates, candidate_blocks
+-        self.score = indexer_score_v41(width, page_size, candidates)
++        self.score = _make(_score_call(width, page_size, candidates))
+         self.select = IndexerTopK(width, topk, 1, candidates)
+         self.select_blocks = (
+             IndexerTopK(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK)
+@@ -1103,6 +1154,24 @@ class IndexerV41Plan:
+             else None
+         )
+ 
++    @staticmethod
++    def calls(
++        width,
++        page_size,
++        *,
++        topk=INDEX_TOPK,
++        candidates=False,
++        candidate_blocks=False,
++    ) -> list:
++        """The kernel calls ``IndexerV41Plan`` of these arguments makes."""
++        calls = [
++            _score_call(width, page_size, candidates),
++            *IndexerTopK.calls(width, topk, 1, candidates),
++        ]
++        if candidate_blocks:
++            calls.extend(IndexerTopK.calls(width, CANDIDATE_BLOCKS, CANDIDATE_BLOCK))
++        return calls
++
+     def scratch_specs(self, rows):
+         specs = [
+             ((rows, self.width), torch.bfloat16),  # scores
+diff --git a/vllm/models/deepseek_v4_1/tilelang/rope.py b/vllm/models/deepseek_v4_1/tilelang/rope.py
+index 1bac801a3..747765363 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/rope.py
++++ b/vllm/models/deepseek_v4_1/tilelang/rope.py
+@@ -15,6 +15,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import prepare
++
+ _PAIRS = 4  # pairs per thread: 8 BF16, one 16-byte access
+ 
+ 
+@@ -99,7 +101,10 @@ def rope_(
+     heads = x.shape[1] if x.ndim == 3 else 1
+     if not x.is_contiguous() or x.dtype != torch.bfloat16:
+         raise ValueError("TileLang RoPE rotates contiguous BF16 rows in place")
+-    kernel = rope_kernel(heads, x.shape[-1], cos_sin_cache.shape[1], ratio, inverse)
++    function, args, kwargs = rope_call(
++        heads, x.shape[-1], cos_sin_cache.shape[1], ratio, inverse
++    )
++    kernel = function(*args, **kwargs)
+     kernel(x.view(rows, heads, x.shape[-1]), positions, cos_sin_cache)
+ 
+ 
+@@ -108,4 +113,10 @@ def _rope_fake(x, positions, cos_sin_cache, ratio, inverse):
+     return None
+ 
+ 
+-__all__ = ["rope_", "rope_kernel"]
++def rope_call(heads: int, dim: int, rope_dim: int, ratio: int, inverse: bool):
++    """The kernel ``rope_`` launches for ``heads`` heads of ``dim`` columns (one for
++    ``[T, D]`` rows) and a ``rope_dim``-wide table, as a ``prepare.call``."""
++    return prepare.call(rope_kernel, heads, dim, rope_dim, ratio, inverse)
++
++
++__all__ = ["rope_", "rope_call", "rope_kernel"]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 0b4eb0761..9ff17f7c0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -59,10 +59,14 @@ entries, instead of the 64x64 SM90 tiles in
+ ``examples/deepseek_v4/sparse_attn_fwd_sm90.py``.
+ """
+ 
++from types import SimpleNamespace
++
+ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from . import prepare
++
+ HEAD_DIM = 512
+ SWA_RECORD_BYTES = 528  # 512 x E4M3 + 16 x UE8M0
+ SWA_GROUP = 32
+@@ -716,10 +720,27 @@ class SparseMlaV41Plan:
+     workspace the decode kernels need, which a caller can borrow from a shared
+     workspace. ``run`` only launches kernels and can be captured in a CUDA
+     graph.
++
++    The constructor takes ``routes``' arguments; ``calls`` lists the kernels a
++    plan of those arguments makes, for declaring them before it is built.
+     """
+ 
+-    def __init__(
+-        self,
++    def __init__(self, *args, **kwargs):
++        routes = self.routes(*args, **kwargs)
++        self.max_rows = routes.max_rows
++        self.idx_width = routes.idx_width
++        self.swa_bytes = routes.swa_bytes
++        self.idx_bytes = routes.idx_bytes
++        self.decode_max_rows = routes.decode_max_rows
++        self.split_max_rows = routes.split_max_rows
++        self.kernels = {
++            name: function(*call_args, **call_kwargs)
++            for name, (function, call_args, call_kwargs) in routes.kernels.items()
++        }
++        self.segments, self.heads = routes.segments, routes.heads
++
++    @staticmethod
++    def routes(
+         heads,
+         swa_width,
+         idx_width,
+@@ -736,7 +757,9 @@ class SparseMlaV41Plan:
+         block_I=32,
+         threads=256,
+         device="cuda",
+-    ):
++    ) -> SimpleNamespace:
++        """The plan's segments, route bounds and kernels (``prepare.call``s by
++        route name) for one layer shape."""
+         shape = (heads, swa_width, idx_width, idx_page_size)
+         config = dict(
+             sm_scale=sm_scale,
+@@ -757,28 +780,54 @@ class SparseMlaV41Plan:
+                 if split_block_H
+                 else 0
+             )
+-        self.max_rows = max_rows
+-        self.idx_width = idx_width
+-        self.swa_bytes = swa_page_size * SWA_RECORD_BYTES
+-        self.idx_bytes = idx_page_size * IDX_RECORD_BYTES
+-        self.decode_max_rows = min(decode_max_rows, max_rows)
+-        self.split_max_rows = min(split_max_rows, self.decode_max_rows)
+-        self.kernels = {
+-            "extend": sparse_mla_fwd_v41(
+-                *shape, "extend", block_H=block_H, threads=threads, **config
++        decode_max_rows = min(decode_max_rows, max_rows)
++        split_max_rows = min(split_max_rows, decode_max_rows)
++        kernels = {
++            "extend": prepare.call(
++                sparse_mla_fwd_v41,
++                *shape,
++                "extend",
++                block_H=block_H,
++                threads=threads,
++                **config,
+             )
+         }
+-        if self.decode_max_rows:
+-            self.kernels["decode"] = sparse_mla_fwd_v41(
+-                *shape, "decode", block_H=block_H, threads=threads, **config
++        if decode_max_rows:
++            kernels["decode"] = prepare.call(
++                sparse_mla_fwd_v41,
++                *shape,
++                "decode",
++                block_H=block_H,
++                threads=threads,
++                **config,
+             )
+-        if self.split_max_rows:
++        if split_max_rows:
+             # One warp per 16x8 tile of the 16-head x block_I score block, at most four.
+             split_threads = 32 * min(4, (split_block_H // 16) * (block_I // 8))
+-            self.kernels["split"] = sparse_mla_fwd_v41(
+-                *shape, "decode", block_H=split_block_H, threads=split_threads, **config
++            kernels["split"] = prepare.call(
++                sparse_mla_fwd_v41,
++                *shape,
++                "decode",
++                block_H=split_block_H,
++                threads=split_threads,
++                **config,
+             )
+-        self.segments, self.heads = segments, heads
++        return SimpleNamespace(
++            heads=heads,
++            max_rows=max_rows,
++            idx_width=idx_width,
++            swa_bytes=swa_page_size * SWA_RECORD_BYTES,
++            idx_bytes=idx_page_size * IDX_RECORD_BYTES,
++            segments=segments,
++            decode_max_rows=decode_max_rows,
++            split_max_rows=split_max_rows,
++            kernels=kernels,
++        )
++
++    @classmethod
++    def calls(cls, *args, **kwargs) -> list:
++        """The kernel calls ``SparseMlaV41Plan(*args, **kwargs)`` makes."""
++        return list(cls.routes(*args, **kwargs).kernels.values())
+ 
+     def scratch_specs(self, rows, kernel=None):
+         """``Partial`` and ``PartialStats`` for a decode launch; nothing for extend."""

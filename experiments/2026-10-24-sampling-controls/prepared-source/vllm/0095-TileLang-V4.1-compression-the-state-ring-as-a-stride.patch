@@ -1,0 +1,77 @@
+From e8b4f7cb3fae55ac37b8010bb99d6699f6a2a117 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:17:13 +0200
+Subject: [PATCH 095/274] TileLang V4.1 compression: the state ring as a
+ strided tensor
+
+The KV allocator pads its pages, so the compressor's ring pool (the cache viewed
+as [blocks, -1]) has a row stride wider than its row: the first serving boot
+failed the packed-ABI check (B4 window 1). The gather and compress kernels take
+the pool with its own row stride, as vLLM's Triton kernels did, and the tests
+use a padded pool.
+
+(cherry picked from commit e849609f96fac932adbfb34236c2225064fa4191)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_compress.py b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+index d8205ebc6..3f10cb76f 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_compress.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_compress.py
+@@ -62,12 +62,19 @@ def _step(lengths, ratio, seed, padding=3):
+             state_slots[starts[r] + k] = int(table[r, 0]) * PAGE + pos % PAGE
+     weight = torch.rand(DIM, generator=g) + 0.5
+     counts = torch.tensor([nt, nr], dtype=torch.int32)
+-    pool = torch.randn(BLOCKS, PAGE * STATE, generator=g)
++    # Padded rows, as the KV allocator lays out its pages.
++    pool = torch.randn(BLOCKS, PAGE * STATE + 64, generator=g)[:, : PAGE * STATE]
+     tensors = dict(
+         starts=starts_t, positions=positions, values=values, gates=gates, slots=slots,
+         table=table, state_slots=state_slots, weight=weight, counts=counts, pool=pool,
+     )  # fmt: skip
+-    return {k: v.to(DEVICE) for k, v in tensors.items()}, rows, starts
++    moved = {k: v.to(DEVICE) for k, v in tensors.items()}
++    moved["pool"] = torch.randn(BLOCKS, PAGE * STATE + 64, device=DEVICE)[
++        :, : PAGE * STATE
++    ]
++    moved["pool"].copy_(tensors["pool"])
++    assert not moved["pool"].is_contiguous()
++    return moved, rows, starts
+ 
+ 
+ def _ring(step):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/compress.py b/vllm/models/deepseek_v4_1/tilelang/compress.py
+index 5b3e8d203..7b3b18dd3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/compress.py
++++ b/vllm/models/deepseek_v4_1/tilelang/compress.py
+@@ -45,13 +45,14 @@ def gather_partial_state_kernel(max_requests: int, page: int):
+     """Each live request's ring carry: the even predecessor of an odd first position."""
+     blocks = T.dynamic("blocks")
+     width = T.dynamic("width")
++    pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
+     table_rows = T.dynamic("table_rows")
+     table_cols = T.dynamic("table_cols")
+     table_stride = T.dynamic("table_stride")
+ 
+     @T.prim_func
+     def gather_partial_state(
+-        pool: T.Tensor((blocks, width), T.float32),
++        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+         table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+         starts: T.Tensor((max_requests + 1,), T.int32),
+         positions: T.Tensor((max_requests,), T.int64),
+@@ -105,6 +106,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+     gate_rows = T.dynamic("gate_rows")  # rows at ratio 2; any buffer at ratio 1
+     blocks = T.dynamic("blocks")
+     width = T.dynamic("width")
++    pool_stride = T.dynamic("pool_stride")  # the allocator pads its pages
+     value_dtype = T.float32 if ratio == 2 else T.bfloat16
+ 
+     @T.prim_func
+@@ -121,7 +123,7 @@ def compress_kernel(ratio: int, max_requests: int, page: int, warps: int = 4):
+         pending_values: T.Tensor((max_requests, DIM), T.float32),
+         pending_gates: T.Tensor((max_requests, DIM), T.float32),
+         tags: T.Tensor((max_requests,), T.int64),
+-        pool: T.Tensor((blocks, width), T.float32),
++        pool: T.StridedTensor((blocks, width), (pool_stride, 1), T.float32),
+         out: T.Tensor((rows, DIM), T.bfloat16),
+         emitted: T.Tensor((rows,), T.bool),
+         emitted_slots: T.Tensor((rows,), T.int64),

@@ -1,0 +1,37 @@
+From 649d0cd9818ce495de6143331fe732b02ccc7ee6 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 07:21:48 +0200
+Subject: [PATCH 108/274] TileLang V4.1 MoE: request the shared row before the
+ routes' loads in the folded combine
+
+The folded combine read the shared expert's row after the top-k loop, a
+dependent load at the end of every call. It is now loaded into registers first
+and added after the routes' FP32 sum: the same arithmetic and bits.
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/moe.py b/vllm/models/deepseek_v4_1/tilelang/moe.py
+index d0bd712d1..eaae68674 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/moe.py
++++ b/vllm/models/deepseek_v4_1/tilelang/moe.py
+@@ -360,6 +360,12 @@ def moe_combine_v41(
+         with T.Kernel(hidden // block_D, rows, threads=threads) as (bd, row):
+             acc = T.alloc_fragment([block_D], T.float32)
+             T.clear(acc)
++            if shared:
++                # Requested before the routes' loads, added after their sum: the
++                # same arithmetic, with the shared row's latency hidden.
++                sv = T.alloc_fragment([block_D], T.bfloat16)
++                for d in T.Parallel(block_D):
++                    sv[d] = Shared[row, bd * block_D + d]
+             for k in T.serial(topk):
+                 pos = RoutePos[row, k]
+                 if pos >= 0:
+@@ -377,8 +383,7 @@ def moe_combine_v41(
+             for d in T.Parallel(block_D):
+                 if shared:
+                     Out[row, bd * block_D + d] = T.cast(
+-                        acc[d] + T.cast(Shared[row, bd * block_D + d], T.float32),
+-                        out_dtype,
++                        acc[d] + T.cast(sv[d], T.float32), out_dtype
+                     )
+                 else:
+                     Out[row, bd * block_D + d] = T.cast(acc[d], out_dtype)

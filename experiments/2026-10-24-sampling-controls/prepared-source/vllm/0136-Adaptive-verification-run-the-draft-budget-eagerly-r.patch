@@ -1,0 +1,191 @@
+From c626d6a4d1f0de4792c838dc9ae71eab3dbd9600 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 08:34:21 +0200
+Subject: [PATCH 136/274] Adaptive verification: run the draft budget eagerly;
+ report torch.compile in serving
+
+The draft-budget selection was a torch.compile function, first compiled on the
+first step that trims a budget: the second decode step of the first request
+after a boot. Inductor's launcher then loaded its kernels with cuModuleLoad,
+which holds the GIL while it waits for the device. The device was waiting for
+the asynchronous disk Engram rows, whose reader thread needs the GIL, so the
+workers hung; a rank that escaped ran alone into the next collective
+(spark-ds41f experiments/2026-10-15-engram-stall).
+
+Run the selection eagerly (six small ops: no compilation and no lazily loaded
+module) and load its kernels at startup, after the cost profile. The JIT monitor
+now reports torch.compile compilations during inference, which its Triton hook
+misses when the compile cache serves the kernels.
+
+diff --git a/tests/utils_/test_jit_monitor_dynamo.py b/tests/utils_/test_jit_monitor_dynamo.py
+new file mode 100644
+index 000000000..0ffadf565
+--- /dev/null
++++ b/tests/utils_/test_jit_monitor_dynamo.py
+@@ -0,0 +1,39 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The JIT monitor reports torch.compile compilations during inference: a function
++compiled during serving also loads its kernels there (CPU only)."""
++
++import pytest
++import torch
++
++from vllm.utils import jit_monitor
++
++
++def _chain(error: BaseException):
++    while error is not None:
++        yield error
++        error = error.__cause__ or error.__context__
++
++
++def test_torch_compile_during_inference_is_an_error(monkeypatch):
++    monkeypatch.setattr(jit_monitor, "_active", False)
++    monkeypatch.setattr(jit_monitor, "_dynamo_hook_installed", False)
++    torch._dynamo.reset()  # drops registered callbacks: reset before installing
++    jit_monitor._setup_dynamo_compile_hook()
++    monkeypatch.setattr(jit_monitor, "_active", True)
++    monkeypatch.setattr(jit_monitor, "_mode", "error")
++    compiled = torch.compile(lambda x: x * 2 + 1, backend="eager")
++    with pytest.raises(Exception) as caught:
++        compiled(torch.ones(3))
++    assert any("torch.compile compilation during inference" in str(e)
++               for e in _chain(caught.value))
++
++
++def test_torch_compile_before_activation_is_allowed(monkeypatch):
++    monkeypatch.setattr(jit_monitor, "_active", False)
++    monkeypatch.setattr(jit_monitor, "_dynamo_hook_installed", False)
++    torch._dynamo.reset()
++    jit_monitor._setup_dynamo_compile_hook()
++    monkeypatch.setattr(jit_monitor, "_mode", "error")
++    compiled = torch.compile(lambda x: x - 1, backend="eager")
++    assert torch.equal(compiled(torch.ones(2)), torch.zeros(2))
+diff --git a/vllm/utils/jit_monitor.py b/vllm/utils/jit_monitor.py
+index bb0bb8df9..4611f3634 100644
+--- a/vllm/utils/jit_monitor.py
++++ b/vllm/utils/jit_monitor.py
+@@ -42,6 +42,7 @@ _verbose: bool = False
+ _cutedsl_hook_installed: bool = False
+ _tilelang_hook_installed: bool = False
+ _tilelang_jitimpl_compile_depth: int = 0
++_dynamo_hook_installed: bool = False
+ 
+ 
+ def is_active() -> bool:
+@@ -75,6 +76,7 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
+     _setup_triton_autotuning_print()
+     _setup_triton_jit_hook()
+     _setup_cutedsl_jit_hook()
++    _setup_dynamo_compile_hook()
+ 
+     # Refer to #51159. tilelang ships broken symbols
+     # on rocm.
+@@ -111,6 +113,44 @@ def _setup_triton_autotuning_print() -> None:
+     knobs.autotuning.print = True
+ 
+ 
++# ------------------------------------------------------------------
++# torch.compile (Dynamo) compilation hook
++# ------------------------------------------------------------------
++
++
++def _setup_dynamo_compile_hook() -> None:
++    """Report torch.compile compilations during inference.
++
++    A function compiled during serving also loads its kernels there, from the
++    compile cache too, where no Triton compilation is seen. Inductor's launcher
++    loads a module (cuModuleLoad) holding the GIL while it waits for the device:
++    a latency spike, and a deadlock if the device is waiting for a host thread
++    that needs the GIL. ``torch._dynamo.reset()`` drops the callback; vLLM does
++    not reset Dynamo after activation.
++    """
++    global _dynamo_hook_installed
++    if _dynamo_hook_installed:
++        return
++    try:
++        from torch._dynamo.callback import on_compile_start
++    except Exception:
++        logger.debug("torch._dynamo callbacks are unavailable; skipping the Dynamo monitor.")
++        return
++
++    def _on_compile_start(*args, **kwargs) -> None:
++        if _active:
++            detail = _safe_repr(args[0]) if args else None
++            _handle_jit_event(
++                backend="torch.compile",
++                event="compilation",
++                fn_name="Dynamo frame",
++                detail=detail,
++            )
++
++    on_compile_start(_on_compile_start)
++    _dynamo_hook_installed = True
++
++
+ # ------------------------------------------------------------------
+ # Triton JIT compilation hook
+ # ------------------------------------------------------------------
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 38f651f1b..919297977 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1357,6 +1357,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                             self.cudagraph_manager.captured_token_counts(),
+                             self.cudagraph_manager.captured_full_batch_shapes(),
+                         )
++                        self.adaptive_verification.load_draft_budget_kernels()
+                     self.kv_connector.reset_capture_state()
+ 
+             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 88b32c3d0..22edc2c01 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -92,11 +92,6 @@ def _assign_draft_token_budget(
+     torch.sum(admitted.view_as(survival), dim=1, dtype=capacities.dtype, out=capacities)
+ 
+ 
+-_assign_draft_token_budget_compiled = torch.compile(
+-    _assign_draft_token_budget, dynamic=True
+-)
+-
+-
+ def build_cost_tables_from_curves(
+     draft_curve: list[tuple[int, float]],
+     verify_curve: list[tuple[int, float]],
+@@ -301,6 +296,24 @@ class AdaptiveVerificationManager:
+                 run_dummy(**batch)
+         self.set_initial_cost_curves(timings, pin_key=key)
+ 
++    def load_draft_budget_kernels(self) -> None:
++        """Run the draft-budget selection once at its smallest and largest shapes,
++        so its kernels are loaded at startup rather than on the first step that
++        trims a budget."""
++        device = self._confidence_probs.device
++        steps = self.num_speculative_steps
++        probs = torch.ones_like(self._confidence_probs)
++        max_reqs = probs.shape[0]
++        for num_reqs, draft_budget in ((1, 1), (max_reqs, max_reqs * steps - 1)):
++            if not 0 < draft_budget < num_reqs * steps:
++                continue
++            capacities = torch.full(
++                (num_reqs,), steps, dtype=self._batch_draft_capacity.dtype, device=device
++            )
++            idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
++            _assign_draft_token_budget(probs, idx_mapping, capacities, draft_budget, steps)
++        torch.cuda.synchronize(device)
++
+     def set_initial_cost_curves(
+         self, samples: list[StepTimingSample], pin_key: dict | None = None
+     ) -> None:
+@@ -743,7 +756,7 @@ class AdaptiveVerificationManager:
+         else:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
+-                _assign_draft_token_budget_compiled(
++                _assign_draft_token_budget(
+                     self._confidence_probs,
+                     idx_mapping,
+                     capacities,

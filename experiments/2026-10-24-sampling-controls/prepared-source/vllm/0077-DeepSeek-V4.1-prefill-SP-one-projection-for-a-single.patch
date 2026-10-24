@@ -1,0 +1,106 @@
+From 2a58387beb40c1b2129e23440213822d5b4c6da7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 20:07:26 +0200
+Subject: [PATCH 077/274] DeepSeek V4.1 prefill SP: one projection for a
+ single-slice unreduced step
+
+Writing each rank's block with its own call re-read a projection's weights
+once per rank; in one slice the rows are now projected once into the send
+buffer and this rank's block copied into its slot. The MoE runner's
+elementwise sum keeps per-block writes (per_block), which land in place.
+
+(cherry picked from commit 3dc83d7ff4060d0facf5f4536cbb8c0d1d5e7e8f)
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 32ea629ed..21e0fbac5 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -58,7 +58,8 @@ def test_wo_slices():
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+ @pytest.mark.parametrize("rank", [0, 2, 3])
+ @pytest.mark.parametrize("slices", [1, 2, 3])
+-def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices):
++@pytest.mark.parametrize("per_block", [False, True])
++def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per_block):
+     """Unreduced rows send every other rank's block, slice by slice, and keep this
+     rank's own block in its slot of the parts (the other ranks stood in by
+     copies of it)."""
+@@ -96,8 +97,11 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices):
+         source.device,
+         slices=slices,
+         then=lambda: order.append(len(calls)),
++        per_block=per_block,
+     )
+     torch.cuda.synchronize()
++    if slices == 1 and not per_block:
++        assert calls == [(0, tokens)]  # one projection
+     padded = torch.zeros(rows.padded_rows, 8, device="cuda")
+     padded[:tokens] = source
+     blocks = padded.view(world, rows.local_rows, 8)
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 7d6fc0ea7..ca41fd448 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -224,6 +224,7 @@ class SPRows:
+         device: torch.device,
+         slices: int = 1,
+         then=None,
++        per_block: bool = False,
+     ) -> torch.Tensor:
+         """This rank's L rows of the sum over ranks of a T-row projection.
+ 
+@@ -238,10 +239,15 @@ class SPRows:
+ 
+         With ``unreduced`` rows the result is every rank's unreduced partial of
+         this rank's rows instead, ``(N, L, *row_shape)``; see "Unreduced results".
++        In one slice, ``per_block`` writes each rank's block with its own call,
++        this rank's straight into its slot (for writers that cost nothing per
++        call, such as an elementwise sum); otherwise one call writes every row
++        and this rank's block is copied into its slot (a projection reads its
++        weights once).
+         """
+         if self.unreduced:
+             return self._project_exchange(
+-                project, row_shape, dtype, device, slices, then
++                project, row_shape, dtype, device, slices, then, per_block
+             )
+         if slices <= 1:
+             padded = self.empty_padded(row_shape, dtype, device)
+@@ -279,7 +285,9 @@ class SPRows:
+         main.wait_stream(side)
+         return out
+ 
+-    def _project_exchange(self, project, row_shape, dtype, device, slices, then):
++    def _project_exchange(
++        self, project, row_shape, dtype, device, slices, then, per_block=False
++    ):
+         """``project_reduce_scatter`` without the sum: each rank's block goes into
+         its slot of one send buffer, this rank's own straight into its slot of
+         the parts, and the chunks are exchanged into the parts; with ``slices``
+@@ -292,6 +300,15 @@ class SPRows:
+         parts = torch.empty_like(send)
+         comm = get_tp_group().device_communicator.pynccl_comm
+         slices = max(slices, 1)
++        if slices == 1 and not per_block:
++            flat = send.view(world * local, *row_shape)
++            project(0, tokens, flat[:tokens])
++            flat[tokens:].zero_()
++            parts[self.rank].copy_(send[self.rank])
++            if then is not None:
++                then()
++            exchange_into(comm, send, parts, self.rank, world)
++            return parts
+         bounds = [local * i // slices for i in range(slices + 1)]
+         main = torch.cuda.current_stream(device)
+         side = _side_stream(device) if slices > 1 else None
+@@ -370,7 +387,9 @@ def project_reduce_scatter_current(
+             f"SP reduce-scatter of {rows} rows ({padded_rows} padded) outside its "
+             f"forward ({sp})"
+         )
+-    return sp.project_reduce_scatter(project, row_shape, dtype, device, then=then)
++    return sp.project_reduce_scatter(
++        project, row_shape, dtype, device, then=then, per_block=True
++    )
+ 
+ 
+ _SIDE_STREAMS: dict = {}

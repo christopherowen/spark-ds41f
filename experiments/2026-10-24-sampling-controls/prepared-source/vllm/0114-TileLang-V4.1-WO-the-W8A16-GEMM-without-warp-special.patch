@@ -1,0 +1,30 @@
+From 7be66e58144f32a0d23a26845e8abebf304a36ff Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 13:27:13 +0200
+Subject: [PATCH 114/274] TileLang V4.1 WO: the W8A16 GEMM without warp
+ specialization
+
+Warp-specialized, the producer warps decoded the tile's scales with ordinary
+shared stores that reached the consumer warps only through the copy barriers,
+which order the asynchronous copies alone: graph replays at 1-48 rows gave other
+bits (WO window 2). Every thread now runs the copies, the decode and the MMA,
+with the pipeliner's barriers between them.
+
+(cherry picked from commit 145a64d104d29ab7d40bf57681f21659b92e3fa6)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index c114e3e52..e5c3124e3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -373,7 +373,10 @@ def bf16_gemm(
+     return gemm_bf16
+ 
+ 
+-@tilelang.jit
++# Not warp-specialized: a producer warp's scale stores would reach the consumers only
++# through the copy barriers, which order the asynchronous copies alone (graph replays
++# gave other bits).
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def fp8w_bf16_gemm(
+     N: int,
+     K: int,

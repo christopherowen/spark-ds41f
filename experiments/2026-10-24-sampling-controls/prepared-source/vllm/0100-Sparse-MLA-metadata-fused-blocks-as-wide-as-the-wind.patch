@@ -1,0 +1,28 @@
+From ebe7ad6eb0211724c1d065d7ee39b8f9ac37c930 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:55:34 +0200
+Subject: [PATCH 100/274] Sparse-MLA metadata: fused blocks as wide as the
+ window part
+
+Two blocks a row beat Triton by 0.68-0.72x at decode but lost at prefill
+(10.3 against 8.2 us at 2048 rows): each block took the page table's width (256
+threads), half of them idle in the window part. Blocks are now as wide as the
+window (128 threads) and the page part loops.
+
+(cherry picked from commit 18ac093baf493bc4ad812d432115d52c3f09430a)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index ef89655f9..d03c58b1d 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -254,7 +254,9 @@ def decode_metadata_kernel(
+     req_count = T.dynamic("req_count")
+     starts_len = T.dynamic("starts_len")
+     replay_len = T.dynamic("replay_len")
+-    threads, per_thread = _threads(max(width, main_width))
++    # Blocks as wide as the window part; the page part loops (idle threads cost the
++    # prefill rows' blocks).
++    threads, per_thread = _threads(width)
+     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+     main_per_thread = (main_width + threads - 1) // threads
+ 

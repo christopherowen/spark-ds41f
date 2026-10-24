@@ -1,0 +1,36 @@
+From 238b7ea3da39d41cec9d305e51159eeeb743e56f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:28:04 +0200
+Subject: [PATCH 147/274] DeepSeek-V4.1 Engram tests: a disk rank gathers only
+ its hash columns
+
+The whole-table disk test staged row IDs in all 24 columns and expected every
+one back, which held while a rank owned a contiguous row range. With
+interleaved columns a TP4 rank owns six: the other eighteen gather as zeros.
+
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 465b09bb1..4ee15db78 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1007,8 +1007,9 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+ @pytest.mark.parametrize("tp_rank", [0, 3])
+ @torch.inference_mode()
+ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+-    """Each rank reads its shard of the global tables from unaligned file offsets;
+-    disk tables prepare no B12X lookup."""
++    """Each rank reads its shard (its hash columns) of the global tables from unaligned
++    file offsets, and other ranks' columns gather as zeros; disk tables prepare no B12X
++    lookup."""
+     device = torch.device("cuda", torch.cuda.current_device())
+     capacity = 7
+     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
+@@ -1072,6 +1073,9 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             module.stage_rows(ids + shift, count, torch.cuda.current_stream())
+             embed.gather_rows(output)
+             reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
++            owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
++            reference[:, ~owned.repeat_interleave(256)] = 0
++            assert int(owned.sum()) == 24 // caps.tp_size
+             torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
+             assert output.data_ptr() == address
+     finally:

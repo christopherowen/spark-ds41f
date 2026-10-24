@@ -1,0 +1,197 @@
+From 7ec49e2a0e0b7ab38dbbacb1ffb5fcc8cb24edb1 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 16:01:23 +0200
+Subject: [PATCH 183/274] Late admission: decide the step after a continuing
+ prompt chunk at once
+
+Late admission (0222) decides step N+1 when step N reaches its admission
+layer, so a request that arrived during N can join N+1. When N carries a
+prompt chunk that is not its prompt's last, N+1's work is already fixed: that
+prompt's next chunk fills N+1's budget (the long-prefill threshold leaves only
+the decode rows beside it), so an arrival can at most join a later step anyway.
+Deciding such a step late gains nothing and puts the decision and its dispatch
+between the chunks.
+
+On DS4.1 TP3 the Engram debug timeline of cold 32K and 131K prefills
+(spark-ds41f-1022 against r6x, the same prompts) shows the next chunk's
+preparation starting 44-49 ms later after each prompt's first chunk, and each
+later chunk 7.7 ms slower on average; the GPU's waits for Engram rows are the
+same in both (the second chunk waits 22-34 ms, later chunks not at all).
+
+The scheduler now says whether a scheduled step continues a prompt
+(SchedulerInterface.continues_prefill: a request in it still has prompt left,
+is_prefill_chunk), and the engine core decides the step after such a step at
+once, as async scheduling does. A step after a prompt's last chunk, or a
+decode step, is still decided late. Schedulers that do not implement it keep
+late admission for every step.
+
+Base: 0222-0225 of spark-ds41f-1022 (patch head 672231a1b).
+
+Quality: no tensor is read or written; only when the next step is decided.
+Its contents cannot differ: no arrival can join a step beside a whole chunk.
+
+Tests: tests/v1/engine/test_late_admission.py: while a prompt's first and
+second chunks are in flight the next steps are decided without waiting and
+nothing is admitted; an arrival during the last chunk joins the next step
+(decided late); a decode step beside another prompt's continuing chunk is
+decided at once.
+
+Upstream status: local; not proposed.
+
+diff --git a/tests/v1/engine/test_late_admission.py b/tests/v1/engine/test_late_admission.py
+index a82862a2f..e095f674f 100644
+--- a/tests/v1/engine/test_late_admission.py
++++ b/tests/v1/engine/test_late_admission.py
+@@ -102,7 +102,25 @@ def engine_core(scheduler, executor, late_admission: bool, admit) -> EngineCore:
+     return engine
+ 
+ 
+-def _engine(model: str, late_admission: bool):
++class ChunkedExecutor(FakeExecutor):
++    """As FakeExecutor, but a prompt chunk that is not the prompt's last samples
++    nothing, as the model runner discards it."""
++
++    def __init__(self, log: list, scheduler):
++        super().__init__(log)
++        self.scheduler = scheduler
++
++    def sample_tokens(self, grammar_output, non_block=False):
++        future = super().sample_tokens(grammar_output, non_block)
++        output = future.result()
++        output.sampled_token_ids = [
++            [] if self.scheduler.requests[req_id].is_prefill_chunk else sampled
++            for req_id, sampled in zip(output.req_ids, output.sampled_token_ids)
++        ]
++        return future
++
++
++def _engine(model: str, late_admission: bool, max_num_batched_tokens: int = 8192):
+     log: list = []
+     arrivals: list = []
+     scheduler = create_scheduler(
+@@ -111,6 +129,7 @@ def _engine(model: str, late_admission: bool):
+         device="cpu",
+         async_scheduling=True,
+         max_model_len=256,
++        max_num_batched_tokens=max_num_batched_tokens,
+     )
+ 
+     def admit():
+@@ -119,7 +138,9 @@ def _engine(model: str, late_admission: bool):
+             scheduler.add_request(request)
+         arrivals.clear()
+ 
+-    engine = engine_core(scheduler, FakeExecutor(log), late_admission, admit)
++    engine = engine_core(
++        scheduler, ChunkedExecutor(log, scheduler), late_admission, admit
++    )
+     return engine, log, arrivals
+ 
+ 
+@@ -147,6 +168,43 @@ def test_an_arrival_joins_the_next_step(opt_model_path, late_admission):
+         assert batches[1] == ["a"]
+ 
+ 
++def test_a_continuing_prompt_decides_the_next_step_at_once(opt_model_path):
++    """While a prompt chunk that is not the prompt's last runs, the prompt's next
++    chunk is the next step's work: that step is decided at once, as async
++    scheduling does, so its preparation keeps the whole step's lead. The step
++    after the prompt's last chunk is decided late again."""
++    engine, log, arrivals = _engine(
++        opt_model_path, late_admission=True, max_num_batched_tokens=16
++    )
++    first, second = create_requests(
++        2, num_tokens=40, max_tokens=8, req_ids=["a", "b"]
++    )
++    engine.scheduler.add_request(first)
++    batches = engine.model_executor.batches
++
++    # Chunks 0-16 and 16-32 are in flight in turn: steps 2 and 3 are decided
++    # without waiting, and nothing is admitted.
++    engine.step_with_batch_queue()
++    engine.step_with_batch_queue()
++    engine.step_with_batch_queue()
++    assert log == [("execute", 1), ("execute", 2), ("execute", 3)]
++    assert batches == [["a"], ["a"], ["a"]]
++
++    # "b" arrives while the last chunk (32-40) runs: step 4 waits for the layer.
++    assert not engine.scheduler.continues_prefill(engine.batch_queue[0][1])
++    arrivals.append(second)
++    engine.step_with_batch_queue()
++    assert log[3:6] == [("reached layer", 3), ("admit", ["b"]), ("execute", 4)]
++    assert batches[3] == ["a", "b"]
++
++    # Step 4 is "a"'s decode beside "b"'s first chunk (15 of 40 tokens), which
++    # continues "b"'s prompt: step 5 is decided at once.
++    assert engine.scheduler.continues_prefill(engine.batch_queue[0][1])
++    engine.step_with_batch_queue()
++    assert log[6:] == [("execute", 5)]
++    assert batches[4] == ["a", "b"]
++
++
+ def test_no_wait_when_nothing_is_in_flight(opt_model_path):
+     engine, log, _ = _engine(opt_model_path, late_admission=True)
+     engine.scheduler.add_request(create_requests(1, num_tokens=8, req_ids=["a"])[0])
+diff --git a/vllm/v1/core/sched/interface.py b/vllm/v1/core/sched/interface.py
+index 74ae6df3d..013e58cf3 100644
+--- a/vllm/v1/core/sched/interface.py
++++ b/vllm/v1/core/sched/interface.py
+@@ -215,6 +215,12 @@ class SchedulerInterface(ABC):
+         not yet returned in SchedulerOutputs."""
+         return self.has_unfinished_requests() or self.has_finished_requests()
+ 
++    def continues_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
++        """Whether a scheduled step carries a prompt chunk that is not its
++        request's last, so that request's next chunk is already the next step's
++        work. Late admission decides the step after such a step at once."""
++        return False
++
+     @property
+     @abstractmethod
+     def pause_state(self) -> PauseState:
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 00b5adbb7..bded94d6c 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3956,6 +3956,15 @@ class Scheduler(SchedulerInterface):
+         )
+         return num_waiting + len(self.running)
+ 
++    def continues_prefill(self, scheduler_output: SchedulerOutput) -> bool:
++        # is_prefill_chunk still describes each request's most recent step, the
++        # one asked about: a finished or aborted request has left self.requests.
++        return any(
++            (request := self.requests.get(req_id)) is not None
++            and request.is_prefill_chunk
++            for req_id in scheduler_output.num_scheduled_tokens
++        )
++
+     def has_finished_requests(self) -> bool:
+         if self.finished_req_ids:
+             return True
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 3a5bc72ad..5e3eaf9ec 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -772,11 +772,19 @@ class EngineCore:
+         deferred_scheduler_output = None
+         deferred_execution_timing = None
+         if self.scheduler.has_requests():
+-            if self.late_admission and batch_queue:
++            if (
++                self.late_admission
++                and batch_queue
++                and not self.scheduler.continues_prefill(batch_queue[0][1])
++            ):
+                 # Late admission: the step in flight replies to execute_model when
+                 # its GPU work reaches the admission layer; the rest of it hides
+                 # this decision and the next step's preparation. Requests that
+-                # arrived meanwhile join this decision.
++                # arrived meanwhile join this decision. A step in flight that
++                # continues a prompt already fixes the next step's work (that
++                # prompt's next chunk fills its budget), so that step is decided
++                # at once, as async scheduling does: its preparation and Engram
++                # read-ahead keep the whole step's lead.
+                 batch_queue[0][2].result()
+                 self._admit_arrivals()
+             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())

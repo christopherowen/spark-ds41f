@@ -1,0 +1,304 @@
+From 93ee808c5c1a0a3532d59b1f338ea37aa7252923 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:40:48 +0200
+Subject: [PATCH 142/274] DeepSeek V4.1 prefill SP: Engram's wkv product
+ exchanged all-to-all
+
+Under prefill sequence parallelism every rank projected all T rows of an
+Engram layer with its column block of wkv, all-gathered the [T, 25632]
+product and then used only its own L rows. On TP3 that all-gather was
+50 ms of a 16K prefill (eight [4048, 8544] gathers on dgx3), and the
+gathered output was sliced and copied in full.
+
+Each rank now sends every other rank that rank's rows of its column block
+(an equal-block all-to-all: PyNCCL grouped send/recv, a registered
+collective so compiled graphs see it) and copies the blocks it receives
+side by side in rank order, the column order the all-gather gave, into
+packed rows (the TileLang gate requires them). It moves 1/N of the
+all-gather's bytes; the arithmetic is unchanged. Decode, which runs on
+full rows, keeps the all-gather.
+
+Test: every rank's exchanged rows are packed and equal its rows of the
+gathered product, with the other ranks' blocks simulated (3 and 4 ranks,
+padded last rank, a wholly padded last block).
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 21e0fbac5..38ba5b7cc 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -119,3 +119,39 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+         sp_prefill.materialize(sp_prefill.unreduced_parts(parts)),
+         collectives.rank_order_sum(list(parts)),
+     )
++
++
++@pytest.mark.parametrize("tokens", [37, 40, 205])
++@pytest.mark.parametrize("world", [3, 4])
++def test_column_exchange_gives_each_rank_its_rows_of_the_product(
++    monkeypatch, tokens, world
++):
++    """Every rank's exchanged rows equal its rows of the gathered product cut to the
++    logical width (the other ranks' all-to-all blocks simulated)."""
++    width, block = 50, 17  # logical width over world * block padded columns
++    product = torch.randn(tokens, world * block, device="cuda")
++    ranks = [
++        sp_prefill.SPRows(num_tokens=tokens, world_size=world, rank=r)
++        for r in range(world)
++    ]
++    padded = []
++    for r, rows in enumerate(ranks):
++        local = torch.zeros(rows.padded_rows, block, device="cuda")
++        local[:tokens] = product[:, r * block : (r + 1) * block]
++        padded.append(local)
++    for r, rows in enumerate(ranks):
++        own = rows.local_rows
++
++        def all_to_all(x, r=r, own=own):  # block s of the result comes from rank s
++            assert torch.equal(x, padded[r])
++            return torch.cat([padded[s][r * own : (r + 1) * own] for s in range(world)])
++
++        monkeypatch.setattr(sp_prefill, "tensor_model_parallel_all_to_all", all_to_all)
++        local = product[:, r * block : (r + 1) * block]
++        result = rows.exchange_columns(local, width)
++        assert result.shape == (own, width) and result.is_contiguous()
++        real = rows.real_rows
++        assert torch.equal(
++            result[:real], product[rows.start : rows.start + real, :width]
++        )
++        assert torch.equal(result[real:], torch.zeros_like(result[real:]))
+diff --git a/vllm/distributed/communication_op.py b/vllm/distributed/communication_op.py
+index faa488141..7f88e5478 100644
+--- a/vllm/distributed/communication_op.py
++++ b/vllm/distributed/communication_op.py
+@@ -26,6 +26,12 @@ def tensor_model_parallel_all_gather(
+     return get_tp_group().all_gather(input_, dim)
+ 
+ 
++def tensor_model_parallel_all_to_all(input_: torch.Tensor) -> torch.Tensor:
++    """Exchange equal dim-0 blocks across the model parallel group: block i goes
++    to rank i, and the output's block i came from rank i."""
++    return get_tp_group().all_to_all(input_)
++
++
+ def tensor_model_parallel_all_gatherv(
+     input_: torch.Tensor, sizes: list[int], dim: int = 0
+ ) -> torch.Tensor:
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 6d954f252..21dcaaca2 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -693,6 +693,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             + input_size[dim + 1 :]
+         )
+ 
++    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
++        """Equal dim-0 blocks: block i goes to rank i; the output's block i came
++        from rank i. PyNCCL only (grouped send/recv)."""
++        self._require_roce_policy()
++        pynccl_comm = self.pynccl_comm
++        if pynccl_comm is None or pynccl_comm.disabled:
++            raise RuntimeError("all_to_all needs the PyNCCL communicator")
++        input_ = input_.contiguous()
++        output = torch.empty_like(input_)
++        pynccl_comm.all_to_all(output, input_)
++        return output
++
+     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
+         self._require_roce_policy()
+         world_size = self.world_size
+diff --git a/vllm/distributed/device_communicators/pynccl.py b/vllm/distributed/device_communicators/pynccl.py
+index ece4db82d..d079d0c40 100644
+--- a/vllm/distributed/device_communicators/pynccl.py
++++ b/vllm/distributed/device_communicators/pynccl.py
+@@ -561,6 +561,28 @@ class PyNcclCommunicator:
+             cudaStream_t(stream.cuda_stream),
+         )
+ 
++    def all_to_all(self, output: torch.Tensor, input_: torch.Tensor, stream=None):
++        """Exchange equal dim-0 blocks: block i of ``input_`` goes to rank i, and
++        block i of ``output`` comes from rank i (one grouped send/recv per peer)."""
++        if self.disabled:
++            return
++        world = self.world_size
++        if input_.shape != output.shape or input_.shape[0] % world:
++            raise ValueError(
++                f"all_to_all needs equal shapes divisible by {world} rows: "
++                f"{tuple(input_.shape)} -> {tuple(output.shape)}"
++            )
++        if stream is None:
++            stream = current_stream()
++        sent, received = input_.chunk(world), output.chunk(world)
++        received[self.rank].copy_(sent[self.rank])
++        self.group_start()
++        for peer in range(world):
++            if peer != self.rank:
++                self.send(sent[peer], peer, stream)
++                self.recv(received[peer], peer, stream)
++        self.group_end()
++
+     def group_start(self):
+         self.nccl.ncclGroupStart()
+ 
+diff --git a/vllm/distributed/parallel_state.py b/vllm/distributed/parallel_state.py
+index ade2879e8..f900171cd 100644
+--- a/vllm/distributed/parallel_state.py
++++ b/vllm/distributed/parallel_state.py
+@@ -305,6 +305,18 @@ def all_gather_fake(
+     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+ 
+ 
++def all_to_all(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
++    assert group_name in _groups, f"Group {group_name} is not found."
++    group = _groups[group_name]()
++    if group is None:
++        raise ValueError(f"Group {group_name} is destroyed.")
++    return group._all_to_all_out_place(tensor)
++
++
++def all_to_all_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
++    return torch.empty_like(tensor)
++
++
+ def patched_fused_scaled_matmul_reduce_scatter_fake(
+     A: torch.Tensor,
+     B: torch.Tensor,
+@@ -475,6 +487,12 @@ direct_register_custom_op(
+     fake_impl=all_gather_fake,
+ )
+ 
++direct_register_custom_op(
++    op_name="all_to_all",
++    op_func=all_to_all,
++    fake_impl=all_to_all_fake,
++)
++
+ # TODO: Remove this once the pytorch fix
+ # (https://github.com/pytorch/pytorch/pull/165086) gets released,
+ # in either 2.9.1 or 2.10
+@@ -850,6 +868,20 @@ class GroupCoordinator:
+             raise ValueError("No device communicator found")
+         return self.device_communicator.all_gather(input_, dim)
+ 
++    def all_to_all(self, input_: torch.Tensor) -> torch.Tensor:
++        """Exchange equal dim-0 blocks: block i of the input goes to rank i, and
++        block i of the output came from rank i."""
++        if self.world_size == 1:
++            return input_
++        if self.use_custom_op_call:
++            return torch.ops.vllm.all_to_all(input_, group_name=self.unique_name)
++        return self._all_to_all_out_place(input_)
++
++    def _all_to_all_out_place(self, input_: torch.Tensor) -> torch.Tensor:
++        if self.device_communicator is None:
++            raise ValueError("No device communicator found")
++        return self.device_communicator.all_to_all(input_)
++
+     def all_gatherv(
+         self,
+         input_: torch.Tensor | list[torch.Tensor],
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 6bca6613d..63928aba0 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -68,6 +68,10 @@ class _PaddedColumnParallelLinear(ColumnParallelLinear):
+             return output
+         return output[..., : self.logical_output_size].contiguous()
+ 
++    def local_product(self, input_):
++        """This rank's column block of the product, not gathered."""
++        return self.quant_method.apply(self, input_, None)
++
+ logger = init_logger(__name__)
+ DEAD_ID = -1
+ 
+@@ -932,7 +936,9 @@ class Engram(nn.Module):
+ 
+         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
+         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
+-        token; the lookup and projection still run on every row.
++        token; the lookup and projection still run on every row, and with a
++        column-parallel projection each rank receives only its own rows of the
++        product (an all-to-all instead of an all-gather of every row).
+         """
+         if (
+             self.embed_tokens.table_memory == "disk"
+@@ -946,7 +952,14 @@ class Engram(nn.Module):
+         if self.embed_tokens.table_memory == "disk":
+             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
+         rows = tensor_model_parallel_all_reduce(self.staged_rows[: hash_ids.shape[0]])
+-        kv = self.wkv(rows)
++        if sp_rows is not None and isinstance(self.wkv, _PaddedColumnParallelLinear):
++            kv = sp_rows.exchange_columns(
++                self.wkv.local_product(rows), self.wkv.logical_output_size
++            )
++            kv_start = 0
++        else:
++            kv = self.wkv(rows)
++            kv_start = 0 if sp_rows is None else sp_rows.start
+         state = hidden_states.flatten(1)
+         out = torch.empty_like(state)
+         mix_out = out
+@@ -957,7 +970,8 @@ class Engram(nn.Module):
+                 out[real:].copy_(state[real:])
+             if real == 0:
+                 return out.view_as(hidden_states)
+-            state, mix_out, kv = state[:real], out[:real], kv[start : start + real]
++            state, mix_out = state[:real], out[:real]
++            kv = kv[kv_start : kv_start + real]
+             if token_mask is not None:
+                 token_mask = token_mask[start : start + real]
+         if kernels.uses_tilelang():
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index c1e794bbe..886ff36cf 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -45,7 +45,8 @@ row and then compacts.
+ 
+ - Local rows (L): the residual carry, mHC pre / post / post_pre / collapse,
+   attn_norm, ffn_norm, the Engram gate (``run_engram_mix``) and the final norm.
+-- Gathered rows (T): the Engram lookup reduction and ``wkv``, attention
++- Gathered rows (T): the Engram lookup reduction and ``wkv`` (each rank keeps
++  only its own rows of ``wkv``'s product, exchanged all-to-all), attention
+   (``wq_b``, indexer, compressor, KV cache writes, sparse MLA, WO), and the
+   MoE gate, top-k, routed and shared experts.
+ - In attention layers without a compressor, the row-wise front
+@@ -86,6 +87,7 @@ from vllm.distributed import (
+     get_tp_group,
+     model_parallel_is_initialized,
+     tensor_model_parallel_all_gather,
++    tensor_model_parallel_all_to_all,
+     tensor_model_parallel_reduce_scatter,
+ )
+ from vllm.logger import init_logger
+@@ -196,6 +198,31 @@ class SPRows:
+             )
+         return tensor_model_parallel_reduce_scatter(padded, dim=0)
+ 
++    def exchange_columns(self, local: torch.Tensor, width: int) -> torch.Tensor:
++        """This rank's L rows of a column-parallel product of all T rows, ``local``
++        being this rank's column block of every row: an all-to-all sends each rank
++        its rows' blocks, laid side by side in rank order (the column order an
++        all-gather of the blocks gives) and cut to ``width``. It moves 1/N of the
++        all-gather's bytes and the arithmetic is unchanged."""
++        if local.shape[0] != self.num_tokens:
++            raise ValueError(
++                f"SP column exchange expects {self.num_tokens} rows, got {local.shape}"
++            )
++        padded = self.empty_padded(local.shape[1:], local.dtype, local.device)
++        padded[: self.num_tokens].copy_(local)
++        blocks = tensor_model_parallel_all_to_all(padded).view(
++            self.world_size, self.local_rows, -1
++        )
++        # One copy into packed rows (consumers such as the TileLang gate require them);
++        # a block wholly past ``width`` is padding and is dropped.
++        block = blocks.shape[-1]
++        parts = [
++            blocks[rank, :, : width - rank * block]
++            for rank in range(self.world_size)
++            if rank * block < width
++        ]
++        return torch.cat(parts, dim=1)
++
+     def empty_padded(
+         self, row_shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+     ) -> torch.Tensor:

@@ -1,0 +1,1328 @@
+From a58660ee1fdfabae5cf8584eb33d70956a85aa5e Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 10:32:02 +0200
+Subject: [PATCH 140/274] DeepSeek-V4.1 Engram: read the rows the host can hash
+ before the step
+
+A disk Engram table's rows were read only after the GPU hashed the step's
+tokens at the start of the step, so the first Engram layer waited for its
+table: 4-36 ms per prefill chunk, 53-119 ms per 16K prefill on TP3.
+
+The runner prepares a step a step ahead of the GPU, and a prefill chunk's
+token ids are on the host then. The model state keeps each request's
+prefill tokens and hashes its chunk rows on the host (host_hash.py, the
+TileLang hash's arithmetic: wrapping multiplies, XOR, floor remainder)
+and passes them with the step as early IDs; rows of tokens the GPU
+samples stay UNKNOWN and come from the GPU's hash. One reader serves both:
+it reads the early rows as soon as the GPU has gathered the previous step
+from the same buffers (the gather now ends with a one-thread release of
+CONSUMED_SEQ), waits for the GPU's IDs only if a lookup is unknown, reads
+those, and publishes the step once. A step of prompt rows is ready before
+the GPU reaches it; a decode step is unchanged; a mixed step reads its
+prompt rows early and its decode rows late.
+
+Adaptive verification gives verifying requests GPU-chosen row counts but
+keeps them at the front of the batch with the host's total, so later
+requests start at the same row on both sides; the host refuses a step
+where a verifying request follows a prefill chunk.
+SPARK3_ENGRAM_CHECK_EARLY_IDS=1 (debug, off in serving) compares every
+early ID with the GPU's and names the first difference.
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index 09af2cf54..d031c0214 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -236,3 +236,213 @@ if __name__ == "__main__" and sys.argv[1:2] == ["--child-timeout"]:
+     _child_times_out(sys.argv[2])
+ if __name__ == "__main__" and sys.argv[1:2] == ["--child-reader-fails"]:
+     _child_reader_fails(sys.argv[2])
++
++
++# --- Rows the host hashed: read while the previous step computes ------------------
++
++
++def _host_hash_inputs(seed=11):
++    """A random Engram geometry over the real vocabulary size (so the image sentinel
++    and out-of-vocabulary ids are in play)."""
++    from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
++
++    gen = torch.Generator().manual_seed(seed)
++    vocab, layers = 129280, 2
++    token_map = torch.randint(0, 1 << 20, (vocab,), generator=gen, dtype=torch.int64)
++    multipliers = torch.randint(
++        -(1 << 62), 1 << 62, (layers, 4), generator=gen, dtype=torch.int64
++    )
++    primes = torch.randint(
++        1 << 20, 1 << 28, (layers, HEADS), generator=gen, dtype=torch.int64
++    )
++    offsets = torch.randint(
++        0, 1 << 30, (layers, HEADS), generator=gen, dtype=torch.int64
++    )
++    host = HostEngramHash(
++        token_map.numpy(), multipliers.numpy(), primes.numpy(), offsets.numpy()
++    )
++    return gen, host, token_map, multipliers, primes, offsets
++
++
++def test_host_hash_equals_the_gpu_hash():
++    """The host's hash of a step's known rows equals the GPU kernel's, bit for bit:
++    requests at their first chunk and later ones (with history), image tokens,
++    out-of-vocabulary ids, a missing history start, and padding."""
++    from vllm.models.deepseek_v4_1.engram_rows.host_hash import IMAGE_SENTINEL
++    from vllm.models.deepseek_v4_1.tilelang.engram_hash import engram_hash
++
++    gen, host, token_map, multipliers, primes, offsets = _host_hash_inputs()
++    specs = [(0, 57), (37, 81), (2, 19), (0, 3)]  # (chunk start, rows) per request
++    requests, ids, history, starts = [], [], [], [0]
++    for start, rows in specs:
++        tokens = torch.randint(
++            0, 129280, (start + rows,), generator=gen, dtype=torch.int64
++        )
++        tokens[torch.randint(0, start + rows, (5,), generator=gen)] = IMAGE_SENTINEL
++        tokens[torch.randint(0, start + rows, (3,), generator=gen)] = (
++            200_000  # out of vocabulary
++        )
++        chunk = tokens[start:]
++        ids.append(chunk)
++        lookback = [int(tokens[p]) if p >= 0 else -1 for p in range(start - 3, start)]
++        history.append(lookback)
++        requests.append(
++            (
++                starts[-1],
++                rows,
++                tokens.numpy().astype("int32"),
++                __import__("numpy").arange(start, start + rows),
++            )
++        )
++        starts.append(starts[-1] + rows)
++    live, padded = starts[-1], starts[-1] + 9
++    ids = torch.cat(ids + [torch.zeros(9, dtype=torch.int64)]).cuda()
++    out = torch.empty((padded, 2, HEADS), dtype=torch.int64, device="cuda")
++    engram_hash(
++        ids,
++        ids == IMAGE_SENTINEL,
++        torch.tensor(starts, dtype=torch.int32, device="cuda"),
++        torch.tensor(history, dtype=torch.int64, device="cuda"),
++        token_map.cuda(),
++        multipliers.cuda(),
++        primes.cuda(),
++        offsets.cuda(),
++        out,
++        torch.zeros(1, dtype=torch.int32, device="cuda"),
++        torch.zeros(1, dtype=torch.int32, device="cuda"),
++    )
++    expected = host.step_ids(padded, requests)
++    assert (expected[live:] == -1).all()
++    assert torch.equal(out.cpu(), torch.from_numpy(expected))
++
++
++def _early_step(rows, ids, live, early):
++    stream = torch.cuda.current_stream()
++    num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
++    out = torch.full(
++        (ids.shape[0], HEADS * 256), 7, dtype=torch.bfloat16, device="cuda"
++    )
++    rows.stage(stream, ids, ids.numel(), early)
++    rows.gather(out, ids, num_tokens)
++    return out
++
++
++@pytest.mark.parametrize("known", ["all", "some"])
++def test_early_rows_give_the_gpu_ids_rows(known):
++    """A step whose rows the host hashed (all, or some with the rest UNKNOWN) gathers
++    the bits a step read from the GPU's IDs does."""
++    from vllm.models.deepseek_v4_1.engram_rows.host_hash import UNKNOWN
++
++    codes, scales, paths = _write_table(_table_dir(), seed=21)
++    rows = _rows(paths, 700, 3900, check_early=True)
++    gen = torch.Generator().manual_seed(22)
++    for step in range(12):
++        ids = torch.randint(0, TABLE_ROWS, (16, HEADS), generator=gen)
++        early = ids.clone().numpy()
++        if known == "some":
++            early[torch.rand(16, generator=gen).numpy() < 0.4] = UNKNOWN
++        out = _early_step(rows, ids.cuda(), 14, early)
++        torch.testing.assert_close(
++            out.cpu(),
++            _reference(codes, scales, ids, 14, 700, 3900),
++            rtol=0,
++            atol=0,
++            equal_nan=True,
++            msg=f"step {step}",
++        )
++    stats = rows.stats()
++    assert (
++        stats["failure"] is None and stats["steps"] == 12 and stats["early_lookups"] > 0
++    )
++    rows.close()
++
++
++def test_early_rows_wait_for_the_previous_gather():
++    """The reader writes a step's early rows only after the GPU has gathered the
++    previous step from the same buffers. As in serving, the next step is staged on the
++    stream after the previous step's gather, while the host runs ahead of the GPU."""
++    codes, scales, paths = _write_table(_table_dir(), seed=23)
++    rows = _rows(paths, tokens=4)
++    stream = torch.cuda.current_stream()
++    first = torch.randint(0, TABLE_ROWS, (4, HEADS)).cuda()
++    second = torch.randint(0, TABLE_ROWS, (4, HEADS))
++    # Device copies before the GPU is kept busy: a pageable copy waits for the stream.
++    second_gpu = second.cuda()
++    num_tokens = torch.tensor([4], dtype=torch.int32, device="cuda")
++    out1 = torch.empty((4, HEADS * 256), dtype=torch.bfloat16, device="cuda")
++    out2 = torch.empty_like(out1)
++    # A whole step first, so no kernel compiles while the GPU is kept busy below.
++    rows.stage(stream, first, first.numel())
++    rows.gather(out1, first, num_tokens)
++    torch.cuda.synchronize()
++    rows.stage(stream, first, first.numel())
++    deadline = time.monotonic() + 30
++    while (
++        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
++        and time.monotonic() < deadline
++    ):
++        time.sleep(0.001)
++    held = rows.weights.host.clone()
++    torch.cuda._sleep(int(1e9))  # the GPU is still busy before step 1's gather
++    rows.gather(out1, first, num_tokens)
++    rows.stage(stream, second_gpu, second.numel(), second.numpy())
++    time.sleep(0.2)
++    assert torch.equal(rows.weights.host, held), (
++        "early rows overwrote rows the GPU had not gathered"
++    )
++    rows.gather(out2, second_gpu, num_tokens)
++    torch.testing.assert_close(
++        out1.cpu(),
++        _reference(codes, scales, first, 4, 0, TABLE_ROWS),
++        rtol=0,
++        atol=0,
++        equal_nan=True,
++    )
++    torch.testing.assert_close(
++        out2.cpu(),
++        _reference(codes, scales, second, 4, 0, TABLE_ROWS),
++        rtol=0,
++        atol=0,
++        equal_nan=True,
++    )
++    rows.close()
++
++
++def test_a_step_the_host_hashed_is_published_before_the_gpu_reaches_it():
++    """All of a step's rows known early: the reader publishes it while the GPU is still
++    busy before the step's staging (its row IDs have not reached the host)."""
++    _, _, paths = _write_table(_table_dir(), seed=25)
++    rows = _rows(paths, tokens=8)
++    stream = torch.cuda.current_stream()
++    ids = torch.randint(0, TABLE_ROWS, (8, HEADS))
++    ids_gpu = ids.cuda()  # before the sleep: a pageable copy waits for the stream
++    torch.cuda._sleep(int(2e9))  # about a second of GPU work ahead of the staging
++    rows.stage(stream, ids_gpu, ids.numel(), ids.numpy())
++    deadline = time.monotonic() + 30
++    while (
++        int(rows._control[rows.native.CTRL_ROWS_SEQ]) != rows._sequence
++        and time.monotonic() < deadline
++    ):
++        time.sleep(0.001)
++    assert int(rows._control[rows.native.CTRL_ROWS_SEQ]) == rows._sequence
++    assert int(rows._control[rows.native.CTRL_IDS_SEQ]) != rows._sequence, (
++        "the GPU reached the staging first"
++    )
++    torch.cuda.synchronize()
++    rows.close()
++
++
++def test_a_mismatched_early_id_is_named():
++    """Debug check: an early ID that differs from the GPU's fails the step with both."""
++    _, _, paths = _write_table(_table_dir(), seed=27)
++    rows = _rows(paths, tokens=2, check_early=True)
++    ids = torch.full((2, HEADS), 10, dtype=torch.int64)
++    early = ids.clone().numpy()
++    early[1, 5] = 11
++    rows.stage(
++        torch.cuda.current_stream(), ids.cuda(), ids.numel(), early
++    )  # no gather: it would wait
++    deadline = time.monotonic() + 30
++    while rows.failure() is None and time.monotonic() < deadline:
++        time.sleep(0.01)
++    assert "lookup 29: the host hashed row 11, the GPU row 10" in rows.failure()
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 7fbe71c0e..0c5f5437b 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -9,6 +9,7 @@ from contextlib import contextmanager
+ from dataclasses import replace
+ from types import SimpleNamespace
+ 
++import numpy as np
+ import pytest
+ import torch
+ from b12x._lib.runtime_control import kernel_resolution_guard
+@@ -21,6 +22,7 @@ from vllm.config.engram import EngramConfig
+ from vllm.config.load import LoadConfig
+ from vllm.model_executor.model_loader import default_loader, weight_utils
+ from vllm.model_executor.models.utils import WeightsMapper
++from vllm.models.deepseek_v4_1.common import engram as engram_module
+ from vllm.models.deepseek_v4_1.common.engram import (
+     Engram,
+     NgramHashState,
+@@ -117,6 +119,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+             ),
+             layer_ids=geometry.layer_ids,
+             geometry=geometry,
++            token_map=list(range(32)),
+             table_memory=memory,
+         )
+         target = DeepseekV4Model.__new__(DeepseekV4Model)
+@@ -442,12 +445,15 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+     state.ced_state = None
+     state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
+     state.disk_engram_models = (target,)
++    state._prefill_tokens = {}
++    state._host_engram_hash = None
+     monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
+     monkeypatch.setattr(DefaultModelState, "prepare_dummy_inputs", lambda *args: {})
+     batch = SimpleNamespace(
+         input_ids=torch.zeros(4, dtype=torch.int32, device="cuda"),
+         query_start_loc=torch.tensor([0, 2, 2], dtype=torch.int32, device="cuda"),
+         idx_mapping=torch.tensor([0], dtype=torch.int32, device="cuda"),
++        has_prefill=False,
+     )
+     req_states = SimpleNamespace(
+         num_computed_tokens=SimpleNamespace(
+@@ -577,6 +583,117 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+     resident_session.close()
+ 
+ 
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
++    tiny_engram_checkpoint, tmp_path, monkeypatch
++):
++    """The host hashes a step's prefill chunks and the reader reads their rows before
++    the GPU's hash; a decode row in the same step comes from the GPU's hash. With the
++    debug check on, every early ID equals the GPU's, and the rows equal the resident
++    table's: a first chunk, a later chunk with history, a mixed step (decode first,
++    an image token in its history) and a decode-only step."""
++    monkeypatch.setattr(engram_module, "ENGRAM_CHECK_EARLY_IDS", True)
++    make_model, weights, paths = tiny_engram_checkpoint
++    root, target, session = make_model("disk")
++    resident_root, resident, resident_session = make_model("device")
++    _load_checkpoint(root, tmp_path)
++    with torch.no_grad():
++        resident_root.load_weights(weights.items())
++        for engram in (*_engrams(target), *_engrams(resident)):
++            engram.process_weights_after_loading()
++    _prepare_engram(session, target)
++    _prepare_engram(resident_session, resident)
++    for engram in _engrams(target):
++        assert engram.embed_tokens.disk_rows.check_early
++
++    prompt = [5, 9, 13, 17, 19, 23]
++    state = DeepseekV41ModelState.__new__(DeepseekV41ModelState)
++    state.ced_state = None
++    state.lookback_token_ids = torch.empty(2, 3, dtype=torch.int32, device="cuda")
++    state.disk_engram_models = (target,)
++    state._prefill_tokens = {"a": np.array(prompt, dtype=np.int32)}
++    state._host_engram_hash = None
++    monkeypatch.setattr(DefaultModelState, "prepare_inputs", lambda *args: {})
++    all_token_ids = torch.tensor(
++        [prompt, [4, 129264, 6, 8, 10, 12]], dtype=torch.int32, device="cuda"
++    )
++    slots = {"a": 0, "b": 1}
++    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
++    # (input ids, [(request, computed tokens, rows, prefilling)], early lookups)
++    steps = (
++        ([13, 17, 19, 31], [("a", 2, 3, True)], 4 * 24),
++        ([23, 31, 31, 31], [("a", 5, 1, True)], 4 * 24),
++        ([10, 13, 17, 31], [("b", 4, 1, False), ("a", 2, 2, True)], 3 * 24),
++        ([10, 31, 31, 31], [("b", 4, 1, False)], 0),
++    )
++    with torch.inference_mode():
++        for ids, requests, early in steps:
++            names = [name for name, *_ in requests]
++            computed = torch.zeros(2, dtype=torch.int32, device="cuda")
++            for name, done, _, _ in requests:
++                computed[slots[name]] = done
++            rows = np.array([n for _, _, n, _ in requests], dtype=np.int32)
++            starts = np.zeros(len(requests) + 1, dtype=np.int32)
++            np.cumsum(rows, out=starts[1:])
++            loc = (
++                np.concatenate([starts, [starts[-1]]]) if len(requests) == 1 else starts
++            )
++            prefilling = np.array([p for *_, p in requests], dtype=np.bool_)
++            batch = SimpleNamespace(
++                input_ids=torch.tensor(ids, dtype=torch.int32, device="cuda"),
++                query_start_loc=torch.tensor(loc, dtype=torch.int32, device="cuda"),
++                idx_mapping=torch.tensor(
++                    [slots[n] for n in names], dtype=torch.int32, device="cuda"
++                ),
++                req_ids=names,
++                query_start_loc_np=loc,
++                num_scheduled_tokens=rows,
++                num_computed_prefill_tokens_np=np.array(
++                    [d for _, d, _, _ in requests], dtype=np.int32
++                ),
++                is_prefilling_np=prefilling,
++                has_prefill=bool(prefilling.any()),
++                num_draft_tokens_per_req=None,
++            )
++            req_states = SimpleNamespace(
++                num_computed_tokens=SimpleNamespace(gpu=computed),
++                all_token_ids=SimpleNamespace(gpu=all_token_ids),
++            )
++            before = [s["early_lookups"] for s in _settled_reader_stats(target)]
++            state.prepare_inputs(batch, req_states)
++            mask = ~image_sentinel_mask(batch.input_ids)
++            actual = tuple(
++                engram(hidden, target.prepared_engram_hashes[:4, index], mask)
++                for index, engram in enumerate(_engrams(target))
++            )
++            stats = _settled_reader_stats(target)
++            for engram in _engrams(target):
++                assert engram.embed_tokens.disk_rows.failure() is None
++            assert [s["early_lookups"] - b for s, b in zip(stats, before)] == [
++                early
++            ] * 2
++
++            history = torch.full((2, 3), -1, dtype=torch.int32, device="cuda")
++            for row, (name, done, _, _) in enumerate(requests):
++                width = min(done, 3)
++                history[row, 3 - width :] = all_token_ids[
++                    slots[name], done - width : done
++                ]
++            hashes = resident.engram_hash(
++                batch.input_ids,
++                None,
++                batch.query_start_loc,
++                image_sentinel_mask(batch.input_ids),
++                history,
++            )
++            for index, engram in enumerate(_engrams(resident)):
++                engram.prepare_embeddings(hashes[:, index])
++                expected = engram(hidden, hashes[:, index], mask)
++                torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
++    session.close()
++    resident_session.close()
++
++
+ def test_dspark_checkpoint_filter_does_not_read_target_engram(tmp_path, monkeypatch):
+     target = "layers.1.engram.embed.weight"
+     draft = "mtp.0.main_proj.weight"
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 513f31616..6bca6613d 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -77,6 +77,9 @@ DEAD_ID = -1
+ ENGRAM_ROWS_TIMEOUT_S = float(os.environ.get("SPARK3_ENGRAM_ROWS_TIMEOUT_MS", "10000")) / 1000
+ # Tests only: delay every disk read, to show the forward waits for its rows.
+ ENGRAM_READ_DELAY_S = float(os.environ.get("SPARK3_ENGRAM_READ_DELAY_MS", "0")) / 1000
++# Debug only (off and free in serving): every row ID the host hashed early must equal
++# the GPU's, or the step fails with both.
++ENGRAM_CHECK_EARLY_IDS = os.environ.get("SPARK3_ENGRAM_CHECK_EARLY_IDS", "0") == "1"
+ 
+ 
+ @lru_cache(maxsize=2)
+@@ -639,21 +642,23 @@ class ParallelEngramEmbedding(nn.Module):
+             max_lookups=self.caps.max_tokens * 24,
+             rows_timeout_s=ENGRAM_ROWS_TIMEOUT_S,
+             delay_s=ENGRAM_READ_DELAY_S,
++            check_early=ENGRAM_CHECK_EARLY_IDS,
+         )
+         for path, offset, scale in self._disk_sources:
+             rows.add_source(path, offset, scale=scale)
+         self.disk_rows = rows
+ 
+-    def stage_rows(self, indices, num_tokens, stream):
+-        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24]) and live
+-        token count, then hand the step to the reader. Returns at once; the forward's
+-        ``gather_rows`` waits for the rows."""
++    def stage_rows(self, indices, num_tokens, stream, early=None):
++        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's
++        hash) and live token count, then hand the step to the reader with the IDs the
++        host hashed (``early`` [tokens, 24] int64 on the host, or None). Returns at
++        once; the forward's ``gather_rows`` waits for the rows."""
+         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+             raise RuntimeError("Disk Engram staging must run outside compile/capture")
+         tokens = indices.shape[0]
+         self.hashes[:tokens].copy_(indices)
+         self.num_tokens.copy_(num_tokens)
+-        self.disk_rows.stage(stream, self.hashes, tokens * 24)
++        self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
+ 
+     def stage_no_rows(self):
+         """A dummy step: the gather writes zeros and waits for nothing."""
+@@ -897,10 +902,11 @@ class Engram(nn.Module):
+         )
+         self.embed_tokens.open_disk_rows()
+ 
+-    def stage_rows(self, hash_ids, num_tokens, stream):
+-        """Queue this step's disk rows; the forward gathers them."""
++    def stage_rows(self, hash_ids, num_tokens, stream, early=None):
++        """Queue this step's disk rows (``early``: the IDs the host hashed); the
++        forward gathers them."""
+         self.invalidate_disk_output()
+-        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream)
++        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream, early)
+         self._disk_prepared_tokens = hash_ids.shape[0]
+         self._disk_prepared = True
+ 
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_native.py b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+index d97676089..c1f99966c 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_native.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/_native.py
+@@ -25,7 +25,7 @@ from pathlib import Path
+ _LOCK = threading.Lock()
+ _SOURCE = Path(__file__).with_name("_reader.c")
+ _NAME = "_engram_rows_reader"
+-ABI_VERSION = 2
++ABI_VERSION = 3
+ 
+ 
+ def _pkg_config(*args: str) -> str:
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/_reader.c b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+index ed01e7d46..c06b7a9c0 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/_reader.c
++++ b/vllm/models/deepseek_v4_1/engram_rows/_reader.c
+@@ -6,11 +6,17 @@
+  * One worker thread serves every reader's steps in the order the model submits
+  * them: per step, the first Engram layer's table, then the second's, so the rows
+  * the forward needs first are read first and the two tables never compete for the
+- * disk. For each step the worker waits until the GPU has written the step's
+- * sequence number into the reader's control block (the stream writes it after
+- * copying the row IDs to the host), reads the rows into the mapped buffers the GPU
+- * gathers from, and publishes the step by writing its sequence number into the
+- * control block. The worker never takes the GIL and never calls CUDA, so nothing
++ * disk. A step's lookups split by when their row IDs exist. Those the host already
++ * hashed (prompt tokens: the runner prepares a step before the GPU runs it) come
++ * with the step as its early IDs, and the worker reads them as soon as the GPU has
++ * finished gathering the reader's previous step (the GPU writes that step's
++ * sequence number into the control block after its gather), so they are read while
++ * the previous step computes. The rest (tokens the GPU samples) are known when the
++ * GPU has written the step's sequence number into the control block (the stream
++ * writes it after copying the row IDs to the host); the worker then reads those,
++ * and publishes the step by writing its sequence number into the control block. A
++ * step with no early IDs is read entirely the second way; one whose IDs are all
++ * early does not wait for the GPU's. The worker never takes the GIL and never calls CUDA, so nothing
+  * another thread does in Python or in the CUDA driver can hold back the rows. A
+  * failed step is recorded and not published, and the control block says so: the
+  * GPU's wait then stops it at once with a named record instead of letting it read
+@@ -50,10 +56,11 @@ static void system_error(failure_t *failure, const char *operation) {
+ #include "_row_plan.h"
+ 
+ #define READER_CAPSULE "vllm.engram_rows.reader"
+-#define ABI_VERSION 2
++#define ABI_VERSION 3
+ 
+ /* Control block: 32-bit words in mapped host memory, one 64-byte line per writer. */
+ #define CTRL_IDS_SEQ 0      /* the GPU stream: the step whose row IDs are on the host */
++#define CTRL_CONSUMED_SEQ 1 /* the GPU: the step whose rows it has gathered */
+ #define CTRL_ROWS_SEQ 16    /* the worker: the step whose rows are in the buffers */
+ #define CTRL_TIMEOUT_US 32  /* the host: how long the GPU waits for a step's rows */
+ #define CTRL_WAITED_US 33   /* the GPU: how long a timed-out wait waited */
+@@ -62,7 +69,10 @@ static void system_error(failure_t *failure, const char *operation) {
+ #define CTRL_PHASE_SEQ 49   /* the worker: the step it is on */
+ #define CTRL_WORDS 64
+ 
+-enum { PHASE_IDLE = 0, PHASE_WAITING_IDS = 1, PHASE_READING = 2, PHASE_FAILED = 3 };
++enum { PHASE_IDLE = 0, PHASE_WAITING_IDS = 1, PHASE_READING = 2, PHASE_FAILED = 3, PHASE_WAITING_CONSUMED = 4 };
++
++/* An early ID the host does not know: the GPU's ID for that lookup is read later. */
++#define UNKNOWN_ID INT64_MIN
+ 
+ #define QUEUE 64u /* steps queued across all readers */
+ 
+@@ -75,6 +85,8 @@ typedef struct {
+ typedef struct {
+     uint32_t sequence;
+     uint32_t count;
++    int64_t *early;   /* the host's IDs (UNKNOWN_ID where only the GPU knows), or NULL */
++    bool has_unknown; /* some lookup needs the GPU's ID */
+ } step_t;
+ 
+ typedef struct {
+@@ -93,6 +105,8 @@ typedef struct {
+     const char *ids;
+     char *weights, *scales;
+     uint32_t *control;
++    int64_t *late; /* the GPU's IDs of a step's lookups the host did not know, -1 elsewhere */
++    bool check_early; /* debug: an early ID must equal the GPU's */
+     /* Serving: started (sources fixed) and closing are set once; pending (steps
+      * queued or being read) is guarded by the queue's mutex, the rest by mutex. */
+     bool started, closing;
+@@ -100,8 +114,8 @@ typedef struct {
+     pthread_mutex_t mutex;
+     uint64_t ids_timeout_ns, delay_ns;
+     failure_t failure; /* the first failure; no step is read after it */
+-    uint64_t steps_done, lookups_done;
+-    double ids_wait_seconds, read_seconds;
++    uint64_t steps_done, lookups_done, early_lookups;
++    double ids_wait_seconds, read_seconds, consumed_wait_seconds, early_read_seconds;
+ } reader_t;
+ 
+ static uint64_t now_ns(void) {
+@@ -282,8 +296,9 @@ static int ple_register_files(ple_plan_t *plan, void *owner) {
+     return error;
+ }
+ 
+-/* Read one step's rows: the IDs are in reader->ids, the rows go to their lookup slots. */
+-static failure_t read_rows(reader_t *reader, uint32_t count) {
++/* Read the rows of ``count`` lookups whose IDs are ``ids`` into their lookup slots; an
++ * ID outside this rank's shard (or -1, or UNKNOWN_ID) leaves its slot untouched. */
++static failure_t read_rows(reader_t *reader, const char *ids, uint32_t count) {
+     reader->plan.failure.message[0] = 0;
+     reader->plan.lookups = count;
+     reader->plan.requested_bytes = reader->plan.read_bytes = reader->plan.read_calls = 0;
+@@ -291,7 +306,7 @@ static failure_t read_rows(reader_t *reader, uint32_t count) {
+     if (reader->poisoned)
+         snprintf(reader->plan.failure.message, sizeof(reader->plan.failure.message),
+                  "Engram reader is unusable after an io_uring submission or completion failure");
+-    else if (ple_plan(&reader->plan, reader->ids, count) &&
++    else if (ple_plan(&reader->plan, ids, count) &&
+              reader->plan.job_count)
+         ple_uring_run(reader);
+     return reader->plan.failure;
+@@ -299,23 +314,22 @@ static failure_t read_rows(reader_t *reader, uint32_t count) {
+ 
+ /* --- worker ------------------------------------------------------------------ */
+ 
+-/* Wait for the GPU to write the step's row IDs: spin for 200 us (the IDs of a step the
+- * GPU is already on arrive within it), then poll every 10 us. */
+-static bool wait_for_ids(reader_t *reader, uint32_t sequence, failure_t *failure) {
++/* Wait until the GPU has written ``target`` (or later) into control word ``word``: spin
++ * for 200 us (a step the GPU is already on answers within it), then poll every 10 us. */
++static bool wait_for_gpu(reader_t *reader, int word, uint32_t target, failure_t *failure,
++                         const char *what, const char *hint) {
+     uint64_t start = now_ns();
+     for (;;) {
+-        if (reached(__atomic_load_n(&reader->control[CTRL_IDS_SEQ], __ATOMIC_ACQUIRE), sequence))
++        if (reached(__atomic_load_n(&reader->control[word], __ATOMIC_ACQUIRE), target))
+             return true;
+         if (__atomic_load_n(&reader->closing, __ATOMIC_RELAXED)) {
+-            snprintf(failure->message, sizeof(failure->message),
+-                     "Engram reader closed before the row IDs of step %u arrived", sequence);
++            snprintf(failure->message, sizeof(failure->message), "Engram reader closed before %s %u", what,
++                     target);
+             return false;
+         }
+         if (now_ns() - start > reader->ids_timeout_ns) {
+-            snprintf(failure->message, sizeof(failure->message),
+-                     "the row IDs of Engram step %u did not arrive within %.1f s: the GPU is "
+-                     "blocked before the step's Engram staging",
+-                     sequence, (double)reader->ids_timeout_ns * 1e-9);
++            snprintf(failure->message, sizeof(failure->message), "%s %u did not come within %.1f s: %s", what,
++                     target, (double)reader->ids_timeout_ns * 1e-9, hint);
+             return false;
+         }
+         if (now_ns() - start > 200000) {
+@@ -329,20 +343,76 @@ static bool wait_for_ids(reader_t *reader, uint32_t sequence, failure_t *failure
+     }
+ }
+ 
++static void pause_for_delay(reader_t *reader) {
++    if (reader->delay_ns) {
++        struct timespec pause = {(time_t)(reader->delay_ns / 1000000000ull),
++                                 (long)(reader->delay_ns % 1000000000ull)};
++        nanosleep(&pause, NULL);
++    }
++}
++
++/* The step's early part: wait until the GPU has gathered the reader's previous step
++ * (its rows are in the same buffers), then read the lookups the host hashed. */
++static bool read_early(reader_t *reader, step_t step, failure_t *failure, double *consumed_wait,
++                       double *early_read, uint64_t *early_count) {
++    control_store(reader, CTRL_PHASE, PHASE_WAITING_CONSUMED);
++    uint64_t start = now_ns();
++    /* Sequences run 1, 2, ... 0xFFFFFFFF, 1: the step before 1 is 0xFFFFFFFF (or none,
++     * when the control block's 0 has reached it already). */
++    uint32_t previous = step.sequence == 1 ? 0xFFFFFFFFu : step.sequence - 1;
++    if (!wait_for_gpu(reader, CTRL_CONSUMED_SEQ, previous, failure,
++                      "the GPU's gather of the rows of Engram step",
++                      "the GPU never gathered the previous step's rows"))
++        return false;
++    uint64_t consumed_at = now_ns();
++    pause_for_delay(reader);
++    control_store(reader, CTRL_PHASE, PHASE_READING);
++    *failure = read_rows(reader, (const char *)step.early, step.count);
++    *consumed_wait = (double)(consumed_at - start) * 1e-9;
++    *early_read = (double)(now_ns() - consumed_at) * 1e-9;
++    for (uint32_t i = 0; i < step.count; i++) *early_count += step.early[i] != UNKNOWN_ID;
++    return !failure->message[0];
++}
++
++/* The GPU's IDs: check the early ones (debug) and keep only those the host did not know. */
++static bool late_ids(reader_t *reader, step_t step, failure_t *failure) {
++    const int64_t *gpu = (const int64_t *)reader->ids;
++    for (uint32_t i = 0; i < step.count; i++) {
++        int64_t id;
++        memcpy(&id, gpu + i, sizeof(id));
++        if (step.early && step.early[i] != UNKNOWN_ID) {
++            if (reader->check_early && step.early[i] != id) {
++                snprintf(failure->message, sizeof(failure->message),
++                         "Engram step %u lookup %u: the host hashed row %lld, the GPU row %lld", step.sequence,
++                         i, (long long)step.early[i], (long long)id);
++                return false;
++            }
++            reader->late[i] = -1;
++        } else {
++            reader->late[i] = id;
++        }
++    }
++    return true;
++}
++
+ static void serve(reader_t *reader, step_t step) {
+     failure_t failure = {{0}};
+     control_store(reader, CTRL_PHASE_SEQ, step.sequence);
+-    control_store(reader, CTRL_PHASE, PHASE_WAITING_IDS);
++    uint64_t early_count = 0;
++    double consumed_wait = 0.0, early_read = 0.0;
++    bool ok = !step.early || read_early(reader, step, &failure, &consumed_wait, &early_read, &early_count);
+     uint64_t start = now_ns(), ids_at = start, read_at = start;
+-    if (wait_for_ids(reader, step.sequence, &failure)) {
++    if (ok && (step.has_unknown || reader->check_early)) {
++        control_store(reader, CTRL_PHASE, PHASE_WAITING_IDS);
++        ok = wait_for_gpu(reader, CTRL_IDS_SEQ, step.sequence, &failure, "the row IDs of Engram step",
++                          "the GPU is blocked before the step's Engram staging");
+         ids_at = now_ns();
+-        if (reader->delay_ns) {
+-            struct timespec pause = {(time_t)(reader->delay_ns / 1000000000ull),
+-                                     (long)(reader->delay_ns % 1000000000ull)};
+-            nanosleep(&pause, NULL);
++        if (ok && !step.early) pause_for_delay(reader);
++        if (ok) ok = late_ids(reader, step, &failure);
++        if (ok && step.has_unknown) {
++            control_store(reader, CTRL_PHASE, PHASE_READING);
++            failure = read_rows(reader, (const char *)reader->late, step.count);
+         }
+-        control_store(reader, CTRL_PHASE, PHASE_READING);
+-        failure = read_rows(reader, step.count);
+         read_at = now_ns();
+     }
+     pthread_mutex_lock(&reader->mutex);
+@@ -351,6 +421,9 @@ static void serve(reader_t *reader, step_t step) {
+     } else {
+         reader->steps_done++;
+         reader->lookups_done += step.count;
++        reader->early_lookups += early_count;
++        reader->consumed_wait_seconds += consumed_wait;
++        reader->early_read_seconds += early_read;
+         reader->ids_wait_seconds += (double)(ids_at - start) * 1e-9;
+         reader->read_seconds += (double)(read_at - ids_at) * 1e-9;
+     }
+@@ -405,6 +478,7 @@ static void *worker_main(void *arg) {
+         bool failed = job.reader->failure.message[0] != 0;
+         pthread_mutex_unlock(&job.reader->mutex);
+         if (!failed) serve(job.reader, job.step);
++        free(job.step.early);
+         pthread_mutex_lock(&queue.mutex);
+         job.reader->pending--;
+         pthread_cond_broadcast(&queue.idle);
+@@ -421,6 +495,7 @@ static void release(reader_t *reader) {
+     pthread_mutex_unlock(&queue.mutex);
+     if (reader->ring_ready) io_uring_queue_exit(&reader->ring);
+     free(reader->iovecs);
++    free(reader->late);
+     free(reader->free_slots);
+     free(reader->registered_fds);
+     ple_plan_release(&reader->plan);
+@@ -446,16 +521,18 @@ static reader_t *get_reader(PyObject *capsule) {
+ }
+ 
+ /* reader(table_rows, shard_start, shard_end, max_lookups, queue_depth, ids, weights,
+- *        scales, control, ids_timeout_s, delay_s): the four buffers are addresses of
+- * host memory that outlives the reader. */
++ *        scales, control, ids_timeout_s, delay_s, check_early): the four buffers are
++ * addresses of host memory that outlives the reader; check_early (debug) fails a step
++ * whose early ID differs from the GPU's. */
+ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     (void)self;
+     long long table_rows, shard_start, shard_end, max_lookups;
+     int depth;
+     unsigned long long ids, weights, scales, control;
+     double ids_timeout, delay;
+-    if (!PyArg_ParseTuple(args, "LLLLiKKKKdd", &table_rows, &shard_start, &shard_end, &max_lookups,
+-                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay))
++    int check_early;
++    if (!PyArg_ParseTuple(args, "LLLLiKKKKddp", &table_rows, &shard_start, &shard_end, &max_lookups,
++                          &depth, &ids, &weights, &scales, &control, &ids_timeout, &delay, &check_early))
+         return NULL;
+     if (table_rows <= 0 || shard_start < 0 || shard_end < shard_start || shard_end > table_rows ||
+         max_lookups <= 0 || max_lookups > UINT32_MAX || depth <= 0 || depth > 32768 || !ids ||
+@@ -478,6 +555,12 @@ static PyObject *py_reader(PyObject *self, PyObject *args) {
+     reader->control = (uint32_t *)(uintptr_t)control;
+     reader->ids_timeout_ns = (uint64_t)(ids_timeout * 1e9);
+     reader->delay_ns = (uint64_t)(delay * 1e9);
++    reader->check_early = check_early != 0;
++    reader->late = malloc((size_t)max_lookups * sizeof(*reader->late));
++    if (!reader->late) {
++        release(reader);
++        return PyErr_NoMemory();
++    }
+     reader->slots_count = (unsigned)depth;
+     reader->slots = calloc(reader->slots_count, sizeof(*reader->slots));
+     error = posix_memalign((void **)&reader->buffers, PLE_BLOCK, (size_t)reader->slots_count * PLE_READ_MAX);
+@@ -548,19 +631,39 @@ static PyObject *py_add(PyObject *self, PyObject *args) {
+     Py_RETURN_NONE;
+ }
+ 
+-/* submit(reader, sequence, count, wait_s): queue one step behind every step already
+- * queued. Returns at once unless the queue is full; then it waits for space, without
+- * the GIL. */
++/* submit(reader, sequence, count, wait_s, early): queue one step behind every step
++ * already queued. ``early`` is None or ``count`` int64 IDs the host hashed
++ * (UNKNOWN_ID where only the GPU knows the ID), copied here. Returns at once unless
++ * the queue is full; then it waits for space, without the GIL. */
+ static PyObject *py_submit(PyObject *self, PyObject *args) {
+     (void)self;
+-    PyObject *capsule;
++    PyObject *capsule, *early_object = Py_None;
+     unsigned int sequence, count;
+     double wait;
+-    if (!PyArg_ParseTuple(args, "OIId", &capsule, &sequence, &count, &wait)) return NULL;
++    if (!PyArg_ParseTuple(args, "OIId|O", &capsule, &sequence, &count, &wait, &early_object)) return NULL;
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+     if (count > reader->plan.max_lookups)
+         return PyErr_Format(PyExc_ValueError, "Engram step of %u lookups exceeds the reader's capacity", count);
++    int64_t *early = NULL;
++    bool has_unknown = true;
++    if (early_object != Py_None) {
++        Py_buffer view;
++        if (PyObject_GetBuffer(early_object, &view, PyBUF_C_CONTIGUOUS) < 0) return NULL;
++        if (view.len != (Py_ssize_t)count * (Py_ssize_t)sizeof(int64_t)) {
++            PyBuffer_Release(&view);
++            return PyErr_Format(PyExc_ValueError, "Engram early IDs must be %u int64 values", count);
++        }
++        early = malloc((size_t)count * sizeof(*early) + 1);
++        if (!early) {
++            PyBuffer_Release(&view);
++            return PyErr_NoMemory();
++        }
++        memcpy(early, view.buf, (size_t)count * sizeof(*early));
++        PyBuffer_Release(&view);
++        has_unknown = false;
++        for (uint32_t i = 0; i < count && !has_unknown; i++) has_unknown = early[i] == UNKNOWN_ID;
++    }
+     const char *problem = NULL;
+     failure_t failure = {{0}};
+     Py_BEGIN_ALLOW_THREADS
+@@ -594,7 +697,8 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+         }
+         if (!problem) {
+             __atomic_store_n(&reader->started, true, __ATOMIC_RELAXED);
+-            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count}};
++            queue.jobs[queue.tail % QUEUE] = (job_t){reader, {sequence, count, early, has_unknown}};
++            early = NULL;
+             queue.tail++;
+             reader->pending++;
+             pthread_cond_signal(&queue.wake);
+@@ -602,6 +706,7 @@ static PyObject *py_submit(PyObject *self, PyObject *args) {
+     }
+     pthread_mutex_unlock(&queue.mutex);
+     Py_END_ALLOW_THREADS
++    free(early); /* not queued */
+     if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
+     if (problem) return PyErr_Format(PyExc_RuntimeError, "%s", problem);
+     Py_RETURN_NONE;
+@@ -613,8 +718,8 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     reader_t *reader = get_reader(capsule);
+     if (!reader) return NULL;
+     failure_t failure;
+-    uint64_t steps, lookups, queued;
+-    double ids_wait, read;
++    uint64_t steps, lookups, queued, early;
++    double ids_wait, read, consumed_wait, early_read;
+     Py_BEGIN_ALLOW_THREADS
+     pthread_mutex_lock(&queue.mutex);
+     queued = reader->pending;
+@@ -625,14 +730,19 @@ static PyObject *py_status(PyObject *self, PyObject *capsule) {
+     lookups = reader->lookups_done;
+     ids_wait = reader->ids_wait_seconds;
+     read = reader->read_seconds;
++    early = reader->early_lookups;
++    consumed_wait = reader->consumed_wait_seconds;
++    early_read = reader->early_read_seconds;
+     pthread_mutex_unlock(&reader->mutex);
+     Py_END_ALLOW_THREADS
+     PyObject *message = failure.message[0] ? PyUnicode_FromString(failure.message) : Py_NewRef(Py_None);
+     if (!message) return NULL;
+-    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:d,s:d}", "failure", message, "steps",
++    PyObject *result = Py_BuildValue("{s:N,s:K,s:K,s:K,s:K,s:d,s:d,s:d,s:d}", "failure", message, "steps",
+                                      (unsigned long long)steps, "lookups", (unsigned long long)lookups,
+-                                     "queued", (unsigned long long)queued, "ids_wait_seconds", ids_wait,
+-                                     "read_seconds", read);
++                                     "early_lookups", (unsigned long long)early, "queued",
++                                     (unsigned long long)queued, "ids_wait_seconds", ids_wait,
++                                     "read_seconds", read, "consumed_wait_seconds", consumed_wait,
++                                     "early_read_seconds", early_read);
+     return result;
+ }
+ 
+@@ -654,6 +764,7 @@ PyMODINIT_FUNC PyInit__engram_rows_reader(void) {
+     if (!result) return NULL;
+     if (PyModule_AddIntConstant(result, "ABI_VERSION", ABI_VERSION) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_IDS_SEQ", CTRL_IDS_SEQ) < 0 ||
++        PyModule_AddIntConstant(result, "CTRL_CONSUMED_SEQ", CTRL_CONSUMED_SEQ) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_ROWS_SEQ", CTRL_ROWS_SEQ) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_TIMEOUT_US", CTRL_TIMEOUT_US) < 0 ||
+         PyModule_AddIntConstant(result, "CTRL_WAITED_US", CTRL_WAITED_US) < 0 ||
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/host_hash.py b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+new file mode 100644
+index 000000000..e5bba8888
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/engram_rows/host_hash.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The Engram n-gram hash on the host, for the tokens whose ids the host already has.
++
++A step's Engram lookups split by when their row IDs can exist. A prompt token's id
++is on the host when the runner prepares the step, a step before the GPU runs it, so
++its rows can be read while the previous step computes; a token the GPU samples (a
++decode token or a draft) is known only to the GPU when the step starts. This module
++hashes the first kind exactly as ``tilelang/engram_hash.py`` does on the GPU (the
++same int64 arithmetic: wrapping multiplies, XOR, TileLang's floor remainder), so the
++reader can be handed those rows early and the GPU's ids for them are never needed.
++
++``UNKNOWN`` marks a lookup whose id only the GPU will know; ``-1`` is a known "no
++row" (a padding token past the step's live tokens), as the GPU writes it.
++"""
++
++import numpy as np
++
++HEADS = 24
++LAGS = 4
++PAD_TOKEN = 2
++IMAGE_SENTINEL = 129264
++UNKNOWN = np.iinfo(np.int64).min
++
++
++class HostEngramHash:
++    """The hash geometry and tokenizer map of a model's Engram layers, on the host."""
++
++    def __init__(self, token_map, multipliers, primes, offsets):
++        self.token_map = np.asarray(token_map, dtype=np.int64)
++        self.multipliers = np.asarray(multipliers, dtype=np.int64)  # [layers, 4]
++        self.primes = np.asarray(primes, dtype=np.int64)  # [layers, 24]
++        self.offsets = np.asarray(offsets, dtype=np.int64)  # [layers, 24]
++        self.layers = self.multipliers.shape[0]
++        if self.multipliers.shape != (self.layers, LAGS) or self.primes.shape != (
++            self.layers,
++            HEADS,
++        ):
++            raise ValueError(
++                "Engram hash geometry must be [layers, 4] multipliers and "
++                "[layers, 24] primes"
++            )
++        self.pad = self.token_map[PAD_TOKEN]
++        self.vocab = self.token_map.shape[0]
++
++    def compress(self, raw: np.ndarray) -> np.ndarray:
++        """Compressed ids of raw token ids; -1 for a missing token (negative), an
++        image token or one outside the tokenizer map."""
++        raw = np.asarray(raw, dtype=np.int64)
++        valid = (raw >= 0) & (raw < self.vocab) & (raw != IMAGE_SENTINEL)
++        return np.where(valid, self.token_map[np.where(valid, raw, 0)], -1)
++
++    def hash_positions(self, tokens: np.ndarray, positions: np.ndarray) -> np.ndarray:
++        """Row ids ``[len(positions), layers, 24]`` of the tokens at ``positions``
++        of one request whose token ids up to the last position are ``tokens`` (prompt
++        order; the GPU's query tokens and committed history are the same ids)."""
++        positions = np.asarray(positions, dtype=np.int64)
++        lags = positions[:, None] - np.arange(LAGS, dtype=np.int64)[None, :]  # [T, 4]
++        raw = np.where(lags >= 0, tokens[np.maximum(lags, 0)], -1)
++        sources = self.compress(raw)
++        # From the first missing source on, every lag takes the pad id.
++        blocked = np.logical_or.accumulate(sources == -1, axis=1)
++        values = np.where(blocked, self.pad, sources)
++        # value * multiplier in wrapping int64, as the GPU computes it.
++        products = (
++            values[:, None, :].astype(np.uint64)
++            * self.multipliers[None, :, :].astype(np.uint64)
++        ).view(np.int64)  # [T, layers, 4]
++        mixed2 = products[..., 0] ^ products[..., 1]
++        mixed3 = mixed2 ^ products[..., 2]
++        mixed4 = mixed3 ^ products[..., 3]
++        # Heads 0-7 hash 2-grams, 8-15 3-grams, 16-23 4-grams.
++        mixed = np.concatenate(
++            [np.repeat(m[..., None], 8, axis=-1) for m in (mixed2, mixed3, mixed4)],
++            axis=-1,
++        )  # [T, layers, 24]
++        # The floor remainder (the sign of the divisor), as TileLang's int64 %. The
++        # model's bounded multipliers keep ``mixed`` non-negative, where it equals
++        # C's truncating one.
++        return np.remainder(mixed, self.primes[None]) + self.offsets[None]
++
++    def step_ids(self, num_tokens: int, requests) -> np.ndarray:
++        """A step's row ids ``[num_tokens, layers, 24]``: ``requests`` yields, per
++        request in the step's token order, ``(first_row, rows, tokens, positions)``:
++        the request's first row and row count in the step, its token ids, and the
++        positions of its leading rows whose ids the host has (the rest of its rows are
++        ``UNKNOWN``). Rows past the last request's rows are padding, -1 as the GPU
++        writes them."""
++        out = np.full((num_tokens, self.layers, HEADS), UNKNOWN, dtype=np.int64)
++        live = 0
++        for first_row, rows, tokens, positions in requests:
++            live = max(live, first_row + rows)
++            if len(positions):
++                out[first_row : first_row + len(positions)] = self.hash_positions(
++                    tokens, positions
++                )
++        out[live:] = -1
++        return out
++
++
++__all__ = ["HEADS", "UNKNOWN", "HostEngramHash"]
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 6599f99ee..b5c5fbd30 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -2,16 +2,20 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """One Engram table's rows on one rank, read from its checkpoint file as steps ask.
+ 
+-Per step, on the model's stream: the step's row IDs are copied to the host and the
+-stream writes the step's sequence number into the control block; the native reader
+-(``_reader.c``), which never takes the GIL or calls CUDA, then reads the rows into
+-mapped host buffers and publishes the step. One worker serves every table in the
+-order the steps are staged (layer order), so the first Engram layer's rows are never
+-held back by the second's. In the forward, one thread waits for the table's step,
+-bounded by a timeout, and stops the GPU with a record of the step if the rows do not
+-come or the reader failed; then the gather dequantizes this rank's rows. No Python
+-thread, CUDA event or stream wait is involved, so the rows arrive however busy the
+-Python side is.
++A step's lookups split by when their row IDs exist. The IDs the host hashed when the
++runner prepared the step (prompt tokens, ``host_hash.py``) come with the step as its
++early IDs, and the native reader (``_reader.c``), which never takes the GIL or calls
++CUDA, reads those rows as soon as the GPU has gathered the previous step, so they are
++read while the previous step computes. For the rest (tokens the GPU samples) the
++step's row IDs are copied to the host on the model's stream and the stream writes the
++step's sequence number into the control block; the reader then reads those rows and
++publishes the step. One worker serves every table in the order the steps are staged
++(layer order), so the first Engram layer's rows are never held back by the second's.
++In the forward, one thread waits for the table's step, bounded by a timeout, and stops
++the GPU with a record of the step if the rows do not come or the reader failed; then
++the gather dequantizes this rank's rows and tells the reader the buffers are free. No
++Python thread, CUDA event or stream wait is involved, so the rows arrive however busy
++the Python side is.
+ """
+ 
+ import math
+@@ -25,7 +29,13 @@ from vllm.models.deepseek_v4_1.engram_rows._native import load
+ 
+ ROW_BYTES = 256  # E4M3 values of one row
+ SCALE_BYTES = 8  # E8M0 scales of one row, one per 32 values
+-PHASES = {0: "idle", 1: "waiting for the step's row IDs", 2: "reading", 3: "failed"}
++PHASES = {
++    0: "idle",
++    1: "waiting for the step's row IDs",
++    2: "reading",
++    3: "failed",
++    4: "waiting for the GPU to gather the previous step's rows",
++}
+ 
+ 
+ def _check(result, operation: str):
+@@ -91,18 +101,21 @@ class MappedHostAllocation:
+ class EngramDiskRows:
+     """Rows ``[shard_start, shard_end)`` of one Engram table, ``max_lookups`` per step.
+ 
+-    ``ids_timeout_s`` bounds the reader's wait for a step's row IDs and
+-    ``rows_timeout_s`` the GPU's wait for its rows; ``delay_s`` (tests only) delays
+-    every read.
++    ``ids_timeout_s`` bounds the reader's waits for the GPU (a step's row IDs, or its
++    gather of the previous step) and ``rows_timeout_s`` the GPU's wait for its rows;
++    ``delay_s`` (tests only) delays every read; ``check_early`` (debug) fails a step
++    whose early ID differs from the GPU's.
+     """
+ 
+     def __init__(self, *, device, table_rows: int, shard_start: int, shard_end: int,
+                  max_lookups: int, queue_depth: int = 128, ids_timeout_s: float = 20.0,
+-                 rows_timeout_s: float = 10.0, delay_s: float = 0.0):
++                 rows_timeout_s: float = 10.0, delay_s: float = 0.0,
++                 check_early: bool = False):
+         self.native = load()
+         self.device = _indexed(device)
+         self.shard_start, self.shard_end = int(shard_start), int(shard_end)
+         self.max_lookups = int(max_lookups)
++        self.check_early = bool(check_early)
+         self._allocations = []
+         self.ids = torch.empty(self.max_lookups, dtype=torch.int64, pin_memory=True)
+         self.weights = self._mapped((self.max_lookups, ROW_BYTES), torch.uint8, True)
+@@ -115,7 +128,7 @@ class EngramDiskRows:
+         self._reader = self.native.reader(
+             table_rows, self.shard_start, self.shard_end, self.max_lookups, queue_depth,
+             self.ids.data_ptr(), self.weights.pointer, self.scales.pointer, self.control.pointer,
+-            float(ids_timeout_s), float(delay_s),
++            float(ids_timeout_s), float(delay_s), self.check_early,
+         )
+         self._ids_seq_device = self.control.device_view.data_ptr() + 4 * self.native.CTRL_IDS_SEQ
+         self._sequence = 0
+@@ -130,18 +143,32 @@ class EngramDiskRows:
+         start at ``offset`` in the immutable file ``path``."""
+         self.native.add(self._reader, str(path), int(offset), bool(scale))
+ 
+-    def stage(self, stream: torch.cuda.Stream, ids: torch.Tensor, count: int) -> None:
++    def stage(
++        self,
++        stream: torch.cuda.Stream,
++        ids: torch.Tensor,
++        count: int,
++        early: np.ndarray | None = None,
++    ) -> None:
+         """Queue a step: ``ids`` holds its ``count`` row IDs (contiguous int64 on the
+-        device). Returns at once; the forward's ``gather`` waits for the rows."""
++        device, written by the GPU's hash); ``early`` (``count`` int64 on the host, or
++        None) the IDs the host hashed, ``host_hash.UNKNOWN`` where only the GPU knows
++        one. Returns at once; the forward's ``gather`` waits for the rows."""
+         self.raise_if_failed()
+         from cuda.bindings import driver
+ 
++        if early is not None:
++            early = np.ascontiguousarray(early, dtype=np.int64).reshape(-1)
++            if early.shape[0] != count:
++                raise ValueError(
++                    f"Engram early IDs: {early.shape[0]} for a step of {count} lookups"
++                )
+         self._sequence = (self._sequence + 1) & 0xFFFFFFFF or 1
+         with torch.cuda.stream(stream):
+             self.ids[:count].copy_(ids.view(-1)[:count], non_blocking=True)
+         _check(driver.cuStreamWriteValue32(stream.cuda_stream, self._ids_seq_device, self._sequence, 0),
+                "cuStreamWriteValue32")
+-        self.native.submit(self._reader, self._sequence, count, 60.0)
++        self.native.submit(self._reader, self._sequence, count, 60.0, early)
+ 
+     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
+         """Wait for the staged step's rows and dequantize the first ``num_tokens``
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 1248721b9..46049b2ab 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -545,9 +545,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             spec_config is not None and spec_config.use_dspark()
+         )
+ 
+-    def prepare_disk_engram(self, input_ids, query_start_loc, lookback_token_ids):
++    def prepare_disk_engram(
++        self, input_ids, query_start_loc, lookback_token_ids, early=None
++    ):
+         """Hash this step's tokens and queue each disk Engram table's rows; each
+-        Engram layer's forward gathers them."""
++        Engram layer's forward gathers them. ``early`` ([tokens, layers, 24] int64 on
++        the host, or None) holds the row IDs the host hashed for the tokens it knows,
++        ``host_hash.UNKNOWN`` elsewhere: the reader reads those rows before the GPU
++        reaches the step."""
+         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+             raise RuntimeError(
+                 "Disk Engram preparation must run outside compile/capture"
+@@ -571,7 +576,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         stream = torch.cuda.current_stream()
+         for engram in engrams:
+             engram.stage_rows(
+-                hashes[:, engram.layer_hash_index], self.engram_hash.num_tokens, stream
++                hashes[:, engram.layer_hash_index],
++                self.engram_hash.num_tokens,
++                stream,
++                None if early is None else early[:, engram.layer_hash_index],
+             )
+ 
+     def prepare_dummy_engram(self, num_tokens):
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 38c9ac5d6..5bacc0f00 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from typing import Any
+ 
++import numpy as np
+ import torch
+ import torch.nn as nn
+ 
+@@ -62,6 +63,12 @@ class DeepseekV41ModelState(DefaultModelState):
+     the full token history on device, so the window is gathered there every
+     step: exact for prompt and generated tokens alike, whatever instance
+     produced their KV.
++
++    With disk Engram tables, the host also keeps each request's prefill tokens
++    and hashes the rows of a step's prefill chunks when it prepares the step,
++    a step before the GPU runs it, so the reader can read them while the
++    previous step computes (``engram_rows/host_hash.py``). Rows of tokens the
++    GPU samples are hashed on the GPU as before; one step can hold both.
+     """
+ 
+     _ced_streaming_prefix_start: tuple[str, int] | None = None
+@@ -130,6 +137,10 @@ class DeepseekV41ModelState(DefaultModelState):
+             for module in model.modules()
+             if isinstance(module, DeepseekV4Model) and module.disk_engram
+         )
++        # Disk Engram: each live request's prefill tokens (prompt, and on resumption
++        # the outputs it recomputes), for the host's hash of its prefill chunks.
++        self._prefill_tokens: dict[str, np.ndarray] = {}
++        self._host_engram_hash = None
+ 
+     def prepare_streaming_update(self, req_id: str) -> None:
+         """Keep decoder history when the runner refreshes a live request."""
+@@ -140,6 +151,10 @@ class DeepseekV41ModelState(DefaultModelState):
+ 
+     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+         super().add_request(req_index, new_req_data)
++        if self.disk_engram_models and new_req_data.prefill_token_ids is not None:
++            self._prefill_tokens[new_req_data.req_id] = np.asarray(
++                new_req_data.prefill_token_ids, dtype=np.int32
++            )
+         sampling = new_req_data.sampling_params
+         if sampling is not None and sampling.prompt_logprobs is not None:
+             self._ced_prompt_logprobs.add(new_req_data.req_id)
+@@ -158,6 +173,7 @@ class DeepseekV41ModelState(DefaultModelState):
+ 
+     def remove_request(self, req_id: str) -> None:
+         super().remove_request(req_id)
++        self._prefill_tokens.pop(req_id, None)
+         self._ced_prompt_logprobs.discard(req_id)
+         self._ced_prefix_start.pop(req_id, None)
+ 
+@@ -273,10 +289,56 @@ class DeepseekV41ModelState(DefaultModelState):
+         model_inputs["lookback_token_ids"] = window
+         for model in self.disk_engram_models:
+             model.prepare_disk_engram(
+-                input_batch.input_ids, input_batch.query_start_loc, window
++                input_batch.input_ids,
++                input_batch.query_start_loc,
++                window,
++                self._early_engram_ids(model, input_batch),
+             )
+         return model_inputs
+ 
++    def _early_engram_ids(self, model, input_batch: InputBatch) -> np.ndarray | None:
++        """The step's Engram row IDs the host can hash now, ``[tokens, layers, 24]``
++        (``host_hash.UNKNOWN`` for rows of tokens the GPU samples, -1 for padding),
++        or None when the step has no prefill chunk to hash."""
++        if not input_batch.has_prefill:
++            return None
++        from vllm.models.deepseek_v4_1.engram_rows.host_hash import HostEngramHash
++
++        if self._host_engram_hash is None:
++            layout = model.engram_hash.layout
++            geometry = layout.geometry
++            self._host_engram_hash = HostEngramHash(
++                layout.token_map,
++                geometry.multipliers,
++                geometry.primes,
++                geometry.offsets,
++            )
++        starts = input_batch.query_start_loc_np
++        requests = []
++        for i, req_id in enumerate(input_batch.req_ids):
++            first, rows = int(starts[i]), int(input_batch.num_scheduled_tokens[i])
++            tokens = self._prefill_tokens.get(req_id)
++            positions = np.empty(0, dtype=np.int64)
++            if tokens is not None and input_batch.is_prefilling_np[i]:
++                start = int(input_batch.num_computed_prefill_tokens_np[i])
++                positions = np.arange(
++                    start, min(start + rows, len(tokens)), dtype=np.int64
++                )
++            requests.append((first, rows, tokens, positions))
++        hashed = [i for i, (*_, positions) in enumerate(requests) if len(positions)]
++        if not hashed:
++            return None
++        # Adaptive verification gives verifying requests row counts the GPU chooses,
++        # but keeps them at the front of the batch with the host's total, so every
++        # later request starts at the same row on the host and the GPU.
++        drafts = input_batch.num_draft_tokens_per_req
++        if drafts is not None and drafts[hashed[0] :].any():
++            raise RuntimeError(
++                "Engram host hash: a verifying request follows a prefill chunk, so "
++                "the chunk's rows are placed by the GPU"
++            )
++        return self._host_engram_hash.step_ids(input_batch.input_ids.shape[0], requests)
++
+     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
+         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
+         if self.ced_state is not None:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 5691f41dc..ae6f14895 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -16,6 +16,9 @@ stream:
+   rounded to BF16) into the token's head slice. A token past the step or a row
+   outside this rank's shard loads nothing and writes zeros (the reader leaves those
+   slots untouched).
++- the release: one thread writes the step it gathered into the control block, so the
++  reader may now fill the buffers with the next step's early rows (those the host
++  hashed while this step ran).
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -34,6 +37,7 @@ _HEADER = r"""
+ // Engram rows: the reader publishes a step by writing its sequence number into the
+ // control block in mapped host memory; this stream wrote the step it staged there.
+ #define ENGRAM_CTRL_IDS_SEQ 0
++#define ENGRAM_CTRL_CONSUMED_SEQ 1
+ #define ENGRAM_CTRL_ROWS_SEQ 16
+ #define ENGRAM_CTRL_TIMEOUT_US 32
+ #define ENGRAM_CTRL_WAITED_US 33
+@@ -79,6 +83,17 @@ __device__ __forceinline__ void engram_wait_rows(void *control) {
+         }
+     }
+ }
++
++// The stream's gather of the step it staged is done (the kernels before this one have
++// retired their loads of the mapped rows): tell the reader, with release semantics.
++__device__ __forceinline__ void engram_release_rows(void *control) {
++    unsigned *ctrl = (unsigned *)control;
++    unsigned staged;
++    asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
++                 : "=r"(staged) : "l"(ctrl + ENGRAM_CTRL_IDS_SEQ) : "memory");
++    asm volatile("st.release.sys.global.u32 [%0], %1;"
++                 :: "l"(ctrl + ENGRAM_CTRL_CONSUMED_SEQ), "r"(staged) : "memory");
++}
+ """
+ 
+ 
+@@ -94,6 +109,20 @@ def engram_rows_wait_kernel():
+     return engram_rows_wait
+ 
+ 
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def engram_rows_release_kernel():
++    @T.prim_func
++    def engram_rows_release(control: T.Tensor((CONTROL_WORDS,), T.int32)):
++        with T.Kernel(1, threads=32):
++            T.import_source(_HEADER)
++            if T.get_thread_binding() == 0:
++                T.call_extern(
++                    "engram_release_rows", T.address_of(control[0]), dtype="handle"
++                )
++
++    return engram_rows_release
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def engram_rows_gather_kernel(
+     max_lookups: int,
+@@ -144,16 +173,16 @@ def engram_rows_gather(
+     shard_start: int,
+     shard_end: int,
+ ) -> None:
+-    """Wait for the staged step's rows and dequantize the first ``num_tokens``
+-    tokens' rows into ``out`` ([tokens, 24 * 256] BF16). ``ids`` ([>= tokens, 24]
+-    int64) are the step's row IDs; ``rows``, ``scales`` and ``control`` are the
+-    reader's mapped buffers."""
++    """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
++    rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
++    reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
++    ``scales`` and ``control`` are the reader's mapped buffers."""
+     engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+-    if tokens == 0:
+-        return
+-    kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
+-    kernel(ids[:tokens], num_tokens, rows, scales, out)
++    if tokens:
++        kernel = engram_rows_gather_kernel(rows.shape[0], shard_start, shard_end)
++        kernel(ids[:tokens], num_tokens, rows, scales, out)
++    engram_rows_release_kernel()(control)
+ 
+ 
+ @engram_rows_gather.register_fake

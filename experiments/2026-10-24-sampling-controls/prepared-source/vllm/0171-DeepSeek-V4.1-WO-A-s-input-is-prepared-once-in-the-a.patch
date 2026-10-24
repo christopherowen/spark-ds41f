@@ -1,0 +1,1028 @@
+From 67403b8d3dffc02d0c1334e67c5cc9698f09e328 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 17:47:07 +0200
+Subject: [PATCH 171/274] DeepSeek V4.1 WO-A's input is prepared once, in the
+ attention's output store
+
+The reference prepares WO-A's input after the attention: the trailing RoPE
+columns rotated back, then act_quant(o, 32, "ue8m0", inplace=True). 0177 did the
+quantization in WO-A's W8A16 GEMM as it loaded each activation tile, so every
+column tile of every group redid it: the 1017 release measured prefill 3% and
+the decode step 0.7% slower than r6s.
+
+The sparse MLA kernels now do both in their output store, once per row
+(sparse_mla.wo_input): extend stages O * (1 / L), rounded to BF16 as before,
+in Q_shared; the decode merge in a row of shared memory. The rotation is
+rope_'s inverse arithmetic, the quantization _reference_roundtrip, in the same
+order and rounding as before, so WO-A's input keeps its bits. The kernels take
+the rows' positions and the RoPE table; the layer no longer declares or
+launches WO's inverse RoPE, and the GEMM loads its BF16 tiles as it did before
+0177.
+
+Tests: wo_input bit for bit against TileKernels' inverse rotation and
+per_token_cast, compiled with fast math as the attention is, at the extend and
+merge head blocks; the sparse MLA's output against the reference attention
+through the same, within one E4M3 step, as act_quant's fixed point and equal on
+every route; WO on prepared input.
+
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index e1807fb2f..c166f5a7b 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -4,6 +4,8 @@
+ 
+ Caches use vLLM's page layout, including allocator padding past each page's
+ records, so the kernels are checked against the strides they see in serving.
++The sparse MLA stores WO-A's input: its output rotated back and through
++``act_quant`` (``wo_input``), checked bit for bit on its own.
+ """
+ 
+ import pytest
+@@ -17,11 +19,17 @@ if not (
+     pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
+ 
+ tilelang = pytest.importorskip("tilelang")
++pytest.importorskip("tile_kernels")
++
++import tilelang.language as T  # noqa: E402
+ 
+ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+     assert_other_rows_equal,
+     assert_rows_nan,
+     assert_same_nonfinite,
++    mxfp8_values,
++    rope_table,
++    wo_input_reference,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
+     CANDIDATE_BLOCK,
+@@ -38,8 +46,10 @@ from vllm.models.deepseek_v4_1.tilelang.indexer import (  # noqa: E402
+ from vllm.models.deepseek_v4_1.tilelang.sparse_mla import (  # noqa: E402
+     HEAD_DIM,
+     IDX_GROUP,
++    ROPE_DIM,
+     SWA_GROUP,
+     SparseMlaV41Plan,
++    wo_input,
+ )
+ 
+ DEVICE = "cuda"
+@@ -586,6 +596,10 @@ def _mla_case(idx_width, heads, rows, swa_width=128, swa_page=128, idx_page=128)
+             ]
+         ).to(torch.int32)
+         case.update(idx=idx, idx_logical=idx_logical, idx_len=idx_len, table=table)
++    case.update(
++        positions=torch.randint(0, 4096, (rows,), generator=_gen(2), device=DEVICE),
++        rope=rope_table(),
++    )
+     return case
+ 
+ 
+@@ -620,6 +634,8 @@ def _mla_run(case, swa_pool=None, idx_pool=None, swa_idx=None, idx_logical=None)
+             case["swa_idx"] if swa_idx is None else swa_idx,
+             case["swa_len"],
+             case["sinks"],
++            case["positions"],
++            case["rope"],
+             out,
+             kernel=kernel,
+             **indexed,
+@@ -637,21 +653,28 @@ def _mla_ref(case, swa=None):
+             idx_len=case["idx_len"],
+         )
+     swa = case["swa"] if swa is None else swa
+-    return _ref_mla(
++    out = _ref_mla(
+         case["q"], swa, case["swa_idx"], case["swa_len"], case["sinks"], **ref_indexed
+     )
++    return wo_input_reference(out, case["positions"], case["rope"])
+ 
+ 
+ @pytest.mark.parametrize("idx_width", [0, 512])
+ # Heads per rank: TP4 (16), TP3 (24 of 72 padded), TP1 (64).
+ @pytest.mark.parametrize("heads", [16, 24, 64])
+ def test_sparse_mla(idx_width, heads, rows=6):
++    """Every route's WO-A input, near the reference's: within one E4M3 step (an
++    attention output a rounding away from the reference's can land on the next MXFP8
++    value), exactly act_quant's values (requantizing changes nothing), the same bits
++    on every route."""
+     case = _mla_case(idx_width, heads, rows)
+     outs = _mla_run(case)
+     ref = _mla_ref(case)
+     torch.testing.assert_close(
+-        outs["extend"].float(), ref.float(), rtol=2e-2, atol=2e-2
++        outs["extend"].float(), ref.float(), rtol=0.13, atol=2e-2
+     )
++    flat = outs["extend"].view(rows, -1)
++    assert torch.equal(mxfp8_values(flat).bfloat16(), flat)
+     for kernel, out in outs.items():
+         assert torch.equal(out, outs["extend"]), f"{kernel} differs from extend"
+ 
+@@ -761,11 +784,67 @@ def test_sparse_mla_routes_short_rows(heads, keys, rows=1024, swa_width=128, pag
+         max_rows=rows, decode_max_rows=rows, split_max_rows=rows,
+     )  # fmt: skip
+     pool = _paged(swa, page)
++    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
++    table = rope_table()
+     outs = {}
+     for kernel in plan.kernels:
+         out = torch.empty((rows, heads, HEAD_DIM), dtype=torch.bfloat16, device=DEVICE)
+-        plan.run(q, pool, swa_idx, swa_len, sinks, out, kernel=kernel)
++        plan.run(q, pool, swa_idx, swa_len, sinks, positions, table, out, kernel=kernel)
+         outs[kernel] = out
+     for kernel, out in outs.items():
+         differ = int((out.view(torch.int16) != outs["extend"].view(torch.int16)).sum())
+         assert differ == 0, f"{kernel} differs from extend in {differ} elements"
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
++def _wo_input_kernel(heads: int, block_heads: int, threads: int):
++    """``wo_input`` alone on ``[rows, heads, 512]`` BF16 rows, ``block_heads`` heads per
++    CTA, compiled as the sparse MLA kernels are (fast math)."""
++    rows, positions_max = T.dynamic("rows, positions_max")
++    blocks = block_heads * HEAD_DIM // 32
++
++    @T.prim_func
++    def kernel(
++        Src: T.Tensor([rows, heads, HEAD_DIM], T.bfloat16),
++        Positions: T.Tensor([rows], T.int64),
++        CosSin: T.Tensor([positions_max, ROPE_DIM], T.float32),
++        Out: T.Tensor([rows, heads, HEAD_DIM], T.bfloat16),
++    ):
++        with T.Kernel(heads // block_heads, rows, threads=threads) as (hb, row):
++            S = T.alloc_shared([block_heads, HEAD_DIM], T.bfloat16)
++            X = T.alloc_fragment([blocks, 32], T.float32)
++            amax = T.alloc_fragment([blocks], T.float32)
++            inv = T.alloc_fragment([blocks], T.float32)
++            scale = T.alloc_fragment([blocks], T.float32)
++            h0 = hb * block_heads
++            T.copy(Src[row, h0 : h0 + block_heads, :], S)
++            wo_input(S, block_heads, Positions[row], CosSin, X, amax, inv, scale)
++            T.copy(S, Out[row, h0 : h0 + block_heads, :])
++
++    return kernel
++
++
++# The extend kernel's head block (32 heads, 256 threads) and the decode merge's (one
++# head, 128 threads).
++@pytest.mark.parametrize(("block_heads", "threads"), [(32, 256), (1, 128)])
++def test_wo_input_is_the_reference_rotation_and_act_quant(block_heads, threads):
++    """The sparse MLA's output store gives WO-A's input bit for bit as the reference
++    prepares it: TileKernels' inverse rotation in BF16, then per_token_cast's values
++    (byte-identical to act_quant), blocks below the amax floor and a wide range of
++    magnitudes included."""
++    rows, heads = 37, 64
++    gen = _gen(21)
++    o = torch.randn((rows, heads, HEAD_DIM), generator=gen, device=DEVICE)
++    exponents = torch.randint(
++        -24, 8, (rows, heads, HEAD_DIM // 32, 1), generator=gen, device=DEVICE
++    )
++    o *= torch.exp2(exponents).repeat_interleave(32, -1).view(rows, heads, HEAD_DIM)
++    o = o.bfloat16()
++    o[::7, ::5] *= 1e-7  # blocks below the amax floor
++    positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
++    table = rope_table()
++    out = torch.empty_like(o)
++    _wo_input_kernel(heads, block_heads, threads)(o, positions, table, out)
++    want = wo_input_reference(o, positions, table)
++    differ = int((out.view(torch.int16) != want.view(torch.int16)).sum())
++    assert differ == 0, f"{differ} of {out.numel()} values differ from the reference"
+diff --git a/tests/kernels/deepseek_v41_contracts.py b/tests/kernels/deepseek_v41_contracts.py
+index 95dc37345..de72f5cfc 100644
+--- a/tests/kernels/deepseek_v41_contracts.py
++++ b/tests/kernels/deepseek_v41_contracts.py
+@@ -12,6 +12,9 @@ checks compare positions and bits, so no tolerance can explain a failure away:
+ - a non-finite input gives non-finite outputs in exactly the reference's positions,
+   NaN for NaN and each infinity with its sign;
+ - a poisoned row changes no other row's bits.
++
++It also holds the references several kernels' tests share: the reference's
++``act_quant`` values, the RoPE table and WO-A's input.
+ """
+ 
+ import torch
+@@ -56,3 +59,46 @@ def assert_other_rows_equal(out: torch.Tensor, clean: torch.Tensor, rows, what="
+         changed = (out[keep] != clean[keep]).flatten(1).any(1).nonzero().flatten()
+         others = keep.nonzero().flatten()[changed][:8].tolist()
+         raise AssertionError(f"{what}poisoning rows {rows} changed rows {others}")
++
++
++def mxfp8_values(x: torch.Tensor) -> torch.Tensor:
++    """DeepSeek's ``act_quant(x, 32, "ue8m0")`` values of the rows of ``x``, in FP64:
++    TileKernels' ``per_token_cast`` (byte-identical to ``act_quant``), E4M3 times
++    2^e."""
++    import tile_kernels
++
++    xq, sf = tile_kernels.quant.per_token_cast(
++        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
++    )
++    exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32].double()
++    return xq.double() * torch.exp2(exps - 127).repeat_interleave(32, -1)
++
++
++def rope_table(positions: int = 4096, rope_dim: int = 64) -> torch.Tensor:
++    """A V4.1 RoPE table on the GPU: FP32 rows of ``cos | sin`` of each position times
++    ``10000^(-2i / rope_dim)``."""
++    exponents = torch.arange(0, rope_dim, 2, device="cuda").double() / rope_dim
++    angles = torch.arange(positions, device="cuda").double()[:, None] * (
++        1.0 / 10000**exponents
++    )
++    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
++
++
++def wo_input_reference(
++    o: torch.Tensor, positions: torch.Tensor, table: torch.Tensor
++) -> torch.Tensor:
++    """WO-A's input from attention output ``o`` (``[rows, heads, 512]`` BF16) as the
++    reference prepares it: the trailing RoPE columns rotated back (TileKernels'
++    ``apply_rotary``, conjugate), then ``act_quant``'s values, in BF16."""
++    import tile_kernels
++
++    rows, heads, dim = o.shape
++    rotated = o.clone()
++    tile_kernels.transform.apply_rotary(
++        rotated[..., -table.shape[1] :],
++        table,
++        positions=positions,
++        interleaved=True,
++        conjugate=True,
++    )
++    return mxfp8_values(rotated.view(rows, -1)).bfloat16().view(rows, heads, dim)
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+index 6ae9a84fb..a433883b4 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_wo.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 TileLang WO projection (inverse RoPE, grouped WO-A, WO-B)."""
++"""DeepSeek-V4.1 TileLang WO projection (grouped WO-A, WO-B) of WO-A's input, which
++the sparse MLA kernels store already rotated back and through ``act_quant``."""
+ 
+ import pytest
+ import torch
+@@ -20,6 +21,9 @@ from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
+     NAN,
+     assert_other_rows_equal,
+     assert_rows_nan,
++    mxfp8_values,
++    rope_table,
++    wo_input_reference,
+ )
+ from vllm.models.deepseek_v4_1.tilelang.linear import (  # noqa: E402
+     _block32_linear,
+@@ -31,7 +35,7 @@ from vllm.v1.worker.workspace import use_preallocated_workspace  # noqa: E402
+ 
+ DEVICE = "cuda"
+ # TP4: 16 heads of 512 in 2 groups, rank 1024, hidden 5120.
+-HEADS, HEAD_DIM, GROUPS, RANK, HIDDEN, ROPE = 16, 512, 2, 1024, 5120, 64
++HEADS, HEAD_DIM, GROUPS, RANK, HIDDEN = 16, 512, 2, 1024, 5120
+ ROWS = (1, 7, 16, 33, 64, 65, 96, 97, 128, 129, 200)
+ 
+ 
+@@ -56,20 +60,6 @@ def _dequant(layer):
+     return layer.weight.double() * scale
+ 
+ 
+-def _mxfp8_values(x):
+-    xq, sf = tile_kernels.quant.per_token_cast(
+-        x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+-    )
+-    exps = sf.contiguous().view(torch.uint8)[:, : x.shape[1] // 32].double()
+-    return xq.double() * torch.exp2(exps - 127).repeat_interleave(32, -1)
+-
+-
+-def _table(positions=4096):
+-    inv = 1.0 / (10000 ** (torch.arange(0, ROPE, 2, device=DEVICE).double() / ROPE))
+-    angles = torch.arange(positions, device=DEVICE).double()[:, None] * inv
+-    return torch.cat((angles.cos(), angles.sin()), dim=-1).float()
+-
+-
+ def test_wo_projection():
+     wo_a = _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1)
+     wo_b = _block32(HIDDEN, GROUPS * RANK, 2)
+@@ -79,29 +69,21 @@ def test_wo_projection():
+     gen = _gen(3)
+     o = torch.randn((rows, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+     positions = torch.randint(0, 4096, (rows,), generator=gen, device=DEVICE)
+-    table = _table()
++    # WO-A's input as the sparse MLA kernels store it: rotated back, act_quant values.
++    prepared = wo_input_reference(o, positions, rope_table())
+     scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
+ 
+     def project(count):
+         out = torch.empty((count, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+         with use_preallocated_workspace(scratch):
+-            wo(o[:count].clone(), positions[:count], table, out)
++            wo(prepared[:count].clone(), out)
+         return out
+ 
+     full = project(rows)
+-    # Reference: TileKernels' inverse rotation in BF16, then FP64 GEMMs: WO-A on the
+-    # activations through act_quant (MXFP8 values; DeepSeek's quantize-dequantize, then
+-    # its BF16 einsum on the dequantized weights), WO-B on MXFP8 ones (its linear), the
+-    # intermediate rounded to BF16 as the kernel stores it.
+-    rotated = o.clone()
+-    tile_kernels.transform.apply_rotary(
+-        rotated[..., -ROPE:],
+-        table,
+-        positions=positions,
+-        interleaved=True,
+-        conjugate=True,
+-    )
+-    x = _mxfp8_values(rotated.view(rows, -1))
++    # Reference: FP64 GEMMs, WO-A on WO-A's input (DeepSeek's BF16 einsum on the
++    # dequantized weights), WO-B on MXFP8 activations (its linear), the intermediate
++    # rounded to BF16 as the kernel stores it.
++    x = prepared.view(rows, -1).double()
+     w_a, width = _dequant(wo_a), HEADS // GROUPS * HEAD_DIM
+     a = torch.cat(
+         [
+@@ -110,7 +92,7 @@ def test_wo_projection():
+         ],
+         dim=1,
+     ).bfloat16()
+-    ref = _mxfp8_values(a) @ _dequant(wo_b).T
++    ref = mxfp8_values(a) @ _dequant(wo_b).T
+     torch.testing.assert_close(
+         full.double(), ref, rtol=2e-2, atol=2e-2 * ref.abs().max().item()
+     )
+@@ -120,8 +102,8 @@ def test_wo_projection():
+ 
+ @pytest.mark.parametrize("count", [7, 97])
+ def test_wo_projection_nan_row(count):
+-    """A NaN in one head of one row's attention output makes that row's whole
+-    projection NaN (WO-B mixes both groups) and leaves the other rows' bits."""
++    """A NaN in one head of one row's input makes that row's whole projection NaN
++    (WO-B mixes both groups) and leaves the other rows' bits."""
+     wo = TileLangWOProjection(
+         _block32(GROUPS * RANK, HEADS // GROUPS * HEAD_DIM, 1),
+         _block32(HIDDEN, GROUPS * RANK, 2),
+@@ -130,14 +112,12 @@ def test_wo_projection_nan_row(count):
+     wo.declare_kernels()
+     gen = _gen(13)
+     o = torch.randn((count, HEADS, HEAD_DIM), generator=gen, device=DEVICE).bfloat16()
+-    positions = torch.randint(0, 4096, (count,), generator=gen, device=DEVICE)
+-    table = _table()
+     scratch = torch.empty(32 << 20, dtype=torch.uint8, device=DEVICE)
+ 
+     def project(values):
+         out = torch.empty((count, HIDDEN), dtype=torch.bfloat16, device=DEVICE)
+         with use_preallocated_workspace(scratch):
+-            wo(values.clone(), positions, table, out)
++            wo(values.clone(), out)
+         return out
+ 
+     clean = project(o)
+@@ -219,22 +199,21 @@ def _wo_a_bf16(layer, x):
+     return out
+ 
+ 
+-def test_wo_a_quantizes_its_input_as_act_quant():
+-    """WO-A within one BF16 rounding of the FP64 product of its input through the
+-    reference's act_quant (MXFP8 values) and the exactly dequantized weights, with the
+-    same bits at every row count (decode rows split the K shards over CTAs and longer
+-    steps add them inside the kernel, in the same order). Quantizing is idempotent, so
+-    the kernel on its input and on that input already through TileKernels'
+-    per_token_cast (byte-identical to act_quant) give the same bits: the in-kernel
+-    quantization is the reference's, below the amax floor too."""
++def test_wo_a_on_act_quant_values():
++    """WO-A within one BF16 rounding of the FP64 product of its input (act_quant's MXFP8
++    values, as the sparse MLA kernels store them, below the amax floor too) and the
++    exactly dequantized weights, with the same bits at every row count (decode rows
++    split the K shards over CTAs and longer steps add them inside the kernel, in the
++    same order)."""
+     width = HEADS // GROUPS * HEAD_DIM
+     layer = _block32(GROUPS * RANK, width, 7)
+     x = torch.randn((300, GROUPS * width), generator=_gen(8), device=DEVICE).bfloat16()
+     x[::5] *= 1e-7  # some blocks fall below the amax floor
++    quantized = mxfp8_values(x)
++    x = quantized.bfloat16()
+     w = _dequant(layer)
+ 
+     full = _wo_a_bf16(layer, x)
+-    quantized = _mxfp8_values(x)
+     ref = torch.cat(
+         [
+             quantized[:, g * width : (g + 1) * width] @ w[g * RANK : (g + 1) * RANK].T
+@@ -244,7 +223,6 @@ def test_wo_a_quantizes_its_input_as_act_quant():
+     )
+     error = (full.double() - ref).abs()
+     assert (error <= ref.abs() * 2**-8 + 1e-3 * ref.abs().max()).all()
+-    assert torch.equal(_wo_a_bf16(layer, quantized.bfloat16()), full)
+     for rows in (1, 7, 16, 17, 33, 64, 65, 96, 97, 100, 128, 129, 200):
+         assert torch.equal(_wo_a_bf16(layer, x[:rows]), full[:rows]), rows
+ 
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index fd79818af..064e9220a 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -783,8 +783,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     def _tilelang_calls(self) -> list:
+         """The TileLang kernels of the shared layer paths, as ``prepare.call``s:
+         window metadata and index page tables, the metadata builders of the cache
+-        groups this layer joins, the RoPE of every role (WO's inverse rotation
+-        included) and the cache writers, each in its call site's call form."""
++        groups this layer joins, the RoPE of every role and the cache writers, each
++        in its call site's call form."""
+         from vllm.models.deepseek_v4_1.tilelang import metadata as tl_metadata
+         from vllm.models.deepseek_v4_1.tilelang.cache_writer import writer_call
+         from vllm.models.deepseek_v4_1.tilelang.rope import rope_call
+@@ -827,12 +827,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             calls.extend(
+                 tilelang_builder_kernels(cache.get_kv_cache_spec(self.config), requests)
+             )
+-        # _rope (heads, columns, ratio) by role; WO rotates its input back.
++        # _rope (heads, columns, ratio) by role (WO's input is rotated back in the
++        # attention kernels' output store).
+         table_width = self.rotary_emb.cos_sin_cache.shape[1]
+         roles = [
+             (self.n_local_heads, self.head_dim, 1, False),  # q
+             (1, 512, 1, False),  # kv
+-            (self.n_local_heads, self.head_dim, 1, True),  # WO's inverse
+         ]
+         if self.indexer is not None:
+             roles.append((self.indexer.heads, 128, 1, False))  # index query
+@@ -1786,7 +1786,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 self.topk_indices_buffer[:rows].copy_(split.gather(selected))
+ 
+         if decode_rows:
+-            self._attend_split(q, output, swa, main, owner, rows, decode_rows)
++            self._attend_split(
++                q, output, positions, swa, main, owner, rows, decode_rows
++            )
+             return
+         # Reuse the shared arena only after indexing completes. Keep full-batch
+         # metadata beside, not overlapping, the native attention scratch.
+@@ -1837,12 +1839,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             q,
+             output,
+             scratch=buffers[metadata_count:],
++            positions=positions,
+             swa_indices=swa_indices[:rows],
+             swa_lengths=swa_lengths[:rows],
+             **kwargs,
+         )
+ 
+-    def _attend_split(self, q, output, swa, main, owner, rows, decode_rows):
++    def _attend_split(self, q, output, positions, swa, main, owner, rows, decode_rows):
+         """A mixed step's attention: its decode requests' rows on the decode plan,
+         the rest on the extend plan. Mixed steps run eagerly, so the per-row
+         metadata is an ordinary allocation and each plan borrows the workspace in
+@@ -1874,6 +1877,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 q[lo:hi],
+                 output[lo:hi],
+                 scratch=list(scratch),
++                positions=positions[lo:hi],
+                 swa_indices=swa_indices[lo:hi],
+                 swa_lengths=swa_lengths[lo:hi],
+                 **kwargs,
+@@ -1949,8 +1953,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         dsa_indexer.score(binding)
+         dsa_indexer.select(binding)
+ 
+-    def _attend(self, mode: str, q, output, *, scratch, **indices):
+-        """Sparse MLA over the SWA and (compressed layers) indexed caches."""
++    def _attend(self, mode: str, q, output, *, scratch, positions, **indices):
++        """Sparse MLA over the SWA and (compressed layers) indexed caches. B12X's WO
++        projection rotates its input back itself, so ``positions`` is unused here; the
++        TileLang layer's kernels prepare WO-A's input in their output store."""
++        del positions
+         binding = mla.bind(self._attention_plan(mode), scratch=scratch, q=q, **indices)
+         mla.run(
+             binding=binding,
+@@ -2190,22 +2197,20 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             )
+         return self._wo_plans[key]
+ 
+-    def _o_proj_tilelang(self, o, positions, sp_rows):
+-        """The TileLang WO projection; ``o``'s RoPE columns are rotated in place.
++    def _o_proj_tilelang(self, o, sp_rows):
++        """The TileLang WO projection of WO-A's input ``o``, which the attention
++        kernels store already rotated back and through ``act_quant``.
+ 
+         A sequence-parallel step projects through ``project_reduce_scatter`` as the
+         B12X path does: in slices, and as unreduced rank-order parts when the step
+         keeps them, so a row's sum over ranks is the non-SP step's all-reduce."""
+         rows, hidden = o.shape[0], self.hidden_size
+-        cache = self.rotary_emb.cos_sin_cache
+         if sp_rows is not None:
+             if rows != sp_rows.num_tokens:
+                 raise ValueError(f"V4.1 SP WO expects {sp_rows.num_tokens} rows")
+ 
+             def project(start, stop, out):
+-                self._wo_projection_weights(
+-                    o[start:stop], positions[start:stop], cache, out
+-                )
++                self._wo_projection_weights(o[start:stop], out)
+ 
+             return sp_rows.project_reduce_scatter(
+                 project,
+@@ -2216,7 +2221,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 then=lambda: l2_prefetch.issue(self._l2pf_ffn, rows),
+             )
+         local = torch.empty((rows, hidden), dtype=torch.bfloat16, device=o.device)
+-        self._wo_projection_weights(o, positions, cache, local)
++        self._wo_projection_weights(o, local)
+         l2_prefetch.issue(self._l2pf_ffn, rows)
+         if get_tensor_model_parallel_world_size() > 1:
+             local = get_tp_group().all_reduce(local)
+@@ -2224,7 +2229,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+ 
+     def _o_proj(self, o, positions, *, is_prefill=False, sp_rows=None):
+         if kernels.uses_tilelang():
+-            return self._o_proj_tilelang(o, positions, sp_rows)
++            return self._o_proj_tilelang(o, sp_rows)
+         from b12x.preparation import require_prepared
+ 
+         rows = o.shape[0]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 1101fde2d..64da43927 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -266,7 +266,7 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+             scratch=scratch,
+         )
+ 
+-    def _attend(self, mode: str, q, output, *, scratch, **indices):
++    def _attend(self, mode: str, q, output, *, scratch, positions, **indices):
+         indexed = {}
+         if "indexed_indices" in indices:
+             indexed = dict(
+@@ -281,6 +281,8 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+             indices["swa_indices"],
+             indices["swa_lengths"],
+             self.attn_sink,
++            positions,
++            self.rotary_emb.cos_sin_cache,
+             output,
+             scratch=scratch or None,
+             **indexed,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/gemm.py b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+index 1d24ab53c..b73525156 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/gemm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/gemm.py
+@@ -328,10 +328,10 @@ def _reference_cast(X, amax, inv, Q, S, row0, col0, rows, blocks, M):
+ 
+ @T.macro
+ def _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K):
+-    """``A_q`` = the activation tile ``A_shared`` through the reference's
+-    ``act_quant(x, 32, "ue8m0", inplace=True)``: per 32-element block of each row, the
+-    E4M3 of ``x * 2^-e`` (``e`` as ``_reference_cast`` derives it) times ``2^e``, which
+-    BF16 holds exactly."""
++    """``A_q`` = the ``[block_M, block_K]`` BF16 tile ``A_shared`` through the
++    reference's ``act_quant(x, 32, "ue8m0", inplace=True)``: per 32-element block of
++    each row, the E4M3 of ``x * 2^-e`` (``e`` as ``_reference_cast`` derives it)
++    times ``2^e``, which BF16 holds exactly. ``A_q`` may be ``A_shared``."""
+     blocks = block_K // 32
+     for r, e in T.Parallel(block_M * blocks, 32):
+         X[r, e] = T.Cast(T.float32, A_shared[r // blocks, (r % blocks) * 32 + e])
+@@ -476,11 +476,10 @@ def fp8w_bf16_gemm(
+     launch: BF16 activations ``A[M, groups*K]`` against block-32 FP8 weights
+     ``W[groups*N, K]`` (E4M3, one UE8M0 exponent per 32x32 block in ``E``), each weight
+     tile expanded exactly to BF16 (an E4M3 value times a power of two fits BF16) and
+-    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. Each activation
+-    tile first goes through the reference's MXFP8 quantize-dequantize
+-    (``_reference_roundtrip``). That is DeepSeek's reference WO-A:
+-    ``act_quant(o, 32, "ue8m0", inplace=True)``, then the BF16 einsum on the FP8 weights
+-    ``convert.py`` dequantizes.
++    multiplied on BF16 tensor cores with FP32 accumulation; BF16 out. This is DeepSeek's
++    reference WO-A: its BF16 einsum on the FP8 weights ``convert.py`` dequantizes, of
++    activations already through ``act_quant`` (the sparse MLA kernels store them so,
++    ``sparse_mla.wo_input``).
+ 
+     Every M tile runs the same K loop, so a row's bits do not depend on its batch. With
+     ``shards`` > 1 each K shard is summed from zero and the shards added in order, the
+@@ -516,20 +515,12 @@ def fp8w_bf16_gemm(
+             C_total = T.alloc_fragment(
+                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
+             )
+-            qa = block_M * (block_K // 32)
+-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
+-            X_a = T.alloc_fragment((qa, 32), T.float32)
+-            amax_a = T.alloc_fragment((qa,), T.float32)
+-            inv_a = T.alloc_fragment((qa,), T.float32)
+-            scale_a = T.alloc_fragment((qa,), T.float32)
+             T.clear(C_local)
+             if shards > 1:
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
+-                            scale_a, W_shared, S_shared, B_shared,
+-                            C_local, by, g, n0, ko, K, block_M,
+-                            block_N, block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
++                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
+                 if shards > 1:  # noqa: SIM102
+                     if (ko + 1) % shard_blocks == 0:
+                         for i, j in T.Parallel(block_M, block_N):
+@@ -594,12 +585,6 @@ def fp8w_bf16_gemm_cast(
+             C_total = T.alloc_fragment(
+                 (block_M, block_N) if shards > 1 else (1, 1), T.float32
+             )
+-            qa = block_M * (block_K // 32)
+-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
+-            X_a = T.alloc_fragment((qa, 32), T.float32)
+-            amax_a = T.alloc_fragment((qa,), T.float32)
+-            inv_a = T.alloc_fragment((qa,), T.float32)
+-            scale_a = T.alloc_fragment((qa,), T.float32)
+             X = T.alloc_fragment((block_M * blocks, 32), T.float32)
+             amax = T.alloc_fragment((block_M * blocks,), T.float32)
+             inv = T.alloc_fragment((block_M * blocks,), T.float32)
+@@ -607,10 +592,8 @@ def fp8w_bf16_gemm_cast(
+             if shards > 1:
+                 T.clear(C_total)
+             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
+-                            scale_a, W_shared, S_shared, B_shared,
+-                            C_local, by, g, n0, ko, K, block_M,
+-                            block_N, block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
++                            by, g, n0, ko, K, block_M, block_N, block_K)  # fmt: skip
+                 if shards > 1:  # noqa: SIM102
+                     if (ko + 1) % shard_blocks == 0:
+                         for i, j in T.Parallel(block_M, block_N):
+@@ -650,17 +633,14 @@ def _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K)
+ 
+ @T.macro
+ def _w8a16_step(
+-    A, W, E, A_shared, A_q, X, amax, inv, scale, W_shared, S_shared, B_shared,
+-    C_local, by, g, n0, ko, K, block_M, block_N, block_K,
++    A, W, E, A_shared, W_shared, S_shared, B_shared, C_local, by, g, n0, ko, K,
++    block_M, block_N, block_K,
+ ):  # fmt: skip
+-    """One K block of the W8A16 GEMM: the activation tile through the reference's MXFP8
+-    quantize-dequantize (``_reference_roundtrip``; ``block_K`` is a multiple of 32 and
+-    each group's K starts on a block, so the tile holds whole reference blocks), the
+-    expanded weight tile, MMA."""
++    """One K block of the W8A16 GEMM: the activation tile, the expanded weight tile,
++    MMA."""
+     T.copy(A[by * block_M, g * K + ko * block_K], A_shared)
+-    _reference_roundtrip(A_shared, A_q, X, amax, inv, scale, block_M, block_K)
+     _w8a16_weights(W, E, W_shared, S_shared, B_shared, n0, ko, block_N, block_K)
+-    T.gemm(A_q, B_shared, C_local, transpose_B=True)
++    T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+@@ -702,18 +682,11 @@ def fp8w_bf16_gemm_partials(
+             S_shared = T.alloc_shared((block_N // 32, block_K // 32), T.float32)
+             B_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
+             C_local = T.alloc_fragment((block_M, block_N), T.float32)
+-            qa = block_M * (block_K // 32)
+-            A_q = T.alloc_shared((block_M, block_K), T.bfloat16)
+-            X_a = T.alloc_fragment((qa, 32), T.float32)
+-            amax_a = T.alloc_fragment((qa,), T.float32)
+-            inv_a = T.alloc_fragment((qa,), T.float32)
+-            scale_a = T.alloc_fragment((qa,), T.float32)
+             T.clear(C_local)
+             for kb in T.Pipelined(shard_blocks, num_stages=num_stages):
+-                _w8a16_step(A, W, E, A_shared, A_q, X_a, amax_a, inv_a,
+-                            scale_a, W_shared, S_shared, B_shared,
+-                            C_local, by, g, n0, s * shard_blocks + kb, K, block_M,
+-                            block_N, block_K)  # fmt: skip
++                _w8a16_step(A, W, E, A_shared, W_shared, S_shared, B_shared, C_local,
++                            by, g, n0, s * shard_blocks + kb, K, block_M, block_N,
++                            block_K)  # fmt: skip
+             T.copy(
+                 C_local,
+                 P[s, by * block_M : (by + 1) * block_M, n0 : n0 + block_N],
+diff --git a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+index 9ff17f7c0..b1b98de70 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/tilelang/sparse_mla.py
+@@ -53,6 +53,13 @@ the arithmetic; ``schedule`` and ``block_H`` are not. ``SparseMlaV41Plan``
+ compiles the kernels for one layer shape, owns the split workspace, and
+ picks a kernel from the row count.
+ 
++The output is WO-A's input, as DeepSeek's reference prepares it after the
++attention (``wo_input``): the trailing RoPE coordinates of each head rotated
++back at the row's position, then ``act_quant(o, 32, "ue8m0", inplace=True)``,
++each 32-value block to E4M3 with a UE8M0 scale and back to BF16. Both run in
++the kernels' output store, once per row, where the rounded ``O * (1 / L)`` is
++already in shared memory: WO-A's GEMM then reads values it uses as they are.
++
+ SM120/SM121 have no WGMMA and allow at most 99 KiB of shared memory per
+ block, so the tiles are ``mma.sync`` tiles of 16..64 heads by 16..32
+ entries, instead of the 64x64 SM90 tiles in
+@@ -66,8 +73,11 @@ import tilelang.language as T
+ import torch
+ 
+ from . import prepare
++from .gemm import _reference_roundtrip
+ 
+ HEAD_DIM = 512
++ROPE_DIM = 64  # each head's trailing RoPE coordinates
++NOPE_DIM = HEAD_DIM - ROPE_DIM
+ SWA_RECORD_BYTES = 528  # 512 x E4M3 + 16 x UE8M0
+ SWA_GROUP = 32
+ IDX_RECORD_BYTES = 288  # 256 x packed E2M1 + 32 x E4M3
+@@ -88,6 +98,33 @@ DECODE_MAX_WAVES = 3
+ # explicit, so every route rounds the same way.
+ 
+ 
++@T.macro
++def wo_input(O_shared, heads, position, CosSin, X, amax, inv, scale):
++    """Turn ``heads`` rows of attention output in ``O_shared`` (``[heads, 512]``
++    BF16) into WO-A's input in place, as the reference does before WO-A::
++
++        o[..., -64:] = inverse_rope(o[..., -64:])  # BF16
++        o = act_quant(o, 32, "ue8m0", inplace=True)  # MXFP8 values, BF16
++
++    The rotation is ``rope_``'s inverse arithmetic at ``position`` (GPT-J pairs, FP32
++    with ``ieee_fmaf``, cos and sin halves of one ``CosSin`` row, BF16 out); the
++    quantization is ``_reference_roundtrip``. ``X``, ``amax``, ``inv`` and ``scale``
++    are its ``[heads * 16, 32]`` and ``[heads * 16]`` FP32 fragments."""
++    half = ROPE_DIM // 2
++    for h, i in T.Parallel(heads, half):
++        first = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i])
++        second = T.Cast(T.float32, O_shared[h, NOPE_DIM + 2 * i + 1])
++        cosine = CosSin[position, i]
++        sine = CosSin[position, half + i]
++        O_shared[h, NOPE_DIM + 2 * i] = T.Cast(
++            T.bfloat16, T.ieee_fmaf(first, cosine, second * sine)
++        )
++        O_shared[h, NOPE_DIM + 2 * i + 1] = T.Cast(
++            T.bfloat16, T.ieee_fmaf(first, -sine, second * cosine)
++        )
++    _reference_roundtrip(O_shared, O_shared, X, amax, inv, scale, heads, HEAD_DIM)
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+ def sparse_mla_fwd_v41(
+     heads: int,
+@@ -119,19 +156,22 @@ def sparse_mla_fwd_v41(
+     - ``IdxLengths``: ``[rows]`` int32 count of leading indexed entries to use;
+     - ``IdxPageTable``: ``[rows, pages]`` int32 physical page of each logical
+       ``idx_page_size`` page, as in vLLM's indexed page table;
+-    - ``Sinks``: ``[heads]`` FP32 attention-sink logits.
++    - ``Sinks``: ``[heads]`` FP32 attention-sink logits;
++    - ``Positions``: ``[rows]`` int64 row positions and ``CosSin``:
++      ``[positions_max, 64]`` FP32 RoPE table rows (cos | sin), for ``wo_input``.
+ 
+     ``decode`` then takes the FP32 workspaces ``Partial``
+     (``[rows, segments, heads, 512]``) and ``PartialStats``
+     (``[rows, segments, heads, 2]``). Both write ``Output``
+-    (``[rows, heads, 512]`` BF16). ``rows``, the cache page counts and
+-    strides, and the page-table width are dynamic.
++    (``[rows, heads, 512]`` BF16): WO-A's input (``wo_input``). ``rows``, the cache
++    page counts and strides, and the page-table width are dynamic.
+     """
+     # Cache pages are rows of a vLLM page buffer, which may interleave other
+     # layers' pages (BLHNC) or pad: the row stride is a runtime value.
+     rows, swa_pool, swa_stride, idx_pool, idx_stride, idx_pages = T.dynamic(
+         "rows, swa_pool, swa_stride, idx_pool, idx_stride, idx_pages"
+     )
++    positions_max = T.dynamic("positions_max")
+     swa_bytes = swa_page_size * SWA_RECORD_BYTES
+     idx_bytes = idx_page_size * IDX_RECORD_BYTES
+ 
+@@ -355,6 +395,8 @@ def sparse_mla_fwd_v41(
+         IdxLengths,
+         IdxPageTable,
+         Sinks,
++        Positions,
++        CosSin,
+         Output,
+     ):
+         with T.Kernel(head_blocks, rows, threads=threads) as (hb, row):
+@@ -379,6 +421,10 @@ def sparse_mla_fwd_v41(
+             L = T.alloc_fragment([block_H], accum_dtype)
+             a = T.alloc_fragment([block_H], accum_dtype)
+             b = T.alloc_fragment([block_H], accum_dtype)
++            X = T.alloc_fragment([block_H * D // 32, 32], accum_dtype)
++            amax = T.alloc_fragment([block_H * D // 32], accum_dtype)
++            inv = T.alloc_fragment([block_H * D // 32], accum_dtype)
++            scale = T.alloc_fragment([block_H * D // 32], accum_dtype)
+ 
+             # Resolve the row's slots once, so record copies never wait on index loads.
+             gather_swa(SwaIndices, SwaLengths, row, 0, swa_blocks * BI, slots, 0)
+@@ -449,9 +495,14 @@ def sparse_mla_fwd_v41(
+ 
+             for h in T.Parallel(block_H):
+                 L[h] = 1.0 / L[h]
++            # WO-A's input, staged in Q_shared once every warp is done with Q.
++            T.sync_threads()
++            for h, d in T.Parallel(block_H, D):
++                Q_shared[h, d] = T.fmul(acc_o[h, d], L[h])
++            wo_input(Q_shared, block_H, Positions[row], CosSin, X, amax, inv, scale)
+             for h, d in T.Parallel(block_H, D):
+                 if h0 + h < heads:
+-                    Output[row, h0 + h, d] = T.fmul(acc_o[h, d], L[h])
++                    Output[row, h0 + h, d] = Q_shared[h, d]
+ 
+     @T.macro
+     def decode_body(
+@@ -464,6 +515,8 @@ def sparse_mla_fwd_v41(
+         IdxLengths,
+         IdxPageTable,
+         Sinks,
++        Positions,
++        CosSin,
+         Partial,
+         PartialStats,
+         Output,
+@@ -551,9 +604,14 @@ def sparse_mla_fwd_v41(
+                     PartialStats[row, seg, h0 + h, 0] = m_g[h]
+                     PartialStats[row, seg, h0 + h, 1] = l_g[h]
+ 
+-        # Fold the segment partials in order, starting from the sink.
++        # Fold the segment partials in order from the sink; store WO-A's input.
+         with T.Kernel(heads, rows, threads=128) as (hc, rc):
+             o = T.alloc_fragment([D], accum_dtype)
++            O_shared = T.alloc_shared([1, D], dtype)
++            X = T.alloc_fragment([D // 32, 32], accum_dtype)
++            amax = T.alloc_fragment([D // 32], accum_dtype)
++            inv = T.alloc_fragment([D // 32], accum_dtype)
++            scale = T.alloc_fragment([D // 32], accum_dtype)
+             M = T.alloc_var(accum_dtype)
+             L = T.alloc_var(accum_dtype)
+             a = T.alloc_var(accum_dtype)
+@@ -573,7 +631,10 @@ def sparse_mla_fwd_v41(
+                     o[d] = T.fma(Partial[rc, c, hc, d], b, T.fmul(o[d], a))
+             L = 1.0 / L
+             for d in T.Parallel(D):
+-                Output[rc, hc, d] = T.fmul(o[d], L)
++                O_shared[0, d] = T.fmul(o[d], L)
++            wo_input(O_shared, 1, Positions[rc], CosSin, X, amax, inv, scale)
++            for d in T.Parallel(D):
++                Output[rc, hc, d] = O_shared[0, d]
+ 
+     # SWA-only layers (idx_width == 0) compile without the indexed tensors.
+     if schedule == "extend":
+@@ -594,6 +655,8 @@ def sparse_mla_fwd_v41(
+                 IdxLengths: T.Tensor([rows], T.int32),
+                 IdxPageTable: T.Tensor([rows, idx_pages], T.int32),
+                 Sinks: T.Tensor([heads], accum_dtype),
++                Positions: T.Tensor([rows], T.int64),
++                CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
+                 Output: T.Tensor([rows, heads, D], dtype),
+             ):
+                 extend_body(
+@@ -606,6 +669,8 @@ def sparse_mla_fwd_v41(
+                     IdxLengths,
+                     IdxPageTable,
+                     Sinks,
++                    Positions,
++                    CosSin,
+                     Output,
+                 )
+ 
+@@ -620,6 +685,8 @@ def sparse_mla_fwd_v41(
+             SwaIndices: T.Tensor([rows, swa_width], T.int32),
+             SwaLengths: T.Tensor([rows], T.int32),
+             Sinks: T.Tensor([heads], accum_dtype),
++            Positions: T.Tensor([rows], T.int64),
++            CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
+             Output: T.Tensor([rows, heads, D], dtype),
+         ):
+             extend_body(
+@@ -632,6 +699,8 @@ def sparse_mla_fwd_v41(
+                 None,
+                 None,
+                 Sinks,
++                Positions,
++                CosSin,
+                 Output,
+             )
+ 
+@@ -654,6 +723,8 @@ def sparse_mla_fwd_v41(
+             IdxLengths: T.Tensor([rows], T.int32),
+             IdxPageTable: T.Tensor([rows, idx_pages], T.int32),
+             Sinks: T.Tensor([heads], accum_dtype),
++            Positions: T.Tensor([rows], T.int64),
++            CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
+             Partial: T.Tensor([rows, segments, heads, D], accum_dtype),
+             PartialStats: T.Tensor([rows, segments, heads, 2], accum_dtype),
+             Output: T.Tensor([rows, heads, D], dtype),
+@@ -668,6 +739,8 @@ def sparse_mla_fwd_v41(
+                 IdxLengths,
+                 IdxPageTable,
+                 Sinks,
++                Positions,
++                CosSin,
+                 Partial,
+                 PartialStats,
+                 Output,
+@@ -682,6 +755,8 @@ def sparse_mla_fwd_v41(
+         SwaIndices: T.Tensor([rows, swa_width], T.int32),
+         SwaLengths: T.Tensor([rows], T.int32),
+         Sinks: T.Tensor([heads], accum_dtype),
++        Positions: T.Tensor([rows], T.int64),
++        CosSin: T.Tensor([positions_max, ROPE_DIM], accum_dtype),
+         Partial: T.Tensor([rows, segments, heads, D], accum_dtype),
+         PartialStats: T.Tensor([rows, segments, heads, 2], accum_dtype),
+         Output: T.Tensor([rows, heads, D], dtype),
+@@ -696,6 +771,8 @@ def sparse_mla_fwd_v41(
+             None,
+             None,
+             Sinks,
++            Positions,
++            CosSin,
+             Partial,
+             PartialStats,
+             Output,
+@@ -850,6 +927,8 @@ class SparseMlaV41Plan:
+         swa_indices,
+         swa_lengths,
+         sinks,
++        positions,
++        cos_sin,
+         out,
+         *,
+         idx_cache=None,
+@@ -861,7 +940,10 @@ class SparseMlaV41Plan:
+     ):
+         """Attend over uint8 ``[pages, page_size * record_bytes]`` cache pages.
+ 
+-        Writes ``out``. The page buffers may have any row stride.
++        Writes WO-A's input into ``out``: the rows' attention output with its RoPE
++        columns rotated back at ``positions`` (int64) through ``cos_sin`` (the FP32
++        ``[positions, 64]`` RoPE table), through the reference's ``act_quant``. The
++        page buffers may have any row stride.
+ 
+         The indexed tensors are required when ``idx_width > 0`` and absent
+         otherwise. ``kernel`` forces ``"split"``, ``"decode"`` or ``"extend"``.
+@@ -883,6 +965,8 @@ class SparseMlaV41Plan:
+             swa_lengths,
+             *(indexed if self.idx_width else ()),
+             sinks,
++            positions,
++            cos_sin,
+         )
+         if kernel == "extend":
+             self.kernels["extend"](*args, out)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/wo.py b/vllm/models/deepseek_v4_1/tilelang/wo.py
+index c7cb305c1..1a882242b 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/wo.py
++++ b/vllm/models/deepseek_v4_1/tilelang/wo.py
+@@ -8,11 +8,13 @@ reference computes it::
+     a = wo_a(o.view(T, groups, -1))                    (grouped, block-32 FP8, BF16 out)
+     out = wo_b(a.flatten(1))                           (block-32 FP8, BF16 out)
+ 
+-WO-A quantizes its input as the reference does (since its 2026-10-12 revision, for
+-both V4.1 Flash checkpoints): each 32-value block of ``o`` to E4M3 with a UE8M0 scale
+-and back to BF16, then the BF16 einsum on the weights ``convert.py`` dequantizes. One
+-launch of the grouped W8A16 GEMM does both: it quantizes each activation tile as it
+-loads it, expands each FP8 weight tile exactly to BF16 and accumulates in FP32.
++The first two lines run in the sparse MLA kernels' output store (``sparse_mla.
++wo_input``, since the reference's 2026-10-12 revision for both V4.1 Flash
++checkpoints), once per row: ``o`` arrives as WO-A's input. Quantizing there instead
++of in WO-A's tile loads keeps the GEMM from redoing it for every column tile (the
++release on 1017 measured 3% of prefill, 2026-10-17). WO-A is the BF16 einsum on the
++weights ``convert.py`` dequantizes: one launch of the grouped W8A16 GEMM expands each
++FP8 weight tile exactly to BF16 and accumulates in FP32.
+ WO-B is the ordinary block-32 projection with MXFP8 activations (DeepSeek's E4M3 and
+ one UE8M0 scale per 32), as the reference's ``linear`` quantizes them. WO-A's last
+ kernel (the GEMM's epilogue, or the split-K reduce at decode) rounds ``a`` to BF16 and
+@@ -42,7 +44,6 @@ from .linear import (
+     _launch,
+     _scratch,
+ )
+-from .rope import rope_
+ 
+ # WO-A's W8A16 GEMM sums K in _WO_A_SHARDS shards at every row count, each from zero,
+ # added in shard order, so a row's bits do not depend on the path. A bucket either
+@@ -155,8 +156,8 @@ class _GroupedBF16:
+ 
+ 
+ class TileLangWOProjection:
+-    """Inverse RoPE, WO-A and WO-B of one attention layer (built after loading; its
+-    layer declares the kernels with ``declare_kernels``)."""
++    """WO-A and WO-B of one attention layer (built after loading; its layer declares
++    the kernels with ``declare_kernels``)."""
+ 
+     def __init__(self, wo_a: nn.Module, wo_b: nn.Module, *, groups: int):
+         self.a = _GroupedBF16(wo_a, groups)
+@@ -166,7 +167,7 @@ class TileLangWOProjection:
+         self.hidden = wo_b.weight.shape[0]
+ 
+     def declare_kernels(self) -> None:
+-        """Declare WO-A's and WO-B's kernels (the inverse RoPE is the layer's)."""
++        """Declare WO-A's and WO-B's kernels."""
+         self.a.declare_kernels()
+         self.b.declare_kernels()
+ 
+@@ -176,19 +177,12 @@ class TileLangWOProjection:
+             "wo_a", self.a
+         ) + l2_prefetch.linear_segments("wo_b", self.b)
+ 
+-    def __call__(
+-        self,
+-        o: torch.Tensor,
+-        positions: torch.Tensor,
+-        cos_sin_cache: torch.Tensor,
+-        out: torch.Tensor,
+-    ) -> torch.Tensor:
+-        """Project ``o`` ([T, heads, head_dim], contiguous BF16; its RoPE columns
+-        are overwritten) into ``out`` ([T, hidden] BF16)."""
++    def __call__(self, o: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
++        """Project WO-A's input ``o`` ([T, heads, head_dim] contiguous BF16, as the
++        sparse MLA kernels store it) into ``out`` ([T, hidden] BF16)."""
+         rows = o.shape[0]
+         if not rows:
+             return out
+-        rope_(o, positions, cos_sin_cache, 1, True)
+         scratch = (
+             None if torch.compiler.is_compiling() else current_preallocated_workspace()
+         )

@@ -1,0 +1,163 @@
+From 5e990d670e24860fb0204e7ce547f56582cda7b8 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 17:19:53 +0200
+Subject: [PATCH 073/274] DeepSeek V4.1 prefill SP: a projection
+ reduce-scattered in slices
+
+SPRows.project_reduce_scatter projects a T-row output and returns this
+rank's reduced rows. In slices, each rank's block is projected piece by
+piece into one contiguous buffer per piece, and each piece is
+reduce-scattered on a side stream while the next is projected. Rows that
+do not depend on one another reduce to the same bits either way. Nothing
+calls it yet.
+
+(cherry picked from commit 440d271951b037e37c8c94d8a3a2eaa5f633441a)
+
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+new file mode 100644
+index 000000000..d95588d16
+--- /dev/null
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -0,0 +1,55 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""A sequence-parallel projection reduce-scattered in slices lands every row where
++one projection and one reduce-scatter put it (one rank's view, the others'
++contributions stood in by zeros)."""
++
++import pytest
++import torch
++
++if not torch.cuda.is_available():
++    pytest.skip("needs a CUDA device", allow_module_level=True)
++
++from vllm.models.deepseek_v4_1 import sp_prefill
++
++
++@pytest.mark.parametrize("tokens", [37, 40, 205])
++@pytest.mark.parametrize("rank", [0, 2, 3])
++@pytest.mark.parametrize("slices", [1, 2, 3])
++def test_slices_land_on_the_owned_rows(monkeypatch, tokens, rank, slices):
++    world = 4
++    rows = sp_prefill.SPRows(num_tokens=tokens, world_size=world, rank=rank)
++
++    def own_block(x, dim=0):  # this rank's block; other ranks add zeros
++        return x.view(world, -1, *x.shape[1:])[rank].clone()
++
++    monkeypatch.setattr(sp_prefill, "tensor_model_parallel_reduce_scatter", own_block)
++    source = torch.randn(tokens, 8, device="cuda")
++    calls = []
++
++    def project(start, stop, out):
++        calls.append((start, stop))
++        out.copy_(source[start:stop])
++
++    order = []
++    result = rows.project_reduce_scatter(
++        project,
++        (8,),
++        source.dtype,
++        source.device,
++        slices=slices,
++        then=lambda: order.append(len(calls)),
++    )
++    torch.cuda.synchronize()
++    padded = torch.zeros(rows.padded_rows, 8, device="cuda")
++    padded[:tokens] = source
++    assert torch.equal(result, own_block(padded))
++    # Every real row projected once; then() after the last projection.
++    projected = sorted(i for start, stop in calls for i in range(start, stop))
++    assert projected == list(range(tokens))
++    assert order == [len(calls)]
++
++
++def test_wo_slices():
++    assert sp_prefill.wo_slices(2047) == 1
++    assert sp_prefill.wo_slices(2048) == 2
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 94c125058..cbda6a14e 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -203,6 +203,82 @@ class SPRows:
+         local[:real].copy_(rows)
+         return local
+ 
++    def project_reduce_scatter(
++        self,
++        project,
++        row_shape: tuple[int, ...],
++        dtype: torch.dtype,
++        device: torch.device,
++        slices: int = 1,
++        then=None,
++    ) -> torch.Tensor:
++        """This rank's L rows of the sum over ranks of a T-row projection.
++
++        ``project(start, stop, out)`` writes rows ``start:stop`` of the projection
++        into ``out``. With ``slices`` > 1 each rank's block is projected in that many
++        pieces, every piece of every block into one contiguous buffer, and each
++        piece is reduce-scattered on a side stream while the next is projected.
++        A projection whose rows do not depend on one another reduces to the same
++        bits as one projection and one reduce-scatter. ``then()`` runs on the
++        current stream after the last projection, before the last reduce-scatter
++        is awaited.
++        """
++        if slices <= 1:
++            padded = self.empty_padded(row_shape, dtype, device)
++            project(0, self.num_tokens, padded[: self.num_tokens])
++            if then is not None:
++                then()
++            return self.reduce_scatter(padded)
++        local, world, tokens = self.local_rows, self.world_size, self.num_tokens
++        out = torch.empty((local, *row_shape), dtype=dtype, device=device)
++        bounds = [local * i // slices for i in range(slices + 1)]
++        main = torch.cuda.current_stream(device)
++        side = _side_stream(device)
++        for lo, hi in zip(bounds, bounds[1:]):
++            if hi == lo:
++                continue
++            piece = torch.empty(
++                (world, hi - lo, *row_shape), dtype=dtype, device=device
++            )
++            for owner in range(world):
++                start, stop = owner * local + lo, owner * local + hi
++                real = max(0, min(stop, tokens) - start)
++                if real:
++                    project(start, start + real, piece[owner, :real])
++                if real < hi - lo:
++                    piece[owner, real:].zero_()
++            side.wait_stream(main)
++            with torch.cuda.stream(side):
++                reduced = tensor_model_parallel_reduce_scatter(
++                    piece.view(world * (hi - lo), *row_shape), dim=0
++                )
++                out[lo:hi].copy_(reduced)
++            piece.record_stream(side)
++        if then is not None:
++            then()
++        main.wait_stream(side)
++        return out
++
++
++# The attention's WO projection is reduce-scattered in two slices from this many
++# tokens, so half its reduce-scatter runs under the other half's projection.
++WO_SLICE_TOKENS = 2048
++
++
++def wo_slices(num_tokens: int) -> int:
++    """Slices of a sequence-parallel WO projection of ``num_tokens`` tokens."""
++    return 2 if num_tokens >= WO_SLICE_TOKENS else 1
++
++
++_SIDE_STREAMS: dict = {}
++
++
++def _side_stream(device: torch.device) -> torch.cuda.Stream:
++    """One stream per device for the reduce-scatters of sliced projections."""
++    if device not in _SIDE_STREAMS:
++        _SIDE_STREAMS[device] = torch.cuda.Stream(device)
++    return _SIDE_STREAMS[device]
++
+ 
+ def plan_rows(
+     num_tokens: int, min_rows: int, world_size: int, rank: int

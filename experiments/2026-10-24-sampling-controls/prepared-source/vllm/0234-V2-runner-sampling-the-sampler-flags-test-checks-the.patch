@@ -1,0 +1,55 @@
+From 59febf02fb3047314df715d16ef236f543771675 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:23:48 +0200
+Subject: [PATCH 234/274] V2 runner sampling: the sampler-flags test checks the
+ TileLang Gumbel kernels compile at warmup only
+
+It hooked every Triton compile, so it failed whenever the top-p kernels it
+also launches were not compiled earlier in the process; the target kernel it
+guards is TileLang now.
+
+diff --git a/tests/v1/worker/test_gpu_sampler_flags.py b/tests/v1/worker/test_gpu_sampler_flags.py
+index 06eb7f745..4686187a5 100644
+--- a/tests/v1/worker/test_gpu_sampler_flags.py
++++ b/tests/v1/worker/test_gpu_sampler_flags.py
+@@ -10,6 +10,7 @@ if not torch.cuda.is_available():
+     pytest.skip("CUDA required for sampler flag tests", allow_module_level=True)
+ 
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu.sample import tilelang_sampling
+ from vllm.v1.worker.gpu.sample.gumbel import warmup_processed_gumbel
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.states import RequestState
+@@ -91,17 +92,18 @@ def test_logits_processing_cache_only_checks_active_requests():
+     assert np.any(sampler.needs_logits_processing[with_processing])
+ 
+ 
+-def test_seeded_filtered_sampler_uses_precompiled_target_kernel(monkeypatch):
+-    """Exercise real UVA sampling states and the InputBatch int64 mapping ABI."""
+-    from triton import knobs
+-
++def test_seeded_filtered_sampler_uses_precompiled_target_kernel():
++    """Exercise real UVA sampling states and the InputBatch int64 mapping ABI: the
++    seeded target sampling of processed logits launches the Gumbel kernel the warmup
++    compiled, and no other."""
+     sampler = _make_sampler()
+     warmup_processed_gumbel(VOCAB_SIZE, DEVICE)
+ 
+-    def unexpected_compile(**kwargs):
+-        pytest.fail("Seeded filtered sampling compiled after target warmup")
++    def gumbel_kernels():
++        factory = id(tilelang_sampling.gumbel_sample_kernel)
++        return {key for key in tilelang_sampling._KERNELS if key[0] == factory}
+ 
+-    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
++    compiled = gumbel_kernels()
+     for req_idx in (0, 3):
+         sampler.add_request(
+             req_idx, 1, SamplingParams(temperature=1, top_p=0.95, seed=43)
+@@ -125,3 +127,6 @@ def test_seeded_filtered_sampler_uses_precompiled_target_kernel(monkeypatch):
+         assert processed.dtype == torch.float32
+         assert sampled.shape == (1,)
+     torch.accelerator.synchronize()
++    assert gumbel_kernels() == compiled, (
++        "seeded filtered sampling compiled a Gumbel kernel after target warmup"
++    )

@@ -1,0 +1,193 @@
+From 11b4c2af06593a5b618333569f58051ac869b825 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:04:27 +0200
+Subject: [PATCH 134/274] RoCE policy: no fallback in any collective
+
+The fail-stop policy guarded the collectives DS4.1 routes, but three entry
+points still reached other backends:
+
+- all_reduce_in_place went straight to NCCL's ring (another addition order)
+  and then to the PyTorch NCCL process group;
+- gather was inherited from the base class, which gathers through the
+  PyTorch NCCL process group the policy never creates (about 3.4 GB of
+  unified memory per rank);
+- broadcast and batch_isend_irecv skipped the policy guard.
+
+DS4.1 never calls in-place all-reduce (it has no routed-output transform)
+or gather (CUDA all-gathers the logits), so under the policy both now
+raise. Broadcast, which adaptive verification issues every decode step, and
+batch_isend_irecv take the guard. Configurations without the policy keep
+the upstream dispatch.
+
+Tests: CPU checks that each collective stays on the policy's backends with
+the PyTorch process-group collectives refused, and that no base-class
+collective backed by torch.distributed is inherited.
+
+diff --git a/tests/distributed/test_roce_policy_no_fallback.py b/tests/distributed/test_roce_policy_no_fallback.py
+new file mode 100644
+index 000000000..40308bcea
+--- /dev/null
++++ b/tests/distributed/test_roce_policy_no_fallback.py
+@@ -0,0 +1,119 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The multi-node RoCE policy has no fallback: every collective runs on the
++selected backends (one-shot runtime, PyNCCL) or raises. Nothing reaches the
++PyTorch NCCL process group, which the policy never creates (about 3.4 GB of
++unified memory per rank on GB10). CPU only."""
++
++import inspect
++import re
++
++import pytest
++import torch
++import torch.distributed
++
++from vllm.distributed.device_communicators import cuda_communicator
++from vllm.distributed.device_communicators.base_device_communicator import (
++    DeviceCommunicatorBase,
++)
++
++PROCESS_GROUP_COLLECTIVES = (
++    "all_reduce",
++    "all_gather",
++    "all_gather_into_tensor",
++    "reduce_scatter_tensor",
++    "gather",
++    "broadcast",
++    "send",
++    "recv",
++    "all_to_all_single",
++    "batch_isend_irecv",
++    "barrier",
++)
++
++
++class _PyNccl:
++    disabled = False
++
++    def __init__(self):
++        self.calls = []
++
++    def broadcast(self, tensor, src):
++        self.calls.append(("broadcast", src))
++
++    def batch_isend_irecv(self, p2p_ops):
++        self.calls.append(("batch_isend_irecv", len(p2p_ops)))
++
++
++class _OneShot:
++    disabled = False
++
++
++def _policy_communicator(pynccl=None):
++    comm = object.__new__(cuda_communicator.CudaCommunicator)
++    comm._roce_policy = True
++    comm.b12x_ar_comm = _OneShot()
++    comm.pynccl_comm = pynccl if pynccl is not None else _PyNccl()
++    comm.world_size = 4
++    comm.rank_in_group = 0
++    comm.device_group = object()
++    return comm
++
++
++@pytest.fixture(autouse=True)
++def no_process_group(monkeypatch):
++    def refuse(*args, **kwargs):
++        raise AssertionError("the RoCE policy reached the PyTorch process group")
++
++    for name in PROCESS_GROUP_COLLECTIVES:
++        monkeypatch.setattr(torch.distributed, name, refuse, raising=False)
++
++
++def test_in_place_all_reduce_is_not_part_of_the_policy():
++    with pytest.raises(RuntimeError, match="no in-place all-reduce"):
++        _policy_communicator().all_reduce_in_place(torch.zeros(4))
++
++
++def test_gather_is_not_part_of_the_policy():
++    with pytest.raises(RuntimeError, match="no gather"):
++        _policy_communicator().gather(torch.zeros(4))
++
++
++def test_broadcast_runs_on_pynccl():
++    pynccl = _PyNccl()
++    tensor = torch.zeros(4)
++    assert _policy_communicator(pynccl).broadcast(tensor, src=0) is tensor
++    assert pynccl.calls == [("broadcast", 0)]
++
++
++def test_batch_isend_irecv_runs_on_pynccl():
++    pynccl = _PyNccl()
++    _policy_communicator(pynccl).batch_isend_irecv([object(), object()])
++    assert pynccl.calls == [("batch_isend_irecv", 2)]
++
++
++@pytest.mark.parametrize("call", ["broadcast", "batch_isend_irecv"])
++def test_lost_pynccl_stops_instead_of_switching_backend(call):
++    pynccl = _PyNccl()
++    pynccl.disabled = True
++    comm = _policy_communicator(pynccl)
++    args = (torch.zeros(4),) if call == "broadcast" else ([object()],)
++    with pytest.raises(RuntimeError, match="lost its PyNCCL communicator"):
++        getattr(comm, call)(*args)
++
++
++def test_no_inherited_collective_uses_the_process_group():
++    """A base-class collective that calls torch.distributed must be overridden,
++    so a new upstream collective cannot bypass the policy unnoticed."""
++    collective = re.compile(
++        r"\b(?:torch\.distributed|dist)\.(?:"
++        + "|".join(PROCESS_GROUP_COLLECTIVES)
++        + r")\("
++    )
++    inherited = []
++    for name, method in inspect.getmembers(DeviceCommunicatorBase, inspect.isfunction):
++        if not collective.search(inspect.getsource(method)):
++            continue
++        if getattr(cuda_communicator.CudaCommunicator, name) is method:
++            inherited.append(name)
++    assert inherited == []
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 56a9b7073..78f84ac0d 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -605,6 +605,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+     def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+         """Use NCCL's aliasing contract for a caller-donated intermediate."""
++        if self._roce_policy:
++            # The policy reduces with the one-shot runtime or the rank-order
++            # exchange. NCCL's in-place ring adds in another order, and no model
++            # served on this policy reduces in place.
++            raise RuntimeError("RoCEnante policy has no in-place all-reduce")
+         pynccl_comm = self.pynccl_comm
+         if (
+             pynccl_comm is None
+@@ -884,8 +889,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+         return tensor
+ 
++    def gather(
++        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
++    ) -> torch.Tensor | None:
++        if self._roce_policy:
++            # The base class gathers through the PyTorch NCCL process group,
++            # which the policy never creates; logits all-gather on CUDA.
++            raise RuntimeError("RoCEnante policy has no gather; all-gather instead")
++        return super().gather(input_, dst, dim)
++
+     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+         """Broadcast a tensor from source rank to all ranks."""
++        self._require_roce_policy()
+         if self.world_size == 1:
+             return tensor
+ 
+@@ -1155,6 +1170,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         )
+ 
+     def batch_isend_irecv(self, p2p_ops: list):
++        self._require_roce_policy()
+         pynccl_comm = self.pynccl_comm
+         if pynccl_comm is not None and not pynccl_comm.disabled:
+             pynccl_comm.batch_isend_irecv(p2p_ops)

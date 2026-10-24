@@ -1,0 +1,65 @@
+From 150053eea7f670fe828bda08bbf8e5d93b554915 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:16:57 +0200
+Subject: [PATCH 268/274] Validate benchmark outputs and keep speculative
+ prefixes request-local
+
+Both implementations share identical tensor addresses and initialized graph-node inputs; correctness is checked again for every timed allocation.
+
+
+diff --git a/benchmarks/kernels/benchmark_sampling_controls.py b/benchmarks/kernels/benchmark_sampling_controls.py
+index 59a586f99..b4584adc0 100644
+--- a/benchmarks/kernels/benchmark_sampling_controls.py
++++ b/benchmarks/kernels/benchmark_sampling_controls.py
+@@ -63,13 +63,15 @@ def make_case(kind, rows, width, seed, count):
+                     BLOCK_SIZE=1024,
+                 )
+ 
+-        return reset, invoke
++        return reset, invoke, lambda i: buffers[i]
+ 
+     source = torch.randn((rows, width), device="cuda")
+     buffers = [source.clone() for _ in range(count)]
+     thresholds = torch.full((states,), 0.1, device="cuda")
+     thresholds[::5] = 0
+     positions = (torch.arange(rows, device="cuda") % 6).int()
++    if kind == "penalties":
++        mapping = (torch.arange(rows, device="cuda") // 6 + 2).long()
+     tokens = torch.randint(width, (rows,), device="cuda", dtype=torch.int32)
+     rep = torch.full((states,), 1.3, device="cuda")
+     freq = torch.full_like(rep, 0.25)
+@@ -123,7 +125,7 @@ def make_case(kind, rows, width, seed, count):
+                 BLOCK_SIZE=8192,
+             )
+ 
+-    return reset, invoke
++    return reset, invoke, lambda i: (buffers[i],)
+ 
+ 
+ def capture(invoke, ours, count):
+@@ -154,7 +156,15 @@ def measure(kind, rows, width, seed):
+     count = 8
+     ours, theirs = [], []
+     for sample in range(8):
+-        reset, invoke = make_case(kind, rows, width, seed + sample, count)
++        reset, invoke, output = make_case(kind, rows, width, seed + sample, count)
++        reset()
++        invoke(0, False)
++        expected = [value.clone() for value in output(0)]
++        reset()
++        invoke(0, True)
++        if any(not torch.equal(a, b) for a, b in zip(output(0), expected)):
++            raise RuntimeError(f"outputs differ: {kind} rows={rows} width={width}")
++        reset()
+         a = capture(invoke, True, count)
+         reset()
+         b = capture(invoke, False, count)
+@@ -162,7 +172,7 @@ def measure(kind, rows, width, seed):
+         times = {id(graph): elapsed(graph, reset, count) for graph in order}
+         ours.append(times[id(a)])
+         theirs.append(times[id(b)])
+-        del a, b, order, reset, invoke
++        del a, b, order, reset, invoke, output, expected
+     paired = [a - b for a, b in zip(ours, theirs)]
+     mean = statistics.fmean(paired)
+     half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
