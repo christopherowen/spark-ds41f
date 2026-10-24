@@ -673,37 +673,43 @@ def container_running(node: dict | None = None) -> bool:
     return bool(output.strip())
 
 
-def other_engine(config: str) -> tuple[str, str | None] | None:
-    """A serving container running on the head node under another name than ``config``'s, and
-    the profile that started it (None if it records none); None when there is no such engine."""
+def other_engines(config: str) -> list[tuple[str, str | None]]:
+    """Every serving container on any node running under another name than ``config``'s, with
+    the profile that started it (None if it records none), each pair once. Every node is asked:
+    when an arm's engine dies its head container exits, but the ranks' keep serving."""
     cluster = spark.read_cluster(config)
     nodes = nodes_config()
-    head = next(node for node in nodes["nodes"] if node["head"])
-    result = spark.run_ssh(nodes, head, "docker", "ps", *spark.serving_filters(cluster),
-                           "--format", f'{{{{.Names}}}}\t{{{{.Label "{spark.PROFILE_LABEL}"}}}}')
-    for line in result.stdout.splitlines():
-        name, _, profile = line.partition("\t")
-        if name and name != cluster["container"]["name"]:
-            return name, profile or None
-    return None
+    found: list[tuple[str, str | None]] = []
+    for node in nodes["nodes"]:
+        result = spark.run_ssh(nodes, node, "docker", "ps", *spark.serving_filters(cluster),
+                               "--format", f'{{{{.Names}}}}\t{{{{.Label "{spark.PROFILE_LABEL}"}}}}')
+        for line in result.stdout.splitlines():
+            name, _, profile = line.partition("\t")
+            engine = (name, profile or None)
+            if name and name != cluster["container"]["name"] and engine not in found:
+                found.append(engine)
+    return found
 
 
 def stop_other_engine(config: str, remove: bool = False, dry: bool = False) -> bool:
     """``cluster start --replace`` and ``cluster stop`` act on their profile's container name
-    only, so an engine serving under another name (the previous release's arm beside a
-    renamed candidate) is stopped first, with the profile that started it."""
+    only, so engines serving under another name (the previous release's arm beside a renamed
+    candidate, or the ranks a dead arm left behind) are stopped first, each with the profile
+    that started it."""
     if dry:
         return True
-    found = other_engine(config)
-    if found is None:
-        return True
-    name, profile = found
-    if profile is None:
-        log(f"{name} is serving and records no profile; stop it before using {config}")
-        return False
-    log(f"{name} is serving (started from {profile}); stopping it with that profile")
-    return spark_cli("--cluster-config", profile, "cluster", "stop", *(["--remove"] if remove else []),
-                     "--apply", "--parallel") == 0
+    found = other_engines(config)
+    for name, profile in found:
+        if profile is None:
+            log(f"{name} is serving and records no profile; stop it before using {config}")
+            return False
+    ok = True
+    for profile in dict.fromkeys(profile for _, profile in found):
+        names = ", ".join(dict.fromkeys(name for name, started in found if started == profile))
+        log(f"{names} is serving (started from {profile}); stopping it with that profile")
+        ok = spark_cli("--cluster-config", profile, "cluster", "stop", *(["--remove"] if remove else []),
+                       "--apply", "--parallel") == 0 and ok
+    return ok
 
 
 # ---------------------------------------------------------------- windows

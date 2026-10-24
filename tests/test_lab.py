@@ -388,7 +388,7 @@ class ProductionProfileTest(unittest.TestCase):
     def test_watchdog_restores_the_recorded_profile(self) -> None:
         self.hold(TP4, heartbeat_at=1_000_000.0)  # stale
         with mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
-                mock.patch.object(lab, "other_engine", return_value=None), \
+                mock.patch.object(lab, "other_engines", return_value=[]), \
                 mock.patch.object(lab, "production_live", side_effect=[False, True]), \
                 mock.patch.object(lab.subprocess, "run", side_effect=no_subprocesses), \
                 mock.patch.object(lab.subprocess, "Popen", side_effect=no_subprocesses):
@@ -1446,6 +1446,40 @@ class ServingNameTest(unittest.TestCase):
             self.assertFalse(lab.boot("renamed.json"))
         cli.assert_not_called()
         self.assertIn("dsv41-karmic-kraken is serving and records no profile", out.getvalue())
+
+    RING = {"ssh_user": "u", "nodes": [{"name": "dgx1", "head": True, "rank": 0},
+                                       {"name": "dgx2", "head": False, "rank": 1},
+                                       {"name": "dgx3", "head": False, "rank": 2}]}
+
+    def ranks(self, output: str):
+        """``docker ps`` on each node: nothing on the head (a dead arm's head container has
+        exited), ``output`` on every rank."""
+        def run(nodes, node, *command):
+            return subprocess.CompletedProcess([], 0, "" if node["head"] else output, "")
+        return mock.patch.object(lab.spark, "run_ssh", side_effect=run)
+
+    def test_a_dead_arms_ranks_are_stopped_before_production_starts(self) -> None:
+        with self.ranks(f"spark-ds41f\t{self.PREVIOUS}\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.RING), \
+                mock.patch.object(lab.spark, "configuration", return_value=({}, self.RING, {})), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(lab.boot(lab.spark.DEFAULT_CLUSTER_CONFIG))
+        self.assertEqual([call.args for call in cli.call_args_list], [
+            ("--cluster-config", self.PREVIOUS, "cluster", "stop", "--apply", "--parallel"),
+            ("--cluster-config", lab.spark.DEFAULT_CLUSTER_CONFIG, "cluster", "start", "--replace",
+             "--change-shape", "--apply")])
+        self.assertIn(f"spark-ds41f is serving (started from {self.PREVIOUS})", out.getvalue())
+
+    def test_a_rank_that_records_no_profile_still_stops_the_boot(self) -> None:
+        with self.ranks("spark-ds41f\t\n"), \
+                mock.patch.object(lab, "nodes_config", return_value=self.RING), \
+                mock.patch.object(lab.spark, "configuration", return_value=({}, self.RING, {})), \
+                mock.patch.object(lab, "spark_cli", return_value=0) as cli, \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertFalse(lab.boot(lab.spark.DEFAULT_CLUSTER_CONFIG))
+        cli.assert_not_called()
+        self.assertIn("spark-ds41f is serving and records no profile", out.getvalue())
 
     def test_a_stop_also_stops_an_arm_under_another_name(self) -> None:
         lab.PRODUCTION_CONFIG = "renamed.json"
