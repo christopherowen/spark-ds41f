@@ -1110,3 +1110,14 @@ vLLM `tilelang-ports` 12d6d2e23:
   - The maxima and ids depend only on the row, so they now load with it.
   - The warp reduction carries the winner's id, which leaves three rounds.
   - Ties and NaN behave as before: the lowest index wins a tie, and NaN counts as -inf.
+
+**Min-p and logit bias are never served in production.** The second serving check's
+controls digest stopped at its min-p scenario with HTTP 400. vLLM rejects `min_p` and
+`logit_bias` under speculative decoding: "The min_p and logit_bias sampling parameters
+are not yet supported with speculative decoding". Production serves DSpark, so those two
+kernels run only in configurations without speculation. Their kernel gates and Triton
+comparisons stand.
+
+[controls_digest.py](controls_digest.py) now records a rejected scenario, with the server's
+message as its digest, and continues. [serving-controls.json](serving-controls.json) runs
+the controls digests alone: ports, candidate 4, then ports again.

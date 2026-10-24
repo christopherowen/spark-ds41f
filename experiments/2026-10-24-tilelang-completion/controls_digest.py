@@ -16,12 +16,15 @@ logprob token ids):
 Each request asks for the chosen tokens' logprobs. One JSON line per scenario and mode
 with the SHA-256 digest of the choices (message, logprobs, finish reason) and any prompt
 logprobs, then a summary of every digest. Two builds whose controls are the same bit for
-bit print the same digests. Exits 0 either way; the run records.
+bit print the same digests. A scenario the server rejects (HTTP 400: vLLM rejects min_p
+and logit_bias under speculative decoding) is recorded with the server's message, and
+its digest is the message's. Exits 0 either way; the run records.
 """
 import argparse
 import hashlib
 import json
 import threading
+import urllib.error
 import urllib.request
 import uuid
 
@@ -106,6 +109,14 @@ def main() -> None:
     seeds = [args.seed + i for i in range(len(PROMPTS))]
     digests = {}
     for name, controls in SCENARIOS.items():
+        try:
+            client.complete(PROMPTS[0], 1, seeds[0], controls)
+        except urllib.error.HTTPError as error:
+            message = error.read().decode(errors="replace")
+            print(json.dumps({"scenario": name, "rejected": error.code, "message": message}),
+                  flush=True)
+            digests[f"{name}/rejected"] = hashlib.sha256(message.encode()).hexdigest()
+            continue
         alone = [client.complete(p, args.tokens, s, controls) for p, s in zip(PROMPTS, seeds)]
         c8 = together(client, args.tokens, seeds, controls)
         for mode, results in (("alone", alone), ("c8", c8)):
