@@ -1,0 +1,908 @@
+............FFFFFFFF...................................................F [ 57%]
+..F..F...............................................                    [100%]
+=================================== FAILURES ===================================
+___ test_min_p_matches_triton_at_vocabulary_boundaries[True-33-index_dtype0] ___
+
+index_dtype = torch.int32, vocab = 33, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[       -inf,        -inf,        -inf,        -inf,        -inf,
+                -inf,        -inf,        -i...  1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,
+          5.3663e-01,        -inf,        -inf]], device='cuda:0')
+expected = tensor([[       -inf,        -inf,        -inf,        -inf,        -inf,
+                -inf,        -inf,        -i...  1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,
+          5.3663e-01,        -inf,        -inf]], device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32), tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e5560bb10>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e5560bb10> = tensor([       -inf,        -inf,        -inf,        -inf,        -inf,\n               -inf,        -inf,        -inf...    1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,  5.3663e-01,\n               -inf,        -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556609b0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556609b0> = tensor([       -inf,        -inf,        -inf,        -inf,        -inf,\n               -inf,        -inf,        -inf...    1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,  5.3663e-01,\n               -inf,        -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+___ test_min_p_matches_triton_at_vocabulary_boundaries[True-33-index_dtype1] ___
+
+index_dtype = torch.int64, vocab = 33, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[       -inf,        -inf,        -inf,        -inf,        -inf,
+                -inf,        -inf,        -i...  1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,
+          5.3663e-01,        -inf,        -inf]], device='cuda:0')
+expected = tensor([[       -inf,        -inf,        -inf,        -inf,        -inf,
+                -inf,        -inf,        -i...  1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,
+          5.3663e-01,        -inf,        -inf]], device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32), tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55661630>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55661630> = tensor([       -inf,        -inf,        -inf,        -inf,        -inf,\n               -inf,        -inf,        -inf...    1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,  5.3663e-01,\n               -inf,        -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([   -8388608,    -8388608,    -8388608,    -8388608,    -8388608,\n           -8388608,    -8388608,    -8388608...66563812,    -8388608,  1057121257,  1057579110,\n           -8388608,    -8388608], device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556615e0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556615e0> = tensor([       -inf,        -inf,        -inf,        -inf,        -inf,\n               -inf,        -inf,        -inf...    1.7351e+00,  1.1443e+00,        -inf,  5.0934e-01,  5.3663e-01,\n               -inf,        -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+__ test_min_p_matches_triton_at_vocabulary_boundaries[True-1023-index_dtype0] __
+
+index_dtype = torch.int32, vocab = 1023, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  1.2265,  0.6336,  ..., -0.213...-inf,    -inf,    -inf],
+        [   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan, 1.2265,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55661b30>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55661b30> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556619a0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556619a0> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+__ test_min_p_matches_triton_at_vocabulary_boundaries[True-1023-index_dtype1] __
+
+index_dtype = torch.int64, vocab = 1023, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  1.2265,  0.6336,  ..., -0.213...-inf,    -inf,    -inf],
+        [   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan, 1.2265,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556623f0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556623f0> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55662490>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55662490> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+__ test_min_p_matches_triton_at_vocabulary_boundaries[True-1025-index_dtype0] __
+
+index_dtype = torch.int32, vocab = 1025, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  1.0559,  0.4520,  ...,  0.298...-inf,    -inf,    -inf],
+        [   -inf,  1.6399,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan, 1.0559,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf, 1.6399,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55662a80>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55662a80> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55662940>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55662940> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+__ test_min_p_matches_triton_at_vocabulary_boundaries[True-1025-index_dtype1] __
+
+index_dtype = torch.int64, vocab = 1025, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  1.0559,  0.4520,  ...,  0.298...-inf,    -inf,    -inf],
+        [   -inf,  1.6399,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan, 1.0559,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf, 1.6399,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55663390>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55663390> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55663070>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55663070> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+_ test_min_p_matches_triton_at_vocabulary_boundaries[True-129280-index_dtype0] _
+
+index_dtype = torch.int32, vocab = 129280, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  0.7981,  0.8058,  ..., -1.363...-inf,    -inf,    -inf],
+        [   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan,   -inf,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556637a0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556637a0> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55663cf0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55663cf0> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+_ test_min_p_matches_triton_at_vocabulary_boundaries[True-129280-index_dtype1] _
+
+index_dtype = torch.int64, vocab = 129280, nonfinite = True
+
+    @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+    @pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
+    @pytest.mark.parametrize("nonfinite", [False, True])
+    def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
+        logits, mapping, thresholds = min_p_case(
+            6, vocab, index_dtype, padded=True, nonfinite=nonfinite
+        )
+        expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
+        expected.copy_(logits)
+        _min_p_kernel[(logits.shape[0],)](
+            expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
+        )
+        candidate.apply_min_p(logits, mapping, thresholds)
+>       assert_bits(logits, expected)
+
+tests/v1/worker/test_gpu_sampling_controls.py:61: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf],
+        [    nan,  0.7981,  0.8058,  ..., -1.363...-inf,    -inf,    -inf],
+        [   -inf,    -inf,    -inf,  ...,    -inf,    -inf,    -inf]],
+       device='cuda:0')
+expected = tensor([[  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf],
+        [   nan,   -inf,   -inf,  ...,   -inf,   -inf,... ...,   -inf,   -inf,   -inf],
+        [  -inf,   -inf,   -inf,  ...,   -inf,   -inf,   -inf]],
+       device='cuda:0')
+
+    def assert_bits(actual, expected):
+        if actual.is_floating_point():
+            # NaN payloads are not part of the logits-processor contract.
+            assert torch.equal(torch.isnan(actual), torch.isnan(expected))
+            valid = ~torch.isnan(expected)
+>           assert torch.equal(
+                actual[valid].view(torch.int32), expected[valid].view(torch.int32)
+            )
+E           AssertionError: assert False
+E            +  where False = <built-in method equal of type object at 0xed1139ffd638>(tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32), tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32))
+E            +    where <built-in method equal of type object at 0xed1139ffd638> = torch.equal
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e55663c50>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e55663c50> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+E            +    and   tensor([-8388608, -8388608, -8388608,  ..., -8388608, -8388608, -8388608],\n       device='cuda:0', dtype=torch.int32) = <built-in method view of Tensor object at 0xed0e556101e0>(torch.int32)
+E            +      where <built-in method view of Tensor object at 0xed0e556101e0> = tensor([-inf, -inf, -inf,  ..., -inf, -inf, -inf], device='cuda:0').view
+E            +      and   torch.int32 = torch.int32
+
+tests/v1/worker/test_gpu_sampling_controls.py:23: AssertionError
+_______________ test_nan_count_ignores_padded_columns[33-dtype1] _______________
+
+dtype = torch.bfloat16, vocab = 33
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:291: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:480: in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:388: in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1719: in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1711: in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1679: in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:193: in nan_count_kernel
+    @T.prim_func
+     ^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1800: in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1798: in impl
+    raise e
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1791: in impl
+    ir_gen.gen(builder)(**annot)
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:208: in nan_count
+    counts[col] += T.cast(T.isnan(value), "int32")
+                      ^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/tir/ir.py:167: in wrapped
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/tirx/op.py:2882: in isnan
+    return _ffi_api.isnan(x, span)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Data type bfloat16 not supported for isnan op. Skipping isnan op...
+
+/workspace/tilelang/3rdparty/tvm/src/tirx/op/op.cc:932: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:14:18  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1797): Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+------------------------------ Captured log call -------------------------------
+CRITICAL tilelang.language.eager.builder:builder.py:1797 Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+______________ test_nan_count_ignores_padded_columns[8193-dtype1] ______________
+
+dtype = torch.bfloat16, vocab = 8193
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:291: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:480: in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:388: in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1719: in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1711: in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1679: in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:193: in nan_count_kernel
+    @T.prim_func
+     ^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1800: in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1798: in impl
+    raise e
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1791: in impl
+    ir_gen.gen(builder)(**annot)
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:208: in nan_count
+    counts[col] += T.cast(T.isnan(value), "int32")
+                      ^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/tir/ir.py:167: in wrapped
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/tirx/op.py:2882: in isnan
+    return _ffi_api.isnan(x, span)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Data type bfloat16 not supported for isnan op. Skipping isnan op...
+
+/workspace/tilelang/3rdparty/tvm/src/tirx/op/op.cc:932: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:14:20  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1797): Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+------------------------------ Captured log call -------------------------------
+CRITICAL tilelang.language.eager.builder:builder.py:1797 Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+_____________ test_nan_count_ignores_padded_columns[129280-dtype1] _____________
+
+dtype = torch.bfloat16, vocab = 129280
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("vocab", [33, 8193, 129280])
+    def test_nan_count_ignores_padded_columns(dtype, vocab):
+        from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+    
+        logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
+        logits[:, vocab:] = float("nan")
+        logits[1::2, ::19] = float("nan")
+        logits = logits[:, :vocab]
+        expected = torch.empty(6, device="cuda", dtype=torch.int32)
+        _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
+>       output = auxiliary.count_nans(logits)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/v1/worker/test_gpu_sampling_controls.py:291: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:218: in count_nans
+    nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:567: in __call__
+    kernel = self.compile(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:480: in compile
+    prim_func = self.get_tir(*args, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/jit/__init__.py:388: in get_tir
+    tir = self.func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1719: in __call__
+    return self.get_tir(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1711: in get_tir
+    self.p1_cache[bound.p1_key] = self._build_tir_template(**bound.compile_kwargs)
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1679: in _build_tir_template
+    return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+                                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:193: in nan_count_kernel
+    @T.prim_func
+     ^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1800: in prim_func
+    return impl(func) if func is not None else impl
+           ^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1798: in impl
+    raise e
+/usr/local/lib/python3.12/dist-packages/tilelang/language/eager/builder.py:1791: in impl
+    ir_gen.gen(builder)(**annot)
+vllm/v1/worker/gpu/sample/tilelang_auxiliary.py:208: in nan_count
+    counts[col] += T.cast(T.isnan(value), "int32")
+                      ^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/language/tir/ir.py:167: in wrapped
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/dist-packages/tilelang/3rdparty/tvm/python/tvm/tirx/op.py:2882: in isnan
+    return _ffi_api.isnan(x, span)  # type: ignore
+           ^^^^^^^^^^^^^^^^^^^^^^^
+python/tvm_ffi/cython/function.pxi:968: in tvm_ffi.core.Function.__call__
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   tvm.error.InternalError: Data type bfloat16 not supported for isnan op. Skipping isnan op...
+
+/workspace/tilelang/3rdparty/tvm/src/tirx/op/op.cc:932: InternalError
+----------------------------- Captured stdout call -----------------------------
+2026-10-24 17:14:22  [TileLang:tilelang.language.eager.builder:CRITICAL] (builder.py:1797): Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+------------------------------ Captured log call -------------------------------
+CRITICAL tilelang.language.eager.builder:builder.py:1797 Failed to build prim_func from nan_count
+args={'logits': logits, 'output': output}
+source=def make_closure(rows, vocab):
+
+    def nan_count(__tb):
+        __tb_fl = '/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py'
+        __tb_fn = 'nan_count'
+        __tb.set_fileline(__tb_fl, 194, __tb_fn)
+
+        def nan_count(logits, output, **__kwargs):
+            __tb.set_fileline(__tb_fl, 195, __tb_fn)
+            logits = __tb.arg('logits', logits)
+            __tb.set_fileline(__tb_fl, 196, __tb_fn)
+            output = __tb.arg('output', output)
+            __tb.set_fileline(__tb_fl, 1, __tb_fn)
+            if __tb.skip_kernel_ctx():
+                __tb.set_fileline(__tb_fl, 1, __tb_fn)
+                return
+            __tb.set_fileline(__tb_fl, 198, __tb_fn)
+            with __tb.ctx_with(__tb.resolve_call(__tb.rval('T', T).Kernel)(__tb.rval('rows', rows), threads=256)) as row:
+                __tb.set_fileline(__tb_fl, 199, __tb_fn)
+                counts = __tb.bind('counts', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((8192,), 'int32'))
+                __tb.set_fileline(__tb_fl, 200, __tb_fn)
+                total = __tb.bind('total', __tb.resolve_call(__tb.rval('T', T).alloc_fragment)((1,), 'int32'))
+                __tb.set_fileline(__tb_fl, 201, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).clear)(__tb.rval('counts', counts)))
+                __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                for __1 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).serial), __tb.resolve_call(__tb.rval('T', T).ceildiv)(__tb.rval('vocab', vocab), 8192))):
+                    __tb.set_fileline(__tb_fl, 202, __tb_fn)
+                    block = __tb.bind('block', __1, loop_target=True)
+                    __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                    for __0 in __tb.ctx_for(__tb.iter_call(__tb.resolve_call(__tb.rval('T', T).Parallel), 8192)):
+                        __tb.set_fileline(__tb_fl, 203, __tb_fn)
+                        col = __tb.bind('col', __0, loop_target=True)
+                        __tb.set_fileline(__tb_fl, 204, __tb_fn)
+                        index = __tb.bind('index', __tb.rval('block', block) * 8192 + __tb.rval('col', col))
+                        __tb.set_fileline(__tb_fl, 205, __tb_fn)
+                        value = __tb.bind('value', __tb.resolve_call(__tb.rval('T', T).if_then_else)(__tb.rval('index', index) < __tb.rval('vocab', vocab), __tb.rval('logits', logits)[__tb.resolve_call(__tb.rval('T', T).cast)(__tb.rval('row', row), 'int64'), __tb.rval('index', index)], 0))
+                        __tb.set_fileline(__tb_fl, 208, __tb_fn)
+                        __tb.aug_assign_slice('Add', __tb.rval('counts', counts), __tb.rval('col', col), __tb.resolve_call(__tb.rval('T', T).cast)(__tb.resolve_call(__tb.rval('T', T).isnan)(__tb.rval('value', value)), 'int32'))
+                __tb.set_fileline(__tb_fl, 209, __tb_fn)
+                __tb.eval(__tb.resolve_call(__tb.rval('T', T).reduce_sum)(__tb.rval('counts', counts), __tb.rval('total', total), dim=0))
+                __tb.set_fileline(__tb_fl, 210, __tb_fn)
+                __tb.assign_slice(__tb.rval('output', output), __tb.rval('row', row), __tb.rval('total', total)[0])
+        return nan_count
+    return nan_count
+=============================== warnings summary ===============================
+../../../../usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: 14 warnings
+  /usr/local/lib/python3.12/dist-packages/torch/jit/_script.py:365: DeprecationWarning: `torch.jit.script_method` is deprecated. Please switch to `torch.compile` or `torch.export`.
+    warnings.warn(
+
+tests/v1/worker/test_gpu_thinking_budget.py::test_v2_greedy_sampling_applies_thinking_budget[triton]
+  /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.
+    from cutlass.base_dsl.arch import Arch
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-33-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-33-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-1023-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-1023-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-1025-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-1025-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-129280-index_dtype0]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_min_p_matches_triton_at_vocabulary_boundaries[True-129280-index_dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[33-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[8193-dtype1]
+FAILED tests/v1/worker/test_gpu_sampling_controls.py::test_nan_count_ignores_padded_columns[129280-dtype1]
+11 failed, 114 passed, 15 warnings in 40.49s
