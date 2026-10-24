@@ -457,4 +457,6 @@ recipe. Only GLP's kernel changes, and it launches only with steering on, so can
 comparison stands; [rc4/rc4-tp4.json](rc4/rc4-tp4.json) builds the image and runs the release tests,
 the GLP benchmark, the gate (outputs identical to candidate 3's and to spark-ds41f-1022's) and
 determinism at 8,192 and with steering on; [rc4/rc4-glp-tp4.json](rc4/rc4-glp-tp4.json) measures
-steering on against off.
+steering on against off. The same window runs the mHC port's GPU tests and benchmark
+(experiments/2026-10-24-tilelang-completion/bundles/mhc-port, vLLM branch tilelang-mhc-post) on
+dgx3 beside the release tests.
