@@ -7,6 +7,9 @@ token that the prompt's last step samples. The fix is one vLLM patch,
 [vllm/0266-Sink-rejection-prompt-logprobs-go-out-with-the-reque.patch](vllm/0266-Sink-rejection-prompt-logprobs-go-out-with-the-reque.patch),
 on candidate 4's series. [vllm/series](vllm/series) is candidate 4's with 0266.
 Production (spark-ds41f-1022) has the same code and is affected; nothing is deployed.
+The lab check passed with 0266 on candidate 4 and on the promoted recipe. The crashing
+request returned the model's own prompt logprobs, and every temperature-0 output was
+unchanged.
 
 ## What was seen (2026-10-24 22:34 CET, run `tilelang-ports-controls`)
 
@@ -172,7 +175,50 @@ An arm passes on these:
 its unfixed arm's. The teacher's agreement is recorded, not gated, because it scores the
 tokens in another forward shape.
 
-Results: pending. The run needs a window after the current lab runs.
+### Results (2026-10-24 23:46-23:54 CET, window `dgx1-1792878362`): pass
+
+The records are in [runs/lab/](runs/lab/):
+- the table, [prompt-logprobs-sink-table.txt](runs/lab/prompt-logprobs-sink-table.txt);
+- each arm's record, `prompt-logprobs-<arm>.jsonl`;
+- the run log, [serving-check.out](runs/lab/serving-check.out);
+- the driver, [run.sh](runs/lab/run.sh) and [run.log](runs/lab/run.log).
+
+The driver waited for the previous window (`tilelang-ports-serving-3`) to close at 23:41 CET,
+then for two quiet minutes. It synced the nodes to `827783c`.
+
+Boot times, to ready:
+
+| Arm | Ready |
+| --- | ---: |
+| `candidate4` | +83.0 s |
+| `candidate4-fix` | +92.6 s |
+| `production-fix` | +77.5 s |
+| `production` | +89.0 s |
+
+Production stopped at 23:46:23 and served again from the last arm at 23:53:43. The close
+found `config/cluster.json` already serving. `doctor --live` was OK, with the 5 known
+weight-fragmentation warnings.
+
+| | `candidate4` | `candidate4-fix` | `production-fix` | `production` |
+| --- | --- | --- | --- | --- |
+| Every request | 200 | 200 | 200 | 200 |
+| The crashing request (`prompt_logprobs: 2`) | not sent | 200: 18 entries, the first null, each with its prompt token and ranks 1-2 | the same | not sent |
+| `echo: true` | not sent | 200, the probe's tokens | 200, the probe's tokens | not sent |
+| Prompt logprobs, alone and beside the seven | | identical | identical | |
+| Teacher forcing: largest gap, prompt / 96 reply tokens | | 0.0 / 0.0, no rank differs | 0.0 / 0.0, no rank differs | |
+| The seven's replies, alone = beside the probe | yes | yes | yes | yes |
+| The probe's reply, plain = with prompt logprobs = beside the seven | yes | yes | yes | yes |
+
+Every arm has the same digests: the seven's replies `2047dcbf…` and the probe's `b1e35aed…`.
+So:
+- 0266 changes no temperature-0 output in either build;
+- prompt logprobs on one request change neither its own reply nor the replies beside it;
+- candidate 4 and production agree, as #503 recorded.
+
+The teacher-forced completion scores the probe's prompt and its 96 reply tokens again in
+another forward shape (114 tokens of prefill). It gives the same logprobs to the last
+digit. So the returned prompt logprobs are the model's own, and so are the reply's
+logprobs.
 
 ## Production
 
@@ -181,8 +227,9 @@ stops the service until it is restarted. This session made no production change.
 options, for the owner:
 
 1. **Hotfix:** boot the promoted recipe with 0266's two files mounted
-   (`production-fix-tp4.json`), once the lab check passes on it. This means one
-   production restart. It keeps sink rejection, and prompt logprobs work.
+   (`production-fix-tp4.json`). It passed the lab check above, with outputs identical to
+   production's. This means one production restart. It keeps sink rejection, and prompt
+   logprobs work.
 2. **Reject at validation:** answer `prompt_logprobs` and `echo` with HTTP 400 while sink
    rejection is on, as vLLM rejects `min_p` under speculative decoding. This is a code
    change, a restart and a lost feature, with no gain over option 1.
@@ -190,8 +237,8 @@ options, for the owner:
    the default the owner set for DS4.1-1017.
 4. **Wait for the next release** with 0266 in it. Production stays exposed until then.
 
-The recommendation is option 1 if the lab check passes, then 0266 in the next release
-(candidate 4's series plus 0266, `vllm/series`).
+The recommendation is option 1, then 0266 in the next release (candidate 4's series plus
+0266, `vllm/series`). Both wait for the owner's go.
 
 ## Follow-ups
 
@@ -202,3 +249,6 @@ The recommendation is option 1 if the lab check passes, then 0266 in the next re
   should stop a dead arm with its own profile before restoring.
 - `controls_digest.py` can take its `prompt-logprobs` scenario back once 0266 is in the
   build it measures.
+- `logprob_token_ids` is a separate bug, reported by the TileLang ports session. Chat
+  requests with custom logprob token ids return HTTP 500 under DSpark
+  (`_create_chat_logprobs` IndexError); the engine survives. It is not fixed here.
