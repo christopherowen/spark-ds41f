@@ -1,0 +1,698 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Paired CUDA graph timings of the V2 sampler's auxiliary TileLang candidates.
+
+Seven kernels against the Triton kernels they replace: logit bias (allowed ids,
+sparse bias, min_tokens stop masking), forbidden sequences, the reasoning-marker
+cache, the thinking budget, prompt-logprob token ids, custom logprob token ids and
+the NaN count, at DS4.1 serving shapes (vocabulary 129280, five drafts a request).
+
+Every buffer a kernel writes is per graph node and reinitialized outside event
+timing, so no call sees an earlier call's writes. Token histories and the
+per-request counts the runner keeps in pinned host memory are read over UVA, as
+in serving. Before timing, each sample runs both implementations on identical
+fresh inputs and requires bit-identical outputs.
+"""
+
+import argparse
+import json
+import math
+import statistics
+
+import torch
+
+from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
+from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary as auxiliary
+from vllm.v1.worker.gpu.sample import tilelang_bias, tilelang_thinking
+from vllm.v1.worker.gpu.sample.bad_words import _bad_words_kernel
+from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
+from vllm.v1.worker.gpu.sample.logprob import _fill_logprob_token_ids_kernel
+from vllm.v1.worker.gpu.sample.prompt_logprob import _prompt_logprobs_token_ids_kernel
+from vllm.v1.worker.gpu.sample.thinking_budget import (
+    _thinking_budget_kernel,
+    _update_committed_marker_cache_kernel,
+)
+
+VOCAB = 129280
+# Logits rows a request verifies: its bonus token and five drafts.
+STEP = 6
+# Token history columns. The runner's rows are max_model_len (1M) apart; 64K
+# columns hold every history below in a small pinned allocation.
+HISTORY = 1 << 16
+# Reasoning markers from the special-token range. Random histories draw ordinary
+# tokens below 128000, so they hold markers only where a case places them.
+START, END = 128798, 128799
+
+# Logits rows: one request without drafts; two requests of six rows and one of
+# four; and 96, the largest decode batch with drafts (sixteen requests of six).
+# The per-request kernels (markers, prompt ids, logprob ids) take them as requests.
+ROWS = (1, 16, 96)
+
+
+def at_rows(variants):
+    return [(rows, variant, size) for variant, size in variants for rows in ROWS]
+
+
+# Per kernel, the (rows, variant, size) cases.
+SHAPES = {
+    # Sampler.apply_sampling_params, also per verification chunk of the rejection
+    # sampler: FP32 logits, LogitBiasState's 1024 allowed and bias slots and 128
+    # stop slots, every request using the variant. 300 bias entries: a large ban
+    # or boost list. 16 allowed ids: a classifier's labels (the kernel rewrites
+    # the whole row regardless). 2 stop ids (EOS and a stop string) below
+    # min_tokens, alone and under structured output, which adds a row scan.
+    "logit_bias": at_rows(
+        [
+            ("bias", 300),
+            ("allowed", 16),
+            ("min_tokens", 2),
+            ("min_tokens_structured", 2),
+        ]
+    ),
+    # Sampler.apply_sampling_params, one program per row and sequence.
+    # SamplingParams.update_from_tokenizer adds each word with and without a
+    # leading space: four words give 8 sequences, and 128 is the
+    # VLLM_MAX_NUM_BAD_WORDS cap. Sequences are 1-4 tokens long.
+    "bad_words": at_rows([("sequences", 8), ("sequences", 128)]),
+    # ThinkingBudgetState.apply, one program per request (idx_mapping). Decode
+    # rescans the 6 tokens committed since the last step (a bonus token and five
+    # accepted drafts). Admission scans back from the end in 1024-token blocks:
+    # one block for a 16K prompt ending in <think>, every block for a request
+    # resumed 16K reasoning tokens after it.
+    "thinking_markers": at_rows([("decode", 6), ("admit", 16384), ("resume", 16384)]),
+    # ThinkingBudgetState.apply, one program per logits row. The forced end is
+    # </think> alone (the DS4.1 reasoning parser's), or a 16-token transition
+    # phrase ending in it (reasoning_end_str).
+    "thinking_budget": at_rows([("end", 1), ("transition", 16)]),
+    # PromptLogprobsWorker.compute_prompt_logprobs, one program per request of a
+    # prefill step of at most 16384 tokens (max_num_batched_tokens): a 1K prompt,
+    # a 16K chunk, sixteen 1K prompts, and 96 prompts of 170 tokens (scoring).
+    "prompt_ids": [
+        (1, "chunk", 1024),
+        (1, "chunk", 16384),
+        (16, "chunk", 1024),
+        (96, "chunk", 170),
+    ],
+    # compute_topk_scores from Sampler.__call__ (the rejection sampler passes no
+    # custom ids), one row per request. top_logprobs 0, 1 and 20 (max_logprobs'
+    # default); every other request scores four ids of its own (A/B/C/D).
+    "logprob_ids": at_rows([("top_k", 0), ("top_k", 1), ("top_k", 20)]),
+    # get_num_nans on the raw logits (VLLM_COMPUTE_NANS_IN_LOGITS) before the
+    # Sampler and the rejection sampler: the DS4.1 head's model dtype, BF16, and
+    # an FP32 head (head_dtype float32), rows num_embeddings_padded (129280) apart.
+    "nan_count": at_rows([("bfloat16", VOCAB), ("float32", VOCAB)]),
+}
+
+
+def pinned(tensor):
+    # A runner tensor in pinned host memory: the token history and the
+    # UvaBackedTensor counts and lengths, which kernels read over UVA.
+    buffer = UvaBuffer(tuple(tensor.shape), tensor.dtype)
+    view = buffer.uva()
+    view.uva_buffer = buffer  # the pinned host tensor lives as long as the view
+    view.copy_(tensor)
+    return view
+
+
+def drafted(rows, states):
+    # Verification rows: per request a bonus row and five drafts at local
+    # positions 0-5, with the requests' slots scattered over the state table.
+    slots = torch.randperm(states, device="cuda")[: (rows + STEP - 1) // STEP]
+    index = torch.arange(rows, device="cuda")
+    return slots, slots[index // STEP], (index % STEP).int()
+
+
+def distinct(states, width):
+    # Distinct token ids per request, as a dict's keys or an id list are.
+    return torch.rand((states, VOCAB), device="cuda").argsort(dim=1)[:, :width].int()
+
+
+def bits(tensor):
+    # Floats compare as bit patterns: NaN equals itself, -0.0 differs from 0.0.
+    if tensor.is_floating_point():
+        width = {2: torch.int16, 4: torch.int32, 8: torch.int64}
+        return tensor.view(width[tensor.element_size()])
+    return tensor
+
+
+def make_logit_bias(rows, variant, size, count):
+    states = rows + 9
+    _, mapping, local = drafted(rows, states)
+    # Absolute positions (int64, as input_batch.positions): 300 tokens into the
+    # output of a 1024-token prompt.
+    positions = (local + 1024 + 300).long()
+    zeros = torch.zeros(states, device="cuda", dtype=torch.int32)
+    num_allowed, num_bias, num_stops, restore = (zeros.clone() for _ in range(4))
+    min_lens = zeros + 1024
+    allowed, bias_ids, stops = (distinct(states, n) for n in (1024, 1024, 128))
+    biases = torch.randn((states, 1024), device="cuda") * 5
+    check = variant == "min_tokens_structured"
+    if variant == "bias":
+        num_bias.fill_(size)
+    elif variant == "allowed":
+        num_allowed.fill_(size)
+    else:
+        # min_tokens=512 keeps every row below the minimum length.
+        num_stops.fill_(size)
+        min_lens += 512
+        restore.fill_(int(check))
+    source = torch.randn((rows, VOCAB), device="cuda")
+    if check:
+        # A grammar at its end leaves only the stop tokens: masking them empties
+        # the row and the kernel restores them. Even rows keep other candidates.
+        ids = stops[mapping, :size].long()
+        kept = source.gather(1, ids)
+        source[local % 2 == 1] = -float("inf")
+        source.scatter_(1, ids, kept)
+    num_allowed, num_bias, min_lens, num_stops, restore = (
+        pinned(t) for t in (num_allowed, num_bias, min_lens, num_stops, restore)
+    )
+    buffers = [source.clone() for _ in range(count)]
+
+    def reset():
+        for logits in buffers:
+            logits.copy_(source)
+
+    def invoke(index, ours):
+        logits = buffers[index]
+        if ours:
+            tilelang_bias.apply_logit_bias(
+                logits,
+                mapping,
+                positions,
+                num_allowed,
+                allowed,
+                num_bias,
+                bias_ids,
+                biases,
+                min_lens,
+                num_stops,
+                restore,
+                stops,
+                check,
+            )
+        else:
+            # BLOCK_SIZE: next_power_of_2 of the widest per-request list.
+            _bias_kernel[(rows,)](
+                logits,
+                logits.stride(0),
+                VOCAB,
+                mapping,
+                num_allowed,
+                allowed,
+                allowed.stride(0),
+                num_bias,
+                bias_ids,
+                bias_ids.stride(0),
+                biases,
+                biases.stride(0),
+                positions,
+                min_lens,
+                num_stops,
+                restore,
+                stops,
+                stops.stride(0),
+                BLOCK_SIZE=1024,
+                LOGITS_BLOCK_SIZE=8192,
+                CHECK_ALL_MASKED_ROWS=check,
+            )
+
+    return reset, invoke, lambda i: (buffers[i],)
+
+
+def make_bad_words(rows, variant, size, count):
+    states = rows + 9
+    _, mapping, local = drafted(rows, states)
+    # Prefixes, history and drafts share a four-token alphabet, so prefixes match
+    # at every length; the banned last tokens are anywhere in the vocabulary.
+    history = torch.randint(50, 54, (states, HISTORY), device="cuda", dtype=torch.int32)
+    inputs = torch.randint(50, 54, (rows,), device="cuda", dtype=torch.int32)
+    # A 1024-token prompt and up to 511 output tokens.
+    prompt = torch.full((states,), 1024, device="cuda", dtype=torch.int32)
+    total = prompt + torch.randint(512, (states,), device="cuda", dtype=torch.int32)
+    # BadWordsState's tables: VLLM_MAX_BAD_WORDS_TOTAL_TOKENS (1024) token slots
+    # and VLLM_MAX_NUM_BAD_WORDS + 1 (129) offsets.
+    ends = (torch.arange(size, device="cuda") % 4 + 1).cumsum(0)
+    words = torch.randint(50, 54, (states, 1024), device="cuda", dtype=torch.int32)
+    words[:, ends - 1] = torch.randint(
+        VOCAB, (states, size), device="cuda", dtype=torch.int32
+    )
+    offsets = torch.zeros((states, 129), device="cuda", dtype=torch.int32)
+    offsets[:, 1 : size + 1] = ends.int()
+    num_words = pinned(torch.full_like(prompt, size))
+    tokens, prompt = pinned(history), pinned(prompt)
+    source = torch.randn((rows, VOCAB), device="cuda")
+    buffers = [source.clone() for _ in range(count)]
+
+    def reset():
+        for logits in buffers:
+            logits.copy_(source)
+
+    def invoke(index, ours):
+        logits = buffers[index]
+        if ours:
+            auxiliary.apply_bad_words(
+                logits,
+                mapping,
+                words,
+                offsets,
+                num_words,
+                tokens,
+                prompt,
+                total,
+                inputs,
+                local,
+                size,
+            )
+        else:
+            _bad_words_kernel[(rows, size)](
+                logits,
+                logits.stride(0),
+                mapping,
+                words,
+                words.stride(0),
+                offsets,
+                offsets.stride(0),
+                num_words,
+                tokens,
+                tokens.stride(0),
+                prompt,
+                total,
+                inputs,
+                local,
+            )
+
+    return reset, invoke, lambda i: (buffers[i],)
+
+
+def make_thinking_markers(rows, variant, size, count):
+    states = rows + 9
+    req_ids = torch.randperm(states, device="cuda")[:rows]
+    history = torch.randint(128000, (states, HISTORY), device="cuda", dtype=torch.int32)
+    budgets = pinned(torch.full((states,), 8192, device="cuda", dtype=torch.int32))
+    start = torch.full((states,), -1, device="cuda", dtype=torch.int32)
+    end = torch.full_like(start, -1)
+    if variant == "decode":
+        # <think> closed a 1024-token prompt and the last scan stopped `size`
+        # tokens ago. Every other request has just closed its reasoning.
+        lengths = 1024 + torch.randint(
+            size, 16384, (states,), device="cuda", dtype=torch.int32
+        )
+        history[:, 1023] = START
+        history[req_ids[::2], (lengths[req_ids[::2]] - 1).long()] = END
+        start.fill_(1023)
+        scanned = lengths - size
+    else:
+        # No cache yet: the kernel scans back from the end until a block holds a
+        # marker. "admit": a `size`-token prompt ends in <think>. "resume":
+        # `size` reasoning tokens follow a <think> ending a 1024-token prompt.
+        if variant == "admit":
+            lengths = torch.full((states,), size, device="cuda", dtype=torch.int32)
+            history[:, size - 1] = START
+        else:
+            lengths = torch.full(
+                (states,), 1024 + size, device="cuda", dtype=torch.int32
+            )
+            history[:, 1023] = START
+        scanned = torch.zeros_like(lengths)
+    tokens = pinned(history)
+    start_ids = torch.tensor([START], device="cuda", dtype=torch.int32)
+    natural_ids = torch.tensor([END], device="cuda", dtype=torch.int32)
+    initial = (start, end, scanned)
+    buffers = [tuple(value.clone() for value in initial) for _ in range(count)]
+
+    def reset():
+        for node in buffers:
+            for buffer, value in zip(node, initial):
+                buffer.copy_(value)
+
+    def invoke(index, ours):
+        start, end, scanned = buffers[index]
+        if ours:
+            # apply_thinking_budget's launch: the natural end is the end marker.
+            tilelang_thinking.marker_cache_kernel(
+                tokens.stride(0), str(req_ids.dtype)[6:], 1, 1
+            )(
+                req_ids,
+                budgets,
+                tokens,
+                lengths,
+                start,
+                end,
+                scanned,
+                start_ids,
+                natural_ids,
+            )
+        else:
+            _update_committed_marker_cache_kernel[(rows,)](
+                req_ids,
+                budgets,
+                tokens,
+                tokens.stride(0),
+                lengths,
+                start,
+                end,
+                scanned,
+                start_ids,
+                natural_ids,
+                START_LEN=1,
+                NATURAL_END_LEN=1,
+                MAX_LEN=1,
+                BLOCK=1024,
+            )
+
+    return reset, invoke, lambda i: buffers[i]
+
+
+def make_thinking_budget(rows, variant, size, count):
+    states = rows + 9
+    slots, mapping, local = drafted(rows, states)
+    history = torch.randint(128000, (states, HISTORY), device="cuda", dtype=torch.int32)
+    # Reasoning opened at the end of a 1024-token prompt (the marker cache holds
+    # it) and has run 2048-8191 tokens.
+    lengths = 1024 + torch.randint(
+        2048, 8192, (states,), device="cuda", dtype=torch.int32
+    )
+    start = torch.full((states,), 1023, device="cuda", dtype=torch.int32)
+    end = torch.full_like(start, -1)
+    # Every other request has used up a 1024-token budget; the rest have room.
+    budgets = torch.full((states,), 1 << 20, device="cuda", dtype=torch.int32)
+    budgets[slots[::2]] = 1024
+    budgets = pinned(budgets)
+    end_ids = torch.randint(128000, (size,), device="cuda", dtype=torch.int32)
+    end_ids[-1] = END
+    # The drafts continue the end phrase, so each row resumes it after a prefix.
+    inputs = torch.randint(128000, (rows,), device="cuda", dtype=torch.int32)
+    phrase = (local > 0) & (local < size)
+    inputs[phrase] = end_ids[(local[phrase] - 1).long()]
+    tokens = pinned(history)
+    start_ids = torch.tensor([START], device="cuda", dtype=torch.int32)
+    natural_ids = torch.tensor([END], device="cuda", dtype=torch.int32)
+    source = torch.randn((rows, VOCAB), device="cuda")
+    buffers = [source.clone() for _ in range(count)]
+
+    def reset():
+        for logits in buffers:
+            logits.copy_(source)
+
+    def invoke(index, ours):
+        logits = buffers[index]
+        if ours:
+            # apply_thinking_budget's launch.
+            tilelang_thinking.thinking_kernel(
+                logits.stride(0), tokens.stride(0), str(mapping.dtype)[6:], 1, 1, size
+            )(
+                logits,
+                mapping,
+                budgets,
+                tokens,
+                lengths,
+                inputs,
+                local,
+                start,
+                end,
+                start_ids,
+                natural_ids,
+                end_ids,
+            )
+        else:
+            _thinking_budget_kernel[(rows,)](
+                logits,
+                logits.stride(0),
+                mapping,
+                budgets,
+                tokens,
+                tokens.stride(0),
+                lengths,
+                inputs,
+                local,
+                start,
+                end,
+                start_ids,
+                natural_ids,
+                end_ids,
+                START_LEN=1,
+                NATURAL_END_LEN=1,
+                END_LEN=size,
+            )
+
+    return reset, invoke, lambda i: (buffers[i],)
+
+
+def make_prompt_ids(rows, variant, size, count):
+    states = rows + 9
+    mapping = torch.randperm(states, device="cuda")[:rows]
+    starts = (torch.arange(rows + 1, device="cuda") * size).int()
+    # Chunks start anywhere in a prompt; the kernel reads up to `size` past it.
+    computed = torch.randint(
+        HISTORY - size, (states,), device="cuda", dtype=torch.int32
+    )
+    tokens = pinned(
+        torch.randint(VOCAB, (states, HISTORY), device="cuda", dtype=torch.int32)
+    )
+    buffers = [
+        torch.empty(rows * size, device="cuda", dtype=torch.int64) for _ in range(count)
+    ]
+
+    def reset():
+        for output in buffers:
+            output.fill_(-7)
+
+    def invoke(index, ours):
+        output = buffers[index]
+        if ours:
+            auxiliary.prompt_token_ids(output, starts, mapping, computed, tokens)
+        else:
+            _prompt_logprobs_token_ids_kernel[(rows,)](
+                output,
+                starts,
+                mapping,
+                computed,
+                tokens,
+                tokens.stride(0),
+                BLOCK_SIZE=1024,
+            )
+
+    return reset, invoke, lambda i: (buffers[i],)
+
+
+def make_logprob_ids(rows, variant, size, count):
+    states = rows + 9
+    mapping = torch.randperm(states, device="cuda")[:rows]
+    num_custom = torch.zeros(states, device="cuda", dtype=torch.int32)
+    num_custom[mapping[::2]] = 4
+    num_custom = pinned(num_custom)
+    # LogprobTokenIdsState's table: MAX_LOGPROB_TOKEN_IDS (128) slots.
+    custom = torch.randint(VOCAB, (states, 128), device="cuda", dtype=torch.int32)
+    sampled = torch.randint(VOCAB, (rows,), device="cuda", dtype=torch.int64)
+    # torch.topk indices as int32; without top-k, compute_topk_scores passes the
+    # custom-id table as an unread pointer.
+    top_ids = (
+        torch.randint(VOCAB, (rows, size), device="cuda", dtype=torch.int32)
+        if size
+        else custom
+    )
+    cols = max(size, 4)
+    buffers = [
+        (
+            torch.zeros((rows, 1 + cols), device="cuda", dtype=torch.int64),
+            torch.zeros((rows, 1 + cols), device="cuda", dtype=torch.bool),
+        )
+        for _ in range(count)
+    ]
+
+    def reset():
+        for output, valid in buffers:
+            output.zero_()
+            valid.zero_()
+
+    def invoke(index, ours):
+        output, valid = buffers[index]
+        if ours:
+            auxiliary.fill_token_ids(
+                output, valid, sampled, top_ids, mapping, num_custom, custom, size
+            )
+        else:
+            _fill_logprob_token_ids_kernel[(rows,)](
+                output,
+                output.stride(0),
+                valid,
+                valid.stride(0),
+                sampled,
+                top_ids,
+                top_ids.stride(0),
+                mapping,
+                num_custom,
+                custom,
+                custom.stride(0),
+                NUM_TOPK=size,
+                PADDED_COLS=1 << (cols - 1).bit_length(),
+            )
+
+    return reset, invoke, lambda i: buffers[i]
+
+
+def make_nan_count(rows, variant, size, count):
+    logits = torch.randn((rows, size), device="cuda", dtype=getattr(torch, variant))
+    # Raw logits rarely hold NaNs; a few per row give counts worth comparing and
+    # change neither kernel's work.
+    where = torch.randint(rows * size, (rows * 64,), device="cuda")
+    logits.view(-1)[where] = float("nan")
+    buffers = [
+        torch.empty(rows, device="cuda", dtype=torch.int32) for _ in range(count)
+    ]
+
+    def reset():
+        for output in buffers:
+            output.fill_(-1)
+
+    def invoke(index, ours):
+        # count_nans' and get_num_nans' launches, into a preallocated output.
+        output = buffers[index]
+        if ours:
+            auxiliary.nan_count_kernel(size, logits.stride(0), variant)(logits, output)
+        else:
+            _num_nans_kernel[(rows,)](
+                logits, logits.stride(0), output, size, BLOCK_SIZE=8192
+            )
+
+    return reset, invoke, lambda i: (buffers[i],)
+
+
+MAKERS = {
+    "logit_bias": make_logit_bias,
+    "bad_words": make_bad_words,
+    "thinking_markers": make_thinking_markers,
+    "thinking_budget": make_thinking_budget,
+    "prompt_ids": make_prompt_ids,
+    "logprob_ids": make_logprob_ids,
+    "nan_count": make_nan_count,
+}
+
+
+def make_case(kind, rows, variant, size, seed, count):
+    torch.manual_seed(seed)
+    return MAKERS[kind](rows, variant, size, count)
+
+
+def capture(invoke, ours, count):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        invoke(0, ours)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for index in range(count):
+            invoke(index, ours)
+    return graph
+
+
+def elapsed(graph, reset, count):
+    reset()
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    begin.record()
+    graph.replay()
+    end.record()
+    end.synchronize()
+    return begin.elapsed_time(end) * 1000 / count
+
+
+def measure(kind, rows, variant, size, seed):
+    count = 8
+    name = f"{kind} rows={rows} {variant}={size}"
+    ours, theirs = [], []
+    for sample in range(8):
+        reset, invoke, output = make_case(
+            kind, rows, variant, size, seed + sample, count
+        )
+        reset()
+        initial = [value.clone() for value in output(0)]
+        invoke(0, False)
+        expected = [value.clone() for value in output(0)]
+        # A case both kernels leave untouched would time an early exit.
+        if all(torch.equal(bits(a), bits(b)) for a, b in zip(expected, initial)):
+            raise RuntimeError(f"Triton wrote nothing: {name}")
+        reset()
+        invoke(0, True)
+        if any(not torch.equal(bits(a), bits(b)) for a, b in zip(output(0), expected)):
+            for actual, target in zip(output(0), expected):
+                indices = (bits(actual) != bits(target)).nonzero()[:8]
+                print(
+                    json.dumps(
+                        {
+                            "sample": sample,
+                            "differences": [
+                                [
+                                    index.tolist(),
+                                    actual[tuple(index)].item(),
+                                    target[tuple(index)].item(),
+                                ]
+                                for index in indices
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
+            raise RuntimeError(f"outputs differ: {name}")
+        reset()
+        a = capture(invoke, True, count)
+        reset()
+        b = capture(invoke, False, count)
+        order = (a, b) if sample % 2 == 0 else (b, a)
+        times = {id(graph): elapsed(graph, reset, count) for graph in order}
+        ours.append(times[id(a)])
+        theirs.append(times[id(b)])
+        del a, b, order, reset, invoke, output, initial, expected
+    paired = [a - b for a, b in zip(ours, theirs)]
+    mean = statistics.fmean(paired)
+    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
+    result = dict(
+        kernel=kind,
+        rows=rows,
+        variant=variant,
+        size=size,
+        tilelang_us=statistics.median(ours),
+        triton_us=statistics.median(theirs),
+        interval_us=[mean - half, mean + half],
+        slower=mean - half > 0,
+        tilelang_samples_us=ours,
+        triton_samples_us=theirs,
+    )
+    print(json.dumps(result), flush=True)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gate", action="store_true")
+    parser.add_argument("--seed", type=int, default=48291)
+    parser.add_argument(
+        "--kernels",
+        default=",".join(SHAPES),
+        help="comma-separated subset of " + ",".join(SHAPES),
+    )
+    args = parser.parse_args()
+    kinds = args.kernels.split(",")
+    unknown = [kind for kind in kinds if kind not in SHAPES]
+    if unknown:
+        parser.error(f"unknown kernels: {','.join(unknown)}")
+    results = [
+        measure(kind, rows, variant, size, args.seed)
+        for kind in kinds
+        for rows, variant, size in SHAPES[kind]
+    ]
+    failed = [
+        (r["kernel"], r["rows"], r["variant"], r["size"])
+        for r in results
+        if r["slower"]
+    ]
+    print(json.dumps({"summary": "sampling auxiliary", "slower": failed}), flush=True)
+    if args.gate and failed:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

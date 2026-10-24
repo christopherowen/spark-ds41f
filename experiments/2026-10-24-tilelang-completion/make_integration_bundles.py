@@ -70,6 +70,8 @@ PARTS = {
                 "tests/v1/worker/test_gpu_logit_bias.py"], 3600),
             ("sampling-controls benchmark",
              ["benchmarks/kernels/benchmark_sampling_controls.py", "--gate"], 1800),
+            ("sampling-controls auxiliary benchmark",
+             ["benchmarks/kernels/benchmark_sampling_auxiliary.py", "--gate"], 1800),
         ],
     ),
     "mhc": (

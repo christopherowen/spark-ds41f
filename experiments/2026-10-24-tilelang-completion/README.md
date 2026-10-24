@@ -912,3 +912,43 @@ Eight distinct prompts, three samples an arm, no bench:
   - They are now predicated loads (`_LOAD_IF`) on the draft count, which arrives in that
     same first round. Decode keeps its single round, and the prefill chunk issues none.
   - The production kernel is timed with and without dead rows.
+
+### Min-p tile form, round 1 (2026-10-24 20:46 CET)
+
+Every variant is bit-exact against Triton: the threshold-boundary seeds and the non-finite
+rows.
+
+| Rows | Triton (µs) | Ours, best shape (µs) | Change |
+| --- | --- | --- | --- |
+| 1 | 67 | 18-20 | -70 to -74% |
+| 16 | 112 | 59-60 | -47% |
+| 96 | 517-523 | 523-527 | +0.2 to +1.5% |
+
+- At 1 and 16 rows, Triton's maximum pass reduces across the whole block on every tile, two
+  barriers each time; ours reduces once.
+- At 96 rows the vector tiles are level at 4096 columns: +0.21% at 256 threads, +0.32% at
+  128. Every other vector shape is +0.8 to +1.5%.
+- Scalars (`run` 1) are +2 to +8% at 96 rows.
+- Both kernels read the 50 MB batch twice. That is more than the L2 holds, so the threshold
+  pass reads it from DRAM again.
+
+**Round 2** (vLLM 80a577a81) takes the threshold pass last tile first. It starts on the
+tiles the maximum's pass read last, the likeliest still in L2. The order of an elementwise
+pass does not change its bits. Shapes: vectors, 128 or 256 threads, 2048 or 4096 columns,
+forward or reversed.
+
+## Eleventh integrated run (run `tilelang-integration-kernels-11`)
+
+vLLM `tilelang-ports` c7ee05a5f:
+- min-p in tile form (above);
+- combine loads a request's drafts only when it has them (742eb9bf5);
+- `benchmark_sampling_auxiliary.py` times the other seven generation-controls candidates
+  against Triton, each first compared bit for bit: logit bias, forbidden sequences, the
+  reasoning-marker cache, the thinking budget, prompt-logprob token ids, custom logprob
+  token ids and the NaN count. The sampling bundle runs it with `--gate`.
+
+[controls_digest.py](controls_digest.py) is the serving workload for switching the
+controls. Each scenario sets one control the default requests never use: penalties at
+temperature 0 and seeded 1, min-p, logit bias, bad words, a thinking budget, prompt logprobs
+and custom logprob ids. It takes digests of the eight prompts alone and eight at once. A
+build with the controls switched must print candidate 4's digests.

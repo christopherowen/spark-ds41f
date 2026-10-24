@@ -6,7 +6,8 @@ its own bound check, so ptxas issued a tile's loads in small groups between bran
 96 rows it was 8% slower than Triton. The tile-form kernel loads a whole tile before using
 it (as 16-byte vectors when the rows are aligned) and handles only the last, partial tile
 with clamped loads and predicated stores. This sweeps its run (4: vectors, 1: scalars),
-threads a block and tile width. Every variant is first compared with Triton bit for bit:
+threads a block and tile width, and (round 2) the threshold pass's order: forward, or
+last tile first, so it starts on the tiles the maximum's pass read last. Every variant is first compared with Triton bit for bit:
 the threshold-boundary seeds 48291-48298 at 96 rows, and rows of -inf, NaN and +inf. Then
 it is timed against Triton at 1, 16 and 96 rows of 129280 columns: eight samples, each a
 CUDA graph of eight calls on their own fresh logits, replayed as a pair whose order
@@ -24,23 +25,24 @@ from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
 VOCAB = 129280
 CALLS = 8
 SAMPLES = 8
+# Round 2: the threshold pass forward or last tile first (``reverse``), at the shapes
+# round 1 found level at 96 rows; scalars once, for exactness.
 VARIANTS = [
-    (run, threads, tile)
-    for run in (4, 1)
+    (4, threads, tile, reverse)
     for threads in (128, 256)
-    for tile in (1024, 2048, 4096)
-    if tile % (threads * run) == 0
-]
+    for tile in (2048, 4096)
+    for reverse in (False, True)
+] + [(1, 256, 4096, True)]
 
 
 def ours(variant):
-    run, threads, tile = variant
+    run, threads, tile, reverse = variant
 
     def apply(logits, mapping, thresholds):
         assert run == 1 or candidate._min_p_run(logits) == 4
         kernel = candidate.min_p_kernel(
             logits.shape[1], logits.stride(0), candidate._DTYPES[mapping.dtype],
-            run, threads, tile)
+            run, threads, tile, reverse)
         kernel(logits, mapping, thresholds)
 
     return apply
@@ -140,7 +142,8 @@ def measure(variant, rows):
     paired = [x - y for x, y in zip(mine, theirs)]
     mean = statistics.fmean(paired)
     half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
-    return dict(run=variant[0], threads=variant[1], tile=variant[2], rows=rows,
+    return dict(run=variant[0], threads=variant[1], tile=variant[2], reverse=variant[3],
+                rows=rows,
                 tilelang_us=round(statistics.median(mine), 2),
                 triton_us=round(statistics.median(theirs), 2),
                 change_pct=round(100 * mean / statistics.fmean(theirs), 2),
@@ -162,7 +165,8 @@ def main():
             results.append(result)
             print(json.dumps(result), flush=True)
     passing = [v for v in VARIANTS if v not in inexact and not any(
-        r["slower"] for r in results if (r["run"], r["threads"], r["tile"]) == v)]
+        r["slower"] for r in results
+        if (r["run"], r["threads"], r["tile"], r["reverse"]) == v)]
     print(json.dumps({"summary": "min-p variants", "inexact": inexact,
                       "never_slower": passing}), flush=True)
 
