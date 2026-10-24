@@ -6,7 +6,9 @@ usage: tables_arms.py RUN LABEL [LABEL...]
 
 The ports arm passes when its temperature-0 references (the eight prompts alone and the
 long prompt) and its seeded temperature-1 reference have the same SHA-256 digests as
-the previous candidate's, and each arm is identical within itself.
+the previous candidate's, and each arm is identical within itself. With
+controls_digest.py's records, each generation-control scenario's digests (alone and
+eight at once) are compared with the first arm's too.
 """
 import json
 import sys
@@ -36,9 +38,11 @@ def main(argv: list[str]) -> int:
         sampled = summary(run, "sampled", label)
         c1 = summary(run, "c1-distinct", label)
         c8 = summary(run, "c8-distinct", label)
+        controls = summary(run, "controls", label)
         digests[label] = (
             greedy and (greedy["reference_sha256"], greedy["long_sha256"]),
             sampled and sampled["reference_sha256"],
+            controls and controls["digests"],
         )
         print(f"{label}:")
         print(f"  temperature 0: identical {greedy and greedy['identical']}, "
@@ -54,6 +58,10 @@ def main(argv: list[str]) -> int:
         print(f"{label} against {labels[0]}: temperature-0 digests "
               f"{'equal' if same_greedy else 'DIFFER'}, seeded temperature-1 digest "
               f"{'equal' if same_sampled else 'DIFFER'}")
+        if digests[label][2] is not None and first[2] is not None:
+            differ = sorted(k for k in first[2] if digests[label][2].get(k) != first[2][k])
+            print(f"  controls: {len(first[2]) - len(differ)}/{len(first[2])} equal"
+                  + (f", DIFFER: {', '.join(differ)}" if differ else ""))
     return 0
 
 

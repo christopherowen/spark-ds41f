@@ -5,7 +5,12 @@
 import torch
 
 from vllm.tilelang_utils import T, tilelang
-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+from vllm.v1.worker.gpu.sample.tilelang_controls import (
+    _DTYPES,
+    _HEADER,
+    _PASS,
+    _declare,
+)
 
 
 def register_bad_words(
@@ -149,11 +154,20 @@ def apply_bad_words(
         )
 
 
+_PROMPT_THREADS = 128
+_PROMPT_PER_THREAD = 32  # 4096 tokens a pass: a 16K chunk in four
+
+
 @tilelang.jit(pass_configs=_PASS)
 def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
+    """A block a request: the token after each of its chunk's positions. Each pass
+    issues all of its loads before its stores (both predicated on the chunk's
+    length), so a long chunk waits on memory once a pass, not once a thread's
+    element."""
     rows, output_len, states, token_cols = T.dynamic(
         "rows, output_len, states, token_cols"
     )
+    tile = _PROMPT_THREADS * _PROMPT_PER_THREAD
 
     @T.prim_func
     def prompt_ids(
@@ -163,17 +177,33 @@ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
         computed: T.Tensor((states,), "int32"),
         tokens: T.StridedTensor((states, token_cols), (tokens_stride, 1), "int32"),
     ):
-        with T.Kernel(rows, threads=128) as row:
-            req = mapping[row]
-            start = query_starts[row]
-            length = query_starts[row + 1] - start
-            for block in T.serial(T.ceildiv(length, 1024)):
-                for i in T.Parallel(1024):
-                    pos = block * 1024 + i
-                    if pos < length:
-                        output[start + pos] = T.cast(
-                            tokens[req, computed[req] + 1 + pos], "int64"
-                        )
+        with T.Kernel(rows, threads=_PROMPT_THREADS) as row:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            req = T.alloc_var(T.int64, init=T.cast(mapping[row], "int64"))
+            start = T.alloc_var(T.int32, init=query_starts[row])
+            length = T.alloc_var(T.int32, init=query_starts[row + 1] - start)
+            first = T.alloc_var(T.int32, init=computed[req] + 1)
+            values = T.alloc_local((_PROMPT_PER_THREAD,), "int32")
+            for block in T.serial(T.ceildiv(length, tile)):
+                for k in T.unroll(_PROMPT_PER_THREAD):
+                    pos = block * tile + k * _PROMPT_THREADS + tx
+                    values[k] = T.call_extern(
+                        "int32",
+                        "vllm_control_load_if_b32",
+                        T.address_of(tokens[req, first + pos]),
+                        0,
+                        pos < length,
+                    )
+                for k in T.unroll(_PROMPT_PER_THREAD):
+                    pos = block * tile + k * _PROMPT_THREADS + tx
+                    T.call_extern(
+                        "handle",
+                        "vllm_control_store_if_b64",
+                        T.address_of(output[start + pos]),
+                        T.cast(values[k], "int64"),
+                        pos < length,
+                    )
 
     return prompt_ids
 

@@ -389,3 +389,82 @@ def test_bias_preserves_allowed_logits_and_applies_bias_before_stop_mask(
         restore,
     )
     assert_bits(logits, expected)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("vocab", [128, 8193, 129280])
+def test_bias_restores_stops_when_only_nan_or_masked_logits_remain(index_dtype, vocab):
+    """The all-masked check ignores NaN, as Triton's maximum does: a row whose only
+    logit left after the stop mask is NaN restores its stop tokens."""
+    from vllm.v1.worker.gpu.sample import tilelang_bias
+    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
+
+    torch.manual_seed(52031)
+    states, rows, width = 9, 5, 8
+    logits = torch.randn((rows, vocab), device="cuda")
+    mapping = torch.tensor([3, 0, 6, 1, 8], device="cuda", dtype=index_dtype)
+    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    # Row 0 allows only its stop tokens; rows 1-4 also allow token 3, which is NaN
+    # in row 1, finite in row 2, and -inf in rows 3 and 4. Row 3's stop logits are
+    # NaN, +inf and finite; row 4's are all -inf.
+    num_allowed = torch.zeros(states, device="cuda", dtype=torch.int32)
+    num_allowed[mapping] = torch.tensor([3, 4, 4, 4, 4], device="cuda").int()
+    allowed = torch.arange(width, device="cuda", dtype=torch.int32).repeat(states, 1)
+    logits[1, 3] = float("nan")
+    logits[3:, 3] = -float("inf")
+    logits[3, 0] = float("nan")
+    logits[3, 1] = float("inf")
+    logits[4, :3] = -float("inf")
+    num_bias = torch.zeros_like(num_allowed)
+    bias_ids = allowed.clone()
+    biases = torch.zeros((states, width), device="cuda")
+    min_lens = torch.full_like(num_allowed, 5)
+    num_stops = torch.full_like(num_allowed, 3)
+    restore_rows = torch.ones_like(num_allowed)
+    stops = torch.zeros((states, width), device="cuda", dtype=torch.int32)
+    stops[:, :3] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    expected = logits.clone()
+    _bias_kernel[(rows,)](
+        expected,
+        expected.stride(0),
+        vocab,
+        mapping,
+        num_allowed,
+        allowed,
+        allowed.stride(0),
+        num_bias,
+        bias_ids,
+        bias_ids.stride(0),
+        biases,
+        biases.stride(0),
+        positions,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        stops.stride(0),
+        BLOCK_SIZE=width,
+        LOGITS_BLOCK_SIZE=8192,
+        CHECK_ALL_MASKED_ROWS=True,
+    )
+    tilelang_bias.apply_logit_bias(
+        logits,
+        mapping,
+        positions,
+        num_allowed,
+        allowed,
+        num_bias,
+        bias_ids,
+        biases,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        True,
+    )
+    assert_bits(logits, expected)
+    # Rows 0 and 1 restored their stop tokens; row 2 kept them masked.
+    assert (
+        torch.isfinite(expected[0, :3]).all() and torch.isfinite(expected[1, :3]).all()
+    )
+    assert (expected[2, :3] == -float("inf")).all()

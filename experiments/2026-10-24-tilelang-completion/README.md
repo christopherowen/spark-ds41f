@@ -975,3 +975,67 @@ Round 5 stopped at the bench's guard that the variants compile with production's
 configs. Production has turned TileLang's bind replay off since vLLM 0441ba1be, and
 runner_variants.py had not. With the configs aligned, it runs again as
 `tilelang-runner-round5b`.
+
+### Eleventh integrated run (2026-10-24 21:18 CET)
+
+**Tests:** every test passes in every bundle, the controls' 141 included. The verdicts read
+FAIL only because two gates flagged kernels (below), and because the min-p sweep's bundle
+uses the "exit" verdict for a script without a pytest summary.
+
+**Min-p, round 2.** Every variant is bit-exact against Triton. Taking the threshold pass last
+tile first:
+
+| Shape | 96 rows (µs) | Triton (µs) | Change |
+| --- | --- | --- | --- |
+| 256 threads, 2048 columns | 452.4 | 517.4 | -13.5% |
+| 128 threads, 4096 columns | 454.6 | 516.7 | -12.2% |
+| 256 threads, 4096 columns | 460.4 | 521.7 | -12.0% |
+
+- Forward-order variants of the same shapes are -0.2 to +1.3%.
+- Even scalars, reversed, are -9.4%.
+- At 1 and 16 rows it stays -46 to -74%.
+- Production takes 256 threads and 2048 columns, always reversed (vLLM c7840d48b). The
+  controls gate times it at -74% / -44% / -15% at 1 / 16 / 96 rows.
+
+**The other seven generation controls** (`benchmark_sampling_auxiliary.py`, each case
+first compared with Triton bit for bit):
+- **Level or faster everywhere:**
+  - forbidden sequences: -2 to -77%, the most at 128 words and 96 rows;
+  - the reasoning-marker cache: up to -49% when it resumes a 16K reasoning span;
+  - the thinking budget: -35 to -39% with a 16-token end phrase;
+  - custom logprob ids: level;
+  - the NaN count: -8 to -47%, level for FP32 at 96 rows.
+- **Slower:**
+  - Prompt-logprob ids at a 16K chunk: 22.5 against 10.3 µs. Each 1024-token block waited
+    on its own branchy loads.
+  - Logit bias at 96 rows, with 300 biases and with min_tokens under structured output:
+    +2.8%.
+
+Both slow kernels are now in tile form (vLLM 5845b392f):
+- Each list's ids and values are loaded, predicated on its length, before the gathered
+  logits, and those before any store.
+- The prompt ids take 4096 tokens a pass.
+- **Bias NaN fix:** the bias kernel's all-masked check now ignores NaN, as Triton's
+  maximum does. #524's kernel counted a NaN logit as alive, so a row whose only unmasked
+  logit is NaN did not get its stop tokens back. A new test pins this against Triton.
+
+**Dispatch.** The generation controls now dispatch to TileLang:
+- the penalties and the histogram (987ef4337; the callers still clear the selected rows);
+- everything else (3bb713c4f).
+
+The Triton kernels stay as the tests' references. The thinking budget and the NaN count
+are now declared at startup; the NaN count only when NaN counting is on.
+
+## Twelfth integrated run (run `tilelang-integration-kernels-12`)
+
+vLLM `tilelang-ports` 3bb713c4f, with the controls dispatched. The sampling bundle also
+runs the bad-words and rejection-sampler tests, which exercise the switched states. If it
+passes, [serving-ports-2.json](serving-ports-2.json) serves the branch beside candidate 4,
+in alternating arms with eight eight-stream samples each. It checks:
+- temperature 0 and seeded temperature 1;
+- the controls' digests ([controls_digest.py](controls_digest.py),
+  [tables_arms.py](tables_arms.py)).
+
+**The next fusion target.** At eight streams the step still launches about 220 PyTorch
+kernels: copies, top-k, sorts and scans, 0.4-0.45 ms a step. There is no Triton kernel
+left on the temperature-0 path.

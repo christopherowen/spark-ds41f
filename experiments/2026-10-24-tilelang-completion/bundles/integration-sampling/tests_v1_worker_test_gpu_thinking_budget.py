@@ -24,15 +24,76 @@ END_B = 93
 VOCAB_SIZE = 128
 
 
+def triton_apply_thinking_budget(
+    logits,
+    req_ids,
+    expanded_idx_mapping,
+    thinking_token_budget,
+    all_token_ids,
+    total_len,
+    input_ids,
+    expanded_local_pos,
+    cached_last_start,
+    cached_last_end,
+    cached_scan_pos,
+    reasoning_start_token_ids,
+    natural_reasoning_end_token_ids,
+    reasoning_end_token_ids,
+):
+    """The Triton kernels the TileLang ones replaced, launched as the sampler did."""
+    from vllm.v1.worker.gpu.sample.thinking_budget import (
+        _COLD_SCAN_BLOCK,
+        _thinking_budget_kernel,
+        _update_committed_marker_cache_kernel,
+    )
+
+    start_len = reasoning_start_token_ids.shape[0]
+    natural_end_len = natural_reasoning_end_token_ids.shape[0]
+    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
+        req_ids,
+        thinking_token_budget,
+        all_token_ids,
+        all_token_ids.stride(0),
+        total_len,
+        cached_last_start,
+        cached_last_end,
+        cached_scan_pos,
+        reasoning_start_token_ids,
+        natural_reasoning_end_token_ids,
+        START_LEN=start_len,
+        NATURAL_END_LEN=natural_end_len,
+        MAX_LEN=max(start_len, natural_end_len),
+        BLOCK=_COLD_SCAN_BLOCK,
+    )
+    _thinking_budget_kernel[(logits.shape[0],)](
+        logits,
+        logits.stride(0),
+        expanded_idx_mapping,
+        thinking_token_budget,
+        all_token_ids,
+        all_token_ids.stride(0),
+        total_len,
+        input_ids,
+        expanded_local_pos,
+        cached_last_start,
+        cached_last_end,
+        reasoning_start_token_ids,
+        natural_reasoning_end_token_ids,
+        reasoning_end_token_ids,
+        START_LEN=start_len,
+        NATURAL_END_LEN=natural_end_len,
+        END_LEN=reasoning_end_token_ids.shape[0],
+    )
+
+
 @pytest.fixture(params=["triton", "tilelang"], autouse=True)
 def thinking_implementation(request, monkeypatch):
-    if request.param == "tilelang":
-        from vllm.v1.worker.gpu.sample import thinking_budget, tilelang_thinking
+    # The sampler launches the TileLang kernels; the Triton ones are the reference.
+    if request.param == "triton":
+        from vllm.v1.worker.gpu.sample import thinking_budget
 
         monkeypatch.setattr(
-            thinking_budget,
-            "apply_thinking_budget",
-            tilelang_thinking.apply_thinking_budget,
+            thinking_budget, "apply_thinking_budget", triton_apply_thinking_budget
         )
 
 

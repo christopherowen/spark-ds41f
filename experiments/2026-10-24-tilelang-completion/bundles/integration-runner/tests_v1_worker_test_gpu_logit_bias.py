@@ -26,14 +26,64 @@ MIN_TOKENS = 10
 POS = 5
 
 
+def triton_apply_logit_bias(
+    logits,
+    expanded_idx_mapping,
+    pos,
+    num_allowed_token_ids,
+    allowed_token_ids,
+    num_logit_bias,
+    logit_bias_token_ids,
+    logit_bias,
+    min_lens,
+    num_stop_token_ids,
+    restore_when_all_masked,
+    stop_token_ids,
+    check_all_masked_rows=False,
+):
+    """The Triton kernel the TileLang one replaced, launched as the sampler did."""
+    import triton
+
+    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
+
+    _bias_kernel[(logits.shape[0],)](
+        logits,
+        logits.stride(0),
+        logits.shape[1],
+        expanded_idx_mapping,
+        num_allowed_token_ids,
+        allowed_token_ids,
+        allowed_token_ids.stride(0),
+        num_logit_bias,
+        logit_bias_token_ids,
+        logit_bias_token_ids.stride(0),
+        logit_bias,
+        logit_bias.stride(0),
+        pos,
+        min_lens,
+        num_stop_token_ids,
+        restore_when_all_masked,
+        stop_token_ids,
+        stop_token_ids.stride(0),
+        BLOCK_SIZE=triton.next_power_of_2(
+            max(
+                allowed_token_ids.shape[-1],
+                logit_bias_token_ids.shape[-1],
+                stop_token_ids.shape[-1],
+            )
+        ),
+        LOGITS_BLOCK_SIZE=8192,
+        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
+    )
+
+
 @pytest.fixture(params=["triton", "tilelang"], autouse=True)
 def bias_implementation(request, monkeypatch):
-    if request.param == "tilelang":
-        from vllm.v1.worker.gpu.sample import logit_bias, tilelang_bias
+    # The sampler launches the TileLang kernel; the Triton one is the reference.
+    if request.param == "triton":
+        from vllm.v1.worker.gpu.sample import logit_bias
 
-        monkeypatch.setattr(
-            logit_bias, "apply_logit_bias", tilelang_bias.apply_logit_bias
-        )
+        monkeypatch.setattr(logit_bias, "apply_logit_bias", triton_apply_logit_bias)
 
 
 def _params(structured: bool) -> SamplingParams:

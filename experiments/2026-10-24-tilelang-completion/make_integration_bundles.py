@@ -61,13 +61,16 @@ PARTS = {
                 "tests/v1/worker/test_prepare_kernels.py"], 5400),
             ("sampling benchmark", ["benchmarks/kernels/benchmark_tilelang_sampling.py",
                                     "--gate"], 3600),
-            # The generation controls' TileLang candidates (not yet dispatched):
-            # experiments/2026-10-24-sampling-controls.
+            # The generation controls' TileLang kernels (dispatched since vLLM
+            # 987ef4337 and 3bb713c4f): experiments/2026-10-24-sampling-controls.
             ("sampling-controls tests", PYTEST + [
                 "--basetemp", "/c/pytest-integration-controls",
                 "tests/v1/worker/test_gpu_sampling_controls.py",
                 "tests/v1/worker/test_gpu_thinking_budget.py",
-                "tests/v1/worker/test_gpu_logit_bias.py"], 3600),
+                "tests/v1/worker/test_gpu_logit_bias.py",
+                "tests/v1/worker/test_gpu_bad_words.py",
+                "tests/v1/worker/test_gpu_rejection_sampler_chunking.py",
+                "tests/v1/worker/test_gpu_rejection_sampler_i64.py"], 3600),
             ("sampling-controls benchmark",
              ["benchmarks/kernels/benchmark_sampling_controls.py", "--gate"], 1800),
             ("sampling-controls auxiliary benchmark",

@@ -16,6 +16,7 @@ from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
@@ -180,7 +181,7 @@ def compute_topk_scores(
     else:
         # Some requests specified logprob_token_ids. Build the [batch_size,
         # 1 + max_cols] token_ids matrix and validity mask on the GPU via a
-        # single triton kernel, overriding the topk columns with per-request
+        # single kernel, overriding the topk columns with per-request
         # tokens where applicable.
         assert logprob_token_ids_state is not None
         assert expanded_idx_mapping is not None
@@ -195,20 +196,15 @@ def compute_topk_scores(
         num_cols = max(num_logprobs, max_per_req_token_ids)
         logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
         valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
-        _fill_logprob_token_ids_kernel[(batch_size,)](
+        tilelang_auxiliary.fill_token_ids(
             logprob_token_ids,
-            logprob_token_ids.stride(0),
             valid_mask,
-            valid_mask.stride(0),
             sampled_token_ids,
             topk_token_ids,
-            topk_token_ids.stride(0),
             expanded_idx_mapping,
             logprob_token_ids_state.num_token_ids.gpu,
             logprob_token_ids_state.token_ids.gpu,
-            logprob_token_ids_state.token_ids.gpu.stride(0),
-            NUM_TOPK=num_logprobs,
-            PADDED_COLS=triton.next_power_of_2(num_cols),
+            num_logprobs,
         )
         if logits_mode:
             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
@@ -230,6 +226,8 @@ def compute_topk_scores(
     )
 
 
+# The reference the TileLang fill (``tilelang_auxiliary.fill_ids_kernel``) is tested
+# against; the sampler no longer launches it.
 @triton.jit
 def _fill_logprob_token_ids_kernel(
     # [batch_size, 1 + num_cols]
@@ -310,6 +308,7 @@ class LogprobTokenIdsState:
 
     def register_warmups(self) -> None:
         self.token_ids.register_warmup()
+        tilelang_auxiliary.register_fill_ids()
 
     def max_num_token_ids(self, idx_mapping_np: np.ndarray) -> int:
         return int(self.num_token_ids.np[idx_mapping_np].max(initial=0))
