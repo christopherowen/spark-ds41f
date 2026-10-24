@@ -14,6 +14,7 @@ Each production kernel is also compiled with TileLang's IfStmtBinding replay of 
 off (``tl.if_stmt_binding_inline_replayable_binds``), which re-issues loads after each store
 and branch. One JSON line per variant and shape.
 """
+import contextlib
 import json
 import math
 import statistics
@@ -99,8 +100,10 @@ def kernel_times(function, calls: int = 50) -> dict:
 
 
 BINDS_OFF = {"tl.if_stmt_binding_inline_replayable_binds": False}
-# Not a pass config: the kernel's read-only buffers loaded by ordinary loads (plain_loads).
+# Not pass configs: the kernel's read-only buffers loaded by ordinary loads
+# (plain_loads), and its combines traced as selects (sampling_tile.branchless).
 PLAIN = {"plain": True}
+BRANCHLESS = {"branchless": True}
 _COMPILED: dict = {}
 
 
@@ -113,8 +116,10 @@ def build(factory, *key, extra=None):
     if slot not in _COMPILED:
         configs = dict(extra)
         plain = configs.pop("plain", False)
+        selects = configs.pop("branchless", False)
         config = {getattr(k, "value", k): v for k, v in tls._PASS.items()}
-        prim = factory.get_tir(*key)
+        with sampling_tile.branchless() if selects else contextlib.nullcontext():
+            prim = factory.get_tir(*key)
         if plain:
             prim = plain_loads.plain(prim)
         _COMPILED[slot] = tilelang.compile(prim, pass_configs={**config, **configs})
@@ -128,10 +133,11 @@ def generator(seed: int) -> torch.Generator:
 # --- Greedy reductions --------------------------------------------------------
 
 
-def run_partial(base, bias, values, indices, threads, extra=None, tile=False):
+def run_partial(base, bias, values, indices, threads, extra=None, tile=False, tree=False):
     vector = tls._vector_rows(base) if bias is None else tls._vector_rows(base, bias)
     key = tls.partial_argmax_key(base.dtype, None if bias is None else bias.dtype, vector)
-    factory = sampling_tile.partial_tile_kernel if tile else tls.partial_argmax_kernel
+    factory = (sampling_tile.partial_tree_kernel if tree
+               else sampling_tile.partial_tile_kernel if tile else tls.partial_argmax_kernel)
     build(factory, *key, threads, extra=extra)(
         base, base if bias is None else bias, values.view(-1), indices.view(-1)
     )
@@ -140,7 +146,7 @@ def run_partial(base, bias, values, indices, threads, extra=None, tile=False):
 def run_finish(values, indices, out, rows, parts, out_stride, vocab_start, output, mode,
                extra=None, tile=False):
     if tile:
-        build(sampling_tile.finish_tile_kernel, output, parts)(
+        build(sampling_tile.finish_tile_kernel, output, parts, extra=extra)(
             values.view(-1), indices.view(-1), out, rows, out_stride, vocab_start
         )
         return
@@ -175,7 +181,7 @@ def pair_inputs(rows, biased, sample):
 
 
 def pair_case(rows, biased, threads, mode, extra=None, tile_partial=False,
-              tile_finish=False):
+              tile_finish=False, tree_partial=False):
     parts = triton.cdiv(SHARD, greedy._BLOCK)
 
     def make(sample):
@@ -186,7 +192,7 @@ def pair_case(rows, biased, threads, mode, extra=None, tile_partial=False,
         v2, i2 = torch.empty(shape, device=DEVICE), torch.empty(shape, dtype=torch.int32, device=DEVICE)
 
         def ours():
-            run_partial(base, bias, v1, i1, threads, extra, tile_partial)
+            run_partial(base, bias, v1, i1, threads, extra, tile_partial, tree_partial)
             run_finish(v1, i1, ours_pairs.view(-1), rows, parts, 2, SHARD, "pair", mode, extra,
                        tile_finish)
 
@@ -525,8 +531,63 @@ def round4c() -> None:
                   "triton": kernel_times(lambda: triton_pair(base, bias, SHARD, pairs, v, i))})
 
 
+def round4d() -> None:
+    """Every sampling kernel with its combines as selects (sampling_tile.branchless);
+    the greedy partial argmax reduced as a tree; each against Triton, then the
+    greedy kernels' device times."""
+    cases = {
+        "gumbel bf16 16 tokens": lambda extra: lambda s: gumbel_inputs(16, torch.bfloat16, extra, s),
+        "gumbel bf16 96 tokens": lambda extra: lambda s: gumbel_inputs(96, torch.bfloat16, extra, s),
+        "gumbel f32 16 tokens": lambda extra: lambda s: gumbel_inputs(16, torch.float32, extra, s),
+        "candidates 1 request t=0": lambda extra: lambda s: candidates_inputs(1, 0.0, extra, s),
+        "candidates 16 requests t=1": lambda extra: lambda s: candidates_inputs(16, 1.0, extra, s),
+        "select 1 row": lambda extra: select_case(1, 0, extra),
+        "select 16 rows": lambda extra: select_case(16, 0, extra),
+    }
+    for name, make in cases.items():
+        for label, extra in (("prod", None), ("branchless", BRANCHLESS)):
+            row = {"case": name, "build": label}
+            try:
+                row.update(paired(make(extra)))
+            except Exception as error:  # noqa: BLE001 (report the case, go on)
+                row["error"] = f"{type(error).__name__}: {error}"[:2000]
+            emit(row)
+    forms = {
+        "prod": (None, False, False, False),
+        "branchless": (BRANCHLESS, False, False, False),
+        "tile both, branchless": (BRANCHLESS, True, True, False),
+        "tree partial, tile finish": (None, False, True, True),
+        "tree partial, tile finish, branchless": (BRANCHLESS, False, True, True),
+    }
+    for biased in (True, False):
+        name = "greedy_markov_shard_pair" if biased else "greedy_shard_pair"
+        for rows in (1, 6, 16, 96):
+            for threads in (128, 256):
+                for form, (extra, tp, tf, tree) in forms.items():
+                    row = {"kernel": name, "rows": rows, "partial_threads": threads,
+                           "form": form}
+                    try:
+                        row.update(paired(pair_case(rows, biased, threads, 0, extra, tp, tf,
+                                                    tree)))
+                    except Exception as error:  # noqa: BLE001 (report the case, go on)
+                        row["error"] = f"{type(error).__name__}: {error}"[:2000]
+                    emit(row)
+    parts = triton.cdiv(SHARD, greedy._BLOCK)
+    for rows in (1, 16):
+        base, bias, shape = pair_inputs(rows, True, 0)
+        pairs = torch.empty(rows, 2, device=DEVICE)
+        v, i = torch.empty(shape, device=DEVICE), torch.empty(shape, dtype=torch.int32, device=DEVICE)
+        for form, (extra, tp, tf, tree) in forms.items():
+            emit({"profile": f"greedy markov pair {rows} rows, {form}",
+                  "tilelang": kernel_times(lambda extra=extra, tp=tp, tf=tf, tree=tree: (
+                      run_partial(base, bias, v, i, 128, extra, tp, tree),
+                      run_finish(v, i, pairs.view(-1), rows, parts, 2, SHARD, "pair", 0, extra,
+                                 tf))),
+                  "triton": kernel_times(lambda: triton_pair(base, bias, SHARD, pairs, v, i))})
+
+
 def main() -> None:
-    rounds = {"3": round3, "4a": round4a, "4b": round4b, "4c": round4c}
+    rounds = {"3": round3, "4a": round4a, "4b": round4b, "4c": round4c, "4d": round4d}
     for name in sys.argv[1:] or ["4a"]:
         rounds[name]()
 

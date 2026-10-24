@@ -514,3 +514,45 @@ The second integrated run repeats every bundle on the fixed branch.
   - a block reused from the cache.
 
   Each buffer's time is printed with its address.
+
+### The second integrated run (2026-10-24 17:48 CET, run `tilelang-integration-kernels-2`)
+
+Every port's tests pass with every other port in place:
+- runner and token counts: 539;
+- embedding, confidence, ranks and the rejection sampler: 211, the int32-position cases
+  included;
+- mHC: 60;
+- sampling: 643.
+
+The eight vocabulary-parallel drafting failures are a bug in the tree, not in the ports.
+The backport of vllm-project/vllm#61161 (`ad6c55362`, 10-19) puts the draft step in the
+seed's high word in the full-vocabulary draft sampler, DFlash2 and the rejection sampler.
+The vocabulary-parallel draft kernel kept the bare seed, so its drafts after step 0
+differed from the full-vocabulary path. DSpark samples its drafts over the full vocabulary
+and is unaffected. Fixed on the branch (`f7cf50549`), to go into the release series too.
+
+### Round 4c and placement results (2026-10-24 18:00 CET)
+
+- **Greedy reductions:** tile form helps little.
+  - Partial argmax: 2.28 to 2.07 µs device at one row (Triton 1.3).
+  - Finish: 1.24 to 1.13 µs (Triton 0.85).
+  - Per call, the pairs stay +18 to +40%.
+
+  Both kernels are chains of dependent combines (16 a thread, then the shuffles). The
+  production combine takes the other pair under an `if`; Triton's is selects.
+- **Placement, round 1:** every scenario had exactly one fast buffer (about 265 GB/s,
+  the rest about 222 GB/s), always the one whose graph was built last. That held even for
+  the last slice of one allocation, and the same address was fast in one scenario and
+  slow in the next. Not settled yet: it may be an ordering effect, not placement.
+
+## Round 4d and placement round 2 ([branchless-placement-kernels.json](branchless-placement-kernels.json))
+
+- **Branchless combines** (sampling-variants `4d`, dgx4): every sampling kernel traced with
+  its combines as selects (`sampling_tile.branchless`). The greedy partial argmax also
+  reduces each thread's sixteen values as a tree. The first maximum is a total order, so
+  the result is the same and the dependent chain is four combines deep instead of
+  fifteen.
+- **Placement, round 2** ([placement2.py](bundles/placement/placement2.py), dgx2):
+  - the graphs built in reverse order, to see whether the fast buffer moves with them;
+  - the same buffers timed without graphs;
+  - a speed map of twenty 48 MiB slices of one 1 GiB allocation.

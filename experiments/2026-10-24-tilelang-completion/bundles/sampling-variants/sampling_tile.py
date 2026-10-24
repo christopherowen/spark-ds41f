@@ -8,6 +8,8 @@ previous store; select reads its ranks in a loop of dynamic length. These varian
 load every run (or rank) first, with the count fixed when the kernel is built.
 """
 
+import contextlib
+
 import tilelang
 import tilelang.language as T
 
@@ -291,3 +293,167 @@ def finish_tile_kernel(output: str, parts: int):
                     )
 
     return finish_argmax
+
+
+# --- Branchless combines -------------------------------------------------------
+# Triton's reduction combines are selects (tl.where); the production macros take the
+# other pair under an ``if``, which compiles to branches in a chain of dependent
+# combines. These take the same pair with selects, the keep decision held in a
+# register so the second select reads the pair as it was.
+
+
+@T.macro
+def keep_or_take_select(best, best_index, value, index):
+    keep = T.alloc_var(
+        T.int32,
+        init=T.call_extern(
+            "int32", "vllm_argmax_keep", best[0], best_index[0], value, index
+        ),
+    )
+    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
+    best[0] = T.if_then_else(keep != 0, best[0], value)
+
+
+@T.macro
+def first_keep_or_take_select(best, best_index, value, index):
+    keep = T.alloc_var(
+        T.int32,
+        init=T.call_extern(
+            "int32", "vllm_first_argmax_keep", best[0], best_index[0], value, index
+        ),
+    )
+    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
+    best[0] = T.if_then_else(keep != 0, best[0], value)
+
+
+@contextlib.contextmanager
+def branchless():
+    """``tls``'s kernels traced while entered combine with selects."""
+    saved = tls._keep_or_take, tls._first_keep_or_take
+    tls._keep_or_take, tls._first_keep_or_take = keep_or_take_select, first_keep_or_take_select
+    try:
+        yield
+    finally:
+        tls._keep_or_take, tls._first_keep_or_take = saved
+
+
+@T.macro
+def _tree_level(v, ix, best, best_index, stride):
+    """``(v[i], ix[i])`` = the first maximum of pairs ``i`` and ``i + stride``."""
+    for i in T.unroll(stride):
+        best[0] = v[i]
+        best_index[0] = ix[i]
+        tls._first_keep_or_take(best, best_index, v[i + stride], ix[i + stride])
+        v[i] = best[0]
+        ix[i] = best_index[0]
+
+
+@tilelang.jit(pass_configs=tls._PASS)
+def partial_tree_kernel(base_dtype: str, bias_dtype: str | None, vector: bool, threads: int):
+    """``partial_tile_kernel`` whose thread reduces its values as a tree: the first
+    maximum is a total order, so the pairing does not change the result, and the
+    chain of dependent combines is log2(values) deep instead of values - 1."""
+    rows, vocab, values_len, indices_len = T.dynamic(
+        "rows, vocab, values_len, indices_len"
+    )
+    base_stride, bias_stride = T.dynamic("base_stride, bias_stride", "int64")
+    biased = bias_dtype is not None
+    if not biased:
+        bias_dtype = base_dtype
+    warps = threads // 32
+    vec = tls._VEC
+    runs = tls.GREEDY_BLOCK // (threads * vec)
+    passes = tls.GREEDY_BLOCK // threads
+    assert passes & (passes - 1) == 0
+
+    @T.prim_func
+    def partial_argmax(
+        base: T.StridedTensor((rows, vocab), (base_stride, 1), base_dtype),
+        bias: T.StridedTensor((rows, vocab), (bias_stride, 1), bias_dtype),
+        values: T.Tensor((values_len,), T.float32),
+        indices: T.Tensor((indices_len,), T.int32),
+    ):
+        with T.Kernel(rows, T.ceildiv(vocab, tls.GREEDY_BLOCK), threads=threads) as (
+            row,
+            part,
+        ):
+            T.import_source(tls._HEADER)
+            tx = T.get_thread_binding()
+            a = T.alloc_local((passes,), base_dtype)
+            b = T.alloc_local((passes,), bias_dtype)
+            v = T.alloc_local((passes,), T.float32)
+            ix = T.alloc_local((passes,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            partial = T.alloc_shared((warps,), T.float32)
+            partial_index = T.alloc_shared((warps,), T.int32)
+            if vector:
+                T.assume(base_stride % vec == 0)
+                T.assume(bias_stride % vec == 0)
+                T.assume(vocab % vec == 0)
+                for run in T.unroll(runs):
+                    col0 = part * tls.GREEDY_BLOCK + (run * threads + tx) * vec
+                    if col0 < vocab:
+                        for i in T.vectorized(vec):
+                            a[run * vec + i] = base[row, col0 + i]
+                        if biased:
+                            for i in T.vectorized(vec):
+                                b[run * vec + i] = bias[row, col0 + i]
+                for run in T.unroll(runs):
+                    col0 = part * tls.GREEDY_BLOCK + (run * threads + tx) * vec
+                    for i in T.unroll(vec):
+                        value = T.cast(a[run * vec + i], T.float32)
+                        if biased:
+                            value = T.cast(
+                                T.cast(value + T.cast(b[run * vec + i], T.float32), base_dtype),
+                                T.float32,
+                            )
+                        v[run * vec + i] = T.if_then_else(
+                            col0 < vocab, value, -T.infinity(T.float32)
+                        )
+                        ix[run * vec + i] = T.if_then_else(
+                            col0 < vocab, col0 + i, tls._INT32_MAX
+                        )
+            else:
+                for j in T.unroll(passes):
+                    col = part * tls.GREEDY_BLOCK + j * threads + tx
+                    if col < vocab:
+                        a[j] = base[row, col]
+                        if biased:
+                            b[j] = bias[row, col]
+                for j in T.unroll(passes):
+                    col = part * tls.GREEDY_BLOCK + j * threads + tx
+                    value = T.cast(a[j], T.float32)
+                    if biased:
+                        value = T.cast(
+                            T.cast(value + T.cast(b[j], T.float32), base_dtype), T.float32
+                        )
+                    v[j] = T.if_then_else(col < vocab, value, -T.infinity(T.float32))
+                    ix[j] = T.if_then_else(col < vocab, col, tls._INT32_MAX)
+            if passes >= 32:
+                _tree_level(v, ix, best, best_index, 16)
+            if passes >= 16:
+                _tree_level(v, ix, best, best_index, 8)
+            if passes >= 8:
+                _tree_level(v, ix, best, best_index, 4)
+            if passes >= 4:
+                _tree_level(v, ix, best, best_index, 2)
+            if passes >= 2:
+                _tree_level(v, ix, best, best_index, 1)
+            best[0] = v[0]
+            best_index[0] = ix[0]
+            tls._warp_first_argmax(best, best_index, other, other_index)
+            if tx % 32 == 0:
+                partial[tx // 32] = best[0]
+                partial_index[tx // 32] = best_index[0]
+            T.sync_threads()
+            if tx == 0:
+                for w in T.unroll(1, warps):
+                    tls._first_keep_or_take(best, best_index, partial[w], partial_index[w])
+                slot = T.cast(row, T.int64) * T.ceildiv(vocab, tls.GREEDY_BLOCK) + part
+                values[slot] = best[0]
+                indices[slot] = best_index[0]
+
+    return partial_argmax
