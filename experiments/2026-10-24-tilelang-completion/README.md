@@ -744,3 +744,36 @@ package files (bundles/serving/overlay, written by `make_integration_bundles.py
 both arms are identical within themselves, their temperature-0 and seeded temperature-1
 digests are equal, and the ports boot and serve with no undeclared kernel
 (`KernelNotPreparedError` would fail the requests).
+
+### Ninth integrated run (2026-10-24 19:20 CET)
+
+- Every test passes.
+- The embedding's 8K cold prefill is 1.7% faster than vLLM's CUDA kernel (it was +0.7%).
+- The greedy reductions are level or faster at every size (-13% at 96 rows).
+- Still slower:
+  - sink candidates at one request and t=0 (+8%, 0.23 µs);
+  - zero_kv_blocks;
+  - combine at the 16K prefill;
+  - expand_idx_mapping at c1;
+  - gather_lookback at c16.
+
+### The serving check (2026-10-24 19:51 CET, run `tilelang-ports-serving`)
+
+The ports booted and served with no undeclared kernel.
+- **Outputs, bit-identical to candidate 4:**
+  - Temperature 0: identical in every scenario within each arm, and the ports' reference
+    digests equal candidate 4's.
+  - Seeded temperature 1: the ports' reference digest equals candidate 4's.
+  - In both arms the same seeded requests come out differently eight at once than alone,
+    so the seeded draws depend on the company. That is the candidate's own behaviour, not
+    the ports'.
+- **Speed:**
+  - One stream: level. Prose step 29.68 against 29.74 ms (±0.2%), JSON 33.60 against
+    33.65 ms; c1 distinct 93.5 against 93.2 tok/s.
+  - **Eight distinct streams: the ports are 1.7% slower**: 189.4 tok/s (±0.05%) against
+    192.65 (±0.2%), on outputs that are identical (equal c8 digests). The ports ran
+    first, so heat soak favoured them. The kernel benchmarks show no such cost, so a
+    torch-profiled pair finds the kernels: [profile/profile-ports.json](profile/profile-ports.json)
+    profiles ports, candidate 4 and ports again on the c8 JSON case and single-stream
+    decode.
+  - Prefill at 1K and 16K: within its intervals (±20-40% at two repeats).
