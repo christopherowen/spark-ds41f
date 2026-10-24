@@ -1,5 +1,10 @@
 # Selected-token vocabulary ranks in TileLang
 
+The latest candidate is the separate [vocabulary-padding fix](rank-padding-fix/README.md).
+It corrects the old reference's negative-infinity overcount after the initial
+bit-identical port was qualified. The initial port and all its evidence below
+are retained as the comparison record.
+
 Base: deployment `99e4e9e3`; vLLM `174a746f4577579841e5aa3e94c8a4964b0aa326`
 (release candidate 4, tree `97fc3579def4ffc32eec88c9149c560559af59d4`).
 The only runtime change is the V2 runner's selected-token rank calculation in

@@ -1,0 +1,37 @@
+{
+ "description": "Follow-up correction: ranks count only real vocabulary entries even for selected -inf logits; 27 GPU tests, sanitizer, and the unchanged paired rank performance gate.",
+ "image": "spark-ds41f:19f2c20ed4d6-next-4",
+ "env": {
+  "HF_HUB_OFFLINE": "1",
+  "TILELANG_CACHE_DIR": "/c/tilelang-logprob-ranks",
+  "PYTHONPATH": "/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+ },
+ "workdir": "vllm",
+ "argv": [
+  "-c",
+  "import subprocess,sys\nc=subprocess.run([\"/opt/compute-sanitizer/compute-sanitizer\",\"--tool\",\"memcheck\",\"--error-exitcode\",\"91\",sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','--basetemp','/c/pytest-logprob-ranks-sanitizer','tests/v1/worker/test_gpu_logprob_ranks.py'],timeout=1200).returncode\nb=subprocess.run([sys.executable,\"benchmarks/kernels/benchmark_logprob_ranks.py\",\"--gate\",\"--seed\",\"33741\"],timeout=1200).returncode\na=subprocess.run([sys.executable,'-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','--basetemp','/c/pytest-logprob-ranks-final','tests/v1/worker/test_gpu_logprob_ranks.py'],timeout=1200).returncode\nsys.exit(a or b or c)\n"
+ ],
+ "verdict": "exit",
+ "mounts": [
+  [
+   "vllm_v1_worker_gpu_sample_tilelang_logprob.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/tilelang_logprob.py"
+  ],
+  [
+   "vllm_v1_worker_gpu_sample_logprob.py",
+   "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/sample/logprob.py"
+  ],
+  [
+   "tests_v1_worker_test_gpu_logprob_ranks.py",
+   "/opt/spark-ds41f/candidate/vllm/tests/v1/worker/test_gpu_logprob_ranks.py"
+  ],
+  [
+   "benchmarks_kernels_benchmark_logprob_ranks.py",
+   "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_logprob_ranks.py"
+  ],
+  [
+   "/usr/local/cuda-13.0/compute-sanitizer",
+   "/opt/compute-sanitizer"
+  ]
+ ]
+}

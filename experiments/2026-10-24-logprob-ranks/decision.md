@@ -1,4 +1,8 @@
-# Decision
+# Initial port decision
+
+The later [padding correction](rank-padding-fix/README.md) supersedes the rank
+behaviour for selected negative-infinity logits. This records the initial port's
+qualification independently of that separate logical fix.
 
 Retain the selected-token vocabulary-rank port as a kernel-qualified candidate.
 Both final 15-shape paired performance runs pass; the focused tests and CUDA
