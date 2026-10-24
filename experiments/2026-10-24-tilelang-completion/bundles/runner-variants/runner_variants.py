@@ -26,9 +26,12 @@ Engram window of 3), which is what the benchmark times.
 import tilelang
 import tilelang.language as T
 
+# The production kernels' (gpu/tilelang_inputs.py ``_PASS``): bind replay off since
+# vLLM 0441ba1be.
 PASS = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+    "tl.if_stmt_binding_inline_replayable_binds": False,
 }
 PAD = -1
 SPAN = 1 << 40

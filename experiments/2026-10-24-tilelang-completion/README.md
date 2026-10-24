@@ -970,3 +970,8 @@ candidate 4:
 Every arm's samples fall in two modes, about 189.5 and 192.8 tok/s, and both builds land in
 both. The serving check's -1.7% and the bracket's -0.7% came from which mode their two or
 three samples hit. This agrees with the profile, which shows equal step times.
+
+Round 5 stopped at the bench's guard that the variants compile with production's pass
+configs. Production has turned TileLang's bind replay off since vLLM 0441ba1be, and
+runner_variants.py had not. With the configs aligned, it runs again as
+`tilelang-runner-round5b`.
