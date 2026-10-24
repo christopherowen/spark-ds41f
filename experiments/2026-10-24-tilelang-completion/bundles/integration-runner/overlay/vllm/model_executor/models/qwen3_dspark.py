@@ -217,10 +217,14 @@ class DSparkConfidenceHead(nn.Module):
         return self.proj(x).squeeze(-1)
 
     def probability(
-        self, hidden: torch.Tensor, markov_embed: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The acceptance probability, ``sigmoid`` of the head's logit."""
-        return torch.sigmoid(self(hidden, markov_embed))
+        """The acceptance probability, ``sigmoid`` of the head's logit (into
+        ``out`` when given)."""
+        return torch.sigmoid(self(hidden, markov_embed), out=out)
 
 
 class Qwen3DSparkModel(DFlashQwen3Model):

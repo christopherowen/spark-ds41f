@@ -486,14 +486,14 @@ class B12xRMSNorm(nn.Module):
             ),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
         if self._plan is None:
             raise PreparationResourceUnavailableError(
                 "V4.1 RMSNorm has no declared plan"
             )
         shape = x.shape
         x = x.reshape(-1, shape[-1]).contiguous()
-        out = torch.empty_like(x)
+        out = torch.empty_like(x) if out is None else out.view(x.shape)
         _rmsnorm(
             x,
             self.weight,
@@ -958,14 +958,16 @@ class B12xMHC(nn.Module):
         pre: torch.Tensor | None = None,
         columns: torch.Tensor | None = None,
         column: int = -1,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if columns is not None:
             columns.copy_(state[:, :, column])
-        out = torch.empty(
-            (state.shape[0], state.shape[-1]),
-            dtype=state.dtype,
-            device=state.device,
-        )
+        if out is None:
+            out = torch.empty(
+                (state.shape[0], state.shape[-1]),
+                dtype=state.dtype,
+                device=state.device,
+            )
         return mhc.run_collapse(
             state,
             pre,

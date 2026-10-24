@@ -44,7 +44,9 @@ PARTS = {
                 # Prompt logprobs under sink rejection (0266, experiments/2026-10-24-prompt-logprobs-sink).
                 "tests/v1/core/test_sink_draft_zero.py",
                 # The grammar bitmask in TileLang (structured output).
-                "tests/v1/worker/test_gpu_tilelang_structured.py"], 3600),
+                "tests/v1/worker/test_gpu_tilelang_structured.py",
+                # Captured outputs written in place (vLLM ed9dae5ae).
+                "tests/v1/worker/test_graph_output_buffers.py"], 3600),
             ("runner benchmark", ["benchmarks/kernels/benchmark_runner_inputs_tilelang.py",
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",

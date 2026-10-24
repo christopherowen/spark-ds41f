@@ -53,12 +53,14 @@ class TileLangRMSNorm(nn.Module):
         )
         prepare.declare(warm=lambda: _warm(hidden, eps, dtype))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """The normalized rows, into ``out`` (contiguous, ``x``'s rows) when given."""
         # TileKernels reads each row by its stride (a contiguous last dimension, rows
         # 16 elements apart): the q and kv halves of the fused projection's output are
         # normalized where they lie, with no copy.
         shape = x.shape
         x = x.reshape(-1, shape[-1])
-        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        _rmsnorm(x, self.weight, out, self.variance_epsilon)
+        if out is None:
+            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        _rmsnorm(x, self.weight, out.view(x.shape), self.variance_epsilon)
         return out.view(shape)

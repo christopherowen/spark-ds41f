@@ -198,9 +198,17 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
         )
 
     def probability(
-        self, hidden: torch.Tensor, markov_embed: torch.Tensor
+        self,
+        hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
+        """Each row's acceptance probability, into ``out`` (FP32 [rows],
+        contiguous) when given."""
+        if out is None:
+            out = torch.empty(
+                hidden.shape[0], dtype=torch.float32, device=hidden.device
+            )
         dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
         return out
 

@@ -957,14 +957,19 @@ class TileKernelsMHC(nn.Module):
         pre: torch.Tensor | None = None,
         columns: torch.Tensor | None = None,
         column: int = -1,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The streams' weighted sum with ``pre``, or their mean; with ``columns``
-        ([tokens, MULT] FP32), also each stream's ``column``, in the same launch."""
+        """The streams' weighted sum with ``pre``, or their mean, into ``out``
+        (contiguous [tokens, hidden]) when given; with ``columns`` ([tokens, MULT]
+        FP32), also each stream's ``column``, in the same launch."""
         if pre is None:
             pre = _constant_mixes(int(state.shape[0]), state.device)[1]
-        out = torch.empty(
-            (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
-        )
+        if out is None:
+            out = torch.empty(
+                (state.shape[0], state.shape[-1]),
+                dtype=state.dtype,
+                device=state.device,
+            )
         if columns is None:
             _mhc_collapse(state, pre, out)
         else:

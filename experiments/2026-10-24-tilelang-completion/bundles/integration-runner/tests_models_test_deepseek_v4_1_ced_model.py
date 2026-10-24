@@ -264,6 +264,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
         aux_hidden_state_layers={3, 4},
         # The sink detector's column buffer: none, the detector is off here.
         _sink_columns=None,
+        # Graph output buffers: none, nothing is captured here.
+        _graph_out=lambda index, rows: None,
         # GLP steering: none, unset here.
         glp=None,
         norm=lambda hidden: hidden,

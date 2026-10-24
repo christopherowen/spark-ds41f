@@ -560,6 +560,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.glp = glp_steering(
             config.num_hidden_layers, config.hidden_size, config.hc_mult
         )
+        # A captured forward's outputs, written in place: the hidden states and one
+        # row block per auxiliary layer (set with them), for the CUDA graph sizes.
+        # The graph manager adopts them rather than copying every replay's outputs.
+        graph_rows = (
+            vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            if get_pp_group().is_last_rank
+            else 0
+        )
+        self._graph_outputs: tuple[torch.Tensor, list[torch.Tensor]] | None = (
+            (
+                torch.empty(
+                    graph_rows,
+                    config.hidden_size,
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                [],
+            )
+            if graph_rows
+            else None
+        )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        if self._graph_outputs is not None:
+            hidden = self._graph_outputs[0]
+            self._graph_outputs = (
+                hidden,
+                [torch.empty_like(hidden) for _ in self.aux_hidden_state_layers],
+            )
+
+    def _graph_out(self, index: int | None, rows: int) -> torch.Tensor | None:
+        """Rows of a captured forward's output buffer (``index`` None: the hidden
+        states, else that auxiliary layer's), or None outside capture."""
+        if self._graph_outputs is None or not torch.cuda.is_current_stream_capturing():
+            return None
+        hidden, aux = self._graph_outputs
+        buffer = hidden if index is None else aux[index]
+        return buffer[:rows] if rows <= buffer.shape[0] else None
 
     def prepare_disk_engram(
         self, input_ids, query_start_loc, lookback_token_ids, early=None
@@ -828,7 +866,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     if residual is None
                     else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
                 )
-                aux_hidden_state = layer.mhc.collapse(aux_recon)
+                aux_out = (
+                    self._graph_out(len(aux_hidden_states), full_num_tokens)
+                    if sp is None
+                    and not decoder_compacted
+                    and not self.use_sequence_parallel
+                    else None
+                )
+                aux_hidden_state = (
+                    layer.mhc.collapse(aux_recon)
+                    if aux_out is None
+                    else layer.mhc.collapse(aux_recon, out=aux_out)
+                )
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 elif sp is not None:
@@ -893,7 +942,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if decoder_compacted:
                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
             self._sink_columns[:full_num_tokens].copy_(columns)
-        hidden_states = self.norm(hidden_states)
+        out = (
+            self._graph_out(None, full_num_tokens)
+            if rows_here and not self.use_sequence_parallel
+            else None
+        )
+        hidden_states = (
+            self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
+        )
         if self.use_sequence_parallel:
             # Gather only the collapsed and normalized hidden states.
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -1121,6 +1177,13 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
         stream, (max_num_batched_tokens, hc_mult) float32, for every token of
         the last forward; None without the detector (vllm.v1.sample.sink)."""
         return self.model._sink_columns
+
+    def get_graph_output_buffers(
+        self,
+    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+        """The buffers a captured forward writes its hidden states and auxiliary
+        hidden states into (rows: the largest CUDA graph); None without graphs."""
+        return self.model._graph_outputs
 
     def forward(
         self,

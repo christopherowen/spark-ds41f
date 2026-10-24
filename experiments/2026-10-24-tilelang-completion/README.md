@@ -1297,7 +1297,7 @@ another candidate. vLLM `tilelang-ports` cb9ed45bd adds:
 - **`benchmark_sink_glue.py --gate`:** the sink kernels against the torch chains, and the
   bitmask against Triton.
 
-Before the window opened, the run moved to `tilelang-ports` 23ae46804. That build also
+Before the window opened, the run moved to `tilelang-ports` ed9dae5ae. That build also
 folds the step's remaining glue that the request inventory found, and ports the
 rejection sampler:
 - **Adaptive verification's offsets** in one kernel (7f2d09d32). This replaces five torch
@@ -1338,6 +1338,11 @@ rejection sampler:
 - **The fused decode router reads the padding mask and the input ids** (23ae46804).
   Before, torch negated the mask and compared the image sentinels once a forward, in
   both the target's and the drafter's graphs.
+- **The drafter's confidences are written straight into their rows** (1838588d0).
+- **Captured forwards write their outputs into the graph buffers** (ed9dae5ae). The
+  model graph manager uses the target's declared buffers as its persistent outputs.
+  Before, every replay copied the hidden states and three auxiliary states: four
+  copies a decode step.
 
 New steps:
 - dgx2: the DSpark context test, `test_tilelang_rejection.py`, and

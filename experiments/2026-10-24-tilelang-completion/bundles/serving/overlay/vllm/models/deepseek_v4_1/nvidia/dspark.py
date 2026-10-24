@@ -745,11 +745,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         return logits.scatter_(1, index, (values + bias).to(logits.dtype))
 
     def compute_confidence(
-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
+        self,
+        head_hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Per-position acceptance probability for each drafted token."""
+        """Per-position acceptance probability for each drafted token, into
+        ``out`` when given."""
         assert self.model.confidence_head is not None
-        return self.model.confidence_head.probability(head_hidden, markov_embed)
+        return self.model.confidence_head.probability(head_hidden, markov_embed, out)
 
     # --- Weight loading ----------------------------------------------------
 

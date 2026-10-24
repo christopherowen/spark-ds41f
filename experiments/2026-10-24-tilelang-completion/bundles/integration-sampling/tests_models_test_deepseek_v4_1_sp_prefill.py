@@ -540,6 +540,8 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
             _l2pf_ready=True,
             # The sink detector's column buffer: none, the detector is off here.
             _sink_columns=None,
+            # Graph output buffers: none, nothing is captured here.
+            _graph_out=lambda index, rows: None,
             # GLP steering: none, unset here.
             glp=None,
             norm=lambda hidden: hidden * 2,

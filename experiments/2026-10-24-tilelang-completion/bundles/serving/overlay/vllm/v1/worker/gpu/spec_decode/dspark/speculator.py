@@ -426,12 +426,17 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.use_confidence_head:
+        if self.use_confidence_head and table is not None:
+            # Straight into the probabilities' rows (contiguous: [:num_reqs]).
+            self.model.compute_confidence(
+                sample_hidden,
+                confidence_embeds.flatten(0, 1),
+                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
+            )
+        elif self.use_confidence_head:
             confidence = self.model.compute_confidence(
                 sample_hidden,
-                confidence_embeds.flatten(0, 1)
-                if table is not None
-                else torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
             )
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
