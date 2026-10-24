@@ -519,6 +519,11 @@ Runs `next-rc4-tp4` and `next-rc4-glp-tp4`.
   lowest MemAvailable in the memory probe 20.4 GiB (dgx4).
 - The TileLang ports' bundles ran beside the release tests on the other nodes
   (experiments/2026-10-24-tilelang-completion, their first GPU run).
+- **Steering on against off** ([rc4/rc4-glp-tp4.json](rc4/rc4-glp-tp4.json), 12:52-13:52 CET, the synthetic
+  file, verdicts against the repeat): grid +1.60% (worse), sixteen streams -1.16% (worse), one
+  stream -1.36% (same), prefill 32K -1.31% (same) and 131K -1.53% (worse). Candidate 2's 128-thread
+  projection had cost the grid +2.41%. This is the price of turning steering on; off, the release
+  runs as spark-ds41f-1022 does.
 
 ## Promotion: spark-ds41f-1024
 
