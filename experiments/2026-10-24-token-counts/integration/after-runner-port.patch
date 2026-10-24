@@ -1,0 +1,505 @@
+From 78c4ae1283cc8b9836cfaa81169d19a63bbc82f7 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:57:00 +0200
+Subject: [PATCH] V2 runner: sampled/rejected counts in TileLang after the
+ input-preparation port
+
+The same token-count migration as 1542277a1, adapted to the runner port's
+shorter register_input_batch_warmups(dead_rows=...) API. Remove the last
+Triton dispatcher imports, which this port makes unused; keep the original
+Triton kernel as a reference. Update the owner-declaration test to the new
+API. The TileLang kernel, wrapper semantics and paired benchmark are
+unchanged from the qualified standalone candidate.
+
+Base: tilelang-runner-inputs 1bc9f13f620c12ea07b5fd0d8542d1758fb81825.
+This integration adjustment passes Ruff and whitespace checks. The kernel
+has 32 exactness tests, zero memcheck errors and ten passing performance
+cases on candidate 4; the combined runner tree has not been GPU-qualified.
+Do not apply this patch as well as the standalone port.
+Upstream status: local DS41F experiment, not submitted upstream.
+
+---
+ benchmarks/kernels/benchmark_token_counts.py | 135 ++++++++++++++++++
+ tests/v1/worker/test_gpu_input_batch_v2.py   | 139 +++++++++++++++++++
+ vllm/v1/worker/gpu/input_batch.py            |  44 ++----
+ vllm/v1/worker/gpu/tilelang_token_counts.py  |  94 +++++++++++++
+ 4 files changed, 377 insertions(+), 35 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_token_counts.py
+ create mode 100644 vllm/v1/worker/gpu/tilelang_token_counts.py
+
+diff --git a/benchmarks/kernels/benchmark_token_counts.py b/benchmarks/kernels/benchmark_token_counts.py
+new file mode 100644
+index 000000000..20400a1a2
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_token_counts.py
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired graph timings for DS41F's post-verification counts, against Triton.
++
++Eight allocations per case, alternating measurement order, and a paired 95%
++interval. --gate rejects a slowdown; --threads screens fixed launch layouts.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.v1.worker.gpu import tilelang_token_counts
++from vllm.v1.worker.gpu.input_batch import _get_num_sampled_and_rejected_kernel
++
++
++def graph(call):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            call()
++    torch.cuda.current_stream().wait_stream(side)
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            call()
++    capture.replay()
++    torch.cuda.synchronize()
++    return capture
++
++
++def elapsed(capture):
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 10
++
++
++def measure(requests, dead_rows, threads, seed):
++    ours, theirs, differences = [], [], []
++    for sample in range(8):
++        torch.manual_seed(seed + sample)
++        spacer = torch.empty((sample * 513 + 17) * 256, device="cuda")
++        capacity = requests + 19
++        idx = torch.randperm(capacity, device="cuda")[:requests]
++        prefill = torch.randint(
++            1, 1048577, (capacity,), device="cuda", dtype=torch.int32
++        )
++        seq = prefill[idx] + 1
++        if dead_rows:
++            seq[::3] -= 2
++        widths = torch.full((requests,), 6, device="cuda", dtype=torch.int32)
++        cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int()))
++        sampled = torch.randint(1, 7, (requests,), device="cuda", dtype=torch.int32)
++        rejected = torch.empty_like(sampled)
++        cut = torch.randint(0, 6, (requests,), device="cuda", dtype=torch.int32)
++        kernel = tilelang_token_counts.counts_kernel(dead_rows, "int64", threads)
++
++        inputs = (sampled, rejected, seq, cu, idx, prefill, cut)
++
++        def original(inputs=inputs):
++            _get_num_sampled_and_rejected_kernel[(requests,)](
++                *inputs, DEAD_ROWS=dead_rows
++            )
++
++        def candidate(kernel=kernel, inputs=inputs):
++            kernel(*inputs)
++
++        saved = sampled.clone()
++        original()
++        expected_sampled, expected_rejected = sampled.clone(), rejected.clone()
++        sampled.copy_(saved)
++        candidate()
++        if not (
++            torch.equal(sampled, expected_sampled)
++            and torch.equal(rejected, expected_rejected)
++        ):
++            raise RuntimeError(f"counts differ: requests={requests}, dead={dead_rows}")
++        a, b = graph(candidate), graph(original)
++        pair = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(c): elapsed(c) for c in pair}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        differences.append(times[id(a)] - times[id(b)])
++        del a, b, pair, spacer
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    result = {
++        "requests": requests,
++        "dead_rows": dead_rows,
++        "threads": threads,
++        "tilelang_us": statistics.median(ours),
++        "triton_us": statistics.median(theirs),
++        "change_pct": 100 * mean / statistics.fmean(theirs),
++        "interval_us": [mean - half, mean + half],
++        "slower": mean - half > 0,
++        "tilelang_samples_us": ours,
++        "triton_samples_us": theirs,
++    }
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--threads", default=str(tilelang_token_counts._THREADS))
++    parser.add_argument("--seed", type=int, default=4135)
++    parser.add_argument("--requests", default="1,8,16,128,257")
++    args = parser.parse_args()
++    results = [
++        measure(requests, dead_rows, threads, args.seed)
++        for threads in map(int, args.threads.split(","))
++        for dead_rows in (False, True)
++        for requests in map(int, args.requests.split(","))
++    ]
++    slower = [
++        [r["requests"], r["dead_rows"], r["threads"]] for r in results if r["slower"]
++    ]
++    print(
++        json.dumps({"summary": "token counts benchmark", "slower": slower}), flush=True
++    )
++    if args.gate and slower:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_input_batch_v2.py b/tests/v1/worker/test_gpu_input_batch_v2.py
+index a951d1054..f69b01067 100644
+--- a/tests/v1/worker/test_gpu_input_batch_v2.py
++++ b/tests/v1/worker/test_gpu_input_batch_v2.py
+@@ -29,6 +29,145 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, post_update
+ DEVICE = current_platform.device_type
+ 
+ 
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("requests", [1, 8, 16, 127, 128, 129, 257])
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("dead_rows", [False, True])
++def test_token_counts_preserve_commits_and_rejections(requests, index_dtype, dead_rows):
++    """DS41F's five drafts, prefill chunks and dead rows commit the same tokens."""
++    from vllm.v1.worker.gpu.input_batch import (
++        _get_num_sampled_and_rejected_kernel,
++        get_num_sampled_and_rejected,
++    )
++
++    torch.manual_seed(41 + requests)
++    capacity = requests + 19
++    idx = torch.randperm(capacity, device="cuda")[:requests].to(index_dtype)
++    prefill = torch.randint(1, 1048577, (capacity,), device="cuda", dtype=torch.int32)
++    seq = (
++        prefill[idx.long()]
++        + torch.arange(requests, device="cuda", dtype=torch.int32) % 3
++        - 1
++    )
++    widths = torch.arange(requests, device="cuda", dtype=torch.int32) % 6 + 1
++    cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int())) + 13
++    sampled = torch.arange(requests, device="cuda", dtype=torch.int32) % (widths + 1)
++    cut = widths - 2 if dead_rows else None
++    read_only = [seq, cu, idx, prefill] + ([] if cut is None else [cut])
++    before = [x.clone() for x in read_only]
++    original = sampled.clone()
++    reference = sampled.clone()
++    rejected = torch.empty_like(reference)
++    _get_num_sampled_and_rejected_kernel[(requests,)](
++        reference,
++        rejected,
++        seq,
++        cu,
++        idx,
++        prefill,
++        cut if cut is not None else reference,
++        DEAD_ROWS=dead_rows,
++    )
++
++    actual, actual_rejected = get_num_sampled_and_rejected(
++        sampled, seq, cu, idx, prefill, cut
++    )
++    live = seq >= prefill[idx.long()]
++    expected = original if cut is None else torch.minimum(original, cut + 1)
++    expected = torch.where(live, expected, 0)
++    expected_rejected = torch.where(live, widths - expected, 0)
++    assert actual.data_ptr() == sampled.data_ptr()
++    assert torch.equal(actual, expected)
++    assert torch.equal(actual_rejected, expected_rejected)
++    assert torch.equal(actual, reference)
++    assert torch.equal(actual_rejected, rejected)
++    for x, saved in zip(read_only, before):
++        assert torch.equal(x, saved)
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_token_counts_graph_replay_uses_current_prefill_and_dead_cuts():
++    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
++
++    def t(x):
++        return torch.tensor(x, dtype=torch.int32, device="cuda")
++
++    sampled, seq, cu, idx, prefill, cut = (
++        t([6, 6, 1]),
++        t([100, 19, 20]),
++        t([0, 6, 12, 13]),
++        t([2, 0, 3]),
++        t([20, 80, 100, 20]),
++        t([2, 4, 0]),
++    )
++    get_num_sampled_and_rejected(sampled, seq, cu, idx, prefill, cut)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.stream(side), torch.cuda.graph(graph):
++        output, rejected = get_num_sampled_and_rejected(
++            sampled, seq, cu, idx, prefill, cut
++        )
++    torch.cuda.current_stream().wait_stream(side)
++    sampled.copy_(t([6, 6, 1]))
++    cut.copy_(t([4, -1, 0]))
++    seq.copy_(t([99, 20, 20]))
++    graph.replay()
++    assert output.tolist() == [0, 0, 1]
++    assert rejected.tolist() == [0, 6, 0]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_token_counts_empty_batch():
++    from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
++
++    empty = torch.empty(0, device="cuda", dtype=torch.int32)
++    actual, rejected = get_num_sampled_and_rejected(empty, empty, empty, empty, empty)
++    assert actual is empty
++    assert rejected.numel() == 0
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_token_counts_preserve_capacity_tail_and_accept_full_dead_cut_buffer():
++    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
++
++    def t(x):
++        return torch.tensor(x, dtype=torch.int32, device="cuda")
++
++    sampled, rejected = t([6, 3, 99, 99]), t([-1, -1, 77, 77])
++    seq, cu, idx = t([80, 20, 90, 90]), t([0, 6, 12, 999]), t([2, 0])
++    prefill, cut = t([20, 40, 80, 80]), t([3, 0, 999, 999])
++    count_tokens(sampled, rejected, seq, cu, idx, prefill, cut)
++    assert sampled.tolist() == [4, 1, 99, 99]
++    assert rejected.tolist() == [2, 5, 77, 77]
++
++
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++def test_token_counts_owner_declares_both_index_and_dead_row_variants():
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.input_batch import register_input_batch_warmups
++    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens, counts_kernel
++
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        register_input_batch_warmups(dead_rows=True)
++    calls = [c for c in prepare.declared_calls(registry) if c[0] is counts_kernel]
++    assert len(calls) == 4
++    prepare.prepare_declared(registry)
++    for dead_rows in (False, True):
++        for dtype in (torch.int32, torch.int64):
++            ones = torch.ones(1, device="cuda", dtype=torch.int32)
++            rejected = torch.empty_like(ones)
++            idx = torch.zeros(1, device="cuda", dtype=dtype)
++            cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
++            count_tokens(
++                ones, rejected, ones, cu, idx, ones, ones if dead_rows else None
++            )
++            assert ones.item() == 1
++            assert rejected.item() == 0
++
++
+ @pytest.mark.parametrize(
+     ("method", "draft_width"), [(None, None), ("mtp", 16), ("mtp", 8), ("dflash", None)]
+ )
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 88608f972..1ee14a5f4 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -2,16 +2,11 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import TYPE_CHECKING, Any, NamedTuple
++from typing import TYPE_CHECKING, NamedTuple
+ 
+ import numpy as np
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils import random_uuid
+ from vllm.utils.math_utils import cdiv
+@@ -624,17 +619,17 @@ def get_num_sampled_and_rejected(
+     prefill_len: torch.Tensor,
+     dead_row_cut: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    num_reqs = idx_mapping.shape[0]
+     num_rejected = torch.empty_like(num_sampled)
+-    _get_num_sampled_and_rejected_launcher[(num_reqs,)](
++    from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
++
++    count_tokens(
+         num_sampled,
+         num_rejected,
+         seq_lens,
+         cu_num_logits,
+         idx_mapping,
+         prefill_len,
+-        dead_row_cut if dead_row_cut is not None else num_sampled,
+-        DEAD_ROWS=dead_row_cut is not None,
++        dead_row_cut,
+     )
+     return num_sampled, num_rejected
+ 
+@@ -853,33 +848,12 @@ def expand_idx_mapping(
+     return expanded_idx_mapping, expanded_local_pos
+ 
+ 
+-def _get_num_sampled_and_rejected_warmup_inputs(*, dead_rows: bool) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    return triton_warmup_inputs(
+-        _get_num_sampled_and_rejected_kernel,
+-        int32,
+-        int32,
+-        int32,
+-        int32,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        int32,
+-        grid=(1,),
+-        DEAD_ROWS=dead_rows,
+-    )
+-
+-
+-_get_num_sampled_and_rejected_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_get_num_sampled_and_rejected_warmup_inputs
+-)(_get_num_sampled_and_rejected_kernel)
+-
+-
+ def register_input_batch_warmups(*, dead_rows: bool) -> None:
+-    """Register the Triton count of a step's sampled and rejected tokens (the
+-    sampler family's), with its dead-row variant when adaptive verification marks
+-    dead rows."""
++    """Declare sampled/rejected counts with each enabled dead-row variant."""
++    from vllm.v1.worker.gpu.tilelang_token_counts import register_counts
++
+     for dead in (False, True) if dead_rows else (False,):
+-        _get_num_sampled_and_rejected_launcher.register_warmup(dead_rows=dead)
++        register_counts(dead_rows=dead)
+ 
+ 
+ def declare_input_batch_kernels(
+diff --git a/vllm/v1/worker/gpu/tilelang_token_counts.py b/vllm/v1/worker/gpu/tilelang_token_counts.py
+new file mode 100644
+index 000000000..b3c47eb7a
+--- /dev/null
++++ b/vllm/v1/worker/gpu/tilelang_token_counts.py
+@@ -0,0 +1,94 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Commit counts after sampling or speculative verification, one block per request."""
++
++import tilelang
++import tilelang.language as T
++import torch
++
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    # The grid covers active requests; idx_mapping holds valid state slots.
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++_THREADS = 128
++
++
++@tilelang.jit(pass_configs=_PASS)
++def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
++    requests = T.dynamic("requests")
++    sampled_len = T.dynamic("sampled_len")
++    seq_len = T.dynamic("seq_len")
++    cu_len = T.dynamic("cu_len")
++    state_len = T.dynamic("state_len")
++    cut_len = T.dynamic("cut_len")
++
++    @T.prim_func
++    def token_counts(
++        sampled: T.Tensor((sampled_len,), T.int32),
++        rejected: T.Tensor((sampled_len,), T.int32),
++        seq_lens: T.Tensor((seq_len,), T.int32),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        idx_mapping: T.Tensor((requests,), index_dtype),
++        prefill_len: T.Tensor((state_len,), T.int32),
++        dead_cut: T.Tensor((cut_len,), T.int32),
++    ):
++        with T.Kernel(requests, threads=threads) as row:
++            if T.get_thread_binding() == 0:
++                req = idx_mapping[row]
++                active = T.cast(seq_lens[row] >= prefill_len[req], "int32")
++                count = sampled[row]
++                if dead_rows:
++                    count = T.min(count, dead_cut[row] + 1)
++                sampled[row] = active * count
++                rejected[row] = active * (
++                    cu_num_logits[row + 1] - cu_num_logits[row] - count
++                )
++
++    return token_counts
++
++
++def counts_call(dead_rows: bool, index_dtype: torch.dtype):
++    from vllm.models.deepseek_v4_1.tilelang.prepare import call
++
++    return call(
++        counts_kernel,
++        dead_rows,
++        "int64" if index_dtype == torch.int64 else "int32",
++        _THREADS,
++    )
++
++
++def register_counts(dead_rows: bool) -> None:
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++
++    if JitWarmupRegistry.active() is None:
++        return
++    from vllm.models.deepseek_v4_1.tilelang.prepare import declare
++
++    declare(
++        lambda: [counts_call(dead_rows, dtype) for dtype in (torch.int32, torch.int64)]
++    )
++
++
++def count_tokens(
++    sampled: torch.Tensor,
++    rejected: torch.Tensor,
++    seq_lens: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    prefill_len: torch.Tensor,
++    dead_cut: torch.Tensor | None,
++) -> None:
++    if idx_mapping.numel() == 0:
++        return
++    _, args, kwargs = counts_call(dead_cut is not None, idx_mapping.dtype)
++    counts_kernel(*args, **kwargs)(
++        sampled,
++        rejected,
++        seq_lens,
++        cu_num_logits,
++        idx_mapping,
++        prefill_len,
++        dead_cut if dead_cut is not None else sampled,
++    )
+-- 
+2.54.0 (Apple Git-157)
+
