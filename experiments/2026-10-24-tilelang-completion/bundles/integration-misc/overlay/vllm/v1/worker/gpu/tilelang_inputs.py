@@ -570,8 +570,7 @@ def zero_kv_blocks(
 
 _PREFILL_THREADS = 256
 _PREFILL_PER_THREAD = 4
-_PREFILL_GROUP = _PREFILL_THREADS * _PREFILL_PER_THREAD  # Triton's BLOCK_SIZE
-_PREFILL_GROUPS = 4  # groups a pass: a 16K chunk in four passes
+_PREFILL_CHUNK = _PREFILL_THREADS * _PREFILL_PER_THREAD  # Triton's BLOCK_SIZE
 
 
 @tilelang.jit(pass_configs=_PASS)
@@ -579,10 +578,10 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
     """A block a request: a prefilling request's chunk of prompt tokens into the
     input ids, and its next ``num_lookahead`` prefill tokens (0 past the prompt).
     The request's state is read before the prefill check and its query starts
-    after it, as in Triton. Then every load is issued before any store: the
-    lookahead tokens with the first pass, each pass's four 1024-token groups
-    together (a group the chunk does not reach is skipped, on its length alone),
-    all predicated (``_LOAD_IF``, ``_STORE_IF``)."""
+    after it, as in Triton. The lookahead token is loaded with the first pass's
+    tokens, and each pass's 1024 tokens before its stores, all predicated
+    (``_LOAD_IF``, ``_STORE_IF``). Four-pass groups were 2x Triton on a 16K chunk
+    but 0.3 us slower on decode's short chunks (runner round 6)."""
     ids_len = T.dynamic("ids_len")
     lookahead = T.dynamic("lookahead")
     lookahead_cols = T.dynamic("lookahead_cols")
@@ -628,35 +627,21 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
                         ahead & (position < prefill),
                     ),
                 )  # fmt: skip
-                tokens = T.alloc_local(
-                    (_PREFILL_PER_THREAD * _PREFILL_GROUPS,), T.int32
-                )
-                tile = _PREFILL_GROUP * _PREFILL_GROUPS
-                for it in T.serial(T.ceildiv(length, tile)):
-                    for g in T.unroll(_PREFILL_GROUPS):
-                        if it * tile + g * _PREFILL_GROUP < length:
-                            for k in T.unroll(_PREFILL_PER_THREAD):
-                                j = (
-                                    it * tile + g * _PREFILL_GROUP
-                                    + k * _PREFILL_THREADS + tx
-                                )  # fmt: skip
-                                tokens[g * _PREFILL_PER_THREAD + k] = T.call_extern(
-                                    "int32", "vllm_load_if_b32",
-                                    T.address_of(all_token_ids[req, computed + j]), 0,
-                                    j < length,
-                                )  # fmt: skip
-                    for g in T.unroll(_PREFILL_GROUPS):
-                        if it * tile + g * _PREFILL_GROUP < length:
-                            for k in T.unroll(_PREFILL_PER_THREAD):
-                                j = (
-                                    it * tile + g * _PREFILL_GROUP
-                                    + k * _PREFILL_THREADS + tx
-                                )  # fmt: skip
-                                T.call_extern(
-                                    "handle", "vllm_store_if_b32",
-                                    T.address_of(input_ids[start + j]),
-                                    tokens[g * _PREFILL_PER_THREAD + k], j < length,
-                                )  # fmt: skip
+                tokens = T.alloc_local((_PREFILL_PER_THREAD,), T.int32)
+                for it in T.serial(T.ceildiv(length, _PREFILL_CHUNK)):
+                    for k in T.unroll(_PREFILL_PER_THREAD):
+                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
+                        tokens[k] = T.call_extern(
+                            "int32", "vllm_load_if_b32",
+                            T.address_of(all_token_ids[req, computed + j]), 0,
+                            j < length,
+                        )  # fmt: skip
+                    for k in T.unroll(_PREFILL_PER_THREAD):
+                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
+                        T.call_extern(
+                            "handle", "vllm_store_if_b32",
+                            T.address_of(input_ids[start + j]), tokens[k], j < length,
+                        )  # fmt: skip
                 T.call_extern(
                     "handle", "vllm_store_if_b32",
                     T.address_of(next_prefill_tokens[tx, req]), next_token, ahead,

@@ -1225,3 +1225,26 @@ against Triton:
 - 4 or 8 tokens a thread;
 - 1, 2 or 4 groups a pass;
 - the lookahead token loaded with the first pass or after the stores.
+
+### Runner round 6 (2026-10-24 22:55 CET)
+
+Every shape is bit-exact against Triton. Against Triton (µs, decode one stream / decode
+sixteen / 16K chunk):
+
+| Shape | One stream | Sixteen | 16K |
+| --- | --- | --- | --- |
+| Production at 04e097902 (256 threads, 4 groups, lookahead hoisted) | +0.29 | +0.33 | -4.54 |
+| 256 threads, 1 group, lookahead hoisted | -0.02 | +0.03 | -0.46 |
+| 128 threads, 1 group, lookahead hoisted | -0.02 | +0.03 | +0.14 |
+| Any shape with the lookahead loaded after the stores | | about +0.3 | |
+| Four groups with the lookahead hoisted | about +0.3 | | |
+
+Production now takes 256 threads, one group a pass, lookahead hoisted (vLLM 54facd853): level at
+decode, faster on a 16K chunk.
+
+## Sixteenth integrated run and the third serving check
+
+At vLLM `tilelang-ports` 54facd853:
+- `tilelang-integration-kernels-16`;
+- [serving-ports-3.json](serving-ports-3.json): the second serving check's arms and
+  workloads, now with every runner change and the custom-logprob-ids scenario.
