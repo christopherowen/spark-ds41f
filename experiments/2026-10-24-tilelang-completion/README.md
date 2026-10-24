@@ -556,3 +556,37 @@ and is unaffected. Fixed on the branch (`f7cf50549`), to go into the release ser
   - the graphs built in reverse order, to see whether the fast buffer moves with them;
   - the same buffers timed without graphs;
   - a speed map of twenty 48 MiB slices of one 1 GiB allocation.
+
+### Round 4d and placement round 2 results (2026-10-24 18:12 CET)
+
+- **Placement round 2:**
+  - Four separate 50 MB buffers, timed in shuffled order with or without graphs, all
+    stream at the same 222-223 GB/s. Round 1's fast buffer was mostly its alternating
+    timing order.
+  - In a 1 GiB allocation mapped in twenty slices, only the last slice is faster (253
+    GB/s), in shuffled order as well. That one remains unexplained.
+  - The boot-spread experiment (2026-10-14) already measured fragmentation at serving
+    boots: 80-93 GiB free in blocks of 2 MiB or more once serving stops, and compaction
+    made no measurable difference to step time.
+
+  So 222 GB/s is GB10's in-place streaming rate. Placement is not a lever for serving,
+  and it is parked.
+- **Branchless combines and the tree:**
+  - Small gains: select from +7-8% to +4-7%; the greedy pairs' best form (tree partial,
+    tile finish) at +0.6 to +0.8 µs (from +0.8 to +1.3).
+  - Gumbel and candidates unchanged.
+- **The cause, in SASS** (disassembled on dgx4 from the bench's compile cache; TileLang
+  embeds the cubin in `executable.so`): the production greedy partial argmax has
+  **107 branches**, Triton's has 3 (with 76 selects). The header's combine helpers,
+  `vllm_first_argmax_keep` and `vllm_argmax_keep`, used `&&` and `||`, which nvcc
+  compiles to a branch for each comparison. Round 4d's select macros kept those helpers,
+  so they were still branchy inside.
+
+  The branch now uses bitwise operators (same values, no short-circuit) and select
+  macros (`1449db182`). Every argmax-style kernel uses these helpers: Gumbel, candidates,
+  greedy, select, finish.
+
+## Third integrated run ([integration-kernels.json](integration-kernels.json), run `tilelang-integration-kernels-3`)
+
+The branch with the branch-free combines and the vocabulary-parallel seed fix (47 files),
+every bundle again: tests, then the gated benchmarks.
