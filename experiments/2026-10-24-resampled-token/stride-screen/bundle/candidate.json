@@ -1,0 +1,41 @@
+{
+  "description": "Fixed physical strides and one-thread rank reduction, with unchanged-image draft-sampling control.",
+  "image": "spark-ds41f:19f2c20ed4d6-next-4",
+  "env": {
+    "HF_HUB_OFFLINE": "1",
+    "TILELANG_CACHE_DIR": "/c/tilelang-resampled-token",
+    "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x"
+  },
+  "workdir": "vllm",
+  "argv": [
+    "-c",
+    "import subprocess,sys\np=['-m','pytest','-q','-rfEs','-p','no:cacheprovider','--noconftest','-p','prepare_fixtures']\na=subprocess.run([sys.executable,*p,'--basetemp','/c/pytest-stride','tests/v1/spec_decode/test_rejection_sampler_utils.py','-k','insert_resampled or ds41f_verification'],timeout=600).returncode\nb=subprocess.run([sys.executable,'benchmarks/kernels/benchmark_resampled_token.py','--threads','1,128','--seed','38572'],timeout=600).returncode\nsys.exit(a or b)\n"
+  ],
+  "verdict": "exit",
+  "mounts": [
+    [
+      "vllm_v1_worker_gpu_spec_decode_tilelang_resampled.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py"
+    ],
+    [
+      "vllm_v1_worker_gpu_spec_decode_rejection_sampler_utils.py",
+      "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py"
+    ],
+    [
+      "tests_v1_spec_decode_test_rejection_sampler_utils.py",
+      "/opt/spark-ds41f/candidate/vllm/tests/v1/spec_decode/test_rejection_sampler_utils.py"
+    ],
+    [
+      "benchmarks_kernels_benchmark_resampled_token.py",
+      "/opt/spark-ds41f/candidate/vllm/benchmarks/kernels/benchmark_resampled_token.py"
+    ],
+    [
+      "/usr/local/cuda-13.0/compute-sanitizer",
+      "/opt/compute-sanitizer"
+    ],
+    [
+      "prepare_fixtures.py",
+      "/b/prepare_fixtures.py"
+    ]
+  ]
+}
