@@ -385,8 +385,9 @@ def test_gumbel_rows_do_not_depend_on_the_batch():
 @pytest.mark.parametrize("vocab", [VOCAB, 100, 8193])
 @pytest.mark.parametrize("stride", STRIDES)
 @pytest.mark.parametrize("case", CASES)
-def test_temperature(vocab, stride, case):
-    tokens, slots = 19, 24
+@pytest.mark.parametrize("tokens", [3, 19])  # both block widths
+def test_temperature(vocab, stride, case, tokens):
+    slots = 24
     logits = _logits(tokens, _stride(vocab, stride), torch.float32, case, 5)[:, :vocab]
     mapping, temperature, _, _ = _sampling_inputs(tokens, slots, "mixed", 5)
     mapping[1] = 4  # Triton reads the temperature without a validity check

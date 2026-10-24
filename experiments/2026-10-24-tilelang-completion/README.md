@@ -677,3 +677,30 @@ On top of the fifth (vLLM `tilelang-ports` 649dde962):
 
 prepare_dflash_inputs in Triton's tile form (vLLM `e4729693c`): every load up front at an
 index that exists whatever the masks say, masks as selects, stores predicated.
+
+### Sixth and seventh integrated runs (2026-10-24 18:47 and 18:58 CET)
+
+Every test passes in both.
+- **combine** with dead rows, every scalar up front and a block a request: -0.20 to -0.38
+  µs against Triton at decode (it was +0.44), +0.07 µs at the 16K prefill.
+- **prepare_dflash_inputs** in tile form: faster than Triton at every shape (-0.18 to
+  -0.38 µs; it was +0.45 to +0.53).
+- **The greedy finish** with its parts loaded first: the pairs are level from 6 rows on
+  and +7% (0.2 µs) at one row.
+- **Temperature at 2048 columns a block:** -15% at one token (it was +7%) but +5% at 16
+  tokens, where 8192 was -13 to -19%.
+- **Still slower:**
+  - sink candidates at one request (+13%);
+  - prepare_prefill_inputs at decode (+0.2 to +0.35 µs; the early exit is the same chain
+    of loads as Triton's, and round 3's thread and hoisting sweeps did not close it);
+  - zero_kv_blocks (+0.1 µs at c1, +0.4% at 16K);
+  - gather_lookback (+0.07 µs);
+  - the embedding's 8K cold prefill (+0.7%).
+
+## Eighth integrated run (run `tilelang-integration-kernels-8`)
+
+vLLM `tilelang-ports` 5c819fba5:
+- the sink candidates' rounds unrolled;
+- temperature's block width by the step's token count (2048 below eight tokens, Triton's
+  8192 from eight), both declared and both tested;
+- zero_kv_blocks reads its segment's scalars before the page test.

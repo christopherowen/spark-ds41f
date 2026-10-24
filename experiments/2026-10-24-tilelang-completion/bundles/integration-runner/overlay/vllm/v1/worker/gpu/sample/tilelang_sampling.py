@@ -54,10 +54,13 @@ GUMBEL_BLOCK = 1024
 _THREADS = 128
 _WARPS = _THREADS // 32
 _PASSES = GUMBEL_BLOCK // _THREADS
-# Columns a temperature block divides. Element-wise, so the split is free: a quarter
-# of Triton's 8192 (gumbel._temperature_kernel's BLOCK_SIZE) gives one token 64
-# blocks instead of 16 for GB10's 48 SMs.
-_TEMPERATURE_BLOCK = 2048
+# Columns a temperature block divides, by the step's token count. Element-wise, so
+# the split is free: below _TEMPERATURE_SMALL tokens a quarter of Triton's 8192
+# (gumbel._temperature_kernel's BLOCK_SIZE) gives a token 64 blocks instead of 16
+# for GB10's 48 SMs (one token: -15% against Triton, +7% at 8192); from it on,
+# Triton's 8192 (sixteen tokens: -13% to -19%, +5% at 2048).
+_TEMPERATURE_BLOCKS = (2048, 8192)
+_TEMPERATURE_SMALL = 8
 # Temperature's threads a block: fewer serial runs a thread than at 128, the shape
 # Triton reaches with its loads all issued up front.
 _TEMPERATURE_THREADS = 256
@@ -753,7 +756,7 @@ def sink_candidates_kernel(
             else:
                 passes(logits, raw, scores, row, rejected, verified, word_seed, blk, tx,
                        False)  # fmt: skip
-            for i in T.serial(num_candidates):
+            for i in T.unroll(num_candidates):
                 best[0] = scores[0]
                 best_index[0] = _element(0, tx, run)
                 for j in T.unroll(1, _PASSES):
@@ -1694,10 +1697,12 @@ def greedy_rejection_sample(
 
 
 @tilelang.jit(pass_configs=_PASS)
-def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THREADS):
+def temperature_kernel(
+    idx_dtype: str, run: int, block: int, threads: int = _TEMPERATURE_THREADS
+):
     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
-    alone; a block of ``threads`` per token and ``_TEMPERATURE_BLOCK`` columns,
+    alone; a block of ``threads`` per token and ``block`` columns,
     each thread's elements in runs of ``run`` (``_triton_run``), one vector load
     and store each when aligned. As in Triton, the thread's runs are all loaded,
     then divided, then stored: the logits are read and written through one pointer,
@@ -1706,7 +1711,7 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THR
     validity check."""
     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
     logits_stride = T.dynamic("logits_stride", "int64")
-    runs = _TEMPERATURE_BLOCK // (threads * run)
+    runs = block // (threads * run)
 
     @T.prim_func
     def temperature(
@@ -1714,9 +1719,7 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THR
         idx_mapping: T.Tensor((idx_len,), idx_dtype),
         temperature: T.Tensor((temp_len,), T.float32),
     ):
-        with T.Kernel(
-            tokens, T.ceildiv(vocab, _TEMPERATURE_BLOCK), threads=threads
-        ) as (t, blk):
+        with T.Kernel(tokens, T.ceildiv(vocab, block), threads=threads) as (t, blk):
             T.import_source(_HEADER)
             tx = T.get_thread_binding()
             temp = T.alloc_local((1,), T.float32)
@@ -1727,12 +1730,12 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THR
             temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
                 for r in T.unroll(runs):
-                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+                    col0 = blk * block + r * (threads * run) + run * tx
                     _load_run_at(logits, raw, r * run, t, col0, vocab, run)
                 for k in T.unroll(runs * run):
                     raw[k] = T.call_extern("float32", "vllm_div_full", raw[k], temp[0])
                 for r in T.unroll(runs):
-                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+                    col0 = blk * block + r * (threads * run) + run * tx
                     _store_run_at(logits, raw, r * run, t, col0, vocab, run)
 
     return temperature
@@ -1746,8 +1749,12 @@ def apply_temperature(
     """``gumbel.apply_temperature``."""
     if logits.shape[0] == 0:
         return
+    block = _TEMPERATURE_BLOCKS[logits.shape[0] >= _TEMPERATURE_SMALL]
     kernel = _kernel(
-        temperature_kernel, _DTYPES[expanded_idx_mapping.dtype], _triton_run(logits)
+        temperature_kernel,
+        _DTYPES[expanded_idx_mapping.dtype],
+        _triton_run(logits),
+        block,
     )
     kernel(logits, expanded_idx_mapping.contiguous(), temperature)
 
@@ -1800,8 +1807,9 @@ def sampling_calls(
     ]
     if temperature:
         calls += [
-            _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run)
+            _call(temperature_kernel, _DTYPES[RUNNER_IDX_DTYPE], run, block)
             for run in _runs(torch.float32)
+            for block in _TEMPERATURE_BLOCKS
         ]
     return calls
 

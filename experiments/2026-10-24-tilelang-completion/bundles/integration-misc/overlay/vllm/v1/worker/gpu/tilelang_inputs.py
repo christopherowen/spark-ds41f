@@ -524,12 +524,15 @@ def zero_kv_blocks_kernel():
         # Blocks on x (up to 2^31 - 1), as Triton's grid has them.
         with T.Kernel(num_ids, segments, chunks, threads=_THREADS) as (b, s, cx):
             tx = T.get_thread_binding()
-            page = seg_page_sizes[s]
+            # Every scalar up front (its index always exists), so the loads issue
+            # together instead of the rest waiting on the page size's test.
+            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
+            stride = T.alloc_var(T.int64, init=seg_block_strides[s])
+            block_id = T.alloc_var(T.int64, init=block_ids[b])
+            segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
             first = T.cast(cx, T.int64) * _CHUNK
             if first < page:
-                stride = seg_block_strides[s]
-                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
-                base = block_ids[b] * stride
+                base = block_id * stride
                 if T.truncmod(seg_addrs[s], 16) == 0 and T.truncmod(stride, 4) == 0:
                     col = first + tx * _PER_THREAD
                     if col + _PER_THREAD <= page:
