@@ -401,3 +401,12 @@ sixteen streams 7.8 against 8.0 us, 8K prefill 2,789 against 2,864 us (-2.0%), 1
 **Where the decode step went ([rc2/ab-tp4.json](rc2/ab-tp4.json)).** One session on image -next-2,
 the grid and closed loops at 16 and 1 streams: candidate 2 as it is, without the malloc settings,
 without them at 8,192, and as it is again.
+
+**Result (2026-10-24 05:15-05:59 CET, run `next-rc2-ab-tp4`).** Grid geometric mean against the plain
+16,384 arm, in run order: malloc pinned at 16,384 (first) -0.14%, plain 16,384 (second) 0, plain
+8,192 (third) -0.93%, malloc pinned at 16,384 again (fourth) -0.79%. The repeat drifted 0.65% faster
+over the session; allowing for that, the malloc settings cost nothing and the 16,384 budget costs
+a decode step about 0.7%. 16 and 1 streams are level throughout. A decode step does not use the
+long-prefill budget, so something in it scales with `max_num_batched_tokens`:
+[profile/profile-tp4.json](profile/profile-tp4.json) profiles decode at one and sixteen streams at
+16,384, 8,192 and 16,384 again (torch profiler, every rank), and compares the kernels' costs.
