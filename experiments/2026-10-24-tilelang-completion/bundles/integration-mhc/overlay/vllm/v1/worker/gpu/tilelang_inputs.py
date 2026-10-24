@@ -503,11 +503,18 @@ def apply_fused_staged_writes(
 # --- KV block zeroing ---------------------------------------------------------
 
 
+_ZERO_THREADS = 128
+_ZERO_PER_THREAD = 8
+_ZERO_CHUNK = _ZERO_THREADS * _ZERO_PER_THREAD  # Triton's BLOCK_SIZE cap
+
+
 @tilelang.jit(pass_configs=_PASS)
 def zero_kv_blocks_kernel():
     """Zero every segment's page of each block: a block covers 1024 int32s of one
-    segment's page of one KV block, in 16-byte stores where the segment's address
-    and block stride allow (four int32s a thread), else an int32 at a time."""
+    segment's page of one KV block, in Triton's form. Only the page size is read
+    before the early exit; the block id, stride and address are read together
+    after it, and every store is an int32 predicated on the page (``_STORE_IF``),
+    each thread's eight 128 apart."""
     segments = T.dynamic("segments")
     stride_len = T.dynamic("stride_len")
     page_len = T.dynamic("page_len")
@@ -522,30 +529,22 @@ def zero_kv_blocks_kernel():
         chunks: T.int32,
     ):
         # Blocks on x (up to 2^31 - 1), as Triton's grid has them.
-        with T.Kernel(num_ids, segments, chunks, threads=_THREADS) as (b, s, cx):
+        with T.Kernel(num_ids, segments, chunks, threads=_ZERO_THREADS) as (b, s, cx):
+            T.import_source(_STORE_IF)
             tx = T.get_thread_binding()
-            # Every scalar up front (its index always exists), so the loads issue
-            # together instead of the rest waiting on the page size's test.
             page = T.alloc_var(T.int64, init=seg_page_sizes[s])
-            stride = T.alloc_var(T.int64, init=seg_block_strides[s])
-            block_id = T.alloc_var(T.int64, init=block_ids[b])
-            segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
-            first = T.cast(cx, T.int64) * _CHUNK
+            first = T.cast(cx, T.int64) * _ZERO_CHUNK
             if first < page:
+                stride = T.alloc_var(T.int64, init=seg_block_strides[s])
+                block_id = T.alloc_var(T.int64, init=block_ids[b])
+                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
                 base = block_id * stride
-                if T.truncmod(seg_addrs[s], 16) == 0 and T.truncmod(stride, 4) == 0:
-                    col = first + tx * _PER_THREAD
-                    if col + _PER_THREAD <= page:
-                        T.stg128(segment[base + col], T.Broadcast(T.uint32(0), 4))
-                    else:
-                        for k in T.unroll(_PER_THREAD):
-                            if col + k < page:
-                                segment[base + col + k] = 0
-                else:
-                    for k in T.unroll(_PER_THREAD):
-                        col = first + k * _THREADS + tx
-                        if col < page:
-                            segment[base + col] = 0
+                for k in T.unroll(_ZERO_PER_THREAD):
+                    col = first + k * _ZERO_THREADS + tx
+                    T.call_extern(
+                        "handle", "vllm_store_if_b32",
+                        T.address_of(segment[base + col]), 0, col < page,
+                    )  # fmt: skip
 
     return zero_kv_blocks
 
@@ -558,7 +557,7 @@ def zero_kv_blocks(
     max_page_size: int,
 ) -> None:
     """``KVBlockZeroer.zero_block_ids``' launch: segment addresses as int64."""
-    chunks = _ceil(max_page_size, _CHUNK)
+    chunks = _ceil(max_page_size, _ZERO_CHUNK)
     if chunks == 0 or seg_addrs.shape[0] == 0 or block_ids.shape[0] == 0:
         return
     _kernel(zero_kv_blocks_kernel)(

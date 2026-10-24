@@ -1028,7 +1028,7 @@ are now declared at startup; the NaN count only when NaN counting is on.
 
 ## Twelfth integrated run (run `tilelang-integration-kernels-12`)
 
-vLLM `tilelang-ports` 3bb713c4f, with the controls dispatched. The sampling bundle also
+vLLM `tilelang-ports` 3fe4099d1: the controls dispatched, and zero_kv_blocks and the lookback in Triton's form (runner round 5b: level at every shape where production was flagged). The sampling bundle also
 runs the bad-words and rejection-sampler tests, which exercise the switched states. If it
 passes, [serving-ports-2.json](serving-ports-2.json) serves the branch beside candidate 4,
 in alternating arms with eight eight-stream samples each. It checks:
