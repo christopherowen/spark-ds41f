@@ -176,7 +176,9 @@ def gumbel_case(tokens: int, dtype: torch.dtype):
         best = torch.empty(tokens, blocks, device=DEVICE)
         kernel = tls._kernel(
             tls.gumbel_sample_kernel,
-            *tls.gumbel_sample_key(dtype, torch.int64, False, False),
+            *tls.gumbel_sample_key(
+                dtype, torch.int64, False, False, run=tls._triton_run(logits)
+            ),
         )
 
         def ours():
@@ -269,7 +271,9 @@ def candidates_case(reqs: int, temperature: float):
         )
         kernel = tls._kernel(
             tls.sink_candidates_kernel,
-            *tls.sink_candidates_key(torch.bfloat16, torch.int64, candidates, True),
+            *tls.sink_candidates_key(
+                torch.bfloat16, torch.int64, candidates, True, tls._triton_run(logits)
+            ),
         )
 
         def ours():

@@ -186,6 +186,13 @@ def _logits(rows: int, vocab: int, dtype: torch.dtype, case: str, seed: int):
 
 
 CASES = ("random", "ties", "special")
+# Row strides: a multiple of 16 (Triton lays the block out in 16-byte runs) or odd
+# (one element a thread); each vocabulary is tested with both.
+STRIDES = ("aligned", "odd")
+
+
+def _stride(vocab: int, stride: str) -> int:
+    return (vocab + 64 + 15) // 16 * 16 if stride == "aligned" else vocab + 3
 
 
 # --- Gumbel sampling ----------------------------------------------------------
@@ -219,6 +226,7 @@ def _gumbel_both(
                 None if cache is None else cache.dtype,
                 None if col is None else col.dtype,
                 col is not None and col.dim() > 0,
+                tls._triton_run(logits),
             )
             tls._kernel(tls.gumbel_sample_kernel, *key)(
                 argmax,
@@ -280,15 +288,17 @@ def _sampling_inputs(tokens: int, slots: int, temps: str, seed: int):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049])
+@pytest.mark.parametrize("stride", STRIDES)
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("temps", ["zero", "one", "mixed"])
 @pytest.mark.parametrize(
     "apply_temperature,is_drafting", [(False, False), (True, False), (True, True)]
 )
-def test_gumbel_sample(dtype, vocab, case, temps, apply_temperature, is_drafting):
+def test_gumbel_sample(
+    dtype, vocab, stride, case, temps, apply_temperature, is_drafting
+):
     tokens, slots = 37, 48
-    padded = vocab + 64
-    logits = _logits(tokens, padded, dtype, case, vocab)[:, :vocab]
+    logits = _logits(tokens, _stride(vocab, stride), dtype, case, vocab)[:, :vocab]
     mapping, temperature, seeds, pos = _sampling_inputs(tokens, slots, temps, vocab)
     (a, b, _), (c, d, _) = _gumbel_both(
         logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
@@ -341,10 +351,11 @@ def test_gumbel_rows_do_not_depend_on_the_batch():
 
 
 @pytest.mark.parametrize("vocab", [VOCAB, 100, 8193])
+@pytest.mark.parametrize("stride", STRIDES)
 @pytest.mark.parametrize("case", CASES)
-def test_temperature(vocab, case):
+def test_temperature(vocab, stride, case):
     tokens, slots = 19, 24
-    logits = _logits(tokens, vocab + 8, torch.float32, case, 5)[:, :vocab]
+    logits = _logits(tokens, _stride(vocab, stride), torch.float32, case, 5)[:, :vocab]
     mapping, temperature, _, _ = _sampling_inputs(tokens, slots, "mixed", 5)
     mapping[1] = 4  # Triton reads the temperature without a validity check
     ours, theirs = logits.clone(), logits.clone()
@@ -383,15 +394,19 @@ def _batch(counts, sampled_width, slots, seed):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("vocab", [VOCAB, 1000])
+@pytest.mark.parametrize("stride", STRIDES)
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize("num_candidates", [4, 2])
 @pytest.mark.parametrize("mask_rejected_draft", [True, False])
-def test_sink_candidates(dtype, case, num_candidates, mask_rejected_draft):
+def test_sink_candidates(
+    dtype, vocab, stride, case, num_candidates, mask_rejected_draft
+):
     counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
-    width, slots, vocab = 6, 16, VOCAB
+    width, slots = 6, 16
     cu, num_sampled, drafts, sampled, mapping = _batch(counts, width, slots, 2)
     rows = int(cu[-1])
-    logits = _logits(rows, vocab + 128, dtype, case, 2)
+    logits = _logits(rows, _stride(vocab, stride), dtype, case, 2)
     _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 2)
     pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
     ours = tls.sink_candidates(
@@ -690,7 +705,8 @@ def test_sample_greedy_markov(dtype, case):
 
 
 @pytest.mark.parametrize("steps", [5, 1])
-def test_greedy_rejection(steps):
+@pytest.mark.parametrize("drafts_dtype", [torch.int32, torch.int64])
+def test_greedy_rejection(steps, drafts_dtype):
     g = torch.Generator(device=DEVICE).manual_seed(steps)
     counts = [steps + 1 if i % 3 else 1 for i in range(37)]
     cu = torch.tensor(
@@ -699,9 +715,9 @@ def test_greedy_rejection(steps):
     rows = int(cu[-1])
     target = torch.randint(0, 6, (rows,), generator=g, device=DEVICE)
     drafts = torch.randint(-1, 6, (rows + 1,), generator=g, device=DEVICE).to(
-        torch.int32
+        drafts_dtype
     )
-    drafts[1::2] = target[: drafts[1::2].numel()].to(torch.int32)
+    drafts[1::2] = target[: drafts[1::2].numel()].to(drafts_dtype)
     ours = tls.greedy_rejection_sample(target, drafts, cu, steps)
     theirs = _triton_greedy_rejection(target, drafts, cu, steps)
     _assert_same(ours[1], theirs[1], "num_sampled")

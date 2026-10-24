@@ -186,3 +186,42 @@ outputs and a seeded temperature-1 run identical to the previous release.
   - The order-of-operations test's expected values had assumed the wrong order; they are
     corrected, with a case that tells the two apart (83b073cec also sorts the declared-calls
     test by factory).
+
+## The ports' kernel window (2026-10-24 14:10 CET, run `tilelang-ports-kernels`)
+
+One spec ([ports-kernels.json](ports-kernels.json)), one node a bundle, image -next-4. Production
+was restored at 14:12.
+
+- **Embedding and confidence head: pass.** 85 tests and the benchmark gate.
+- **mHC: all 60 tests pass, bit-identical to TileKernels.**
+  - The post is faster at every shape: one stream -37%, sixteen -6%, 8K and 16K prefill -4.6%.
+  - The collapse is faster at decode (-4.6%, -10%) but 1.1-1.2% slower at 8K and 16K
+    prefill, so the gate fails; under repair.
+- **Runner inputs: all 507 tests pass.** Its benchmark hit an illegal memory access in its first
+  case before printing a row; under repair.
+- **Sampling: 351 passed, 43 failed.**
+  - The image's Triton is 3.7.1, not 3.5.0. The noise on all 2**32 words and the Philox streams
+    still match: 3.7.1 inlines the same libdevice sequences.
+  - **3.7.1 lays the block out by the load's specialization.** When the logits' base and row
+    stride are divisible by 16, a thread holds 16-byte runs: four FP32 values, runs 512
+    apart, or eight 16-bit values. Otherwise it holds one element, 128 apart (the order the
+    port first replicated). The order decides the index a block with NaN reports, which is
+    every failing Gumbel and candidates case: the "special" logits at a stride of 129,344.
+    The cases at strides 1,064 and 2,113 passed. Production's Triton cache shows the same:
+    FP32 runs of four and bf16 runs of eight, at every cached variant.
+  - The port now takes the run from the same rule and loads each whole run as one vector, as
+    Triton does (vLLM `tilelang-sampling` e5f883a9c). The tests cover both strides at every
+    vocabulary, partial tail runs included.
+  - The policy kernel had one length for its flags, values and drafts, but the drafts may be
+    longer, and TileLang's packed ABI checked them equal. Every buffer now has its own length.
+  - Greedy verification also takes int64 drafts.
+  - The sampler-flags test hooked every Triton compile and caught the top-p kernels, which an
+    earlier test happened to have compiled in the release tests. It now checks that the
+    TileLang Gumbel kernels compile at warmup only (0cfca05d8).
+  - **Speed** (before the layout change, scalar loads):
+    - the Gumbel sampler was 2-18% slower with bf16 logits at 1-6 tokens and level or faster
+      with FP32;
+    - the temperature kernel was 6-50% slower;
+    - the sink candidates were 4-46% slower.
+
+    Triton's 16-byte loads account for most of it; the next run measures the vector port.
