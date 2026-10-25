@@ -54,11 +54,8 @@ they join a candidate only within 1% of r6n with its bits.
 5. ~~Credit huxiaofengtiger with a `Reported-by:` trailer on vLLM 0143~~: carried by r6o's
    series ([experiments/2026-10-16-r6o](experiments/2026-10-16-r6o/README.md)) into r6s,
    promoted for TP3 on 2026-10-16; TP4 carries it from its r6s release.
-6. **Unpin TP4's cost curves at its next release.** Since 2026-10-15 a profile without a
-   pinned directory schedules on its own build's curves (`bin/spark` derives
-   `SPARK3_DSPARK_COST_DIR` per build). `tp4-ring` still pins r6h's
-   (`ring4-r6h-headout-20261012`), as r6n's TP4 release ran; drop the pin with the next
-   TP4 release so its candidate profiles its own.
+6. ~~Unpin TP4's cost curves at its next release~~: nothing reads cost curves since vLLM
+   0184 (the DSpark draft budget is a rule of the inputs since r6x), and the recipe pins none.
 7. **Retire the old bench's measurements.** servebench suites decide releases and are the
    benchmark reference (2026-10-15). Remove `bin/spark bench`'s own suites (single-prompt
    decode points that move with the text, burst distinct streams, the quality gate's
@@ -258,10 +255,6 @@ and eight streams for every decode change, and sixteen on TP4.
   `bin/spark bench --suites quality,decode --decode-cases prose,code,prose-nothink,code-nothink --concurrency 1,8 --min-samples 3 --max-samples 3`
   (about 8 minutes with the boot). Run the full matrix only for a promotion
   candidate.
-- **Pin the verification cost table.** Same-TP arms share one pinned
-  adaptive-verification table (`SPARK3_DSPARK_COST_DIR`, vLLM patch 0005), with
-  its hash recorded, so verification policy is fixed. TP3 and TP4 need their
-  own tables.
 - **Start cool.** `bench` and lab jobs bring every node below 55 °C before
   measuring (`--cool-below`, `--cool-timeout`). Long prefills still reach
   83 °C on dgx1 and dgx2 (see Four nodes).
@@ -270,11 +263,10 @@ and eight streams for every decode change, and sixteen on TP4.
   on the generated text varies between samples: accepted drafts per step,
   prefix-cache hits, output length. Time per verification step is stable to
   about ±0.5 ms with three samples; acceptance is not. For changes that move
-  acceptance, replay a recorded draft trace (patch 0008 `SPARK3_DSPARK_TRACE`
-  with `experiments/2026-09-26-dspark-policy/replay.py`) or raise the sample
-  count. Eight-stream aggregates swing 3-5% between samples. Across 231
-  recorded runs, 41% of three-sample one-stream A/A pairs differ by more than
-  3% in tok/s (24% at eight streams); gate on step time.
+  acceptance, raise the sample count. Eight-stream aggregates swing 3-5%
+  between samples. Across 231 recorded runs, 41% of three-sample one-stream
+  A/A pairs differ by more than 3% in tok/s (24% at eight streams); gate on
+  step time.
 - **Boot-to-boot noise can look significant.** The 2026-09-27 `base` and
   `nol2` arms ran identical code (the L2 prefetch was not running) and read
   1.2 ms per step (-2.4%) apart, "significant" with two boots per arm. When a

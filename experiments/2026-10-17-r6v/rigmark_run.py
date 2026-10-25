@@ -22,7 +22,8 @@ REPOSITORY = "https://github.com/alexellis/rigmark"
 REVISION = "770c3106729d5b73543afa2d9b498cebda6456f3"  # 2026-10-14, protocol 1.3.0
 EXTRA_BODY = {"chat_template_kwargs": {"reasoning_effort": "low"}}
 ROOT = Path(__file__).resolve().parents[2]
-CONTAINER = "dsv41-karmic-kraken"
+# bin/spark's serving names: the container since the rename to spark-ds41f, every dsv41-* before it.
+SERVING = ("^spark-ds41f$", "^dsv41-")
 
 
 def git(*args: str, cwd: Path) -> str:
@@ -44,12 +45,21 @@ def checkout() -> Path:
     return target
 
 
+def serving_container() -> str:
+    """The running serving container: a stopped one is production's, kept while an arm serves."""
+    names = subprocess.run(["docker", "ps", *(f"--filter=name={pattern}" for pattern in SERVING),
+                            "--format", "{{.Names}}"], check=True, capture_output=True, text=True).stdout.split()
+    if len(names) != 1:
+        raise SystemExit(f"expected one running serving container, found {', '.join(names) or 'none'}")
+    return names[0]
+
+
 def main(url: str, label: str, metadata: str, comparison: str) -> None:
     rigmark = checkout()
     out = ROOT / "results" / "private" / "rigmark" / label
     out.mkdir(parents=True, exist_ok=True)
     meta = json.loads((ROOT / metadata).read_text())
-    image = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}} {{.Image}}", CONTAINER],
+    image = subprocess.run(["docker", "inspect", "-f", "{{.Config.Image}} {{.Image}}", serving_container()],
                            check=True, capture_output=True, text=True).stdout.split()
     meta["serving_image"] = f"{image[0]} ({image[1]}, built from the spark-ds41f recipe; not published)"
     meta["recipe_revision"] = git("rev-parse", "HEAD", cwd=ROOT)

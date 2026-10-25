@@ -86,9 +86,7 @@ check_files() {
   fi
   for legacy in \
     /etc/systemd/system.conf.d/90-law-watchdog.conf \
-    /etc/systemd/system.conf.d/90-law-watchdog.conf.spark3-migrated \
-    /etc/sysctl.d/90-law-watchdog.conf \
-    /etc/sysctl.d/90-law-watchdog.conf.spark3-migrated; do
+    /etc/sysctl.d/90-law-watchdog.conf; do
     if sudo -n test -e "$legacy"; then
       echo "retired legacy recovery file remains: $legacy" >&2
       failed=1
@@ -170,12 +168,11 @@ done
 
 # Retire the earlier ad-hoc files only after their repository-owned replacements
 # are installed. Their directives are fully represented by the managed files;
-# removing both active and migrated copies keeps every host's configuration
-# inventory identical.
+# removing them keeps every host's configuration inventory identical.
 for legacy in \
   /etc/systemd/system.conf.d/90-law-watchdog.conf \
   /etc/sysctl.d/90-law-watchdog.conf; do
-  sudo -n rm -f "$legacy" "$legacy.spark3-migrated"
+  sudo -n rm -f "$legacy"
 done
 
 # Regenerate the boot menu when it still passes splash, and switch the active
