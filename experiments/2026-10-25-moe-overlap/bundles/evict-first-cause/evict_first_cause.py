@@ -14,7 +14,10 @@ its generated CUDA, and runs in its own process (the error kills the context):
 - helper, policy operand: the hint with the policy word as a C operand, the form that
   ran alone.
 
-Then it prints the generated-source diffs against the release.
+Each runs at the gate/up shape (512x512, gathered, no K tail) and the TP4 down shape
+(384x576, a 64-wide K tail: the first failing test's). Two more variants put the helper
+on one copy only (the K tail's 8 bytes or the scale codes' 16), TileLang's cp.async on
+the other. Then it prints the down shape's generated-source diffs against the release.
 
 Mounts: /b/moe_release.py (the release's moe.py), /b/moe_evict_first.py (the change's).
 """
@@ -71,17 +74,40 @@ OPERAND = (
     )
 )
 assert PLAIN != HELPER and OPERAND != HELPER
+TAIL_HELPER = """                        _cp_async_evict_first(
+                            T.access_ptr(B_shared[s, n, g * 16], "w", 8),"""
+TAIL_RELEASE = """                        T.ptx_cp_async(
+                            T.access_ptr(B_shared[s, n, g * 16], "w", 8),"""
+CODES_HELPER = """                _cp_async_evict_first(
+                    T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
+                    T.access_ptr(
+                        SFB[(expert * n_blocks + bx) * k_blocks + ko, tx * 8], "r", 8
+                    ),
+                    16,  # eight 2-byte codes"""
+CODES_RELEASE = """                T.ptx_cp_async(
+                    T.access_ptr(SFB_shared[s, tx * 8], "w", 8),
+                    T.access_ptr(
+                        SFB[(expert * n_blocks + bx) * k_blocks + ko, tx * 8], "r", 8
+                    ),
+                    8,  # elements: eight 2-byte codes, one 16-byte copy"""
+assert HELPER.count(TAIL_HELPER) == 1 and HELPER.count(CODES_HELPER) == 1
+assert RELEASE.count(TAIL_RELEASE) == 1 and RELEASE.count(CODES_RELEASE) == 1
 VARIANTS = {
     "release": RELEASE,
     "helper": HELPER,
     "helper, no hint": PLAIN,
     "helper, policy operand": OPERAND,
+    "helper, tail only": HELPER.replace(CODES_HELPER, CODES_RELEASE),
+    "helper, codes only": HELPER.replace(TAIL_HELPER, TAIL_RELEASE),
 }
+SHAPES = ((512, 512, True), (384, 576, False))
+DIFFS = ("helper, tail only", "helper, no hint", "helper, codes only")
 
 RUN = r"""
 import importlib.util, sys
 import torch
 path, out, source_out = sys.argv[1], sys.argv[2], sys.argv[3]
+n, k, gather = int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "True"
 package = "vllm.models.deepseek_v4_1.tilelang"
 spec = importlib.util.spec_from_file_location(package + ".moe_variant", path)
 moe = importlib.util.module_from_spec(spec)
@@ -91,7 +117,6 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
 from vllm.models.deepseek_v4_1.tilelang.gemm import pack_scale_codes
 from vllm.models.deepseek_v4_1.tilelang.linear import _calls
 import tile_kernels
-n, k, gather = 512, 512, True
 experts, topk, rows, block_N = 32, 6, 12, 128
 gen = torch.Generator(device="cuda").manual_seed(22)
 packed = torch.randint(0, 256, (experts, n, k // 2), generator=gen, device="cuda", dtype=torch.uint8)
@@ -106,60 +131,82 @@ weights = torch.rand((rows, topk), generator=gen, device="cuda")
 specs = dispatch.workspace_specs(rows)
 layout = dispatch.dispatch(ids, weights, moe.carve(torch.empty(moe.workspace_bytes(specs), dtype=torch.uint8, device="cuda"), specs))
 order, tile_expert = layout["order"], layout["tile_expert"]
-x = (torch.randn((rows, k), generator=gen, device="cuda") * 0.5).bfloat16()
+a_rows = rows if gather else order.shape[0]
+x = (torch.randn((a_rows, k), generator=gen, device="cuda") * 0.5).bfloat16()
 xq, sf = tile_kernels.quant.per_token_cast(x, "e4m3", 32, round_sf=True, use_packed_ue8m0=True)
 gemm = moe.grouped_fp8_fp4_gemm(experts, n, k, topk, gather, 32, block_N, coded_scales=True)
 open(source_out, "w").write(gemm.get_kernel_source())
 c = torch.zeros((order.shape[0], n), dtype=torch.bfloat16, device="cuda")
-gemm(xq, sf.contiguous().view(torch.uint32), tiles, moe.tile_codes(codes, block_N), row_base, order, tile_expert, c)
+extra = (tails,) if tails is not None else ()
+gemm(xq, sf.contiguous().view(torch.uint32), tiles, *extra, moe.tile_codes(codes, block_N), row_base, order, tile_expert, c)
 torch.cuda.synchronize()
 torch.save(c[order >= 0].view(torch.int16).cpu(), out)
 """
 
 
 def main() -> int:
-    outputs, sources = {}, {}
-    for index, (name, module) in enumerate(VARIANTS.items()):
-        path = Path(f"/tmp/moe_cause_{index}.py")
-        out, source = f"/tmp/moe_cause_{index}.pt", Path(f"/tmp/moe_cause_{index}.cu")
-        path.write_text(module)
-        script = Path(f"/tmp/moe_cause_run_{index}.py")
-        script.write_text(RUN)
-        run = subprocess.run(
-            [sys.executable, str(script), str(path), out, str(source)],
-            capture_output=True,
-            text=True,
-        )
-        if source.exists():
-            sources[name] = source.read_text()
-        if run.returncode == 0:
-            import torch
-
-            outputs[name] = torch.load(out)
-            same = (
-                outputs[name].equal(outputs["release"])
-                if "release" in outputs
-                else None
+    sources = {}
+    for n, k, gather in SHAPES:
+        shape = f"{n}x{k}"
+        outputs = {}
+        for index, (name, module) in enumerate(VARIANTS.items()):
+            tag = f"{index}_{shape}"
+            path, script = (
+                Path(f"/tmp/moe_cause_{tag}.py"),
+                Path(f"/tmp/moe_cause_run_{tag}.py"),
             )
-            outcome = {"ran": True, "bits_equal_release": same}
-        else:
-            lines = [line for line in run.stderr.splitlines() if "Error" in line]
-            outcome = {"ran": False, "error": lines[-1] if lines else run.stderr[-400:]}
-        print(json.dumps({"variant": name, **outcome}), flush=True)
-    for name in ("helper", "helper, no hint", "helper, policy operand"):
-        if name not in sources or "release" not in sources:
+            out, source = f"/tmp/moe_cause_{tag}.pt", Path(f"/tmp/moe_cause_{tag}.cu")
+            path.write_text(module)
+            script.write_text(RUN)
+            source.unlink(missing_ok=True)
+            run = subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    str(path),
+                    out,
+                    str(source),
+                    str(n),
+                    str(k),
+                    str(gather),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if source.exists():
+                sources[name, shape] = source.read_text()
+            if run.returncode == 0:
+                import torch
+
+                outputs[name] = torch.load(out)
+                same = (
+                    outputs[name].equal(outputs["release"])
+                    if "release" in outputs
+                    else None
+                )
+                outcome = {"ran": True, "bits_equal_release": same}
+            else:
+                lines = [line for line in run.stderr.splitlines() if "Error" in line]
+                outcome = {
+                    "ran": False,
+                    "error": lines[-1] if lines else run.stderr[-400:],
+                }
+            print(json.dumps({"shape": shape, "variant": name, **outcome}), flush=True)
+    shape = "384x576"
+    for name in DIFFS:
+        if (name, shape) not in sources or ("release", shape) not in sources:
             continue
         diff = difflib.unified_diff(
-            sources["release"].splitlines(),
-            sources[name].splitlines(),
+            sources["release", shape].splitlines(),
+            sources[name, shape].splitlines(),
             "release",
             name,
-            n=4,
+            n=6,
             lineterm="",
         )
         body = [line for line in diff if not line.startswith(("---", "+++"))]
         print(
-            f"\n===== generated source, release -> {name}: {len(body)} lines",
+            f"\n===== {shape} generated source, release -> {name}: {len(body)} lines",
             flush=True,
         )
         print("\n".join(body[:400]), flush=True)
