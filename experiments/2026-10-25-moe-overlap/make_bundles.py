@@ -5,12 +5,13 @@ usage: make_bundles.py VLLM_REPO
 
 Each change is one vLLM commit on the release's source (BASE, tilelang-ports 26382f5cf,
 which candidate 6's image holds with two test-only patches), on a branch of its own so
-that each arm carries one variable: ``moe-evict-first`` and ``mhc-mxfp8-cast``. For each,
+that each arm carries one variable: ``mhc-mxfp8-cast``. (``moe-evict-first`` was dropped
+after its dgx4 run, README "Results"; its bundle stays as that run's record.) For each,
 every file the branch changes from BASE goes into bundles/<change>: package files under
 overlay/vllm (the lab mounts them over the image's tree), tests and benchmarks as
 mounts, and the release's copy of the module its benchmark compares against
-(``baseline_*``). <change>-tp4-dev.json is the serving arm: candidate 6's dev arm with the
-same package files mounted.
+(``baseline_*``). <change>-tp4-dev.json and <change>-tp3-dev.json are the serving arms:
+candidate 6's dev arm on the ring and on the triangle, with the same package files mounted.
 """
 import json
 import shutil
@@ -23,7 +24,11 @@ REPO_EXPERIMENT = "experiments/2026-10-25-moe-overlap"
 ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BASE = "26382f5cf"
-BASE_ARM = "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4-dev.json"
+# Candidate 6 (spark-ds41f-1025's image) dev arms by shape: the ring and the triangle.
+BASE_ARMS = {
+    "tp4": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4-dev.json",
+    "tp3": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp3-dev.json",
+}
 FIXTURES = HERE.parent / "2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
@@ -32,19 +37,6 @@ PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest
 # change: (branch, description, baseline modules, [(label, argv after python, timeout
 # seconds[, env])]); env sets a step's variables over the bundle's (None unsets one).
 CHANGES = {
-    "evict-first": (
-        "moe-evict-first",
-        "the routed experts' grouped GEMMs load every weight byte evict-first in L2",
-        ["vllm/models/deepseek_v4_1/tilelang/moe.py"],
-        [
-            ("MoE tests", PYTEST + [
-                "--basetemp", "/c/pytest-moe-overlap-evict-first",
-                "tests/kernels/moe/test_deepseek_v41_tilelang_moe.py"], 3600),
-            ("evict-first benchmark", [
-                "benchmarks/kernels/benchmark_deepseek_v41_moe_evict_first.py",
-                "--baseline", "/b/baseline/moe.py", "--gate"], 5400),
-        ],
-    ),
     "mhc-cast": (
         "mhc-mxfp8-cast",
         "mHC finalize writes its output's MXFP8 cast; the projections it feeds (fused "
@@ -157,13 +149,15 @@ def main() -> None:
         arm_mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]]
         arm_mounts += [[f"{experiment}/bundles/{name}/overlay/{path}", f"{ROOT}/{path}", "ro"]
                        for path in package]
-        arm = {
-            "notes": (f"Candidate 6 (dev-mode RPC) with {what}: the package files of vLLM "
-                      f"branch {branch} {head} mounted over the image ({len(package)})."),
-            "extends": {"config": BASE_ARM},
-            "set": {"container": {"mounts": arm_mounts}},
-        }
-        (HERE / f"{name}-tp4-dev.json").write_text(json.dumps(arm, indent=1) + "\n")
+        for shape, base in BASE_ARMS.items():
+            arm = {
+                "notes": (f"Candidate 6 ({shape}, dev-mode RPC) with {what}: the package files "
+                          f"of vLLM branch {branch} {head} mounted over the image "
+                          f"({len(package)})."),
+                "extends": {"config": base},
+                "set": {"container": {"mounts": arm_mounts}},
+            }
+            (HERE / f"{name}-{shape}-dev.json").write_text(json.dumps(arm, indent=1) + "\n")
         print(f"{name}: {branch} {head}, {len(package)} package files, "
               f"{len(changed) - len(package)} test and benchmark files, {len(steps)} steps")
 
