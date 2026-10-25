@@ -75,7 +75,13 @@ STEPS = [
     ("the ring's recorded blocks and DS4.1's specs", PYTEST + [
         "--basetemp", "/c/pytest-kv-zeroing-specs",
         "tests/v1/core/test_single_type_kv_cache_manager.py",
-        "tests/models/test_deepseek_v4_1_compressor.py"], 1800),
+        "tests/models/test_deepseek_v4_1_compressor.py",
+        # The release tests' deselections: the native B12X compressor, which production
+        # does not run (config/release-tests.json).
+        "--deselect", "tests/models/test_deepseek_v4_1_compressor.py::"
+        "test_native_compressor_high_page_offsets",
+        "--deselect", "tests/models/test_deepseek_v4_1_compressor.py::"
+        "test_native_compressor_rejection_reorder_padding_and_page_boundaries"], 1800),
     ("window metadata: TileLang against Triton, CED and the draft windows", PYTEST + [
         "--basetemp", "/c/pytest-kv-zeroing-windows",
         "tests/kernels/test_deepseek_v41_tilelang_metadata.py",
