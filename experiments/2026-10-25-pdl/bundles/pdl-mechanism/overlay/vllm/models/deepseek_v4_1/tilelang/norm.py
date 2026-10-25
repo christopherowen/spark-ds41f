@@ -14,7 +14,7 @@ from vllm.models.deepseek_v4_1.tilelang import pdl, prepare
 def _rmsnorm(
     x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor, eps: float
 ) -> None:
-    pdl.tile_kernels().quant.norm_forward(x, weight, eps, out=out)
+    pdl.norm_forward(x, weight, eps, out=out)
 
 
 @_rmsnorm.register_fake

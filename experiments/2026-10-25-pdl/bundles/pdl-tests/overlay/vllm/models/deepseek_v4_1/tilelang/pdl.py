@@ -26,11 +26,15 @@ predecessor completes; one that does, after a kernel that does not, starts as
 that kernel's CTAs exit. Kernels compiled with warp specialization do not use
 it: their producer warps' TMA loads would have to follow the wait too.
 
-TileKernels' casts and norms (``tile_kernels()``) use DeepSeek's own PDL
-switch, which places the wait first and the trigger after the stores.
+TileKernels' kernels on the chain (``per_token_cast``, ``norm_forward``,
+``moe_topk_gate_forward`` here) use DeepSeek's own PDL switch, set only for the
+call: these place the wait first and the trigger after their stores. The switch
+stays off for every other TileKernels kernel. Some read an input before their
+wait (the mHC post its mixes, RoPE its positions), which is safe only where the
+kernel launched just before them did not write it.
 """
 
-import functools
+import contextlib
 
 import tilelang.language as T
 
@@ -41,10 +45,33 @@ def chain():
     T.pdl_trigger()
 
 
-@functools.cache
-def tile_kernels():
-    """TileKernels, with PDL on for every kernel it compiles from now on."""
+@contextlib.contextmanager
+def _tile_kernels():
+    """TileKernels with its PDL switch on inside the block (each call compiles and
+    launches with it; the kernel cache keys on the switch)."""
     import tile_kernels
 
-    tile_kernels.config.set_pdl(True)
-    return tile_kernels
+    previous = tile_kernels.get_pdl()
+    tile_kernels.set_pdl(True)
+    try:
+        yield tile_kernels
+    finally:
+        tile_kernels.set_pdl(previous)
+
+
+def per_token_cast(*args, **kwargs):
+    """TileKernels' ``quant.per_token_cast``, chained."""
+    with _tile_kernels() as tk:
+        return tk.quant.per_token_cast(*args, **kwargs)
+
+
+def norm_forward(*args, **kwargs):
+    """TileKernels' ``quant.norm_forward``, chained."""
+    with _tile_kernels() as tk:
+        return tk.quant.norm_forward(*args, **kwargs)
+
+
+def moe_topk_gate_forward(*args, **kwargs):
+    """TileKernels' ``moe.moe_topk_gate_forward``, chained."""
+    with _tile_kernels() as tk:
+        return tk.moe.moe_topk_gate_forward(*args, **kwargs)

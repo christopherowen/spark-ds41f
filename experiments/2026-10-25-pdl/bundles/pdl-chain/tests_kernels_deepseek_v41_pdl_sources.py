@@ -12,11 +12,12 @@ first launch and, when the session ends, checks every ``__global__`` function:
   parameters, then ``cudaTriggerProgrammaticLaunchCompletion()``;
 - a warp-specialized GEMM (``WARP_SPECIALIZED``, ``gemm_mxfp8``'s prefill tiles)
   has no PDL: its producer warps' loads would have to follow the wait too;
-- any other kernel that waits (TileKernels', whose PDL switch ``pdl.tile_kernels``
-  turns on) waits before it names a pointer parameter.
+- any other kernel that waits (TileKernels' casts, norms and top-k gate, which the
+  deployment launches through ``pdl``'s wrappers with DeepSeek's switch on) waits
+  before it names a pointer parameter.
 
-A violation fails the session. TileKernels' switch is turned on when the session
-starts, so its kernels compile as serving compiles them.
+A violation fails the session. ``EXEMPT`` names the PDL test's deliberate early
+reader.
 """
 
 import re
@@ -58,6 +59,8 @@ CHAIN = {
     "sparse_mla",
 }
 WARP_SPECIALIZED = {"gemm_bf16", "gemm_bf16_partials", "gemm_bf16_two"}
+# test_deepseek_v41_tilelang_pdl's reader that loads before its wait on purpose
+EXEMPT = {"pdl_early_reader"}
 WAIT = "cudaGridDependencySynchronize()"
 TRIGGER = "cudaTriggerProgrammaticLaunchCompletion()"
 _GLOBAL = re.compile(
@@ -94,6 +97,8 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
     out = []
     for name, pointers, body in functions(source):
         base = re.sub(r"_kernel(_\d+)?$", "", name)
+        if base in EXEMPT:
+            continue
         wait = body.find(WAIT)
         if base in WARP_SPECIALIZED or (base == "gemm_mxfp8" and warp_specialized):
             if wait >= 0 or TRIGGER in body:
@@ -121,13 +126,9 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
 def pytest_configure(config):
     import importlib
 
-    from vllm.models.deepseek_v4_1.tilelang import pdl
-
     # ``tilelang.jit`` is also the decorator tilelang re-exports, so the module is
     # imported by name.
     kernel_module = importlib.import_module("tilelang.jit.kernel")
-
-    pdl.tile_kernels()
     launch = kernel_module.JITKernel.__call__
 
     def recorded(self, *args, **kwargs):

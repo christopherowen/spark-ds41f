@@ -263,7 +263,7 @@ def _topk_gate(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """TileKernels' top-k gate as V4.1 routes: sqrtsoftplus with a correction
     bias and no shared experts."""
-    return pdl.tile_kernels().moe.moe_topk_gate_forward(
+    return pdl.moe_topk_gate_forward(
         logits,
         num_topk,
         use_shared_as_routed=False,

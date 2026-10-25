@@ -15,7 +15,7 @@ the launches are programmatic in CUDA graphs and that nothing reads early:
 - one decode layer's chain (``deepseek_v41_pdl_chains``), replayed in a CUDA graph
   with every intermediate buffer poisoned with NaN before each replay, gives its
   eager outputs bit for bit on every replay;
-- TileKernels compiles with its PDL switch on.
+- TileKernels' cast is chained when called through ``pdl`` and only then.
 
 ``deepseek_v41_pdl_sources`` (a pytest plugin) checks the compiled sources of every
 chain kernel that the DS4.1 kernel tests build: the wait comes before any access to
@@ -23,6 +23,7 @@ global memory.
 """
 
 import ctypes
+import functools
 import re
 
 import pytest
@@ -76,7 +77,8 @@ def slow_copy(n: int):
 
 @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def reader(n: int, early: bool):
-    """``out = dst``; with ``early``, ``dst`` is loaded before the wait."""
+    """``out = dst``; with ``early``, ``dst`` is loaded before the wait (a kernel the
+    source check exempts by name)."""
 
     @T.prim_func
     def pdl_reader(
@@ -84,17 +86,23 @@ def reader(n: int, early: bool):
         out: T.Tensor((n,), T.float32),
     ):
         with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
+            pdl.chain()
+            i = bx * THREADS + T.get_thread_binding()
+            out[i] = dst[i]
+
+    @T.prim_func
+    def pdl_early_reader(
+        dst: T.Tensor((n,), T.float32),
+        out: T.Tensor((n,), T.float32),
+    ):
+        with T.Kernel(T.ceildiv(n, THREADS), threads=THREADS) as bx:
             i = bx * THREADS + T.get_thread_binding()
             value = T.alloc_var(T.float32)
-            if early:
-                value = dst[i]
-                T.pdl_sync()
-            else:
-                pdl.chain()
-                value = dst[i]
+            value = dst[i]
+            T.pdl_sync()
             out[i] = value
 
-    return pdl_reader
+    return pdl_early_reader if early else pdl_reader
 
 
 def _graph(fn, keep: bool = False) -> torch.cuda.CUDAGraph:
@@ -201,9 +209,33 @@ def _chained(kernel: str) -> bool:
     )
 
 
-def test_tile_kernels_pdl_on():
-    tk = pdl.tile_kernels()
-    assert tk.get_pdl()
+def test_tile_kernels_chained_through_pdl_only():
+    """TileKernels' cast is chained when the deployment calls it through ``pdl``
+    (a programmatic edge from the torch kernel before it) and not when called
+    directly; its switch is off again after the call."""
+    import tile_kernels
+
+    x = torch.randn((64, 5120), device=DEVICE)
+
+    def cast(through_pdl: bool) -> None:
+        y = (x * 2).bfloat16()
+        if through_pdl:
+            pdl.per_token_cast(y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True)
+        else:
+            tile_kernels.quant.per_token_cast(
+                y, "e4m3", 32, round_sf=True, use_packed_ue8m0=True
+            )
+
+    for through_pdl in (True, False):
+        graph = _graph(functools.partial(cast, through_pdl), keep=True)
+        edges = [
+            (source, kind)
+            for source, target, kind in _edges(graph)
+            if target is not None and target.startswith("per_token_cast")
+        ]
+        assert len(edges) == 1 and edges[0][0] is not None, edges
+        assert (edges[0][1] == PROGRAMMATIC) == through_pdl, (through_pdl, edges)
+        assert not tile_kernels.get_pdl()
 
 
 @pytest.mark.parametrize("launch", ["graph", "eager"])

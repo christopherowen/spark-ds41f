@@ -1183,7 +1183,7 @@ class MoeExpertsV41Plan:
             )
             for dtype in (torch.int32, torch.int64)
         }
-        self.tk = _tile_kernels(block_M)
+        _tile_kernels(block_M)  # TileKernels' token alignment for the layout
 
     def kernels(self) -> dict:
         """The grouped GEMMs and the fused SwiGLU, as the calls ``bind`` makes."""
@@ -1297,7 +1297,7 @@ class MoeExpertsV41Plan:
         xq, x_sf, h, hq, h_sf, y = buffers[count:]
         gate_up, down = weights
         layout = dispatch.dispatch(topk_ids, topk_weights, buffers[:count])
-        self.tk.quant.per_token_cast(
+        pdl.per_token_cast(
             x, "e4m3", SF_BLOCK, round_sf=True, use_packed_ue8m0=True, out=(xq, x_sf)
         )
         order, tile_expert = layout["order"], layout["tile_expert"]
@@ -1317,7 +1317,8 @@ def _present(weights):
 
 
 def _tile_kernels(block_M):
-    tile_kernels = pdl.tile_kernels()
+    import tile_kernels
+
     # Expert segments in the dispatch layout start on block_M rows.
     tile_kernels.config.set_token_alignment(block_M)
     return tile_kernels

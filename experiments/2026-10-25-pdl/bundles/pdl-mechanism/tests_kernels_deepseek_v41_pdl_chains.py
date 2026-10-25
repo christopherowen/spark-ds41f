@@ -30,6 +30,11 @@ import hashlib
 import torch
 
 from vllm.models.deepseek_v4_1.tilelang import linear, mhc
+
+try:  # a build with PDL casts the activations as its projections do, chained
+    from vllm.models.deepseek_v4_1.tilelang.pdl import per_token_cast
+except ImportError:  # the build before PDL
+    per_token_cast = linear._tile_kernels().quant.per_token_cast
 from vllm.models.deepseek_v4_1.tilelang.activation import swiglu_clamp_kernel
 from vllm.models.deepseek_v4_1.tilelang.moe import MoeExpertsV41Plan, workspace_bytes
 from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
@@ -148,7 +153,6 @@ class LayerChain:
             return torch.randn(*shape, generator=gen, device=DEVICE) * scale
 
         self.rows = rows
-        self.tk = linear._tile_kernels()
         # The chain's inputs: the streams, the previous FFN output and its mixes.
         self.x = randn(rows, HIDDEN).bfloat16()
         self.streams = randn(rows, mhc.MULT * HIDDEN).bfloat16()
@@ -244,7 +248,7 @@ class LayerChain:
     def _project(self, name: str, layer: _Projection, x, out) -> None:
         """A block-32 projection: TileKernels' MXFP8 cast, then the decode GEMM."""
         xq, sf = self.casts[name]
-        self.tk.quant.per_token_cast(
+        per_token_cast(
             x,
             "e4m3",
             32,

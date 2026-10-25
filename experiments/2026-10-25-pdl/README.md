@@ -53,7 +53,7 @@ merged.
   binds; the forks cost about 0.04%.
 - **Built:** every kernel on the layer chain begins with `pdl.chain()`, TileKernels' casts and
   norms take DeepSeek's PDL switch, the warp-specialized GEMMs keep their launch (vLLM `pdl`
-  0b7952de4, with tests in 75e6d02c7 and 59b72eb81, over 26382f5cf). Scheduling only: the tests require identical bits.
+  0b7952de4 and 62538a5d8, with tests in 75e6d02c7, 59b72eb81 and 352b07b52, over 26382f5cf). Scheduling only: the tests require identical bits.
 
 ## How the critical path was computed
 
@@ -324,6 +324,43 @@ Acceptance, before running: bits identical everywhere (kernel tests, chain diges
 determinism gate's hashes); the chain benchmark and the screen's c1 decode step faster by at
 least 0.5%, no suite row slower beyond the run's own repeat. The specs need this branch merged
 (the lab syncs node checkouts to origin/main): after the release window, on the owner's word.
+
+## Results on dgx4 (2026-10-25, CET)
+
+dgx4 alone, uncabled, image `spark-ds41f:19f2c20ed4d6-next-6` (`sha256:82b071b57485`), bundles
+run with `scripts/lab.py kernel-local BUNDLE --out DIR` from a checkout of this branch under
+`~/spark-lab/agents/bound-and-prototype-pdl/` (outputs in its `out/`). Serving, determinism
+and profile checks stay queued: they need the cluster.
+
+1. **Source check without a GPU** ([sources_cpu.py](sources_cpu.py),
+   [sources_cpu.txt](sources_cpu.txt)), spark-ds41f 4de3d223 (vLLM `pdl` 352b07b52), the image
+   run without `--gpus`: 64 chain-kernel calls at TP4 shapes lowered for sm_121 with each
+   factory's pass configs. 62 wait first and trigger after, the two warp-specialized GEMMs have
+   no PDL, **0 violations**; 2 calls need a GPU to pick their arguments. The decode MXFP8 GEMM's
+   generated code sets up its shared-memory pointers, then calls
+   `cudaGridDependencySynchronize()` and `cudaTriggerProgrammaticLaunchCompletion()` before
+   any load; its pointer parameters lose `__restrict__`, as TileLang does for a kernel that
+   waits.
+2. **pdl-tests, first runs.**
+   - e29733a0 (smoke, the PDL test file alone): the plugin failed to load. `tilelang.jit` is
+     also the decorator tilelang re-exports, so `import tilelang.jit.kernel` resolved to the
+     function. Fixed in vLLM 352b07b52 (the module imported by name).
+   - 4de3d223 (`out/pdl-tests`, 454 s): **PDL tests 10 passed**, among them the early reader
+     reading the producer's buffer unwritten (graph and eager), the waiting reader never, the
+     graph edges, and the layer chain bit-equal over poisoned replays. **Kernel tests of the
+     11 changed modules: 416 passed, 1 xfailed.**
+   - The source check failed the bundle with three distinct findings, each root-caused:
+     - `pdl_reader_kernel` reads before its wait: the test's deliberate early reader. It is now
+       its own kernel, `pdl_early_reader`, which the check exempts.
+     - TileKernels' `mhc_post_fwd` reads its mixes, and its RoPE its positions and cos/sin
+       table, before their wait; RoPE also waits inside a branch. DeepSeek's placement is safe
+       only where the kernel launched just before did not write those inputs. The deployment
+       never launches these two, but `set_pdl(True)` at first use had turned PDL on for every
+       TileKernels kernel, the tests' references included. Fixed in vLLM 62538a5d8:
+       `pdl.per_token_cast`, `pdl.norm_forward` and `pdl.moe_topk_gate_forward` set
+       DeepSeek's switch for their call only, and every other TileKernels kernel keeps its
+       default (no PDL). A new test checks that a cast through `pdl` has a programmatic edge
+       and a direct call does not.
 
 ## Interactions with the other sessions
 
