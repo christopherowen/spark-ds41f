@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 23:23:49 +0200
+Subject: [PATCH 408/488] Sink rejection: prompt logprobs go out with the
+ request's first output
+
+The step that finishes a prompt samples the request's first token, and
+with sink rejection (on by default for DeepSeek V4.1) that token is held
+back as the next step's draft zero. The step therefore has no output for
+the request: new_token_ids is empty, the request has not stopped, and
+update_from_output emits nothing. The V2 runner's PromptLogprobsWorker
+returns the prompt's logprobs in that same step, so the scheduler's
+"no partial prefill outputs" assertion failed and the engine core died
+(EngineDeadError, HTTP 500) on any request with prompt_logprobs and more
+than one token to generate. A request whose first token ends it (one
+token, a stop token) commits that token at once and was not affected.
+
+The scheduler now keeps such a step's prompt logprobs on the request and
+emits them with the request's first output, beside the token, as they go
+out without sink rejection. A request preempted while its first token is
+still held has committed nothing, so its resumed prompt returns its
+logprobs again; the new ones replace those held. The assertion still
+holds for every other step without output.
+
+Tests: the scripted V2-runner worker of the sink tests returns prompt
+logprobs as PromptLogprobsWorker does (accumulated over chunks, skipped
+for a request resumed after its prompt). The prompt logprobs go out once,
+in the request's first output, with sync and async scheduling, with and
+without drafts and chunked prompts; the request's tokens and its
+neighbour's are those of the same run without prompt logprobs; through
+the output processor one response carries a logprob for every prompt
+token after the first; across a preemption with the token held the
+resumed prompt's logprobs replace the held ones. All fail on the
+assertion without the change.
+---
+ tests/v1/core/test_sink_draft_zero.py | 206 +++++++++++++++++++++++++-
+ vllm/v1/core/sched/scheduler.py       |  15 ++
+ vllm/v1/request.py                    |   6 +-
+ 3 files changed, 224 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/core/test_sink_draft_zero.py b/tests/v1/core/test_sink_draft_zero.py
+index c763691f0..5c5862282 100644
+--- a/tests/v1/core/test_sink_draft_zero.py
++++ b/tests/v1/core/test_sink_draft_zero.py
+@@ -40,7 +40,12 @@ from vllm.v1.core.sched.utils import stops_on_next_token
+ from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest
+ from vllm.v1.engine.output_processor import OutputProcessor
+ from vllm.v1.metrics.stats import RequestSinkMetrics
+-from vllm.v1.outputs import DraftTokenIds, LogprobsLists, ModelRunnerOutput
++from vllm.v1.outputs import (
++    DraftTokenIds,
++    LogprobsLists,
++    LogprobsTensors,
++    ModelRunnerOutput,
++)
+ from vllm.v1.request import Request, RequestStatus
+ from vllm.v1.sample.sink import SinkConfig, SinkEvent, SinkOutcome, SinkRow
+ 
+@@ -86,6 +91,20 @@ class WorkerRequest:
+ Row = tuple[int, int, int]
+ 
+ 
++def scripted_prompt_logprobs(
++    prompt_token_ids: list[int], positions: list[int]
++) -> LogprobsTensors:
++    """The scripted prompt logprobs: row ``p`` scores prompt token ``p + 1``,
++    at logprob ``-(p + 1) / 64`` and rank 1 (it is its own best)."""
++    tokens = torch.tensor([prompt_token_ids[p + 1] for p in positions])
++    values = torch.tensor([-(p + 1) / 64 for p in positions])
++    return LogprobsTensors(
++        logprob_token_ids=torch.stack([tokens, tokens], dim=1),
++        logprobs=torch.stack([values, values], dim=1),
++        selected_token_ranks=torch.ones(len(positions), dtype=torch.int64),
++    )
++
++
+ class ScriptedWorker:
+     """The V2 runner's side of draft zero, with a perfect drafter unless
+     ``draft_errors`` says otherwise (``(req_id, position) -> token``)."""
+@@ -114,6 +133,10 @@ class ScriptedWorker:
+         # Per scheduler output (by id) and request: the drafter tokens the
+         # step's inputs held.
+         self.consumed_drafts: dict[int, dict[str, list[int]]] = {}
++        # Prompt logprobs, as the V2 runner's PromptLogprobsWorker: the prompt
++        # positions scored so far, until the step that finishes the prompt
++        # returns them all.
++        self.prompt_positions: dict[str, list[int]] = {}
+ 
+     def candidates(self, req_id: str, position: int) -> list[int]:
+         return self.scripts[req_id][position]
+@@ -144,6 +167,18 @@ class ScriptedWorker:
+     def execute(self, so: SchedulerOutput) -> ModelRunnerOutput:
+         for req_id in (so.preempted_req_ids or set()) | so.finished_req_ids:
+             self.requests.pop(req_id, None)
++            self.prompt_positions.pop(req_id, None)
++        for new_req in so.scheduled_new_reqs:
++            params = new_req.sampling_params
++            assert params is not None and new_req.prompt_token_ids is not None
++            assert new_req.prefill_token_ids is not None
++            # A request resumed after its prompt had its prompt logprobs
++            # computed before the preemption.
++            if params.prompt_logprobs is not None and len(
++                new_req.prefill_token_ids
++            ) == len(new_req.prompt_token_ids):
++                self.prompt_positions[new_req.req_id] = []
++        prompt_logprobs: dict[str, LogprobsTensors] = {}
+         draft_zero = so.sink_draft_zero_req_ids or set()
+         req_ids = list(so.num_scheduled_tokens)
+         sampled: list[list[int]] = []
+@@ -154,6 +189,17 @@ class ScriptedWorker:
+             request = self.scheduler.requests[req_id]
+             spec = so.scheduled_spec_decode_tokens.get(req_id, [])
+             event = None
++            positions = self.prompt_positions.get(req_id)
++            if positions is not None:
++                end = request.num_computed_tokens
++                start = end - so.num_scheduled_tokens[req_id]
++                positions.extend(range(start, min(end, request.num_prompt_tokens - 1)))
++                if not request.is_prefill_chunk:
++                    assert request.prompt_token_ids is not None
++                    prompt_logprobs[req_id] = scripted_prompt_logprobs(
++                        request.prompt_token_ids, positions
++                    )
++                    del self.prompt_positions[req_id]
+             if req_id in draft_zero:
+                 st = self.requests[req_id]
+                 consumed[req_id] = st.drafts[: len(spec) - 1]
+@@ -194,7 +240,7 @@ class ScriptedWorker:
+             req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+             sampled_token_ids=sampled,
+             logprobs=logprobs,
+-            prompt_logprobs_dict={},
++            prompt_logprobs_dict=prompt_logprobs,
+             pooler_output=[],
+             sink_events=events or None,
+         )
+@@ -317,6 +363,7 @@ def _make_request(
+     *,
+     max_tokens: int = 32,
+     logprobs: int | None = None,
++    prompt_logprobs: int | None = None,
+     stop_token_ids: list[int] | None = None,
+     prompt_len: int = 20,
+     structured: bool = False,
+@@ -325,6 +372,7 @@ def _make_request(
+     sampling_params = SamplingParams(
+         max_tokens=max_tokens,
+         logprobs=logprobs,
++        prompt_logprobs=prompt_logprobs,
+         stop_token_ids=stop_token_ids,
+         temperature=0.0,
+         structured_outputs=StructuredOutputsParams(regex=".*") if structured else None,
+@@ -715,6 +763,160 @@ def test_logprobs_of_committed_provisional_tokens(async_scheduling):
+     assert all(rank == 1 for i, (_, _, rank, _) in enumerate(rows) if i != 1)
+ 
+ 
++def _assert_prompt_logprobs_once(run: Run, request: Request) -> None:
++    """The request's first output carries its prompt logprobs, the worker's
++    for every prompt position, and no other output carries any."""
++    first, *rest = run.outputs[request.request_id]
++    assert first.new_token_ids
++    assert all(out.new_prompt_logprobs_tensors is None for out in rest)
++    assert request.prompt_token_ids is not None
++    expected = scripted_prompt_logprobs(
++        request.prompt_token_ids, list(range(request.num_prompt_tokens - 1))
++    )
++    got = first.new_prompt_logprobs_tensors
++    assert got is not None
++    assert torch.equal(got.logprob_token_ids, expected.logprob_token_ids)
++    assert torch.equal(got.logprobs, expected.logprobs)
++    assert torch.equal(got.selected_token_ranks, expected.selected_token_ranks)
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize("num_drafts", [None, 2])
++@pytest.mark.parametrize("max_num_batched_tokens", [8192, 16])
++def test_prompt_logprobs_go_out_with_the_held_first_token(
++    async_scheduling, num_drafts, max_num_batched_tokens
++):
++    """The step that finishes a prompt samples the request's first token, and
++    sink rejection holds it back: that step has no output for the request.
++    The prompt logprobs it returns go out with the token, in the request's
++    first output (the engine core died on them). Its tokens, and those of the
++    request beside it, are as without prompt logprobs."""
++    scripts = {"a": SAY_HI, "b": _script(HOW, I_, HELP, YOU)}
++
++    def serve(prompt_logprobs: int | None) -> tuple[Request, Run]:
++        scheduler = _scheduler(
++            async_scheduling,
++            num_drafts,
++            max_num_batched_tokens=max_num_batched_tokens,
++        )
++        request = _make_request(
++            "a", max_tokens=10, prompt_len=40, prompt_logprobs=prompt_logprobs
++        )
++        scheduler.add_request(request)
++        scheduler.add_request(_make_request("b", max_tokens=10))
++        worker = ScriptedWorker(
++            scheduler, scripts, num_drafts or 0, draft_errors={("a", 1): 999}
++        )
++        return request, drive(scheduler, worker, async_scheduling=async_scheduling)
++
++    request, run = serve(prompt_logprobs=1)
++    _, plain = serve(prompt_logprobs=None)
++    assert run.emitted == plain.emitted
++    assert run.emitted["a"] == expected_reply(SAY_HI, 10)
++    _assert_prompt_logprobs_once(run, request)
++    assert all(out.new_prompt_logprobs_tensors is None for out in run.outputs["b"])
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++@pytest.mark.parametrize(
++    "output_kind", [RequestOutputKind.FINAL_ONLY, RequestOutputKind.DELTA]
++)
++def test_prompt_logprobs_reach_the_response(async_scheduling, output_kind):
++    """Through the frontend's output processor: one response carries the
++    prompt logprobs, a logprob for every prompt token after the first."""
++    scheduler = _scheduler(async_scheduling, 2)
++    request = _make_request("a", max_tokens=8, prompt_logprobs=1)
++    scheduler.add_request(request)
++    worker = ScriptedWorker(scheduler, {"a": SAY_HI}, 2, draft_errors={("a", 1): 999})
++    run = drive(scheduler, worker, async_scheduling=async_scheduling)
++
++    processor = OutputProcessor(None, log_stats=False)
++    processor.add_request(
++        EngineCoreRequest(
++            request_id="a",
++            external_req_id="a",
++            prompt_token_ids=list(request.prompt_token_ids or ()),
++            mm_features=None,
++            sampling_params=SamplingParams(
++                max_tokens=8,
++                prompt_logprobs=1,
++                output_kind=output_kind,
++                detokenize=False,
++            ),
++            pooling_params=None,
++            arrival_time=0,
++            lora_request=None,
++            cache_salt=None,
++            data_parallel_rank=None,
++        ),
++        None,
++    )
++    tokens: list[int] = []
++    prompt_logprobs = []
++    for out in run.outputs["a"]:
++        for request_output in processor.process_outputs(
++            [out], engine_core_timestamp=0
++        ).request_outputs:
++            tokens.extend(request_output.outputs[0].token_ids)
++            if request_output.prompt_logprobs:
++                prompt_logprobs.append(request_output.prompt_logprobs)
++    assert tokens == expected_reply(SAY_HI, 8)
++    assert len(prompt_logprobs) == 1
++    prompt = request.prompt_token_ids
++    assert prompt is not None and len(prompt_logprobs[0]) == len(prompt)
++    assert prompt_logprobs[0][0] is None
++    for p, position in enumerate(prompt_logprobs[0][1:], 1):
++        assert position is not None and list(position) == [prompt[p]]
++        assert position[prompt[p]].logprob == pytest.approx(-p / 64)
++        assert position[prompt[p]].rank == 1
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++def test_prompt_logprobs_held_across_a_preemption(async_scheduling):
++    """A request preempted while its first token is held has committed
++    nothing, so its resumed prompt returns its logprobs again: those replace
++    the ones held, and go out once, with the first token."""
++    scheduler = _scheduler(async_scheduling, 2)
++    request = _make_request("a", max_tokens=8, prompt_logprobs=1)
++    scheduler.add_request(request)
++    worker = ScriptedWorker(scheduler, {"a": SAY_HI}, 2, draft_errors={("a", 1): 999})
++    returned: list[LogprobsTensors] = []
++
++    def on_output(so: SchedulerOutput, mro: ModelRunnerOutput) -> None:
++        if "a" not in mro.prompt_logprobs_dict:
++            return
++        returned.append(mro.prompt_logprobs_dict["a"])
++        if len(returned) == 1:
++            assert request.sink_prompt_logprobs is returned[0]
++            assert not request.output_token_ids
++            scheduler.reset_prefix_cache(reset_running_requests=True)
++
++    run = drive(
++        scheduler, worker, async_scheduling=async_scheduling, on_output=on_output
++    )
++    assert request.num_preemptions == 1 and len(returned) == 2
++    assert run.emitted["a"] == expected_reply(SAY_HI, 8)
++    _assert_prompt_logprobs_once(run, request)
++    assert run.outputs["a"][0].new_prompt_logprobs_tensors is returned[1]
++
++
++def test_prompt_logprobs_once_across_preemptions():
++    """Async scheduling under KV pressure, both requests with prompt
++    logprobs: each request's go out once, with its first token, and a request
++    resumed after it committed tokens does not compute them again."""
++    scheduler = _scheduler(True, 2, num_blocks=7)
++    scripts = {"a": SAY_HI, "b": _script(HOW, I_, HELP, YOU)}
++    requests = {r: _make_request(r, max_tokens=40, prompt_logprobs=1) for r in scripts}
++    for request in requests.values():
++        scheduler.add_request(request)
++    worker = ScriptedWorker(scheduler, scripts, 2, draft_errors={("a", 1): 999})
++    run = drive(scheduler, worker, async_scheduling=True)
++    assert any(request.num_preemptions for request in requests.values())
++    for req_id, script in scripts.items():
++        assert run.emitted[req_id] == expected_reply(script, 40)
++        _assert_prompt_logprobs_once(run, requests[req_id])
++
++
+ @pytest.mark.parametrize("async_scheduling", [False, True])
+ def test_two_sequences_of_one_request(async_scheduling):
+     """n > 1: two sequences of one request run as two engine requests, each
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index bded94d6c..0500a656e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3387,6 +3387,13 @@ class Scheduler(SchedulerInterface):
+ 
+             # Get prompt logprobs for this request.
+             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
++            if should_emit_output and request.sink_prompt_logprobs is not None:
++                # The prompt logprobs held with the request's first token. A
++                # prompt computed again after a preemption returns new ones,
++                # which replace them.
++                if prompt_logprobs_tensors is None:
++                    prompt_logprobs_tensors = request.sink_prompt_logprobs
++                request.sink_prompt_logprobs = None
+             if should_emit_output:
+                 # Add EngineCoreOutput for this Request.
+                 outputs[request.client_index].append(
+@@ -3419,6 +3426,14 @@ class Scheduler(SchedulerInterface):
+                         ),
+                     )
+                 )
++            elif (
++                prompt_logprobs_tensors and self.sink_rejection and generated_token_ids
++            ):
++                # The step finished the prompt and sampled the request's first
++                # token, which sink rejection holds back (or a stale output
++                # drops): the prompt logprobs wait for the request's first
++                # output.
++                request.sink_prompt_logprobs = prompt_logprobs_tensors
+             else:
+                 # Invariant: EngineCore returns no partial prefill outputs.
+                 assert not prompt_logprobs_tensors
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 519bc4aaa..5dd7d57f0 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -32,7 +32,7 @@ if TYPE_CHECKING:
+     from vllm.lora.request import LoRARequest
+     from vllm.v1.core.boundary_checkpoint import BoundaryCheckpoint
+     from vllm.v1.core.kv_cache_utils import BlockHash
+-    from vllm.v1.outputs import LogprobsLists
++    from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+ 
+ 
+ @dataclass
+@@ -245,6 +245,10 @@ class Request:
+         # request holds none.
+         self.sink_provisional: int | None = None
+         self.sink_provisional_logprobs: LogprobsLists | None = None
++        # Sink rejection: the prompt logprobs of a prompt whose last step had
++        # its sampled token held back. They go out with the request's first
++        # output, as they do with its first token when no token is held.
++        self.sink_prompt_logprobs: LogprobsTensors | None = None
+         # Whether the request's next step starts with draft zero: set once a
+         # step that samples a provisional token is scheduled, cleared when the
+         # request loses it (preemption, a new streaming input).

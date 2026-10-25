@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:21:34 +0100
+Subject: [PATCH 462/488] [DS4.1] Row copies put rows on the grid's x axis
+
+The NCCL gathers' concatenation launched rows on the grid's y axis,
+whose limit is 65535: the startup profile's 16K-token Engram all-gather
+(98304 rows of 256 columns) failed with CUDA_ERROR_INVALID_VALUE, so the
+fourth serving check's ports arm did not start. Rows go on x; the column
+copies follow. The test adds the profile's shape.
+---
+ tests/kernels/test_deepseek_v41_tilelang_collectives.py | 2 ++
+ vllm/models/deepseek_v4_1/tilelang/collectives.py       | 5 +++--
+ vllm/models/deepseek_v4_1/tilelang/columns.py           | 5 +++--
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index a20df4855..ce3cf956d 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -266,6 +266,8 @@ def _assert_same_bits(got, want):
+     "shard, dtype",
+     [
+         ((8192 * 6, 256), torch.bfloat16),  # TP4 disk Engram columns, 8K prefill
++        # The profile run's 16K tokens: rows past the grid's y-axis limit (65535).
++        ((16384 * 6, 256), torch.bfloat16),
+         ((17, 3, 2048), torch.bfloat16),
+         ((5, 32320), torch.float32),  # vocab-parallel logits
+         ((9, 20), torch.int64),
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index d638cf81e..ad8175dd7 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -162,9 +162,10 @@ def rank_rows_kernel():
+         rows: T.int32,
+         packs: T.int32,
+     ):
+-        with T.Kernel(T.ceildiv(world * packs, threads), rows, threads=threads) as (
+-            bx,
++        # Rows on the grid's x axis: a prefill gather's rows pass the y axis' 65535.
++        with T.Kernel(rows, T.ceildiv(world * packs, threads), threads=threads) as (
+             r,
++            bx,
+         ):
+             T.import_source(_RANK_ROWS_HEADER)
+             p = bx * threads + T.get_thread_binding()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index eb1e76ff8..3dc715438 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -68,7 +68,8 @@ def copy_columns_kernel(width: int, dtype: str):
+         dst: T.StridedTensor((dst_rows, width), (dst_stride, 1), dtype),
+         rows: T.int32,
+     ):
+-        with T.Kernel(T.ceildiv(width, span), rows, threads=_THREADS) as (bx, row):
++        # Rows on the grid's x axis (no 65535 limit), column blocks on y.
++        with T.Kernel(rows, T.ceildiv(width, span), threads=_THREADS) as (row, bx):
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
+             if col < width:
+@@ -139,7 +140,7 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool =
+         out2: T.Tensor((rows2, max(w2, vector)), dtype),
+         rows: T.int32,
+     ):
+-        with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
++        with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
+             # The whole row's address inline in each call: bound to a variable it

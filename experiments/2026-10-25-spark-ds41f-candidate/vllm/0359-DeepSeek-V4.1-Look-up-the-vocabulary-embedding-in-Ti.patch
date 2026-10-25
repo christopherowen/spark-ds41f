@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:36:30 +0200
+Subject: [PATCH 359/488] DeepSeek-V4.1: Look up the vocabulary embedding in
+ TileLang
+
+Under the TileLang family, kernels.embedding_method() returns
+TileLangEmbeddingMethod, so the target's embed_tokens, which the DSpark drafter
+aliases, runs its tensor-parallel lookup (decode, and prefill SP's
+reduce-scatter) as the TileLang kernel instead of vLLM's CUDA
+vocab_parallel_embedding_kernel. The output is the CUDA kernel's bit for bit:
+each owned id's shard row, zeros for the rest. The method declares the int32
+and int64 lookups of the 5120-wide BF16 rows, so kernel preparation compiles
+them before the cache freezes; both families' weights load and tie as before.
+---
+ vllm/models/deepseek_v4_1/kernels.py | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 181b76116..ff2ef9278 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -42,11 +42,9 @@ def block_fp8_linear_method(quant_config):
+ 
+ def embedding_method():
+     if uses_tilelang():
+-        from vllm.model_executor.layers.vocab_parallel_embedding import (
+-            UnquantizedEmbeddingMethod,
+-        )
++        from .tilelang.embedding import TileLangEmbeddingMethod
+ 
+-        return UnquantizedEmbeddingMethod()
++        return TileLangEmbeddingMethod()
+     from .b12x_layers import B12xEmbeddingMethod
+ 
+     return B12xEmbeddingMethod()

@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:25:28 +0200
+Subject: [PATCH 363/488] V2 runner sampling: temperature and select in
+ Triton's tile form
+
+Temperature loads a thread's runs, divides them, then stores them, at 256
+threads a block: stored run by run through the one logits pointer, every load
+waited for the store before it. Select reads one rank a lane for a number of
+ranks fixed when it is built (the declarations name it), and reduces over the
+next power of two, instead of a loop of dynamic length. Against Triton per
+call: temperature at one token from +17% to +7%, level at 16; select from
++23-33% to +6-8%.
+---
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 156 +++++++++++-------
+ .../worker/gpu/spec_decode/dspark/greedy.py   |   2 +-
+ 2 files changed, 95 insertions(+), 63 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 765d9e336..67147a56e 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -56,6 +56,9 @@ _WARPS = _THREADS // 32
+ _PASSES = GUMBEL_BLOCK // _THREADS
+ # gumbel._TEMPERATURE_BLOCK_SIZE.
+ _TEMPERATURE_BLOCK = 8192
++# Temperature's threads a block: fewer serial runs a thread than at 128, the shape
++# Triton reaches with its loads all issued up front.
++_TEMPERATURE_THREADS = 256
+ # gumbel._DRAFT_NOISE_SALT.
+ _DRAFT_NOISE_SALT = 1 << 30
+ 
+@@ -280,6 +283,38 @@ def _store_run(dst, raw, row, col0, vocab, run):
+                     dst[row, col0 + k] = raw[k]
+ 
+ 
++@T.macro
++def _load_run_at(src, raw, base, row, col0, vocab, run):
++    """``_load_run`` into ``raw[base:base + run]``."""
++    if run == 1:
++        if col0 < vocab:
++            raw[base] = src[row, col0]
++    else:
++        if col0 + run <= vocab:
++            for k in T.vectorized(run):
++                raw[base + k] = src[row, col0 + k]
++        else:
++            for k in T.unroll(run):
++                if col0 + k < vocab:
++                    raw[base + k] = src[row, col0 + k]
++
++
++@T.macro
++def _store_run_at(dst, raw, base, row, col0, vocab, run):
++    """``_store_run`` from ``raw[base:base + run]``."""
++    if run == 1:
++        if col0 < vocab:
++            dst[row, col0] = raw[base]
++    else:
++        if col0 + run <= vocab:
++            for k in T.vectorized(run):
++                dst[row, col0 + k] = raw[base + k]
++        else:
++            for k in T.unroll(run):
++                if col0 + k < vocab:
++                    dst[row, col0 + k] = raw[base + k]
++
++
+ @T.macro
+ def _keep_or_take(best, best_index, value, index):
+     """``(best, best_index)`` = Triton's argmax combine of itself and ``(value,
+@@ -1292,13 +1327,18 @@ def finish_argmax_kernel(output: str, rows_per_block: int = 0):
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def select_first_argmax_kernel(output_dtype: str, rows_per_block: int = 0):
++def select_first_argmax_kernel(output_dtype: str, ranks: int):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+     over the all-gathered ``(value, index)`` pairs of each row ([rows, 2 * ranks]
+-    FP32; indices exact in FP32), into ``out[row * out_stride]``: one warp per
+-    row, or with ``rows_per_block`` one thread per row, the ranks in order."""
++    FP32; indices exact in FP32), into ``out[row * out_stride]``, a warp a row.
++    As in Triton, the number of ranks is fixed when the kernel is built and every
++    load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
++    the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
++    over the next power of two (the combine is a total order)."""
++    assert 1 <= ranks <= 32
+     rows, width, out_len = T.dynamic("rows, width, out_len")
+     pairs_stride = T.dynamic("pairs_stride", "int64")
++    span = 1 << max(ranks - 1, 0).bit_length()
+ 
+     @T.prim_func
+     def select_first_argmax(
+@@ -1306,50 +1346,34 @@ def select_first_argmax_kernel(output_dtype: str, rows_per_block: int = 0):
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
+     ):
+-        if rows_per_block:
+-            with T.Kernel(
+-                T.ceildiv(rows, rows_per_block), threads=rows_per_block
+-            ) as bx:
+-                T.import_source(_HEADER)
+-                row = bx * rows_per_block + T.get_thread_binding()
+-                best = T.alloc_local((1,), T.float32)
+-                best_index = T.alloc_local((1,), T.int32)
+-                best[0] = -T.infinity(T.float32)
+-                best_index[0] = 1 << 30
+-                if row < rows:
+-                    for rank in T.serial(width // 2):
+-                        _first_keep_or_take(
+-                            best,
+-                            best_index,
+-                            pairs[row, 2 * rank],
+-                            T.cast(pairs[row, 2 * rank + 1], T.int32),
+-                        )
+-                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                        best_index[0], output_dtype
+-                    )
+-        else:
+-            with T.Kernel(rows, threads=32) as row:
+-                T.import_source(_HEADER)
+-                tx = T.get_thread_binding()
+-                best = T.alloc_local((1,), T.float32)
+-                best_index = T.alloc_local((1,), T.int32)
+-                other = T.alloc_local((1,), T.float32)
+-                other_index = T.alloc_local((1,), T.int32)
+-                best[0] = -T.infinity(T.float32)
+-                best_index[0] = 1 << 30
+-                for k in T.serial(T.ceildiv(width // 2 - tx, 32)):
+-                    rank = tx + k * 32
+-                    _first_keep_or_take(
+-                        best,
+-                        best_index,
+-                        pairs[row, 2 * rank],
+-                        T.cast(pairs[row, 2 * rank + 1], T.int32),
+-                    )
+-                _warp_first_argmax(best, best_index, other, other_index)
+-                if tx == 0:
+-                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                        best_index[0], output_dtype
+-                    )
++        with T.Kernel(rows, threads=32) as row:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            lane = T.min(tx, ranks - 1)
++            value = pairs[row, 2 * lane]
++            index = pairs[row, 2 * lane + 1]
++            best[0] = T.if_then_else(tx < ranks, value, -T.infinity(T.float32))
++            best_index[0] = T.if_then_else(
++                tx < ranks, T.cast(index, T.int32), T.int32(1 << 30)
++            )
++            if span >= 32:
++                _first_exchange(best, best_index, other, other_index, 16)
++            if span >= 16:
++                _first_exchange(best, best_index, other, other_index, 8)
++            if span >= 8:
++                _first_exchange(best, best_index, other, other_index, 4)
++            if span >= 4:
++                _first_exchange(best, best_index, other, other_index, 2)
++            if span >= 2:
++                _first_exchange(best, best_index, other, other_index, 1)
++            if tx == 0:
++                out[T.cast(row, T.int64) * out_stride] = T.cast(
++                    best_index[0], output_dtype
++                )
+ 
+     return select_first_argmax
+ 
+@@ -1498,7 +1522,9 @@ def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
+     rows = pairs.shape[0]
+     if rows == 0:
+         return
+-    kernel = _kernel(select_first_argmax_kernel, _DTYPES[output.dtype])
++    kernel = _kernel(
++        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // 2
++    )
+     kernel(pairs, _flat(output), output.stride(0))
+ 
+ 
+@@ -1608,13 +1634,16 @@ def greedy_rejection_sample(
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def temperature_kernel(idx_dtype: str, run: int, threads: int = _THREADS):
++def temperature_kernel(idx_dtype: str, run: int, threads: int = _TEMPERATURE_THREADS):
+     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
+     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
+     alone; a block of ``threads`` per ``(token, 8192 columns)``, each thread's
+     elements in runs of ``run`` (``_triton_run``), one vector load and store each
+-    when aligned. As in Triton, the temperature is read at the mapped index without
+-    a validity check."""
++    when aligned. As in Triton, the thread's runs are all loaded, then divided,
++    then stored: the logits are read and written through one pointer, so a run
++    stored before the next run's load would make every load wait for a store. As
++    in Triton, the temperature is read at the mapped index without a validity
++    check."""
+     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
+     logits_stride = T.dynamic("logits_stride", "int64")
+     runs = _TEMPERATURE_BLOCK // (threads * run)
+@@ -1631,7 +1660,7 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _THREADS):
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+             temp = T.alloc_local((1,), T.float32)
+-            raw = T.alloc_local((run,), T.float32)
++            raw = T.alloc_local((runs * run,), T.float32)
+             if run > 1:
+                 # The launch checked it: a 16-byte base and a stride of 16 elements.
+                 T.assume(logits_stride % 16 == 0)
+@@ -1639,12 +1668,12 @@ def temperature_kernel(idx_dtype: str, run: int, threads: int = _THREADS):
+             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
+                 for r in T.unroll(runs):
+                     col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+-                    _load_run(logits, raw, t, col0, vocab, run)
+-                    for k in T.unroll(run):
+-                        raw[k] = T.call_extern(
+-                            "float32", "vllm_div_full", raw[k], temp[0]
+-                        )
+-                    _store_run(logits, raw, t, col0, vocab, run)
++                    _load_run_at(logits, raw, r * run, t, col0, vocab, run)
++                for k in T.unroll(runs * run):
++                    raw[k] = T.call_extern("float32", "vllm_div_full", raw[k], temp[0])
++                for r in T.unroll(runs):
++                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
++                    _store_run_at(logits, raw, r * run, t, col0, vocab, run)
+ 
+     return temperature
+ 
+@@ -1801,7 +1830,7 @@ def greedy_calls(
+     *,
+     markov: Sequence[tuple[torch.dtype, torch.dtype]] = (),
+     logits: Sequence[torch.dtype] = (),
+-    select: Sequence[torch.dtype] = (),
++    select: Sequence[tuple[torch.dtype, int]] = (),
+     finish_outputs: Sequence[torch.dtype] = (),
+     rejection_widths: Sequence[int] = (),
+ ) -> list:
+@@ -1809,8 +1838,8 @@ def greedy_calls(
+     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
+     ``greedy_shard_pair`` for each logits dtype (both the 16-byte and the
+     element-wise reads, which the launch picks from the rows' alignment); the
+-    pair finish when there is a pair, ``select_first_argmax`` for each output
+-    dtype, ``sample_greedy_markov``'s index finish for each of
++    pair finish when there is a pair, ``select_first_argmax`` for each
++    ``(output dtype, ranks)``, ``sample_greedy_markov``'s index finish for each of
+     ``finish_outputs``, and greedy verification for each sampled width."""
+     calls = [
+         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+@@ -1825,7 +1854,10 @@ def greedy_calls(
+     if markov or logits:
+         calls.append(_call(finish_argmax_kernel, "pair"))
+     calls += [_call(finish_argmax_kernel, _DTYPES[dtype]) for dtype in finish_outputs]
+-    calls += [_call(select_first_argmax_kernel, _DTYPES[dtype]) for dtype in select]
++    calls += [
++        _call(select_first_argmax_kernel, _DTYPES[dtype], ranks)
++        for dtype, ranks in select
++    ]
+     calls += [
+         _call(greedy_rejection_kernel, width, _DTYPES[dtype])
+         for width in rejection_widths
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index 5e9254169..3e014e74c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -172,7 +172,7 @@ def register_select_first_argmax_warmup(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.declare(
+-        lambda: tilelang_sampling.greedy_calls(select=[output_dtype])
++        lambda: tilelang_sampling.greedy_calls(select=[(output_dtype, ranks)])
+     )
+ 
+ 

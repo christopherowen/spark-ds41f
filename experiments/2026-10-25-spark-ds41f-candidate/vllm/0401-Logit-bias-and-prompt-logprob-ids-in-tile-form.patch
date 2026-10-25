@@ -1,0 +1,461 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:23:19 +0200
+Subject: [PATCH 401/488] Logit bias and prompt-logprob ids in tile form
+
+Each list's ids and values are loaded (predicated on its length) before
+the gathered logits, and those before any store; the prompt ids take
+4096 tokens a pass with predicated loads and stores, so a 16K chunk waits
+on memory four times, not sixteen. The all-masked scan ignores NaN as
+Triton's maximum does (a row is alive when some logit is above -inf),
+which the new test pins against the Triton kernel.
+---
+ tests/v1/worker/test_gpu_sampling_controls.py |  79 ++++++
+ .../worker/gpu/sample/tilelang_auxiliary.py   |  54 +++-
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    | 233 +++++++++++++-----
+ 3 files changed, 294 insertions(+), 72 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index ccf644470..28c0739a4 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -389,3 +389,82 @@ def test_bias_preserves_allowed_logits_and_applies_bias_before_stop_mask(
+         restore,
+     )
+     assert_bits(logits, expected)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("vocab", [128, 8193, 129280])
++def test_bias_restores_stops_when_only_nan_or_masked_logits_remain(index_dtype, vocab):
++    """The all-masked check ignores NaN, as Triton's maximum does: a row whose only
++    logit left after the stop mask is NaN restores its stop tokens."""
++    from vllm.v1.worker.gpu.sample import tilelang_bias
++    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
++
++    torch.manual_seed(52031)
++    states, rows, width = 9, 5, 8
++    logits = torch.randn((rows, vocab), device="cuda")
++    mapping = torch.tensor([3, 0, 6, 1, 8], device="cuda", dtype=index_dtype)
++    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
++    # Row 0 allows only its stop tokens; rows 1-4 also allow token 3, which is NaN
++    # in row 1, finite in row 2, and -inf in rows 3 and 4. Row 3's stop logits are
++    # NaN, +inf and finite; row 4's are all -inf.
++    num_allowed = torch.zeros(states, device="cuda", dtype=torch.int32)
++    num_allowed[mapping] = torch.tensor([3, 4, 4, 4, 4], device="cuda").int()
++    allowed = torch.arange(width, device="cuda", dtype=torch.int32).repeat(states, 1)
++    logits[1, 3] = float("nan")
++    logits[3:, 3] = -float("inf")
++    logits[3, 0] = float("nan")
++    logits[3, 1] = float("inf")
++    logits[4, :3] = -float("inf")
++    num_bias = torch.zeros_like(num_allowed)
++    bias_ids = allowed.clone()
++    biases = torch.zeros((states, width), device="cuda")
++    min_lens = torch.full_like(num_allowed, 5)
++    num_stops = torch.full_like(num_allowed, 3)
++    restore_rows = torch.ones_like(num_allowed)
++    stops = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    stops[:, :3] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
++    expected = logits.clone()
++    _bias_kernel[(rows,)](
++        expected,
++        expected.stride(0),
++        vocab,
++        mapping,
++        num_allowed,
++        allowed,
++        allowed.stride(0),
++        num_bias,
++        bias_ids,
++        bias_ids.stride(0),
++        biases,
++        biases.stride(0),
++        positions,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        stops.stride(0),
++        BLOCK_SIZE=width,
++        LOGITS_BLOCK_SIZE=8192,
++        CHECK_ALL_MASKED_ROWS=True,
++    )
++    tilelang_bias.apply_logit_bias(
++        logits,
++        mapping,
++        positions,
++        num_allowed,
++        allowed,
++        num_bias,
++        bias_ids,
++        biases,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        True,
++    )
++    assert_bits(logits, expected)
++    # Rows 0 and 1 restored their stop tokens; row 2 kept them masked.
++    assert (
++        torch.isfinite(expected[0, :3]).all() and torch.isfinite(expected[1, :3]).all()
++    )
++    assert (expected[2, :3] == -float("inf")).all()
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 4a1b3ace5..a03f8cd14 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -5,7 +5,12 @@
+ import torch
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
++from vllm.v1.worker.gpu.sample.tilelang_controls import (
++    _DTYPES,
++    _HEADER,
++    _PASS,
++    _declare,
++)
+ 
+ 
+ def register_bad_words(
+@@ -149,11 +154,20 @@ def apply_bad_words(
+         )
+ 
+ 
++_PROMPT_THREADS = 128
++_PROMPT_PER_THREAD = 32  # 4096 tokens a pass: a 16K chunk in four
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
++    """A block a request: the token after each of its chunk's positions. Each pass
++    issues all of its loads before its stores (both predicated on the chunk's
++    length), so a long chunk waits on memory once a pass, not once a thread's
++    element."""
+     rows, output_len, states, token_cols = T.dynamic(
+         "rows, output_len, states, token_cols"
+     )
++    tile = _PROMPT_THREADS * _PROMPT_PER_THREAD
+ 
+     @T.prim_func
+     def prompt_ids(
+@@ -163,17 +177,33 @@ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
+         computed: T.Tensor((states,), "int32"),
+         tokens: T.StridedTensor((states, token_cols), (tokens_stride, 1), "int32"),
+     ):
+-        with T.Kernel(rows, threads=128) as row:
+-            req = mapping[row]
+-            start = query_starts[row]
+-            length = query_starts[row + 1] - start
+-            for block in T.serial(T.ceildiv(length, 1024)):
+-                for i in T.Parallel(1024):
+-                    pos = block * 1024 + i
+-                    if pos < length:
+-                        output[start + pos] = T.cast(
+-                            tokens[req, computed[req] + 1 + pos], "int64"
+-                        )
++        with T.Kernel(rows, threads=_PROMPT_THREADS) as row:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            req = T.alloc_var(T.int64, init=T.cast(mapping[row], "int64"))
++            start = T.alloc_var(T.int32, init=query_starts[row])
++            length = T.alloc_var(T.int32, init=query_starts[row + 1] - start)
++            first = T.alloc_var(T.int32, init=computed[req] + 1)
++            values = T.alloc_local((_PROMPT_PER_THREAD,), "int32")
++            for block in T.serial(T.ceildiv(length, tile)):
++                for k in T.unroll(_PROMPT_PER_THREAD):
++                    pos = block * tile + k * _PROMPT_THREADS + tx
++                    values[k] = T.call_extern(
++                        "int32",
++                        "vllm_control_load_if_b32",
++                        T.address_of(tokens[req, first + pos]),
++                        0,
++                        pos < length,
++                    )
++                for k in T.unroll(_PROMPT_PER_THREAD):
++                    pos = block * tile + k * _PROMPT_THREADS + tx
++                    T.call_extern(
++                        "handle",
++                        "vllm_control_store_if_b64",
++                        T.address_of(output[start + pos]),
++                        T.cast(values[k], "int64"),
++                        pos < length,
++                    )
+ 
+     return prompt_ids
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index ced6f4251..1fc770911 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -3,7 +3,12 @@
+ """Allowed-token, sparse-bias and minimum-length candidate."""
+ 
+ from vllm.tilelang_utils import T, tilelang
+-from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
++from vllm.v1.worker.gpu.sample.tilelang_controls import (
++    _DTYPES,
++    _HEADER,
++    _PASS,
++    _declare,
++)
+ 
+ 
+ def register_bias(
+@@ -39,6 +44,12 @@ def register_bias(
+     )
+ 
+ 
++_THREADS = 128
++_ROW_TILE = (
++    8192  # Triton's LOGITS_BLOCK_SIZE: the row's fill and scan, a tile at a time
++)
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def bias_kernel(
+     vocab: int,
+@@ -52,9 +63,63 @@ def bias_kernel(
+     index_dtype: str,
+     position_dtype: str,
+ ):
++    """``_bias_kernel`` in its tile form: a block a row, each list's ids and values
++    loaded (predicated on the list's length) before the gathered logits, and those
++    before any store, every masked store predicated. The row's -inf fill and the
++    all-masked scan take 8192 columns a tile; only the last, partial tile clamps
++    its loads and predicates its stores. As Triton's maximum, the scan ignores NaN:
++    a row is alive when some logit is above -inf."""
+     rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
+         "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
+     )
++    per = max(width // _THREADS, 1)
++    row_per = _ROW_TILE // _THREADS
++    full = vocab // _ROW_TILE
++    warps = _THREADS // 32
++
++    def load_if(dtype, address, other, ok):
++        helper = (
++            "vllm_control_load_if_b32"
++            if dtype == "int32"
++            else ("vllm_control_load_if_f32")
++        )
++        return T.call_extern(dtype, helper, address, other, ok)
++
++    def store_if(address, value, ok):
++        return T.call_extern("handle", "vllm_control_store_if", address, value, ok)
++
++    @T.macro
++    def fill_row(logits, row, tx):
++        for tile in T.serial(full):
++            for j in T.unroll(row_per):
++                logits[row, tile * _ROW_TILE + j * _THREADS + tx] = -T.infinity(
++                    "float32"
++                )
++        if vocab % _ROW_TILE:
++            for j in T.unroll(row_per):
++                col = full * _ROW_TILE + j * _THREADS + tx
++                store_if(
++                    T.address_of(logits[row, col]), -T.infinity("float32"), col < vocab
++                )
++
++    @T.macro
++    def scan_row(logits, row, tx, row_values, alive):
++        for tile in T.serial(full):
++            for j in T.unroll(row_per):
++                row_values[j] = logits[row, tile * _ROW_TILE + j * _THREADS + tx]
++            for j in T.unroll(row_per):
++                alive[0] = alive[0] | T.cast(
++                    row_values[j] > -T.infinity("float32"), "int32"
++                )
++        if vocab % _ROW_TILE:
++            # A repeated last column does not change whether any is alive.
++            for j in T.unroll(row_per):
++                col = full * _ROW_TILE + j * _THREADS + tx
++                row_values[j] = logits[row, T.min(col, vocab - 1)]
++            for j in T.unroll(row_per):
++                alive[0] = alive[0] | T.cast(
++                    row_values[j] > -T.infinity("float32"), "int32"
++                )
+ 
+     @T.prim_func
+     def bias(
+@@ -73,70 +138,118 @@ def bias_kernel(
+         restore_row: T.Tensor((states,), "int32"),
+         stops: T.StridedTensor((states, stop_cols), (stop_stride, 1), "int32"),
+     ):
+-        with T.Kernel(rows, threads=128) as row:
+-            req = mapping[row]
+-            saved = T.alloc_fragment((width,), "float32")
+-            saved_ids = T.alloc_fragment((width,), "int32")
+-            alive = T.alloc_fragment((8192,), "int32")
+-            any_alive = T.alloc_fragment((1,), "int32")
+-            if num_allowed[req] > 0:
+-                for col in T.Parallel(width):
+-                    if col < num_allowed[req]:
+-                        saved_ids[col] = allowed[req, col]
+-                        saved[col] = logits[T.cast(row, "int64"), saved_ids[col]]
+-                T.sync_threads()
+-                for block in T.serial(T.ceildiv(vocab, 8192)):
+-                    for col in T.Parallel(8192):
+-                        index = block * 8192 + col
+-                        if index < vocab:
+-                            logits[T.cast(row, "int64"), index] = -T.infinity("float32")
++        with T.Kernel(rows, threads=_THREADS) as block:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            row = T.cast(block, "int64")
++            req = T.alloc_var(T.int64, init=T.cast(mapping[block], "int64"))
++            n_allowed = T.alloc_var(T.int32, init=num_allowed[req])
++            n_bias = T.alloc_var(T.int32, init=num_bias[req])
++            n_stops = T.alloc_var(T.int32, init=num_stops[req])
++            position = T.alloc_var(position_dtype, init=positions[block])
++            min_len = T.alloc_var(T.int32, init=min_lens[req])
++            # Whether this row restores its stop tokens when nothing else is left.
++            keep = T.alloc_var(T.int32, init=restore_row[req] if restore else 0)
++            ids = T.alloc_local((per,), "int32")
++            values = T.alloc_local((per,), "float32")
++            extra = T.alloc_local((per,), "float32")
++            row_values = T.alloc_local((row_per,), "float32")
++            alive = T.alloc_local((1,), "int32")
++            partial = T.alloc_shared((warps,), "int32")
++            if n_allowed > 0:
++                for k in T.unroll(per):
++                    col = k * _THREADS + tx
++                    ids[k] = load_if(
++                        "int32", T.address_of(allowed[req, col]), 0, col < n_allowed
++                    )
++                for k in T.unroll(per):
++                    values[k] = load_if(
++                        "float32",
++                        T.address_of(logits[row, ids[k]]),
++                        T.float32(0),
++                        k * _THREADS + tx < n_allowed,
++                    )
+                 T.sync_threads()
+-                for col in T.Parallel(width):
+-                    if col < num_allowed[req]:
+-                        logits[T.cast(row, "int64"), saved_ids[col]] = saved[col]
++                fill_row(logits, row, tx)
+                 T.sync_threads()
+-            if num_bias[req] > 0:
+-                for col in T.Parallel(width):
+-                    if col < num_bias[req]:
+-                        token = bias_ids[req, col]
+-                        logits[T.cast(row, "int64"), token] += biases[req, col]
++                for k in T.unroll(per):
++                    store_if(
++                        T.address_of(logits[row, ids[k]]),
++                        values[k],
++                        k * _THREADS + tx < n_allowed,
++                    )
+                 T.sync_threads()
+-            if (num_stops[req] > 0) & (positions[row] + 1 < min_lens[req]):
+-                for col in T.Parallel(width):
+-                    if col < num_stops[req]:
+-                        saved_ids[col] = stops[req, col]
+-                        if restore:
+-                            saved[col] = logits[T.cast(row, "int64"), saved_ids[col]]
++            if n_bias > 0:
++                for k in T.unroll(per):
++                    col = k * _THREADS + tx
++                    ids[k] = load_if(
++                        "int32", T.address_of(bias_ids[req, col]), 0, col < n_bias
++                    )
++                    extra[k] = load_if(
++                        "float32",
++                        T.address_of(biases[req, col]),
++                        T.float32(0),
++                        col < n_bias,
++                    )
++                for k in T.unroll(per):
++                    values[k] = load_if(
++                        "float32",
++                        T.address_of(logits[row, ids[k]]),
++                        T.float32(0),
++                        k * _THREADS + tx < n_bias,
++                    )
++                for k in T.unroll(per):
++                    store_if(
++                        T.address_of(logits[row, ids[k]]),
++                        values[k] + extra[k],
++                        k * _THREADS + tx < n_bias,
++                    )
+                 T.sync_threads()
+-                for col in T.Parallel(width):
+-                    if col < num_stops[req]:
+-                        logits[T.cast(row, "int64"), saved_ids[col]] = -T.infinity(
+-                            "float32"
++            if (n_stops > 0) & (position + 1 < min_len):
++                for k in T.unroll(per):
++                    col = k * _THREADS + tx
++                    ids[k] = load_if(
++                        "int32", T.address_of(stops[req, col]), 0, col < n_stops
++                    )
++                if keep != 0:
++                    for k in T.unroll(per):
++                        values[k] = load_if(
++                            "float32",
++                            T.address_of(logits[row, ids[k]]),
++                            -T.infinity("float32"),
++                            k * _THREADS + tx < n_stops,
++                        )
++                    T.sync_threads()
++                for k in T.unroll(per):
++                    store_if(
++                        T.address_of(logits[row, ids[k]]),
++                        -T.infinity("float32"),
++                        k * _THREADS + tx < n_stops,
++                    )
++                if keep != 0:
++                    T.sync_threads()
++                    alive[0] = 0
++                    scan_row(logits, row, tx, row_values, alive)
++                    alive[0] = alive[0] | T.shfl_xor(alive[0], 16)
++                    alive[0] = alive[0] | T.shfl_xor(alive[0], 8)
++                    alive[0] = alive[0] | T.shfl_xor(alive[0], 4)
++                    alive[0] = alive[0] | T.shfl_xor(alive[0], 2)
++                    alive[0] = alive[0] | T.shfl_xor(alive[0], 1)
++                    if tx % 32 == 0:
++                        partial[tx // 32] = alive[0]
++                    T.sync_threads()
++                    alive[0] = partial[0]
++                    for w in T.unroll(1, warps):
++                        alive[0] = alive[0] | partial[w]
++                    for k in T.unroll(per):
++                        store_if(
++                            T.address_of(logits[row, ids[k]]),
++                            values[k],
++                            (alive[0] == 0)
++                            & (k * _THREADS + tx < n_stops)
++                            & (values[k] > -T.infinity("float32"))
++                            & (values[k] < T.infinity("float32")),
+                         )
+-                T.sync_threads()
+-                if restore and restore_row[req] != 0:
+-                    T.clear(alive)
+-                    for block in T.serial(T.ceildiv(vocab, 8192)):
+-                        for col in T.Parallel(8192):
+-                            index = block * 8192 + col
+-                            value = T.if_then_else(
+-                                index < vocab,
+-                                logits[T.cast(row, "int64"), index],
+-                                -T.infinity("float32"),
+-                            )
+-                            alive[col] |= T.cast(
+-                                value != -T.infinity("float32"), "int32"
+-                            )
+-                    T.reduce_max(alive, any_alive, dim=0)
+-                    if any_alive[0] == 0:
+-                        for col in T.Parallel(width):
+-                            if col < num_stops[req]:  # noqa: SIM102
+-                                if (saved[col] > -T.infinity("float32")) & (
+-                                    saved[col] < T.infinity("float32")
+-                                ):
+-                                    logits[T.cast(row, "int64"), saved_ids[col]] = (
+-                                        saved[col]
+-                                    )
+ 
+     return bias
+ 

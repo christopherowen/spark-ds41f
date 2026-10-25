@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:10:31 +0200
+Subject: [PATCH 435/488] [DS4.1] Adaptive verification's draft budget and
+ logits rows in TileLang
+
+The draft budget (_assign_draft_token_budget) took about thirteen torch
+launches whenever the budget trimmed the drafts: the gather, cumprod,
+mask, topk, index_fill and sum. One block now reproduces it bit for bit:
+the survival products in cumprod's order (CUB's sequential scan for one
+request, tensor_kernel_scan_innermost_dim's Sklansky scan for several),
+torch.topk's ranking by radix key (NaN first, ties to the lower slot)
+and each request's admitted count.
+
+The offsets kernel also writes the expanded state indices and positions
+of each request's logits rows, so production's path (adaptive
+verification) no longer launches expand_idx_mapping, which run 17 still
+timed 0.03 us slower than Triton. Without adaptive verification the
+expand kernel serves as before.
+---
+ .../benchmark_runner_inputs_tilelang.py       |  43 ++++-
+ tests/v1/worker/test_gpu_tilelang_inputs.py   |  93 ++++++++--
+ vllm/v1/worker/gpu/model_runner.py            |  17 +-
+ .../gpu/spec_decode/adaptive_verification.py  |  22 ++-
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 175 +++++++++++++++++-
+ 5 files changed, 313 insertions(+), 37 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+index 484793afb..24df2fbbe 100644
+--- a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
++++ b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+@@ -357,13 +357,18 @@ def case_expand_idx_mapping(gen, num_reqs, prefill, widths):
+ 
+ 
+ def case_adaptive_offsets(gen, num_reqs, prefill, widths):
+-    """Adaptive verification's offsets: before the port, five torch launches
+-    (two zeroes, two adds and cumsums, the tail fill)."""
++    """Adaptive verification's offsets and expanded logits rows: before the port,
++    five torch launches (two zeroes, two adds and cumsums, the tail fill) and the
++    Triton expand_idx_mapping launch."""
+     reqs = 1 if prefill else num_reqs
+     capacities = _randint(0, ROWS, (MAX_REQS,), gen)[:reqs]
+     non_draft = _randint(1, 2, (MAX_REQS,), gen)[:reqs]
++    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
+     cu = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
+     starts = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
++    num_logits = reqs + int(capacities.sum())
++    expanded = torch.empty(num_logits, dtype=torch.int64, device=DEVICE)
++    local = torch.empty(num_logits, dtype=torch.int32, device=DEVICE)
+     tokens = reqs * ROWS
+ 
+     def torch_call():
+@@ -372,9 +377,40 @@ def case_adaptive_offsets(gen, num_reqs, prefill, widths):
+         starts[:1].zero_()
+         torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : reqs + 1])
+         starts[reqs + 1 :].fill_(tokens)
++        ib._expand_idx_mapping_kernel[(reqs,)](
++            idx, expanded, local, cu, BLOCK_SIZE=triton.next_power_of_2(ROWS)
++        )
++
++    def tilelang_call():
++        tli.adaptive_offsets(
++            capacities, non_draft, cu, starts, idx, num_logits, ROWS, 1, tokens, True
++        )
++
++    return torch_call, tilelang_call
++
++
++def case_assign_draft_budget(gen, num_reqs, prefill, widths):
++    """Adaptive verification's draft budget at half the scheduled drafts: before
++    the port, about thirteen torch launches (the gather, cumprod, mask, topk,
++    index_fill and sum)."""
++    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++        _assign_draft_token_budget,
++    )
++
++    reqs = 1 if prefill else num_reqs
++    probs = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
++    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
++    scheduled = torch.full((reqs,), DRAFTS, dtype=torch.int32, device=DEVICE)
++    capacities = scheduled.clone()
++    budget = max(1, reqs * DRAFTS // 2)
++
++    def torch_call():
++        capacities.copy_(scheduled)
++        _assign_draft_token_budget(probs, idx, capacities, budget, DRAFTS)
+ 
+     def tilelang_call():
+-        tli.adaptive_offsets(capacities, non_draft, cu, starts, 1, tokens, True)
++        capacities.copy_(scheduled)
++        tli.assign_draft_budget(probs, idx, capacities, budget, DRAFTS)
+ 
+     return torch_call, tilelang_call
+ 
+@@ -533,6 +569,7 @@ CASES = {
+     "combine_sampled_and_draft_tokens (dead rows)": case_combine_dead_rows,
+     "expand_idx_mapping": case_expand_idx_mapping,
+     "adaptive_offsets": case_adaptive_offsets,
++    "assign_draft_budget": case_assign_draft_budget,
+     "dspark_context": case_dspark_context,
+     "post_update": case_post_update,
+     "prepare_dflash_inputs": case_prepare_dflash_inputs,
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 2cab49092..c4e69232d 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -759,36 +759,82 @@ def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, draf
+ @pytest.mark.parametrize("drafted", [True, False])
+ def test_adaptive_offsets(num_reqs, drafted):
+     """reallocate_drafts' offsets: both prefix sums, query_start_loc's tail and, on a
+-    step without drafts, the zeroed capacities, in buffers longer than the batch."""
++    step without drafts, the zeroed capacities, in buffers longer than the batch;
++    and the expanded state indices and positions of the logits rows, against
++    the Triton expand_idx_mapping launch that followed the torch chain."""
+     gen = _gen(num_reqs + 17)
+     size = num_reqs + 7
++    width = DRAFTS + 1
+     capacities = _randint(0, DRAFTS + 1, (size,), gen)
+     non_draft = _randint(0, MAX_TOKENS, (size,), gen)
+     cu = _garbage((size + 1,), torch.int32, gen)
+     starts = _garbage((size + 1,), torch.int32, gen)
++    idx = torch.randperm(size, generator=gen, device=DEVICE)[:num_reqs]
+     bonus, tokens = 1, int(_randint(0, 1 << 20, (1,), gen))
++    num_logits = num_reqs * bonus + (int(capacities[:num_reqs].sum()) if drafted else 0)
+     results = []
+     for kind in ("ref", "ours"):
+         buffers = [capacities.clone(), cu.clone(), starts.clone()]
+-        args = (
+-            buffers[0][:num_reqs],
+-            non_draft[:num_reqs],
+-            buffers[1],
+-            buffers[2],
+-            bonus,
+-            tokens,
+-            drafted,
+-        )
++        args = (buffers[0][:num_reqs], non_draft[:num_reqs], buffers[1], buffers[2])
+         if kind == "ref":
+-            _adaptive_offsets_ref(*args)
++            _adaptive_offsets_ref(*args, bonus, tokens, drafted)
++            expanded = _garbage((num_logits,), torch.int64, _gen(5))
++            local = _garbage((num_logits,), torch.int32, _gen(6))
++            ib._expand_idx_mapping_kernel[(num_reqs,)](
++                idx,
++                expanded,
++                local,
++                buffers[1],
++                BLOCK_SIZE=triton.next_power_of_2(width),
++            )
+         else:
+-            tli.adaptive_offsets(*args)
+-        results.append(buffers)
++            expanded, local = tli.adaptive_offsets(
++                *args, idx, num_logits, width, bonus, tokens, drafted
++            )
++        results.append((*buffers, expanded, local))
+     torch.accelerator.synchronize()
+     for r, o in zip(*results):
+         assert torch.equal(r, o)
+ 
+ 
++def _budget_case(num_reqs, gen, steps=DRAFTS):
++    """Confidences with exact ties, ones, zeros and a NaN, and scheduled counts
++    from none to every step."""
++    probs = torch.rand(MAX_REQS * 2, steps, generator=gen, device=DEVICE) ** 0.25
++    probs[0, :] = 1.0
++    probs[1 % (MAX_REQS * 2), 2] = 0.0
++    probs[2, :2] = probs[3, :2]  # survivals equal across requests
++    probs[5, 1] = float("nan")
++    idx = torch.randperm(MAX_REQS * 2, generator=gen, device=DEVICE)[:num_reqs]
++    capacities = _randint(0, steps + 1, (num_reqs,), gen)
++    return probs, idx, capacities
++
++
++@pytest.mark.parametrize("num_reqs", [1, 2, 3, 7, 16, 32])
++@pytest.mark.parametrize("fraction", [0.1, 0.5, 0.9])
++def test_assign_draft_budget(num_reqs, fraction):
++    """The draft budget against the torch chain it replaces, bit for bit: the
++    survival products in cumprod's order (CUB's sequential scan for one request,
++    the Sklansky scan for several), torch.topk's ranking (ties to the lower slot,
++    NaN first) and each request's admitted count."""
++    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
++        _assign_draft_token_budget,
++    )
++
++    gen = _gen(num_reqs * 13 + int(fraction * 10))
++    probs, idx, capacities = _budget_case(num_reqs, gen)
++    scheduled = int(capacities.sum())
++    budget = max(1, min(scheduled - 1, int(scheduled * fraction)))
++    if scheduled <= 1:
++        pytest.skip("no budget below the scheduled drafts")
++    expected, actual = capacities.clone(), capacities.clone()
++    _assign_draft_token_budget(probs, idx, expected, budget, DRAFTS)
++    tli.assign_draft_budget(probs, idx, actual, budget, DRAFTS)
++    torch.accelerator.synchronize()
++    assert torch.equal(actual, expected)
++    assert int(actual.sum()) == budget
++
++
+ def _post_update_case(num_reqs, width, gen, vocab=64):
+     idx = _idx(num_reqs, gen)
+     if num_reqs > 2:
+@@ -1128,7 +1174,23 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
+     capacities = _randint(0, DRAFTS + 1, (4,), gen)
+     starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
+     tli.adaptive_offsets(
+-        capacities, _randint(1, 2, (4,), gen), starts.clone(), starts, 1, 24, True
++        capacities,
++        _randint(1, 2, (4,), gen),
++        starts.clone(),
++        starts,
++        idx,
++        4 + int(capacities.sum()),
++        DRAFTS + 1,
++        1,
++        24,
++        True,
++    )
++    tli.assign_draft_budget(
++        torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE),
++        idx,
++        torch.full((4,), DRAFTS, dtype=torch.int32, device=DEVICE),
++        7,
++        DRAFTS,
+     )
+     tli.padding_rows(torch.zeros(32, dtype=torch.bool, device=DEVICE), 24, 32)
+     ids = _randint(0, 1 << 17, (64,), gen)
+@@ -1144,7 +1206,8 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
+         tli.flatten_sampled_calls()
+         + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
+-        + tli.adaptive_offsets_calls()
++        + tli.adaptive_offsets_calls(DRAFTS + 1)
++        + tli.assign_draft_budget_calls(DRAFTS)
+         + tli.padding_rows_calls()
+         + tli.logits_rows_calls(torch.int64)
+         + tli.logits_rows_calls(torch.int32)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 3e201e908..a0ccd2d9e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1757,11 +1757,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         query_start_loc = self.input_buffers.query_start_loc
+         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
+         if adaptive_verification is not None:
+-            cu_num_logits, query_start_loc, total_num_draft_tokens = (
+-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
+-            )
++            (
++                cu_num_logits,
++                query_start_loc,
++                total_num_draft_tokens,
++                expanded_idx_mapping,
++                expanded_local_pos,
++            ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
+             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+-        if draft_tokens:
++        elif draft_tokens:
+             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
+                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
+             )
+@@ -2138,8 +2142,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # The target's padding rows (prepare_inputs).
+             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
+         if self.adaptive_verification is not None:
++            steps = self.num_speculative_steps
++            width = steps + self.model_state.num_new_sampled_tokens_per_step
+             tilelang_inputs.declare(
+-                lambda: tilelang_inputs.adaptive_offsets_calls()
++                lambda: tilelang_inputs.adaptive_offsets_calls(width)
++                + tilelang_inputs.assign_draft_budget_calls(steps)
+                 + tilelang_inputs.scatter_rows_calls(
+                     torch.int64, torch.float32, gather=False
+                 )
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index c2ffe3b8c..b5a9a3ab7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -61,6 +61,8 @@ def resolve_adaptive_cudagraph_mode(
+     return CUDAGraphMode.FULL_AND_PIECEWISE
+ 
+ 
++# The reference ``tilelang_inputs.assign_draft_budget`` is tested against; the
++# manager no longer launches it.
+ def _assign_draft_token_budget(
+     confidence_probs: torch.Tensor,
+     idx_mapping: torch.Tensor,
+@@ -200,7 +202,7 @@ class AdaptiveVerificationManager:
+                 device=device,
+             )
+             idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+-            _assign_draft_token_budget(
++            tilelang_inputs.assign_draft_budget(
+                 probs, idx_mapping, capacities, draft_budget, steps
+             )
+         torch.cuda.synchronize(device)
+@@ -387,7 +389,10 @@ class AdaptiveVerificationManager:
+ 
+     def reallocate_drafts(
+         self, req_ids: list[str], idx_mapping: torch.Tensor
+-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
++    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
++        """The step's logits offsets, query starts and draft budget, and its
++        expanded state indices and positions (``expand_idx_mapping``'s), all
++        from the admitted drafts."""
+         batch_budget, self._batch_budget = self._batch_budget, None
+         assert batch_budget is not None
+         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+@@ -411,7 +416,7 @@ class AdaptiveVerificationManager:
+         if draft_budget:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
+-                _assign_draft_token_budget(
++                tilelang_inputs.assign_draft_budget(
+                     self._confidence_probs,
+                     idx_mapping,
+                     capacities,
+@@ -421,13 +426,16 @@ class AdaptiveVerificationManager:
+ 
+         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
+-        # Both prefix sums and query_start_loc's tail in one kernel, which zeroes
+-        # capacities on a step without drafts.
+-        tilelang_inputs.adaptive_offsets(
++        # Both prefix sums, query_start_loc's tail and the expanded logits rows in
++        # one kernel, which zeroes capacities on a step without drafts.
++        expanded_idx_mapping, expanded_local_pos = tilelang_inputs.adaptive_offsets(
+             capacities,
+             num_non_draft_tokens_gpu,
+             self._cu_num_logits,
+             self.query_start_loc,
++            idx_mapping,
++            num_reqs * self.num_bonus_tokens + draft_budget,
++            self.num_speculative_steps + self.num_bonus_tokens,
+             self.num_bonus_tokens,
+             num_tokens,
+             drafted=draft_budget > 0,
+@@ -436,6 +444,8 @@ class AdaptiveVerificationManager:
+             self._cu_num_logits[: num_reqs + 1],
+             self.query_start_loc,
+             draft_budget,
++            expanded_idx_mapping,
++            expanded_local_pos,
+         )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 1c4099844..8db846a34 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -821,6 +821,137 @@ def scatter_rows_calls(
+     return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
+ 
+ 
++# --- Adaptive verification's draft budget -----------------------------------------
++
++_BUDGET_THREADS = 256
++
++_BUDGET_HEADER = r"""
++// torch.topk's radix key of an FP32 value: larger keys rank first, every NaN
++// above +inf (TopKTypeConfig<float>::convert).
++__device__ __forceinline__ unsigned int vllm_topk_key(float v) {
++  unsigned int x = __float_as_uint(v);
++  unsigned int mask = (x & 0x80000000u) ? 0xffffffffu : 0x80000000u;
++  return (v == v) ? (x ^ mask) : 0xffffffffu;
++}
++// A product rounded as torch's scan writes it (no contraction with a neighbour).
++__device__ __forceinline__ float vllm_budget_mul(float a, float b) {
++  return __fmul_rn(a, b);
++}
++"""
++
++
++@tilelang.jit(pass_configs=_PASS)
++def assign_draft_budget_kernel(steps: int, idx_dtype: str):
++    """``adaptive_verification._assign_draft_token_budget``'s torch chain, one
++    block: each request's survival (the running product of its confidences, in
++    the order torch's cumprod takes: sequential through CUB for one request, the
++    Sklansky scan of ``tensor_kernel_scan_innermost_dim`` for several), -inf
++    past its scheduled drafts; the ``draft_budget`` best slots as ``torch.topk``
++    picks them (radix keys, NaN highest, ties to the lower slot); and each
++    request's admitted count into ``capacities``."""
++    num_reqs, prob_rows = T.dynamic("num_reqs, prob_rows")
++    scan_threads = 16  # torch's num_threads_x for these rows (at least 2**4)
++    while 2 * scan_threads < steps:
++        scan_threads *= 2
++    scan_levels = scan_threads.bit_length()  # m = 0 .. log2(scan_threads)
++
++    @T.prim_func
++    def assign_draft_budget(
++        confidence_probs: T.Tensor((prob_rows, steps), T.float32),
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        capacities: T.Tensor((num_reqs,), T.int32),
++        draft_budget: T.int32,
++    ):
++        with T.Kernel(1, threads=_BUDGET_THREADS):
++            T.import_source(_BUDGET_HEADER)
++            tx = T.get_thread_binding()
++            slots = num_reqs * steps
++            keys = T.alloc_shared((_BUDGET_THREADS * 8,), T.uint32)
++            admitted = T.alloc_shared((_BUDGET_THREADS * 8,), T.int32)
++            row = T.alloc_local((steps,), T.float32)
++            for chunk in T.serial(T.ceildiv(num_reqs, _BUDGET_THREADS)):
++                req = chunk * _BUDGET_THREADS + tx
++                if req < num_reqs:
++                    state = T.cast(idx_mapping[req], T.int64)
++                    for j in T.unroll(steps):
++                        row[j] = confidence_probs[state, j]
++                    if num_reqs == 1:
++                        for j in T.unroll(1, steps):
++                            row[j] = T.call_extern(
++                                "float32", "vllm_budget_mul", row[j - 1], row[j]
++                            )
++                    else:
++                        # tensor_kernel_scan_innermost_dim's Sklansky levels over the
++                        # row padded with ones to 2 * scan_threads positions (ones
++                        # past the row: their products are exact and none feeds it).
++                        for m in T.unroll(scan_levels):
++                            for t in T.unroll(scan_threads):
++                                a = ((t >> m) << (m + 1)) | (1 << m)
++                                if a + t % (1 << m) < steps:
++                                    row[a + t % (1 << m)] = T.call_extern(
++                                        "float32",
++                                        "vllm_budget_mul",
++                                        row[a + t % (1 << m)],
++                                        row[a - 1],
++                                    )
++                    limit = capacities[req]
++                    for j in T.unroll(steps):
++                        keys[req * steps + j] = T.call_extern(
++                            "uint32",
++                            "vllm_topk_key",
++                            T.if_then_else(j >= limit, -T.infinity(T.float32), row[j]),
++                        )
++            T.sync_threads()
++            for chunk in T.serial(T.ceildiv(slots, _BUDGET_THREADS)):
++                e = chunk * _BUDGET_THREADS + tx
++                if e < slots:
++                    key = keys[e]
++                    rank = T.alloc_var(T.int32, init=0)
++                    for f in T.serial(slots):
++                        if (keys[f] > key) | ((keys[f] == key) & (f < e)):
++                            rank = rank + 1
++                    admitted[e] = T.if_then_else(rank < draft_budget, 1, 0)
++            T.sync_threads()
++            for chunk in T.serial(T.ceildiv(num_reqs, _BUDGET_THREADS)):
++                req = chunk * _BUDGET_THREADS + tx
++                if req < num_reqs:
++                    count = T.alloc_var(T.int32, init=0)
++                    for j in T.unroll(steps):
++                        count = count + admitted[req * steps + j]
++                    capacities[req] = count
++
++    return assign_draft_budget
++
++
++def assign_draft_budget_key(steps: int, idx_dtype: torch.dtype) -> tuple:
++    return (steps, _DTYPES[idx_dtype])
++
++
++def assign_draft_budget(
++    confidence_probs: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    capacities: torch.Tensor,
++    draft_budget: int,
++    steps: int,
++) -> None:
++    """``_assign_draft_token_budget``: ``capacities`` enters holding each
++    request's scheduled draft count and leaves holding its admitted count."""
++    if idx_mapping.shape[0] * steps > _BUDGET_THREADS * 8:
++        raise ValueError(
++            f"{idx_mapping.shape[0]} requests of {steps} drafts exceed the draft "
++            f"budget kernel's {_BUDGET_THREADS * 8} slots"
++        )
++    _kernel(
++        assign_draft_budget_kernel, *assign_draft_budget_key(steps, idx_mapping.dtype)
++    )(confidence_probs, idx_mapping, capacities, draft_budget)
++
++
++def assign_draft_budget_calls(steps: int) -> list:
++    return [
++        _call(assign_draft_budget_kernel, *assign_draft_budget_key(steps, torch.int64))
++    ]
++
++
+ # --- Adaptive verification's offsets ------------------------------------------
+ 
+ _SCAN = 256  # requests a pass of the offsets' scan
+@@ -838,16 +969,21 @@ def _scan_step(a, b, tx, offset):
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def adaptive_offsets_kernel():
++def adaptive_offsets_kernel(width: int, idx_dtype: str):
+     """``AdaptiveVerificationManager.reallocate_drafts``' offsets in one block, the
+     torch chain's values: ``cu_num_logits = [0, cumsum(capacities + bonus)]``,
+     ``query_start_loc = [0, cumsum(capacities + non_draft)]``, and every later entry
+     of ``query_start_loc`` ``num_tokens``. A step without drafts (``drafted`` 0)
+     zeroes ``capacities`` first. The scans take 256 requests a pass, each pass
+-    carrying the last one's totals."""
++    carrying the last one's totals.
++
++    With the offsets, each request's logits rows (up to ``width``, the decode
++    query length) take its state index and position, ``expand_idx_mapping``'s
++    values, which its own launch wrote after this one."""
+     num_reqs, non_draft_len, cu_len, starts_len = T.dynamic(
+         "num_reqs, non_draft_len, cu_len, starts_len"
+     )
++    expanded_len, local_len = T.dynamic("expanded_len, local_len")
+ 
+     @T.prim_func
+     def adaptive_offsets(
+@@ -855,6 +991,9 @@ def adaptive_offsets_kernel():
+         non_draft: T.Tensor((non_draft_len,), T.int32),
+         cu_num_logits: T.Tensor((cu_len,), T.int32),
+         query_start_loc: T.Tensor((starts_len,), T.int32),
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        expanded_idx_mapping: T.Tensor((expanded_len,), idx_dtype),
++        expanded_local_pos: T.Tensor((local_len,), T.int32),
+         bonus: T.int32,
+         num_tokens: T.int32,
+         drafted: T.int32,
+@@ -895,8 +1034,14 @@ def adaptive_offsets_kernel():
+                 _scan_step(a, b, tx, 64)
+                 _scan_step(a, b, tx, 128)
+                 if inside:
+-                    cu_num_logits[req + 1] = carry_a + a[tx]
++                    end = carry_a + a[tx]
++                    cu_num_logits[req + 1] = end
+                     query_start_loc[req + 1] = carry_b + b[tx]
++                    state = T.alloc_var(idx_dtype, init=idx_mapping[req])
++                    for j in T.serial(width):
++                        if j < capacity + bonus:
++                            expanded_idx_mapping[end - capacity - bonus + j] = state
++                            expanded_local_pos[end - capacity - bonus + j] = j
+                 carry_a = carry_a + a[_SCAN - 1]
+                 carry_b = carry_b + b[_SCAN - 1]
+                 T.sync_threads()
+@@ -913,26 +1058,40 @@ def adaptive_offsets(
+     non_draft: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     query_start_loc: torch.Tensor,
++    idx_mapping: torch.Tensor,
++    num_logits: int,
++    width: int,
+     bonus: int,
+     num_tokens: int,
+     drafted: bool,
+-) -> None:
++) -> tuple[torch.Tensor, torch.Tensor]:
+     """``reallocate_drafts``' launch: ``cu_num_logits[: n + 1]`` and all of
+     ``query_start_loc`` for the ``n`` requests of ``capacities``, which a step
+-    without drafts zeroes."""
+-    _kernel(adaptive_offsets_kernel)(
++    without drafts zeroes; returns the expanded state indices and positions of
++    the ``num_logits`` logits rows (``expand_idx_mapping``'s)."""
++    expanded = idx_mapping.new_empty(num_logits)
++    local_pos = torch.empty(num_logits, dtype=torch.int32, device=idx_mapping.device)
++    _kernel(adaptive_offsets_kernel, *adaptive_offsets_key(width, idx_mapping.dtype))(
+         capacities,
+         non_draft,
+         cu_num_logits,
+         query_start_loc,
++        idx_mapping,
++        expanded,
++        local_pos,
+         bonus,
+         num_tokens,
+         int(drafted),
+     )
++    return expanded, local_pos
++
++
++def adaptive_offsets_key(width: int, idx_dtype: torch.dtype) -> tuple:
++    return (width, _DTYPES[idx_dtype])
+ 
+ 
+-def adaptive_offsets_calls() -> list:
+-    return [_call(adaptive_offsets_kernel)]
++def adaptive_offsets_calls(width: int) -> list:
++    return [_call(adaptive_offsets_kernel, *adaptive_offsets_key(width, torch.int64))]
+ 
+ 
+ # --- Step inputs --------------------------------------------------------------

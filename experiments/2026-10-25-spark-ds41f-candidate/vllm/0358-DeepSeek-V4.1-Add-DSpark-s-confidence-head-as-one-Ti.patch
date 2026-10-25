@@ -1,0 +1,537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:36:23 +0200
+Subject: [PATCH 358/488] DeepSeek-V4.1: Add DSpark's confidence head as one
+ TileLang launch
+
+DSpark's acceptance-confidence head ran as torch ops on every draft step:
+torch.cat of the head hidden (BF16, R x 5120) and the Markov embeddings (BF16,
+R x 256), a widening FP32 copy, F.linear against one FP32 weight row (cuBLAS:
+dot products and their reduction for a few rows, a GEMV for more) and
+torch.sigmoid. tilelang/confidence.py does all of it in one kernel, a block per
+row, reading both halves where they are:
+
+- every load first: each thread's sixteen-byte pieces of the row and their
+  weights;
+- eight FP32 accumulators a thread, one per lane of a piece, each adding its
+  products in piece order (six pieces a lane at 5120 + 256 with 128 threads),
+  then the lanes in a tree, the warp by shuffles and the four warps in order;
+- the probability as ATen's sigmoid evaluates it, 1 / (1 + expf(-z)) in FP32
+  with IEEE division.
+
+Precision: the products are of exactly widened BF16 values with FP32 weights and
+accumulate in FP32, the reference's precision. Along any path the sum carries at
+most 17 roundings with fused multiply-adds (23 without), so |z - z_exact| <=
+17 * 2^-24 * sum(|x w|) to first order, against cuBLAS's own order; the sigmoid
+adds expf's 2 ulp, the add and the division. The order is fixed per row, so a
+draft's probability no longer depends on how many requests the step drafts for
+(cuBLAS's dot or GEMV), and repeats run to run. Where FP32 sums exactly in any
+order the result is the torch head's, bit for bit.
+
+TileLangConfidenceHead keeps DSparkConfidenceHead's FP32 projection (and so its
+weight loading), declares its kernel for preparation and computes probabilities
+only; its logit forward raises. DSparkConfidenceHead gains probability()
+(sigmoid of its logit, as before), which compute_confidence now calls, and
+kernels.dspark_confidence_head() picks the TileLang head under the TileLang
+family. Nothing builds it yet: the switch is a later commit.
+
+Tests (tests/kernels/test_deepseek_v41_tilelang_confidence.py, SM12x with
+TileLang): the torch head's bits on sums exact in FP32; within the FP32 bound of
+FP64 at 1 to 1000 rows and within 2^-18 of the cuBLAS head; over 4096 rows an
+error at most twice cuBLAS's, on average and at worst; rows independent
+of the batch; repeatable; NaN and infinities as through the torch head with
+other rows untouched; no rows; refused layouts; the head reads its weight row;
+the declared call.
+---
+ .../test_deepseek_v41_tilelang_confidence.py  | 208 +++++++++++++++++
+ vllm/model_executor/models/qwen3_dspark.py    |   6 +
+ vllm/models/deepseek_v4_1/kernels.py          |  12 +
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |   2 +-
+ .../deepseek_v4_1/tilelang/confidence.py      | 213 ++++++++++++++++++
+ 5 files changed, 440 insertions(+), 1 deletion(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_confidence.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/confidence.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_confidence.py b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+new file mode 100644
+index 000000000..6d1dd230f
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_confidence.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark's TileLang confidence head against FP64 and the torch head it replaces
++(``sigmoid(F.linear(cat([h, e]).float(), w))``: a cuBLAS dot product for a few
++rows, a GEMV for more)."""
++
++import math
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_finite_equal,
++    assert_other_rows_equal,
++    assert_same_nonfinite,
++)
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import confidence, prepare  # noqa: E402
++
++# DeepSeek-V4.1's drafter: 5120-wide head hidden, 256-wide Markov embeddings.
++HIDDEN, RANK = 5120, 256
++WIDTH = HIDDEN + RANK
++# Roundings along the kernel's longest path, FMA contraction or not (confidence.py).
++ROUNDINGS = 23
++U = 2.0**-24
++
++
++def _inputs(rows: int, seed: int = 0):
++    """Hidden and Markov rows near unit scale and a weight row that keeps the logits
++    near unit scale too, where the probability is most sensitive to them."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    hidden = torch.randn(rows, HIDDEN, generator=generator, device="cuda").bfloat16()
++    markov = torch.randn(rows, RANK, generator=generator, device="cuda").bfloat16()
++    weight = torch.randn(WIDTH, generator=generator, device="cuda") / math.sqrt(WIDTH)
++    return hidden, markov, weight
++
++
++def _exact_inputs(rows: int, seed: int = 0):
++    """Small integers and weights in multiples of 2^-10: every product and partial
++    sum is a multiple of 2^-10 below 2^14, exact in FP32 in any order."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++
++    def ints(low, high, shape):
++        return torch.randint(low, high, shape, generator=generator, device="cuda")
++
++    hidden = ints(-4, 5, (rows, HIDDEN)).bfloat16()
++    markov = ints(-4, 5, (rows, RANK)).bfloat16()
++    weight = ints(-8, 9, (WIDTH,)).float() * 2.0**-10
++    return hidden, markov, weight
++
++
++def _tilelang(hidden, markov, weight) -> torch.Tensor:
++    out = torch.empty(hidden.shape[0], dtype=torch.float32, device="cuda")
++    confidence.dspark_confidence(hidden, markov, weight, out)
++    return out
++
++
++def _torch_head(hidden, markov, weight) -> torch.Tensor:
++    """``DSparkConfidenceHead.probability`` as the deployment ran it."""
++    x = torch.cat([hidden, markov], dim=-1).float()
++    return torch.sigmoid(F.linear(x, weight.view(1, -1)).squeeze(-1))
++
++
++def _fp64(hidden, markov, weight):
++    """The exact probability and each row's sum of |products|."""
++    x = torch.cat([hidden, markov], dim=-1).double()
++    w = weight.double()
++    return torch.sigmoid(x @ w), x.abs() @ w.abs()
++
++
++def _bound(p64: torch.Tensor, magnitude: torch.Tensor) -> torch.Tensor:
++    """The kernel's error bound: the FP32 sum's roundings through the sigmoid's
++    slope, plus the sigmoid's own (expf within 2 ulp, the add and the division)."""
++    return p64 * (1 - p64) * ROUNDINGS * U * magnitude * 1.01 + p64 * 2.0**-21
++
++
++@pytest.mark.parametrize("rows", [1, 5, 10, 80, 96])
++def test_an_exact_sum_gives_the_torch_heads_bits(rows):
++    """Where FP32 sums exactly in any order, the logits agree, so the probability
++    shows the kernel's layout (the concatenation, the weight's halves) and its
++    sigmoid: ATen's ``1 / (1 + expf(-z))`` bit for bit."""
++    hidden, markov, weight = _exact_inputs(rows, seed=rows)
++    got = _tilelang(hidden, markov, weight)
++    want = _torch_head(hidden, markov, weight)
++    assert got.shape == (rows,) and got.dtype == torch.float32
++    assert torch.equal(got, want)
++
++
++@pytest.mark.parametrize("rows", [1, 5, 10, 80, 96, 1000])
++def test_within_its_fp32_bound_of_fp64(rows):
++    hidden, markov, weight = _inputs(rows, seed=rows)
++    got = _tilelang(hidden, markov, weight).double()
++    p64, magnitude = _fp64(hidden, markov, weight)
++    error = (got - p64).abs()
++    assert (error <= _bound(p64, magnitude)).all(), error.max().item()
++    # The torch head computes the same FP32 sum in another order.
++    torch_head = _torch_head(hidden, markov, weight).double()
++    assert (got - torch_head).abs().max().item() <= 2.0**-18
++
++
++def test_as_accurate_as_cublas():
++    """Over many rows, no less accurate than cuBLAS's FP32 sum: the kernel's eight
++    short chains a thread and its trees keep the error near cuBLAS's."""
++    hidden, markov, weight = _inputs(4096, seed=11)
++    p64, _ = _fp64(hidden, markov, weight)
++    ours = (_tilelang(hidden, markov, weight).double() - p64).abs()
++    cublas = (_torch_head(hidden, markov, weight).double() - p64).abs()
++    assert ours.mean().item() <= 2 * cublas.mean().item() + 2.0**-27, (
++        ours.mean().item(),
++        cublas.mean().item(),
++    )
++    assert ours.max().item() <= 2 * cublas.max().item() + 2.0**-24, (
++        ours.max().item(),
++        cublas.max().item(),
++    )
++
++
++def test_rows_independent_of_batch():
++    """cuBLAS sums a row in another order when the step has more rows (dot below,
++    GEMV above); the kernel's row does not depend on the other rows."""
++    hidden, markov, weight = _inputs(130, seed=3)
++    full = _tilelang(hidden, markov, weight)
++    for start, stop in ((0, 1), (0, 5), (0, 10), (7, 20), (0, 80), (1, 130)):
++        assert torch.equal(
++            _tilelang(hidden[start:stop], markov[start:stop], weight),
++            full[start:stop],
++        ), (start, stop)
++
++
++def test_repeatable():
++    hidden, markov, weight = _inputs(80, seed=4)
++    first = _tilelang(hidden, markov, weight)
++    for _ in range(3):
++        assert torch.equal(_tilelang(hidden, markov, weight), first)
++
++
++def test_nonfinite_like_the_torch_head():
++    """A NaN reaches its row's probability; an infinite product saturates it at 0 or
++    1, as through the torch head; other rows keep their bits."""
++    hidden, markov, weight = _inputs(8, seed=5)
++    weight[3], weight[HIDDEN + 9] = 0.5, -0.5
++    hidden[0, 17] = NAN
++    hidden[2, 3] = INF  # +inf * 0.5: probability 1
++    markov[4, 9] = INF  # +inf * -0.5: probability 0
++    markov[5, 30] = NAN
++    rows = [0, 2, 4, 5]
++    clean = _tilelang(hidden[[1, 3, 6, 7]], markov[[1, 3, 6, 7]], weight)
++    got = _tilelang(hidden, markov, weight)
++    want = _torch_head(hidden, markov, weight)
++    assert_same_nonfinite(got, want)
++    assert_finite_equal(got[rows], want[rows])
++    assert got[2].item() == 1.0 and got[4].item() == 0.0
++    expected = torch.empty_like(got)
++    expected[[1, 3, 6, 7]] = clean
++    assert_other_rows_equal(got, expected, rows)
++
++
++def test_no_rows_launch_nothing():
++    hidden, markov, weight = _inputs(0)
++    assert _tilelang(hidden, markov, weight).shape == (0,)
++
++
++def test_refuses_other_layouts():
++    hidden, markov, weight = _inputs(5)
++    with pytest.raises(ValueError):
++        _tilelang(hidden.float(), markov, weight)
++    with pytest.raises(ValueError):
++        _tilelang(hidden, markov, weight.bfloat16())
++    with pytest.raises(ValueError):
++        _tilelang(hidden, markov[:4], weight)
++    with pytest.raises(ValueError):
++        _tilelang(hidden[:, ::2], markov, weight[: HIDDEN // 2 + RANK])
++
++
++def test_the_head_runs_its_weight_row():
++    """``TileLangConfidenceHead.probability`` reads its projection's [1, H + R]
++    weight; its logit path is not available."""
++    head = confidence.TileLangConfidenceHead.__new__(confidence.TileLangConfidenceHead)
++    torch.nn.Module.__init__(head)
++    hidden, markov, weight = _inputs(5, seed=6)
++    head.proj = SimpleNamespace(weight=weight.view(1, -1))
++    head.hidden_size, head.markov_rank = HIDDEN, RANK
++    assert torch.equal(
++        head.probability(hidden, markov), _tilelang(hidden, markov, weight)
++    )
++    with pytest.raises(NotImplementedError):
++        head(hidden, markov)
++
++
++def test_declared_as_the_head_calls_it():
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        confidence.declare(HIDDEN, RANK)
++    calls = list(prepare.declared_calls(registry))
++    assert calls == [(confidence.dspark_confidence_kernel, (HIDDEN, RANK), {})]
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index 682e25800..f37e81acd 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -216,6 +216,12 @@ class DSparkConfidenceHead(nn.Module):
+         ).float()
+         return self.proj(x).squeeze(-1)
+ 
++    def probability(
++        self, hidden: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor:
++        """The acceptance probability, ``sigmoid`` of the head's logit."""
++        return torch.sigmoid(self(hidden, markov_embed))
++
+ 
+ class Qwen3DSparkModel(DFlashQwen3Model):
+     """DFlash Qwen3 backbone + DSpark Markov / confidence heads."""
+diff --git a/vllm/models/deepseek_v4_1/kernels.py b/vllm/models/deepseek_v4_1/kernels.py
+index 1383edf39..181b76116 100644
+--- a/vllm/models/deepseek_v4_1/kernels.py
++++ b/vllm/models/deepseek_v4_1/kernels.py
+@@ -124,3 +124,15 @@ def is_native_linear_method(method) -> bool:
+ 
+         native = (TileLangFP8LinearMethod, TileLangLinearMethod)
+     return isinstance(method, native)
++
++
++def dspark_confidence_head(hidden_size: int, markov_rank: int, prefix: str):
++    """DSpark's acceptance-confidence head over the drafter's head hidden and the
++    Markov embedding of the token before each draft."""
++    if uses_tilelang():
++        from .tilelang.confidence import TileLangConfidenceHead
++
++        return TileLangConfidenceHead(hidden_size, markov_rank, prefix=prefix)
++    from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead
++
++    return DSparkConfidenceHead(hidden_size + markov_rank, prefix=prefix)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 6447f8069..01827bfb3 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -733,7 +733,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     ) -> torch.Tensor:
+         """Per-position acceptance probability for each drafted token."""
+         assert self.model.confidence_head is not None
+-        return torch.sigmoid(self.model.confidence_head(head_hidden, markov_embed))
++        return self.model.confidence_head.probability(head_hidden, markov_embed)
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+new file mode 100644
+index 000000000..cfc5be692
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -0,0 +1,213 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark's acceptance-confidence head in one TileLang launch.
++
++For each drafted position the head scores the drafter's head hidden ``h`` (BF16,
++``hidden`` wide) and the Markov embedding ``e`` of the token before it (BF16,
++``rank`` wide) with one FP32 weight row ``w`` (``hidden + rank``) and returns the
++acceptance probability ``sigmoid(w . [h | e])``. vLLM ran it as torch ops: a
++concatenation, a widening FP32 copy, ``F.linear`` (a cuBLAS dot product and its
++reduction for a few rows, a GEMV for more, so a row's order of summation depended
++on how many requests the step drafted for) and ``torch.sigmoid``. This kernel reads
++both halves where they are, one block per row:
++
++- every load first: each thread's sixteen-byte pieces of ``h`` and ``e`` and their
++  weights (thread ``x`` takes the pieces ``x``, ``x + threads``, ...);
++- eight FP32 accumulators a thread, one per lane of a piece, each adding its
++  products in piece order, so a value's chain is the thread's pieces (six at
++  DS4.1's 5120 + 256 with 128 threads); then the eight lanes in a tree (three
++  levels), the warp's lanes by shuffles (five) and the warps in order (three);
++- ``1 / (1 + exp(-z))`` in FP32 with IEEE division and the accurate ``expf``,
++  the expression ATen's sigmoid evaluates.
++
++The products are of exactly widened BF16 values with FP32 weights, accumulated in
++FP32 (fused multiply-adds), so the sum carries at most 17 roundings along any path
++(``|z - z_exact| <= 17 * 2^-24 * sum(|h w| + |e w|)`` to first order; 23 without
++FMA contraction), and the probability adds the sigmoid's own few roundings. The
++order is fixed per row: a row's result does not depend on the batch, and a dot
++product that is exact in FP32 gives the torch head's bits.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.model_executor.models.qwen3_dspark import DSparkConfidenceHead
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++# BF16 values in one sixteen-byte piece; one accumulator per value of a piece.
++_VEC = 8
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def dspark_confidence_kernel(hidden: int, rank: int, threads: int = 128):
++    """``p[m] = sigmoid(sum(h[m] * w[:hidden]) + sum(e[m] * w[hidden:]))``."""
++    assert hidden % _VEC == 0 and rank % _VEC == 0 and threads % 32 == 0
++    warps = threads // 32
++    hidden_pieces = hidden // _VEC
++    rank_pieces = rank // _VEC
++    hidden_chunks = -(-hidden_pieces // threads)
++    rank_chunks = -(-rank_pieces // threads)
++    chunks = hidden_chunks + rank_chunks
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def dspark_confidence(
++        h: T.Tensor((rows, hidden), T.bfloat16),
++        e: T.Tensor((rows, rank), T.bfloat16),
++        weight: T.Tensor((hidden + rank,), T.float32),
++        out: T.Tensor((rows,), T.float32),
++    ):
++        with T.Kernel(rows, threads=threads) as m:
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * _VEC,), T.bfloat16)
++            ws = T.alloc_local((chunks * _VEC,), T.float32)
++            acc = T.alloc_local((_VEC,), T.float32)
++            total = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            # Every load before any arithmetic; a thread past the last piece of a
++            # half holds zeros there, which add nothing.
++            for c in T.unroll(hidden_chunks):
++                piece = c * threads + tx
++                if piece < hidden_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = h[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + i] = weight[piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[c * _VEC + 4 + i] = weight[piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[c * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[c * _VEC + i] = T.float32(0)
++            for c in T.unroll(rank_chunks):
++                piece = c * threads + tx
++                k = hidden_chunks + c
++                if piece < rank_pieces:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = e[m, piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + i] = weight[hidden + piece * _VEC + i]
++                    for i in T.vectorized(4):
++                        ws[k * _VEC + 4 + i] = weight[hidden + piece * _VEC + 4 + i]
++                else:
++                    for i in T.vectorized(_VEC):
++                        xs[k * _VEC + i] = T.bfloat16(0)
++                    for i in T.vectorized(_VEC):
++                        ws[k * _VEC + i] = T.float32(0)
++            for i in T.unroll(_VEC):
++                acc[i] = T.float32(0)
++            for c in T.unroll(chunks):
++                for i in T.unroll(_VEC):
++                    acc[i] += T.cast(xs[c * _VEC + i], T.float32) * ws[c * _VEC + i]
++            for i in T.unroll(4):
++                acc[i] = acc[i] + acc[i + 4]
++            for i in T.unroll(2):
++                acc[i] = acc[i] + acc[i + 2]
++            acc[0] = acc[0] + acc[1]
++            acc[0] = T.warp_reduce_sum(acc[0])
++            if tx % 32 == 0:
++                partial[tx // 32] = acc[0]
++            T.sync_threads()
++            if tx == 0:
++                total[0] = T.float32(0)
++                for warp in T.serial(warps):
++                    total[0] += partial[warp]
++                out[m] = T.float32(1) / (T.float32(1) + T.exp(-total[0]))
++
++    return dspark_confidence
++
++
++@cache
++def _kernel(hidden: int, rank: int):
++    return dspark_confidence_kernel(hidden, rank)
++
++
++def declare(hidden: int, rank: int) -> None:
++    """Declare the head over ``hidden``-wide hidden states and ``rank``-wide Markov
++    embeddings, and keep it."""
++    prepare.declare(
++        lambda: [prepare.call(dspark_confidence_kernel, hidden, rank)],
++        bind=lambda: _kernel(hidden, rank),
++    )
++
++
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_dspark_confidence", mutates_args=("out",)
++)
++def dspark_confidence(
++    hidden: torch.Tensor,
++    markov_embed: torch.Tensor,
++    weight: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    """``out[m] = sigmoid(weight . [hidden[m] | markov_embed[m]])`` for BF16 rows
++    ``hidden`` ([M, H]) and ``markov_embed`` ([M, R]) and the FP32 head row
++    ``weight`` ([H + R]), into ``out`` ([M], FP32)."""
++    rows, width = hidden.shape
++    rank = markov_embed.shape[-1]
++    if (
++        hidden.dtype != torch.bfloat16
++        or markov_embed.dtype != torch.bfloat16
++        or weight.dtype != torch.float32
++        or out.dtype != torch.float32
++        or markov_embed.shape != (rows, rank)
++        or weight.shape != (width + rank,)
++        or out.shape != (rows,)
++        or not (hidden.is_contiguous() and markov_embed.is_contiguous())
++        or not (weight.is_contiguous() and out.is_contiguous())
++    ):
++        raise ValueError(
++            "The TileLang DSpark confidence head needs contiguous BF16 [M, H] hidden "
++            "and [M, R] Markov rows, an FP32 [H + R] weight and an FP32 [M] output: "
++            f"hidden {tuple(hidden.shape)} {hidden.dtype}, Markov "
++            f"{tuple(markov_embed.shape)} {markov_embed.dtype}, weight "
++            f"{tuple(weight.shape)} {weight.dtype}, output {tuple(out.shape)} "
++            f"{out.dtype}"
++        )
++    if rows == 0:
++        return
++    _kernel(width, rank)(hidden, markov_embed, weight, out)
++
++
++@dspark_confidence.register_fake
++def _dspark_confidence_fake(hidden, markov_embed, weight, out):
++    return None
++
++
++class TileLangConfidenceHead(DSparkConfidenceHead):
++    """``DSparkConfidenceHead`` (its FP32 projection and weight loading) whose
++    probability is the one-launch kernel."""
++
++    def __init__(self, hidden_size: int, markov_rank: int, prefix: str = ""):
++        super().__init__(hidden_size + markov_rank, prefix=prefix)
++        self.hidden_size = hidden_size
++        self.markov_rank = markov_rank
++
++    def declare_kernels(self) -> None:
++        declare(self.hidden_size, self.markov_rank)
++
++    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
++        raise NotImplementedError(
++            "The TileLang DSpark confidence head returns probabilities: probability()"
++        )
++
++    def probability(
++        self, hidden: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor:
++        out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
++        dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
++        return out
++
++
++__all__ = [
++    "TileLangConfidenceHead",
++    "declare",
++    "dspark_confidence",
++    "dspark_confidence_kernel",
++]

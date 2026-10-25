@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:32:42 +0200
+Subject: [PATCH 439/488] [DS4.1] Run 18 fixes: InputBatch methods, bitmask
+ stand-in, Engram test backend
+
+- input_batch.py: the logits_rows helpers sat between InputBatch's
+  fields and make_dummy, which they swallowed (make_dummy became dead
+  code inside a function). They follow the class now.
+- The grammar bitmask's unread input-index stand-in was cu_num_logits
+  converted to int64 on every call, one more launch (run 18: +1.2 us at
+  one request); an empty int64 tensor stands in.
+- test_engram_gates_only_the_real_local_rows stubs the B12X mix; it pins
+  the B12X path whatever backend the process selects.
+---
+ tests/models/test_deepseek_v4_1_sp_prefill.py |  2 ++
+ vllm/v1/worker/gpu/input_batch.py             | 32 +++++++++----------
+ vllm/v1/worker/gpu/tilelang_structured.py     |  8 +++--
+ 3 files changed, 23 insertions(+), 19 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 551a9df57..564333f52 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -309,6 +309,8 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
+ 
+     monkeypatch.setattr(engram_ops.hyperconnection, "run_engram_mix", mix)
+     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
++    # The B12X mix, stubbed above, whatever backend the process selects.
++    monkeypatch.setattr(engram_ops.kernels, "uses_tilelang", lambda: False)
+     staged = torch.randn(tokens, 6)
+     engram = SimpleNamespace(
+         embed_tokens=SimpleNamespace(table_memory="device", columns=None),
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index d747d3863..fcc3f5933 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -145,22 +145,6 @@ class InputBatch:
+             self._logits_rows = _gather_logits_rows(self)
+         return self._logits_rows
+ 
+-
+-def _gather_logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
+-    from vllm.v1.worker.gpu import tilelang_inputs
+-
+-    return tilelang_inputs.logits_rows(
+-        batch.input_ids, batch.positions, batch.logits_indices
+-    )
+-
+-
+-def logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
+-    """``batch.logits_rows()`` for an ``InputBatch`` (gathered once a step), and the
+-    same gather for any object with its input ids, positions and logits indices."""
+-    if isinstance(batch, InputBatch):
+-        return batch.logits_rows()
+-    return _gather_logits_rows(batch)
+-
+     @classmethod
+     def make_dummy(
+         cls,
+@@ -255,6 +239,22 @@ def logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
+         )
+ 
+ 
++def _gather_logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    return tilelang_inputs.logits_rows(
++        batch.input_ids, batch.positions, batch.logits_indices
++    )
++
++
++def logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
++    """``batch.logits_rows()`` for an ``InputBatch`` (gathered once a step), and the
++    same gather for any object with its input ids, positions and logits indices."""
++    if isinstance(batch, InputBatch):
++        return batch.logits_rows()
++    return _gather_logits_rows(batch)
++
++
+ def set_dummy_context(
+     input_batch: InputBatch,
+     block_tables: "BlockTables",
+diff --git a/vllm/v1/worker/gpu/tilelang_structured.py b/vllm/v1/worker/gpu/tilelang_structured.py
+index 592ce3845..864cb5ce8 100644
+--- a/vllm/v1/worker/gpu/tilelang_structured.py
++++ b/vllm/v1/worker/gpu/tilelang_structured.py
+@@ -97,8 +97,8 @@ def apply_grammar_bitmask(
+     mask_stride: int,
+ ) -> None:
+     """``StructuredOutputsWorker.apply_grammar_bitmask``'s launch. Without
+-    ``input_ids`` (no invalid draft inputs to mark), ``keys`` and ``cu_num_logits``
+-    stand in for the unread input tensors."""
++    ``input_ids`` (no invalid draft inputs to mark), ``keys`` and an empty int64
++    tensor stand in for the unread input tensors (no conversion is launched)."""
+     if keys.shape[0] == 0:
+         return
+     invalid = input_ids is not None
+@@ -107,6 +107,8 @@ def apply_grammar_bitmask(
+         keys,
+         cu_num_logits,
+         input_ids if invalid else keys,
+-        input_logits_indices if invalid else cu_num_logits.long(),
++        input_logits_indices
++        if invalid
++        else torch.empty(1, dtype=torch.int64, device=keys.device),
+         bitmask,
+     )

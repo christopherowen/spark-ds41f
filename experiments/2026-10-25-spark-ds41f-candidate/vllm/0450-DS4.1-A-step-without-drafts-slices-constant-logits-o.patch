@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:08:09 +0100
+Subject: [PATCH 450/488] [DS4.1] A step without drafts slices constant logits
+ offsets
+
+cu_num_logits (arange) and the local positions (zeros) of a step without
+drafts are persistent constants in the input buffers, sliced each step:
+no torch launches build them.
+---
+ vllm/v1/worker/gpu/input_batch.py  | 13 +++++++++++--
+ vllm/v1/worker/gpu/model_runner.py |  8 ++------
+ 2 files changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index eded49aea..d1d7096ee 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -38,6 +38,15 @@ class InputBuffers:
+             max_num_reqs + 1, dtype=torch.int32, device=device
+         )
+         self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
++        # A step without drafts: one logits row a request (cu_num_logits is
++        # arange(num_reqs + 1)), each at local position 0. Constants, never
++        # written, sliced each step instead of built.
++        self.one_logit_cu = torch.arange(
++            max_num_reqs + 1, dtype=torch.int32, device=device
++        )
++        self.zero_local_pos = torch.zeros(
++            max_num_reqs, dtype=torch.int32, device=device
++        )
+         # DCP: per-request local seq_lens buffer
+         self.dcp_local_seq_lens = torch.zeros(
+             max_num_reqs, dtype=torch.int32, device=device
+@@ -160,7 +169,7 @@ class InputBatch:
+         idx_mapping_np = np.arange(num_reqs, dtype=np.intp)
+         idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
+         expanded_idx_mapping = idx_mapping
+-        expanded_local_pos = torch.zeros(num_reqs, dtype=torch.int32, device=device)
++        expanded_local_pos = input_buffers.zero_local_pos[:num_reqs]
+ 
+         # Distribute the remainder evenly so that no dummy request exceeds
+         # ceil(num_tokens / num_reqs) <= max_model_len tokens. Varlen graphs
+@@ -200,7 +209,7 @@ class InputBatch:
+ 
+         # int64, as a real step's: the dummy runs the kernels serving runs.
+         logits_indices = (query_start_loc[1:] - 1).long()
+-        cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
++        cu_num_logits = input_buffers.one_logit_cu[: num_reqs + 1]
+         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+         # Copy so set_dummy_context can add context in place without touching
+         # num_scheduled_tokens.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c4b9c147c..eeaf8773e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1700,13 +1700,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             total_num_draft_tokens = 0
+             total_num_logits = num_reqs
+             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+-            cu_num_logits = torch.arange(
+-                num_reqs + 1, device=self.device, dtype=torch.int32
+-            )
++            cu_num_logits = self.input_buffers.one_logit_cu[: num_reqs + 1]
+             expanded_idx_mapping = idx_mapping
+-            expanded_local_pos = torch.zeros(
+-                num_reqs, dtype=torch.int32, device=self.device
+-            )
++            expanded_local_pos = self.input_buffers.zero_local_pos[:num_reqs]
+         else:
+             num_draft_tokens_per_req = np.fromiter(
+                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),

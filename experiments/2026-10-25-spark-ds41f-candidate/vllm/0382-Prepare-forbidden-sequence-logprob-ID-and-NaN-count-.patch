@@ -1,0 +1,387 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:04:34 +0200
+Subject: [PATCH 382/488] Prepare forbidden-sequence, logprob ID and NaN count
+ candidates
+
+Keep logprob widths and top-k counts dynamic so new request options do not create undeclared specializations.
+---
+ tests/v1/worker/test_gpu_sampling_controls.py | 133 +++++++++++
+ .../worker/gpu/sample/tilelang_auxiliary.py   | 220 ++++++++++++++++++
+ 2 files changed, 353 insertions(+)
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 136a678c0..0fd19d710 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -9,6 +9,7 @@ pytest.importorskip("triton")
+ if not torch.cuda.is_available():
+     pytest.skip("CUDA required for sampling controls", allow_module_level=True)
+ 
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary as auxiliary
+ from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
+ from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
+ from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
+@@ -157,3 +158,135 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, lengt
+     candidate.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
+     assert_bits(mask, expected_mask)
+     assert_bits(counts, expected_counts)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("word_count", [1, 7, 33, 129])
++def test_bad_words_match_across_committed_and_draft_boundary(index_dtype, word_count):
++    from vllm.v1.worker.gpu.sample.bad_words import _bad_words_kernel
++
++    rows, states, vocab = 18, 11, 129280
++    logits = torch.randn((rows, vocab + 13), device="cuda")[:, :vocab]
++    mapping = (torch.arange(rows, device="cuda") // 6 + 2).to(index_dtype)
++    pos = (torch.arange(rows, device="cuda") % 6).int()
++    inputs = (torch.arange(rows, device="cuda") % 6 + 50).int()
++    tokens = torch.full((states, 50), 50, dtype=torch.int32, device="cuda")
++    prompt = torch.full((states,), 10, dtype=torch.int32, device="cuda")
++    total = torch.full_like(prompt, 16)
++    words = torch.full((states, word_count * 3), 50, dtype=torch.int32, device="cuda")
++    words[:, 2::3] = torch.arange(word_count, device="cuda") + 80
++    offsets = (torch.arange(word_count + 1, device="cuda") * 3).int().repeat(states, 1)
++    num_words = torch.full_like(prompt, word_count)
++    num_words[3] = 0
++    expected = logits.clone()
++    _bad_words_kernel[(rows, word_count)](
++        expected,
++        expected.stride(0),
++        mapping,
++        words,
++        words.stride(0),
++        offsets,
++        offsets.stride(0),
++        num_words,
++        tokens,
++        tokens.stride(0),
++        prompt,
++        total,
++        inputs,
++        pos,
++    )
++    auxiliary.apply_bad_words(
++        logits,
++        mapping,
++        words,
++        offsets,
++        num_words,
++        tokens,
++        prompt,
++        total,
++        inputs,
++        pos,
++        word_count,
++    )
++    assert_bits(logits, expected)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("length", [0, 1, 1023, 1025, 8192])
++def test_prompt_ids_shift_each_chunk_to_its_next_token(index_dtype, length):
++    from vllm.v1.worker.gpu.sample.prompt_logprob import (
++        _prompt_logprobs_token_ids_kernel,
++    )
++
++    states = 9
++    mapping = torch.tensor([8, 2, 4], device="cuda", dtype=index_dtype)
++    starts = torch.tensor(
++        [0, length, length + 3, length + 10], device="cuda", dtype=torch.int32
++    )
++    computed = torch.arange(states, device="cuda", dtype=torch.int32) * 3
++    tokens = torch.randint(
++        129280, (states, length + 100), device="cuda", dtype=torch.int32
++    )
++    output = torch.full((length + 10,), -7, device="cuda", dtype=torch.int64)
++    expected = output.clone()
++    _prompt_logprobs_token_ids_kernel[(3,)](
++        expected, starts, mapping, computed, tokens, tokens.stride(0), BLOCK_SIZE=1024
++    )
++    auxiliary.prompt_token_ids(output, starts, mapping, computed, tokens)
++    assert_bits(output, expected)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("topk", [0, 1, 7, 1024])
++def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype, topk):
++    from vllm.v1.worker.gpu.sample.logprob import _fill_logprob_token_ids_kernel
++
++    states, rows = 11, 6
++    cols = max(topk, 17)
++    output = torch.full((rows, cols + 1), -19, device="cuda", dtype=torch.int64)
++    valid = torch.zeros_like(output, dtype=torch.bool)
++    mapping = torch.tensor([10, 2, 4, 7, 5, 8], device="cuda", dtype=index_dtype)
++    sampled = torch.randint(129280, (rows,), device="cuda", dtype=torch.int64)
++    top_ids = torch.randint(
++        129280, (rows, max(topk, 1)), device="cuda", dtype=torch.int32
++    )
++    count = torch.zeros(states, device="cuda", dtype=torch.int32)
++    count[mapping[::2]] = 17
++    custom = torch.randint(129280, (states, 17), device="cuda", dtype=torch.int32)
++    expected, expected_valid = output.clone(), valid.clone()
++    _fill_logprob_token_ids_kernel[(rows,)](
++        expected,
++        expected.stride(0),
++        expected_valid,
++        valid.stride(0),
++        sampled,
++        top_ids,
++        top_ids.stride(0),
++        mapping,
++        count,
++        custom,
++        custom.stride(0),
++        NUM_TOPK=topk,
++        PADDED_COLS=1 << (cols - 1).bit_length(),
++    )
++    auxiliary.fill_token_ids(
++        output, valid, sampled, top_ids, mapping, count, custom, topk
++    )
++    assert_bits(output, expected)
++    assert_bits(valid, expected_valid)
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("vocab", [33, 8193, 129280])
++def test_nan_count_ignores_padded_columns(dtype, vocab):
++    from vllm.v1.worker.gpu.metrics.logits import _num_nans_kernel
++
++    logits = torch.randn((6, vocab + 17), device="cuda", dtype=dtype)
++    logits[:, vocab:] = float("nan")
++    logits[1::2, ::19] = float("nan")
++    logits = logits[:, :vocab]
++    expected = torch.empty(6, device="cuda", dtype=torch.int32)
++    _num_nans_kernel[(6,)](logits, logits.stride(0), expected, vocab, BLOCK_SIZE=8192)
++    output = auxiliary.count_nans(logits)
++    assert_bits(output, expected)
++    assert torch.equal(output, torch.isnan(logits).sum(-1))
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+new file mode 100644
+index 000000000..5806c395d
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -0,0 +1,220 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Integer-only sampler bookkeeping and forbidden-sequence candidates."""
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
++
++
++@tilelang.jit(pass_configs=_PASS)
++def bad_words_kernel(
++    logits_stride: int,
++    words_stride: int,
++    offsets_stride: int,
++    tokens_stride: int,
++    index_dtype: str,
++):
++    rows, vocab, states, word_cols, offset_cols, token_cols = T.dynamic(
++        "rows, vocab, states, word_cols, offset_cols, token_cols"
++    )
++
++    @T.prim_func
++    def bad_words(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), "float32"),
++        mapping: T.Tensor((rows,), index_dtype),
++        words: T.StridedTensor((states, word_cols), (words_stride, 1), "int32"),
++        offsets: T.StridedTensor((states, offset_cols), (offsets_stride, 1), "int32"),
++        num_words: T.Tensor((states,), "int32"),
++        tokens: T.StridedTensor((states, token_cols), (tokens_stride, 1), "int32"),
++        prompt_len: T.Tensor((states,), "int32"),
++        total_len: T.Tensor((states,), "int32"),
++        inputs: T.Tensor((rows,), "int32"),
++        local_pos: T.Tensor((rows,), "int32"),
++        max_words: T.int32,
++    ):
++        with T.Kernel(rows, T.ceildiv(max_words, 32), threads=32) as (row, group):
++            word = group * 32 + T.get_thread_binding()
++            req = T.alloc_local((1,), "int64")
++            actual = T.alloc_local((1,), "int32")
++            matches = T.alloc_local((1,), "int32")
++            req[0] = mapping[row]
++            if word < num_words[req[0]]:
++                start = offsets[req[0], word]
++                end = offsets[req[0], word + 1]
++                prefix = end - start - 1
++                output_len = total_len[req[0]] - prompt_len[req[0]]
++                effective_len = output_len + local_pos[row]
++                if prefix <= effective_len:
++                    matches[0] = 1
++                    for i in T.serial(prefix):
++                        pos = effective_len - prefix + i
++                        if pos >= output_len:
++                            actual[0] = inputs[
++                                row - local_pos[row] + pos - output_len + 1
++                            ]
++                        else:
++                            actual[0] = tokens[req[0], prompt_len[req[0]] + pos]
++                        matches[0] &= T.cast(
++                            words[req[0], start + i] == actual[0], "int32"
++                        )
++                    if matches[0] != 0:
++                        logits[
++                            T.cast(row, "int64"), words[req[0], end - 1]
++                        ] = -T.infinity("float32")
++
++    return bad_words
++
++
++def apply_bad_words(
++    logits,
++    mapping,
++    words,
++    offsets,
++    num_words,
++    tokens,
++    prompt_len,
++    total_len,
++    inputs,
++    local_pos,
++    max_words,
++):
++    if logits.shape[0] and max_words:
++        bad_words_kernel(
++            logits.stride(0),
++            words.stride(0),
++            offsets.stride(0),
++            tokens.stride(0),
++            _DTYPES[mapping.dtype],
++        )(
++            logits,
++            mapping,
++            words,
++            offsets,
++            num_words,
++            tokens,
++            prompt_len,
++            total_len,
++            inputs,
++            local_pos,
++            max_words,
++        )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
++    rows, output_len, states, token_cols = T.dynamic(
++        "rows, output_len, states, token_cols"
++    )
++
++    @T.prim_func
++    def prompt_ids(
++        output: T.Tensor((output_len,), "int64"),
++        query_starts: T.Tensor((rows + 1,), "int32"),
++        mapping: T.Tensor((rows,), index_dtype),
++        computed: T.Tensor((states,), "int32"),
++        tokens: T.StridedTensor((states, token_cols), (tokens_stride, 1), "int32"),
++    ):
++        with T.Kernel(rows, threads=128) as row:
++            req = mapping[row]
++            start = query_starts[row]
++            length = query_starts[row + 1] - start
++            for block in T.serial(T.ceildiv(length, 1024)):
++                for i in T.Parallel(1024):
++                    pos = block * 1024 + i
++                    if pos < length:
++                        output[start + pos] = T.cast(
++                            tokens[req, computed[req] + 1 + pos], "int64"
++                        )
++
++    return prompt_ids
++
++
++def prompt_token_ids(output, query_starts, mapping, computed, tokens):
++    if mapping.numel():
++        prompt_ids_kernel(tokens.stride(0), _DTYPES[mapping.dtype])(
++            output, query_starts, mapping, computed, tokens
++        )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
++    output_stride, mask_stride, topk_stride, custom_stride = T.dynamic(
++        "output_stride, mask_stride, topk_stride, custom_stride", "int64"
++    )
++    rows, out_cols, mask_cols, topk_cols, states, custom_cols = T.dynamic(
++        "rows, out_cols, mask_cols, topk_cols, states, custom_cols"
++    )
++
++    @T.prim_func
++    def fill_ids(
++        output: T.StridedTensor((rows, out_cols), (output_stride, 1), "int64"),
++        valid: T.StridedTensor((rows, mask_cols), (mask_stride, 1), "bool"),
++        sampled: T.Tensor((rows,), sampled_dtype),
++        topk_ids: T.StridedTensor((rows, topk_cols), (topk_stride, 1), topk_dtype),
++        mapping: T.Tensor((rows,), index_dtype),
++        num_custom: T.Tensor((states,), "int32"),
++        custom_ids: T.StridedTensor((states, custom_cols), (custom_stride, 1), "int32"),
++        topk: T.int32,
++    ):
++        with T.Kernel(rows, threads=128) as row:
++            req = mapping[row]
++            if T.get_thread_binding() == 0:
++                output[row, 0] = T.cast(sampled[row], "int64")
++                valid[row, 0] = True
++            for i in T.serial(T.ceildiv(out_cols - 1, 128)):
++                col = i * 128 + T.get_thread_binding()
++                if col + 1 < out_cols:
++                    if num_custom[req] > 0:
++                        if col < num_custom[req]:
++                            output[row, col + 1] = T.cast(custom_ids[req, col], "int64")
++                            valid[row, col + 1] = True
++                    elif col < topk:
++                        output[row, col + 1] = T.cast(topk_ids[row, col], "int64")
++                        valid[row, col + 1] = True
++
++    return fill_ids
++
++
++def fill_token_ids(
++    output, valid, sampled, topk_ids, mapping, num_custom, custom_ids, topk
++):
++    if mapping.numel():
++        fill_ids_kernel(
++            _DTYPES[mapping.dtype], _DTYPES[sampled.dtype], _DTYPES[topk_ids.dtype]
++        )(output, valid, sampled, topk_ids, mapping, num_custom, custom_ids, topk)
++
++
++@tilelang.jit(pass_configs=_PASS)
++def nan_count_kernel(vocab: int, stride: int, dtype: str):
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def nan_count(
++        logits: T.StridedTensor((rows, vocab), (stride, 1), dtype),
++        output: T.Tensor((rows,), "int32"),
++    ):
++        with T.Kernel(rows, threads=256) as row:
++            counts = T.alloc_fragment((8192,), "int32")
++            total = T.alloc_fragment((1,), "int32")
++            T.clear(counts)
++            for block in T.serial(T.ceildiv(vocab, 8192)):
++                for col in T.Parallel(8192):
++                    index = block * 8192 + col
++                    if index < vocab:
++                        value = logits[T.cast(row, "int64"), index]
++                        counts[col] += T.cast(value != value, "int32")
++            T.reduce_sum(counts, total, dim=0)
++            output[row] = total[0]
++
++    return nan_count
++
++
++def count_nans(logits):
++    output = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
++    if logits.shape[0]:
++        nan_count_kernel(logits.shape[1], logits.stride(0), str(logits.dtype)[6:])(
++            logits, output
++        )
++    return output

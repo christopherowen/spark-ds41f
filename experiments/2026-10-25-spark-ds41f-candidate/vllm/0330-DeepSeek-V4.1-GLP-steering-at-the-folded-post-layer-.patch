@@ -1,0 +1,859 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Matt Suiche <msuiche@enidon.com>
+Date: Mon, 19 Oct 2026 19:48:11 +0200
+Subject: [PATCH 330/488] DeepSeek-V4.1: GLP steering at the folded post-layer
+ residual, off unless WEIGHTLESS_STEER_PATH is set
+
+A weightless GLP file (github.com/msuiche/weightless, docs/spec/GLP.md)
+projects one unit direction per layer off the residual stream,
+h <- h - alpha (h.d) d, at residual_stream_post_layer: the layer's write
+folded into the hyper-connection streams, before the next layer reads
+Engram. Every stream is projected, so the stream mean the directions are
+derived on is projected too.
+
+Unset, the model has no steering module and the forward is unchanged.
+Set, each layer's write is folded explicitly and the next layer takes the
+folded streams, as an Engram layer does. The direction stack (zero rows
+for unsteered layers) and alpha are buffers, so a file's contents never
+change the traced graph, and the WEIGHTLESS_STEER_* variables are vLLM
+env variables and so part of the compile cache key.
+
+The reader is fail-closed: another mode, spec version, rank or hook
+point; a direction for layer 0, outside the model, of another width, not
+finite or not unit norm; a tensor that is not a direction; a layer list
+that disagrees with the tensor names; or bytes past the last tensor stop
+the boot. `python -m vllm.models.deepseek_v4_1.glp FILE` checks a file
+without serving.
+
+Reworked for spark-ds41f (christopherowen/spark-ds41f#401) from the
+pending-FFN-write hotfix: steering moves to the folded residual that the
+1017 GLP-39 file declares and was derived at, is absent rather than
+zero-valued when off, and the .pt format, the global fallback vector and
+the hook override are gone.
+---
+ tests/models/test_deepseek_v4_1_glp.py    | 380 ++++++++++++++++++++++
+ vllm/envs.py                              |   9 +
+ vllm/models/deepseek_v4_1/glp.py          | 348 ++++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/model.py |  18 +-
+ 4 files changed, 752 insertions(+), 3 deletions(-)
+ create mode 100644 tests/models/test_deepseek_v4_1_glp.py
+ create mode 100644 vllm/models/deepseek_v4_1/glp.py
+
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+new file mode 100644
+index 000000000..039002757
+--- /dev/null
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -0,0 +1,380 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering: the fail-closed reader, the projection, and the off state."""
++
++import math
++import os
++import struct
++
++import numpy as np
++import pytest
++import torch
++
++from vllm import envs
++from vllm.models.deepseek_v4_1 import glp
++
++NUM_LAYERS = 8
++HIDDEN = 16
++STREAMS = 4
++LAYERS = (1, 2, 5)
++METADATA = {
++    "general.base_model.0.name": "test-model",
++    "glp.mode": "project",
++    "glp.spec_version": 1,
++    "glp.rank": 1,
++    "glp.hook_point": glp.HOOK_POINT,
++    "glp.alpha_default": 0.75,
++    "glp.layer_ids_zero_based": "1,2,5",
++}
++STEER_ENV = (
++    "WEIGHTLESS_STEER_PATH",
++    "WEIGHTLESS_STEER_ALPHA",
++    "WEIGHTLESS_STEER_LAYERS",
++)
++
++
++def _string(text: str) -> bytes:
++    raw = text.encode()
++    return struct.pack("<Q", len(raw)) + raw
++
++
++def _value(value) -> bytes:
++    if isinstance(value, bool):
++        return struct.pack("<I?", 7, value)
++    if isinstance(value, int):
++        return struct.pack("<II", 4, value)
++    if isinstance(value, float):
++        return struct.pack("<If", 6, value)
++    return struct.pack("<I", 8) + _string(value)
++
++
++def write_gguf(path, metadata, tensors, *, version=3, kind=0, trailing=b""):
++    """A GGUF file as llama.cpp's writer lays it out, aligned to 32 bytes."""
++    header = b"GGUF" + struct.pack("<IQQ", version, len(tensors), len(metadata))
++    for key, value in metadata.items():
++        header += _string(key) + _value(value)
++    blobs, offset = [], 0
++    for name, values in tensors.items():
++        values = np.asarray(values, dtype="<f4")
++        dims = values.shape[::-1]
++        header += _string(name) + struct.pack(f"<I{len(dims)}Q", len(dims), *dims)
++        header += struct.pack("<IQ", kind, offset)
++        blob = values.tobytes()
++        blob += b"\0" * (-len(blob) % 32)
++        blobs.append(blob)
++        offset += len(blob)
++    header += b"\0" * (-len(header) % 32)
++    path.write_bytes(header + b"".join(blobs) + trailing)
++    return str(path)
++
++
++def unit(seed: int, width: int = HIDDEN) -> np.ndarray:
++    vector = np.random.default_rng(seed).standard_normal(width)
++    return (vector / np.linalg.norm(vector)).astype(np.float32)
++
++
++def glp_file(tmp_path, metadata=None, tensors=None, **kwargs):
++    merged = dict(METADATA)
++    for key, value in (metadata or {}).items():
++        if value is None:
++            merged.pop(key, None)
++        else:
++            merged[key] = value
++    if tensors is None:
++        tensors = {f"direction.{layer}": unit(layer) for layer in LAYERS}
++    return write_gguf(tmp_path / "vector.gguf", merged, tensors, **kwargs)
++
++
++@pytest.fixture(autouse=True)
++def _no_steering_env(monkeypatch):
++    for name in STEER_ENV:
++        monkeypatch.delenv(name, raising=False)
++
++
++# The container reader.
++
++
++def test_reader_returns_the_metadata_and_tensors(tmp_path):
++    path = glp_file(tmp_path)
++    metadata, tensors = glp.read_gguf(path)
++    assert metadata["glp.mode"] == "project"
++    assert metadata["glp.spec_version"] == 1
++    assert metadata["glp.alpha_default"] == pytest.approx(0.75)
++    assert sorted(tensors) == [f"direction.{layer}" for layer in LAYERS]
++    for layer in LAYERS:
++        np.testing.assert_array_equal(tensors[f"direction.{layer}"], unit(layer))
++
++
++@pytest.mark.parametrize(
++    "kwargs, message",
++    [
++        ({"version": 2}, "GGUF version 2"),
++        ({"kind": 1}, "not F32"),
++        ({"trailing": b"\x7f" * 64}, "unexpected bytes"),
++        ({"tensors": {"direction.1": np.zeros((2, HIDDEN))}}, "not 1-D"),
++    ],
++)
++def test_reader_refuses_what_it_cannot_read(tmp_path, kwargs, message):
++    with pytest.raises(ValueError, match=message):
++        glp.read_gguf(glp_file(tmp_path, **kwargs))
++
++
++def test_reader_refuses_a_file_that_is_not_gguf(tmp_path):
++    path = tmp_path / "vector.gguf"
++    path.write_bytes(b"PK\x03\x04" + b"\0" * 60)
++    with pytest.raises(ValueError, match="not a GGUF file"):
++        glp.read_gguf(str(path))
++
++
++def test_reader_refuses_a_truncated_file(tmp_path):
++    glp_file(tmp_path)
++    path = tmp_path / "vector.gguf"
++    path.write_bytes(path.read_bytes()[:-40])
++    with pytest.raises(ValueError, match="outside the file|truncated"):
++        glp.read_gguf(str(path))
++
++
++# The GLP contract.
++
++
++def test_directions_land_on_their_own_layer_numbers(tmp_path):
++    directions, alpha = glp.read_glp(glp_file(tmp_path), NUM_LAYERS, HIDDEN)
++    assert sorted(directions) == list(LAYERS)
++    assert alpha == pytest.approx(0.75)
++    for layer in LAYERS:
++        np.testing.assert_allclose(directions[layer], unit(layer), atol=1e-7)
++        assert np.linalg.norm(directions[layer]) == pytest.approx(1.0, abs=1e-6)
++
++
++@pytest.mark.parametrize(
++    "metadata, tensors, message",
++    [
++        ({"glp.mode": None}, None, "absent mode means 'add'"),
++        ({"glp.mode": "add"}, None, "never adds"),
++        ({"glp.spec_version": None}, None, "spec_version"),
++        ({"glp.spec_version": 2}, None, "spec_version"),
++        ({"glp.rank": 2}, None, "rank"),
++        ({"glp.hook_point": None}, None, "hook_point"),
++        ({"glp.hook_point": "ffn_out_pre_residual"}, None, "hook_point"),
++        ({"glp.alpha_default": math.nan}, None, "alpha_default"),
++        ({"glp.alpha_default": math.inf}, None, "alpha_default"),
++        ({"glp.layer_ids_zero_based": "1,2,6"}, None, "disagrees"),
++        ({}, {"direction.0": unit(0)}, "direction.0"),
++        ({}, {f"direction.{NUM_LAYERS}": unit(9)}, "outside layers"),
++        ({}, {"direction.1": unit(1, HIDDEN + 1)}, "width"),
++        ({}, {"direction.1": np.full(HIDDEN, np.nan)}, "not finite"),
++        ({}, {"direction.1": 2 * unit(1)}, "norm"),
++        ({}, {"bias.1": unit(1)}, "not a direction"),
++        ({}, {}, "no direction tensors"),
++    ],
++)
++def test_reader_refuses_files_it_cannot_apply_exactly(
++    tmp_path, metadata, tensors, message
++):
++    if tensors is not None:
++        metadata = {"glp.layer_ids_zero_based": None, **metadata}
++    path = glp_file(tmp_path, metadata=metadata, tensors=tensors)
++    with pytest.raises(ValueError, match=message):
++        glp.read_glp(path, NUM_LAYERS, HIDDEN)
++
++
++def test_a_transferred_vector_is_read(tmp_path):
++    path = glp_file(tmp_path, metadata={"glp.derived_at": "ffn_out_pre_residual"})
++    directions, _ = glp.read_glp(path, NUM_LAYERS, HIDDEN)
++    assert sorted(directions) == list(LAYERS)
++
++
++# Steering on and off.
++
++
++def test_no_path_means_no_steering_module(monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
++    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
++    assert glp.glp_steering(NUM_LAYERS, HIDDEN) is None
++
++
++def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
++    assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
++    assert steering.directions.dtype == torch.float32
++    for layer in range(NUM_LAYERS):
++        expected = unit(layer) if layer in LAYERS else np.zeros(HIDDEN)
++        np.testing.assert_allclose(steering.directions[layer], expected, atol=1e-7)
++    assert steering.alpha.item() == pytest.approx(0.75)
++    # Buffers, never weights: the checkpoint loader must not see them.
++    assert dict(steering.named_parameters()) == {}
++    assert steering.state_dict() == {}
++
++
++def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
++    monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
++    assert steering.alpha.item() == pytest.approx(0.5)
++    assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
++    assert steering.directions[1].abs().sum() == 0
++
++
++@pytest.mark.parametrize(
++    "env, message",
++    [
++        ({"WEIGHTLESS_STEER_ALPHA": "strong"}, "WEIGHTLESS_STEER_ALPHA"),
++        ({"WEIGHTLESS_STEER_ALPHA": "inf"}, "WEIGHTLESS_STEER_ALPHA"),
++        ({"WEIGHTLESS_STEER_LAYERS": "1,x"}, "comma list"),
++        ({"WEIGHTLESS_STEER_LAYERS": "1,3"}, "without a direction"),
++        ({"WEIGHTLESS_STEER_LAYERS": ","}, "without a direction"),
++    ],
++)
++def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
++    for name, value in env.items():
++        monkeypatch.setenv(name, value)
++    with pytest.raises(ValueError, match=message):
++        glp.glp_steering(NUM_LAYERS, HIDDEN)
++
++
++def test_a_missing_file_is_refused(tmp_path, monkeypatch):
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
++    with pytest.raises(FileNotFoundError):
++        glp.glp_steering(NUM_LAYERS, HIDDEN)
++
++
++def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
++    path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
++    with pytest.raises(ValueError, match="no glp.alpha_default"):
++        glp.glp_steering(NUM_LAYERS, HIDDEN)
++
++
++def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
++    unsteered = envs.compile_factors()
++    for name in STEER_ENV:
++        assert name in unsteered
++    monkeypatch.setenv("WEIGHTLESS_STEER_PATH", "/vectors/a.gguf")
++    assert envs.compile_factors() != unsteered
++
++
++# The projection.
++
++
++def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
++    directions = torch.zeros(NUM_LAYERS, HIDDEN)
++    for layer in layers:
++        directions[layer] = torch.from_numpy(unit(layer))
++    return glp.GLPSteering(directions, alpha)
++
++
++def streams(dtype=torch.float32, tokens: int = 7) -> torch.Tensor:
++    generator = torch.Generator().manual_seed(0)
++    return torch.randn(tokens, STREAMS, HIDDEN, generator=generator).to(dtype)
++
++
++@pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
++def test_projection_scales_only_the_direction(alpha):
++    d = torch.from_numpy(unit(2))
++    h = streams()
++    out = steering(alpha)(h, 2)
++    torch.testing.assert_close(out @ d, (1 - alpha) * (h @ d), atol=1e-5, rtol=0)
++    rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
++    torch.testing.assert_close(rest(out), rest(h), atol=1e-5, rtol=0)
++
++
++def test_every_stream_is_projected_so_their_mean_is_too():
++    d = torch.from_numpy(unit(5))
++    h = streams()
++    out = steering(1.0)(h, 5)
++    torch.testing.assert_close(out @ d, torch.zeros(7, STREAMS), atol=1e-5, rtol=0)
++    mean = h.mean(dim=1)
++    torch.testing.assert_close(
++        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=1e-5, rtol=0
++    )
++
++
++@pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
++def test_projection_never_adds_to_a_stream(alpha):
++    h = streams()
++    out = steering(alpha)(h, 1)
++    assert (out.norm(dim=-1) <= h.norm(dim=-1) + 1e-5).all()
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++def test_an_unsteered_layer_is_unchanged(dtype):
++    h = streams(dtype)
++    out = steering(0.75)(h, 3)
++    assert out.dtype == dtype
++    assert torch.equal(out, h)
++
++
++def test_alpha_is_read_when_the_projection_runs():
++    module = steering(1.0)
++    h = streams()
++    full = module(h, 1)
++    module.alpha.fill_(0.0)
++    assert torch.equal(module(h, 1), h)
++    assert not torch.equal(full, h)
++
++
++# The model loop's step.
++
++
++class _FoldingMHC(torch.nn.Module):
++    def __init__(self):
++        super().__init__()
++        self.calls = 0
++
++    def post(self, x, residual, post_mix, res_mix):
++        self.calls += 1
++        return post_mix.unsqueeze(-1) * x.unsqueeze(1) + res_mix @ residual
++
++
++def _layer_outputs():
++    generator = torch.Generator().manual_seed(1)
++    x = torch.randn(3, HIDDEN, generator=generator)
++    residual = torch.randn(3, STREAMS, HIDDEN, generator=generator)
++    post_mix = torch.rand(3, STREAMS, generator=generator)
++    res_mix = torch.rand(3, STREAMS, STREAMS, generator=generator)
++    return x, residual, post_mix, res_mix
++
++
++def test_unsteered_layer_outputs_pass_through_untouched():
++    mhc = _FoldingMHC()
++    outputs = _layer_outputs()
++    passed = glp.steer_post_layer(None, mhc, 1, *outputs)
++    assert all(a is b for a, b in zip(passed, outputs))
++    assert mhc.calls == 0
++
++
++def test_steered_layer_outputs_are_the_projected_fold():
++    mhc = _FoldingMHC()
++    outputs = _layer_outputs()
++    module = steering(1.0)
++    hidden_states, residual, post_mix, res_mix = glp.steer_post_layer(
++        module, mhc, 5, *outputs
++    )
++    assert (residual, post_mix, res_mix) == (None, None, None)
++    assert mhc.calls == 1
++    fold = _FoldingMHC().post(*outputs)
++    torch.testing.assert_close(hidden_states, module(fold, 5))
++    d = torch.from_numpy(unit(5))
++    torch.testing.assert_close(
++        hidden_states @ d, torch.zeros(3, STREAMS), atol=1e-5, rtol=0
++    )
++
++
++# A real GLP file, when one is named (it is not redistributed with the tests).
++
++REAL_FILE = os.environ.get("GLP_TEST_FILE")
++
++
++@pytest.mark.skipif(not REAL_FILE, reason="GLP_TEST_FILE names no file")
++def test_a_published_ds41_file_holds_only_unit_directions():
++    metadata, tensors = glp.read_gguf(REAL_FILE)
++    assert all(key.startswith(("general.", "glp.")) for key in metadata)
++    assert all(name.startswith("direction.") for name in tensors)
++    directions, alpha = glp.read_glp(REAL_FILE, 40, 5120)
++    assert sorted(directions) == list(range(1, 40))
++    assert alpha == pytest.approx(0.75)
++    for direction in directions.values():
++        assert np.linalg.norm(direction) == pytest.approx(1.0, abs=1e-5)
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5d06110d0..b83105166 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -227,6 +227,9 @@ if TYPE_CHECKING:
+     VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
++    WEIGHTLESS_STEER_PATH: str | None = None
++    WEIGHTLESS_STEER_ALPHA: str | None = None
++    WEIGHTLESS_STEER_LAYERS: str | None = None
+     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
+     VLLM_QWEN3_8_FLASH_NEXT_HC_TP: bool = True
+     VLLM_MIMO_L2_PREFETCH: bool = False
+@@ -1937,6 +1940,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DS41_ENGRAM_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_DS41_ENGRAM_OVERLAP", "1"))
+     ),
++    # DeepSeek V4.1 GLP steering (models/deepseek_v4_1/glp.py): the GLP file,
++    # and overrides of its alpha and steered layers. Part of the compile key, as
++    # every variable here is: steering adds the fold and projection to the graph.
++    "WEIGHTLESS_STEER_PATH": lambda: os.getenv("WEIGHTLESS_STEER_PATH") or None,
++    "WEIGHTLESS_STEER_ALPHA": lambda: os.getenv("WEIGHTLESS_STEER_ALPHA") or None,
++    "WEIGHTLESS_STEER_LAYERS": lambda: os.getenv("WEIGHTLESS_STEER_LAYERS") or None,
+     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
+     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(
+         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_OVERLAP", "1"))
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+new file mode 100644
+index 000000000..a698b7485
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -0,0 +1,348 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering: a weightless control vector projected off the residual stream.
++
++A GLP file (GGUF Layer Projection; github.com/msuiche/weightless, spec
++docs/spec/GLP.md) holds one unit direction ``direction.N`` per layer N. Steering
++applies
++
++    h <- h - alpha * (h . d) d
++
++at ``residual_stream_post_layer``: layer N's write folded into the
++hyper-connection streams, before layer N + 1 reads Engram. Every stream is
++projected, so their mean, the reduction the directions are derived on, is
++projected too. The layer's write alone (``ffn_out_pre_residual``) is a different
++site, and a file for it is refused.
++
++Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
++module and its forward is unchanged. The reader is fail-closed: a file this
++runtime cannot apply exactly stops the boot rather than serving unsteered or
++steering at another site.
++"""
++
++import argparse
++import math
++import re
++import struct
++from pathlib import Path
++
++import numpy as np
++import torch
++from torch import nn
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++HOOK_POINT = "residual_stream_post_layer"
++SPEC_VERSION = 1
++# A direction's norm may differ from 1 by float32 export rounding, no more.
++UNIT_NORM_TOLERANCE = 1e-3
++
++_GGUF_MAGIC = b"GGUF"
++_GGUF_VERSION = 3
++_GGUF_F32 = 0
++_GGUF_STRING = 8
++_GGUF_ARRAY = 9
++_GGUF_SCALARS = {
++    0: "<B",
++    1: "<b",
++    2: "<H",
++    3: "<h",
++    4: "<I",
++    5: "<i",
++    6: "<f",
++    7: "<?",
++    10: "<Q",
++    11: "<q",
++    12: "<d",
++}
++_DIRECTION = re.compile(r"direction\.(\d+)")
++
++
++class _Cursor:
++    def __init__(self, path: str, data: bytes):
++        self.path = path
++        self.data = data
++        self.offset = 0
++
++    def bytes(self, size: int) -> bytes:
++        if self.offset + size > len(self.data):
++            raise ValueError(f"{self.path}: truncated GGUF at byte {self.offset}")
++        raw = self.data[self.offset : self.offset + size]
++        self.offset += size
++        return raw
++
++    def take(self, fmt: str):
++        values = struct.unpack(fmt, self.bytes(struct.calcsize(fmt)))
++        return values[0] if len(values) == 1 else values
++
++    def string(self) -> str:
++        try:
++            return self.bytes(self.take("<Q")).decode("utf-8")
++        except UnicodeDecodeError:
++            raise ValueError(f"{self.path}: GGUF string is not UTF-8") from None
++
++    def value(self, kind: int):
++        if kind == _GGUF_STRING:
++            return self.string()
++        if kind == _GGUF_ARRAY:
++            item, count = self.take("<IQ")
++            if item == _GGUF_ARRAY:
++                raise ValueError(f"{self.path}: nested GGUF arrays are not supported")
++            return [self.value(item) for _ in range(count)]
++        if kind not in _GGUF_SCALARS:
++            raise ValueError(f"{self.path}: unknown GGUF value type {kind}")
++        return self.take(_GGUF_SCALARS[kind])
++
++
++def read_gguf(path: str) -> tuple[dict[str, object], dict[str, np.ndarray]]:
++    """A GGUF v3 file's metadata and tensors, which must be 1-D float32.
++
++    Anything else, and any byte past the last tensor's alignment, is refused.
++    """
++    data = Path(path).read_bytes()
++    cursor = _Cursor(path, data)
++    if cursor.bytes(4) != _GGUF_MAGIC:
++        raise ValueError(f"{path}: not a GGUF file")
++    version = cursor.take("<I")
++    if version != _GGUF_VERSION:
++        raise ValueError(f"{path}: GGUF version {version}, expected {_GGUF_VERSION}")
++    tensor_count, key_count = cursor.take("<QQ")
++
++    metadata: dict[str, object] = {}
++    for _ in range(key_count):
++        key = cursor.string()
++        if key in metadata:
++            raise ValueError(f"{path}: duplicate GGUF key {key!r}")
++        metadata[key] = cursor.value(cursor.take("<I"))
++
++    infos = []
++    for _ in range(tensor_count):
++        name = cursor.string()
++        dims = cursor.take(f"<{cursor.take('<I')}Q")
++        dims = (dims,) if isinstance(dims, int) else dims
++        kind, offset = cursor.take("<IQ")
++        if kind != _GGUF_F32:
++            raise ValueError(f"{path}: tensor {name} is GGML type {kind}, not F32")
++        if len(dims) != 1:
++            raise ValueError(f"{path}: tensor {name} has shape {dims}, not 1-D")
++        infos.append((name, dims[0], offset))
++
++    alignment = metadata.get("general.alignment", 32)
++    if not isinstance(alignment, int) or alignment <= 0:
++        raise ValueError(f"{path}: general.alignment is {alignment!r}")
++    base = -(-cursor.offset // alignment) * alignment
++    tensors: dict[str, np.ndarray] = {}
++    end = base
++    for name, count, offset in infos:
++        if name in tensors:
++            raise ValueError(f"{path}: duplicate tensor {name}")
++        start = base + offset
++        if start % alignment or start + 4 * count > len(data):
++            raise ValueError(f"{path}: tensor {name} lies outside the file")
++        tensors[name] = np.frombuffer(data, "<f4", count, start).copy()
++        end = max(end, start + 4 * count)
++    if len(data) - end >= alignment:
++        raise ValueError(
++            f"{path}: {len(data) - end} unexpected bytes after the last tensor"
++        )
++    return metadata, tensors
++
++
++def _layer_list(text: str, what: str) -> list[int]:
++    try:
++        return sorted(int(item) for item in text.split(",") if item.strip())
++    except ValueError:
++        raise ValueError(f"{what} is not a comma list of layer ids: {text!r}") from None
++
++
++def read_glp(
++    path: str, num_layers: int, hidden_size: int
++) -> tuple[dict[int, np.ndarray], float | None]:
++    """The file's unit directions by layer, and its ``glp.alpha_default``.
++
++    Refuses whatever this reader cannot apply exactly (spec, Reader
++    conformance): another mode, spec version, rank or hook point; a direction
++    for layer 0, outside the model, of another width, not finite or not unit
++    norm; a tensor that is not a direction; a layer list that disagrees with the
++    tensor names.
++    """
++    metadata, tensors = read_gguf(path)
++    mode = metadata.get("glp.mode")
++    if mode != "project":
++        raise ValueError(
++            f"{path}: glp.mode is {mode!r}; this runtime projects ('project') "
++            "and never adds a control vector (an absent mode means 'add')"
++        )
++    version = metadata.get("glp.spec_version")
++    if type(version) is not int or version != SPEC_VERSION:
++        raise ValueError(
++            f"{path}: glp.spec_version is {version!r}; this reader implements "
++            f"version {SPEC_VERSION} (rank 1, no alpha scaling keys)"
++        )
++    rank = metadata.get("glp.rank", 1)
++    if type(rank) is not int or rank != 1:
++        raise ValueError(f"{path}: glp.rank is {rank!r}; this reader applies rank 1")
++    hook = metadata.get("glp.hook_point")
++    if hook != HOOK_POINT:
++        raise ValueError(
++            f"{path}: glp.hook_point is {hook!r}; this runtime applies at "
++            f"{HOOK_POINT} only"
++        )
++    derived_at = metadata.get("glp.derived_at", hook)
++    if derived_at != hook:
++        logger.warning(
++            "%s: transferred vector, derived at %s and applied at %s",
++            path,
++            derived_at,
++            hook,
++        )
++    alpha = metadata.get("glp.alpha_default")
++    if alpha is not None and not (isinstance(alpha, float) and math.isfinite(alpha)):
++        raise ValueError(f"{path}: glp.alpha_default is {alpha!r}")
++
++    directions: dict[int, np.ndarray] = {}
++    for name, values in tensors.items():
++        match = _DIRECTION.fullmatch(name)
++        if match is None:
++            raise ValueError(f"{path}: tensor {name} is not a direction.<layer>")
++        layer = int(match.group(1))
++        if not 1 <= layer < num_layers:
++            raise ValueError(
++                f"{path}: {name} is outside layers 1..{num_layers - 1} "
++                "(direction.0 cannot be expressed)"
++            )
++        if values.size != hidden_size:
++            raise ValueError(
++                f"{path}: {name} has width {values.size}, not {hidden_size}"
++            )
++        if not np.isfinite(values).all():
++            raise ValueError(f"{path}: {name} is not finite")
++        norm = float(np.linalg.norm(values.astype(np.float64)))
++        if abs(norm - 1.0) > UNIT_NORM_TOLERANCE:
++            raise ValueError(f"{path}: {name} has norm {norm:.6f}, not 1")
++        directions[layer] = (values.astype(np.float64) / norm).astype(np.float32)
++    if not directions:
++        raise ValueError(f"{path}: no direction tensors")
++    declared = metadata.get("glp.layer_ids_zero_based")
++    if declared is not None and _layer_list(str(declared), path) != sorted(directions):
++        raise ValueError(
++            f"{path}: glp.layer_ids_zero_based {declared!r} disagrees with the "
++            f"direction tensors {sorted(directions)}; re-export the file"
++        )
++    logger.info(
++        "GLP file %s: %d directions, layers %s, alpha_default %s, base %s@%s",
++        path,
++        len(directions),
++        sorted(directions),
++        alpha,
++        metadata.get("general.base_model.0.name"),
++        metadata.get("general.base_model.0.version"),
++    )
++    return directions, alpha
++
++
++class GLPSteering(nn.Module):
++    """Projects a layer's direction off its folded hyper-connection streams."""
++
++    def __init__(self, directions: torch.Tensor, alpha: float):
++        super().__init__()
++        # One float32 row per model layer; unsteered layers are zero rows, so
++        # the traced graph does not depend on which layers a file covers.
++        self.register_buffer("directions", directions, persistent=False)
++        # A tensor, not a Python float, which would be a graph constant.
++        self.register_buffer(
++            "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
++        )
++
++    def forward(self, streams: torch.Tensor, layer: int) -> torch.Tensor:
++        h = streams.float()
++        d = self.directions[layer]
++        coefficient = h @ d
++        return (h - (self.alpha * coefficient).unsqueeze(-1) * d).to(streams.dtype)
++
++
++def steer_post_layer(
++    glp: GLPSteering | None,
++    mhc: nn.Module,
++    layer: int,
++    hidden_states,
++    residual: torch.Tensor,
++    post_mix: torch.Tensor,
++    res_mix: torch.Tensor,
++):
++    """Layer outputs for the next layer, steered when ``glp`` is set.
++
++    Unsteered, the outputs pass through untouched, for the next layer's fused
++    post/pre. Steered, the layer's write is folded into its streams here,
++    projected, and passed on as the next layer's input with no residual: the
++    layer then reads Engram and runs its pre on the folded streams, as an Engram
++    layer does.
++    """
++    if glp is None:
++        return hidden_states, residual, post_mix, res_mix
++    return (
++        glp(mhc.post(hidden_states, residual, post_mix, res_mix), layer),
++        None,
++        None,
++        None,
++    )
++
++
++def glp_steering(num_layers: int, hidden_size: int) -> GLPSteering | None:
++    """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
++
++    WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
++    WEIGHTLESS_STEER_LAYERS restricts steering to a comma list of the file's
++    layers. Both are refused when malformed.
++    """
++    path = envs.WEIGHTLESS_STEER_PATH
++    if path is None:
++        return None
++    directions, alpha = read_glp(path, num_layers, hidden_size)
++    if envs.WEIGHTLESS_STEER_ALPHA is not None:
++        try:
++            alpha = float(envs.WEIGHTLESS_STEER_ALPHA)
++        except ValueError:
++            alpha = math.nan
++        if not math.isfinite(alpha):
++            raise ValueError(
++                f"WEIGHTLESS_STEER_ALPHA is {envs.WEIGHTLESS_STEER_ALPHA!r}"
++            )
++    if alpha is None:
++        raise ValueError(f"{path}: no glp.alpha_default and no WEIGHTLESS_STEER_ALPHA")
++    layers = sorted(directions)
++    if envs.WEIGHTLESS_STEER_LAYERS is not None:
++        layers = _layer_list(envs.WEIGHTLESS_STEER_LAYERS, "WEIGHTLESS_STEER_LAYERS")
++        missing = sorted(set(layers) - set(directions))
++        if not layers or missing:
++            raise ValueError(
++                f"WEIGHTLESS_STEER_LAYERS {envs.WEIGHTLESS_STEER_LAYERS!r} names "
++                f"layers without a direction in {path}: {missing}"
++            )
++    stack = torch.zeros((num_layers, hidden_size), dtype=torch.float32)
++    for layer in layers:
++        stack[layer] = torch.from_numpy(directions[layer])
++    logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
++    return GLPSteering(stack, alpha)
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description="Check a GLP file against this runtime's reader without serving."
++    )
++    parser.add_argument("path")
++    parser.add_argument("--num-layers", type=int, default=40)
++    parser.add_argument("--hidden-size", type=int, default=5120)
++    args = parser.parse_args()
++    metadata, _ = read_gguf(args.path)
++    directions, alpha = read_glp(args.path, args.num_layers, args.hidden_size)
++    for key in sorted(metadata):
++        print(f"{key} = {metadata[key]!r}")
++    print(f"directions: {len(directions)}, layers {sorted(directions)}, alpha {alpha}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 6301eb55f..b8d86176a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -67,6 +67,7 @@ from .. import kernels, l2_prefetch, sp_prefill
+ from ..attention import DeepseekV4Attention
+ from ..ced import ced_decoder_start, gather_rows, scatter_rows
+ from ..common.engram import Engram, EngramLayout, NgramHashState
++from ..glp import glp_steering, steer_post_layer
+ from .b12x_attention import DeepseekV41B12xAttention
+ 
+ if typing.TYPE_CHECKING:
+@@ -570,6 +571,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 self.hc_mult,
+                 dtype=torch.float32,
+             )
++        # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
++        # which leaves the forward as it is.
++        self.glp = glp_steering(config.num_hidden_layers, config.hidden_size)
+ 
+     def prepare_disk_engram(
+         self, input_ids, query_start_loc, lookback_token_ids, early=None
+@@ -813,9 +817,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 if input_ids is not None:
+                     input_ids = gather_rows(input_ids, ced_indices)
+                 decoder_compacted = True
++            hidden_states, residual, post_mix, res_mix = steer_post_layer(
++                self.glp, layer.mhc, idx, hidden_states, residual, post_mix, res_mix
++            )
+             if idx + 1 in self.aux_hidden_state_layers:
+-                # Reconstruct the aux hidden state for draft models
+-                aux_recon = layer.mhc.post(hidden_states, residual, post_mix, res_mix)
++                # Reconstruct the aux hidden state for draft models; steering has
++                # already folded it.
++                aux_recon = (
++                    hidden_states
++                    if residual is None
++                    else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
++                )
+                 aux_hidden_state = layer.mhc.collapse(aux_recon)
+                 if self.use_sequence_parallel:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+@@ -832,7 +844,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             # Reuse if the last layer was captured as an aux hidden state
+             if self.end_layer in self.aux_hidden_state_layers:
+                 hidden_states = final_aux_recon
+-            else:
++            elif residual is not None:
+                 hidden_states = layer.mhc.post(
+                     hidden_states, residual, post_mix, res_mix
+                 )

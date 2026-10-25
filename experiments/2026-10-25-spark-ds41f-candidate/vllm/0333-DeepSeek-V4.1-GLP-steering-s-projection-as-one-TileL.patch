@@ -1,0 +1,753 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 17:04:38 +0200
+Subject: [PATCH 333/488] DeepSeek-V4.1: GLP steering's projection as one
+ TileLang launch
+
+With a GLP file set, every layer projects its direction off the folded
+hyper-connection streams. The projection ran as torch ops (a widening
+copy, an FP32 GEMV for h . d and the update), which Inductor compiled into
+a cuBLAS call and a generated elementwise kernel. It is now one TileLang
+kernel (tilelang/glp.py): a block per stream of a token widens the stream
+to FP32 once, reduces h . d in a fixed order and writes
+bf16(h - (alpha (h . d)) d). Rows are independent, so a token's result
+does not depend on the batch; alpha zero and a zero direction (a layer
+the file does not steer) return the stream bit for bit.
+
+GLPSteering declares the kernel for the model's [T, hc_mult, hidden]
+streams, so kernel preparation compiles it before the cache freezes, and
+refuses any other shape or dtype. glp_steering takes hc_mult.
+
+Tests: tests/kernels/test_deepseek_v41_tilelang_glp.py checks the kernel
+against FP64 (within one BF16 rounding, correctly rounded at least as
+often as the FP32 torch projection), batch independence, repeatability,
+in-place rows of the layer stack, non-finite propagation and its
+declaration; the model tests run the projection on the GPU at the serving
+width. benchmarks/kernels/benchmark_deepseek_v41_glp.py times it against
+the compiled torch projection at decode and long-prefill shapes.
+---
+ .../kernels/benchmark_deepseek_v41_glp.py     | 101 ++++++++++++
+ .../kernels/test_deepseek_v41_tilelang_glp.py | 152 ++++++++++++++++++
+ tests/models/test_deepseek_v4_1_glp.py        | 118 ++++++++++----
+ vllm/models/deepseek_v4_1/glp.py              |  39 ++++-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |   4 +-
+ vllm/models/deepseek_v4_1/tilelang/glp.py     | 109 +++++++++++++
+ 6 files changed, 479 insertions(+), 44 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_glp.py
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_glp.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/glp.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_glp.py b/benchmarks/kernels/benchmark_deepseek_v41_glp.py
+new file mode 100644
+index 000000000..8e0ec7cdf
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_glp.py
+@@ -0,0 +1,101 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of GLP steering's TileLang projection against the torch
++projection it replaces, compiled as the model's forward compiles it (Inductor: a
++cuBLAS GEMV for ``h @ d`` and a fused elementwise kernel), at serving shapes.
++
++Each shape is measured on eight fresh inputs; on each, CUDA graphs of 100 calls of
++both run back to back, alternating which goes first, and the case's 95% interval
++comes from the eight per-input differences. The gate (``--gate``) is that the
++TileLang projection is not slower at any serving shape: a decode step (16 requests
++of 1 + 5 drafted tokens) and a long-prefill chunk.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import glp
++
++STREAMS, HIDDEN = 4, 5120
++SHAPES = {"decode c1": 6, "decode c16": 96, "prefill 8K": 8192, "prefill 16K": 16384}
++GATED = ("decode c16", "prefill 16K")
++
++
++def _torch_projection(h, direction, alpha):
++    x = h.float()
++    return (x - (alpha * (x @ direction)).unsqueeze(-1) * direction).to(h.dtype)
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 10  # ms / 100 calls to microseconds
++
++
++def measure(tokens: int, compiled, samples: int = 8) -> dict:
++    ours_us, torch_us, differences = [], [], []
++    for sample in range(samples):
++        generator = torch.Generator(device="cuda").manual_seed(sample)
++        h = torch.randn(
++            tokens, STREAMS, HIDDEN, generator=generator, device="cuda"
++        ).bfloat16()
++        d = torch.randn(HIDDEN, generator=generator, device="cuda")
++        d /= d.norm()
++        alpha = torch.tensor([0.75], device="cuda")
++        out = torch.empty_like(h)
++        ours = graph(lambda: glp.glp_project(h, d, alpha, out))
++        theirs = graph(lambda: compiled(h, d, alpha))
++        pair = (ours, theirs) if sample % 2 == 0 else (theirs, ours)
++        times = {id(capture): elapsed(capture) for capture in pair}
++        ours_us.append(times[id(ours)])
++        torch_us.append(times[id(theirs)])
++        differences.append(times[id(ours)] - times[id(theirs)])
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(samples)  # t(7), 95%
++    return {
++        "tokens": tokens,
++        "tilelang_us": statistics.median(ours_us),
++        "torch_us": statistics.median(torch_us),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    compiled = torch.compile(_torch_projection, dynamic=False)
++    results = {name: measure(tokens, compiled) for name, tokens in SHAPES.items()}
++    print(json.dumps(results, indent=1))
++    if args.gate:
++        slower = [name for name in GATED if results[name]["interval_us"][0] > 0]
++        if slower:
++            raise SystemExit(f"TileLang projection slower at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_glp.py b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+new file mode 100644
+index 000000000..ffddfdf6e
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+@@ -0,0 +1,152 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering's TileLang projection against FP64 and the FP32 torch projection
++it replaces (``h - (alpha (h @ d)) d`` in FP32, then BF16)."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_same_nonfinite,
++)
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import glp, prepare  # noqa: E402
++
++STREAMS, HIDDEN = 4, 5120
++
++
++def _inputs(tokens: int, seed: int = 0, layers: int = 3):
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    streams = torch.randn(
++        tokens, STREAMS, HIDDEN, generator=generator, device="cuda"
++    ).bfloat16()
++    directions = torch.randn(layers, HIDDEN, generator=generator, device="cuda")
++    directions /= directions.double().norm(dim=-1, keepdim=True).float()
++    return streams, directions
++
++
++def _project(streams, direction, alpha: float) -> torch.Tensor:
++    out = torch.empty_like(streams)
++    glp.glp_project(
++        streams, direction, torch.tensor([alpha], device="cuda"), out
++    )
++    return out
++
++
++def _fp64(streams, direction, alpha: float) -> torch.Tensor:
++    h, d = streams.double(), direction.double()
++    return h - (alpha * (h @ d)).unsqueeze(-1) * d
++
++
++def _fp32_torch(streams, direction, alpha: float) -> torch.Tensor:
++    """The projection as GLP steering first ran it, in eager torch."""
++    h = streams.float()
++    return (h - (alpha * (h @ direction)).unsqueeze(-1) * direction).bfloat16()
++
++
++def _ulp(x: torch.Tensor) -> torch.Tensor:
++    """BF16's spacing at ``|x|`` (eight significant bits)."""
++    _, exponent = torch.frexp(x.abs().clamp_min(2.0**-126))
++    return torch.ldexp(torch.ones_like(x), exponent - 8)
++
++
++@pytest.mark.parametrize("tokens", [1, 7, 96, 384, 2048])
++@pytest.mark.parametrize("alpha", [0.75, 1.0, 2.0])
++def test_within_one_rounding_of_fp64(tokens, alpha):
++    streams, directions = _inputs(tokens, seed=tokens)
++    out = _project(streams, directions[1], alpha)
++    exact = _fp64(streams, directions[1], alpha)
++    assert out.dtype == torch.bfloat16 and out.shape == streams.shape
++    # One rounding to BF16, plus the FP32 dot product's own error where an output
++    # cancels to nearly zero (about 1e-8 here; 2^-24 bounds it).
++    assert ((out.double() - exact).abs() <= _ulp(exact) + 2.0**-24).all()
++    # At least as often correctly rounded as the FP32 torch projection.
++    rounded = exact.bfloat16()
++    ours = (out != rounded).double().mean().item()
++    torch_path = (_fp32_torch(streams, directions[1], alpha) != rounded)
++    assert ours <= torch_path.double().mean().item() + 1e-4, (ours, torch_path)
++
++
++def test_the_direction_is_removed():
++    streams, directions = _inputs(256)
++    d = directions[2].double()
++    out = _project(streams, directions[2], 1.0).double()
++    # What remains along d is the outputs' own BF16 rounding.
++    assert (out @ d).abs().max().item() < 0.02
++
++
++def test_alpha_zero_and_a_zero_direction_change_nothing():
++    streams, directions = _inputs(96)
++    assert torch.equal(_project(streams, directions[0], 0.0), streams)
++    zero = torch.zeros(HIDDEN, device="cuda")
++    assert torch.equal(_project(streams, zero, 0.75), streams)
++
++
++def test_rows_independent_of_batch():
++    streams, directions = _inputs(130)
++    full = _project(streams, directions[1], 0.75)
++    for tokens in (1, 7, 64, 129):
++        assert torch.equal(
++            _project(streams[:tokens], directions[1], 0.75), full[:tokens]
++        ), tokens
++
++
++def test_repeatable():
++    streams, directions = _inputs(384)
++    first = _project(streams, directions[1], 0.75)
++    for _ in range(3):
++        assert torch.equal(_project(streams, directions[1], 0.75), first)
++
++
++def test_a_row_of_the_layer_stack_is_read_in_place():
++    """The model passes ``directions[layer]``, a view into the stack."""
++    streams, directions = _inputs(16, layers=5)
++    for layer in range(5):
++        assert torch.equal(
++            _project(streams, directions[layer], 0.75),
++            _project(streams, directions[layer].clone(), 0.75),
++        )
++
++
++def test_nonfinite_like_the_torch_projection():
++    """A NaN or an infinity in a stream reaches its whole row, as through
++    ``h @ d``; other rows keep their bits."""
++    streams, directions = _inputs(8)
++    clean = _project(streams, directions[1], 0.75)
++    for token, stream, col, value in ((0, 1, 3, NAN), (2, 0, 9, INF), (5, 3, 17, -INF)):
++        streams[token, stream, col] = value
++    out = _project(streams, directions[1], 0.75)
++    assert_same_nonfinite(out, _fp32_torch(streams, directions[1], 0.75))
++    poisoned = {(0, 1), (2, 0), (5, 3)}
++    for token in range(8):
++        for stream in range(STREAMS):
++            if (token, stream) not in poisoned:
++                assert torch.equal(out[token, stream], clean[token, stream])
++
++
++def test_no_tokens_launch_nothing():
++    streams, directions = _inputs(0)
++    out = torch.empty_like(streams)
++    glp.glp_project(streams, directions[0], torch.tensor([0.75], device="cuda"), out)
++
++
++def test_declared_as_the_forward_calls_it():
++    registry = JitWarmupRegistry(vllm_config=None)
++    with registry.activate():
++        glp.declare(STREAMS, HIDDEN)
++    calls = [
++        (function, args, kwargs)
++        for function, args, kwargs in prepare.declared_calls(registry)
++    ]
++    assert calls == [(glp.glp_project_kernel, (STREAMS, HIDDEN), {})]
+diff --git a/tests/models/test_deepseek_v4_1_glp.py b/tests/models/test_deepseek_v4_1_glp.py
+index 039002757..f4cec3331 100644
+--- a/tests/models/test_deepseek_v4_1_glp.py
++++ b/tests/models/test_deepseek_v4_1_glp.py
+@@ -190,12 +190,12 @@ def test_a_transferred_vector_is_read(tmp_path):
+ def test_no_path_means_no_steering_module(monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "not a number")
+     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "99")
+-    assert glp.glp_steering(NUM_LAYERS, HIDDEN) is None
++    assert glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS) is None
+ 
+ 
+ def test_steering_stacks_the_file_directions(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+     assert steering.directions.shape == (NUM_LAYERS, HIDDEN)
+     assert steering.directions.dtype == torch.float32
+     for layer in range(NUM_LAYERS):
+@@ -211,7 +211,7 @@ def test_alpha_and_layers_can_be_overridden(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", glp_file(tmp_path))
+     monkeypatch.setenv("WEIGHTLESS_STEER_ALPHA", "0.5")
+     monkeypatch.setenv("WEIGHTLESS_STEER_LAYERS", "2, 5")
+-    steering = glp.glp_steering(NUM_LAYERS, HIDDEN)
++    steering = glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+     assert steering.alpha.item() == pytest.approx(0.5)
+     assert torch.count_nonzero(steering.directions.abs().sum(-1)) == 2
+     assert steering.directions[1].abs().sum() == 0
+@@ -232,20 +232,20 @@ def test_malformed_overrides_are_refused(tmp_path, monkeypatch, env, message):
+     for name, value in env.items():
+         monkeypatch.setenv(name, value)
+     with pytest.raises(ValueError, match=message):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+ 
+ 
+ def test_a_missing_file_is_refused(tmp_path, monkeypatch):
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", str(tmp_path / "missing.gguf"))
+     with pytest.raises(FileNotFoundError):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+ 
+ 
+ def test_no_alpha_anywhere_is_refused(tmp_path, monkeypatch):
+     path = glp_file(tmp_path, metadata={"glp.alpha_default": None})
+     monkeypatch.setenv("WEIGHTLESS_STEER_PATH", path)
+     with pytest.raises(ValueError, match="no glp.alpha_default"):
+-        glp.glp_steering(NUM_LAYERS, HIDDEN)
++        glp.glp_steering(NUM_LAYERS, HIDDEN, STREAMS)
+ 
+ 
+ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+@@ -256,57 +256,80 @@ def test_the_steering_variables_are_part_of_the_compile_key(monkeypatch):
+     assert envs.compile_factors() != unsteered
+ 
+ 
+-# The projection.
++# The projection: one TileLang launch (tilelang/glp.py) on the model's BF16
++# streams, at the serving width. Its precision against FP64 is
++# tests/kernels/test_deepseek_v41_tilelang_glp.py's.
++
++WIDE = 5120
++on_gpu = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or torch.cuda.get_device_capability()[0] != 12,
++    reason="the TileLang projection targets SM120/SM121",
++)
+ 
+ 
+ def steering(alpha: float, layers=LAYERS) -> glp.GLPSteering:
+-    directions = torch.zeros(NUM_LAYERS, HIDDEN)
++    directions = torch.zeros(NUM_LAYERS, WIDE)
+     for layer in layers:
+-        directions[layer] = torch.from_numpy(unit(layer))
+-    return glp.GLPSteering(directions, alpha)
++        directions[layer] = torch.from_numpy(unit(layer, WIDE))
++    return glp.GLPSteering(directions, alpha, STREAMS).cuda()
+ 
+ 
+-def streams(dtype=torch.float32, tokens: int = 7) -> torch.Tensor:
++def streams(tokens: int = 7) -> torch.Tensor:
+     generator = torch.Generator().manual_seed(0)
+-    return torch.randn(tokens, STREAMS, HIDDEN, generator=generator).to(dtype)
++    return torch.randn(tokens, STREAMS, WIDE, generator=generator).bfloat16().cuda()
++
++
++def direction(layer: int) -> torch.Tensor:
++    return torch.from_numpy(unit(layer, WIDE)).double().cuda()
+ 
+ 
++@on_gpu
+ @pytest.mark.parametrize("alpha", [0.0, 0.25, 0.75, 1.0, 2.0])
+ def test_projection_scales_only_the_direction(alpha):
+-    d = torch.from_numpy(unit(2))
++    d = direction(2)
+     h = streams()
+-    out = steering(alpha)(h, 2)
+-    torch.testing.assert_close(out @ d, (1 - alpha) * (h @ d), atol=1e-5, rtol=0)
++    out = steering(alpha)(h, 2).double()
++    # One BF16 rounding of each output element bounds the error.
++    torch.testing.assert_close(
++        out @ d, (1 - alpha) * (h.double() @ d), atol=0.05, rtol=0
++    )
+     rest = lambda x: x - (x @ d).unsqueeze(-1) * d  # noqa: E731
+-    torch.testing.assert_close(rest(out), rest(h), atol=1e-5, rtol=0)
++    torch.testing.assert_close(rest(out), rest(h.double()), atol=0.05, rtol=0.01)
+ 
+ 
++@on_gpu
+ def test_every_stream_is_projected_so_their_mean_is_too():
+-    d = torch.from_numpy(unit(5))
++    d = direction(5)
+     h = streams()
+-    out = steering(1.0)(h, 5)
+-    torch.testing.assert_close(out @ d, torch.zeros(7, STREAMS), atol=1e-5, rtol=0)
+-    mean = h.mean(dim=1)
++    out = steering(1.0)(h, 5).double()
++    torch.testing.assert_close(
++        out @ d, torch.zeros(7, STREAMS, dtype=torch.float64, device="cuda"),
++        atol=0.05, rtol=0,
++    )
++    mean = h.double().mean(dim=1)
+     torch.testing.assert_close(
+-        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=1e-5, rtol=0
++        out.mean(dim=1), mean - (mean @ d).unsqueeze(-1) * d, atol=0.02, rtol=0.01
+     )
+ 
+ 
++@on_gpu
+ @pytest.mark.parametrize("alpha", [0.0, 0.75, 1.0, 2.0])
+ def test_projection_never_adds_to_a_stream(alpha):
+     h = streams()
+     out = steering(alpha)(h, 1)
+-    assert (out.norm(dim=-1) <= h.norm(dim=-1) + 1e-5).all()
++    assert (out.double().norm(dim=-1) <= h.double().norm(dim=-1) * (1 + 2**-8)).all()
+ 
+ 
+-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+-def test_an_unsteered_layer_is_unchanged(dtype):
+-    h = streams(dtype)
++@on_gpu
++def test_an_unsteered_layer_is_unchanged():
++    h = streams()
+     out = steering(0.75)(h, 3)
+-    assert out.dtype == dtype
++    assert out.dtype == torch.bfloat16
+     assert torch.equal(out, h)
+ 
+ 
++@on_gpu
+ def test_alpha_is_read_when_the_projection_runs():
+     module = steering(1.0)
+     h = streams()
+@@ -316,6 +339,25 @@ def test_alpha_is_read_when_the_projection_runs():
+     assert not torch.equal(full, h)
+ 
+ 
++@on_gpu
++def test_only_the_models_streams_are_projected():
++    module = steering(1.0)
++    with pytest.raises(ValueError, match="BF16 streams"):
++        module(streams().float(), 1)
++    with pytest.raises(ValueError, match="BF16 streams"):
++        module(streams()[:, :2], 1)
++
++
++def test_the_projection_is_declared_for_the_models_streams(monkeypatch):
++    declared = []
++    monkeypatch.setattr(
++        glp.tilelang_glp, "declare", lambda *shape: declared.append(shape)
++    )
++    directions = torch.zeros(NUM_LAYERS, WIDE)
++    glp.GLPSteering(directions, 0.75, STREAMS).declare_kernels()
++    assert declared == [(STREAMS, WIDE)]
++
++
+ # The model loop's step.
+ 
+ 
+@@ -326,16 +368,19 @@ class _FoldingMHC(torch.nn.Module):
+ 
+     def post(self, x, residual, post_mix, res_mix):
+         self.calls += 1
+-        return post_mix.unsqueeze(-1) * x.unsqueeze(1) + res_mix @ residual
++        return (
++            post_mix.unsqueeze(-1) * x.float().unsqueeze(1)
++            + res_mix @ residual.float()
++        ).to(residual.dtype)
+ 
+ 
+-def _layer_outputs():
++def _layer_outputs(device="cpu"):
+     generator = torch.Generator().manual_seed(1)
+-    x = torch.randn(3, HIDDEN, generator=generator)
+-    residual = torch.randn(3, STREAMS, HIDDEN, generator=generator)
++    x = torch.randn(3, WIDE, generator=generator).bfloat16()
++    residual = torch.randn(3, STREAMS, WIDE, generator=generator).bfloat16()
+     post_mix = torch.rand(3, STREAMS, generator=generator)
+     res_mix = torch.rand(3, STREAMS, STREAMS, generator=generator)
+-    return x, residual, post_mix, res_mix
++    return tuple(t.to(device) for t in (x, residual, post_mix, res_mix))
+ 
+ 
+ def test_unsteered_layer_outputs_pass_through_untouched():
+@@ -346,9 +391,10 @@ def test_unsteered_layer_outputs_pass_through_untouched():
+     assert mhc.calls == 0
+ 
+ 
++@on_gpu
+ def test_steered_layer_outputs_are_the_projected_fold():
+     mhc = _FoldingMHC()
+-    outputs = _layer_outputs()
++    outputs = _layer_outputs("cuda")
+     module = steering(1.0)
+     hidden_states, residual, post_mix, res_mix = glp.steer_post_layer(
+         module, mhc, 5, *outputs
+@@ -356,10 +402,12 @@ def test_steered_layer_outputs_are_the_projected_fold():
+     assert (residual, post_mix, res_mix) == (None, None, None)
+     assert mhc.calls == 1
+     fold = _FoldingMHC().post(*outputs)
+-    torch.testing.assert_close(hidden_states, module(fold, 5))
+-    d = torch.from_numpy(unit(5))
++    assert torch.equal(hidden_states, module(fold, 5))
+     torch.testing.assert_close(
+-        hidden_states @ d, torch.zeros(3, STREAMS), atol=1e-5, rtol=0
++        hidden_states.double() @ direction(5),
++        torch.zeros(3, STREAMS, dtype=torch.float64, device="cuda"),
++        atol=0.05,
++        rtol=0,
+     )
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/glp.py b/vllm/models/deepseek_v4_1/glp.py
+index a698b7485..e79d863ea 100644
+--- a/vllm/models/deepseek_v4_1/glp.py
++++ b/vllm/models/deepseek_v4_1/glp.py
+@@ -17,7 +17,9 @@ site, and a file for it is refused.
+ Off unless WEIGHTLESS_STEER_PATH names a file; the model then has no steering
+ module and its forward is unchanged. The reader is fail-closed: a file this
+ runtime cannot apply exactly stops the boot rather than serving unsteered or
+-steering at another site.
++steering at another site. On, the projection is one TileLang launch per layer
++(``tilelang/glp.py``), declared for kernel preparation with the model's other
++kernels.
+ """
+ 
+ import argparse
+@@ -32,6 +34,7 @@ from torch import nn
+ 
+ import vllm.envs as envs
+ from vllm.logger import init_logger
++from vllm.models.deepseek_v4_1.tilelang import glp as tilelang_glp
+ 
+ logger = init_logger(__name__)
+ 
+@@ -247,8 +250,9 @@ def read_glp(
+ class GLPSteering(nn.Module):
+     """Projects a layer's direction off its folded hyper-connection streams."""
+ 
+-    def __init__(self, directions: torch.Tensor, alpha: float):
++    def __init__(self, directions: torch.Tensor, alpha: float, hc_mult: int):
+         super().__init__()
++        self.hc_mult = hc_mult
+         # One float32 row per model layer; unsteered layers are zero rows, so
+         # the traced graph does not depend on which layers a file covers.
+         self.register_buffer("directions", directions, persistent=False)
+@@ -257,11 +261,28 @@ class GLPSteering(nn.Module):
+             "alpha", torch.tensor(alpha, dtype=torch.float32), persistent=False
+         )
+ 
++    def declare_kernels(self) -> None:
++        """The projection of the model's streams, the only shape the forward runs."""
++        tilelang_glp.declare(self.hc_mult, self.directions.shape[1])
++
+     def forward(self, streams: torch.Tensor, layer: int) -> torch.Tensor:
+-        h = streams.float()
+-        d = self.directions[layer]
+-        coefficient = h @ d
+-        return (h - (self.alpha * coefficient).unsqueeze(-1) * d).to(streams.dtype)
++        """``streams`` ([T, hc_mult, hidden], BF16) with layer ``layer``'s direction
++        projected off every stream."""
++        if streams.dtype != torch.bfloat16 or streams.shape[1:] != (
++            self.hc_mult,
++            self.directions.shape[1],
++        ):
++            raise ValueError(
++                f"GLP steering projects [T, {self.hc_mult}, "
++                f"{self.directions.shape[1]}] BF16 streams, not "
++                f"{list(streams.shape)} {streams.dtype}"
++            )
++        streams = streams.contiguous()
++        out = torch.empty_like(streams)
++        tilelang_glp.glp_project(
++            streams, self.directions[layer], self.alpha.view(1), out
++        )
++        return out
+ 
+ 
+ def steer_post_layer(
+@@ -291,7 +312,9 @@ def steer_post_layer(
+     )
+ 
+ 
+-def glp_steering(num_layers: int, hidden_size: int) -> GLPSteering | None:
++def glp_steering(
++    num_layers: int, hidden_size: int, hc_mult: int
++) -> GLPSteering | None:
+     """The steering WEIGHTLESS_STEER_PATH asks for, or None when it is unset.
+ 
+     WEIGHTLESS_STEER_ALPHA overrides the file's alpha_default and
+@@ -326,7 +349,7 @@ def glp_steering(num_layers: int, hidden_size: int) -> GLPSteering | None:
+     for layer in layers:
+         stack[layer] = torch.from_numpy(directions[layer])
+     logger.info("GLP steering on: alpha %s, layers %s", alpha, layers)
+-    return GLPSteering(stack, alpha)
++    return GLPSteering(stack, alpha, hc_mult)
+ 
+ 
+ def main() -> None:
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index b8d86176a..344c2caa0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -573,7 +573,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             )
+         # GLP steering (glp.py) when WEIGHTLESS_STEER_PATH is set; None otherwise,
+         # which leaves the forward as it is.
+-        self.glp = glp_steering(config.num_hidden_layers, config.hidden_size)
++        self.glp = glp_steering(
++            config.num_hidden_layers, config.hidden_size, config.hc_mult
++        )
+ 
+     def prepare_disk_engram(
+         self, input_ids, query_start_loc, lookback_token_ids, early=None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+new file mode 100644
+index 000000000..f4edbf34d
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -0,0 +1,109 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""GLP steering's projection, ``h <- h - alpha (h . d) d``, in one launch.
++
++``streams`` ([T, hc_mult, hidden], BF16) are a layer's folded hyper-connection
++streams, ``direction`` ([hidden], FP32) the layer's unit row (zero for a layer the
++file does not steer) and ``alpha`` ([1], FP32) a buffer, so a file's contents never
++change the traced graph. One block projects one stream of one token: it widens the
++stream to FP32, reduces ``h . d`` in a fixed order (each thread's values in
++sequence, then the warp's lanes, then the warps), and writes
++``bf16(h - (alpha (h . d)) d)``. No row depends on another, so a token's result
++does not depend on what else the step carries. Alpha zero and a zero direction
++return the stream unchanged; a non-finite value in a stream reaches its whole row,
++as it does through ``h @ d``.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
++def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 128, vec: int = 8):
++    assert hidden % (threads * vec) == 0 and threads % 32 == 0
++    chunks = hidden // (threads * vec)
++    warps = threads // 32
++    tokens = T.dynamic("tokens")
++
++    @T.prim_func
++    def glp_project(
++        streams: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++        direction: T.Tensor((hidden,), T.float32),
++        alpha: T.Tensor((1,), T.float32),
++        out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
++    ):
++        with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
++            tx = T.get_thread_binding()
++            xs = T.alloc_local((chunks * vec,), T.float32)
++            ds = T.alloc_local((chunks * vec,), T.float32)
++            acc = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            scale = T.alloc_shared((1,), T.float32)
++            acc[0] = T.float32(0)
++            for c in T.serial(chunks):
++                for i in T.vectorized(vec):
++                    xs[c * vec + i] = streams[t, h, (c * threads + tx) * vec + i]
++                for i in T.vectorized(vec):
++                    ds[c * vec + i] = direction[(c * threads + tx) * vec + i]
++                for i in T.serial(vec):
++                    acc[0] += xs[c * vec + i] * ds[c * vec + i]
++            acc[0] = T.warp_reduce_sum(acc[0])
++            if tx % 32 == 0:
++                partial[tx // 32] = acc[0]
++            T.sync_threads()
++            if tx == 0:
++                acc[0] = T.float32(0)
++                for warp in T.serial(warps):
++                    acc[0] += partial[warp]
++                scale[0] = alpha[0] * acc[0]
++            T.sync_threads()
++            for c in T.serial(chunks):
++                for i in T.vectorized(vec):
++                    out[t, h, (c * threads + tx) * vec + i] = T.cast(
++                        xs[c * vec + i] - scale[0] * ds[c * vec + i], T.bfloat16
++                    )
++
++    return glp_project
++
++
++@cache
++def _kernel(hc_mult: int, hidden: int):
++    return glp_project_kernel(hc_mult, hidden)
++
++
++@torch.library.custom_op("vllm::dsv41_tilelang_glp_project", mutates_args=("out",))
++def glp_project(
++    streams: torch.Tensor,
++    direction: torch.Tensor,
++    alpha: torch.Tensor,
++    out: torch.Tensor,
++) -> None:
++    """Project ``direction`` off ``streams`` ([T, hc_mult, hidden], BF16) into
++    ``out``, scaled by ``alpha`` ([1], FP32)."""
++    tokens, hc_mult, hidden = streams.shape
++    if tokens == 0:
++        return
++    _kernel(hc_mult, hidden)(streams, direction, alpha, out)
++
++
++@glp_project.register_fake
++def _glp_project_fake(streams, direction, alpha, out):
++    return None
++
++
++def declare(hc_mult: int, hidden: int) -> None:
++    """Declare the projection of ``hc_mult`` streams of ``hidden``, and keep it."""
++    prepare.declare(
++        lambda: [prepare.call(glp_project_kernel, hc_mult, hidden)],
++        bind=lambda: _kernel(hc_mult, hidden),
++    )
++
++
++__all__ = ["declare", "glp_project", "glp_project_kernel"]

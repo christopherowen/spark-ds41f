@@ -1,0 +1,660 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:28:19 +0100
+Subject: [PATCH 473/488] [DS4.1] Verification: the insertion caps counts at
+ the dead-row cut; chunk offsets without a launch
+
+The rejection sampler capped each request's count at its dead-row cut plus one
+with two torch launches (dead_row_cut + 1, torch.minimum) after verification.
+The resampled-token insertion, which stores every count, now stores the capped
+one in the same store (insert_kernel's limited variant, declared beside the
+uncapped one when the step can have dead rows); the token still goes where the
+uncapped count puts it.
+
+The first verification chunk takes the batch's offsets as a view instead of
+subtracting 0 from them; a later chunk (never adaptive) uploads its offsets
+from the host. A single chunk's sink alternates are returned as they are, not
+concatenated.
+
+benchmark_resampled_token.py --dead-rows times the capped insertion against
+the uncapped one plus torch's cap.
+---
+ .../kernels/benchmark_resampled_token.py      |  57 ++++++-
+ .../test_rejection_sampler_utils.py           | 144 ++++++++++++++++++
+ .../test_gpu_rejection_sampler_chunking.py    |   8 +
+ vllm/v1/worker/gpu/model_runner.py            |   1 +
+ .../gpu/spec_decode/rejection_sampler.py      |  42 +++--
+ .../spec_decode/rejection_sampler_utils.py    |   5 +
+ .../gpu/spec_decode/tilelang_resampled.py     |  44 +++++-
+ 7 files changed, 281 insertions(+), 20 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_resampled_token.py b/benchmarks/kernels/benchmark_resampled_token.py
+index 5fb059d5b..dece73f7a 100644
+--- a/benchmarks/kernels/benchmark_resampled_token.py
++++ b/benchmarks/kernels/benchmark_resampled_token.py
+@@ -2,6 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Paired graph timings for DS41F's resampled-token insertion, against Triton.
+ 
++With --dead-rows, the insertion that caps each count at its dead-row cut plus one,
++against what the rejection sampler launched before it took the cap: the uncapped
++insertion, then torch's ``dead_row_cut + 1`` and ``torch.minimum``.
++
+ Eight allocations per case, alternating measurement order, and a paired 95%
+ interval. --gate rejects a slowdown; --threads screens fixed launch layouts.
+ """
+@@ -50,7 +54,7 @@ def elapsed(capture, reset):
+     return begin.elapsed_time(end) * 10
+ 
+ 
+-def measure(requests, blocks, threads, seed, mixed):
++def measure(requests, blocks, threads, seed, mixed, dead_rows=False):
+     ours, theirs, differences = [], [], []
+     for sample in range(8):
+         torch.manual_seed(seed + sample)
+@@ -69,10 +73,35 @@ def measure(requests, blocks, threads, seed, mixed):
+         if mixed:
+             temp[mapping[::12]] = 0
+         kernel = port.insert_kernel(
+-            blocks, "float32", "int64", threads, 6, blocks, blocks
++            blocks, "float32", "int64", threads, 6, blocks, blocks, dead_rows
++        )
++        # Cuts from -1 to past the last row.
++        cut = torch.randint(-1, 7, (requests,), device="cuda", dtype=torch.int32)
++        capped = torch.empty_like(counts)
++        capped_views = list(capped.unbind())
++        uncapped = port.insert_kernel(
++            blocks, "float32", "int64", threads, 6, blocks, blocks, False
+         )
+ 
+-        def original(
++        def torch_capped(
++            i,
++            uncapped=uncapped,
++            sampled=sampled,
++            count_views=count_views,
++            capped_views=capped_views,
++            ids=ids,
++            values=values,
++            cu=cu,
++            mapping=mapping,
++            temp=temp,
++            cut=cut,
++        ):
++            uncapped(
++                sampled, count_views[i], ids, values, cu, mapping, temp, count_views[i]
++            )
++            torch.minimum(count_views[i], cut + 1, out=capped_views[i])
++
++        def triton_insert(
+             i,
+             sampled=sampled,
+             count_views=count_views,
+@@ -107,14 +136,26 @@ def measure(requests, blocks, threads, seed, mixed):
+             cu=cu,
+             mapping=mapping,
+             temp=temp,
++            cut=cut,
+         ):
+-            kernel(sampled, count_views[i], ids, values, cu, mapping, temp)
++            kernel(
++                sampled,
++                count_views[i],
++                ids,
++                values,
++                cu,
++                mapping,
++                temp,
++                cut if dead_rows else count_views[i],
++            )
+ 
+         def reset(counts=counts, initial=initial):
+             counts.copy_(initial.expand_as(counts))
+ 
++        original = torch_capped if dead_rows else triton_insert
+         original(0)
+-        expected, expected_counts = sampled.clone(), counts[0].clone()
++        expected = sampled.clone()
++        expected_counts = (capped if dead_rows else counts)[0].clone()
+         sampled.fill_(-1)
+         reset()
+         candidate(0)
+@@ -135,6 +176,10 @@ def measure(requests, blocks, threads, seed, mixed):
+         "requests": requests,
+         "blocks": blocks,
+         "mixed": mixed,
++        "dead_rows": dead_rows,
++        # The "triton_us" timings are the reference's: with dead_rows, the uncapped
++        # insertion and torch's cap.
++        "reference": "insertion + torch cap" if dead_rows else "triton",
+         "threads": threads,
+         "tilelang_us": statistics.median(ours),
+         "triton_us": statistics.median(theirs),
+@@ -156,6 +201,7 @@ def main():
+     parser.add_argument("--requests", default="1,8,16,96")
+     parser.add_argument("--blocks", default="3,4,127")
+     parser.add_argument("--mixed", action="store_true")
++    parser.add_argument("--dead-rows", action="store_true")
+     args = parser.parse_args()
+     layouts = (
+         [None] if args.threads == "auto" else list(map(int, args.threads.split(",")))
+@@ -167,6 +213,7 @@ def main():
+             (1 if blocks <= 4 else port._THREADS) if threads is None else threads,
+             args.seed,
+             args.mixed,
++            args.dead_rows,
+         )
+         for threads in layouts
+         for blocks in map(int, args.blocks.split(","))
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index 645fa6ad9..e51c266f7 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -1334,3 +1334,147 @@ def test_insert_resampled_prepared_before_optional_warmup_return(
+     assert {args[0] for _, args, _ in calls} == ({127, tp} if draft_logits else {127})
+     assert len(calls) == (4 if draft_logits else 2)
+     prepare.prepare_declared(registry)
++
++
++def _insert_inputs(blocks: int, index_dtype: torch.dtype, seed: int):
++    """A batch of 17 requests for ``insert_resampled``: counts below each request's
++    logits, winners with NaN, ties and infinities, a strided sampled view."""
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    n = 17
++    widths = torch.randint(1, 7, (n,), generator=g, device="cuda", dtype=torch.int32)
++    counts = torch.arange(n, device="cuda", dtype=torch.int32) % widths
++    cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int()))
++    states = torch.randperm(n + 11, generator=g, device="cuda")[:n].to(index_dtype)
++    mapping = states.repeat_interleave(widths.long())
++    temp = torch.ones(n + 11, device="cuda")
++    temp[states[9::2].long()] = 0
++    values = torch.randn(n, blocks, generator=g, device="cuda")
++    values[0] = float("nan")
++    values[1, 0] = float("inf")
++    ids = torch.randint(0, 129280, (n, blocks), generator=g, device="cuda")
++    storage = torch.full((n, 9), -999, device="cuda", dtype=torch.int64)
++    storage[:, 1:7] = torch.randint(0, 129280, (n, 6), generator=g, device="cuda")
++    # Cuts from 0 (only the first row is live) to past every count, and -1.
++    cut = torch.randint(-1, 7, (n,), generator=g, device="cuda", dtype=torch.int32)
++    return storage, counts, ids, values, cu, mapping, temp, cut
++
++
++@pytest.mark.parametrize("blocks", [1, 4, 127, 129])
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++def test_insert_resampled_caps_counts_at_the_dead_row_cut(blocks, index_dtype):
++    """With a dead-row cut, the insertion stores ``torch.minimum(count + 1, cut +
++    1)``, which the rejection sampler computed after it with two torch launches; the
++    token goes where the uncapped count puts it, every other element untouched, and
++    the cut is read on each graph replay."""
++    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
++
++    storage, counts, ids, values, cu, mapping, temp, cut = _insert_inputs(
++        blocks, index_dtype, 4111 + blocks
++    )
++    saved_storage, saved_counts, saved_cut = (
++        storage.clone(),
++        counts.clone(),
++        cut.clone(),
++    )
++    expected_storage = storage.clone()
++    expected_counts = counts.clone()
++    insert_resampled(
++        expected_storage[:, 1:7], expected_counts, ids, values, cu, mapping, temp
++    )
++    expected_counts = torch.minimum(expected_counts, cut + 1)
++    insert_resampled(storage[:, 1:7], counts, ids, values, cu, mapping, temp, cut)
++    assert torch.equal(storage, expected_storage)
++    assert torch.equal(counts, expected_counts)
++    assert counts.dtype == torch.int32
++    assert torch.equal(cut, saved_cut)
++
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.stream(side), torch.cuda.graph(graph):
++        insert_resampled(storage[:, 1:7], counts, ids, values, cu, mapping, temp, cut)
++    torch.cuda.current_stream().wait_stream(side)
++    for shift in (0, 1, 3):
++        storage.copy_(saved_storage)
++        counts.copy_(saved_counts)
++        cut.copy_((saved_cut + shift) % 7 - 1)
++        expected_storage = saved_storage.clone()
++        expected_counts = saved_counts.clone()
++        insert_resampled(
++            expected_storage[:, 1:7], expected_counts, ids, values, cu, mapping, temp
++        )
++        expected_counts = torch.minimum(expected_counts, cut + 1)
++        graph.replay()
++        assert torch.equal(storage, expected_storage)
++        assert torch.equal(counts, expected_counts)
++
++
++@pytest.mark.parametrize("temperature", [0.0, 1.0])
++def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
++    """``rejection_sample(..., dead_row_cut=cut)`` is ``torch.minimum(num_sampled,
++    cut + 1)`` of the uncapped verification, the sampled tokens unchanged, on the
++    production path (block verification, one-hot drafts, FP32 draws)."""
++    torch.manual_seed(5309)
++    inputs = _build_rejection_sample_inputs(
++        torch.randn(129280, device="cuda"),
++        torch.randn(129280, device="cuda"),
++        5,
++        temperature,
++        num_trials=9,
++    )
++    inputs["draft_logits"] = None
++    sampled, num_sampled = rejection_sample(
++        **inputs, num_speculative_steps=5, use_block_verification=True
++    )
++    cut = torch.tensor([0, 1, 2, 3, 4, 5, -1, 2, 0], dtype=torch.int32, device="cuda")
++    capped_sampled, capped = rejection_sample(
++        **inputs,
++        num_speculative_steps=5,
++        use_block_verification=True,
++        dead_row_cut=cut,
++    )
++    assert torch.equal(capped, torch.minimum(num_sampled, cut + 1))
++    assert torch.equal(capped_sampled, sampled)
++
++
++@pytest.mark.parametrize("draft_logits", [False, True])
++def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
++    """A step that can have dead rows declares the capped insertion beside the
++    uncapped one, for every index dtype, before the cache freezes."""
++    from types import SimpleNamespace
++
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as module
++    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
++
++    monkeypatch.setattr(
++        module,
++        "get_current_vllm_config",
++        lambda: SimpleNamespace(
++            parallel_config=SimpleNamespace(tensor_parallel_size=4)
++        ),
++    )
++    owner = module.RejectionSampler.__new__(module.RejectionSampler)
++    owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
++    owner.num_speculative_steps = 5
++    owner.watermark_key = None
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        owner.register_warmups(
++            logits=[(torch.float32, 129280)],
++            processed_logits=[(torch.float32, 129280)],
++            vocab_size=129280,
++            has_draft_logits=draft_logits,
++            dead_rows=True,
++        )
++    calls = [c for c in prepare.declared_calls(registry) if c[0] is insert_kernel]
++    keys = {(args[0], args[2], args[-1]) for _, args, _ in calls}
++    blocks = {127, 4} if draft_logits else {127}
++    assert keys == {
++        (b, index, limited)
++        for b in blocks
++        for index in ("int32", "int64")
++        for limited in (False, True)
++    }
++    prepare.prepare_declared(registry)
+diff --git a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+index e94f6790d..6dfe180fb 100644
+--- a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
++++ b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+@@ -54,6 +54,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+     )
+     rejection_sampler.num_speculative_steps = 3
+     rejection_sampler.enable_adaptive_verification = False
++    chunk_offsets: list[torch.Tensor] = []
+ 
+     def fake_verify(
+         self,
+@@ -65,6 +66,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         idx_mapping,
+         *_mappings,
+     ):
++        chunk_offsets.append(cu_num_logits)
+         num_sampled = torch.diff(cu_num_logits).to(torch.int32)
+         sampled = (
+             idx_mapping.to(torch.int64).unsqueeze(1) + torch.arange(4, device=device)
+@@ -94,6 +96,12 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         logprobs_dims=(2, 0),
+     )
+ 
++    # Chunks (0, 2), (2, 3), (3, 4): the first chunk's offsets are a view of the
++    # batch's (no launch), the later ones the host's uploaded, from 0.
++    assert [c.tolist() for c in chunk_offsets] == [[0, 3, 4], [0, 4], [0, 2]]
++    assert all(c.dtype == torch.int32 and c.is_cuda for c in chunk_offsets)
++    first = chunk_offsets[0]
++    assert first.data_ptr() == input_batch.cu_num_logits.data_ptr()
+     assert sampled[:, 0].tolist() == idx_mapping_np.tolist()
+     assert num_sampled.tolist() == num_logits_per_req.tolist()
+     assert chunked_logprobs is not None
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index eb5b66a41..b15953b11 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2201,6 +2201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     vocab_size=vocab_size,
+                     has_draft_logits=getattr(self.speculator, "draft_logits", None)
+                     is not None,
++                    dead_rows=dead_rows,
+                 )
+             if self.prompt_logprobs_worker is not None:
+                 self.prompt_logprobs_worker.register_warmups(
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 46a3361d6..9c142f04b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -15,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+     triton_warmup_inputs,
+ )
+ from vllm.triton_utils import tl, triton
++from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+ from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+@@ -159,21 +160,26 @@ class RejectionSampler:
+         processed_logits: Sequence[tuple[torch.dtype, int]],
+         vocab_size: int,
+         has_draft_logits: bool,
++        dead_rows: bool = False,
+     ) -> None:
+         """Register verification of target logits given as ``(dtype, row stride)``
+         pairs, raw (``logits``) or after sampling parameters (``processed_logits``),
+         and the logprobs of verified tokens. Draft logits and watermarking are not
+-        covered by Triton warmup; the TileLang insertion is always declared."""
++        covered by Triton warmup; the TileLang insertion is always declared, also
++        capped at a dead-row cut when the step can have dead rows (``dead_rows``)."""
++        limits = (False, True) if dead_rows else (False,)
+         register_insert(
+             triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
+             self.sampler.use_fp64_gumbel,
+             self.num_speculative_steps + 1,
++            limits,
+         )
+         if has_draft_logits:
+             register_insert(
+                 get_current_vllm_config().parallel_config.tensor_parallel_size,
+                 self.sampler.use_fp64_gumbel,
+                 self.num_speculative_steps + 1,
++                limits,
+             )
+         if has_draft_logits or self.watermark_key is not None:
+             return
+@@ -265,9 +271,11 @@ class RejectionSampler:
+         idx_mapping_np: np.ndarray,
+         expanded_idx_mapping: torch.Tensor,
+         expanded_local_pos: torch.Tensor,
+-        max_sampled: torch.Tensor | None = None,
++        dead_row_cut: torch.Tensor | None = None,
+         sink: _SinkChunk | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        """With ``dead_row_cut`` ([num_reqs] int32), each request's count is capped
++        at its cut plus one (the insertion of the resampled token stores it so)."""
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -302,12 +310,11 @@ class RejectionSampler:
+             self.synthetic_conditional_rates,
+             use_fp64=self.sampler.use_fp64_gumbel,
+             use_block_verification=self.use_block_verification,
++            dead_row_cut=dead_row_cut,
+             **self._watermarking_kwargs(
+                 draft_sampled, expanded_idx_mapping, expanded_local_pos
+             ),
+         )
+-        if max_sampled is not None:
+-            num_sampled = torch.minimum(num_sampled, max_sampled)
+         if cut is not None:
+             assert self.sink is not None and sink is not None
+             # From the scores the last tokens were drawn from: the cut stays
+@@ -336,13 +343,14 @@ class RejectionSampler:
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+         logprobs_dims: tuple[int, int] | None,
+-        max_sampled: torch.Tensor | None = None,
++        dead_row_cut: torch.Tensor | None = None,
+         sink_flags: torch.Tensor | None = None,
+         sink_alternates: list[SinkAlternates] | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
+         """With ``sink_flags`` (sink rejection), cuts the verification at
+         flagged drafter rows and appends the alternates of each request's last
+-        draw to ``sink_alternates``."""
++        draw to ``sink_alternates``. With ``dead_row_cut``, the counts are capped
++        at it (``_verify``)."""
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         num_reqs = input_batch.num_reqs
+@@ -368,7 +376,17 @@ class RejectionSampler:
+             lo = int(cu_num_logits_np[start])
+             hi = int(cu_num_logits_np[end])
+             chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
+-            chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
++            if lo == 0:
++                # The first chunk's offsets are the batch's own: a view, no launch.
++                # (Adaptive verification's compacted offsets exist on the device
++                # only, and its batch is always one chunk.)
++                chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1]
++            else:
++                # A later chunk (never adaptive, so the host's offsets are the
++                # device's): its offsets uploaded from the host, no kernel.
++                chunk_cu_num_logits = async_tensor_h2d(
++                    chunk_cu_num_logits_np, device=input_batch.cu_num_logits.device
++                )
+             # draft_logits uses persistent request-state indices and stays global.
+             sink = None if sink_flags is None else _SinkChunk(sink_flags[lo:hi])
+             processed_logits, sampled, num_sampled = self._verify(
+@@ -381,7 +399,7 @@ class RejectionSampler:
+                 input_batch.idx_mapping_np[start:end],
+                 input_batch.expanded_idx_mapping[lo:hi],
+                 input_batch.expanded_local_pos[lo:hi],
+-                None if max_sampled is None else max_sampled[start:end],
++                None if dead_row_cut is None else dead_row_cut[start:end],
+                 sink,
+             )
+             if sink is not None:
+@@ -418,6 +436,8 @@ class RejectionSampler:
+         if len(sampled_chunks) == 1:
+             logprobs_tensors = logprobs_chunks[0] if logprobs_chunks else None
+             return sampled_chunks[0], num_sampled_chunks[0], logprobs_tensors
++        # Several chunks (more than get_max_chunk_logits rows; never at DS4.1's
++        # decode shapes): torch concatenates their results.
+ 
+         logprobs_tensors = None
+         if logprobs_chunks:
+@@ -467,7 +487,7 @@ class RejectionSampler:
+             # Logprobs (and the sink alternates) take their token counts
+             # inside the chunks; clamp there too so they match the committed
+             # tokens.
+-            dead_row_cut + 1
++            dead_row_cut
+             if dead_row_cut is not None
+             and (logprobs_dims is not None or sink_rejection)
+             else None,
+@@ -475,7 +495,9 @@ class RejectionSampler:
+             alternates_chunks,
+         )
+         alternates = None
+-        if alternates_chunks:
++        if len(alternates_chunks) == 1:
++            alternates = alternates_chunks[0]
++        elif alternates_chunks:
+             first = alternates_chunks[0]
+             alternates = SinkAlternates(
+                 torch.cat([a.tokens for a in alternates_chunks]),
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index f91b5da9d..bdeb06918 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -1328,6 +1328,8 @@ def rejection_sample(
+     contexts: torch.Tensor | None = None,
+     watermarking: torch.Tensor | None = None,
+     watermark_key: int | None = None,
++    # [num_reqs] int32: with it, each request's count is capped at its cut + 1.
++    dead_row_cut: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+     assert draft_logits is None or (
+@@ -1372,6 +1374,7 @@ def rejection_sample(
+             cu_num_logits,
+             expanded_idx_mapping,
+             temperature,
++            dead_row_cut,
+         )
+         return sampled, num_sampled
+     contexts_stride = 0
+@@ -1612,6 +1615,7 @@ def rejection_sample(
+             cu_num_logits,
+             expanded_idx_mapping,
+             temperature,
++            dead_row_cut,
+         )
+         return sampled, num_sampled
+ 
+@@ -1669,5 +1673,6 @@ def rejection_sample(
+         cu_num_logits,
+         expanded_idx_mapping,
+         temperature,
++        dead_row_cut,
+     )
+     return sampled, num_sampled
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py b/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
+index b2c5a14e9..b9e88feda 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
+@@ -1,6 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Choose and commit the resampled or bonus token after verification."""
++"""Choose and commit the resampled or bonus token after verification.
++
++With a dead-row cut (``limited``), the kernel also caps each request's committed
++count at its cut plus one, ``torch.minimum(num_sampled, dead_row_cut + 1)`` as the
++rejection sampler computed it, in the store of the count: the token is inserted at
++the uncapped count, as before.
++"""
+ 
+ import tilelang
+ import tilelang.language as T
+@@ -40,6 +46,14 @@ def _exchange(best, best_index, best_id, distance):
+     )  # fmt: skip
+ 
+ 
++def _committed(count, dead_row_cut, row, limited: bool):
++    """The request's count with its inserted token, capped at its dead-row cut plus
++    one when ``limited`` (``torch.minimum`` of int32 counts)."""
++    if limited:
++        return T.min(count + 1, dead_row_cut[row] + 1)
++    return count + 1
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def insert_kernel(
+     blocks: int,
+@@ -49,11 +63,13 @@ def insert_kernel(
+     sampled_stride: int,
+     id_stride: int,
+     value_stride: int,
++    limited: bool,
+ ):
+     requests = T.dynamic("requests")
+     width = T.dynamic("width")
+     mapping_len = T.dynamic("mapping_len")
+     state_len = T.dynamic("state_len")
++    cut_len = T.dynamic("cut_len")
+     padded = 1 << (blocks - 1).bit_length()
+     per = (blocks + 31) // 32
+     if blocks > 4 and threads != 32:
+@@ -68,13 +84,14 @@ def insert_kernel(
+         cu: T.Tensor((requests + 1,), T.int32),
+         mapping: T.Tensor((mapping_len,), index_dtype),
+         temperature: T.Tensor((state_len,), T.float32),
++        dead_row_cut: T.Tensor((cut_len,), T.int32),
+     ):
+         with T.Kernel(requests, threads=threads) as row:
+             thread = T.get_thread_binding()
+             if blocks <= 4:
+                 if thread == 0:
+                     count = counts[row]
+-                    counts[row] = count + 1
++                    counts[row] = _committed(count, dead_row_cut, row, limited)
+                     position = cu[row] + count
+                     state = mapping[position]
+                     if (
+@@ -106,7 +123,7 @@ def insert_kernel(
+                 count_local = T.alloc_var(T.int32, init=0)
+                 if thread == 0:
+                     count_local = counts[row]
+-                    counts[row] = count_local + 1
++                    counts[row] = _committed(count_local, dead_row_cut, row, limited)
+                 count = T.shfl_sync(count_local, 0)
+                 position = first + count
+                 state = mapping[position]
+@@ -144,6 +161,7 @@ def insert_call(
+     value_dtype: torch.dtype,
+     index_dtype: torch.dtype,
+     strides: tuple[int, int, int],
++    limited: bool,
+ ):
+     from vllm.models.deepseek_v4_1.tilelang.prepare import call
+ 
+@@ -154,10 +172,18 @@ def insert_call(
+         "int64" if index_dtype == torch.int64 else "int32",
+         1 if blocks <= 4 else _THREADS,
+         *strides,
++        limited,
+     )
+ 
+ 
+-def register_insert(blocks: int, use_fp64: bool, sampled_width: int) -> None:
++def register_insert(
++    blocks: int,
++    use_fp64: bool,
++    sampled_width: int,
++    limits: tuple[bool, ...] = (False,),
++) -> None:
++    """Declare the insertion for ``blocks`` winners a request, each index dtype, and
++    each of ``limits`` (True: capped at a dead-row cut)."""
+     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+ 
+     if JitWarmupRegistry.active() is None:
+@@ -167,8 +193,9 @@ def register_insert(blocks: int, use_fp64: bool, sampled_width: int) -> None:
+     dtype = torch.float64 if use_fp64 else torch.float32
+     declare(
+         lambda: [
+-            insert_call(blocks, dtype, d, (sampled_width, blocks, blocks))
++            insert_call(blocks, dtype, d, (sampled_width, blocks, blocks), limited)
+             for d in (torch.int32, torch.int64)
++            for limited in limits
+         ]
+     )
+ 
+@@ -181,7 +208,11 @@ def insert_resampled(
+     cu_num_logits: torch.Tensor,
+     expanded_idx_mapping: torch.Tensor,
+     temperature: torch.Tensor,
++    dead_row_cut: torch.Tensor | None = None,
+ ) -> None:
++    """Insert each request's resampled or bonus token at its count and count it; with
++    ``dead_row_cut`` ([num_reqs] int32), the stored count is capped at the cut plus
++    one."""
+     if counts.numel() == 0:
+         return
+     _, args, kwargs = insert_call(
+@@ -189,6 +220,7 @@ def insert_resampled(
+         local_max.dtype,
+         expanded_idx_mapping.dtype,
+         (sampled.stride(0), local_ids.stride(0), local_max.stride(0)),
++        dead_row_cut is not None,
+     )
+     insert_kernel(*args, **kwargs)(
+         sampled,
+@@ -198,4 +230,6 @@ def insert_resampled(
+         cu_num_logits,
+         expanded_idx_mapping,
+         temperature,
++        # Unlimited, the cut is not read: the counts stand in.
++        counts if dead_row_cut is None else dead_row_cut,
+     )

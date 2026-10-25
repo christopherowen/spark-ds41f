@@ -1,0 +1,695 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:52:24 +0100
+Subject: [PATCH 485/488] [DS4.1] Greedy verification selects its targets from
+ the gathered pairs, in one launch
+
+Greedy verification launched select_first_argmax over the all-gathered shard
+pairs, then the rejection kernel over its ids; at the launch floor the
+selection stayed 1-9% behind Triton's. greedy_rejection_kernel now takes the
+pairs: lane j of a request loads position start + j's pairs (every rank's,
+before the first combine), reduces them in rank order with the selection's
+combine (a total order, the masked pad pair included where the selection has
+one), and stages the target and the draft it verifies in shared memory; lane 0
+then runs the unchanged acceptance loop from there. The kernel is keyed by
+(width, drafts dtype, ranks, pair width).
+
+vocab_parallel_argmax becomes vocab_parallel_pairs (the gathered 16-byte pair
+rows), greedy_rejection_sample takes them, the runner's two sites pass them,
+and the greedy verification declares the fused kernel for its TP size instead
+of the separate selection. The plain selection stays: DSpark's drafter
+launches it for its last step and without a Markov table.
+
+benchmark_tilelang_sampling.py's greedy_rejection case times the fused launch
+against Triton's selection and verification.
+---
+ .../kernels/benchmark_tilelang_sampling.py    |  35 ++++-
+ .../v1/worker/gpu/test_greedy_verification.py |  96 +++++++++++--
+ tests/v1/worker/test_gpu_sink.py              |   6 +-
+ tests/v1/worker/test_gpu_tilelang_sampling.py |  44 +++++-
+ vllm/v1/worker/gpu/model_runner.py            |  10 +-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 131 +++++++++++++-----
+ .../gpu/spec_decode/greedy_verification.py    |  56 ++++----
+ 7 files changed, 290 insertions(+), 88 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_sampling.py b/benchmarks/kernels/benchmark_tilelang_sampling.py
+index 73d8230a6..a62975efa 100644
+--- a/benchmarks/kernels/benchmark_tilelang_sampling.py
++++ b/benchmarks/kernels/benchmark_tilelang_sampling.py
+@@ -484,14 +484,40 @@ def markov_full_case(rows: int):
+ 
+ 
+ def rejection_case(reqs: int):
++    """Greedy verification at TP4 from the gathered 16-byte pair rows, one launch,
++    against Triton's selection over the packed pairs and its verification."""
++    ranks = 4
++
+     def make(sample: int):
+         g = generator(sample)
+         cu, _, drafts, _, _ = _verification_batch(reqs, g)
+-        target = drafts[1:].long().clone()
+-        target[::4] += 1
++        rows = reqs * WIDTH
++        # Each row's first maximum is mostly the draft that verifies it.
++        values = torch.randn(rows, ranks, generator=g, device=DEVICE)
++        index = torch.randint(0, VOCAB, (rows, ranks), generator=g, device=DEVICE)
++        best = values.argmax(-1)
++        index[torch.arange(rows, device=DEVICE), best] = drafts[1:].long()
++        index[::4, :] += 1
++        full = torch.zeros(rows, ranks, 4, device=DEVICE)
++        full[..., 0], full[..., 1] = values, index.float()
++        pairs = full.view(rows, 4 * ranks)
++        packed = full[..., :2].contiguous().view(rows, 2 * ranks)
++        target = torch.empty(rows, dtype=torch.int64, device=DEVICE)
++
++        def theirs():
++            triton_select(packed, target)
++            triton_greedy_rejection(target, drafts, cu, WIDTH - 1)
++
++        ours = tls.greedy_rejection_sample(pairs, drafts, cu, WIDTH - 1)
++        theirs()
++        expected = triton_greedy_rejection(target, drafts, cu, WIDTH - 1)
++        assert torch.equal(ours[1], expected[1])
++        for r in range(reqs):
++            n = int(expected[1][r])
++            assert torch.equal(ours[0][r, :n], expected[0][r, :n])
+         return (
+-            lambda: tls.greedy_rejection_sample(target, drafts, cu, WIDTH - 1),
+-            lambda: triton_greedy_rejection(target, drafts, cu, WIDTH - 1),
++            lambda: tls.greedy_rejection_sample(pairs, drafts, cu, WIDTH - 1),
++            theirs,
+         )
+ 
+     return make
+@@ -517,6 +543,7 @@ CASES = {
+     "greedy_shard_pair": [(f"{r} rows", shard_pair_case(r)) for r in (6, 36, 96, 384)],
+     "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16, 96)],
+     "sample_greedy_markov": [(f"{r} rows", markov_full_case(r)) for r in (1, 16)],
++    # The fused selection and verification against Triton's two launches.
+     "greedy_rejection": [(f"{r} requests", rejection_case(r)) for r in (1, 16, 64)],
+ }
+ 
+diff --git a/tests/v1/worker/gpu/test_greedy_verification.py b/tests/v1/worker/gpu/test_greedy_verification.py
+index d3b0b065f..6c58ce94d 100644
+--- a/tests/v1/worker/gpu/test_greedy_verification.py
++++ b/tests/v1/worker/gpu/test_greedy_verification.py
+@@ -10,16 +10,23 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     scratch_shape,
+     select_first_argmax,
+ )
+-from vllm.v1.worker.gpu.spec_decode.greedy_verification import greedy_rejection_sample
++from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
++    PAIR_WIDTH,
++    greedy_rejection_sample,
++    vocab_parallel_pairs,
++)
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sample
+ 
+ DEVICE = "cuda"
+ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+ 
+ 
+-def _sharded_argmax(logits: torch.Tensor, ranks: int, padding: int) -> torch.Tensor:
+-    """Each simulated rank's padded shard reduced to a pair, the pairs concatenated in
+-    rank order (what the all-gather returns) and reduced to the first maximum."""
++def _sharded_pairs(
++    logits: torch.Tensor, ranks: int, padding: int, pair_width: int = 2
++) -> torch.Tensor:
++    """Each simulated rank's padded shard reduced to a pair (in rows of
++    ``pair_width`` columns), the rows concatenated in rank order: what the
++    all-gather returns."""
+     rows, vocab = logits.shape
+     shard = -(-vocab // ranks)
+     pairs = []
+@@ -28,14 +35,19 @@ def _sharded_argmax(logits: torch.Tensor, ranks: int, padding: int) -> torch.Ten
+         real = max(0, min(shard, vocab - start))
+         local = torch.full((rows, shard + padding), 1e30, device=DEVICE)  # junk padding
+         local[:, :real] = logits[:, start : start + real]
+-        pair = torch.empty((rows, 2), dtype=torch.float32, device=DEVICE)
++        pair = torch.full((rows, pair_width), -3.0, device=DEVICE)
+         shape = scratch_shape(rows, real)
+         values = torch.empty(shape, dtype=torch.float32, device=DEVICE)
+         indices = torch.empty(shape, dtype=torch.int32, device=DEVICE)
+         greedy_shard_pair(local, real, start, pair, values, indices)
+         pairs.append(pair)
+-    ids = torch.empty(rows, dtype=torch.int64, device=DEVICE)
+-    select_first_argmax(torch.cat(pairs, dim=-1), ids)
++    return torch.cat(pairs, dim=-1)
++
++
++def _sharded_argmax(logits: torch.Tensor, ranks: int, padding: int) -> torch.Tensor:
++    """The simulated ranks' pairs reduced to the first maximum."""
++    ids = torch.empty(logits.shape[0], dtype=torch.int64, device=DEVICE)
++    select_first_argmax(_sharded_pairs(logits, ranks, padding), ids)
+     return ids
+ 
+ 
+@@ -53,10 +65,29 @@ def test_vocab_parallel_argmax_is_the_full_argmax(ranks, vocab):
+     logits[2, [0, vocab - 1]] = 50.0
+     logits[3, :] = 1.0  # all equal: the first index
+     assert torch.equal(_sharded_argmax(logits, ranks, padding=7), logits.argmax(-1))
++    # Greedy verification selects the same targets from the runner's 16-byte pair
++    # rows: one logits row a request, no drafts, so each commits its row's target.
++    pairs = _sharded_pairs(logits, ranks, padding=7, pair_width=PAIR_WIDTH)
++    cu = torch.arange(rows + 1, dtype=torch.int32, device=DEVICE)
++    drafts = torch.full((rows,), -1, dtype=torch.int32, device=DEVICE)
++    sampled, num_sampled = greedy_rejection_sample(pairs, drafts, cu, 5)
++    assert (num_sampled == 1).all()
++    assert torch.equal(sampled[:, 0], logits.argmax(-1))
++
++
++def test_vocab_parallel_pairs_on_one_rank():
++    """One rank's pairs: its 16-byte rows, the pair in the first two columns."""
++    torch.manual_seed(2)
++    logits = torch.randn((7, 4099), device=DEVICE)
++    pairs = vocab_parallel_pairs(logits, 4000, 0, 1)
++    assert pairs.shape == (7, PAIR_WIDTH) and pairs.dtype == torch.float32
++    assert torch.equal(pairs[:, 0], logits[:, :4000].amax(-1))
++    assert torch.equal(pairs[:, 1].long(), logits[:, :4000].argmax(-1))
+ 
+ 
++@pytest.mark.parametrize("ranks", [1, 3, 4])
+ @pytest.mark.parametrize("block_verification", [True, False])
+-def test_greedy_rejection_matches_rejection_sample(block_verification):
++def test_greedy_rejection_matches_rejection_sample(ranks, block_verification):
+     torch.manual_seed(1)
+     num_spec, vocab = 5, 32768 + 123
+     drafts_per_req = [5, 5, 5, 5, 5, 3, 0, 5, 1, 5, 5, 5]
+@@ -95,10 +126,57 @@ def test_greedy_rejection_matches_rejection_sample(block_verification):
+         expanded_idx_mapping, expanded_local_pos, temperature, seed, num_spec,
+         use_block_verification=block_verification,
+     )  # fmt: skip
++    pairs = _sharded_pairs(logits, ranks, padding=5, pair_width=PAIR_WIDTH)
+     greedy, greedy_n = greedy_rejection_sample(
+-        target, draft_sampled, cu_num_logits, num_spec
++        pairs, draft_sampled, cu_num_logits, num_spec
+     )
+     assert torch.equal(greedy_n, stock_n)
+     for r in range(num_reqs):
+         n = int(stock_n[r])
+         assert torch.equal(greedy[r, :n], stock[r, :n]), r
++
++
++@pytest.mark.parametrize("tp_size", [1, 3, 4])
++def test_greedy_verification_declares_its_one_launch(monkeypatch, tp_size):
++    """The runner's declaration covers the fused selection and verification for
++    the TP size's pair rows (the runner's int32 drafts, and int64), and no separate
++    selection; the launch takes a declared key."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.sample import tilelang_sampling as tls
++    from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
++        register_greedy_verification_warmups,
++    )
++
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        register_greedy_verification_warmups(
++            logits_dtype=torch.bfloat16,
++            logits_stride=32320,
++            vocab=32320,
++            vocab_start=0,
++            tp_size=tp_size,
++            num_speculative_steps=5,
++        )
++    calls = prepare.declared_calls(registry)
++    declared = {args for f, args, _ in calls if f is tls.greedy_rejection_kernel}
++    assert declared == {
++        (6, "int32", tp_size, PAIR_WIDTH),
++        (6, "int64", tp_size, PAIR_WIDTH),
++    }
++    assert not any(f is tls.select_first_argmax_kernel for f, _, _ in calls)
++    prepare.prepare_declared(registry)
++    launched = []
++    original = tls._kernel
++
++    def record(factory, *key):
++        launched.append((factory, key))
++        return original(factory, *key)
++
++    monkeypatch.setattr(tls, "_kernel", record)
++    cu = torch.tensor([0, 6, 7, 13], dtype=torch.int32, device=DEVICE)
++    pairs = torch.zeros((13, PAIR_WIDTH * tp_size), device=DEVICE)
++    drafts = torch.zeros(13, dtype=torch.int32, device=DEVICE)
++    greedy_rejection_sample(pairs, drafts, cu, 5)
++    assert [factory for factory, _ in launched] == [tls.greedy_rejection_kernel]
++    assert launched[0][1] in declared
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index a419c5de8..2337ee68d 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -28,7 +28,7 @@ from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
+ from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+     greedy_rejection_sample,
+-    vocab_parallel_argmax,
++    vocab_parallel_pairs,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+ from vllm.v1.worker.gpu.states import RequestState
+@@ -377,8 +377,8 @@ def test_greedy_shards_match_the_full_logits():
+     # Request 0 rejects its second draft; request 1 takes the bonus.
+     drafts[2] = (drafts[2] + 1) % vocab
+     cu = _cu([3, 3])
+-    target = vocab_parallel_argmax(logits, vocab, 0, 1)
+-    sampled, num_sampled = greedy_rejection_sample(target, drafts, cu, k)
++    pairs = vocab_parallel_pairs(logits, vocab, 0, 1)
++    sampled, num_sampled = greedy_rejection_sample(pairs, drafts, cu, k)
+     shard = sink.alternates_of_greedy_shards(
+         logits, cu, num_sampled, sampled, 0, vocab, 1
+     )
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index d01251060..7f4eb9f13 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -928,21 +928,51 @@ def test_sample_greedy_markov(dtype, case):
+ 
+ @pytest.mark.parametrize("steps", [5, 1])
+ @pytest.mark.parametrize("drafts_dtype", [torch.int32, torch.int64])
+-def test_greedy_rejection(steps, drafts_dtype):
+-    g = torch.Generator(device=DEVICE).manual_seed(steps)
++@pytest.mark.parametrize("ranks", [1, 2, 3, 4, 8])
++@pytest.mark.parametrize("pair_width,strided", [(4, False), (4, True), (2, False)])
++def test_greedy_rejection(steps, drafts_dtype, ranks, pair_width, strided):
++    """Greedy verification from the gathered pairs, one launch, against Triton's
++    two: ``_select_first_argmax`` over the packed pairs, then
++    ``_greedy_rejection_kernel`` over its targets. The pairs carry ties within and
++    across ranks, NaN (alone and in every rank) and -inf rows, junk in the columns
++    past each pair, and (strided) a row stride past the pairs; drafts accept, miss,
++    hold -1 and end blocks fully accepted."""
++    g = torch.Generator(device=DEVICE).manual_seed(steps * 100 + ranks)
+     counts = [steps + 1 if i % 3 else 1 for i in range(37)]
+     cu = torch.tensor(
+         [0, *itertools.accumulate(counts)], dtype=torch.int32, device=DEVICE
+     )
+     rows = int(cu[-1])
+-    target = torch.randint(0, 6, (rows,), generator=g, device=DEVICE)
+-    drafts = torch.randint(-1, 6, (rows + 1,), generator=g, device=DEVICE).to(
+-        drafts_dtype
++    values = torch.round(torch.randn(rows, ranks, generator=g, device=DEVICE))
++    values[2::7, ranks - 1] = float("nan")
++    values[5::13] = float("nan")
++    values[9::11] = -float("inf")
++    index = torch.randint(0, 6, (rows, ranks), generator=g, device=DEVICE).float()
++    index[4::17] = torch.randint(
++        0, 1 << 24, index[4::17].shape, generator=g, device=DEVICE
++    ).float()
++    full = torch.full((rows, ranks, pair_width), 7.5, device=DEVICE)
++    full[..., 0], full[..., 1] = values, index
++    storage = torch.full(
++        (rows, ranks * pair_width + (3 if strided else 0)), -2.0, device=DEVICE
+     )
+-    drafts[1::2] = target[: drafts[1::2].numel()].to(drafts_dtype)
+-    ours = tls.greedy_rejection_sample(target, drafts, cu, steps)
++    pairs = storage[:, : ranks * pair_width]
++    pairs.copy_(full.view(rows, ranks * pair_width))
++    packed = full[..., :2].contiguous().view(rows, 2 * ranks)
++    target = torch.empty(rows, dtype=torch.int64, device=DEVICE)
++    _triton_select(packed, target)
++    # A draft verifies the row before it: most are that row's target (accepted),
++    # some miss or are -1.
++    drafts = torch.empty(rows + 1, dtype=torch.int64, device=DEVICE)
++    drafts[0] = 0
++    drafts[1:] = target
++    drafts[3::5] = (drafts[3::5] + 1) % 6
++    drafts[7::9] = -1
++    drafts = drafts.to(drafts_dtype)
++    ours = tls.greedy_rejection_sample(pairs, drafts, cu, steps, pair_width)
+     theirs = _triton_greedy_rejection(target, drafts, cu, steps)
+     _assert_same(ours[1], theirs[1], "num_sampled")
++    assert (ours[1] > 1).any() and (ours[1] < steps + 1).any()
+     for r in range(len(counts)):
+         n = int(theirs[1][r])
+         _assert_same(ours[0][r, :n], theirs[0][r, :n], f"request {r}'s tokens")
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9d1c2e9cd..70d570250 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -208,7 +208,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+ from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
+     greedy_rejection_sample,
+     register_greedy_verification_warmups,
+-    vocab_parallel_argmax,
++    vocab_parallel_pairs,
+ )
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+     RejectionSampler,
+@@ -1189,14 +1189,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # live path's dtypes and strides.
+             assert self.rejection_sampler is not None
+             shard = self._language_model().lm_head.shard_indices
+-            target_ids = vocab_parallel_argmax(
++            pairs = vocab_parallel_pairs(
+                 self.model.compute_logits_local(hidden_states),
+                 shard.num_org_elements,
+                 shard.org_vocab_start_index,
+                 get_tensor_model_parallel_world_size(),
+             )
+             greedy_rejection_sample(
+-                target_ids,
++                pairs,
+                 self.input_buffers.input_ids[:num_reqs],
+                 dummy_input_batch.cu_num_logits,
+                 self.rejection_sampler.num_speculative_steps,
+@@ -2381,14 +2381,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 shard.org_vocab_start_index,
+                 shard.num_org_elements,
+             )
+-        target_ids = vocab_parallel_argmax(
++        pairs = vocab_parallel_pairs(
+             local_logits,
+             shard.num_org_elements,
+             shard.org_vocab_start_index,
+             tp_size,
+         )
+         sampled, num_sampled = greedy_rejection_sample(
+-            target_ids,
++            pairs,
+             drafts,
+             input_batch.cu_num_logits,
+             self.rejection_sampler.num_speculative_steps,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index ac41d2c80..c8ea146c2 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -2490,75 +2490,135 @@ def sample_greedy_markov(
+     )
+ 
+ 
++# select_first_argmax's masked pair: no real pair loses to it.
++_MASKED_INDEX = 1 << 30
++
++
+ @tilelang.jit(pass_configs=_PASS)
+-def greedy_rejection_kernel(width: int, drafts_dtype: str):
+-    """``greedy_verification._greedy_rejection_kernel``: per request, drafts are
+-    accepted while they equal the target's argmax (a -1 draft never is); the first
+-    mismatch commits the argmax, and a fully accepted block commits the bonus
+-    position's argmax. Positions after the first mismatch are not written."""
+-    reqs, cu_len, targets_len, drafts_len = T.dynamic(
+-        "reqs, cu_len, targets_len, drafts_len"
++def greedy_rejection_kernel(width: int, drafts_dtype: str, ranks: int, pair_width: int):
++    """``dspark.greedy._select_first_argmax`` and
++    ``greedy_verification._greedy_rejection_kernel`` in one launch, from the
++    all-gathered ``(value, index)`` pairs of each logits row ([rows, pair_width *
++    ranks] FP32, a rank's pair first in its ``pair_width`` columns), a warp a
++    request.
++
++    Lane ``j`` of a request with ``num_drafts`` drafts (``j <= num_drafts``) takes
++    position ``start + j``: it loads the row's ``ranks`` pairs, all before the
++    first combine, and reduces them in rank order with ``_first_keep_or_take``
++    (the selection's combine, a total order: NaN first, then the larger value,
++    then the smaller index; with ``ranks`` not a power of two, the masked pair the
++    selection pads with too), so the target is the selection's, bit for bit; the
++    lanes below ``num_drafts`` also stage the draft the position verifies. Lane 0
++    then runs the rejection kernel's loop from shared memory: drafts are accepted
++    while they equal the target (a -1 draft never is); the first mismatch commits
++    the target, and a fully accepted block commits the bonus position's. Positions
++    after the first mismatch are not written; ``num_sampled`` is the accepted
++    count plus one."""
++    if not 1 <= width <= 32:
++        raise ValueError(f"{width} sampled tokens a request: a warp takes them")
++    if not 1 <= ranks <= 32 or pair_width < 2:
++        raise ValueError(f"{ranks} ranks of {pair_width}-column pairs")
++    span = 1 << max(ranks - 1, 0).bit_length()
++    reqs, cu_len, drafts_len, rows, cols = T.dynamic(
++        "reqs, cu_len, drafts_len, rows, cols"
+     )
++    pairs_stride = T.dynamic("pairs_stride", "int64")
+ 
+     @T.prim_func
+     def greedy_rejection(
+         sampled: T.Tensor((reqs, width), T.int64),
+         num_sampled: T.Tensor((reqs,), T.int32),
+-        target_ids: T.Tensor((targets_len,), T.int64),
++        pairs: T.StridedTensor((rows, cols), (pairs_stride, 1), T.float32),
+         draft_sampled: T.Tensor((drafts_len,), drafts_dtype),
+         cu_num_logits: T.Tensor((cu_len,), T.int32),
+     ):
+         with T.Kernel(reqs, threads=32) as req:
++            T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+-            start = T.alloc_local((1,), T.int64)
+-            num_drafts = T.alloc_local((1,), T.int64)
++            values = T.alloc_local((ranks,), T.float32)
++            indices = T.alloc_local((ranks,), T.int32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            targets = T.alloc_shared((width,), T.int64)
++            drafts = T.alloc_shared((width,), T.int64)
+             accepted = T.alloc_local((1,), T.int64)
+             verifying = T.alloc_local((1,), T.int32)
+-            draft = T.alloc_local((1,), T.int64)
+-            target = T.alloc_local((1,), T.int64)
++            start = T.alloc_var(T.int64, init=T.cast(cu_num_logits[req], T.int64))
++            num_drafts = T.alloc_var(
++                T.int64, init=T.cast(cu_num_logits[req + 1], T.int64) - start - 1
++            )
++            if (tx < width) & (T.cast(tx, T.int64) <= num_drafts):
++                for k in tuple(range(ranks)):
++                    values[k] = pairs[start + tx, pair_width * k]
++                    indices[k] = T.cast(pairs[start + tx, pair_width * k + 1], T.int32)
++                best[0] = values[0]
++                best_index[0] = indices[0]
++                for k in tuple(range(1, ranks)):
++                    _first_keep_or_take(best, best_index, values[k], indices[k])
++                if span > ranks:
++                    _first_keep_or_take(
++                        best, best_index, -T.infinity(T.float32), _MASKED_INDEX
++                    )
++                targets[tx] = T.cast(best_index[0], T.int64)
++                if T.cast(tx, T.int64) < num_drafts:
++                    drafts[tx] = T.cast(draft_sampled[start + tx + 1], T.int64)
++            T.sync_threads()
+             if tx == 0:
+-                start[0] = T.cast(cu_num_logits[req], T.int64)
+-                num_drafts[0] = T.cast(cu_num_logits[req + 1], T.int64) - start[0] - 1
+                 accepted[0] = 0
+                 verifying[0] = 1
+-                for i in T.serial(num_drafts[0]):
+-                    if verifying[0] != 0:
+-                        draft[0] = T.cast(draft_sampled[start[0] + i + 1], T.int64)
+-                        target[0] = target_ids[start[0] + i]
++                for i in tuple(range(width - 1)):
++                    if (num_drafts > i) & (verifying[0] != 0):
+                         # -1 is a placeholder draft that is always rejected.
+-                        if (target[0] == draft[0]) & (draft[0] >= 0):
+-                            sampled[req, i] = draft[0]
++                        if (targets[i] == drafts[i]) & (drafts[i] >= 0):
++                            sampled[req, i] = drafts[i]
+                             accepted[0] = accepted[0] + 1
+                         else:
+-                            sampled[req, i] = target[0]
++                            sampled[req, i] = targets[i]
+                             verifying[0] = 0
+-                if accepted[0] == num_drafts[0]:
+-                    # Every draft accepted: the bonus position's argmax.
+-                    sampled[req, num_drafts[0]] = target_ids[start[0] + num_drafts[0]]
++                if accepted[0] == num_drafts:
++                    # Every draft accepted: the bonus position's target.
++                    sampled[req, num_drafts] = targets[num_drafts]
+                 num_sampled[req] = T.cast(accepted[0] + 1, T.int32)
+ 
+     return greedy_rejection
+ 
+ 
++def greedy_rejection_key(
++    width: int, drafts_dtype: torch.dtype, ranks: int, pair_width: int
++) -> tuple:
++    return (width, _DTYPES[drafts_dtype], ranks, pair_width)
++
++
+ def greedy_rejection_sample(
+-    target_ids: torch.Tensor,
++    pairs: torch.Tensor,
+     draft_sampled: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     num_speculative_steps: int,
++    pair_width: int = 4,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """``greedy_verification.greedy_rejection_sample``."""
++    """``greedy_verification.greedy_rejection_sample``: the targets selected from
++    the gathered pairs ([rows, pair_width * ranks] FP32) and the drafts verified
++    against them, in one launch."""
+     num_reqs = cu_num_logits.shape[0] - 1
+     sampled = draft_sampled.new_empty(
+         num_reqs, num_speculative_steps + 1, dtype=torch.int64
+     )
+     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+     if num_reqs > 0:
++        if pairs.shape[1] % pair_width:
++            raise ValueError(
++                f"{pairs.shape[1]} pair columns are not whole {pair_width}-column pairs"
++            )
+         kernel = _kernel(
+             greedy_rejection_kernel,
+-            num_speculative_steps + 1,
+-            _DTYPES[draft_sampled.dtype],
++            *greedy_rejection_key(
++                num_speculative_steps + 1,
++                draft_sampled.dtype,
++                pairs.shape[1] // pair_width,
++                pair_width,
++            ),
+         )
+-        kernel(sampled, num_sampled, target_ids, draft_sampled, cu_num_logits)
++        kernel(sampled, num_sampled, pairs, draft_sampled, cu_num_logits)
+     return sampled, num_sampled
+ 
+ 
+@@ -2806,7 +2866,7 @@ def greedy_calls(
+     logits: Sequence[torch.dtype] = (),
+     select: Sequence[tuple[torch.dtype, int, int]] = (),
+     finish_outputs: Sequence[torch.dtype] = (),
+-    rejection_widths: Sequence[int] = (),
++    rejection: Sequence[tuple[int, int, int]] = (),
+ ) -> list:
+     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
+     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
+@@ -2814,8 +2874,9 @@ def greedy_calls(
+     element-wise reads, which the launch picks from the rows' alignment); the
+     pair finish when there is a pair, ``select_first_argmax`` for each
+     ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
+-    for each of ``finish_outputs``, and greedy verification for each sampled
+-    width."""
++    for each of ``finish_outputs``, and greedy verification (its selection of the
++    targets included) for each ``(sampled width, ranks, pair width)`` of
++    ``rejection``."""
+     calls = [
+         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+         for base, bias in markov
+@@ -2840,8 +2901,10 @@ def greedy_calls(
+         for dtype, ranks, width in select
+     ]
+     calls += [
+-        _call(greedy_rejection_kernel, width, _DTYPES[dtype])
+-        for width in rejection_widths
++        _call(
++            greedy_rejection_kernel, *greedy_rejection_key(width, dtype, ranks, pairs)
++        )
++        for width, ranks, pairs in rejection
+         for dtype in (torch.int32, torch.int64)
+     ]
+     return _unique(calls)
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index 1ef7b032c..8b2d99ac7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -6,12 +6,12 @@ When every request in a step is greedy and nothing reads or changes its logits
+ (no logprobs, penalties, logit bias, bad words, thinking budget, grammar, top-k,
+ top-p or min-p), verification needs only the target's argmax at each verified
+ position. Each tensor-parallel rank reduces its vocabulary shard to one
+-``(max, global index)`` pair per row; the pairs are all-gathered (8 bytes per row
+-and rank instead of the shard's logits) and reduced to the first maximum, which
+-is ``torch.argmax`` of the full row, ties and NaNs included. The acceptance rule
+-is ``rejection_sample``'s greedy branch: a draft is accepted while it equals the
+-target's argmax; the first mismatch commits the argmax, and a fully accepted
+-block commits the argmax at the bonus position.
++``(max, global index)`` pair per row; the pairs are all-gathered (16-byte rows per
++rank instead of the shard's logits) and, in the verification's own launch, reduced
++to the first maximum, which is ``torch.argmax`` of the full row, ties and NaNs
++included. The acceptance rule is ``rejection_sample``'s greedy branch: a draft is
++accepted while it equals the target's argmax; the first mismatch commits the
++argmax, and a fully accepted block commits the argmax at the bonus position.
+ """
+ 
+ import torch
+@@ -21,32 +21,36 @@ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     greedy_shard_pair,
+     register_greedy_shard_pair_warmup,
+-    register_select_first_argmax_warmup,
+     scratch_shape,
+-    select_first_argmax,
+ )
+ 
++# Columns of a rank's pair row: 16 bytes, which the one-shot all-gather writes in
++# place (the pair in the first two).
++PAIR_WIDTH = 4
+ 
+-def vocab_parallel_argmax(
++
++def vocab_parallel_pairs(
+     local_logits: torch.Tensor, vocab: int, vocab_start: int, tp_size: int
+ ) -> torch.Tensor:
+-    """The full-vocabulary argmax of each row ([rows], int64) from this rank's
+-    shard of the logits (``vocab`` real columns starting at ``vocab_start``)."""
++    """Every rank's ``(max, global index)`` pair of each row, all-gathered
++    ([rows, PAIR_WIDTH * tp_size] FP32, in rank order), from this rank's shard of
++    the logits (``vocab`` real columns starting at ``vocab_start``):
++    ``greedy_rejection_sample`` selects each row's first maximum from them."""
+     rows = local_logits.shape[0]
+     shape = scratch_shape(rows, vocab)
+     values = torch.empty(shape, dtype=torch.float32, device=local_logits.device)
+     indices = torch.empty(shape, dtype=torch.int32, device=local_logits.device)
+-    # 16-byte rows: the one-shot all-gather writes them in place.
+-    pairs = torch.empty((rows, 4), dtype=torch.float32, device=local_logits.device)
++    pairs = torch.empty(
++        (rows, PAIR_WIDTH), dtype=torch.float32, device=local_logits.device
++    )
+     greedy_shard_pair(local_logits, vocab, vocab_start, pairs, values, indices)
+     if tp_size > 1:
+         pairs = tensor_model_parallel_all_gather(pairs, dim=-1)
+-    ids = torch.empty(rows, dtype=torch.int64, device=local_logits.device)
+-    select_first_argmax(pairs, ids, pair_width=4)
+-    return ids
++    return pairs
+ 
+ 
+-# Reference for ``tilelang_sampling``; the runner no longer launches it.
++# Reference for ``tilelang_sampling`` (after dspark.greedy._select_first_argmax);
++# the runner no longer launches it.
+ @triton.jit
+ def _greedy_rejection_kernel(
+     sampled_ptr,
+@@ -92,35 +96,35 @@ def register_greedy_verification_warmups(
+     tp_size: int,
+     num_speculative_steps: int,
+ ) -> None:
+-    """Declare the kernels ``vocab_parallel_argmax`` and ``greedy_rejection_sample``
++    """Declare the kernels ``vocab_parallel_pairs`` and ``greedy_rejection_sample``
+     launch: this rank's shard of ``compute_logits_local`` (``logits_dtype``, rows
+     ``logits_stride`` elements apart, ``vocab`` real columns from global index
+-    ``vocab_start``), drafts and logits offsets from the input batch (int32)."""
++    ``vocab_start``), the pairs of ``tp_size`` ranks, drafts and logits offsets from
++    the input batch."""
+     register_greedy_shard_pair_warmup(
+         logits_dtype=logits_dtype,
+         logits_stride=logits_stride,
+         vocab=vocab,
+         vocab_start=vocab_start,
+     )
+-    register_select_first_argmax_warmup(
+-        ranks=tp_size, output_dtype=torch.int64, output_stride=1, output_aligned=True
+-    )
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.declare(
+         lambda: tilelang_sampling.greedy_calls(
+-            rejection_widths=[num_speculative_steps + 1]
++            rejection=[(num_speculative_steps + 1, tp_size, PAIR_WIDTH)]
+         )
+     )
+ 
+ 
+ def greedy_rejection_sample(
+-    target_ids: torch.Tensor,
++    pairs: torch.Tensor,
+     draft_sampled: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     num_speculative_steps: int,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    """``rejection_sample`` for an all-greedy batch from the target's argmax ids.
++    """``rejection_sample`` for an all-greedy batch from the gathered shard pairs
++    (``vocab_parallel_pairs``): each row's target is the first maximum over its
++    ranks' pairs, selected in the verification's launch.
+ 
+     Returns ``sampled`` ([num_reqs, num_speculative_steps + 1], int64) and
+     ``num_sampled`` ([num_reqs], int32), the committed prefix of each row.
+@@ -128,5 +132,5 @@ def greedy_rejection_sample(
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     return tilelang_sampling.greedy_rejection_sample(
+-        target_ids, draft_sampled, cu_num_logits, num_speculative_steps
++        pairs, draft_sampled, cu_num_logits, num_speculative_steps, PAIR_WIDTH
+     )

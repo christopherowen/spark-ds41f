@@ -1,0 +1,306 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:44:19 +0200
+Subject: [PATCH 427/488] [DS4.1] The fused decode router reads the padding
+ mask and input ids
+
+Every forward negated the step's padding mask for the routers and, in a
+vision model, compared the input ids with the image sentinels: torch
+kernels in the target's and the drafter's graphs. route_partials now
+takes the padding mask as it is (a set row is skipped; a CED decoder's
+routing mask keeps its sense) and compares the ids itself. The TileKernels
+path for longer batches keeps the shared masks.
+---
+ .../moe/test_deepseek_v41_tilelang_router.py  |  32 ++++
+ vllm/models/deepseek_v4_1/tilelang/router.py  | 140 +++++++++++++-----
+ 2 files changed, 132 insertions(+), 40 deletions(-)
+
+diff --git a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+index 3a9cf2ad5..2454c868d 100644
+--- a/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
++++ b/tests/kernels/moe/test_deepseek_v41_tilelang_router.py
+@@ -344,3 +344,35 @@ def test_ced_decoder_skips_nan_padding_rows(ced_step):
+     torch.cuda.synchronize()
+     assert (ids[~expected] == -1).all() and (weights[~expected] == 0).all()
+     assert (ids[expected] >= 0).all() and torch.isfinite(weights).all()
++
++
++def test_gate_router_reads_the_padding_and_ced_masks_itself(plain_scratch, ced_step):
++    """The fused decode router takes the step's padding mask as it is (a set row
++    is skipped) and a CED decoder's routing mask (a clear row is skipped), the
++    rows the unfused router routes, bit for bit."""
++    context, _, compact = ced_step
++    generator = torch.Generator(device="cuda").manual_seed(29)
++    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
++    kwargs = dict(
++        top_k=6,
++        global_num_experts=384,
++        e_score_correction_bias=bias,
++        renormalize=True,
++        routed_scaling_factor=SCALE,
++        scoring_func="sqrtsoftplus",
++    )
++    for rows, ced, skipped in ((361, False, context.is_padding), (158, True, ~compact)):
++        gate = _Gate(384, seed=rows)
++        x = torch.randn(rows, 5120, device="cuda", generator=generator)
++        x = x.to(torch.bfloat16)
++        router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
++        router._ds41_is_ced_decoder = ced
++        router.declare_kernels()
++        weights, ids = router._compute_routing(None, x, None)
++        logits, _ = gate(x)
++        unfused = tilelang_router.TileKernelsRouter(**kwargs)
++        unfused._ds41_is_ced_decoder = ced
++        expected = unfused._compute_routing(None, logits, None)
++        assert (ids[skipped] == -1).all()
++        assert torch.equal(ids, expected[1])
++        assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/router.py b/vllm/models/deepseek_v4_1/tilelang/router.py
+index 0772744d9..c74edd462 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/router.py
++++ b/vllm/models/deepseek_v4_1/tilelang/router.py
+@@ -54,13 +54,10 @@ def _image_token_mask(input_ids: torch.Tensor, lo: int, count: int) -> torch.Ten
+     return mask
+ 
+ 
+-def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | None:
+-    """Rows to route this step (False pads the batch), computed once per layout."""
+-    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
+-        return None
+-    context = get_forward_context()
+-    # A CED decoder layer routes compact rows: its mask comes from the
+-    # decoder metadata (gathered by the CED indices), not from the step's.
++def _ced_routing_mask(context, rows: int, ced_decoder: bool) -> torch.Tensor | None:
++    """A CED decoder layer's rows to route: it routes compact rows, so its mask
++    comes from the decoder metadata (gathered by the CED indices), not from the
++    step's. None for other layers, or without CED metadata."""
+     compact_masks = getattr(context, "_ds41_ced_routing_masks", None)
+     if compact_masks is None:
+         compact_masks = {}
+@@ -76,6 +73,17 @@ def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | Non
+         if rows not in compact_masks:
+             raise RuntimeError("CED routing mask does not match the decoder rows")
+         return compact_masks[rows]
++    return None
++
++
++def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | None:
++    """Rows to route this step (False pads the batch), computed once per layout."""
++    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
++        return None
++    context = get_forward_context()
++    ced = _ced_routing_mask(context, rows, ced_decoder)
++    if ced is not None:
++        return ced
+     is_padding = context.is_padding
+     if is_padding is None:
+         return None
+@@ -86,6 +94,22 @@ def _routing_mask(rows: int, *, ced_decoder: bool = False) -> torch.Tensor | Non
+     return cached[1][:rows]
+ 
+ 
++def _partials_mask(
++    rows: int, *, ced_decoder: bool = False
++) -> tuple[torch.Tensor | None, bool]:
++    """``route_partials``' mask of this step's rows and whether it is the padding
++    mask itself (a set row is skipped; nothing negates it) or a CED decoder's
++    routing mask (a clear row is skipped)."""
++    if not envs.VLLM_MOE_SKIP_PADDING or not is_forward_context_available():
++        return None, False
++    context = get_forward_context()
++    ced = _ced_routing_mask(context, rows, ced_decoder)
++    if ced is not None:
++        return ced, False
++    is_padding = context.is_padding
++    return (None, False) if is_padding is None else (is_padding[:rows], True)
++
++
+ def _routing_mask_variants(vllm_config) -> tuple[bool, ...]:
+     """Whether ``_routing_mask`` can return a mask (True) or None (False).
+ 
+@@ -218,9 +242,18 @@ def route_partials(
+     image_mask: bool,
+     routing_mask: bool,
+     warps: int = 2,
++    image_ids: str | None = None,
++    image_lo: int = 0,
++    image_count: int = 0,
++    padding: bool = False,
+ ):
+     """Sum a gate's split-K partials in shard order and route each token.
+ 
++    With ``image_ids`` (their dtype), the image tokens come from the step's input
++    ids, ``image_lo <= id < image_lo + image_count``, which torch compared once a
++    forward; with ``padding``, ``route_mask`` is the step's padding mask (a row it
++    sets is skipped), which torch negated once a forward.
++
+     The routing is TileKernels' ``moe_topk_gate_forward`` for sqrtsoftplus
+     with a correction bias: the same scores, selection order and weights. Its
+     inputs are the partials ``P[shards, rows, experts]``, added from shard 0
+@@ -231,15 +264,16 @@ def route_partials(
+     """
+     assert num_topk <= _WARP and num_experts % _VECTOR == 0
+     per_lane = tilelang.cdiv(tilelang.cdiv(num_experts, _WARP), _VECTOR) * _VECTOR
+-    rows = T.dynamic("rows")
++    rows, image_len, mask_len = T.dynamic("rows, image_len, mask_len")
++    image_dtype = image_ids if image_ids is not None else T.bool
+ 
+     @T.prim_func
+     def router_partials(
+         P: T.Tensor((shards, rows, num_experts), T.float32),
+         bias: T.Tensor((num_experts,), T.float32),
+         image_bias: T.Tensor((num_experts,), T.float32),
+-        image_token_mask: T.Tensor((rows,), T.bool),
+-        route_mask: T.Tensor((rows,), T.bool),
++        image_token_mask: T.Tensor((image_len,), image_dtype),
++        route_mask: T.Tensor((mask_len,), T.bool),
+         topk_idx: T.Tensor((rows, num_topk), T.int64),
+         topk_weights: T.Tensor((rows, num_topk), T.float32),
+         routed_scaling_factor: T.float32,
+@@ -251,7 +285,7 @@ def route_partials(
+             lane = thread % _WARP
+             if row >= rows:
+                 T.thread_return()
+-            if routing_mask and not route_mask[row]:
++            if routing_mask and route_mask[row] == padding:
+                 if lane < num_topk:
+                     topk_idx[row, lane] = -1
+                     topk_weights[row, lane] = 0.0
+@@ -269,7 +303,14 @@ def route_partials(
+             chosen_score = T.alloc_var(T.float32)
+             total = T.alloc_var(T.float32)
+             is_image = T.alloc_var(T.bool)
+-            is_image = image_token_mask[row] if image_mask else False
++            if image_mask and image_ids is not None:
++                is_image = (image_token_mask[row] >= image_lo) & (
++                    image_token_mask[row] < image_lo + image_count
++                )
++            elif image_mask:
++                is_image = image_token_mask[row]
++            else:
++                is_image = False
+ 
+             T.fill(ids, -1)
+             T.fill(scores, -T.infinity(T.float32))
+@@ -354,7 +395,7 @@ class TileLangGateRouter(TileKernelsRouter):
+     def __init__(self, *args, gate: torch.nn.Module, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.gate = gate
+-        self._kernels: dict[tuple[bool, bool], object] = {}
++        self._kernels: dict[tuple, object] = {}
+         # Text-only layers pass no image tokens; one all-false mask serves them.
+         self._no_image = None
+         vllm_config = get_current_vllm_config_or_none()
+@@ -367,24 +408,40 @@ class TileLangGateRouter(TileKernelsRouter):
+         )
+         self._mask_variants = _routing_mask_variants(vllm_config)
+ 
+-    def _partials_kernels(self) -> dict[tuple[bool, bool], prepare.TileLangCall]:
+-        """``route_partials`` for each (image, routing mask) a decode step can pass,
+-        keyed as ``_compute_routing`` looks it up; none when the gate does not
+-        split."""
++    def _partials_kernels(self) -> dict[tuple, prepare.TileLangCall]:
++        """``route_partials`` for each (input ids' dtype, routing mask) a decode
++        step can pass, keyed as ``_compute_routing`` looks it up; none when the
++        gate does not split. A vision layer reads its image tokens from the input
++        ids (the runner's int32, or int64); the mask is the step's padding mask,
++        a CED decoder layer's routing mask, or none."""
+         gate = self.gate
+         if gate.tilelang_shards == 1:
+             return {}
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
++        ids = ("int32", "int64") if image else (None,)
++        masks = []
++        for mask in self._mask_variants:
++            if not mask:
++                masks.append(None)
++                continue
++            masks.append("padding")
++            if getattr(self, "_ds41_is_ced_decoder", False):
++                masks.append("route")
+         return {
+-            (image, mask): prepare.call(
++            (ids_dtype, mask): prepare.call(
+                 route_partials,
+                 self.top_k,
+                 gate.weight.shape[0],
+                 gate.tilelang_shards,
+                 image,
+-                mask,
++                mask is not None,
++                image_ids=ids_dtype,
++                image_lo=self.image_sentinel_lo if image else 0,
++                image_count=self.image_sentinel_count if image else 0,
++                padding=mask == "padding",
+             )
+-            for mask in self._mask_variants
++            for ids_dtype in ids
++            for mask in masks
+         }
+ 
+     def _warm(self) -> None:
+@@ -441,41 +498,44 @@ class TileLangGateRouter(TileKernelsRouter):
+         image = self.bias_vl is not None and self.image_sentinel_lo > 0
+         if image and input_ids is None:
+             raise ValueError("DeepSeek V4.1 vision routing requires input_ids")
+-        route_mask = _routing_mask(
++        route_mask, padding = _partials_mask(
+             x.shape[0],
+             ced_decoder=getattr(self, "_ds41_is_ced_decoder", False),
+         )
+-        key = (image, route_mask is not None)
++        key = (
++            {torch.int32: "int32", torch.int64: "int64"}[input_ids.dtype]
++            if image
++            else None,
++            None if route_mask is None else "padding" if padding else "route",
++        )
+         rows = x.shape[0]
+         topk_ids = torch.empty(rows, self.top_k, dtype=torch.int64, device=x.device)
+         topk_weights = torch.empty(
+             rows, self.top_k, dtype=torch.float32, device=x.device
+         )
+         bias = self.e_score_correction_bias.data
+-        if image:
+-            image_bias = self.bias_vl.data
+-            mask = _image_token_mask(
+-                input_ids, self.image_sentinel_lo, self.image_sentinel_count
++        if (
++            self._no_image is None
++            or self._no_image.device != x.device
++            or self._no_image.numel() < rows
++        ):
++            # Every row count this fused path takes: the gate's split rows.
++            self._no_image = torch.zeros(
++                max(rows, gate.tilelang_split_rows),
++                dtype=torch.bool,
++                device=x.device,
+             )
+-        else:
+-            if (
+-                self._no_image is None
+-                or self._no_image.device != x.device
+-                or self._no_image.numel() < rows
+-            ):
+-                # Every row count this fused path takes: the gate's split rows.
+-                self._no_image = torch.zeros(
+-                    max(rows, gate.tilelang_split_rows),
+-                    dtype=torch.bool,
+-                    device=x.device,
+-                )
+-            image_bias, mask = bias, self._no_image[:rows]
++        # A vision layer's kernel compares the ids with the sentinels itself; a
++        # text layer's, and an absent routing mask, read nothing of these rows.
++        image_bias, mask = (
++            (self.bias_vl.data, input_ids) if image else (bias, self._no_image[:rows])
++        )
+         self._kernels[key](
+             partials,
+             bias,
+             image_bias,
+             mask,
+-            route_mask if route_mask is not None else mask,
++            route_mask if route_mask is not None else self._no_image[:rows],
+             topk_ids,
+             topk_weights,
+             self.routed_scaling_factor,

@@ -1,0 +1,313 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:11:16 +0200
+Subject: [PATCH 415/488] [DS4.1] Adaptive verification's offsets in one
+ TileLang kernel
+
+reallocate_drafts launched five torch kernels for its offsets (two zeroes,
+two add+cumsum pairs, the query_start_loc tail fill) plus a capacities
+reset on a step without drafts. One block now scans both prefix sums in
+shared memory, 256 requests a pass, writes the tail, and zeroes the
+capacities when the step has no drafts. Tested bit for bit against the
+torch chain across the scan's pass boundaries.
+---
+ .../benchmark_runner_inputs_tilelang.py       |  24 ++++
+ tests/v1/worker/test_gpu_tilelang_inputs.py   |  47 ++++++++
+ vllm/v1/worker/gpu/model_runner.py            |   4 +
+ .../gpu/spec_decode/adaptive_verification.py  |  27 ++---
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 114 ++++++++++++++++++
+ 5 files changed, 201 insertions(+), 15 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+index 64f455b63..709655673 100644
+--- a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
++++ b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+@@ -356,6 +356,29 @@ def case_expand_idx_mapping(gen, num_reqs, prefill, widths):
+     return triton_call, tilelang_call
+ 
+ 
++def case_adaptive_offsets(gen, num_reqs, prefill, widths):
++    """Adaptive verification's offsets: before the port, five torch launches
++    (two zeroes, two adds and cumsums, the tail fill)."""
++    reqs = 1 if prefill else num_reqs
++    capacities = _randint(0, ROWS, (MAX_REQS,), gen)[:reqs]
++    non_draft = _randint(1, 2, (MAX_REQS,), gen)[:reqs]
++    cu = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
++    starts = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
++    tokens = reqs * ROWS
++
++    def torch_call():
++        cu[:1].zero_()
++        torch.cumsum(capacities + 1, dim=0, out=cu[1 : reqs + 1])
++        starts[:1].zero_()
++        torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : reqs + 1])
++        starts[reqs + 1 :].fill_(tokens)
++
++    def tilelang_call():
++        tli.adaptive_offsets(capacities, non_draft, cu, starts, 1, tokens, True)
++
++    return torch_call, tilelang_call
++
++
+ def case_post_update(gen, num_reqs, prefill, widths):
+     """The commit of a verified step (up to 1 + 5 tokens a request), or of a
+     prefill chunk's one sampled token. Repeated calls keep committing: both
+@@ -474,6 +497,7 @@ CASES = {
+     "combine_sampled_and_draft_tokens": case_combine,
+     "combine_sampled_and_draft_tokens (dead rows)": case_combine_dead_rows,
+     "expand_idx_mapping": case_expand_idx_mapping,
++    "adaptive_offsets": case_adaptive_offsets,
+     "post_update": case_post_update,
+     "prepare_dflash_inputs": case_prepare_dflash_inputs,
+     "gather_lookback": case_gather_lookback,
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 031b4fb19..471ec603c 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -653,6 +653,53 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
+     assert torch.equal(ref_pos, ours_pos)
+ 
+ 
++def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
++    """reallocate_drafts' torch chain before the port."""
++    num_reqs = capacities.shape[0]
++    if not drafted:
++        capacities.zero_()
++    cu[:1].zero_()
++    torch.cumsum(capacities + bonus, dim=0, out=cu[1 : num_reqs + 1])
++    starts[:1].zero_()
++    torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : num_reqs + 1])
++    starts[num_reqs + 1 :].fill_(tokens)
++
++
++# The batch's request counts, and counts at and across the scan's 256-request passes.
++@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:] + (255, 256, 257, 600))
++@pytest.mark.parametrize("drafted", [True, False])
++def test_adaptive_offsets(num_reqs, drafted):
++    """reallocate_drafts' offsets: both prefix sums, query_start_loc's tail and, on a
++    step without drafts, the zeroed capacities, in buffers longer than the batch."""
++    gen = _gen(num_reqs + 17)
++    size = num_reqs + 7
++    capacities = _randint(0, DRAFTS + 1, (size,), gen)
++    non_draft = _randint(0, MAX_TOKENS, (size,), gen)
++    cu = _garbage((size + 1,), torch.int32, gen)
++    starts = _garbage((size + 1,), torch.int32, gen)
++    bonus, tokens = 1, int(_randint(0, 1 << 20, (1,), gen))
++    results = []
++    for kind in ("ref", "ours"):
++        buffers = [capacities.clone(), cu.clone(), starts.clone()]
++        args = (
++            buffers[0][:num_reqs],
++            non_draft[:num_reqs],
++            buffers[1],
++            buffers[2],
++            bonus,
++            tokens,
++            drafted,
++        )
++        if kind == "ref":
++            _adaptive_offsets_ref(*args)
++        else:
++            tli.adaptive_offsets(*args)
++        results.append(buffers)
++    torch.accelerator.synchronize()
++    for r, o in zip(*results):
++        assert torch.equal(r, o)
++
++
+ def _post_update_case(num_reqs, width, gen, vocab=64):
+     idx = _idx(num_reqs, gen)
+     if num_reqs > 2:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index fd8a3d234..1abab77eb 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2116,6 +2116,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             + ((self.num_speculative_steps + 1,) if self.num_speculative_steps else ()),
+             commits=commits,
+         )
++        if self.adaptive_verification is not None:
++            from vllm.v1.worker.gpu import tilelang_inputs
++
++            tilelang_inputs.declare(tilelang_inputs.adaptive_offsets_calls)
+         self.req_states.register_warmups()
+         if not samples:
+             return
+diff --git a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+index 5506e8630..469612c42 100644
+--- a/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/adaptive_verification.py
+@@ -16,6 +16,7 @@ from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.attention.backend import AttentionCGSupport
+ from vllm.v1.utils import CpuGpuBuffer
++from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.async_utils import stream
+ from vllm.v1.worker.gpu.attn_utils import (
+     get_attn_cg_support,
+@@ -406,9 +407,7 @@ class AdaptiveVerificationManager:
+         # capacities enters holding each request's valid draft count (the kernel
+         # uses it to bound eligible slots) and leaves holding the admitted count.
+         capacities = self._batch_draft_capacity[:num_reqs]
+-        if draft_budget == 0:
+-            capacities.zero_()
+-        else:
++        if draft_budget:
+             async_tensor_h2d(scheduled_drafts, out=capacities)
+             if draft_budget < int(scheduled_drafts.sum()):
+                 _assign_draft_token_budget(
+@@ -421,19 +420,17 @@ class AdaptiveVerificationManager:
+ 
+         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
+-        self._cu_num_logits[:1].zero_()
+-        torch.cumsum(
+-            capacities + self.num_bonus_tokens,
+-            dim=0,
+-            out=self._cu_num_logits[1 : num_reqs + 1],
+-        )
+-        self.query_start_loc[:1].zero_()
+-        torch.cumsum(
+-            capacities + num_non_draft_tokens_gpu,
+-            dim=0,
+-            out=self.query_start_loc[1 : num_reqs + 1],
++        # Both prefix sums and query_start_loc's tail in one kernel, which zeroes
++        # capacities on a step without drafts.
++        tilelang_inputs.adaptive_offsets(
++            capacities,
++            num_non_draft_tokens_gpu,
++            self._cu_num_logits,
++            self.query_start_loc,
++            self.num_bonus_tokens,
++            num_tokens,
++            drafted=draft_budget > 0,
+         )
+-        self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
+         return (
+             self._cu_num_logits[: num_reqs + 1],
+             self.query_start_loc,
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 3b6799018..64b3dbf3d 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -565,6 +565,120 @@ def zero_kv_blocks(
+     )
+ 
+ 
++# --- Adaptive verification's offsets ------------------------------------------
++
++_SCAN = 256  # requests a pass of the offsets' scan
++
++
++@T.macro
++def _scan_step(a, b, tx, offset):
++    """One Hillis-Steele step of two inclusive scans in shared memory."""
++    left_a = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, a[tx - offset], 0))
++    left_b = T.alloc_var(T.int32, init=T.if_then_else(tx >= offset, b[tx - offset], 0))
++    T.sync_threads()
++    a[tx] = a[tx] + left_a
++    b[tx] = b[tx] + left_b
++    T.sync_threads()
++
++
++@tilelang.jit(pass_configs=_PASS)
++def adaptive_offsets_kernel():
++    """``AdaptiveVerificationManager.reallocate_drafts``' offsets in one block, the
++    torch chain's values: ``cu_num_logits = [0, cumsum(capacities + bonus)]``,
++    ``query_start_loc = [0, cumsum(capacities + non_draft)]``, and every later entry
++    of ``query_start_loc`` ``num_tokens``. A step without drafts (``drafted`` 0)
++    zeroes ``capacities`` first. The scans take 256 requests a pass, each pass
++    carrying the last one's totals."""
++    num_reqs, non_draft_len, cu_len, starts_len = T.dynamic(
++        "num_reqs, non_draft_len, cu_len, starts_len"
++    )
++
++    @T.prim_func
++    def adaptive_offsets(
++        capacities: T.Tensor((num_reqs,), T.int32),
++        non_draft: T.Tensor((non_draft_len,), T.int32),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        query_start_loc: T.Tensor((starts_len,), T.int32),
++        bonus: T.int32,
++        num_tokens: T.int32,
++        drafted: T.int32,
++    ):
++        with T.Kernel(1, threads=_SCAN):
++            tx = T.get_thread_binding()
++            a = T.alloc_shared((_SCAN,), T.int32)
++            b = T.alloc_shared((_SCAN,), T.int32)
++            carry_a = T.alloc_var(T.int32, init=0)
++            carry_b = T.alloc_var(T.int32, init=0)
++            if tx == 0:
++                cu_num_logits[0] = 0
++                query_start_loc[0] = 0
++            for chunk in T.serial(T.ceildiv(num_reqs, _SCAN)):
++                req = chunk * _SCAN + tx
++                inside = req < num_reqs
++                capacity = T.alloc_var(
++                    T.int32,
++                    init=T.if_then_else(
++                        inside & (drafted != 0),
++                        capacities[T.min(req, num_reqs - 1)],
++                        0,
++                    ),
++                )
++                if inside & (drafted == 0):
++                    capacities[req] = 0
++                a[tx] = T.if_then_else(inside, capacity + bonus, 0)
++                b[tx] = T.if_then_else(
++                    inside, capacity + non_draft[T.min(req, num_reqs - 1)], 0
++                )
++                T.sync_threads()
++                _scan_step(a, b, tx, 1)
++                _scan_step(a, b, tx, 2)
++                _scan_step(a, b, tx, 4)
++                _scan_step(a, b, tx, 8)
++                _scan_step(a, b, tx, 16)
++                _scan_step(a, b, tx, 32)
++                _scan_step(a, b, tx, 64)
++                _scan_step(a, b, tx, 128)
++                if inside:
++                    cu_num_logits[req + 1] = carry_a + a[tx]
++                    query_start_loc[req + 1] = carry_b + b[tx]
++                carry_a = carry_a + a[_SCAN - 1]
++                carry_b = carry_b + b[_SCAN - 1]
++                T.sync_threads()
++            for chunk in T.serial(T.ceildiv(starts_len, _SCAN)):
++                index = chunk * _SCAN + tx
++                if (index > num_reqs) & (index < starts_len):
++                    query_start_loc[index] = num_tokens
++
++    return adaptive_offsets
++
++
++def adaptive_offsets(
++    capacities: torch.Tensor,
++    non_draft: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    bonus: int,
++    num_tokens: int,
++    drafted: bool,
++) -> None:
++    """``reallocate_drafts``' launch: ``cu_num_logits[: n + 1]`` and all of
++    ``query_start_loc`` for the ``n`` requests of ``capacities``, which a step
++    without drafts zeroes."""
++    _kernel(adaptive_offsets_kernel)(
++        capacities,
++        non_draft,
++        cu_num_logits,
++        query_start_loc,
++        bonus,
++        num_tokens,
++        int(drafted),
++    )
++
++
++def adaptive_offsets_calls() -> list:
++    return [_call(adaptive_offsets_kernel)]
++
++
+ # --- Step inputs --------------------------------------------------------------
+ 
+ 

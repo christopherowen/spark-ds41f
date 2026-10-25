@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 17:40:49 +0200
+Subject: [PATCH 365/488] V2 runner sampling: int32 positions draw as Triton's
+ do
+
+Triton's tl.randint takes an int32 position as the Philox offset's only word
+and adds the draft salt in 32 bits; the TileLang Gumbel sampler and sink
+candidates required int64 positions, and the rejection sampler's unbiasedness
+test draws its proposals with int32 ones. The positions' dtype is part of both
+kernels' keys (int64 in serving, as declared), and the uncached sampler's
+placeholder column no longer borrows the positions.
+---
+ tests/v1/worker/test_gpu_tilelang_sampling.py | 50 ++++++++++++++++-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 55 +++++++++++++------
+ 2 files changed, 86 insertions(+), 19 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index 9cc0be91b..5b9a2e8fb 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -227,6 +227,7 @@ def _gumbel_both(
+                 None if col is None else col.dtype,
+                 col is not None and col.dim() > 0,
+                 tls._triton_run(logits),
++                pos.dtype,
+             )
+             tls._kernel(tls.gumbel_sample_kernel, *key)(
+                 argmax,
+@@ -237,7 +238,7 @@ def _gumbel_both(
+                 pos,
+                 temperature,
+                 best.unsqueeze(1) if cache is None else cache_copy,
+-                pos if col is None else col.view(-1),
++                argmax.view(-1) if col is None else col.view(-1),
+             )
+         else:
+             gumbel._gumbel_sample_kernel[(tokens, blocks)](
+@@ -313,6 +314,37 @@ def test_gumbel_sample(
+     _assert_same(ours, theirs, "sampled tokens")
+ 
+ 
++def _int32_positions(pos: torch.Tensor) -> torch.Tensor:
++    """``pos`` as int32 positions, two of them where the draft salt (2**30) reaches
++    and passes 2**31 in 32 bits."""
++    pos = (pos % (1 << 30)).to(torch.int32)
++    pos[1] = (1 << 30) - 1
++    pos[2] = (1 << 31) - 5
++    return pos
++
++
++@pytest.mark.parametrize(
++    "apply_temperature,is_drafting", [(False, False), (True, False), (True, True)]
++)
++def test_gumbel_sample_int32_positions(apply_temperature, is_drafting):
++    """Triton takes an int32 position as the Philox offset's only word and salts a
++    draft's in 32 bits."""
++    tokens, slots, vocab = 37, 48, 5000
++    logits = _logits(tokens, vocab, torch.float32, "special", 5)
++    mapping, temperature, seeds, pos = _sampling_inputs(tokens, slots, "mixed", 5)
++    pos = _int32_positions(pos)
++    (a, b, _), (c, d, _) = _gumbel_both(
++        logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
++    )
++    _assert_same(a, c, "block argmax")
++    _assert_same(b, d, "block maximum")
++    ours = tls.gumbel_sample(
++        logits, mapping, temperature, seeds, pos, apply_temperature, is_drafting
++    )
++    theirs = c.gather(dim=-1, index=d.argmax(dim=-1, keepdim=True)).view(-1)
++    _assert_same(ours, theirs, "sampled tokens")
++
++
+ @pytest.mark.parametrize("col_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize("per_token", [False, True])
+ @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float32])
+@@ -401,6 +433,20 @@ def _batch(counts, sampled_width, slots, seed):
+ @pytest.mark.parametrize("mask_rejected_draft", [True, False])
+ def test_sink_candidates(
+     dtype, vocab, stride, case, num_candidates, mask_rejected_draft
++):
++    _check_sink_candidates(
++        dtype, vocab, stride, case, num_candidates, mask_rejected_draft, torch.int64
++    )
++
++
++def test_sink_candidates_int32_positions():
++    _check_sink_candidates(
++        torch.bfloat16, VOCAB, STRIDES[0], CASES[0], 4, True, torch.int32
++    )
++
++
++def _check_sink_candidates(
++    dtype, vocab, stride, case, num_candidates, mask_rejected_draft, pos_dtype
+ ):
+     counts = [6, 1, 6, 3, 6, 2, 6, 6, 1, 4, 6]
+     width, slots = 6, 16
+@@ -409,6 +455,8 @@ def test_sink_candidates(
+     logits = _logits(rows, _stride(vocab, stride), dtype, case, 2)
+     _, temperature, seeds, _ = _sampling_inputs(len(counts), slots, "mixed", 2)
+     pos = torch.randint(0, 1 << 20, (rows,), device=DEVICE)
++    if pos_dtype == torch.int32:
++        pos = _int32_positions(pos)
+     ours = tls.sink_candidates(
+         logits,
+         vocab,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 67147a56e..b625e1122 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -99,6 +99,14 @@ __device__ __forceinline__ unsigned int vllm_randint64(long long seed,
+                      (unsigned int)key, (unsigned int)(key >> 32));
+ }
+ 
++// tl.randint(seed, offset) for an int64 seed and an int32 offset: Triton gives a
++// 32-bit offset no high word.
++__device__ __forceinline__ unsigned int vllm_randint64_offset32(long long seed,
++                                                               unsigned int offset) {
++  const unsigned long long key = (unsigned long long)seed;
++  return vllm_philox(offset, 0u, 0u, 0u, (unsigned int)key, (unsigned int)(key >> 32));
++}
++
+ // tl.randint(seed, offset) for a uint32 seed (tl.randint's own result, widened
+ // with zeros) and an int32 offset (no high word).
+ __device__ __forceinline__ unsigned int vllm_randint32(unsigned int seed, int offset) {
+@@ -360,6 +368,19 @@ def _block_argmax(best, best_index, other, other_index, partial, partial_index,
+ # --- Gumbel-max sampling ------------------------------------------------------
+ 
+ 
++def _randint_at(seed, position, pos_dtype: str, salted: bool):
++    """``tl.randint(seed, position)`` (``position + _DRAFT_NOISE_SALT`` when
++    ``salted``) for an int64 seed and a position of ``pos_dtype``: an int64 offset
++    gives its two words, an int32 one its own word, the salt added in 32 bits."""
++    if pos_dtype == "int64":
++        offset = position + T.int64(_DRAFT_NOISE_SALT) if salted else position
++        return T.call_extern("uint32", "vllm_randint64", seed, offset)
++    word = T.cast(position, "uint32")
++    if salted:
++        word = word + T.uint32(_DRAFT_NOISE_SALT)
++    return T.call_extern("uint32", "vllm_randint64_offset32", seed, word)
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def gumbel_sample_kernel(
+     logits_dtype: str,
+@@ -370,13 +391,16 @@ def gumbel_sample_kernel(
+     col_dtype: str | None,
+     per_token_col: bool,
+     run: int,
++    pos_dtype: str = "int64",
+ ):
+     """``gumbel._gumbel_sample_kernel``: one block of 128 threads per
+     ``(token, vocabulary block of 1024)``; each block's argmax index (global, int64)
+     and score, a thread's elements in runs of ``run`` (``_triton_run``). With a
+     logits cache (``cache_dtype``), the logits before the temperature are stored at
+     the step's column (``col_dtype``, one per token with ``per_token_col``) and the
+-    seed takes the column in its high word."""
++    seed takes the column in its high word. Positions of ``pos_dtype`` place the
++    draw as Triton's ``tl.randint`` does: an int32 position (salted in 32 bits when
++    drafting) is the offset's only word."""
+     tokens, vocab, blocks = T.dynamic("tokens, vocab, blocks")
+     # Inputs may be longer than the batch: each has its own length.
+     idx_len, pos_len, seed_len, temp_len = T.dynamic(
+@@ -403,7 +427,7 @@ def gumbel_sample_kernel(
+         logits: T.StridedTensor((tokens, vocab), (logits_stride, 1), logits_dtype),
+         idx_mapping: T.Tensor((idx_len,), idx_dtype),
+         seeds: T.Tensor((seed_len,), T.int64),
+-        pos: T.Tensor((pos_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
+         temperature: T.Tensor((temp_len,), T.float32),
+         cache: T.StridedTensor(
+             (cache_reqs, cache_cols, cache_vocab),
+@@ -445,17 +469,7 @@ def gumbel_sample_kernel(
+                     col[0] = T.cast(cache_col[0], T.int64)
+                 # gumbel.spec_step_seed
+                 seed[0] = seed[0] ^ T.shift_left(col[0], T.int64(32))
+-            if is_drafting:
+-                word_seed[0] = T.call_extern(
+-                    "uint32",
+-                    "vllm_randint64",
+-                    seed[0],
+-                    pos[t] + T.int64(_DRAFT_NOISE_SALT),
+-                )
+-            else:
+-                word_seed[0] = T.call_extern(
+-                    "uint32", "vllm_randint64", seed[0], pos[t]
+-                )
++            word_seed[0] = _randint_at(seed[0], pos[t], pos_dtype, is_drafting)
+             for r in T.unroll(_PASSES // run):
+                 col0 = blk * GUMBEL_BLOCK + r * (_THREADS * run) + run * tx
+                 _load_run(logits, raw, t, col0, vocab, run)
+@@ -509,6 +523,7 @@ def gumbel_sample_key(
+     col_dtype: torch.dtype | None = None,
+     per_token_col: bool = False,
+     run: int = 1,
++    pos_dtype: torch.dtype = torch.int64,
+ ) -> tuple:
+     cached = cache_dtype is not None
+     return (
+@@ -520,6 +535,7 @@ def gumbel_sample_key(
+         _DTYPES[col_dtype] if cached else None,
+         per_token_col and cached,
+         run,
++        _DTYPES[pos_dtype],
+     )
+ 
+ 
+@@ -566,6 +582,7 @@ def gumbel_sample(
+                 logits_cache_col.dtype if cached else None,
+                 per_token_col,
+                 _triton_run(logits),
++                pos.dtype,
+             ),
+         )
+         kernel(
+@@ -578,7 +595,7 @@ def gumbel_sample(
+             temperature,
+             # Placeholders of the declared types when there is no cache.
+             logits_cache if cached else local_max.unsqueeze(1),
+-            logits_cache_col.view(-1) if cached else pos,
++            logits_cache_col.view(-1) if cached else local_argmax.view(-1),
+         )
+     # NOTE(woosuk): Use int64 for later indexing.
+     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+@@ -598,6 +615,7 @@ def sink_candidates_kernel(
+     num_candidates: int,
+     mask_rejected_draft: bool,
+     run: int,
++    pos_dtype: str = "int64",
+ ):
+     """``sink._sink_candidates_kernel``: one block of 128 threads per ``(request,
+     vocabulary block of 1024)``, a thread's elements in runs of ``run``
+@@ -631,7 +649,7 @@ def sink_candidates_kernel(
+         idx_mapping: T.Tensor((idx_len,), idx_dtype),
+         temperature: T.Tensor((temp_len,), T.float32),
+         seeds: T.Tensor((seed_len,), T.int64),
+-        pos: T.Tensor((pos_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
+     ):
+         with T.Kernel(
+             reqs, T.ceildiv(vocab, SINK_CANDIDATE_BLOCK), threads=_THREADS
+@@ -676,9 +694,7 @@ def sink_candidates_kernel(
+                         & (temp[0] != T.float32(0))
+                     ):
+                         rejected[0] = 1
+-            word_seed[0] = T.call_extern(
+-                "uint32", "vllm_randint64", seeds[state[0]], pos[row[0]]
+-            )
++            word_seed[0] = _randint_at(seeds[state[0]], pos[row[0]], pos_dtype, False)
+             for r in T.unroll(_PASSES // run):
+                 col0 = blk * SINK_CANDIDATE_BLOCK + r * (_THREADS * run) + run * tx
+                 _load_run(logits, raw, row[0], col0, vocab, run)
+@@ -726,6 +742,7 @@ def sink_candidates_key(
+     num_candidates: int,
+     mask_rejected_draft: bool,
+     run: int = 1,
++    pos_dtype: torch.dtype = torch.int64,
+ ) -> tuple:
+     return (
+         _DTYPES[logits_dtype],
+@@ -733,6 +750,7 @@ def sink_candidates_key(
+         num_candidates,
+         mask_rejected_draft,
+         run,
++        _DTYPES[pos_dtype],
+     )
+ 
+ 
+@@ -767,6 +785,7 @@ def sink_candidates(
+                 num_candidates,
+                 mask_rejected_draft,
+                 _triton_run(logits),
++                pos.dtype,
+             ),
+         )
+         kernel(

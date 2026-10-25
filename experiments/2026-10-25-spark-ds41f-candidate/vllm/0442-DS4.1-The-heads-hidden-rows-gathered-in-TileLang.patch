@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:34:47 +0200
+Subject: [PATCH 442/488] [DS4.1] The heads' hidden rows gathered in TileLang
+
+The target's logits rows (hidden_states[logits_indices]) and the
+drafter's sample rows (head_hidden[sample_indices]) were torch index
+kernels every step. Both go through the CED decoder's TileLang row copy
+(packed rows in 16-byte pieces), declared for each model's hidden width.
+Tested against torch's indexing.
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py   | 21 +++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py            | 13 +++++++++--
+ .../gpu/spec_decode/dspark/speculator.py      | 14 +++++++++--
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 23 +++++++++++++++++++
+ 4 files changed, 67 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index c4e69232d..a2f039066 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -653,6 +653,27 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
+     assert torch.equal(ref_pos, ours_pos)
+ 
+ 
++@pytest.mark.parametrize("num_rows", [1, 6, 96, 1000])
++@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
++def test_gather_hidden_rows(num_rows, index_dtype):
++    """The hidden rows the heads project, against torch's indexing: repeated rows,
++    any order, a dummy batch's int32 indices."""
++    gen = _gen(num_rows + 9)
++    hidden = torch.randn(MAX_TOKENS // 8, 5120, generator=gen, device=DEVICE)
++    hidden = hidden.to(torch.bfloat16)
++    indices = _randint(0, hidden.shape[0], (num_rows,), gen, index_dtype)
++    if num_rows > 1:
++        indices[1] = indices[0]
++    out = tli.gather_hidden_rows(hidden, indices)
++    torch.accelerator.synchronize()
++    assert torch.equal(out.view(torch.int16), hidden[indices].view(torch.int16))
++    # The launch's key (CED's, from the source layout) is the declared one.
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    ((_, declared, _),) = tli.gather_hidden_rows_calls(torch.bfloat16, 5120)
++    assert declared == ced.copy_rows_key("bfloat16", (5120,), (1,), 5120, False)
++
++
+ @pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
+ @pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+ def test_logits_rows(num_logits, index_dtype):
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 11bf55a4c..b95b2e30a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1158,7 +1158,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.step_timing.drafter_end()
+ 
+         assert hidden_states is not None  # Last PP rank always has hidden_states
+-        sample_hidden_states = hidden_states[input_batch.logits_indices]
++        sample_hidden_states = tilelang_inputs.gather_hidden_rows(
++            hidden_states, input_batch.logits_indices
++        )
+         return hidden_states, sample_hidden_states
+ 
+     @torch.inference_mode()
+@@ -1954,7 +1956,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             logits = all_to_all_logits(local_logits, shard_metadata)
+             logits = logits[:, : self.vocab_size]
+         else:
+-            sample_hidden_states = hidden_states[input_batch.logits_indices]
++            sample_hidden_states = tilelang_inputs.gather_hidden_rows(
++                hidden_states, input_batch.logits_indices
++            )
+             if self._verifies_greedily(input_batch, grammar_output):
+                 output = self._verify_greedily(
+                     sample_hidden_states, input_batch, sink_flags
+@@ -2146,6 +2150,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return
+         assert self.sampler is not None
+         register_input_batch_warmups(dead_rows=dead_rows)
++        # The hidden rows the LM head projects (gather_hidden_rows).
++        hidden_size = self.model_config.get_hidden_size()
++        tilelang_inputs.declare(
++            lambda: tilelang_inputs.gather_hidden_rows_calls(self.dtype, hidden_size)
++        )
+         # The logits rows' inputs (InputBatch.logits_rows): a step's logits
+         # indices are int64, a dummy batch's int32.
+         tilelang_inputs.declare(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 1ea566194..af71df562 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -35,6 +35,7 @@ from vllm.distributed import (
+     tensor_model_parallel_all_gather,
+ )
+ from vllm.logger import init_logger
++from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+     DFlashSpeculator,
+@@ -283,6 +284,11 @@ class DSparkSpeculator(DFlashSpeculator):
+                 output_stride=self.draft_tokens.stride(0),
+                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
+             )
++        tilelang_inputs.declare(
++            lambda: tilelang_inputs.gather_hidden_rows_calls(
++                self.hidden_states.dtype, self.hidden_states.shape[1]
++            )
++        )
+         table = self._markov_table()
+         if table is not None:
+             from vllm.v1.worker.gpu.sample import tilelang_sampling
+@@ -319,7 +325,9 @@ class DSparkSpeculator(DFlashSpeculator):
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+         # Per-(req, position) head hidden, ordered (req, step).
+-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        sample_hidden = tilelang_inputs.gather_hidden_rows(
++            head_hidden, self.sample_indices[:num_sample]
++        )
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+         vocab_parallel = self._vocab_parallel_greedy(local_head)
+@@ -453,7 +461,9 @@ class DSparkSpeculator(DFlashSpeculator):
+         assert self._draft_topk is not None
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        sample_hidden = tilelang_inputs.gather_hidden_rows(
++            head_hidden, self.sample_indices[:num_sample]
++        )
+         base_logits = self.model.compute_draft_logits(sample_hidden)
+         base_logits = base_logits.view(num_reqs, n_spec, -1)
+         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 8db846a34..c1dd9b310 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -628,6 +628,29 @@ def logits_rows_calls(index_dtype: torch.dtype) -> list:
+     return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
+ 
+ 
++# --- Rows the heads project ------------------------------------------------------
++
++
++def gather_hidden_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
++    """``source[indices]`` for in-range indices: the hidden rows the LM head and the
++    drafter's head project, through the CED decoder's TileLang row copy (packed
++    rows, 16-byte pieces). A dummy batch's int32 indices are widened first."""
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    out = source.new_empty((indices.shape[0], *source.shape[1:]))
++    if out.numel():
++        rows = indices if indices.dtype == torch.int64 else indices.long()
++        ced.copy_rows(source, rows, out, scatter=False)
++    return out
++
++
++def gather_hidden_rows_calls(dtype: torch.dtype, width: int) -> list:
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    key = ced.packed_copy_rows_key(str(dtype).removeprefix("torch."), (width,), False)
++    return [_call(ced.copy_rows_kernel, *key)]
++
++
+ # --- Padding rows -----------------------------------------------------------------
+ 
+ _PADDING_THREADS = 256

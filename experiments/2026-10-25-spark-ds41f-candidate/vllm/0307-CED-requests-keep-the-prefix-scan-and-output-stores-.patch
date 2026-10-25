@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:56:05 +0200
+Subject: [PATCH 307/488] CED requests: keep the prefix scan and output stores
+ in one warp layout
+
+---
+ vllm/models/deepseek_v4_1/tilelang/ced.py | 44 +++++++++++------------
+ 1 file changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index fb3afd9c3..f3c55f539 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -26,32 +26,32 @@ def requests_kernel(max_requests: int):
+         counts: T.Tensor((2,), T.int32),
+         nr: T.int32,
+     ):
+-        with T.Kernel(1, threads=128):
+-            kept = T.alloc_shared((block,), T.int32)
+-            cumulative = T.alloc_shared((block,), T.int32)
++        with T.Kernel(1, threads=32):
++            kept = T.alloc_fragment((block,), T.int32)
++            cumulative = T.alloc_fragment((block,), T.int32)
+             for r in T.Parallel(block):
+                 kept[r] = T.if_then_else(
+                     r < nr, T.min(starts[r + 1] - starts[r], limits[r]), 0
+                 )
+-            T.copy(kept, cumulative)
+-            T.cumsum(cumulative, dim=0)
+-            for r in T.Parallel(max_requests + 1):
+-                out_starts[r] = T.if_then_else(
+-                    r < nr, cumulative[r] - kept[r], cumulative[block - 1]
+-                )
+-            for r in T.Parallel(max_requests):
+-                if r < nr:
+-                    q = starts[r + 1] - starts[r]
+-                    position = T.cast(seq[r], T.int64) - kept[r]
+-                    positions[r] = position
+-                    replay[r] = T.max(
+-                        prefix[r], T.if_then_else(q > kept[r], position, 0)
+-                    )
+-                else:
+-                    positions[r] = -1
+-                    replay[r] = 0
+-            for i in T.Parallel(2):
+-                counts[i] = T.if_then_else(i == 0, cumulative[block - 1], nr)
++            T.cumsum(kept, cumulative, dim=0)
++            for r in T.Parallel(block):
++                if r <= max_requests:
++                    out_starts[r] = cumulative[r] - kept[r]
++                if r < max_requests:
++                    if r < nr:
++                        q = starts[r + 1] - starts[r]
++                        position = T.cast(seq[r], T.int64) - kept[r]
++                        positions[r] = position
++                        replay[r] = T.max(
++                            prefix[r], T.if_then_else(q > kept[r], position, 0)
++                        )
++                    else:
++                        positions[r] = -1
++                        replay[r] = 0
++                if r == block - 1:
++                    counts[0] = cumulative[r]
++                if r == 0:
++                    counts[1] = nr
+ 
+     return ced_requests
+ 

@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 07:48:43 +0100
+Subject: [PATCH 472/488] b12x preparation: no temporary KV cache for a model
+ that declares no unit
+
+The state stage built a temporary KV cache and tore it down whenever b12x
+was installed on SM12x, whether or not any layer had a plan to tune. A
+worker now records when a stage collects a unit of either stage, and only
+then builds the temporary cache. With no unit, the weights, profile,
+state and bind passes find nothing to prepare and open no session.
+---
+ tests/model_executor/test_b12x_warmup.py   | 35 ++++++++++++++++++++++
+ vllm/model_executor/warmup/b12x_prepare.py |  8 +++++
+ vllm/v1/worker/gpu_worker.py               |  2 ++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/tests/model_executor/test_b12x_warmup.py b/tests/model_executor/test_b12x_warmup.py
+index 41dcf611a..2c1395a93 100644
+--- a/tests/model_executor/test_b12x_warmup.py
++++ b/tests/model_executor/test_b12x_warmup.py
+@@ -296,6 +296,7 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
+         model_runner=SimpleNamespace(
+             initialize_kv_cache=lambda c, **kw: initialized.append((c, kw))
+         ),
++        _b12x_units_declared=True,
+     )
+     monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda _: True)
+     assert b12x_prepare.initialize_b12x_tuning_cache(worker, final)
+@@ -310,6 +311,40 @@ def test_tuning_pool_preserves_final_group_layout_with_less_storage(
+         assert after.block_stride == before.block_stride
+ 
+ 
++def test_tuning_pool_is_not_built_for_a_model_that_declared_no_unit(monkeypatch):
++    # A model whose kernels need no preparation (DeepSeek V4.1 under TileLang)
++    # builds no temporary KV cache, so the state stage has nothing to run.
++    initialized = []
++    cache = SimpleNamespace(num_gpu_blocks=None, num_gpu_blocks_override=None)
++    worker = SimpleNamespace(
++        use_v2_model_runner=True,
++        cache_config=cache,
++        model_runner=SimpleNamespace(
++            initialize_kv_cache=lambda c, **kw: initialized.append((c, kw))
++        ),
++    )
++    monkeypatch.setattr(b12x_prepare, "b12x_native_supported", lambda _: True)
++    assert not b12x_prepare.initialize_b12x_tuning_cache(worker, object())
++    assert initialized == []
++    assert cache.num_gpu_blocks is None and cache.num_gpu_blocks_override is None
++    assert not getattr(worker, "_b12x_tuning_cache", False)
++
++
++def test_collection_records_whether_any_unit_was_declared(monkeypatch) -> None:
++    monkeypatch.setattr(b12x_prepare, "b12x_unit_providers", lambda: [])
++    model = torch.nn.Module()
++    model.layer = torch.nn.Module()
++    worker = _worker(model)
++    assert b12x_prepare.collect_b12x_units(worker, _workload("weights")) == []
++    assert b12x_prepare.collect_b12x_units(worker, _workload("state")) == []
++    assert not getattr(worker, "_b12x_units_declared", False)
++
++    # A unit of the other stage counts: the state stage tunes it.
++    model.layer.b12x_preparation_provider = _Provider("state")
++    assert b12x_prepare.collect_b12x_units(worker, _workload("weights")) == []
++    assert worker._b12x_units_declared
++
++
+ @pytest.mark.parametrize("failure", [False, True])
+ def test_tuning_pool_teardown_batches_plan_release_even_on_failure(
+     monkeypatch, failure
+diff --git a/vllm/model_executor/warmup/b12x_prepare.py b/vllm/model_executor/warmup/b12x_prepare.py
+index bc15f4d48..3cf49bd87 100644
+--- a/vllm/model_executor/warmup/b12x_prepare.py
++++ b/vllm/model_executor/warmup/b12x_prepare.py
+@@ -388,6 +388,10 @@ def collect_b12x_units(
+                 replace(unit, workspace_lanes=tuple(sorted({0, lane})))
+                 for unit in hook(provider, workload)
+             )
++    if units:
++        # Only a model that declares units, of either stage, tunes its state
++        # against a temporary cache (initialize_b12x_tuning_cache).
++        worker._b12x_units_declared = True
+     # The state stage also carries the weights-stage units: their prepared
+     # plans are skipped by the session, and any plan a layer declared for a
+     # count that only the state stage exposes is prepared before capture.
+@@ -606,6 +610,10 @@ def initialize_b12x_tuning_cache(worker: Worker, kv_cache_config) -> bool:
+     """Use final cache groups and layout with a small disposable block pool."""
+     if not b12x_native_supported(worker) or not worker.use_v2_model_runner:
+         return False
++    # A model that declared no unit, in its weights stage or against the
++    # profiling pools, has nothing to tune.
++    if not getattr(worker, "_b12x_units_declared", False):
++        return False
+     # HiSparse has a separate shared host-pool lifecycle.
+     if worker.vllm_config.attention_config.hisparse_config is not None:
+         return False
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 2b217d3e9..e1c2d5ec0 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -285,6 +285,8 @@ class Worker(WorkerBase):
+         self._b12x_profile_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_batch: B12xPreparedBatch | None = None
+         self._b12x_tuning_cache = False
++        # Whether a preparation stage collected any unit (collect_b12x_units).
++        self._b12x_units_declared = False
+         # Startup-plan key computed before profiling can rewrite the config.
+         self.startup_plan_fingerprint: str | None = None
+         # Resolved lazily on first sleep/wake; persists worker-process state.

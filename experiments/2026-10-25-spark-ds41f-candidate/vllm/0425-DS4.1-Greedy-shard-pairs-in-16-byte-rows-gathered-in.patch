@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:38:02 +0200
+Subject: [PATCH 425/488] [DS4.1] Greedy shard pairs in 16-byte rows, gathered
+ in place
+
+The drafter's five greedy steps and the all-greedy verification gather
+each rank's (max, index) pair across the vocabulary shards. As [rows, 2]
+FP32 (8-byte rows) they took the one-shot all-gather's padded path: a
+staging copy and a reshape copy around every gather, ten graph kernels a
+decode step and two eager ones. The pairs now sit in the first two
+columns of [rows, 4] rows, which the gather writes straight into the
+concatenated layout; the finish writes at the pairs' row stride and the
+selection reads each rank's pair at its width.
+---
+ tests/v1/worker/test_gpu_tilelang_sampling.py | 35 +++++++++++++++++++
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 33 +++++++++--------
+ .../worker/gpu/spec_decode/dspark/greedy.py   | 17 +++++----
+ .../gpu/spec_decode/dspark/speculator.py      |  8 +++--
+ .../gpu/spec_decode/greedy_verification.py    |  5 +--
+ 5 files changed, 74 insertions(+), 24 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index 05a000450..fae0a304a 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -737,6 +737,41 @@ def test_select_first_argmax(ranks, out_dtype, strided):
+     _assert_same(outs[0], outs[1], "selected index")
+ 
+ 
++@pytest.mark.parametrize("case", CASES)
++def test_greedy_pairs_in_sixteen_byte_rows(case):
++    """The drafter's and the greedy verification's 16-byte pair rows ([rows, 4],
++    which the one-shot all-gather writes in place): the shard pair lands in each
++    row's first two columns, the others untouched, and the selection over the
++    gathered rows equals Triton's over the packed [rows, 2 * ranks] pairs."""
++    rows, vocab, ranks = 13, 32320, 4
++    base = _logits(rows, vocab, torch.bfloat16, case, 6)
++    bias = _logits(rows, vocab, torch.bfloat16, case, 7)
++    packed, wide = [], []
++    for rank in range(ranks):
++        narrow = torch.full((rows, 2), -3.0, device=DEVICE)
++        values, indices = _scratch(rows, vocab)
++        _triton_markov_pair(
++            base.roll(rank, 1), bias, rank * vocab, narrow, values, indices
++        )
++        rows4 = torch.full((rows, 4), -3.0, device=DEVICE)
++        tls.greedy_markov_shard_pair(
++            base.roll(rank, 1), bias, rank * vocab, rows4, values, indices
++        )
++        _assert_same(rows4[:, :2], narrow, "pair")
++        assert (rows4[:, 2:] == -3.0).all()
++        packed.append(narrow)
++        wide.append(rows4)
++    outs = []
++    for fn, pairs, kwargs in (
++        (tls.select_first_argmax, torch.cat(wide, dim=-1), {"pair_width": 4}),
++        (_triton_select, torch.cat(packed, dim=-1), {}),
++    ):
++        out = torch.full((rows,), -2, dtype=torch.int64, device=DEVICE)
++        fn(pairs, out, **kwargs)
++        outs.append(out)
++    _assert_same(outs[0], outs[1], "selected index")
++
++
+ @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+ @pytest.mark.parametrize("case", CASES)
+ def test_sample_greedy_markov(dtype, case):
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 5aa2f540c..fa884bd90 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -1804,9 +1804,10 @@ _FINISH_LANES = (1, 2)
+ @tilelang.jit(pass_configs=_PASS)
+ def finish_argmax_kernel(output: str, per_lane: int = 1):
+     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
+-    maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
+-    ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
+-    out_stride]``), from the parts' scratch, a warp a row. As Triton's, every part
++    maximum and its global index ``+ vocab_start`` as FP32 into ``out[row *
++    out_stride]`` and the element after it) and ``_finish_argmax`` ("int32" /
++    "int64": the index into ``out[row * out_stride]``), from the parts' scratch, a
++    warp a row. As Triton's, every part
+     is loaded before any is combined: lane ``k`` reads parts ``k``, ``k + 32``, ...
+     (``per_lane`` of them, Triton's masked values past ``parts``), then the lanes
+     reduce; the combine is a total order, so the pairing does not matter."""
+@@ -1849,8 +1850,8 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+             _warp_first_argmax(best, best_index, other, other_index)
+             if tx == 0:
+                 if pair:
+-                    out[T.cast(row, T.int64) * 2] = best[0]
+-                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
++                    out[T.cast(row, T.int64) * out_stride] = best[0]
++                    out[T.cast(row, T.int64) * out_stride + 1] = T.cast(
+                         best_index[0] + vocab_start, T.float32
+                     )
+                 else:
+@@ -1864,8 +1865,9 @@ def finish_argmax_kernel(output: str, per_lane: int = 1):
+ @tilelang.jit(pass_configs=_PASS)
+ def select_first_argmax_kernel(output_dtype: str, ranks: int):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+-    over the all-gathered ``(value, index)`` pairs of each row ([rows, 2 * ranks]
+-    FP32; indices exact in FP32), into ``out[row * out_stride]``, a warp a row.
++    over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
++    ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
++    exact in FP32), into ``out[row * out_stride]``, a warp a row.
+     As in Triton, the number of ranks is fixed when the kernel is built and every
+     load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
+     the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
+@@ -1880,6 +1882,7 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int):
+         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
++        pair_width: T.int32,
+     ):
+         with T.Kernel(rows, threads=32) as row:
+             T.import_source(_HEADER)
+@@ -1889,8 +1892,8 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int):
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
+             lane = T.min(tx, ranks - 1)
+-            value = pairs[row, 2 * lane]
+-            index = pairs[row, 2 * lane + 1]
++            value = pairs[row, pair_width * lane]
++            index = pairs[row, pair_width * lane + 1]
+             best[0] = T.if_then_else(tx < ranks, value, -T.infinity(T.float32))
+             best_index[0] = T.if_then_else(
+                 tx < ranks, T.cast(index, T.int32), T.int32(1 << 30)
+@@ -2022,7 +2025,7 @@ def greedy_markov_shard_pair(
+         pairs.view(-1),
+         rows,
+         parts,
+-        2,
++        pairs.stride(0),
+         vocab_start,
+         "pair",
+     )
+@@ -2052,21 +2055,23 @@ def greedy_shard_pair(
+         pairs.view(-1),
+         rows,
+         parts,
+-        2,
++        pairs.stride(0),
+         vocab_start,
+         "pair",
+     )
+ 
+ 
+-def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
++def select_first_argmax(
++    pairs: torch.Tensor, output: torch.Tensor, pair_width: int = 2
++) -> None:
+     """``dspark.greedy.select_first_argmax``."""
+     rows = pairs.shape[0]
+     if rows == 0:
+         return
+     kernel = _kernel(
+-        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // 2
++        select_first_argmax_kernel, _DTYPES[output.dtype], pairs.shape[1] // pair_width
+     )
+-    kernel(pairs, _flat(output), output.stride(0))
++    kernel(pairs, _flat(output), output.stride(0), pair_width)
+ 
+ 
+ def sample_greedy_markov(
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index 3e014e74c..1634f23b0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -199,7 +199,8 @@ def greedy_markov_shard_pair(
+     partial_indices: torch.Tensor,
+ ) -> None:
+     """Write each row's ``(max, global index)`` of ``base_logits + markov_bias``
+-    over one vocabulary shard into FP32 ``pairs`` ([rows, 2]).
++    over one vocabulary shard into the first two columns of FP32 ``pairs`` ([rows,
++    2], or [rows, 4]: 16-byte rows, which the one-shot all-gather writes in place).
+ 
+     The value keeps the materialized sum's rounding, and the index is the
+     shard-local first maximum offset by ``vocab_start`` (exact in FP32 below
+@@ -224,7 +225,8 @@ def greedy_shard_pair(
+ ) -> None:
+     """``greedy_markov_shard_pair`` without a bias: each row's ``(max, global
+     index)`` over the first ``vocab`` columns of one vocabulary shard of
+-    ``logits`` (its padding columns excluded), into FP32 ``pairs`` ([rows, 2])."""
++    ``logits`` (its padding columns excluded), into the first two columns of FP32
++    ``pairs`` ([rows, 2] or [rows, 4])."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.greedy_shard_pair(
+@@ -232,12 +234,15 @@ def greedy_shard_pair(
+     )
+ 
+ 
+-def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
+-    """Reduce all-gathered shard pairs ([rows, 2 * ranks], FP32) to the first
+-    maximum's global index, written to ``output`` (one per row)."""
++def select_first_argmax(
++    pairs: torch.Tensor, output: torch.Tensor, pair_width: int = 2
++) -> None:
++    """Reduce all-gathered shard pairs ([rows, pair_width * ranks], FP32, each
++    rank's pair first in its ``pair_width`` columns) to the first maximum's global
++    index, written to ``output`` (one per row)."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+-    tilelang_sampling.select_first_argmax(pairs, output)
++    tilelang_sampling.select_first_argmax(pairs, output, pair_width)
+ 
+ 
+ def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 60fb66d8f..f9f9483d4 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -110,8 +110,10 @@ class DSparkSpeculator(DFlashSpeculator):
+         )
+         # Per-request (max, global index) of this rank's vocabulary shard,
+         # for vocabulary-parallel greedy drafts.
++        # (value, index) and two unused columns: 16-byte rows, which the
++        # one-shot all-gather writes in place (no staging or reshape copies).
+         self._greedy_shard_pairs = torch.empty(
+-            (self.max_num_reqs, 2), dtype=torch.float32, device=device
++            (self.max_num_reqs, 4), dtype=torch.float32, device=device
+         )
+ 
+     @property
+@@ -333,7 +335,9 @@ class DSparkSpeculator(DFlashSpeculator):
+                 )
+                 draft_sampled_i = self.draft_tokens[:num_reqs, i]
+                 select_first_argmax(
+-                    tensor_model_parallel_all_gather(pairs, dim=-1), draft_sampled_i
++                    tensor_model_parallel_all_gather(pairs, dim=-1),
++                    draft_sampled_i,
++                    pair_width=4,
+                 )
+                 prev = draft_sampled_i
+                 continue
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index 0631e5087..1ef7b032c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -36,12 +36,13 @@ def vocab_parallel_argmax(
+     shape = scratch_shape(rows, vocab)
+     values = torch.empty(shape, dtype=torch.float32, device=local_logits.device)
+     indices = torch.empty(shape, dtype=torch.int32, device=local_logits.device)
+-    pairs = torch.empty((rows, 2), dtype=torch.float32, device=local_logits.device)
++    # 16-byte rows: the one-shot all-gather writes them in place.
++    pairs = torch.empty((rows, 4), dtype=torch.float32, device=local_logits.device)
+     greedy_shard_pair(local_logits, vocab, vocab_start, pairs, values, indices)
+     if tp_size > 1:
+         pairs = tensor_model_parallel_all_gather(pairs, dim=-1)
+     ids = torch.empty(rows, dtype=torch.int64, device=local_logits.device)
+-    select_first_argmax(pairs, ids)
++    select_first_argmax(pairs, ids, pair_width=4)
+     return ids
+ 
+ 

@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 15:03:53 +0200
+Subject: [PATCH 350/488] V2 runner sampling: the greedy reductions' and
+ temperature's free shapes as parameters
+
+The partial argmax's and temperature's threads a block, and a thread per
+row in place of a warp for the finish and select kernels, for a measured
+choice; the defaults are unchanged.
+---
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 179 +++++++++++-------
+ 1 file changed, 113 insertions(+), 66 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 827af9d93..765d9e336 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -1125,13 +1125,16 @@ def _warp_first_argmax(best, best_index, other, other_index):
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool):
++def partial_argmax_kernel(
++    base_dtype: str, bias_dtype: str | None, vector: bool, threads: int = _THREADS
++):
+     """``dspark.greedy._partial_argmax`` (with a bias, each sum rounded to the base
+     dtype as the materialized ``torch.add``) and ``_partial_argmax_logits``
+     (without): the first maximum of each 2048-column part of each row, by value
+     and shard-local column, into flat FP32 / int32 scratch at ``row * parts +
+-    part``. 128 threads; with ``vector`` (16-byte aligned rows, columns a multiple
+-    of eight), each thread reads two runs of eight consecutive values."""
++    part``. ``threads`` a block; with ``vector`` (16-byte aligned rows, columns a
++    multiple of eight), each thread reads runs of eight consecutive values. The
++    combine is a total order, so the layout does not change the result."""
+     rows, vocab, values_len, indices_len = T.dynamic(
+         "rows, vocab, values_len, indices_len"
+     )
+@@ -1139,8 +1142,9 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+     biased = bias_dtype is not None
+     if not biased:
+         bias_dtype = base_dtype  # placeholder the variant never reads
+-    runs = GREEDY_BLOCK // (_THREADS * _VEC)
+-    passes = GREEDY_BLOCK // _THREADS
++    warps = threads // 32
++    runs = GREEDY_BLOCK // (threads * _VEC)
++    passes = GREEDY_BLOCK // threads
+ 
+     @T.macro
+     def visit(base, bias, best, best_index, row, col):
+@@ -1159,7 +1163,7 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+         values: T.Tensor((values_len,), T.float32),
+         indices: T.Tensor((indices_len,), T.int32),
+     ):
+-        with T.Kernel(rows, T.ceildiv(vocab, GREEDY_BLOCK), threads=_THREADS) as (
++        with T.Kernel(rows, T.ceildiv(vocab, GREEDY_BLOCK), threads=threads) as (
+             row,
+             part,
+         ):
+@@ -1171,8 +1175,8 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+             best_index = T.alloc_local((1,), T.int32)
+             other = T.alloc_local((1,), T.float32)
+             other_index = T.alloc_local((1,), T.int32)
+-            partial = T.alloc_shared((_WARPS,), T.float32)
+-            partial_index = T.alloc_shared((_WARPS,), T.int32)
++            partial = T.alloc_shared((warps,), T.float32)
++            partial_index = T.alloc_shared((warps,), T.int32)
+             # Triton's masked lanes, which no column beats.
+             best[0] = -T.infinity(T.float32)
+             best_index[0] = _INT32_MAX
+@@ -1182,7 +1186,7 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+                 T.assume(bias_stride % _VEC == 0)
+                 T.assume(vocab % _VEC == 0)
+                 for run in T.unroll(runs):
+-                    col0 = part * GREEDY_BLOCK + (run * _THREADS + tx) * _VEC
++                    col0 = part * GREEDY_BLOCK + (run * threads + tx) * _VEC
+                     if col0 < vocab:
+                         for i in T.vectorized(_VEC):
+                             a[i] = base[row, col0 + i]
+@@ -1199,7 +1203,7 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+                             _first_keep_or_take(best, best_index, value, col0 + i)
+             else:
+                 for j in T.unroll(passes):
+-                    col = part * GREEDY_BLOCK + j * _THREADS + tx
++                    col = part * GREEDY_BLOCK + j * threads + tx
+                     if col < vocab:
+                         visit(base, bias, best, best_index, row, col)
+             _warp_first_argmax(best, best_index, other, other_index)
+@@ -1208,7 +1212,7 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+                 partial_index[tx // 32] = best_index[0]
+             T.sync_threads()
+             if tx == 0:
+-                for w in T.unroll(1, _WARPS):
++                for w in T.unroll(1, warps):
+                     _first_keep_or_take(best, best_index, partial[w], partial_index[w])
+                 slot = T.cast(row, T.int64) * T.ceildiv(vocab, GREEDY_BLOCK) + part
+                 values[slot] = best[0]
+@@ -1218,17 +1222,28 @@ def partial_argmax_kernel(base_dtype: str, bias_dtype: str | None, vector: bool)
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def finish_argmax_kernel(output: str):
++def finish_argmax_kernel(output: str, rows_per_block: int = 0):
+     """``dspark.greedy._finish_argmax_pair`` (``output`` "pair": the row's first
+     maximum and its global index ``+ vocab_start`` as FP32 into ``pairs[row]``) and
+     ``_finish_argmax`` ("int32" / "int64": the index into ``out[row *
+-    out_stride]``), from the parts' scratch; one warp per row."""
++    out_stride]``), from the parts' scratch: one warp per row, or with
++    ``rows_per_block`` one thread per row, the parts in order."""
+     rows, values_len, indices_len, out_len = T.dynamic(
+         "rows, values_len, indices_len, out_len"
+     )
+     pair = output == "pair"
+     out_dtype = "float32" if pair else output
+ 
++    @T.macro
++    def _finish_store(out, best, best_index, row, out_stride, vocab_start):
++        if pair:
++            out[T.cast(row, T.int64) * 2] = best[0]
++            out[T.cast(row, T.int64) * 2 + 1] = T.cast(
++                best_index[0] + vocab_start, T.float32
++            )
++        else:
++            out[T.cast(row, T.int64) * out_stride] = T.cast(best_index[0], out_dtype)
++
+     @T.prim_func
+     def finish_argmax(
+         values: T.Tensor((values_len,), T.float32),
+@@ -1239,39 +1254,49 @@ def finish_argmax_kernel(output: str):
+         out_stride: T.int64,
+         vocab_start: T.int32,
+     ):
+-        with T.Kernel(out_rows, threads=32) as row:
+-            T.import_source(_HEADER)
+-            tx = T.get_thread_binding()
+-            best = T.alloc_local((1,), T.float32)
+-            best_index = T.alloc_local((1,), T.int32)
+-            other = T.alloc_local((1,), T.float32)
+-            other_index = T.alloc_local((1,), T.int32)
+-            best[0] = -T.infinity(T.float32)
+-            best_index[0] = _INT32_MAX
+-            for k in T.serial(T.ceildiv(parts - tx, 32)):
+-                slot = T.cast(row, T.int64) * parts + tx + k * 32
+-                _first_keep_or_take(best, best_index, values[slot], indices[slot])
+-            _warp_first_argmax(best, best_index, other, other_index)
+-            if tx == 0:
+-                if pair:
+-                    out[T.cast(row, T.int64) * 2] = best[0]
+-                    out[T.cast(row, T.int64) * 2 + 1] = T.cast(
+-                        best_index[0] + vocab_start, T.float32
+-                    )
+-                else:
+-                    out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                        best_index[0], out_dtype
+-                    )
++        if rows_per_block:
++            with T.Kernel(
++                T.ceildiv(out_rows, rows_per_block), threads=rows_per_block
++            ) as bx:
++                T.import_source(_HEADER)
++                row = bx * rows_per_block + T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                best[0] = -T.infinity(T.float32)
++                best_index[0] = _INT32_MAX
++                if row < out_rows:
++                    for k in T.serial(parts):
++                        slot = T.cast(row, T.int64) * parts + k
++                        _first_keep_or_take(
++                            best, best_index, values[slot], indices[slot]
++                        )
++                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
++        else:
++            with T.Kernel(out_rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                best[0] = -T.infinity(T.float32)
++                best_index[0] = _INT32_MAX
++                for k in T.serial(T.ceildiv(parts - tx, 32)):
++                    slot = T.cast(row, T.int64) * parts + tx + k * 32
++                    _first_keep_or_take(best, best_index, values[slot], indices[slot])
++                _warp_first_argmax(best, best_index, other, other_index)
++                if tx == 0:
++                    _finish_store(out, best, best_index, row, out_stride, vocab_start)
+ 
+     return finish_argmax
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def select_first_argmax_kernel(output_dtype: str):
++def select_first_argmax_kernel(output_dtype: str, rows_per_block: int = 0):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+     over the all-gathered ``(value, index)`` pairs of each row ([rows, 2 * ranks]
+-    FP32; indices exact in FP32), into ``out[row * out_stride]``; one warp per
+-    row."""
++    FP32; indices exact in FP32), into ``out[row * out_stride]``: one warp per
++    row, or with ``rows_per_block`` one thread per row, the ranks in order."""
+     rows, width, out_len = T.dynamic("rows, width, out_len")
+     pairs_stride = T.dynamic("pairs_stride", "int64")
+ 
+@@ -1281,28 +1306,50 @@ def select_first_argmax_kernel(output_dtype: str):
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
+     ):
+-        with T.Kernel(rows, threads=32) as row:
+-            T.import_source(_HEADER)
+-            tx = T.get_thread_binding()
+-            best = T.alloc_local((1,), T.float32)
+-            best_index = T.alloc_local((1,), T.int32)
+-            other = T.alloc_local((1,), T.float32)
+-            other_index = T.alloc_local((1,), T.int32)
+-            best[0] = -T.infinity(T.float32)
+-            best_index[0] = 1 << 30
+-            for k in T.serial(T.ceildiv(width // 2 - tx, 32)):
+-                rank = tx + k * 32
+-                _first_keep_or_take(
+-                    best,
+-                    best_index,
+-                    pairs[row, 2 * rank],
+-                    T.cast(pairs[row, 2 * rank + 1], T.int32),
+-                )
+-            _warp_first_argmax(best, best_index, other, other_index)
+-            if tx == 0:
+-                out[T.cast(row, T.int64) * out_stride] = T.cast(
+-                    best_index[0], output_dtype
+-                )
++        if rows_per_block:
++            with T.Kernel(
++                T.ceildiv(rows, rows_per_block), threads=rows_per_block
++            ) as bx:
++                T.import_source(_HEADER)
++                row = bx * rows_per_block + T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                best[0] = -T.infinity(T.float32)
++                best_index[0] = 1 << 30
++                if row < rows:
++                    for rank in T.serial(width // 2):
++                        _first_keep_or_take(
++                            best,
++                            best_index,
++                            pairs[row, 2 * rank],
++                            T.cast(pairs[row, 2 * rank + 1], T.int32),
++                        )
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
++        else:
++            with T.Kernel(rows, threads=32) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                best = T.alloc_local((1,), T.float32)
++                best_index = T.alloc_local((1,), T.int32)
++                other = T.alloc_local((1,), T.float32)
++                other_index = T.alloc_local((1,), T.int32)
++                best[0] = -T.infinity(T.float32)
++                best_index[0] = 1 << 30
++                for k in T.serial(T.ceildiv(width // 2 - tx, 32)):
++                    rank = tx + k * 32
++                    _first_keep_or_take(
++                        best,
++                        best_index,
++                        pairs[row, 2 * rank],
++                        T.cast(pairs[row, 2 * rank + 1], T.int32),
++                    )
++                _warp_first_argmax(best, best_index, other, other_index)
++                if tx == 0:
++                    out[T.cast(row, T.int64) * out_stride] = T.cast(
++                        best_index[0], output_dtype
++                    )
+ 
+     return select_first_argmax
+ 
+@@ -1561,16 +1608,16 @@ def greedy_rejection_sample(
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def temperature_kernel(idx_dtype: str, run: int):
++def temperature_kernel(idx_dtype: str, run: int, threads: int = _THREADS):
+     """``gumbel._temperature_kernel``: FP32 logits divided in place by their
+     request's temperature (``div.full.f32``), rows at temperature 0 or 1 left
+-    alone; a block of 128 threads per ``(token, 8192 columns)``, each thread's
++    alone; a block of ``threads`` per ``(token, 8192 columns)``, each thread's
+     elements in runs of ``run`` (``_triton_run``), one vector load and store each
+     when aligned. As in Triton, the temperature is read at the mapped index without
+     a validity check."""
+     tokens, vocab, idx_len, temp_len = T.dynamic("tokens, vocab, idx_len, temp_len")
+     logits_stride = T.dynamic("logits_stride", "int64")
+-    runs = _TEMPERATURE_BLOCK // (_THREADS * run)
++    runs = _TEMPERATURE_BLOCK // (threads * run)
+ 
+     @T.prim_func
+     def temperature(
+@@ -1579,7 +1626,7 @@ def temperature_kernel(idx_dtype: str, run: int):
+         temperature: T.Tensor((temp_len,), T.float32),
+     ):
+         with T.Kernel(
+-            tokens, T.ceildiv(vocab, _TEMPERATURE_BLOCK), threads=_THREADS
++            tokens, T.ceildiv(vocab, _TEMPERATURE_BLOCK), threads=threads
+         ) as (t, blk):
+             T.import_source(_HEADER)
+             tx = T.get_thread_binding()
+@@ -1591,7 +1638,7 @@ def temperature_kernel(idx_dtype: str, run: int):
+             temp[0] = temperature[T.cast(idx_mapping[t], T.int64)]
+             if (temp[0] != T.float32(0)) & (temp[0] != T.float32(1)):
+                 for r in T.unroll(runs):
+-                    col0 = blk * _TEMPERATURE_BLOCK + r * (_THREADS * run) + run * tx
++                    col0 = blk * _TEMPERATURE_BLOCK + r * (threads * run) + run * tx
+                     _load_run(logits, raw, t, col0, vocab, run)
+                     for k in T.unroll(run):
+                         raw[k] = T.call_extern(

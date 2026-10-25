@@ -1,0 +1,635 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:31:37 +0100
+Subject: [PATCH 474/488] [DS4.1] Sampler: one-token counts in the counts
+ kernel; top-k and top-p by the row gather
+
+The sampler filled a tensor of ones (seq_lens.new_ones) for the counts kernel
+to read every step. The counts kernel's one variant takes 1 as the count and
+only writes the counts; get_num_sampled_and_rejected(None, ...) launches it,
+and the input batch's declarations include it.
+
+get_top_k_top_p gathered each logits row's top-k and top-p with torch
+indexing. It uses the runner's TileLang row gather (gather_rows, a negative
+index wrapping as torch's), declared for int32 and int64 indices by
+SamplingStates.register_warmups, which the sampler's declarations call.
+
+benchmark_token_counts.py --one times the one-token counts against the fill
+and the counts kernel.
+---
+ benchmarks/kernels/benchmark_token_counts.py  |  96 +++++++++-
+ tests/v1/worker/test_gpu_input_batch_v2.py    |  68 ++++++-
+ .../worker/test_gpu_sampling_states_gather.py | 169 ++++++++++++++++++
+ vllm/v1/worker/gpu/input_batch.py             |  16 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |   7 +-
+ vllm/v1/worker/gpu/sample/states.py           |  25 ++-
+ vllm/v1/worker/gpu/tilelang_token_counts.py   |  25 ++-
+ 7 files changed, 380 insertions(+), 26 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_sampling_states_gather.py
+
+diff --git a/benchmarks/kernels/benchmark_token_counts.py b/benchmarks/kernels/benchmark_token_counts.py
+index 20400a1a2..3f0189696 100644
+--- a/benchmarks/kernels/benchmark_token_counts.py
++++ b/benchmarks/kernels/benchmark_token_counts.py
+@@ -2,6 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Paired graph timings for DS41F's post-verification counts, against Triton.
+ 
++``--one``: the sampler's counts (one token a request), the kernel taking 1 as the
++count, against what the sampler launched before: torch's ``seq_lens.new_ones`` fill,
++then the counts kernel reading it.
++
+ Eight allocations per case, alternating measurement order, and a paired 95%
+ interval. --gate rejects a slowdown; --threads screens fixed launch layouts.
+ """
+@@ -43,6 +47,72 @@ def elapsed(capture):
+     return begin.elapsed_time(end) * 10
+ 
+ 
++def measure_one(requests, threads, seed):
++    """The one-token counts against ``new_ones`` and the counts kernel."""
++    ours, theirs, differences = [], [], []
++    for sample in range(8):
++        torch.manual_seed(seed + sample)
++        spacer = torch.empty((sample * 513 + 17) * 256, device="cuda")
++        capacity = requests + 19
++        idx = torch.randperm(capacity, device="cuda")[:requests]
++        prefill = torch.randint(
++            1, 1048577, (capacity,), device="cuda", dtype=torch.int32
++        )
++        seq = prefill[idx] + 1
++        seq[::5] -= 2
++        cu = torch.arange(requests + 1, device="cuda", dtype=torch.int32)
++        reading = tilelang_token_counts.counts_kernel(False, "int64", threads, False)
++        one = tilelang_token_counts.counts_kernel(False, "int64", threads, True)
++        outputs = {}
++
++        def original(
++            reading=reading, seq=seq, cu=cu, idx=idx, prefill=prefill, outputs=outputs
++        ):
++            sampled = seq.new_ones(requests)
++            rejected = torch.empty_like(sampled)
++            reading(sampled, rejected, seq, cu, idx, prefill, sampled)
++            outputs["original"] = (sampled, rejected)
++
++        def candidate(
++            one=one, seq=seq, cu=cu, idx=idx, prefill=prefill, outputs=outputs
++        ):
++            sampled = seq.new_empty(requests)
++            rejected = torch.empty_like(sampled)
++            one(sampled, rejected, seq, cu, idx, prefill, sampled)
++            outputs["candidate"] = (sampled, rejected)
++
++        original()
++        candidate()
++        if not all(
++            torch.equal(a, b) for a, b in zip(outputs["original"], outputs["candidate"])
++        ):
++            raise RuntimeError(f"one-token counts differ: requests={requests}")
++        a, b = graph(candidate), graph(original)
++        pair = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(c): elapsed(c) for c in pair}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        differences.append(times[id(a)] - times[id(b)])
++        del a, b, pair, spacer
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    result = {
++        "requests": requests,
++        "one": True,
++        "threads": threads,
++        "tilelang_us": statistics.median(ours),
++        "reference": "new_ones + counts",
++        "reference_us": statistics.median(theirs),
++        "change_pct": 100 * mean / statistics.fmean(theirs),
++        "interval_us": [mean - half, mean + half],
++        "slower": mean - half > 0,
++        "tilelang_samples_us": ours,
++        "reference_samples_us": theirs,
++    }
++    print(json.dumps(result), flush=True)
++    return result
++
++
+ def measure(requests, dead_rows, threads, seed):
+     ours, theirs, differences = [], [], []
+     for sample in range(8):
+@@ -61,7 +131,7 @@ def measure(requests, dead_rows, threads, seed):
+         sampled = torch.randint(1, 7, (requests,), device="cuda", dtype=torch.int32)
+         rejected = torch.empty_like(sampled)
+         cut = torch.randint(0, 6, (requests,), device="cuda", dtype=torch.int32)
+-        kernel = tilelang_token_counts.counts_kernel(dead_rows, "int64", threads)
++        kernel = tilelang_token_counts.counts_kernel(dead_rows, "int64", threads, False)
+ 
+         inputs = (sampled, rejected, seq, cu, idx, prefill, cut)
+ 
+@@ -114,15 +184,25 @@ def main():
+     parser.add_argument("--threads", default=str(tilelang_token_counts._THREADS))
+     parser.add_argument("--seed", type=int, default=4135)
+     parser.add_argument("--requests", default="1,8,16,128,257")
++    parser.add_argument("--one", action="store_true")
+     args = parser.parse_args()
+-    results = [
+-        measure(requests, dead_rows, threads, args.seed)
+-        for threads in map(int, args.threads.split(","))
+-        for dead_rows in (False, True)
+-        for requests in map(int, args.requests.split(","))
+-    ]
++    if args.one:
++        results = [
++            measure_one(requests, threads, args.seed)
++            for threads in map(int, args.threads.split(","))
++            for requests in map(int, args.requests.split(","))
++        ]
++    else:
++        results = [
++            measure(requests, dead_rows, threads, args.seed)
++            for threads in map(int, args.threads.split(","))
++            for dead_rows in (False, True)
++            for requests in map(int, args.requests.split(","))
++        ]
+     slower = [
+-        [r["requests"], r["dead_rows"], r["threads"]] for r in results if r["slower"]
++        [r["requests"], r.get("dead_rows", False), r["threads"]]
++        for r in results
++        if r["slower"]
+     ]
+     print(
+         json.dumps({"summary": "token counts benchmark", "slower": slower}), flush=True
+diff --git a/tests/v1/worker/test_gpu_input_batch_v2.py b/tests/v1/worker/test_gpu_input_batch_v2.py
+index f69b01067..ccc42a5a3 100644
+--- a/tests/v1/worker/test_gpu_input_batch_v2.py
++++ b/tests/v1/worker/test_gpu_input_batch_v2.py
+@@ -153,21 +153,81 @@ def test_token_counts_owner_declares_both_index_and_dead_row_variants():
+     with registry.activate():
+         register_input_batch_warmups(dead_rows=True)
+     calls = [c for c in prepare.declared_calls(registry) if c[0] is counts_kernel]
+-    assert len(calls) == 4
++    # Both dead-row variants, and the sampler's one-token counts, by either index.
++    assert {(args[0], args[1], args[3]) for _, args, _ in calls} == {
++        (dead, index, one)
++        for dead, one in ((False, False), (True, False), (False, True))
++        for index in ("int32", "int64")
++    }
+     prepare.prepare_declared(registry)
+-    for dead_rows in (False, True):
++    for dead_rows, one in ((False, False), (True, False), (False, True)):
+         for dtype in (torch.int32, torch.int64):
+             ones = torch.ones(1, device="cuda", dtype=torch.int32)
++            sampled = torch.full_like(ones, -5) if one else ones
+             rejected = torch.empty_like(ones)
+             idx = torch.zeros(1, device="cuda", dtype=dtype)
+             cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+             count_tokens(
+-                ones, rejected, ones, cu, idx, ones, ones if dead_rows else None
++                sampled,
++                rejected,
++                ones,
++                cu,
++                idx,
++                ones,
++                ones if dead_rows else None,
++                one,
+             )
+-            assert ones.item() == 1
++            assert sampled.item() == 1
+             assert rejected.item() == 0
+ 
+ 
++@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
++@pytest.mark.parametrize("requests", [1, 8, 16, 127, 128, 129, 257])
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++def test_one_sampled_token_counts_without_a_fill(requests, index_dtype):
++    """The sampler's counts (one token a request, none for a request still
++    prefilling): ``get_num_sampled_and_rejected(None, ...)`` writes what the counts
++    of ``seq_lens.new_ones(num_reqs)`` were, the Triton kernel's too, into a fresh
++    tensor, its inputs untouched, in one launch."""
++    from vllm.v1.worker.gpu.input_batch import (
++        _get_num_sampled_and_rejected_kernel,
++        get_num_sampled_and_rejected,
++    )
++
++    torch.manual_seed(97 + requests)
++    capacity = requests + 19
++    idx = torch.randperm(capacity, device="cuda")[:requests].to(index_dtype)
++    prefill = torch.randint(1, 1048577, (capacity,), device="cuda", dtype=torch.int32)
++    seq = (
++        prefill[idx.long()]
++        + torch.arange(requests, device="cuda", dtype=torch.int32) % 3
++        - 1
++    )
++    cu = torch.arange(requests + 1, device="cuda", dtype=torch.int32) + 7
++    read_only = [seq, cu, idx, prefill]
++    before = [x.clone() for x in read_only]
++
++    expected, expected_rejected = get_num_sampled_and_rejected(
++        seq.new_ones(requests), seq, cu, idx, prefill
++    )
++    triton_sampled = seq.new_ones(requests)
++    triton_rejected = torch.empty_like(triton_sampled)
++    _get_num_sampled_and_rejected_kernel[(requests,)](
++        triton_sampled, triton_rejected, seq, cu, idx, prefill, triton_sampled
++    )
++    actual, rejected = get_num_sampled_and_rejected(None, seq, cu, idx, prefill)
++    assert actual.dtype == rejected.dtype == torch.int32
++    assert actual.shape == rejected.shape == (requests,)
++    assert torch.equal(actual, expected)
++    assert torch.equal(rejected, expected_rejected)
++    assert torch.equal(actual, triton_sampled)
++    assert torch.equal(rejected, triton_rejected)
++    assert torch.equal(actual, (seq >= prefill[idx.long()]).int())
++    assert not rejected.any()
++    for x, saved in zip(read_only, before):
++        assert torch.equal(x, saved)
++
++
+ @pytest.mark.parametrize(
+     ("method", "draft_width"), [(None, None), ("mtp", 16), ("mtp", 8), ("dflash", None)]
+ )
+diff --git a/tests/v1/worker/test_gpu_sampling_states_gather.py b/tests/v1/worker/test_gpu_sampling_states_gather.py
+new file mode 100644
+index 000000000..6af2afbf8
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_sampling_states_gather.py
+@@ -0,0 +1,169 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The sampler's per-row top-k and top-p (``SamplingStates.get_top_k_top_p``) through
++the runner's TileLang row gather, against the torch indexing it replaces: the same
++values, bit for bit, by int64 and int32 request indices (a repeated and a negative,
++wrapping, index included), and only the gathers ``SamplingStates.register_warmups``
++declares are launched."""
++
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.sampling_params import SamplingParams
++
++if not torch.cuda.is_available():
++    pytest.skip("needs a CUDA device", allow_module_level=True)
++pytest.importorskip("tilelang")
++
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import prepare  # noqa: E402
++from vllm.v1.worker.gpu import tilelang_inputs as tli  # noqa: E402
++from vllm.v1.worker.gpu.sample import sampler as sampler_module  # noqa: E402
++from vllm.v1.worker.gpu.sample.states import SamplingStates  # noqa: E402
++
++DEVICE = torch.device("cuda")
++VOCAB = 129280
++MAX_REQS = 32
++
++
++def _states(seed: int) -> SamplingStates:
++    """Every slot a request: top-k from 1 to the vocabulary (-1: all of it), top-p
++    in (0, 1]; slot 0 uses both."""
++    rng = np.random.default_rng(seed)
++    states = SamplingStates(MAX_REQS, VOCAB)
++    for slot in range(MAX_REQS):
++        top_k = 7 if slot == 0 else int(rng.choice([-1, 1, 7, 50, VOCAB]))
++        top_p = (
++            0.5 if slot == 0 else float(rng.choice([1.0, 0.9, rng.uniform(0.01, 1)]))
++        )
++        states.add_request(slot, SamplingParams(top_k=top_k, top_p=top_p))
++    states.apply_staged_writes()
++    torch.accelerator.synchronize()
++    return states
++
++
++def _rows(num_rows: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
++    """The logits rows' request slots: a request's rows together, a repeated slot,
++    and -1 (the last slot, as torch's indexing wraps it)."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    rows = torch.randint(0, MAX_REQS, (num_rows,), generator=gen, device=DEVICE)
++    if num_rows > 2:
++        rows[1] = rows[0]
++        rows[-1] = -1
++    return rows.to(dtype)
++
++
++@pytest.mark.parametrize("num_rows", [1, 6, 16, 96, 192])
++@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
++def test_top_k_top_p_gather_is_torch_indexing(num_rows, index_dtype):
++    states = _states(num_rows)
++    rows = _rows(num_rows, index_dtype, num_rows)
++    slots = np.arange(MAX_REQS)
++    top_k, top_p = states.get_top_k_top_p(rows, slots)
++    torch.accelerator.synchronize()
++    assert top_k is not None and top_p is not None
++    expected_k = states.top_k.gpu[rows]
++    expected_p = states.top_p.gpu[rows]
++    assert top_k.dtype == expected_k.dtype == torch.int32
++    assert top_p.dtype == expected_p.dtype == torch.float32
++    assert top_k.shape == top_p.shape == (num_rows,)
++    assert top_k.is_contiguous() and top_p.is_contiguous()
++    assert torch.equal(top_k, expected_k)
++    assert torch.equal(top_p.view(torch.int32), expected_p.view(torch.int32))
++
++
++def test_top_k_top_p_gathers_only_what_the_batch_uses():
++    """A batch whose requests leave top-k (or top-p) at its default gathers
++    nothing for it, as before."""
++    states = SamplingStates(MAX_REQS, VOCAB)
++    states.add_request(0, SamplingParams(top_k=5))
++    states.add_request(1, SamplingParams(top_p=0.5))
++    states.add_request(2, SamplingParams())
++    states.apply_staged_writes()
++    rows = torch.tensor([0, 0, 2], dtype=torch.int64, device=DEVICE)
++    top_k, top_p = states.get_top_k_top_p(rows, np.array([0, 2]))
++    assert top_p is None and top_k is not None
++    assert top_k.tolist() == [5, 5, VOCAB]
++    rows = torch.tensor([1, 2], dtype=torch.int64, device=DEVICE)
++    top_k, top_p = states.get_top_k_top_p(rows, np.array([1, 2]))
++    assert top_k is None and top_p is not None
++    assert top_p.tolist() == [0.5, 1.0]
++    assert states.get_top_k_top_p(rows, np.array([2])) == (None, None)
++
++
++def test_the_gathers_launched_are_the_declared_ones(monkeypatch):
++    """``SamplingStates.register_warmups`` declares the gathers the sampler can
++    launch (int32 top-k and FP32 top-p, by int64 or int32 indices); the launches
++    use exactly those keys, so a frozen cache serves them."""
++    states = _states(3)
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        states.register_warmups()
++    declared = {
++        (args[0], args[1])
++        for function, args, _ in prepare.declared_calls(registry)
++        if function is tli.gather_rows_kernel
++    }
++    assert declared == {
++        (index, dtype) for index in ("int32", "int64") for dtype in ("int32", "float32")
++    }
++    prepare.prepare_declared(registry)
++    launched = set()
++    original = tli._kernel
++
++    def record(factory, *key):
++        launched.add((id(factory), key))
++        return original(factory, *key)
++
++    monkeypatch.setattr(tli, "_kernel", record)
++    for index_dtype in (torch.int64, torch.int32):
++        states.get_top_k_top_p(_rows(6, index_dtype, 5), np.arange(MAX_REQS))
++    torch.accelerator.synchronize()
++    assert launched == {(id(tli.gather_rows_kernel), key) for key in declared}
++
++
++def test_sampler_declares_the_states_gathers(monkeypatch):
++    """The sampler's declarations include its sampling states' gathers."""
++    called = []
++    for name in (
++        "register_min_p_warmup",
++        "register_sampling_warmups",
++        "register_topk_scores_warmup",
++    ):
++        monkeypatch.setattr(sampler_module, name, lambda *a, **k: None)
++    monkeypatch.setattr(
++        sampler_module.tilelang_topk_topp,
++        "register_top_k_top_p",
++        lambda *a, **k: None,
++    )
++    owner = SimpleNamespace(
++        sampling_states=SimpleNamespace(
++            max_num_reqs=MAX_REQS,
++            register_warmups=lambda: called.append("gathers"),
++        ),
++        num_speculative_tokens=1,
++        use_fp64_gumbel=False,
++        compute_nans=False,
++        trace_replay_state=None,
++        logprobs_mode="raw_logprobs",
++        **{
++            name: SimpleNamespace(register_warmups=lambda *a, **k: None)
++            for name in (
++                "penalties_state",
++                "logit_bias_state",
++                "bad_words_state",
++                "thinking_budget_state",
++                "logprob_token_ids_state",
++            )
++        },
++    )
++    sampler_module.Sampler.register_warmups(
++        owner,
++        logits=((torch.float32, VOCAB),),
++        processed_logits_strides=(VOCAB,),
++        vocab_size=VOCAB,
++    )
++    assert called == ["gathers"]
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index d1d7096ee..bbb9a76b0 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -652,16 +652,23 @@ def _get_num_sampled_and_rejected_kernel(
+ 
+ 
+ def get_num_sampled_and_rejected(
+-    num_sampled: torch.Tensor,
++    num_sampled: torch.Tensor | None,
+     seq_lens: torch.Tensor,
+     cu_num_logits: torch.Tensor,
+     idx_mapping: torch.Tensor,
+     prefill_len: torch.Tensor,
+     dead_row_cut: torch.Tensor | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+-    num_rejected = torch.empty_like(num_sampled)
++    """Each request's committed and rejected token counts (int32), ``num_sampled``
++    updated in place. ``num_sampled`` None: every request sampled one token (the
++    sampler's step), which the count kernel takes as its count, so no tensor of
++    ones is filled first."""
+     from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
+ 
++    one = num_sampled is None
++    if num_sampled is None:
++        num_sampled = seq_lens.new_empty(idx_mapping.shape[0])
++    num_rejected = torch.empty_like(num_sampled)
+     count_tokens(
+         num_sampled,
+         num_rejected,
+@@ -670,6 +677,7 @@ def get_num_sampled_and_rejected(
+         idx_mapping,
+         prefill_len,
+         dead_row_cut,
++        one,
+     )
+     return num_sampled, num_rejected
+ 
+@@ -889,11 +897,13 @@ def expand_idx_mapping(
+ 
+ 
+ def register_input_batch_warmups(*, dead_rows: bool) -> None:
+-    """Declare sampled/rejected counts with each enabled dead-row variant."""
++    """Declare sampled/rejected counts with each enabled dead-row variant, and the
++    sampler's one-token counts (no dead rows)."""
+     from vllm.v1.worker.gpu.tilelang_token_counts import register_counts
+ 
+     for dead in (False, True) if dead_rows else (False,):
+         register_counts(dead_rows=dead)
++    register_counts(dead_rows=False, one=True)
+ 
+ 
+ def declare_input_batch_kernels(
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 667801d20..5b81da050 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -119,7 +119,9 @@ class Sampler:
+         )
+         for logits_stride in processed_logits_strides:
+             register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
+-        # Top-k / top-p over the processed logits, at up to every request's rows.
++        # Top-k / top-p over the processed logits, at up to every request's rows,
++        # and the gathers of their per-request values (get_top_k_top_p).
++        self.sampling_states.register_warmups()
+         tilelang_topk_topp.register_top_k_top_p(
+             logits_strides=processed_logits_strides,
+             vocab_size=vocab_size,
+@@ -225,8 +227,9 @@ class Sampler:
+         # 1 sampled token per request, except chunked-prefill requests
+         # (seq_len < prefill_len) which aren't done prefilling and produce no
+         # output token. num_rejected is always 0 here (one logit per request).
++        # None: the count kernel takes one token a request itself.
+         num_sampled, num_rejected = get_num_sampled_and_rejected(
+-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
++            None,
+             input_batch.seq_lens,
+             input_batch.cu_num_logits,
+             input_batch.idx_mapping,
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index 63a991aae..533b7bdc4 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -4,6 +4,7 @@ import numpy as np
+ import torch
+ 
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+ from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+ from vllm.v1.worker.gpu.sample.min_p import apply_min_p
+@@ -96,10 +97,22 @@ class SamplingStates:
+     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+         do_top_k = np.any(self.top_k.np[idx_mapping_np] != self.vocab_size)
+         do_top_p = np.any(self.top_p.np[idx_mapping_np] != 1.0)
+-        top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
+-        top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
++        top_k = _gather(self.top_k.gpu, expanded_idx_mapping) if do_top_k else None
++        top_p = _gather(self.top_p.gpu, expanded_idx_mapping) if do_top_p else None
+         return top_k, top_p
+ 
++    def register_warmups(self) -> None:
++        """Declare ``get_top_k_top_p``'s gathers: int32 top-k and FP32 top-p, by the
++        runner's int64 request indices or another caller's int32."""
++        tilelang_inputs.declare(
++            lambda: [
++                call
++                for index_dtype in (torch.int32, torch.int64)
++                for dtype in (self.top_k.dtype, self.top_p.dtype)
++                for call in tilelang_inputs.gather_rows_calls(index_dtype, dtype)
++            ]
++        )
++
+     def apply_top_k_top_p(
+         self,
+         logits: torch.Tensor,
+@@ -119,3 +132,11 @@ class SamplingStates:
+ 
+     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
+         return int(np.max(self.num_logprobs[idx_mapping_np]))
++
++
++def _gather(state: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
++    """``state[index]`` of a per-request state (1-D), as a new tensor, through the
++    runner's TileLang row gather: a negative index wraps, as torch's indexing does."""
++    out = torch.empty((index.shape[0], 1), dtype=state.dtype, device=index.device)
++    tilelang_inputs.gather_rows(index, state.view(-1, 1), out)
++    return out.view(-1)
+diff --git a/vllm/v1/worker/gpu/tilelang_token_counts.py b/vllm/v1/worker/gpu/tilelang_token_counts.py
+index b3c47eb7a..15a7139e6 100644
+--- a/vllm/v1/worker/gpu/tilelang_token_counts.py
++++ b/vllm/v1/worker/gpu/tilelang_token_counts.py
+@@ -1,6 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Commit counts after sampling or speculative verification, one block per request."""
++"""Commit counts after sampling or speculative verification, one block per request.
++
++With ``one``, every request sampled one token (the sampler's step): the kernel takes
++1 as the count instead of reading it, so ``sampled`` is written only, where the
++sampler filled it with ones first (``seq_lens.new_ones``).
++"""
+ 
+ import tilelang
+ import tilelang.language as T
+@@ -15,7 +20,7 @@ _THREADS = 128
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
++def counts_kernel(dead_rows: bool, index_dtype: str, threads: int, one: bool):
+     requests = T.dynamic("requests")
+     sampled_len = T.dynamic("sampled_len")
+     seq_len = T.dynamic("seq_len")
+@@ -37,7 +42,7 @@ def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
+             if T.get_thread_binding() == 0:
+                 req = idx_mapping[row]
+                 active = T.cast(seq_lens[row] >= prefill_len[req], "int32")
+-                count = sampled[row]
++                count = T.int32(1) if one else sampled[row]
+                 if dead_rows:
+                     count = T.min(count, dead_cut[row] + 1)
+                 sampled[row] = active * count
+@@ -48,7 +53,7 @@ def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
+     return token_counts
+ 
+ 
+-def counts_call(dead_rows: bool, index_dtype: torch.dtype):
++def counts_call(dead_rows: bool, index_dtype: torch.dtype, one: bool):
+     from vllm.models.deepseek_v4_1.tilelang.prepare import call
+ 
+     return call(
+@@ -56,10 +61,11 @@ def counts_call(dead_rows: bool, index_dtype: torch.dtype):
+         dead_rows,
+         "int64" if index_dtype == torch.int64 else "int32",
+         _THREADS,
++        one,
+     )
+ 
+ 
+-def register_counts(dead_rows: bool) -> None:
++def register_counts(dead_rows: bool, one: bool = False) -> None:
+     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+ 
+     if JitWarmupRegistry.active() is None:
+@@ -67,7 +73,9 @@ def register_counts(dead_rows: bool) -> None:
+     from vllm.models.deepseek_v4_1.tilelang.prepare import declare
+ 
+     declare(
+-        lambda: [counts_call(dead_rows, dtype) for dtype in (torch.int32, torch.int64)]
++        lambda: [
++            counts_call(dead_rows, dtype, one) for dtype in (torch.int32, torch.int64)
++        ]
+     )
+ 
+ 
+@@ -79,10 +87,13 @@ def count_tokens(
+     idx_mapping: torch.Tensor,
+     prefill_len: torch.Tensor,
+     dead_cut: torch.Tensor | None,
++    one: bool = False,
+ ) -> None:
++    """The committed and rejected counts of each request, in place; with ``one``,
++    each request sampled one token, and ``sampled`` is only written."""
+     if idx_mapping.numel() == 0:
+         return
+-    _, args, kwargs = counts_call(dead_cut is not None, idx_mapping.dtype)
++    _, args, kwargs = counts_call(dead_cut is not None, idx_mapping.dtype, one)
+     counts_kernel(*args, **kwargs)(
+         sampled,
+         rejected,

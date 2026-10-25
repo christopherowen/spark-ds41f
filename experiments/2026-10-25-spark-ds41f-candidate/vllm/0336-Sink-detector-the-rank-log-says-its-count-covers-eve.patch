@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 09:35:53 +0200
+Subject: [PATCH 336/488] Sink detector: the rank log says its count covers
+ every executed step
+
+The rank log's flagged-row count and vllm:sink_* count different things:
+the detector counts every row it flags in every step the rank executes;
+the scheduler counts the flags of outputs it commits, and skips the step
+in flight when a request finishes or is aborted (async scheduling keeps
+one) and stale output after a preemption. A nine-hour TP3 run logged 9
+flags against a metric of 1 (spark-ds41f#489). The log line and the module
+docstring now say so; the counts themselves are unchanged.
+---
+ tests/v1/worker/test_gpu_sink.py  |  3 ++-
+ vllm/v1/worker/gpu/sample/sink.py | 11 ++++++++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index 2136324d0..05e7d93a0 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -494,7 +494,8 @@ def test_warmup_rows_are_neither_logged_nor_kept(monkeypatch: pytest.MonkeyPatch
+     assert sink.counts.tolist() == [0, 0, 0] and not sink.warming
+     step()
+     assert lines == [
+-        "Sink detector, rank 0: 1 flagged rows (draft zero 1, drafter 0, prompt 0)"
++        "Sink detector, rank 0: 1 flagged rows in executed steps (draft zero 1, "
++        "drafter 0, prompt 0; vllm:sink_* counts committed outputs only)"
+     ]
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/sink.py b/vllm/v1/worker/gpu/sample/sink.py
+index 12b60aaa1..7ba571a2e 100644
+--- a/vllm/v1/worker/gpu/sample/sink.py
++++ b/vllm/v1/worker/gpu/sample/sink.py
+@@ -10,7 +10,11 @@ same Gumbel noise for random rows) in descending order after the sampled token,
+ i.e. sampling without replacement. A flagged drafter row cuts the verification:
+ its draft is masked in the row before, and restored after the verification.
+ Everything stays on the device; each rank counts the rows it flagged and logs
+-the counts without a synchronization.
++the counts without a synchronization. That count covers every step the rank
++executes, including steps whose output the scheduler then discards (the step in
++flight when a request finishes or is aborted, stale output after a preemption);
++``vllm:sink_*`` counts the flags in committed outputs, so the log reads at least
++the metric.
+ """
+ 
+ from dataclasses import dataclass
+@@ -755,8 +759,9 @@ class SinkSampler:
+             if counts != self._logged_counts:
+                 self._logged_counts = counts
+                 logger.info(
+-                    "Sink detector, rank %d: %d flagged rows (draft zero %d, "
+-                    "drafter %d, prompt %d)",
++                    "Sink detector, rank %d: %d flagged rows in executed steps "
++                    "(draft zero %d, drafter %d, prompt %d; vllm:sink_* counts "
++                    "committed outputs only)",
+                     rank,
+                     sum(counts),
+                     *counts,

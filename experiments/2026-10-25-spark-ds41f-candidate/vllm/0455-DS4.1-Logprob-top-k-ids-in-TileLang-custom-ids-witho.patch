@@ -1,0 +1,1608 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:37:05 +0100
+Subject: [PATCH 455/488] [DS4.1] Logprob top-k ids in TileLang; custom ids
+ without torch glue
+
+- compute_topk_scores' torch.topk (both paths) is one TileLang kernel:
+  PyTorch 2.13's order (radix keys, NaN first, ties to the lower column,
+  then the k <= 32 bitonic network's tie order), k up to 32. A larger
+  --max-logprobs, or -1, is refused at startup; no torch.topk path.
+- The custom-ids fill writes every column (0 and invalid where unused),
+  so its outputs are allocated empty, and the log-softmax writes -inf in
+  invalid columns in its own store (the zeros and masked_fill gone).
+- Top-k ids refuse logits without a unit column stride (no copy path).
+---
+ .../kernels/benchmark_tilelang_topk_ids.py    | 135 ++++
+ .../test_gpu_tilelang_logprob_softmax.py      |  22 +-
+ tests/v1/worker/test_gpu_tilelang_topk_ids.py | 575 ++++++++++++++++++
+ .../test_gpu_verified_logprob_token_ids.py    |  53 +-
+ vllm/v1/worker/gpu/sample/logprob.py          |  50 +-
+ .../worker/gpu/sample/tilelang_auxiliary.py   |   8 +
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py |  50 +-
+ .../v1/worker/gpu/sample/tilelang_topk_ids.py | 470 ++++++++++++++
+ 8 files changed, 1322 insertions(+), 41 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_tilelang_topk_ids.py
+ create mode 100644 tests/v1/worker/test_gpu_tilelang_topk_ids.py
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_topk_ids.py b/benchmarks/kernels/benchmark_tilelang_topk_ids.py
+new file mode 100644
+index 000000000..6b684e4c1
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_tilelang_topk_ids.py
+@@ -0,0 +1,135 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of ``tilelang_topk_ids.logprob_token_ids`` against what it
++replaced in ``compute_topk_scores``' fast path, ``torch.cat((sampled[:, None],
++torch.topk(logits, k).indices), 1)``: the DeepSeek V4.1 vocabulary (129280 columns,
++dense rows), FP32 and bf16 logits, one, sixteen and 96 rows, k 1, 5 and 20.
++
++Each case is measured on eight fresh inputs; on each, CUDA graphs of 100 calls of
++both run back to back, alternating which goes first, and the case's 95% interval
++comes from the eight per-input differences. The gate (``--gate``) is that the
++TileLang launch is nowhere slower (the interval's lower bound above zero). Before
++timing, each pair's outputs are compared index for index (the logits are rounded to
++bf16, so ties reach the top k).
++"""
++
++import argparse
++import json
++import math
++import statistics
++from collections.abc import Callable
++
++import torch
++
++from vllm.v1.worker.gpu.sample import tilelang_topk_ids
++
++DEVICE = torch.device("cuda")
++CALLS = 100
++VOCAB = 129280
++SHAPES = {"1 row": 1, "16 rows": 16, "96 rows": 96}
++DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
++KS = (1, 5, 20)
++
++
++def graph(function: Callable[[], None]) -> torch.cuda.CUDAGraph:
++    """A CUDA graph of ``CALLS`` calls of ``function``, after one warm-up call."""
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        function()
++    torch.cuda.current_stream().wait_stream(side)
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(CALLS):
++            function()
++    return capture
++
++
++def elapsed(capture: torch.cuda.CUDAGraph) -> float:
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 1000 / CALLS
++
++
++def case(dtype: torch.dtype, rows: int, k: int, seed: int):
++    """(torch call, TileLang call, their outputs) on fresh logits: normal, sd 4,
++    rounded to bf16."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    logits = (torch.randn(rows, VOCAB, generator=gen, device=DEVICE) * 4).to(
++        torch.bfloat16
++    )
++    logits = logits.to(dtype)
++    sampled = torch.randint(VOCAB, (rows,), generator=gen, device=DEVICE)
++    out = {}
++
++    def reference():
++        topk = torch.topk(logits, k, dim=-1).indices
++        out["ref"] = torch.cat((sampled.unsqueeze(-1), topk), dim=1)
++
++    def candidate():
++        out["new"] = tilelang_topk_ids.logprob_token_ids(logits, k, sampled)
++
++    return reference, candidate, lambda: (out["ref"], out["new"])
++
++
++def measure(dtype: torch.dtype, rows: int, k: int, samples: int) -> dict:
++    ours, theirs = [], []
++    for sample in range(samples):
++        reference, candidate, outputs = case(dtype, rows, k, 7919 + sample)
++        reference()
++        candidate()
++        ref, new = outputs()
++        if not torch.equal(ref, new):
++            raise SystemExit(
++                f"{dtype} at {rows} rows, k {k}: ids differ from torch.topk's"
++            )
++        a, b = graph(candidate), graph(reference)
++        order = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(g): elapsed(g) for g in order}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++    paired = [x - y for x, y in zip(ours, theirs)]
++    mean = statistics.fmean(paired)
++    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++    return {
++        "rows": rows,
++        "k": k,
++        "tilelang_us": statistics.median(ours),
++        "reference_us": statistics.median(theirs),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++        "slower": mean - half > 0,
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--samples", type=int, default=8)
++    args = parser.parse_args()
++    results = []
++    for dtype_name, dtype in DTYPES.items():
++        for shape, rows in SHAPES.items():
++            for k in KS:
++                result = measure(dtype, rows, k, args.samples)
++                result["dtype"] = dtype_name
++                result["shape"] = shape
++                results.append(result)
++                print(json.dumps(result), flush=True)
++    slower = [
++        f"{r['dtype']} at {r['shape']}, k {r['k']}" for r in results if r["slower"]
++    ]
++    print(
++        json.dumps({"summary": "top-k token ids vs torch.topk", "slower": slower}),
++        flush=True,
++    )
++    if args.gate and slower:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+index d62ed6afd..17aa46172 100644
+--- a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -246,10 +246,27 @@ def test_layout_decides_the_bits(dtype, vocab):
+     tls._kernel(
+         tilelang_logprob.topk_log_softmax_kernel,
+         *tilelang_logprob.topk_log_softmax_key(dtype, 1),
+-    )(other, logits, ids)
++    )(other, logits, ids, ids[:1].view(torch.bool))
+     assert not torch.equal(_bits(other), _bits(theirs))
+ 
+ 
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++@pytest.mark.parametrize("layout", ["aligned", "odd_stride"])
++def test_masked_columns_are_minus_inf(dtype, layout):
++    """The custom-ids path's mask in the same store: the unmasked kernel's bits
++    where ``valid``, -inf elsewhere (torch's ``masked_fill`` after it before)."""
++    values = _values(37, VOCAB, "special", seed=13)
++    logits = _logits(values, dtype, layout)
++    ids = _ids(values, 21, 13)
++    g = torch.Generator(device=DEVICE).manual_seed(14)
++    valid = torch.rand(ids.shape, generator=g, device=DEVICE) < 0.6
++    valid[:, 0] = True
++    expected = _tilelang(logits, ids).masked_fill(~valid, float("-inf"))
++    ours = torch.full_like(expected, SENTINEL)
++    tilelang_logprob.topk_log_softmax(logits, ids, ours, valid)
++    _assert_same(ours, expected, "masked")
++
++
+ # --- Call sites ------------------------------------------------------------------
+ 
+ 
+@@ -350,10 +367,11 @@ def test_runner_declares_the_launched_calls(logits_mode):
+     expected = {
+         (
+             id(tilelang_logprob.topk_log_softmax_kernel),
+-            tilelang_logprob.topk_log_softmax_key(dtype, run),
++            tilelang_logprob.topk_log_softmax_key(dtype, run, masked),
+         )
+         for dtype in (torch.bfloat16, torch.float32)
+         for run in tls._runs(dtype)
++        for masked in (False, True)
+     }
+     declared = _declared(registry)
+     softmax = {
+diff --git a/tests/v1/worker/test_gpu_tilelang_topk_ids.py b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+new file mode 100644
+index 000000000..c13dd2458
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_tilelang_topk_ids.py
+@@ -0,0 +1,575 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``tilelang_topk_ids`` against ``torch.topk`` on CUDA (PyTorch 2.13), index for
++index and in its order: FP32 and bf16 logits; one to 1024 rows (decode batches and a
++prompt-logprobs chunk); k from 1 to 32; the DeepSeek V4.1 vocabulary, a quarter
++shard and odd widths; rows at 16-byte addresses and strides (vector loads), at
++strides past the row, at an odd stride and at a base past 16 bytes (one element at a
++time); heavy ties (bf16-rounded logits, a few distinct values, equal rows, tie
++groups straddling the k-th place, ascending rows), NaN of any sign and payload,
++infinities, zeros of both signs and subnormals. Then the fast path's ``[sampled,
++ids]`` rows and the custom-ids path's int32 ids, the call sites (TileLang up to
++``TOPK_IDS_MAX``, torch.topk above), a CUDA graph replay and the runner's
++declarations.
++
++``_model`` is PyTorch's algorithm as read from its sources (see
++``tilelang_topk_ids``): the k largest by radix key and lower column, laid out as
++``gatherTopK`` writes them, then ``bitonicSortKVInPlace`` with ``GTOp``.
++``test_model_matches_torch`` pins that reading on the tie-heavy rows: if PyTorch
++ever orders differently, it fails beside the kernel tests and names the row."""
++
++import math
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang top-k ids target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm.sampling_params import SamplingParams  # noqa: E402
++from vllm.v1.worker.gpu.sample import logprob  # noqa: E402
++from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
++from vllm.v1.worker.gpu.sample import tilelang_topk_ids as tki  # noqa: E402
++
++DEVICE = torch.device("cuda")
++VOCAB = 129280  # DeepSeek V4.1
++SHARD = 32320  # a quarter of it
++PADDED = 131072
++DTYPES = (torch.float32, torch.bfloat16)
++# "aligned": 16-byte rows, dense where the width allows; "padded": 16-byte rows with
++# a stride 1024 past them; "odd_stride" and "shifted_base" (one element past a
++# 16-byte base): one element at a time.
++LAYOUTS = ("aligned", "padded", "odd_stride", "shifted_base")
++KS = (1, 2, 5, 20, 31, 32)
++CASES = (
++    "random",
++    "rounded",
++    "ties",
++    "equal",
++    "straddle",
++    "special",
++    "ascending",
++)
++# Past each row: a NaN outranks everything, so a read past the row would win.
++PAD = float("nan")
++
++
++# --- Inputs -------------------------------------------------------------------
++
++
++def _values(rows: int, vocab: int, case: str, seed: int) -> torch.Tensor:
++    """FP32 values ([rows, vocab]). "random": normal, sd 4; "rounded": the same
++    rounded to bf16 (ties among the largest); "ties": integers -3..3; "equal": one
++    value a row; "straddle": ``r % 8`` distinct values above a group of 96 equal
++    ones at random columns (the k-th place falls in the group), the rest below;
++    "special": the kinds of ``_special``; "ascending": rising columns (every
++    element enters a warp's list), odd rows falling."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(rows, vocab, generator=g, device=DEVICE) * 4
++    if case == "rounded":
++        x = x.bfloat16().float()
++    elif case == "ties":
++        x = torch.randint(-3, 4, (rows, vocab), generator=g, device=DEVICE).float()
++    elif case == "equal":
++        x = (torch.arange(rows, device=DEVICE).float()[:, None] * 0.25 - 1).expand(
++            rows, vocab
++        )
++        x = x.contiguous()
++    elif case == "straddle":
++        x = x / 4 - 10
++        for r in range(rows):
++            top = r % 8
++            pick = torch.randperm(vocab, generator=g, device=DEVICE)
++            above = pick[: min(top, vocab)]
++            x[r, above] = 5.0 + torch.arange(above.numel(), device=DEVICE).float()
++            x[r, pick[min(top, vocab) : top + 96]] = 2.0
++    elif case == "special":
++        for r in range(rows):
++            _special(x[r], r % 12, g)
++    elif case == "ascending":
++        x = torch.arange(vocab, device=DEVICE).float().expand(rows, vocab) * 1.0e-3
++        x = x.contiguous()
++        x[1::2] = x[1::2].flip(-1)
++    return x
++
++
++def _special(row: torch.Tensor, kind: int, g: torch.Generator) -> None:
++    """Row kinds: 0 five NaN; 1 forty NaN; 2 all NaN; 3 three +inf and two NaN over
++    -inf; 4 all -inf; 5 zeros of both signs; 6 three positives, ten +0 and ten -0
++    over negatives (the k-th place among the zeros); 7 subnormals and zeros; 8
++    magnitudes up to 3e38 with infinities; 9 NaN of both signs and several payloads
++    (``_nan_payloads``); 10 four positives over -0; 11 three finite values over
++    -inf."""
++    vocab = row.numel()
++    pick = torch.randperm(vocab, generator=g, device=DEVICE)
++
++    def at(start: int, count: int) -> torch.Tensor:
++        return pick[min(start, vocab) : min(start + count, vocab)]
++
++    if kind == 0:
++        row[at(0, 5)] = float("nan")
++    elif kind == 1:
++        row[at(0, 40)] = float("nan")
++    elif kind == 2:
++        row.fill_(float("nan"))
++    elif kind == 3:
++        row.fill_(float("-inf"))
++        row[at(0, 3)] = float("inf")
++        row[at(3, 2)] = float("nan")
++    elif kind == 4:
++        row.fill_(float("-inf"))
++    elif kind == 5:
++        row.zero_()
++        row[1::2] = -0.0
++    elif kind == 6:
++        row.copy_(-row.abs() - 1)
++        row[at(0, 3)] = torch.tensor([3.0, 1.0, 2.0], device=DEVICE)[: at(0, 3).numel()]
++        row[at(3, 10)] = 0.0
++        row[at(13, 10)] = -0.0
++    elif kind == 7:
++        row.mul_(1.0e-40)
++        row[at(0, 20)] = 0.0
++        row[at(20, 20)] = -0.0
++    elif kind == 8:
++        unit = torch.rand(vocab, generator=g, device=DEVICE)
++        row.copy_((unit * 2 - 1) * 3.0e38)
++        row[at(0, 2)] = float("inf")
++        row[at(2, 2)] = float("-inf")
++    elif kind == 10:
++        row.fill_(-0.0)
++        row[at(0, 4)] = torch.tensor([4.0, 1.0, 3.0, 2.0], device=DEVICE)[
++            : at(0, 4).numel()
++        ]
++    elif kind == 11:
++        row.fill_(float("-inf"))
++        row[at(0, 3)] = torch.tensor([-1.0, 7.0, -1.0], device=DEVICE)[
++            : at(0, 3).numel()
++        ]
++
++
++# NaN bit patterns of each width: quiet and signalling, both signs.
++_NAN_BITS = {
++    4: (0x7FC00000, 0x7F800001, -0x00400000, -0x007FFFFF),
++    2: (0x7FC0, 0x7F81, -0x0040, -0x007F),
++}
++
++
++def _nan_payloads(logits: torch.Tensor, case: str) -> None:
++    """Rows of "special" kind 9: eight NaNs of each pattern at spread columns."""
++    if case != "special":
++        return
++    rows, vocab = logits.shape
++    ints = {4: torch.int32, 2: torch.int16}[logits.element_size()]
++    bits = logits.view(ints)
++    for r in range(9, rows, 12):
++        for i, pattern in enumerate(_NAN_BITS[logits.element_size()]):
++            for j in range(8):
++                bits[r, (vocab * (4 * j + i)) // 32] = pattern
++
++
++def _logits(
++    values: torch.Tensor, dtype: torch.dtype, layout: str, case: str = ""
++) -> torch.Tensor:
++    """``values`` in ``dtype`` rows of ``layout``, NaN past each row."""
++    rows, vocab = values.shape
++    aligned = -(-vocab // 16) * 16
++    stride = {
++        "aligned": aligned,
++        "padded": aligned + 1024,
++        "odd_stride": aligned + 1,
++        "shifted_base": aligned,
++    }[layout]
++    flat = torch.full((rows * stride + 1,), PAD, dtype=dtype, device=DEVICE)
++    start = 1 if layout == "shifted_base" else 0
++    logits = flat[start : start + rows * stride].view(rows, stride)[:, :vocab]
++    logits.copy_(values.to(dtype))
++    _nan_payloads(logits, case)
++    vector = layout in ("aligned", "padded")
++    assert tls._triton_run(logits) == (16 // logits.element_size() if vector else 1)
++    return logits
++
++
++def _sampled(rows: int, vocab: int, seed: int) -> torch.Tensor:
++    g = torch.Generator(device=DEVICE).manual_seed(seed + 1)
++    return torch.randint(vocab, (rows,), generator=g, device=DEVICE)
++
++
++# --- PyTorch's algorithm --------------------------------------------------------
++
++
++def _keys(logits: torch.Tensor) -> torch.Tensor:
++    """TopKTypeConfig<T>::convert of the values (int64 holding uint32 keys), on the
++    host: the FP32 key of the widened value orders as the 16-bit key."""
++    x = logits.float().cpu()
++    bits = x.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
++    keys = bits ^ torch.where(bits >= 0x80000000, 0xFFFFFFFF, 0x80000000)
++    return torch.where(x.isnan(), torch.full_like(keys, 0xFFFFFFFF), keys)
++
++
++def _gt(a: float, b: float) -> bool:
++    """GTOp<scalar_t, true> (SortingCommon.cuh)."""
++    return (math.isnan(a) and not math.isnan(b)) or a > b
++
++
++def _bitonic(values: list[float], cols: list[int]) -> list[int]:
++    """bitonicSortKVInPlace (SortUtils.cuh) as SmallBitonicSort launches it: 32
++    slots, two for each of 16 threads, the slots past ``len(cols)`` invalid,
++    descending by GTOp."""
++    k = len(cols)
++    keys = values + [0.0] * (32 - k)
++    vals = cols + [0] * (32 - k)
++    valid = [True] * k + [False] * (32 - k)
++
++    def swap(t: int, stride: int, direction: bool) -> None:
++        a = 2 * t - (t & (stride - 1))
++        b = a + stride
++        exchange = (_gt(keys[a], keys[b]) and valid[a]) or not valid[b]
++        if exchange == direction:
++            keys[a], keys[b] = keys[b], keys[a]
++            vals[a], vals[b] = vals[b], vals[a]
++            valid[a], valid[b] = valid[b], valid[a]
++
++    size = 2
++    while size < 32:
++        stride = size // 2
++        while stride:
++            for t in range(16):
++                swap(t, stride, (t & (size // 2)) != 0)
++            stride //= 2
++        size *= 2
++    stride = 16
++    while stride:
++        for t in range(16):
++            swap(t, stride, False)
++        stride //= 2
++    return vals[:k]
++
++
++def _model(logits: torch.Tensor, k: int) -> torch.Tensor:
++    """torch.topk(logits, k).indices (k <= 32) by PyTorch's algorithm, on the host:
++    the k largest by key then lower column; gatherTopK's layout (those above the
++    k-th key in column order, then those equal to it in column order); the bitonic
++    sort unless k is 1."""
++    keys = _keys(logits)
++    values = logits.float().cpu()
++    out = []
++    for r in range(keys.shape[0]):
++        chosen = torch.sort(keys[r], descending=True, stable=True).indices[:k]
++        chosen_keys = keys[r, chosen].tolist()
++        chosen = chosen.tolist()
++        kth = chosen_keys[-1]
++        above = sorted(c for c, key in zip(chosen, chosen_keys) if key != kth)
++        equal = [c for c, key in zip(chosen, chosen_keys) if key == kth]
++        gathered = above + equal
++        if k > 1:
++            gathered = _bitonic([values[r, c].item() for c in gathered], gathered)
++        out.append(gathered)
++    return torch.tensor(out, dtype=torch.int64)
++
++
++# --- Checks -----------------------------------------------------------------------
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    return x.view({4: torch.int32, 2: torch.int16}[x.element_size()])
++
++
++def _assert_ids(
++    ours: torch.Tensor, theirs: torch.Tensor, logits: torch.Tensor, what: str
++) -> None:
++    ours, theirs = ours.cpu(), theirs.cpu()
++    assert ours.shape == theirs.shape, f"{what}: {ours.shape} vs {theirs.shape}"
++    if torch.equal(ours, theirs):
++        return
++    rows = (ours != theirs).any(dim=1).nonzero().flatten().tolist()
++    r = rows[0]
++    last = logits.shape[1] - 1
++
++    def values(ids: torch.Tensor) -> list[float]:
++        return logits[r, ids.clamp(0, last).to(logits.device)].float().tolist()
++
++    raise AssertionError(
++        f"{what}: {len(rows)} of {ours.shape[0]} rows differ, first row {r}: "
++        f"ours {ours[r].tolist()}, torch's {theirs[r].tolist()}, values ours "
++        f"{values(ours[r])}, torch's {values(theirs[r])}"
++    )
++
++
++def _check(logits: torch.Tensor, k: int, what: str) -> None:
++    """Both paths against torch.topk: the fast path's [sampled, ids] (int64) and the
++    custom-ids path's ids (int32); the logits untouched."""
++    before = _bits(logits).clone()
++    theirs = torch.topk(logits, k, dim=-1).indices
++    sampled = _sampled(logits.shape[0], logits.shape[1], k)
++    rows = tki.logprob_token_ids(logits, k, sampled)
++    assert rows.dtype == torch.int64 and rows.is_contiguous()
++    assert torch.equal(rows[:, 0], sampled), f"{what}: sampled column"
++    _assert_ids(rows[:, 1:], theirs, logits, f"{what} k={k} int64")
++    ids = tki.topk_token_ids(logits, k)
++    assert ids.dtype == torch.int32
++    _assert_ids(ids, theirs.to(torch.int32), logits, f"{what} k={k} int32")
++    assert torch.equal(_bits(logits), before), f"{what}: logits changed"
++
++
++# --- Indices ---------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize(
++    "vocab", [VOCAB, SHARD, 1, 7, 33, 16385, 50001], ids=lambda v: f"v{v}"
++)
++@pytest.mark.parametrize("layout", LAYOUTS)
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_ids_match_torch(dtype, layout, vocab, case):
++    """Twelve rows (every "special" kind), each k up to the width."""
++    values = _values(12, vocab, case, seed=vocab + len(case))
++    logits = _logits(values, dtype, layout, case)
++    for k in KS:
++        if k <= vocab:
++            _check(logits, k, f"{dtype} {layout} v{vocab} {case}")
++
++
++@pytest.mark.parametrize("case", ("straddle", "special", "equal", "ties", "rounded"))
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_every_k(dtype, case):
++    """Every k from 1 to 32 where the k-th place falls inside tie groups."""
++    values = _values(24, SHARD, case, seed=31 + len(case))
++    logits = _logits(values, dtype, "aligned", case)
++    for k in range(1, tki.TOPK_IDS_MAX + 1):
++        _check(logits, k, f"{dtype} {case}")
++
++
++@pytest.mark.parametrize("case", ("random", "rounded", "ties"))
++@pytest.mark.parametrize("rows", [1, 6, 16, 96, 1024])
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_batch_sizes(dtype, rows, case):
++    """Decode batches and a prompt-logprobs chunk (compute_prompt_logprobs_with_
++    chunking's 1024 rows) at the LM head's padded stride."""
++    values = _values(rows, VOCAB, case, seed=rows)
++    flat = torch.full((rows, PADDED), PAD, dtype=dtype, device=DEVICE)
++    logits = flat[:, :VOCAB]
++    logits.copy_(values.to(dtype))
++    for k in (1, 5, 20, 32):
++        _check(logits, k, f"{dtype} {rows} rows {case}")
++
++
++@pytest.mark.parametrize("case", ("straddle", "special", "equal", "ascending"))
++@pytest.mark.parametrize("dtype", (*DTYPES, torch.float16), ids=str)
++def test_model_matches_torch(dtype, case):
++    """PyTorch's algorithm as ``_model`` reads it, against torch.topk itself (the
++    kernel's tests stand on this reading), and the kernel against both."""
++    values = _values(12, SHARD, case, seed=7 + len(case))
++    logits = _logits(values, dtype, "aligned", case)
++    for k in KS:
++        theirs = torch.topk(logits, k, dim=-1).indices
++        _assert_ids(_model(logits, k), theirs, logits, f"model {dtype} {case} k={k}")
++        _check(logits, k, f"{dtype} {case}")
++
++
++def test_ties_leave_in_the_network_order():
++    """The order the tests pin is not a stable one: eight equal values at columns
++    0..7 come out as the bitonic network leaves them."""
++    logits = torch.full((1, 64), -1.0, device=DEVICE)
++    logits[0, :8] = 2.0
++    expected = [7, 6, 4, 5, 1, 0, 2, 3]
++    assert torch.topk(logits, 8, dim=-1).indices[0].tolist() == expected
++    assert tki.topk_token_ids(logits, 8)[0].tolist() == expected
++
++
++# --- Bounds and layouts -------------------------------------------------------------
++
++
++def test_bounds():
++    logits = torch.randn(3, 40, device=DEVICE)
++    sampled = torch.zeros(3, dtype=torch.int64, device=DEVICE)
++    for k in (0, tki.TOPK_IDS_MAX + 1):
++        with pytest.raises(ValueError):
++            tki.logprob_token_ids(logits, k, sampled)
++        with pytest.raises(ValueError):
++            tki.topk_token_ids(logits, k)
++    narrow = logits[:, :4]
++    with pytest.raises(RuntimeError, match="out of range"):
++        tki.topk_token_ids(narrow, 5)
++    # No row: nothing to launch.
++    assert tki.logprob_token_ids(logits[:0], 5, sampled[:0]).shape == (0, 6)
++    assert tki.topk_token_ids(logits[:0], 5).shape == (0, 5)
++
++
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_sampled_column(dtype):
++    """The fast path's rows are torch.cat((sampled[:, None], indices), 1), int64,
++    for int64 and int32 sampled tokens."""
++    values = _values(9, VOCAB, "rounded", seed=3)
++    logits = _logits(values, dtype, "aligned")
++    sampled = _sampled(9, VOCAB, 3)
++    expected = torch.cat(
++        (sampled.unsqueeze(-1), torch.topk(logits, 20, dim=-1).indices), dim=1
++    )
++    for tokens in (sampled, sampled.int()):
++        rows = tki.logprob_token_ids(logits, 20, tokens)
++        assert rows.dtype == expected.dtype
++        _assert_ids(rows, expected, logits, f"{dtype} sampled {tokens.dtype}")
++
++
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_strided_columns(dtype):
++    """Logits whose columns are not adjacent are refused (every logits row the
++    samplers pass has a unit column stride; no copy path)."""
++    wide = torch.zeros(4, 4099, 2, dtype=dtype, device=DEVICE)
++    logits = wide[..., 0]
++    assert logits.stride(1) == 2
++    with pytest.raises(ValueError, match="unit column stride"):
++        tki.topk_token_ids(logits, 20)
++
++
++# --- Call sites ----------------------------------------------------------------------
++
++
++def _no_topk(*args, **kwargs):
++    raise AssertionError("torch.topk was called below TOPK_IDS_MAX")
++
++
++@pytest.mark.parametrize("logits_mode", [False, True])
++@pytest.mark.parametrize("num_logprobs", [0, 1, 5, 20, 32, 33, 64])
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_compute_topk_scores_fast_path(dtype, num_logprobs, logits_mode, monkeypatch):
++    """The fast path's ids: the kernel up to TOPK_IDS_MAX (torch.topk is not
++    called); above it the count is refused (--max-logprobs bounds it at startup)."""
++    values = _values(6, VOCAB, "special", seed=num_logprobs)
++    logits = _logits(values, dtype, "aligned", "special")
++    sampled = _sampled(6, VOCAB, num_logprobs)
++    if num_logprobs > tki.TOPK_IDS_MAX:
++        with pytest.raises(ValueError, match="max-logprobs"):
++            logprob.compute_topk_scores(
++                logits, num_logprobs, sampled, logits_mode=logits_mode
++            )
++        return
++    expected = sampled.unsqueeze(-1)
++    if num_logprobs:
++        expected = torch.cat(
++            (expected, torch.topk(logits, num_logprobs, dim=-1).indices), dim=1
++        )
++    monkeypatch.setattr(torch, "topk", _no_topk)
++    result = logprob.compute_topk_scores(
++        logits, num_logprobs, sampled, logits_mode=logits_mode
++    )
++    monkeypatch.undo()
++    _assert_ids(result.logprob_token_ids, expected, logits, f"fast {num_logprobs}")
++    assert result.logprobs.shape == expected.shape
++
++
++@pytest.mark.parametrize("num_logprobs", [0, 3, 20, 33])
++def test_compute_topk_scores_custom_ids(num_logprobs, monkeypatch):
++    """With a request's logprob_token_ids, the other rows take the top-k from the
++    int32 ids (the kernel up to TOPK_IDS_MAX, above it refused), the request's
++    rows its own ids; an unused column is id 0 and -inf."""
++    custom = [5, 129279, 2]
++    state = logprob.LogprobTokenIdsState(8, DEVICE)
++    for req in range(8):
++        params = SamplingParams(logprob_token_ids=custom if req == 3 else None)
++        state.add_request(req, params)
++    state.apply_staged_writes()
++    rows = 7
++    mapping = torch.tensor([0, 3, 1, 3, 7, 2, 6], dtype=torch.int64, device=DEVICE)
++    values = _values(rows, VOCAB, "straddle", seed=num_logprobs)
++    logits = _logits(values, torch.float32, "aligned")
++    sampled = _sampled(rows, VOCAB, num_logprobs)
++    top = torch.topk(logits, max(num_logprobs, 1), dim=-1).indices
++    if num_logprobs > tki.TOPK_IDS_MAX:
++        with pytest.raises(ValueError, match="max-logprobs"):
++            logprob.compute_topk_scores(
++                logits,
++                num_logprobs,
++                sampled,
++                logprob_token_ids_state=state,
++                expanded_idx_mapping=mapping,
++                max_per_req_token_ids=len(custom),
++            )
++        return
++    monkeypatch.setattr(torch, "topk", _no_topk)
++    result = logprob.compute_topk_scores(
++        logits,
++        num_logprobs,
++        sampled,
++        logprob_token_ids_state=state,
++        expanded_idx_mapping=mapping,
++        max_per_req_token_ids=len(custom),
++    )
++    monkeypatch.undo()
++    ids = result.logprob_token_ids.cpu()
++    width = 1 + max(num_logprobs, len(custom))
++    assert ids.shape == (rows, width)
++    scores = result.logprobs.cpu()
++    for r, req in enumerate(mapping.tolist()):
++        assert ids[r, 0].item() == sampled[r].item()
++        wanted = custom if req == 3 else top[r, :num_logprobs].tolist()
++        assert ids[r, 1 : 1 + len(wanted)].tolist() == wanted, (r, req)
++        # The straddle rows are finite: a masked (invalid) column is -inf.
++        assert torch.isfinite(scores[r, : 1 + len(wanted)]).all(), (r, req)
++        assert (scores[r, 1 + len(wanted) :] == float("-inf")).all(), (r, req)
++        assert (ids[r, 1 + len(wanted) :] == 0).all(), (r, req)
++
++
++def test_cuda_graph_replay():
++    """A captured launch replays on new values in the same tensors."""
++    values = _values(16, VOCAB, "random", seed=3)
++    logits = _logits(values, torch.float32, "aligned")
++    sampled = _sampled(16, VOCAB, 3)
++    tki.logprob_token_ids(logits, 20, sampled)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            out = tki.logprob_token_ids(logits, 20, sampled)
++    torch.cuda.current_stream().wait_stream(side)
++    fresh = _values(16, VOCAB, "straddle", seed=4)
++    logits.copy_(fresh)
++    sampled.copy_(_sampled(16, VOCAB, 4))
++    graph.replay()
++    torch.cuda.synchronize()
++    expected = torch.cat(
++        (sampled.unsqueeze(-1), torch.topk(logits, 20, dim=-1).indices), dim=1
++    )
++    _assert_ids(out, expected, logits, "graph replay")
++
++
++# --- Preparation --------------------------------------------------------------
++
++
++def test_runner_declares_the_launched_calls():
++    """register_topk_scores_warmup declares both ids layouts of each logits dtype in
++    both load layouts (the stride and k are arguments); the declared calls compile
++    and serve every layout."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    pairs = [(torch.bfloat16, PADDED), (torch.float32, VOCAB), (torch.float32, PADDED)]
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        logprob.register_topk_scores_warmup(
++            logits=pairs, vocab_size=VOCAB, logits_mode=True
++        )
++    declared = {
++        (id(function), args)
++        for function, args, _ in prepare.declared_calls(registry)
++        if function is tki.topk_ids_kernel
++    }
++    assert declared == {
++        (id(tki.topk_ids_kernel), tki.topk_ids_key(dtype, ids_dtype, run))
++        for dtype in (torch.bfloat16, torch.float32)
++        for ids_dtype in (torch.int64, torch.int32)
++        for run in tls._runs(dtype)
++    }
++    prepare.prepare_declared(registry)
++    for dtype in (torch.bfloat16, torch.float32):
++        values = _values(3, VOCAB, "rounded", seed=9)
++        for layout in ("aligned", "odd_stride"):
++            logits = _logits(values, dtype, layout)
++            _check(logits, 20, f"declared {dtype} {layout}")
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+index 22333d87f..c64f3a3cc 100644
+--- a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -25,7 +25,13 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+-from vllm.v1.worker.gpu.sample import logprob, states, tilelang_logprob
++from vllm.v1.worker.gpu.sample import (
++    logprob,
++    states,
++    tilelang_auxiliary,
++    tilelang_logprob,
++    tilelang_topk_ids,
++)
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.sample.sink import SinkAlternates
+ from vllm.v1.worker.gpu.spec_decode import rejection_sampler
+@@ -100,6 +106,35 @@ def _fill_logprob_token_ids(
+         valid[row, : 1 + len(tokens)] = True
+ 
+ 
++def _fill_token_ids(
++    out_ids, valid, sampled, topk, expanded_idx_mapping, num_per_req, per_req_ids, k
++):
++    """``tilelang_auxiliary.fill_token_ids``: every column written, 0 and invalid
++    where unused."""
++    out_ids.zero_()
++    valid.zero_()
++    _fill_logprob_token_ids(
++        out_ids,
++        None,
++        valid,
++        None,
++        sampled,
++        topk,
++        None,
++        expanded_idx_mapping,
++        num_per_req,
++        per_req_ids,
++        None,
++        k,
++        None,
++    )
++
++
++def _compute_token_logprobs(logits, ids, valid=None):
++    scores = torch.log_softmax(logits.float(), -1).gather(1, ids.long())
++    return scores if valid is None else scores.masked_fill(~valid, float("-inf"))
++
++
+ def _token_ranks(logits, token_ids, out):
+     chosen = logits.gather(1, token_ids.view(-1, 1).long())
+     out.copy_((logits >= chosen).sum(1))
+@@ -123,15 +158,21 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+     monkeypatch.setattr(states, "UvaBackedTensor", HostTensor)
+     monkeypatch.setattr(logprob, "UvaBackedTensor", HostTensor)
+     monkeypatch.setattr(logprob, "StagedWriteTensor", HostStagedTensor)
++    monkeypatch.setattr(tilelang_auxiliary, "fill_token_ids", _fill_token_ids)
+     monkeypatch.setattr(
+-        logprob, "_fill_logprob_token_ids_kernel", HostKernel(_fill_logprob_token_ids)
++        tilelang_topk_ids,
++        "topk_token_ids",
++        lambda logits, k: torch.topk(logits, k, dim=-1).indices.int(),
+     )
+-    monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
+     monkeypatch.setattr(
+-        logprob,
+-        "compute_token_logprobs",
+-        lambda logits, ids: torch.log_softmax(logits.float(), -1).gather(1, ids.long()),
++        tilelang_topk_ids,
++        "logprob_token_ids",
++        lambda logits, k, sampled: torch.cat(
++            (sampled.unsqueeze(-1), torch.topk(logits, k, dim=-1).indices), dim=1
++        ),
+     )
++    monkeypatch.setattr(tilelang_logprob, "token_ranks", _token_ranks)
++    monkeypatch.setattr(logprob, "compute_token_logprobs", _compute_token_logprobs)
+     monkeypatch.setattr(
+         logprob.triton,
+         "next_power_of_2",
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index f6e60db97..88a4d88a9 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -10,7 +10,7 @@ from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_ids
+ 
+ # Upper bound on the topk kernel's per-iteration gather width.
+ _MAX_TOPK_BLOCK = 1024
+@@ -89,21 +89,34 @@ def _ranks_kernel(
+ def register_topk_scores_warmup(
+     *, logits: Sequence[tuple[torch.dtype, int]], vocab_size: int, logits_mode: bool
+ ) -> None:
+-    """Register ``compute_topk_scores`` (without per-request token ids) for
+-    ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
++    """Register ``compute_topk_scores`` for ``vocab_size``-wide logits given as
++    ``(dtype, row stride)`` pairs: the top-k token ids (both paths' layouts), the
+     selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
++    from vllm.config import get_current_vllm_config_or_none
+     from vllm.v1.worker.gpu.sample.tilelang_logprob import (
+         register_log_softmax,
+         register_ranks,
+     )
+ 
++    # The top-k ids kernel takes k up to TOPK_IDS_MAX: a larger --max-logprobs
++    # (or -1, the whole vocabulary) is refused here rather than at its request.
++    config = get_current_vllm_config_or_none()
++    model_config = None if config is None else config.model_config
++    if model_config is not None and not (
++        0 <= model_config.max_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX
++    ):
++        raise ValueError(
++            f"--max-logprobs {model_config.max_logprobs} is outside the TileLang "
++            f"top-k logprobs' range 0..{tilelang_topk_ids.TOPK_IDS_MAX}"
++        )
++    tilelang_topk_ids.register_topk_ids(logits)
+     register_ranks(logits, vocab_size)
+     if not logits_mode:
+         register_log_softmax(logits)
+ 
+ 
+ def compute_token_logprobs(
+-    logits: torch.Tensor, token_ids: torch.Tensor
++    logits: torch.Tensor, token_ids: torch.Tensor, valid: torch.Tensor | None = None
+ ) -> torch.Tensor:
+     # NOTE(woosuk): To save GPU memory, we do not materialize the full
+     # [batch_size, vocab_size] logprobs tensor. The kernel computes
+@@ -115,8 +128,9 @@ def compute_token_logprobs(
+     num_logprobs = token_ids.shape[1]
+     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+     # The requested count is runtime data, including the single selected token
+-    # for prompt_logprobs=0: one kernel serves every count.
+-    topk_log_softmax(logits, token_ids, logprobs)
++    # for prompt_logprobs=0: one kernel serves every count. With ``valid``, its
++    # false columns are -inf.
++    topk_log_softmax(logits, token_ids, logprobs, valid)
+     return logprobs
+ 
+ 
+@@ -130,15 +144,19 @@ def compute_topk_scores(
+     max_per_req_token_ids: int = 0,
+     logits_mode: bool = False,
+ ) -> LogprobsTensors:
+-    assert num_logprobs >= 0
++    if not 0 <= num_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX:
++        raise ValueError(f"{num_logprobs} logprobs a token: --max-logprobs bounds them")
+     batch_size, vocab_size = logits.shape
+ 
+     if max_per_req_token_ids == 0:
+         # Fast path: no request asked for custom logprob_token_ids.
+-        logprob_token_ids = sampled_token_ids.unsqueeze(-1)
+         if num_logprobs > 0:
+-            topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
+-            logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
++            # [sampled, top-k...] in torch.topk's order, one launch.
++            logprob_token_ids = tilelang_topk_ids.logprob_token_ids(
++                logits, num_logprobs, sampled_token_ids
++            )
++        else:
++            logprob_token_ids = sampled_token_ids.unsqueeze(-1)
+         if logits_mode:
+             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+         else:
+@@ -152,15 +170,15 @@ def compute_topk_scores(
+         assert expanded_idx_mapping is not None
+ 
+         if num_logprobs > 0:
+-            topk_token_ids = torch.topk(logits, num_logprobs, dim=-1).indices
+-            topk_token_ids = topk_token_ids.to(torch.int32)
++            topk_token_ids = tilelang_topk_ids.topk_token_ids(logits, num_logprobs)
+         else:
+             # This tensor just used as an int32 pointer, data not accessed.
+             topk_token_ids = logprob_token_ids_state.token_ids.gpu
+ 
+         num_cols = max(num_logprobs, max_per_req_token_ids)
+-        logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
+-        valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
++        # The fill writes every column (0 and invalid where unused).
++        logprob_token_ids = sampled_token_ids.new_empty((batch_size, 1 + num_cols))
++        valid_mask = torch.empty_like(logprob_token_ids, dtype=torch.bool)
+         tilelang_auxiliary.fill_token_ids(
+             logprob_token_ids,
+             valid_mask,
+@@ -173,9 +191,9 @@ def compute_topk_scores(
+         )
+         if logits_mode:
+             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
++            scores = scores.masked_fill(~valid_mask, float("-inf"))
+         else:
+-            scores = compute_token_logprobs(logits, logprob_token_ids)
+-        scores = scores.masked_fill(~valid_mask, float("-inf"))
++            scores = compute_token_logprobs(logits, logprob_token_ids, valid_mask)
+ 
+     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
+     from vllm.v1.worker.gpu.sample.tilelang_logprob import token_ranks as fill_ranks
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 7d293ab34..c02526cbe 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -252,6 +252,8 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
+             if T.get_thread_binding() == 0:
+                 output[row, 0] = T.cast(sampled[row], "int64")
+                 valid[row, 0] = True
++            # Every column is written: an unused one is 0 and invalid (the zeros
++            # the outputs were allocated with before).
+             for i in T.serial(T.ceildiv(out_cols - 1, 128)):
+                 col = i * 128 + T.get_thread_binding()
+                 if col + 1 < out_cols:
+@@ -259,9 +261,15 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
+                         if col < num_custom[req]:
+                             output[row, col + 1] = T.cast(custom_ids[req, col], "int64")
+                             valid[row, col + 1] = True
++                        else:
++                            output[row, col + 1] = T.int64(0)
++                            valid[row, col + 1] = False
+                     elif col < topk:
+                         output[row, col + 1] = T.cast(topk_ids[row, col], "int64")
+                         valid[row, col + 1] = True
++                    else:
++                        output[row, col + 1] = T.int64(0)
++                        valid[row, col + 1] = False
+ 
+     return fill_ids
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index bd3d99e1f..7fe3bf0be 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -176,15 +176,18 @@ def _masked(value, column, vocab, guarded: bool, other):
+ 
+ 
+ @tilelang.jit(pass_configs=tilelang_sampling._PASS)
+-def topk_log_softmax_kernel(logits_dtype: str, run: int):
++def topk_log_softmax_kernel(logits_dtype: str, run: int, masked: bool = False):
+     """``_topk_log_softmax_kernel`` (BLOCK_SIZE and TOPK_BLOCK_SIZE 1024, four
+     warps): one block of 128 threads a row, whose ``topk`` selected tokens' log
+-    probabilities it writes. A thread holds its eight columns of each 1024-column
++    probabilities it writes; with ``masked``, -inf where ``valid`` is false (the
++    custom-ids path's ``masked_fill``, in the same store; unmasked, ``valid`` is
++    not read). A thread holds its eight columns of each 1024-column
+     block in runs of ``run`` (``_triton_run``); chunks of eight whole blocks load
+     their runs as vectors (the launch checked the alignment), and the row's last
+     chunk loads each column clamped to the row, the columns past it masked."""
+     rows, vocab, topk = T.dynamic("rows, vocab, topk")
+     logits_stride = T.dynamic("logits_stride", "int64")
++    valid_rows, valid_cols = T.dynamic("valid_rows, valid_cols")
+     per = _SOFTMAX_PER_THREAD
+     unroll = _SOFTMAX_UNROLL
+ 
+@@ -285,6 +288,7 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int):
+         output: T.Tensor((rows, topk), T.float32),
+         logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
+         token_ids: T.Tensor((rows, topk), T.int64),
++        valid: T.Tensor((valid_rows, valid_cols), T.bool),
+     ):
+         with T.Kernel(rows, threads=_THREADS) as row:
+             T.import_source(_HEADER)
+@@ -351,31 +355,36 @@ def topk_log_softmax_kernel(logits_dtype: str, run: int):
+                     picked[u] = T.cast(logits[row, tokens[u]], T.float32)
+                 for u in tuple(range(per)):
+                     if c * SOFTMAX_BLOCK + u * _THREADS + tx < topk:
+-                        output[row64, c * SOFTMAX_BLOCK + u * _THREADS + tx] = (
+-                            T.call_extern(
+-                                "float32",
+-                                "vllm_sub",
+-                                T.call_extern(
+-                                    "float32", "vllm_sub", picked[u], maximum
+-                                ),
+-                                lse,
+-                            )
++                        col = c * SOFTMAX_BLOCK + u * _THREADS + tx
++                        value = T.call_extern(
++                            "float32",
++                            "vllm_sub",
++                            T.call_extern("float32", "vllm_sub", picked[u], maximum),
++                            lse,
+                         )
++                        if masked:
++                            value = T.if_then_else(
++                                valid[row64, col], value, -T.infinity(T.float32)
++                            )
++                        output[row64, col] = value
+ 
+     return topk_log_softmax
+ 
+ 
+-def topk_log_softmax_key(logits_dtype: torch.dtype, run: int = 1) -> tuple:
+-    return (_DTYPES[logits_dtype], run)
++def topk_log_softmax_key(
++    logits_dtype: torch.dtype, run: int = 1, masked: bool = False
++) -> tuple:
++    return (_DTYPES[logits_dtype], run, masked)
+ 
+ 
+ def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
+     """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
+-    layouts a launch may take (``_runs``)."""
++    layouts a launch may take (``_runs``), unmasked and masked (custom ids)."""
+     return [
+-        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run))
++        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run, masked))
+         for dtype in dict.fromkeys(logits_dtypes)
+         for run in _runs(dtype)
++        for masked in (False, True)
+     ]
+ 
+ 
+@@ -391,6 +400,7 @@ def topk_log_softmax(
+     logits: torch.Tensor,  # [rows, vocab_size]
+     token_ids: torch.Tensor,  # [rows, topk], int64, contiguous
+     output: torch.Tensor,  # [rows, topk], FP32, contiguous
++    valid: torch.Tensor | None = None,  # [rows, topk], bool, contiguous
+ ) -> None:
+     """``_topk_log_softmax_kernel``'s launch: each row's log-softmax at its
+     ``token_ids``, into ``output``."""
+@@ -398,6 +408,12 @@ def topk_log_softmax(
+         return
+     kernel = _kernel(
+         topk_log_softmax_kernel,
+-        *topk_log_softmax_key(logits.dtype, _triton_run(logits)),
++        *topk_log_softmax_key(logits.dtype, _triton_run(logits), valid is not None),
++    )
++    # Unmasked, the kernel does not read ``valid``: the ids' first row stands in.
++    kernel(
++        output,
++        logits,
++        token_ids,
++        token_ids[:1].view(torch.bool) if valid is None else valid,
+     )
+-    kernel(output, logits, token_ids)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+new file mode 100644
+index 000000000..bb53be3ba
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_ids.py
+@@ -0,0 +1,470 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The top-k token ids of ``compute_topk_scores``, as ``torch.topk`` returns them.
++
++- ``logprob_token_ids``: ``torch.cat((sampled[:, None], torch.topk(logits,
++  k).indices), 1)``, int64 ``[rows, 1 + k]``
++- ``topk_token_ids``: ``torch.topk(logits, k).indices.to(torch.int32)``
++
++Both are one launch of ``topk_ids_kernel`` and return PyTorch 2.13.0's CUDA indices,
++in its order, ties, signed zeros and NaN included, for ``k`` up to ``TOPK_IDS_MAX``.
++
++PyTorch's path (``aten/src/ATen/native/cuda`` at v2.13.0) for a ``[rows, vocab]``
++float32, bfloat16 or float16 input, ``largest=True, sorted=True``:
++
++1. ``topk_out_cuda`` (TensorTopK.cpp) runs ``launch_gather_topk_kernel`` on the
++   input made contiguous. Values are ranked by ``TopKTypeConfig<T>::convert``
++   (SortingRadixSelect.cuh): an unsigned key that orders as the value, ``-0``
++   below ``+0``, every NaN equal and above ``+inf``. A radix select finds the
++   k-th largest key; ``gatherTopK`` writes every element whose key is greater, in
++   column order, then the lowest-column elements whose key equals it, in column
++   order. That holds on both slice paths (``sbtopk``: a block a row, its prefix
++   scans in thread order; ``mbtopk``, which ``should_use_multiblock`` picks for
++   every vocabulary and row count here: blocks in column order, each block's
++   ``BlockScan``s in item then thread order). The selected set is the ``k`` largest
++   by (key, then lower column).
++2. ``sortKeyValueInplace(values, indices, dim, largest)`` (Sort.cu), unstable, for
++   ``k <= 32``: ``SmallBitonicSort``, ``bitonicSortKVInPlace`` (SortUtils.cuh) on
++   32 slots, two a thread for 16 threads, the slots past ``k`` invalid. Its
++   comparator is ``GTOp<T, true>`` (SortingCommon.cuh): a NaN above any other value
++   and NaNs equal; otherwise ``>`` on the values, so ``-0`` and ``+0`` are equal. A
++   compare-exchange swaps equal values in some stages (``bitonicSwap``'s ``swap ==
++   dir``), so ties leave in an order only the network decides: ``k`` equal values
++   at columns ``0..7`` come out ``7, 6, 4, 5, 1, 0, 2, 3``. ``k == 1`` is not sorted.
++
++Above 32, PyTorch sorts with another algorithm (``WarpMergeSort`` up to 128, a block
++radix sort up to 4096, a segmented sort beyond), each with its own tie order, and a
++full-vocabulary request (``prompt_logprobs=-1``) is a sort of the whole row:
++``compute_topk_scores`` keeps ``torch.topk`` there.
++
++The kernel, a block of 512 threads a row:
++
++- Each warp keeps a descending list of 32 entries, one a lane, whose first ``k``
++  are the ``k`` largest it has seen. An entry is the element's key (the key of its
++  FP32 value: widening a bfloat16 or float16 is exact, so the key orders as the
++  16-bit one) above the complement of its column: unique, and ordered as PyTorch
++  selects. Each thread loads 32 elements of a tile, and the warp inserts those
++  above its k-th entry, one at a time (``vllm_tki_insert``); a value below the
++  k-th entry's value is not looked at again.
++- The warps' first ``k`` entries meet in shared memory; each entry's rank is the
++  count of larger ones (a binary search in each list), and the ``k`` ranked below
++  ``k`` are the selection, in descending order.
++- One warp lays them out as ``gatherTopK`` wrote them and runs the bitonic network
++  across its lanes (``vllm_tki_order``): the comparisons are made on the keys,
++  which give ``GTOp``'s answers bit for bit (no flush-to-zero).
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from collections.abc import Sequence
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.v1.worker.gpu.sample.tilelang_sampling import (
++    _DTYPES,
++    _PASS,
++    _call,
++    _kernel,
++    _runs,
++    _triton_run,
++    declare,
++)
++
++# The largest k the kernel serves: PyTorch's bitonic sort of 32 slots.
++TOPK_IDS_MAX = 32
++_THREADS = 512
++_WARPS = _THREADS // 32
++# Elements a thread loads per tile, and a tile's columns.
++_PER = 32
++_TILE = _THREADS * _PER
++
++_HEADER = r"""
++// TopKTypeConfig<float>::convert: an unsigned key that orders as the value, -0 below
++// +0, every NaN above +inf.
++__device__ __forceinline__ unsigned int vllm_tki_key(float v) {
++  const unsigned int x = __float_as_uint(v);
++  if ((x & 0x7fffffffu) > 0x7f800000u) return 0xffffffffu;
++  return x ^ ((x & 0x80000000u) ? 0xffffffffu : 0x80000000u);
++}
++
++// An element's entry: its key, then the complement of its column, so that entries
++// are unique and the larger one is the one torch.topk selects first.
++__device__ __forceinline__ unsigned long long vllm_tki_entry(float v, int col) {
++  return ((unsigned long long)vllm_tki_key(v) << 32) |
++         (unsigned long long)(~(unsigned int)col);
++}
++
++// Whether a value can rank above an entry of value `floor`: it is not below it (a
++// NaN value, or a NaN floor, passes).
++__device__ __forceinline__ int vllm_tki_pass(float v, float floor) {
++  return !(v < floor);
++}
++
++// The value of an entry's key; -inf for an empty entry (0).
++__device__ __forceinline__ float vllm_tki_floor(unsigned long long entry) {
++  const unsigned int key = (unsigned int)(entry >> 32);
++  if (key == 0u) return __uint_as_float(0xff800000u);
++  return __uint_as_float(key ^ ((key & 0x80000000u) ? 0x80000000u : 0xffffffffu));
++}
++
++__device__ __forceinline__ unsigned int vllm_tki_ballot(int flag) {
++  return __ballot_sync(0xffffffffu, flag);
++}
++
++__device__ __forceinline__ unsigned long long vllm_tki_lane(unsigned long long v,
++                                                            int lane) {
++  return __shfl_sync(0xffffffffu, v, lane);
++}
++
++// The warp's list (lane i holds its i-th largest entry, 0 where empty) with the
++// entries of the lanes in `mask` inserted, the lowest lane first: the entries below
++// one move down a lane, and the last falls off.
++__device__ __forceinline__ unsigned long long vllm_tki_insert(unsigned long long list,
++                                                              unsigned long long entry,
++                                                              unsigned int mask) {
++  const int lane = threadIdx.x & 31;
++  while (mask != 0u) {
++    const int src = __ffs(mask) - 1;
++    mask &= mask - 1u;
++    const unsigned long long x = __shfl_sync(0xffffffffu, entry, src);
++    const unsigned long long up = __shfl_up_sync(0xffffffffu, list, 1);
++    list = (lane > 0 && x > up) ? up : (x > list ? x : list);
++  }
++  return list;
++}
++
++__device__ __forceinline__ bool vllm_tki_zero(unsigned int key) {
++  return key == 0x80000000u || key == 0x7fffffffu;
++}
++
++// GTOp<scalar_t, true> on the values of keys a and b: a NaN is above any other
++// value and equal to a NaN; otherwise a > b, -0 equal to +0.
++__device__ __forceinline__ bool vllm_tki_gt(unsigned int a, unsigned int b) {
++  return b != 0xffffffffu && a > b && !(vllm_tki_zero(a) && vllm_tki_zero(b));
++}
++
++// bitonicSwap between this lane's slot and the slot `stride` lanes away: the lower
++// slot is A, the upper B; an invalid slot (column -1) sorts last.
++__device__ __forceinline__ void vllm_tki_exchange(unsigned int& key, int& col,
++                                                  int stride, bool dir) {
++  const int lane = threadIdx.x & 31;
++  const unsigned int other_key = __shfl_xor_sync(0xffffffffu, key, stride);
++  const int other_col = __shfl_xor_sync(0xffffffffu, col, stride);
++  const bool lower = (lane & stride) == 0;
++  const unsigned int key_a = lower ? key : other_key;
++  const unsigned int key_b = lower ? other_key : key;
++  const bool valid_a = (lower ? col : other_col) >= 0;
++  const bool valid_b = (lower ? other_col : col) >= 0;
++  const bool swap = (vllm_tki_gt(key_a, key_b) && valid_a) || !valid_b;
++  if (swap == dir) {
++    key = other_key;
++    col = other_col;
++  }
++}
++
++// torch.topk's order of its k <= 32 selected entries, lane i holding the entry
++// ranked i (i < k): gatherTopK's layout (the entries above the k-th key in column
++// order, then those equal to it, in column order already), then
++// bitonicSortKVInPlace over 32 slots, a slot a lane. Lane p returns the column at
++// position p.
++__device__ __forceinline__ int vllm_tki_order(unsigned long long entry, int k) {
++  const int lane = threadIdx.x & 31;
++  const unsigned int key = (unsigned int)(entry >> 32);
++  const int col = (int)~(unsigned int)entry;
++  const unsigned int kth = __shfl_sync(0xffffffffu, key, k - 1);
++  const int above = (lane < k && key != kth) ? 1 : 0;
++  int before = 0;
++#pragma unroll
++  for (int j = 0; j < 32; ++j) {
++    const int above_j = __shfl_sync(0xffffffffu, above, j);
++    const int col_j = __shfl_sync(0xffffffffu, col, j);
++    before += (above_j != 0 && col_j < col) ? 1 : 0;
++  }
++  const int at = above ? before : lane;
++  unsigned int slot_key = 0u;
++  int slot_col = -1;
++#pragma unroll
++  for (int j = 0; j < 32; ++j) {
++    const int at_j = __shfl_sync(0xffffffffu, at, j);
++    const unsigned int key_j = __shfl_sync(0xffffffffu, key, j);
++    const int col_j = __shfl_sync(0xffffffffu, col, j);
++    if (j < k && at_j == lane) {
++      slot_key = key_j;
++      slot_col = col_j;
++    }
++  }
++  // bitonicSort<32>: the flag of thread t, (t & (size / 2)) != 0, is bit `size` of
++  // its slots' positions.
++#pragma unroll
++  for (int size = 2; size < 32; size <<= 1) {
++    const bool dir = (lane & size) != 0;
++#pragma unroll
++    for (int stride = size >> 1; stride > 0; stride >>= 1) {
++      vllm_tki_exchange(slot_key, slot_col, stride, dir);
++    }
++  }
++#pragma unroll
++  for (int stride = 16; stride > 0; stride >>= 1) {
++    vllm_tki_exchange(slot_key, slot_col, stride, false);
++  }
++  return slot_col;
++}
++"""
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topk_ids_kernel(logits_dtype: str, ids_dtype: str, run: int):
++    """A block a row: its ``k = width - first`` top columns in ``torch.topk``'s order,
++    at ``out[row, first:]``. int64 ids take the sampled token at column 0 (``first``
++    1); int32 ids have no sampled column. A thread loads its elements of a tile in
++    runs of ``run`` (``_triton_run``: one 16-byte vector, the launch checked the
++    alignment, or one element)."""
++    rows, vocab, width = T.dynamic("rows, vocab, width")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    with_sampled = ids_dtype == "int64"
++    first = 1 if with_sampled else 0
++    vectors = _PER // run
++
++    def column(base, e: int, tx):
++        """The column of thread ``tx``'s ``e``-th element of the tile at ``base``:
++        runs of ``run`` columns, ``_THREADS * run`` apart."""
++        return base + (e // run) * (_THREADS * run) + tx * run + e % run
++
++    @T.macro
++    def load(logits, raw, row, base, tx, guarded):
++        """The thread's elements of the tile at ``base``; a guarded tile (the row's
++        last, partial one) loads only the columns below ``vocab``."""
++        for r in tuple(range(vectors)):
++            col0 = base + r * (_THREADS * run) + tx * run
++            if run == 1:
++                if guarded:
++                    if col0 < vocab:
++                        raw[r] = logits[row, col0]
++                else:
++                    raw[r] = logits[row, col0]
++            elif guarded:
++                if col0 + run <= vocab:
++                    for v in T.vectorized(run):
++                        raw[r * run + v] = logits[row, col0 + v]
++                else:
++                    for v in T.unroll(run):
++                        if col0 + v < vocab:
++                            raw[r * run + v] = logits[row, col0 + v]
++            else:
++                for v in T.vectorized(run):
++                    raw[r * run + v] = logits[row, col0 + v]
++
++    @T.macro
++    def scan(raw, base, tx, k, best, thr, floor, bits, entry, mask, guarded):
++        """Insert the tile's elements that rank above the warp's k-th entry
++        ``thr[0]`` (of value ``floor[0]``) into the warp's list ``best[0]``. Every
++        element is tested against the floor first, which consumes the loads before
++        any branch; an element position some lane passes then takes its exact
++        entries, and the lanes whose entry is above ``thr[0]`` are inserted."""
++        bits[0] = T.uint32(0)
++        for e in tuple(range(_PER)):
++            passes = T.call_extern(
++                "int32", "vllm_tki_pass", T.cast(raw[e], T.float32), floor[0]
++            )
++            if guarded:
++                passes = T.if_then_else(column(base, e, tx) < vocab, passes, 0)
++            bits[0] = bits[0] | T.if_then_else(
++                passes != 0, T.uint32(1 << e), T.uint32(0)
++            )
++        for e in tuple(range(_PER)):
++            flag = (bits[0] & T.uint32(1 << e)) != T.uint32(0)
++            if T.call_extern("uint32", "vllm_tki_ballot", T.cast(flag, T.int32)) != 0:
++                entry[0] = T.call_extern(
++                    "uint64",
++                    "vllm_tki_entry",
++                    T.cast(raw[e], T.float32),
++                    column(base, e, tx),
++                )
++                mask[0] = T.call_extern(
++                    "uint32",
++                    "vllm_tki_ballot",
++                    T.cast(flag & (entry[0] > thr[0]), T.int32),
++                )
++                if mask[0] != 0:
++                    best[0] = T.call_extern(
++                        "uint64", "vllm_tki_insert", best[0], entry[0], mask[0]
++                    )
++                    thr[0] = T.call_extern("uint64", "vllm_tki_lane", best[0], k - 1)
++                    floor[0] = T.call_extern("float32", "vllm_tki_floor", thr[0])
++
++    @T.macro
++    def select(logits, out, row, tx, lists, chosen):
++        """The row's top ``k`` into ``out[row, first:first + k]``."""
++        lane = tx % 32
++        warp = tx // 32
++        k = width - first
++        raw = T.alloc_local((_PER,), logits_dtype)
++        best = T.alloc_local((1,), T.uint64)
++        thr = T.alloc_local((1,), T.uint64)
++        floor = T.alloc_local((1,), T.float32)
++        bits = T.alloc_local((1,), T.uint32)
++        entry = T.alloc_local((1,), T.uint64)
++        mask = T.alloc_local((1,), T.uint32)
++        rank = T.alloc_local((1,), T.int32)
++        found = T.alloc_local((1,), T.int32)
++        picked = T.alloc_local((1,), T.int32)
++        if run > 1:
++            # The launch checked it: a 16-byte base and a stride of 16 elements.
++            T.assume(logits_stride % 16 == 0)
++        best[0] = T.uint64(0)
++        thr[0] = T.uint64(0)
++        floor[0] = -T.infinity(T.float32)
++
++        full = vocab // _TILE
++        for t in T.serial(full):
++            load(logits, raw, row, t * _TILE, tx, False)
++            scan(raw, t * _TILE, tx, k, best, thr, floor, bits, entry, mask, False)
++        if full * _TILE < vocab:
++            load(logits, raw, row, full * _TILE, tx, True)
++            scan(raw, full * _TILE, tx, k, best, thr, floor, bits, entry, mask, True)
++
++        # The warps' lists meet: an entry's rank is the count of larger entries
++        # among every list's first k (its own list's: its lane).
++        lists[warp, lane] = best[0]
++        T.sync_threads()
++        rank[0] = 0
++        for w in tuple(range(_WARPS)):
++            found[0] = 0
++            for step in (16, 8, 4, 2, 1):
++                found[0] = found[0] + T.if_then_else(
++                    (found[0] + (step - 1) < k)
++                    & (lists[w, found[0] + (step - 1)] > best[0]),
++                    step,
++                    0,
++                )
++            # All 32 larger: the steps reach 31.
++            found[0] = found[0] + T.if_then_else(
++                (found[0] < k) & (lists[w, found[0]] > best[0]), 1, 0
++            )
++            rank[0] = rank[0] + found[0]
++        if (lane < k) & (best[0] != T.uint64(0)) & (rank[0] < k):
++            chosen[rank[0]] = best[0]
++        T.sync_threads()
++
++        if warp == 0:
++            picked[0] = T.call_extern(
++                "int32",
++                "vllm_tki_order",
++                T.if_then_else(lane < k, chosen[lane], T.uint64(0)),
++                k,
++            )
++            if lane < k:
++                out[row, first + lane] = T.cast(picked[0], ids_dtype)
++
++    if with_sampled:
++
++        @T.prim_func
++        def topk_ids(
++            logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++            sampled: T.Tensor((rows,), T.int64),
++            out: T.Tensor((rows, width), T.int64),
++        ):
++            with T.Kernel(rows, threads=_THREADS) as row:
++                T.import_source(_HEADER)
++                tx = T.get_thread_binding()
++                lists = T.alloc_shared((_WARPS, 32), T.uint64)
++                chosen = T.alloc_shared((32,), T.uint64)
++                select(logits, out, row, tx, lists, chosen)
++                if tx == 0:
++                    out[row, 0] = sampled[row]
++
++        return topk_ids
++
++    @T.prim_func
++    def topk_ids_only(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++        out: T.Tensor((rows, width), T.int32),
++    ):
++        with T.Kernel(rows, threads=_THREADS) as row:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            lists = T.alloc_shared((_WARPS, 32), T.uint64)
++            chosen = T.alloc_shared((32,), T.uint64)
++            select(logits, out, row, tx, lists, chosen)
++
++    return topk_ids_only
++
++
++def topk_ids_key(logits_dtype: torch.dtype, ids_dtype: torch.dtype, run: int) -> tuple:
++    return (_DTYPES[logits_dtype], _DTYPES[ids_dtype], run)
++
++
++# The ids each path writes: the fast path's int64 rows with the sampled token, the
++# custom-ids path's int32 top-k.
++_IDS_DTYPES = (torch.int64, torch.int32)
++
++
++def topk_ids_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
++    """The calls for logits of each of ``logits_dtypes``: both ids layouts, in both
++    load layouts a launch may take (``_runs``)."""
++    return [
++        _call(topk_ids_kernel, *topk_ids_key(dtype, ids_dtype, run))
++        for dtype in dict.fromkeys(logits_dtypes)
++        for ids_dtype in _IDS_DTYPES
++        for run in _runs(dtype)
++    ]
++
++
++def register_topk_ids(logits: Sequence[tuple[torch.dtype, int]]) -> None:
++    """Declare ``topk_ids_calls`` for logits given as ``(dtype, row stride)`` pairs
++    with the runner's JIT registry (a no-op where none collects). The stride and
++    ``k`` are launch arguments, not part of the key."""
++    dtypes = tuple(dtype for dtype, _ in logits)
++    declare(lambda: topk_ids_calls(dtypes))
++
++
++def _check(logits: torch.Tensor, num_logprobs: int) -> None:
++    if not 0 < num_logprobs <= TOPK_IDS_MAX:
++        raise ValueError(
++            f"top-k ids take 1 to {TOPK_IDS_MAX} tokens, not {num_logprobs}"
++        )
++    if num_logprobs > logits.shape[1]:
++        # torch.topk's own check.
++        raise RuntimeError("selected index k out of range")
++
++
++def _launch(
++    logits: torch.Tensor, out: torch.Tensor, sampled: torch.Tensor | None
++) -> None:
++    if logits.stride(1) != 1:
++        raise ValueError("top-k ids read logits rows with a unit column stride")
++    kernel = _kernel(
++        topk_ids_kernel, *topk_ids_key(logits.dtype, out.dtype, _triton_run(logits))
++    )
++    if sampled is None:
++        kernel(logits, out)
++    else:
++        kernel(logits, sampled, out)
++
++
++def logprob_token_ids(
++    logits: torch.Tensor,  # [rows, vocab]
++    num_logprobs: int,
++    sampled: torch.Tensor,  # [rows]
++) -> torch.Tensor:
++    """``torch.cat((sampled[:, None], torch.topk(logits, num_logprobs).indices),
++    1)``: ``[rows, 1 + num_logprobs]`` int64, ``num_logprobs`` at most
++    ``TOPK_IDS_MAX``."""
++    _check(logits, num_logprobs)
++    rows = logits.shape[0]
++    out = torch.empty((rows, 1 + num_logprobs), dtype=torch.int64, device=logits.device)
++    if rows:
++        _launch(logits, out, sampled.to(torch.int64).contiguous())
++    return out
++
++
++def topk_token_ids(logits: torch.Tensor, num_logprobs: int) -> torch.Tensor:
++    """``torch.topk(logits, num_logprobs).indices.to(torch.int32)``: ``[rows,
++    num_logprobs]`` int32, ``num_logprobs`` at most ``TOPK_IDS_MAX``."""
++    _check(logits, num_logprobs)
++    rows = logits.shape[0]
++    out = torch.empty((rows, num_logprobs), dtype=torch.int32, device=logits.device)
++    if rows:
++        _launch(logits, out, None)
++    return out

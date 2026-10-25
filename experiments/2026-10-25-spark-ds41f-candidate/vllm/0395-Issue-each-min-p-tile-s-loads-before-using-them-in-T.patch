@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:36:22 +0200
+Subject: [PATCH 395/488] Issue each min-p tile's loads before using them, in
+ Triton's layout
+
+Rows 16-byte aligned load and store their tiles as vectors; the last,
+partial tile loads at columns clamped to the row and predicates its
+stores. The threshold keeps the exact reference logarithm.
+---
+ .../v1/worker/gpu/sample/tilelang_controls.py | 133 ++++++++++++++----
+ 1 file changed, 105 insertions(+), 28 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 4f8083062..84bed8541 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -50,6 +50,11 @@ __device__ __forceinline__ float vllm_control_log(float x) {
+       : "=f"(result) : "f"(x));
+   return result;
+ }
++__device__ __forceinline__ void vllm_control_store_if(void* p, float v, bool ok) {
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q st.global.f32 [%0], %1;\n}"
++               :: "l"(p), "f"(v), "r"((int)ok) : "memory");
++}
+ __device__ __forceinline__ float vllm_control_reciprocal(float x) {
+   float y;
+   asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+@@ -78,10 +83,36 @@ def _declare(factory, keys):
+     declare(lambda: [call(factory, *key) for key in keys])
+ 
+ 
++def _min_p_column(start, j, tx, tile, threads, run):
++    """Column of thread ``tx``'s ``j``-th element in tile ``start``: runs of ``run``
++    consecutive columns, ``threads * run`` apart (Triton's layout for its loads)."""
++    return start * tile + (j // run) * (threads * run) + run * tx + j % run
++
++
+ @tilelang.jit(pass_configs=_PASS)
+-def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
++def min_p_kernel(
++    vocab: int,
++    stride: int,
++    index_dtype: str,
++    run: int,
++    threads: int = 128,
++    tile: int = 1024,
++):
++    """One row a block, in tiles of ``tile`` columns. Each tile's loads are issued
++    before its values are used: with ``run`` 4 (16-byte aligned rows, the launch
++    checked) as vectors, and in the last, partial tile at columns clamped to the row
++    (a repeated column does not change the maximum; its stores are predicated)."""
+     rows, states = T.dynamic("rows, states")
+-    block = 1024
++    per_thread = tile // threads
++    full = vocab // tile
++    warps = threads // 32
++
++    @T.macro
++    def load_tile(values, src, row, start, tx):
++        for r in T.unroll(per_thread // run):
++            col0 = _min_p_column(start, r * run, tx, tile, threads, run)
++            for k in T.vectorized(run):
++                values[r * run + k] = src[row, col0 + k]
+ 
+     @T.prim_func
+     def min_p(
+@@ -89,45 +120,86 @@ def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
+         mapping: T.Tensor((rows,), index_dtype),
+         thresholds: T.Tensor((states,), "float32"),
+     ):
+-        with T.Kernel(rows, threads=threads) as row:
++        with T.Kernel(rows, threads=threads) as block:
+             T.import_source(_HEADER)
+-            maximum = T.alloc_fragment((block,), "float32")
+-            reduced = T.alloc_fragment((1,), "float32")
+-            value = T.alloc_local((1,), "float32")
++            tx = T.get_thread_binding()
++            row = T.cast(block, "int64")
++            values = T.alloc_local((per_thread,), "float32")
++            best = T.alloc_local((1,), "float32")
+             minimum = T.alloc_local((1,), "float32")
+-            minimum[0] = thresholds[mapping[row]]
++            partial = T.alloc_shared((warps,), "float32")
++            minimum[0] = thresholds[mapping[block]]
+             if minimum[0] != 0:
+-                T.fill(maximum, -T.infinity("float32"))
+-                for start in T.serial(T.ceildiv(vocab, block)):
+-                    for col in T.Parallel(block):
+-                        index = start * block + col
+-                        value[0] = -T.infinity("float32")
+-                        if index < vocab:
+-                            value[0] = logits[T.cast(row, "int64"), index]
+-                        maximum[col] = T.max(maximum[col], value[0])
+-                T.reduce_max(maximum, reduced, dim=0)
+-                minimum[0] = reduced[0] + T.call_extern(
++                best[0] = -T.infinity("float32")
++                for start in T.serial(full):
++                    load_tile(values, logits, row, start, tx)
++                    for j in T.unroll(per_thread):
++                        best[0] = T.max(best[0], values[j])
++                if vocab % tile:
++                    for j in T.unroll(per_thread):
++                        col = _min_p_column(full, j, tx, tile, threads, run)
++                        values[j] = logits[row, T.min(col, vocab - 1)]
++                    for j in T.unroll(per_thread):
++                        best[0] = T.max(best[0], values[j])
++                # The maximum ignores isolated NaNs, as Triton's does.
++                best[0] = T.max(best[0], T.shfl_xor(best[0], 16))
++                best[0] = T.max(best[0], T.shfl_xor(best[0], 8))
++                best[0] = T.max(best[0], T.shfl_xor(best[0], 4))
++                best[0] = T.max(best[0], T.shfl_xor(best[0], 2))
++                best[0] = T.max(best[0], T.shfl_xor(best[0], 1))
++                if tx % 32 == 0:
++                    partial[tx // 32] = best[0]
++                T.sync_threads()
++                best[0] = partial[0]
++                for w in T.unroll(1, warps):
++                    best[0] = T.max(best[0], partial[w])
++                minimum[0] = best[0] + T.call_extern(
+                     "float32", "vllm_control_log", minimum[0]
+                 )
+-                # The maximum reduction ignores isolated NaNs, as Triton does.
+-                for start in T.serial(T.ceildiv(vocab, block)):
+-                    for col in T.Parallel(block):
+-                        index = start * block + col
+-                        if index < vocab:
+-                            value[0] = logits[T.cast(row, "int64"), index]
+-                            logits[T.cast(row, "int64"), index] = T.if_then_else(
+-                                value[0] < minimum[0],
++                for start in T.serial(full):
++                    load_tile(values, logits, row, start, tx)
++                    for r in T.unroll(per_thread // run):
++                        col0 = _min_p_column(start, r * run, tx, tile, threads, run)
++                        for k in T.vectorized(run):
++                            logits[row, col0 + k] = T.if_then_else(
++                                values[r * run + k] < minimum[0],
+                                 -T.infinity("float32"),
+-                                value[0],
++                                values[r * run + k],
+                             )
++                if vocab % tile:
++                    for j in T.unroll(per_thread):
++                        col = _min_p_column(full, j, tx, tile, threads, run)
++                        values[j] = logits[row, T.min(col, vocab - 1)]
++                    for j in T.unroll(per_thread):
++                        col = _min_p_column(full, j, tx, tile, threads, run)
++                        T.call_extern(
++                            "handle",
++                            "vllm_control_store_if",
++                            T.address_of(logits[row, col]),
++                            T.if_then_else(
++                                values[j] < minimum[0],
++                                -T.infinity("float32"),
++                                values[j],
++                            ),
++                            col < vocab,
++                        )
+ 
+     return min_p
+ 
+ 
++def _min_p_run(logits) -> int:
++    """4 when every row starts 16-byte aligned, else 1."""
++    return 4 if logits.data_ptr() % 16 == 0 and logits.stride(0) % 4 == 0 else 1
++
++
+ def register_min_p(*, logits_stride: int, vocab_size: int):
+     _declare(
+         min_p_kernel,
+-        [(vocab_size, logits_stride, dtype) for dtype in _DTYPES.values()],
++        [
++            (vocab_size, logits_stride, dtype, run)
++            for dtype in _DTYPES.values()
++            for run in (1, 4)
++        ],
+     )
+ 
+ 
+@@ -135,7 +207,12 @@ def apply_min_p(logits, mapping, thresholds):
+     if logits.shape[0]:
+         _launch(
+             min_p_kernel,
+-            (logits.shape[1], logits.stride(0), _DTYPES[mapping.dtype]),
++            (
++                logits.shape[1],
++                logits.stride(0),
++                _DTYPES[mapping.dtype],
++                _min_p_run(logits),
++            ),
+             logits,
+             mapping,
+             thresholds,

@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:47:28 +0100
+Subject: [PATCH 484/488] Tests: run 24's verification failures; a
+ deterministic DSpark stand-in projection
+
+The insertion port's test stood in a seven-argument insertion for the one
+rejection_sample now calls with its dead-row cut; the stand-in takes it (None).
+The dead-row cap test compared sampled tokens past the uncapped count, which
+both paths leave unwritten (new_empty); it compares the written columns. The
+capped insertion's declaration test already takes only the early returns
+(01b4c3b04).
+
+The DSpark context test projects with an elementwise stand-in instead of a
+GEMM, so its reference cannot differ by the GEMM's choice of algorithm.
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 25 +++++++++++--------
+ .../test_rejection_sampler_utils.py           | 11 +++++---
+ 2 files changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index 025a9c4d2..59e83276e 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -95,8 +95,8 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+     """The context graph's combine writes main_x straight into the speculator's
+     context buffer (the norm's ``out``), which the context KV projections then read:
+     no copy between the norm and their per-token casts, the buffer's bits the
+-    combine's own (TileKernels' norm of a projection of the joined sources), the
+-    rows past the capacity untouched."""
++    combine's own (TileKernels' norm of a stand-in projection of the joined
++    sources), the rows past the capacity untouched."""
+     from types import SimpleNamespace
+ 
+     from vllm.models.deepseek_v4_1.nvidia.dspark import (
+@@ -109,9 +109,11 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+     norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
+     norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
+     joined = dspark_context.NUM_SOURCES * WIDTH
+-    projection = torch.randn(joined, WIDTH, generator=gen, device=DEVICE) / joined
+-    projection = projection.to(torch.bfloat16)
+-    model = SimpleNamespace(main_proj=lambda x: x @ projection, main_norm=norm)
++
++    def main_proj(x):  # a stand-in projection, elementwise, so deterministic
++        return x[:, :WIDTH] * 2 + x[:, WIDTH : 2 * WIDTH]
++
++    model = SimpleNamespace(main_proj=main_proj, main_norm=norm)
+     aux = torch.randn(LIMIT, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
+     aux[0, :8] = float("nan")
+     hidden_states = torch.randn(LIMIT + 4, WIDTH, generator=gen, device=DEVICE)
+@@ -119,13 +121,16 @@ def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+     before = hidden_states.clone()
+     expected = DSparkDeepseekV4Model.combine_hidden_states(model, aux[:capacity])
+     projected = []
++
++    def combine(x, out):
++        return DSparkDeepseekV4Model.combine_hidden_states(model, x, out)
++
++    def project(states, positions, slots):
++        projected.append((states, slots))
++
+     graphs = DSparkContextCudaGraphs.__new__(DSparkContextCudaGraphs)
+     graphs.model = SimpleNamespace(
+-        combine_hidden_states=lambda x,
+-        out: DSparkDeepseekV4Model.combine_hidden_states(model, x, out),
+-        precompute_and_store_context_kv=lambda states, positions, slots: (
+-            projected.append((states, slots))
+-        ),
++        combine_hidden_states=combine, precompute_and_store_context_kv=project
+     )
+     graphs.aux = aux
+     graphs.hidden_states = hidden_states
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index 8a1074923..0e0d761a7 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -1242,7 +1242,9 @@ def test_ds41f_verification_emits_same_tokens_with_insert_port(
+     from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
+     from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+ 
+-    def original(sampled, counts, ids, values, cu, mapping, temp):
++    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
++        # rejection_sample passes its dead-row cut, None without one.
++        assert dead_row_cut is None
+         utils._insert_resampled_kernel[(counts.numel(),)](
+             sampled,
+             sampled.stride(0),
+@@ -1412,7 +1414,7 @@ def test_insert_resampled_caps_counts_at_the_dead_row_cut(blocks, index_dtype):
+ @pytest.mark.parametrize("temperature", [0.0, 1.0])
+ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+     """``rejection_sample(..., dead_row_cut=cut)`` is ``torch.minimum(num_sampled,
+-    cut + 1)`` of the uncapped verification, the sampled tokens unchanged, on the
++    cut + 1)`` of the uncapped verification, the written tokens unchanged, on the
+     production path (block verification, one-hot drafts, FP32 draws)."""
+     torch.manual_seed(5309)
+     inputs = _build_rejection_sample_inputs(
+@@ -1434,7 +1436,10 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+         dead_row_cut=cut,
+     )
+     assert torch.equal(capped, torch.minimum(num_sampled, cut + 1))
+-    assert torch.equal(capped_sampled, sampled)
++    # Both leave the columns past the uncapped count unwritten (``new_empty``), and
++    # the cap moves no token: compare the written columns, which are the same.
++    written = torch.arange(6, device="cuda")[None, :] < num_sampled[:, None]
++    assert torch.equal(capped_sampled[written], sampled[written])
+ 
+ 
+ @pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])

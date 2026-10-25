@@ -1,0 +1,107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:50:54 +0100
+Subject: [PATCH 464/488] [DS4.1] The runner reads a None MTP override as none
+
+DS4.1's VL model inherits get_mtp_target_hidden_states, which returns the
+target's MTP buffer, None since 58a492841 removed it (the drafter takes
+the auxiliary states and never read it). The runner sliced the result
+unconditionally, so the profile run's dummy step failed and the serving
+check's ports arm did not start. A None override now means none.
+---
+ tests/v1/worker/test_mtp_target_states.py | 31 +++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py        | 29 +++++++++++----------
+ 2 files changed, 47 insertions(+), 13 deletions(-)
+ create mode 100644 tests/v1/worker/test_mtp_target_states.py
+
+diff --git a/tests/v1/worker/test_mtp_target_states.py b/tests/v1/worker/test_mtp_target_states.py
+new file mode 100644
+index 000000000..ed666fc45
+--- /dev/null
++++ b/tests/v1/worker/test_mtp_target_states.py
+@@ -0,0 +1,31 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The hidden states the runner hands the drafter: the target's override buffer cut to
++the step's rows, or the step's hidden states when the target has none (no method, or
++the method returns None, as DS4.1's inherited one does without an MTP buffer)."""
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.v1.worker.gpu.model_runner import _mtp_target_states
++
++pytestmark = pytest.mark.cpu_test
++
++
++def test_override_buffer_is_cut_to_the_step():
++    buffer = torch.arange(40.0).view(10, 4)
++    model = SimpleNamespace(get_mtp_target_hidden_states=lambda: buffer)
++    hidden = torch.zeros(3, 2)
++    assert torch.equal(_mtp_target_states(model, hidden), buffer[:3])
++
++
++@pytest.mark.parametrize(
++    "model",
++    [SimpleNamespace(), SimpleNamespace(get_mtp_target_hidden_states=lambda: None)],
++    ids=["no method", "returns None"],
++)
++def test_without_an_override_the_drafter_takes_the_hidden_states(model):
++    hidden = torch.ones(3, 2)
++    assert _mtp_target_states(model, hidden) is hidden
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9f88bf9ac..b0887928a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -244,6 +244,16 @@ from vllm.v1.worker.workspace import (
+ logger = init_logger(__name__)
+ 
+ 
++def _mtp_target_states(model, hidden_states: torch.Tensor) -> torch.Tensor:
++    """The hidden states the drafter takes: the target's override buffer
++    (``get_mtp_target_hidden_states``, e.g. DeepSeek V4 MTP's pre-hc_head
++    residual) cut to the step's rows, or ``hidden_states`` where the target
++    defines none or returns None."""
++    get_states = getattr(model, "get_mtp_target_hidden_states", None)
++    states = None if get_states is None else get_states()
++    return hidden_states if states is None else states[: hidden_states.shape[0]]
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.cudagraph_native_memory_profile: tuple[int, int, int] | None = None
+@@ -1121,12 +1131,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+             # Let the target override the hidden state fed to the drafter
+             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+-            # target returns a persistent buffer sized at max_num_batched_tokens;
+-            # slice to the active token count that propose() expects.
+-            spec_hidden_states = hidden_states
+-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            # target returns a persistent buffer sized at max_num_batched_tokens,
++            # sliced to the active token count that propose() expects, or None
++            # (no override: DS4.1 keeps no such buffer).
++            spec_hidden_states = _mtp_target_states(self.model, hidden_states)
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),
+@@ -3307,13 +3315,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     input_batch.idx_mapping, num_sampled, observed_rejected
+                 )
+             # Let the target override the hidden state fed to the drafter
+-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
+-            # target returns a persistent buffer sized at max_num_batched_tokens;
+-            # slice to the active token count that propose() expects.
+-            spec_hidden_states = draft_hidden_states
+-            if hasattr(self.model, "get_mtp_target_hidden_states"):
+-                pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+-                spec_hidden_states = pre_hc_hidden_states[: draft_hidden_states.size(0)]
++            # (_mtp_target_states).
++            spec_hidden_states = _mtp_target_states(self.model, draft_hidden_states)
+             if isinstance(self.sampler, GPUWatermarkSampler):
+                 self.speculator.prepare_watermarking(
+                     self.sampler._get_contexts(input_batch.idx_mapping),

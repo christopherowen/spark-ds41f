@@ -1,0 +1,429 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:45:24 +0200
+Subject: [PATCH 321/488] CED row copy: predicated loads ahead of every branch,
+ coherent source reads
+
+Each element branched on its row's validity and loaded inside the branch, so
+an index load, the source pointer's constant load and the row load ran in
+series, element after element. Loads now issue before any branch: the row
+indices, then the rows, then the stores.
+
+- Indices, whole-row pieces and gathered elements use predicated loads, which
+  touch no memory when off and read as zero bits, a gathered invalid row's
+  zero. They are volatile, so the compiler cannot sink a scatter's row load
+  behind the store's validity test. Scattered elements load from their clamped
+  row. TileLang lacks 1- and 2-byte predicated loads, and its 8-byte one
+  returns a register pair that costs a copy before each index compare; the
+  kernel defines those three.
+- The previous vector path loaded float32 rows before checking the index, so
+  the plan's -1 padding read 16 bytes before the source on every step.
+- The source is not marked restrict: the read-only path a restrict source
+  takes is slower for these dependent loads.
+- Element layouts keep Triton's coalescing (16-byte runs of up to four
+  elements, repeated a block-width apart); rows are copied in 16-byte pieces
+  when the tail is packed.
+- The row stride is an argument, a constant when rows are packed, so views of
+  wider rows share one kernel. Whole-row pieces need 16-byte aligned rows and
+  the copy needs a row to copy; both raise otherwise.
+
+Paired against Triton at the serving layouts (eight placed graph pairs, 95%
+intervals): no case slower; scatters 4 to 20% faster, whole-row gathers 1 to
+7% faster, element gathers level (within 0.8%). One-row bf16 gathers, below
+any CED plan, are about 5% slower.
+
+Tests cover the serving layouts with -1 padding and out-of-range indices
+across a block boundary, views of wider rows, and the preconditions.
+---
+ .../test_deepseek_v41_tilelang_metadata.py    |  98 ++++++++
+ vllm/models/deepseek_v4_1/tilelang/ced.py     | 218 ++++++++++++++----
+ 2 files changed, 275 insertions(+), 41 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 64de8f9ab..fc03319d2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -125,6 +125,104 @@ def test_ced_row_copy_serving_widths(rows, tail):
+     assert torch.equal(scatter_rows(output, indices, rows), restored)
+ 
+ 
++@pytest.mark.parametrize(
++    "dtype, tail",
++    [
++        (torch.int32, ()),
++        (torch.int64, ()),
++        (torch.bool, ()),
++        (torch.float32, (4,)),
++        (torch.float32, (4, 4)),
++        (torch.bfloat16, (5120,)),
++        (torch.bfloat16, (4, 5120)),
++    ],
++)
++@pytest.mark.parametrize("rows", [1, 129, 600])
++def test_ced_row_copy_serving_layouts_skip_invalid_rows(dtype, tail, rows):
++    """The serving layouts with the plan's -1 padding and out-of-range indices,
++    across a block boundary, against the Triton copies."""
++    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    source = torch.randint(-100, 100, (rows, *tail), device=DEVICE).to(dtype)
++    kept = min(rows, 128)
++    indices = torch.cat(
++        [
++            torch.arange(rows - kept, rows, device=DEVICE),
++            torch.tensor([-1, rows, -5, 1 << 40], device=DEVICE),
++            torch.full((131,), -1, device=DEVICE),
++        ]
++    )
++    expected = gather_rows(source, indices)
++    output = torch.full_like(expected, 7)
++    ced.copy_rows(source, indices, output, False)
++    assert torch.equal(expected, output)
++    restored = torch.full_like(source, 3)
++    ced.copy_rows(output, indices, restored, True)
++    reference = torch.full_like(source, 3)
++    reference[indices[:kept]] = output[:kept]
++    assert torch.equal(reference, restored)
++    assert torch.equal(
++        scatter_rows(output, indices, rows)[indices[:kept]], output[:kept]
++    )
++
++
++@pytest.mark.parametrize(
++    "dtype, width, columns",
++    [
++        (torch.bfloat16, 5184, slice(64, 5184)),
++        (torch.float32, 20, slice(4, 20)),
++        (torch.int32, 3, 1),
++        (torch.bool, 5, 2),
++    ],
++)
++def test_ced_row_copy_views_of_wider_rows(dtype, width, columns):
++    """Column views of wider rows: the row stride is an argument, and the copies
++    match Triton's."""
++    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    wide = torch.randint(-100, 100, (300, width), device=DEVICE).to(dtype)
++    source = wide[:, columns]
++    if source.ndim == 2 and source.shape[1] == 16:
++        source = source.unflatten(1, (4, 4))
++    indices = torch.cat(
++        [torch.arange(172, 300, device=DEVICE), torch.full((5,), -1, device=DEVICE)]
++    )
++    expected = gather_rows(source, indices)
++    output = torch.full_like(expected, 7)
++    ced.copy_rows(source, indices, output, False)
++    assert torch.equal(expected, output)
++    restored = torch.zeros((300, *source.shape[1:]), dtype=dtype, device=DEVICE)
++    ced.copy_rows(output, indices, restored, True)
++    assert torch.equal(scatter_rows(output, indices, 300), restored)
++
++
++def test_ced_row_copy_preconditions():
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    indices = torch.zeros(2, dtype=torch.int64, device=DEVICE)
++    rows = torch.zeros((2, 5120), dtype=torch.bfloat16, device=DEVICE)
++    with pytest.raises(ValueError, match="a row to copy"):
++        ced.copy_rows(rows, indices[:0], rows[:0], False)
++    with pytest.raises(ValueError, match="one index"):
++        ced.copy_rows(rows, indices[:1], rows, False)
++    storage = torch.zeros(2 * 5120 + 1, dtype=torch.bfloat16, device=DEVICE)
++    with pytest.raises(ValueError, match="aligned"):
++        ced.copy_rows(storage[1:].view(2, 5120), indices, rows, False)
++    with pytest.raises(ValueError, match="aligned"):
++        ced.copy_rows(rows, indices, storage[1:].view(2, 5120), False)
++    # Element copies have no alignment requirement, and an empty source gathers
++    # zeros.
++    flags = torch.ones(9, dtype=torch.bool, device=DEVICE)
++    ced.copy_rows(flags[1:3], indices, flags[5:7], False)
++    assert flags.all()
++    for dtype in (torch.bool, torch.int32, torch.bfloat16):
++        output = torch.ones(2, dtype=dtype, device=DEVICE)
++        ced.copy_rows(output[:0], indices, output, False)
++        assert not output.any()
++
++
+ @pytest.mark.parametrize("lengths", [[], [0], [1], [129], [0, 257, 0, 1], [4096] * 8])
+ @pytest.mark.parametrize("padding", [0, 1, 127])
+ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 679fb74a4..090b680d6 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Integer row selection for the DeepSeek-V4.1 CED decoder."""
+ 
++import math
++
+ import tilelang
+ import tilelang.language as T
+ 
+@@ -218,6 +220,70 @@ def indices(starts, compact_starts, output, nr, nt):
+     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
+ 
+ 
++_ITEMSIZE = {"bool": 1, "int32": 4, "int64": 8, "float32": 4, "bfloat16": 2}
++_THREADS = 128
++
++# Predicated global loads for the row copies (zero when off), in the form of
++# TileLang's tl::ldg32: 1 and 2 bytes, which it lacks, and 8 bytes into one
++# 64-bit register, which spares the register copies its uint2 result costs
++# before each index is compared.
++_COPY_LOADS = r"""
++__device__ __forceinline__ unsigned char ced_ldg8(const void *ptr, bool pred) {
++  unsigned int data;
++  asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n mov.b32 %0, 0;\n"
++               " @p ld.global.u8 %0, [%1];\n}\n"
++               : "=r"(data) : "l"(ptr), "r"((int)pred));
++  return (unsigned char)data;
++}
++__device__ __forceinline__ unsigned short ced_ldg16(const void *ptr, bool pred) {
++  unsigned short data;
++  asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n mov.b16 %0, 0;\n"
++               " @p ld.global.u16 %0, [%1];\n}\n"
++               : "=h"(data) : "l"(ptr), "r"((int)pred));
++  return data;
++}
++__device__ __forceinline__ long long ced_ldg64(const void *ptr, bool pred) {
++  long long data;
++  asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n mov.b64 %0, 0;\n"
++               " @p ld.global.b64 %0, [%1];\n}\n"
++               : "=l"(data) : "l"(ptr), "r"((int)pred));
++  return data;
++}
++"""
++
++
++def _copy_load(dtype, load, pred):
++    """``load``'s element by a predicated load, zero when ``pred`` is off."""
++    nbytes = _ITEMSIZE[dtype]
++    if nbytes == 4:
++        return T.reinterpret(T.ldg32(load, pred=pred), dtype)
++    if nbytes == 1:
++        return T.cast(
++            T.call_extern("uint8", "ced_ldg8", T.address_of(load), pred), dtype
++        )
++    bits = {2: ("uint16", "ced_ldg16"), 8: ("int64", "ced_ldg64")}[nbytes]
++    return T.reinterpret(
++        T.call_extern(bits[0], bits[1], T.address_of(load), pred), dtype
++    )
++
++
++def _copy_layout(dtype: str, tail: tuple[int, ...], tail_strides: tuple[int, ...]):
++    """A row's width and the elements one thread copies.
++
++    A row whose tail is packed and divides into 16-byte pieces is copied a piece
++    per thread (``pieces``), which needs 16-byte aligned rows; any other layout is
++    copied four elements per thread, which may span rows.
++    """
++    width = 1
++    packed = []
++    for dim in reversed(tail):
++        packed.append(width)
++        width *= dim
++    vector = 16 // _ITEMSIZE[dtype]
++    pieces = tuple(reversed(packed)) == tuple(tail_strides) and width % vector == 0
++    return width, (vector if pieces else 4), pieces
++
++
+ @tilelang.jit(
+     pass_configs={
+         **_PASS,
+@@ -225,29 +291,50 @@ def indices(starts, compact_starts, output, nr, nt):
+     }
+ )
+ def copy_rows_kernel(
+-    dtype: str, tail: tuple[int, ...], strides: tuple[int, ...], scatter: bool
++    dtype: str,
++    tail: tuple[int, ...],
++    tail_strides: tuple[int, ...],
++    packed: bool,
++    scatter: bool,
+ ):
++    """Specialized by element type, row shape, in-row strides and whether source
++    rows are packed (row stride = row width, a constant then). A view of wider
++    rows passes its row stride, so all such views share one kernel."""
+     source_span = T.dynamic("source_span")
+     index_rows = T.dynamic("index_rows")
+     output_span = T.dynamic("output_span")
+-    width = 1
+-    for dim in tail:
+-        width *= dim
++    width, group, pieces = _copy_layout(dtype, tail, tail_strides)
+ 
+     def column_offset(col):
+         # Build the strided address at specialization time; a TIR loop variable
+         # cannot index Python's layout tuples.
+         result = 0
+         divisor = 1
+-        for dim, stride in zip(reversed(tail), reversed(strides[1:])):
++        for dim, stride in zip(reversed(tail), reversed(tail_strides)):
+             result = result + (col // divisor % dim) * stride
+             divisor *= dim
+         return result
+ 
+-    tile = 1024 if width >= 32 else 512
+-    layout = T.Fragment(
+-        (tile,), forward_fn=lambda i: (i // (tile // 128), i % (tile // 128))
+-    )
++    # Loads issue before any branch: the row indices, then the rows, then the
++    # stores. Branching on validity first serializes those latencies per element.
++    # Indices, whole-row pieces and gathered elements use predicated loads, which
++    # touch no memory when off and then read as zero bits (a gathered invalid
++    # row's zero); they are volatile, so the compiler cannot sink a scatter's row
++    # load behind the store's validity test. Scattered elements load from their
++    # clamped row (a launched block has a row). The source is not marked
++    # restrict, so its loads take the coherent path: the read-only path a
++    # restrict source takes is slower for these dependent loads. Element layouts
++    # keep Triton's coalescing: each thread holds 16-byte aligned runs of up to
++    # four elements, repeated a block-width apart.
++    run = min(4, 16 // _ITEMSIZE[dtype])
++
++    def element(bx, tx, k):
++        return (
++            T.cast(bx, T.int64) * (_THREADS * group)
++            + k // run * (_THREADS * run)
++            + tx * run
++            + k % run
++        )
+ 
+     @T.prim_func
+     def ced_copy_rows(
+@@ -256,53 +343,102 @@ def copy_rows_kernel(
+         output: T.Tensor((output_span,), dtype),
+         source_rows: T.int64,
+         output_rows: T.int64,
++        row_stride: T.int64,
+     ):
+         with T.Kernel(
+-            T.ceildiv(width, tile)
+-            if width >= 32
+-            else T.ceildiv((source_rows if scatter else output_rows) * width, tile),
+-            (source_rows if scatter else output_rows) if width >= 32 else 1,
+-            threads=128,
+-        ) as (bx, by):
+-            for i in T.Parallel(tile, loop_layout=layout):
+-                row = (
+-                    T.cast(by, T.int64)
+-                    if width >= 32
+-                    else T.cast(bx * tile + i, T.int64) // width
+-                )
+-                col = bx * tile + i if width >= 32 else (bx * tile + i) % width
+-                limit = source_rows if scatter else output_rows
+-                if (row < limit) & (col < width):
+-                    index = row_indices[row]
+-                    valid = (index >= 0) & (
+-                        index < (output_rows if scatter else source_rows)
++            T.ceildiv(
++                (source_rows if scatter else output_rows) * width, _THREADS * group
++            ),
++            threads=_THREADS,
++            prelude=_COPY_LOADS,
++        ) as bx:
++            T.annotate_restrict_buffers(source)
++            limit = source_rows if scatter else output_rows
++            bound = output_rows if scatter else source_rows
++            stride = width if packed else row_stride
++            tx = T.get_thread_binding()
++            if pieces:
++                first = (T.cast(bx, T.int64) * _THREADS + tx) * group
++                row = first // width
++                col = first % width
++                live = row < limit
++                index = _copy_load("int64", row_indices[row], live)
++                valid = live & (index >= 0) & (index < bound)
++                if scatter:
++                    piece = T.ldg128(source[row * stride + col], pred=live)
++                    T.stg128(output[index * width + col], piece, pred=valid)
++                else:
++                    piece = T.ldg128(source[index * stride + col], pred=valid)
++                    T.stg128(output[first], piece, pred=live)
++            else:
++                indices = T.alloc_local((group,), T.int64)
++                values = T.alloc_local((group,), dtype)
++                for k in T.unroll(group):
++                    indices[k] = _copy_load(
++                        "int64",
++                        row_indices[element(bx, tx, k) // width],
++                        element(bx, tx, k) // width < limit,
+                     )
++                for k in T.unroll(group):
++                    row = element(bx, tx, k) // width
++                    col = element(bx, tx, k) % width
+                     if scatter:
+-                        if valid:
+-                            output[index * width + col] = source[
+-                                row * strides[0] + column_offset(col)
+-                            ]
++                        values[k] = source[
++                            T.min(row, limit - 1) * stride + column_offset(col)
++                        ]
+                     else:
+-                        output[row * width + col] = T.if_then_else(
++                        valid = (row < limit) & (indices[k] >= 0) & (indices[k] < bound)
++                        values[k] = _copy_load(
++                            dtype,
++                            source[indices[k] * stride + column_offset(col)],
+                             valid,
+-                            source[index * strides[0] + column_offset(col)],
+-                            T.cast(0, dtype),
+                         )
++                for k in T.unroll(group):
++                    row = element(bx, tx, k) // width
++                    col = element(bx, tx, k) % width
++                    valid = (row < limit) & (indices[k] >= 0) & (indices[k] < bound)
++                    if scatter:
++                        if valid:
++                            output[indices[k] * width + col] = values[k]
++                    elif row < limit:
++                        output[element(bx, tx, k)] = values[k]
+ 
+     return ced_copy_rows
+ 
+ 
+ def copy_rows(source, row_indices, output, scatter: bool):
+-    """Copy logical rows from a possibly strided source without copying its storage."""
++    """Copy logical rows from a possibly strided source without copying its storage.
++
++    Gathering reads ``source[row_indices[i]]`` into ``output[i]``; scattering writes
++    ``source[i]`` to ``output[row_indices[i]]``. Indices outside the indexed tensor
++    are skipped (gathered as zero). There must be a row to copy, and a row copied
++    in 16-byte pieces needs 16-byte aligned source rows and output storage.
++    """
++    dtype = str(source.dtype).removeprefix("torch.")
++    tail = tuple(source.shape[1:])
++    tail_strides = tuple(source.stride()[1:])
++    row_stride = source.stride(0)
++    if row_indices.numel() != (source.shape[0] if scatter else output.shape[0]):
++        raise ValueError("CED row copies need one index per copied row")
++    if not row_indices.numel():
++        raise ValueError("CED row copies need a row to copy")
++    if _copy_layout(dtype, tail, tail_strides)[2] and (
++        source.data_ptr() % 16
++        or output.data_ptr() % 16
++        or row_stride * source.element_size() % 16
++    ):
++        raise ValueError("CED row copies of whole rows need 16-byte aligned rows")
+     span = (
+         1 + sum((n - 1) * s for n, s in zip(source.shape, source.stride()))
+         if source.numel()
+         else 0
+     )
+     flat_source = source.as_strided((span,), (1,))
+-    copy_rows_kernel(
+-        str(source.dtype).removeprefix("torch."),
+-        tuple(source.shape[1:]),
+-        tuple(source.stride()),
+-        scatter,
+-    )(flat_source, row_indices, output.view(-1), source.shape[0], output.shape[0])
++    copy_rows_kernel(dtype, tail, tail_strides, row_stride == math.prod(tail), scatter)(
++        flat_source,
++        row_indices,
++        output.view(-1),
++        source.shape[0],
++        output.shape[0],
++        row_stride,
++    )

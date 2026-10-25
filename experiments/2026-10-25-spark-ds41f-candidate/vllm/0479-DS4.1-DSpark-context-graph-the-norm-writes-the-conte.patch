@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:42:26 +0100
+Subject: [PATCH 479/488] [DS4.1] DSpark context graph: the norm writes the
+ context buffer, no copy
+
+The context graph combined the auxiliary states into a new tensor and copied
+it into the speculator's context buffer: a device-to-device copy captured as a
+memcpy node between TileKernels' norm and the context KV projections' per-token
+casts. combine_hidden_states takes an out, and the graph has main_norm write
+the buffer the projections read.
+---
+ ...st_deepseek_v41_tilelang_dspark_context.py | 61 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 22 ++++---
+ 2 files changed, 76 insertions(+), 7 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+index b63244b46..025a9c4d2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -88,3 +88,64 @@ def test_context_inputs_rejects_misaligned_rows():
+     slots = torch.zeros(1, 8, dtype=torch.int64, device=DEVICE)
+     with pytest.raises(ValueError, match="16-byte aligned"):
+         dspark_context.context_inputs(aux, sources, positions, slots, 4, 8)
++
++
++@pytest.mark.parametrize("capacity", [1, 6, 32, LIMIT])
++def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
++    """The context graph's combine writes main_x straight into the speculator's
++    context buffer (the norm's ``out``), which the context KV projections then read:
++    no copy between the norm and their per-token casts, the buffer's bits the
++    combine's own (TileKernels' norm of a projection of the joined sources), the
++    rows past the capacity untouched."""
++    from types import SimpleNamespace
++
++    from vllm.models.deepseek_v4_1.nvidia.dspark import (
++        DSparkContextCudaGraphs,
++        DSparkDeepseekV4Model,
++    )
++    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
++
++    gen = torch.Generator(device=DEVICE).manual_seed(capacity)
++    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
++    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
++    joined = dspark_context.NUM_SOURCES * WIDTH
++    projection = torch.randn(joined, WIDTH, generator=gen, device=DEVICE) / joined
++    projection = projection.to(torch.bfloat16)
++    model = SimpleNamespace(main_proj=lambda x: x @ projection, main_norm=norm)
++    aux = torch.randn(LIMIT, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
++    aux[0, :8] = float("nan")
++    hidden_states = torch.randn(LIMIT + 4, WIDTH, generator=gen, device=DEVICE)
++    hidden_states = hidden_states.to(torch.bfloat16)
++    before = hidden_states.clone()
++    expected = DSparkDeepseekV4Model.combine_hidden_states(model, aux[:capacity])
++    projected = []
++    graphs = DSparkContextCudaGraphs.__new__(DSparkContextCudaGraphs)
++    graphs.model = SimpleNamespace(
++        combine_hidden_states=lambda x,
++        out: DSparkDeepseekV4Model.combine_hidden_states(model, x, out),
++        precompute_and_store_context_kv=lambda states, positions, slots: (
++            projected.append((states, slots))
++        ),
++    )
++    graphs.aux = aux
++    graphs.hidden_states = hidden_states
++    graphs.positions = torch.zeros(LIMIT, dtype=torch.int64, device=DEVICE)
++    graphs.slot_mappings = torch.zeros(1, LIMIT, dtype=torch.int64, device=DEVICE)
++    graphs.layer_group_idx = None
++
++    def refuse(self, *args, **kwargs):
++        raise AssertionError("the context graph copied a tensor")
++
++    monkeypatch.setattr(torch.Tensor, "copy_", refuse)
++    graphs._forward(capacity)
++    monkeypatch.undo()
++    torch.accelerator.synchronize()
++    ((states, slots),) = projected
++    assert states.data_ptr() == hidden_states.data_ptr()
++    assert states.shape == (capacity, WIDTH)
++    assert torch.equal(
++        hidden_states[:capacity].view(torch.int16), expected.view(torch.int16)
++    )
++    assert torch.equal(
++        hidden_states[capacity:].view(torch.int16), before[capacity:].view(torch.int16)
++    )
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 861214fb0..3b73dd9e7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -268,8 +268,11 @@ class DSparkContextCudaGraphs:
+         )
+ 
+     def _forward(self, capacity: int) -> None:
+-        main_x = self.model.combine_hidden_states(self.aux[:capacity])
+-        self.hidden_states[:capacity].copy_(main_x)
++        # The norm writes the combined rows into the context buffer itself: no
++        # copy between it and the context KV projections.
++        self.model.combine_hidden_states(
++            self.aux[:capacity], out=self.hidden_states[:capacity]
++        )
+         slots = (
+             self.slot_mappings[0, :capacity]
+             if self.layer_group_idx is None
+@@ -468,12 +471,15 @@ class DSparkDeepseekV4Model(nn.Module):
+         assert self.embed_tokens is not None
+         return self.embed_tokens(input_ids)
+ 
+-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
++    def combine_hidden_states(
++        self, aux_hidden_states: torch.Tensor, out: torch.Tensor | None = None
++    ) -> torch.Tensor:
+         """main_x = main_norm(main_proj(concat of target aux hidden states)).
+ 
+-        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
++        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)]. With
++        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there.
+         """
+-        return self.main_norm(self.main_proj(aux_hidden_states))
++        return self.main_norm(self.main_proj(aux_hidden_states), out=out)
+ 
+     def combine_aux_hidden_states_into(
+         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
+@@ -621,8 +627,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.model.embed_input_ids(input_ids)
+ 
+-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+-        return self.model.combine_hidden_states(aux_hidden_states)
++    def combine_hidden_states(
++        self, aux_hidden_states: torch.Tensor, out: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        return self.model.combine_hidden_states(aux_hidden_states, out)
+ 
+     def combine_aux_hidden_states_into(
+         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor

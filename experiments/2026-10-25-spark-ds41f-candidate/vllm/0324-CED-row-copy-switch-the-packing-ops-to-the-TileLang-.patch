@@ -1,0 +1,361 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:52:14 +0200
+Subject: [PATCH 324/488] CED row copy: switch the packing ops to the TileLang
+ copy and remove the old one
+
+gather_rows and scatter_rows copy with the TileLang kernel. CEDState declares
+the packed-row layouts it registered with Triton's warmup, through
+packed_copy_rows_key, so they compile before the cache freezes; a source view
+of wider rows would stop its first CED step with KernelNotPreparedError rather
+than compile mid-forward. The Triton copy, its warmup inputs and its launcher
+are removed; the kernel tests compare against the benchmark's copy of it, and
+the startup test clears the CED kernels' in-memory caches before freezing, so
+an undeclared call cannot hide behind an earlier test's compile.
+---
+ .../test_deepseek_v41_tilelang_metadata.py    |  36 +++-
+ .../attention/test_b12x_v41_ced_metadata.py   |  15 +-
+ vllm/models/deepseek_v4_1/ced.py              | 165 ++++--------------
+ 3 files changed, 72 insertions(+), 144 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 6002233ff..4622eb13f 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DeepSeek-V4.1 TileLang sparse-MLA metadata against the Triton kernels, exactly."""
+ 
++import math
++
+ import pytest
+ import torch
+ 
+@@ -87,6 +89,36 @@ DEVICE = "cuda"
+ R, CAP, COLS = 16, 1024, 40
+ 
+ 
++def _triton_copy(source, indices, rows, scatter):
++    """Triton's row copy, which the TileLang copy replaced (the benchmark's copy)."""
++    from benchmarks.kernels.ced_reference import _copy_rows
++
++    tail = tuple(source.shape[1:])
++    width = math.prod(tail)
++    output = source.new_zeros((rows, *tail))
++    _copy_rows[(triton.cdiv((source.shape[0] if scatter else rows) * width, 512),)](
++        source,
++        indices,
++        output,
++        source.shape[0],
++        rows,
++        tail,
++        source.stride(),
++        width,
++        scatter,
++        512,
++    )
++    return output
++
++
++def gather_rows(source, indices):
++    return _triton_copy(source, indices, indices.numel(), False)
++
++
++def scatter_rows(source, indices, rows):
++    return _triton_copy(source, indices, rows, True)
++
++
+ @pytest.mark.parametrize(
+     "dtype",
+     [
+@@ -103,7 +135,6 @@ R, CAP, COLS = 16, 1024, 40
+ )
+ @pytest.mark.parametrize("transpose", [False, True])
+ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, transpose):
+-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     source = torch.arange(7 * 3 * 5, device=DEVICE).reshape(7, 3, 5).to(dtype)
+@@ -122,7 +153,6 @@ def test_ced_row_copy_preserves_strides_invalid_indices_and_scatter(dtype, trans
+ @pytest.mark.parametrize("rows", [1, 48, 4048])
+ @pytest.mark.parametrize("tail", [(5120,), (4, 5120)])
+ def test_ced_row_copy_serving_widths(rows, tail):
+-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     source = torch.randn((rows, *tail), dtype=torch.bfloat16, device=DEVICE)
+@@ -152,7 +182,6 @@ def test_ced_row_copy_serving_widths(rows, tail):
+ def test_ced_row_copy_serving_layouts_skip_invalid_rows(dtype, tail, rows):
+     """The serving layouts with the plan's -1 padding and out-of-range indices,
+     across a block boundary, against the Triton copies."""
+-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     source = torch.randint(-100, 100, (rows, *tail), device=DEVICE).to(dtype)
+@@ -190,7 +219,6 @@ def test_ced_row_copy_serving_layouts_skip_invalid_rows(dtype, tail, rows):
+ def test_ced_row_copy_views_of_wider_rows(dtype, width, columns):
+     """Column views of wider rows: the row stride is an argument, and the copies
+     match Triton's."""
+-    from vllm.models.deepseek_v4_1.ced import gather_rows, scatter_rows
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
+     wide = torch.randint(-100, 100, (300, width), device=DEVICE).to(dtype)
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index 8694bc649..e4705cf83 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -208,7 +208,7 @@ def test_frozen_packing_graph_replays_new_live_rows(monkeypatch):
+         packed = gather_rows(source, indices)
+         restored = scatter_rows(packed, indices, 256)
+     # Replay cannot consult Python or compile another packing specialization.
+-    monkeypatch.setattr(ced, "_copy_rows_launcher", None)
++    monkeypatch.setattr(ced.ced_kernels, "copy_rows", None)
+     indices.fill_(-1)
+     indices[:2] = torch.tensor([31, 127], device="cuda")
+     source.add_(1000)
+@@ -517,7 +517,6 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
+ @cuda
+ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+     import importlib
+-    from collections import defaultdict
+ 
+     import tilelang.cache
+     from triton import knobs
+@@ -529,11 +528,13 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+     cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+     monkeypatch.setattr(cache_module, "_frozen_reason", None)
+     # Isolate compilation state so earlier tests cannot hide a missing warmup.
+-    monkeypatch.setattr(
+-        ced._copy_rows,
+-        "device_caches",
+-        defaultdict(ced._copy_rows.device_caches.default_factory),
+-    )
++    for kernel in (
++        ced.ced_kernels.requests_kernel,
++        ced.ced_kernels.indices_kernel,
++        ced.ced_kernels.copy_rows_kernel,
++    ):
++        monkeypatch.setattr(kernel, "_kernel_cache", {})
++        monkeypatch.setattr(kernel, "_call_form_cache", type(kernel._call_form_cache)())
+     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+     # The packings compile with the runner's JIT warmup, as under the worker.
+     registry = JitWarmupRegistry(None)
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 6a4995a16..85e2c06c8 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -8,16 +8,8 @@ from bisect import bisect_left
+ from dataclasses import dataclass, replace
+ from typing import TYPE_CHECKING, Any
+ 
+-import numpy as np
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+-from vllm.triton_utils import tl, triton
+-
+ from .tilelang import ced as ced_kernels
+ from .tilelang import prepare
+ 
+@@ -42,99 +34,12 @@ def ced_decoder_start(hf_config: Any) -> int | None:
+     return None
+ 
+ 
+-@triton.jit(do_not_specialize=["source_rows", "output_rows"])
+-def _copy_rows(
+-    Source,
+-    Indices,
+-    Output,
+-    source_rows,
+-    output_rows,
+-    DIMS: tl.constexpr,
+-    STRIDES: tl.constexpr,
+-    WIDTH: tl.constexpr,
+-    SCATTER: tl.constexpr,
+-    B: tl.constexpr,
+-):
+-    offset = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B).to(tl.int64)
+-    row = offset // WIDTH
+-    col = offset % WIDTH
+-    limit = source_rows if SCATTER else output_rows
+-    index = tl.load(Indices + row, row < limit, other=-1).to(tl.int64)
+-    valid = (row < limit) & (index >= 0)
+-    valid &= index < (output_rows if SCATTER else source_rows)
+-    source_row = row if SCATTER else index
+-    source_offset = source_row * STRIDES[0]
+-    remainder = col
+-    for axis in tl.static_range(len(DIMS) - 1, -1, -1):
+-        source_offset += (remainder % DIMS[axis]) * STRIDES[axis + 1]
+-        remainder = remainder // DIMS[axis]
+-    value = tl.load(Source + source_offset, valid, other=0)
+-    if SCATTER:
+-        tl.store(Output + index * WIDTH + col, value, valid)
+-    else:
+-        tl.store(Output + offset, value, row < output_rows)
+-
+-
+-def _copy_rows_warmup_inputs(
+-    *, layouts: tuple[tuple[torch.dtype, tuple[int, ...], bool], ...]
+-) -> list[dict[str, Any]]:
+-    cases = []
+-    for dtype, tail, scatter in layouts:
+-        rows = TritonWarmupTensor(dtype, shape=(4, *tail))
+-        cases.append(
+-            triton_warmup_inputs(
+-                _copy_rows,
+-                rows,
+-                TritonWarmupTensor(torch.int64),
+-                rows,
+-                4,
+-                4,
+-                tail,
+-                rows.stride(),
+-                int(np.prod(tail)),
+-                scatter,
+-                512,
+-                grid=(1,),
+-            )
+-        )
+-    return cases
+-
+-
+-_copy_rows_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_copy_rows_warmup_inputs
+-)(_copy_rows)
+-
+-
+-def register_copy_rows_warmup(
+-    layouts: tuple[tuple[torch.dtype, tuple[int, ...], bool], ...],
+-) -> None:
+-    """Register ``gather_rows`` / ``scatter_rows`` for contiguous, 16-byte aligned
+-    sources of each ``(dtype, shape[1:], scatter)`` layout with int64 indices."""
+-    _copy_rows_launcher.register_warmup(layouts=layouts)
+-
+-
+ @torch.library.custom_op("vllm::dsv41_gather_rows", mutates_args=())
+ def gather_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+     """Gather first-axis rows, zeroing invalid indices (including graph padding)."""
+     output = source.new_empty((indices.numel(), *source.shape[1:]))
+-    width = (
+-        source.numel() // source.shape[0]
+-        if source.shape[0]
+-        else int(np.prod(source.shape[1:]))
+-    )
+     if output.numel():
+-        _copy_rows_launcher[(triton.cdiv(output.numel(), 512),)](
+-            source,
+-            indices,
+-            output,
+-            source.shape[0],
+-            indices.numel(),
+-            tuple(source.shape[1:]),
+-            source.stride(),
+-            width,
+-            False,
+-            512,
+-        )
++        ced_kernels.copy_rows(source, indices, output, scatter=False)
+     return output
+ 
+ 
+@@ -149,24 +54,8 @@ def scatter_rows(
+ ) -> torch.Tensor:
+     """Restore the full-row ABI; discarded rows are always zero."""
+     output = source.new_zeros((full_rows, *source.shape[1:]))
+-    width = (
+-        source.numel() // source.shape[0]
+-        if source.shape[0]
+-        else int(np.prod(source.shape[1:]))
+-    )
+     if source.numel():
+-        _copy_rows_launcher[(triton.cdiv(source.numel(), 512),)](
+-            source,
+-            indices,
+-            output,
+-            source.shape[0],
+-            full_rows,
+-            tuple(source.shape[1:]),
+-            source.stride(),
+-            width,
+-            True,
+-            512,
+-        )
++        ced_kernels.copy_rows(source, indices, output, scatter=True)
+     return output
+ 
+ 
+@@ -221,8 +110,9 @@ class CEDState:
+         self.plan: CEDPlan | None = None
+ 
+     def warmup(self, hidden_size: int, hc_mult: int) -> None:
+-        """Resolve the row mapping before graph capture, and register both packing
+-        directions with the runner's JIT warmup (compiled before memory profiling).
++        """Resolve the row mapping before graph capture, and declare the metadata
++        kernels and both packing directions for preparation (compiled before memory
++        profiling).
+         """
+         device = self.indices.device
+         if torch.cuda.is_current_stream_capturing():
+@@ -233,24 +123,22 @@ class CEDState:
+         starts = torch.tensor([0, count], dtype=torch.int32, device=device)
+         seq = torch.tensor([count], dtype=torch.int32, device=device)
+         rows, streams, mixes = (hidden_size,), (hc_mult, hidden_size), (hc_mult,)
+-        register_copy_rows_warmup(
+-            (
+-                # Gathered: the decoder boundary's rows, mixes, positions and token
+-                # ids, the decoder's attention metadata, the step's padding mask
+-                # and the drafter's context rows, positions and slots.
+-                (torch.int32, (), False),
+-                (torch.int64, (), False),
+-                (torch.bool, (), False),
+-                (torch.bfloat16, rows, False),
+-                (torch.bfloat16, streams, False),
+-                (torch.float32, mixes, False),
+-                (torch.float32, (hc_mult, hc_mult), False),
+-                # Scattered back to every row: hidden states (collapsed, or the MTP
+-                # buffer's streams) and a pipeline stage's pre-mix.
+-                (torch.bfloat16, rows, True),
+-                (torch.bfloat16, streams, True),
+-                (torch.float32, mixes, True),
+-            )
++        copies = (
++            # Gathered: the decoder boundary's rows, mixes, positions and token
++            # ids, the decoder's attention metadata, the step's padding mask and
++            # the drafter's context rows, positions and slots.
++            (torch.int32, (), False),
++            (torch.int64, (), False),
++            (torch.bool, (), False),
++            (torch.bfloat16, rows, False),
++            (torch.bfloat16, streams, False),
++            (torch.float32, mixes, False),
++            (torch.float32, (hc_mult, hc_mult), False),
++            # Scattered back to every row: hidden states (collapsed, or the MTP
++            # buffer's streams) and a pipeline stage's pre-mix.
++            (torch.bfloat16, rows, True),
++            (torch.bfloat16, streams, True),
++            (torch.float32, mixes, True),
+         )
+ 
+         def warm_metadata():
+@@ -261,6 +149,17 @@ class CEDState:
+         prepare.declare(
+             lambda: [
+                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
++                # Packed rows of each layout. A source view of wider rows would
++                # stop its first CED step with KernelNotPreparedError.
++                *(
++                    prepare.call(
++                        ced_kernels.copy_rows_kernel,
++                        *ced_kernels.packed_copy_rows_key(
++                            str(dtype).removeprefix("torch."), tail, scatter
++                        ),
++                    )
++                    for dtype, tail, scatter in copies
++                ),
+                 # Unchanged rows, then a compaction of one request and of several.
+                 *(
+                     prepare.call(

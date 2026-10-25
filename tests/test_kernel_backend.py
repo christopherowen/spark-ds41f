@@ -61,6 +61,7 @@ TILELANG_EXPERIMENTS = (
     "experiments/2026-10-18-r6x",
     "experiments/2026-10-22-spark-ds41f-1022",
     "experiments/2026-10-23-next-release",
+    "experiments/2026-10-25-spark-ds41f-candidate",
 )
 FLAGS = ("--attention-backend", "--linear-backend", "--moe-backend")
 # Each TileLang profile and the B12X configuration it mirrors, with that

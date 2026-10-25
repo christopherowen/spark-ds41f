@@ -1,0 +1,674 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:36:19 +0100
+Subject: [PATCH 476/488] [DS4.1] Sink: the alternates' rows in one TileLang
+ launch; the policy writes the recovered zeros
+
+alternate_logprobs_of computed each request's drawing row, gathered the rows
+and clamped every alternate with torch, then scored the alternates one at a
+time and copied each score into its column. sink_rows copies the rows densely
+and clamps the alternates in one launch (with a logits logprobs mode, it also
+takes their logits); one log-softmax launch scores every alternate of a row
+(the row's maximum and log-sum-exp do not depend on how many tokens are
+scored), and the rank kernel ranks one alternate a launch into its row of
+alternate-major ranks. The rank and log-softmax kernels are unchanged.
+
+The policy reads the step's alternate logprobs and ranks at their strides,
+and in its logprobs variant writes every request's recovered logprob and rank,
+0 where nothing was recovered, so apply no longer zero-fills them.
+
+The sink declares the copy for each logits dtype and the log-softmax of the
+dense rows; the runner passes the logprobs mode.
+---
+ tests/v1/worker/test_gpu_sink.py              | 184 ++++++++++++++++++
+ tests/v1/worker/test_gpu_tilelang_sampling.py |  24 ++-
+ vllm/v1/worker/gpu/model_runner.py            |   2 +
+ vllm/v1/worker/gpu/sample/sink.py             |  71 ++++---
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 172 +++++++++++++++-
+ 5 files changed, 416 insertions(+), 37 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index 4a1c1d33d..a419c5de8 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -1077,3 +1077,187 @@ def test_rejection_leaves_the_batch_neighbours_unchanged():
+         SinkOutcome.REJECTED
+     ]
+     assert not any("b" in e for e in without.events)
++
++
++# --- The alternates' logprobs and ranks ---------------------------------------
++
++
++def _alternate_scores_reference(sink, logits, cu, num_sampled, alternates, mode):
++    """``alternate_logprobs_of`` before its port: torch's row index math, gather,
++    clamps and column copies around ``compute_topk_scores`` of each alternate."""
++    from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
++
++    num_reqs = alternates.shape[0]
++    rows = cu[:num_reqs].to(torch.int64) + (num_sampled.to(torch.int64) - 1).clamp(
++        min=0
++    )
++    row_logits = logits[rows]
++    logprobs = torch.empty(
++        (num_reqs, sink.num_alternates), dtype=torch.float32, device=DEVICE
++    )
++    ranks = torch.empty(
++        (num_reqs, sink.num_alternates), dtype=torch.int64, device=DEVICE
++    )
++    for i in range(sink.num_alternates):
++        tokens = alternates[:, i].clamp(min=0)
++        scores = compute_topk_scores(row_logits, 0, tokens, None, logits_mode=mode)
++        logprobs[:, i] = scores.logprobs[:, 0]
++        ranks[:, i] = scores.selected_token_ranks
++    return logprobs, ranks
++
++
++def _alternates_case(vocab: int, stride: int, dtype: torch.dtype, seed: int):
++    """Seven requests' logits rows (in a wider row stride), with NaN, infinities and
++    ties in the rows the alternates are drawn from, their sampled counts (a prefill
++    chunk's 0 included), and alternates with -1 (no further candidate) among them."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    counts = [6, 1, 6, 3, 2, 6, 1]
++    cu = _cu(counts)
++    rows = int(cu[-1])
++    storage = (torch.randn(rows, stride, generator=g, device=DEVICE) * 4).to(dtype)
++    logits = storage[:, :vocab]
++    num_sampled = torch.tensor([3, 0, 6, 1, 2, 4, 1], dtype=torch.int32, device=DEVICE)
++    # The drawing rows: cu[r] + max(num_sampled[r] - 1, 0) = 2, 6, 12, 13, 17, 21, 24.
++    logits[2, 7] = float("nan")  # request 0's
++    logits[12, 3] = float("inf")  # request 2's
++    logits[12, 4] = -float("inf")
++    logits[13, :] = logits[13, 0]  # request 3's: every column tied
++    alternates = torch.randint(0, vocab, (7, 3), generator=g, device=DEVICE)
++    alternates[1, 2] = -1
++    alternates[4, 1:] = -1
++    alternates[0, 0] = 7  # the NaN column
++    return logits, cu, num_sampled, alternates
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("logits_mode", [False, True])
++@pytest.mark.parametrize(
++    "vocab,stride", [(129280, 129280), (129280, 129408), (1000, 1003)]
++)
++def test_alternate_logprobs_match_the_torch_glue(dtype, logits_mode, vocab, stride):
++    """``alternate_logprobs_of`` (one copy launch, one log-softmax launch, a rank
++    launch an alternate) gives the bits of the torch glue it replaces, which scored
++    each alternate with its own log-softmax and rank launches and copied their
++    columns: logprobs (or, in a logits mode, logits) and ranks, at DS4.1's
++    vocabulary in a dense and a padded (TP3) row stride and at a width that is not
++    16-element aligned."""
++    sink = _sink(vocab=vocab)
++    assert sink.num_alternates == 3
++    logits, cu, num_sampled, alternates = _alternates_case(vocab, stride, dtype, 31)
++    before = logits.clone()
++    out = sink.alternate_logprobs_of(logits, cu, num_sampled, alternates, logits_mode)
++    logprobs, ranks = _alternate_scores_reference(
++        sink, logits, cu, num_sampled, alternates, logits_mode
++    )
++    assert out.tokens is alternates
++    assert out.logprobs is not None and out.ranks is not None
++    assert out.logprobs.shape == out.ranks.shape == (7, 3)
++    assert out.logprobs.dtype == torch.float32 and out.ranks.dtype == torch.int64
++    assert torch.equal(out.logprobs.view(torch.int32), logprobs.view(torch.int32))
++    assert torch.equal(out.ranks, ranks)
++    assert torch.equal(logits.view(torch.uint8), before.view(torch.uint8))
++
++
++def test_alternate_logprobs_of_an_empty_batch():
++    sink = _sink()
++    logits = torch.randn(0, 2048, device=DEVICE)
++    out = sink.alternate_logprobs_of(
++        logits,
++        torch.zeros(1, dtype=torch.int32, device=DEVICE),
++        torch.zeros(0, dtype=torch.int32, device=DEVICE),
++        torch.zeros((0, 3), dtype=torch.int64, device=DEVICE),
++        False,
++    )
++    assert out.logprobs.shape == out.ranks.shape == (0, 3)
++
++
++def test_alternate_logprobs_feed_the_policy():
++    """The policy keeps a step's alternate logprobs and ranks as the sink computed
++    them (its ranks alternate by alternate) and recovers them for a rejected draft
++    zero: the same state as from request-major copies of them."""
++    results = []
++    for contiguous in (False, True):
++        sink = _sink()
++        logits, cu, num_sampled, alternates = _alternates_case(
++            2048, 2048, torch.float32, 5
++        )
++        out = sink.alternate_logprobs_of(logits, cu, num_sampled, alternates, False)
++        if contiguous:
++            out = SinkAlternates(
++                out.tokens, out.logprobs.contiguous(), out.ranks.contiguous()
++            )
++        else:
++            assert not out.ranks.is_contiguous()
++        num_reqs = 7
++        sampled = torch.zeros((num_reqs, 3), dtype=torch.int64, device=DEVICE)
++        flags = torch.zeros(int(cu[-1]), dtype=torch.int8, device=DEVICE)
++        result = sink.apply(
++            sampled,
++            num_sampled.clone(),
++            torch.zeros(num_reqs, dtype=torch.int32, device=DEVICE),
++            cu,
++            torch.arange(num_reqs, device=DEVICE),
++            torch.ones(num_reqs, dtype=torch.int8, device=DEVICE),
++            flags,
++            torch.zeros(int(cu[-1]), dtype=torch.int32, device=DEVICE),
++            out,
++            torch.full((8,), 40, dtype=torch.int32, device=DEVICE),
++            torch.ones((8, 2048), dtype=torch.int32, device=DEVICE),
++            torch.zeros(int(cu[-1]), device=DEVICE),
++        )
++        results.append(
++            (
++                sink.alternate_logprobs[:num_reqs].clone(),
++                sink.alternate_ranks[:num_reqs].clone(),
++                result.recovered_logprobs,
++                result.recovered_ranks,
++            )
++        )
++    (lp, rk, rec_lp, rec_rk), (lp2, rk2, rec_lp2, rec_rk2) = results
++    assert torch.equal(lp.view(torch.int32), lp2.view(torch.int32))
++    assert torch.equal(rk, rk2)
++    # Nothing was recovered: the policy wrote zeros for every request.
++    assert torch.equal(rec_lp, torch.zeros_like(rec_lp))
++    assert torch.equal(rec_rk, torch.zeros_like(rec_rk))
++    assert torch.equal(rec_lp2, rec_lp) and torch.equal(rec_rk2, rec_rk)
++
++
++def test_alternate_logprobs_kernels_are_declared():
++    """The sink declares the alternates' copy (each logits dtype, the logits mode
++    given), and the log-softmax and ranks of their dense rows."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.v1.worker.gpu.sample import tilelang_logprob, tilelang_sampling
++
++    vocab = 129280
++    for logits_mode in (False, True):
++        sink = _sink(vocab=vocab)
++        registry = JitWarmupRegistry(None)
++        with registry.activate():
++            sink.register_warmups(
++                logits=((torch.bfloat16, 129408),),
++                processed_logits_strides=(vocab, 129408),
++                sampled_widths=(1, 6),
++                bin_counts_stride=vocab,
++                vocab_size=vocab,
++                logits_mode=logits_mode,
++            )
++        calls = prepare.declared_calls(registry)
++        keys = {(f, args) for f, args, _ in calls}
++        for dtype in (torch.bfloat16, torch.float32):
++            assert (
++                tilelang_sampling.sink_rows_kernel,
++                tilelang_sampling.sink_rows_key(dtype, 3, logits_mode),
++            ) in keys
++            _, rank_args, _ = tilelang_logprob.rank_call(
++                dtype, vocab, vocab, torch.int64
++            )
++            assert (tilelang_logprob.ranks_kernel, rank_args) in keys
++            dense = torch.empty((1, vocab), dtype=dtype, device=DEVICE)
++            softmax = (
++                tilelang_logprob.topk_log_softmax_kernel,
++                tilelang_logprob.topk_log_softmax_key(
++                    dtype, tilelang_sampling._triton_run(dense)
++                ),
++            )
++            assert (softmax in keys) != logits_mode
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index 45d53374a..d01251060 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -631,7 +631,12 @@ def _policy_state(reqs, width, slots, alternates, seed):
+     "rejection,logprobs", [(True, True), (True, False), (False, False)]
+ )
+ @pytest.mark.parametrize("width", [6, 1])
+-def test_sink_policy(rejection, logprobs, width):
++@pytest.mark.parametrize("alternate_major", [False, True])
++def test_sink_policy(rejection, logprobs, width, alternate_major):
++    """The policy against the Triton kernel. The Triton launch's recovered logprobs
++    and ranks were zero-filled by torch; the TileLang kernel writes every request's
++    (0 where none was recovered) over garbage. The step's alternate logprobs and
++    ranks may be views of alternate-major storage (the sink's ranks are)."""
+     reqs, slots, alternates, fields = 23, 40, 3, 6
+     cu, drafts, mapping, state = _policy_state(reqs, width, slots, alternates, 9)
+     results = []
+@@ -640,8 +645,17 @@ def test_sink_policy(rejection, logprobs, width):
+         events = torch.full((reqs, fields), -9, dtype=torch.int32, device=DEVICE)
+         tokens = torch.full((reqs, width + 1), -9, dtype=torch.int64, device=DEVICE)
+         num_out = torch.full((reqs,), -9, dtype=torch.int32, device=DEVICE)
+-        rec_lp = torch.full((reqs,), -9.0, device=DEVICE)
+-        rec_rk = torch.full((reqs,), -9, dtype=torch.int64, device=DEVICE)
++        # Only a logprobs launch writes them: garbage for ours, zeros for Triton.
++        garbage = ours and logprobs
++        rec_lp = torch.full((reqs,), -9.0 if garbage else 0.0, device=DEVICE)
++        rec_rk = torch.full(
++            (reqs,), -9 if garbage else 0, dtype=torch.int64, device=DEVICE
++        )
++        new_logprobs, new_ranks = s["new_logprobs"], s["new_ranks"]
++        if ours and alternate_major:
++            new_logprobs = new_logprobs.t().contiguous().t()
++            new_ranks = new_ranks.t().contiguous().t()
++            assert not new_ranks.is_contiguous()
+         args = (
+             s["sampled"],
+             s["num_sampled"],
+@@ -658,8 +672,8 @@ def test_sink_policy(rejection, logprobs, width):
+             s["values"],
+             drafts,
+             s["new_alternates"] if rejection else s["alternates"],
+-            s["new_logprobs"] if logprobs else s["alt_logprobs"],
+-            s["new_ranks"] if logprobs else s["alt_ranks"],
++            new_logprobs if logprobs else s["alt_logprobs"],
++            new_ranks if logprobs else s["alt_ranks"],
+             s["alternates"],
+             s["alt_logprobs"],
+             s["alt_ranks"],
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b15953b11..9d1c2e9cd 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2229,6 +2229,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                         0
+                     ),
+                     vocab_size=vocab_size,
++                    logits_mode=self.sampler.logprobs_mode
++                    in ("raw_logits", "processed_logits"),
+                 )
+         if self.rejection_sampler is not None and self._greedy_verification_available():
+             assert head is not None and processor is not None
+diff --git a/vllm/v1/worker/gpu/sample/sink.py b/vllm/v1/worker/gpu/sample/sink.py
+index 4e0c167c0..ab9345da8 100644
+--- a/vllm/v1/worker/gpu/sample/sink.py
++++ b/vllm/v1/worker/gpu/sample/sink.py
+@@ -311,7 +311,8 @@ class SinkCut:
+ class SinkAlternates:
+     """The next candidates of each request's last draw: [num_reqs, max_retries]
+     tokens (-1 past the possible ones), with logprobs and ranks when the batch
+-    returns logprobs."""
++    returns logprobs (``[num_reqs, max_retries]`` each, the ranks possibly a view
++    of alternate-major storage)."""
+ 
+     tokens: torch.Tensor
+     logprobs: torch.Tensor | None = None
+@@ -524,28 +525,39 @@ class SinkSampler:
+         logits_mode: bool,
+     ) -> SinkAlternates:
+         """The logprob and rank of each alternate in the distribution of the
+-        row that drew it, as the sampled token's are computed for logprobs."""
+-        from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
++        row that drew it, as the sampled token's are computed for logprobs
++        (``compute_topk_scores`` of each alternate, the bits it gives): one launch
++        copies the rows densely and clamps the alternates (``sink_rows``), one
++        log-softmax launch scores every alternate of a row (with ``logits_mode``,
++        the copy takes their logits instead), and the rank kernel ranks one
++        alternate a launch, into its own row of alternate-major ranks."""
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++        from vllm.v1.worker.gpu.sample.tilelang_logprob import (
++            token_ranks,
++            topk_log_softmax,
++        )
+ 
+         num_reqs = alternates.shape[0]
+-        rows = cu_num_logits[:num_reqs].to(torch.int64) + (
+-            num_sampled.to(torch.int64) - 1
+-        ).clamp(min=0)
+-        row_logits = logits[rows]
++        num_alternates = self.num_alternates
++        if alternates.shape[1] != num_alternates:
++            raise ValueError(
++                f"{alternates.shape[1]} alternates a request, not {num_alternates}"
++            )
+         logprobs = torch.empty(
+-            (num_reqs, self.num_alternates), dtype=torch.float32, device=self.device
++            (num_reqs, num_alternates), dtype=torch.float32, device=self.device
+         )
+         ranks = torch.empty(
+-            (num_reqs, self.num_alternates), dtype=torch.int64, device=self.device
++            (num_alternates, num_reqs), dtype=torch.int64, device=self.device
+         )
+-        for i in range(self.num_alternates):
+-            tokens = alternates[:, i].clamp(min=0)
+-            scores = compute_topk_scores(
+-                row_logits, 0, tokens, None, logits_mode=logits_mode
++        if num_reqs and num_alternates:
++            rows, tokens, tokens_by_alt = tilelang_sampling.sink_rows(
++                logits, cu_num_logits, num_sampled, alternates, logprobs, logits_mode
+             )
+-            logprobs[:, i] = scores.logprobs[:, 0]
+-            ranks[:, i] = scores.selected_token_ranks
+-        return SinkAlternates(alternates, logprobs, ranks)
++            if not logits_mode:
++                topk_log_softmax(rows, tokens, logprobs)
++            for i in range(num_alternates):
++                token_ranks(rows, tokens_by_alt[i], ranks[i])
++        return SinkAlternates(alternates, logprobs, ranks.t())
+ 
+     def apply(
+         self,
+@@ -585,10 +597,11 @@ class SinkSampler:
+                 num_reqs, dtype=torch.int32, device=self.device
+             )
+             if logprobs:
+-                out.recovered_logprobs = torch.zeros(
++                # The policy writes every request's: 0 where nothing was recovered.
++                out.recovered_logprobs = torch.empty(
+                     num_reqs, dtype=torch.float32, device=self.device
+                 )
+-                out.recovered_ranks = torch.zeros(
++                out.recovered_ranks = torch.empty(
+                     num_reqs, dtype=torch.int64, device=self.device
+                 )
+         new_tokens = alternates.tokens if alternates is not None else self.alternates
+@@ -670,21 +683,28 @@ class SinkSampler:
+         sampled_widths: tuple[int, ...],
+         bin_counts_stride: int,
+         vocab_size: int,
++        logits_mode: bool = False,
+     ) -> None:
+         """Declare the kernels a step launches: the policy for each sampled
+         width, and the alternates of the raw and processed target logits
+-        (``(dtype, row stride)``; the TileLang kernels take any stride)."""
++        (``(dtype, row stride)``; the TileLang kernels take any stride), with
++        their logprobs as ``logits_mode`` (the logprobs mode is a logits mode)
++        computes them."""
+         from vllm.v1.worker.gpu.sample import tilelang_sampling
+-        from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
++        from vllm.v1.worker.gpu.sample.tilelang_logprob import (
++            register_log_softmax,
++            register_ranks,
++        )
+ 
+         logits_dtypes = [dtype for dtype, _ in logits]
+         if processed_logits_strides:
+             logits_dtypes.append(torch.float32)
+-        # alternate_logprobs_of ranks the alternates in dense copies of their rows,
+-        # vocab_size apart whatever the logits' (padded) row stride.
+-        register_ranks(
+-            [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)], vocab_size
+-        )
++        # alternate_logprobs_of ranks and scores the alternates in dense copies of
++        # their rows, vocab_size apart whatever the logits' (padded) row stride.
++        dense = [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)]
++        register_ranks(dense, vocab_size)
++        if self.rejection and not logits_mode:
++            register_log_softmax(dense)
+         tilelang_sampling.declare(
+             lambda: tilelang_sampling.sink_calls(
+                 logits_dtypes=logits_dtypes,
+@@ -692,5 +712,6 @@ class SinkSampler:
+                 num_alternates=self.num_alternates,
+                 rejection=self.rejection,
+                 num_event_fields=NUM_SINK_EVENT_FIELDS,
++                logits_mode=logits_mode,
+             )
+         )
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 9ace429cf..71ce9b392 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -1154,6 +1154,116 @@ def sink_merge(
+     return alternates
+ 
+ 
++# The alternates' rows: threads a block, and columns a thread copies.
++_SINK_ROWS_THREADS = 256
++_SINK_ROWS_PER_THREAD = 8
++SINK_ROWS_BLOCK = _SINK_ROWS_THREADS * _SINK_ROWS_PER_THREAD
++
++
++@tilelang.jit(pass_configs=_PASS)
++def sink_rows_kernel(logits_dtype: str, num_alternates: int, logits_mode: bool):
++    """``SinkSampler.alternate_logprobs_of``'s glue, the torch chain it replaces in
++    one launch: each request's row that drew its last sampled token,
++    ``cu_num_logits[r] + max(num_sampled[r] - 1, 0)`` in int64, copied whole into
++    ``rows[r]`` (``logits[rows]``), and its alternates clamped at 0
++    (``alternates.clamp(min=0)``), stored request by request (``tokens``, the
++    log-softmax's ids) and alternate by alternate (``tokens_by_alt``, a rank
++    launch's ids); with ``logits_mode``, also each alternate's logit as FP32 into
++    ``scores`` (``rows.gather(-1, tokens).to(torch.float32)``). Requests are on the
++    grid's x axis and blocks of ``SINK_ROWS_BLOCK`` columns on its y axis; a thread
++    loads its eight columns (``_SINK_ROWS_THREADS`` apart) before it stores them."""
++    alts = num_alternates
++    if not 1 <= alts <= _SINK_ROWS_THREADS:
++        raise ValueError(f"{alts} alternates: a block's threads take one each")
++    per = _SINK_ROWS_PER_THREAD
++    reqs, num_logits, vocab, cu_len, sampled_len = T.dynamic(
++        "reqs, num_logits, vocab, cu_len, sampled_len"
++    )
++    # 64-bit row offsets, for the logits and their dense copies alike.
++    logits_stride, rows_stride = T.dynamic("logits_stride, rows_stride", "int64")
++
++    @T.prim_func
++    def sink_rows(
++        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        num_sampled: T.Tensor((sampled_len,), T.int32),
++        alternates: T.Tensor((reqs, alts), T.int64),
++        rows: T.StridedTensor((reqs, vocab), (rows_stride, 1), logits_dtype),
++        tokens: T.Tensor((reqs, alts), T.int64),
++        tokens_by_alt: T.Tensor((alts, reqs), T.int64),
++        scores: T.Tensor((reqs, alts), T.float32),
++    ):
++        with T.Kernel(
++            reqs, T.ceildiv(vocab, SINK_ROWS_BLOCK), threads=_SINK_ROWS_THREADS
++        ) as (req, blk):
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((per,), logits_dtype)
++            row = T.alloc_var(
++                T.int64,
++                init=T.cast(cu_num_logits[req], T.int64)
++                + T.max(T.cast(num_sampled[req], T.int64) - 1, T.int64(0)),
++            )
++            token = T.alloc_var(T.int64, init=T.int64(0))
++            for k in T.unroll(per):
++                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
++                    raw[k] = logits[
++                        row, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx
++                    ]
++            for k in T.unroll(per):
++                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
++                    rows[req, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx] = (
++                        raw[k]
++                    )
++            if (blk == 0) & (tx < alts):
++                token = T.max(alternates[req, tx], T.int64(0))
++                tokens[req, tx] = token
++                tokens_by_alt[tx, req] = token
++                if logits_mode:
++                    scores[req, tx] = T.cast(logits[row, token], T.float32)
++
++    return sink_rows
++
++
++def sink_rows_key(
++    logits_dtype: torch.dtype, num_alternates: int, logits_mode: bool
++) -> tuple:
++    return (_DTYPES[logits_dtype], num_alternates, logits_mode)
++
++
++def sink_rows(
++    logits: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    num_sampled: torch.Tensor,
++    alternates: torch.Tensor,
++    scores: torch.Tensor,
++    logits_mode: bool,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """``sink_rows_kernel``'s launch for ``[num_reqs, num_alternates]`` alternates
++    (both at least 1): the rows ``[num_reqs, vocab]`` in the logits' dtype, the
++    clamped alternates ``[num_reqs, num_alternates]`` and ``[num_alternates,
++    num_reqs]`` (int64); with ``logits_mode``, their logits into ``scores``."""
++    num_reqs, num_alternates = alternates.shape
++    device = logits.device
++    rows = torch.empty((num_reqs, logits.shape[1]), dtype=logits.dtype, device=device)
++    tokens = torch.empty((num_reqs, num_alternates), dtype=torch.int64, device=device)
++    tokens_by_alt = torch.empty(
++        (num_alternates, num_reqs), dtype=torch.int64, device=device
++    )
++    _kernel(
++        sink_rows_kernel, *sink_rows_key(logits.dtype, num_alternates, logits_mode)
++    )(
++        logits,
++        cu_num_logits,
++        num_sampled,
++        alternates.contiguous(),
++        rows,
++        tokens,
++        tokens_by_alt,
++        scores,
++    )
++    return rows, tokens, tokens_by_alt
++
++
+ SINK_CANDIDATE_BLOCK = 1024
+ 
+ 
+@@ -1400,7 +1510,11 @@ def sink_policy_kernel(
+     Triton's order. The flagged-value maximum takes the lowest row among equal
+     values (``row_values`` are finite: the detector stores them through
+     ``nan_to_num``). Each buffer is passed flat; ``num_alternates`` is at least 1,
+-    as the Triton launch's ``NUM_ALTERNATES``."""
++    as the Triton launch's ``NUM_ALTERNATES``. The step's alternate logprobs and
++    ranks are read at their request and alternate strides (the ranks are stored
++    alternate by alternate). With ``logprobs``, every request's recovered logprob
++    and rank is written, 0 where no draft zero was replaced: the zeros the Triton
++    launch's buffers were filled with."""
+     alts = num_alternates
+     width = sampled_width
+     padded = _next_power_of_2(width + 1)
+@@ -1450,6 +1564,10 @@ def sink_policy_kernel(
+             (count_rows, count_cols), (count_stride, 1), T.int32
+         ),
+         counts: T.Tensor((3,), T.int64),
++        new_lp_req_stride: T.int64,
++        new_lp_alt_stride: T.int64,
++        new_rank_req_stride: T.int64,
++        new_rank_alt_stride: T.int64,
+     ):
+         with T.Kernel(reqs, threads=32) as req:
+             tx = T.get_thread_binding()
+@@ -1481,6 +1599,9 @@ def sink_policy_kernel(
+                 sampled_n[0] = num_sampled[req]
+                 if sampled_n[0] == 0:
+                     # A prefill chunk: its row is not sampled.
++                    if logprobs:
++                        recovered_logprobs[req] = T.float32(0)
++                        recovered_ranks[req] = T.int64(0)
+                     num_out[req] = 0
+                     events[req, 0] = 0
+                     events[req, 1] = 2
+@@ -1557,6 +1678,9 @@ def sink_policy_kernel(
+                             ]
+                             num_out[req] = 1
+                         else:
++                            if logprobs:
++                                recovered_logprobs[req] = T.float32(0)
++                                recovered_ranks[req] = T.int64(0)
+                             # The last sampled token's draw provides the next
+                             # alternates.
+                             for a in T.serial(alts):
+@@ -1566,12 +1690,14 @@ def sink_policy_kernel(
+                                 if logprobs:
+                                     alternate_logprobs[state[0] * alts + a] = (
+                                         new_alternate_logprobs[
+-                                            T.cast(req, T.int64) * alts + a
++                                            T.cast(req, T.int64) * new_lp_req_stride
++                                            + a * new_lp_alt_stride
+                                         ]
+                                     )
+                                     alternate_ranks[state[0] * alts + a] = (
+                                         new_alternate_ranks[
+-                                            T.cast(req, T.int64) * alts + a
++                                            T.cast(req, T.int64) * new_rank_req_stride
++                                            + a * new_rank_alt_stride
+                                         ]
+                                     )
+                             tries[state[0]] = 0
+@@ -1656,10 +1782,15 @@ def sink_policy(
+ ) -> None:
+     """``SinkSampler.apply``'s launch, with the Triton launch's arguments (the
+     placeholders where a variant has no buffer included); the per-slot and step
+-    buffers are contiguous."""
++    buffers are contiguous, except the step's alternate logprobs and ranks
++    (``[num_reqs, alternates]``), which may be stored alternate by alternate. With
++    ``logprobs``, the recovered logprobs and ranks need no zeros first: every
++    request's is written."""
+     num_reqs, sampled_width = sampled.shape
+     if num_reqs == 0:
+         return
++    new_lp, new_lp_strides = _alternate_columns(new_alternate_logprobs)
++    new_ranks, new_rank_strides = _alternate_columns(new_alternate_ranks)
+     kernel = _kernel(
+         sink_policy_kernel,
+         *sink_policy_key(
+@@ -1687,8 +1818,8 @@ def sink_policy(
+         row_values,
+         drafts,
+         new_alternates.view(-1),
+-        new_alternate_logprobs.view(-1),
+-        new_alternate_ranks.view(-1),
++        new_lp,
++        new_ranks,
+         alternates.view(-1),
+         alternate_logprobs.view(-1),
+         alternate_ranks.view(-1),
+@@ -1696,6 +1827,23 @@ def sink_policy(
+         total_len,
+         bin_counts,
+         counts,
++        *new_lp_strides,
++        *new_rank_strides,
++    )
++
++
++def _alternate_columns(
++    columns: torch.Tensor,
++) -> tuple[torch.Tensor, tuple[int, int]]:
++    """A ``[num_reqs, alternates]`` tensor stored request by request or alternate by
++    alternate, as its flat storage and its (request, alternate) strides."""
++    if columns.is_contiguous():
++        return columns.view(-1), (columns.stride(0), columns.stride(1))
++    if columns.t().is_contiguous():
++        return columns.t().view(-1), (columns.stride(0), columns.stride(1))
++    raise ValueError(
++        f"alternate columns of strides {columns.stride()} are neither request- "
++        "nor alternate-major"
+     )
+ 
+ 
+@@ -2594,12 +2742,14 @@ def sink_calls(
+     num_alternates: int,
+     rejection: bool,
+     num_event_fields: int,
++    logits_mode: bool = False,
+ ) -> list:
+     """``SinkSampler``'s calls: the flags, with and without dead rows; the policy
+     for each sampled width, with and without logprobs; with rejection on, the
+     candidates of logits of each of
+     ``logits_dtypes`` (a rejected draft masked when more than one row is
+-    sampled)."""
++    sampled), and the alternates' rows for their logprobs (with ``logits_mode``,
++    their logits too)."""
+     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
+     if rejection:
+         # The cut and its restore, on raw and processed logits and on a rank's
+@@ -2620,6 +2770,14 @@ def sink_calls(
+             _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
+             _call(sink_merge_kernel, False, 0, num_alternates),
+         ]
++        if num_alternates:
++            calls += [
++                _call(
++                    sink_rows_kernel,
++                    *sink_rows_key(dtype, num_alternates, logits_mode),
++                )
++                for dtype in dict.fromkeys(logits_dtypes)
++            ]
+     calls += [
+         _call(
+             sink_policy_kernel,

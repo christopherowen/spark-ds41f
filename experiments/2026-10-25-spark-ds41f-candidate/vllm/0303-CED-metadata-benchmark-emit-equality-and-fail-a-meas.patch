@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:45:30 +0200
+Subject: [PATCH 303/488] CED metadata benchmark: emit equality and fail a
+ measured regression
+
+---
+ benchmarks/kernels/benchmark_deepseek_v41_ced.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_ced.py b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+index 9de76a7c1..13b41ef79 100644
+--- a/benchmarks/kernels/benchmark_deepseek_v41_ced.py
++++ b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+@@ -106,6 +106,10 @@ def main():
+             print(json.dumps(row), flush=True)
+             rows.append(row)
+     print(json.dumps({"summary": "CED requests per call", "rows": rows}))
++    print(json.dumps({"bits": "CED request metadata", "differs_at": []}))
++    slower = [r for r in rows if r["change_pct"] - r["ci95_pct"] > 3.0]
++    if slower:
++        raise RuntimeError(f"CED metadata is slower beyond the 3% floor: {slower}")
+ 
+ 
+ if __name__ == "__main__":

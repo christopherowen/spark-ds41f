@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:58:14 +0200
+Subject: [PATCH 430/488] [DS4.1] The CED decoder's token metadata in one
+ TileLang launch
+
+decoder_metadata gathered the positions, request ids, slots and cache
+lengths at the CED indices one field at a time and set the -1 sentinels
+with a negation and three masked fills: ten torch launches each time a
+prefill builds a decoder's metadata. One kernel now writes all four, the
+sentinels at negative indices and gather_rows' zero past the step's
+rows included. Tested against the torch chain.
+---
+ .../kernels/test_deepseek_v41_tilelang_ced.py | 25 ++++++++
+ vllm/models/deepseek_v4_1/ced.py              | 24 ++++----
+ vllm/models/deepseek_v4_1/tilelang/ced.py     | 59 +++++++++++++++++++
+ 3 files changed, 97 insertions(+), 11 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_ced.py b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+index 168621ba9..b02cdbd1a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_ced.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+@@ -293,3 +293,28 @@ def test_ced_indices_preserves_last_rows_and_padding(lengths, padding):
+     )
+     ced.indices(starts, compact, actual, nr, nt)
+     assert torch.equal(reference, actual)
++
++
++@pytest.mark.parametrize("rows", [1, 22, 158, 4096])
++def test_ced_token_metadata_matches_the_torch_chain(rows):
++    """The decoder's per-token metadata in one launch: the gathered fields with
++    -1 at negative indices (0 lengths) and 0 past the step's rows, as
++    ``gather_rows`` then ``masked_fill`` wrote them."""
++    from vllm.models.deepseek_v4_1.ced import gather_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++
++    g = torch.Generator(device="cuda").manual_seed(rows)
++    tokens = 4200
++    positions = torch.randint(0, 1 << 20, (tokens,), generator=g, device="cuda")
++    reqs = torch.randint(0, 16, (tokens,), generator=g, device="cuda").int()
++    slots = torch.randint(-1, 1 << 24, (tokens,), generator=g, device="cuda")
++    lengths = torch.randint(0, 1 << 16, (tokens,), generator=g, device="cuda").int()
++    indices = torch.randint(-1, tokens + 3, (rows,), generator=g, device="cuda")
++    valid = indices >= 0
++    expected = [
++        gather_rows(field, indices).masked_fill(~valid, -1)
++        for field in (positions, reqs, slots)
++    ] + [gather_rows(lengths, indices)]
++    actual = ced.token_metadata(indices, positions, reqs, slots, lengths)
++    for a, e in zip(actual, expected):
++        assert a.dtype == e.dtype and torch.equal(a, e)
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 73060b5c9..978e22aef 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -207,6 +207,7 @@ class CEDState:
+         prepare.declare(
+             lambda: [
+                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
++                prepare.call(ced_kernels.token_metadata_kernel),
+                 # Packed rows of each layout. A source view of wider rows would
+                 # stop its first CED step with KernelNotPreparedError.
+                 *(
+@@ -289,13 +290,14 @@ class CEDState:
+         plan = self.plan
+         assert plan is not None
+         indices = self.indices[: plan.num_tokens]
+-        # Generic packing zeros invalid rows; native metadata uses -1 sentinels.
+-        valid = indices >= 0
+-
+-        def gather(field, sentinel=0):
+-            result = gather_rows(field, indices)
+-            return result if sentinel == 0 else result.masked_fill(~valid, sentinel)
+-
++        # The native metadata's sentinels at invalid rows: -1, and 0 lengths.
++        positions, reqs, slots, lengths = ced_kernels.token_metadata(
++            indices,
++            metadata.positions,
++            metadata.req_id_per_token,
++            metadata.slot_mapping,
++            metadata.cache_lengths,
++        )
+         return replace(
+             metadata,
+             num_actual_tokens=plan.num_tokens,
+@@ -303,10 +305,10 @@ class CEDState:
+             query_start_loc=self.starts,
+             request_positions=self.request_positions,
+             live_counts=self.counts,
+-            positions=gather(metadata.positions, -1),
+-            req_id_per_token=gather(metadata.req_id_per_token, -1),
+-            slot_mapping=gather(metadata.slot_mapping, -1),
+-            cache_lengths=gather(metadata.cache_lengths),
++            positions=positions,
++            req_id_per_token=reqs,
++            slot_mapping=slots,
++            cache_lengths=lengths,
+             is_decode=plan.max_query_len <= 1,
+             decoder=None,
+             swa_replay_start=self.replay_start,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index fca5ba42b..81224928a 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -220,6 +220,65 @@ def indices(starts, compact_starts, output, nr, nt):
+     indices_kernel(compact_starts.shape[0] - 1)(starts, compact_starts, output, nr, nt)
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def token_metadata_kernel():
++    """The decoder's per-token attention metadata at the CED indices, a thread a
++    decoder row: positions, request ids and slots (-1 at an invalid index, as the
++    native metadata's sentinels) and cache lengths (0 there); an index past the
++    step's rows reads 0, as ``gather_rows`` gives it. ``decoder_metadata``
++    gathered each field and masked three of them with torch. Every load issues
++    before the stores, clamped into the step's rows."""
++    rows, tokens = T.dynamic("rows, tokens")
++
++    @T.prim_func
++    def ced_token_metadata(
++        indices: T.Tensor((rows,), T.int64),
++        positions: T.Tensor((tokens,), T.int64),
++        reqs: T.Tensor((tokens,), T.int32),
++        slots: T.Tensor((tokens,), T.int64),
++        lengths: T.Tensor((tokens,), T.int32),
++        positions_out: T.Tensor((rows,), T.int64),
++        reqs_out: T.Tensor((rows,), T.int32),
++        slots_out: T.Tensor((rows,), T.int64),
++        lengths_out: T.Tensor((rows,), T.int32),
++    ):
++        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
++            row = bx * 128 + T.get_thread_binding()
++            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
++            source = T.alloc_var(T.int64, init=T.max(T.min(index, tokens - 1), 0))
++            position = T.alloc_var(T.int64, init=positions[source])
++            req = T.alloc_var(T.int32, init=reqs[source])
++            slot = T.alloc_var(T.int64, init=slots[source])
++            length = T.alloc_var(T.int32, init=lengths[source])
++            if row < rows:
++                # gather_rows' zero past the step's rows, then the sentinels at the
++                # negative indices, as the torch chain wrote them.
++                valid = index >= 0
++                inside = valid & (index < tokens)
++                positions_out[row] = T.if_then_else(
++                    valid, T.if_then_else(inside, position, T.int64(0)), T.int64(-1)
++                )
++                reqs_out[row] = T.if_then_else(
++                    valid, T.if_then_else(inside, req, 0), -1
++                )
++                slots_out[row] = T.if_then_else(
++                    valid, T.if_then_else(inside, slot, T.int64(0)), T.int64(-1)
++                )
++                lengths_out[row] = T.if_then_else(inside, length, 0)
++
++    return ced_token_metadata
++
++
++def token_metadata(indices, positions, reqs, slots, lengths):
++    """``(positions, req_id_per_token, slot_mapping, cache_lengths)`` of the
++    decoder rows ``indices`` selects."""
++    rows = indices.shape[0]
++    outs = tuple(field.new_empty(rows) for field in (positions, reqs, slots, lengths))
++    if rows:
++        token_metadata_kernel()(indices, positions, reqs, slots, lengths, *outs)
++    return outs
++
++
+ _ITEMSIZE = {
+     "bool": 1,
+     "int8": 1,

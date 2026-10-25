@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:46:14 +0200
+Subject: [PATCH 405/488] prepare_prefill, combine and the resampled token:
+ Triton's shapes and loads
+
+prepare_prefill_inputs takes Triton's four warps (eight tokens a thread,
+loads and stores predicated): at decode every block exits at once, and
+eight warps a block cost 0.1-0.3 us. Combine's index and input-id stores
+are predicated instead of branching. The resampled token's warp loads
+every block's maximum and id with the row, before the count, state and
+temperature, and its reduction carries the winner's id, so the chain is
+three rounds of loads, not five.
+---
+ .../gpu/spec_decode/tilelang_resampled.py     | 102 ++++++++++++------
+ vllm/v1/worker/gpu/tilelang_inputs.py         |  74 +++++++++----
+ 2 files changed, 125 insertions(+), 51 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py b/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
+index 92a17e495..b2c5a14e9 100644
+--- a/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_resampled.py
+@@ -13,6 +13,33 @@ _PASS = {
+ _THREADS = 32
+ 
+ 
++@T.macro
++def _take_better(best, best_index, best_id, value, index, value_id, valid):
++    """Take ``(value, index, value_id)`` if it is valid and larger, or equal with
++    a lower index."""
++    take = T.alloc_var(
++        T.int32,
++        init=T.cast(
++            valid
++            & ((value > best[0]) | ((value == best[0]) & (index < best_index[0]))),
++            T.int32,
++        ),
++    )
++    best_id[0] = T.if_then_else(take != 0, value_id, best_id[0])
++    best_index[0] = T.if_then_else(take != 0, index, best_index[0])
++    best[0] = T.if_then_else(take != 0, value, best[0])
++
++
++@T.macro
++def _exchange(best, best_index, best_id, distance):
++    """Combine with the lane at XOR ``distance``."""
++    _take_better(
++        best, best_index, best_id,
++        T.shfl_xor(best[0], distance), T.shfl_xor(best_index[0], distance),
++        T.shfl_xor(best_id[0], distance), T.bool(True),
++    )  # fmt: skip
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def insert_kernel(
+     blocks: int,
+@@ -28,6 +55,9 @@ def insert_kernel(
+     mapping_len = T.dynamic("mapping_len")
+     state_len = T.dynamic("state_len")
+     padded = 1 << (blocks - 1).bit_length()
++    per = (blocks + 31) // 32
++    if blocks > 4 and threads != 32:
++        raise ValueError("more than four blocks take a warp a row")
+ 
+     @T.prim_func
+     def insert(
+@@ -60,43 +90,51 @@ def insert_kernel(
+                                 winner = i
+                         sampled[row, count] = local_ids[row, winner]
+             else:
+-                if threads == 32:
+-                    count_local = T.alloc_var(T.int32, init=0)
+-                    if thread == 0:
+-                        count_local = counts[row]
+-                        counts[row] = count_local + 1
+-                    count = T.shfl_sync(count_local, 0)
+-                else:
+-                    count = counts[row]
+-                position = cu[row] + count
++                # A warp a row. Every block's maximum and id is loaded first (they
++                # depend only on the row), then the count, the request's state and
++                # its temperature; the reduction carries each candidate's id, so no
++                # load waits on the winner. As before: NaN counts as -inf, and the
++                # lowest block index wins a tie.
++                values = T.alloc_local((per,), value_dtype)
++                ids = T.alloc_local((per,), T.int64)
++                for k in T.unroll(per):
++                    i = T.min(k * 32 + thread, blocks - 1)
++                    values[k] = local_max[row, i]
++                    ids[k] = local_ids[row, i]
++                first = T.alloc_var(T.int32, init=cu[row])
++                last = T.alloc_var(T.int32, init=cu[row + 1] - 1)
++                count_local = T.alloc_var(T.int32, init=0)
++                if thread == 0:
++                    count_local = counts[row]
++                    counts[row] = count_local + 1
++                count = T.shfl_sync(count_local, 0)
++                position = first + count
+                 state = mapping[position]
+                 if (
+                     T.cast(temperature[state] != 0, T.int32)
+-                    | T.cast(position == cu[row + 1] - 1, T.int32)
++                    | T.cast(position == last, T.int32)
+                 ) != 0:
+-                    values = T.alloc_fragment((padded,), value_dtype)
+-                    maximum = T.alloc_fragment((1,), value_dtype)
+-                    indices = T.alloc_fragment((padded,), T.int32)
+-                    winner = T.alloc_fragment((1,), T.int32)
+-                    for i in T.Parallel(padded):
+-                        values[i] = -T.infinity(value_dtype)
+-                        if i < blocks:
+-                            value = local_max[row, i]
+-                            values[i] = T.if_then_else(
+-                                T.isnan(value), -T.infinity(value_dtype), value
+-                            )
+-                    T.reduce_max(values, maximum, dim=0)
+-                    for i in T.Parallel(padded):
+-                        indices[i] = T.if_then_else(
+-                            i < blocks and values[i] == maximum[0], i, padded
+-                        )
+-                    T.reduce_min(indices, winner, dim=0)
+-                    if thread == 0:
+-                        sampled[row, count] = local_ids[row, winner[0]]
+-                if threads != 32:
+-                    T.sync_threads()
++                    best = T.alloc_local((1,), value_dtype)
++                    best_index = T.alloc_local((1,), T.int32)
++                    best_id = T.alloc_local((1,), T.int64)
++                    best[0] = -T.infinity(value_dtype)
++                    best_index[0] = padded
++                    best_id[0] = 0
++                    for k in T.unroll(per):
++                        _take_better(
++                            best, best_index, best_id,
++                            T.if_then_else(
++                                T.isnan(values[k]), -T.infinity(value_dtype), values[k]
++                            ),
++                            k * 32 + thread, ids[k], k * 32 + thread < blocks,
++                        )  # fmt: skip
++                    _exchange(best, best_index, best_id, 16)
++                    _exchange(best, best_index, best_id, 8)
++                    _exchange(best, best_index, best_id, 4)
++                    _exchange(best, best_index, best_id, 2)
++                    _exchange(best, best_index, best_id, 1)
+                     if thread == 0:
+-                        counts[row] = count + 1
++                        sampled[row, count] = best_id[0]
+ 
+     return insert
+ 
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 96b57a70e..6b1de2d01 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -568,10 +568,18 @@ def zero_kv_blocks(
+ # --- Step inputs --------------------------------------------------------------
+ 
+ 
++_PREFILL_THREADS = 128
++_PREFILL_PER_THREAD = 8
++_PREFILL_CHUNK = _PREFILL_THREADS * _PREFILL_PER_THREAD  # Triton's BLOCK_SIZE
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
+     """A block a request: a prefilling request's chunk of prompt tokens into the
+-    input ids, and its next ``num_lookahead`` prefill tokens (0 past the prompt)."""
++    input ids, and its next ``num_lookahead`` prefill tokens (0 past the prompt).
++    In Triton's shape: four warps, the request's state read before the prefill
++    check and its query starts after it, each pass's eight tokens a thread loaded
++    and stored predicated (``_LOAD_IF``, ``_STORE_IF``)."""
+     ids_len = T.dynamic("ids_len")
+     lookahead = T.dynamic("lookahead")
+     lookahead_cols = T.dynamic("lookahead_cols")
+@@ -598,7 +606,8 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
+         prefill_len: T.Tensor((prefill_rows,), T.int32),
+         num_computed_tokens: T.Tensor((counts_len,), T.int32),
+     ):
+-        with T.Kernel(num_reqs, threads=_THREADS) as b:
++        with T.Kernel(num_reqs, threads=_PREFILL_THREADS) as b:
++            T.import_source(_LOAD_IF + _STORE_IF)
+             tx = T.get_thread_binding()
+             req = T.cast(idx_mapping[b], T.int64)
+             prefill = prefill_len[req]
+@@ -606,11 +615,21 @@ def prepare_prefill_inputs_kernel(lookahead_block: int, idx_dtype: str):
+             if computed < prefill:
+                 start = query_start_loc[b]
+                 length = query_start_loc[b + 1] - start
+-                for it in T.serial(T.ceildiv(length, _CHUNK)):
+-                    for k in T.unroll(_PER_THREAD):
+-                        j = it * _CHUNK + k * _THREADS + tx
+-                        if j < length:
+-                            input_ids[start + j] = all_token_ids[req, computed + j]
++                tokens = T.alloc_local((_PREFILL_PER_THREAD,), T.int32)
++                for it in T.serial(T.ceildiv(length, _PREFILL_CHUNK)):
++                    for k in T.unroll(_PREFILL_PER_THREAD):
++                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
++                        tokens[k] = T.call_extern(
++                            "int32", "vllm_load_if_b32",
++                            T.address_of(all_token_ids[req, computed + j]), 0,
++                            j < length,
++                        )  # fmt: skip
++                    for k in T.unroll(_PREFILL_PER_THREAD):
++                        j = it * _PREFILL_CHUNK + k * _PREFILL_THREADS + tx
++                        T.call_extern(
++                            "handle", "vllm_store_if_b32",
++                            T.address_of(input_ids[start + j]), tokens[k], j < length,
++                        )  # fmt: skip
+                 if tx < lookahead_block and tx < lookahead:
+                     position = computed + length + tx
+                     next_prefill_tokens[tx, req] = T.if_then_else(
+@@ -731,16 +750,26 @@ def combine_sampled_and_draft_tokens_kernel(
+                     "float32", "vllm_load_if_f32", T.address_of(confidence[req, j]),
+                     T.float32(1.0), j < num_drafts,
+                 )  # fmt: skip
++        # Every store predicated, as Triton's masked ones: no branch to wait behind.
+         for j in T.unroll(block):
+-            if j < num_logits:
+-                logits_indices[first + j] = T.cast(query_end - num_logits + j, T.int64)
+-        if seq > prefill:
++            T.call_extern(
++                "handle", "vllm_store_if_b64", T.address_of(logits_indices[first + j]),
++                T.cast(query_end - num_logits + j, T.int64), j < num_logits,
++            )  # fmt: skip
++        decoding = seq > prefill
++        if num_new > 0:
+             # Keep prompt-tail slots; only generated-token slots take it.
+-            if num_new > 0 and seq - num_logits >= prefill:
+-                input_ids[query_end - num_logits] = T.cast(last, T.int32)
+-            for j in T.unroll(drafts):
+-                if j < num_drafts:
+-                    input_ids[query_end - num_drafts + j] = T.cast(tokens[j], T.int32)
++            T.call_extern(
++                "handle", "vllm_store_if_b32",
++                T.address_of(input_ids[query_end - num_logits]), T.cast(last, T.int32),
++                decoding & (seq - num_logits >= prefill),
++            )  # fmt: skip
++        for j in T.unroll(drafts):
++            T.call_extern(
++                "handle", "vllm_store_if_b32",
++                T.address_of(input_ids[query_end - num_drafts + j]),
++                T.cast(tokens[j], T.int32), decoding & (j < num_drafts),
++            )  # fmt: skip
+         if dead_rows:
+             # Requests without drafts are never clamped.
+             cut = T.alloc_var(T.int32, init=block + 1)
+@@ -784,7 +813,7 @@ def combine_sampled_and_draft_tokens_kernel(
+             logits_indices: T.Tensor((logits_len,), T.int64),
+         ):
+             with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
+-                T.import_source(_LOAD_IF)
++                T.import_source(_LOAD_IF + _STORE_IF)
+                 b = bx * _REQUESTS + T.get_thread_binding()
+                 if b < num_reqs:
+                     request(
+@@ -814,7 +843,7 @@ def combine_sampled_and_draft_tokens_kernel(
+         log_tau: T.float32,
+     ):
+         with T.Kernel(num_reqs, threads=32) as b:
+-            T.import_source(_LOAD_IF)
++            T.import_source(_LOAD_IF + _STORE_IF)
+             if T.get_thread_binding() == 0:
+                 request(
+                     b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
+@@ -858,6 +887,13 @@ __device__ __forceinline__ long long vllm_load_if_b64(const void* p, long long o
+                : "+l"(v) : "l"(p), "r"((int)ok));
+   return v;
+ }
++__device__ __forceinline__ int vllm_load_if_b32(const void* p, int other, bool ok) {
++  int v = other;
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q ld.global.b32 %0, [%1];\n}"
++               : "+r"(v) : "l"(p), "r"((int)ok));
++  return v;
++}
+ __device__ __forceinline__ float vllm_load_if_f32(const void* p, float other, bool ok) {
+   float v = other;
+   asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
+@@ -1186,8 +1222,8 @@ def post_update_kernel(
+ 
+ def prepare_prefill_inputs_key(num_lookahead: int, idx_dtype: str) -> tuple:
+     block = _next_power_of_2(num_lookahead)
+-    if block > _THREADS:
+-        raise ValueError(f"at most {_THREADS} prefill lookahead tokens")
++    if block > _PREFILL_THREADS:
++        raise ValueError(f"at most {_PREFILL_THREADS} prefill lookahead tokens")
+     return (block, idx_dtype)
+ 
+ 

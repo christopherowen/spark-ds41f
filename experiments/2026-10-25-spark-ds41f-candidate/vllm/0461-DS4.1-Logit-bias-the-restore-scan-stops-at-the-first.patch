@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:11:39 +0100
+Subject: [PATCH 461/488] [DS4.1] Logit bias: the restore scan stops at the
+ first live tile
+
+The all-masked check reads the row a tile at a time; each tile now ends
+with __syncthreads_or (one barrier that ORs the block's flags) and the
+scan stops once a column is alive, since the answer cannot change. A
+dead row still reads every column; the verdict is the same. Run 20's
+gate measured the structured min-tokens case at 96 rows 1.1 us behind
+Triton (inside the noise); a row with a live column now reads one tile.
+A test puts the only live column in the first, a middle, the last whole
+and the partial tile, and a NaN-only and a dead row, against Triton.
+---
+ tests/v1/worker/test_gpu_sampling_controls.py | 76 +++++++++++++++++++
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    | 45 ++++++-----
+ 2 files changed, 98 insertions(+), 23 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index b90296dab..52d977009 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -637,3 +637,79 @@ def test_bias_restore_decided_by_allowed_ids_whatever_biases_meet_outside(vocab)
+     assert torch.isfinite(expected[2, :2]).all()
+     assert (expected[1, :3] == -float("inf")).all()
+     assert (expected[0, :3] == -float("inf")).all()
++
++
++@pytest.mark.parametrize("vocab", [8192, 8193, 129280])
++def test_bias_restore_scan_finds_the_last_live_column(vocab):
++    """The all-masked scan stops at the first tile with a live column: rows whose
++    only live column (after the stop mask) is in the first tile, a middle one, the
++    last whole tile or the partial tail, a row whose only other value is NaN, and a
++    dead row, against Triton's full-row maximum."""
++    from vllm.v1.worker.gpu.sample import tilelang_bias
++    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
++
++    torch.manual_seed(31337)
++    columns = sorted(
++        {5, vocab // 2, max(vocab - vocab % 8192 - 1, 5), vocab - 1} - {0, 1, 2}
++    )
++    rows = len(columns) + 2
++    states, width = rows, 8
++    logits = torch.full((rows, vocab), -float("inf"), device="cuda")
++    for row, column in enumerate(columns):
++        logits[row, column] = 1.5
++    logits[len(columns), vocab - 1] = float("nan")
++    logits[:, :3] = torch.randn(rows, 3, device="cuda")  # the stop tokens
++    mapping = torch.arange(rows, device="cuda", dtype=torch.int64)
++    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
++    zeros = torch.zeros(states, device="cuda", dtype=torch.int32)
++    allowed = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    bias_ids = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    biases = torch.zeros((states, width), device="cuda")
++    min_lens = zeros + 5
++    num_stops = zeros + 3
++    restore_rows = zeros + 1
++    stops = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    stops[:, :3] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
++    expected = logits.clone()
++    _bias_kernel[(rows,)](
++        expected,
++        expected.stride(0),
++        vocab,
++        mapping,
++        zeros,
++        allowed,
++        allowed.stride(0),
++        zeros,
++        bias_ids,
++        bias_ids.stride(0),
++        biases,
++        biases.stride(0),
++        positions,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        stops.stride(0),
++        BLOCK_SIZE=width,
++        LOGITS_BLOCK_SIZE=8192,
++        CHECK_ALL_MASKED_ROWS=True,
++    )
++    tilelang_bias.apply_logit_bias(
++        logits,
++        mapping,
++        positions,
++        zeros,
++        allowed,
++        zeros,
++        bias_ids,
++        biases,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        True,
++    )
++    assert_bits(logits, expected)
++    # Live rows keep their stops masked; the NaN and dead rows restore them.
++    assert (expected[: len(columns), :3] == -float("inf")).all()
++    assert torch.isfinite(expected[len(columns) :, :3]).all()
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index d3b34f4ad..48b55a538 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -82,7 +82,6 @@ def bias_kernel(
+     per = max(width // _THREADS, 1)
+     row_per = _ROW_TILE // _THREADS
+     full = vocab // _ROW_TILE
+-    warps = _THREADS // 32
+ 
+     def load_if(dtype, address, other, ok):
+         helper = (
+@@ -111,7 +110,13 @@ def bias_kernel(
+ 
+     @T.macro
+     def scan_row(logits, row, tx, row_values, alive):
+-        for tile in T.serial(full):
++        """Whether some column of the row is above -inf, the block's verdict in every
++        thread's ``alive[0]``. Each tile ends with ``__syncthreads_or`` (one barrier
++        that ORs the block's flags), and the scan stops at the first tile with a
++        live column: the answer cannot change after it. A dead row reads every
++        column, as Triton's maximum does."""
++        tile = T.alloc_var(T.int32, init=0)
++        while (tile < full) & (alive[0] == 0):
+             for r in T.unroll(row_per // run):
+                 col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
+                 for k in T.vectorized(run):
+@@ -120,15 +125,20 @@ def bias_kernel(
+                 alive[0] = alive[0] | T.cast(
+                     row_values[j] > -T.infinity("float32"), "int32"
+                 )
+-        if vocab % _ROW_TILE:
+-            # A repeated last column does not change whether any is alive.
+-            for j in T.unroll(row_per):
+-                col = full * _ROW_TILE + j * _THREADS + tx
+-                row_values[j] = logits[row, T.min(col, vocab - 1)]
+-            for j in T.unroll(row_per):
+-                alive[0] = alive[0] | T.cast(
+-                    row_values[j] > -T.infinity("float32"), "int32"
+-                )
++            alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
++            tile = tile + 1
++        # A trace-time width check around a runtime test: not one condition.
++        if vocab % _ROW_TILE:  # noqa: SIM102
++            if alive[0] == 0:
++                # A repeated last column does not change whether any is alive.
++                for j in T.unroll(row_per):
++                    col = full * _ROW_TILE + j * _THREADS + tx
++                    row_values[j] = logits[row, T.min(col, vocab - 1)]
++                for j in T.unroll(row_per):
++                    alive[0] = alive[0] | T.cast(
++                        row_values[j] > -T.infinity("float32"), "int32"
++                    )
++                alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
+ 
+     @T.prim_func
+     def bias(
+@@ -165,7 +175,6 @@ def bias_kernel(
+             extra = T.alloc_local((per,), "float32")
+             row_values = T.alloc_local((row_per,), "float32")
+             alive = T.alloc_local((1,), "int32")
+-            partial = T.alloc_shared((warps,), "int32")
+             if n_allowed > 0:
+                 for k in T.unroll(per):
+                     col = k * _THREADS + tx
+@@ -252,19 +261,9 @@ def bias_kernel(
+                             alive[0] = alive[0] | T.cast(
+                                 seen > -T.infinity("float32"), "int32"
+                             )
++                        alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
+                     else:
+                         scan_row(logits, row, tx, row_values, alive)
+-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 16)
+-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 8)
+-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 4)
+-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 2)
+-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 1)
+-                    if tx % 32 == 0:
+-                        partial[tx // 32] = alive[0]
+-                    T.sync_threads()
+-                    alive[0] = partial[0]
+-                    for w in T.unroll(1, warps):
+-                        alive[0] = alive[0] | partial[w]
+                     for k in T.unroll(per):
+                         store_if(
+                             T.address_of(logits[row, ids[k]]),

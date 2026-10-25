@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:49:03 +0200
+Subject: [PATCH 413/488] Structured output: the grammar bitmask as a TileLang
+ kernel
+
+The V2 runner's grammar bitmask was a Triton kernel; the TileLang one
+keeps its grid (a block a mask row and 8192 tokens), masks the same
+tokens and marks the same rejected draft inputs, bit for bit. The
+block's bitmask words go through shared memory so each thread's stores
+coalesce. The Triton kernel stays as the test's reference.
+---
+ .../v1/worker/test_gpu_tilelang_structured.py |  79 ++++++++++++
+ vllm/v1/worker/gpu/structured_outputs.py      |  87 ++++----------
+ vllm/v1/worker/gpu/tilelang_structured.py     | 112 ++++++++++++++++++
+ 3 files changed, 216 insertions(+), 62 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_tilelang_structured.py
+ create mode 100644 vllm/v1/worker/gpu/tilelang_structured.py
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_structured.py b/tests/v1/worker/test_gpu_tilelang_structured.py
+new file mode 100644
+index 000000000..6e29dfc67
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_tilelang_structured.py
+@@ -0,0 +1,79 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The TileLang grammar bitmask against the Triton kernel it replaced, bit for bit."""
++
++import pytest
++import torch
++
++pytest.importorskip("triton")
++if not torch.cuda.is_available():
++    pytest.skip("CUDA required", allow_module_level=True)
++
++from vllm.v1.worker.gpu import tilelang_structured
++from vllm.v1.worker.gpu.structured_outputs import _apply_grammar_bitmask_kernel
++
++DEVICE = torch.device("cuda")
++MASK_STRIDE = 8
++
++
++def _case(vocab, seed, dtype, invalid):
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    counts = [6, 1, 4, 6, 3]
++    cu = torch.tensor([0, 6, 7, 11, 17, 20], dtype=torch.int32, device=DEVICE)
++    num_logits = cu[-1].item()
++    logits = torch.randn(num_logits, vocab + 5, generator=gen, device=DEVICE).to(dtype)
++    logits = logits[:, :vocab]
++    # Masks for requests 0, 2 and 4 at every scheduled position, one past the
++    # request's logits (inactive) for request 2.
++    keys = [r * MASK_STRIDE + p for r, n in ((0, 6), (2, 5), (4, 3)) for p in range(n)]
++    if invalid:
++        keys[4] = -keys[4] - 1
++        keys[13] = -keys[13] - 1
++    keys = torch.tensor(keys, dtype=torch.int32, device=DEVICE)
++    words = -(-vocab // 32)
++    bitmask = torch.randint(
++        -(2**31), 2**31 - 1, (keys.shape[0], words), generator=gen, device=DEVICE
++    ).int()
++    bitmask[1] = -1  # nothing masked
++    bitmask[2] = 0  # everything masked
++    input_ids = torch.arange(100, 100 + num_logits, device=DEVICE).int()
++    input_logits_indices = torch.randperm(num_logits, generator=gen, device=DEVICE)
++    assert sum(counts) == num_logits
++    return logits, keys, cu, input_ids, input_logits_indices, bitmask
++
++
++@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
++@pytest.mark.parametrize("vocab", [129280, 8193, 31])
++@pytest.mark.parametrize("invalid", [False, True])
++def test_bitmask_matches_triton(dtype, vocab, invalid):
++    logits, keys, cu, input_ids, input_indices, bitmask = _case(
++        vocab, 7, dtype, invalid
++    )
++    expected, expected_ids = logits.clone(), input_ids.clone()
++    _apply_grammar_bitmask_kernel[(keys.shape[0], -(-vocab // 8192))](
++        expected,
++        expected.stride(0),
++        keys,
++        cu,
++        expected_ids if invalid else None,
++        input_indices if invalid else None,
++        bitmask,
++        bitmask.stride(0),
++        vocab,
++        MASK_STRIDE=MASK_STRIDE,
++        BLOCK_SIZE=8192,
++    )
++    tilelang_structured.apply_grammar_bitmask(
++        logits,
++        keys,
++        cu,
++        input_ids if invalid else None,
++        input_indices if invalid else None,
++        bitmask,
++        MASK_STRIDE,
++    )
++    assert torch.equal(
++        logits.view(torch.int16 if dtype == torch.bfloat16 else torch.int32),
++        expected.view(torch.int16 if dtype == torch.bfloat16 else torch.int32),
++    )
++    assert torch.equal(input_ids, expected_ids)
+diff --git a/vllm/v1/worker/gpu/structured_outputs.py b/vllm/v1/worker/gpu/structured_outputs.py
+index 3f695c33b..16b93a0f3 100644
+--- a/vllm/v1/worker/gpu/structured_outputs.py
++++ b/vllm/v1/worker/gpu/structured_outputs.py
+@@ -1,16 +1,10 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+-from typing import Any
+ 
+ import numpy as np
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.torch_utils import PIN_MEMORY, async_tensor_h2d
+@@ -76,19 +70,25 @@ class StructuredOutputsWorker:
+         vocab_size: int,
+         invalid_spec_tokens: bool,
+     ) -> None:
+-        """Register the bitmask kernel for raw logits (``(dtype, row stride)``
+-        pairs), and its form that also invalidates rejected draft inputs when the
+-        scheduler can report invalid speculative tokens."""
+-        for logits_dtype, logits_stride in logits:
+-            for invalid in (False, True) if invalid_spec_tokens else (False,):
+-                _apply_grammar_bitmask_launcher.register_warmup(
+-                    logits_dtype=logits_dtype,
+-                    logits_stride=logits_stride,
+-                    bitmask_stride=self.grammar_bitmask.stride(0),
+-                    vocab_size=vocab_size,
+-                    mask_stride=self.mask_stride,
+-                    invalid_spec_tokens=invalid,
++        """Declare the bitmask kernel for raw logits (``(dtype, row stride)``
++        pairs; the kernel takes any stride), and its form that also invalidates
++        rejected draft inputs when the scheduler can report invalid speculative
++        tokens."""
++        from vllm.v1.worker.gpu import tilelang_structured
++        from vllm.v1.worker.gpu.sample.tilelang_sampling import _call, declare
++
++        declare(
++            lambda: [
++                _call(
++                    tilelang_structured.grammar_bitmask_kernel,
++                    *tilelang_structured.grammar_bitmask_key(
++                        logits_dtype, self.mask_stride, invalid
++                    ),
+                 )
++                for logits_dtype in dict.fromkeys(dtype for dtype, _ in logits)
++                for invalid in ((False, True) if invalid_spec_tokens else (False,))
++            ]
++        )
+ 
+     def apply_grammar_bitmask(
+         self,
+@@ -134,23 +134,17 @@ class StructuredOutputsWorker:
+         current_stream = torch.cuda.current_stream()
+         current_stream.wait_stream(self.copy_stream)
+ 
+-        num_masks = bitmask.shape[0]
+-        assert num_masks == len(mapping)
+-        vocab_size = logits.shape[-1]
+-        BLOCK_SIZE = 8192
+-        grid = (num_masks, triton.cdiv(vocab_size, BLOCK_SIZE))
+-        _apply_grammar_bitmask_launcher[grid](
++        from vllm.v1.worker.gpu import tilelang_structured
++
++        assert bitmask.shape[0] == len(mapping)
++        tilelang_structured.apply_grammar_bitmask(
+             logits,
+-            logits.stride(0),
+             logits_indices,
+             input_batch.cu_num_logits,
+             input_batch.input_ids if num_invalid_spec_tokens else None,
+             input_batch.logits_indices if num_invalid_spec_tokens else None,
+             bitmask,
+-            bitmask.stride(0),
+-            vocab_size,
+-            MASK_STRIDE=self.mask_stride,
+-            BLOCK_SIZE=BLOCK_SIZE,
++            self.mask_stride,
+         )
+ 
+         # Ensure the copy stream waits for the device tensors to finish being used
+@@ -158,7 +152,8 @@ class StructuredOutputsWorker:
+         self.copy_stream.wait_stream(current_stream)
+ 
+ 
+-# Adapted from
++# The reference the TileLang bitmask (``tilelang_structured``) is tested against; the
++# runner no longer launches it. Adapted from
+ # https://github.com/mlc-ai/xgrammar/blob/main/python/xgrammar/kernels/apply_token_bitmask_inplace_triton.py
+ @triton.jit
+ def _apply_grammar_bitmask_kernel(
+@@ -208,35 +203,3 @@ def _apply_grammar_bitmask_kernel(
+         -float("inf"),
+         mask=position_is_active & bitmask & (block_offset < vocab_size),
+     )
+-
+-
+-def _apply_grammar_bitmask_warmup_inputs(
+-    *,
+-    logits_dtype: torch.dtype,
+-    logits_stride: int,
+-    bitmask_stride: int,
+-    vocab_size: int,
+-    mask_stride: int,
+-    invalid_spec_tokens: bool,
+-) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    return triton_warmup_inputs(
+-        _apply_grammar_bitmask_kernel,
+-        TritonWarmupTensor(logits_dtype),
+-        logits_stride,
+-        int32,
+-        int32,
+-        int32 if invalid_spec_tokens else None,
+-        TritonWarmupTensor(torch.int64) if invalid_spec_tokens else None,
+-        int32,
+-        bitmask_stride,
+-        vocab_size,
+-        grid=(1,),
+-        MASK_STRIDE=mask_stride,
+-        BLOCK_SIZE=8192,
+-    )
+-
+-
+-_apply_grammar_bitmask_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_apply_grammar_bitmask_warmup_inputs
+-)(_apply_grammar_bitmask_kernel)
+diff --git a/vllm/v1/worker/gpu/tilelang_structured.py b/vllm/v1/worker/gpu/tilelang_structured.py
+new file mode 100644
+index 000000000..592ce3845
+--- /dev/null
++++ b/vllm/v1/worker/gpu/tilelang_structured.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The grammar bitmask in TileLang, the contract of
++``structured_outputs._apply_grammar_bitmask_kernel`` bit for bit (masked tokens -inf,
++the others untouched)."""
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++_DTYPES = {
++    torch.bfloat16: "bfloat16",
++    torch.float16: "float16",
++    torch.float32: "float32",
++}
++_BLOCK = 8192  # Triton's BLOCK_SIZE: tokens a block
++_THREADS = _BLOCK // 32  # a bitmask word a thread to load
++
++
++@tilelang.jit(pass_configs=_PASS)
++def grammar_bitmask_kernel(logits_dtype: str, mask_stride: int, invalid: bool):
++    """A block a bitmask row and 8192 tokens, as Triton's grid. The row's key is
++    ``request * mask_stride + position`` (with ``invalid``, a negative key marks a
++    rejected draft input: ``-key - 1``, and the first block sets that input id to -1);
++    the logits row is the request's first plus the position, when the request has
++    that many. The block's 256 bitmask words go through shared memory, so each thread
++    masks tokens 256 apart and the stores coalesce."""
++    rows, vocab, logits_stride = T.dynamic("rows, vocab, logits_stride")
++    num_masks, cu_len, num_ids, num_logits = T.dynamic(
++        "num_masks, cu_len, num_ids, num_logits"
++    )
++    words, bitmask_rows, bitmask_stride = T.dynamic(
++        "words, bitmask_rows, bitmask_stride"
++    )
++
++    @T.prim_func
++    def grammar_bitmask(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++        keys: T.Tensor((num_masks,), T.int32),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++        input_ids: T.Tensor((num_ids,), T.int32),
++        input_logits_indices: T.Tensor((num_logits,), T.int64),
++        bitmask: T.StridedTensor((bitmask_rows, words), (bitmask_stride, 1), T.int32),
++    ):
++        with T.Kernel(num_masks, T.ceildiv(vocab, _BLOCK), threads=_THREADS) as (
++            m,
++            block,
++        ):
++            tx = T.get_thread_binding()
++            packed = T.alloc_shared((_THREADS,), T.int32)
++            key = T.alloc_var(T.int32, init=keys[m])
++            rejected = T.alloc_var(T.int32, init=0)
++            if invalid:
++                rejected = T.cast(key < 0, T.int32)
++                key = T.if_then_else(key < 0, -key - 1, key)
++            req = key // mask_stride
++            position = key % mask_stride
++            first = T.alloc_var(T.int32, init=cu_num_logits[req])
++            count = T.alloc_var(T.int32, init=cu_num_logits[req + 1] - first)
++            row = first + position
++            word = block * _THREADS + tx
++            packed[tx] = T.if_then_else(
++                word < words, bitmask[m, T.min(word, words - 1)], 0
++            )
++            if invalid and (
++                (block == 0) & (tx == 0) & (position < count) & (rejected != 0)
++            ):
++                input_ids[input_logits_indices[row]] = -1
++            T.sync_threads()
++            if position < count:
++                for i in T.unroll(32):
++                    token = block * _BLOCK + i * _THREADS + tx
++                    bit = (packed[i * (_THREADS // 32) + tx // 32] >> (tx % 32)) & 1
++                    if (bit == 0) & (token < vocab):
++                        logits[T.cast(row, T.int64), token] = -T.infinity(logits_dtype)
++
++    return grammar_bitmask
++
++
++def grammar_bitmask_key(
++    logits_dtype: torch.dtype, mask_stride: int, invalid: bool
++) -> tuple:
++    return (_DTYPES[logits_dtype], mask_stride, invalid)
++
++
++def apply_grammar_bitmask(
++    logits: torch.Tensor,
++    keys: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    input_ids: torch.Tensor | None,
++    input_logits_indices: torch.Tensor | None,
++    bitmask: torch.Tensor,
++    mask_stride: int,
++) -> None:
++    """``StructuredOutputsWorker.apply_grammar_bitmask``'s launch. Without
++    ``input_ids`` (no invalid draft inputs to mark), ``keys`` and ``cu_num_logits``
++    stand in for the unread input tensors."""
++    if keys.shape[0] == 0:
++        return
++    invalid = input_ids is not None
++    grammar_bitmask_kernel(*grammar_bitmask_key(logits.dtype, mask_stride, invalid))(
++        logits,
++        keys,
++        cu_num_logits,
++        input_ids if invalid else keys,
++        input_logits_indices if invalid else cu_num_logits.long(),
++        bitmask,
++    )

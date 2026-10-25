@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:05:58 +0200
+Subject: [PATCH 433/488] [DS4.1] Rejection declaration tests key calls by
+ function identity
+
+TileLang's JIT functions are not hashable; the tests' sets of declared
+calls now hold id(function), as the runner's declaration tests do.
+---
+ .../v1/spec_decode/test_tilelang_rejection.py | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+index d834e7c19..23eed97e3 100644
+--- a/tests/v1/spec_decode/test_tilelang_rejection.py
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -656,7 +656,10 @@ def test_other_configurations_launch_triton(
+ def _declared(registry):
+     from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+-    return {(function, args) for function, args, _ in prepare.declared_calls(registry)}
++    # JIT functions are not hashable: a call is its function's identity and key.
++    return {
++        (id(function), args) for function, args, _ in prepare.declared_calls(registry)
++    }
+ 
+ 
+ def test_runner_declares_the_launched_calls():
+@@ -681,14 +684,20 @@ def test_runner_declares_the_launched_calls():
+     for dtype, _ in logits:
+         for run in tls._runs(dtype):
+             expected.add(
+-                (tlr.local_stats_kernel, tlr.local_stats_key(dtype, idx, local, run))
++                (
++                    id(tlr.local_stats_kernel),
++                    tlr.local_stats_key(dtype, idx, local, run),
++                )
+             )
+             expected.add(
+-                (tlr.resample_kernel, tlr.resample_key(dtype, idx, drafts, pos, run))
++                (
++                    id(tlr.resample_kernel),
++                    tlr.resample_key(dtype, idx, drafts, pos, run),
++                )
+             )
+         expected.add(
+             (
+-                tlr.verify_kernel,
++                id(tlr.verify_kernel),
+                 tlr.verify_key(dtype, drafts, idx, pos, VOCAB, STEPS),
+             )
+         )
+@@ -715,5 +724,5 @@ def test_other_configurations_declare_no_tilelang_kernel(
+             use_block_verification=use_block_verification,
+             use_fp64=use_fp64,
+         )
+-    ours = {tlr.local_stats_kernel, tlr.verify_kernel, tlr.resample_kernel}
++    ours = {id(tlr.local_stats_kernel), id(tlr.verify_kernel), id(tlr.resample_kernel)}
+     assert not {function for function, _ in _declared(registry)} & ours

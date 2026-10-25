@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:15:43 +0200
+Subject: [PATCH 416/488] [DS4.1] DSpark context-graph inputs in one TileLang
+ launch
+
+DSparkContextCudaGraphs.run copied the target's three auxiliary hidden
+states into the graph's buffer and scrubbed the tail of the buffer, the
+positions and every group's slots: three strided copies and three fills,
+eager before each replay. One launch now does both, a block a row and
+1024 columns of each source, 16-byte accesses with the three loads
+issued before the stores. Declared at model construction; tested bit for
+bit against the torch prologue, NaN and infinities included.
+---
+ .../benchmark_runner_inputs_tilelang.py       |  38 ++++-
+ ...st_deepseek_v41_tilelang_dspark_context.py |  90 +++++++++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    |  31 ++--
+ .../deepseek_v4_1/tilelang/dspark_context.py  | 141 ++++++++++++++++++
+ 4 files changed, 288 insertions(+), 12 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/dspark_context.py
+
+diff --git a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+index 709655673..484793afb 100644
+--- a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
++++ b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+@@ -25,7 +25,7 @@ from collections.abc import Callable
+ import torch
+ 
+ from vllm.models.deepseek_v4_1.nvidia.model_state import _gather_lookback_kernel
+-from vllm.models.deepseek_v4_1.tilelang import lookback
++from vllm.models.deepseek_v4_1.tilelang import dspark_context, lookback
+ from vllm.triton_utils import triton
+ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.worker.gpu import input_batch as ib
+@@ -379,6 +379,41 @@ def case_adaptive_offsets(gen, num_reqs, prefill, widths):
+     return torch_call, tilelang_call
+ 
+ 
++def case_dspark_context(gen, num_reqs, prefill, widths):
++    """DSpark's context-graph inputs (DSparkContextCudaGraphs.run): the three
++    auxiliary hidden states into the graph's buffer and its tail scrubbed; before
++    the port, three strided copies and three fills. The prefill shape stands for
++    a batch shrinking into a larger graph (90 rows in a 96-row graph)."""
++    width = 5120
++    num_tokens = 90 if prefill else num_reqs * ROWS
++    # The context graphs' capacities: powers of two up to 96 rows.
++    capacity = 96 if prefill else min(1 << (num_tokens - 1).bit_length(), 96)
++    wide = [
++        torch.randn(MAX_TOKENS, width + 64, generator=gen, device=DEVICE).to(
++            torch.bfloat16
++        )
++        for _ in range(3)
++    ]
++    sources = [buffer[:, :width] for buffer in wide]
++    aux = torch.empty(capacity, 3 * width, dtype=torch.bfloat16, device=DEVICE)
++    positions = torch.empty(MAX_TOKENS, dtype=torch.int64, device=DEVICE)
++    slots = torch.empty(2, MAX_TOKENS, dtype=torch.int64, device=DEVICE)
++
++    def torch_call():
++        for i, source in enumerate(sources):
++            aux[:num_tokens, i * width : (i + 1) * width].copy_(source[:num_tokens])
++        aux[num_tokens:capacity].zero_()
++        positions[num_tokens:capacity].zero_()
++        slots[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
++
++    def tilelang_call():
++        dspark_context.context_inputs(
++            aux, sources, positions, slots, num_tokens, capacity
++        )
++
++    return torch_call, tilelang_call, wide
++
++
+ def case_post_update(gen, num_reqs, prefill, widths):
+     """The commit of a verified step (up to 1 + 5 tokens a request), or of a
+     prefill chunk's one sampled token. Repeated calls keep committing: both
+@@ -498,6 +533,7 @@ CASES = {
+     "combine_sampled_and_draft_tokens (dead rows)": case_combine_dead_rows,
+     "expand_idx_mapping": case_expand_idx_mapping,
+     "adaptive_offsets": case_adaptive_offsets,
++    "dspark_context": case_dspark_context,
+     "post_update": case_post_update,
+     "prepare_dflash_inputs": case_prepare_dflash_inputs,
+     "gather_lookback": case_gather_lookback,
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+new file mode 100644
+index 000000000..b63244b46
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_dspark_context.py
+@@ -0,0 +1,90 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark's context-graph input launch against the torch prologue it replaces
++(``DSparkContextCudaGraphs.run``: three strided copies into ``aux``, then the
++tail of ``aux``, ``positions`` and every group's slots scrubbed), bit for bit:
++every buffer the launch may write is compared whole, starting from identical
++garbage, with sources that are views of wider buffers (row strides past the
++width) and longer than the step, NaN and infinite values copied as bits."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm.models.deepseek_v4_1.tilelang import dspark_context  # noqa: E402
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # noqa: E402
++
++DEVICE = torch.device("cuda")
++WIDTH = 5120  # DeepSeek-V4.1 Flash's hidden size
++LIMIT = 96  # 16 requests of 1 + 5 rows: the largest context graph
++GROUPS = 2
++
++
++def _reference(aux, sources, positions, slots, num_tokens, capacity):
++    for i, source in enumerate(sources):
++        aux[:num_tokens, i * WIDTH : (i + 1) * WIDTH].copy_(source[:num_tokens])
++    aux[num_tokens:capacity].zero_()
++    positions[num_tokens:capacity].zero_()
++    slots[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
++
++
++@pytest.mark.parametrize(
++    "num_tokens,capacity",
++    [(1, 1), (5, 8), (6, 8), (31, 32), (64, 64), (90, LIMIT), (LIMIT, LIMIT)],
++)
++@pytest.mark.parametrize("dtype", [torch.bfloat16])
++def test_context_inputs(num_tokens, capacity, dtype):
++    gen = torch.Generator(device=DEVICE).manual_seed(num_tokens * 131 + capacity)
++    # Each source a view of a wider, longer buffer, as the target's outputs are.
++    sources = []
++    for i in range(dspark_context.NUM_SOURCES):
++        wide = torch.randn(
++            LIMIT + 3, WIDTH + 8 * (i + 1), generator=gen, device=DEVICE
++        ).to(dtype)
++        wide[0, :3] = torch.tensor([float("nan"), float("inf"), -float("inf")])
++        sources.append(wide[:, 8 * i : 8 * i + WIDTH])
++    garbage = torch.randint(
++        -(2**15),
++        2**15,
++        (LIMIT, dspark_context.NUM_SOURCES * WIDTH),
++        generator=gen,
++        device=DEVICE,
++        dtype=torch.int16,
++    ).view(dtype)
++    positions = torch.randint(0, 1 << 20, (LIMIT + 4,), generator=gen, device=DEVICE)
++    slots = torch.randint(0, 1 << 20, (GROUPS, LIMIT + 4), generator=gen, device=DEVICE)
++    results = []
++    for kind in ("ref", "ours"):
++        buffers = (garbage.clone(), positions.clone(), slots.clone())
++        args = (buffers[0], sources, buffers[1], buffers[2], num_tokens, capacity)
++        if kind == "ref":
++            _reference(*args)
++        else:
++            dspark_context.context_inputs(*args)
++        results.append(buffers)
++    torch.accelerator.synchronize()
++    for r, o in zip(*results):
++        assert torch.equal(
++            r.view(torch.int16) if r.dtype == dtype else r,
++            o.view(torch.int16) if o.dtype == dtype else o,
++        )
++
++
++def test_context_inputs_rejects_misaligned_rows():
++    aux = torch.zeros(
++        8, dspark_context.NUM_SOURCES * WIDTH, device=DEVICE, dtype=torch.bfloat16
++    )
++    wide = torch.zeros(8, WIDTH + 1, device=DEVICE, dtype=torch.bfloat16)
++    sources = [wide[:, 1:]] * dspark_context.NUM_SOURCES
++    positions = torch.zeros(8, dtype=torch.int64, device=DEVICE)
++    slots = torch.zeros(1, 8, dtype=torch.int64, device=DEVICE)
++    with pytest.raises(ValueError, match="16-byte aligned"):
++        dspark_context.context_inputs(aux, sources, positions, slots, 4, 8)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 230cf4b60..7ff875e64 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -67,6 +67,7 @@ from .. import kernels, l2_prefetch
+ from ..b12x_layers import (
+     _execution_capacities,
+ )
++from ..tilelang import dspark_context, prepare
+ from .model import (
+     DeepseekV4DecoderLayer,
+     _linear_scale_param_name,
+@@ -314,17 +315,18 @@ class DSparkContextCudaGraphs:
+             for x in aux_hidden_states
+         ):
+             raise ValueError("DSpark context auxiliary states have invalid dimensions")
+-        for i, source in enumerate(aux_hidden_states):
+-            self.aux[:num_tokens, i * self.width : (i + 1) * self.width].copy_(
+-                source[:num_tokens]
+-            )
+-        # Context input preparation initializes rejected rows, but not rows
+-        # beyond the target batch. Scrub that tail on EVERY replay, including
+-        # transitions from a larger batch to a smaller one.
+-        capacity = desc.num_tokens
+-        self.aux[num_tokens:capacity].zero_()
+-        self.positions[num_tokens:capacity].zero_()
+-        self.slot_mappings[:, num_tokens:capacity].fill_(PAD_SLOT_ID)
++        # The sources side by side in aux. Context input preparation initializes
++        # rejected rows, but not rows beyond the target batch: the same launch
++        # scrubs that tail on EVERY replay, including transitions from a larger
++        # batch to a smaller one.
++        dspark_context.context_inputs(
++            self.aux,
++            aux_hidden_states,
++            self.positions,
++            self.slot_mappings,
++            num_tokens,
++            desc.num_tokens,
++        )
+         self.manager.run_fullgraph(desc)
+ 
+     def close(self) -> None:
+@@ -346,6 +348,13 @@ class DSparkDeepseekV4Model(nn.Module):
+         self.rms_norm_eps = config.rms_norm_eps
+         self.num_hidden_layers = config.num_hidden_layers
+         self.target_layer_ids = tuple(config.dspark_target_layer_ids)
++        # The context graphs' input launch (DSparkContextCudaGraphs.run).
++        context_key = dspark_context.context_inputs_key(
++            self.hidden_size, vllm_config.model_config.dtype
++        )
++        prepare.declare(
++            lambda: [prepare.call(dspark_context.context_inputs_kernel, *context_key)]
++        )
+         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+         self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
+         self._context_kv_projections: list = []
+diff --git a/vllm/models/deepseek_v4_1/tilelang/dspark_context.py b/vllm/models/deepseek_v4_1/tilelang/dspark_context.py
+new file mode 100644
+index 000000000..030316318
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/dspark_context.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark's context-graph inputs, ``DSparkContextCudaGraphs.run``'s torch prologue.
++
++Before a context graph replays, its persistent inputs take the step's rows: the
++target's three auxiliary hidden states side by side in ``aux`` (row ``r``'s
++columns ``[i * width, (i + 1) * width)`` from source ``i``), and every row from
++the step's ``num_tokens`` up to the graph's ``capacity`` scrubbed: ``aux`` zero,
++``positions`` zero and each KV cache group's slot ``PAD_SLOT_ID``. Three strided
++copies and three fills in torch; one launch here: a block a row and 1024 columns
++of each source, a thread 16 bytes of each, its three loads issued before its
++three stores.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from functools import cache
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++
++NUM_SOURCES = 3  # dspark_target_layer_ids of DeepSeek V4.1 Flash
++_THREADS = 128
++_VECTOR_BYTES = 16
++_DTYPES = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
++
++_HEADER = r"""
++__device__ __forceinline__ void vllm_dspark_context_b128(void* d0, const void* s0,
++                                                         void* d1, const void* s1,
++                                                         void* d2, const void* s2,
++                                                         bool live) {
++  uint4 a = make_uint4(0u, 0u, 0u, 0u), b = a, c = a;
++  if (live) {
++    a = *reinterpret_cast<const uint4*>(s0);
++    b = *reinterpret_cast<const uint4*>(s1);
++    c = *reinterpret_cast<const uint4*>(s2);
++  }
++  *reinterpret_cast<uint4*>(d0) = a;
++  *reinterpret_cast<uint4*>(d1) = b;
++  *reinterpret_cast<uint4*>(d2) = c;
++}
++"""
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def context_inputs_kernel(width: int, dtype: str):
++    vector = _VECTOR_BYTES // 2
++    if width % vector:
++        raise ValueError(f"a width of {width} is not whole 16-byte vectors")
++    span = _THREADS * vector
++    aux_rows, positions_len, groups, slots_len, slots_stride = T.dynamic(
++        "aux_rows, positions_len, groups, slots_len, slots_stride"
++    )
++    rows0, rows1, rows2, stride0, stride1, stride2 = T.dynamic(
++        "rows0, rows1, rows2, stride0, stride1, stride2"
++    )
++
++    @T.prim_func
++    def context_inputs(
++        aux: T.Tensor((aux_rows, NUM_SOURCES * width), dtype),
++        source0: T.StridedTensor((rows0, width), (stride0, 1), dtype),
++        source1: T.StridedTensor((rows1, width), (stride1, 1), dtype),
++        source2: T.StridedTensor((rows2, width), (stride2, 1), dtype),
++        positions: T.Tensor((positions_len,), T.int64),
++        slot_mappings: T.StridedTensor((groups, slots_len), (slots_stride, 1), T.int64),
++        num_tokens: T.int32,
++        capacity: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(width, span), capacity, threads=_THREADS) as (
++            bx,
++            row,
++        ):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            col = bx * span + tx * vector
++            if col < width:
++                T.call_extern(
++                    "handle",
++                    "vllm_dspark_context_b128",
++                    T.address_of(aux[row, col]),
++                    T.address_of(source0[row, col]),
++                    T.address_of(aux[row, width + col]),
++                    T.address_of(source1[row, col]),
++                    T.address_of(aux[row, 2 * width + col]),
++                    T.address_of(source2[row, col]),
++                    row < num_tokens,
++                )
++            if (bx == 0) & (tx == 0) & (row >= num_tokens):
++                positions[row] = T.int64(0)
++                for g in T.serial(groups):
++                    slot_mappings[g, row] = T.int64(PAD_SLOT_ID)
++
++    return context_inputs
++
++
++def context_inputs_key(width: int, dtype: torch.dtype) -> tuple:
++    return (width, _DTYPES[dtype])
++
++
++@cache
++def _bound(*key):
++    """The kernel of ``key``, resolved once (after the kernel cache freezes, an
++    undeclared key raises by name)."""
++    return context_inputs_kernel(*key)
++
++
++def context_inputs(
++    aux: torch.Tensor,
++    sources: list[torch.Tensor],
++    positions: torch.Tensor,
++    slot_mappings: torch.Tensor,
++    num_tokens: int,
++    capacity: int,
++) -> None:
++    """``aux[:num_tokens]`` from ``sources`` side by side, and rows ``num_tokens``
++    to ``capacity`` of ``aux``, ``positions`` and every group's ``slot_mappings``
++    scrubbed."""
++    width = aux.shape[1] // NUM_SOURCES
++    if len(sources) != NUM_SOURCES or aux.shape[1] != NUM_SOURCES * width:
++        raise ValueError(f"DSpark context inputs take {NUM_SOURCES} sources")
++    vector = _VECTOR_BYTES // aux.element_size()
++    for source in (aux, *sources):
++        if (
++            source.dtype != aux.dtype
++            or source.stride(-1) != 1
++            or source.stride(0) % vector
++            or source.data_ptr() % _VECTOR_BYTES
++        ):
++            raise ValueError(
++                "DSpark context rows must be 16-byte aligned rows of the aux dtype"
++            )
++    _bound(*context_inputs_key(width, aux.dtype))(
++        aux, *sources, positions, slot_mappings, num_tokens, capacity
++    )

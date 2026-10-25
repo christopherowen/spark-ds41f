@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:24:29 +0200
+Subject: [PATCH 328/488] DeepSeek V4.1 tokenizer: honor add_generation_prompt
+ and continue_final_message
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The reference encoder opens the assistant turn after a final user, tool or
+mid-conversation system message and closes a final assistant message with its
+end-of-sentence token; it has no generation controls. The tokenizer ignored
+both of vLLM's, so a conversation ending with an assistant message (an agent's
+compaction call, a client replaying its own turns) asked the model to write
+after end-of-sentence, which gives empty or off-distribution replies, among
+them leaked <ds_safety> blocks (vllm-project/vllm#46256).
+
+The encoder's prompt is kept and adjusted only where the caller asks:
+- add_generation_prompt=True after a closed assistant message appends the
+  turn prefix the encoder writes after a user message (<｜Assistant｜> and
+  <think>, or </think> in chat mode); a task token after the message
+  (e.g. <｜title｜>) already asks for that task and is left alone;
+- add_generation_prompt=False leaves the turn the encoder opened unopened;
+- continue_final_message=True ends the prompt at the final message's text: an
+  assistant message through the encoder's own wo_eos, its reasoning left open
+  in thinking mode while it has no content or tool calls; any other message
+  without the opened turn;
+- both set is a request error.
+
+Callers that pass neither control, and the chat API's defaults on any
+conversation the encoder already opens, get the reference prompt unchanged:
+every reference fixture renders identically under the API defaults.
+---
+ tests/tokenizers_/test_deepseek_v41.py | 148 +++++++++++++++++++++++++
+ vllm/tokenizers/deepseek_v41.py        |  72 ++++++++++++
+ 2 files changed, 220 insertions(+)
+
+diff --git a/tests/tokenizers_/test_deepseek_v41.py b/tests/tokenizers_/test_deepseek_v41.py
+index 8adc539ff..7d6aed01b 100644
+--- a/tests/tokenizers_/test_deepseek_v41.py
++++ b/tests/tokenizers_/test_deepseek_v41.py
+@@ -567,3 +567,151 @@ def test_renderer_tokenizes_so_control_spellings_stay_text():
+     messages = [{"role": "user", "content": INJECTED}]
+     ids = renderer._apply_chat_template(messages=messages, tokenize=False)
+     assert ids == renderer.tokenizer.apply_chat_template(messages)
++# Generation controls. The chat API passes add_generation_prompt=True and
++# continue_final_message=False unless the request says otherwise.
++_API_DEFAULTS = {"add_generation_prompt": True, "continue_final_message": False}
++_EOS = "<｜end▁of▁sentence｜>"
++_ASSISTANT_TURNS = [
++    {"role": "user", "content": "What is 2+2?"},
++    {"role": "assistant", "content": "4.", "reasoning_content": "sum"},
++]
++
++
++@pytest.mark.parametrize("case", _FIXTURES["cases"], ids=lambda case: case["name"])
++def test_api_defaults_leave_reference_prompts_unchanged(case):
++    request = ChatCompletionRequest(
++        messages=case["messages"], tools=case.get("tools")
++    )
++    prompt = get_deepseek_v41_tokenizer(FakeHfTokenizer()).apply_chat_template(
++        request.messages,
++        tools=[tool.model_dump(exclude_none=True) for tool in request.tools]
++        if request.tools
++        else None,
++        tokenize=False,
++        **case["kwargs"],
++        **_API_DEFAULTS,
++    )
++    assert prompt == case["expected"]
++
++
++@pytest.mark.parametrize(
++    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
++)
++def test_user_terminated_prompt_is_the_reference_encoder_output(controls, token):
++    messages = [{"role": "user", "content": "Say hi."}]
++    thinking = controls.get("thinking", True)
++    reference = encode_messages(
++        messages,
++        thinking_mode="thinking" if thinking else "chat",
++        reasoning_effort="high",
++    )
++    assert reference.endswith("<｜Assistant｜>" + token)
++    assert render(messages, **controls, **_API_DEFAULTS) == reference
++    assert render(messages, **controls) == reference
++
++
++@pytest.mark.parametrize(
++    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
++)
++def test_assistant_terminated_conversation_opens_a_new_turn(controls, token):
++    closed = render(_ASSISTANT_TURNS, **controls)
++    assert closed.endswith("4." + _EOS)  # the reference encoder's own prompt
++    opened = render(_ASSISTANT_TURNS, **controls, **_API_DEFAULTS)
++    assert opened == closed + "<｜Assistant｜>" + token
++    assert render(_ASSISTANT_TURNS, **controls, add_generation_prompt=False) == closed
++
++
++def test_chat_request_on_assistant_terminated_conversation_opens_a_turn():
++    request = ChatCompletionRequest(
++        model="deepseek-ai/DeepSeek-V4.1-Flash", messages=_ASSISTANT_TURNS
++    )
++    kwargs = request.build_chat_params(None, "auto").get_apply_chat_template_kwargs()
++    assert render(request.messages, **kwargs).endswith(
++        "4." + _EOS + "<｜Assistant｜><think>"
++    )
++
++
++@pytest.mark.parametrize(
++    ("controls", "token"), [({}, "<think>"), ({"thinking": False}, "</think>")]
++)
++def test_add_generation_prompt_false_leaves_the_turn_unopened(controls, token):
++    messages = [{"role": "user", "content": "Say hi."}]
++    opened = render(messages, **controls, **_API_DEFAULTS)
++    unopened = render(messages, **controls, add_generation_prompt=False)
++    assert unopened.endswith("<｜User｜>Say hi.")
++    assert opened == unopened + "<｜Assistant｜>" + token
++
++
++@pytest.mark.parametrize(
++    ("controls", "tail"),
++    [
++        ({}, "<｜Assistant｜><think>sum</think>4."),
++        ({"thinking": False}, "<｜Assistant｜></think>4."),
++    ],
++)
++def test_continue_final_message_continues_the_assistant_text(controls, tail):
++    prompt = render(
++        _ASSISTANT_TURNS,
++        **controls,
++        add_generation_prompt=False,
++        continue_final_message=True,
++    )
++    assert prompt.endswith(tail)
++    assert prompt + _EOS == render(_ASSISTANT_TURNS, **controls)
++
++
++def test_continue_final_message_keeps_partial_reasoning_open():
++    messages = [
++        {"role": "user", "content": "What is 2+2?"},
++        {"role": "assistant", "content": "", "reasoning_content": "Adding two"},
++    ]
++    prompt = render(messages, continue_final_message=True)
++    assert prompt.endswith("<｜Assistant｜><think>Adding two")
++    # Chat mode has no reasoning to continue: the closed prefix stays.
++    chat = render(messages, thinking=False, continue_final_message=True)
++    assert chat.endswith("<｜Assistant｜></think>")
++
++
++def test_continue_final_message_on_an_empty_assistant_turn_is_a_new_turn():
++    messages = [
++        {"role": "user", "content": "What is 2+2?"},
++        {"role": "assistant", "content": ""},
++    ]
++    continued = render(messages, continue_final_message=True)
++    assert continued == render(messages[:1], **_API_DEFAULTS)
++
++
++def test_continue_final_message_after_instructions_is_a_prompt_prefix():
++    # The recurrent-instruction boundary renders the leading instructions with an
++    # empty user turn this way and needs a prefix of the full prompt.
++    instructions = [{"role": "system", "content": "Be brief."}]
++    prefix = render(
++        instructions + [{"role": "user", "content": ""}],
++        add_generation_prompt=False,
++        continue_final_message=True,
++    )
++    full = render(instructions + [{"role": "user", "content": "hi"}], **_API_DEFAULTS)
++    assert prefix.endswith("<｜User｜>")
++    assert full.startswith(prefix)
++
++
++def test_task_token_after_an_assistant_message_is_left_alone():
++    case = next(c for c in _FIXTURES["cases"] if c["name"] == "title_task")
++    prompt = render(case["messages"], **case["kwargs"], **_API_DEFAULTS)
++    assert prompt == case["expected"]
++    assert prompt.endswith(_EOS + "<｜title｜>")
++
++
++def test_both_generation_controls_is_a_request_error():
++    with pytest.raises(ValueError, match="continue_final_message"):
++        render(
++            _ASSISTANT_TURNS,
++            add_generation_prompt=True,
++            continue_final_message=True,
++        )
++
++
++def test_generation_controls_do_not_mutate_messages():
++    messages = copy.deepcopy(_ASSISTANT_TURNS)
++    render(messages, add_generation_prompt=False, continue_final_message=True)
++    assert messages == _ASSISTANT_TURNS
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 0ea06adf5..1f430ba5f 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -12,9 +12,13 @@ from transformers import TokenizersBackend
+ from vllm.entrypoints.chat_utils import ChatCompletionMessageParam
+ 
+ from .deepseek_v41_encoding import (
++    ASSISTANT_SP_TOKEN,
+     IMAGE_PLACEHOLDER,
+     REASONING_EFFORT_MAPPINGS,
+     encode_messages,
++    eos_token,
++    thinking_end_token,
++    thinking_start_token,
+ )
+ from .hf import HfTokenizer, get_cached_tokenizer
+ from .protocol import TokenizerLike
+@@ -206,6 +210,51 @@ def _normalize_messages(
+     return result
+ 
+ 
++def _apply_generation_controls(
++    prompt: str,
++    final: dict[str, Any] | None,
++    *,
++    thinking: bool,
++    add_generation_prompt: bool | None,
++    continue_final_message: bool,
++) -> str:
++    """Honor `add_generation_prompt` and `continue_final_message` on the prompt
++    the reference encoder rendered.
++
++    The encoder opens the assistant turn (`<｜Assistant｜>` and the thinking
++    token) after a final user, tool or mid-conversation system message, and
++    closes a final assistant message with its end-of-sentence token. Left alone,
++    its prompt is unchanged: a caller that does not pass the controls, or passes
++    the API defaults on a conversation the encoder already opens, gets exactly
++    the reference prompt.
++    - `add_generation_prompt=True` after a closed assistant message opens a new
++      assistant turn instead of asking the model to write after its
++      end-of-sentence token. A message the encoder followed with a task token
++      (e.g. `<｜title｜>`) already asks for that task and is left alone.
++    - `add_generation_prompt=False` leaves the turn the encoder opened unopened.
++    - `continue_final_message=True` ends the prompt at the final message's text:
++      an assistant message without its end-of-sentence token (the encoder's
++      `wo_eos`), its reasoning still open in thinking mode when it has no
++      content or tool calls yet; any other message without the opened turn.
++    """
++    cue = ASSISTANT_SP_TOKEN + (
++        thinking_start_token if thinking else thinking_end_token
++    )
++    final_is_assistant = final is not None and final["role"] == "assistant"
++    if continue_final_message:
++        if not final_is_assistant:
++            return prompt.removesuffix(cue)
++        if thinking and not final.get("content") and not final.get("tool_calls"):
++            # The reasoning is still being written: leave it open.
++            return prompt.removesuffix(thinking_end_token)
++        return prompt
++    if add_generation_prompt is False and not final_is_assistant:
++        return prompt.removesuffix(cue)
++    if add_generation_prompt and final_is_assistant and prompt.endswith(eos_token):
++        return prompt + cue
++    return prompt
++
++
+ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+     """Wrap an HF tokenizer with the V4.1 prompt encoder."""
+     wrapped = copy.copy(tokenizer)
+@@ -293,12 +342,35 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+                     "or an integer within [1, 100] in chat_template_kwargs"
+                 )
+ 
++            add_generation_prompt = kwargs.get("add_generation_prompt")
++            continue_final_message = bool(kwargs.get("continue_final_message"))
++            if continue_final_message and add_generation_prompt:
++                raise ValueError(
++                    "Cannot set both `add_generation_prompt` and "
++                    "`continue_final_message` to True."
++                )
++            if continue_final_message and not conversation:
++                raise ValueError("`continue_final_message` needs a final message.")
++            final = conversation[-1] if conversation else None
++            final_is_assistant = final is not None and final["role"] == "assistant"
++            # The reference encoder's own switch for an assistant message the
++            # model continues: rendered without its end-of-sentence token.
++            if continue_final_message and final_is_assistant:
++                final["wo_eos"] = True
++
+             prompt = encode_messages(
+                 conversation,
+                 thinking_mode="thinking" if thinking else "chat",
+                 drop_thinking=kwargs.get("drop_thinking", True),
+                 reasoning_effort=effort,
+             )
++            prompt = _apply_generation_controls(
++                prompt,
++                final,
++                thinking=thinking,
++                add_generation_prompt=add_generation_prompt,
++                continue_final_message=continue_final_message,
++            )
+             if kwargs.get("tokenize", True):
+                 tokenizer_kwargs = {
+                     key: kwargs[key]

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:10:13 +0100
+Subject: [PATCH 452/488] [DS4.1] Engram's SP pad rows pass through by a
+ TileLang copy
+
+Under prefill sequence parallelism a rank's trailing pad rows keep their
+residual: a TileLang column copy instead of torch's.
+---
+ vllm/models/deepseek_v4_1/common/engram.py | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index 689c043ac..8d9cdd454 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -1073,6 +1073,12 @@ class Engram(nn.Module):
+         sequence_parallel = (
+             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
+         )
++        if sequence_parallel:
++            # SP's trailing pad rows pass through (forward).
++            from vllm.models.deepseek_v4_1.tilelang import columns
++
++            key = columns.copy_columns_key(self.hc_mult * self.dim, torch.bfloat16)
++            calls.append(prepare.call(columns.copy_columns_kernel, *key))
+         if sequence_parallel and isinstance(self.wkv, _PaddedColumnParallelLinear):
+             calls.append(
+                 prepare.call(
+@@ -1169,7 +1175,12 @@ class Engram(nn.Module):
+             # Gate the real local rows; the trailing pad rows pass through.
+             start, real = sp_rows.start, sp_rows.real_rows
+             if real < state.shape[0]:
+-                out[real:].copy_(state[real:])
++                if kernels.uses_tilelang():
++                    from vllm.models.deepseek_v4_1.tilelang import columns
++
++                    columns.copy_columns(state[real:], out[real:])
++                else:
++                    out[real:].copy_(state[real:])
+             if real == 0:
+                 return out.view_as(hidden_states)
+             state, mix_out = state[:real], out[:real]

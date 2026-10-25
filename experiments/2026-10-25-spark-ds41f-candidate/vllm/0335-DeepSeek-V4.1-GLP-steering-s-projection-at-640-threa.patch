@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 03:36:25 +0200
+Subject: [PATCH 335/488] DeepSeek-V4.1: GLP steering's projection at 640
+ threads a row
+
+0261's projection gave each stream row 128 threads, five loads of eight
+values a thread, and held the row and the direction in registers: level
+with or faster than the compiled torch projection at decode, but 1.2-1.4%
+slower on 8K and 16K-token prefill chunks, where both run near the
+memory's bandwidth. Of ten variants (threads a row, values a load, the
+direction held or re-read), one load a thread over 640 threads (the
+model's 5,120) is the fastest at every shape: one stream 2.4 against
+2.5 us, sixteen streams 7.8 against 8.0 us, 8K prefill -2.0%, 16K -2.5%.
+The arithmetic and its order within a thread are unchanged; the warps'
+partial sums are twenty instead of four.
+
+Tests: what alpha 1 leaves along the direction is bounded by what the
+correctly rounded BF16 projection leaves (rows with a large component
+keep up to about 0.04 after rounding; the 0.02 bound was below that),
+and by 5% of what was there.
+---
+ tests/kernels/test_deepseek_v41_tilelang_glp.py | 10 +++++++---
+ vllm/models/deepseek_v4_1/tilelang/glp.py       | 14 +++++++++-----
+ 2 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_glp.py b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+index ffddfdf6e..43a5cecdd 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_glp.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_glp.py
+@@ -79,11 +79,15 @@ def test_within_one_rounding_of_fp64(tokens, alpha):
+ 
+ 
+ def test_the_direction_is_removed():
++    """At alpha 1 what remains along d is only the outputs' BF16 rounding: no more than
++    the correctly rounded projection leaves, and a small part of what was there."""
+     streams, directions = _inputs(256)
+     d = directions[2].double()
+-    out = _project(streams, directions[2], 1.0).double()
+-    # What remains along d is the outputs' own BF16 rounding.
+-    assert (out @ d).abs().max().item() < 0.02
++    before = (streams.double() @ d).abs()
++    after = (_project(streams, directions[2], 1.0).double() @ d).abs()
++    rounded = (_fp64(streams, directions[2], 1.0).bfloat16().double() @ d).abs()
++    assert after.max().item() <= 1.25 * rounded.max().item() + 1e-4
++    assert after.mean().item() <= 0.05 * before.mean().item()
+ 
+ 
+ def test_alpha_zero_and_a_zero_direction_change_nothing():
+diff --git a/vllm/models/deepseek_v4_1/tilelang/glp.py b/vllm/models/deepseek_v4_1/tilelang/glp.py
+index f4edbf34d..423f205b2 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/glp.py
++++ b/vllm/models/deepseek_v4_1/tilelang/glp.py
+@@ -5,10 +5,14 @@
+ ``streams`` ([T, hc_mult, hidden], BF16) are a layer's folded hyper-connection
+ streams, ``direction`` ([hidden], FP32) the layer's unit row (zero for a layer the
+ file does not steer) and ``alpha`` ([1], FP32) a buffer, so a file's contents never
+-change the traced graph. One block projects one stream of one token: it widens the
+-stream to FP32, reduces ``h . d`` in a fixed order (each thread's values in
+-sequence, then the warp's lanes, then the warps), and writes
+-``bf16(h - (alpha (h . d)) d)``. No row depends on another, so a token's result
++change the traced graph. One block projects one stream of one token: each of its
++threads loads eight values of the stream once (640 threads cover the model's 5,120),
++widens them to FP32, and the block reduces ``h . d`` in a fixed order (each thread's
++values in sequence, then the warp's lanes, then the warps) before every thread writes
++``bf16(h - (alpha (h . d)) d)``. With the row spread that wide a thread holds sixteen
++values, so more rows are in flight at once: at 8K and 16K-token prefill chunks it is
++2.0-2.5% faster than the compiled torch projection, where 128 threads a row (five loads
++a thread) were 1.2-1.4% slower (experiments/2026-10-23-next-release, glp-variants). No row depends on another, so a token's result
+ does not depend on what else the step carries. Alpha zero and a zero direction
+ return the stream unchanged; a non-finite value in a stream reaches its whole row,
+ as it does through ``h @ d``.
+@@ -26,7 +30,7 @@ from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+ 
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+-def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 128, vec: int = 8):
++def glp_project_kernel(hc_mult: int, hidden: int, threads: int = 640, vec: int = 8):
+     assert hidden % (threads * vec) == 0 and threads % 32 == 0
+     chunks = hidden // (threads * vec)
+     warps = threads // 32

@@ -1,0 +1,2701 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:10:58 +0200
+Subject: [PATCH 436/488] [DS4.1] Top-k and top-p filtering in TileLang
+
+The V2 runner's top-k / top-p filtering ran apply_top_k_top_p_triton's
+four Triton kernels: the monolithic top-k/top-p kernel and the split
+top-p pipeline (stats, five pivot-search steps, mask). Each is now a
+TileLang kernel that is its Triton kernel's contract bit for bit, with
+the arithmetic read from Triton 3.7's PTX for sm_121a (exp, log, sqrt,
+division, the contractions LLVM made, the thread layout by the logits'
+16-byte alignment, and the split pipeline's per-lane row sums), launched
+as the Triton dispatch does on CUDA and on its buffers. The V2 runner no
+longer registers the Triton kernels; the V1 sampler keeps them.
+---
+ .../kernels/benchmark_tilelang_topk_topp.py   |  189 ++
+ .../v1/worker/test_gpu_tilelang_topk_topp.py  |  259 ++
+ vllm/v1/worker/gpu/model_runner.py            |    6 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |   13 +-
+ vllm/v1/worker/gpu/sample/states.py           |    2 +-
+ .../worker/gpu/sample/tilelang_topk_topp.py   | 2124 +++++++++++++++++
+ 6 files changed, 2584 insertions(+), 9 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_tilelang_topk_topp.py
+ create mode 100644 tests/v1/worker/test_gpu_tilelang_topk_topp.py
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_topk_topp.py b/benchmarks/kernels/benchmark_tilelang_topk_topp.py
+new file mode 100644
+index 000000000..4ae5c242a
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_tilelang_topk_topp.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired CUDA graph timings of the V2 top-k / top-p filter, TileLang against
++Triton, with fresh inputs per graph node.
++
++The filter masks its logits in place, so no call may see an earlier call's output:
++that changes both the workload and the branch paths. Each of the graph's calls gets
++its own initialized logits. Copies are outside event timing. Both implementations
++see the same tensor addresses. Before timing, each sample checks the TileLang
++output against Triton's bit for bit, padding included.
++
++Rows come six to a request (five drafts), each request with its own k and p. Row
++counts cover each slice count of Triton's split top-p pipeline on 48 SMs (1, 2, 4,
++8, 16 and 32 rows: 32, 16, 8, 4, 2 and 1 slices; 6, 12 and 24 rows at the upper
++ends) and the monolithic kernel above 64 rows. Modes: top-k alone, top-p alone,
++both, and ``mixed`` (requests with top-k alone, top-p alone and both).
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
++from vllm.v1.worker.gpu.sample import tilelang_topk_topp as candidate
++
++WIDTH = 6  # Rows a request: one target and five drafts.
++TOP_K = (20, 50, 64, 100, 40)
++TOP_P = (0.9, 0.95, 0.8, 0.92)
++
++
++def make_controls(mode, rows, vocab):
++    """Per-row k and p, the same across a request's rows."""
++    request = torch.arange(rows, device="cuda") // WIDTH
++    k = torch.tensor(TOP_K, device="cuda", dtype=torch.int32)[request % len(TOP_K)]
++    p = torch.tensor(TOP_P, device="cuda")[request % len(TOP_P)]
++    if mode == "mixed":
++        # Requests in threes: top-k alone, top-p alone, both.
++        k = torch.where(request % 3 == 1, vocab, k).to(torch.int32)
++        p = torch.where(request % 3 == 0, 1.0, p)
++    return (None if mode == "p" else k), (None if mode == "k" else p)
++
++
++def make_logits(rows, vocab, generator):
++    """Model-like rows: a Gaussian body with a head of a few dozen tokens well
++    above it, of varied height."""
++    logits = torch.randn((rows, vocab), device="cuda", generator=generator) * 1.5
++    head = torch.randint(vocab, (rows, 32), device="cuda", generator=generator)
++    lift = torch.rand((rows, 32), device="cuda", generator=generator) * 10 + 4
++    return logits.scatter_add_(1, head, lift)
++
++
++def make_case(mode, rows, vocab, stride, seed, count):
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    source = make_logits(rows, vocab, generator)
++    storage = [
++        torch.empty((rows, stride), device="cuda").fill_(-7.0) for _ in range(count)
++    ]
++    buffers = [buffer[:, :vocab] for buffer in storage]
++    k, p = make_controls(mode, rows, vocab)
++
++    def reset():
++        for logits in buffers:
++            logits.copy_(source)
++
++    def invoke(index, ours):
++        if ours:
++            candidate.apply_top_k_top_p(buffers[index], k, p)
++        else:
++            apply_top_k_top_p_triton(buffers[index], k, p)
++
++    return reset, invoke, lambda i: storage[i]
++
++
++def capture(invoke, ours, count):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        invoke(0, ours)
++    torch.cuda.current_stream().wait_stream(side)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for index in range(count):
++            invoke(index, ours)
++    return graph
++
++
++def elapsed(graph, reset, count):
++    reset()
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    graph.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 1000 / count
++
++
++def measure(mode, rows, vocab, stride, seed):
++    count = 8
++    ours, theirs = [], []
++    for sample in range(8):
++        reset, invoke, output = make_case(
++            mode, rows, vocab, stride, seed + sample, count
++        )
++        reset()
++        invoke(0, False)
++        expected = output(0).clone()
++        reset()
++        invoke(0, True)
++        actual = output(0)
++        if not torch.equal(actual.view(torch.int32), expected.view(torch.int32)):
++            indices = (actual.view(torch.int32) != expected.view(torch.int32)).nonzero()
++            print(
++                json.dumps(
++                    {
++                        "sample": sample,
++                        "count": indices.shape[0],
++                        "differences": [
++                            [
++                                index.tolist(),
++                                actual[tuple(index)].item(),
++                                expected[tuple(index)].item(),
++                            ]
++                            for index in indices[:8]
++                        ],
++                    }
++                ),
++                flush=True,
++            )
++            raise RuntimeError(
++                f"outputs differ: {mode} rows={rows} vocab={vocab} stride={stride}"
++            )
++        reset()
++        a = capture(invoke, True, count)
++        reset()
++        b = capture(invoke, False, count)
++        order = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(graph): elapsed(graph, reset, count) for graph in order}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        del a, b, order, reset, invoke, output, expected
++    paired = [a - b for a, b in zip(ours, theirs)]
++    mean = statistics.fmean(paired)
++    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++    result = dict(
++        mode=mode,
++        rows=rows,
++        vocab=vocab,
++        stride=stride,
++        tilelang_us=statistics.median(ours),
++        triton_us=statistics.median(theirs),
++        interval_us=[mean - half, mean + half],
++        slower=mean - half > 0,
++        tilelang_samples_us=ours,
++        triton_samples_us=theirs,
++    )
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--seed", type=int, default=48291)
++    parser.add_argument("--modes", default="k,p,kp,mixed")
++    parser.add_argument("--rows", default="1,2,4,6,8,12,16,24,32,64,96")
++    parser.add_argument("--vocab", type=int, default=129280)
++    parser.add_argument(
++        "--stride", type=int, default=0, help="row stride (default: the vocabulary)"
++    )
++    args = parser.parse_args()
++    stride = args.stride or args.vocab
++    cases = [
++        (mode, int(rows), args.vocab, stride)
++        for mode in args.modes.split(",")
++        for rows in args.rows.split(",")
++    ]
++    results = [measure(*case, args.seed) for case in cases]
++    failed = [(r["mode"], r["rows"]) for r in results if r["slower"]]
++    print(json.dumps({"summary": "top-k / top-p", "slower": failed}), flush=True)
++    if args.gate and failed:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_tilelang_topk_topp.py b/tests/v1/worker/test_gpu_tilelang_topk_topp.py
+new file mode 100644
+index 000000000..6d674c9d1
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_tilelang_topk_topp.py
+@@ -0,0 +1,259 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The TileLang top-k / top-p filter against the Triton kernels it replaces, bit for
++bit: ``apply_top_k_top_p`` against ``apply_top_k_top_p_triton`` on copies of the same
++logits (the whole padded rows compared, so nothing outside the vocabulary moves), for
++top-k, top-p and both, at the batch sizes that take each of Triton's paths (the split
++pipeline at every slice count, the monolithic kernel beside it and above 64 rows), on
++the DeepSeek V4.1 vocabulary and odd ones, rows aligned or not, with per-row k and p
++(k = vocab and p = 1 among them) and logits with ties at the thresholds, infinities
++and NaN."""
++
++import pytest
++import torch
++
++pytest.importorskip("triton")
++pytest.importorskip("tilelang")
++
++from vllm.utils.platform_utils import num_compute_units  # noqa: E402
++from vllm.v1.sample.ops.topk_topp_triton import (  # noqa: E402
++    _topp_split_count,
++    apply_top_k_top_p_triton,
++)
++from vllm.v1.worker.gpu.sample import tilelang_topk_topp as ttk  # noqa: E402
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="requires a CUDA device"
++)
++
++DEVICE = torch.device("cuda")
++VOCAB = 129280  # DeepSeek V4.1
++MODES = ("k", "p", "kp")
++# Rows: one request; one request's six with five drafts; the split pipeline's
++# smallest slice count on GB10 (48 SMs); above the split pipeline's 64.
++ROWS = (1, 6, 16, 96)
++# (vocabulary, row layout): contiguous rows of an odd vocabulary are Triton's
++# unaligned specialization (one element a thread's run), padded rows the aligned one
++# with an odd vocabulary (a run of four on the logits, of one or two on the buffer).
++LAYOUTS = (
++    (VOCAB, "contiguous"),
++    (VOCAB, "padded"),
++    (2049, "contiguous"),
++    (2049, "padded"),
++    (1002, "contiguous"),
++)
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    return x.view(torch.int32) if x.dtype == torch.float32 else x
++
++
++def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
++    a, b = _bits(ours), _bits(theirs)
++    if torch.equal(a, b):
++        return
++    differ = (a != b).nonzero()
++    first = differ[:5].tolist()
++    raise AssertionError(
++        f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
++        f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
++        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
++    )
++
++
++def _width(vocab: int, layout: str) -> int:
++    """A row's storage: the vocabulary, or padded to a multiple of 16 elements."""
++    return vocab if layout == "contiguous" else (vocab + 16 + 15) // 16 * 16
++
++
++def _logits(rows: int, vocab: int, layout: str, seed: int) -> torch.Tensor:
++    """Rows of logits, a pattern each by the row's index: Gaussian; rounded (few
++    distinct values, ties everywhere); a peak of 40 equal values over a Gaussian; a
++    few large values over a flat tail; -inf, +inf and NaN sprinkled; a grammar mask
++    (all -inf but a few); all -inf; NaN everywhere but a few finite values."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    storage = torch.randn(rows, _width(vocab, layout), generator=g, device=DEVICE) * 3
++    x = storage[:, :vocab]
++    for r in range(rows):
++        kind = r % 8
++        if kind == 1:
++            x[r] = torch.round(x[r] / 3)
++        elif kind == 2:
++            top = torch.randperm(vocab, generator=g, device=DEVICE)[:40]
++            x[r, top] = x[r].max() + 1
++        elif kind == 3:
++            x[r] = torch.round(x[r] * 4) / 64
++            top = torch.randperm(vocab, generator=g, device=DEVICE)[: min(6, vocab)]
++            x[r, top] = 12.0 + torch.arange(top.numel(), device=DEVICE) % 3
++        elif kind == 4:
++            pick = torch.randperm(vocab, generator=g, device=DEVICE)
++            x[r, pick[: vocab // 97]] = float("-inf")
++            x[r, pick[vocab // 97 : vocab // 97 + 2]] = float("inf")
++            x[r, pick[vocab // 97 + 2 : vocab // 97 + 2 + vocab // 307]] = float("nan")
++        elif kind == 5:
++            keep = torch.randperm(vocab, generator=g, device=DEVICE)[: 3 + r % 50]
++            kept = x[r, keep].clone()
++            x[r] = float("-inf")
++            x[r, keep] = kept
++        elif kind == 6:
++            x[r] = float("-inf")
++        elif kind == 7:
++            keep = torch.randperm(vocab, generator=g, device=DEVICE)[:9]
++            kept = x[r, keep].clone()
++            x[r] = float("nan")
++            x[r, keep] = kept
++    return x
++
++
++def _controls(rows: int, vocab: int, mode: str, seed: int):
++    """Per-row k (int32) and p (FP32), or None: varied, with k = vocab (no top-k)
++    and p = 1 (no top-p) among them, k of 1, k above any outlier count, p tiny and
++    p near 1."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    k = torch.randint(1, 300, (rows,), generator=g, device=DEVICE).to(torch.int32)
++    k[1::5] = vocab
++    k[2::7] = 1
++    k[3::9] = max(vocab // 3, 1)
++    p = torch.rand(rows, generator=g, device=DEVICE) * 0.9 + 0.05
++    p[1::4] = 1.0
++    p[2::6] = 0.01
++    p[3::8] = 0.999
++    return (k if "k" in mode else None), (p if "p" in mode else None)
++
++
++def _copy(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """A copy of ``x`` with its storage's padding: ``(storage, view)``."""
++    storage = torch.full(
++        (x.shape[0], max(x.stride(0), x.shape[1])), -7.0, device=DEVICE
++    )
++    view = storage[:, : x.shape[1]]
++    view.copy_(x)
++    return storage, view
++
++
++def _check(logits: torch.Tensor, k, p, what: str) -> None:
++    ours_storage, ours = _copy(logits)
++    theirs_storage, theirs = _copy(logits)
++    ours_out = ttk.apply_top_k_top_p(ours, k, p)
++    theirs_out = apply_top_k_top_p_triton(theirs, k, p)
++    assert ours_out.data_ptr() == ours.data_ptr()
++    assert theirs_out.data_ptr() == theirs.data_ptr()
++    _assert_same(ours_storage, theirs_storage, what)
++
++
++@pytest.mark.parametrize("vocab,layout", LAYOUTS)
++@pytest.mark.parametrize("rows", ROWS)
++@pytest.mark.parametrize("mode", MODES)
++def test_filter(mode, rows, vocab, layout):
++    logits = _logits(rows, vocab, layout, rows * 7 + vocab)
++    k, p = _controls(rows, vocab, mode, rows + vocab)
++    _check(logits, k, p, f"{mode} rows={rows} vocab={vocab} {layout}")
++
++
++def _split_rows() -> list[int]:
++    """The fewest rows at each of this device's slice counts of the split pipeline."""
++    num_sm = num_compute_units(DEVICE.index or 0)
++    first: dict[int, int] = {}
++    for rows in range(1, ttk.SPLIT_MAX_BATCH + 1):
++        first.setdefault(_topp_split_count(rows, num_sm), rows)
++    return sorted(first.values())
++
++
++@pytest.mark.parametrize("mode", ["p", "kp"])
++def test_split_slice_counts(mode):
++    """Every slice count the split pipeline takes, with and without a top-k."""
++    for rows in _split_rows():
++        logits = _logits(rows, VOCAB, "contiguous", rows)
++        k, p = _controls(rows, VOCAB, mode, rows + 1)
++        _check(logits, k, p, f"{mode} rows={rows}")
++
++
++def _tied_rows(vocab: int) -> torch.Tensor:
++    """Rows whose top-k and top-p boundaries fall inside groups of equal values:
++    levels of 7, 23, 91 and 400 copies over a low Gaussian tail."""
++    g = torch.Generator(device=DEVICE).manual_seed(5)
++    rows = 6
++    x = torch.randn(rows, vocab, generator=g, device=DEVICE) * 0.25 - 6.0
++    for r in range(rows):
++        pick = torch.randperm(vocab, generator=g, device=DEVICE)
++        start = 0
++        for level, copies in enumerate((7, 23, 91, 400)):
++            x[r, pick[start : start + copies]] = 4.0 - level * (0.5 + 0.25 * r)
++            start += copies
++    return x
++
++
++@pytest.mark.parametrize("mode", MODES)
++@pytest.mark.parametrize("rows", [6, 96])
++def test_ties_at_the_thresholds(mode, rows):
++    """k and p that cut inside a group of equal values: Triton keeps the first of
++    the boundary value's copies by column (counting tile by tile)."""
++    x = _tied_rows(VOCAB).repeat((rows + 5) // 6, 1)[:rows].contiguous()
++    k = torch.tensor(
++        [3, 7, 19, 30, 50, 114, 200, 515, VOCAB], dtype=torch.int32, device=DEVICE
++    ).repeat(rows)[:rows]
++    p = torch.tensor(
++        [0.2, 0.33, 0.5, 0.61, 0.75, 0.9, 0.97, 1.0], device=DEVICE
++    ).repeat(rows)[:rows]
++    _check(
++        x,
++        k if "k" in mode else None,
++        p if "p" in mode else None,
++        f"ties {mode} rows={rows}",
++    )
++
++
++@pytest.mark.parametrize("mode", MODES)
++@pytest.mark.parametrize("rows", [1, 6, 96])
++def test_nothing_to_filter(mode, rows):
++    """k = vocab and p = 1 on every row: the logits stay as they are."""
++    logits = _logits(rows, VOCAB, "padded", 3)
++    k = torch.full((rows,), VOCAB, dtype=torch.int32, device=DEVICE)
++    p = torch.ones(rows, device=DEVICE)
++    k, p = (k if "k" in mode else None), (p if "p" in mode else None)
++    _check(logits, k, p, f"none {mode} rows={rows}")
++    _, view = _copy(logits)
++    ttk.apply_top_k_top_p(view, k, p)
++    _assert_same(view, logits, "unfiltered logits")
++
++
++@pytest.mark.parametrize("mode", MODES)
++@pytest.mark.parametrize("rows", [6, 96])
++def test_nonfinite_rows(mode, rows):
++    """Rows of -inf, of NaN, of +inf, with one finite value, and NaN, +inf and -inf
++    mixed into Gaussian rows."""
++    g = torch.Generator(device=DEVICE).manual_seed(11)
++    x = torch.randn(rows, VOCAB, generator=g, device=DEVICE) * 2
++    kinds = 9
++    for r in range(rows):
++        kind = r % kinds
++        if kind == 0:
++            x[r] = float("-inf")
++        elif kind == 1:
++            x[r] = float("nan")
++        elif kind == 2:
++            x[r] = float("inf")
++        elif kind == 3:
++            x[r] = float("-inf")
++            x[r, r * 37 % VOCAB] = 1.5
++        elif kind == 4:
++            x[r, ::5] = float("nan")
++        elif kind == 5:
++            x[r, 1000:1003] = float("inf")
++        elif kind == 6:
++            x[r, :8192] = float("-inf")
++        elif kind == 7:
++            x[r, :8192] = float("nan")
++            x[r, 0] = float("inf")
++        else:
++            x[r, -5:] = float("inf")
++            x[r, :5] = float("nan")
++    k = torch.tensor([1, 5, 50, 2000, VOCAB], dtype=torch.int32, device=DEVICE)
++    k = k.repeat(rows)[:rows]
++    p = torch.tensor([0.1, 0.5, 0.9, 1.0], device=DEVICE).repeat(rows)[:rows]
++    _check(
++        x,
++        k if "k" in mode else None,
++        p if "p" in mode else None,
++        f"nonfinite {mode} rows={rows}",
++    )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index a0ccd2d9e..c2b74590e 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -94,7 +94,6 @@ from vllm.v1.outputs import (
+     ModelRunnerOutput,
+     RoutedExpertsTensors,
+ )
+-from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
+ from vllm.v1.sample.sink import SinkConfig, SinkOutcome
+ from vllm.v1.watermarking import create_watermarker
+ from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+@@ -552,10 +551,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # Initialize samplers. Model states may override via custom_sampler().
+         if self.is_last_pp_rank and not self.is_pooling_model:
+-            # Seeded and processed-logprob requests use native filtering even
+-            # when unseeded warmup requests select FlashInfer sampling.
+-            with self.jit_warmup_registry.activate():
+-                register_top_k_top_p_warmups()
++            # Top-k / top-p filtering is TileLang's (Sampler.register_warmups).
+             sampler_kwargs: dict[str, Any] = {
+                 "max_num_reqs": self.max_num_reqs,
+                 "vocab_size": self.vocab_size,
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index bbfc039c6..4665b72fa 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -9,7 +9,6 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+ from vllm.config.reasoning import ReasoningConfig
+ from vllm.sampling_params import SamplingParams
+ from vllm.v1.sample.ops.topk_topp_sampler import (
+-    apply_top_k_top_p,
+     flashinfer_sample,
+     flashinfer_sampler_supported,
+ )
+@@ -19,7 +18,7 @@ from vllm.v1.worker.gpu.input_batch import (
+     logits_rows,
+ )
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_topp
+ from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
+ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+@@ -120,6 +119,12 @@ class Sampler:
+         )
+         for logits_stride in processed_logits_strides:
+             register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
++        # Top-k / top-p over the processed logits, at up to every request's rows.
++        tilelang_topk_topp.register_top_k_top_p(
++            logits_strides=processed_logits_strides,
++            vocab_size=vocab_size,
++            max_rows=self.sampling_states.max_num_reqs * self.num_speculative_tokens,
++        )
+         register_sampling_warmups(
+             logits=(*logits, *processed),
+             processed_logits_strides=processed_logits_strides,
+@@ -407,7 +412,9 @@ class Sampler:
+         if use_flashinfer:
+             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+         else:
+-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
++            processed_logits = tilelang_topk_topp.apply_top_k_top_p(
++                processed_logits, top_k, top_p
++            )
+             sampled = gumbel_sample(
+                 processed_logits,
+                 expanded_idx_mapping,
+diff --git a/vllm/v1/worker/gpu/sample/states.py b/vllm/v1/worker/gpu/sample/states.py
+index fe4dee6a6..63a991aae 100644
+--- a/vllm/v1/worker/gpu/sample/states.py
++++ b/vllm/v1/worker/gpu/sample/states.py
+@@ -4,10 +4,10 @@ import numpy as np
+ import torch
+ 
+ from vllm.sampling_params import SamplingParams
+-from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
+ from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
+ from vllm.v1.worker.gpu.sample.min_p import apply_min_p
++from vllm.v1.worker.gpu.sample.tilelang_topk_topp import apply_top_k_top_p
+ 
+ NO_LOGPROBS = -1
+ _NP_INT64_MIN = np.iinfo(np.int64).min
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py b/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
+new file mode 100644
+index 000000000..6a687fc0c
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_topk_topp.py
+@@ -0,0 +1,2124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang top-k / top-p filtering of the V2 model runner.
++
++Each kernel is the contract of the Triton kernel it replaces in
++``vllm/v1/sample/ops/topk_topp_triton.py``, bit for bit, NaN and infinite logits and
++ties at the thresholds included (the Triton kernels stay importable as the tests'
++reference and serve the V1 sampler):
++
++- ``topk_topp_kernel``: ``_topk_topp_kernel`` (CUDA's blocks of 8192 and 4096)
++- ``topp_stats_kernel``: ``_topp_sb_stats_kernel``
++- ``topp_step_kernel``: ``_topp_sb_step_kernel``
++- ``topp_mask_kernel``: ``_topp_sb_mask_kernel``
++
++``apply_top_k_top_p`` launches them as ``apply_top_k_top_p_triton`` does on CUDA, on
++its buffers.
++
++The arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX: ``tl.exp`` is
++``ex2.approx.f32`` (subnormals kept) of the product with log2(e), ``tl.log``
++libdevice's ``__nv_logf`` as Triton bundles it (``vllm_control_log``), ``tl.sqrt``
++``sqrt.approx.ftz.f32`` and ``/`` ``div.full.f32``. LLVM contracts ``a * b + c`` and
++``c - a * b`` to one FMA; every other add and product rounds to nearest, as the
++header writes it (nvcc would contract them otherwise). Every comparison NaN decides
++is made in the header: TVM's simplifier rewrites ``a <= b`` as ``!(b < a)``, which a
++NaN flips. Maxima and minima are ``max.f32`` / ``min.f32``: a NaN gives way.
++
++Every kernel runs Triton's eight warps, and a tile's elements sit with the threads as
++Triton's coalescing lays them out (``_column``): runs of ``run`` consecutive columns,
++``256 * run`` apart, ``run`` the widest vector every access of that tile shape in the
++kernel admits (``_split_run``, ``_monolithic_runs``). A tile's sum takes the thread's
++elements in register order (a sum of products ``fma(x0, y0, x1 * y1)``, then an FMA
++each), the lanes at XOR distances 16 to 1, then the warps' sums as threads 0-7
++combine them at distances 4, 2 and 1 (``_tree_add``). Maxima, minima, counts and
++prefix counts (``tl.cumsum``) do not depend on the order, and the warps exchange them
++together, where each of Triton's reductions takes three barriers.
++
++The split pipeline's row statistics (``_row_stats``) are each slice's partials, slice
++``s`` at the lanes ``s`` modulo the slice count, reduced at XOR distances from half
++that count down to 1, and LLVM contracts the first level's product into an FMA: each
++lane adds its own product unrounded to its partner's rounded one, so lanes reach
++different sums, and each thread goes on with its own lane's, through the ladders of
++the pivot search, to the probabilities of the columns it holds. Here every thread
++computes what its Triton thread computes, from the same lanes. Where Triton's threads
++would part (they never do, or its barriers would hang), a step runs when any thread
++takes it, its effects kept to those that do.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from collections.abc import Sequence
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.utils.gpu_sync_debug import gpu_sync_allowed
++from vllm.utils.math_utils import next_power_of_2
++from vllm.utils.platform_utils import num_compute_units
++from vllm.v1.sample.ops import topk_topp_triton as reference
++from vllm.v1.worker.gpu.sample import tilelang_controls
++from vllm.v1.worker.gpu.sample.tilelang_sampling import _PASS, _call, _kernel, declare
++
++_THREADS = 256  # Triton's eight warps
++_WARPS = _THREADS // 32
++_WARP_DISTANCES = (16, 8, 4, 2, 1)
++# topk_topp_triton's BLOCK_SIZE and BLOCK_SIZE_TRUNC on CUDA.
++BLOCK = 8192
++TRUNC_BLOCK = 4096
++# The split pipeline's limits; its step kernel's BLOCK (its other kernels' is 8192).
++SPLIT_MAX_BATCH = reference._SPLIT_MAX_BATCH
++FANOUT = reference._SPLIT_FANOUT
++ROUNDS = reference._SPLIT_ROUNDS
++STEP_BLOCK = 2048
++# A ladder slot is a lane's position in its group of eight lanes.
++assert FANOUT == 8
++# The pivot searches stop after this many steps.
++_STEPS = 18
++# Exchange slots in shared memory: _SLOTS values of each warp, then the warps' counts
++# of flags in each run of a tile, run-major (up to 32 runs).
++_SLOTS = 4
++_RUNS = _SLOTS * _WARPS
++_RUN_SLOTS = _RUNS + 32 * _WARPS
++
++_HEADER = (
++    # vllm_control_log: tl.log, Triton's bundled libdevice __nv_logf.
++    tilelang_controls._HEADER
++    + r"""
++// tl.exp of an FP32 value: the product with log2(e), then ex2.approx.f32 without
++// flush-to-zero.
++__device__ __forceinline__ float vllm_topk_exp(float x) {
++  float y;
++  asm("{\n"
++      ".reg .b32 t;\n"
++      "mul.rn.f32 t, %1, 0f3FB8AA3B;\n"
++      "ex2.approx.f32 %0, t;\n"
++      "}"
++      : "=f"(y)
++      : "f"(x));
++  return y;
++}
++
++// Triton's FP32 `/`: div.full.f32.
++__device__ __forceinline__ float vllm_topk_div(float x, float y) {
++  float q;
++  asm("div.full.f32 %0, %1, %2;" : "=f"(q) : "f"(x), "f"(y));
++  return q;
++}
++
++// tl.sqrt: sqrt.approx.ftz.f32.
++__device__ __forceinline__ float vllm_topk_sqrt(float x) {
++  float y;
++  asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return y;
++}
++
++// FP32 arithmetic rounded to nearest, out of nvcc's contraction and the TileLang
++// simplifier's reach.
++__device__ __forceinline__ float vllm_topk_add(float a, float b) {
++  float c;
++  asm("add.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_topk_sub(float a, float b) {
++  float c;
++  asm("sub.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_topk_mul(float a, float b) {
++  float c;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_topk_fma(float a, float b, float c) {
++  float d;
++  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
++  return d;
++}
++
++// max.f32 and min.f32: a NaN gives way to the other operand.
++__device__ __forceinline__ float vllm_topk_max(float a, float b) {
++  float c;
++  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_topk_min(float a, float b) {
++  float c;
++  asm("min.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++
++// Ordered comparisons: false when either side is NaN.
++__device__ __forceinline__ int vllm_topk_lt(float a, float b) { return a < b; }
++__device__ __forceinline__ int vllm_topk_le(float a, float b) { return a <= b; }
++__device__ __forceinline__ int vllm_topk_gt(float a, float b) { return a > b; }
++__device__ __forceinline__ int vllm_topk_ge(float a, float b) { return a >= b; }
++__device__ __forceinline__ int vllm_topk_eq(float a, float b) { return a == b; }
++
++// tl.abs(a - b) < 1e-9, the tolerance of the pivot searches.
++__device__ __forceinline__ int vllm_topk_near(float a, float b) {
++  float d;
++  asm("sub.rn.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b));
++  return fabsf(d) < __int_as_float(0x3089705F);
++}
++
++// tl.cast to uint32 and to int32: cvt.rzi, saturating, NaN to 0.
++__device__ __forceinline__ unsigned int vllm_topk_u32(float x) {
++  unsigned int y;
++  asm("cvt.rzi.u32.f32 %0, %1;" : "=r"(y) : "f"(x));
++  return y;
++}
++__device__ __forceinline__ int vllm_topk_i32(float x) {
++  int y;
++  asm("cvt.rzi.s32.f32 %0, %1;" : "=r"(y) : "f"(x));
++  return y;
++}
++
++// The warp's ballot of a flag, a ballot's flags, and its flags below this lane.
++__device__ __forceinline__ unsigned int vllm_topk_ballot(int flag) {
++  return __ballot_sync(0xffffffffu, flag);
++}
++__device__ __forceinline__ int vllm_topk_popc(unsigned int mask) {
++  return __popc(mask);
++}
++__device__ __forceinline__ int vllm_topk_below(unsigned int mask) {
++  unsigned int lower;
++  asm("mov.u32 %0, %%lanemask_lt;" : "=r"(lower));
++  return __popc(mask & lower);
++}
++
++// The warp's sum of an integer, its inclusive prefix sums over the lanes, and the
++// value of a lane.
++__device__ __forceinline__ int vllm_topk_warp_count(int v) {
++  return __reduce_add_sync(0xffffffffu, v);
++}
++__device__ __forceinline__ int vllm_topk_warp_scan(int v) {
++  const int lane = threadIdx.x & 31;
++#pragma unroll
++  for (int d = 1; d < 32; d <<= 1) {
++    const int u = __shfl_up_sync(0xffffffffu, v, d);
++    if (lane >= d) v += u;
++  }
++  return v;
++}
++__device__ __forceinline__ int vllm_topk_lane(int v, int lane) {
++  return __shfl_sync(0xffffffffu, v, lane);
++}
++
++// Whether any thread of the block passes a nonzero flag (a barrier).
++__device__ __forceinline__ int vllm_topk_any(int flag) {
++  return __syncthreads_or(flag);
++}
++"""
++)
++
++
++def _f32(name: str, *args):
++    return T.call_extern("float32", f"vllm_topk_{name}", *args)
++
++
++def _add(a, b):
++    return _f32("add", a, b)
++
++
++def _sub(a, b):
++    return _f32("sub", a, b)
++
++
++def _mul(a, b):
++    return _f32("mul", a, b)
++
++
++def _fma(a, b, c):
++    return _f32("fma", a, b, c)
++
++
++def _div(a, b):
++    return _f32("div", a, b)
++
++
++def _max(a, b):
++    return _f32("max", a, b)
++
++
++def _min(a, b):
++    return _f32("min", a, b)
++
++
++def _exp(x):
++    return _f32("exp", x)
++
++
++def _sqrt(x):
++    return _f32("sqrt", x)
++
++
++def _log(x):
++    return T.call_extern("float32", "vllm_control_log", x)
++
++
++def _is(op: str, a, b):
++    """``a op b`` for ``op`` in lt, le, gt, ge and eq; false when either is NaN."""
++    return T.call_extern("int32", f"vllm_topk_{op}", a, b) != 0
++
++
++def _isnt(op: str, a, b):
++    """``not (a op b)``: true when either side is NaN."""
++    return T.call_extern("int32", f"vllm_topk_{op}", a, b) == 0
++
++
++def _near(a, b):
++    return T.call_extern("int32", "vllm_topk_near", a, b) != 0
++
++
++def _u32(x):
++    return T.call_extern("uint32", "vllm_topk_u32", x)
++
++
++def _i32(x):
++    return T.call_extern("int32", "vllm_topk_i32", x)
++
++
++def _warp_count(v):
++    return T.call_extern("int32", "vllm_topk_warp_count", v)
++
++
++def _any(flag):
++    """Whether ``flag`` holds for any thread of the block: a barrier, so every
++    thread asks."""
++    return T.call_extern("int32", "vllm_topk_any", T.cast(flag, T.int32)) != 0
++
++
++def _inf():
++    return T.infinity(T.float32)
++
++
++def _column(e, tx, run: int):
++    """Column of thread ``tx``'s ``e``-th element of a tile: runs of ``run``
++    consecutive columns, ``256 * run`` apart (Triton 3.7's coalesced layout)."""
++    return (e // run) * (_THREADS * run) + run * tx + e % run
++
++
++def _butterfly(lanes: int) -> tuple[int, ...]:
++    """The XOR distances of a butterfly over ``lanes`` lanes, the widest first."""
++    return tuple(lanes >> i for i in range(1, lanes.bit_length()))
++
++
++def _tree_add(values: list):
++    """Lane 0's sum of ``values``, one a lane, after a butterfly over them (XOR
++    distances ``len(values) / 2`` to 1)."""
++    while len(values) > 1:
++        half = len(values) // 2
++        values = [_add(values[i], values[i + half]) for i in range(half)]
++    return values[0]
++
++
++def _warps_add(red, offset, count: int = _WARPS):
++    """Triton's sum of ``count`` warps' partials ``red[offset:offset + count]``:
++    threads ``0..count - 1`` at XOR distances ``count / 2`` to 1."""
++    return _tree_add([red[offset + w] for w in range(count)])
++
++
++def _warps_max(red, offset):
++    value = red[offset]
++    for w in range(1, _WARPS):
++        value = _max(value, red[offset + w])
++    return value
++
++
++def _warps_min(red, offset, count: int = _WARPS):
++    value = red[offset]
++    for w in range(1, count):
++        value = _min(value, red[offset + w])
++    return value
++
++
++def _warps_count(red, offset):
++    value = red[offset]
++    for w in range(1, _WARPS):
++        value = value + red[offset + w]
++    return value
++
++
++@T.macro
++def _lanes_add(value, index, distances):
++    """``value[index]`` summed over the lanes at XOR ``distances``."""
++    for distance in distances:
++        value[index] = _add(value[index], T.shfl_xor(value[index], distance))
++
++
++@T.macro
++def _lanes_max(value, index, distances):
++    for distance in distances:
++        value[index] = _max(value[index], T.shfl_xor(value[index], distance))
++
++
++@T.macro
++def _lanes_min(value, index, distances):
++    for distance in distances:
++        value[index] = _min(value[index], T.shfl_xor(value[index], distance))
++
++
++@T.macro
++def _load(values, src, row, base, limit, other, tx, per_thread, run, vector):
++    """``values[e]`` = ``src[row, base + _column(e)]``, ``other`` from ``limit`` on
++    (Triton's masked load); with ``vector`` (16-byte aligned rows, ``run`` 4) a whole
++    run in one vector load."""
++    for r in T.unroll(per_thread // run):
++        col0 = base + r * (_THREADS * run) + run * tx
++        if vector:
++            if col0 + run <= limit:
++                for v in T.vectorized(run):
++                    values[r * run + v] = src[row, col0 + v]
++            else:
++                for v in T.unroll(run):
++                    values[r * run + v] = other
++                    if col0 + v < limit:
++                        values[r * run + v] = src[row, col0 + v]
++        else:
++            for v in T.unroll(run):
++                values[r * run + v] = other
++                if col0 + v < limit:
++                    values[r * run + v] = src[row, col0 + v]
++
++
++@T.macro
++def _store(values, dst, row, base, limit, tx, per_thread, run, vector):
++    """``_load``'s store."""
++    for r in T.unroll(per_thread // run):
++        col0 = base + r * (_THREADS * run) + run * tx
++        if vector:
++            if col0 + run <= limit:
++                for v in T.vectorized(run):
++                    dst[row, col0 + v] = values[r * run + v]
++            else:
++                for v in T.unroll(run):
++                    if col0 + v < limit:
++                        dst[row, col0 + v] = values[r * run + v]
++        else:
++            for v in T.unroll(run):
++                if col0 + v < limit:
++                    dst[row, col0 + v] = values[r * run + v]
++
++
++@T.macro
++def _ballot_runs(flags, masks, runs, per_thread, run):
++    """The warp's ballot of each element's 0/1 ``flags``, and its flags in each run
++    of the tile's columns."""
++    for e in T.unroll(per_thread):
++        masks[e] = T.call_extern("uint32", "vllm_topk_ballot", flags[e])
++    for c in T.unroll(per_thread // run):
++        runs[c] = 0
++        for v in T.unroll(run):
++            runs[c] = runs[c] + T.call_extern(
++                "int32", "vllm_topk_popc", masks[c * run + v]
++            )
++
++
++@T.macro
++def _publish_runs(red_i, runs, tx, per_thread, run):
++    """A warp's lane 0 publishes its runs' counts at ``red_i[_RUNS:]``, run-major."""
++    for c in T.unroll(per_thread // run):
++        red_i[_RUNS + c * _WARPS + tx // 32] = runs[c]
++
++
++@T.macro
++def _rank_runs(red_i, masks, flags, ranks, total, entries, tx, per_thread, run):
++    """From the published runs (after a barrier): ``ranks[e]``, the flags before
++    element ``e`` in column order (Triton's ``tl.cumsum`` less the flag), and
++    ``total[0]``, the tile's. Each warp scans every run's count, a lane taking
++    ``per_lane`` in a row; the lanes below give the rest."""
++    chunks = per_thread // run
++    per_lane = chunks * _WARPS // 32
++    lane = tx % 32
++    warp = tx // 32
++    total[0] = 0
++    for q in T.unroll(per_lane):
++        entries[q] = red_i[_RUNS + lane * per_lane + q]
++        total[0] = total[0] + entries[q]
++    inclusive = T.alloc_var(
++        T.int32, init=T.call_extern("int32", "vllm_topk_warp_scan", total[0])
++    )
++    # The flags before this lane's entry warp % per_lane: the one its warp asks for.
++    before = T.alloc_var(T.int32, init=inclusive - total[0])
++    for q in T.unroll(per_lane):
++        before = before + T.if_then_else(q < warp % per_lane, entries[q], 0)
++    total[0] = T.call_extern("int32", "vllm_topk_lane", inclusive, 31)
++    for c in T.unroll(chunks):
++        rank = T.alloc_var(
++            T.int32,
++            init=T.call_extern(
++                "int32", "vllm_topk_lane", before, (c * _WARPS + warp) // per_lane
++            ),
++        )
++        for v in T.unroll(run):
++            rank = rank + T.call_extern("int32", "vllm_topk_below", masks[c * run + v])
++        for v in T.unroll(run):
++            ranks[c * run + v] = rank
++            rank = rank + flags[c * run + v]
++
++
++@T.macro
++def _ranks(flags, masks, runs, entries, ranks, total, red_i, tx, per_thread, run):
++    """``_rank_runs`` of ``flags`` with an exchange of its own."""
++    _ballot_runs(flags, masks, runs, per_thread, run)
++    T.sync_threads()
++    if tx % 32 == 0:
++        _publish_runs(red_i, runs, tx, per_thread, run)
++    T.sync_threads()
++    _rank_runs(red_i, masks, flags, ranks, total, entries, tx, per_thread, run)
++
++
++@T.macro
++def _merge(larger, ties, index, tile_min, tile_count):
++    """``_update_min_larger_stats``: a tile's least larger value and its count merged
++    into the running ``larger[index]`` and ``ties[index]``."""
++    fresh = T.alloc_var(
++        T.int32, init=T.cast(_is("lt", tile_min, larger[index]), T.int32)
++    )
++    same = T.alloc_var(T.int32, init=T.cast(_near(tile_min, larger[index]), T.int32))
++    ties[index] = T.if_then_else(
++        fresh != 0, tile_count, ties[index] + tile_count * same
++    )
++    larger[index] = _min(larger[index], tile_min)
++
++
++# --- Split-row top-p ----------------------------------------------------------
++
++
++def _split_run(aligned: bool, vocab: int, splits: int) -> int:
++    """The split kernels' run: their tiles start at a slice's start, so for aligned
++    logits (``_aligned``) 4 (16 bytes) when the slices start at multiples of 4, else
++    the power of two in the slice length; 1 for other logits (Triton then knows only
++    4-byte aligned rows)."""
++    if not aligned:
++        return 1
++    if splits == 1:
++        return 4
++    slice_len = -(-vocab // splits)
++    return min(4, slice_len & -slice_len)
++
++
++def _filtered(k, p, row, vocab: int, has_k: bool):
++    """Whether the split pipeline filters ``row``: Triton's kernels return when ``p``
++    is at least 1, and with ``has_k`` when the row's top-k is below the vocabulary."""
++    filtered = _isnt("ge", p[row], T.float32(1))
++    if has_k:
++        filtered = filtered & (k[row] >= vocab)
++    return filtered
++
++
++@T.macro
++def _row_stats(stats, row, tx, splits, top, norm, least, finite):
++    """``_topp_sb_row_stats`` as thread ``tx``'s Triton thread reaches it: slice ``tx
++    % splits``'s partials, reduced over the lanes at XOR distances ``splits / 2`` to
++    1. The sum's first level is an FMA of the lane's own weighted sum and its
++    partner's rounded one (for one slice, the product)."""
++    entry = (row * splits + tx % splits) * 4
++    part_max = T.alloc_var(T.float32, init=stats[entry])
++    part_sum = T.alloc_var(T.float32, init=stats[entry + 1])
++    least[0] = stats[entry + 2]
++    finite[0] = stats[entry + 3]
++    top[0] = part_max
++    _lanes_max(top, 0, _butterfly(splits))
++    weight = T.alloc_var(
++        T.float32,
++        init=T.if_then_else(
++            _is("eq", part_max, -_inf()), T.float32(0), _exp(_sub(part_max, top[0]))
++        ),
++    )
++    if splits == 1:
++        norm[0] = _mul(weight, part_sum)
++    else:
++        norm[0] = _fma(
++            weight, part_sum, T.shfl_xor(_mul(weight, part_sum), splits // 2)
++        )
++        _lanes_add(norm, 0, _butterfly(splits)[1:])
++    _lanes_min(least, 0, _butterfly(splits))
++    _lanes_add(finite, 0, _butterfly(splits))
++
++
++@T.macro
++def _row_bounds(norm, least, top, finite, lo, hi, live):
++    """The search's first bounds, and whether Triton's thread goes on: it returns
++    when the row has no mass or no finite logit, or is (nearly) uniform."""
++    hi[0] = _div(T.float32(1), norm[0])
++    lo[0] = _max(_div(_exp(_sub(least[0], top[0])), norm[0]), T.float32(1e-30))
++    live[0] = T.cast(
++        _isnt("le", norm[0], T.float32(0))
++        & _isnt("lt", finite[0], T.float32(1))
++        & _isnt("le", hi[0], _mul(lo[0], T.float32(1.0 + 1e-6))),
++        T.int32,
++    )
++
++
++def _slice_lanes(splits: int) -> tuple[int, ...]:
++    """XOR distances between the lanes of a warp that hold a ladder slot's other
++    slices in Triton's ``[splits, 8]`` layout (slice ``(lane / 8) % splits``)."""
++    return {1: (), 2: (8,)}.get(splits, (16, 8))
++
++
++@T.macro
++def _ladder_sums(parts, base, tx, splits, red, mass, gmin, nmin):
++    """``_topp_sb_combine``'s reductions over the slices for ladder slot ``tx % 8``,
++    from the round's partials at ``parts[base:]`` as Triton's ``[splits, 8]`` layout
++    holds them (slice ``(tx / 8) % splits``): the lanes 16 and 8 apart (8 alone for
++    two slices), then for more than four slices the first lanes of ``splits / 4``
++    warps, as threads combine them at XOR distances ``splits / 8`` to 1. Every thread
++    gets its slot's sums; the count at the least larger value waits for that value."""
++    slot = tx % FANOUT
++    warp = tx // 32
++    width = splits // 4
++    entry = base + ((tx // FANOUT) % splits) * FANOUT * 3 + slot * 3
++    part_minl = T.alloc_var(T.float32, init=parts[entry + 1])
++    part_nmin = T.alloc_var(T.float32, init=parts[entry + 2])
++    mass[0] = parts[entry]
++    gmin[0] = part_minl
++    _lanes_add(mass, 0, _slice_lanes(splits))
++    _lanes_min(gmin, 0, _slice_lanes(splits))
++    if splits >= 8:
++        T.sync_threads()
++        if (tx % 32 < FANOUT) & (warp < width):
++            red[slot * width + warp] = mass[0]
++            red[(FANOUT + slot) * width + warp] = gmin[0]
++        T.sync_threads()
++        mass[0] = _warps_add(red, slot * width, width)
++        gmin[0] = _warps_min(red, (FANOUT + slot) * width, width)
++    nmin[0] = T.if_then_else(_near(part_minl, gmin[0]), part_nmin, T.float32(0))
++    _lanes_add(nmin, 0, _slice_lanes(splits))
++    if splits >= 8:
++        T.sync_threads()
++        if (tx % 32 < FANOUT) & (warp < width):
++            red[slot * width + warp] = nmin[0]
++        T.sync_threads()
++        nmin[0] = _warps_add(red, slot * width, width)
++
++
++def _ladder(lo, hi, slot):
++    """Ladder slot ``slot``'s pivot (``_topp_sb_ladder``): ``lo * exp(log(hi / lo) *
++    (slot + 1) / 9)``."""
++    return _mul(
++        lo,
++        _exp(
++            _div(
++                _mul(_log(_div(hi, lo)), T.cast(slot + 1, T.float32)),
++                T.float32(FANOUT + 1),
++            )
++        ),
++    )
++
++
++@T.macro
++def _ladder_marks(mark, ladder, mass, gmin, nmin, threshold, slot):
++    """The slot's verdicts, as its group of eight lanes reduces them (XOR distances
++    4, 2 and 1): ``mark[0]`` the last slot whose mass reaches ``threshold`` and falls
++    below it without its least larger values (``ok``), ``mark[1]`` the last whose
++    mass reaches it (``ge``), each -1 for none; ``mark[2]`` the greatest pivot whose
++    mass reaches it, ``mark[3]`` the least other pivot."""
++    ge = _is("ge", mass[0], threshold)
++    mark[0] = T.if_then_else(
++        ge & _is("lt", _fma(-gmin[0], nmin[0], mass[0]), threshold),
++        T.cast(slot, T.float32),
++        T.float32(-1),
++    )
++    mark[1] = T.if_then_else(ge, T.cast(slot, T.float32), T.float32(-1))
++    mark[2] = T.if_then_else(ge, ladder[0], -_inf())
++    mark[3] = T.if_then_else(ge, _inf(), ladder[0])
++    _lanes_max(mark, 0, (4, 2, 1))
++    _lanes_max(mark, 1, (4, 2, 1))
++    _lanes_max(mark, 2, (4, 2, 1))
++    _lanes_min(mark, 3, (4, 2, 1))
++
++
++@T.macro
++def _ladder_picks(pick, ladder, mass, gmin, nmin, slot, mark):
++    """``pick[0:4]``: the ``(pivot, mass, gmin, nmin)`` of slot ``mark[0]`` (ok),
++    ``pick[4:8]`` slot ``mark[1]``'s (ge): each lane's own where it holds the slot,
++    else 0, summed over the group (XOR distances 4, 2 and 1)."""
++    for half in T.unroll(2):
++        mine = slot == _i32(mark[half])
++        pick[half * 4] = T.if_then_else(mine, ladder[0], T.float32(0))
++        pick[half * 4 + 1] = T.if_then_else(mine, mass[0], T.float32(0))
++        pick[half * 4 + 2] = T.if_then_else(mine, gmin[0], T.float32(0))
++        pick[half * 4 + 3] = T.if_then_else(mine, nmin[0], T.float32(0))
++    for i in T.unroll(8):
++        _lanes_add(pick, i, (4, 2, 1))
++
++
++# The mask kernel's search state besides the bounds, as Triton names it.
++(_BEST, _BEST_MASS, _BEST_MINL, _BEST_NMIN, _DONE, _NOMASK, _PIVOT, _DUP, _NUMDUP,
++ _NUMKEEP, _FIN, _BEST_FIN) = range(12)  # fmt: skip
++
++
++@T.macro
++def _settle(state, lo, hi, pick, mark, threshold, norm, round_index):
++    """The rest of ``_topp_sb_combine`` at round ``round_index`` of the mask kernel's
++    chain, and its bookkeeping (``fin``, ``best_fin``), for a thread whose search
++    goes on (``state[_DONE]`` 0)."""
++    best_sel = T.alloc_var(T.float32, init=T.float32(-1))
++    if _is("ge", mark[1], T.float32(0)):  # noqa: SIM102
++        if _is("gt", pick[4], state[_BEST]):
++            state[_BEST] = pick[4]
++            state[_BEST_MASS] = pick[5]
++            state[_BEST_MINL] = pick[6]
++            state[_BEST_NMIN] = pick[7]
++            best_sel = mark[1]
++    sel_mass = T.alloc_var(T.float32, init=T.float32(0))
++    state[_NOMASK] = T.float32(0)
++    state[_PIVOT] = T.float32(0)
++    state[_DUP] = T.float32(1)
++    state[_NUMDUP] = T.float32(1)
++    state[_NUMKEEP] = T.float32(1)
++    if _is("ge", mark[0], T.float32(0)):
++        state[_PIVOT] = pick[0]
++        sel_mass = pick[1]
++        state[_DUP] = pick[2]
++        state[_NUMDUP] = pick[3]
++        state[_DONE] = T.float32(1)
++    else:
++        lo[0] = _max(lo[0], mark[2])
++        hi[0] = _min(hi[0], mark[3])
++        if (round_index == ROUNDS - 1) | _isnt(
++            "gt", hi[0], _mul(lo[0], T.float32(1.0 + 1e-7))
++        ):
++            # Out of rounds or the range collapsed: the tightest pivot whose mass
++            # reaches p, or the whole row when none did.
++            if _is("gt", state[_BEST], T.float32(0)):
++                state[_PIVOT] = state[_BEST]
++                sel_mass = state[_BEST_MASS]
++                state[_DUP] = state[_BEST_MINL]
++                state[_NUMDUP] = state[_BEST_NMIN]
++            else:
++                state[_NOMASK] = T.float32(1)
++            state[_DONE] = T.float32(1)
++    if _isnt("eq", state[_DONE], T.float32(0)) & _is(
++        "eq", state[_NOMASK], T.float32(0)
++    ):
++        # A pivot at or above the maximum would mask everything; numkeep of the
++        # boundary value's numdup copies keep the mass at least p.
++        state[_NOMASK] = T.if_then_else(
++            _is("ge", _mul(state[_PIVOT], norm[0]), T.float32(1)),
++            T.float32(1),
++            T.float32(0),
++        )
++        state[_NUMKEEP] = _min(
++            _max(
++                _sub(
++                    state[_NUMDUP],
++                    T.cast(
++                        _u32(
++                            _div(
++                                _max(_sub(sel_mass, threshold), T.float32(0)),
++                                state[_DUP],
++                            )
++                        ),
++                        T.float32,
++                    ),
++                ),
++                T.float32(1),
++            ),
++            state[_NUMDUP],
++        )
++    if _is("ge", mark[0], T.float32(0)):
++        state[_FIN] = _add(T.cast(round_index * FANOUT, T.float32), mark[0])
++    if _is("ge", best_sel, T.float32(0)):
++        state[_BEST_FIN] = _add(T.cast(round_index * FANOUT, T.float32), best_sel)
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topp_stats_kernel(vocab: int, splits: int, has_k: bool, aligned: bool):
++    """``_topp_sb_stats_kernel`` (eight warps, BLOCK 8192): a block a ``(row,
++    slice)`` of the rows the split pipeline filters (``_filtered``): the slice's
++    maximum, its sum of ``exp(x - maximum)`` rescaled tile by tile (an FMA), its
++    least finite logit and its count of finite logits, into ``stats[(row * splits +
++    slice) * 4:]``. Tiles of 8192 columns from the slice's start, a thread's 32
++    elements in runs of ``_split_run``."""
++    rows, stats_len = T.dynamic("rows, stats_len")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    run = _split_run(aligned, vocab, splits)
++    slice_len = -(-vocab // splits)
++    per_thread = BLOCK // _THREADS
++
++    @T.prim_func
++    def topp_stats(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), T.float32),
++        stats: T.Tensor((stats_len,), T.float32),
++        k: T.Tensor((rows,), T.int32),
++        p: T.Tensor((rows,), T.float32),
++    ):
++        with T.Kernel(rows * splits, threads=_THREADS) as pid:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            values = T.alloc_local((per_thread,), T.float32)
++            terms = T.alloc_local((per_thread,), T.float32)
++            part = T.alloc_local((2,), T.float32)
++            count = T.alloc_local((1,), T.int32)
++            maximum = T.alloc_local((1,), T.float32)
++            exp_sum = T.alloc_local((1,), T.float32)
++            minimum = T.alloc_local((1,), T.float32)
++            finite = T.alloc_local((1,), T.float32)
++            red = T.alloc_shared((2 * _WARPS,), T.float32)
++            red_i = T.alloc_shared((_WARPS,), T.int32)
++            if run == 4:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++            row = pid // splits
++            part_index = pid % splits
++            start = part_index * slice_len
++            end = T.min(start + slice_len, vocab)
++            if _filtered(k, p, row, vocab, has_k):
++                maximum[0] = -_inf()
++                exp_sum[0] = T.float32(0)
++                minimum[0] = _inf()
++                finite[0] = T.float32(0)
++                for tile in T.serial(-(-slice_len // BLOCK)):
++                    base = start + tile * BLOCK
++                    if base < end:
++                        _load(values, logits, row, base, end, -_inf(), tx,
++                              per_thread, run, run == 4)  # fmt: skip
++                        part[0] = values[0]
++                        for e in T.unroll(1, per_thread):
++                            part[0] = _max(part[0], values[e])
++                        _lanes_max(part, 0, _WARP_DISTANCES)
++                        T.sync_threads()
++                        if tx % 32 == 0:
++                            red[tx // 32] = part[0]
++                        T.sync_threads()
++                        top = T.alloc_var(
++                            T.float32, init=_max(maximum[0], _warps_max(red, 0))
++                        )
++                        rescale = T.alloc_var(
++                            T.float32,
++                            init=T.if_then_else(
++                                _is("eq", maximum[0], -_inf()),
++                                T.float32(0),
++                                _exp(_sub(maximum[0], top)),
++                            ),
++                        )
++                        part[1] = _inf()
++                        count[0] = 0
++                        for e in T.unroll(per_thread):
++                            live = _is("gt", values[e], -_inf())
++                            terms[e] = T.if_then_else(
++                                live, _exp(_sub(values[e], top)), T.float32(0)
++                            )
++                            part[1] = _min(
++                                part[1], T.if_then_else(live, values[e], _inf())
++                            )
++                            count[0] = count[0] + T.cast(live, T.int32)
++                        part[0] = _add(terms[0], terms[1])
++                        for e in T.unroll(2, per_thread):
++                            part[0] = _add(part[0], terms[e])
++                        _lanes_add(part, 0, _WARP_DISTANCES)
++                        _lanes_min(part, 1, _WARP_DISTANCES)
++                        count[0] = _warp_count(count[0])
++                        T.sync_threads()
++                        if tx % 32 == 0:
++                            red[tx // 32] = part[0]
++                            red[_WARPS + tx // 32] = part[1]
++                            red_i[tx // 32] = count[0]
++                        T.sync_threads()
++                        exp_sum[0] = _fma(exp_sum[0], rescale, _warps_add(red, 0))
++                        maximum[0] = top
++                        minimum[0] = _min(minimum[0], _warps_min(red, _WARPS))
++                        finite[0] = _add(
++                            finite[0], T.cast(_warps_count(red_i, 0), T.float32)
++                        )
++                if tx == 0:
++                    entry = (row * splits + part_index) * 4
++                    stats[entry] = maximum[0]
++                    stats[entry + 1] = exp_sum[0]
++                    stats[entry + 2] = minimum[0]
++                    stats[entry + 3] = finite[0]
++
++    return topp_stats
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topp_step_kernel(vocab: int, splits: int, has_k: bool, aligned: bool):
++    """``_topp_sb_step_kernel`` (eight warps, BLOCK 2048) at round ``round_``: a block
++    a ``(row, slice)``. Each thread replays the rounds before with its own lane's row
++    statistics (``_row_stats``) and, while the search goes on, sweeps the slice in
++    tiles of 2048 against its eight ladder pivots: a column's probability comes from
++    the thread whose run holds it (``_split_run``), then column ``256 * i + tx`` goes
++    to thread ``tx`` through shared memory, as Triton converts its layout, and each
++    slot sums its thread's in that order. Every slot's ``(mass, least larger value,
++    its count)`` goes to ``parts``."""
++    rows, stats_len, parts_len = T.dynamic("rows, stats_len, parts_len")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    run = _split_run(aligned, vocab, splits)
++    slice_len = -(-vocab // splits)
++    per_thread = STEP_BLOCK // _THREADS
++
++    @T.prim_func
++    def topp_step(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), T.float32),
++        stats: T.Tensor((stats_len,), T.float32),
++        parts: T.Tensor((parts_len,), T.float32),
++        k: T.Tensor((rows,), T.int32),
++        p: T.Tensor((rows,), T.float32),
++        round_: T.int32,
++    ):
++        with T.Kernel(rows * splits, threads=_THREADS) as pid:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            slot = tx % FANOUT
++            values = T.alloc_local((per_thread,), T.float32)
++            probs = T.alloc_local((per_thread,), T.float32)
++            top = T.alloc_local((1,), T.float32)
++            norm = T.alloc_local((1,), T.float32)
++            least = T.alloc_local((1,), T.float32)
++            finite = T.alloc_local((1,), T.float32)
++            lo = T.alloc_local((1,), T.float32)
++            hi = T.alloc_local((1,), T.float32)
++            live = T.alloc_local((1,), T.int32)
++            done = T.alloc_local((1,), T.int32)
++            mass = T.alloc_local((1,), T.float32)
++            gmin = T.alloc_local((1,), T.float32)
++            nmin = T.alloc_local((1,), T.float32)
++            ladder = T.alloc_local((FANOUT,), T.float32)
++            mark = T.alloc_local((4,), T.float32)
++            sums = T.alloc_local((FANOUT,), T.float32)
++            lows = T.alloc_local((FANOUT,), T.float32)
++            counts = T.alloc_local((FANOUT,), T.int32)
++            slot_mass = T.alloc_local((FANOUT,), T.float32)
++            slot_minl = T.alloc_local((FANOUT,), T.float32)
++            slot_nmin = T.alloc_local((FANOUT,), T.float32)
++            red = T.alloc_shared((2 * FANOUT * _WARPS,), T.float32)
++            red_i = T.alloc_shared((FANOUT * _WARPS,), T.int32)
++            wide = T.alloc_shared((STEP_BLOCK,), T.float32)
++            if run == 4:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++            row = pid // splits
++            part_index = pid % splits
++            start = part_index * slice_len
++            end = T.min(start + slice_len, vocab)
++            threshold = p[row]
++            if _filtered(k, p, row, vocab, has_k):
++                _row_stats(stats, row, tx, splits, top, norm, least, finite)
++                _row_bounds(norm, least, top, finite, lo, hi, live)
++                done[0] = 1 - live[0]
++                if _any(live[0]):
++                    for j in T.serial(round_):
++                        if _any(done[0] == 0):
++                            _ladder_sums(
++                                parts, (row * ROUNDS + j) * splits * FANOUT * 3, tx,
++                                splits, red, mass, gmin, nmin,
++                            )  # fmt: skip
++                            ladder[0] = _ladder(lo[0], hi[0], slot)
++                            _ladder_marks(mark, ladder, mass, gmin, nmin, threshold,
++                                          slot)  # fmt: skip
++                            if done[0] == 0:
++                                if _is("ge", mark[0], T.float32(0)):
++                                    done[0] = 1
++                                else:
++                                    lo[0] = _max(lo[0], mark[2])
++                                    hi[0] = _min(hi[0], mark[3])
++                                    done[0] = T.if_then_else(
++                                        _is(
++                                            "gt",
++                                            hi[0],
++                                            _mul(lo[0], T.float32(1.0 + 1e-7)),
++                                        ),
++                                        0,
++                                        1,
++                                    )
++                    if _any(done[0] == 0):
++                        log_ratio = T.alloc_var(
++                            T.float32, init=_log(_div(hi[0], lo[0]))
++                        )
++                        for f in T.unroll(FANOUT):
++                            ladder[f] = _mul(
++                                lo[0],
++                                _exp(
++                                    _div(
++                                        _mul(log_ratio, T.cast(f + 1, T.float32)),
++                                        T.float32(FANOUT + 1),
++                                    )
++                                ),
++                            )
++                            slot_mass[f] = T.float32(0)
++                            slot_minl[f] = T.float32(1)
++                            slot_nmin[f] = T.float32(0)
++                        for tile in T.serial(-(-slice_len // STEP_BLOCK)):
++                            base = start + tile * STEP_BLOCK
++                            if base < end:
++                                _load(values, logits, row, base, end, -_inf(), tx,
++                                      per_thread, run, run == 4)  # fmt: skip
++                                T.sync_threads()
++                                for e in T.unroll(per_thread):
++                                    wide[_column(e, tx, run)] = _div(
++                                        _exp(_sub(values[e], top[0])), norm[0]
++                                    )
++                                T.sync_threads()
++                                for i in T.unroll(per_thread):
++                                    probs[i] = wide[i * _THREADS + tx]
++                                for f in T.unroll(FANOUT):
++                                    for i in T.unroll(per_thread):
++                                        values[i] = T.if_then_else(
++                                            _is("gt", probs[i], ladder[f]),
++                                            probs[i],
++                                            T.float32(0),
++                                        )
++                                    sums[f] = _add(values[0], values[1])
++                                    for i in T.unroll(2, per_thread):
++                                        sums[f] = _add(sums[f], values[i])
++                                    lows[f] = _inf()
++                                    for i in T.unroll(per_thread):
++                                        lows[f] = _min(
++                                            lows[f],
++                                            T.if_then_else(
++                                                _is("gt", probs[i], ladder[f]),
++                                                probs[i],
++                                                _inf(),
++                                            ),
++                                        )
++                                    _lanes_add(sums, f, _WARP_DISTANCES)
++                                    _lanes_min(lows, f, _WARP_DISTANCES)
++                                T.sync_threads()
++                                if tx % 32 == 0:
++                                    for f in T.unroll(FANOUT):
++                                        red[f * _WARPS + tx // 32] = sums[f]
++                                        red[(FANOUT + f) * _WARPS + tx // 32] = lows[f]
++                                T.sync_threads()
++                                for f in T.unroll(FANOUT):
++                                    sums[f] = _warps_add(red, f * _WARPS)
++                                    lows[f] = _warps_min(red, (FANOUT + f) * _WARPS)
++                                    counts[f] = 0
++                                    for i in T.unroll(per_thread):
++                                        counts[f] = counts[f] + T.cast(
++                                            _is("gt", probs[i], ladder[f])
++                                            & _near(probs[i], lows[f]),
++                                            T.int32,
++                                        )
++                                    counts[f] = _warp_count(counts[f])
++                                T.sync_threads()
++                                if tx % 32 == 0:
++                                    for f in T.unroll(FANOUT):
++                                        red_i[f * _WARPS + tx // 32] = counts[f]
++                                T.sync_threads()
++                                for f in T.unroll(FANOUT):
++                                    tally = T.alloc_var(
++                                        T.float32,
++                                        init=T.cast(
++                                            _warps_count(red_i, f * _WARPS), T.float32
++                                        ),
++                                    )
++                                    slot_nmin[f] = T.if_then_else(
++                                        _is("lt", lows[f], slot_minl[f]),
++                                        tally,
++                                        _add(
++                                            slot_nmin[f],
++                                            T.if_then_else(
++                                                _near(lows[f], slot_minl[f]),
++                                                tally,
++                                                T.float32(0),
++                                            ),
++                                        ),
++                                    )
++                                    slot_minl[f] = _min(slot_minl[f], lows[f])
++                                    slot_mass[f] = _add(slot_mass[f], sums[f])
++                        if done[0] == 0:
++                            for f in T.unroll(FANOUT):
++                                if tx == f:
++                                    entry = (
++                                        ((row * ROUNDS + round_) * splits + part_index)
++                                        * FANOUT
++                                        + f
++                                    ) * 3
++                                    parts[entry] = slot_mass[f]
++                                    parts[entry + 1] = slot_minl[f]
++                                    parts[entry + 2] = slot_nmin[f]
++
++    return topp_step
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topp_mask_kernel(vocab: int, splits: int, has_k: bool, aligned: bool):
++    """``_topp_sb_mask_kernel`` (eight warps, BLOCK 8192): a block a ``(row,
++    slice)``. Each thread replays the five rounds with its own lane's row statistics
++    and masks the columns of the slice it holds (``_split_run``) at or below its pivot
++    in logit space, keeping with ties the first ``numkeep`` copies of the boundary
++    value, counted within each tile of 8192 after the slices before, as Triton
++    counts them."""
++    rows, stats_len, parts_len = T.dynamic("rows, stats_len, parts_len")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    run = _split_run(aligned, vocab, splits)
++    slice_len = -(-vocab // splits)
++    per_thread = BLOCK // _THREADS
++
++    @T.prim_func
++    def topp_mask(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), T.float32),
++        stats: T.Tensor((stats_len,), T.float32),
++        parts: T.Tensor((parts_len,), T.float32),
++        k: T.Tensor((rows,), T.int32),
++        p: T.Tensor((rows,), T.float32),
++    ):
++        with T.Kernel(rows * splits, threads=_THREADS) as pid:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            slot = tx % FANOUT
++            values = T.alloc_local((per_thread,), T.float32)
++            flags = T.alloc_local((per_thread,), T.int32)
++            masks = T.alloc_local((per_thread,), T.uint32)
++            ranks = T.alloc_local((per_thread,), T.int32)
++            runs = T.alloc_local((per_thread,), T.int32)
++            entries = T.alloc_local((per_thread // 4,), T.int32)
++            total = T.alloc_local((1,), T.int32)
++            top = T.alloc_local((1,), T.float32)
++            norm = T.alloc_local((1,), T.float32)
++            least = T.alloc_local((1,), T.float32)
++            finite = T.alloc_local((1,), T.float32)
++            lo = T.alloc_local((1,), T.float32)
++            hi = T.alloc_local((1,), T.float32)
++            live = T.alloc_local((1,), T.int32)
++            mass = T.alloc_local((1,), T.float32)
++            gmin = T.alloc_local((1,), T.float32)
++            nmin = T.alloc_local((1,), T.float32)
++            ladder = T.alloc_local((1,), T.float32)
++            mark = T.alloc_local((4,), T.float32)
++            pick = T.alloc_local((8,), T.float32)
++            state = T.alloc_local((12,), T.float32)
++            preceding = T.alloc_local((1,), T.float32)
++            red = T.alloc_shared((2 * FANOUT * _WARPS,), T.float32)
++            red_i = T.alloc_shared((_RUN_SLOTS,), T.int32)
++            if run == 4:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++            row = pid // splits
++            part_index = pid % splits
++            start = part_index * slice_len
++            end = T.min(start + slice_len, vocab)
++            threshold = p[row]
++            if _filtered(k, p, row, vocab, has_k):
++                _row_stats(stats, row, tx, splits, top, norm, least, finite)
++                _row_bounds(norm, least, top, finite, lo, hi, live)
++                state[_BEST] = T.float32(-1)
++                state[_BEST_MASS] = T.float32(0)
++                state[_BEST_MINL] = T.float32(1)
++                state[_BEST_NMIN] = T.float32(0)
++                state[_DONE] = T.cast(1 - live[0], T.float32)
++                state[_NOMASK] = T.cast(1 - live[0], T.float32)
++                state[_PIVOT] = T.float32(0)
++                state[_DUP] = T.float32(1)
++                state[_NUMDUP] = T.float32(1)
++                state[_NUMKEEP] = T.float32(1)
++                state[_FIN] = T.float32(-1)
++                state[_BEST_FIN] = T.float32(-1)
++                if _any(live[0]):
++                    for j in T.serial(ROUNDS):
++                        if _any(_is("eq", state[_DONE], T.float32(0))):
++                            _ladder_sums(
++                                parts, (row * ROUNDS + j) * splits * FANOUT * 3, tx,
++                                splits, red, mass, gmin, nmin,
++                            )  # fmt: skip
++                            ladder[0] = _ladder(lo[0], hi[0], slot)
++                            _ladder_marks(mark, ladder, mass, gmin, nmin, threshold,
++                                          slot)  # fmt: skip
++                            _ladder_picks(pick, ladder, mass, gmin, nmin, slot, mark)
++                            if _is("eq", state[_DONE], T.float32(0)):
++                                _settle(state, lo, hi, pick, mark, threshold, norm, j)
++                    masking = T.alloc_var(
++                        T.int32,
++                        init=T.cast(_is("eq", state[_NOMASK], T.float32(0)), T.int32),
++                    )
++                    if _any(masking):
++                        if _is("lt", state[_FIN], T.float32(0)):
++                            state[_FIN] = state[_BEST_FIN]
++                        pivot_logit = T.alloc_var(
++                            T.float32,
++                            init=_add(_add(_log(state[_PIVOT]), _log(norm[0])), top[0]),
++                        )
++                        ties = T.alloc_var(
++                            T.int32,
++                            init=T.cast(
++                                (masking != 0)
++                                & _is("lt", state[_NUMKEEP], state[_NUMDUP]),
++                                T.int32,
++                            ),
++                        )
++                        # The boundary value's copies in the slices before this one:
++                        # the finalizing round's partials, slice s at lane s % splits.
++                        fin_round = T.alloc_var(
++                            T.int32, init=_i32(_div(state[_FIN], T.float32(FANOUT)))
++                        )
++                        fin_slot = T.alloc_var(
++                            T.int32,
++                            init=_i32(
++                                _fma(
++                                    T.cast(fin_round, T.float32),
++                                    T.float32(-FANOUT),
++                                    state[_FIN],
++                                )
++                            ),
++                        )
++                        preceding[0] = T.float32(0)
++                        if ties != 0:
++                            entry = (
++                                ((row * ROUNDS + fin_round) * splits + tx % splits)
++                                * FANOUT
++                                + fin_slot
++                            ) * 3
++                            if (tx % splits < part_index) & _near(
++                                parts[entry + 1], state[_DUP]
++                            ):
++                                preceding[0] = parts[entry + 2]
++                        _lanes_add(preceding, 0, _butterfly(splits))
++                        counting = T.alloc_var(
++                            T.int32, init=T.cast(_any(ties != 0), T.int32)
++                        )
++                        for tile in T.serial(-(-slice_len // BLOCK)):
++                            base = start + tile * BLOCK
++                            if base < end:
++                                _load(values, logits, row, base, end, -_inf(), tx,
++                                      per_thread, run, run == 4)  # fmt: skip
++                                if counting != 0:
++                                    for e in T.unroll(per_thread):
++                                        flags[e] = T.cast(
++                                            (ties != 0)
++                                            & _is(
++                                                "eq",
++                                                _div(
++                                                    _exp(_sub(values[e], top[0])),
++                                                    norm[0],
++                                                ),
++                                                state[_DUP],
++                                            ),
++                                            T.int32,
++                                        )
++                                    _ranks(flags, masks, runs, entries, ranks, total,
++                                           red_i, tx, per_thread, run)  # fmt: skip
++                                for e in T.unroll(per_thread):
++                                    keep = T.alloc_var(
++                                        T.int32,
++                                        init=T.cast(
++                                            _is("gt", values[e], pivot_logit), T.int32
++                                        ),
++                                    )
++                                    # A copy is kept while the copies up to it, these
++                                    # slices' and the earlier slices', are numkeep.
++                                    if counting != 0:  # noqa: SIM102
++                                        if flags[e] != 0:
++                                            keep = keep & T.cast(
++                                                _is(
++                                                    "le",
++                                                    _add(
++                                                        T.cast(ranks[e] + 1, T.float32),
++                                                        preceding[0],
++                                                    ),
++                                                    state[_NUMKEEP],
++                                                ),
++                                                T.int32,
++                                            )
++                                    values[e] = T.if_then_else(
++                                        keep != 0, values[e], -_inf()
++                                    )
++                                if masking != 0:
++                                    _store(values, logits, row, base, end, tx,
++                                           per_thread, run, run == 4)  # fmt: skip
++
++    return topp_mask
++
++
++# --- Top-k, and top-p, a block a row ------------------------------------------
++
++# The monolithic kernel's row state, as Triton names it: FP32, int32 (Triton's
++# uint32 counts, which stay below 2**31) and uint32 (where Triton's wrap).
++(_FINAL_PIVOT, _DUPLICATE_LOGIT, _MAX_LOGIT, _MIN_LOGIT, _AVG_LOGIT, _STD_LOGIT,
++ _K_PIVOT, _MIN_LARGER, _MAX_RANGE, _MIN_RANGE, _SUM_EXP_LOGITS, _P_PIVOT,
++ _P_PIVOTS_SUM) = range(13)  # fmt: skip
++(_NUM_FINITE_TOTAL, _NUM_OUTLIERS, _NUM_ITERS, _K_PIVOTS_NUM, _NUM_MIN_LARGER,
++ _SEARCH_RANGE) = range(6)  # fmt: skip
++_NUM_DUPLICATE_LOGIT, _NUM_KEEP, _NUM_KEPT = range(3)
++
++
++@T.macro
++def _keep_copies(flags, marks, ranks, total, rowu, per_thread):
++    """Triton's boundary duplicates: of the tile's copies (``marks``), keep those
++    whose count with the copies kept before stays within ``rowu[_NUM_KEEP]`` (uint32,
++    as ``rowu[_NUM_KEPT]``), and drop the rest from ``flags``."""
++    room = T.alloc_var(T.uint32, init=rowu[_NUM_KEEP] - rowu[_NUM_KEPT])
++    for e in T.unroll(per_thread):
++        if (marks[e] != 0) & (T.cast(ranks[e] + 1, T.uint32) > room):
++            flags[e] = 0
++    rowu[_NUM_KEPT] = rowu[_NUM_KEPT] + T.min(T.cast(total[0], T.uint32), room)
++
++
++def _monolithic_runs(aligned: bool, vocab: int, topp: bool) -> tuple[int, int]:
++    """Triton's runs for ``_topk_topp_kernel``'s tiles of 8192 and of 4096. A 4096
++    tile only reads or writes the program's buffer row (``pid * vocab``): the power of
++    two in the vocabulary, up to 4. The 8192 tiles read the logits (4 when aligned,
++    else 1) and, with top-p, the buffer row too: Triton takes the widest."""
++    buffer_run = min(4, vocab & -vocab)
++    run = 4 if aligned else 1
++    if topp:
++        run = max(run, buffer_run)
++    return run, buffer_run
++
++
++@T.macro
++def _sample_stats(logits, row, vocab, values, terms, part, tally, red, red_i, tx,
++                  per_thread, run, vector, rowf):  # fmt: skip
++    """The zeroth pass: the mean and the standard deviation of the finite logits
++    among the first 8192 (sums of the logits and of their squares, an FMA each)."""
++    _load(values, logits, row, 0, vocab, -_inf(), tx, per_thread, run, vector)
++    tally[0] = 0
++    for e in T.unroll(per_thread):
++        live = _is("gt", values[e], -_inf())
++        terms[e] = T.if_then_else(live, values[e], T.float32(0))
++        tally[0] = tally[0] + T.cast(live, T.int32)
++    part[0] = _add(terms[0], terms[1])
++    part[1] = _fma(terms[0], terms[0], _mul(terms[1], terms[1]))
++    for e in T.unroll(2, per_thread):
++        part[0] = _add(part[0], terms[e])
++        part[1] = _fma(terms[e], terms[e], part[1])
++    _lanes_add(part, 0, _WARP_DISTANCES)
++    _lanes_add(part, 1, _WARP_DISTANCES)
++    tally[0] = _warp_count(tally[0])
++    T.sync_threads()
++    if tx % 32 == 0:
++        red[tx // 32] = part[0]
++        red[_WARPS + tx // 32] = part[1]
++        red_i[tx // 32] = tally[0]
++    T.sync_threads()
++    count = T.alloc_var(T.int32, init=_warps_count(red_i, 0))
++    rowf[_AVG_LOGIT] = T.if_then_else(
++        count > 0, _div(_warps_add(red, 0), T.cast(count, T.float32)), T.float32(0)
++    )
++    square = T.alloc_var(
++        T.float32,
++        init=T.if_then_else(
++            count > 0,
++            _div(_warps_add(red, _WARPS), T.cast(count, T.float32)),
++            T.float32(0),
++        ),
++    )
++    rowf[_STD_LOGIT] = _sqrt(
++        _max(_fma(-rowf[_AVG_LOGIT], rowf[_AVG_LOGIT], square), T.float32(0))
++    )
++
++
++@T.macro
++def _k_search(src, src_row, tiles, tile, limit, per_thread, run, vector, k_row, values,
++              part, tally, red, red_i, tx, rowf, rowi, pivots, above, larger,
++              ties):  # fmt: skip
++    """Top-k's ternary search for the pivot above which ``k_row`` logits lie,
++    between ``rowf[_MIN_RANGE]`` and ``rowf[_MAX_RANGE]``, over ``limit`` values of
++    ``src``'s row in tiles of ``tile`` (the gathered outliers in 4096s, or the
++    vocabulary in 8192s): two pivots a step, each with its count above, its least
++    larger value and that value's count."""
++    found = T.alloc_var(T.int32, init=0)
++    for search_step in T.serial(_STEPS):  # noqa: B007
++        if found == 0:
++            span = T.alloc_var(T.float32, init=_sub(rowf[_MAX_RANGE], rowf[_MIN_RANGE]))
++            pivots[0] = _add(rowf[_MIN_RANGE], _div(span, T.float32(3)))
++            pivots[1] = _add(rowf[_MIN_RANGE], _div(_add(span, span), T.float32(3)))
++            for q in T.unroll(2):
++                above[q] = 0
++                larger[q] = _inf()
++                ties[q] = 0
++            for t in T.serial(tiles):
++                _load(values, src, src_row, t * tile, limit, -_inf(), tx, per_thread,
++                      run, vector)  # fmt: skip
++                for q in T.unroll(2):
++                    part[q] = _inf()
++                    tally[q] = 0
++                    for e in T.unroll(per_thread):
++                        over = _is("gt", values[e], pivots[q])
++                        tally[q] = tally[q] + T.cast(over, T.int32)
++                        part[q] = _min(part[q], T.if_then_else(over, values[e], _inf()))
++                    tally[q] = _warp_count(tally[q])
++                    _lanes_min(part, q, _WARP_DISTANCES)
++                T.sync_threads()
++                if tx % 32 == 0:
++                    for q in T.unroll(2):
++                        red[q * _WARPS + tx // 32] = part[q]
++                        red_i[q * _WARPS + tx // 32] = tally[q]
++                T.sync_threads()
++                for q in T.unroll(2):
++                    part[q] = _warps_min(red, q * _WARPS)
++                    above[q] = above[q] + _warps_count(red_i, q * _WARPS)
++                    tally[q] = 0
++                    for e in T.unroll(per_thread):
++                        tally[q] = tally[q] + T.cast(
++                            _is("gt", values[e], pivots[q]) & _near(values[e], part[q]),
++                            T.int32,
++                        )
++                    tally[q] = _warp_count(tally[q])
++                T.sync_threads()
++                if tx % 32 == 0:
++                    for q in T.unroll(2):
++                        red_i[(2 + q) * _WARPS + tx // 32] = tally[q]
++                T.sync_threads()
++                for q in T.unroll(2):
++                    _merge(
++                        larger, ties, q, part[q], _warps_count(red_i, (2 + q) * _WARPS)
++                    )
++            # A pivot that keeps k without its least larger copies ends the search,
++            # the second over the first.
++            for q in T.unroll(2):
++                if (above[q] >= k_row) & (above[q] - ties[q] < k_row):
++                    rowf[_K_PIVOT] = pivots[q]
++                    rowi[_K_PIVOTS_NUM] = above[q]
++                    rowf[_MIN_LARGER] = larger[q]
++                    rowi[_NUM_MIN_LARGER] = ties[q]
++                    found = 1
++            if above[1] > k_row:
++                rowf[_MIN_RANGE] = pivots[1]
++            elif above[0] > k_row:
++                rowf[_MIN_RANGE] = pivots[0]
++            if above[0] < k_row:
++                rowf[_MAX_RANGE] = pivots[0]
++            elif above[1] < k_row:
++                rowf[_MAX_RANGE] = pivots[1]
++            rowi[_NUM_ITERS] = rowi[_NUM_ITERS] + 1
++            if (rowi[_NUM_ITERS] >= _STEPS) | _near(rowf[_MIN_RANGE], rowf[_MAX_RANGE]):
++                rowf[_K_PIVOT] = _div(
++                    _add(rowf[_MAX_RANGE], rowf[_MIN_RANGE]), T.float32(2)
++                )
++                rowf[_MIN_LARGER] = larger[0]
++                rowi[_NUM_MIN_LARGER] = ties[0]
++                found = 1
++
++
++@T.macro
++def _p_search(buffer, pid, tiles, tile, limit, per_thread, run, vector, threshold,
++              values, terms, part, tally, red, red_i, tx, rowf, rowi, larger,
++              ties):  # fmt: skip
++    """Top-p's binary search for the probability pivot between ``rowf[_MIN_RANGE]``
++    and ``rowf[_MAX_RANGE]``, over ``limit`` probabilities of the program's buffer row
++    in tiles of ``tile``: the mass above the pivot (a sum of products), its least
++    larger probability and that probability's count."""
++    rowf[_P_PIVOT] = T.float32(1)
++    rowf[_MIN_LARGER] = T.float32(1)
++    rowi[_NUM_MIN_LARGER] = 0
++    rowf[_P_PIVOTS_SUM] = T.float32(0)
++    num_iters = T.alloc_var(T.int32, init=0)
++    found = T.alloc_var(T.int32, init=0)
++    for search_step in T.serial(_STEPS):  # noqa: B007
++        if found == 0:
++            pivot = T.alloc_var(
++                T.float32,
++                init=_fma(
++                    _sub(rowf[_MAX_RANGE], rowf[_MIN_RANGE]),
++                    T.float32(0.5),
++                    rowf[_MIN_RANGE],
++                ),
++            )
++            mass = T.alloc_var(T.float32, init=T.float32(0))
++            larger[0] = T.float32(1)
++            ties[0] = 0
++            for t in T.serial(tiles):
++                _load(values, buffer, pid, t * tile, limit, T.float32(0), tx,
++                      per_thread, run, vector)  # fmt: skip
++                for e in T.unroll(per_thread):
++                    terms[e] = T.if_then_else(
++                        _is("gt", values[e], pivot), T.float32(1), T.float32(0)
++                    )
++                part[0] = _fma(values[0], terms[0], _mul(values[1], terms[1]))
++                for e in T.unroll(2, per_thread):
++                    part[0] = _fma(values[e], terms[e], part[0])
++                part[1] = T.float32(1)
++                for e in T.unroll(per_thread):
++                    part[1] = _min(
++                        part[1],
++                        T.if_then_else(
++                            _is("gt", values[e], pivot), values[e], T.float32(1)
++                        ),
++                    )
++                _lanes_add(part, 0, _WARP_DISTANCES)
++                _lanes_min(part, 1, _WARP_DISTANCES)
++                T.sync_threads()
++                if tx % 32 == 0:
++                    red[tx // 32] = part[0]
++                    red[_WARPS + tx // 32] = part[1]
++                T.sync_threads()
++                mass = _add(mass, _warps_add(red, 0))
++                part[1] = _warps_min(red, _WARPS)
++                tally[0] = 0
++                for e in T.unroll(per_thread):
++                    tally[0] = tally[0] + T.cast(
++                        _is("gt", values[e], pivot) & _near(values[e], part[1]),
++                        T.int32,
++                    )
++                tally[0] = _warp_count(tally[0])
++                T.sync_threads()
++                if tx % 32 == 0:
++                    red_i[tx // 32] = tally[0]
++                T.sync_threads()
++                _merge(larger, ties, 0, part[1], _warps_count(red_i, 0))
++            if _is("ge", mass, threshold) & _is(
++                "lt", _fma(-larger[0], T.cast(ties[0], T.float32), mass), threshold
++            ):
++                rowf[_P_PIVOT] = pivot
++                rowf[_MIN_LARGER] = larger[0]
++                rowi[_NUM_MIN_LARGER] = ties[0]
++                rowf[_P_PIVOTS_SUM] = mass
++                found = 1
++            if _is("gt", mass, threshold):
++                rowf[_MIN_RANGE] = pivot
++            elif _is("lt", mass, threshold):
++                rowf[_MAX_RANGE] = pivot
++            num_iters = num_iters + 1
++            if _is("lt", _sub(rowf[_MAX_RANGE], rowf[_MIN_RANGE]), T.float32(1e-9)) | (
++                num_iters >= _STEPS
++            ):
++                rowf[_P_PIVOT] = _div(
++                    _add(rowf[_MAX_RANGE], rowf[_MIN_RANGE]), T.float32(2)
++                )
++                rowf[_MIN_LARGER] = larger[0]
++                rowi[_NUM_MIN_LARGER] = ties[0]
++                rowf[_P_PIVOTS_SUM] = mass
++                found = 1
++
++
++@T.macro
++def _p_cut(rowf, rowi, rowu, threshold, shift):
++    """The search's verdict in logit space, ``shift`` the logit the probabilities
++    were taken against: the boundary value, its copies, the copies to keep (uint32,
++    wrapping as Triton's) and the pivot."""
++    rowf[_DUPLICATE_LOGIT] = _add(
++        _log(_mul(rowf[_MIN_LARGER], rowf[_SUM_EXP_LOGITS])), shift
++    )
++    rowu[_NUM_DUPLICATE_LOGIT] = T.cast(rowi[_NUM_MIN_LARGER], T.uint32)
++    rowu[_NUM_KEEP] = rowu[_NUM_DUPLICATE_LOGIT] - _u32(
++        _div(_sub(rowf[_P_PIVOTS_SUM], threshold), rowf[_MIN_LARGER])
++    )
++    rowu[_NUM_KEPT] = T.uint32(0)
++    rowf[_FINAL_PIVOT] = _add(_log(_mul(rowf[_P_PIVOT], rowf[_SUM_EXP_LOGITS])), shift)
++
++
++@tilelang.jit(pass_configs=_PASS)
++def topk_topp_kernel(
++    vocab: int, topk: bool, topp: bool, split_covers_ponly: bool, aligned: bool
++):
++    """``_topk_topp_kernel`` (eight warps, BLOCK_SIZE 8192, BLOCK_SIZE_TRUNC 4096,
++    MASK_VALUE -inf; ``topk``: TOPK_ENABLED, ``topp``: TOPP_ENABLED,
++    ``split_covers_ponly``: SPLIT_COVERS_PONLY): a block a program, the programs
++    taking the rows in turn, each with its row of ``buffer``. The vocabulary in tiles
++    of 8192 and the buffer's gathered values in tiles of 4096 (8192 for the full
++    softmax), each in Triton's runs (``_monolithic_runs``); every reduction ends in
++    all threads, as Triton's thread 0 shares it."""
++    rows, programs = T.dynamic("rows, programs")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    run, buffer_run = _monolithic_runs(aligned, vocab, topp)
++    tiles = -(-vocab // BLOCK)
++    wide = BLOCK // _THREADS
++    narrow = TRUNC_BLOCK // _THREADS
++    narrow_vector = buffer_run == 4
++    wide_vector = run == 4 and buffer_run == 4
++
++    @T.macro
++    def topk_pivot(logits, buffer, percentile_to_std, row, pid, k_row, values, terms,
++                   flags, masks, ranks, runs, entries, total, part, tally, pivots,
++                   above, larger, ties, red, red_i, tx, rowf, rowi,
++                   rowu):  # fmt: skip
++        """Top-k: the zeroth pass, the first (the outliers above a Gaussian's k-th
++        percentile, gathered), the ternary search, and the pivot with the boundary
++        duplicates to keep."""
++        _sample_stats(logits, row, vocab, values, terms, part, tally, red, red_i, tx,
++                      wide, run, aligned, rowf)  # fmt: skip
++        percentile = T.min(
++            _u32(
++                _mul(_div(T.cast(k_row, T.float32), T.float32(vocab)), T.float32(200))
++            ),
++            T.uint32(199),
++        )
++        sigma = T.alloc_var(
++            T.float32, init=percentile_to_std[T.cast(percentile, T.int32)]
++        )
++        sigma = _fma(T.abs(sigma), T.float32(-0.15), sigma)
++        outlier_pivot = T.alloc_var(
++            T.float32, init=_fma(rowf[_STD_LOGIT], sigma, rowf[_AVG_LOGIT])
++        )
++        # First pass.
++        rowi[_NUM_FINITE_TOTAL] = 0
++        rowi[_NUM_OUTLIERS] = 0
++        for t in T.serial(tiles):
++            base = t * BLOCK
++            _load(values, logits, row, base, vocab, -_inf(), tx, wide, run, aligned)
++            part[0] = values[0]
++            part[1] = _inf()
++            tally[0] = 0
++            for e in T.unroll(wide):
++                live = _is("gt", values[e], -_inf())
++                part[0] = _max(part[0], values[e])
++                part[1] = _min(part[1], T.if_then_else(live, values[e], _inf()))
++                tally[0] = tally[0] + T.cast(live, T.int32)
++                flags[e] = T.cast(
++                    _is("gt", values[e], outlier_pivot)
++                    & (base + _column(e, tx, run) < vocab),
++                    T.int32,
++                )
++            _lanes_max(part, 0, _WARP_DISTANCES)
++            _lanes_min(part, 1, _WARP_DISTANCES)
++            tally[0] = _warp_count(tally[0])
++            _ballot_runs(flags, masks, runs, wide, run)
++            T.sync_threads()
++            if tx % 32 == 0:
++                red[tx // 32] = part[0]
++                red[_WARPS + tx // 32] = part[1]
++                red_i[tx // 32] = tally[0]
++                _publish_runs(red_i, runs, tx, wide, run)
++            T.sync_threads()
++            rowf[_MAX_LOGIT] = _max(rowf[_MAX_LOGIT], _warps_max(red, 0))
++            rowf[_MIN_LOGIT] = _min(rowf[_MIN_LOGIT], _warps_min(red, _WARPS))
++            rowi[_NUM_FINITE_TOTAL] = rowi[_NUM_FINITE_TOTAL] + _warps_count(red_i, 0)
++            _rank_runs(red_i, masks, flags, ranks, total, entries, tx, wide, run)
++            for e in T.unroll(wide):
++                if flags[e] != 0:
++                    buffer[pid, rowi[_NUM_OUTLIERS] + ranks[e]] = values[e]
++            rowi[_NUM_OUTLIERS] = rowi[_NUM_OUTLIERS] + total[0]
++        # Every thread reads what the others gathered.
++        T.sync_threads()
++        # No finite logit (all -inf): the search converges to -inf.
++        rowf[_MIN_LOGIT] = _min(rowf[_MIN_LOGIT], rowf[_MAX_LOGIT])
++        # Second passes.
++        rowi[_NUM_ITERS] = 0
++        rowf[_K_PIVOT] = _inf()
++        rowi[_K_PIVOTS_NUM] = 0
++        rowf[_MIN_LARGER] = _inf()
++        rowi[_NUM_MIN_LARGER] = 0
++        rowf[_MAX_RANGE] = rowf[_MAX_LOGIT]
++        if rowi[_NUM_OUTLIERS] > k_row:
++            rowf[_MIN_RANGE] = outlier_pivot
++            _k_search(buffer, pid, T.ceildiv(rowi[_NUM_OUTLIERS], TRUNC_BLOCK),
++                      TRUNC_BLOCK, rowi[_NUM_OUTLIERS], narrow, buffer_run,
++                      narrow_vector, k_row, values, part, tally, red, red_i, tx, rowf,
++                      rowi, pivots, above, larger, ties)  # fmt: skip
++        else:
++            # The outliers missed: search the whole vocabulary.
++            rowf[_MIN_RANGE] = rowf[_MIN_LOGIT]
++            _k_search(logits, row, tiles, BLOCK, vocab, wide, run, aligned, k_row,
++                      values, part, tally, red, red_i, tx, rowf, rowi, pivots, above,
++                      larger, ties)  # fmt: skip
++        rowf[_DUPLICATE_LOGIT] = rowf[_MIN_LARGER]
++        rowu[_NUM_DUPLICATE_LOGIT] = T.cast(rowi[_NUM_MIN_LARGER], T.uint32)
++        rowu[_NUM_KEEP] = rowu[_NUM_DUPLICATE_LOGIT] - (
++            T.cast(rowi[_K_PIVOTS_NUM], T.uint32) - T.cast(k_row, T.uint32)
++        )
++        rowu[_NUM_KEPT] = T.uint32(0)
++        # With k finite logits or fewer (a grammar mask), keep them all.
++        rowf[_FINAL_PIVOT] = T.if_then_else(
++            rowi[_NUM_FINITE_TOTAL] > k_row, rowf[_K_PIVOT], -_inf()
++        )
++
++    @T.macro
++    def topp_over_topk(logits, buffer, row, pid, k_row, threshold, values, terms,
++                       flags, marks, masks, ranks, runs, entries, total, part, tally,
++                       larger, ties, red, red_i, tx, rowf, rowi,
++                       rowu):  # fmt: skip
++        """Top-p over what top-k kept: the probabilities above the k pivot, without
++        the boundary duplicates top-k drops, from the gathered outliers when they
++        hold k (gathered again from the vocabulary when they missed); the binary
++        search over them; the pivot in logit space."""
++        rowf[_MIN_LOGIT] = rowf[_K_PIVOT]
++        rowf[_SUM_EXP_LOGITS] = T.float32(0)
++        rowi[_SEARCH_RANGE] = rowi[_NUM_OUTLIERS]
++        if rowi[_NUM_OUTLIERS] > k_row:
++            # Third pass: the sum of exp(x - max_logit) over the outliers kept.
++            for t in T.serial(T.ceildiv(rowi[_SEARCH_RANGE], TRUNC_BLOCK)):
++                base = t * TRUNC_BLOCK
++                _load(values, buffer, pid, base, rowi[_SEARCH_RANGE], -_inf(), tx,
++                      narrow, buffer_run, narrow_vector)  # fmt: skip
++                for e in T.unroll(narrow):
++                    flags[e] = T.cast(
++                        _is("gt", values[e], rowf[_MIN_LOGIT])
++                        & (base + _column(e, tx, buffer_run) < rowi[_SEARCH_RANGE]),
++                        T.int32,
++                    )
++                if rowu[_NUM_KEEP] < rowu[_NUM_DUPLICATE_LOGIT]:
++                    for e in T.unroll(narrow):
++                        marks[e] = T.cast(
++                            _near(values[e], rowf[_DUPLICATE_LOGIT]), T.int32
++                        )
++                    _ranks(marks, masks, runs, entries, ranks, total, red_i, tx,
++                           narrow, buffer_run)  # fmt: skip
++                    _keep_copies(flags, marks, ranks, total, rowu, narrow)
++                for e in T.unroll(narrow):
++                    terms[e] = _exp(
++                        _sub(
++                            T.if_then_else(flags[e] != 0, values[e], -_inf()),
++                            rowf[_MAX_LOGIT],
++                        )
++                    )
++                part[0] = _add(terms[0], terms[1])
++                for e in T.unroll(2, narrow):
++                    part[0] = _add(part[0], terms[e])
++                _lanes_add(part, 0, _WARP_DISTANCES)
++                T.sync_threads()
++                if tx % 32 == 0:
++                    red[tx // 32] = part[0]
++                T.sync_threads()
++                rowf[_SUM_EXP_LOGITS] = _add(rowf[_SUM_EXP_LOGITS], _warps_add(red, 0))
++            # Fourth pass: every outlier's probability, in place.
++            for t in T.serial(T.ceildiv(rowi[_SEARCH_RANGE], TRUNC_BLOCK)):
++                base = t * TRUNC_BLOCK
++                _load(values, buffer, pid, base, rowi[_SEARCH_RANGE], -_inf(), tx,
++                      narrow, buffer_run, narrow_vector)  # fmt: skip
++                for e in T.unroll(narrow):
++                    values[e] = _div(
++                        _exp(_sub(values[e], rowf[_MAX_LOGIT])), rowf[_SUM_EXP_LOGITS]
++                    )
++                _store(values, buffer, pid, base, rowi[_SEARCH_RANGE], tx, narrow,
++                       buffer_run, narrow_vector)  # fmt: skip
++        else:
++            # The outliers missed: gather again above the k pivot, from the
++            # vocabulary, without the boundary duplicates dropped.
++            rowi[_SEARCH_RANGE] = 0
++            for t in T.serial(tiles):
++                base = t * BLOCK
++                _load(values, logits, row, base, vocab, -_inf(), tx, wide, run,
++                      aligned)  # fmt: skip
++                for e in T.unroll(wide):
++                    flags[e] = T.cast(
++                        _is("gt", values[e], rowf[_MIN_LOGIT])
++                        & (base + _column(e, tx, run) < vocab),
++                        T.int32,
++                    )
++                    marks[e] = T.cast(_near(values[e], rowf[_DUPLICATE_LOGIT]), T.int32)
++                _ranks(marks, masks, runs, entries, ranks, total, red_i, tx, wide,
++                       run)  # fmt: skip
++                _keep_copies(flags, marks, ranks, total, rowu, wide)
++                for e in T.unroll(wide):
++                    terms[e] = _exp(
++                        _sub(
++                            T.if_then_else(flags[e] != 0, values[e], -_inf()),
++                            rowf[_MAX_LOGIT],
++                        )
++                    )
++                part[0] = _add(terms[0], terms[1])
++                for e in T.unroll(2, wide):
++                    part[0] = _add(part[0], terms[e])
++                _lanes_add(part, 0, _WARP_DISTANCES)
++                _ballot_runs(flags, masks, runs, wide, run)
++                T.sync_threads()
++                if tx % 32 == 0:
++                    red[tx // 32] = part[0]
++                    _publish_runs(red_i, runs, tx, wide, run)
++                T.sync_threads()
++                rowf[_SUM_EXP_LOGITS] = _add(rowf[_SUM_EXP_LOGITS], _warps_add(red, 0))
++                _rank_runs(red_i, masks, flags, ranks, total, entries, tx, wide, run)
++                for e in T.unroll(wide):
++                    if flags[e] != 0:
++                        buffer[pid, rowi[_SEARCH_RANGE] + ranks[e]] = terms[e]
++                rowi[_SEARCH_RANGE] = rowi[_SEARCH_RANGE] + total[0]
++            T.sync_threads()
++            # Fourth pass: every gathered probability, in place.
++            for t in T.serial(T.ceildiv(rowi[_SEARCH_RANGE], TRUNC_BLOCK)):
++                base = t * TRUNC_BLOCK
++                _load(values, buffer, pid, base, rowi[_SEARCH_RANGE], T.float32(0),
++                      tx, narrow, buffer_run, narrow_vector)  # fmt: skip
++                for e in T.unroll(narrow):
++                    values[e] = _div(values[e], rowf[_SUM_EXP_LOGITS])
++                _store(values, buffer, pid, base, rowi[_SEARCH_RANGE], tx, narrow,
++                       buffer_run, narrow_vector)  # fmt: skip
++        rowf[_MAX_RANGE] = _div(
++            _exp(_sub(rowf[_MAX_LOGIT], rowf[_MAX_LOGIT])), rowf[_SUM_EXP_LOGITS]
++        )
++        rowf[_MIN_RANGE] = _div(
++            _exp(_sub(rowf[_MIN_LOGIT], rowf[_MAX_LOGIT])), rowf[_SUM_EXP_LOGITS]
++        )
++        # Fifth passes.
++        _p_search(buffer, pid, T.ceildiv(rowi[_SEARCH_RANGE], TRUNC_BLOCK),
++                  TRUNC_BLOCK, rowi[_SEARCH_RANGE], narrow, buffer_run, narrow_vector,
++                  threshold, values, terms, part, tally, red, red_i, tx, rowf, rowi,
++                  larger, ties)  # fmt: skip
++        _p_cut(rowf, rowi, rowu, threshold, rowf[_MAX_LOGIT])
++
++    @T.macro
++    def topp_alone(logits, buffer, normal_cdf_to_sigma, row, pid, threshold, values,
++                   terms, flags, masks, ranks, runs, entries, total, part, tally,
++                   larger, ties, red, red_i, tx, rowf, rowi, rowu):  # fmt: skip
++        """Standalone top-p: the zeroth pass, the first (the row's maximum, its least
++        finite logit, the sum of exp(x - max_sample)), the second (the probabilities
++        above a Gaussian's p-th quantile, gathered), and the binary search over them,
++        or over the full softmax when they hold less than p."""
++        _sample_stats(logits, row, vocab, values, terms, part, tally, red, red_i, tx,
++                      wide, run, aligned, rowf)  # fmt: skip
++        max_sample = T.alloc_var(
++            T.float32, init=_fma(rowf[_STD_LOGIT], T.float32(10), rowf[_AVG_LOGIT])
++        )
++        rowf[_SUM_EXP_LOGITS] = T.float32(0)
++        # First pass.
++        for t in T.serial(tiles):
++            base = t * BLOCK
++            _load(values, logits, row, base, vocab, -_inf(), tx, wide, run, aligned)
++            part[0] = values[0]
++            part[1] = _inf()
++            for e in T.unroll(wide):
++                part[0] = _max(part[0], values[e])
++                part[1] = _min(
++                    part[1],
++                    T.if_then_else(_is("gt", values[e], -_inf()), values[e], _inf()),
++                )
++                terms[e] = T.if_then_else(
++                    base + _column(e, tx, run) < vocab,
++                    _exp(_sub(values[e], max_sample)),
++                    T.float32(0),
++                )
++            part[2] = _add(terms[0], terms[1])
++            for e in T.unroll(2, wide):
++                part[2] = _add(part[2], terms[e])
++            _lanes_max(part, 0, _WARP_DISTANCES)
++            _lanes_min(part, 1, _WARP_DISTANCES)
++            _lanes_add(part, 2, _WARP_DISTANCES)
++            T.sync_threads()
++            if tx % 32 == 0:
++                red[tx // 32] = part[0]
++                red[_WARPS + tx // 32] = part[1]
++                red[2 * _WARPS + tx // 32] = part[2]
++            T.sync_threads()
++            rowf[_MAX_LOGIT] = _max(rowf[_MAX_LOGIT], _warps_max(red, 0))
++            rowf[_MIN_LOGIT] = _min(rowf[_MIN_LOGIT], _warps_min(red, _WARPS))
++            rowf[_SUM_EXP_LOGITS] = _add(
++                rowf[_SUM_EXP_LOGITS], _warps_add(red, 2 * _WARPS)
++            )
++        # No finite logit (all -inf): the search converges to -inf.
++        rowf[_MIN_LOGIT] = _min(rowf[_MIN_LOGIT], rowf[_MAX_LOGIT])
++        sigma = T.alloc_var(
++            T.float32,
++            init=normal_cdf_to_sigma[
++                T.max(0, T.min(_i32(_mul(threshold, T.float32(200))), 199))
++            ],
++        )
++        sigma = _fma(T.abs(sigma), T.float32(-0.25), sigma)
++        outlier_prob = T.alloc_var(
++            T.float32,
++            init=_div(
++                _exp(_sub(_fma(rowf[_STD_LOGIT], sigma, rowf[_AVG_LOGIT]), max_sample)),
++                rowf[_SUM_EXP_LOGITS],
++            ),
++        )
++        sum_outlier_probs = T.alloc_var(T.float32, init=T.float32(0))
++        # Second pass.
++        rowi[_NUM_OUTLIERS] = 0
++        for t in T.serial(tiles):
++            base = t * BLOCK
++            _load(values, logits, row, base, vocab, -_inf(), tx, wide, run, aligned)
++            for e in T.unroll(wide):
++                terms[e] = _div(
++                    _exp(_sub(values[e], max_sample)), rowf[_SUM_EXP_LOGITS]
++                )
++                flags[e] = T.cast(
++                    _is("gt", terms[e], outlier_prob)
++                    & (base + _column(e, tx, run) < vocab),
++                    T.int32,
++                )
++                values[e] = T.cast(flags[e], T.float32)
++            part[0] = _fma(values[0], terms[0], _mul(values[1], terms[1]))
++            for e in T.unroll(2, wide):
++                part[0] = _fma(values[e], terms[e], part[0])
++            _lanes_add(part, 0, _WARP_DISTANCES)
++            _ballot_runs(flags, masks, runs, wide, run)
++            T.sync_threads()
++            if tx % 32 == 0:
++                red[tx // 32] = part[0]
++                _publish_runs(red_i, runs, tx, wide, run)
++            T.sync_threads()
++            sum_outlier_probs = _add(sum_outlier_probs, _warps_add(red, 0))
++            _rank_runs(red_i, masks, flags, ranks, total, entries, tx, wide, run)
++            for e in T.unroll(wide):
++                if flags[e] != 0:
++                    buffer[pid, rowi[_NUM_OUTLIERS] + ranks[e]] = terms[e]
++            rowi[_NUM_OUTLIERS] = rowi[_NUM_OUTLIERS] + total[0]
++        T.sync_threads()
++        rowf[_MAX_RANGE] = _div(
++            _exp(_sub(rowf[_MAX_LOGIT], max_sample)), rowf[_SUM_EXP_LOGITS]
++        )
++        rowf[_MIN_RANGE] = _div(
++            _exp(_sub(rowf[_MIN_LOGIT], max_sample)), rowf[_SUM_EXP_LOGITS]
++        )
++        # Third passes.
++        if _is("gt", sum_outlier_probs, threshold):
++            rowf[_MIN_RANGE] = outlier_prob
++            _p_search(buffer, pid, T.ceildiv(rowi[_NUM_OUTLIERS], TRUNC_BLOCK),
++                      TRUNC_BLOCK, rowi[_NUM_OUTLIERS], narrow, buffer_run,
++                      narrow_vector, threshold, values, terms, part, tally, red, red_i,
++                      tx, rowf, rowi, larger, ties)  # fmt: skip
++        else:
++            # The full softmax in the buffer row, then the search over it.
++            for t in T.serial(tiles):
++                base = t * BLOCK
++                _load(values, logits, row, base, vocab, -_inf(), tx, wide, run,
++                      aligned)  # fmt: skip
++                for e in T.unroll(wide):
++                    values[e] = _div(
++                        _exp(_sub(values[e], max_sample)), rowf[_SUM_EXP_LOGITS]
++                    )
++                _store(values, buffer, pid, base, vocab, tx, wide, run, wide_vector)
++            T.sync_threads()
++            _p_search(buffer, pid, tiles, BLOCK, vocab, wide, run, wide_vector,
++                      threshold, values, terms, part, tally, red, red_i, tx, rowf,
++                      rowi, larger, ties)  # fmt: skip
++        _p_cut(rowf, rowi, rowu, threshold, max_sample)
++
++    @T.macro
++    def mask_row(logits, row, values, flags, marks, masks, ranks, runs, entries, total,
++                 red_i, tx, rowf, rowu):  # fmt: skip
++        """The sixth pass: everything at or below the pivot to -inf, but the first
++        ``num_keep`` copies of the boundary value in column order."""
++        for t in T.serial(tiles):
++            base = t * BLOCK
++            _load(values, logits, row, base, vocab, -_inf(), tx, wide, run, aligned)
++            for e in T.unroll(wide):
++                flags[e] = T.cast(
++                    _is("gt", values[e], rowf[_FINAL_PIVOT])
++                    & (base + _column(e, tx, run) < vocab),
++                    T.int32,
++                )
++            if rowu[_NUM_KEEP] < rowu[_NUM_DUPLICATE_LOGIT]:
++                for e in T.unroll(wide):
++                    marks[e] = T.cast(
++                        _near(values[e], rowf[_DUPLICATE_LOGIT])
++                        & (base + _column(e, tx, run) < vocab),
++                        T.int32,
++                    )
++                _ranks(marks, masks, runs, entries, ranks, total, red_i, tx, wide,
++                       run)  # fmt: skip
++                _keep_copies(flags, marks, ranks, total, rowu, wide)
++            for e in T.unroll(wide):
++                values[e] = T.if_then_else(flags[e] != 0, values[e], -_inf())
++            _store(values, logits, row, base, vocab, tx, wide, run, aligned)
++
++    @T.prim_func
++    def topk_topp(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), T.float32),
++        buffer: T.Tensor((programs, vocab), T.float32),
++        percentile_to_std: T.Tensor((200,), T.float32),
++        normal_cdf_to_sigma: T.Tensor((200,), T.float32),
++        k: T.Tensor((rows,), T.int32),
++        p: T.Tensor((rows,), T.float32),
++    ):
++        with T.Kernel(programs, threads=_THREADS) as pid:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            values = T.alloc_local((wide,), T.float32)
++            terms = T.alloc_local((wide,), T.float32)
++            flags = T.alloc_local((wide,), T.int32)
++            marks = T.alloc_local((wide,), T.int32)
++            masks = T.alloc_local((wide,), T.uint32)
++            ranks = T.alloc_local((wide,), T.int32)
++            runs = T.alloc_local((wide,), T.int32)
++            entries = T.alloc_local((wide // 4,), T.int32)
++            total = T.alloc_local((1,), T.int32)
++            part = T.alloc_local((3,), T.float32)
++            tally = T.alloc_local((2,), T.int32)
++            pivots = T.alloc_local((2,), T.float32)
++            above = T.alloc_local((2,), T.int32)
++            larger = T.alloc_local((2,), T.float32)
++            ties = T.alloc_local((2,), T.int32)
++            rowf = T.alloc_local((13,), T.float32)
++            rowi = T.alloc_local((6,), T.int32)
++            rowu = T.alloc_local((3,), T.uint32)
++            red = T.alloc_shared((_SLOTS * _WARPS,), T.float32)
++            red_i = T.alloc_shared((_RUN_SLOTS,), T.int32)
++            if aligned:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++            for step in T.serial(T.ceildiv(rows - pid, programs)):
++                row = pid + step * programs
++                rowf[_FINAL_PIVOT] = -_inf()
++                rowf[_DUPLICATE_LOGIT] = _inf()
++                rowf[_MAX_LOGIT] = -_inf()
++                rowf[_MIN_LOGIT] = _inf()
++                rowu[_NUM_DUPLICATE_LOGIT] = T.uint32(0)
++                rowu[_NUM_KEEP] = T.uint32(0)
++                rowu[_NUM_KEPT] = T.uint32(0)
++                if topk:
++                    k_row = T.alloc_var(T.int32, init=k[row])
++                    if k_row < vocab:
++                        topk_pivot(logits, buffer, percentile_to_std, row, pid, k_row,
++                                   values, terms, flags, masks, ranks, runs, entries,
++                                   total, part, tally, pivots, above, larger, ties, red,
++                                   red_i, tx, rowf, rowi, rowu)  # fmt: skip
++                        if topp:  # noqa: SIM102
++                            if rowi[_NUM_FINITE_TOTAL] > k_row:
++                                threshold = T.alloc_var(T.float32, init=p[row])
++                                if _is("lt", threshold, T.float32(1)):
++                                    topp_over_topk(logits, buffer, row, pid, k_row,
++                                                   threshold, values, terms, flags,
++                                                   marks, masks, ranks, runs, entries,
++                                                   total, part, tally, larger, ties,
++                                                   red, red_i, tx, rowf, rowi,
++                                                   rowu)  # fmt: skip
++                if topp:  # noqa: SIM102
++                    if _is("eq", rowf[_FINAL_PIVOT], -_inf()):
++                        # With the split pipeline beside it, rows without a top-k
++                        # below the vocabulary are its; rows whose top-k kept
++                        # everything stay here.
++                        standalone = T.alloc_var(T.int32, init=1)
++                        if split_covers_ponly and topk:
++                            standalone = T.cast(k[row] < vocab, T.int32)
++                        threshold = T.alloc_var(T.float32, init=p[row])
++                        if (standalone != 0) & _is("lt", threshold, T.float32(1)):
++                            topp_alone(logits, buffer, normal_cdf_to_sigma, row, pid,
++                                       threshold, values, terms, flags, masks, ranks,
++                                       runs, entries, total, part, tally, larger, ties,
++                                       red, red_i, tx, rowf, rowi, rowu)  # fmt: skip
++                # A pivot at or above the maximum (or NaN) would mask everything:
++                # it masks nothing.
++                if _is("lt", rowf[_FINAL_PIVOT], rowf[_MAX_LOGIT]) & _isnt(
++                    "eq", rowf[_FINAL_PIVOT], -_inf()
++                ):
++                    mask_row(logits, row, values, flags, marks, masks, ranks, runs,
++                             entries, total, red_i, tx, rowf, rowu)  # fmt: skip
++
++    return topk_topp
++
++
++# --- Launches -----------------------------------------------------------------
++
++
++def _aligned(logits: torch.Tensor) -> bool:
++    """Triton's specialization of the logits: a 16-byte base and a row stride of 16
++    elements."""
++    return logits.data_ptr() % 16 == 0 and logits.stride(0) % 16 == 0
++
++
++def _program_buffer(logits: torch.Tensor, programs: int, num_sm: int) -> torch.Tensor:
++    """``apply_top_k_top_p_triton``'s buffer, a row a program, from its cache."""
++    key = (logits.device, logits.dtype, logits.shape[1])
++    buffer = reference._TRITON_BUFFER_CACHE.get(key)
++    if buffer is None or buffer.shape[0] < programs:
++        size = min(next_power_of_2(programs), num_sm)
++        buffer = logits.new_empty((size, logits.shape[1]))
++        reference._TRITON_BUFFER_CACHE[key] = buffer
++    return buffer[:programs]
++
++
++def _tables(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """The normal CDF and percentile tables, ``(normal_cdf_to_sigma,
++    percentile_to_std)``, from ``apply_top_k_top_p_triton``'s cache."""
++    tables = reference._TRITON_TABLE_CACHE.get(logits.device)
++    if tables is None:
++        with gpu_sync_allowed():
++            tables = (
++                logits.new_tensor(reference._NORMAL_CDF_TO_SIGMA_TABLE),
++                logits.new_tensor(reference._PERCENTILE_TO_STD_TABLE),
++            )
++        reference._TRITON_TABLE_CACHE[logits.device] = tables
++    return tables
++
++
++def _split_workspace(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    """The split pipeline's ``(stats, parts)``, flat, from its cache."""
++    workspace = reference._TRITON_SPLIT_CACHE.get(logits.device)
++    if workspace is None:
++        workspace = {
++            "stats": logits.new_empty(
++                (SPLIT_MAX_BATCH * reference._SPLIT_MAX_SPLITS, 4)
++            ),
++            "parts": logits.new_empty(
++                (
++                    SPLIT_MAX_BATCH,
++                    ROUNDS,
++                    reference._SPLIT_MAX_SPLITS,
++                    FANOUT,
++                    3,
++                )
++            ),
++        }
++        reference._TRITON_SPLIT_CACHE[logits.device] = workspace
++    return workspace["stats"].view(-1), workspace["parts"].view(-1)
++
++
++def _launches(
++    rows: int, vocab: int, has_k: bool, has_p: bool, aligned: bool, num_sm: int
++) -> list[tuple]:
++    """The kernels ``apply_top_k_top_p`` launches, as ``(factory, key)``:
++    ``topk_topp_kernel`` unless the split pipeline takes every row (top-p alone in a
++    batch of 64 rows or fewer), then the split pipeline's when there is top-p in such
++    a batch."""
++    use_split = has_p and rows <= SPLIT_MAX_BATCH
++    launches = []
++    if not use_split or has_k:
++        launches.append((topk_topp_kernel, (vocab, has_k, has_p, use_split, aligned)))
++    if use_split:
++        splits = reference._topp_split_count(rows, num_sm)
++        launches += [
++            (factory, (vocab, splits, has_k, aligned))
++            for factory in (topp_stats_kernel, topp_step_kernel, topp_mask_kernel)
++        ]
++    return launches
++
++
++def apply_top_k_top_p(
++    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
++) -> torch.Tensor:
++    """``topk_topp_triton.apply_top_k_top_p_triton`` on CUDA, masking with -inf:
++    top-k by logit, then top-p by probability over what top-k kept. Returns the
++    masked logits (FP32): ``logits`` itself unless its columns are strided."""
++    assert logits.ndim == 2
++    assert logits.dtype == torch.float32
++    rows, vocab = logits.shape
++    if rows == 0 or (k is None and p is None):
++        return logits
++    if logits.stride(1) != 1:
++        logits = logits.contiguous()
++    if k is not None:
++        assert k.ndim == 1 and k.shape[0] == rows
++        k = k.to(torch.int32)
++    if p is not None:
++        assert p.ndim == 1 and p.shape[0] == rows
++        p = p.to(torch.float32)
++    num_sm = num_compute_units(logits.device.index)
++    # A missing k or p: the other's view stands in, never read.
++    k_arg = k if k is not None else p.view(torch.int32)
++    p_arg = p if p is not None else k.view(torch.float32)
++    for factory, key in _launches(
++        rows, vocab, k is not None, p is not None, _aligned(logits), num_sm
++    ):
++        kernel = _kernel(factory, *key)
++        if factory is topk_topp_kernel:
++            normal_cdf_to_sigma, percentile_to_std = _tables(logits)
++            buffer = _program_buffer(logits, min(num_sm, rows), num_sm)
++            kernel(logits, buffer, percentile_to_std, normal_cdf_to_sigma, k_arg, p_arg)
++            continue
++        stats, parts = _split_workspace(logits)
++        if factory is topp_stats_kernel:
++            kernel(logits, stats, k_arg, p_arg)
++        elif factory is topp_step_kernel:
++            for round_ in range(ROUNDS):
++                kernel(logits, stats, parts, k_arg, p_arg, round_)
++        else:
++            kernel(logits, stats, parts, k_arg, p_arg)
++    return logits
++
++
++def topk_topp_calls(
++    *,
++    vocab_size: int,
++    logits_strides: Sequence[int],
++    max_rows: int,
++    num_sm: int,
++) -> list:
++    """Every kernel ``apply_top_k_top_p`` launches (``_launches``) for FP32 logits
++    ``vocab_size`` wide, rows each of ``logits_strides`` apart (16-byte aligned), in
++    batches of 1 to ``max_rows`` rows, with top-k, top-p or both."""
++    launches: dict = {}
++    for aligned in dict.fromkeys(stride % 16 == 0 for stride in logits_strides):
++        for rows in range(1, max_rows + 1):
++            for has_k, has_p in ((True, False), (False, True), (True, True)):
++                for factory, key in _launches(
++                    rows, vocab_size, has_k, has_p, aligned, num_sm
++                ):
++                    # A JIT function is keyed by identity.
++                    launches.setdefault((id(factory), key), (factory, key))
++    return [_call(factory, *key) for factory, key in launches.values()]
++
++
++def register_top_k_top_p(
++    *, logits_strides: Sequence[int], vocab_size: int, max_rows: int
++) -> None:
++    """Declare ``apply_top_k_top_p``'s kernels (``topk_topp_calls``) for the
++    sampler's processed FP32 logits."""
++    declare(
++        lambda: topk_topp_calls(
++            vocab_size=vocab_size,
++            logits_strides=logits_strides,
++            max_rows=max_rows,
++            num_sm=num_compute_units(),
++        )
++    )

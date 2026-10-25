@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:10:27 +0200
+Subject: [PATCH 385/488] Constrain penalty vectorization and make reduction
+ layouts explicit
+
+Initial GPU screen: 80 tests passed; penalties hit unsupported boolx8 code generation and NaN counts needed an unconditional fragment update. Preserve the failed screen as evidence.
+---
+ vllm/v1/worker/gpu/sample/tilelang_auxiliary.py |  7 ++++---
+ vllm/v1/worker/gpu/sample/tilelang_bias.py      | 14 ++++++++------
+ vllm/v1/worker/gpu/sample/tilelang_controls.py  |  4 +++-
+ 3 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index 5806c395d..70858a855 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -202,9 +202,10 @@ def nan_count_kernel(vocab: int, stride: int, dtype: str):
+             for block in T.serial(T.ceildiv(vocab, 8192)):
+                 for col in T.Parallel(8192):
+                     index = block * 8192 + col
+-                    if index < vocab:
+-                        value = logits[T.cast(row, "int64"), index]
+-                        counts[col] += T.cast(value != value, "int32")
++                    value = T.if_then_else(
++                        index < vocab, logits[T.cast(row, "int64"), index], 0
++                    )
++                    counts[col] += T.cast(value != value, "int32")
+             T.reduce_sum(counts, total, dim=0)
+             output[row] = total[0]
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 02319f674..d68983a87 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -86,12 +86,14 @@ def bias_kernel(
+                     for block in T.serial(T.ceildiv(vocab, 8192)):
+                         for col in T.Parallel(8192):
+                             index = block * 8192 + col
+-                            if index < vocab:
+-                                alive[col] |= T.cast(
+-                                    logits[T.cast(row, "int64"), index]
+-                                    != -T.infinity("float32"),
+-                                    "int32",
+-                                )
++                            value = T.if_then_else(
++                                index < vocab,
++                                logits[T.cast(row, "int64"), index],
++                                -T.infinity("float32"),
++                            )
++                            alive[col] |= T.cast(
++                                value != -T.infinity("float32"), "int32"
++                            )
+                     T.reduce_max(alive, any_alive, dim=0)
+                     if any_alive[0] == 0:
+                         for col in T.Parallel(width):
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 867b74866..67ed6cdfc 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -115,7 +115,9 @@ def apply_min_p(logits, mapping, thresholds):
+         )
+ 
+ 
+-@tilelang.jit(pass_configs=_PASS)
++@tilelang.jit(
++    pass_configs={**_PASS, tilelang.PassConfigKey.TIR_DISABLE_VECTORIZE: True}
++)
+ def penalties_kernel(
+     vocab: int,
+     logits_stride: int,

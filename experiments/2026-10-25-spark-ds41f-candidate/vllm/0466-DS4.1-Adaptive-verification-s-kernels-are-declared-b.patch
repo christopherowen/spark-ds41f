@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:10:56 +0100
+Subject: [PATCH 466/488] [DS4.1] Adaptive verification's kernels are declared
+ before its manager exists
+
+Kernels are prepared inside memory profiling, before initialize_kv_cache
+builds the adaptive verification manager, so gating the declarations on the
+manager skipped them and the draft budget's first launch hit the frozen
+cache. The speculator's flag decides that the manager will exist.
+---
+ tests/v1/worker/test_prepare_kernels.py | 51 +++++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py      | 11 +++---
+ 2 files changed, 56 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 1c83da23e..3be04eb09 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -106,3 +106,54 @@ def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
+         "collect", "step kernels", "collected", "compile",
+         "release", "freeze", "bind", "monitor",
+     ]  # fmt: skip
++
++
++def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
++    monkeypatch,
++):
++    """Preparation runs inside memory profiling, before ``initialize_kv_cache``
++    builds the adaptive verification manager: the speculator's flag, not the
++    manager, decides that its kernels (the draft budget among them) are declared."""
++    import torch
++
++    import vllm.v1.core.kv_cache_utils as kv_cache_utils
++    import vllm.v1.worker.gpu.model_runner as runner_module
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    declared: list = []
++    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *_: [])
++    for name in (
++        "add_kv_sharing_layers_to_kv_cache_groups",
++        "get_shared_kv_cache_layers",
++        "select_kernel_block_sizes",
++        "declare_input_batch_kernels",
++    ):
++        monkeypatch.setattr(runner_module, name, lambda *_, **__: None)
++    monkeypatch.setattr(runner_module, "dead_rows_enabled", lambda: False)
++    monkeypatch.setattr(runner_module.envs, "VLLM_MOE_SKIP_PADDING", False)
++    monkeypatch.setattr(tilelang_inputs, "declare", declared.append)
++    monkeypatch.setattr(tilelang_inputs, "_call", lambda factory, *key: (factory, key))
++    steps = 5
++    runner = SimpleNamespace(
++        vllm_config=SimpleNamespace(use_request_boundary_checkpoints=False),
++        get_kv_cache_spec=dict,
++        _register_kv_cache_warmups=lambda *_: None,
++        speculator=SimpleNamespace(enable_adaptive_verification=True),
++        adaptive_verification=None,
++        batch_sharder=None,
++        num_speculative_steps=steps,
++        draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
++        req_states=SimpleNamespace(
++            next_prefill_tokens=torch.zeros(4, dtype=torch.int32),
++            draft_tokens=torch.zeros(16, steps, dtype=torch.int32),
++            register_warmups=lambda: None,
++        ),
++        model_state=SimpleNamespace(num_new_sampled_tokens_per_step=1),
++        is_last_pp_rank=False,
++        is_pooling_model=False,
++    )
++    runner_module.GPUModelRunner.declare_step_kernels(runner)
++    calls = [call for calls in declared for call in calls()]
++    budget = (tilelang_inputs.assign_draft_budget_kernel, (steps, "int64"))
++    assert budget in calls
++    assert (tilelang_inputs.fill_rows_kernel, ("int64", "float32")) in calls
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b0887928a..3d14f43e3 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2098,11 +2098,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             kv_cache_groups, self.vllm_config
+         )
+         self._register_kv_cache_warmups(kv_cache_groups, kernel_block_sizes)
+-        dead_rows = bool(
+-            getattr(self.speculator, "enable_adaptive_verification", False)
+-            and dead_rows_enabled()
+-            and self.batch_sharder is None
+-        )
++        # The manager is built with the KV cache, after preparation; the
++        # speculator's flag is what decides it exists.
++        adaptive = bool(getattr(self.speculator, "enable_adaptive_verification", False))
++        dead_rows = adaptive and dead_rows_enabled() and self.batch_sharder is None
+         samples = self.is_last_pp_rank and not self.is_pooling_model
+         if not samples:
+             # A stage before the last commits what the last stage sampled.
+@@ -2147,7 +2146,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         if envs.VLLM_MOE_SKIP_PADDING:
+             # The target's padding rows (prepare_inputs).
+             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
+-        if self.adaptive_verification is not None:
++        if adaptive:
+             steps = self.num_speculative_steps
+             width = steps + self.model_state.num_new_sampled_tokens_per_step
+             tilelang_inputs.declare(

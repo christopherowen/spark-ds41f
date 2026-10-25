@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:22:18 +0200
+Subject: [PATCH 353/488] V2 runner: exclude vocabulary padding from
+ selected-token ranks
+
+The original Triton rank scan pads to 8192 columns with -inf and counts
+padding when the scored token also has logit -inf. On DS41F this reports
+131072 instead of 129280. The first TileLang port deliberately preserved
+that result to establish reference equivalence.
+
+Now count only columns inside the real vocabulary. This is a separate
+correction after the bit-identical port: ties, NaNs and finite selected
+logits retain their previous ranks. Token IDs, scores and probabilities are
+unchanged. Rank reporting runs after token selection, including trace
+replay, and sink recovery copies ranks only as output metadata.
+
+The regression uses DS41F's actual vocabulary through compute_topk_scores
+for all three logit types, requires the corrected rank, reproduces the
+reference's overcount, and checks that the token IDs and -inf score stay
+the same. Nonfinite tests now compare to an independent real-vocabulary
+count and document the exact old-reference difference.
+
+Base: local rank port 57b48408fd39ea933c8d7d52d8ce9b69fafc70c0.
+Upstream status: local DS41F experiment, not submitted upstream.
+Validation: 27 GPU tests pass on DGX4 in candidate-4's image; all 27 also
+pass under CUDA 13.0 memcheck, zero errors. All 15 paired performance cases
+pass the unchanged gate; FP32 one row 7.79 vs 17.10 us, sixteen rows 8.42
+vs 17.45 us, 96 rows 167.99 vs 168.52 us. Offline SM121a compilation, Ruff
+and whitespace checks pass. No production promotion.
+---
+ tests/v1/worker/test_gpu_logprob_ranks.py     | 29 ++++++++++++++++---
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py |  8 ++---
+ 2 files changed, 29 insertions(+), 8 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_logprob_ranks.py b/tests/v1/worker/test_gpu_logprob_ranks.py
+index 3c6ce9e92..395034403 100644
+--- a/tests/v1/worker/test_gpu_logprob_ranks.py
++++ b/tests/v1/worker/test_gpu_logprob_ranks.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Reported ranks must preserve the previous kernel's ties, padding and NaNs."""
++"""Reported ranks count real vocabulary entries, including ties and nonfinite values."""
+ 
+ import pytest
+ import torch
+@@ -43,7 +43,7 @@ def test_ranks_match_triton(dtype, rows, vocab, padding):
+ 
+ 
+ @pytest.mark.parametrize("dtype", DTYPES)
+-def test_ranks_keep_ties_nonfinite_and_padding(dtype):
++def test_ranks_keep_ties_nonfinite_and_exclude_padding(dtype):
+     logits = torch.zeros(6, 8193, device="cuda", dtype=dtype)
+     logits[0, 0] = -torch.inf
+     logits[1, 0] = torch.inf
+@@ -54,8 +54,29 @@ def test_ranks_keep_ties_nonfinite_and_padding(dtype):
+     ids = torch.zeros(6, device="cuda", dtype=torch.int32)
+     output = torch.empty(6, device="cuda", dtype=torch.int64)
+     tilelang_logprob.token_ranks(logits, ids, output)
+-    assert torch.equal(output, reference(logits, ids))
+-    assert output.tolist() == [16384, 1, 0, 8192, 16384, 8193]
++    expected = (logits >= logits.gather(1, ids.long()[:, None])).sum(-1)
++    assert torch.equal(output, expected)
++    assert output.tolist() == [8193, 1, 0, 8192, 8193, 8193]
++    # The old kernel's only difference is its 8,191 phantom vocabulary
++    # entries when the scored token has logit -inf.
++    assert (reference(logits, ids) - output).tolist() == [8191, 0, 0, 0, 8191, 0]
++
++
++@pytest.mark.parametrize("dtype", DTYPES)
++def test_ds41f_zero_probability_token_reports_rank_within_vocabulary(dtype):
++    """Forced-token scoring must not count DS41F's 1,792 padded columns."""
++    vocab = 129280
++    logits = torch.zeros(2, vocab, device="cuda", dtype=dtype)
++    ids = torch.tensor([0, vocab - 1], device="cuda", dtype=torch.int64)
++    logits[0, 0] = -torch.inf
++    logits[1, -1] = -torch.inf
++    original_ids = ids.clone()
++    result = logprob.compute_topk_scores(logits, 0, ids, logits_mode=True)
++    assert result.selected_token_ranks.tolist() == [vocab, vocab]
++    assert reference(logits, ids).tolist() == [131072, 131072]
++    assert torch.isneginf(result.logprobs[:, 0]).all()
++    assert torch.equal(result.logprob_token_ids[:, 0], original_ids)
++    assert torch.equal(ids, original_ids)
+ 
+ 
+ def test_rank_is_independent_of_batch_and_graph_replay():
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index fef0cda7c..1c3210fba 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Selected-token ranks, with the V2 runner's Triton rank semantics."""
++"""Selected-token ranks over the real vocabulary, including ties."""
+ 
+ from collections.abc import Sequence
+ 
+@@ -47,9 +47,9 @@ def ranks_kernel(vocab: int, stride: int, dtype: str, id_dtype: str, threads: in
+                         T.cast(logits[T.cast(row, "int64"), index], "float32"),
+                         -T.infinity("float32"),
+                     )
+-                    # Triton counts its -inf padding when the selected logit
+-                    # is -inf; keep that behaviour as well as ties and NaNs.
+-                    counts[col] += T.cast(value >= selected[0], "int32")
++                    counts[col] += T.cast(
++                        (index < vocab) & (value >= selected[0]), "int32"
++                    )
+             T.reduce_sum(counts, total, dim=0)
+             output[row] = T.cast(total[0], "int64")
+ 

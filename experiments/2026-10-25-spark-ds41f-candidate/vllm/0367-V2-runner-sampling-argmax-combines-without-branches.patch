@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:15:51 +0200
+Subject: [PATCH 367/488] V2 runner sampling: argmax combines without branches
+
+The combine helpers used short-circuit && and ||, which nvcc compiled to a
+branch for each comparison: the greedy partial argmax had 107 branches where
+Triton's has 3 (selects). Bitwise operators evaluate every comparison into
+predicates, and the macros take the other pair with selects; the decision and
+the results are unchanged.
+---
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 47 +++++++++++--------
+ 1 file changed, 27 insertions(+), 20 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index b625e1122..7428899d2 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -213,20 +213,23 @@ __device__ __forceinline__ float vllm_div_full(float x, float y) {
+ 
+ // dspark.greedy._first_argmax: keep (av, ai) over (bv, bi) when av is NaN and bv
+ // is not or has a higher index, or neither is NaN and av > bv, or av == bv with
+-// ai < bi: torch.argmax's first maximum, NaN above everything.
++// ai < bi: torch.argmax's first maximum, NaN above everything. Bitwise, not
++// short-circuit, operators: every comparison is evaluated and combined in
++// predicates, as Triton's tl.where combine is, instead of a branch for each.
+ __device__ __forceinline__ int vllm_first_argmax_keep(float av, int ai, float bv,
+                                                       int bi) {
+   const bool a_nan = av != av;
+   const bool b_nan = bv != bv;
+-  return (a_nan && (!b_nan || ai < bi)) ||
+-         (!a_nan && !b_nan && (av > bv || (av == bv && ai < bi)));
++  return (a_nan & (!b_nan | (ai < bi))) |
++         (!a_nan & !b_nan & ((av > bv) | ((av == bv) & (ai < bi))));
+ }
+ 
+ // tl.max(..., return_indices=True)'s combine (tie break to the left): keep
+ // (v, i) over (w, j) when v > w, or v == w and i < j. Comparisons with NaN are
+-// false. Compiled here, out of the TileLang simplifier's reach.
++// false. Compiled here, out of the TileLang simplifier's reach; bitwise
++// operators, as above.
+ __device__ __forceinline__ int vllm_argmax_keep(float v, int i, float w, int j) {
+-  return (v > w) || ((v == w) && (i < j));
++  return (v > w) | ((v == w) & (i < j));
+ }
+ """
+ 
+@@ -326,13 +329,16 @@ def _store_run_at(dst, raw, base, row, col0, vocab, run):
+ @T.macro
+ def _keep_or_take(best, best_index, value, index):
+     """``(best, best_index)`` = Triton's argmax combine of itself and ``(value,
+-    index)``."""
+-    if (
+-        T.call_extern("int32", "vllm_argmax_keep", best[0], best_index[0], value, index)
+-        == 0
+-    ):
+-        best[0] = value
+-        best_index[0] = index
++    index)``, by selects (Triton's tl.where), the decision held in a register so
++    both selects read the pair as it was."""
++    keep = T.alloc_var(
++        T.int32,
++        init=T.call_extern(
++            "int32", "vllm_argmax_keep", best[0], best_index[0], value, index
++        ),
++    )
++    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
++    best[0] = T.if_then_else(keep != 0, best[0], value)
+ 
+ 
+ @T.macro
+@@ -1149,15 +1155,16 @@ _INT32_MAX = 2147483647
+ 
+ @T.macro
+ def _first_keep_or_take(best, best_index, value, index):
+-    """``(best, best_index)`` = ``_first_argmax`` of itself and ``(value, index)``."""
+-    if (
+-        T.call_extern(
++    """``(best, best_index)`` = ``_first_argmax`` of itself and ``(value, index)``,
++    by selects."""
++    keep = T.alloc_var(
++        T.int32,
++        init=T.call_extern(
+             "int32", "vllm_first_argmax_keep", best[0], best_index[0], value, index
+-        )
+-        == 0
+-    ):
+-        best[0] = value
+-        best_index[0] = index
++        ),
++    )
++    best_index[0] = T.if_then_else(keep != 0, best_index[0], index)
++    best[0] = T.if_then_else(keep != 0, best[0], value)
+ 
+ 
+ @T.macro

@@ -1,0 +1,281 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:56:09 +0100
+Subject: [PATCH 458/488] [DS4.1] Run 19 fixes: column copies compile, host
+ tests stub launches, bias restore
+
+- columns.py: the row's address passes inline (bound to a variable it
+  was declared void* from a const buffer, which nvcc refused), and the
+  16-byte helpers take const destinations.
+- Host tests of adaptive verification and DSpark's Markov drafter stub
+  the TileLang row scatter and hidden-row gather they now reach; the rank
+  declaration test counts the rank calls only.
+- Logit bias: with an allowed list, the all-masked check reads back the
+  allowed ids instead of rescanning the row (every other column is -inf
+  or NaN after the fill). Run 19's gate had the min-tokens structured
+  case at 96 rows 0.9% behind Triton; a new test covers biases meeting
+  the fill.
+---
+ .../spec_decode/test_adaptive_verification.py |  6 ++
+ tests/v1/worker/test_dspark_greedy_markov.py  | 10 ++-
+ tests/v1/worker/test_gpu_logprob_ranks.py     |  7 +-
+ tests/v1/worker/test_gpu_sampling_controls.py | 85 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 27 ++++--
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    | 21 ++++-
+ 6 files changed, 144 insertions(+), 12 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_adaptive_verification.py b/tests/v1/spec_decode/test_adaptive_verification.py
+index 267999ad5..110a956ff 100644
+--- a/tests/v1/spec_decode/test_adaptive_verification.py
++++ b/tests/v1/spec_decode/test_adaptive_verification.py
+@@ -106,6 +106,12 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
+     monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
+     monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
+     monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
++
++    def scatter_rows(idx_mapping, source, state, gather=False):
++        """The TileLang row scatter (its own GPU test) as torch, on the host."""
++        state[idx_mapping, : source.shape[1]] = source
++
++    monkeypatch.setattr(adaptive_module.tilelang_inputs, "scatter_rows", scatter_rows)
+     batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
+ 
+     # Two records expose the completed previous-step snapshot to CPU selection.
+diff --git a/tests/v1/worker/test_dspark_greedy_markov.py b/tests/v1/worker/test_dspark_greedy_markov.py
+index eb70579dd..8d6e9c358 100644
+--- a/tests/v1/worker/test_dspark_greedy_markov.py
++++ b/tests/v1/worker/test_dspark_greedy_markov.py
+@@ -15,9 +15,17 @@ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+ 
+ 
+ @pytest.mark.parametrize("needs_distribution", [False, True])
+-def test_sequential_sharded_sampling_preserves_each_token(needs_distribution):
++def test_sequential_sharded_sampling_preserves_each_token(
++    needs_distribution, monkeypatch
++):
++    from vllm.v1.worker.gpu import tilelang_inputs
+     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ 
++    # The heads' TileLang row gather (its own GPU test) as torch, on the host.
++    monkeypatch.setattr(
++        tilelang_inputs, "gather_hidden_rows", lambda source, indices: source[indices]
++    )
++
+     shared = torch.zeros(2, dtype=torch.int64)
+     seen_anchors = []
+ 
+diff --git a/tests/v1/worker/test_gpu_logprob_ranks.py b/tests/v1/worker/test_gpu_logprob_ranks.py
+index 395034403..514336617 100644
+--- a/tests/v1/worker/test_gpu_logprob_ranks.py
++++ b/tests/v1/worker/test_gpu_logprob_ranks.py
+@@ -135,7 +135,12 @@ def test_rank_calls_are_prepared_for_both_token_id_types():
+         logprob.register_topk_scores_warmup(
+             logits=[(torch.float32, 129280)], vocab_size=129280, logits_mode=True
+         )
+-    calls = prepare.declared_calls(registry)
++    # The ranks' two calls (one a token id type); the top-k ids declare theirs too.
++    calls = [
++        call
++        for call in prepare.declared_calls(registry)
++        if call[0] is tilelang_logprob.ranks_kernel
++    ]
+     assert len(calls) == 2
+     prepare.prepare_declared(registry)
+     logits = torch.randn(3, 129280, device="cuda")
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index d7563badc..b90296dab 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -552,3 +552,88 @@ def test_bias_restores_stops_when_only_nan_or_masked_logits_remain(index_dtype,
+         torch.isfinite(expected[0, :3]).all() and torch.isfinite(expected[1, :3]).all()
+     )
+     assert (expected[2, :3] == -float("inf")).all()
++
++
++@pytest.mark.parametrize("vocab", [128, 8193, 129280])
++def test_bias_restore_decided_by_allowed_ids_whatever_biases_meet_outside(vocab):
++    """With an allowed list, the all-masked check reads back only the allowed ids:
++    biases on ids outside the list meet the fill's -inf and leave -inf or NaN
++    (+inf, -inf, NaN and finite biases here), which never keep a row alive. Rows:
++    allowed ids all -inf (dead, nothing finite to restore), one allowed id finite
++    (stays masked), the allowed ids being stop tokens (restores), no allowed list
++    (the row's scan)."""
++    from vllm.v1.worker.gpu.sample import tilelang_bias
++    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
++
++    torch.manual_seed(70913)
++    states, rows, width = 6, 4, 8
++    logits = torch.randn((rows, vocab), device="cuda")
++    mapping = torch.tensor([2, 0, 5, 3], device="cuda", dtype=torch.int64)
++    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
++    allowed = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    num_allowed = torch.zeros(states, device="cuda", dtype=torch.int32)
++    allowed[2, :2] = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
++    num_allowed[2] = 2
++    logits[0, 3:5] = -float("inf")
++    allowed[0, :2] = torch.tensor([3, 4], device="cuda", dtype=torch.int32)
++    num_allowed[0] = 2
++    logits[1, 4] = -float("inf")
++    allowed[5, :2] = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
++    num_allowed[5] = 2
++    bias_ids = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    bias_ids[:, :4] = torch.tensor([10, 11, 12, 13], device="cuda", dtype=torch.int32)
++    biases = torch.zeros((states, width), device="cuda")
++    biases[:, :4] = torch.tensor(
++        [float("inf"), -float("inf"), float("nan"), 5.0], device="cuda"
++    )
++    num_bias = torch.full_like(num_allowed, 4)
++    min_lens = torch.full_like(num_allowed, 5)
++    num_stops = torch.full_like(num_allowed, 3)
++    restore_rows = torch.ones_like(num_allowed)
++    stops = torch.zeros((states, width), device="cuda", dtype=torch.int32)
++    stops[:, :3] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
++    expected = logits.clone()
++    _bias_kernel[(rows,)](
++        expected,
++        expected.stride(0),
++        vocab,
++        mapping,
++        num_allowed,
++        allowed,
++        allowed.stride(0),
++        num_bias,
++        bias_ids,
++        bias_ids.stride(0),
++        biases,
++        biases.stride(0),
++        positions,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        stops.stride(0),
++        BLOCK_SIZE=width,
++        LOGITS_BLOCK_SIZE=8192,
++        CHECK_ALL_MASKED_ROWS=True,
++    )
++    tilelang_bias.apply_logit_bias(
++        logits,
++        mapping,
++        positions,
++        num_allowed,
++        allowed,
++        num_bias,
++        bias_ids,
++        biases,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        True,
++    )
++    assert_bits(logits, expected)
++    # Row 2 restored its allowed stop tokens; row 1 kept its stops masked. Row 0's
++    # stops are outside its allowed list: the fill left nothing finite to restore.
++    assert torch.isfinite(expected[2, :2]).all()
++    assert (expected[1, :3] == -float("inf")).all()
++    assert (expected[0, :3] == -float("inf")).all()
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index 11bdb5a50..eb1e76ff8 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -33,13 +33,15 @@ _PASS = {
+     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
+ }
+ 
++# The destinations are const-qualified pointers: TileLang declares a buffer written
++# only through these calls read-only.
+ _HEADER = r"""
+-__device__ __forceinline__ void vllm_columns_b128(void* d, const void* s) {
+-  *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
++__device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s) {
++  *reinterpret_cast<uint4*>(const_cast<void*>(d)) = *reinterpret_cast<const uint4*>(s);
+ }
+ 
+-__device__ __forceinline__ void vllm_columns_zero_b128(void* d) {
+-  *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
++__device__ __forceinline__ void vllm_columns_zero_b128(const void* d) {
++  *reinterpret_cast<uint4*>(const_cast<void*>(d)) = make_uint4(0u, 0u, 0u, 0u);
+ }
+ """
+ 
+@@ -140,13 +142,22 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool =
+         with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
+-            whole = T.address_of(src[row, col])
++            # The whole row's address inline in each call: bound to a variable it
++            # is declared void* from a read-only (const) buffer, which nvcc refuses.
+             if col < w0:
+-                _move(T.address_of(out0[row, col]), whole, join)
++                _move(T.address_of(out0[row, col]), T.address_of(src[row, col]), join)
+             elif col < w0 + w1:
+-                _move(T.address_of(out1[row, col - w0]), whole, join)
++                _move(
++                    T.address_of(out1[row, col - w0]),
++                    T.address_of(src[row, col]),
++                    join,
++                )
+             elif col < total:
+-                _move(T.address_of(out2[row, col - w0 - w1]), whole, join)
++                _move(
++                    T.address_of(out2[row, col - w0 - w1]),
++                    T.address_of(src[row, col]),
++                    join,
++                )
+ 
+     return split_columns
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 7d1795f89..d3b34f4ad 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -73,7 +73,9 @@ def bias_kernel(
+     its loads and predicates its stores; with ``run`` 4 (16-byte aligned rows, the
+     launch checked) the whole tiles are filled and read as vectors in Triton's
+     layout. As Triton's maximum, the scan ignores NaN: a row is alive when some
+-    logit is above -inf."""
++    logit is above -inf. A row with an allowed list reads back only its allowed ids:
++    every other column is the fill's -inf, or -inf or NaN where a bias met it, so
++    they decide the scan's answer without the row's second pass."""
+     rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
+         "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
+     )
+@@ -158,6 +160,7 @@ def bias_kernel(
+             # Whether this row restores its stop tokens when nothing else is left.
+             keep = T.alloc_var(T.int32, init=restore_row[req] if restore else 0)
+             ids = T.alloc_local((per,), "int32")
++            allowed_ids = T.alloc_local((per,), "int32")
+             values = T.alloc_local((per,), "float32")
+             extra = T.alloc_local((per,), "float32")
+             row_values = T.alloc_local((row_per,), "float32")
+@@ -169,6 +172,8 @@ def bias_kernel(
+                     ids[k] = load_if(
+                         "int32", T.address_of(allowed[req, col]), 0, col < n_allowed
+                     )
++                for k in T.unroll(per):
++                    allowed_ids[k] = ids[k]
+                 for k in T.unroll(per):
+                     values[k] = load_if(
+                         "float32",
+@@ -236,7 +241,19 @@ def bias_kernel(
+                 if keep != 0:
+                     T.sync_threads()
+                     alive[0] = 0
+-                    scan_row(logits, row, tx, row_values, alive)
++                    if n_allowed > 0:
++                        for k in T.unroll(per):
++                            seen = load_if(
++                                "float32",
++                                T.address_of(logits[row, allowed_ids[k]]),
++                                -T.infinity("float32"),
++                                k * _THREADS + tx < n_allowed,
++                            )
++                            alive[0] = alive[0] | T.cast(
++                                seen > -T.infinity("float32"), "int32"
++                            )
++                    else:
++                        scan_row(logits, row, tx, row_values, alive)
+                     alive[0] = alive[0] | T.shfl_xor(alive[0], 16)
+                     alive[0] = alive[0] | T.shfl_xor(alive[0], 8)
+                     alive[0] = alive[0] | T.shfl_xor(alive[0], 4)

@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:57:21 +0200
+Subject: [PATCH 377/488] V2 runner: zero_kv_blocks reads its segment's scalars
+ before the page test
+
+The stride, block id and segment address were read only after the page size had
+been loaded and tested, a second round trip to memory; their indices always
+exist, so they are read with it.
+---
+ vllm/v1/worker/gpu/tilelang_inputs.py | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 7c0706f58..ab7df67c7 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -524,12 +524,15 @@ def zero_kv_blocks_kernel():
+         # Blocks on x (up to 2^31 - 1), as Triton's grid has them.
+         with T.Kernel(num_ids, segments, chunks, threads=_THREADS) as (b, s, cx):
+             tx = T.get_thread_binding()
+-            page = seg_page_sizes[s]
++            # Every scalar up front (its index always exists), so the loads issue
++            # together instead of the rest waiting on the page size's test.
++            page = T.alloc_var(T.int64, init=seg_page_sizes[s])
++            stride = T.alloc_var(T.int64, init=seg_block_strides[s])
++            block_id = T.alloc_var(T.int64, init=block_ids[b])
++            segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
+             first = T.cast(cx, T.int64) * _CHUNK
+             if first < page:
+-                stride = seg_block_strides[s]
+-                segment = T.make_tensor(seg_addrs[s], (_SPAN,), T.int32)
+-                base = block_ids[b] * stride
++                base = block_id * stride
+                 if T.truncmod(seg_addrs[s], 16) == 0 and T.truncmod(stride, 4) == 0:
+                     col = first + tx * _PER_THREAD
+                     if col + _PER_THREAD <= page:

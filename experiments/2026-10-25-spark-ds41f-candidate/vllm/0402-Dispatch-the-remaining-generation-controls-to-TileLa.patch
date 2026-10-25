@@ -1,0 +1,834 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:23:19 +0200
+Subject: [PATCH 402/488] Dispatch the remaining generation controls to
+ TileLang
+
+Min-p, logit bias, forbidden sequences, the thinking budget's marker cache
+and budget, prompt-logprob token ids, custom logprob token ids and the NaN
+count. Each is bit-exact with its Triton kernel, which stays as the tests'
+reference; the thinking budget and the NaN count are now declared at
+startup (the latter only when NaN counting is on), as the frozen kernel
+cache requires.
+---
+ tests/v1/worker/test_gpu_logit_bias.py       |  60 +++++++++-
+ tests/v1/worker/test_gpu_thinking_budget.py  |  71 +++++++++++-
+ vllm/v1/worker/gpu/metrics/logits.py         |  15 +--
+ vllm/v1/worker/gpu/sample/bad_words.py       |  58 ++--------
+ vllm/v1/worker/gpu/sample/logit_bias.py      | 113 ++++---------------
+ vllm/v1/worker/gpu/sample/logprob.py         |  15 ++-
+ vllm/v1/worker/gpu/sample/min_p.py           |  45 ++------
+ vllm/v1/worker/gpu/sample/prompt_logprob.py  |  44 +-------
+ vllm/v1/worker/gpu/sample/sampler.py         |   5 +
+ vllm/v1/worker/gpu/sample/thinking_budget.py |  49 ++++----
+ 10 files changed, 202 insertions(+), 273 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_logit_bias.py b/tests/v1/worker/test_gpu_logit_bias.py
+index 3e7b77c0d..17643318a 100644
+--- a/tests/v1/worker/test_gpu_logit_bias.py
++++ b/tests/v1/worker/test_gpu_logit_bias.py
+@@ -26,14 +26,64 @@ MIN_TOKENS = 10
+ POS = 5
+ 
+ 
++def triton_apply_logit_bias(
++    logits,
++    expanded_idx_mapping,
++    pos,
++    num_allowed_token_ids,
++    allowed_token_ids,
++    num_logit_bias,
++    logit_bias_token_ids,
++    logit_bias,
++    min_lens,
++    num_stop_token_ids,
++    restore_when_all_masked,
++    stop_token_ids,
++    check_all_masked_rows=False,
++):
++    """The Triton kernel the TileLang one replaced, launched as the sampler did."""
++    import triton
++
++    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
++
++    _bias_kernel[(logits.shape[0],)](
++        logits,
++        logits.stride(0),
++        logits.shape[1],
++        expanded_idx_mapping,
++        num_allowed_token_ids,
++        allowed_token_ids,
++        allowed_token_ids.stride(0),
++        num_logit_bias,
++        logit_bias_token_ids,
++        logit_bias_token_ids.stride(0),
++        logit_bias,
++        logit_bias.stride(0),
++        pos,
++        min_lens,
++        num_stop_token_ids,
++        restore_when_all_masked,
++        stop_token_ids,
++        stop_token_ids.stride(0),
++        BLOCK_SIZE=triton.next_power_of_2(
++            max(
++                allowed_token_ids.shape[-1],
++                logit_bias_token_ids.shape[-1],
++                stop_token_ids.shape[-1],
++            )
++        ),
++        LOGITS_BLOCK_SIZE=8192,
++        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
++    )
++
++
+ @pytest.fixture(params=["triton", "tilelang"], autouse=True)
+ def bias_implementation(request, monkeypatch):
+-    if request.param == "tilelang":
+-        from vllm.v1.worker.gpu.sample import logit_bias, tilelang_bias
++    # The sampler launches the TileLang kernel; the Triton one is the reference.
++    if request.param == "triton":
++        from vllm.v1.worker.gpu.sample import logit_bias
+ 
+-        monkeypatch.setattr(
+-            logit_bias, "apply_logit_bias", tilelang_bias.apply_logit_bias
+-        )
++        monkeypatch.setattr(logit_bias, "apply_logit_bias", triton_apply_logit_bias)
+ 
+ 
+ def _params(structured: bool) -> SamplingParams:
+diff --git a/tests/v1/worker/test_gpu_thinking_budget.py b/tests/v1/worker/test_gpu_thinking_budget.py
+index e967749ef..20c09cb01 100644
+--- a/tests/v1/worker/test_gpu_thinking_budget.py
++++ b/tests/v1/worker/test_gpu_thinking_budget.py
+@@ -24,15 +24,76 @@ END_B = 93
+ VOCAB_SIZE = 128
+ 
+ 
++def triton_apply_thinking_budget(
++    logits,
++    req_ids,
++    expanded_idx_mapping,
++    thinking_token_budget,
++    all_token_ids,
++    total_len,
++    input_ids,
++    expanded_local_pos,
++    cached_last_start,
++    cached_last_end,
++    cached_scan_pos,
++    reasoning_start_token_ids,
++    natural_reasoning_end_token_ids,
++    reasoning_end_token_ids,
++):
++    """The Triton kernels the TileLang ones replaced, launched as the sampler did."""
++    from vllm.v1.worker.gpu.sample.thinking_budget import (
++        _COLD_SCAN_BLOCK,
++        _thinking_budget_kernel,
++        _update_committed_marker_cache_kernel,
++    )
++
++    start_len = reasoning_start_token_ids.shape[0]
++    natural_end_len = natural_reasoning_end_token_ids.shape[0]
++    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
++        req_ids,
++        thinking_token_budget,
++        all_token_ids,
++        all_token_ids.stride(0),
++        total_len,
++        cached_last_start,
++        cached_last_end,
++        cached_scan_pos,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++        START_LEN=start_len,
++        NATURAL_END_LEN=natural_end_len,
++        MAX_LEN=max(start_len, natural_end_len),
++        BLOCK=_COLD_SCAN_BLOCK,
++    )
++    _thinking_budget_kernel[(logits.shape[0],)](
++        logits,
++        logits.stride(0),
++        expanded_idx_mapping,
++        thinking_token_budget,
++        all_token_ids,
++        all_token_ids.stride(0),
++        total_len,
++        input_ids,
++        expanded_local_pos,
++        cached_last_start,
++        cached_last_end,
++        reasoning_start_token_ids,
++        natural_reasoning_end_token_ids,
++        reasoning_end_token_ids,
++        START_LEN=start_len,
++        NATURAL_END_LEN=natural_end_len,
++        END_LEN=reasoning_end_token_ids.shape[0],
++    )
++
++
+ @pytest.fixture(params=["triton", "tilelang"], autouse=True)
+ def thinking_implementation(request, monkeypatch):
+-    if request.param == "tilelang":
+-        from vllm.v1.worker.gpu.sample import thinking_budget, tilelang_thinking
++    # The sampler launches the TileLang kernels; the Triton ones are the reference.
++    if request.param == "triton":
++        from vllm.v1.worker.gpu.sample import thinking_budget
+ 
+         monkeypatch.setattr(
+-            thinking_budget,
+-            "apply_thinking_budget",
+-            tilelang_thinking.apply_thinking_budget,
++            thinking_budget, "apply_thinking_budget", triton_apply_thinking_budget
+         )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/metrics/logits.py b/vllm/v1/worker/gpu/metrics/logits.py
+index fd7b30bea..a26f6f97e 100644
+--- a/vllm/v1/worker/gpu/metrics/logits.py
++++ b/vllm/v1/worker/gpu/metrics/logits.py
+@@ -4,8 +4,11 @@ import torch
+ from torch._inductor.runtime.triton_helpers import libdevice
+ 
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ 
+ 
++# The reference the TileLang count (``tilelang_auxiliary.nan_count_kernel``) is
++# tested against; the sampler no longer launches it.
+ @triton.jit
+ def _num_nans_kernel(
+     logits_ptr,
+@@ -29,14 +32,4 @@ def _num_nans_kernel(
+ 
+ 
+ def get_num_nans(logits: torch.Tensor) -> torch.Tensor:
+-    num_reqs, vocab_size = logits.shape
+-    BLOCK_SIZE = 8192
+-    num_nans = torch.empty(num_reqs, dtype=torch.int32, device=logits.device)
+-    _num_nans_kernel[(num_reqs,)](
+-        logits,
+-        logits.stride(0),
+-        num_nans,
+-        vocab_size,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-    )
+-    return num_nans
++    return tilelang_auxiliary.count_nans(logits)
+diff --git a/vllm/v1/worker/gpu/sample/bad_words.py b/vllm/v1/worker/gpu/sample/bad_words.py
+index 19e62b39e..f96e27c47 100644
+--- a/vllm/v1/worker/gpu/sample/bad_words.py
++++ b/vllm/v1/worker/gpu/sample/bad_words.py
+@@ -1,19 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from typing import Any
+-
+ import numpy as np
+ import torch
+ 
+ import vllm.envs as envs
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ 
+@@ -79,12 +73,12 @@ class BadWordsState:
+         self.bad_word_offsets.apply_write()
+ 
+     def register_warmups(self, logits_strides: tuple[int, ...]) -> None:
+-        """Register the staged writes of the bad words and the bad-words kernel
+-        for processed FP32 logits with each row stride in ``logits_strides``."""
++        """Register the staged writes of the bad words and declare the bad-words
++        kernel for processed FP32 logits with each row stride in ``logits_strides``."""
+         self.bad_word_token_ids.register_warmup()
+         self.bad_word_offsets.register_warmup()
+         for logits_stride in logits_strides:
+-            _bad_words_launcher.register_warmup(
++            tilelang_auxiliary.register_bad_words(
+                 logits_stride=logits_stride,
+                 bad_word_token_ids_stride=self.bad_word_token_ids.gpu.stride(0),
+                 bad_word_offsets_stride=self.bad_word_offsets.gpu.stride(0),
+@@ -119,6 +113,9 @@ class BadWordsState:
+         )
+ 
+ 
++# The reference the TileLang forbidden sequences
++# (``tilelang_auxiliary.bad_words_kernel``) are tested against; the sampler no longer
++# launches it.
+ @triton.jit
+ def _bad_words_kernel(
+     logits_ptr,
+@@ -199,53 +196,16 @@ def apply_bad_words(
+     expanded_local_pos: torch.Tensor,
+     max_num_bad_words: int,
+ ) -> None:
+-    num_tokens = logits.shape[0]
+-    _bad_words_launcher[(num_tokens, max_num_bad_words)](
++    tilelang_auxiliary.apply_bad_words(
+         logits,
+-        logits.stride(0),
+         expanded_idx_mapping,
+         bad_word_token_ids,
+-        bad_word_token_ids.stride(0),
+         bad_word_offsets,
+-        bad_word_offsets.stride(0),
+         num_bad_words,
+         all_token_ids,
+-        all_token_ids.stride(0),
+         prompt_len,
+         total_len,
+         input_ids,
+         expanded_local_pos,
++        max_num_bad_words,
+     )
+-
+-
+-def _bad_words_warmup_inputs(
+-    *,
+-    logits_stride: int,
+-    bad_word_token_ids_stride: int,
+-    bad_word_offsets_stride: int,
+-    all_token_ids_stride: int,
+-) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    return triton_warmup_inputs(
+-        _bad_words_kernel,
+-        TritonWarmupTensor(torch.float32),
+-        logits_stride,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        bad_word_token_ids_stride,
+-        int32,
+-        bad_word_offsets_stride,
+-        int32,
+-        int32,
+-        all_token_ids_stride,
+-        int32,
+-        int32,
+-        int32,
+-        int32,
+-        grid=(1,),
+-    )
+-
+-
+-_bad_words_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_bad_words_warmup_inputs
+-)(_bad_words_kernel)
+diff --git a/vllm/v1/worker/gpu/sample/logit_bias.py b/vllm/v1/worker/gpu/sample/logit_bias.py
+index 48786b45f..673f31a05 100644
+--- a/vllm/v1/worker/gpu/sample/logit_bias.py
++++ b/vllm/v1/worker/gpu/sample/logit_bias.py
+@@ -1,18 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from typing import Any
+-
+ import numpy as np
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
++from vllm.v1.worker.gpu.sample import tilelang_bias
+ 
+ MAX_NUM_ALLOWED_TOKEN_IDS = 1024
+ MAX_NUM_LOGIT_BIAS_TOKENS = 1024
+@@ -136,8 +130,8 @@ class LogitBiasState:
+     def register_warmups(
+         self, logits_strides: tuple[int, ...], vocab_size: int
+     ) -> None:
+-        """Register the staged writes of the per-request lists and the bias
+-        kernel for processed FP32 logits with each row stride in
++        """Register the staged writes of the per-request lists and declare the
++        bias kernel for processed FP32 logits with each row stride in
+         ``logits_strides``, with and without the all-masked stop-token restore."""
+         for tensor in (
+             self.allowed_token_ids,
+@@ -146,24 +140,21 @@ class LogitBiasState:
+             self.stop_token_ids,
+         ):
+             tensor.register_warmup()
+-        for logits_stride in logits_strides:
+-            for check_all_masked_rows in (False, True):
+-                _bias_launcher.register_warmup(
+-                    logits_stride=logits_stride,
+-                    vocab_size=vocab_size,
+-                    allowed_token_ids_stride=self.allowed_token_ids.gpu.stride(0),
+-                    bias_token_ids_stride=self.logit_bias_token_ids.gpu.stride(0),
+-                    bias_stride=self.logit_bias.gpu.stride(0),
+-                    stop_token_ids_stride=self.stop_token_ids.gpu.stride(0),
+-                    block_size=triton.next_power_of_2(
+-                        max(
+-                            self.allowed_token_ids.gpu.shape[-1],
+-                            self.logit_bias_token_ids.gpu.shape[-1],
+-                            self.stop_token_ids.gpu.shape[-1],
+-                        )
+-                    ),
+-                    check_all_masked_rows=check_all_masked_rows,
++        tilelang_bias.register_bias(
++            vocab_size=vocab_size,
++            logits_strides=logits_strides,
++            allowed_stride=self.allowed_token_ids.gpu.stride(0),
++            bias_ids_stride=self.logit_bias_token_ids.gpu.stride(0),
++            bias_stride=self.logit_bias.gpu.stride(0),
++            stop_stride=self.stop_token_ids.gpu.stride(0),
++            width=triton.next_power_of_2(
++                max(
++                    self.allowed_token_ids.gpu.shape[-1],
++                    self.logit_bias_token_ids.gpu.shape[-1],
++                    self.stop_token_ids.gpu.shape[-1],
+                 )
++            ),
++        )
+ 
+     def apply_logit_bias(
+         self,
+@@ -197,6 +188,8 @@ class LogitBiasState:
+         )
+ 
+ 
++# The reference the TileLang bias (``tilelang_bias.bias_kernel``) is tested against;
++# the sampler no longer launches it.
+ @triton.jit
+ def _bias_kernel(
+     logits_ptr,
+@@ -357,80 +350,18 @@ def apply_logit_bias(
+     stop_token_ids: torch.Tensor,
+     check_all_masked_rows: bool = False,
+ ) -> None:
+-    num_tokens, vocab_size = logits.shape
+-    BLOCK_SIZE = triton.next_power_of_2(
+-        max(
+-            allowed_token_ids.shape[-1],
+-            logit_bias_token_ids.shape[-1],
+-            stop_token_ids.shape[-1],
+-        )
+-    )
+-    LOGITS_BLOCK_SIZE = 8192
+-    _bias_launcher[(num_tokens,)](
++    tilelang_bias.apply_logit_bias(
+         logits,
+-        logits.stride(0),
+-        vocab_size,
+         expanded_idx_mapping,
++        pos,
+         num_allowed_token_ids,
+         allowed_token_ids,
+-        allowed_token_ids.stride(0),
+         num_logit_bias,
+         logit_bias_token_ids,
+-        logit_bias_token_ids.stride(0),
+         logit_bias,
+-        logit_bias.stride(0),
+-        pos,
+         min_lens,
+         num_stop_token_ids,
+         restore_when_all_masked,
+         stop_token_ids,
+-        stop_token_ids.stride(0),
+-        BLOCK_SIZE=BLOCK_SIZE,
+-        LOGITS_BLOCK_SIZE=LOGITS_BLOCK_SIZE,
+-        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
++        check_all_masked_rows,
+     )
+-
+-
+-def _bias_warmup_inputs(
+-    *,
+-    logits_stride: int,
+-    vocab_size: int,
+-    allowed_token_ids_stride: int,
+-    bias_token_ids_stride: int,
+-    bias_stride: int,
+-    stop_token_ids_stride: int,
+-    block_size: int,
+-    check_all_masked_rows: bool,
+-) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    float32 = TritonWarmupTensor(torch.float32)
+-    return triton_warmup_inputs(
+-        _bias_kernel,
+-        float32,
+-        logits_stride,
+-        vocab_size,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        int32,
+-        allowed_token_ids_stride,
+-        int32,
+-        int32,
+-        bias_token_ids_stride,
+-        float32,
+-        bias_stride,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        int32,
+-        int32,
+-        int32,
+-        stop_token_ids_stride,
+-        grid=(1,),
+-        BLOCK_SIZE=block_size,
+-        LOGITS_BLOCK_SIZE=8192,
+-        CHECK_ALL_MASKED_ROWS=check_all_masked_rows,
+-    )
+-
+-
+-_bias_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_bias_warmup_inputs
+-)(_bias_kernel)
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index 0361eade0..c1d6e60bf 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -16,6 +16,7 @@ from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ 
+ # Upper bound on the topk kernel's per-iteration gather width.
+ _MAX_TOPK_BLOCK = 1024
+@@ -180,7 +181,7 @@ def compute_topk_scores(
+     else:
+         # Some requests specified logprob_token_ids. Build the [batch_size,
+         # 1 + max_cols] token_ids matrix and validity mask on the GPU via a
+-        # single triton kernel, overriding the topk columns with per-request
++        # single kernel, overriding the topk columns with per-request
+         # tokens where applicable.
+         assert logprob_token_ids_state is not None
+         assert expanded_idx_mapping is not None
+@@ -195,20 +196,15 @@ def compute_topk_scores(
+         num_cols = max(num_logprobs, max_per_req_token_ids)
+         logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
+         valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
+-        _fill_logprob_token_ids_kernel[(batch_size,)](
++        tilelang_auxiliary.fill_token_ids(
+             logprob_token_ids,
+-            logprob_token_ids.stride(0),
+             valid_mask,
+-            valid_mask.stride(0),
+             sampled_token_ids,
+             topk_token_ids,
+-            topk_token_ids.stride(0),
+             expanded_idx_mapping,
+             logprob_token_ids_state.num_token_ids.gpu,
+             logprob_token_ids_state.token_ids.gpu,
+-            logprob_token_ids_state.token_ids.gpu.stride(0),
+-            NUM_TOPK=num_logprobs,
+-            PADDED_COLS=triton.next_power_of_2(num_cols),
++            num_logprobs,
+         )
+         if logits_mode:
+             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+@@ -230,6 +226,8 @@ def compute_topk_scores(
+     )
+ 
+ 
++# The reference the TileLang fill (``tilelang_auxiliary.fill_ids_kernel``) is tested
++# against; the sampler no longer launches it.
+ @triton.jit
+ def _fill_logprob_token_ids_kernel(
+     # [batch_size, 1 + num_cols]
+@@ -310,6 +308,7 @@ class LogprobTokenIdsState:
+ 
+     def register_warmups(self) -> None:
+         self.token_ids.register_warmup()
++        tilelang_auxiliary.register_fill_ids()
+ 
+     def max_num_token_ids(self, idx_mapping_np: np.ndarray) -> int:
+         return int(self.num_token_ids.np[idx_mapping_np].max(initial=0))
+diff --git a/vllm/v1/worker/gpu/sample/min_p.py b/vllm/v1/worker/gpu/sample/min_p.py
+index 5b57b13bc..78b7d9451 100644
+--- a/vllm/v1/worker/gpu/sample/min_p.py
++++ b/vllm/v1/worker/gpu/sample/min_p.py
+@@ -1,17 +1,13 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-from typing import Any
+-
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.sample import tilelang_controls
+ 
+ 
++# The reference the TileLang min-p (``tilelang_controls.min_p_kernel``) is tested
++# against; the sampler no longer launches it.
+ @triton.jit
+ def _min_p_kernel(
+     logits_ptr,
+@@ -52,40 +48,13 @@ def _min_p_kernel(
+         tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
+ 
+ 
+-def _min_p_warmup_inputs(*, logits_stride: int, vocab_size: int) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _min_p_kernel,
+-        TritonWarmupTensor(torch.float32),
+-        logits_stride,
+-        TritonWarmupTensor(torch.int64),
+-        TritonWarmupTensor(torch.float32),
+-        vocab_size,
+-        grid=(1,),
+-        BLOCK_SIZE=1024,
+-    )
+-
+-
+-_min_p_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_min_p_warmup_inputs
+-)(_min_p_kernel)
+-
+-
+ def register_min_p_warmup(*, logits_stride: int, vocab_size: int) -> None:
+-    """Register ``apply_min_p`` for processed FP32 logits, rows ``logits_stride``
+-    apart, int64 request indices and FP32 thresholds."""
+-    _min_p_launcher.register_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
++    """Declare ``apply_min_p`` for processed FP32 logits, rows ``logits_stride``
++    apart, and FP32 thresholds."""
++    tilelang_controls.register_min_p(logits_stride=logits_stride, vocab_size=vocab_size)
+ 
+ 
+ def apply_min_p(
+     logits: torch.Tensor, expanded_idx_mapping: torch.Tensor, min_p: torch.Tensor
+ ) -> None:
+-    num_tokens, vocab_size = logits.shape
+-    BLOCK_SIZE = 1024
+-    _min_p_launcher[(num_tokens,)](
+-        logits,
+-        logits.stride(0),
+-        expanded_idx_mapping,
+-        min_p,
+-        vocab_size,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-    )
++    tilelang_controls.apply_min_p(logits, expanded_idx_mapping, min_p)
+diff --git a/vllm/v1/worker/gpu/sample/prompt_logprob.py b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+index 0a9ae74ee..d92f1357b 100644
+--- a/vllm/v1/worker/gpu/sample/prompt_logprob.py
++++ b/vllm/v1/worker/gpu/sample/prompt_logprob.py
+@@ -1,21 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Callable, Sequence
+-from typing import Any
+ 
+ import numpy as np
+ import torch
+ 
+ from vllm.config.model import LogprobsMode
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ from vllm.v1.worker.gpu.sample.logprob import (
+     compute_topk_scores,
+     register_topk_scores_warmup,
+@@ -51,7 +46,7 @@ class PromptLogprobsWorker:
+     ) -> None:
+         """Register the prompt token gather and the scores of prompt logits from
+         ``logits_fn`` (``(dtype, row stride)`` pairs)."""
+-        _prompt_logprobs_token_ids_launcher.register_warmup(
++        tilelang_auxiliary.register_prompt_ids(
+             all_token_ids_stride=all_token_ids_stride
+         )
+         register_topk_scores_warmup(
+@@ -169,6 +164,8 @@ class PromptLogprobsWorker:
+         return prompt_logprobs_dict
+ 
+ 
++# The reference the TileLang gather (``tilelang_auxiliary.prompt_ids_kernel``) is
++# tested against; the runner no longer launches it.
+ @triton.jit
+ def _prompt_logprobs_token_ids_kernel(
+     prompt_logprobs_token_ids_ptr,
+@@ -202,28 +199,6 @@ def _prompt_logprobs_token_ids_kernel(
+         )
+ 
+ 
+-def _prompt_logprobs_token_ids_warmup_inputs(
+-    *, all_token_ids_stride: int
+-) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    return triton_warmup_inputs(
+-        _prompt_logprobs_token_ids_kernel,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        TritonWarmupTensor(torch.int64),
+-        int32,
+-        int32,
+-        all_token_ids_stride,
+-        grid=(1,),
+-        BLOCK_SIZE=1024,
+-    )
+-
+-
+-_prompt_logprobs_token_ids_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_prompt_logprobs_token_ids_warmup_inputs
+-)(_prompt_logprobs_token_ids_kernel)
+-
+-
+ def get_prompt_logprobs_token_ids(
+     num_tokens: int,
+     query_start_loc: torch.Tensor,
+@@ -232,15 +207,8 @@ def get_prompt_logprobs_token_ids(
+     all_token_ids: torch.Tensor,
+ ) -> torch.Tensor:
+     token_ids = torch.empty(num_tokens, dtype=torch.int64, device=idx_mapping.device)
+-    num_reqs = idx_mapping.shape[0]
+-    _prompt_logprobs_token_ids_launcher[(num_reqs,)](
+-        token_ids,
+-        query_start_loc,
+-        idx_mapping,
+-        num_computed_tokens,
+-        all_token_ids,
+-        all_token_ids.stride(0),
+-        BLOCK_SIZE=1024,
++    tilelang_auxiliary.prompt_token_ids(
++        token_ids, query_start_loc, idx_mapping, num_computed_tokens, all_token_ids
+     )
+     return token_ids
+ 
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 187fafa7a..67a9364a4 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -15,6 +15,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
+ )
+ from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
++from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
+ from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
+@@ -124,6 +125,10 @@ class Sampler:
+         self.penalties_state.register_warmups(processed_logits_strides)
+         self.logit_bias_state.register_warmups(processed_logits_strides, vocab_size)
+         self.bad_words_state.register_warmups(processed_logits_strides)
++        self.thinking_budget_state.register_warmups(processed_logits_strides)
++        if self.compute_nans:
++            # The raw logits' NaN count, here and in the rejection sampler.
++            tilelang_auxiliary.register_nan_counts(logits=logits, vocab_size=vocab_size)
+         self.logprob_token_ids_state.register_warmups()
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.trace_token_ids.register_warmup()
+diff --git a/vllm/v1/worker/gpu/sample/thinking_budget.py b/vllm/v1/worker/gpu/sample/thinking_budget.py
+index eca792986..f42656c3c 100644
+--- a/vllm/v1/worker/gpu/sample/thinking_budget.py
++++ b/vllm/v1/worker/gpu/sample/thinking_budget.py
+@@ -9,12 +9,15 @@ from vllm.sampling_params import SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.torch_utils import async_tensor_h2d
+ from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
++from vllm.v1.worker.gpu.sample import tilelang_thinking
+ from vllm.v1.worker.gpu.states import RequestState
+ 
+ if TYPE_CHECKING:
+     from vllm.config.reasoning import ReasoningConfig
+ 
+ _INT32_MAX = np.iinfo(np.int32).max
++# The Triton marker cache's cold-scan block (tests launch the Triton kernels as
++# references).
+ _COLD_SCAN_BLOCK = 1024
+ 
+ 
+@@ -107,6 +110,19 @@ class ThinkingBudgetState:
+             self.thinking_token_budget.copy_to_uva()
+             self._budget_dirty = False
+ 
++    def register_warmups(self, logits_strides: tuple[int, ...]) -> None:
++        """Declare the marker cache and budget kernels for processed FP32 logits
++        with each row stride in ``logits_strides``."""
++        if not self.enabled:
++            return
++        tilelang_thinking.register_thinking(
++            logits_strides=logits_strides,
++            tokens_stride=self.req_states.all_token_ids.gpu.stride(0),
++            start_len=self.reasoning_start_token_ids.numel(),
++            natural_len=self.natural_reasoning_end_token_ids.numel(),
++            end_len=self.reasoning_end_token_ids.numel(),
++        )
++
+     def apply(
+         self,
+         logits: torch.Tensor,
+@@ -156,6 +172,8 @@ def _load_effective_token(
+     return tl.load(input_ids_ptr + input_pos)
+ 
+ 
++# The references the TileLang marker cache and budget (``tilelang_thinking``) are
++# tested against; the sampler no longer launches them.
+ @triton.jit
+ def _update_committed_marker_cache_kernel(
+     req_ids_ptr,
+@@ -385,44 +403,19 @@ def apply_thinking_budget(
+     natural_reasoning_end_token_ids: torch.Tensor,
+     reasoning_end_token_ids: torch.Tensor,
+ ) -> None:
+-    num_tokens = logits.shape[0]
+-    start_len = reasoning_start_token_ids.shape[0]
+-    natural_end_len = natural_reasoning_end_token_ids.shape[0]
+-    end_len = reasoning_end_token_ids.shape[0]
+-
+-    _update_committed_marker_cache_kernel[(req_ids.shape[0],)](
+-        req_ids,
+-        thinking_token_budget,
+-        all_token_ids,
+-        all_token_ids.stride(0),
+-        total_len,
+-        cached_last_start,
+-        cached_last_end,
+-        cached_scan_pos,
+-        reasoning_start_token_ids,
+-        natural_reasoning_end_token_ids,
+-        START_LEN=start_len,
+-        NATURAL_END_LEN=natural_end_len,
+-        MAX_LEN=max(start_len, natural_end_len),
+-        BLOCK=_COLD_SCAN_BLOCK,
+-    )
+-
+-    _thinking_budget_kernel[(num_tokens,)](
++    tilelang_thinking.apply_thinking_budget(
+         logits,
+-        logits.stride(0),
++        req_ids,
+         expanded_idx_mapping,
+         thinking_token_budget,
+         all_token_ids,
+-        all_token_ids.stride(0),
+         total_len,
+         input_ids,
+         expanded_local_pos,
+         cached_last_start,
+         cached_last_end,
++        cached_scan_pos,
+         reasoning_start_token_ids,
+         natural_reasoning_end_token_ids,
+         reasoning_end_token_ids,
+-        START_LEN=start_len,
+-        NATURAL_END_LEN=natural_end_len,
+-        END_LEN=end_len,
+     )

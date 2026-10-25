@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:09:54 +0100
+Subject: [PATCH 451/488] [DS4.1] CED's full-row output zeroed in TileLang
+
+scatter_rows restores the full-row ABI into zeros: a TileLang fill of
+16-byte packs (any dtype) instead of torch's new_zeros, before the
+TileLang scatter.
+---
+ .../test_deepseek_v41_tilelang_columns.py     | 17 +++++++++
+ vllm/models/deepseek_v4_1/ced.py              |  5 +--
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 35 +++++++++++++++++++
+ 3 files changed, 55 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_columns.py b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+index 4fabd0b52..cb4b7d2f7 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_columns.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+@@ -79,6 +79,23 @@ def test_join_columns_like_torch_cat(parts, rows):
+     assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
+ 
+ 
++@pytest.mark.parametrize(
++    "shape, dtype",
++    [
++        ((8192, 5120), torch.bfloat16),  # CED's full hidden rows
++        ((37, 4), torch.float32),  # pre_mix / sink columns
++        ((3, 8), torch.bfloat16),
++    ],
++)
++def test_zero_fills_every_byte(shape, dtype):
++    """CED's full-row output starts as zeros (torch's new_zeros), any dtype."""
++    out = torch.full(shape, float("nan"), dtype=dtype, device=DEVICE)
++    assert columns.zero_(out) is out
++    assert not out.view(torch.uint8).any()
++    with pytest.raises(ValueError, match="16-byte"):
++        columns.zero_(torch.empty(3, 5, dtype=torch.bfloat16, device=DEVICE))
++
++
+ def test_float32_parts():
+     gathered = _rows(9, 64 + 32 + 16, 5, torch.float32)
+     expected = [p.contiguous() for p in gathered.split((64, 32, 16), dim=-1)]
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 8833cc2b8..25dd274a8 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
+ import torch
+ 
+ from .tilelang import ced as ced_kernels
+-from .tilelang import prepare
++from .tilelang import columns, prepare
+ 
+ if TYPE_CHECKING:
+     from .sparse_mla import DeepseekV41B12xMetadata
+@@ -54,7 +54,7 @@ def scatter_rows(
+     source: torch.Tensor, indices: torch.Tensor, full_rows: int
+ ) -> torch.Tensor:
+     """Restore the full-row ABI; discarded rows are always zero."""
+-    output = source.new_zeros((full_rows, *source.shape[1:]))
++    output = columns.zero_(source.new_empty((full_rows, *source.shape[1:])))
+     if source.numel():
+         ced_kernels.copy_rows(source, indices, output, scatter=True)
+     return output
+@@ -210,6 +210,7 @@ class CEDState:
+                 prepare.call(ced_kernels.token_metadata_kernel),
+                 prepare.call(ced_kernels.routing_mask_kernel),
+                 prepare.call(ced_kernels.slots_kernel),
++                prepare.call(columns.zero_packs_kernel),
+                 # Packed rows of each layout. A source view of wider rows would
+                 # stop its first CED step with KernelNotPreparedError.
+                 *(
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index 90f93e278..11bdb5a50 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -37,6 +37,10 @@ _HEADER = r"""
+ __device__ __forceinline__ void vllm_columns_b128(void* d, const void* s) {
+   *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
+ }
++
++__device__ __forceinline__ void vllm_columns_zero_b128(void* d) {
++  *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
++}
+ """
+ 
+ 
+@@ -76,6 +80,35 @@ def copy_columns_kernel(width: int, dtype: str):
+     return copy_columns
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def zero_packs_kernel():
++    """Zero bits into the first ``packs`` 16-byte packs of ``out``, any dtype (viewed
++    as int32 words, four a pack)."""
++    words = T.dynamic("words")
++
++    @T.prim_func
++    def zero_packs(out: T.Tensor((words,), T.int32), packs: T.int32):
++        with T.Kernel(T.ceildiv(packs, _THREADS), threads=_THREADS) as bx:
++            T.import_source(_HEADER)
++            p = bx * _THREADS + T.get_thread_binding()
++            if p < packs:
++                T.call_extern(
++                    "handle", "vllm_columns_zero_b128", T.address_of(out[p * 4])
++                )
++
++    return zero_packs
++
++
++def zero_(out: torch.Tensor) -> torch.Tensor:
++    """``out.zero_()`` for a contiguous tensor of whole 16-byte packs."""
++    nbytes = out.numel() * out.element_size()
++    if not out.is_contiguous() or nbytes % _VECTOR_BYTES or out.data_ptr() % 16:
++        raise ValueError("zero_ fills contiguous 16-byte packs")
++    if nbytes:
++        zero_packs_kernel()(out.view(-1).view(torch.int32), nbytes // _VECTOR_BYTES)
++    return out
++
++
+ def _move(part, whole, join: bool):
+     """A 16-byte copy between a part's and the whole row's addresses, in the
+     direction ``join`` gives."""
+@@ -198,6 +231,8 @@ def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
+ 
+ 
+ __all__ = [
++    "zero_",
++    "zero_packs_kernel",
+     "copy_columns",
+     "copy_columns_kernel",
+     "copy_columns_key",

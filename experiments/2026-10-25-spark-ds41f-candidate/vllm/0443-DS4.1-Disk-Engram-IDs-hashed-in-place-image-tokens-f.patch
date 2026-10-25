@@ -1,0 +1,772 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:46:03 +0200
+Subject: [PATCH 443/488] [DS4.1] Disk Engram IDs hashed in place, image tokens
+ found in the ids
+
+The TileLang hash and gate take the step's token ids and find the image
+sentinel themselves: no mask kernels before them. The model keeps the
+step's row IDs layer-major; each disk Engram layer reads its own plane
+and the hash's live token count, so staging copies nothing.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  |  1 -
+ .../test_deepseek_v41_tilelang_engram.py      | 62 ++++++++++---------
+ .../test_deepseek_v41_tilelang_engram_hash.py | 22 ++++---
+ tests/models/test_deepseek_v4_1_engram.py     | 19 +++---
+ vllm/models/deepseek_v4_1/common/engram.py    | 56 ++++++++++-------
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 60 +++++++++++-------
+ vllm/models/deepseek_v4_1/tilelang/engram.py  | 41 +++++++-----
+ .../deepseek_v4_1/tilelang/engram_hash.py     | 27 ++++----
+ 8 files changed, 169 insertions(+), 119 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index b27bdd642..fbaff52f1 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -307,7 +307,6 @@ def test_host_hash_equals_the_gpu_hash():
+     out = torch.empty((padded, 2, HEADS), dtype=torch.int64, device="cuda")
+     engram_hash(
+         ids,
+-        ids == IMAGE_SENTINEL,
+         torch.tensor(starts, dtype=torch.int32, device="cuda"),
+         torch.tensor(history, dtype=torch.int64, device="cuda"),
+         token_map.cuda(),
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram.py b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+index 05534bb73..e7e4b8665 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram.py
+@@ -25,19 +25,29 @@ from vllm.models.deepseek_v4_1.tilelang.engram import (  # noqa: E402
+     engram_gate,
+     engram_gate_blocked,
+ )
++from vllm.models.deepseek_v4_1.tilelang.engram_hash import (  # noqa: E402
++    IMAGE_SENTINEL,
++)
+ 
+ DEVICE = "cuda"
+ HC, DIM, EPS = 4, 5120, 1e-6
+ ROWS = (1, 6, 17, 96, 300)
+ 
+ 
+-def _inputs(rows, seed=3):
++def _inputs(rows, seed=3, images=True, ids_dtype=torch.int32):
++    """The gate's inputs and the step's token ids, a quarter of them the image
++    sentinel when ``images``, the rest its neighbours (the compare is exact)."""
+     gen = torch.Generator(device=DEVICE).manual_seed(seed)
+     x = torch.randn((rows, HC * DIM), generator=gen, device=DEVICE).bfloat16()
+     kv = torch.randn((rows, (HC + 1) * DIM), generator=gen, device=DEVICE).bfloat16()
+     weight = torch.rand((HC * DIM,), generator=gen, device=DEVICE) + 0.5
+-    image = torch.rand((rows,), generator=gen, device=DEVICE) < 0.25
+-    return x, kv, weight, image
++    ids = torch.randint(
++        IMAGE_SENTINEL - 1, IMAGE_SENTINEL + 2, (rows,), generator=gen, device=DEVICE
++    )
++    ids[ids == IMAGE_SENTINEL] += 1
++    if images:
++        ids[torch.rand((rows,), generator=gen, device=DEVICE) < 0.25] = IMAGE_SENTINEL
++    return x, kv, weight, ids.to(ids_dtype)
+ 
+ 
+ def _reference(x, kv, weight, image):
+@@ -54,16 +64,17 @@ def _reference(x, kv, weight, image):
+     return (xs + gate[..., None] * v).view(rows, HC * DIM)
+ 
+ 
+-@pytest.mark.parametrize("masked", [True, False])
+-def test_engram_gate(masked):
+-    x, kv, weight, image = _inputs(max(ROWS))
+-    mask = image if masked else None
++@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("images", [True, False])
++def test_engram_gate(images, ids_dtype):
++    x, kv, weight, ids = _inputs(max(ROWS), images=images, ids_dtype=ids_dtype)
++    image = ids == IMAGE_SENTINEL
++    assert bool(image.any()) == images
+     full = torch.empty_like(x)
+-    engram_gate(x, kv, weight, mask, full, EPS, HC)
+-    ref = _reference(x, kv, weight, image if masked else torch.zeros_like(image))
++    engram_gate(x, kv, weight, ids, full, EPS, HC)
++    ref = _reference(x, kv, weight, image)
+     torch.testing.assert_close(full.double(), ref, rtol=1e-2, atol=1e-2)
+-    if masked:
+-        assert torch.equal(full[image], x[image]), "image tokens must pass through"
++    assert torch.equal(full[image], x[image]), "image tokens must pass through"
+     # TileKernels' reference kernel: the same formula, its own summation order.
+     expected, *_ = tile_kernels.engram.engram_gate_fwd(
+         x.view(-1, HC, DIM),
+@@ -72,20 +83,12 @@ def test_engram_gate(masked):
+         EPS,
+         CLAMP,
+         save_for_backward=False,
+-        image_token_mask=mask,
++        image_token_mask=image if images else None,
+     )
+     torch.testing.assert_close(full.view_as(expected), expected, rtol=1e-2, atol=1e-2)
+     for rows in ROWS:
+         out = torch.full_like(x, float("nan"))
+-        engram_gate(
+-            x[:rows],
+-            kv[:rows],
+-            weight,
+-            None if mask is None else mask[:rows],
+-            out[:rows],
+-            EPS,
+-            HC,
+-        )
++        engram_gate(x[:rows], kv[:rows], weight, ids[:rows], out[:rows], EPS, HC)
+         assert torch.equal(out[:rows], full[:rows]), f"rows={rows}"
+         assert out[rows:].isnan().all(), f"rows={rows} wrote past its rows"
+ 
+@@ -96,9 +99,9 @@ def test_nonfinite_like_the_reference(where):
+     whole stream is NaN (``clamp_min`` passes it, unlike ``max(|dot|, CLAMP)``);
+     a NaN in the shared value reaches every stream at that channel."""
+     rows, t, h, d = 17, 5, 2, 100
+-    x, kv, weight, _ = _inputs(rows, seed=5)
++    x, kv, weight, ids = _inputs(rows, seed=5, images=False)
+     clean = torch.empty_like(x)
+-    engram_gate(x, kv, weight, None, clean, EPS, HC)
++    engram_gate(x, kv, weight, ids, clean, EPS, HC)
+     if where == "residual":
+         x[t, h * DIM + d] = NAN
+     elif where == "key":
+@@ -106,28 +109,27 @@ def test_nonfinite_like_the_reference(where):
+     else:
+         kv[t, HC * DIM + d] = NAN
+     out = torch.empty_like(x)
+-    engram_gate(x, kv, weight, None, out, EPS, HC)
++    engram_gate(x, kv, weight, ids, out, EPS, HC)
+     ref = _reference(x, kv, weight, torch.zeros(rows, dtype=torch.bool, device=DEVICE))
+     assert_same_nonfinite(out, ref)
+     assert_other_rows_equal(out, clean, [t])
+ 
+ 
+-@pytest.mark.parametrize("masked", [False, True])
++@pytest.mark.parametrize("images", [False, True])
+ @pytest.mark.parametrize("blocks, block_cols", [(3, 8544), (4, 6400)])
+ @pytest.mark.parametrize("rows", [6, 300])
+-def test_blocked_kv_gives_the_packed_bits(masked, blocks, block_cols, rows):
++def test_blocked_kv_gives_the_packed_bits(images, blocks, block_cols, rows):
+     """kv as prefill SP's exchanged column blocks [N, L, C] (TP3's and TP4's widths),
+     read in place, gives the packed gate's bits; rows past the tokens are not read."""
+-    x, kv, weight, image = _inputs(rows, seed=7)
++    x, kv, weight, ids = _inputs(rows, seed=7, images=images)
+     width = (HC + 1) * DIM
+     padded = torch.zeros((rows + 3, blocks * block_cols), device=DEVICE).bfloat16()
+     padded[:rows, :width] = kv
+     padded[rows:] = NAN  # rows a rank does not own: never read
+     blocked = padded.view(rows + 3, blocks, block_cols).transpose(0, 1).contiguous()
+-    mask = image if masked else None
+     packed_out = torch.empty_like(x)
+     blocked_out = torch.empty_like(x)
+-    engram_gate(x, kv, weight, mask, packed_out, EPS, HC)
+-    engram_gate_blocked(x, blocked, weight, mask, blocked_out, EPS, HC)
++    engram_gate(x, kv, weight, ids, packed_out, EPS, HC)
++    engram_gate_blocked(x, blocked, weight, ids, blocked_out, EPS, HC)
+     torch.cuda.synchronize()
+     assert torch.equal(packed_out.view(torch.int16), blocked_out.view(torch.int16))
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+index 1ae6ef373..e3d47b707 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_engram_hash.py
+@@ -94,7 +94,7 @@ def _case(lengths, padding, seed):
+ 
+ 
+ def _expected(token_map, ids, history, starts, geometry):
+-    image = ids == IMAGE_SENTINEL
++    image = ids == IMAGE_SENTINEL  # the hash finds the sentinel in the ids itself
+     live = int(starts[-1])
+     tokens = ids[:live].clamp(0, VOCAB - 1).tolist()
+     keep = ((ids[:live] < VOCAB) & ~image[:live]).tolist()
+@@ -113,28 +113,34 @@ def _expected(token_map, ids, history, starts, geometry):
+         )
+         for layer in range(len(LAYERS))
+     ]
+-    return torch.stack(rows, dim=1), image
++    return torch.stack(rows, dim=1)
+ 
+ 
++@pytest.mark.parametrize("layer_major", [False, True])
+ @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize("history_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize(
+     "lengths, padding",
+     [((1,), 0), ((6, 1, 3, 6), 5), ((700, 1, 2, 1300), 0), ((0, 4, 0, 2), 3)],
+ )
+-def test_engram_hash(lengths, padding, ids_dtype, history_dtype):
++def test_engram_hash(lengths, padding, ids_dtype, history_dtype, layer_major):
++    """``layer_major``: ``out`` is the permutation of a [layers, rows, 24] buffer,
++    as the model's disk Engram planes are."""
+     geometry = _geometry(LAYERS)
+     token_map, ids, history, starts = _case(lengths, padding, sum(lengths) + padding)
+-    expected, image = _expected(token_map, ids, history, starts, geometry)
+-    out = torch.full((ids.numel() + 2, len(LAYERS), 24), 7, dtype=torch.int64)
+-    out, num_seqs, num_tokens = (
+-        out.to(DEVICE),
++    expected = _expected(token_map, ids, history, starts, geometry)
++    rows = ids.numel() + 2
++    if layer_major:
++        out = torch.full((len(LAYERS), rows, 24), 7, dtype=torch.int64)
++        out = out.to(DEVICE).permute(1, 0, 2)
++    else:
++        out = torch.full((rows, len(LAYERS), 24), 7, dtype=torch.int64).to(DEVICE)
++    num_seqs, num_tokens = (
+         torch.zeros(1, dtype=torch.int32, device=DEVICE),
+         torch.zeros(1, dtype=torch.int32, device=DEVICE),
+     )
+     engram_hash(
+         ids.to(DEVICE, ids_dtype),
+-        image.to(DEVICE),
+         starts.to(DEVICE),
+         history.to(DEVICE, history_dtype),
+         token_map.to(DEVICE),
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index d69a788d1..51d7df55f 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -146,11 +146,8 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+         finally:
+             torch.set_default_dtype(old_dtype)
+         target.engram_hash = NgramHashState(None, layout, None)
+-        target.register_buffer(
+-            "prepared_engram_hashes",
+-            torch.empty(8, len(caps), 24, dtype=torch.int64, device="cuda"),
+-            persistent=False,
+-        )
++        if memory == "disk":
++            target.register_engram_hashes()
+         target.get_expert_mapping = lambda: []
+         language = DeepseekV41LLMForCausalLM.__new__(DeepseekV41LLMForCausalLM)
+         nn.Module.__init__(language)
+@@ -256,7 +253,10 @@ def test_engram_descriptor_loading_preserves_ordinary_weights(
+         indices = torch.arange(24, device="cuda").expand(4, -1).contiguous()
+         count = torch.tensor([3], dtype=torch.int32, device="cuda")
+         if table_memory == "disk":
+-            engram.stage_rows(indices, count, torch.cuda.current_stream())
++            # The model's hash writes the layer's IDs and live count in place.
++            engram.embed_tokens.hashes[:4].copy_(indices)
++            engram.embed_tokens.num_tokens.copy_(count)
++            engram.stage_rows(4, torch.cuda.current_stream())
+             engram.embed_tokens.gather_rows(engram.staged_rows)
+         else:
+             engram.embed_tokens.lookup_native(indices[:3], engram.staged_rows)
+@@ -1005,6 +1005,9 @@ def test_disk_engram_model_allocates_hash_buffer_from_declared_caps(monkeypatch)
+     hashes = model.prepared_engram_hashes
+     assert hashes.shape == (13, 2, 24)
+     assert hashes.dtype == torch.int64 and hashes.device == caps.device
++    # Layer-major: each layer's plane is a contiguous [max_tokens, 24].
++    assert hashes.permute(1, 0, 2).is_contiguous()
++    assert (hashes == -1).all()
+     assert "prepared_engram_hashes" not in model.state_dict()
+ 
+ 
+@@ -1075,7 +1078,9 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+         output = module.staged_rows
+         address = output.data_ptr()
+         for shift in (0, 1):
+-            module.stage_rows(ids + shift, count, torch.cuda.current_stream())
++            embed.hashes[:capacity].copy_(ids + shift)
++            embed.num_tokens.copy_(count)
++            module.stage_rows(capacity, torch.cuda.current_stream())
+             embed.gather_rows(output)
+             reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
+             owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index ba98234d6..ca31b18d6 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -431,8 +431,8 @@ class NgramHashState(nn.Module):
+     def run_native(self, ids, mask, starts, history, out):
+         """Hash ``ids`` for every Engram layer into ``out`` [T, layers, 24].
+ 
+-        ``mask`` marks the tokens to hash under the B12X kernels, and the image
+-        tokens to exclude (DeepSeek's mask) under the TileLang kernels.
++        ``mask`` marks the tokens to hash under the B12X kernels; the TileLang
++        hash finds the image tokens (the sentinel's ids) itself and takes None.
+         """
+         retain_cuda_graph_capture_resource(self)
+         c = self.layout.caps[0]
+@@ -448,7 +448,6 @@ class NgramHashState(nn.Module):
+ 
+             engram_hash(
+                 ids,
+-                mask,
+                 starts,
+                 history,
+                 self._tl_token_map,
+@@ -501,7 +500,7 @@ class NgramHashState(nn.Module):
+             dtype=torch.int64,
+             device=input_ids.device,
+         )
+-        mask = dead_mask if kernels.uses_tilelang() else ~dead_mask
++        mask = None if kernels.uses_tilelang() else ~dead_mask
+         self.run_native(input_ids, mask, query_start_loc, lookback_token_ids, out)
+         return out
+ 
+@@ -793,16 +792,23 @@ class ParallelEngramEmbedding(nn.Module):
+         if ENGRAM_TIMELINE:
+             _record_timeline(rows, self.caps.tp_rank, self.caps.layer_id)
+ 
+-    def stage_rows(self, indices, num_tokens, stream, early=None):
+-        """Queue a step's rows: copy its row IDs (``indices`` [tokens, 24], the GPU's
+-        hash) and live token count, then hand the step to the reader with the IDs the
+-        host hashed (``early`` [tokens, 24] int64 on the host, or None). Returns at
+-        once; the forward's ``gather_rows`` waits for the rows."""
++    def share_hashes(self, hashes, num_tokens):
++        """Read each step's row IDs (``hashes`` [max_tokens, 24], contiguous) and live
++        token count from the model's buffers, which its hash writes in place, instead
++        of this table's own."""
++        if hashes.shape != self.hashes.shape or not hashes.is_contiguous():
++            raise ValueError("Engram row IDs must be a contiguous [max_tokens, 24]")
++        self.hashes = hashes
++        self.num_tokens = num_tokens
++
++    def stage_rows(self, tokens, stream, early=None):
++        """Queue a step's rows: hand the reader the row IDs of its ``tokens`` tokens
++        (``hashes``, with the live token count in ``num_tokens``, both written before
++        on ``stream``) and the IDs the host hashed (``early`` [tokens, 24] int64 on the
++        host, or None). Returns at once; the forward's ``gather_rows`` waits for the
++        rows."""
+         if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+             raise RuntimeError("Disk Engram staging must run outside compile/capture")
+-        tokens = indices.shape[0]
+-        self.hashes[:tokens].copy_(indices)
+-        self.num_tokens.copy_(num_tokens)
+         self.disk_rows.stage(stream, self.hashes, tokens * 24, early)
+ 
+     def stage_no_rows(self):
+@@ -1051,8 +1057,8 @@ class Engram(nn.Module):
+     def declare_kernels(self) -> None:
+         """Declare the TileLang gate: on packed rows always, and on the column blocks
+         of a column-parallel projection when the model runs prefill sequence
+-        parallel (the blocked gate, one block per rank). The model always passes
+-        the image-token mask."""
++        parallel (the blocked gate, one block per rank). The model passes the
++        step's int32 token ids, the gate finding the image sentinel itself."""
+         if not kernels.uses_tilelang():
+             return
+         from vllm.models.deepseek_v4_1.tilelang import prepare
+@@ -1062,7 +1068,7 @@ class Engram(nn.Module):
+         )
+ 
+         calls = [
+-            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, True)
++            prepare.call(engram_gate_kernel, self.hc_mult, self.dim, self.eps, "int32")
+         ]
+         sequence_parallel = (
+             0 < self.prefill_sp_min_rows <= self.embed_tokens.caps.max_tokens
+@@ -1074,7 +1080,7 @@ class Engram(nn.Module):
+                     self.hc_mult,
+                     self.dim,
+                     self.eps,
+-                    True,
++                    "int32",
+                     get_tensor_model_parallel_world_size(),
+                     self.wkv.output_size_per_partition,
+                 )
+@@ -1087,12 +1093,13 @@ class Engram(nn.Module):
+         )
+         self.embed_tokens.open_disk_rows()
+ 
+-    def stage_rows(self, hash_ids, num_tokens, stream, early=None):
+-        """Queue this step's disk rows (``early``: the IDs the host hashed); the
+-        forward gathers them."""
++    def stage_rows(self, tokens, stream, early=None):
++        """Queue the disk rows of this step's ``tokens`` tokens (their row IDs in
++        ``embed_tokens.hashes``; ``early``: the IDs the host hashed); the forward
++        gathers them."""
+         self.invalidate_disk_output()
+-        self.embed_tokens.stage_rows(hash_ids, num_tokens, stream, early)
+-        self._disk_prepared_tokens = hash_ids.shape[0]
++        self.embed_tokens.stage_rows(tokens, stream, early)
++        self._disk_prepared_tokens = tokens
+         self._disk_prepared = True
+ 
+     def prepare_embeddings(self, hash_ids):
+@@ -1112,8 +1119,9 @@ class Engram(nn.Module):
+     def forward(self, hidden_states, hash_ids, token_mask=None, sp_rows=None):
+         """Gate ``hidden_states`` with this layer's Engram rows.
+ 
+-        ``token_mask`` marks the tokens to gate under the B12X kernels, and the
+-        image tokens to pass through (DeepSeek's mask) under the TileLang kernels.
++        ``token_mask`` marks the tokens to gate under the B12X kernels; under the
++        TileLang kernels it is the step's token ids (the image sentinel's rows pass
++        through).
+ 
+         With ``sp_rows`` (prefill sequence parallelism) ``hidden_states`` holds
+         this rank's rows while ``hash_ids`` and ``token_mask`` cover every
+@@ -1183,7 +1191,7 @@ class Engram(nn.Module):
+                 engram_gate_blocked,
+             )
+ 
+-            # The TileLang model passes DeepSeek's image-token mask (True skips).
++            # The TileLang model passes the token ids: the sentinel's rows pass.
+             gate = engram_gate_blocked if blocked else engram_gate
+             gate(
+                 state,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 1d506023a..713976e67 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -527,16 +527,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             and self.engram_layout.table_memory in ("ram", "disk")
+         )
+         if self.disk_engram:
+-            caps = self.engram_layout.caps[0]
+-            self.register_buffer(
+-                "prepared_engram_hashes",
+-                torch.empty(
+-                    (caps.max_tokens, len(self.engram_layout.layer_ids), 24),
+-                    dtype=torch.int64,
+-                    device=caps.device,
+-                ),
+-                persistent=False,
+-            )
++            self.register_engram_hashes()
+ 
+         if get_pp_group().is_last_rank:
+             self.norm = kernels.rms_norm(config.hidden_size, self.rms_norm_eps)
+@@ -599,6 +590,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         buffer = hidden if index is None else aux[index]
+         return buffer[:rows] if rows <= buffer.shape[0] else None
+ 
++    def register_engram_hashes(self) -> None:
++        """The step's disk Engram row IDs, ``prepared_engram_hashes`` [max_tokens,
++        layers, 24]: a view of a layer-major buffer whose planes are the local disk
++        Engram layers' own IDs, the hash writing them (and the live token count) in
++        place for every layer's reader and gather."""
++        caps = self.engram_layout.caps[0]
++        planes = torch.full(
++            (len(self.engram_layout.layer_ids), caps.max_tokens, 24),
++            -1,
++            dtype=torch.int64,
++            device=caps.device,
++        )
++        self.register_buffer(
++            "prepared_engram_hashes", planes.permute(1, 0, 2), persistent=False
++        )
++        for layer in islice(self.layers, self.start_layer, self.end_layer):
++            engram = getattr(layer, "engram", None)
++            if engram is not None:
++                engram.embed_tokens.share_hashes(
++                    planes[engram.layer_hash_index], self.engram_hash.num_tokens
++                )
++
+     def prepare_disk_engram(
+         self, input_ids, query_start_loc, lookback_token_ids, early=None
+     ):
+@@ -618,20 +631,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         )
+         if self.engram_hash is None:
+             raise RuntimeError("Disk Engram requires initialized hash state")
+-        hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+-        image_mask = image_sentinel_mask(input_ids)
++        tokens = input_ids.shape[0]
++        # Each layer's IDs land in its own plane; the TileLang hash finds the image
++        # sentinel in the ids itself.
+         self.engram_hash.run_native(
+             input_ids,
+-            image_mask if kernels.uses_tilelang() else ~image_mask,
++            None if kernels.uses_tilelang() else ~image_sentinel_mask(input_ids),
+             query_start_loc,
+             lookback_token_ids,
+-            hashes,
++            self.prepared_engram_hashes[:tokens],
+         )
+         stream = torch.cuda.current_stream()
+         for engram in engrams:
+             engram.stage_rows(
+-                hashes[:, engram.layer_hash_index],
+-                self.engram_hash.num_tokens,
++                tokens,
+                 stream,
+                 None if early is None else early[:, engram.layer_hash_index],
+             )
+@@ -751,9 +764,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         engram_mask: torch.Tensor | None = None
+         if self.disk_engram and input_ids is not None:
+             engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
+-            image_mask = image_sentinel_mask(input_ids)
+-            # The TileLang gate takes DeepSeek's mask: True passes an image through.
+-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
++            # The TileLang gate takes the ids: the image sentinel's rows pass.
++            engram_mask = (
++                input_ids
++                if kernels.uses_tilelang()
++                else ~image_sentinel_mask(input_ids)
++            )
+         elif self.engram_hash is not None and input_ids is not None:
+             attn_metadata = (
+                 get_forward_context().attn_metadata
+@@ -777,8 +793,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 )
+                 query_start_loc[1] = input_ids.shape[0]
+                 lookback_token_ids = input_ids.new_full((1, 3), -1)
+-            image_mask = image_sentinel_mask(input_ids)
+-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
++            image_mask = (
++                None if kernels.uses_tilelang() else image_sentinel_mask(input_ids)
++            )
++            engram_mask = input_ids if image_mask is None else ~image_mask
+             engram_hashes = self.engram_hash(
+                 input_ids,
+                 positions,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram.py b/vllm/models/deepseek_v4_1/tilelang/engram.py
+index b6418bdac..e2023cc72 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram.py
+@@ -11,7 +11,8 @@ the multi-stream residual. For each token and stream, with the stream's residual
+     gate = sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot))
+     out  = x + gate * v
+ 
+-in FP32, rounded to BF16. Image tokens keep ``x``. The magnitude's floor compares
++in FP32, rounded to BF16. Image tokens (the step's ids equal to the image sentinel:
++no mask kernel before the gate) keep ``x``. The magnitude's floor compares
+ and selects, as the reference's ``clamp_min``, so a NaN dot makes the stream NaN
+ rather than gating it with the floor. One block per (token, stream)
+ spreads a row's loads over the whole block, and every load (the value too) is
+@@ -24,6 +25,8 @@ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
++
+ # Gate magnitudes below this clamp to it before the square root.
+ CLAMP = 1e-6
+ 
+@@ -33,7 +36,7 @@ def engram_gate_kernel(
+     hc_mult: int,
+     hidden: int,
+     eps: float,
+-    has_mask: bool,
++    ids_dtype: str,
+     threads: int = 256,
+     vec: int = 4,
+ ):
+@@ -48,7 +51,7 @@ def engram_gate_kernel(
+         x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+         kv: T.Tensor((tokens, hc_mult + 1, hidden), T.bfloat16),
+         weight: T.Tensor((hc_mult, hidden), T.float32),
+-        image_mask: T.Tensor((tokens,), T.bool),
++        ids: T.Tensor((tokens,), ids_dtype),
+         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+     ):
+         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+@@ -63,7 +66,7 @@ def engram_gate_kernel(
+             for c in T.serial(chunks):
+                 for i in T.vectorized(vec):
+                     xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
+-            if has_mask and image_mask[t]:
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                 for c in T.serial(chunks):
+                     for i in T.vectorized(vec):
+                         out[t, h, (c * threads + tx) * vec + i] = T.cast(
+@@ -117,35 +120,40 @@ def engram_gate_kernel(
+     return engram_gate
+ 
+ 
++def _dtype(ids: torch.Tensor) -> str:
++    return str(ids.dtype).removeprefix("torch.")
++
++
+ @torch.library.custom_op("vllm::dsv41_tilelang_engram_gate", mutates_args=("out",))
+ def engram_gate(
+     x: torch.Tensor,
+     kv: torch.Tensor,
+     weight: torch.Tensor,
+-    image_mask: torch.Tensor | None,
++    ids: torch.Tensor,
+     out: torch.Tensor,
+     eps: float,
+     hc_mult: int,
+ ) -> None:
+     """Gate ``x`` ([T, hc_mult * D]) with ``kv`` ([T, (hc_mult + 1) * D]: the keys,
+     then the shared value) and the fused norm ``weight`` ([hc_mult * D], FP32) into
+-    ``out``. ``image_mask`` marks tokens that pass through unchanged."""
++    ``out``. ``ids`` ([T], int32 or int64) are the step's token ids: the image
++    sentinel's rows pass through unchanged."""
+     tokens = x.shape[0]
+     if tokens == 0:
+         return
+     hidden = weight.numel() // hc_mult
+-    kernel = engram_gate_kernel(hc_mult, hidden, eps, image_mask is not None)
++    kernel = engram_gate_kernel(hc_mult, hidden, eps, _dtype(ids))
+     kernel(
+         x.view(tokens, hc_mult, hidden),
+         kv.view(tokens, hc_mult + 1, hidden),
+         weight.view(hc_mult, hidden),
+-        image_mask,
++        ids,
+         out.view(tokens, hc_mult, hidden),
+     )
+ 
+ 
+ @engram_gate.register_fake
+-def _engram_gate_fake(x, kv, weight, image_mask, out, eps, hc_mult):
++def _engram_gate_fake(x, kv, weight, ids, out, eps, hc_mult):
+     return None
+ 
+ 
+@@ -154,7 +162,7 @@ def engram_gate_blocked_kernel(
+     hc_mult: int,
+     hidden: int,
+     eps: float,
+-    has_mask: bool,
++    ids_dtype: str,
+     blocks: int,
+     block_cols: int,
+     threads: int = 256,
+@@ -174,7 +182,7 @@ def engram_gate_blocked_kernel(
+         x: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+         kv: T.Tensor((blocks, rows, block_cols), T.bfloat16),
+         weight: T.Tensor((hc_mult, hidden), T.float32),
+-        image_mask: T.Tensor((tokens,), T.bool),
++        ids: T.Tensor((tokens,), ids_dtype),
+         out: T.Tensor((tokens, hc_mult, hidden), T.bfloat16),
+     ):
+         with T.Kernel(hc_mult, tokens, threads=threads) as (h, t):
+@@ -189,7 +197,7 @@ def engram_gate_blocked_kernel(
+             for c in T.serial(chunks):
+                 for i in T.vectorized(vec):
+                     xs[c * vec + i] = x[t, h, (c * threads + tx) * vec + i]
+-            if has_mask and image_mask[t]:
++            if T.cast(ids[t], T.int64) == IMAGE_SENTINEL:
+                 for c in T.serial(chunks):
+                     for i in T.vectorized(vec):
+                         out[t, h, (c * threads + tx) * vec + i] = T.cast(
+@@ -246,6 +254,7 @@ def engram_gate_blocked_kernel(
+ 
+     return engram_gate_blocked
+ 
++
+ @torch.library.custom_op(
+     "vllm::dsv41_tilelang_engram_gate_blocked", mutates_args=("out",)
+ )
+@@ -253,7 +262,7 @@ def engram_gate_blocked(
+     x: torch.Tensor,
+     kv: torch.Tensor,
+     weight: torch.Tensor,
+-    image_mask: torch.Tensor | None,
++    ids: torch.Tensor,
+     out: torch.Tensor,
+     eps: float,
+     hc_mult: int,
+@@ -268,19 +277,19 @@ def engram_gate_blocked(
+     hidden = weight.numel() // hc_mult
+     blocks, _, block_cols = kv.shape
+     kernel = engram_gate_blocked_kernel(
+-        hc_mult, hidden, eps, image_mask is not None, blocks, block_cols
++        hc_mult, hidden, eps, _dtype(ids), blocks, block_cols
+     )
+     kernel(
+         x.view(tokens, hc_mult, hidden),
+         kv,
+         weight.view(hc_mult, hidden),
+-        image_mask,
++        ids,
+         out.view(tokens, hc_mult, hidden),
+     )
+ 
+ 
+ @engram_gate_blocked.register_fake
+-def _engram_gate_blocked_fake(x, kv, weight, image_mask, out, eps, hc_mult):
++def _engram_gate_blocked_fake(x, kv, weight, ids, out, eps, hc_mult):
+     return None
+ 
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+index 1a450a877..a9b42dd97 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_hash.py
+@@ -5,9 +5,10 @@
+ For token ``t`` of request ``r`` (the last request whose query starts at or before
+ ``t``) and head ``h`` of Engram layer ``l``, the sources are the compressed ids of
+ tokens ``t``, ``t - 1``, ``t - 2`` and ``t - 3``: query tokens while they are in the
+-request's query, then its three committed history tokens, then nothing. A query
+-token compresses through the tokenizer map unless it is an image token or out of
+-vocabulary; a history token unless it is the image sentinel or out of vocabulary.
++request's query, then its three committed history tokens, then nothing. A token
++compresses through the tokenizer map unless it is the image sentinel or out of
++vocabulary (the image tokens are the sentinel's ids: no mask kernel before the
++hash).
+ From the first missing source on, every lag takes the pad id (the compressed id of
+ token 2). Heads 0-7 hash 2-grams, 8-15 3-grams and 16-23 4-grams::
+ 
+@@ -37,17 +38,19 @@ PAD_TOKEN = 2
+ def engram_hash_kernel(
+     layers: int, vocab: int, ids_dtype: str = "int64", history_dtype: str = "int64"
+ ):
++    """``out`` may be any ``[rows, layers, 24]`` view with a contiguous head
++    dimension: a layer-major buffer's permutation writes each layer's plane."""
+     threads = (layers * HEADS + 31) // 32 * 32
+     tokens = T.dynamic("tokens")
+     seqs1 = T.dynamic("seqs1")  # requests + 1
+     history_rows = T.dynamic("history_rows")
+     history_stride = T.dynamic("history_stride")
+     out_rows = T.dynamic("out_rows")
++    out_token_stride, out_layer_stride = T.dynamic("out_token_stride, out_layer_stride")
+ 
+     @T.prim_func
+     def engram_hash(
+         ids: T.Tensor((tokens,), ids_dtype),
+-        image_mask: T.Tensor((tokens,), T.bool),
+         starts: T.Tensor((seqs1,), T.int32),
+         history: T.StridedTensor(
+             (history_rows, HISTORY), (history_stride, 1), history_dtype
+@@ -56,7 +59,9 @@ def engram_hash_kernel(
+         multipliers: T.Tensor((layers, LAGS), T.int64),
+         primes: T.Tensor((layers, HEADS), T.int64),
+         offsets: T.Tensor((layers, HEADS), T.int64),
+-        out: T.Tensor((out_rows, layers, HEADS), T.int64),
++        out: T.StridedTensor(
++            (out_rows, layers, HEADS), (out_token_stride, out_layer_stride, 1), T.int64
++        ),
+         num_seqs: T.Tensor((1,), T.int32),
+         num_tokens: T.Tensor((1,), T.int32),
+     ):
+@@ -91,7 +96,7 @@ def engram_hash_kernel(
+                         relative = t - start - lag
+                         if relative >= 0:
+                             raw = T.cast(ids[t - lag], T.int64)
+-                            if raw >= 0 and raw < vocab and not image_mask[t - lag]:
++                            if raw >= 0 and raw < vocab and raw != IMAGE_SENTINEL:
+                                 source = token_map[raw]
+                         elif relative >= -HISTORY:
+                             raw = T.cast(history[request, HISTORY + relative], T.int64)
+@@ -112,7 +117,6 @@ def engram_hash_kernel(
+ )
+ def engram_hash(
+     ids: torch.Tensor,
+-    image_mask: torch.Tensor,
+     starts: torch.Tensor,
+     history: torch.Tensor,
+     token_map: torch.Tensor,
+@@ -124,9 +128,10 @@ def engram_hash(
+     num_tokens: torch.Tensor,
+ ) -> None:
+     """Hash ``ids`` ([T], int32 or int64; T may include padding past the live count
+-    ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64) and write the request
+-    and live token counts. ``history`` (int32 or int64; the runner keeps int32)
+-    holds each request's last three committed token ids, oldest first."""
++    ``starts[-1]``) into ``out`` ([>= T, layers, 24] int64, any view with contiguous
++    heads) and write the request and live token counts. ``history`` (int32 or
++    int64; the runner keeps int32) holds each request's last three committed token
++    ids, oldest first."""
+     if ids.numel() == 0:
+         return
+     kernel = engram_hash_kernel(
+@@ -137,7 +142,6 @@ def engram_hash(
+     )
+     kernel(
+         ids,
+-        image_mask,
+         starts,
+         history,
+         token_map,
+@@ -153,7 +157,6 @@ def engram_hash(
+ @engram_hash.register_fake
+ def _engram_hash_fake(
+     ids,
+-    image_mask,
+     starts,
+     history,
+     token_map,

@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 07:48:39 +0100
+Subject: [PATCH 471/488] [DS4.1] TileLang declares no B12X preparation unit
+
+Under the TileLang kernel family the attention helpers declared a B12X
+rotary plan (kept for the attention staging it allocated) and cache-writer
+plans, and every compressor built a B12X grouped-RMSNorm plan; serving
+launched none of them. The helpers now declare nothing under TileLang,
+the layer's kernel binding allocates the same staging before memory
+profiling, cache writes look up a B12X plan only under B12X, and the
+compressor's norm holds just its weight. The B12X family is unchanged.
+---
+ tests/models/test_deepseek_v4_1_attention.py  | 115 ++++++++++++++++++
+ .../test_deepseek_v4_1_compressor_prepare.py  |  31 +++++
+ vllm/models/deepseek_v4_1/attention.py        |  74 ++++++-----
+ vllm/models/deepseek_v4_1/compressor.py       |   9 +-
+ .../deepseek_v4_1/tilelang/attention.py       |   7 +-
+ 5 files changed, 194 insertions(+), 42 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_attention.py b/tests/models/test_deepseek_v4_1_attention.py
+index 74c8d0d71..2e845ad71 100644
+--- a/tests/models/test_deepseek_v4_1_attention.py
++++ b/tests/models/test_deepseek_v4_1_attention.py
+@@ -394,3 +394,118 @@ def test_wo_prefill_remainders_reuse_declared_chunk_capacity():
+     assert module._wo_plans == declarations
+     assert not module._wo_plan(1).query.dynamic_tokens
+     assert module._wo_plan(8).query.max_tokens == 8
++
++
++def _tilelang_layer(monkeypatch, layer_id):
++    """A TileLang attention layer with the geometry its bind reads (no weights)."""
++    from vllm.models.deepseek_v4_1 import attention
++    from vllm.models.deepseek_v4_1.tilelang.attention import (
++        DeepseekV41TileLangAttention,
++    )
++
++    monkeypatch.setattr(attention.kernels, "uses_tilelang", lambda: True)
++    module = DeepseekV41TileLangAttention.__new__(DeepseekV41TileLangAttention)
++    torch.nn.Module.__init__(module)
++    module.prefix = f"model.layers.{layer_id}.attn"
++    module.layer_id, module.candidate_source_layer = layer_id, 3
++    module.capacity, module.swa_width, module.compress_ratio = 300, 128, 1
++    module._main_page = module._index_page = 64
++    module._main_width = module._index_width = 16
++    module.is_ced_decoder, module.is_index_source = False, True
++    module.topk_indices_buffer = None
++    module.indexer = SimpleNamespace(heads=32)
++    module.compressor = None
++    module.config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(max_num_seqs=4),
++        speculative_config=None,
++        compilation_config=SimpleNamespace(max_cudagraph_capture_size=24),
++    )
++    module.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(16, 64))
++    module._helper_plans = {}
++    module._ready = False
++    return attention, module
++
++
++def test_tilelang_attention_declares_no_b12x_unit(monkeypatch):
++    attention, module = _tilelang_layer(monkeypatch, layer_id=3)
++    workload = SimpleNamespace(stage="weights")
++    helpers = attention._AttentionHelpers(module)
++    assert helpers.get_b12x_preparation_units(helpers, workload) == ()
++    assert module.get_b12x_preparation_units(module, workload) == ()
++    assert module._helper_plans == {} and not module._ready
++
++
++@pytest.mark.parametrize(
++    "layer_id,staging",
++    [
++        (2, ["topk_indices_buffer", "_index_pages", "_active", "_short_index_pages"]),
++        (
++            3,
++            [
++                "topk_indices_buffer",
++                "_index_pages",
++                "_active",
++                "_candidates",
++                "_candidate_lens",
++            ],
++        ),
++    ],
++)
++def test_tilelang_binding_prepares_the_attention_staging(
++    monkeypatch, layer_id, staging
++):
++    # B12X's kv helper plan used to allocate the staging while it was prepared;
++    # under TileLang the layer's kernel binding does, before memory profiling.
++    _, module = _tilelang_layer(monkeypatch, layer_id)
++    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
++    module._build_tilelang_plans = lambda: "plans"
++    module._attention_geometry()  # declare_kernels() runs it before binding
++    with torch.inference_mode():  # the worker prepares kernels inside it
++        module._bind_plans()
++    assert module._ready and module._tilelang_plans == "plans"
++    assert [name for name, _, _ in module._staging_specs] == staging
++    for name, shape, dtype in module._staging_specs:
++        tensor = getattr(module, name)
++        assert tuple(tensor.shape) == shape and tensor.dtype == dtype
++        assert not tensor.is_inference()  # updated in place while serving
++    assert module._active.tolist() == [16 * 64]
++
++
++def test_tilelang_context_kv_write_needs_no_helper_plan(monkeypatch):
++    from vllm.models.deepseek_v4_1.tilelang import cache_writer, rope
++
++    _, module = _tilelang_layer(monkeypatch, layer_id=3)
++    writes = []
++    monkeypatch.setattr(rope, "rope_", lambda *args: None)
++    monkeypatch.setattr(
++        cache_writer, "write_cache", lambda *args, **kwargs: writes.append(kwargs)
++    )
++    module.swa_cache_layer = SimpleNamespace(
++        kv_cache=torch.empty(2, 8, dtype=torch.uint8), block_size=64
++    )
++    module._ready = True
++    kv = torch.zeros(1, 512, dtype=torch.bfloat16)
++    slots = torch.zeros(1, dtype=torch.int64)
++    module.insert_context_kv(kv, slots, slots)
++    assert writes == [dict(page_size=64, cache_kind="swa")]
++
++
++def test_b12x_cache_writes_use_the_helper_plan_of_their_kind(monkeypatch):
++    from vllm.models.deepseek_v4_1 import attention
++
++    monkeypatch.setattr(attention.kernels, "uses_tilelang", lambda: False)
++    plans = []
++    monkeypatch.setattr(
++        attention.mla, "write_cache", lambda *args, **kwargs: plans.append(kwargs)
++    )
++    module = attention.DeepseekV4Attention.__new__(attention.DeepseekV4Attention)
++    torch.nn.Module.__init__(module)
++    module.prefix = "model.layers.0.attn"
++    module._helper_plans = {"swa_cache_write": "swa", "indexed_cache_write": "main"}
++    x = torch.zeros(1, 512, dtype=torch.bfloat16)
++    cache = torch.empty(2, 8, dtype=torch.uint8)
++    slots = torch.zeros(1, dtype=torch.int64)
++    for kind in ("swa", "indexed"):
++        module._write_v41_cache(x, cache, slots, page_size=64, cache_kind=kind)
++    assert [kwargs["plan"] for kwargs in plans] == ["swa", "main"]
++    assert {kwargs["cache_format"] for kwargs in plans} == {"deepseek_v41"}
+diff --git a/tests/models/test_deepseek_v4_1_compressor_prepare.py b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+index 960f79acf..0a740c551 100644
+--- a/tests/models/test_deepseek_v4_1_compressor_prepare.py
++++ b/tests/models/test_deepseek_v4_1_compressor_prepare.py
+@@ -72,6 +72,37 @@ def test_binding_allocates_the_serving_storage(monkeypatch):
+     assert compressor._primer_starts is None
+ 
+ 
++@pytest.mark.parametrize("tilelang", [False, True])
++def test_norm_weight_loads_unchanged_and_only_b12x_builds_a_norm(monkeypatch, tilelang):
++    # The TileLang compression applies the norm's weight itself, so no B12X norm
++    # (and no preparation unit) is built; the checkpoint loads the same parameter.
++    from vllm.model_executor import parameter
++    from vllm.model_executor.layers import linear
++    from vllm.models.deepseek_v4_1 import b12x_layers
++
++    for module in (linear, parameter):
++        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
++        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
++    monkeypatch.setattr(compressor_module.kernels, "uses_tilelang", lambda: tilelang)
++    monkeypatch.setattr(b12x_layers, "_capacity", lambda: TOKENS)
++    config = SimpleNamespace(
++        scheduler_config=SimpleNamespace(
++            max_num_batched_tokens=TOKENS, max_num_seqs=REQUESTS
++        ),
++        model_config=SimpleNamespace(hf_config=SimpleNamespace(rms_norm_eps=1e-6)),
++    )
++    compressor = DeepseekCompressor(config, 1, 32, 512, prefix="layers.0.compressor")
++    weight = dict(compressor.named_parameters())["norm.weight"]
++    assert weight is compressor.norm.weight
++    assert weight.shape == (512,) and weight.dtype == torch.float32
++    assert not weight.requires_grad and not hasattr(weight, "weight_loader")
++    if tilelang:
++        assert type(compressor.norm) is torch.nn.Module
++        assert not hasattr(compressor.norm, "b12x_preparation_provider")
++    else:
++        assert isinstance(compressor.norm, b12x_layers.B12xRMSNorm)
++
++
+ def test_forwarding_before_binding_fails_by_name(monkeypatch):
+     compressor = _compressor(monkeypatch, 1)
+     with pytest.raises(PreparationResourceUnavailableError, match="bound"):
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 7e909fcb8..8c3bf8958 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -93,25 +93,6 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
+     return out
+ 
+ 
+-def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
+-    """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+-    if kernels.uses_tilelang():
+-        # The same bytes as B12X's writer; its plans stay declared.
+-        from .tilelang.cache_writer import write_cache
+-
+-        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+-        return
+-    mla.write_cache(
+-        x,
+-        cache,
+-        slots,
+-        page_size=page_size,
+-        cache_kind=cache_kind,
+-        cache_format="deepseek_v41",
+-        plan=plan,
+-    )
+-
+-
+ class _AttentionHelpers:
+     """Loaded-resource owner, independent of unpublished attention caches."""
+ 
+@@ -121,26 +102,26 @@ class _AttentionHelpers:
+     def get_b12x_preparation_units(
+         self, layer: object, workload: B12xWorkload
+     ) -> tuple[B12xPreparationUnit, ...]:
++        # The TileLang kernels launch no helper plan; binding them prepares the
++        # attention staging (DeepseekV41TileLangAttention._bind_plans).
++        if kernels.uses_tilelang():
++            return ()
+         from b12x.preparation import FrozenMapping, MemoryRequirements, PreparedCall
+ 
+         attn = self.attention
+         table = attn.rotary_emb.cos_sin_cache
+         device = table.device
+         attn._declare_attention(device)
+-        roles = [("kv", 1, 512, 1)]
+-        # TileLang RoPE needs no plan; the kv plan stays for the attention staging
+-        # memory it carries and materializes.
+-        if not kernels.uses_tilelang():
+-            roles.append(("q", attn.n_local_heads, 512, 1))
+-            if attn.indexer is not None:
+-                roles.append(("index_query", attn.indexer.heads, 128, 1))
+-            if attn.compressor is not None:
+-                roles.extend(
+-                    (
+-                        ("index_key", 1, 128, attn.compress_ratio),
+-                        ("latent", 1, 512, attn.compress_ratio),
+-                    )
++        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
++        if attn.indexer is not None:
++            roles.append(("index_query", attn.indexer.heads, 128, 1))
++        if attn.compressor is not None:
++            roles.extend(
++                (
++                    ("index_key", 1, 128, attn.compress_ratio),
++                    ("latent", 1, 512, attn.compress_ratio),
+                 )
++            )
+         plans: dict[str, object] = {}
+         requests = []
+         for role, heads, dim, ratio in roles:
+@@ -194,8 +175,7 @@ class _AttentionHelpers:
+                     prepare_call=prepare,
+                 )
+             )
+-        # The TileLang indexer folds the head-weight scale into its projection.
+-        if attn.indexer is not None and not kernels.uses_tilelang():
++        if attn.indexer is not None:
+             declaration = weight_scale.plan(
+                 weight_scale.Query(max_elements=attn.capacity * attn.indexer.heads),
+                 device=device,
+@@ -258,8 +238,6 @@ class _AttentionHelpers:
+             requests=tuple(requests),
+             stage="weights",
+         )
+-        if kernels.uses_tilelang():  # the TileLang WO projection needs no plan
+-            return (helpers,)
+         return (helpers, attn._wo_preparation_unit(workload))
+ 
+ 
+@@ -1310,6 +1288,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return x
+         return _rotated(x, positions, table, plan=self._helper_plan(role))
+ 
++    def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
++        """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
++        if kernels.uses_tilelang():
++            # The same bytes as B12X's writer.
++            from .tilelang.cache_writer import write_cache
++
++            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
++            return
++        mla.write_cache(
++            x,
++            cache,
++            slots,
++            page_size=page_size,
++            cache_kind=cache_kind,
++            cache_format="deepseek_v41",
++            plan=self._helper_plan(f"{cache_kind}_cache_write"),
++        )
++
+     def _helper_plan(self, role: str):
+         try:
+             return self._helper_plans[role]
+@@ -1386,13 +1382,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 "V4.1 attention metadata is not prepared"
+             )
+         rotated = self._rope(kv, positions, "kv")
+-        _write_v41_cache(
++        self._write_v41_cache(
+             rotated,
+             self.swa_cache_layer.kv_cache,
+             slot_mapping,
+             page_size=self.swa_cache_layer.block_size,
+             cache_kind="swa",
+-            plan=self._helper_plan("swa_cache_write"),
+         )
+ 
+     def _query_metadata(self, metadata):
+@@ -1441,13 +1436,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
+         self._write_index_keys(key, index_meta.slot_mapping[:rows])
+         latent = self._rope(latent, positions, "latent")
+-        _write_v41_cache(
++        self._write_v41_cache(
+             latent,
+             self.kv_cache,
+             slots,
+             page_size=self._main_page,
+             cache_kind="indexed",
+-            plan=self._helper_plan("indexed_cache_write"),
+         )
+ 
+     def forward(
+diff --git a/vllm/models/deepseek_v4_1/compressor.py b/vllm/models/deepseek_v4_1/compressor.py
+index 552ec2f68..13274662a 100644
+--- a/vllm/models/deepseek_v4_1/compressor.py
++++ b/vllm/models/deepseek_v4_1/compressor.py
+@@ -162,7 +162,14 @@ class DeepseekCompressor(nn.Module):
+         self.fused_wkv_wgate.out_dtype = (
+             torch.float32 if compress_ratio == 2 else torch.bfloat16
+         )
+-        self.norm = B12xRMSNorm(512, vllm_config.model_config.hf_config.rms_norm_eps)
++        if kernels.uses_tilelang():
++            # The TileLang compression applies the norm's weight itself: the
++            # module only holds the parameter, under its checkpoint name.
++            self.norm = nn.Module()
++        else:
++            self.norm = B12xRMSNorm(
++                512, vllm_config.model_config.hf_config.rms_norm_eps
++            )
+         self.norm.weight = nn.Parameter(
+             torch.ones(512, dtype=torch.float32), requires_grad=False
+         )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 64da43927..1e0d6c45e 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -92,7 +92,8 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+ 
+     def declare_kernels(self) -> None:
+         """Also declare the sparse MLA, indexer and MXFP4 quantizer kernels; binding
+-        builds the plans and reserves their scratch, before memory profiling."""
++        allocates the layer's staging, builds the plans and reserves their scratch,
++        before memory profiling."""
+         super().declare_kernels()
+         calls = self._plan_calls()
+         prepare.declare(lambda: calls, bind=self._bind_plans)
+@@ -152,6 +153,10 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         return calls
+ 
+     def _bind_plans(self) -> None:
++        # The staging is mutable serving state: ordinary tensors, not inference
++        # tensors of the worker's profiling scope.
++        with torch.inference_mode(False):
++            self._prepare(self.rotary_emb.cos_sin_cache.device)
+         self._tilelang_plans = self._build_tilelang_plans()
+ 
+     def _tilelang(self) -> SimpleNamespace:

@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 10:48:45 +0200
+Subject: [PATCH 322/488] CED requests: switch to the TileLang kernel with
+ per-request row limits and remove the old one
+
+CEDState stages each request's kept-row limit, 2^31-1 for a request that keeps
+every row and the 128-row window otherwise, in place of the bool keep_full, and
+stages its metadata with the TileLang requests kernel. Its three
+specializations (unchanged rows, one request compacted, several) are declared
+with the row map, so they compile before the cache freezes. With those two
+limit values the outputs are identical to the Triton kernel's; per-request
+limits are the interface the CED skip needs. The Triton kernel is removed; the
+benchmark and the kernel tests keep their copy as the reference.
+---
+ .../attention/test_b12x_v41_ced_metadata.py   |  9 +--
+ vllm/models/deepseek_v4_1/ced.py              | 67 ++++++-------------
+ 2 files changed, 27 insertions(+), 49 deletions(-)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index ec7c22955..8694bc649 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -529,10 +529,11 @@ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
+     cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
+     monkeypatch.setattr(cache_module, "_frozen_reason", None)
+     # Isolate compilation state so earlier tests cannot hide a missing warmup.
+-    for kernel in (ced._decoder_requests, ced._copy_rows):
+-        monkeypatch.setattr(
+-            kernel, "device_caches", defaultdict(kernel.device_caches.default_factory)
+-        )
++    monkeypatch.setattr(
++        ced._copy_rows,
++        "device_caches",
++        defaultdict(ced._copy_rows.device_caches.default_factory),
++    )
+     state = CEDState(4, 8192, (128, 256, 384, 512, 8192), "cuda")
+     # The packings compile with the runner's JIT warmup, as under the worker.
+     registry = JitWarmupRegistry(None)
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index a4d2ec768..6a4995a16 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -25,6 +25,7 @@ if TYPE_CHECKING:
+     from .sparse_mla import DeepseekV41B12xMetadata
+ 
+ CED_WINDOW = 128
++KEEP_ALL = 2**31 - 1
+ 
+ 
+ def ced_decoder_start(hf_config: Any) -> int | None:
+@@ -200,41 +201,6 @@ def plan_ced(query_lengths, keep_full, capacities: tuple[int, ...]) -> CEDPlan |
+     )
+ 
+ 
+-@triton.jit(do_not_specialize=["nr"])
+-def _decoder_requests(
+-    Starts,
+-    Seq,
+-    KeepFull,
+-    PrefixStart,
+-    OutStarts,
+-    RequestPositions,
+-    ReplayStart,
+-    Counts,
+-    nr,
+-    R: tl.constexpr,
+-    B: tl.constexpr,
+-    WINDOW: tl.constexpr,
+-):
+-    r = tl.arange(0, B)
+-    valid = r < nr
+-    start = tl.load(Starts + r, valid, other=0)
+-    end = tl.load(Starts + r + 1, valid, other=0)
+-    seq = tl.load(Seq + r, valid, other=0).to(tl.int64)
+-    full = tl.load(KeepFull + r, valid, other=0)
+-    q = end - start
+-    kept = tl.where(full, q, tl.minimum(q, WINDOW))
+-    cumulative = tl.cumsum(kept)
+-    count = tl.sum(kept)
+-    tl.store(OutStarts + r, tl.where(valid, cumulative - kept, count), r <= R)
+-    tl.store(OutStarts + nr, count)
+-    tl.store(RequestPositions + r, tl.where(valid, seq - kept, -1), r < R)
+-    prefix = tl.load(PrefixStart + r, valid, other=0)
+-    replay = tl.maximum(prefix, tl.where(q > kept, seq - kept, 0))
+-    tl.store(ReplayStart + r, replay, r < R)
+-    tl.store(Counts, count)
+-    tl.store(Counts + 1, nr)
+-
+-
+ class CEDState:
+     """Stable per-model staging buffers shared by dummy, capture, and runtime."""
+ 
+@@ -250,7 +216,7 @@ class CEDState:
+         )
+         self.replay_start = torch.empty_like(self.request_positions)
+         self.counts = torch.empty(2, dtype=torch.int32, device=device)
+-        self.keep_full = torch.empty(max_requests, dtype=torch.bool, device=device)
++        self.limits = torch.empty(max_requests, dtype=torch.int32, device=device)
+         self.prefix_start = torch.empty_like(self.request_positions)
+         self.plan: CEDPlan | None = None
+ 
+@@ -293,7 +259,16 @@ class CEDState:
+             self.replay_start.zero_()
+ 
+         prepare.declare(
+-            lambda: [prepare.call(ced_kernels.indices_kernel, self.max_requests)],
++            lambda: [
++                prepare.call(ced_kernels.indices_kernel, self.max_requests),
++                # Unchanged rows, then a compaction of one request and of several.
++                *(
++                    prepare.call(
++                        ced_kernels.requests_kernel, self.max_requests, compact, single
++                    )
++                    for compact, single in ((False, False), (True, True), (True, False))
++                ),
++            ],
+             warm=warm_metadata,
+         )
+ 
+@@ -309,27 +284,29 @@ class CEDState:
+         self.plan = plan_ced(query_lengths, keep_full, self.capacities)
+         # Fresh pinned sources remain owned by the async-copy allocator until
+         # transfer completion; reusing a CPU staging buffer could race overlap.
+-        keep_host = torch.tensor(
+-            keep_full, dtype=torch.bool, device="cpu", pin_memory=True
++        # A request keeps at most its limit of rows: all of them, or the window.
++        limits_host = torch.tensor(
++            [KEEP_ALL if full else CED_WINDOW for full in keep_full],
++            dtype=torch.int32,
++            device="cpu",
++            pin_memory=True,
+         )
+         prefix_host = torch.tensor(
+             prefix_start, dtype=torch.int64, device="cpu", pin_memory=True
+         )
+-        self.keep_full[:nr].copy_(keep_host, non_blocking=True)
++        self.limits[:nr].copy_(limits_host, non_blocking=True)
+         self.prefix_start[:nr].copy_(prefix_host, non_blocking=True)
+-        _decoder_requests[(1,)](
++        ced_kernels.requests(
+             starts,
+             seq,
+-            self.keep_full,
++            self.limits,
+             self.prefix_start,
+             self.starts,
+             self.request_positions,
+             self.replay_start,
+             self.counts,
+             nr,
+-            self.max_requests,
+-            triton.next_power_of_2(self.max_requests + 1),
+-            CED_WINDOW,
++            compact=self.plan is not None,
+         )
+         if self.plan is not None:
+             ced_kernels.indices(

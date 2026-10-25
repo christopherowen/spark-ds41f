@@ -1,0 +1,2448 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:23:49 +0200
+Subject: [PATCH 420/488] [DS4.1] Rejection sampler's block verification in
+ TileLang
+
+Production's verification (one-hot drafts, block verification, FP32
+draws, no watermark) runs as TileLang kernels, the contract of the
+Triton kernels bit for bit: the local logits statistics, the cumulative
+log-probabilities and the rejection fused into one verify kernel, and
+the resample. The arithmetic follows Triton 3.7's PTX and SASS for
+sm_121a, including the FMA LLVM fuses into the first level of a row's
+log-sum-exp reduction (lane 0, which stores, is the contract). Every
+other configuration stays on the Triton kernels.
+---
+ .../kernels/benchmark_tilelang_rejection.py   |  503 ++++++++
+ .../v1/spec_decode/test_tilelang_rejection.py |  719 +++++++++++
+ .../spec_decode/rejection_sampler_utils.py    |   93 +-
+ .../gpu/spec_decode/tilelang_rejection.py     | 1060 +++++++++++++++++
+ 4 files changed, 2352 insertions(+), 23 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_tilelang_rejection.py
+ create mode 100644 tests/v1/spec_decode/test_tilelang_rejection.py
+ create mode 100644 vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_rejection.py b/benchmarks/kernels/benchmark_tilelang_rejection.py
+new file mode 100644
+index 000000000..a5b8cb8a0
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_tilelang_rejection.py
+@@ -0,0 +1,503 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired CUDA graph timings of the TileLang rejection sampler against the Triton
++kernels it replaces, in production's configuration: one-hot drafts, block
++verification, FP32 draws, DeepSeek V4.1's vocabulary and five draft steps.
++
++``rejection_sample`` times the whole verification: ``rejection_sample`` itself
++(TileLang's three kernels) against the four Triton kernels they replace, both with
++the shared insertion; ``local_stats``, ``verify`` (against the cumulative-ratio and
++rejection kernels together) and ``resample`` time one step each, from inputs the
++steps before it computed once with Triton. Every graph node has its own inputs and
++outputs, so no call reads logits another left in L2. Outputs start at a sentinel,
++reset outside the timed replay, and the two implementations must agree bit for bit
++before anything is timed, the elements they leave alone included. Both see the same
++tensor addresses.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++import triton
++
++from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as rs
++from vllm.v1.worker.gpu.spec_decode import tilelang_rejection as candidate
++
++VOCAB = 129280
++STEPS = 5
++KERNELS = ("rejection_sample", "local_stats", "verify", "resample")
++DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
++
++
++def requests(rows):
++    """Blocks of STEPS + 1 rows, the remainder as one shorter block (adaptive
++    verification)."""
++    counts = [STEPS + 1] * (rows // (STEPS + 1))
++    if rows % (STEPS + 1):
++        counts.append(rows % (STEPS + 1))
++    return counts
++
++
++def make_inputs(rows, dtype, temps, seed):
++    """One graph node's verification inputs. Each row's next input is lifted by a
++    margin that varies by row, so some drafts are accepted and others rejected;
++    with ``temps`` "mixed" every other request is greedy."""
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    counts = requests(rows)
++    reqs = len(counts)
++    states = reqs + 9
++    mapping = torch.randperm(states, generator=g, device="cuda")[:reqs]
++    sizes = torch.tensor(counts, device="cuda")
++    temperature = torch.ones(states, device="cuda")
++    if temps == "mixed":
++        temperature[mapping[::2]] = 0
++    drafts = torch.randint(0, VOCAB, (rows,), generator=g, device="cuda")
++    logits = torch.randn(rows, VOCAB, generator=g, device="cuda") * 4
++    if rows > 1:
++        r = torch.arange(rows - 1, device="cuda")
++        margin = torch.tensor([0.0, 3.0, 6.0, 9.0, 14.0, 40.0], device="cuda")
++        logits[r, drafts[1:]] += margin[r % 6]
++    return {
++        "logits": logits.to(dtype),
++        "drafts": drafts.int(),
++        "cu": torch.cat((sizes.new_zeros(1), sizes.cumsum(0))).int(),
++        "pos": torch.randint(0, 1 << 20, (rows,), generator=g, device="cuda"),
++        "idx_mapping": mapping,
++        "expanded": mapping.repeat_interleave(sizes),
++        "local": torch.cat([torch.arange(c, device="cuda") for c in counts]).int(),
++        "temperature": temperature,
++        "seeds": torch.randint(
++            -(2**63), 2**63 - 1, (states,), generator=g, device="cuda"
++        ),
++    }
++
++
++# --- rejection_sample's Triton launches for this configuration ----------------
++
++
++def triton_local_stats(x, stats):
++    rows, vocab = x["logits"].shape
++    argmax, maximum, sumexp = stats
++    unused = torch.empty_like(maximum)
++    rs._compute_local_logits_stats_kernel[(rows, maximum.shape[1])](
++        argmax,
++        argmax.stride(0),
++        maximum,
++        maximum.stride(0),
++        sumexp,
++        sumexp.stride(0),
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        x["logits"],
++        x["logits"].stride(0),
++        None,
++        0,
++        0,
++        x["expanded"],
++        x["local"],
++        x["temperature"],
++        vocab,
++        STEPS,
++        BLOCK_SIZE=candidate.STATS_BLOCK,
++        HAS_DRAFT_LOGITS=False,
++    )
++
++
++def triton_verify(x, stats, verified):
++    argmax, maximum, sumexp = stats
++    cumulative, sampled, num_sampled, target_lse, draft_lse = verified
++    reqs = num_sampled.shape[0]
++    blocks = maximum.shape[1]
++    padded = triton.next_power_of_2(blocks)
++    unused = torch.empty_like(maximum)
++    logits = x["logits"]
++    rs._compute_cumulative_log_p_kernel[(reqs,)](
++        cumulative,
++        logits,
++        logits.stride(0),
++        maximum,
++        maximum.stride(0),
++        sumexp,
++        sumexp.stride(0),
++        x["drafts"],
++        None,
++        0,
++        0,
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        x["cu"],
++        x["idx_mapping"],
++        x["temperature"],
++        blocks,
++        PADDED_VOCAB_NUM_BLOCKS=padded,
++        HAS_DRAFT_LOGITS=False,
++        num_warps=1,
++    )
++    rs._rejection_kernel[(reqs,)](
++        sampled,
++        sampled.stride(0),
++        num_sampled,
++        target_lse,
++        draft_lse,
++        logits,
++        logits.stride(0),
++        argmax,
++        argmax.stride(0),
++        maximum,
++        maximum.stride(0),
++        sumexp,
++        sumexp.stride(0),
++        x["drafts"],
++        None,
++        0,
++        0,
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        x["cu"],
++        x["idx_mapping"],
++        x["temperature"],
++        x["seeds"],
++        x["pos"],
++        None,
++        cumulative,
++        None,
++        0,
++        blocks,
++        target_lse,
++        target_lse,
++        0,
++        PADDED_VOCAB_NUM_BLOCKS=padded,
++        HAS_DRAFT_LOGITS=False,
++        SYNTHETIC_MODE=False,
++        USE_BLOCK_VERIFICATION=True,
++        VP_DRAFT=False,
++        num_warps=1,
++    )
++
++
++def triton_resample(x, verified, resampled):
++    cumulative, _, num_sampled, target_lse, draft_lse = verified
++    ids, values = resampled
++    logits = x["logits"]
++    rs._resample_kernel[(num_sampled.shape[0], ids.shape[1])](
++        ids,
++        ids.stride(0),
++        values,
++        values.stride(0),
++        logits,
++        logits.stride(0),
++        target_lse,
++        None,
++        0,
++        0,
++        draft_lse,
++        num_sampled,
++        x["cu"],
++        x["expanded"],
++        x["drafts"],
++        x["temperature"],
++        x["seeds"],
++        x["pos"],
++        cumulative,
++        None,
++        0,
++        None,
++        0,
++        0,
++        logits.shape[1],
++        BLOCK_SIZE=candidate.RESAMPLE_BLOCK,
++        HAS_DRAFT_LOGITS=False,
++        USE_FP64=False,
++        USE_BLOCK_VERIFICATION=True,
++        CONTEXT_WIDTH=1,
++        WATERMARK=False,
++    )
++
++
++def stats_buffers(x):
++    rows, vocab = x["logits"].shape
++    blocks = triton.cdiv(vocab, candidate.STATS_BLOCK)
++    return (
++        torch.empty((rows, blocks), device="cuda", dtype=torch.int64),
++        torch.empty((rows, blocks), device="cuda"),
++        torch.empty((rows, blocks), device="cuda"),
++    )
++
++
++def verify_buffers(x):
++    rows = x["logits"].shape[0]
++    reqs = x["cu"].shape[0] - 1
++    return (
++        torch.empty(rows, device="cuda"),
++        torch.empty((reqs, STEPS + 1), device="cuda", dtype=torch.int64),
++        torch.empty(reqs, device="cuda", dtype=torch.int32),
++        torch.empty(reqs, device="cuda"),
++        torch.empty(reqs, device="cuda"),
++    )
++
++
++def resample_buffers(x):
++    reqs = x["cu"].shape[0] - 1
++    blocks = triton.cdiv(x["logits"].shape[1], candidate.RESAMPLE_BLOCK)
++    return (
++        torch.empty((reqs, blocks), device="cuda", dtype=torch.int64),
++        torch.empty((reqs, blocks), device="cuda"),
++    )
++
++
++def triton_rejection_sample(x):
++    """rejection_sample's Triton path, with its allocations: the four kernels the
++    TileLang ones replace, then the insertion both paths share."""
++    stats = stats_buffers(x)
++    triton_local_stats(x, stats)
++    verified = verify_buffers(x)
++    triton_verify(x, stats, verified)
++    resampled = resample_buffers(x)
++    triton_resample(x, verified, resampled)
++    _, sampled, num_sampled, _, _ = verified
++    rs.insert_resampled(
++        sampled, num_sampled, *resampled, x["cu"], x["expanded"], x["temperature"]
++    )
++    return sampled, num_sampled
++
++
++def tilelang_rejection_sample(x):
++    """rejection_sample itself, which takes the TileLang kernels here."""
++    return rs.rejection_sample(
++        x["logits"],
++        None,
++        x["drafts"],
++        x["cu"],
++        x["pos"],
++        x["idx_mapping"],
++        x["expanded"],
++        x["local"],
++        x["temperature"],
++        x["seeds"],
++        STEPS,
++        use_block_verification=True,
++    )
++
++
++def make_case(kind, rows, dtype, temps, seed, count):
++    """``reset``, ``invoke(index, ours)`` and ``output(index)`` for ``count`` graph
++    nodes, each with its own inputs and outputs."""
++    nodes = [make_inputs(rows, dtype, temps, seed * 1000 + i) for i in range(count)]
++
++    if kind == "rejection_sample":
++        results = [None] * count
++
++        def invoke(index, ours):
++            run = tilelang_rejection_sample if ours else triton_rejection_sample
++            results[index] = run(nodes[index])
++
++        def output(index):
++            # Only the committed tokens are defined.
++            sampled, num_sampled = results[index]
++            columns = torch.arange(sampled.shape[1], device="cuda")
++            valid = columns[None, :] < num_sampled[:, None]
++            return (num_sampled, torch.where(valid, sampled, -1))
++
++        return lambda: None, invoke, output
++
++    # The steps before the timed one, once, with Triton.
++    for x in nodes:
++        x["stats"] = stats_buffers(x)
++        triton_local_stats(x, x["stats"])
++        if kind == "resample":
++            x["verified"] = verify_buffers(x)
++            triton_verify(x, x["stats"], x["verified"])
++    outputs = {
++        "local_stats": lambda x: stats_buffers(x),
++        "verify": lambda x: verify_buffers(x),
++        "resample": lambda x: resample_buffers(x),
++    }[kind]
++    buffers = [outputs(x) for x in nodes]
++
++    def reset():
++        for tensors in buffers:
++            for t in tensors:
++                t.fill_(-7)
++
++    def invoke(index, ours):
++        x, out = nodes[index], buffers[index]
++        if kind == "local_stats":
++            if ours:
++                candidate.compute_local_stats(
++                    *out,
++                    x["logits"],
++                    x["expanded"],
++                    x["local"],
++                    x["temperature"],
++                    STEPS,
++                )
++            else:
++                triton_local_stats(x, out)
++        elif kind == "verify":
++            if ours:
++                cumulative, sampled, num_sampled, target_lse, draft_lse = out
++                candidate.verify(
++                    sampled,
++                    num_sampled,
++                    target_lse,
++                    draft_lse,
++                    cumulative,
++                    x["logits"],
++                    *x["stats"],
++                    x["drafts"],
++                    x["cu"],
++                    x["idx_mapping"],
++                    x["temperature"],
++                    x["seeds"],
++                    x["pos"],
++                    STEPS,
++                )
++            else:
++                triton_verify(x, x["stats"], out)
++        elif ours:
++            candidate.resample(
++                *out,
++                x["logits"],
++                x["verified"][2],
++                x["cu"],
++                x["expanded"],
++                x["drafts"],
++                x["temperature"],
++                x["seeds"],
++                x["pos"],
++            )
++        else:
++            triton_resample(x, x["verified"], out)
++
++    return reset, invoke, lambda index: buffers[index]
++
++
++def bits(t):
++    return t.view(torch.int32) if t.dtype == torch.float32 else t
++
++
++def capture(invoke, ours, count):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        invoke(0, ours)
++    torch.cuda.current_stream().wait_stream(side)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for index in range(count):
++            invoke(index, ours)
++    return graph
++
++
++def elapsed(graph, reset, count):
++    reset()
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    graph.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 1000 / count
++
++
++def measure(kind, rows, dtype_name, temps, seed):
++    count = 8
++    ours, theirs = [], []
++    for sample in range(8):
++        reset, invoke, output = make_case(
++            kind, rows, DTYPES[dtype_name], temps, seed + sample, count
++        )
++        reset()
++        invoke(0, False)
++        expected = [value.clone() for value in output(0)]
++        reset()
++        invoke(0, True)
++        for actual, target in zip(output(0), expected):
++            if torch.equal(bits(actual), bits(target)):
++                continue
++            indices = (bits(actual) != bits(target)).nonzero()[:8]
++            print(
++                json.dumps(
++                    {
++                        "sample": sample,
++                        "differences": [
++                            [
++                                index.tolist(),
++                                actual[tuple(index)].item(),
++                                target[tuple(index)].item(),
++                            ]
++                            for index in indices
++                        ],
++                    }
++                ),
++                flush=True,
++            )
++            raise RuntimeError(
++                f"outputs differ: {kind} rows={rows} {dtype_name} {temps}"
++            )
++        reset()
++        a = capture(invoke, True, count)
++        reset()
++        b = capture(invoke, False, count)
++        order = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(graph): elapsed(graph, reset, count) for graph in order}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        del a, b, order, reset, invoke, output, expected
++    paired = [a - b for a, b in zip(ours, theirs)]
++    mean = statistics.fmean(paired)
++    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++    result = dict(
++        kernel=kind,
++        rows=rows,
++        dtype=dtype_name,
++        temperatures=temps,
++        tilelang_us=statistics.median(ours),
++        triton_us=statistics.median(theirs),
++        interval_us=[mean - half, mean + half],
++        slower=mean - half > 0,
++        tilelang_samples_us=ours,
++        triton_samples_us=theirs,
++    )
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--seed", type=int, default=48291)
++    parser.add_argument("--kernels", default=",".join(KERNELS))
++    parser.add_argument("--rows", default="1,6,16,48,96")
++    parser.add_argument("--dtypes", default="float32,bfloat16")
++    parser.add_argument("--temperatures", default="sampled,mixed")
++    args = parser.parse_args()
++    cases = [
++        (kind, rows, dtype, temps)
++        for kind in args.kernels.split(",")
++        for dtype in args.dtypes.split(",")
++        for temps in args.temperatures.split(",")
++        for rows in map(int, args.rows.split(","))
++    ]
++    results = [measure(*case, args.seed) for case in cases]
++    failed = [
++        (r["kernel"], r["rows"], r["dtype"], r["temperatures"])
++        for r in results
++        if r["slower"]
++    ]
++    print(json.dumps({"summary": "rejection sampler", "slower": failed}), flush=True)
++    if args.gate and failed:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/spec_decode/test_tilelang_rejection.py b/tests/v1/spec_decode/test_tilelang_rejection.py
+new file mode 100644
+index 000000000..d834e7c19
+--- /dev/null
++++ b/tests/v1/spec_decode/test_tilelang_rejection.py
+@@ -0,0 +1,719 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The TileLang rejection sampler (``spec_decode.tilelang_rejection``) against the
++Triton kernels it replaces, bit for bit: each kernel's outputs (floats compared as
++bit patterns, including the elements a launch leaves alone) and
++``rejection_sample``'s tokens and counts against the Triton launches', on batches of
++requests with 0 to 5 drafts, -1 placeholders, mixed temperatures and per-request
++seeds, and logits with ties, infinities and NaN."""
++
++import itertools
++
++import pytest
++import torch
++
++triton = pytest.importorskip("triton")
++pytest.importorskip("tilelang")
++
++from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
++from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as rs  # noqa: E402
++from vllm.v1.worker.gpu.spec_decode import tilelang_rejection as tlr  # noqa: E402
++
++pytestmark = pytest.mark.skipif(
++    not torch.cuda.is_available(), reason="requires a CUDA device"
++)
++
++DEVICE = torch.device("cuda")
++VOCAB = 129280  # DeepSeek V4.1
++STEPS = 5  # DSpark's num_speculative_steps
++SLOTS = 160
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    return x.view(torch.int32) if x.dtype == torch.float32 else x
++
++
++def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
++    a, b = _bits(ours), _bits(theirs)
++    if torch.equal(a, b):
++        return
++    differ = (a != b).nonzero()
++    first = differ[:5].tolist()
++    raise AssertionError(
++        f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
++        f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
++        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
++    )
++
++
++# --- Batches ------------------------------------------------------------------
++
++
++def _counts(rows: int) -> list[int]:
++    """Logits rows of the requests covering ``rows`` rows: 1 to STEPS + 1 each (0 to
++    5 drafts, adaptive verification's shorter blocks included)."""
++    pattern = itertools.cycle([6, 1, 4, 6, 2, 5, 3, 6])
++    counts: list[int] = []
++    while sum(counts) < rows:
++        counts.append(min(next(pattern), rows - sum(counts)))
++    return counts
++
++
++# The runner's index dtypes: int32 drafts and local positions, int64 indices and
++# positions; and the other of each.
++INDICES = {
++    "runner": (torch.int32, torch.int64, torch.int64, torch.int32),
++    "other": (torch.int64, torch.int32, torch.int32, torch.int64),
++}
++
++
++def _batch(counts, temps, seed, vocab, indices="runner"):
++    """A verification batch: requests of ``counts`` logits rows (one more than their
++    drafts) at random states of SLOTS, the request's last token then its drafts as
++    the rows' inputs, some trailing and one inner -1 placeholder, per-state
++    temperatures (``temps``) and seeds, and positions (one with a high word when they
++    are int64)."""
++    drafts_dtype, idx_dtype, pos_dtype, local_dtype = INDICES[indices]
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    reqs = len(counts)
++    cu = torch.tensor(
++        [0, *itertools.accumulate(counts)], dtype=torch.int32, device=DEVICE
++    )
++    rows = int(cu[-1])
++    states = torch.randperm(SLOTS, generator=g, device=DEVICE)[:reqs]
++    sizes = torch.tensor(counts, device=DEVICE)
++    drafts = torch.randint(0, vocab, (rows,), generator=g, device=DEVICE)
++    for r, count in enumerate(counts):
++        start = int(cu[r])
++        if r % 4 == 1 and count > 2:
++            drafts[start + count - 1] = -1
++        if r % 4 == 3 and count > 3:
++            drafts[start + count - 2 : start + count] = -1
++        if r % 9 == 5 and count > 4:
++            drafts[start + 2] = -1
++    values = {
++        "sampled": [1.0, 0.6, 1.3, 1e-3, 37.0],
++        "mixed": [0.0, 1.0, 0.6, 0.0, 1.3, 37.0],
++    }[temps]
++    temperature = torch.tensor(
++        [values[i % len(values)] for i in range(SLOTS)], device=DEVICE
++    )
++    seeds = torch.randint(-(2**63), 2**63 - 1, (SLOTS,), generator=g, device=DEVICE)
++    seeds[states[0]] = 0
++    pos = torch.randint(0, 1 << 20, (rows,), generator=g, device=DEVICE)
++    if pos_dtype == torch.int64:
++        pos[0] = (1 << 33) + 5
++    return {
++        "cu": cu,
++        "idx_mapping": states.to(idx_dtype),
++        "expanded": states.repeat_interleave(sizes).to(idx_dtype),
++        "local": torch.cat([torch.arange(c, device=DEVICE) for c in counts]).to(
++            local_dtype
++        ),
++        "drafts": drafts.to(drafts_dtype),
++        "temperature": temperature,
++        "seeds": seeds,
++        "pos": pos.to(pos_dtype),
++    }
++
++
++CASES = ("peaked", "ties", "special")
++# Row strides: a multiple of 16 (Triton lays the block out in 16-byte runs) or odd
++# (one element a thread).
++STRIDES = ("aligned", "odd")
++
++
++def _stride(vocab: int, stride: str) -> int:
++    return (vocab + 64 + 15) // 16 * 16 if stride == "aligned" else vocab + 3
++
++
++def _logits(batch, vocab, dtype, case, seed, stride="aligned"):
++    """The batch's logits rows, ``vocab`` columns of rows ``_stride`` apart.
++    "peaked": random, each row's next input lifted by a margin that varies by row,
++    so verification accepts some drafts and rejects others; "ties": few distinct
++    values, and rows all equal (one of zeros of both signs); "special": NaN, +inf
++    and -inf scattered, a row all -inf but one, a row all NaN, and NaN before
++    +inf."""
++    rows = batch["cu"][-1].item()
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(rows, _stride(vocab, stride), generator=g, device=DEVICE) * 4
++    if case == "peaked" and rows > 1:
++        nxt = batch["drafts"][1:].long()
++        r = torch.arange(rows - 1, device=DEVICE)
++        lifted = nxt >= 0
++        margin = torch.tensor([0.0, 3.0, 6.0, 9.0, 14.0, 40.0], device=DEVICE)
++        x[r[lifted], nxt[lifted]] += margin[r[lifted] % 6]
++    elif case == "ties":
++        x = torch.round(x / 4)
++        x[::5] = 1.0
++        if rows > 3:
++            x[3] = 0.0
++            x[3, 1::2] = -0.0
++    elif case == "special":
++        n = x.numel()
++        pick = torch.randperm(n, generator=g, device=DEVICE)
++        x.view(-1)[pick[: n // 97]] = float("-inf")
++        x.view(-1)[pick[n // 97 : n // 97 + n // 211]] = float("inf")
++        x.view(-1)[pick[n // 97 + n // 211 : n // 97 + n // 211 + n // 307]] = float(
++            "nan"
++        )
++        if rows > 1:
++            x[0] = float("-inf")
++            x[0, vocab // 2] = 3.0
++        if rows > 2:
++            x[1] = float("nan")
++        if rows > 3:
++            x[2, : min(vocab, 9000)] = float("nan")
++            x[2, 0] = float("inf")
++    return x.to(dtype)[:, :vocab]
++
++
++# --- The Triton launches (rejection_sample's, for this configuration) --------
++
++
++def _stats_buffers(rows, vocab):
++    blocks = triton.cdiv(vocab, tlr.STATS_BLOCK)
++    return (
++        torch.full((rows, blocks), -7, dtype=torch.int64, device=DEVICE),
++        torch.full((rows, blocks), -7.0, device=DEVICE),
++        torch.full((rows, blocks), -7.0, device=DEVICE),
++    )
++
++
++def _triton_local_stats(logits, batch):
++    rows, vocab = logits.shape
++    stats = _stats_buffers(rows, vocab)
++    unused = torch.empty_like(stats[1])
++    rs._compute_local_logits_stats_kernel[(rows, stats[1].shape[1])](
++        stats[0],
++        stats[0].stride(0),
++        stats[1],
++        stats[1].stride(0),
++        stats[2],
++        stats[2].stride(0),
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        logits,
++        logits.stride(0),
++        None,
++        0,
++        0,
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        vocab,
++        STEPS,
++        BLOCK_SIZE=tlr.STATS_BLOCK,
++        HAS_DRAFT_LOGITS=False,
++    )
++    return stats
++
++
++def _verify_buffers(reqs, rows):
++    return (
++        torch.full((rows,), -7.0, device=DEVICE),
++        torch.full((reqs, STEPS + 1), -7, dtype=torch.int64, device=DEVICE),
++        torch.full((reqs,), -7, dtype=torch.int32, device=DEVICE),
++        torch.full((reqs,), -7.0, device=DEVICE),
++        torch.full((reqs,), -7.0, device=DEVICE),
++    )
++
++
++def _triton_verify(logits, stats, batch):
++    """_compute_cumulative_log_p_kernel, then _rejection_kernel: the cumulative log
++    ratios, sampled tokens, counts and rejected rows' log-sum-exps."""
++    reqs = batch["cu"].shape[0] - 1
++    blocks = stats[1].shape[1]
++    padded = triton.next_power_of_2(blocks)
++    cumulative, sampled, num_sampled, target_lse, draft_lse = _verify_buffers(
++        reqs, logits.shape[0]
++    )
++    unused = torch.empty_like(stats[1])
++    rs._compute_cumulative_log_p_kernel[(reqs,)](
++        cumulative,
++        logits,
++        logits.stride(0),
++        stats[1],
++        stats[1].stride(0),
++        stats[2],
++        stats[2].stride(0),
++        batch["drafts"],
++        None,
++        0,
++        0,
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        batch["cu"],
++        batch["idx_mapping"],
++        batch["temperature"],
++        blocks,
++        PADDED_VOCAB_NUM_BLOCKS=padded,
++        HAS_DRAFT_LOGITS=False,
++        num_warps=1,
++    )
++    rs._rejection_kernel[(reqs,)](
++        sampled,
++        sampled.stride(0),
++        num_sampled,
++        target_lse,
++        draft_lse,
++        logits,
++        logits.stride(0),
++        stats[0],
++        stats[0].stride(0),
++        stats[1],
++        stats[1].stride(0),
++        stats[2],
++        stats[2].stride(0),
++        batch["drafts"],
++        None,
++        0,
++        0,
++        unused,
++        unused.stride(0),
++        unused,
++        unused.stride(0),
++        batch["cu"],
++        batch["idx_mapping"],
++        batch["temperature"],
++        batch["seeds"],
++        batch["pos"],
++        None,
++        cumulative,
++        None,
++        0,
++        blocks,
++        target_lse,
++        target_lse,
++        0,
++        PADDED_VOCAB_NUM_BLOCKS=padded,
++        HAS_DRAFT_LOGITS=False,
++        SYNTHETIC_MODE=False,
++        USE_BLOCK_VERIFICATION=True,
++        VP_DRAFT=False,
++        num_warps=1,
++    )
++    return cumulative, sampled, num_sampled, target_lse, draft_lse
++
++
++def _resample_buffers(reqs, vocab):
++    blocks = triton.cdiv(vocab, tlr.RESAMPLE_BLOCK)
++    return (
++        torch.full((reqs, blocks), -7, dtype=torch.int64, device=DEVICE),
++        torch.full((reqs, blocks), -7.0, device=DEVICE),
++    )
++
++
++def _triton_resample(logits, num_sampled, batch, verified):
++    cumulative, _, _, target_lse, draft_lse = verified
++    reqs = num_sampled.shape[0]
++    vocab = logits.shape[1]
++    ids, values = _resample_buffers(reqs, vocab)
++    rs._resample_kernel[(reqs, ids.shape[1])](
++        ids,
++        ids.stride(0),
++        values,
++        values.stride(0),
++        logits,
++        logits.stride(0),
++        target_lse,
++        None,
++        0,
++        0,
++        draft_lse,
++        num_sampled,
++        batch["cu"],
++        batch["expanded"],
++        batch["drafts"],
++        batch["temperature"],
++        batch["seeds"],
++        batch["pos"],
++        cumulative,
++        None,
++        0,
++        None,
++        0,
++        0,
++        vocab,
++        BLOCK_SIZE=tlr.RESAMPLE_BLOCK,
++        HAS_DRAFT_LOGITS=False,
++        USE_FP64=False,
++        USE_BLOCK_VERIFICATION=True,
++        CONTEXT_WIDTH=1,
++        WATERMARK=False,
++    )
++    return ids, values
++
++
++def _triton_rejection_sample(logits, batch):
++    """rejection_sample's Triton launches for one-hot drafts and block
++    verification, the insertion included."""
++    stats = _triton_local_stats(logits, batch)
++    verified = _triton_verify(logits, stats, batch)
++    _, sampled, num_sampled, _, _ = verified
++    ids, values = _triton_resample(logits, num_sampled, batch, verified)
++    rs._insert_resampled_kernel[(num_sampled.shape[0],)](
++        sampled,
++        sampled.stride(0),
++        num_sampled,
++        ids,
++        ids.stride(0),
++        values,
++        values.stride(0),
++        ids.shape[1],
++        batch["cu"],
++        batch["expanded"],
++        batch["temperature"],
++        PADDED_RESAMPLE_NUM_BLOCKS=triton.next_power_of_2(ids.shape[1]),
++    )
++    return sampled, num_sampled
++
++
++def _rejection_sample(logits, batch):
++    return rs.rejection_sample(
++        logits,
++        None,
++        batch["drafts"],
++        batch["cu"],
++        batch["pos"],
++        batch["idx_mapping"],
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        batch["seeds"],
++        STEPS,
++        use_block_verification=True,
++    )
++
++
++# --- Each kernel --------------------------------------------------------------
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000, 8193])
++@pytest.mark.parametrize("stride", STRIDES)
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("rows", [1, 16, 96])
++def test_local_stats(dtype, vocab, stride, case, rows):
++    """The block statistics of greedy and sampled rows; bonus rows left alone."""
++    batch = _batch(_counts(rows), "mixed", rows, vocab)
++    logits = _logits(batch, vocab, dtype, case, rows, stride)
++    theirs = _triton_local_stats(logits, batch)
++    ours = _stats_buffers(rows, vocab)
++    tlr.compute_local_stats(
++        *ours,
++        logits,
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        STEPS,
++    )
++    for name, a, b in zip(("argmax", "maximum", "sum of exponentials"), ours, theirs):
++        _assert_same(a, b, name)
++
++
++@pytest.mark.parametrize("indices", INDICES)
++def test_local_stats_index_dtypes(indices):
++    batch = _batch(_counts(37), "mixed", 3, VOCAB, indices)
++    logits = _logits(batch, VOCAB, torch.float32, "special", 3)
++    theirs = _triton_local_stats(logits, batch)
++    ours = _stats_buffers(logits.shape[0], VOCAB)
++    tlr.compute_local_stats(
++        *ours,
++        logits,
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        STEPS,
++    )
++    for name, a, b in zip(("argmax", "maximum", "sum of exponentials"), ours, theirs):
++        _assert_same(a, b, name)
++
++
++def _verified(logits, batch):
++    """Both implementations' verification outputs from Triton's block statistics."""
++    stats = _triton_local_stats(logits, batch)
++    theirs = _triton_verify(logits, stats, batch)
++    ours = _verify_buffers(batch["cu"].shape[0] - 1, logits.shape[0])
++    cumulative, sampled, num_sampled, target_lse, draft_lse = ours
++    tlr.verify(
++        sampled,
++        num_sampled,
++        target_lse,
++        draft_lse,
++        cumulative,
++        logits,
++        *stats,
++        batch["drafts"],
++        batch["cu"],
++        batch["idx_mapping"],
++        batch["temperature"],
++        batch["seeds"],
++        batch["pos"],
++        STEPS,
++    )
++    return ours, theirs
++
++
++VERIFIED = ("cumulative log ratio", "sampled", "num_sampled", "target lse", "draft lse")
++
++
++# Vocabularies of 16 blocks (DeepSeek V4.1's), of 9, 3 and 2 (padded to 16, 4 and 2)
++# and of one block, which Triton reduces without a shuffle.
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 70000, 20000, 16000, 2])
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("temps", ["sampled", "mixed"])
++@pytest.mark.parametrize("indices", INDICES)
++def test_verify(dtype, vocab, case, temps, indices):
++    """The cumulative ratio and rejection kernels' outputs; with peaked logits, the
++    batch accepts some drafts and rejects others."""
++    batch = _batch(_counts(96), temps, 7, vocab, indices)
++    logits = _logits(batch, vocab, dtype, case, 7)
++    ours, theirs = _verified(logits, batch)
++    for name, a, b in zip(VERIFIED, ours, theirs):
++        _assert_same(a, b, name)
++    if case == "peaked" and vocab > 2:
++        drafts = (batch["cu"][1:] - batch["cu"][:-1] - 1).long()
++        counts = theirs[2].long()
++        assert (counts > 0).any() and (counts < drafts).any()
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049])
++@pytest.mark.parametrize("stride", STRIDES)
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("temps", ["sampled", "mixed"])
++def test_resample(dtype, vocab, stride, case, temps):
++    """The residual's block winners: rejected and placeholder drafts, bonus rows,
++    greedy rows left alone."""
++    batch = _batch(_counts(96), temps, 11, vocab)
++    logits = _logits(batch, vocab, dtype, case, 11, stride)
++    stats = _triton_local_stats(logits, batch)
++    verified = _triton_verify(logits, stats, batch)
++    num_sampled = verified[2]
++    theirs = _triton_resample(logits, num_sampled, batch, verified)
++    ours = _resample_buffers(num_sampled.shape[0], vocab)
++    tlr.resample(
++        *ours,
++        logits,
++        num_sampled,
++        batch["cu"],
++        batch["expanded"],
++        batch["drafts"],
++        batch["temperature"],
++        batch["seeds"],
++        batch["pos"],
++    )
++    _assert_same(ours[0], theirs[0], "block argmax")
++    _assert_same(ours[1], theirs[1], "block maximum")
++
++
++def test_resample_index_dtypes():
++    batch = _batch(_counts(96), "mixed", 13, VOCAB, "other")
++    logits = _logits(batch, VOCAB, torch.bfloat16, "peaked", 13)
++    stats = _triton_local_stats(logits, batch)
++    verified = _triton_verify(logits, stats, batch)
++    num_sampled = verified[2]
++    theirs = _triton_resample(logits, num_sampled, batch, verified)
++    ours = _resample_buffers(num_sampled.shape[0], VOCAB)
++    tlr.resample(
++        *ours,
++        logits,
++        num_sampled,
++        batch["cu"],
++        batch["expanded"],
++        batch["drafts"],
++        batch["temperature"],
++        batch["seeds"],
++        batch["pos"],
++    )
++    _assert_same(ours[0], theirs[0], "block argmax")
++    _assert_same(ours[1], theirs[1], "block maximum")
++
++
++# --- rejection_sample ---------------------------------------------------------
++
++
++def _assert_same_tokens(ours, theirs):
++    (sampled, num_sampled), (expected, expected_counts) = ours, theirs
++    _assert_same(num_sampled, expected_counts, "num_sampled")
++    for r in range(expected_counts.shape[0]):
++        n = int(expected_counts[r])
++        _assert_same(sampled[r, :n], expected[r, :n], f"request {r}'s tokens")
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++@pytest.mark.parametrize("vocab", [VOCAB, 1000, 8193])
++@pytest.mark.parametrize("stride", STRIDES)
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize("rows", [1, 16, 96])
++def test_rejection_sample(monkeypatch, dtype, vocab, stride, case, rows):
++    """rejection_sample's tokens and counts, through the TileLang kernels, against
++    the Triton launches."""
++    launched = []
++
++    def tilelang(*args, **kwargs):
++        launched.append(True)
++        return tlr.verify_and_resample(*args, **kwargs)
++
++    monkeypatch.setattr(rs, "verify_and_resample", tilelang)
++    batch = _batch(_counts(rows), "mixed", 17 + rows, vocab)
++    logits = _logits(batch, vocab, dtype, case, 17 + rows, stride)
++    ours = _rejection_sample(logits, batch)
++    assert launched
++    _assert_same_tokens(ours, _triton_rejection_sample(logits, batch))
++
++
++@pytest.mark.parametrize("indices", INDICES)
++@pytest.mark.parametrize("temps", ["sampled", "mixed"])
++def test_rejection_sample_index_dtypes(indices, temps):
++    batch = _batch(_counts(48), temps, 19, VOCAB, indices)
++    logits = _logits(batch, VOCAB, torch.float32, "peaked", 19)
++    _assert_same_tokens(
++        _rejection_sample(logits, batch), _triton_rejection_sample(logits, batch)
++    )
++
++
++def test_rejection_sample_rows_do_not_depend_on_the_batch():
++    """A request's tokens are those it gets alone."""
++    batch = _batch(_counts(48), "mixed", 23, VOCAB)
++    logits = _logits(batch, VOCAB, torch.float32, "peaked", 23)
++    whole, counts = _rejection_sample(logits, batch)
++    cu = batch["cu"]
++    for r in (0, 3, cu.shape[0] - 2):
++        start, end = int(cu[r]), int(cu[r + 1])
++        alone = {
++            "cu": torch.tensor([0, end - start], dtype=torch.int32, device=DEVICE),
++            "idx_mapping": batch["idx_mapping"][r : r + 1],
++            **{k: batch[k][start:end] for k in ("expanded", "local", "drafts", "pos")},
++            "temperature": batch["temperature"],
++            "seeds": batch["seeds"],
++        }
++        sampled, count = _rejection_sample(logits[start:end], alone)
++        assert count.item() == counts[r].item()
++        assert torch.equal(sampled[0, : count.item()], whole[r, : count.item()])
++
++
++def test_rejection_sample_without_requests():
++    """No launch: TileLang's grids may not be empty."""
++    index = torch.empty(0, dtype=torch.int64, device=DEVICE)
++    batch = {
++        "cu": torch.zeros(1, dtype=torch.int32, device=DEVICE),
++        "idx_mapping": index,
++        "expanded": index,
++        "local": index.int(),
++        "drafts": index.int(),
++        "temperature": torch.ones(SLOTS, device=DEVICE),
++        "seeds": torch.zeros(SLOTS, dtype=torch.int64, device=DEVICE),
++        "pos": index,
++    }
++    logits = torch.empty((0, VOCAB), device=DEVICE)
++    sampled, num_sampled = _rejection_sample(logits, batch)
++    assert sampled.shape == (0, STEPS + 1) and num_sampled.shape == (0,)
++
++
++@pytest.mark.parametrize(
++    "use_block_verification,synthetic,use_fp64",
++    [(False, False, False), (False, True, False), (True, False, True)],
++)
++def test_other_configurations_launch_triton(
++    monkeypatch, use_block_verification, synthetic, use_fp64
++):
++    def refuse(*args, **kwargs):
++        raise AssertionError("launched the TileLang kernels")
++
++    monkeypatch.setattr(rs, "verify_and_resample", refuse)
++    batch = _batch(_counts(16), "mixed", 29, 1000)
++    logits = _logits(batch, 1000, torch.float32, "peaked", 29)
++    rates = torch.full((STEPS,), 0.5, device=DEVICE) if synthetic else None
++    sampled, num_sampled = rs.rejection_sample(
++        logits,
++        None,
++        batch["drafts"],
++        batch["cu"],
++        batch["pos"],
++        batch["idx_mapping"],
++        batch["expanded"],
++        batch["local"],
++        batch["temperature"],
++        batch["seeds"],
++        STEPS,
++        rates,
++        use_fp64=use_fp64,
++        use_block_verification=use_block_verification,
++    )
++    assert num_sampled.shape == (batch["cu"].shape[0] - 1,)
++
++
++# --- Preparation --------------------------------------------------------------
++
++
++def _declared(registry):
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    return {(function, args) for function, args, _ in prepare.declared_calls(registry)}
++
++
++def test_runner_declares_the_launched_calls():
++    """register_rejection_sample_warmups declares the calls the runner's launches
++    make (its logits dtypes, both layouts, its index dtypes), and they compile."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    logits = [(torch.bfloat16, VOCAB), (torch.float32, VOCAB)]
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        rs.register_rejection_sample_warmups(
++            logits=logits,
++            vocab_size=VOCAB,
++            num_speculative_steps=STEPS,
++            synthetic_mode=False,
++            use_block_verification=True,
++            use_fp64=False,
++        )
++    drafts, idx, pos, local = INDICES["runner"]
++    expected = set()
++    for dtype, _ in logits:
++        for run in tls._runs(dtype):
++            expected.add(
++                (tlr.local_stats_kernel, tlr.local_stats_key(dtype, idx, local, run))
++            )
++            expected.add(
++                (tlr.resample_kernel, tlr.resample_key(dtype, idx, drafts, pos, run))
++            )
++        expected.add(
++            (
++                tlr.verify_kernel,
++                tlr.verify_key(dtype, drafts, idx, pos, VOCAB, STEPS),
++            )
++        )
++    assert expected <= _declared(registry)
++    prepare.prepare_declared(registry)
++
++
++@pytest.mark.parametrize(
++    "use_block_verification,synthetic_mode,use_fp64",
++    [(False, False, False), (False, True, False), (True, False, True)],
++)
++def test_other_configurations_declare_no_tilelang_kernel(
++    use_block_verification, synthetic_mode, use_fp64
++):
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        rs.register_rejection_sample_warmups(
++            logits=[(torch.float32, VOCAB)],
++            vocab_size=VOCAB,
++            num_speculative_steps=STEPS,
++            synthetic_mode=synthetic_mode,
++            use_block_verification=use_block_verification,
++            use_fp64=use_fp64,
++        )
++    ours = {tlr.local_stats_kernel, tlr.verify_kernel, tlr.resample_kernel}
++    assert not {function for function, _ in _declared(registry)} & ours
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+index f49a8ce45..f91b5da9d 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -17,6 +17,10 @@ from vllm.v1.worker.gpu.sample.gumbel import (
+     tl_rand32,
+ )
+ from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
++from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++    register_block_verification,
++    verify_and_resample,
++)
+ from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import (
+     insert_resampled,
+     register_insert,
+@@ -1250,35 +1254,44 @@ def register_rejection_sample_warmups(
+     """Register ``rejection_sample`` without draft logits or watermarking, for
+     ``vocab_size``-wide target logits given as ``(dtype, row stride)`` pairs, with
+     the input batch's int32 drafts and offsets and int64 indices and positions.
++    Block verification with FP32 draws declares its TileLang kernels; the other
++    configurations register the Triton kernels.
+     """
+-    for logits_dtype, logits_stride in logits:
+-        _compute_local_logits_stats_launcher.register_warmup(
+-            logits_dtype=logits_dtype,
+-            logits_stride=logits_stride,
+-            vocab_size=vocab_size,
+-            num_speculative_steps=num_speculative_steps,
++    if use_block_verification and not synthetic_mode and not use_fp64:
++        register_block_verification(
++            [logits_dtype for logits_dtype, _ in logits],
++            vocab_size,
++            num_speculative_steps,
+         )
+-        if use_block_verification:
+-            _compute_cumulative_log_p_launcher.register_warmup(
++    else:
++        for logits_dtype, logits_stride in logits:
++            _compute_local_logits_stats_launcher.register_warmup(
+                 logits_dtype=logits_dtype,
+                 logits_stride=logits_stride,
+                 vocab_size=vocab_size,
++                num_speculative_steps=num_speculative_steps,
++            )
++            if use_block_verification:
++                _compute_cumulative_log_p_launcher.register_warmup(
++                    logits_dtype=logits_dtype,
++                    logits_stride=logits_stride,
++                    vocab_size=vocab_size,
++                )
++            _rejection_launcher.register_warmup(
++                logits_dtype=logits_dtype,
++                logits_stride=logits_stride,
++                vocab_size=vocab_size,
++                num_speculative_steps=num_speculative_steps,
++                synthetic_mode=synthetic_mode,
++                use_block_verification=use_block_verification,
++            )
++            _resample_launcher.register_warmup(
++                logits_dtype=logits_dtype,
++                logits_stride=logits_stride,
++                vocab_size=vocab_size,
++                use_block_verification=use_block_verification,
++                use_fp64=use_fp64,
+             )
+-        _rejection_launcher.register_warmup(
+-            logits_dtype=logits_dtype,
+-            logits_stride=logits_stride,
+-            vocab_size=vocab_size,
+-            num_speculative_steps=num_speculative_steps,
+-            synthetic_mode=synthetic_mode,
+-            use_block_verification=use_block_verification,
+-        )
+-        _resample_launcher.register_warmup(
+-            logits_dtype=logits_dtype,
+-            logits_stride=logits_stride,
+-            vocab_size=vocab_size,
+-            use_block_verification=use_block_verification,
+-            use_fp64=use_fp64,
+-        )
+     register_insert(
+         triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
+         use_fp64,
+@@ -1327,6 +1340,40 @@ def rejection_sample(
+     assert watermark == (watermarking is not None) == (watermark_key is not None), (
+         "contexts, watermarking and watermark_key must be set together."
+     )
++    if (
++        draft_logits is None
++        and use_block_verification
++        and synthetic_conditional_rates is None
++        and not watermark
++        and not use_fp64
++    ):
++        # One-hot drafts, block verification and FP32 draws, without watermark,
++        # run as TileLang kernels (tilelang_rejection), the contract of the Triton
++        # kernels below, which serve every other configuration.
++        sampled, num_sampled, resampled_local_argmax, resampled_local_max = (
++            verify_and_resample(
++                target_logits,
++                draft_sampled,
++                cu_num_logits,
++                pos,
++                idx_mapping,
++                expanded_idx_mapping,
++                expanded_local_pos,
++                temperature,
++                seed,
++                num_speculative_steps,
++            )
++        )
++        insert_resampled(
++            sampled,
++            num_sampled,
++            resampled_local_argmax,
++            resampled_local_max,
++            cu_num_logits,
++            expanded_idx_mapping,
++            temperature,
++        )
++        return sampled, num_sampled
+     contexts_stride = 0
+     context_width = 1
+     watermarking_bytes: torch.Tensor | None = None
+diff --git a/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+new file mode 100644
+index 000000000..040686025
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/tilelang_rejection.py
+@@ -0,0 +1,1060 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang kernels of the V2 runner's rejection sampler, for production's
++verification: one-hot (greedy) drafts, block verification, FP32 draws and no
++watermark. Each kernel is the contract of the Triton kernels it replaces in
++``rejection_sampler_utils``, bit for bit, NaN and infinite logits included, and
++writes the elements they write and no others (the Triton kernels stay importable
++as the tests' reference and serve every other configuration):
++
++- ``local_stats``: ``_compute_local_logits_stats_kernel`` without draft logits
++- ``verify``: ``_compute_cumulative_log_p_kernel`` without draft logits and
++  ``_rejection_kernel`` with block verification, as one kernel
++- ``resample``: ``_resample_kernel`` without draft logits or watermark, FP32
++
++``rejection_sample`` inserts the resampled token, as for every configuration
++(``tilelang_resampled``).
++
++The arithmetic is Triton 3.7's for sm_121a, read from the kernels' PTX and SASS:
++``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with log2(e),
++``tl.log`` libdevice's ``__nv_logf`` as Triton bundles it (``vllm_control_log``),
++``/`` is ``div.full.f32``, and every add, product and FMA rounds to nearest as the
++header writes it (nvcc would contract them otherwise). The random stream, the Gumbel
++noise and the argmax order are ``tilelang_sampling``'s.
++
++A vocabulary block's statistics (8192 columns, four warps) follow Triton's layout
++(``_triton_run``): a thread holds 64 elements, sums their exponentials in register
++order, then the warp sums at XOR distances 16 to 1 and threads 0-3 at 2 and 1. The
++maxima ignore NaN, so any order gives them; the argmax is the Gumbel sampler's.
++
++A row's log-sum-exp over its blocks (``_compute_global_logsumexp``) runs on one warp
++in Triton, the blocks padded to a power of two, block ``k`` at lanes ``k`` and
++``k + padded`` (and so on), reduced at XOR distances ``padded / 2`` to 1. LLVM fuses
++the first level's product into an FMA: lane 0 adds its own product unrounded to its
++partner's rounded one, so lanes reach different sums, and lane 0, which stores, is
++the contract. Here ``padded`` lanes take a row, the first of them as Triton's lane 0.
++
++Every comparison NaN decides is made in the header: TVM's simplifier rewrites
++``a <= b`` as ``!(b < a)``, which a NaN flips.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from collections.abc import Sequence
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.v1.worker.gpu.sample import tilelang_controls, tilelang_sampling
++from vllm.v1.worker.gpu.sample.tilelang_sampling import (
++    _DTYPES,
++    _PASS,
++    _PASSES,
++    _THREADS,
++    _WARPS,
++    GUMBEL_BLOCK,
++    RUNNER_IDX_DTYPE,
++    _block_argmax,
++    _call,
++    _element,
++    _exchange,
++    _keep_or_take,
++    _kernel,
++    _load_run,
++    _load_run_at,
++    _randint_at,
++    _runs,
++    _triton_run,
++    declare,
++)
++
++# rejection_sampler_utils._VOCAB_BLOCK_SIZE and _RESAMPLE_BLOCK_SIZE.
++STATS_BLOCK = 8192
++RESAMPLE_BLOCK = GUMBEL_BLOCK
++_STATS_PER_THREAD = STATS_BLOCK // _THREADS
++# A row's blocks, padded, are at most one warp of lanes.
++_MAX_LANES = 32
++
++_HEADER = (
++    # Philox, the Gumbel noise and the argmax combine.
++    tilelang_sampling._HEADER
++    # vllm_control_log: tl.log, Triton's bundled libdevice __nv_logf.
++    + tilelang_controls._HEADER
++    + r"""
++// tl.exp of an FP32 value: the product with log2(e), then ex2.approx.f32 without
++// flush-to-zero (ptxas keeps subnormal results).
++__device__ __forceinline__ float vllm_exp(float x) {
++  float y;
++  asm("{\n"
++      ".reg .b32 t;\n"
++      "mul.rn.f32 t, %1, 0f3FB8AA3B;\n"
++      "ex2.approx.f32 %0, t;\n"
++      "}"
++      : "=f"(y)
++      : "f"(x));
++  return y;
++}
++
++// FP32 arithmetic rounded to nearest, out of nvcc's contraction and the TileLang
++// simplifier's reach.
++__device__ __forceinline__ float vllm_add(float a, float b) {
++  float c;
++  asm("add.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_sub(float a, float b) {
++  float c;
++  asm("sub.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_mul(float a, float b) {
++  float c;
++  asm("mul.rn.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++__device__ __forceinline__ float vllm_fma(float a, float b, float c) {
++  float d;
++  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
++  return d;
++}
++// max.f32: a NaN gives way to the other operand.
++__device__ __forceinline__ float vllm_max(float a, float b) {
++  float c;
++  asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
++  return c;
++}
++
++// tl.exp(x - m).
++__device__ __forceinline__ float vllm_exp_from(float x, float m) {
++  return vllm_exp(vllm_sub(x, m));
++}
++
++// A row's log-sum-exp from its maximum and its rescaled sum: m + log(s).
++__device__ __forceinline__ float vllm_lse(float m, float s) {
++  return vllm_add(m, vllm_control_log(s));
++}
++
++// A sampled row's block sum of exponentials, kept while the block's maximum is
++// above -inf (a NaN maximum is not), else 0.
++__device__ __forceinline__ float vllm_live_sum(float m, float s) {
++  float y;
++  asm("{\n"
++      ".reg .pred live;\n"
++      "setp.gt.f32 live, %1, 0fFF800000;\n"
++      "selp.f32 %0, %2, 0f00000000, live;\n"
++      "}"
++      : "=f"(y)
++      : "f"(m), "f"(s));
++  return y;
++}
++
++// A step of the cumulative log ratio: min(log_p + log_prob, 0), min.f32 (a NaN sum
++// gives 0).
++__device__ __forceinline__ float vllm_log_ratio(float log_p, float log_prob) {
++  float y;
++  asm("{\n"
++      ".reg .b32 t;\n"
++      "add.rn.f32 t, %1, %2;\n"
++      "min.f32 %0, t, 0f00000000;\n"
++      "}"
++      : "=f"(y)
++      : "f"(log_p), "f"(log_prob));
++  return y;
++}
++
++// tl_rand32(includes_zero=False) of a Philox word: uint_to_uniform_float, then the
++// clamp to _TL_RAND_MIN (0f2FFFFFFF).
++__device__ __forceinline__ float vllm_uniform(unsigned int word) {
++  float u;
++  asm("{\n"
++      ".reg .b32 s, x, v;\n"
++      "shr.s32 s, %1, 31;\n"
++      "xor.b32 x, s, %1;\n"
++      "cvt.rn.f32.s32 v, x;\n"
++      "mul.rn.f32 v, v, 0f2FFFFFFF;\n"
++      "max.f32 %0, v, 0f2FFFFFFF;\n"
++      "}"
++      : "=f"(u)
++      : "r"(word));
++  return u;
++}
++
++// Block verification's acceptance threshold for a one-hot draft followed by a valid
++// one, from the prefix's joint ratio p and the next draft's target probability m:
++// the residual mass p * (1 - m) over residual + 1 - p, which Triton contracts to
++// fma(p, 1 - m, 1) - p; div.full.f32, and 1 where that is not positive.
++__device__ __forceinline__ float vllm_block_threshold(float p, float m) {
++  float h;
++  asm("{\n"
++      ".reg .pred positive;\n"
++      ".reg .b32 rest, residual, denom, ratio;\n"
++      "sub.rn.f32 rest, 0f3F800000, %2;\n"
++      "mul.rn.f32 residual, %1, rest;\n"
++      "fma.rn.f32 denom, %1, rest, 0f3F800000;\n"
++      "sub.rn.f32 denom, denom, %1;\n"
++      "setp.gt.f32 positive, denom, 0f00000000;\n"
++      "div.full.f32 ratio, residual, denom;\n"
++      "selp.f32 %0, ratio, 0f3F800000, positive;\n"
++      "}"
++      : "=f"(h)
++      : "f"(p), "f"(m));
++  return h;
++}
++
++// u <= h, ordered: a NaN threshold accepts nothing.
++__device__ __forceinline__ int vllm_at_most(float u, float h) { return u <= h; }
++"""
++)
++
++
++def _distances(lanes: int) -> tuple[int, ...]:
++    """The XOR distances of a butterfly over ``lanes`` lanes, the widest first."""
++    return tuple(lanes >> i for i in range(1, lanes.bit_length()))
++
++
++@T.macro
++def _block_reduce(value, partial, tx, combine):
++    """Combine every thread's ``value[0]`` across the block in Triton's order into
++    thread 0's: lanes at XOR distances 16 to 1, lane 0 of each warp into ``partial``,
++    then threads 0-3 at distances 2 and 1 (the other lanes exchange what they hold,
++    as in Triton, and their results are unused). ``combine`` is the header's
++    ``vllm_max`` or ``vllm_add``, the thread's own value first."""
++    for distance in (16, 8, 4, 2, 1):
++        value[0] = T.call_extern(
++            "float32", combine, value[0], T.shfl_xor(value[0], distance)
++        )
++    if tx % 32 == 0:
++        partial[tx // 32] = value[0]
++    T.sync_threads()
++    if tx < _WARPS:
++        value[0] = partial[tx]
++    for distance in (2, 1):
++        value[0] = T.call_extern(
++            "float32", combine, value[0], T.shfl_xor(value[0], distance)
++        )
++
++
++# --- Vocabulary-block statistics ----------------------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def local_stats_kernel(logits_dtype: str, idx_dtype: str, step_dtype: str, run: int):
++    """``_compute_local_logits_stats_kernel`` without draft logits: one block of 128
++    threads per ``(logits row, vocabulary block of 8192)``; rows at a bonus position
++    (``expanded_local_pos >= num_speculative_steps``) are left alone. A greedy row
++    stores its block's argmax (global, int64) and maximum, a sampled row its block's
++    maximum and the sum of ``exp(logit - maximum)`` (0 unless the maximum is above
++    -inf). A thread's 64 elements come in runs of ``run`` (``_triton_run``), all
++    loaded with the request's state index: Triton loads them once the temperature is
++    known, a round trip later."""
++    rows, vocab, blocks = T.dynamic("rows, vocab, blocks")
++    # Inputs may be longer than the batch: each has its own length.
++    idx_len, step_len, temp_len = T.dynamic("idx_len, step_len, temp_len")
++    logits_stride, argmax_stride, max_stride, sumexp_stride = T.dynamic(
++        "logits_stride, argmax_stride, max_stride, sumexp_stride", "int64"
++    )
++
++    @T.prim_func
++    def local_stats(
++        local_argmax: T.StridedTensor((rows, blocks), (argmax_stride, 1), T.int64),
++        local_max: T.StridedTensor((rows, blocks), (max_stride, 1), T.float32),
++        local_sumexp: T.StridedTensor((rows, blocks), (sumexp_stride, 1), T.float32),
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++        expanded_idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        expanded_local_pos: T.Tensor((step_len,), step_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        num_speculative_steps: T.int32,
++    ):
++        with T.Kernel(rows, blocks, threads=_THREADS) as (t, blk):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((_STATS_PER_THREAD,), logits_dtype)
++            values = T.alloc_local((_STATS_PER_THREAD,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            total = T.alloc_local((1,), T.float32)
++            partial = T.alloc_shared((_WARPS,), T.float32)
++            partial_index = T.alloc_shared((_WARPS,), T.int32)
++            partial_sum = T.alloc_shared((_WARPS,), T.float32)
++            maximum = T.alloc_shared((1,), T.float32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++
++            # Bonus rows need no statistics.
++            if T.cast(expanded_local_pos[t], T.int64) < T.cast(
++                num_speculative_steps, T.int64
++            ):
++                state = T.alloc_var(
++                    T.int64, init=T.cast(expanded_idx_mapping[t], T.int64)
++                )
++                for r in T.unroll(_STATS_PER_THREAD // run):
++                    col0 = blk * STATS_BLOCK + r * (_THREADS * run) + run * tx
++                    _load_run_at(logits, raw, r * run, t, col0, vocab, run)
++                temp = T.alloc_var(T.float32, init=temperature[state])
++                # Triton's masked lanes read -inf.
++                for j in T.unroll(_STATS_PER_THREAD):
++                    values[j] = T.if_then_else(
++                        blk * STATS_BLOCK + _element(j, tx, run) < vocab,
++                        T.cast(raw[j], T.float32),
++                        -T.infinity(T.float32),
++                    )
++                # The thread's maximum before the temperature's test, so the loads
++                # issue ahead of it rather than in its branches.
++                best[0] = values[0]
++                for j in T.unroll(1, _STATS_PER_THREAD):
++                    best[0] = T.call_extern("float32", "vllm_max", best[0], values[j])
++                if temp == T.float32(0):
++                    best[0] = values[0]
++                    best_index[0] = _element(0, tx, run)
++                    for j in T.unroll(1, _STATS_PER_THREAD):
++                        _keep_or_take(best, best_index, values[j], _element(j, tx, run))
++                    _block_argmax(
++                        best, best_index, other, other_index, partial, partial_index, tx
++                    )
++                    if tx == 0:
++                        local_argmax[t, blk] = T.cast(
++                            blk * STATS_BLOCK + best_index[0], T.int64
++                        )
++                        local_max[t, blk] = best[0]
++                else:
++                    _block_reduce(best, partial, tx, "vllm_max")
++                    if tx == 0:
++                        maximum[0] = best[0]
++                    T.sync_threads()
++                    best[0] = maximum[0]
++                    # The exponentials in register order, the first two added first.
++                    total[0] = T.call_extern(
++                        "float32", "vllm_exp_from", values[0], best[0]
++                    )
++                    for j in T.unroll(1, _STATS_PER_THREAD):
++                        total[0] = T.call_extern(
++                            "float32",
++                            "vllm_add",
++                            total[0],
++                            T.call_extern(
++                                "float32", "vllm_exp_from", values[j], best[0]
++                            ),
++                        )
++                    _block_reduce(total, partial_sum, tx, "vllm_add")
++                    if tx == 0:
++                        local_max[t, blk] = best[0]
++                        local_sumexp[t, blk] = T.call_extern(
++                            "float32", "vllm_live_sum", best[0], total[0]
++                        )
++
++    return local_stats
++
++
++def local_stats_key(
++    logits_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    step_dtype: torch.dtype,
++    run: int = 1,
++) -> tuple:
++    return (_DTYPES[logits_dtype], _DTYPES[idx_dtype], _DTYPES[step_dtype], run)
++
++
++def compute_local_stats(
++    local_argmax: torch.Tensor,  # [num_logits, blocks]
++    local_max: torch.Tensor,  # [num_logits, blocks]
++    local_sumexp: torch.Tensor,  # [num_logits, blocks]
++    logits: torch.Tensor,  # [num_logits, vocab_size]
++    expanded_idx_mapping: torch.Tensor,  # [num_logits]
++    expanded_local_pos: torch.Tensor,  # [num_logits]
++    temperature: torch.Tensor,  # [max_num_reqs]
++    num_speculative_steps: int,
++) -> None:
++    """``_compute_local_logits_stats_kernel``'s launch without draft logits, into
++    the given ``[num_logits, cdiv(vocab_size, 8192)]`` statistics."""
++    if logits.shape[0] == 0:
++        return
++    kernel = _kernel(
++        local_stats_kernel,
++        *local_stats_key(
++            logits.dtype,
++            expanded_idx_mapping.dtype,
++            expanded_local_pos.dtype,
++            _triton_run(logits),
++        ),
++    )
++    kernel(
++        local_argmax,
++        local_max,
++        local_sumexp,
++        logits,
++        expanded_idx_mapping.contiguous(),
++        expanded_local_pos.contiguous(),
++        temperature,
++        num_speculative_steps,
++    )
++
++
++# --- Cumulative ratio and rejection -----------------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def verify_kernel(
++    logits_dtype: str,
++    drafts_dtype: str,
++    idx_dtype: str,
++    pos_dtype: str,
++    lanes: int,
++    width: int,
++):
++    """``_compute_cumulative_log_p_kernel`` and ``_rejection_kernel`` (block
++    verification, one-hot drafts), a block a request. ``lanes`` is Triton's
++    PADDED_VOCAB_NUM_BLOCKS and ``width`` the sampled tokens' (num_speculative_steps
++    + 1). Each draft step takes ``lanes`` threads, one a vocabulary block: they load
++    its statistics, its draft and the draft's target logit at once, every load at an
++    index that exists whatever the masks say, the masks as selects, and reduce them
++    to the step's log-sum-exp and the draft's log probability (as Triton's lane 0),
++    the greedy step's target argmax, and the step's uniform draw. Thread 0 then runs
++    both kernels' loops over the drafts from shared memory, where Triton's take two
++    or three dependent round trips to memory a step. The step's cumulative log ratio
++    is stored as the cumulative kernel stores it, for sampled requests only; the
++    sampled tokens, counts and rejected rows' log-sum-exps as the rejection
++    kernel's."""
++    steps = width - 1
++    if not 1 <= lanes <= _MAX_LANES:
++        raise ValueError(f"{lanes} vocabulary blocks: a row's blocks take one warp")
++    threads = max(32, -(-max(steps, 1) * lanes // 32) * 32)
++    if threads > 1024:
++        raise ValueError(f"{steps} draft steps of {lanes} blocks exceed a block")
++    groups = threads // lanes
++    reqs, num_logits, vocab, blocks = T.dynamic("reqs, num_logits, vocab, blocks")
++    drafts_len, idx_len, temp_len, seed_len, pos_len = T.dynamic(
++        "drafts_len, idx_len, temp_len, seed_len, pos_len"
++    )
++    sampled_stride, logits_stride, argmax_stride, max_stride, sumexp_stride = T.dynamic(
++        "sampled_stride, logits_stride, argmax_stride, max_stride, sumexp_stride",
++        "int64",
++    )
++
++    @T.prim_func
++    def verify(
++        sampled: T.StridedTensor((reqs, width), (sampled_stride, 1), T.int64),
++        num_sampled: T.Tensor((reqs,), T.int32),
++        target_lse: T.Tensor((reqs,), T.float32),
++        draft_lse: T.Tensor((reqs,), T.float32),
++        cumulative: T.Tensor((num_logits,), T.float32),
++        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
++        local_argmax: T.StridedTensor(
++            (num_logits, blocks), (argmax_stride, 1), T.int64
++        ),
++        local_max: T.StridedTensor((num_logits, blocks), (max_stride, 1), T.float32),
++        local_sumexp: T.StridedTensor(
++            (num_logits, blocks), (sumexp_stride, 1), T.float32
++        ),
++        drafts: T.Tensor((drafts_len,), drafts_dtype),
++        cu_num_logits: T.Tensor((reqs + 1,), T.int32),
++        idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        seeds: T.Tensor((seed_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
++    ):
++        with T.Kernel(reqs, threads=threads) as req:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            step = tx // lanes
++            block = tx % lanes
++            row_max = T.alloc_local((1,), T.float32)
++            total = T.alloc_local((1,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            lse_s = T.alloc_shared((groups,), T.float32)
++            log_prob_s = T.alloc_shared((groups,), T.float32)
++            uniform_s = T.alloc_shared((groups,), T.float32)
++            draft_s = T.alloc_shared((groups,), T.int64)
++            target_s = T.alloc_shared((groups,), T.int64)
++
++            start = T.alloc_var(T.int32, init=cu_num_logits[req])
++            end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
++            state = T.alloc_var(T.int64, init=T.cast(idx_mapping[req], T.int64))
++            num_drafts = end - start - 1
++            # Step s verifies the draft at row s + 1 with row s's logits; the steps
++            # past the request's drafts read its last rows and are masked.
++            live = step < num_drafts
++            row = T.alloc_var(T.int32, init=start + T.min(step, num_drafts))
++            draft = T.alloc_var(
++                T.int64,
++                init=T.cast(drafts[start + T.min(step + 1, num_drafts)], T.int64),
++            )
++            maximum = T.alloc_var(
++                T.float32, init=local_max[row, T.min(block, blocks - 1)]
++            )
++            sumexp = T.alloc_var(
++                T.float32, init=local_sumexp[row, T.min(block, blocks - 1)]
++            )
++            position = T.alloc_var(pos_dtype, init=pos[row])
++            temp = T.alloc_var(T.float32, init=temperature[state])
++            seed = T.alloc_var(T.int64, init=seeds[state])
++            in_row = live & (block < blocks)
++            maximum = T.if_then_else(in_row, maximum, -T.infinity(T.float32))
++            sumexp = T.if_then_else(in_row, sumexp, T.float32(0))
++            draft = T.if_then_else(live, draft, T.int64(-1))
++            logit = T.alloc_var(
++                T.float32,
++                init=T.cast(logits[row, T.max(draft, T.int64(0))], T.float32),
++            )
++
++            # _compute_global_logsumexp: the blocks' maximum, then their sums
++            # rescaled to it, the first level's product fused into its add.
++            row_max[0] = maximum
++            for distance in _distances(lanes):
++                row_max[0] = T.call_extern(
++                    "float32", "vllm_max", row_max[0], T.shfl_xor(row_max[0], distance)
++                )
++            scale = T.alloc_var(
++                T.float32,
++                init=T.call_extern("float32", "vllm_exp_from", maximum, row_max[0]),
++            )
++            if lanes == 1:
++                total[0] = T.call_extern("float32", "vllm_mul", scale, sumexp)
++            else:
++                total[0] = T.call_extern(
++                    "float32",
++                    "vllm_fma",
++                    scale,
++                    sumexp,
++                    T.shfl_xor(
++                        T.call_extern("float32", "vllm_mul", scale, sumexp), lanes // 2
++                    ),
++                )
++                for distance in _distances(lanes)[1:]:
++                    total[0] = T.call_extern(
++                        "float32", "vllm_add", total[0], T.shfl_xor(total[0], distance)
++                    )
++            lse = T.alloc_var(
++                T.float32,
++                init=T.call_extern("float32", "vllm_lse", row_max[0], total[0]),
++            )
++
++            # _compute_global_target_argmax: NaN maxima count as -inf, and the lower
++            # block wins a tie.
++            best[0] = T.if_then_else(T.isnan(maximum), -T.infinity(T.float32), maximum)
++            best_index[0] = block
++            for distance in _distances(lanes):
++                _exchange(best, best_index, other, other_index, distance)
++            target = T.alloc_var(T.int64, init=local_argmax[row, best_index[0]])
++
++            # The step's draw: tl_rand32 at spec_step_seed(seed, step).
++            word = _randint_at(
++                seed ^ T.shift_left(T.cast(step, T.int64), T.int64(32)),
++                position,
++                pos_dtype,
++                False,
++            )
++            if block == 0:
++                lse_s[step] = lse
++                log_prob_s[step] = T.call_extern("float32", "vllm_sub", logit, lse)
++                uniform_s[step] = T.call_extern("float32", "vllm_uniform", word)
++                draft_s[step] = draft
++                target_s[step] = target
++            T.sync_threads()
++
++            if tx == 0:
++                greedy = T.alloc_var(
++                    T.int32, init=T.cast(temp == T.float32(0), T.int32)
++                )
++                log_p = T.alloc_var(T.float32, init=T.float32(0))
++                accepted = T.alloc_var(T.int64, init=T.int64(0))
++                verifying = T.alloc_var(T.int32, init=1)
++                for i in tuple(range(steps)):
++                    if i < num_drafts:
++                        drafted = T.alloc_var(T.int64, init=draft_s[i])
++                        valid = T.cast(drafted >= 0, T.int32)
++                        token = T.max(drafted, T.int64(0))
++                        if greedy == 0:
++                            # The cumulative ratio, which a -1 placeholder leaves
++                            # as it was; a placeholder ends verification.
++                            log_p = T.if_then_else(
++                                valid != 0,
++                                T.call_extern(
++                                    "float32", "vllm_log_ratio", log_p, log_prob_s[i]
++                                ),
++                                log_p,
++                            )
++                            cumulative[start + i] = log_p
++                            verifying = verifying & valid
++                        if verifying != 0:
++                            if greedy != 0:
++                                # Accepted while the draft is the target argmax,
++                                # which replaces the first one that is not.
++                                hit = T.alloc_var(
++                                    T.int32,
++                                    init=T.cast(target_s[i] == token, T.int32) & valid,
++                                )
++                                sampled[req, i] = T.if_then_else(
++                                    hit != 0, token, target_s[i]
++                                )
++                                accepted = accepted + T.cast(hit, T.int64)
++                                verifying = hit
++                            else:
++                                # Block verification: the prefix's joint ratio,
++                                # or the threshold of the residual mass when a
++                                # valid draft follows (its log probability is the
++                                # next step's).
++                                threshold = T.alloc_var(
++                                    T.float32,
++                                    init=T.call_extern("float32", "vllm_exp", log_p),
++                                )
++                                if i + 1 < steps:  # noqa: SIM102
++                                    if draft_s[i + 1] >= 0:
++                                        threshold = T.call_extern(
++                                            "float32",
++                                            "vllm_block_threshold",
++                                            threshold,
++                                            T.call_extern(
++                                                "float32", "vllm_exp", log_prob_s[i + 1]
++                                            ),
++                                        )
++                                accepted = T.if_then_else(
++                                    T.call_extern(
++                                        "int32",
++                                        "vllm_at_most",
++                                        uniform_s[i],
++                                        threshold,
++                                    )
++                                    != 0,
++                                    T.int64(i + 1),
++                                    accepted,
++                                )
++                                sampled[req, i] = token
++                num_sampled[req] = T.cast(accepted, T.int32)
++                # The first rejected row's log-sum-exp, which resampling with draft
++                # logits reads; 0 for greedy requests and fully accepted blocks.
++                target_lse[req] = T.if_then_else(
++                    (greedy == 0) & (accepted < T.cast(num_drafts, T.int64)),
++                    lse_s[T.min(accepted, T.int64(groups - 1))],
++                    T.float32(0),
++                )
++                draft_lse[req] = T.float32(0)
++
++    return verify
++
++
++def _padded_blocks(vocab_size: int) -> int:
++    """Triton's PADDED_VOCAB_NUM_BLOCKS for ``vocab_size`` columns."""
++    blocks = -(-vocab_size // STATS_BLOCK)
++    return 1 << max(blocks - 1, 0).bit_length()
++
++
++def verify_key(
++    logits_dtype: torch.dtype,
++    drafts_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    pos_dtype: torch.dtype,
++    vocab_size: int,
++    num_speculative_steps: int,
++) -> tuple:
++    return (
++        _DTYPES[logits_dtype],
++        _DTYPES[drafts_dtype],
++        _DTYPES[idx_dtype],
++        _DTYPES[pos_dtype],
++        _padded_blocks(vocab_size),
++        num_speculative_steps + 1,
++    )
++
++
++def verify(
++    sampled: torch.Tensor,  # [num_reqs, num_speculative_steps + 1]
++    num_sampled: torch.Tensor,  # [num_reqs]
++    target_rejected_logsumexp: torch.Tensor,  # [num_reqs]
++    draft_rejected_logsumexp: torch.Tensor,  # [num_reqs]
++    cumulative_log_p: torch.Tensor,  # [num_logits]
++    target_logits: torch.Tensor,  # [num_logits, vocab_size]
++    target_local_argmax: torch.Tensor,  # [num_logits, blocks]
++    target_local_max: torch.Tensor,  # [num_logits, blocks]
++    target_local_sumexp: torch.Tensor,  # [num_logits, blocks]
++    draft_sampled: torch.Tensor,  # [num_logits]
++    cu_num_logits: torch.Tensor,  # [num_reqs + 1]
++    idx_mapping: torch.Tensor,  # [num_reqs]
++    temperature: torch.Tensor,  # [max_num_reqs]
++    seed: torch.Tensor,  # [max_num_reqs]
++    pos: torch.Tensor,  # [num_logits]
++    num_speculative_steps: int,
++) -> None:
++    """The launches of ``_compute_cumulative_log_p_kernel`` and
++    ``_rejection_kernel`` (block verification, one-hot drafts) as one, into the
++    given outputs."""
++    if num_sampled.shape[0] == 0:
++        return
++    kernel = _kernel(
++        verify_kernel,
++        *verify_key(
++            target_logits.dtype,
++            draft_sampled.dtype,
++            idx_mapping.dtype,
++            pos.dtype,
++            target_logits.shape[1],
++            num_speculative_steps,
++        ),
++    )
++    kernel(
++        sampled,
++        num_sampled,
++        target_rejected_logsumexp,
++        draft_rejected_logsumexp,
++        cumulative_log_p,
++        target_logits,
++        target_local_argmax,
++        target_local_max,
++        target_local_sumexp,
++        draft_sampled.contiguous(),
++        cu_num_logits,
++        idx_mapping.contiguous(),
++        temperature,
++        seed,
++        pos.contiguous(),
++    )
++
++
++# --- Resampling ---------------------------------------------------------------
++
++
++@tilelang.jit(pass_configs=_PASS)
++def resample_kernel(
++    logits_dtype: str, idx_dtype: str, drafts_dtype: str, pos_dtype: str, run: int
++):
++    """``_resample_kernel`` without draft logits or watermark, FP32: one block of
++    128 threads per ``(request, vocabulary block of 1024)``, a thread's elements in
++    runs of ``run`` (``_triton_run``). The request's first unaccepted row is
++    resampled: the target logits with a rejected draft masked to -inf (the residual of
++    a one-hot draft; a bonus row and a -1 placeholder mask nothing), plus the draw's
++    Gumbel noise unless the temperature is 0; each block's argmax index (global,
++    int64) and score. A greedy request's rejected row is left alone: verification
++    stored its target argmax."""
++    reqs, num_logits, vocab, blocks = T.dynamic("reqs, num_logits, vocab, blocks")
++    # Inputs may be longer than the batch: each has its own length.
++    idx_len, drafts_len, temp_len, seed_len, pos_len = T.dynamic(
++        "idx_len, drafts_len, temp_len, seed_len, pos_len"
++    )
++    logits_stride, argmax_stride, max_stride = T.dynamic(
++        "logits_stride, argmax_stride, max_stride", "int64"
++    )
++
++    @T.macro
++    def passes(logits, raw, score, best, best_index, row, rejected, word_seed, blk,
++               tx, noisy):  # fmt: skip
++        """The thread's residual scores, combined into ``(best, best_index)``; with
++        ``noisy`` each element's Philox word is drawn ahead of its bound check (the
++        Gumbel sampler's ``passes``)."""
++        for r in T.unroll(_PASSES // run):
++            col0 = blk * RESAMPLE_BLOCK + r * (_THREADS * run) + run * tx
++            _load_run(logits, raw, row, col0, vocab, run)
++            for k in T.unroll(run):
++                local = r * (_THREADS * run) + run * tx + k
++                index = col0 + k
++                if noisy:
++                    word = T.alloc_var(
++                        T.uint32,
++                        init=T.call_extern(
++                            "uint32", "vllm_randint32", word_seed[0], index
++                        ),
++                    )
++                score[0] = -T.infinity(T.float32)
++                if index < vocab:
++                    score[0] = T.if_then_else(
++                        T.cast(index, T.int64) == rejected[0],
++                        -T.infinity(T.float32),
++                        T.cast(raw[k], T.float32),
++                    )
++                    if noisy:
++                        score[0] = T.call_extern(
++                            "float32", "vllm_gumbel_score", score[0], word
++                        )
++                if r * run + k == 0:
++                    best[0] = score[0]
++                    best_index[0] = local
++                else:
++                    _keep_or_take(best, best_index, score[0], local)
++
++    @T.prim_func
++    def resample(
++        local_argmax: T.StridedTensor((reqs, blocks), (argmax_stride, 1), T.int64),
++        local_max: T.StridedTensor((reqs, blocks), (max_stride, 1), T.float32),
++        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
++        num_sampled: T.Tensor((reqs,), T.int32),
++        cu_num_logits: T.Tensor((reqs + 1,), T.int32),
++        expanded_idx_mapping: T.Tensor((idx_len,), idx_dtype),
++        drafts: T.Tensor((drafts_len,), drafts_dtype),
++        temperature: T.Tensor((temp_len,), T.float32),
++        seeds: T.Tensor((seed_len,), T.int64),
++        pos: T.Tensor((pos_len,), pos_dtype),
++    ):
++        with T.Kernel(reqs, blocks, threads=_THREADS) as (req, blk):
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((run,), logits_dtype)
++            score = T.alloc_local((1,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            rejected = T.alloc_local((1,), T.int64)
++            word_seed = T.alloc_local((1,), T.uint32)
++            partial = T.alloc_shared((_WARPS,), T.float32)
++            partial_index = T.alloc_shared((_WARPS,), T.int32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++
++            end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
++            row = T.alloc_var(
++                T.int64,
++                init=T.cast(cu_num_logits[req], T.int64)
++                + T.cast(num_sampled[req], T.int64),
++            )
++            state = T.alloc_var(
++                T.int64, init=T.cast(expanded_idx_mapping[row], T.int64)
++            )
++            # As Triton's, the test's temperature is read without a validity check.
++            temp = T.alloc_var(T.float32, init=temperature[state])
++            bonus = row == T.cast(end - 1, T.int64)
++            if (temp != T.float32(0)) | bonus:
++                # The rejected draft is the next row's input; a bonus row has none.
++                draft = T.alloc_var(
++                    T.int64,
++                    init=T.cast(
++                        drafts[T.min(row + 1, T.cast(end - 1, T.int64))], T.int64
++                    ),
++                )
++                rejected[0] = T.if_then_else(bonus | (draft < 0), T.int64(-1), draft)
++                # gumbel_block_argmax: a padded row draws with seed 0 and no noise.
++                seed = T.alloc_var(
++                    T.int64,
++                    init=T.if_then_else(
++                        state >= 0, seeds[T.max(state, T.int64(0))], T.int64(0)
++                    ),
++                )
++                word_seed[0] = _randint_at(seed, pos[row], pos_dtype, False)
++                if T.if_then_else(state >= 0, temp, T.float32(0)) != T.float32(0):
++                    passes(logits, raw, score, best, best_index, row, rejected,
++                           word_seed, blk, tx, True)  # fmt: skip
++                else:
++                    passes(logits, raw, score, best, best_index, row, rejected,
++                           word_seed, blk, tx, False)  # fmt: skip
++                _block_argmax(
++                    best, best_index, other, other_index, partial, partial_index, tx
++                )
++                if tx == 0:
++                    local_argmax[req, blk] = T.cast(
++                        blk * RESAMPLE_BLOCK + best_index[0], T.int64
++                    )
++                    local_max[req, blk] = best[0]
++
++    return resample
++
++
++def resample_key(
++    logits_dtype: torch.dtype,
++    idx_dtype: torch.dtype,
++    drafts_dtype: torch.dtype,
++    pos_dtype: torch.dtype,
++    run: int = 1,
++) -> tuple:
++    return (
++        _DTYPES[logits_dtype],
++        _DTYPES[idx_dtype],
++        _DTYPES[drafts_dtype],
++        _DTYPES[pos_dtype],
++        run,
++    )
++
++
++def resample(
++    resampled_local_argmax: torch.Tensor,  # [num_reqs, blocks]
++    resampled_local_max: torch.Tensor,  # [num_reqs, blocks]
++    target_logits: torch.Tensor,  # [num_logits, vocab_size]
++    num_sampled: torch.Tensor,  # [num_reqs]
++    cu_num_logits: torch.Tensor,  # [num_reqs + 1]
++    expanded_idx_mapping: torch.Tensor,  # [num_logits]
++    draft_sampled: torch.Tensor,  # [num_logits]
++    temperature: torch.Tensor,  # [max_num_reqs]
++    seed: torch.Tensor,  # [max_num_reqs]
++    pos: torch.Tensor,  # [num_logits]
++) -> None:
++    """``_resample_kernel``'s launch without draft logits or watermark (FP32), into
++    the given ``[num_reqs, cdiv(vocab_size, 1024)]`` block winners."""
++    if num_sampled.shape[0] == 0:
++        return
++    kernel = _kernel(
++        resample_kernel,
++        *resample_key(
++            target_logits.dtype,
++            expanded_idx_mapping.dtype,
++            draft_sampled.dtype,
++            pos.dtype,
++            _triton_run(target_logits),
++        ),
++    )
++    kernel(
++        resampled_local_argmax,
++        resampled_local_max,
++        target_logits,
++        num_sampled,
++        cu_num_logits,
++        expanded_idx_mapping.contiguous(),
++        draft_sampled.contiguous(),
++        temperature,
++        seed,
++        pos.contiguous(),
++    )
++
++
++# --- rejection_sample ---------------------------------------------------------
++
++
++def verify_and_resample(
++    # [num_logits, V]
++    target_logits: torch.Tensor,
++    # [num_logits]
++    draft_sampled: torch.Tensor,
++    # [num_reqs + 1]
++    cu_num_logits: torch.Tensor,
++    # [num_logits]
++    pos: torch.Tensor,
++    # [num_reqs]
++    idx_mapping: torch.Tensor,
++    # [num_logits]
++    expanded_idx_mapping: torch.Tensor,
++    # [num_logits]
++    expanded_local_pos: torch.Tensor,
++    # [max_num_reqs]
++    temperature: torch.Tensor,
++    # [max_num_reqs]
++    seed: torch.Tensor,
++    num_speculative_steps: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """``rejection_sample``'s launches before the insertion, with one-hot drafts,
++    block verification, FP32 draws and no watermark: the sampled tokens
++    ([num_reqs, num_speculative_steps + 1], int64) up to the first rejected or bonus
++    token, their counts ([num_reqs], int32), and the block winners of that token's
++    resampling (``[num_reqs, cdiv(V, 1024)]`` indices, int64, and scores, FP32)."""
++    num_reqs = cu_num_logits.shape[0] - 1
++    num_logits, vocab_size = target_logits.shape
++
++    # The per-vocab-block logits stats: target argmax for greedy requests, target
++    # max and summed exponentials for the others.
++    blocks = -(-vocab_size // STATS_BLOCK)
++    target_local_argmax = target_logits.new_empty(num_logits, blocks, dtype=torch.int64)
++    target_local_max = target_logits.new_empty(num_logits, blocks, dtype=torch.float32)
++    target_local_sumexp = target_logits.new_empty(
++        num_logits, blocks, dtype=torch.float32
++    )
++    compute_local_stats(
++        target_local_argmax,
++        target_local_max,
++        target_local_sumexp,
++        target_logits,
++        expanded_idx_mapping,
++        expanded_local_pos,
++        temperature,
++        num_speculative_steps,
++    )
++
++    # Verification up to the first rejected or bonus token.
++    cumulative_log_p = target_logits.new_empty(num_logits, dtype=torch.float32)
++    sampled = draft_sampled.new_empty(
++        num_reqs, num_speculative_steps + 1, dtype=torch.int64
++    )
++    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
++    target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
++    draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
++    verify(
++        sampled,
++        num_sampled,
++        target_rejected_logsumexp,
++        draft_rejected_logsumexp,
++        cumulative_log_p,
++        target_logits,
++        target_local_argmax,
++        target_local_max,
++        target_local_sumexp,
++        draft_sampled,
++        cu_num_logits,
++        idx_mapping,
++        temperature,
++        seed,
++        pos,
++        num_speculative_steps,
++    )
++
++    # Resample the rejected/bonus tokens.
++    resample_blocks = -(-vocab_size // RESAMPLE_BLOCK)
++    resampled_local_argmax = target_logits.new_empty(
++        num_reqs, resample_blocks, dtype=torch.int64
++    )
++    resampled_local_max = target_logits.new_empty(
++        num_reqs, resample_blocks, dtype=torch.float32
++    )
++    resample(
++        resampled_local_argmax,
++        resampled_local_max,
++        target_logits,
++        num_sampled,
++        cu_num_logits,
++        expanded_idx_mapping,
++        draft_sampled,
++        temperature,
++        seed,
++        pos,
++    )
++    return sampled, num_sampled, resampled_local_argmax, resampled_local_max
++
++
++# --- Preparation --------------------------------------------------------------
++
++
++def rejection_calls(
++    logits_dtypes: Sequence[torch.dtype], vocab_size: int, num_speculative_steps: int
++) -> list:
++    """``verify_and_resample``'s calls for ``vocab_size``-wide target logits of
++    each of ``logits_dtypes``, in both layouts a launch may take (``_runs``), with
++    the input batch's int32 drafts and local positions and its int64 indices and
++    positions."""
++    calls = []
++    for dtype in dict.fromkeys(logits_dtypes):
++        for run in _runs(dtype):
++            calls.append(
++                _call(
++                    local_stats_kernel,
++                    *local_stats_key(dtype, RUNNER_IDX_DTYPE, torch.int32, run),
++                )
++            )
++            calls.append(
++                _call(
++                    resample_kernel,
++                    *resample_key(
++                        dtype, RUNNER_IDX_DTYPE, torch.int32, torch.int64, run
++                    ),
++                )
++            )
++        calls.append(
++            _call(
++                verify_kernel,
++                *verify_key(
++                    dtype,
++                    torch.int32,
++                    RUNNER_IDX_DTYPE,
++                    torch.int64,
++                    vocab_size,
++                    num_speculative_steps,
++                ),
++            )
++        )
++    return calls
++
++
++def register_block_verification(
++    logits_dtypes: Sequence[torch.dtype], vocab_size: int, num_speculative_steps: int
++) -> None:
++    """Declare ``rejection_calls`` with the runner's JIT registry (a no-op where
++    none collects)."""
++    declare(lambda: rejection_calls(logits_dtypes, vocab_size, num_speculative_steps))

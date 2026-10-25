@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 18:45:53 +0200
+Subject: [PATCH 374/488] V2 runner: DFlash inputs in Triton's tile form
+
+The decode path issued its loads in rounds behind branches (the request index,
+then the positions, then the block table, each in its own conditional block):
++0.5 us against Triton, whose kernel issues its nine loads together and stores
+under masks. Every load is now issued up front at an index that exists whatever
+the masks say, the masks are selects and the stores predicated; every value
+written is unchanged.
+---
+ vllm/v1/worker/gpu/tilelang_inputs.py | 218 +++++++++++++++++---------
+ 1 file changed, 144 insertions(+), 74 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 1deaf9866..7c0706f58 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -828,6 +828,11 @@ __device__ __forceinline__ void vllm_store_if_b32(void* p, int v, bool ok) {
+                " @q st.global.b32 [%0], %1;\n}"
+                :: "l"(p), "r"(v), "r"((int)ok) : "memory");
+ }
++__device__ __forceinline__ void vllm_store_if_f32(void* p, float v, bool ok) {
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q st.global.f32 [%0], %1;\n}"
++               :: "l"(p), "f"(v), "r"((int)ok) : "memory");
++}
+ """
+ 
+ _STORE_BITS = {"int32": 32, "int64": 64}
+@@ -1420,6 +1425,7 @@ def prepare_dflash_inputs_kernel(
+         with T.Kernel(
+             num_blocks + _DFLASH_PAD_BLOCKS, num_reqs, threads=_DFLASH_THREADS
+         ) as (bk, r):
++            T.import_source(_STORE_IF)
+             tx = T.get_thread_binding()
+             if bk >= num_blocks:
+                 # The last request's extra blocks pad the query slots past the
+@@ -1435,94 +1441,158 @@ def prepare_dflash_inputs_kernel(
+                         if (i < first + chunk) and (i < max_num_tokens):
+                             out_query_slot_mapping[i] = T.int64(_PAD)
+             else:
+-                req = T.cast(idx_mapping[r], T.int64)
+-                context_start = target_query_start_loc[r]
+-                context_end = target_query_start_loc[r + 1]
+-                valid_end = context_end - num_rejected[r]
++                # Triton's form: every load the thread needs is issued up front, at
++                # an index that exists whatever the masks say; the masks are
++                # selects and the stores predicated (_STORE_IF), so no load waits
++                # behind a branch for another.
++                req = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
++                context_start = T.alloc_var(T.int32, init=target_query_start_loc[r])
++                context_end = T.alloc_var(T.int32, init=target_query_start_loc[r + 1])
++                rejected = T.alloc_var(T.int32, init=num_rejected[r])
++                sampled = T.alloc_var(T.int32, init=num_sampled[r])
++                j = bk * _DFLASH_THREADS + tx
++                rows = context_end - context_start
++                valid_end = context_end - rejected
+                 num_valid = valid_end - context_start
++                anchor = T.alloc_var(
++                    T.int64,
++                    init=target_positions[T.max(valid_end - 1, context_start)],
++                )
++                first = T.alloc_var(T.int64, init=target_positions[context_start])
++                row_position = T.alloc_var(
++                    T.int64,
++                    init=target_positions[context_start + T.min(j, T.max(rows - 1, 0))],
++                )
++                last_token = T.alloc_var(T.int64, init=last_sampled[req])
++                next_token = T.alloc_var(T.int32, init=next_prefill_tokens[req])
++                temp = T.alloc_var(T.float32, init=temperature[req])
++                seed = T.alloc_var(T.int64, init=seeds[req])
+                 # No valid row: every row was rejected, the first one included (sink
+                 # rejection replaced draft zero). The anchor takes draft zero's
+                 # position; the context before it is in the cache already.
+-                last_valid = T.if_then_else(
+-                    num_valid > 0,
+-                    target_positions[T.max(valid_end - 1, context_start)],
+-                    target_positions[context_start] - 1,
+-                )
++                last_valid = T.if_then_else(num_valid > 0, anchor, first - 1)
+                 span = block_size * cp_size
+                 last_column = T.cast(table_stride - 1, T.int64)
+-                j = bk * _DFLASH_THREADS + tx
+-                if j < context_end - context_start:
+-                    live = j < num_valid
+-                    position = T.if_then_else(
+-                        live, target_positions[context_start + j], T.int64(0)
+-                    )
+-                    block_id = T.if_then_else(
+-                        live,
+-                        T.cast(
+-                            block_table[
+-                                r, T.min(T.truncdiv(position, span), last_column)
+-                            ],
+-                            T.int64,
+-                        ),
+-                        T.int64(0),
+-                    )
+-                    # Block 0 is the null block: evicted sliding-window positions and
+-                    # rejected rows write no draft KV.
+-                    out_context_positions[context_start + j] = position
+-                    out_context_slot_mapping[context_start + j] = T.if_then_else(
+-                        live and block_id != 0,
+-                        _local_slot(
+-                            position, block_id, block_size, cp_rank, cp_size,
+-                            cp_interleave,
+-                        ),
+-                        T.int64(_PAD),
+-                    )  # fmt: skip
+-                if j >= num_valid and j < num_valid + num_query_per_req:
+-                    offset = j - num_valid
+-                    position = last_valid + 1 + offset
+-                    block_id = T.cast(
++                in_context = j < rows
++                live = j < num_valid
++                position = T.if_then_else(live, row_position, T.int64(0))
++                offset = j - num_valid
++                is_query = (j >= num_valid) & (j < num_valid + num_query_per_req)
++                query_position = last_valid + 1 + offset
++                context_block = T.alloc_var(
++                    T.int64,
++                    init=T.cast(
+                         block_table[r, T.min(T.truncdiv(position, span), last_column)],
+                         T.int64,
+-                    )
+-                    query = r * num_query_per_req + offset
+-                    out_input_ids[query] = T.if_then_else(
+-                        offset == 0,
+-                        T.if_then_else(
+-                            num_sampled[r] > 0,
+-                            T.cast(last_sampled[req], T.int32),
+-                            next_prefill_tokens[req],
+-                        ),
+-                        parallel_drafting_token_id,
+-                    )
+-                    out_query_positions[query] = T.min(
+-                        position, T.cast(max_model_len - 1, T.int64)
+-                    )
+-                    out_query_slot_mapping[query] = T.if_then_else(
+-                        block_id != 0,
+-                        _local_slot(
+-                            position, block_id, block_size, cp_rank, cp_size,
+-                            cp_interleave,
+-                        ),
+-                        T.int64(_PAD),
+-                    )  # fmt: skip
+-                    if offset >= sample_offset:
+-                        sample = r * num_speculative_steps + offset - sample_offset
+-                        out_sample_indices[sample] = T.cast(query, T.int64)
+-                        out_sample_pos[sample] = position + 1 - sample_offset
+-                        out_sample_idx_mapping[sample] = T.cast(req, T.int32)
++                    ),
++                )
++                query_block = T.alloc_var(
++                    T.int64,
++                    init=T.cast(
++                        block_table[
++                            r,
++                            T.min(
++                                T.truncdiv(T.max(query_position, T.int64(0)), span),
++                                last_column,
++                            ),
++                        ],
++                        T.int64,
++                    ),
++                )
++                # Block 0 is the null block: evicted sliding-window positions and
++                # rejected rows write no draft KV.
++                context_slot = T.if_then_else(
++                    live and context_block != 0,
++                    _local_slot(
++                        position, context_block, block_size, cp_rank, cp_size,
++                        cp_interleave,
++                    ),
++                    T.int64(_PAD),
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_context_positions[context_start + j]), position,
++                    in_context,
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_context_slot_mapping[context_start + j]),
++                    context_slot, in_context,
++                )  # fmt: skip
++                query = r * num_query_per_req + offset
++                input_id = T.if_then_else(
++                    offset == 0,
++                    T.if_then_else(
++                        sampled > 0, T.cast(last_token, T.int32), next_token
++                    ),
++                    parallel_drafting_token_id,
++                )
++                query_slot = T.if_then_else(
++                    query_block != 0,
++                    _local_slot(
++                        query_position, query_block, block_size, cp_rank, cp_size,
++                        cp_interleave,
++                    ),
++                    T.int64(_PAD),
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b32",
++                    T.address_of(out_input_ids[query]), input_id, is_query,
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_query_positions[query]),
++                    T.min(query_position, T.cast(max_model_len - 1, T.int64)), is_query,
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_query_slot_mapping[query]), query_slot, is_query,
++                )  # fmt: skip
++                is_sample = is_query and offset >= sample_offset
++                sample = r * num_speculative_steps + offset - sample_offset
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_sample_indices[sample]), T.cast(query, T.int64),
++                    is_sample,
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b64",
++                    T.address_of(out_sample_pos[sample]),
++                    query_position + 1 - sample_offset, is_sample,
++                )  # fmt: skip
++                T.call_extern(
++                    "handle", "vllm_store_if_b32",
++                    T.address_of(out_sample_idx_mapping[sample]), T.cast(req, T.int32),
++                    is_sample,
++                )  # fmt: skip
+                 if bk == 0:
+-                    if tx == 0:
+-                        out_query_start_loc[r] = r * num_query_per_req
+-                        # The absolute length the draft attention reads up to.
+-                        out_seq_lens[r] = T.cast(
++                    lead = tx == 0
++                    T.call_extern(
++                        "handle", "vllm_store_if_b32",
++                        T.address_of(out_query_start_loc[r]), r * num_query_per_req,
++                        lead,
++                    )  # fmt: skip
++                    # The absolute length the draft attention reads up to.
++                    T.call_extern(
++                        "handle", "vllm_store_if_b32",
++                        T.address_of(out_seq_lens[r]),
++                        T.cast(
+                             T.min(
+                                 last_valid + 1 + num_query_per_req,
+                                 T.cast(max_model_len, T.int64),
+                             ),
+                             T.int32,
+-                        )
+-                        out_temperature[req] = temperature[req]
+-                        out_seeds[req] = seeds[req]
++                        ),
++                        lead,
++                    )  # fmt: skip
++                    T.call_extern(
++                        "handle", "vllm_store_if_f32",
++                        T.address_of(out_temperature[req]), temp, lead,
++                    )  # fmt: skip
++                    T.call_extern(
++                        "handle", "vllm_store_if_b64",
++                        T.address_of(out_seeds[req]), seed, lead,
++                    )  # fmt: skip
+                     if r == num_reqs - 1:
+                         # Pad the per-request buffers to max_num_reqs for graph replay.
+                         last_query_end = num_reqs * num_query_per_req

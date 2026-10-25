@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:04:51 +0100
+Subject: [PATCH 448/488] [DS4.1] DSpark's eager context step joins and stores
+ in TileLang
+
+The drafter's model joins the target's auxiliary hidden states side by
+side in one TileLang launch and its norm writes the combined rows into
+the speculator's context buffer: torch's cat and the copy after the
+combine gone.
+---
+ .../test_deepseek_v41_tilelang_columns.py     | 15 +++++
+ vllm/models/deepseek_v4_1/nvidia/dspark.py    | 30 ++++++++-
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 65 ++++++++++++-------
+ .../gpu/spec_decode/dflash/speculator.py      | 17 +++--
+ 4 files changed, 95 insertions(+), 32 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_columns.py b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+index 441c5dea2..4fabd0b52 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_columns.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+@@ -66,6 +66,19 @@ def test_split_columns_like_torch(widths, rows):
+         assert torch.equal(_bits(part), _bits(reference))
+ 
+ 
++@pytest.mark.parametrize("parts", [3, 2])
++@pytest.mark.parametrize("rows", [1, 5, 96, 8192])
++def test_join_columns_like_torch_cat(parts, rows):
++    """The DSpark drafter's eager context join: the target's auxiliary hidden
++    states side by side, as torch's cat."""
++    width = 5120  # DeepSeek-V4.1 Flash's hidden size, one a target layer
++    states = [_rows(rows, width, rows + 11 * i) for i in range(parts)]
++    out = _rows(rows, parts * width, rows + 99)
++    joined = columns.join_columns(states, out)
++    assert joined.data_ptr() == out.data_ptr()
++    assert torch.equal(_bits(out), _bits(torch.cat(states, dim=-1)))
++
++
+ def test_float32_parts():
+     gathered = _rows(9, 64 + 32 + 16, 5, torch.float32)
+     expected = [p.contiguous() for p in gathered.split((64, 32, 16), dim=-1)]
+@@ -81,3 +94,5 @@ def test_refuses_what_it_cannot_copy_in_vectors():
+         columns.split_columns(_rows(4, 12, 8), (4, 8))
+     with pytest.raises(ValueError, match="contiguous"):
+         columns.split_columns(_rows(4, 128, 9)[:, :64], (32, 32))
++    with pytest.raises(ValueError, match="contiguous parts"):
++        columns.join_columns([x, _rows(5, 64, 10)], _rows(4, 128, 11))
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index a827fbcf7..861214fb0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -67,7 +67,7 @@ from .. import kernels, l2_prefetch
+ from ..b12x_layers import (
+     _execution_capacities,
+ )
+-from ..tilelang import dspark_context, prepare
++from ..tilelang import columns, dspark_context, prepare
+ from .model import (
+     DeepseekV4DecoderLayer,
+     _linear_scale_param_name,
+@@ -352,8 +352,17 @@ class DSparkDeepseekV4Model(nn.Module):
+         context_key = dspark_context.context_inputs_key(
+             self.hidden_size, vllm_config.model_config.dtype
+         )
++        # combine_aux_hidden_states_into: the eager context step's join.
++        join_key = columns.split_columns_key(
++            (self.hidden_size,) * len(self.target_layer_ids),
++            vllm_config.model_config.dtype,
++            join=True,
++        )
+         prepare.declare(
+-            lambda: [prepare.call(dspark_context.context_inputs_kernel, *context_key)]
++            lambda: [
++                prepare.call(dspark_context.context_inputs_kernel, *context_key),
++                prepare.call(columns.split_columns_kernel, *join_key),
++            ]
+         )
+         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+         self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
+@@ -466,6 +475,18 @@ class DSparkDeepseekV4Model(nn.Module):
+         """
+         return self.main_norm(self.main_proj(aux_hidden_states))
+ 
++    def combine_aux_hidden_states_into(
++        self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
++    ) -> None:
++        """``combine_hidden_states`` of the target aux hidden states' first
++        ``out.shape[0]`` rows, written into ``out``: the states joined side by side
++        in one TileLang launch and the norm writing ``out`` (torch's cat, and the
++        speculator's copy into its context buffer, gone)."""
++        rows = out.shape[0]
++        joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
++        columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
++        self.main_norm(self.main_proj(joined), out=out)
++
+     @torch.inference_mode()
+     def precompute_and_store_context_kv(
+         self,
+@@ -603,6 +624,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+         return self.model.combine_hidden_states(aux_hidden_states)
+ 
++    def combine_aux_hidden_states_into(
++        self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
++    ) -> None:
++        self.model.combine_aux_hidden_states_into(aux_hidden_states, out)
++
+     def get_draft_kv_cache_layer_names(self) -> list[str]:
+         # DSV4 MLA path: each draft layer's sliding-window cache is a separate
+         # layer, named by its prefix.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+index d4c547035..90f93e278 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/columns.py
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -7,8 +7,10 @@ normalized Q and KV halves of the fused projection and the indexer's head weight
+ in one all-gather: the norms write their halves into the gather's buffer in place,
+ ``copy_columns`` puts the head weights beside them, and ``split_columns`` cuts the
+ gathered rows into one contiguous tensor a part. Torch's cat and three contiguous
+-copies, as two TileLang launches. A thread copies 16 bytes; the block widths are
+-whole vectors, so no vector straddles two parts.
++copies, as two TileLang launches. ``join_columns`` is the split reversed: the
++DSpark drafter's eager context step joins the target's auxiliary hidden states side
++by side (torch's cat). A thread copies 16 bytes; the block widths are whole vectors,
++so no vector straddles two parts.
+ """
+ 
+ # No `from __future__ import annotations`: TileLang reads the prim_func
+@@ -74,11 +76,18 @@ def copy_columns_kernel(width: int, dtype: str):
+     return copy_columns
+ 
+ 
++def _move(part, whole, join: bool):
++    """A 16-byte copy between a part's and the whole row's addresses, in the
++    direction ``join`` gives."""
++    destination, source = (whole, part) if join else (part, whole)
++    return T.call_extern("handle", "vllm_columns_b128", destination, source)
++
++
+ @tilelang.jit(pass_configs=_PASS)
+-def split_columns_kernel(widths: tuple[int, int, int], dtype: str):
++def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = False):
+     """Row ``r`` of ``src`` ([rows, sum(widths)], contiguous) cut into ``out0``,
+     ``out1`` and ``out2`` (contiguous, ``widths[i]`` wide; a zero width has no
+-    part)."""
++    part), or with ``join`` the parts' rows side by side into ``src``."""
+     vector = _vector(dtype)
+     if any(width % vector for width in widths) or not widths[0] or not widths[1]:
+         raise ValueError(f"widths {widths} are not whole 16-byte vectors")
+@@ -98,27 +107,13 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str):
+         with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
+             T.import_source(_HEADER)
+             col = bx * span + T.get_thread_binding() * vector
++            whole = T.address_of(src[row, col])
+             if col < w0:
+-                T.call_extern(
+-                    "handle",
+-                    "vllm_columns_b128",
+-                    T.address_of(out0[row, col]),
+-                    T.address_of(src[row, col]),
+-                )
++                _move(T.address_of(out0[row, col]), whole, join)
+             elif col < w0 + w1:
+-                T.call_extern(
+-                    "handle",
+-                    "vllm_columns_b128",
+-                    T.address_of(out1[row, col - w0]),
+-                    T.address_of(src[row, col]),
+-                )
++                _move(T.address_of(out1[row, col - w0]), whole, join)
+             elif col < total:
+-                T.call_extern(
+-                    "handle",
+-                    "vllm_columns_b128",
+-                    T.address_of(out2[row, col - w0 - w1]),
+-                    T.address_of(src[row, col]),
+-                )
++                _move(T.address_of(out2[row, col - w0 - w1]), whole, join)
+ 
+     return split_columns
+ 
+@@ -149,8 +144,10 @@ def copy_columns_key(width: int, dtype: torch.dtype) -> tuple:
+     return (width, _DTYPES[dtype])
+ 
+ 
+-def split_columns_key(widths: tuple[int, ...], dtype: torch.dtype) -> tuple:
+-    return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype])
++def split_columns_key(
++    widths: tuple[int, ...], dtype: torch.dtype, join: bool = False
++) -> tuple:
++    return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype], join)
+ 
+ 
+ def copy_columns(src: torch.Tensor, dst: torch.Tensor) -> None:
+@@ -181,10 +178,30 @@ def split_columns(src: torch.Tensor, widths: tuple[int, ...]) -> list[torch.Tens
+     return parts
+ 
+ 
++def join_columns(parts: list[torch.Tensor], out: torch.Tensor) -> torch.Tensor:
++    """``torch.cat(parts, -1, out=out)`` for two or three contiguous parts of the
++    same rows into contiguous ``out``."""
++    widths = tuple(part.shape[-1] for part in parts)
++    if len(parts) not in (2, 3) or out.shape != (parts[0].shape[0], sum(widths)):
++        raise ValueError(f"cannot join {widths} into {tuple(out.shape)}")
++    if not all(t.is_contiguous() for t in (out, *parts)) or any(
++        part.shape[0] != out.shape[0] for part in parts
++    ):
++        raise ValueError("join_columns joins contiguous parts of the same rows")
++    dtype = _check(out, *parts)
++    rows = out.shape[0]
++    if rows:
++        third = parts[2] if len(parts) == 3 else parts[0].view(-1, _vector(dtype))
++        key = split_columns_key(widths, out.dtype, join=True)
++        _bound(True, *key)(out, parts[0], parts[1], third, rows)
++    return out
++
++
+ __all__ = [
+     "copy_columns",
+     "copy_columns_kernel",
+     "copy_columns_key",
++    "join_columns",
+     "split_columns",
+     "split_columns_kernel",
+     "split_columns_key",
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 291dcb422..0a2032ee1 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -623,16 +623,21 @@ class DFlashSpeculator(DraftModelSpeculator):
+                     ]
+                 else:
+                     last_hidden_states = gather_rows(last_hidden_states, ced_indices)
++            combine_into = getattr(self.model, "combine_aux_hidden_states_into", None)
+             if context_states_are_streamed:
+                 assert aux_hidden_states is not None
+                 context_states = aux_hidden_states[0]
+-            elif aux_hidden_states:
+-                hidden_states = self.model.combine_hidden_states(
+-                    torch.cat(aux_hidden_states, dim=-1)
+-                )
++            elif aux_hidden_states and combine_into is not None:
++                # The model joins the aux states and writes the combined rows
++                # into the context buffer itself.
++                combine_into(aux_hidden_states, context_states)
+             else:
+-                hidden_states = last_hidden_states
+-            if not context_states_are_streamed:
++                if aux_hidden_states:
++                    hidden_states = self.model.combine_hidden_states(
++                        torch.cat(aux_hidden_states, dim=-1)
++                    )
++                else:
++                    hidden_states = last_hidden_states
+                 context_states.copy_(hidden_states[:num_context_tokens])
+ 
+         if dummy_run and skip_attn_for_dummy_run:

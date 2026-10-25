@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:50:43 +0200
+Subject: [PATCH 444/488] [DS4.1] Disk Engram columns all-gathered with no
+ copies
+
+A rank's row gather writes its own hash columns side by side, and the
+all-gather takes them as 256-wide rows along the last dimension: rank
+r's k-th block lands at column k * tp + r, the column order, so neither
+the strided slice before the collective nor the transpose after it
+remains.
+---
+ .../kernels/test_deepseek_v41_engram_rows.py  | 23 ++++++++--
+ tests/models/test_deepseek_v4_1_engram.py     | 30 ++++++++-----
+ vllm/models/deepseek_v4_1/common/engram.py    | 36 ++++++---------
+ vllm/models/deepseek_v4_1/engram_rows/rows.py |  5 ++-
+ .../deepseek_v4_1/tilelang/engram_rows.py     | 45 ++++++++++++-------
+ 5 files changed, 83 insertions(+), 56 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_engram_rows.py b/tests/kernels/test_deepseek_v41_engram_rows.py
+index fbaff52f1..4e358c4e8 100644
+--- a/tests/kernels/test_deepseek_v41_engram_rows.py
++++ b/tests/kernels/test_deepseek_v41_engram_rows.py
+@@ -50,10 +50,11 @@ def _write_table(directory: str, seed: int = 0):
+ 
+ 
+ def _reference(codes, scales, ids, live, start, end, columns=ALL_COLUMNS):
+-    """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16."""
+-    rows = ids.cpu().long()
++    """b12x's lookup in torch: value times its E8M0 scale, rounded to BF16, of the
++    hash columns in the mask ``columns``, side by side."""
++    owned = [h for h in range(HEADS) if columns >> h & 1]
++    rows = ids.cpu().long()[:, owned]
+     local = (rows >= start) & (rows < end)
+-    local &= torch.tensor([bool(columns >> h & 1) for h in range(HEADS)])[None, :]
+     local[live:] = False
+     safe = rows.clamp(0, TABLE_ROWS - 1)
+     values = codes[safe].view(torch.float8_e4m3fn).float()
+@@ -77,7 +78,8 @@ def _rows(paths, start=0, end=TABLE_ROWS, tokens=16, **kwargs):
+ def _step(rows, ids, live):
+     stream = torch.cuda.current_stream()
+     num_tokens = torch.tensor([live], dtype=torch.int32, device="cuda")
+-    out = torch.full((ids.shape[0], HEADS * 256), 7, dtype=torch.bfloat16, device="cuda")
++    width = bin(rows.columns).count("1") * 256  # the rank's columns, side by side
++    out = torch.full((ids.shape[0], width), 7, dtype=torch.bfloat16, device="cuda")
+     rows.stage(stream, ids, ids.numel())
+     rows.gather(out, ids, num_tokens)
+     return out, num_tokens
+@@ -495,6 +497,19 @@ def test_timeline_records_each_step_and_the_gpu_wait():
+     assert result.returncode == 0, result.stderr[-3000:]
+ 
+ 
++def test_the_gather_takes_every_nth_column():
++    """The gather writes a rank's columns side by side: every n-th from the first
++    (``column_shard``), or it refuses the mask."""
++    from vllm.models.deepseek_v4_1.tilelang.engram_rows import column_span
++
++    assert column_span(ALL_COLUMNS) == (0, 1, HEADS)
++    assert column_span(TP3_RANK1) == (1, 3, 8)
++    assert column_span(1 << 23) == (23, 1, 1)
++    for columns in (0, 0b1011, (1 << 2) | (1 << 5) | (1 << 9)):
++        with pytest.raises(ValueError, match="every n-th"):
++            column_span(columns)
++
++
+ @pytest.mark.parametrize("columns", [0, 1 << HEADS])
+ def test_a_malformed_column_mask_is_refused(columns):
+     _, _, paths = _write_table(_table_dir(), seed=29)
+diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
+index 51d7df55f..742bd9e1c 100644
+--- a/tests/models/test_deepseek_v4_1_engram.py
++++ b/tests/models/test_deepseek_v4_1_engram.py
+@@ -1082,11 +1082,13 @@ def test_disk_rows_read_whole_table_sources(tmp_path, dist_init, tp_rank):
+             embed.num_tokens.copy_(count)
+             module.stage_rows(capacity, torch.cuda.current_stream())
+             embed.gather_rows(output)
+-            reference = weight.float()[ids.cpu() + shift].flatten(1).bfloat16()
+-            owned = torch.tensor([bool(embed.column_mask >> h & 1) for h in range(24)])
+-            reference[:, ~owned.repeat_interleave(256)] = 0
+-            assert int(owned.sum()) == 24 // caps.tp_size
+-            torch.testing.assert_close(output.cpu(), reference, rtol=0, atol=0)
++            # The rank's own columns, side by side.
++            owned = [h for h in range(24) if embed.column_mask >> h & 1]
++            assert len(owned) == 24 // caps.tp_size
++            reference = weight.float()[ids.cpu()[:, owned] + shift].flatten(1)
++            torch.testing.assert_close(
++                output.cpu(), reference.bfloat16(), rtol=0, atol=0
++            )
+             assert output.data_ptr() == address
+     finally:
+         embed.close()
+@@ -1113,7 +1115,8 @@ def test_disk_shards_interleave_hash_columns(tp_size):
+ 
+ @pytest.mark.parametrize("tp_size", [1, 2, 3, 4, 6])
+ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+-    """Every rank's columns, all-gathered rank-major, go back to column order exactly."""
++    """Every rank's columns, all-gathered as 256-wide rows along the last dimension,
++    are the column order exactly, with no copy after the collective."""
+     import vllm.models.deepseek_v4_1.common.engram as engram_module
+ 
+     tokens = 5
+@@ -1122,9 +1125,14 @@ def test_interleaved_rows_restore_column_order(tp_size, monkeypatch):
+         full.view(tokens, 24 // tp_size, tp_size, 256)[:, :, r, :].reshape(tokens, -1)
+         for r in range(tp_size)
+     ]
+-    monkeypatch.setattr(
+-        engram_module, "tensor_model_parallel_all_gather",
+-        lambda local, dim: torch.cat(locals_, dim=dim),
+-    )
+-    rows = engram_module.interleaved_rows(locals_[0], tp_size)
++    gathered = []
++
++    def all_gather(local, dim):
++        assert local.shape == (tokens * 24 // tp_size, 256) and dim == -1
++        gathered.append(torch.cat([part.view(-1, 256) for part in locals_], dim=dim))
++        return gathered[-1]
++
++    monkeypatch.setattr(engram_module, "tensor_model_parallel_all_gather", all_gather)
++    rows = engram_module.interleaved_rows(locals_[0])
+     assert torch.equal(rows.view(torch.int16), full.view(torch.int16))
++    assert rows.data_ptr() == gathered[0].data_ptr()
+diff --git a/vllm/models/deepseek_v4_1/common/engram.py b/vllm/models/deepseek_v4_1/common/engram.py
+index ca31b18d6..689c043ac 100644
+--- a/vllm/models/deepseek_v4_1/common/engram.py
++++ b/vllm/models/deepseek_v4_1/common/engram.py
+@@ -571,18 +571,16 @@ def column_shard(geometry, layer_index: int, tp_size: int, tp_rank: int):
+     return tuple(range(tp_rank, columns, tp_size))
+ 
+ 
+-def interleaved_rows(local: torch.Tensor, tp_size: int) -> torch.Tensor:
++def interleaved_rows(local: torch.Tensor) -> torch.Tensor:
+     """Rows ``[T, 24 * 256]`` in column order from every rank's columns: ``local`` is
+-    this rank's ``[T, (24 / tp_size) * 256]``, columns ``rank, rank + tp, ...``. The
+-    all-gather lays them out rank-major, so rank r's k-th block is column k * tp + r;
+-    a transpose puts them back. Exact copies: the same values as one reader's rows."""
++    this rank's ``[T, (24 / tp) * 256]``, columns ``rank, rank + tp, ...`` side by
++    side. All-gathered as 256-wide rows along the last dimension, rank r's k-th block
++    of token t lands at column k * tp + r of the token's row: the column order, with
++    no copy before or after the collective (the one-shot all-gather writes the layout
++    directly). Exact copies: the same values as one reader's rows."""
+     tokens = local.shape[0]
+-    gathered = tensor_model_parallel_all_gather(local, dim=-1)
+-    return (
+-        gathered.view(tokens, tp_size, 24 // tp_size, 256)
+-        .transpose(1, 2)
+-        .reshape(tokens, 24 * 256)
+-    )
++    gathered = tensor_model_parallel_all_gather(local.view(-1, 256), dim=-1)
++    return gathered.view(tokens, 24 * 256)
+ 
+ 
+ class ParallelEngramEmbedding(nn.Module):
+@@ -895,12 +893,14 @@ class Engram(nn.Module):
+             torch.empty(self.hc_mult * self.dim, dtype=torch.float32),
+             persistent=False,
+         )
+-        # Zeroed: a gather writes only its own step's rows.
++        # Zeroed: a gather writes only its own step's rows. A disk table sharded on
++        # hash columns gathers only its own columns, side by side.
++        columns = self.embed_tokens.columns
+         self.register_buffer(
+             "staged_rows",
+             torch.zeros(
+                 caps.max_tokens,
+-                6144,
++                6144 if columns is None else len(columns) * 256,
+                 dtype=torch.bfloat16,
+                 device=caps.device,
+             ),
+@@ -1140,17 +1140,9 @@ class Engram(nn.Module):
+             raise RuntimeError("Disk Engram output is not prepared")
+         if self.embed_tokens.table_memory == "disk":
+             self.embed_tokens.gather_rows(self.staged_rows[: hash_ids.shape[0]])
+-        columns = self.embed_tokens.columns
+-        if columns is not None:
++        if self.embed_tokens.columns is not None:
+             # This rank's gathered rows are its hash columns, every tp-th.
+-            tp_size = 24 // len(columns)
+-            tokens = hash_ids.shape[0]
+-            local = (
+-                self.staged_rows[:tokens]
+-                .view(tokens, len(columns), tp_size, 256)[:, :, columns[0], :]
+-                .reshape(tokens, len(columns) * 256)
+-            )
+-            rows = interleaved_rows(local, tp_size)
++            rows = interleaved_rows(self.staged_rows[: hash_ids.shape[0]])
+         else:
+             rows = tensor_model_parallel_all_reduce(
+                 self.staged_rows[: hash_ids.shape[0]]
+diff --git a/vllm/models/deepseek_v4_1/engram_rows/rows.py b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+index 3d0027784..89dcca295 100644
+--- a/vllm/models/deepseek_v4_1/engram_rows/rows.py
++++ b/vllm/models/deepseek_v4_1/engram_rows/rows.py
+@@ -182,8 +182,9 @@ class EngramDiskRows:
+ 
+     def gather(self, out: torch.Tensor, ids: torch.Tensor, num_tokens: torch.Tensor) -> None:
+         """Wait for the staged step's rows and dequantize the first ``num_tokens``
+-        tokens' rows into ``out`` (``[tokens, 24 * 256]`` BF16), zero elsewhere and for
+-        rows outside this rank's shard or columns. Capturable in a CUDA graph."""
++        tokens' rows into ``out`` (``[tokens, columns * 256]`` BF16, this rank's hash
++        columns side by side), zero elsewhere and for rows outside this rank's shard.
++        Capturable in a CUDA graph."""
+         from vllm.models.deepseek_v4_1.tilelang.engram_rows import engram_rows_gather
+ 
+         engram_rows_gather(ids, num_tokens, self.rows_e4m3, self.scales.device_view,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+index 685993e63..56b03a58f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
++++ b/vllm/models/deepseek_v4_1/tilelang/engram_rows.py
+@@ -11,11 +11,11 @@ stream:
+   that reports a failure, records the step and the time waited and stops the GPU,
+   so no kernel after it reads stale rows. One wait per table and step: polling host
+   memory from every gather block cost about 0.5 us a block.
+-- the gather: one block per (head, token) dequantizes the row as b12x's Engram
+-  lookup does (the value times its E8M0 scale, 2^-127 for byte 0 and NaN for 255,
+-  rounded to BF16) into the token's head slice. A token past the step, or a row
+-  outside this rank's shard or hash columns, loads nothing and writes zeros (the
+-  reader leaves those slots untouched).
++- the gather: one block per (column, token) of this rank's hash columns dequantizes
++  the row as b12x's Engram lookup does (the value times its E8M0 scale, 2^-127 for
++  byte 0 and NaN for 255, rounded to BF16) into the token's slice of the column, the
++  rank's columns side by side. A token past the step, or a row outside this rank's
++  shard, loads nothing and writes zeros (the reader leaves those slots untouched).
+ - the release: one thread writes the step it gathered into the control block, so the
+   reader may now fill the buffers with the next step's early rows (those the host
+   hashed while this step ran).
+@@ -158,6 +158,18 @@ def engram_rows_release_kernel():
+     return engram_rows_release
+ 
+ 
++def column_span(columns: int) -> tuple[int, int, int]:
++    """The hash columns of the 24-bit mask ``columns`` as (first, step, count): a
++    rank reads every ``step``-th column from its ``first`` (``column_shard``)."""
++    heads = [head for head in range(HEADS) if columns >> head & 1]
++    step = heads[1] - heads[0] if len(heads) > 1 else 1
++    if not heads or heads != list(range(heads[0], HEADS, step))[: len(heads)]:
++        raise ValueError(
++            f"Engram row columns must be every n-th column from the first: {columns:#x}"
++        )
++    return heads[0], step, len(heads)
++
++
+ @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
+ def engram_rows_gather_kernel(
+     max_lookups: int,
+@@ -168,6 +180,7 @@ def engram_rows_gather_kernel(
+     vec: int = 4,
+ ):
+     assert threads * vec == ROW and 32 % vec == 0
++    first, step, count = column_span(columns)
+     tokens = T.dynamic("tokens")
+ 
+     @T.prim_func
+@@ -176,30 +189,27 @@ def engram_rows_gather_kernel(
+         num_tokens: T.Tensor((1,), T.int32),
+         rows: T.Tensor((max_lookups, ROW), T.float8_e4m3fn),
+         scales: T.Tensor((max_lookups, SCALES), T.uint8),
+-        out: T.Tensor((tokens, HEADS * ROW), T.bfloat16),
++        out: T.Tensor((tokens, count * ROW), T.bfloat16),
+     ):
+-        with T.Kernel(HEADS, tokens, threads=threads) as (head, t):
++        with T.Kernel(count, tokens, threads=threads) as (column, t):
+             tx = T.get_thread_binding()
++            head = first + column * step
+             row = ids[t, head]
+             lookup = t * HEADS + head
+             owned = (t < num_tokens[0]) & (row >= shard_start) & (row < shard_end)
+-            if columns != (1 << HEADS) - 1:
+-                owned = owned & (
+-                    T.bitwise_and(T.shift_right(T.int32(columns), head), 1) == 1
+-                )
+             if owned:
+                 exponent = T.cast(scales[lookup, tx * vec // 32], T.uint32)
+                 scale = T.reinterpret(T.shift_left(exponent, 23), T.float32)
+                 scale = T.if_then_else(exponent == 0, T.float32(2.0**-127), scale)
+                 scale = T.if_then_else(exponent == 255, T.float32(float("nan")), scale)
+                 for i in T.vectorized(vec):
+-                    out[t, head * ROW + tx * vec + i] = T.cast(
++                    out[t, column * ROW + tx * vec + i] = T.cast(
+                         T.cast(rows[lookup, tx * vec + i], T.float32) * scale,
+                         T.bfloat16,
+                     )
+             else:
+                 for i in T.vectorized(vec):
+-                    out[t, head * ROW + tx * vec + i] = T.bfloat16(0)
++                    out[t, column * ROW + tx * vec + i] = T.bfloat16(0)
+ 
+     return engram_rows_gather
+ 
+@@ -232,10 +242,11 @@ def engram_rows_gather(
+     columns: int = (1 << HEADS) - 1,
+ ) -> None:
+     """Wait for the staged step's rows, dequantize the first ``num_tokens`` tokens'
+-    rows into ``out`` ([tokens, 24 * 256] BF16), then release the buffers to the
+-    reader. ``ids`` ([>= tokens, 24] int64) are the step's row IDs; ``rows``,
+-    ``scales`` and ``control`` are the reader's mapped buffers; the rank owns the
+-    rows in [shard_start, shard_end) of the hash columns in the mask ``columns``."""
++    rows into ``out`` ([tokens, columns * 256] BF16: the rank's hash columns side by
++    side), then release the buffers to the reader. ``ids`` ([>= tokens, 24] int64)
++    are the step's row IDs; ``rows``, ``scales`` and ``control`` are the reader's
++    mapped buffers; the rank owns the rows in [shard_start, shard_end) of the hash
++    columns in the mask ``columns``, every n-th from the first."""
+     engram_rows_wait_kernel()(control)
+     tokens = out.shape[0]
+     if tokens:

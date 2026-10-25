@@ -1,0 +1,864 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:16:08 +0200
+Subject: [PATCH 437/488] Spec decode: verified tokens carry their
+ logprob_token_ids
+
+A request's logprob_token_ids name the tokens whose logprobs it gets for
+every generated token; the OpenAI APIs send them with logprobs unset. The
+V2 runner's sampler returns them, but with speculative decoding only the
+token of a step without drafts goes through it. Every verified token went
+through the rejection sampler, which sized its logprobs from
+sampling_states (the logprobs parameter alone) and never passed the
+requests' ids to compute_topk_scores; a greedy batch that wanted only
+custom ids also took greedy verification, which returns no logprobs. So
+verified tokens came back without logprobs, or with the top logprobs of
+a neighbour's request instead of the ids, and a chat completion with
+logprob_token_ids got fewer logprob entries than tokens: IndexError in
+_create_chat_logprobs, HTTP 500. With sink rejection the first token's
+row was dropped as well, since the step that verifies it had none.
+
+The rejection sampler now takes the sampler's logprobs dimensions (top
+logprobs and per-request ids) and scores each logits row as the sampler
+does, with the request-state index of each row; it also scores the sink
+alternates and clamps dead rows whenever any request wants logprobs.
+Greedy verification is taken only when no request wants logprobs,
+logprob_token_ids included. The batch-sharded gather takes the ids'
+columns for verification steps too, so get_logprobs_dims no longer has an
+include_token_ids switch. Requests without logprobs are unchanged: their
+steps take the same paths as before.
+
+boundary_checkpoint.py's slot constants follow watermark.py's HAS_TRITON
+guard, so the V2 runner's sampler, rejection sampler and model runner
+import without Triton (CPU tests). With Triton they are unchanged.
+
+Tests: tests/v1/worker/test_gpu_verified_logprob_token_ids.py runs the
+real sampling state and rejection sampler on the host (host tensors for
+the device buffers, torch references for the Triton launches it
+reaches): every verified token carries its request's ids' logprobs in
+its row's distribution, alone and beside a top-logprobs request and one
+without logprobs, in one verification chunk or several and with adaptive
+verification, in every logprobs mode; the sink alternates are scored for
+an ids-only batch; greedy verification is refused when any request wants
+ids. All but the two greedy cases without ids fail without the change.
+The scripted worker of test_sink_draft_zero.py returns rows with the
+ids, and the scheduler, the output processor and _create_chat_logprobs
+give one entry per token, with the ids scored in the draw that chose
+each token, a rejected draft zero's replacement included (this part
+passes before the change too).
+---
+ tests/v1/core/test_sink_draft_zero.py         | 126 ++++++-
+ .../test_gpu_rejection_sampler_chunking.py    |   9 +-
+ .../test_gpu_verified_logprob_token_ids.py    | 345 ++++++++++++++++++
+ vllm/v1/worker/gpu/boundary_checkpoint.py     |  22 +-
+ vllm/v1/worker/gpu/model_runner.py            |  11 +-
+ vllm/v1/worker/gpu/sample/sampler.py          |  10 +-
+ .../gpu/spec_decode/rejection_sampler.py      |  31 +-
+ 7 files changed, 504 insertions(+), 50 deletions(-)
+ create mode 100644 tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+
+diff --git a/tests/v1/core/test_sink_draft_zero.py b/tests/v1/core/test_sink_draft_zero.py
+index 5c5862282..730d307a8 100644
+--- a/tests/v1/core/test_sink_draft_zero.py
++++ b/tests/v1/core/test_sink_draft_zero.py
+@@ -27,6 +27,7 @@ import pytest
+ import torch
+ 
+ from vllm.entrypoints.generate.base.serving import build_sink_usage
++from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+ from vllm.outputs import CompletionOutput, RequestOutput
+ from vllm.sampling_params import (
+     RequestOutputKind,
+@@ -75,6 +76,12 @@ def logprob_of(rank: int) -> float:
+     return -0.6931471805599453 * rank
+ 
+ 
++def logprob_of_id(position: int, token_id: int) -> float:
++    """The scripted logprob of a requested ``logprob_token_ids`` entry in
++    the draw at output ``position`` (-1: a sunk row's)."""
++    return -(position + 2) - token_id / 10000
++
++
+ @dataclass
+ class WorkerRequest:
+     committed: list[int] = field(default_factory=list)
+@@ -87,8 +94,9 @@ class WorkerRequest:
+     drafts: list[int] = field(default_factory=list)
+ 
+ 
+-# One logprobs row per sampled token: (token, its rank, the draw's best).
+-Row = tuple[int, int, int]
++# One logprobs row per sampled token: (token, its rank, the draw's best, the
++# draw's output position).
++Row = tuple[int, int, int, int]
+ 
+ 
+ def scripted_prompt_logprobs(
+@@ -119,6 +127,7 @@ class ScriptedWorker:
+         draft_errors: dict[tuple[str, int], int] | None = None,
+         no_drafts: frozenset[str] = frozenset(),
+         logprobs: bool = False,
++        logprob_token_ids: list[int] | None = None,
+     ):
+         self.scheduler = scheduler
+         self.scripts = scripts
+@@ -127,6 +136,9 @@ class ScriptedWorker:
+         self.draft_errors = draft_errors or {}
+         self.no_drafts = no_drafts
+         self.logprobs = logprobs
++        # As the V2 runner's samplers: each row holds the sampled token, then
++        # these ids (instead of the draw's best), scored in its draw.
++        self.logprob_token_ids = logprob_token_ids
+         self.requests: dict[str, WorkerRequest] = {}
+         # (req_id, output position, token) of every draw, in order.
+         self.draws: list[tuple[str, int, int]] = []
+@@ -150,7 +162,7 @@ class ScriptedWorker:
+         st.alternate_ranks = ranks[1 : 1 + self.max_retries]
+         st.tries = 0
+         self.draws.append((req_id, position, candidates[0]))
+-        return candidates[0], ranks[0], everything[0]
++        return candidates[0], ranks[0], everything[0], position
+ 
+     def _propose(self, req_id: str, st: WorkerRequest) -> None:
+         if req_id in self.no_drafts:
+@@ -222,17 +234,23 @@ class ScriptedWorker:
+                 self._propose(req_id, self.requests[req_id])
+         self.consumed_drafts[id(so)] = consumed
+         logprobs = None
+-        if self.logprobs:
++        if self.logprobs or self.logprob_token_ids:
+             flat = [row for step_rows in rows for row in step_rows]
++            ids = self.logprob_token_ids
++            if ids:
++                columns = [[t, *ids] for t, *_ in flat]
++                values = [
++                    [logprob_of(rank), *(logprob_of_id(q, k) for k in ids)]
++                    for _, rank, _, q in flat
++                ]
++            else:
++                columns = [[t, best] for t, _, best, _ in flat]
++                values = [[logprob_of(rank), logprob_of(1)] for _, rank, _, _ in flat]
++            width = 1 + (len(ids) if ids else 1)
+             logprobs = LogprobsLists(
+-                np.array([[t, best] for t, _, best in flat], dtype=np.int64).reshape(
+-                    -1, 2
+-                ),
+-                np.array(
+-                    [[logprob_of(rank), logprob_of(1)] for _, rank, _ in flat],
+-                    dtype=np.float32,
+-                ).reshape(-1, 2),
+-                np.array([rank for _, rank, _ in flat], dtype=np.int64),
++                np.array(columns, dtype=np.int64).reshape(-1, width),
++                np.array(values, dtype=np.float32).reshape(-1, width),
++                np.array([rank for _, rank, *_ in flat], dtype=np.int64),
+                 np.cumsum([0] + [len(r) for r in rows]).tolist(),
+             )
+         return ModelRunnerOutput(
+@@ -271,7 +289,7 @@ class ScriptedWorker:
+             )
+             # The step's own row for it is the sunk row's: the scheduler
+             # must not use it.
+-            return [alternate], [(alternate, 99, -1)], event
++            return [alternate], [(alternate, 99, -1, -1)], event
+         outcome = SinkOutcome.FALLTHROUGH if draft_zero in SUNK else SinkOutcome.NONE
+         st.committed.append(draft_zero)
+         drafts = st.drafts[: len(spec) - 1]
+@@ -283,7 +301,7 @@ class ScriptedWorker:
+             best = self.candidates(req_id, q)[0]
+             if draft == best and draft not in SUNK:
+                 out.append(draft)
+-                step_rows.append((draft, 1, best))
++                step_rows.append((draft, 1, best, q))
+                 st.committed.append(draft)
+                 continue
+             if draft == best:
+@@ -364,6 +382,7 @@ def _make_request(
+     max_tokens: int = 32,
+     logprobs: int | None = None,
+     prompt_logprobs: int | None = None,
++    logprob_token_ids: list[int] | None = None,
+     stop_token_ids: list[int] | None = None,
+     prompt_len: int = 20,
+     structured: bool = False,
+@@ -373,6 +392,7 @@ def _make_request(
+         max_tokens=max_tokens,
+         logprobs=logprobs,
+         prompt_logprobs=prompt_logprobs,
++        logprob_token_ids=logprob_token_ids,
+         stop_token_ids=stop_token_ids,
+         temperature=0.0,
+         structured_outputs=StructuredOutputsParams(regex=".*") if structured else None,
+@@ -763,6 +783,84 @@ def test_logprobs_of_committed_provisional_tokens(async_scheduling):
+     assert all(rank == 1 for i, (_, _, rank, _) in enumerate(rows) if i != 1)
+ 
+ 
++@pytest.mark.parametrize("async_scheduling", [False, True])
++def test_logprob_token_ids_of_every_token(async_scheduling):
++    """With ``logprob_token_ids`` (as the chat API sends them, ``logprobs``
++    unset), every committed token carries the requested ids' logprobs from
++    the draw that chose it, through the held token and a rejected draft zero's
++    replacement. The response then has one logprobs entry per token: with
++    fewer, the chat completion fails with HTTP 500."""
++    ids = [100, 1000, 3000]
++    scheduler = _scheduler(async_scheduling, 2)
++    request = _make_request("a", max_tokens=8, logprob_token_ids=ids)
++    assert request.sampling_params is not None
++    assert request.sampling_params.logprobs is None
++    scheduler.add_request(request)
++    worker = ScriptedWorker(
++        scheduler,
++        {"a": SAY_HI},
++        2,
++        draft_errors={("a", 1): 999},
++        logprob_token_ids=ids,
++    )
++    run = drive(scheduler, worker, async_scheduling=async_scheduling)
++
++    processor = OutputProcessor(None, log_stats=False)
++    processor.add_request(
++        EngineCoreRequest(
++            request_id="a",
++            external_req_id="a",
++            prompt_token_ids=list(request.prompt_token_ids or ()),
++            mm_features=None,
++            sampling_params=SamplingParams(
++                max_tokens=8,
++                logprob_token_ids=ids,
++                output_kind=RequestOutputKind.FINAL_ONLY,
++                detokenize=False,
++            ),
++            pooling_params=None,
++            arrival_time=0,
++            lora_request=None,
++            cache_salt=None,
++            data_parallel_rank=None,
++        ),
++        None,
++    )
++    final = None
++    for out in run.outputs["a"]:
++        for request_output in processor.process_outputs(
++            [out], engine_core_timestamp=0
++        ).request_outputs:
++            final = request_output.outputs[0]
++    assert final is not None and final.logprobs is not None
++    tokens = list(final.token_ids)
++    assert tokens == expected_reply(SAY_HI, 8)
++    assert len(final.logprobs) == len(tokens)
++    for q, (token, position) in enumerate(zip(tokens, final.logprobs)):
++        assert set(position) == {token, *ids}
++        for token_id in ids:
++            assert position[token_id].logprob == pytest.approx(
++                logprob_of_id(q, token_id)
++            )
++    # `` I`` replaced `` can`` at position 1: rank 2 of `` can``'s draw.
++    assert final.logprobs[1][I_].rank == 2
++    assert final.logprobs[1][I_].logprob == pytest.approx(logprob_of(2))
++
++    chat = object.__new__(OpenAIServingChat)
++    content = chat._create_chat_logprobs(
++        token_ids=tokens,
++        top_logprobs=final.logprobs,
++        tokenizer=None,
++        num_output_top_logprobs=0,
++        logprob_token_ids=ids,
++        return_as_token_id=True,
++    ).content
++    assert [entry.token for entry in content] == [f"token_id:{t}" for t in tokens]
++    for entry in content:
++        listed = {top.token for top in entry.top_logprobs}
++        assert {f"token_id:{token_id}" for token_id in ids} <= listed
++
++
+ def _assert_prompt_logprobs_once(run: Run, request: Request) -> None:
+     """The request's first output carries its prompt logprobs, the worker's
+     for every prompt position, and no other output carries any."""
+diff --git a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+index 2e5adfabd..e94f6790d 100644
+--- a/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
++++ b/tests/v1/worker/test_gpu_rejection_sampler_chunking.py
+@@ -49,7 +49,9 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         ).to(device),
+     )
+     rejection_sampler = object.__new__(RejectionSampler)
+-    rejection_sampler.sampler = SimpleNamespace(logprobs_mode=logprobs_mode)
++    rejection_sampler.sampler = SimpleNamespace(
++        logprobs_mode=logprobs_mode, logprob_token_ids_state=None
++    )
+     rejection_sampler.num_speculative_steps = 3
+     rejection_sampler.enable_adaptive_verification = False
+ 
+@@ -79,7 +81,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         draft_sampled=torch.arange(10, device=device),
+         pos=torch.arange(10, device=device),
+         max_chunk_logits=5,
+-        max_num_logprobs=2,
++        logprobs_dims=(2, 0),
+     )
+     score_logits = logits + 1 if logprobs_mode in PROCESSED_LOGPROBS_MODES else logits
+     full_logprobs = rejection_sampler._get_logprobs_tensors(
+@@ -88,7 +90,8 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
+         score_logits,
+         input_batch.cu_num_logits,
+         input_batch.cu_num_logits_np,
+-        max_num_logprobs=2,
++        input_batch.expanded_idx_mapping,
++        logprobs_dims=(2, 0),
+     )
+ 
+     assert sampled[:, 0].tolist() == idx_mapping_np.tolist()
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+new file mode 100644
+index 000000000..6920e766e
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -0,0 +1,345 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``logprob_token_ids`` under speculative decoding, in the V2 runner.
++
++A request's ``logprob_token_ids`` name the tokens whose logprobs it gets for
++every generated token (the OpenAI APIs send them with ``logprobs`` unset). The
++sampler returns them for the token of a step without drafts; verification must
++return them for every verified token too, and a greedy batch that wants them
++must not take greedy verification, which returns no logprobs. Otherwise a chat
++completion gets fewer logprob entries than tokens and fails with HTTP 500.
++
++The runner's real sampling state and verification code run on the host: its
++device buffers are host tensors, and the Triton kernels they launch are torch
++references. ``_verify`` is replaced, as in test_gpu_rejection_sampler_chunking.py.
++"""
++
++from types import MethodType, SimpleNamespace
++from typing import get_args
++
++import numpy as np
++import pytest
++import torch
++
++from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
++from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++from vllm.v1.worker.gpu.sample import logprob, states
++from vllm.v1.worker.gpu.sample.sampler import Sampler
++from vllm.v1.worker.gpu.sample.sink import SinkAlternates
++from vllm.v1.worker.gpu.spec_decode import rejection_sampler
++from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
++
++pytestmark = pytest.mark.cpu_test
++
++VOCAB = 32
++MAX_REQS = 8
++IDS = [3, 17, 29, 8, 0]
++
++
++class HostTensor:
++    """UvaBackedTensor on the host: the numpy view is the "device" tensor."""
++
++    def __init__(self, size, dtype, max_concurrency=None):
++        self.cpu = torch.zeros(size, dtype=dtype)
++        self.np = self.cpu.numpy()
++        self.gpu = self.cpu
++
++    def copy_to_uva(self, n=None):
++        return self.gpu
++
++
++class HostStagedTensor:
++    """StagedWriteTensor on the host."""
++
++    def __init__(self, size, dtype, device, **kwargs):
++        self.gpu = torch.zeros(size, dtype=dtype)
++        self.writes: list[tuple[int, int, list]] = []
++
++    def stage_write(self, index, start, x):
++        self.writes.append((index, start, list(x)))
++
++    def apply_write(self):
++        for index, start, x in self.writes:
++            self.gpu[index, start : start + len(x)] = torch.tensor(x)
++        self.writes.clear()
++
++
++class HostKernel:
++    """A Triton launch, ``kernel[grid](*args)``, by a torch reference."""
++
++    def __init__(self, fn):
++        self.fn = fn
++
++    def __getitem__(self, grid):
++        return self.fn
++
++
++def _fill_logprob_token_ids(
++    out_ids,
++    _ids_stride,
++    valid,
++    _valid_stride,
++    sampled,
++    topk,
++    _topk_stride,
++    expanded_idx_mapping,
++    num_per_req,
++    per_req_ids,
++    _per_req_stride,
++    NUM_TOPK,
++    PADDED_COLS,
++):
++    for row in range(out_ids.shape[0]):
++        req = int(expanded_idx_mapping[row])
++        n = int(num_per_req[req])
++        tokens = per_req_ids[req, :n] if n > 0 else topk[row, :NUM_TOPK]
++        out_ids[row, 0] = sampled[row]
++        out_ids[row, 1 : 1 + len(tokens)] = tokens
++        valid[row, : 1 + len(tokens)] = True
++
++
++def _ranks(out, logits, _logits_stride, token_ids, _vocab_size, BLOCK_SIZE):
++    chosen = logits.gather(1, token_ids.view(-1, 1).long())
++    out.copy_((logits >= chosen).sum(1))
++
++
++def _flatten_sampled(flat, sampled, _, num_sampled, cu_num_logits, num_warps):
++    for req in range(num_sampled.shape[0]):
++        n = int(num_sampled[req])
++        start = int(cu_num_logits[req])
++        flat[start : start + n] = sampled[req, :n]
++
++
++@pytest.fixture(autouse=True)
++def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(states, "UvaBackedTensor", HostTensor)
++    monkeypatch.setattr(logprob, "UvaBackedTensor", HostTensor)
++    monkeypatch.setattr(logprob, "StagedWriteTensor", HostStagedTensor)
++    monkeypatch.setattr(
++        logprob, "_fill_logprob_token_ids_kernel", HostKernel(_fill_logprob_token_ids)
++    )
++    monkeypatch.setattr(logprob, "_ranks_launcher", HostKernel(_ranks))
++    monkeypatch.setattr(
++        logprob,
++        "compute_token_logprobs",
++        lambda logits, ids: torch.log_softmax(logits.float(), -1).gather(1, ids.long()),
++    )
++    monkeypatch.setattr(
++        logprob.triton,
++        "next_power_of_2",
++        lambda n: 1 << (n - 1).bit_length(),
++        raising=False,
++    )
++    monkeypatch.setattr(
++        rejection_sampler, "_flatten_sampled_launcher", HostKernel(_flatten_sampled)
++    )
++    monkeypatch.setattr(
++        rejection_sampler,
++        "get_num_sampled_and_rejected",
++        lambda num_sampled, *args, **kwargs: (
++            num_sampled,
++            torch.zeros_like(num_sampled),
++        ),
++    )
++
++
++def _sampler(params: dict[int, SamplingParams], logprobs_mode: str) -> Sampler:
++    """The runner's sampler, its sampling state from the requests' params (by
++    request-state index)."""
++    sampler = object.__new__(Sampler)
++    sampler.logprobs_mode = logprobs_mode
++    sampler.compute_nans = False
++    sampler.req_states = SimpleNamespace(prefill_len=SimpleNamespace(gpu=None))
++    sampler.sampling_states = states.SamplingStates(MAX_REQS, VOCAB)
++    sampler.logprob_token_ids_state = logprob.LogprobTokenIdsState(
++        MAX_REQS, torch.device("cpu")
++    )
++    sampler.needs_logits_processing = np.zeros(MAX_REQS, dtype=bool)
++    for req_idx, sampling_params in params.items():
++        sampler.sampling_states.add_request(req_idx, sampling_params)
++        sampler.logprob_token_ids_state.add_request(req_idx, sampling_params)
++    sampler.logprob_token_ids_state.apply_staged_writes()
++    return sampler
++
++
++# Request-state index -> (params, logits rows: drafts + bonus, verified tokens).
++REQUESTS = {
++    5: (SamplingParams(temperature=0.0, logprob_token_ids=IDS), 4, 3),
++    1: (SamplingParams(temperature=0.0, logprobs=2), 3, 1),
++    3: (SamplingParams(temperature=0.0), 2, 2),
++}
++
++
++def _batch(order: list[int]) -> SimpleNamespace:
++    num_logits = np.array([REQUESTS[r][1] for r in order], dtype=np.int32)
++    cu_num_logits_np = np.concatenate([[0], np.cumsum(num_logits)]).astype(np.int32)
++    idx_mapping_np = np.array(order, dtype=np.int32)
++    total = int(cu_num_logits_np[-1])
++    return SimpleNamespace(
++        num_reqs=len(order),
++        num_draft_tokens=total - len(order),
++        cu_num_logits_np=cu_num_logits_np,
++        cu_num_logits=torch.from_numpy(cu_num_logits_np),
++        idx_mapping_np=idx_mapping_np,
++        idx_mapping=torch.from_numpy(idx_mapping_np),
++        expanded_idx_mapping=torch.from_numpy(np.repeat(idx_mapping_np, num_logits)),
++        expanded_local_pos=torch.from_numpy(
++            np.concatenate([np.arange(n, dtype=np.int32) for n in num_logits])
++        ),
++        input_ids=torch.arange(total),
++        positions=torch.arange(total),
++        logits_indices=torch.arange(total),
++        seq_lens=torch.full((len(order),), 64, dtype=torch.int32),
++    )
++
++
++def _rejection_sampler(
++    sampler: Sampler, sink=None, adaptive: bool = False
++) -> RejectionSampler:
++    """Verification whose target picks each row's argmax of the processed
++    logits (twice the raw ones) and accepts ``REQUESTS``' token counts."""
++    rs = object.__new__(RejectionSampler)
++    rs.sampler = sampler
++    rs.sink = sink
++    rs.watermark_key = None
++    rs.num_speculative_steps = 3
++    rs.enable_adaptive_verification = adaptive
++
++    def verify(
++        self, logits, _draft_logits, _drafts, _pos, cu_num_logits, idx_mapping, *rest
++    ):
++        # rest: the index mappings, the token cap and the sink chunk (last).
++        chunk = rest[-1]
++        processed = logits.float() * 2
++        num_reqs = idx_mapping.shape[0]
++        sampled = torch.zeros(
++            (num_reqs, self.num_speculative_steps + 1), dtype=torch.int64
++        )
++        num_sampled = torch.empty(num_reqs, dtype=torch.int32)
++        for i in range(num_reqs):
++            lo, hi = int(cu_num_logits[i]), int(cu_num_logits[i + 1])
++            sampled[i, : hi - lo] = processed[lo:hi].argmax(-1)
++            num_sampled[i] = REQUESTS[int(idx_mapping[i])][2]
++        if chunk is not None:
++            chunk.alternates = sampled[:, :2] + 1
++        return processed, sampled, num_sampled
++
++    rs._verify = MethodType(verify, rs)
++    return rs
++
++
++def _scores(logits: torch.Tensor, logprobs_mode: str) -> torch.Tensor:
++    """What the logprobs report for each logits row, per ``logprobs_mode``."""
++    if logprobs_mode in PROCESSED_LOGPROBS_MODES:
++        logits = logits.float() * 2
++    if logprobs_mode.endswith("logprobs"):
++        return torch.log_softmax(logits.float(), -1)
++    return logits.float()
++
++
++@pytest.mark.parametrize("logprobs_mode", get_args(LogprobsMode))
++@pytest.mark.parametrize(
++    ("max_chunk_logits", "adaptive"),
++    [(None, False), (4, False), (None, True)],
++    ids=["one-chunk", "chunks", "adaptive-verification"],
++)
++@pytest.mark.parametrize("order", [[5], [1, 5, 3]])
++def test_verified_tokens_carry_their_logprob_token_ids(
++    monkeypatch, logprobs_mode, max_chunk_logits, adaptive, order
++):
++    """Every verified token of the request with ``logprob_token_ids`` carries
++    those ids' logprobs in the distribution of its row, beside its own logprob
++    and rank, alone or beside a top-logprobs request and one without logprobs,
++    in one verification chunk or several, and with adaptive verification (its
++    request boundaries on the device). The top-logprobs request keeps its top
++    two. (Without the fix: no logprobs alone, the top two beside them.)"""
++    if max_chunk_logits is not None:
++        monkeypatch.setattr(
++            rejection_sampler, "get_max_chunk_logits", lambda _: max_chunk_logits
++        )
++    sampler = _sampler({r: REQUESTS[r][0] for r in order}, logprobs_mode)
++    batch = _batch(order)
++    logits = torch.randn(
++        int(batch.cu_num_logits_np[-1]),
++        VOCAB,
++        generator=torch.Generator().manual_seed(1024),
++    )
++    out = _rejection_sampler(sampler, adaptive=adaptive)(logits, batch)
++
++    assert out.logprobs_tensors is not None
++    lists = out.logprobs_tensors.tolists()
++    scores = _scores(logits, logprobs_mode)
++    for batch_idx, req in enumerate(order):
++        params, _, num_tokens = REQUESTS[req]
++        if params.num_logprobs is None:
++            continue
++        lo = int(batch.cu_num_logits_np[batch_idx])
++        rows = lists.slice_request(batch_idx, num_tokens)
++        assert len(rows.sampled_token_ranks) == num_tokens
++        for j in range(num_tokens):
++            row = scores[lo + j]
++            token = int(out.sampled_token_ids[batch_idx, j])
++            wanted = IDS if params.logprob_token_ids else row.topk(2).indices.tolist()
++            ids = [token, *wanted]
++            width = len(ids)
++            assert rows.logprob_token_ids[j, :width].tolist() == ids
++            assert rows.logprobs[j, :width].tolist() == pytest.approx(row[ids].tolist())
++            assert np.all(rows.logprobs[j, width:] == float("-inf"))
++            assert rows.sampled_token_ranks[j] == int((row >= row[token]).sum())
++
++
++def test_sink_alternates_carry_logprobs_for_logprob_token_ids():
++    """With sink rejection, a step whose only logprobs request asks for
++    ``logprob_token_ids`` scores its alternates too: the scheduler reports a
++    rejected draft zero's replacement with its own logprob and rank, and
++    asserts that they are there."""
++    calls = []
++
++    def alternate_logprobs_of(logits, cu_num_logits, num_sampled, alternates, **_):
++        calls.append(alternates)
++        num_reqs, width = alternates.shape
++        return SinkAlternates(
++            alternates,
++            torch.zeros((num_reqs, width)),
++            torch.ones((num_reqs, width), dtype=torch.int64),
++        )
++
++    sink = SimpleNamespace(alternate_logprobs_of=alternate_logprobs_of)
++    sampler = _sampler({5: REQUESTS[5][0], 3: REQUESTS[3][0]}, "raw_logprobs")
++    batch = _batch([5, 3])
++    logits = torch.randn(int(batch.cu_num_logits_np[-1]), VOCAB)
++    out = _rejection_sampler(sampler, sink)(
++        logits,
++        batch,
++        sink_flags=torch.zeros(logits.shape[0], dtype=torch.bool),
++    )
++    assert len(calls) == 1
++    assert out.sink_alternates is not None
++    assert out.sink_alternates.logprobs is not None
++    assert out.sink_alternates.ranks is not None
++    assert out.logprobs_tensors is not None
++
++
++@pytest.mark.parametrize(
++    ("neighbour", "greedy"),
++    [
++        (SamplingParams(temperature=0.0), True),
++        (SamplingParams(temperature=0.0, logprob_token_ids=IDS), False),
++        (SamplingParams(temperature=0.0, logprobs=2), False),
++    ],
++    ids=["no-logprobs", "logprob-token-ids", "top-logprobs"],
++)
++def test_greedy_verification_only_without_logprobs(neighbour, greedy):
++    """An all-greedy step verifies from the vocabulary shards only when no
++    request wants logprobs, ``logprob_token_ids`` included: that path returns
++    none."""
++    runner = object.__new__(GPUModelRunner)
++    runner.sampler = _sampler(
++        {2: SamplingParams(temperature=0.0), 6: neighbour}, "raw_logprobs"
++    )
++    runner._greedy_verification = True
++    batch = SimpleNamespace(
++        num_reqs=2, num_draft_tokens=4, idx_mapping_np=np.array([2, 6])
++    )
++    assert runner._verifies_greedily(batch, None) is greedy
+diff --git a/vllm/v1/worker/gpu/boundary_checkpoint.py b/vllm/v1/worker/gpu/boundary_checkpoint.py
+index 06902fbdf..0343c8f7f 100644
+--- a/vllm/v1/worker/gpu/boundary_checkpoint.py
++++ b/vllm/v1/worker/gpu/boundary_checkpoint.py
+@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, cast
+ 
+ import torch
+ 
+-from vllm.triton_utils import tl, triton
++from vllm.triton_utils import HAS_TRITON, tl, triton
+ from vllm.v1.core.boundary_checkpoint import (
+     INSTRUCTION_CHECKPOINT_SLOT,
+     MAX_BOUNDARY_STOP_TOKENS,
+@@ -27,10 +27,22 @@ if TYPE_CHECKING:
+     from vllm.v1.worker.gpu.model_states.interface import ModelState
+     from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+ 
+-_PROMPT_CHECKPOINT_SLOT = tl.constexpr(PROMPT_CHECKPOINT_SLOT)
+-_RESPONSE_CHECKPOINT_SLOT = tl.constexpr(RESPONSE_CHECKPOINT_SLOT)
+-_INSTRUCTION_CHECKPOINT_SLOT = tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
+-_PREFILL_TAIL_CHECKPOINT_SLOT = tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
++_PROMPT_CHECKPOINT_SLOT = (
++    tl.constexpr(PROMPT_CHECKPOINT_SLOT) if HAS_TRITON else PROMPT_CHECKPOINT_SLOT
++)
++_RESPONSE_CHECKPOINT_SLOT = (
++    tl.constexpr(RESPONSE_CHECKPOINT_SLOT) if HAS_TRITON else RESPONSE_CHECKPOINT_SLOT
++)
++_INSTRUCTION_CHECKPOINT_SLOT = (
++    tl.constexpr(INSTRUCTION_CHECKPOINT_SLOT)
++    if HAS_TRITON
++    else INSTRUCTION_CHECKPOINT_SLOT
++)
++_PREFILL_TAIL_CHECKPOINT_SLOT = (
++    tl.constexpr(PREFILL_TAIL_CHECKPOINT_SLOT)
++    if HAS_TRITON
++    else PREFILL_TAIL_CHECKPOINT_SLOT
++)
+ 
+ 
+ @triton.jit
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index c2b74590e..11bf55a4c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -189,7 +189,6 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
+-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
+ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+@@ -2017,12 +2016,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 local_batch=input_batch,
+                 gather_num_nans=self.sampler.compute_nans,
+                 logprobs_dims=self.sampler.get_logprobs_dims(
+-                    global_input_batch.idx_mapping_np,
+-                    # Rejection sampler does not return logprob token ids.
+-                    include_token_ids=(
+-                        global_input_batch.num_draft_tokens == 0
+-                        or self.rejection_sampler is None
+-                    ),
++                    global_input_batch.idx_mapping_np
+                 ),
+             )
+ 
+@@ -2330,10 +2324,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         assert self.sampler is not None
+         idx = input_batch.idx_mapping_np
+         states = self.sampler.sampling_states
++        # No logprobs: neither top logprobs nor logprob_token_ids.
+         return bool(
+             np.all(states.temperature.np[idx] == 0.0)
+             and not np.any(self.sampler.needs_logits_processing[idx])
+-            and states.max_num_logprobs(idx) == NO_LOGPROBS
++            and self.sampler.get_logprobs_dims(idx) is None
+         )
+ 
+     def _verify_greedily(
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 4665b72fa..667801d20 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -159,17 +159,11 @@ class Sampler:
+         if self.trace_replay_state is not None:
+             self.trace_replay_state.apply_staged_writes()
+ 
+-    def get_logprobs_dims(
+-        self, idx_mapping_np: np.ndarray, include_token_ids: bool = True
+-    ) -> tuple[int, int] | None:
++    def get_logprobs_dims(self, idx_mapping_np: np.ndarray) -> tuple[int, int] | None:
+         """(num_logprobs, max_per_req_token_ids) for the given requests, or
+         None when none of them want logprobs."""
+         max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
+-        max_token_ids = (
+-            self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+-            if include_token_ids
+-            else 0
+-        )
++        max_token_ids = self.logprob_token_ids_state.max_num_token_ids(idx_mapping_np)
+         if max_num_logprobs == NO_LOGPROBS and max_token_ids == 0:
+             return None
+         num_logprobs = max_num_logprobs if max_num_logprobs != NO_LOGPROBS else 0
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index e8f637d89..46a3361d6 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -32,7 +32,6 @@ from vllm.v1.worker.gpu.sample.logprob import (
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
+-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
+ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+     _RESAMPLE_BLOCK_SIZE,
+     register_rejection_sample_warmups,
+@@ -202,11 +201,15 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         cu_num_logits: torch.Tensor,
+         cu_num_logits_np: np.ndarray,
+-        max_num_logprobs: int,
++        expanded_idx_mapping: torch.Tensor,
++        logprobs_dims: tuple[int, int] | None,
+     ) -> LogprobsTensors | None:
+-        if max_num_logprobs == NO_LOGPROBS:
++        """Each logits row's scores, as the sampler's: the top logprobs, or
++        the request's own ``logprob_token_ids``."""
++        if logprobs_dims is None:
+             return None
+ 
++        num_logprobs, max_per_req_token_ids = logprobs_dims
+         num_reqs = cu_num_logits.shape[0] - 1
+         num_logits = logits.shape[0]
+         flat_sampled = tilelang_inputs.flatten_sampled(
+@@ -224,9 +227,12 @@ class RejectionSampler:
+                 cu_num_generated_tokens = cu_num_logits_np.tolist()
+         return compute_topk_scores(
+             logits,
+-            max_num_logprobs,
++            num_logprobs,
+             flat_sampled,
+             cu_num_generated_tokens,
++            logprob_token_ids_state=self.sampler.logprob_token_ids_state,
++            expanded_idx_mapping=expanded_idx_mapping,
++            max_per_req_token_ids=max_per_req_token_ids,
+             logits_mode=self.sampler.logprobs_mode
+             in ("raw_logits", "processed_logits"),
+         )
+@@ -329,7 +335,7 @@ class RejectionSampler:
+         draft_sampled: torch.Tensor,
+         pos: torch.Tensor,
+         max_chunk_logits: int,
+-        max_num_logprobs: int,
++        logprobs_dims: tuple[int, int] | None,
+         max_sampled: torch.Tensor | None = None,
+         sink_flags: torch.Tensor | None = None,
+         sink_alternates: list[SinkAlternates] | None = None,
+@@ -381,7 +387,7 @@ class RejectionSampler:
+             if sink is not None:
+                 alternates = sink.alternates
+                 assert self.sink is not None and alternates is not None
+-                if max_num_logprobs != NO_LOGPROBS:
++                if logprobs_dims is not None:
+                     alternates_chunks.append(
+                         self.sink.alternate_logprobs_of(
+                             processed_logits if use_processed_logits else logits[lo:hi],
+@@ -400,7 +406,8 @@ class RejectionSampler:
+                 processed_logits if use_processed_logits else logits[lo:hi],
+                 chunk_cu_num_logits,
+                 chunk_cu_num_logits_np,
+-                max_num_logprobs,
++                input_batch.expanded_idx_mapping[lo:hi],
++                logprobs_dims,
+             )
+             if chunk_logprobs is not None:
+                 logprobs_chunks.append(chunk_logprobs)
+@@ -443,9 +450,9 @@ class RejectionSampler:
+ 
+         draft_sampled, pos = logits_rows(input_batch)
+ 
+-        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+-            input_batch.idx_mapping_np
+-        )
++        # As the sampler's: requests with logprob_token_ids get those ids'
++        # logprobs for every verified token too.
++        logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+         sink_rejection = sink_flags is not None and self.sink is not None
+         alternates_chunks: list[SinkAlternates] = []
+@@ -456,13 +463,13 @@ class RejectionSampler:
+             draft_sampled,
+             pos,
+             chunk_logit_limit,
+-            max_num_logprobs,
++            logprobs_dims,
+             # Logprobs (and the sink alternates) take their token counts
+             # inside the chunks; clamp there too so they match the committed
+             # tokens.
+             dead_row_cut + 1
+             if dead_row_cut is not None
+-            and (max_num_logprobs != NO_LOGPROBS or sink_rejection)
++            and (logprobs_dims is not None or sink_rejection)
+             else None,
+             sink_flags if sink_rejection else None,
+             alternates_chunks,

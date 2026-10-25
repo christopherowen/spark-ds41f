@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:22:46 +0200
+Subject: [PATCH 419/488] [DS4.1] The logits rows' inputs gathered once a step,
+ in TileLang
+
+input_ids[logits_indices] and positions[logits_indices] were gathered
+with torch up to four times a step: by the rejection sampler (or the
+sampler), the all-greedy verification's sink cut and the sink policy.
+InputBatch.logits_rows() gathers both in one TileLang launch the first
+time a step asks and every reader shares the result. Tested against
+torch's indexing, repeated and negative indices included.
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py   | 18 ++++++
+ vllm/v1/worker/gpu/input_batch.py             | 20 +++++-
+ vllm/v1/worker/gpu/model_runner.py            | 10 ++-
+ vllm/v1/worker/gpu/sample/sampler.py          |  3 +-
+ .../gpu/spec_decode/rejection_sampler.py      |  3 +-
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 63 +++++++++++++++++++
+ 6 files changed, 110 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 5220a492f..23905df93 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -653,6 +653,24 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
+     assert torch.equal(ref_pos, ours_pos)
+ 
+ 
++@pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
++@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
++def test_logits_rows(num_logits, index_dtype):
++    """The logits rows' input ids and positions against torch's indexing,
++    repeated rows and a negative index (which wraps) included."""
++    gen = _gen(num_logits + 5)
++    input_ids = _randint(0, 1 << 17, (MAX_TOKENS,), gen)
++    positions = _randint(0, 1 << 20, (MAX_TOKENS,), gen, torch.int64)
++    indices = _randint(0, MAX_TOKENS, (num_logits,), gen, index_dtype)
++    if num_logits > 2:
++        indices[1] = indices[0]
++        indices[2] = -1
++    ids, pos = tli.logits_rows(input_ids, positions, indices)
++    torch.accelerator.synchronize()
++    assert torch.equal(ids, input_ids[indices])
++    assert torch.equal(pos, positions[indices])
++
++
+ @pytest.mark.parametrize(
+     "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
+ )
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 1ee14a5f4..09bb4e484 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, NamedTuple
+ 
+ import numpy as np
+@@ -131,6 +131,24 @@ class InputBatch:
+     # replay, not for the dummy sequence lengths.
+     cudagraph_capture: bool = False
+ 
++    # The input ids and positions at the logits rows (logits_rows()), gathered
++    # once a step. Not an init field: a replaced batch gathers its own.
++    _logits_rows: "tuple[torch.Tensor, torch.Tensor] | None" = field(
++        default=None, init=False, repr=False, compare=False
++    )
++
++    def logits_rows(self) -> tuple[torch.Tensor, torch.Tensor]:
++        """``input_ids[logits_indices]`` and ``positions[logits_indices]``: one
++        TileLang launch the first time a step asks, shared by every reader (the
++        samplers, the sink policy and its cut read them, never write them)."""
++        if self._logits_rows is None:
++            from vllm.v1.worker.gpu import tilelang_inputs
++
++            self._logits_rows = tilelang_inputs.logits_rows(
++                self.input_ids, self.positions, self.logits_indices
++            )
++        return self._logits_rows
++
+     @classmethod
+     def make_dummy(
+         cls,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 6f4e357aa..d85da578a 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2148,6 +2148,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             return
+         assert self.sampler is not None
+         register_input_batch_warmups(dead_rows=dead_rows)
++        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
++        # indices are int64, a dummy batch's int32.
++        tilelang_inputs.declare(
++            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
++            + tilelang_inputs.logits_rows_calls(torch.int32)
++        )
+ 
+         language_model = self._language_model()
+         head = getattr(language_model, "lm_head", None)
+@@ -2338,7 +2344,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         shard = self._language_model().lm_head.shard_indices
+         tp_size = get_tensor_model_parallel_world_size()
+         local_logits = self.model.compute_logits_local(sample_hidden_states)
+-        drafts = input_batch.input_ids[input_batch.logits_indices]
++        drafts = input_batch.logits_rows()[0]
+         rejection = self.sink is not None and self.sink.rejection
+         if rejection:
+             assert self.sink is not None and sink_flags is not None
+@@ -2547,7 +2553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             input_batch.idx_mapping,
+             self._sink_decoding[:num_reqs],
+             sink_flags,
+-            input_batch.input_ids[input_batch.logits_indices],
++            input_batch.logits_rows()[0],
+             sampler_output.sink_alternates,
+             self.req_states.total_len.gpu,
+             self.sampler.penalties_state.output_bin_counts,
+diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
+index 67a9364a4..ab10d502c 100644
+--- a/vllm/v1/worker/gpu/sample/sampler.py
++++ b/vllm/v1/worker/gpu/sample/sampler.py
+@@ -176,8 +176,7 @@ class Sampler:
+         idx_mapping_np = input_batch.idx_mapping_np
+         cu_num_logits_np = input_batch.cu_num_logits_np
+         expanded_local_pos = input_batch.expanded_local_pos
+-        pos = input_batch.positions[input_batch.logits_indices]
+-        input_ids = input_batch.input_ids[input_batch.logits_indices]
++        input_ids, pos = input_batch.logits_rows()
+ 
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index d97b136e2..e13d91696 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -447,8 +447,7 @@ class RejectionSampler:
+         # that num_nans is computed before applying penalties and temperature.
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
+-        draft_sampled = input_batch.input_ids[input_batch.logits_indices]
+-        pos = input_batch.positions[input_batch.logits_indices]
++        draft_sampled, pos = input_batch.logits_rows()
+ 
+         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+             input_batch.idx_mapping_np
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 5a610ca09..d58461ad4 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -565,6 +565,69 @@ def zero_kv_blocks(
+     )
+ 
+ 
++# --- The logits rows' inputs ------------------------------------------------------
++
++_LOGITS_ROWS_THREADS = 128
++
++
++@tilelang.jit(pass_configs=_PASS)
++def logits_rows_kernel(index_dtype: str):
++    """``input_ids[logits_indices]`` and ``positions[logits_indices]``, a thread a
++    logits row, a negative index wrapping as torch's indexing does: the step's
++    drafts and positions at its logits rows, which the samplers, the sink policy
++    and its cut each gathered with torch."""
++    num_tokens, num_logits = T.dynamic("num_tokens, num_logits")
++
++    @T.prim_func
++    def logits_rows(
++        input_ids: T.Tensor((num_tokens,), T.int32),
++        positions: T.Tensor((num_tokens,), T.int64),
++        logits_indices: T.Tensor((num_logits,), index_dtype),
++        ids_out: T.Tensor((num_logits,), T.int32),
++        positions_out: T.Tensor((num_logits,), T.int64),
++    ):
++        with T.Kernel(
++            T.ceildiv(num_logits, _LOGITS_ROWS_THREADS), threads=_LOGITS_ROWS_THREADS
++        ) as b:
++            i = b * _LOGITS_ROWS_THREADS + T.get_thread_binding()
++            index = T.alloc_var(
++                T.int64,
++                init=T.cast(logits_indices[T.min(i, num_logits - 1)], T.int64),
++            )
++            row = T.alloc_var(
++                T.int64, init=T.if_then_else(index < 0, index + num_tokens, index)
++            )
++            token = T.alloc_var(T.int32, init=input_ids[row])
++            position = T.alloc_var(T.int64, init=positions[row])
++            if i < num_logits:
++                ids_out[i] = token
++                positions_out[i] = position
++
++    return logits_rows
++
++
++def logits_rows_key(index_dtype: torch.dtype) -> tuple:
++    return (_DTYPES[index_dtype],)
++
++
++def logits_rows(
++    input_ids: torch.Tensor, positions: torch.Tensor, logits_indices: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """The input ids and positions at the logits rows, as new tensors."""
++    num_logits = logits_indices.shape[0]
++    ids = torch.empty(num_logits, dtype=input_ids.dtype, device=input_ids.device)
++    pos = torch.empty(num_logits, dtype=positions.dtype, device=positions.device)
++    if num_logits:
++        _kernel(logits_rows_kernel, *logits_rows_key(logits_indices.dtype))(
++            input_ids, positions, logits_indices, ids, pos
++        )
++    return ids, pos
++
++
++def logits_rows_calls(index_dtype: torch.dtype) -> list:
++    return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
++
++
+ # --- Padding rows -----------------------------------------------------------------
+ 
+ _PADDING_THREADS = 256

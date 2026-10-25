@@ -1,0 +1,1202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:01:05 +0200
+Subject: [PATCH 347/488] V2 runner: sample, verify and detect sinks with the
+ TileLang kernels
+
+The Gumbel sampler and temperature, the sink detector's candidates and
+policy, DSpark's greedy reductions and greedy verification launch the
+TileLang kernels; each owner declares the calls it launches where it
+registered the Triton kernels' warmups, including probabilistic
+drafting's and the full-vocabulary greedy draft's, which compiled at
+first launch before. The Triton kernels stay as the tests' reference.
+
+use_fp64_gumbel now fails at startup: the TileLang draw is FP32 only.
+---
+ tests/v1/worker/test_gpu_gumbel_sample.py     |  56 ++--
+ vllm/v1/worker/gpu/model_runner.py            |  15 +
+ vllm/v1/worker/gpu/sample/gumbel.py           | 190 ++++---------
+ vllm/v1/worker/gpu/sample/sink.py             | 193 +++----------
+ .../worker/gpu/spec_decode/dspark/greedy.py   | 263 ++++--------------
+ .../gpu/spec_decode/dspark/speculator.py      |  27 +-
+ .../gpu/spec_decode/greedy_verification.py    |  55 +---
+ 7 files changed, 227 insertions(+), 572 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_gumbel_sample.py b/tests/v1/worker/test_gpu_gumbel_sample.py
+index aa5f7b950..a7ad40828 100644
+--- a/tests/v1/worker/test_gpu_gumbel_sample.py
++++ b/tests/v1/worker/test_gpu_gumbel_sample.py
+@@ -21,7 +21,12 @@ pytest.importorskip("triton")
+ if not torch.cuda.is_available():
+     pytest.skip("CUDA required for Gumbel sampler tests", allow_module_level=True)
+ 
+-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, warmup_processed_gumbel
++from vllm.v1.worker.gpu.sample import tilelang_sampling
++from vllm.v1.worker.gpu.sample.gumbel import (
++    gumbel_sample,
++    register_sampling_warmups,
++    warmup_processed_gumbel,
++)
+ 
+ DEVICE = "cuda"
+ VOCAB_SIZE = 200_000
+@@ -34,21 +39,12 @@ Z_TOLERANCE = 10.0
+ 
+ 
+ @pytest.mark.parametrize("vocab_size", [257, 129280])
+-@pytest.mark.parametrize("use_fp64", [False, True])
+-def test_processed_gumbel_warmup_covers_seeded_target_sampling(
+-    monkeypatch, vocab_size, use_fp64
+-):
++def test_processed_gumbel_warmup_covers_seeded_target_sampling(vocab_size):
+     """Explicitly seeded FP32 requests must not JIT after server warmup."""
+-    from triton import knobs
+-
+     device = torch.device(DEVICE)
+-    warmup_processed_gumbel(vocab_size, device, use_fp64=use_fp64)
++    warmup_processed_gumbel(vocab_size, device)
+     torch.accelerator.synchronize()
+-
+-    def unexpected_compile(**kwargs):
+-        pytest.fail("Seeded target sampling compiled after sampler warmup")
+-
+-    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", unexpected_compile)
++    compiled = set(tilelang_sampling._KERNELS)
+     for rows in (1, 2, 7, 8, 16, 31):
+         logits = torch.zeros(rows, vocab_size, device=device)
+         # InputBatch uses np.intp / torch.int64 request mappings.
+@@ -64,11 +60,38 @@ def test_processed_gumbel_warmup_covers_seeded_target_sampling(
+             position,
+             apply_temperature=False,
+             is_drafting=False,
+-            use_fp64=use_fp64,
+         )
+         assert sampled.shape == (rows,)
+         assert ((sampled >= 0) & (sampled < vocab_size)).all()
+     torch.accelerator.synchronize()
++    assert set(tilelang_sampling._KERNELS) == compiled, (
++        "seeded target sampling compiled after sampler warmup"
++    )
++
++
++def test_fp64_draw_is_rejected():
++    """The TileLang sampler draws in FP32 only: use_fp64_gumbel fails at
++    startup, and a direct FP64 call fails rather than drawing in FP32."""
++    with pytest.raises(ValueError, match="FP32 only"):
++        register_sampling_warmups(
++            logits=((torch.bfloat16, 1024),),
++            processed_logits_strides=(1024,),
++            vocab_size=1024,
++            use_fp64=True,
++        )
++    logits = torch.zeros(1, 1024, device=DEVICE)
++    zeros = torch.zeros(1, dtype=torch.int64, device=DEVICE)
++    with pytest.raises(ValueError, match="FP32 only"):
++        gumbel_sample(
++            logits,
++            zeros,
++            torch.ones(1, device=DEVICE),
++            zeros,
++            zeros,
++            apply_temperature=False,
++            is_drafting=False,
++            use_fp64=True,
++        )
+ 
+ 
+ def _make_heavy_tailed_counts(seed: int = 1234) -> torch.Tensor:
+@@ -160,13 +183,12 @@ def _sample_histogram(
+ # ----------------------------- Accuracy ------------------------------------
+ 
+ 
+-@pytest.mark.parametrize("use_fp64", [False, True])
+-def test_sampling_matches_target_distribution(use_fp64: bool):
++def test_sampling_matches_target_distribution():
+     counts = _make_heavy_tailed_counts()
+     total = counts.sum().item()
+     logits = _counts_to_logits(counts)
+ 
+-    sampled = _sample(logits, NUM_SAMPLES, use_fp64=use_fp64)
++    sampled = _sample(logits, NUM_SAMPLES)
+     assert sampled.min() >= 0 and sampled.max() < VOCAB_SIZE
+ 
+     # The dominant token (index 0) and the aggregate tail are the two
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 31bd50f02..fd8a3d234 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -183,6 +183,7 @@ from vllm.v1.worker.gpu.sample.batch_shard import (
+     all_to_all_logits,
+     gather_sampler_output,
+ )
++from vllm.v1.worker.gpu.sample.gumbel import register_drafting_warmups
+ from vllm.v1.worker.gpu.sample.output import SamplerOutput
+ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+@@ -2192,6 +2193,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.speculator.register_warmups(
+                 self._draft_block_table_layouts(kv_cache_groups, kernel_block_sizes)
+             )
++        draft_logits = getattr(self.speculator, "draft_logits", None)
++        if draft_logits is not None:
++            # Probabilistic drafting samples the draft logits with the logits
++            # cache: the head's dtype, or the cache's when it scatters into it.
++            head_dtype = getattr(processor, "head_dtype", None)
++            register_drafting_warmups(
++                logits_dtypes=tuple(
++                    dtype
++                    for dtype in (head_dtype, draft_logits.dtype, torch.float32)
++                    if dtype is not None
++                ),
++                cache_dtype=draft_logits.dtype,
++                use_fp64=self.model_config.use_fp64_gumbel,
++            )
+ 
+     def _register_kv_cache_warmups(
+         self, kv_cache_groups: list[KVCacheGroupSpec], kernel_block_sizes: list[int]
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index 00caa99ed..cb7864645 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -1,15 +1,9 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Sequence
+-from typing import Any
+ 
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+ 
+ # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
+@@ -28,6 +22,7 @@ _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-1
+ _DRAFT_NOISE_SALT = tl.constexpr(1 << 30) if HAS_TRITON else (1 << 30)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _temperature_kernel(
+     logits_ptr,
+@@ -54,45 +49,14 @@ def _temperature_kernel(
+     tl.store(logits_ptr + token_idx * logits_stride + block, logits, mask=mask)
+ 
+ 
+-_TEMPERATURE_BLOCK_SIZE = 8192
+-
+-
+-def _temperature_warmup_inputs(
+-    *, logits_stride: int, vocab_size: int
+-) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _temperature_kernel,
+-        TritonWarmupTensor(torch.float32),
+-        logits_stride,
+-        TritonWarmupTensor(torch.int64),
+-        TritonWarmupTensor(torch.float32),
+-        vocab_size,
+-        grid=(1,),
+-        BLOCK_SIZE=_TEMPERATURE_BLOCK_SIZE,
+-    )
+-
+-
+-_temperature_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_temperature_warmup_inputs
+-)(_temperature_kernel)
+-
+-
+ def apply_temperature(
+     logits: torch.Tensor,
+     expanded_idx_mapping: torch.Tensor,
+     temperature: torch.Tensor,
+ ) -> None:
+-    num_tokens, vocab_size = logits.shape
+-    BLOCK_SIZE = _TEMPERATURE_BLOCK_SIZE
+-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+-    _temperature_launcher[(num_tokens, num_blocks)](
+-        logits,
+-        logits.stride(0),
+-        expanded_idx_mapping,
+-        temperature,
+-        vocab_size,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-    )
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.apply_temperature(logits, expanded_idx_mapping, temperature)
+ 
+ 
+ @triton.jit
+@@ -256,6 +220,7 @@ def gumbel_block_argmax(
+     )
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _gumbel_sample_kernel(
+     local_argmax_ptr,
+@@ -315,76 +280,55 @@ def _gumbel_sample_kernel(
+     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
+ 
+ 
+-_GUMBEL_BLOCK_SIZE = 1024
+-
+-
+-def _gumbel_sample_warmup_inputs(
++def register_sampling_warmups(
+     *,
+     logits: Sequence[tuple[torch.dtype, int]],
++    processed_logits_strides: Sequence[int],
+     vocab_size: int,
+-    apply_temperature: bool,
+-    is_drafting: bool,
+     use_fp64: bool,
+-) -> list[dict[str, Any]]:
+-    num_blocks = triton.cdiv(vocab_size, _GUMBEL_BLOCK_SIZE)
+-    int64 = TritonWarmupTensor(torch.int64)
+-    local_max = TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32)
+-    return [
+-        triton_warmup_inputs(
+-            _gumbel_sample_kernel,
+-            int64,
+-            num_blocks,
+-            local_max,
+-            num_blocks,
+-            None,
+-            0,
+-            0,
+-            None,
+-            TritonWarmupTensor(dtype),
+-            logits_stride,
+-            int64,
+-            int64,
+-            int64,
+-            TritonWarmupTensor(torch.float32),
+-            vocab_size,
+-            grid=(1,),
+-            BLOCK_SIZE=_GUMBEL_BLOCK_SIZE,
+-            IS_DRAFTING=is_drafting,
+-            APPLY_TEMPERATURE=apply_temperature,
+-            USE_FP64=use_fp64,
+-            PER_TOKEN_COL=False,
++) -> None:
++    """Declare the target sampler's temperature scaling of processed FP32 logits
++    and its Gumbel-max sampling without a logits cache of logits of each
++    ``(dtype, row stride)``; the TileLang kernels take any stride."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    if use_fp64:
++        raise ValueError(
++            "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
+         )
+-        for dtype, logits_stride in logits
+-    ]
+-
+-
+-_gumbel_sample_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_gumbel_sample_warmup_inputs
+-)(_gumbel_sample_kernel)
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.sampling_calls(
++            [dtype for dtype, _ in logits], temperature=bool(processed_logits_strides)
++        )
++    )
+ 
+ 
+-def register_sampling_warmups(
++def register_drafting_warmups(
+     *,
+-    logits: Sequence[tuple[torch.dtype, int]],
+-    processed_logits_strides: Sequence[int],
+-    vocab_size: int,
++    logits_dtypes: Sequence[torch.dtype],
++    cache_dtype: torch.dtype,
+     use_fp64: bool,
+ ) -> None:
+-    """Register the target sampler's temperature scaling (of the processed FP32
+-    logits, rows ``processed_logits_strides`` apart) and its Gumbel-max sampling
+-    without a logits cache, of ``vocab_size``-wide logits given as ``(dtype, row
+-    stride)`` pairs, with int64 request indices, seeds and positions and FP32
+-    temperatures."""
+-    for logits_stride in processed_logits_strides:
+-        _temperature_launcher.register_warmup(
+-            logits_stride=logits_stride, vocab_size=vocab_size
++    """Declare a speculator's probabilistic draft sampling: the temperature in the
++    kernel, the drafting noise stream and the logits cache of ``cache_dtype``, for
++    logits of each of ``logits_dtypes`` and a step column of either index type,
++    one per token or shared."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    if use_fp64:
++        raise ValueError(
++            "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
+         )
+-    _gumbel_sample_launcher.register_warmup(
+-        logits=tuple(logits),
+-        vocab_size=vocab_size,
+-        apply_temperature=False,
+-        is_drafting=False,
+-        use_fp64=use_fp64,
++    tilelang_sampling.declare(
++        lambda: [
++            call
++            for dtype in dict.fromkeys(logits_dtypes)
++            for col_dtype in (torch.int32, torch.int64)
++            for per_token_col in (False, True)
++            for call in tilelang_sampling.drafting_calls(
++                dtype, cache_dtype, col_dtype, per_token_col
++            )
++        ]
+     )
+ 
+ 
+@@ -400,50 +344,20 @@ def gumbel_sample(
+     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
+     use_fp64: bool = False,
+ ) -> torch.Tensor:
+-    # Enforce contiguity on non-strided input tensors
+-    expanded_idx_mapping = expanded_idx_mapping.contiguous()
+-    pos = pos.contiguous()
+-    if logits_cache_col is not None:
+-        logits_cache_col = logits_cache_col.contiguous()
+-    num_tokens, vocab_size = logits.shape
+-    if logits_cache is not None:
+-        assert logits_cache.size(-1) >= vocab_size, (
+-            f"draft logits cache vocab dim ({logits_cache.size(-1)}) is narrower "
+-            f"than the sampled logits ({vocab_size}). Cached logits would be "
+-            "truncated."
+-        )
+-    BLOCK_SIZE = _GUMBEL_BLOCK_SIZE
+-    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+-    local_argmax = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
+-    local_max_dtype = torch.float64 if use_fp64 else torch.float32
+-    local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
+-    per_token_col = logits_cache_col is not None and logits_cache_col.dim() > 0
+-    _gumbel_sample_launcher[(num_tokens, num_blocks)](
+-        local_argmax,
+-        local_argmax.stride(0),
+-        local_max,
+-        local_max.stride(0),
+-        logits_cache,
+-        logits_cache.stride(0) if logits_cache is not None else 0,
+-        logits_cache.stride(1) if logits_cache is not None else 0,
+-        logits_cache_col,
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    return tilelang_sampling.gumbel_sample(
+         logits,
+-        logits.stride(0),
+         expanded_idx_mapping,
++        temperature,
+         seed,
+         pos,
+-        temperature,
+-        vocab_size,
+-        BLOCK_SIZE=BLOCK_SIZE,
+-        IS_DRAFTING=is_drafting,
+-        APPLY_TEMPERATURE=apply_temperature,
+-        USE_FP64=use_fp64,
+-        PER_TOKEN_COL=per_token_col,
++        apply_temperature,
++        is_drafting,
++        logits_cache,
++        logits_cache_col,
++        use_fp64,
+     )
+-    # NOTE(woosuk): Use int64 for later indexing.
+-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+-    sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+-    return sampled
+ 
+ 
+ def warmup_processed_gumbel(
+diff --git a/vllm/v1/worker/gpu/sample/sink.py b/vllm/v1/worker/gpu/sample/sink.py
+index 7ba571a2e..9b878d5f4 100644
+--- a/vllm/v1/worker/gpu/sample/sink.py
++++ b/vllm/v1/worker/gpu/sample/sink.py
+@@ -18,17 +18,11 @@ the metric.
+ """
+ 
+ from dataclasses import dataclass
+-from typing import Any
+ 
+ import torch
+ 
+ from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.logger import init_logger
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.sample.sink import NUM_SINK_EVENT_FIELDS, SinkConfig, SinkRow
+ from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_scores
+@@ -40,6 +34,7 @@ logger = init_logger(__name__)
+ _CANDIDATE_BLOCK_SIZE = 1024
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _sink_candidates_kernel(
+     # [num_reqs, num_blocks * NUM_CANDIDATES]
+@@ -118,6 +113,7 @@ def _sink_candidates_kernel(
+         scores = tl.where(offsets == idx, float("-inf"), scores)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _sink_policy_kernel(
+     # Verification results, updated in place for rejected draft zeros.
+@@ -287,102 +283,6 @@ def _sink_policy_kernel(
+     tl.atomic_add(counts_ptr + 2, ((not decoding) & row0_flag).to(tl.int64))
+ 
+ 
+-def _candidates_warmup_inputs(
+-    *,
+-    logits_dtype: torch.dtype,
+-    logits_stride: int,
+-    vocab_size: int,
+-    sampled_stride: int,
+-    num_candidates: int,
+-    use_fp64: bool,
+-    mask_rejected_draft: bool,
+-) -> dict[str, Any]:
+-    int32 = TritonWarmupTensor(torch.int32)
+-    int64 = TritonWarmupTensor(torch.int64)
+-    num_blocks = triton.cdiv(vocab_size, _CANDIDATE_BLOCK_SIZE)
+-    return triton_warmup_inputs(
+-        _sink_candidates_kernel,
+-        TritonWarmupTensor(torch.float64 if use_fp64 else torch.float32),
+-        int64,
+-        num_blocks * num_candidates,
+-        TritonWarmupTensor(logits_dtype),
+-        logits_stride,
+-        vocab_size,
+-        int32,
+-        int32,
+-        int64,
+-        sampled_stride,
+-        int32,
+-        int64,
+-        TritonWarmupTensor(torch.float32),
+-        int64,
+-        int64,
+-        grid=(1,),
+-        BLOCK_SIZE=_CANDIDATE_BLOCK_SIZE,
+-        NUM_CANDIDATES=num_candidates,
+-        USE_FP64=use_fp64,
+-        MASK_REJECTED_DRAFT=mask_rejected_draft,
+-    )
+-
+-
+-def _policy_warmup_inputs(
+-    *,
+-    sampled_width: int,
+-    num_alternates: int,
+-    rejection: bool,
+-    logprobs: bool,
+-    bin_counts_stride: int,
+-) -> dict[str, Any]:
+-    int8 = TritonWarmupTensor(torch.int8)
+-    int32 = TritonWarmupTensor(torch.int32)
+-    int64 = TritonWarmupTensor(torch.int64)
+-    float32 = TritonWarmupTensor(torch.float32)
+-    return triton_warmup_inputs(
+-        _sink_policy_kernel,
+-        int64,
+-        int32,
+-        int32,
+-        int64,
+-        int32,
+-        int32,
+-        float32,
+-        int64,
+-        int32,
+-        int64,
+-        int8,
+-        int8,
+-        float32,
+-        int32,
+-        int64,
+-        float32,
+-        int64,
+-        int64,
+-        float32,
+-        int64,
+-        int32,
+-        int32,
+-        int32,
+-        bin_counts_stride,
+-        int64,
+-        grid=(1,),
+-        NUM_ALTERNATES=max(num_alternates, 1),
+-        REJECTION=rejection,
+-        LOGPROBS=logprobs,
+-        SAMPLED_WIDTH=sampled_width,
+-        PADDED_WIDTH=triton.next_power_of_2(sampled_width + 1),
+-        PADDED_ALTERNATES=triton.next_power_of_2(max(num_alternates, 1)),
+-        NUM_EVENT_FIELDS=NUM_SINK_EVENT_FIELDS,
+-    )
+-
+-
+-_candidates_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_candidates_warmup_inputs
+-)(_sink_candidates_kernel)
+-_policy_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_policy_warmup_inputs
+-)(_sink_policy_kernel)
+-
+-
+ @dataclass
+ class SinkCut:
+     """The logits the cut overwrote, for the restore."""
+@@ -434,6 +334,10 @@ class SinkSampler:
+         device: torch.device,
+         use_fp64_gumbel: bool,
+     ):
++        if use_fp64_gumbel:
++            raise ValueError(
++                "use_fp64_gumbel: the V2 runner's TileLang sampler draws in FP32 only"
++            )
+         if config.column >= hidden_size:
+             raise ValueError(
+                 f"sink detector column {config.column} is outside the hidden "
+@@ -541,37 +445,21 @@ class SinkSampler:
+         """The next ``max_retries`` candidates of each request's last draw
+         from the full-vocabulary scores it was drawn from (after sampling
+         parameters, with the cut applied)."""
+-        num_reqs = idx_mapping.shape[0]
+-        vocab_size = min(logits.shape[1], self.vocab_size)
+-        num_blocks = triton.cdiv(vocab_size, _CANDIDATE_BLOCK_SIZE)
+-        num_candidates = num_blocks * self.num_candidates
+-        values_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
+-        values = torch.empty(
+-            (num_reqs, num_candidates), dtype=values_dtype, device=self.device
+-        )
+-        indices = torch.empty(
+-            (num_reqs, num_candidates), dtype=torch.int64, device=self.device
+-        )
+-        _candidates_launcher[(num_reqs, num_blocks)](
+-            values,
+-            indices,
+-            num_candidates,
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++        values, indices = tilelang_sampling.sink_candidates(
+             logits,
+-            logits.stride(0),
+-            vocab_size,
++            min(logits.shape[1], self.vocab_size),
+             cu_num_logits,
+             num_sampled,
+             sampled,
+-            sampled.stride(0),
+             drafts,
+             idx_mapping,
+             temperature,
+             seeds,
+             pos,
+-            BLOCK_SIZE=_CANDIDATE_BLOCK_SIZE,
+-            NUM_CANDIDATES=self.num_candidates,
+-            USE_FP64=self.use_fp64_gumbel,
+-            MASK_REJECTED_DRAFT=mask_rejected_draft,
++            self.num_candidates,
++            mask_rejected_draft,
+         )
+         return self._merge(values, indices, num_sampled, sampled)
+ 
+@@ -701,7 +589,9 @@ class SinkSampler:
+                     num_reqs, dtype=torch.int64, device=self.device
+                 )
+         new_tokens = alternates.tokens if alternates is not None else self.alternates
+-        _policy_launcher[(num_reqs,)](
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++        tilelang_sampling.sink_policy(
+             sampled,
+             num_sampled,
+             num_rejected,
+@@ -725,15 +615,11 @@ class SinkSampler:
+             self.tries,
+             total_len,
+             bin_counts,
+-            bin_counts.stride(0),
+             self.counts,
+-            NUM_ALTERNATES=max(self.num_alternates, 1),
+-            REJECTION=self.rejection,
+-            LOGPROBS=logprobs,
+-            SAMPLED_WIDTH=sampled_width,
+-            PADDED_WIDTH=triton.next_power_of_2(sampled_width + 1),
+-            PADDED_ALTERNATES=triton.next_power_of_2(max(self.num_alternates, 1)),
+-            NUM_EVENT_FIELDS=NUM_SINK_EVENT_FIELDS,
++            self.num_alternates,
++            self.rejection,
++            logprobs,
++            NUM_SINK_EVENT_FIELDS,
+         )
+         return out
+ 
+@@ -781,29 +667,20 @@ class SinkSampler:
+         sampled_widths: tuple[int, ...],
+         bin_counts_stride: int,
+     ) -> None:
+-        """Register the kernels a step launches: the policy for each sampled
++        """Declare the kernels a step launches: the policy for each sampled
+         width, and the alternates of the raw and processed target logits
+-        (``(dtype, row stride)``)."""
+-        for logprobs in (False, True):
+-            for width in sampled_widths:
+-                _policy_launcher.register_warmup(
+-                    sampled_width=width,
+-                    num_alternates=self.num_alternates,
+-                    rejection=self.rejection,
+-                    logprobs=logprobs and self.rejection,
+-                    bin_counts_stride=bin_counts_stride,
+-                )
+-        if not self.rejection:
+-            return
+-        targets = (*logits, *((torch.float32, s) for s in processed_logits_strides))
+-        for dtype, stride in targets:
+-            for width in sampled_widths:
+-                _candidates_launcher.register_warmup(
+-                    logits_dtype=dtype,
+-                    logits_stride=stride,
+-                    vocab_size=self.vocab_size,
+-                    sampled_stride=width,
+-                    num_candidates=self.num_candidates,
+-                    use_fp64=self.use_fp64_gumbel,
+-                    mask_rejected_draft=width > 1,
+-                )
++        (``(dtype, row stride)``; the TileLang kernels take any stride)."""
++        from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++        logits_dtypes = [dtype for dtype, _ in logits]
++        if processed_logits_strides:
++            logits_dtypes.append(torch.float32)
++        tilelang_sampling.declare(
++            lambda: tilelang_sampling.sink_calls(
++                logits_dtypes=logits_dtypes,
++                sampled_widths=sampled_widths,
++                num_alternates=self.num_alternates,
++                rejection=self.rejection,
++                num_event_fields=NUM_SINK_EVENT_FIELDS,
++            )
++        )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index 905ad2d42..5e9254169 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -2,15 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Allocation-free greedy reduction of base logits and sequential Markov bias."""
+ 
+-from typing import Any
+-
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
+ 
+ _BLOCK = 2048
+@@ -26,6 +19,7 @@ def _first_argmax(av, ai, bv, bi):
+     return tl.where(take_a, av, bv), tl.where(take_a, ai, bi)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _partial_argmax(
+     base,
+@@ -54,6 +48,7 @@ def _partial_argmax(
+     tl.store(indices + row * PARTS + part, index)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _partial_argmax_logits(
+     logits,
+@@ -75,6 +70,7 @@ def _partial_argmax_logits(
+     tl.store(indices + row * PARTS + part, index)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _finish_argmax(
+     values,
+@@ -92,6 +88,7 @@ def _finish_argmax(
+     tl.store(output + row * output_stride, result)
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _finish_argmax_pair(
+     values,
+@@ -110,6 +107,7 @@ def _finish_argmax_pair(
+     tl.store(pairs + row * 2 + 1, (result + vocab_start).to(tl.float32))
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _select_first_argmax(
+     pairs,
+@@ -130,95 +128,6 @@ def _select_first_argmax(
+     tl.store(output + row * output_stride, result)
+ 
+ 
+-def _partial_argmax_warmup_inputs(
+-    *,
+-    base_dtype: torch.dtype,
+-    base_stride: int,
+-    base_aligned: bool,
+-    bias_dtype: torch.dtype,
+-    bias_stride: int,
+-    vocab: int,
+-) -> dict[str, Any]:
+-    parts = triton.cdiv(vocab, _BLOCK)
+-    return triton_warmup_inputs(
+-        _partial_argmax,
+-        TritonWarmupTensor(base_dtype, aligned=base_aligned),
+-        TritonWarmupTensor(bias_dtype),
+-        TritonWarmupTensor(torch.float32),
+-        TritonWarmupTensor(torch.int32),
+-        base_stride,
+-        bias_stride,
+-        vocab,
+-        parts,
+-        _BLOCK,
+-        grid=(1,),
+-    )
+-
+-
+-def _partial_argmax_logits_warmup_inputs(
+-    *, dtype: torch.dtype, stride: int, vocab: int
+-) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _partial_argmax_logits,
+-        TritonWarmupTensor(dtype),
+-        TritonWarmupTensor(torch.float32),
+-        TritonWarmupTensor(torch.int32),
+-        stride,
+-        vocab,
+-        triton.cdiv(vocab, _BLOCK),
+-        _BLOCK,
+-        grid=(1,),
+-    )
+-
+-
+-def _finish_argmax_pair_warmup_inputs(
+-    *, vocab: int, vocab_start: int
+-) -> dict[str, Any]:
+-    parts = triton.cdiv(vocab, _BLOCK)
+-    return triton_warmup_inputs(
+-        _finish_argmax_pair,
+-        TritonWarmupTensor(torch.float32),
+-        TritonWarmupTensor(torch.int32),
+-        TritonWarmupTensor(torch.float32),
+-        vocab_start,
+-        parts,
+-        triton.next_power_of_2(parts),
+-        grid=(1,),
+-    )
+-
+-
+-def _select_first_argmax_warmup_inputs(
+-    *,
+-    ranks: int,
+-    output_dtype: torch.dtype,
+-    output_stride: int,
+-    output_aligned: bool,
+-) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _select_first_argmax,
+-        TritonWarmupTensor(torch.float32),
+-        TritonWarmupTensor(output_dtype, aligned=output_aligned),
+-        output_stride,
+-        ranks,
+-        triton.next_power_of_2(ranks),
+-        grid=(1,),
+-    )
+-
+-
+-_partial_argmax_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_partial_argmax_warmup_inputs
+-)(_partial_argmax)
+-_partial_argmax_logits_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_partial_argmax_logits_warmup_inputs
+-)(_partial_argmax_logits)
+-_finish_argmax_pair_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_finish_argmax_pair_warmup_inputs
+-)(_finish_argmax_pair)
+-_select_first_argmax_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_select_first_argmax_warmup_inputs
+-)(_select_first_argmax)
+-
+-
+ def register_greedy_markov_shard_pair_warmup(
+     *,
+     base_dtype: torch.dtype,
+@@ -229,30 +138,26 @@ def register_greedy_markov_shard_pair_warmup(
+     vocab: int,
+     vocab_start: int,
+ ) -> None:
+-    """Register the kernels ``greedy_markov_shard_pair`` launches for one layout
+-    of its inputs: rows ``base_stride`` and ``bias_stride`` elements apart, the
+-    base logits' first element 16-byte aligned or not, ``vocab`` columns of the
+-    shard starting at global index ``vocab_start``; FP32/int32 scratch."""
+-    _partial_argmax_launcher.register_warmup(
+-        base_dtype=base_dtype,
+-        base_stride=base_stride,
+-        base_aligned=base_aligned,
+-        bias_dtype=bias_dtype,
+-        bias_stride=bias_stride,
+-        vocab=vocab,
++    """Declare the kernels ``greedy_markov_shard_pair`` launches for base logits
++    and a Markov bias of these dtypes (the TileLang kernels take any stride,
++    alignment, shard and offset)."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.greedy_calls(markov=[(base_dtype, bias_dtype)])
+     )
+-    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
+ 
+ 
+ def register_greedy_shard_pair_warmup(
+     *, logits_dtype: torch.dtype, logits_stride: int, vocab: int, vocab_start: int
+ ) -> None:
+-    """Register the kernels ``greedy_shard_pair`` launches for freshly allocated
+-    logits of ``logits_dtype`` whose rows are ``logits_stride`` elements apart."""
+-    _partial_argmax_logits_launcher.register_warmup(
+-        dtype=logits_dtype, stride=logits_stride, vocab=vocab
++    """Declare the kernels ``greedy_shard_pair`` launches for logits of
++    ``logits_dtype``."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.greedy_calls(logits=[logits_dtype])
+     )
+-    _finish_argmax_pair_launcher.register_warmup(vocab=vocab, vocab_start=vocab_start)
+ 
+ 
+ def register_select_first_argmax_warmup(
+@@ -262,14 +167,26 @@ def register_select_first_argmax_warmup(
+     output_stride: int,
+     output_aligned: bool,
+ ) -> None:
+-    """Register ``select_first_argmax`` for ``ranks`` freshly gathered pairs per
+-    row and an output column of ``output_dtype``, ``output_stride`` elements per
+-    row, whose first element is 16-byte aligned or not."""
+-    _select_first_argmax_launcher.register_warmup(
+-        ranks=ranks,
+-        output_dtype=output_dtype,
+-        output_stride=output_stride,
+-        output_aligned=output_aligned,
++    """Declare ``select_first_argmax`` for an output column of
++    ``output_dtype``."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.greedy_calls(select=[output_dtype])
++    )
++
++
++def register_sample_greedy_markov_warmup(
++    *, dtype: torch.dtype, output_dtype: torch.dtype
++) -> None:
++    """Declare the kernels ``sample_greedy_markov`` launches for base logits and
++    a Markov bias of ``dtype`` and an output column of ``output_dtype``."""
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.greedy_calls(
++            markov=[(dtype, dtype)], finish_outputs=[output_dtype]
++        )
+     )
+ 
+ 
+@@ -290,35 +207,10 @@ def greedy_markov_shard_pair(
+     ``select_first_argmax`` reproduces the full-vocabulary argmax, ties and
+     NaNs included, because shards hold ascending index ranges.
+     """
+-    if base_logits.shape != markov_bias.shape:
+-        raise ValueError(
+-            "DSpark greedy base logits and Markov bias must have identical shapes: "
+-            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
+-        )
+-    rows, vocab = base_logits.shape
+-    if vocab_start + vocab > 1 << 24:
+-        raise ValueError("vocabulary indices must stay exact in FP32")
+-    parts = triton.cdiv(vocab, _BLOCK)
+-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+-        raise ValueError("DSpark greedy scratch is smaller than the logits require")
+-    _partial_argmax_launcher[(rows, parts)](
+-        base_logits,
+-        markov_bias,
+-        partial_values,
+-        partial_indices,
+-        base_logits.stride(0),
+-        markov_bias.stride(0),
+-        vocab,
+-        parts,
+-        _BLOCK,
+-    )
+-    _finish_argmax_pair_launcher[(rows,)](
+-        partial_values,
+-        partial_indices,
+-        pairs,
+-        vocab_start,
+-        parts,
+-        triton.next_power_of_2(parts),
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.greedy_markov_shard_pair(
++        base_logits, markov_bias, vocab_start, pairs, partial_values, partial_indices
+     )
+ 
+ 
+@@ -333,45 +225,19 @@ def greedy_shard_pair(
+     """``greedy_markov_shard_pair`` without a bias: each row's ``(max, global
+     index)`` over the first ``vocab`` columns of one vocabulary shard of
+     ``logits`` (its padding columns excluded), into FP32 ``pairs`` ([rows, 2])."""
+-    rows = logits.shape[0]
+-    if vocab > logits.shape[1]:
+-        raise ValueError("the shard's real vocabulary exceeds its logits")
+-    if vocab_start + vocab > 1 << 24:
+-        raise ValueError("vocabulary indices must stay exact in FP32")
+-    parts = triton.cdiv(vocab, _BLOCK)
+-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+-        raise ValueError("greedy scratch is smaller than the logits require")
+-    _partial_argmax_logits_launcher[(rows, parts)](
+-        logits,
+-        partial_values,
+-        partial_indices,
+-        logits.stride(0),
+-        vocab,
+-        parts,
+-        _BLOCK,
+-    )
+-    _finish_argmax_pair_launcher[(rows,)](
+-        partial_values,
+-        partial_indices,
+-        pairs,
+-        vocab_start,
+-        parts,
+-        triton.next_power_of_2(parts),
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.greedy_shard_pair(
++        logits, vocab, vocab_start, pairs, partial_values, partial_indices
+     )
+ 
+ 
+ def select_first_argmax(pairs: torch.Tensor, output: torch.Tensor) -> None:
+     """Reduce all-gathered shard pairs ([rows, 2 * ranks], FP32) to the first
+     maximum's global index, written to ``output`` (one per row)."""
+-    rows, width = pairs.shape
+-    ranks = width // 2
+-    _select_first_argmax_launcher[(rows,)](
+-        pairs,
+-        output,
+-        output.stride(0),
+-        ranks,
+-        triton.next_power_of_2(ranks),
+-    )
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.select_first_argmax(pairs, output)
+ 
+ 
+ def scratch_shape(max_requests: int, vocabulary_size: int) -> tuple[int, int]:
+@@ -403,31 +269,8 @@ def sample_greedy_markov(
+     Raises:
+         ValueError: Input shapes differ or scratch cannot hold every partial.
+     """
+-    if base_logits.shape != markov_bias.shape:
+-        raise ValueError(
+-            "DSpark greedy base logits and Markov bias must have identical shapes: "
+-            f"{tuple(base_logits.shape)} != {tuple(markov_bias.shape)}"
+-        )
+-    rows, vocab = base_logits.shape
+-    parts = triton.cdiv(vocab, _BLOCK)
+-    if min(partial_values.numel(), partial_indices.numel()) < rows * parts:
+-        raise ValueError("DSpark greedy scratch is smaller than the logits require")
+-    _partial_argmax_launcher[(rows, parts)](
+-        base_logits,
+-        markov_bias,
+-        partial_values,
+-        partial_indices,
+-        base_logits.stride(0),
+-        markov_bias.stride(0),
+-        vocab,
+-        parts,
+-        _BLOCK,
+-    )
+-    _finish_argmax[(rows,)](
+-        partial_values,
+-        partial_indices,
+-        output,
+-        output.stride(0),
+-        parts,
+-        triton.next_power_of_2(parts),
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.sample_greedy_markov(
++        base_logits, markov_bias, output, partial_values, partial_indices
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index e70ab5f65..60fb66d8f 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -43,6 +43,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     greedy_markov_shard_pair,
+     register_greedy_markov_shard_pair_warmup,
++    register_sample_greedy_markov_warmup,
+     register_select_first_argmax_warmup,
+     sample_greedy_markov,
+     scratch_shape,
+@@ -224,14 +225,28 @@ class DSparkSpeculator(DFlashSpeculator):
+     def register_warmups(
+         self, block_table_layouts: Sequence[DraftBlockTableLayout]
+     ) -> None:
+-        """Also register the vocabulary-parallel greedy reduction of each draft
+-        position: its base logits and Markov bias are this rank's shards, written
+-        in the draft head's dtype; draft position ``i`` is column ``i`` of both
+-        the base logits' ``[requests, positions, shard]`` view and the draft
+-        tokens."""
++        """Also register the greedy reduction of each draft position: the
++        vocabulary-parallel one, whose base logits and Markov bias are this rank's
++        shards, written in the draft head's dtype (draft position ``i`` is column
++        ``i`` of both the base logits' ``[requests, positions, shard]`` view and
++        the draft tokens); or the full-vocabulary one, when no logits cache,
++        vocabulary map or estimator needs the logits."""
+         super().register_warmups(block_table_layouts)
+         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
+-        if self._draft_topk is not None or not self._vocab_parallel_greedy(local_head):
++        if self._draft_topk is not None:
++            return
++        if not self._vocab_parallel_greedy(local_head):
++            processor = getattr(self.model, "logits_processor", None)
++            if (
++                not local_head
++                and processor is not None
++                and self.draft_logits is None
++                and self.model.draft_id_to_target_id is None
++                and getattr(self, "acceptance_estimator", None) is None
++            ):
++                register_sample_greedy_markov_warmup(
++                    dtype=processor.head_dtype, output_dtype=self.draft_tokens.dtype
++                )
+             return
+         vocab_start, shard_vocab = self.model.draft_vocab_shard
+         dtype, head_width, markov_width = self.model.draft_logits_local_layout
+diff --git a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+index b70c23ace..0631e5087 100644
+--- a/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
++++ b/vllm/v1/worker/gpu/spec_decode/greedy_verification.py
+@@ -14,16 +14,9 @@ target's argmax; the first mismatch commits the argmax, and a fully accepted
+ block commits the argmax at the bonus position.
+ """
+ 
+-from typing import Any
+-
+ import torch
+ 
+ from vllm.distributed import tensor_model_parallel_all_gather
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.spec_decode.dspark.greedy import (
+     greedy_shard_pair,
+@@ -52,6 +45,7 @@ def vocab_parallel_argmax(
+     return ids
+ 
+ 
++# Reference for ``tilelang_sampling``; the runner no longer launches it.
+ @triton.jit
+ def _greedy_rejection_kernel(
+     sampled_ptr,
+@@ -88,25 +82,6 @@ def _greedy_rejection_kernel(
+     tl.store(num_sampled_ptr + req_idx, (accepted_length + 1).to(tl.int32))
+ 
+ 
+-def _greedy_rejection_warmup_inputs(*, num_speculative_steps: int) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _greedy_rejection_kernel,
+-        TritonWarmupTensor(torch.int64),
+-        num_speculative_steps + 1,
+-        TritonWarmupTensor(torch.int32),
+-        TritonWarmupTensor(torch.int64),
+-        TritonWarmupTensor(torch.int32),
+-        TritonWarmupTensor(torch.int32),
+-        grid=(1,),
+-        num_warps=1,
+-    )
+-
+-
+-_greedy_rejection_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_greedy_rejection_warmup_inputs
+-)(_greedy_rejection_kernel)
+-
+-
+ def register_greedy_verification_warmups(
+     *,
+     logits_dtype: torch.dtype,
+@@ -116,7 +91,7 @@ def register_greedy_verification_warmups(
+     tp_size: int,
+     num_speculative_steps: int,
+ ) -> None:
+-    """Register the kernels ``vocab_parallel_argmax`` and ``greedy_rejection_sample``
++    """Declare the kernels ``vocab_parallel_argmax`` and ``greedy_rejection_sample``
+     launch: this rank's shard of ``compute_logits_local`` (``logits_dtype``, rows
+     ``logits_stride`` elements apart, ``vocab`` real columns from global index
+     ``vocab_start``), drafts and logits offsets from the input batch (int32)."""
+@@ -129,8 +104,12 @@ def register_greedy_verification_warmups(
+     register_select_first_argmax_warmup(
+         ranks=tp_size, output_dtype=torch.int64, output_stride=1, output_aligned=True
+     )
+-    _greedy_rejection_launcher.register_warmup(
+-        num_speculative_steps=num_speculative_steps
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    tilelang_sampling.declare(
++        lambda: tilelang_sampling.greedy_calls(
++            rejection_widths=[num_speculative_steps + 1]
++        )
+     )
+ 
+ 
+@@ -145,18 +124,8 @@ def greedy_rejection_sample(
+     Returns ``sampled`` ([num_reqs, num_speculative_steps + 1], int64) and
+     ``num_sampled`` ([num_reqs], int32), the committed prefix of each row.
+     """
+-    num_reqs = cu_num_logits.shape[0] - 1
+-    sampled = draft_sampled.new_empty(
+-        num_reqs, num_speculative_steps + 1, dtype=torch.int64
+-    )
+-    num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
+-    _greedy_rejection_launcher[(num_reqs,)](
+-        sampled,
+-        sampled.stride(0),
+-        num_sampled,
+-        target_ids,
+-        draft_sampled,
+-        cu_num_logits,
+-        num_warps=1,
++    from vllm.v1.worker.gpu.sample import tilelang_sampling
++
++    return tilelang_sampling.greedy_rejection_sample(
++        target_ids, draft_sampled, cu_num_logits, num_speculative_steps
+     )
+-    return sampled, num_sampled

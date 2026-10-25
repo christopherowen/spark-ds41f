@@ -1,0 +1,2714 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 03:07:10 +0100
+Subject: [PATCH 459/488] [DS4.1] The vision tower in TileLang
+
+Under the TileLang backend the ViT and the aligner run TileLang kernels
+only (B12X is not imported); the checkpoint's parameter tree is the same.
+- Projections: BF16 GEMMs with the bias added in FP32 before the one
+  rounding; gate/up and SwiGLU in one epilogue, bias and GELU in the
+  aligner's first projection.
+- RoPE in place in the qkv buffer; non-causal flash attention over one
+  image reading q, k and v from it, columns past the live rows masked.
+- Residual add fused with RMSNorm in B12X's reduction order; the spatial
+  merge staged through shared memory; patch rows padded to whole tiles.
+- Workspaces at the tower's capacity, allocated at binding; every kernel
+  declared for preparation.
+Gates: elementwise and rowwise ops bit for bit with B12X's arithmetic;
+GEMMs and attention against FP64 within B12X's own error; the whole tower
+and aligner against DeepSeek's math. benchmark_tilelang_vision.py --gate
+times it against the B12X tower.
+---
+ .../kernels/benchmark_tilelang_vision.py      |  411 ++++++
+ .../test_deepseek_v41_tilelang_vision.py      | 1158 +++++++++++++++++
+ .../deepseek_v4_1/nvidia/tilelang_vision.py   |  385 ++++++
+ vllm/models/deepseek_v4_1/nvidia/vl_model.py  |   31 +-
+ vllm/models/deepseek_v4_1/tilelang/vision.py  |  640 +++++++++
+ 5 files changed, 2617 insertions(+), 8 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_tilelang_vision.py
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_vision.py
+ create mode 100644 vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/vision.py
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_vision.py b/benchmarks/kernels/benchmark_tilelang_vision.py
+new file mode 100644
+index 000000000..8bc448c6e
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_tilelang_vision.py
+@@ -0,0 +1,411 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1's vision tower per image: TileLang (``nvidia/tilelang_vision.py``)
++against B12X (``nvidia/b12x_vision.py``), at the checkpoint's geometry.
++
++Both towers hold the same random weights (32 blocks of 1024 wide, 16 heads, 2816,
++14-pixel patches, a 5120-wide aligner, capacity 9216 patches) and encode the same
++images eagerly, as the model's multimodal path does: the ViT and the aligner, one
++image a call. B12X is prepared as serving prepares it (its projections' plans for
++one row and the capacity, autotuned unless ``--no-b12x-autotune``).
++
++- End to end: at each grid, ``--samples`` fresh images; on each, ``--calls`` images
++  of both towers back to back, alternating which goes first; the 95% interval of
++  the per-image difference comes from the samples' differences. The outputs are
++  compared (relative difference of the aligner's rows) before timing.
++- Per op: one image of each tower under the CUDA profiler, device time by kernel
++  name and by operation (projections, attention, RoPE, norms and adds, SwiGLU,
++  merge, GELU, padding).
++- ``--sweep`` (ungated): standalone launches of alternative TileLang tiles for every
++  projection, the SwiGLU projection and attention at the largest grid, to pick the
++  ``vision.LINEAR_TILE`` / ``SWIGLU_TILE`` / ``ATTENTION_TILE`` defaults.
++
++The gate (``--gate``) is that TileLang is nowhere slower than B12X beyond noise: at
++no grid is the interval's lower bound above zero.
++"""
++
++import argparse
++import functools
++import json
++import math
++import statistics
++from collections.abc import Callable
++from types import SimpleNamespace
++
++import torch
++
++from vllm.models.deepseek_v4_1.nvidia import tilelang_vision
++from vllm.models.deepseek_v4_1.tilelang import vision
++
++DEVICE = torch.device("cuda")
++# DeepSeek-V4.1's vision_config (checkpoint 1017) and its text hidden size.
++CONFIG = dict(
++    vision_patch_size=14,
++    vision_dim=1024,
++    vision_n_heads=16,
++    vision_inter_dim=2816,
++    vision_n_layers=32,
++    vision_rope_theta=10000.0,
++    vision_downsample_ratio=3,
++    hidden_size=5120,
++    vision_max_n_token=1024,
++)
++# Grids of 14-pixel patches: the minimum-pixel image (544 x 544), a 4:3 photo, and
++# 16:9 and square images at the 1024-token cap.
++GRIDS = {
++    "39x39 minimum pixels": (39, 39),
++    "54x72 4:3": (54, 72),
++    "72x128 16:9 at the cap": (72, 128),
++    "96x96 square at the cap": (96, 96),
++}
++# Student's t (two-sided 95%) by degrees of freedom.
++_T95 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365}
++_T95.update({8: 2.306, 9: 2.262, 11: 2.201, 15: 2.131, 19: 2.093})
++
++# Device time by operation, from kernel names (TileLang's are the prim_funcs';
++# B12X's by substring, best effort; the raw names are printed too).
++_OPERATIONS = (
++    ("attention", ("vision_attention", "attention", "fmha", "contiguous")),
++    ("swiglu projection", ("vision_swiglu_linear",)),
++    ("projections", ("vision_linear", "gemv", "gemm", "linear")),
++    ("rope", ("vision_rope", "rope")),
++    ("norms and adds", ("vision_add_norm", "rmsnorm", "norm", "add")),
++    ("swiglu", ("swiglu", "pointwise")),
++    ("merge", ("vision_spatial_merge", "merge")),
++    ("gelu", ("gelu",)),
++    ("padding", ("vision_pad_columns",)),
++    ("vision support (b12x rope/merge/gelu)", ("vision",)),
++)
++
++
++def _operation(name: str) -> str:
++    lowered = name.lower()
++    for operation, keys in _OPERATIONS:
++        if any(key.lower() in lowered for key in keys):
++            return operation
++    return "other"
++
++
++def _init(module: torch.nn.Module, seed: int) -> None:
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    with torch.no_grad():
++        for name, parameter in module.named_parameters():
++            noise = torch.randn(parameter.shape, generator=gen, device=DEVICE)
++            if "norm" in name:
++                parameter.copy_(1 + 0.1 * noise)
++            elif name.endswith("bias"):
++                parameter.copy_(0.1 * noise)
++            else:
++                parameter.copy_(noise / math.sqrt(parameter.shape[1]))
++
++
++def towers(config: SimpleNamespace, autotune: bool):
++    """The TileLang and B12X towers, the same weights, both prepared."""
++    from b12x.preparation import PreparationSession
++
++    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
++    from vllm.models.deepseek_v4_1.nvidia import b12x_vision
++    from vllm.utils.b12x import B12xWorkload
++
++    with torch.device(DEVICE):
++        ours = SimpleNamespace(
++            vit=tilelang_vision.DeepseekV4ViT(config),
++            aligner=tilelang_vision.DeepseekV4Aligner(config),
++        )
++        theirs = SimpleNamespace(
++            vit=b12x_vision.DeepseekV4ViT(config),
++            aligner=b12x_vision.DeepseekV4Aligner(config),
++        )
++    _init(ours.vit, 411)
++    _init(ours.aligner, 412)
++    theirs.vit.load_state_dict(ours.vit.state_dict())
++    theirs.aligner.load_state_dict(ours.aligner.state_dict())
++    ours.vit.declare_kernels()
++    ours.aligner.declare_kernels()
++    capacity = ours.vit.capacity
++    workload = B12xWorkload(
++        stage="weights",
++        token_counts=(1,),
++        fixed_token_counts=(),
++        output_dtype=torch.bfloat16,
++        max_tokens=capacity,
++        max_seqs=1,
++        max_model_len=capacity,
++    )
++    session = PreparationSession(device=DEVICE, autotune=autotune)
++    units = [
++        unit
++        for provider in (theirs.vit, theirs.aligner)
++        for unit in _units_from_modules(provider, workload)
++    ]
++    session.prepare(tuple(request for unit in units for request in unit.requests))
++    theirs.session = session
++    return ours, theirs
++
++
++def encode(tower, patches: torch.Tensor, height: int, width: int) -> torch.Tensor:
++    return tower.aligner(tower.vit(patches, height, width), height, width)
++
++
++def per_image_ms(run: Callable[[], object], calls: int) -> float:
++    torch.cuda.synchronize()
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    for _ in range(calls):
++        run()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) / calls
++
++
++def interval(differences: list[float]) -> list[float]:
++    mean = statistics.fmean(differences)
++    if len(differences) < 2:
++        return [mean, mean]
++    dof = len(differences) - 1
++    # The nearest tabulated degrees of freedom at or below: conservative.
++    t = _T95[max(k for k in _T95 if k <= dof)]
++    half = t * statistics.stdev(differences) / math.sqrt(len(differences))
++    return [mean - half, mean + half]
++
++
++def end_to_end(ours, theirs, config, grid, samples: int, calls: int) -> dict:
++    height, width = grid
++    rows = height * width
++    p = config.vision_patch_size
++    ours_ms, theirs_ms, differences, agreement = [], [], [], []
++    for sample in range(samples):
++        gen = torch.Generator(device=DEVICE).manual_seed(sample)
++        patches = torch.randn(rows, 3, p, p, generator=gen, device=DEVICE).bfloat16()
++        ours_out = encode(ours, patches, height, width)
++        theirs_out = encode(theirs, patches, height, width)
++        agreement.append(
++            (
++                (ours_out.float() - theirs_out.float()).norm()
++                / theirs_out.float().norm()
++            ).item()
++        )
++
++        def run_ours(patches=patches):
++            encode(ours, patches, height, width)
++
++        def run_theirs(patches=patches):
++            encode(theirs, patches, height, width)
++
++        pair = (run_ours, run_theirs) if sample % 2 == 0 else (run_theirs, run_ours)
++        times = {id(run): per_image_ms(run, calls) for run in pair}
++        ours_ms.append(times[id(run_ours)])
++        theirs_ms.append(times[id(run_theirs)])
++        differences.append(times[id(run_ours)] - times[id(run_theirs)])
++    return {
++        "patches": rows,
++        "tilelang_ms": statistics.median(ours_ms),
++        "b12x_ms": statistics.median(theirs_ms),
++        "difference_ms": statistics.fmean(differences),
++        "interval_ms": interval(differences),
++        "relative_difference_of_outputs": max(agreement),
++    }
++
++
++def profile(run: Callable[[], object]) -> dict[str, float]:
++    """Device milliseconds by kernel name for one call of ``run``."""
++    from torch.autograd import DeviceType
++    from torch.profiler import ProfilerActivity
++    from torch.profiler import profile as torch_profile
++
++    run()
++    torch.cuda.synchronize()
++    with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
++        run()
++        torch.cuda.synchronize()
++    kernels: dict[str, float] = {}
++    for event in prof.key_averages():
++        if event.device_type != DeviceType.CUDA:
++            continue
++        kernels[event.key] = kernels.get(event.key, 0.0) + (
++            event.self_device_time_total / 1000
++        )
++    return kernels
++
++
++def per_op(ours, theirs, config, grid) -> dict:
++    height, width = grid
++    p = config.vision_patch_size
++    gen = torch.Generator(device=DEVICE).manual_seed(1234)
++    patches = torch.randn(
++        height * width, 3, p, p, generator=gen, device=DEVICE
++    ).bfloat16()
++    result = {}
++    for name, tower in (("tilelang", ours), ("b12x", theirs)):
++        kernels = profile(lambda tower=tower: encode(tower, patches, height, width))
++        operations: dict[str, float] = {}
++        for kernel, ms in kernels.items():
++            operation = _operation(kernel)
++            operations[operation] = operations.get(operation, 0.0) + ms
++        result[name] = {
++            "total_ms": sum(kernels.values()),
++            "by_operation_ms": dict(sorted(operations.items(), key=lambda i: -i[1])),
++            "by_kernel_ms": dict(
++                sorted(kernels.items(), key=lambda item: -item[1])[:24]
++            ),
++        }
++    return result
++
++
++# --- Tile sweep (ungated) ---------------------------------------------------------
++
++_LINEAR_TILES = [
++    dict(block_M=128, block_N=128, block_K=64, num_stages=2, threads=256),
++    dict(block_M=128, block_N=128, block_K=32, num_stages=3, threads=256),
++    dict(block_M=128, block_N=128, block_K=64, num_stages=3, threads=128),
++    dict(block_M=128, block_N=256, block_K=32, num_stages=3, threads=256),
++    dict(block_M=256, block_N=128, block_K=32, num_stages=3, threads=256),
++    dict(block_M=64, block_N=128, block_K=64, num_stages=3, threads=128),
++    dict(block_M=128, block_N=64, block_K=64, num_stages=3, threads=128),
++]
++_SWIGLU_TILES = [
++    dict(block_M=128, block_N=64, block_K=64, num_stages=2, threads=256),
++    dict(block_M=128, block_N=64, block_K=32, num_stages=3, threads=256),
++    dict(block_M=128, block_N=128, block_K=32, num_stages=2, threads=256),
++    dict(block_M=64, block_N=64, block_K=64, num_stages=3, threads=128),
++    dict(block_M=128, block_N=32, block_K=64, num_stages=3, threads=128),
++]
++_ATTENTION_TILES = [
++    dict(block_M=128, block_N=64, num_stages=2, threads=128),
++    dict(block_M=128, block_N=128, num_stages=1, threads=128),
++    dict(block_M=128, block_N=128, num_stages=2, threads=256),
++    dict(block_M=128, block_N=64, num_stages=3, threads=128),
++    dict(block_M=64, block_N=64, num_stages=2, threads=128),
++    dict(block_M=64, block_N=128, num_stages=2, threads=128),
++]
++
++
++def _median_ms(run: Callable[[], object], repeats: int = 10) -> float:
++    run()
++    times = []
++    for _ in range(repeats):
++        times.append(per_image_ms(run, 1))
++    return statistics.median(times)
++
++
++def sweep(config: SimpleNamespace, rows: int) -> dict:
++    """Each candidate tile of each GEMM role and attention, launched alone on random
++    data of ``rows`` patches (the aligner's projections on its merged rows)."""
++    import tilelang
++
++    hidden, inter = config.vision_dim, config.vision_inter_dim
++    heads, out_dim = config.vision_n_heads, config.hidden_size
++    r = config.vision_downsample_ratio
++    merged = -(-rows // (r * r))
++    patch = vision.padded_width(3 * config.vision_patch_size**2)
++    linears = {
++        "patch [1024, 640] + bias": (hidden, patch, True, False, rows),
++        "qkv [3072, 1024] + bias": (3 * hidden, hidden, True, False, rows),
++        "wo [1024, 1024] + bias": (hidden, hidden, True, False, rows),
++        "mlp down [1024, 2816]": (hidden, inter, False, False, rows),
++        "aligner w1 [5120, 9216] + bias + gelu": (
++            out_dim,
++            hidden * r * r,
++            True,
++            True,
++            merged,
++        ),
++        "aligner w2 [5120, 5120] + bias": (out_dim, out_dim, True, False, merged),
++    }
++    candidates = []
++    for name, (n, k, bias, gelu, m) in linears.items():
++        for tile in _LINEAR_TILES:
++            call = vision.linear_call(n, k, bias=bias, gelu=gelu, **tile)
++            candidates.append((name, tile, call, m))
++    for tile in _SWIGLU_TILES:
++        call = vision.swiglu_call(inter, hidden, **tile)
++        candidates.append(("mlp gate/up + swiglu [5632, 1024]", tile, call, rows))
++    for tile in _ATTENTION_TILES:
++        call = vision.attention_call(heads, hidden // heads, **tile)
++        candidates.append(("attention 16 x 64", tile, call, rows))
++    try:
++        tilelang.prepare([call for _, _, call, _ in candidates])
++    except Exception as error:  # noqa: BLE001 - a candidate may not fit; listed below
++        print(json.dumps({"sweep compile": repr(error)}), flush=True)
++
++    def tensor(*shape):
++        return torch.randn(shape, device=DEVICE).bfloat16()
++
++    results: dict[str, list] = {}
++    for name, tile, call, m in candidates:
++        function, args, _ = call
++        try:
++            kernel = vision.resolve(call)
++        except Exception as error:  # noqa: BLE001 - a candidate may not compile
++            results.setdefault(name, []).append({"tile": tile, "error": repr(error)})
++            continue
++        if function is vision.attention_kernel:
++            tensors = (tensor(m, 3 * hidden), tensor(m, hidden))
++        elif function is vision.swiglu_linear_kernel:
++            tensors = (tensor(m, hidden), tensor(2 * inter, hidden), tensor(m, inter))
++        else:
++            n, k, bias = args[0], args[1], args[2]
++            bias_tensor = (tensor(n),) if bias else ()
++            tensors = (tensor(m, k), tensor(n, k), *bias_tensor, tensor(m, n))
++        launch = functools.partial(kernel, *tensors)
++        results.setdefault(name, []).append(
++            {"tile": tile, "rows": m, "ms": _median_ms(launch)}
++        )
++    for entries in results.values():
++        entries.sort(key=lambda entry: entry.get("ms", math.inf))
++    return results
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--sweep", action="store_true")
++    parser.add_argument("--samples", type=int, default=8)
++    parser.add_argument("--calls", type=int, default=3)
++    parser.add_argument(
++        "--layers", type=int, default=CONFIG["vision_n_layers"], help="ViT blocks"
++    )
++    parser.add_argument(
++        "--no-b12x-autotune",
++        dest="b12x_autotune",
++        action="store_false",
++        help="prepare B12X with its default tiles (serving autotunes)",
++    )
++    parser.add_argument(
++        "--grid",
++        action="append",
++        metavar="HxW",
++        help="patch grids to time (default: the representative four)",
++    )
++    args = parser.parse_args()
++    if args.grid:
++        grids = {g: tuple(int(v) for v in g.split("x")) for g in args.grid}
++    else:
++        grids = GRIDS
++    config = SimpleNamespace(**{**CONFIG, "vision_n_layers": args.layers})
++    ours, theirs = towers(config, args.b12x_autotune)
++    results = {"config": CONFIG | {"vision_n_layers": args.layers}, "grids": {}}
++    slower = []
++    for name, grid in grids.items():
++        result = end_to_end(ours, theirs, config, grid, args.samples, args.calls)
++        result["per_op"] = per_op(ours, theirs, config, grid)
++        results["grids"][name] = result
++        if result["interval_ms"][0] > 0:
++            slower.append(name)
++        print(json.dumps({name: result}, indent=1), flush=True)
++    if args.sweep:
++        rows = max(h * w for h, w in grids.values())
++        results["sweep (ungated)"] = sweep(config, rows)
++        print(json.dumps({"sweep": results["sweep (ungated)"]}, indent=1), flush=True)
++    theirs.session.close()
++    print(
++        json.dumps({"summary": "TileLang vs B12X vision tower", "slower": slower}),
++        flush=True,
++    )
++    if args.gate and slower:
++        raise SystemExit(f"TileLang vision slower than B12X at {', '.join(slower)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_vision.py b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+new file mode 100644
+index 000000000..854f493f2
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_vision.py
+@@ -0,0 +1,1158 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1's TileLang vision tower against B12X's arithmetic and DeepSeek's
++reference.
++
++Bit for bit (compared as bits): the patch padding and the spatial merge (copies),
++the residual add with RMSNorm, the 2-D RoPE, the exact GELU epilogue and the bias
++epilogue's single rounding, against torch models of B12X's arithmetic (``_b12x_*``,
++read from its CuTe kernels: the same reduction tree, FMAs where libNVVM contracts,
++the same FP32 constants). Where b12x is importable, the same operations and the
++SwiGLU epilogue against B12X's own kernels, bit for bit; a mismatch names the
++arithmetic B12X's kernel matched instead.
++
++Against FP64 references, with tolerances no looser than B12X's own error on the
++same inputs (both measured and reported): the projections, attention, and the whole
++tower and aligner (DeepSeek's ``deepseek_v4/common/vision.py`` math in FP64, rounded
++to BF16 where its modules return BF16) at grids from 1x1 to the capacity, odd sizes
++included for the merge padding. Then non-finite values (the reference's positions),
++stale capacity rows, CUDA graph replay, the data-parallel runner and declaration
++coverage.
++"""
++
++import math
++from types import SimpleNamespace
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from tests.kernels.deepseek_v41_contracts import (  # noqa: E402
++    INF,
++    NAN,
++    assert_finite_equal,
++    assert_other_rows_equal,
++    assert_same_nonfinite,
++)
++from vllm.models.deepseek_v4_1.nvidia import tilelang_vision  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import prepare, vision  # noqa: E402
++
++DEVICE = "cuda"
++
++
++def _config(**overrides) -> SimpleNamespace:
++    base = dict(
++        vision_patch_size=2,
++        vision_dim=128,
++        vision_n_heads=2,
++        vision_inter_dim=192,
++        vision_n_layers=2,
++        vision_rope_theta=10000.0,
++        vision_downsample_ratio=3,
++        hidden_size=256,
++        vision_max_n_token=16,
++    )
++    return SimpleNamespace(**{**base, **overrides})
++
++
++# Two blocks of narrow widths, capacity 144 rows.
++SMALL = _config()
++# DeepSeek-V4.1's widths (1024 wide, 16 heads of 64, 2816, 14-pixel patches, a
++# 5120-wide aligner), one block and a 576-row capacity.
++REAL = _config(
++    vision_patch_size=14,
++    vision_dim=1024,
++    vision_n_heads=16,
++    vision_inter_dim=2816,
++    vision_n_layers=1,
++    hidden_size=5120,
++    vision_max_n_token=64,
++)
++# Grids from one patch to the capacity; odd sizes pad the 3x3 merge.
++SMALL_GRIDS = [(1, 1), (1, 7), (4, 7), (5, 5), (7, 11), (12, 12), (3, 48), (1, 144)]
++REAL_GRIDS = [(1, 1), (5, 7), (13, 17), (24, 24), (1, 576)]
++
++
++# --- Construction ---------------------------------------------------------------
++
++
++@torch.no_grad()
++def _init(module: torch.nn.Module, seed: int) -> None:
++    """Random weights at serving scale: unit-variance projections, small biases,
++    norm weights near one."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    for name, parameter in module.named_parameters():
++        noise = torch.randn(parameter.shape, generator=gen, device=DEVICE)
++        if "norm" in name:
++            parameter.copy_(1 + 0.1 * noise)
++        elif name.endswith("bias"):
++            parameter.copy_(0.1 * noise)
++        else:
++            parameter.copy_(noise / math.sqrt(parameter.shape[1]))
++
++
++def _build(config, seed: int = 411):
++    with torch.device(DEVICE):
++        vit = tilelang_vision.DeepseekV4ViT(config)
++        aligner = tilelang_vision.DeepseekV4Aligner(config)
++    _init(vit, seed)
++    _init(aligner, seed + 1)
++    return vit, aligner
++
++
++def _towers(config, seed: int = 411):
++    vit, aligner = _build(config, seed)
++    vit.declare_kernels()
++    aligner.declare_kernels()
++    return vit, aligner
++
++
++@pytest.fixture(scope="module")
++def small():
++    return _towers(SMALL)
++
++
++@pytest.fixture(scope="module")
++def real():
++    return _towers(REAL)
++
++
++def _b12x_towers(config, vit, aligner):
++    """B12X's tower and aligner with the same weights, prepared as the existing
++    native-vision test prepares them (plans for one row and the capacity)."""
++    pytest.importorskip("b12x")
++    from b12x.preparation import PreparationSession
++
++    from vllm.model_executor.warmup.b12x_prepare import _units_from_modules
++    from vllm.models.deepseek_v4_1.nvidia import b12x_vision
++    from vllm.utils.b12x import B12xWorkload
++
++    with torch.device(DEVICE):
++        b12x_vit = b12x_vision.DeepseekV4ViT(config)
++        b12x_aligner = b12x_vision.DeepseekV4Aligner(config)
++    b12x_vit.load_state_dict(vit.state_dict())
++    b12x_aligner.load_state_dict(aligner.state_dict())
++    workload = B12xWorkload(
++        stage="weights",
++        token_counts=(1,),
++        fixed_token_counts=(),
++        output_dtype=torch.bfloat16,
++        max_tokens=vit.capacity,
++        max_seqs=1,
++        max_model_len=vit.capacity,
++    )
++    session = PreparationSession(
++        device=torch.device(DEVICE), autotune=False, compile_workers=2
++    )
++    units = [
++        unit
++        for provider in (b12x_vit, b12x_aligner)
++        for unit in _units_from_modules(provider, workload)
++    ]
++    session.prepare(tuple(request for unit in units for request in unit.requests))
++    return SimpleNamespace(vit=b12x_vit, aligner=b12x_aligner, session=session)
++
++
++@pytest.fixture(scope="module")
++def b12x_small(small):
++    towers = _b12x_towers(SMALL, *small)
++    yield towers
++    towers.session.close()
++
++
++@pytest.fixture(scope="module")
++def b12x_real(real):
++    towers = _b12x_towers(REAL, *real)
++    yield towers
++    towers.session.close()
++
++
++def _kernel(module, role: str):
++    return vision.resolve(module.kernel_calls()[role])
++
++
++def _randn(*shape, seed: int, scale: float = 1.0) -> torch.Tensor:
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    return (scale * torch.randn(shape, generator=gen, device=DEVICE)).bfloat16()
++
++
++def _patches(config, rows: int, seed: int) -> torch.Tensor:
++    p = config.vision_patch_size
++    return _randn(rows, 3, p, p, seed=seed)
++
++
++def _norm_weight(width: int, seed: int) -> torch.Tensor:
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    return (1 + 0.1 * torch.randn(width, generator=gen, device=DEVICE)).bfloat16()
++
++
++# --- Bits and errors --------------------------------------------------------------
++
++
++def _bits(tensor: torch.Tensor) -> torch.Tensor:
++    return tensor.contiguous().view(torch.int16)
++
++
++def _differing(got: torch.Tensor, want: torch.Tensor) -> str | None:
++    diff = _bits(got) != _bits(want)
++    if not bool(diff.any()):
++        return None
++    return (
++        f"{int(diff.sum())} of {diff.numel()} values differ, first at "
++        f"{diff.nonzero()[:4].tolist()}"
++    )
++
++
++def _assert_bits(got: torch.Tensor, want: torch.Tensor, what: str) -> None:
++    assert got.shape == want.shape, (what, got.shape, want.shape)
++    message = _differing(got, want)
++    assert message is None, f"{what}: {message}"
++
++
++def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
++    """The spacing of BF16 values at ``|x|`` (FP64), normals' at the least."""
++    exponent = torch.floor(torch.log2(x.abs().clamp_min(2.0**-126)))
++    return torch.exp2(exponent - 7)
++
++
++def _fma32(a, b, c) -> torch.Tensor:
++    """Correctly rounded FP32 ``a * b + c`` of FP32 tensors (one rounding, an FMA).
++
++    The product is exact in FP64; the sum is rounded to odd in FP64 (Knuth's
++    two-sum gives the first rounding's error), and FP64 rounded to odd and then to
++    FP32 is FP32 correctly rounded (53 >= 24 + 2 bits)."""
++    a, b, c = torch.broadcast_tensors(a.double(), b.double(), c.double())
++    product = a * b
++    total = product + c
++    a1 = total - c
++    b1 = total - a1
++    error = (product - a1) + (c - b1)
++    bits = total.contiguous().view(torch.int64)
++    inexact = (error != 0) & torch.isfinite(total)
++    toward_zero = inexact & ((error > 0) != (total > 0))
++    bits = torch.where(toward_zero, bits - 1, bits)
++    bits = torch.where(inexact, bits | 1, bits)
++    return bits.view(torch.float64).float()
++
++
++def _round(x: torch.Tensor) -> torch.Tensor:
++    """FP64 values rounded to BF16 (where the reference's modules return BF16)."""
++    return x.bfloat16().double()
++
++
++def _relative(out: torch.Tensor, ref: torch.Tensor) -> float:
++    return ((out.double() - ref).norm() / ref.norm()).item()
++
++
++def _max_ulps(out: torch.Tensor, ref: torch.Tensor, floor) -> float:
++    return ((out.double() - ref).abs() / (_bf16_ulp(ref) + floor)).max().item()
++
++
++# --- B12X's arithmetic, as torch ----------------------------------------------------
++
++
++def _b12x_rmsnorm(x: torch.Tensor, weight: torch.Tensor, fused: bool = True):
++    """B12X's grouped RMSNorm (one stream, not zero-centered, eps 1e-6) in its
++    order: thread ``t`` of 256 adds the squares of columns ``t, t + 256, ...``
++    (``fused``: by FMA, as libNVVM contracts ``square_sum += value * value``), a
++    butterfly over each warp's lanes, the eight warp sums in one warp's butterfly,
++    ``rsqrt(sum / width + eps)`` (``rsqrtf``: torch's CUDA rsqrt), then
++    ``(x * inverse) * (0 + weight)``."""
++    rows, width = x.shape
++    threads = 256
++    items = -(-width // threads)
++    values = torch.zeros(rows, items * threads, device=x.device)
++    values[:, :width] = x.float()
++    total = torch.zeros(rows, threads, device=x.device)
++    for item in range(items):
++        v = values[:, item * threads : (item + 1) * threads]
++        total = _fma32(v, v, total) if fused else total + v * v
++    lanes = torch.arange(32, device=x.device)
++    total = total.view(rows, threads // 32, 32)
++    for level in range(5):
++        total = total + total[..., lanes ^ (1 << level)]
++    warps = torch.zeros(rows, 32, device=x.device)
++    warps[:, : threads // 32] = total[..., 0]
++    for level in range(5):
++        warps = warps + warps[:, lanes ^ (1 << level)]
++    inverse = torch.rsqrt(warps[:, :1] / width + 1e-6)
++    return ((values[:, :width] * inverse) * (weight.float() + 0.0)).bfloat16()
++
++
++def _inv_freq(config) -> torch.Tensor:
++    """B12X's FP32 inverse frequencies (computed on the CPU, as its workspace)."""
++    dim = config.vision_dim // config.vision_n_heads
++    inv = 1.0 / (
++        config.vision_rope_theta
++        ** (torch.arange(0, dim // 2, 2, dtype=torch.float32) / (dim // 2))
++    )
++    return inv.to(DEVICE)
++
++
++def _b12x_rope(qkv, height, width, inv_freq, heads, form: str = "left"):
++    """B12X's 2-D split-half RoPE of q and k in ``qkv``: pair ``j`` of a head rotates
++    by ``float(position) * inv_freq[j % (dim / 4)]`` (the row for ``j < dim / 4``,
++    else the column), ``cosf``/``sinf`` of that FP32 product. ``form`` is how
++    ``q0 * cos + sign * q1 * sin`` rounds: ``left`` (the left product fused, as
++    nvcc and libNVVM contract), ``right``, or ``unfused``."""
++    rows, hidden = qkv.shape[0], qkv.shape[1] // 3
++    dim = hidden // heads
++    half, quarter = dim // 2, dim // 4
++    index = torch.arange(rows, device=qkv.device)
++    j = torch.arange(half, device=qkv.device)
++    position = torch.where(
++        j[None, :] < quarter, (index // width)[:, None], (index % width)[:, None]
++    ).float()
++    angle = position * inv_freq[j % quarter][None, :]
++    cos, sin = angle.cos()[:, None, :], angle.sin()[:, None, :]
++    out = qkv.clone()
++    for part in range(2):
++        x = qkv[:, part * hidden : (part + 1) * hidden].view(rows, heads, dim).float()
++        x1, x2 = x[..., :half], x[..., half:]
++        if form == "left":
++            first = _fma32(x1, cos, -(x2 * sin))
++            second = _fma32(x2, cos, x1 * sin)
++        elif form == "right":
++            first = _fma32(-x2, sin, x1 * cos)
++            second = _fma32(x1, sin, x2 * cos)
++        else:
++            first = x1 * cos - x2 * sin
++            second = x2 * cos + x1 * sin
++        rotated = torch.cat((first, second), -1).bfloat16().view(rows, hidden)
++        out[:, part * hidden : (part + 1) * hidden] = rotated
++    return out
++
++
++def _b12x_gelu(h: torch.Tensor) -> torch.Tensor:
++    """B12X's exact GELU of BF16 values: ``(0.5 * x) * (1 + erff(x * 0.70710677))``
++    in FP32 (the constant rounded to FP32), rounded to BF16."""
++    x = h.float()
++    return ((0.5 * x) * (1.0 + torch.erf(x * 0.7071067811865476))).bfloat16()
++
++
++def _reference_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
++    """DeepSeek's reference MLP activation as vLLM's ``SiluAndMul`` runs it on BF16:
++    SiLU rounded to BF16, times ``up``, rounded."""
++    gate, up = gate_up.chunk(2, -1)
++    return F.silu(gate) * up
++
++
++# --- FP64 references (DeepSeek's vision math) -----------------------------------
++
++
++def _linear64(x: torch.Tensor, layer) -> torch.Tensor:
++    out = x.double() @ layer.weight.double().T
++    if layer.bias is not None:
++        out = out + layer.bias.double()
++    return out
++
++
++def _norm64(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
++    x = x.double()
++    return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * weight.double()
++
++
++def _attention64(q, k, v):
++    """``[rows, heads, dim]`` FP64 softmax attention over all rows."""
++    scores = torch.einsum("thd,shd->hts", q, k) * q.shape[-1] ** -0.5
++    return torch.einsum("hts,shd->thd", scores.softmax(-1), v)
++
++
++def _vit_reference(vit, patches: torch.Tensor, height: int, width: int):
++    """``deepseek_v4/common/vision.py``'s ViT in FP64, rounded to BF16 at each
++    module's output (as the reference model's BF16 activations)."""
++    config = vit.config
++    heads, hidden = config.vision_n_heads, config.vision_dim
++    dim, rows = hidden // heads, height * width
++    rope_dim = dim // 2
++    inv = 1.0 / (
++        config.vision_rope_theta
++        ** (torch.arange(0, rope_dim, 2, device=DEVICE).double() / rope_dim)
++    )
++    hpos = torch.arange(height, device=DEVICE)[:, None].expand(height, width)
++    wpos = torch.arange(width, device=DEVICE)[None, :].expand(height, width)
++    angles = (torch.stack((hpos, wpos), -1).reshape(-1, 2, 1).double() * inv).flatten(
++        1
++    )[:, None]
++    cos, sin = angles.cos(), angles.sin()
++
++    def rotate(x):
++        first, second = x.chunk(2, -1)
++        return _round(
++            torch.cat((first * cos - second * sin, second * cos + first * sin), -1)
++        )
++
++    x = _round(_linear64(patches.reshape(rows, -1), vit.patch_embed.proj))
++    for block in vit.blocks:
++        qkv = _round(_linear64(_round(_norm64(x, block.norm1.weight)), block.attn.wqkv))
++        q, k, v = (t.reshape(rows, heads, dim) for t in qkv.chunk(3, -1))
++        attended = _round(_attention64(rotate(q), rotate(k), v)).reshape(rows, hidden)
++        x = _round(x + _round(_linear64(attended, block.attn.wo)))
++        gate_up = _round(
++            _linear64(_round(_norm64(x, block.norm2.weight)), block.mlp.w1)
++        )
++        gate, up = gate_up.chunk(2, -1)
++        activated = _round(_round(F.silu(gate)) * up)
++        x = _round(x + _round(_linear64(activated, block.mlp.w2)))
++    return _round(_norm64(x, vit.norm.weight))
++
++
++def _merge64(x: torch.Tensor, height: int, width: int, ratio: int) -> torch.Tensor:
++    """The reference's channel-major padded unfold (FP64)."""
++    image = x.double().reshape(height, width, -1).permute(2, 0, 1)
++    image = F.pad(image, (0, -width % ratio, 0, -height % ratio))
++    return F.unfold(image[None], ratio, stride=ratio)[0].T
++
++
++def _aligner_reference(aligner, x: torch.Tensor, height: int, width: int):
++    merged = _merge64(x, height, width, aligner.downsample_ratio)
++    hidden = _round(F.gelu(_round(_linear64(merged, aligner.w1))))
++    return _round(_linear64(hidden, aligner.w2))
++
++
++# --- Copies: padding and merge --------------------------------------------------
++
++
++@pytest.mark.parametrize("rows", [1, 7, 300])
++def test_pad_columns_copies_and_zero_fills(rows):
++    """588-wide patch rows at an 8-byte (not 16-byte) address become 640-wide rows
++    with zero tails; rows past the call stay untouched."""
++    kernel = vision.resolve(vision.pad_call(588))
++    source = _randn(rows + 1, 588, seed=rows)[1:]
++    assert source.data_ptr() % 16 == 8
++    out = torch.full((rows + 3, 640), NAN, dtype=torch.bfloat16, device=DEVICE)
++    kernel(source, out[:rows])
++    _assert_bits(out[:rows, :588], source, "padded rows")
++    assert bool((out[:rows, 588:] == 0).all()) and not bool(
++        torch.signbit(out[:rows, 588:]).any()
++    )
++    assert bool(out[rows:].isnan().all()), "rows past the call were written"
++
++
++@pytest.mark.parametrize("channels", [128, 1024])
++@pytest.mark.parametrize("height, width", [(1, 1), (1, 5), (4, 7), (7, 11), (9, 9)])
++def test_spatial_merge_matches_unfold(channels, height, width):
++    kernel = vision.resolve(vision.merge_call(channels, 3))
++    x = _randn(height * width, channels, seed=channels + height * width)
++    rows = -(-height // 3) * -(-width // 3)
++    out = torch.full((rows + 2, channels * 9), NAN, dtype=torch.bfloat16, device=DEVICE)
++    kernel(x, out[:rows], height, width)
++    _assert_bits(out[:rows], _merge64(x, height, width, 3).bfloat16(), "merge")
++    assert bool(out[rows:].isnan().all())
++
++
++def test_spatial_merge_matches_b12x(real, b12x_real):
++    from b12x.norm.vision import run_spatial_merge
++
++    _, aligner = real
++    for height, width in REAL_GRIDS:
++        x = _randn(height * width, REAL.vision_dim, seed=height * 31 + width)
++        rows = -(-height // 3) * -(-width // 3)
++        ours = torch.empty(
++            rows, REAL.vision_dim * 9, dtype=torch.bfloat16, device=DEVICE
++        )
++        theirs = torch.empty_like(ours)
++        _kernel(aligner, "merge")(x, ours, height, width)
++        run_spatial_merge(
++            x,
++            height,
++            width,
++            ratio=3,
++            out=theirs,
++            plan=b12x_real.aligner._merge_plan,
++        )
++        _assert_bits(ours, theirs, f"merge {height}x{width} against B12X")
++
++
++# --- The residual add and RMSNorm -----------------------------------------------
++
++
++def _add_norm(width, x, branch, weight):
++    out = torch.empty_like(x)
++    if branch is None:
++        vision.resolve(vision.norm_call(width, add=False))(x, weight, out)
++        return None, out
++    summed = torch.empty_like(x)
++    vision.resolve(vision.norm_call(width, add=True))(x, branch, weight, summed, out)
++    return summed, out
++
++
++@pytest.mark.parametrize("config", [SMALL, REAL], ids=["narrow", "v41"])
++@pytest.mark.parametrize("rows", [1, 3, 257])
++@pytest.mark.parametrize("add", [False, True])
++def test_add_norm_is_b12x_arithmetic(config, rows, add):
++    width = config.vision_dim
++    x = _randn(rows, width, seed=rows, scale=3.0)
++    branch = _randn(rows, width, seed=rows + 1, scale=2.0) if add else None
++    weight = _norm_weight(width, seed=rows)
++    weight[3] = -0.0  # B12X's (0 + weight) turns it positive
++    summed, out = _add_norm(width, x, branch, weight)
++    total = x
++    if add:
++        total = (x.float() + branch.float()).bfloat16()
++        _assert_bits(summed, total, "residual sum")
++    _assert_bits(out, _b12x_rmsnorm(total, weight), "normalized rows")
++    # DeepSeek's FP64 norm of the same rounded sum: within one BF16 step.
++    ref = _norm64(total, weight)
++    assert _max_ulps(out, ref, 0.0) <= 1.0
++
++
++def test_add_norm_matches_b12x(real, b12x_real):
++    from b12x.norm import hyperconnection
++
++    vit, _ = real
++    b12x_vit = b12x_real.vit
++    plans = b12x_vit._workspace
++    width = REAL.vision_dim
++    for rows in (1, 77, vit.capacity):
++        x = _randn(rows, width, seed=rows, scale=3.0)
++        branch = _randn(rows, width, seed=rows + 1, scale=2.0)
++        weight = b12x_vit.norm.weight
++        summed, out = _add_norm(width, x, branch, weight)
++        theirs_sum = torch.empty_like(x)
++        hyperconnection.run_add(x, branch, out=theirs_sum, plan=plans.add_plan)
++        _assert_bits(summed, theirs_sum, f"residual add, {rows} rows, against B12X")
++        theirs = torch.empty_like(x)
++        b12x_vit.norm(theirs_sum, out=theirs, plan=plans.norm_plan)
++        message = _differing(out, theirs)
++        if message is not None:
++            unfused = _differing(_b12x_rmsnorm(theirs_sum, weight, fused=False), theirs)
++            raise AssertionError(
++                f"RMSNorm of {rows} rows against B12X: {message}; B12X "
++                + (
++                    "adds rounded squares (no FMA)"
++                    if unfused is None
++                    else "matches neither summation"
++                )
++            )
++
++
++def test_add_norm_nonfinite_like_the_reference():
++    width, rows = REAL.vision_dim, 6
++    x = _randn(rows, width, seed=5)
++    branch = _randn(rows, width, seed=6)
++    weight = _norm_weight(width, seed=7)
++    clean_sum, clean = _add_norm(width, x, branch, weight)
++    x[1, 7], x[4, 900] = NAN, INF
++    summed, out = _add_norm(width, x, branch, weight)
++    total = (x.float() + branch.float()).bfloat16()
++    assert_same_nonfinite(summed, total, "sum: ")
++    ref = _norm64(total, weight)
++    assert_same_nonfinite(out, ref, "norm: ")
++    assert_other_rows_equal(out, clean, [1, 4], "norm: ")
++    assert_other_rows_equal(summed, clean_sum, [1, 4], "sum: ")
++
++
++# --- RoPE -------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("config", [SMALL, REAL], ids=["narrow", "v41"])
++@pytest.mark.parametrize("height, width", [(1, 1), (3, 5), (5, 3), (7, 11), (24, 24)])
++def test_rope_is_b12x_arithmetic(config, height, width):
++    heads, hidden = config.vision_n_heads, config.vision_dim
++    rows = height * width
++    kernel = vision.resolve(vision.rope_call(heads, hidden // heads))
++    inv = _inv_freq(config)
++    buffer = torch.full(
++        (rows + 5, 3 * hidden), NAN, dtype=torch.bfloat16, device=DEVICE
++    )
++    qkv = _randn(rows, 3 * hidden, seed=rows + hidden, scale=4.0)
++    buffer[:rows] = qkv
++    kernel(buffer[:rows], inv, width)
++    _assert_bits(buffer[:rows], _b12x_rope(qkv, height, width, inv, heads), "rope")
++    _assert_bits(buffer[:rows, 2 * hidden :], qkv[:, 2 * hidden :], "v moved")
++    assert bool(buffer[rows:].isnan().all()), "rows past the call were written"
++    # DeepSeek's FP64 rotation (true cos and sin of the exact angle): within one
++    # BF16 step, plus 2^-12 for FP32's angle (position * inv_freq, rounded) and
++    # cos/sin where the two products cancel.
++    dim = hidden // heads
++    angles = (
++        torch.stack(
++            (
++                torch.arange(rows, device=DEVICE) // width,
++                torch.arange(rows, device=DEVICE) % width,
++            ),
++            -1,
++        ).double()[:, :, None]
++        * inv.double()[None, None, :]
++    )
++    angles = angles.flatten(1)[:, None]
++    for part in range(2):
++        x = qkv[:, part * hidden : (part + 1) * hidden].double().view(rows, heads, dim)
++        first, second = x.chunk(2, -1)
++        ref = torch.cat(
++            (
++                first * angles.cos() - second * angles.sin(),
++                second * angles.cos() + first * angles.sin(),
++            ),
++            -1,
++        ).view(rows, hidden)
++        got = buffer[:rows, part * hidden : (part + 1) * hidden]
++        assert _max_ulps(got, ref, 2.0**-12) <= 1.0
++
++
++def test_rope_matches_b12x(real, b12x_real):
++    from b12x.norm.vision import run_rope_qkv
++
++    vit, _ = real
++    ws = b12x_real.vit._workspace
++    heads, hidden = REAL.vision_n_heads, REAL.vision_dim
++    inv = _inv_freq(REAL)
++    _assert_bits(inv, ws.inv_freq, "inverse frequencies")
++    kernel = _kernel(vit, "rope")
++    for height, width in REAL_GRIDS:
++        rows = height * width
++        qkv = _randn(rows, 3 * hidden, seed=rows, scale=4.0)
++        ours = qkv.clone()
++        kernel(ours, inv, width)
++        run_rope_qkv(
++            qkv,
++            height,
++            width,
++            ws.inv_freq,
++            q=ws.q,
++            k=ws.k,
++            v=ws.v,
++            cu_seqlens=ws.cu,
++            plan=ws.rope_plan,
++        )
++        theirs = torch.cat(
++            [t[:rows].reshape(rows, hidden) for t in (ws.q, ws.k, ws.v)], -1
++        )
++        message = _differing(ours, theirs)
++        if message is not None:
++            forms = [
++                form
++                for form in ("right", "unfused")
++                if _differing(_b12x_rope(qkv, height, width, inv, heads, form), theirs)
++                is None
++            ]
++            raise AssertionError(
++                f"RoPE {height}x{width} against B12X: {message}; B12X matches "
++                f"{forms or 'no modelled form'}"
++            )
++
++
++def test_rope_nonfinite_like_the_reference():
++    heads, hidden, height, width = 16, 1024, 3, 4
++    rows = height * width
++    kernel = vision.resolve(vision.rope_call(heads, hidden // heads))
++    inv = _inv_freq(REAL)
++    qkv = _randn(rows, 3 * hidden, seed=3)
++    clean = qkv.clone()
++    kernel(clean, inv, width)
++    qkv[2, 5] = NAN  # q head 0, first half
++    qkv[7, hidden + 64 + 40] = INF  # k head 1, second half
++    poisoned = qkv.clone()
++    kernel(poisoned, inv, width)
++    model = _b12x_rope(qkv, height, width, inv, heads)
++    assert_same_nonfinite(poisoned, model)
++    assert_finite_equal(poisoned, model)
++    assert_other_rows_equal(poisoned, clean, [2, 7])
++
++
++# --- Projections ------------------------------------------------------------------
++
++
++def _projection_error(out, a, weight, bias):
++    """Max ``|out - ref|`` in BF16 steps at the FP64 reference plus FP32 accumulation
++    noise (``sqrt(K) 2^-24 sum |a w|``), and how many outputs differ from the
++    correctly rounded reference, of how many."""
++    a64, w64 = a.double(), weight.double()
++    ref, scale = a64 @ w64.T, a64.abs() @ w64.abs().T
++    if bias is not None:
++        ref, scale = ref + bias.double(), scale + bias.double().abs()
++    noise = scale * math.sqrt(a.shape[1]) * 2.0**-24
++    error = ((out.double() - ref).abs() / (_bf16_ulp(ref) + noise)).max().item()
++    return error, int((out != ref.bfloat16()).sum()), out.numel()
++
++
++def _check_projection(name, ours, theirs):
++    """Ours within one BF16 step of the reference (plus accumulation noise), or at
++    most B12X's worst; and off the correctly rounded value no more often than
++    B12X (1.5x, plus four values for sampling noise)."""
++    error, off, total = ours
++    message = f"{name}: ours {error:.3f} steps, {off} of {total} off; "
++    if theirs is None:
++        assert error <= 1.0 and off <= 0.01 * total + 4, message + "B12X unavailable"
++        return
++    b12x_error, b12x_off, _ = theirs
++    message += f"B12X {b12x_error:.3f} steps, {b12x_off} off"
++    assert error <= max(1.0, b12x_error), message
++    assert off <= 1.5 * b12x_off + 4, message
++
++
++def _projection_cases(vit, aligner):
++    """Each projection: its TileLang kernel (the declared one, or for the two with
++    an epilogue the plain GEMM their epilogues start from), its layer, and its
++    module path (the same in B12X's tower)."""
++    block, out_dim = vit.blocks[0], aligner.out_dim
++    gate_up = block.mlp.w1.weight.shape
++    return {
++        "qkv": (_kernel(vit, "qkv"), block.attn.wqkv, "blocks.0.attn.wqkv"),
++        "wo": (_kernel(vit, "wo"), block.attn.wo, "blocks.0.attn.wo"),
++        "mlp gate/up": (
++            vision.resolve(vision.linear_call(*gate_up, bias=False)),
++            block.mlp.w1,
++            "blocks.0.mlp.w1",
++        ),
++        "mlp down": (_kernel(vit, "mlp_out"), block.mlp.w2, "blocks.0.mlp.w2"),
++        "aligner w1": (
++            vision.resolve(
++                vision.linear_call(out_dim, aligner.w1.weight.shape[1], bias=True)
++            ),
++            aligner.w1,
++            "w1",
++        ),
++        "aligner w2": (_kernel(aligner, "w2"), aligner.w2, "w2"),
++    }
++
++
++def _optional(request, name: str):
++    """A B12X fixture, or None where b12x is not importable."""
++    try:
++        return request.getfixturevalue(name)
++    except pytest.skip.Exception:
++        return None
++
++
++# B12X plans its aligner projections for the merged capacity (192 rows here).
++@pytest.mark.parametrize("rows", [1, 77, 192])
++def test_projections_against_fp64(real, rows, request):
++    vit, aligner = real
++    b12x = _optional(request, "b12x_real")
++    for name, (kernel, layer, path) in _projection_cases(vit, aligner).items():
++        a = _randn(rows, layer.weight.shape[1], seed=rows + layer.weight.shape[0])
++        out = torch.empty(
++            rows, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE
++        )
++        if layer.bias is None:
++            kernel(a, layer.weight, out)
++        else:
++            kernel(a, layer.weight, layer.bias, out)
++        ours = _projection_error(out, a, layer.weight, layer.bias)
++        theirs = None
++        if b12x is not None:
++            root = b12x.aligner if name.startswith("aligner") else b12x.vit
++            b12x_out = torch.empty_like(out)
++            root.get_submodule(path)(a, out=b12x_out)
++            theirs = _projection_error(b12x_out, a, layer.weight, layer.bias)
++        _check_projection(f"{name} at {rows} rows", ours, theirs)
++
++
++@pytest.mark.parametrize("rows", [1, 77, 300])
++def test_patch_embedding_against_fp64(real, rows, request):
++    """The padded patch GEMM: 588 columns as 640 (zero tail, zero-padded weight)."""
++    vit, _ = real
++    b12x = _optional(request, "b12x_real")
++    proj = vit.patch_embed.proj
++    patches = _patches(REAL, rows + 1, seed=rows)[1:]
++    padded = torch.empty(rows, 640, dtype=torch.bfloat16, device=DEVICE)
++    weight = torch.empty(proj.weight.shape[0], 640, dtype=torch.bfloat16, device=DEVICE)
++    _kernel(vit, "pad")(patches.reshape(rows, -1), padded)
++    _kernel(vit, "pad")(proj.weight, weight)
++    out = torch.empty(rows, proj.weight.shape[0], dtype=torch.bfloat16, device=DEVICE)
++    _kernel(vit, "patch")(padded, weight, proj.bias, out)
++    flat = patches.reshape(rows, -1)
++    ours = _projection_error(out, flat, proj.weight, proj.bias)
++    theirs = None
++    if b12x is not None:
++        b12x_out = torch.empty_like(out)
++        b12x.vit.patch_embed(patches, out=b12x_out)
++        theirs = _projection_error(b12x_out, flat, proj.weight, proj.bias)
++    _check_projection(f"patch embedding at {rows} rows", ours, theirs)
++
++
++def test_bias_is_added_before_the_one_rounding(small):
++    """``acc = 257`` (exact in FP32) plus a bias of 0.5 rounds to 258 in BF16; rounding
++    the accumulator first (257 ties to 256) and then adding would give 256."""
++    vit, _ = small
++    kernel = _kernel(vit, "patch")  # [128, 64] with bias
++    a = torch.zeros(5, 64, dtype=torch.bfloat16, device=DEVICE)
++    a[:, :3] = 1
++    weight = torch.zeros(128, 64, dtype=torch.bfloat16, device=DEVICE)
++    weight[:, 0], weight[:, 1], weight[:, 2] = 128, 128, 1
++    bias = torch.full((128,), 0.5, dtype=torch.bfloat16, device=DEVICE)
++    out = torch.empty(5, 128, dtype=torch.bfloat16, device=DEVICE)
++    kernel(a, weight, bias, out)
++    assert bool((out == 258).all()), out.unique().tolist()
++
++
++def test_projection_nonfinite_rows(small):
++    vit, _ = small
++    layer = vit.blocks[0].attn.wqkv
++    kernel = _kernel(vit, "qkv")
++    a = _randn(9, layer.weight.shape[1], seed=9)
++    out = torch.empty(9, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE)
++    kernel(a, layer.weight, layer.bias, out)
++    clean = out.clone()
++    a[4, 3] = NAN
++    kernel(a, layer.weight, layer.bias, out)
++    assert bool(out[4].isnan().all())
++    assert_other_rows_equal(out, clean, [4])
++
++
++# --- Epilogues: GELU and SwiGLU ---------------------------------------------------
++
++
++def _aligner_w1(aligner, merged: torch.Tensor, gelu: bool) -> torch.Tensor:
++    """The aligner's first projection of ``merged``: with the GELU epilogue (the
++    declared kernel) or without (biased, rounded)."""
++    out = torch.empty(
++        merged.shape[0], aligner.out_dim, dtype=torch.bfloat16, device=DEVICE
++    )
++    if gelu:
++        kernel = _kernel(aligner, "w1")
++    else:
++        call = vision.linear_call(aligner.out_dim, merged.shape[1], bias=True)
++        kernel = vision.resolve(call)
++    kernel(merged, aligner.w1.weight, aligner.w1.bias, out)
++    return out
++
++
++@pytest.mark.parametrize("rows", [1, 33, 144])
++def test_gelu_epilogue_is_b12x_arithmetic(small, rows):
++    """The GELU epilogue is exact GELU of the rounded biased projection: B12X's
++    arithmetic, which is also torch's ``F.gelu`` on BF16."""
++    _, aligner = small
++    merged = _randn(rows, aligner.w1.weight.shape[1], seed=rows)
++    activated = _aligner_w1(aligner, merged, gelu=True)
++    hidden = _aligner_w1(aligner, merged, gelu=False)
++    _assert_bits(activated, _b12x_gelu(hidden), "GELU epilogue")
++    _assert_bits(activated, F.gelu(hidden, approximate="none"), "torch F.gelu")
++    merged[rows // 2, 0] = NAN
++    poisoned = _aligner_w1(aligner, merged, gelu=True)
++    assert bool(poisoned[rows // 2].isnan().all())
++    assert_other_rows_equal(poisoned, activated, [rows // 2])
++
++
++def test_gelu_epilogue_matches_b12x(real, b12x_real):
++    from b12x.norm.vision import run_gelu
++
++    _, aligner = real
++    for rows in (1, 64, 192):
++        merged = _randn(rows, aligner.w1.weight.shape[1], seed=rows)
++        activated = _aligner_w1(aligner, merged, gelu=True)
++        hidden = _aligner_w1(aligner, merged, gelu=False)
++        theirs = torch.empty_like(hidden)
++        run_gelu(hidden, out=theirs, plan=b12x_real.aligner._gelu_plan)
++        _assert_bits(activated, theirs, f"GELU of {rows} rows against B12X")
++
++
++def _mlp_in(vit, rows: int, seed: int):
++    """The MLP's fused gate/up projection with SwiGLU, and the unfused projection's
++    BF16 gate/up of the same rows."""
++    mlp = vit.blocks[0].mlp
++    inter2, k = mlp.w1.weight.shape
++    x = _randn(rows, k, seed=seed)
++    activated = torch.empty(rows, inter2 // 2, dtype=torch.bfloat16, device=DEVICE)
++    _kernel(vit, "mlp_in")(x, mlp.w1.weight, activated)
++    gate_up = torch.empty(rows, inter2, dtype=torch.bfloat16, device=DEVICE)
++    vision.resolve(vision.linear_call(inter2, k, bias=False))(x, mlp.w1.weight, gate_up)
++    return x, activated, gate_up
++
++
++@pytest.mark.parametrize("rows", [1, 33, 144])
++def test_swiglu_epilogue_against_the_reference(small, rows):
++    """SwiGLU of the rounded gate/up, as the reference rounds them. ``__expf`` (B12X's
++    fast exponential) and its reciprocal may move SiLU's last FP32 bits, so a SiLU
++    may round to the neighbouring BF16 value; times ``up`` and rounded again, that
++    is at most two BF16 steps, and rare."""
++    vit, _ = small
++    _, activated, gate_up = _mlp_in(vit, rows, rows)
++    ref = _reference_swiglu(gate_up)
++    steps = (activated.double() - ref.double()).abs() / _bf16_ulp(ref.double())
++    assert steps.max().item() <= 2.0
++    assert (activated != ref).float().mean().item() <= 2e-3
++
++
++def test_swiglu_epilogue_matches_b12x(real, b12x_real):
++    """The fused epilogue equals B12X's vision SwiGLU of the same BF16 gate/up (our
++    unfused projection's; both projections accumulate in the same order)."""
++    from b12x.norm import hyperconnection
++
++    vit, _ = real
++    ws = b12x_real.vit._workspace
++    for rows in (1, 77, 300):
++        _, activated, gate_up = _mlp_in(vit, rows, rows)
++        theirs = torch.empty_like(activated)
++        hyperconnection.run_swiglu(
++            gate_up,
++            limit=float("inf"),
++            round_silu=True,
++            out=theirs,
++            plan=ws.swiglu_plan,
++        )
++        _assert_bits(activated, theirs, f"SwiGLU of {rows} rows against B12X")
++
++
++def test_swiglu_epilogue_nonfinite_rows(small):
++    vit, _ = small
++    mlp = vit.blocks[0].mlp
++    x, clean, _ = _mlp_in(vit, 9, 9)
++    x[2, 1] = NAN
++    out = torch.empty_like(clean)
++    _kernel(vit, "mlp_in")(x, mlp.w1.weight, out)
++    assert bool(out[2].isnan().all())
++    assert_other_rows_equal(out, clean, [2])
++
++
++# --- Attention --------------------------------------------------------------------
++
++
++def _attention(vit, qkv: torch.Tensor) -> torch.Tensor:
++    hidden = vit.config.vision_dim
++    out = torch.empty(qkv.shape[0], hidden, dtype=torch.bfloat16, device=DEVICE)
++    _kernel(vit, "attention")(qkv, out)
++    return out
++
++
++def _split64(qkv: torch.Tensor, heads: int):
++    rows, hidden = qkv.shape[0], qkv.shape[1] // 3
++    return [
++        t.double().reshape(rows, heads, hidden // heads) for t in qkv.split(hidden, -1)
++    ]
++
++
++def _b12x_attention(b12x, qkv: torch.Tensor) -> torch.Tensor:
++    from b12x.attention import varlen
++
++    ws = b12x.vit._workspace
++    rows, hidden = qkv.shape[0], qkv.shape[1] // 3
++    for buffer, part in zip((ws.q, ws.k, ws.v), qkv.split(hidden, -1)):
++        buffer[:rows].copy_(part.reshape(rows, *buffer.shape[1:]))
++    ws.cu.copy_(torch.tensor([0, rows], dtype=torch.int32))
++    attended, _ = varlen.run(binding=ws.attention_binding)
++    return attended[:rows].reshape(rows, hidden).clone()
++
++
++@pytest.mark.parametrize("rows", [1, 77, 300, 576])
++def test_attention_against_fp64(real, rows, request):
++    """Relative RMS error at most 1.25x B12X's, and the worst element at most one
++    BF16 step past B12X's worst (FP64 softmax attention, in BF16 steps of the
++    reference plus 2^-12 of its RMS)."""
++    vit, _ = real
++    b12x = _optional(request, "b12x_real")
++    heads = REAL.vision_n_heads
++    qkv = _randn(rows, 3 * REAL.vision_dim, seed=rows, scale=2.0)
++    ref = _attention64(*_split64(qkv, heads)).reshape(rows, -1)
++    floor = 2.0**-12 * ref.square().mean().sqrt()
++    out = _attention(vit, qkv)
++    ours = (_relative(out, ref), _max_ulps(out, ref, floor))
++    message = f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps"
++    if b12x is None:
++        assert ours[0] <= 2.0**-8 and ours[1] <= 4.0, message + "; B12X unavailable"
++        return
++    theirs_out = _b12x_attention(b12x, qkv)
++    theirs = (_relative(theirs_out, ref), _max_ulps(theirs_out, ref, floor))
++    message += f"; B12X {theirs[0]:.3e} relative, {theirs[1]:.2f} steps"
++    assert ours[0] <= 1.25 * theirs[0], message
++    assert ours[1] <= theirs[1] + 1.0, message
++
++
++def test_attention_ignores_stale_capacity_rows(real):
++    """Rows past the live ones hold NaN: no output changes."""
++    vit, _ = real
++    rows, hidden = 77, REAL.vision_dim
++    qkv = _randn(rows, 3 * hidden, seed=1)
++    clean = _attention(vit, qkv)
++    buffer = torch.full(
++        (vit.capacity, 3 * hidden), NAN, dtype=torch.bfloat16, device=DEVICE
++    )
++    buffer[:rows] = qkv
++    _assert_bits(_attention(vit, buffer[:rows]), clean, "stale rows")
++
++
++def test_attention_nonfinite_like_the_reference(real):
++    """A NaN query poisons its row; a NaN key every row; a NaN value its column."""
++    vit, _ = real
++    rows, hidden, heads = 40, REAL.vision_dim, REAL.vision_n_heads
++    qkv = _randn(rows, 3 * hidden, seed=2)
++    clean = _attention(vit, qkv)
++    for target, column in ((5, 3), (11, hidden + 70), (17, 2 * hidden + 130)):
++        poisoned = qkv.clone()
++        poisoned[target, column] = NAN
++        out = _attention(vit, poisoned)
++        ref = _attention64(*_split64(poisoned, heads)).reshape(rows, -1)
++        assert_same_nonfinite(out, ref, f"NaN at ({target}, {column}): ")
++        if column < hidden:
++            assert_other_rows_equal(out, clean, [target])
++
++
++# --- The tower and aligner ----------------------------------------------------------
++
++
++def _tower_case(vit, aligner, b12x, height, width, seed):
++    rows = height * width
++    patches = _patches(vit.config, rows, seed)
++    encoded = vit(patches, height, width)
++    aligned = aligner(encoded, height, width)
++    vit_ref = _vit_reference(vit, patches, height, width)
++    aligner_ref = _aligner_reference(aligner, encoded, height, width)
++    ours = (_relative(encoded, vit_ref), _relative(aligned, aligner_ref))
++    message = (
++        f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64"
++    )
++    if b12x is None:
++        assert ours[0] <= 2.0**-7 and ours[1] <= 2.0**-7, message + " (no B12X)"
++        return
++    b12x_encoded = b12x.vit(patches, height, width)
++    # The aligner on our ViT's output: each stage's error on the same input.
++    b12x_aligned = b12x.aligner(encoded, height, width)
++    theirs = (
++        _relative(b12x_encoded, vit_ref),
++        _relative(b12x_aligned, aligner_ref),
++    )
++    message += f"; B12X {theirs[0]:.3e}, {theirs[1]:.3e}"
++    # Both round the same activations to BF16; their errors come from FP32
++    # accumulation orders and attention, so ours may differ by sampling noise.
++    assert ours[0] <= 1.5 * theirs[0] + 2.0**-14, message
++    assert ours[1] <= 1.5 * theirs[1] + 2.0**-14, message
++
++
++@pytest.mark.parametrize("height, width", SMALL_GRIDS)
++def test_small_tower_against_reference(small, height, width, request):
++    b12x = _optional(request, "b12x_small")
++    _tower_case(*small, b12x, height, width, seed=height * 1000 + width)
++
++
++@pytest.mark.parametrize("height, width", REAL_GRIDS)
++def test_v41_tower_against_reference(real, height, width, request):
++    b12x = _optional(request, "b12x_real")
++    _tower_case(*real, b12x, height, width, seed=height * 1000 + width)
++
++
++def test_images_do_not_contaminate_each_other(small):
++    """Every capacity buffer is reused: an image's output does not depend on the
++    image before it (bits), and the tower's output equals a fresh run's."""
++    vit, aligner = small
++    patches = _patches(SMALL, 28, seed=3)
++    first = aligner(vit(patches, 4, 7), 4, 7)
++    big = _patches(SMALL, 144, seed=4) * 4
++    aligner(vit(big, 12, 12), 12, 12)
++    _assert_bits(aligner(vit(patches, 4, 7), 4, 7), first, "after a larger image")
++
++
++def test_graph_replay_allocates_nothing(small):
++    vit, aligner = small
++    height, width = 7, 11
++    rows = height * width
++    patches = _patches(SMALL, rows, seed=5)
++    encoded = torch.empty(rows, SMALL.vision_dim, dtype=torch.bfloat16, device=DEVICE)
++    merged = -(-height // 3) * -(-width // 3)
++    out = torch.empty(merged, SMALL.hidden_size, dtype=torch.bfloat16, device=DEVICE)
++    vit(patches, height, width, out=encoded)
++    aligner(encoded, height, width, out=out)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            vit(patches, height, width, out=encoded)
++            aligner(encoded, height, width, out=out)
++    torch.cuda.current_stream().wait_stream(side)
++    patches.copy_(_patches(SMALL, rows, seed=6))
++    encoded.fill_(NAN)
++    out.fill_(NAN)
++    pointers = (encoded.data_ptr(), out.data_ptr())
++    allocated = torch.cuda.memory_allocated()
++    graph.replay()
++    torch.cuda.synchronize()
++    assert torch.cuda.memory_allocated() == allocated
++    assert (encoded.data_ptr(), out.data_ptr()) == pointers
++    expected = aligner(vit(patches, height, width), height, width)
++    _assert_bits(out, expected, "graph replay")
++    graph.reset()
++
++
++def test_data_parallel_runner_on_one_rank(small, monkeypatch):
++    """The sharded runner keeps each image's rows and order (one rank: no gather)."""
++    import vllm.distributed as distributed
++
++    monkeypatch.setattr(distributed, "get_tensor_model_parallel_world_size", lambda: 1)
++    monkeypatch.setattr(distributed, "get_tensor_model_parallel_rank", lambda: 0)
++    vit, aligner = small
++    grids = [[4, 7], [1, 1], [7, 11], [2, 5]]
++    images = [_patches(SMALL, h * w, seed=10 + i) for i, (h, w) in enumerate(grids)]
++    result = tilelang_vision.run_dp_sharded_vision_tower(
++        vit, aligner, torch.cat(images), grids
++    )
++    assert len(result) == len(grids)
++    for image, (h, w), got in zip(images, grids, result):
++        _assert_bits(got, aligner(vit(image, h, w), h, w), f"image {h}x{w}")
++
++
++def test_rejects_unprepared_and_misaligned_inputs():
++    vit, aligner = _build(SMALL, seed=1)
++    patches = _patches(SMALL, 4, seed=1)
++    with pytest.raises(RuntimeError, match="not prepared"):
++        vit(patches, 2, 2)
++    with pytest.raises(ValueError, match="capacity"):
++        vit(_patches(SMALL, 145, seed=1), 1, 145)
++    x = torch.zeros(4, SMALL.vision_dim, dtype=torch.bfloat16, device=DEVICE)
++    with pytest.raises(RuntimeError, match="not prepared"):
++        aligner(x, 2, 2)
++
++
++# --- Declarations -----------------------------------------------------------------
++
++
++class _Recording:
++    def __init__(self, kernel, name: str, launched: set):
++        self.kernel, self.name, self.launched = kernel, name, launched
++
++    def __call__(self, *args):
++        self.launched.add(self.name)
++        return self.kernel(*args)
++
++
++def test_declarations_cover_every_launch(monkeypatch):
++    """The worker's entry point declares exactly the calls the modules bind (after
++    the kernel cache freezes, an undeclared one raises KernelNotPreparedError), and
++    one image launches every bound kernel and nothing else."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++
++    vit, aligner = _build(SMALL, seed=2)
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        prepare.declare_modules(vit, aligner)
++    assert vit._kernels is None and vit._workspace is None, "bound before preparing"
++    declared = {prepare._CallKey(*call) for call in prepare.declared_calls(registry)}
++    expected = {
++        prepare._CallKey(*call)
++        for module in (vit, aligner)
++        for call in module.kernel_calls().values()
++    }
++    assert declared == expected
++    resolved = set()
++    original = vision.resolve
++
++    def record(call):
++        resolved.add(prepare._CallKey(*call))
++        return original(call)
++
++    monkeypatch.setattr(vision, "resolve", record)
++    prepare.prepare_declared(registry)
++    prepare.bind_declared(registry)
++    assert resolved == declared
++    launched: set = set()
++    for module in (vit, aligner):
++        module._kernels = {
++            name: _Recording(kernel, f"{type(module).__name__}.{name}", launched)
++            for name, kernel in module._kernels.items()
++        }
++    aligner(vit(_patches(SMALL, 28, seed=2), 4, 7), 4, 7)
++    assert launched == {
++        f"{type(module).__name__}.{name}"
++        for module in (vit, aligner)
++        for name in module.kernel_calls()
++    }
+diff --git a/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+new file mode 100644
+index 000000000..5cf483ad1
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/nvidia/tilelang_vision.py
+@@ -0,0 +1,385 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Replicated V4.1 ViT and aligner on DeepSeek-V4.1's TileLang kernels.
++
++The TileLang family's (``VLLM_DS41_KERNEL_BACKEND=tilelang``) vision tower:
++``b12x_vision``'s classes, forward signatures and checkpoint parameter tree, with
++every launch a kernel of ``tilelang/vision.py``. One image is evaluated per call.
++Each module declares its kernels (``declare_kernels``, which the worker calls after
++loading); binding them provisions a workspace for the tower's capacity
++(``_capacity``), so a forward allocates nothing but an output the caller did not
++pass, and a capture with outputs passed allocates nothing at all.
++
++A block runs seven launches: the fused q/k/v projection with its bias, the 2-D
++rotation of q and k in place in it, attention over the image's rows (reading
++q, k and v where the projection wrote them), the output projection with its bias,
++the residual add with the second norm, the gate/up projection with the SwiGLU in
++its epilogue, the down projection, and the residual add with the next block's (or
++the final) norm. The aligner merges each window, projects with the bias and exact
++GELU in one launch, and projects again.
++"""
++
++import itertools
++
++import torch
++from torch import nn
++
++from vllm.models.deepseek_v4_1.tilelang import prepare
++from vllm.models.deepseek_v4_1.tilelang import vision as kernels
++
++
++def _capacity(config) -> int:
++    """Rows of the largest image the tower serves (``b12x_vision``'s)."""
++    capacity = getattr(config, "vision_max_tokens", None)
++    if capacity is None:
++        capacity = config.vision_max_n_token * config.vision_downsample_ratio**2
++    if capacity <= 0:
++        raise ValueError("vision token capacity must be positive")
++    return int(capacity)
++
++
++def _bf16_rows(tensor: torch.Tensor, shape: tuple[int, ...], name: str) -> None:
++    if tensor.shape != shape or tensor.dtype != torch.bfloat16:
++        raise ValueError(f"{name} must be BF16 {shape}, got {tuple(tensor.shape)}")
++    if not tensor.is_contiguous() or tensor.data_ptr() % 16:
++        raise ValueError(f"{name} must be contiguous and 16-byte aligned")
++
++
++class _Linear(nn.Module):
++    """A replicated checkpoint projection: BF16 ``weight [out, in]`` and ``bias``."""
++
++    def __init__(self, in_features: int, out_features: int, bias: bool = True):
++        super().__init__()
++        self.weight = nn.Parameter(
++            torch.empty(out_features, in_features, dtype=torch.bfloat16),
++            requires_grad=False,
++        )
++        self.bias = (
++            nn.Parameter(
++                torch.empty(out_features, dtype=torch.bfloat16), requires_grad=False
++            )
++            if bias
++            else None
++        )
++
++
++class _Norm(nn.Module):
++    def __init__(self, dim: int):
++        super().__init__()
++        self.weight = nn.Parameter(
++            torch.ones(dim, dtype=torch.bfloat16), requires_grad=False
++        )
++
++
++class _PatchEmbed(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.proj = _Linear(3 * config.vision_patch_size**2, config.vision_dim)
++
++
++class _Attention(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.wqkv = _Linear(config.vision_dim, 3 * config.vision_dim)
++        self.wo = _Linear(config.vision_dim, config.vision_dim)
++
++
++class _MLP(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.w1 = _Linear(config.vision_dim, 2 * config.vision_inter_dim, False)
++        self.w2 = _Linear(config.vision_inter_dim, config.vision_dim, False)
++
++
++class _Block(nn.Module):
++    def __init__(self, config):
++        super().__init__()
++        self.norm1, self.norm2 = _Norm(config.vision_dim), _Norm(config.vision_dim)
++        self.attn, self.mlp = _Attention(config), _MLP(config)
++
++
++class _VisionWorkspace:
++    """The ViT's capacity-sized buffers. The attention output reuses ``normalized``
++    (the q/k/v projection has read it by then), and ``qkv`` holds q, k and v."""
++
++    def __init__(self, config, capacity: int, device: torch.device):
++        hidden, inter = config.vision_dim, config.vision_inter_dim
++        patch = 3 * config.vision_patch_size**2
++        padded = kernels.padded_width(patch)
++        dim = hidden // config.vision_n_heads
++
++        def empty(*shape):
++            return torch.empty(shape, dtype=torch.bfloat16, device=device)
++
++        self.patches = empty(capacity, padded)
++        self.patch_weight = empty(hidden, padded)
++        self.state, self.residual, self.normalized, self.branch = (
++            empty(capacity, hidden) for _ in range(4)
++        )
++        self.qkv = empty(capacity, 3 * hidden)
++        self.activated = empty(capacity, inter)
++        # B12X's static head geometry, computed the same way (on the CPU, in FP32).
++        inv = 1.0 / (
++            config.vision_rope_theta
++            ** (
++                torch.arange(0, dim // 2, 2, dtype=torch.float32, device="cpu")
++                / (dim // 2)
++            )
++        )
++        self.inv_freq = inv.to(device=device)
++
++
++def _device(module: nn.Module) -> torch.device:
++    device = next(module.parameters()).device
++    if device.type != "cuda":
++        raise ValueError("the TileLang vision tower requires CUDA weights")
++    return device
++
++
++class DeepseekV4ViT(nn.Module):
++    """Reference 2D split-half RoPE and full bidirectional attention per image."""
++
++    def __init__(self, config):
++        super().__init__()
++        if (
++            config.vision_dim % config.vision_n_heads
++            or (config.vision_dim // config.vision_n_heads) % 16
++        ):
++            raise ValueError("vision head dimension must be a multiple of 16")
++        self.config, self.capacity = config, _capacity(config)
++        self.rope_dim = config.vision_dim // config.vision_n_heads // 2
++        self.rope_theta = config.vision_rope_theta
++        self.patch_embed = _PatchEmbed(config)
++        self.blocks = nn.ModuleList(
++            [_Block(config) for _ in range(config.vision_n_layers)]
++        )
++        self.norm = _Norm(config.vision_dim)
++        self._kernels: dict | None = None
++        self._workspace: _VisionWorkspace | None = None
++
++    def kernel_calls(self) -> dict[str, prepare.TileLangCall]:
++        """Every kernel the forward launches, by role."""
++        config = self.config
++        hidden, heads = config.vision_dim, config.vision_n_heads
++        inter, dim = config.vision_inter_dim, hidden // heads
++        patch = 3 * config.vision_patch_size**2
++        return {
++            "pad": kernels.pad_call(patch),
++            "patch": kernels.linear_call(
++                hidden, kernels.padded_width(patch), bias=True
++            ),
++            "norm": kernels.norm_call(hidden, add=False),
++            "qkv": kernels.linear_call(3 * hidden, hidden, bias=True),
++            "rope": kernels.rope_call(heads, dim),
++            "attention": kernels.attention_call(heads, dim),
++            "wo": kernels.linear_call(hidden, hidden, bias=True),
++            "add_norm": kernels.norm_call(hidden, add=True),
++            "mlp_in": kernels.swiglu_call(inter, hidden),
++            "mlp_out": kernels.linear_call(hidden, inter, bias=False),
++        }
++
++    def declare_kernels(self) -> None:
++        calls = self.kernel_calls()
++        prepare.declare(lambda: list(calls.values()), bind=lambda: self._bind(calls))
++
++    def _bind(self, calls: dict) -> None:
++        """Store the prepared kernels and provision the workspace (never during a
++        CUDA graph capture)."""
++        device = _device(self)
++        self._kernels = {name: kernels.resolve(call) for name, call in calls.items()}
++        if self._workspace is None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("vision workspace cannot allocate during capture")
++            self._workspace = _VisionWorkspace(self.config, self.capacity, device)
++        elif self._workspace.state.device != device:
++            raise ValueError("vision moved devices after preparation")
++
++    def forward(self, patches, n_vit_h: int, n_vit_w: int, *, out=None):
++        rows = n_vit_h * n_vit_w
++        if (
++            n_vit_h <= 0
++            or n_vit_w <= 0
++            or rows != patches.shape[0]
++            or rows > self.capacity
++        ):
++            raise ValueError(
++                "vision image grid exceeds capacity or does not match patches"
++            )
++        # Patch rows are 588 values (1176 bytes): 8-byte pieces.
++        if (
++            patches.dtype != torch.bfloat16
++            or not patches.is_contiguous()
++            or patches.data_ptr() % 8
++        ):
++            raise ValueError("vision patches must be contiguous 8-byte aligned BF16")
++        if self._kernels is None or self._workspace is None:
++            raise RuntimeError("vision kernels were not prepared")
++        hidden = self.config.vision_dim
++        if out is None:
++            out = torch.empty(
++                (rows, hidden), dtype=torch.bfloat16, device=patches.device
++            )
++        _bf16_rows(out, (rows, hidden), "vision output")
++        launch, ws = self._kernels, self._workspace
++        state, residual = ws.state[:rows], ws.residual[:rows]
++        normalized, branch = ws.normalized[:rows], ws.branch[:rows]
++        qkv, activated = ws.qkv[:rows], ws.activated[:rows]
++        proj = self.patch_embed.proj
++
++        launch["pad"](patches.reshape(rows, -1), ws.patches[:rows])
++        launch["pad"](proj.weight, ws.patch_weight)
++        launch["patch"](ws.patches[:rows], ws.patch_weight, proj.bias, state)
++        # Each block ends with the next block's first norm; the last with the final.
++        norms = [block.norm1.weight for block in self.blocks] + [self.norm.weight]
++        launch["norm"](state, norms[0], normalized if len(self.blocks) else out)
++        for index, block in enumerate(self.blocks):
++            attn, mlp = block.attn, block.mlp
++            launch["qkv"](normalized, attn.wqkv.weight, attn.wqkv.bias, qkv)
++            launch["rope"](qkv, ws.inv_freq, n_vit_w)
++            launch["attention"](qkv, normalized)
++            launch["wo"](normalized, attn.wo.weight, attn.wo.bias, branch)
++            launch["add_norm"](state, branch, block.norm2.weight, residual, normalized)
++            launch["mlp_in"](normalized, mlp.w1.weight, activated)
++            launch["mlp_out"](activated, mlp.w2.weight, branch)
++            last = index + 1 == len(self.blocks)
++            launch["add_norm"](
++                residual, branch, norms[index + 1], state, out if last else normalized
++            )
++        return out
++
++
++class _AlignerWorkspace:
++    def __init__(self, hidden: int, out_dim: int, ratio: int, rows: int, device):
++        self.merged = torch.empty(
++            (rows, hidden * ratio * ratio), dtype=torch.bfloat16, device=device
++        )
++        self.hidden = torch.empty((rows, out_dim), dtype=torch.bfloat16, device=device)
++
++
++class DeepseekV4Aligner(nn.Module):
++    """Channel-major padded spatial merge, biased projections, exact GELU."""
++
++    def __init__(self, config):
++        super().__init__()
++        self.downsample_ratio = config.vision_downsample_ratio
++        if self.downsample_ratio <= 0:
++            raise ValueError("vision downsample ratio must be positive")
++        self.out_dim = config.hidden_size
++        self.hidden_size, self.capacity = config.vision_dim, _capacity(config)
++        # Merged rows of the widest grid the capacity admits (one row of patches).
++        r = self.downsample_ratio
++        self.merged_capacity = (self.capacity + r - 1) // r
++        self.w1 = _Linear(config.vision_dim * r**2, self.out_dim)
++        self.w2 = _Linear(self.out_dim, self.out_dim)
++        self._kernels: dict | None = None
++        self._workspace: _AlignerWorkspace | None = None
++
++    def kernel_calls(self) -> dict[str, prepare.TileLangCall]:
++        r = self.downsample_ratio
++        return {
++            "merge": kernels.merge_call(self.hidden_size, r),
++            "w1": kernels.linear_call(
++                self.out_dim, self.hidden_size * r * r, bias=True, gelu=True
++            ),
++            "w2": kernels.linear_call(self.out_dim, self.out_dim, bias=True),
++        }
++
++    def declare_kernels(self) -> None:
++        calls = self.kernel_calls()
++        prepare.declare(lambda: list(calls.values()), bind=lambda: self._bind(calls))
++
++    def _bind(self, calls: dict) -> None:
++        device = _device(self)
++        self._kernels = {name: kernels.resolve(call) for name, call in calls.items()}
++        if self._workspace is None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("aligner workspace cannot allocate during capture")
++            self._workspace = _AlignerWorkspace(
++                self.hidden_size,
++                self.out_dim,
++                self.downsample_ratio,
++                self.merged_capacity,
++                device,
++            )
++        elif self._workspace.merged.device != device:
++            raise ValueError("aligner moved devices after preparation")
++
++    def forward(self, x, n_vit_h: int, n_vit_w: int, *, out=None):
++        if (
++            n_vit_h <= 0
++            or n_vit_w <= 0
++            or x.shape != (n_vit_h * n_vit_w, self.hidden_size)
++            or x.shape[0] > self.capacity
++        ):
++            raise ValueError(
++                "aligner image grid exceeds capacity or does not match input"
++            )
++        if self._kernels is None or self._workspace is None:
++            raise RuntimeError("aligner kernels were not prepared")
++        _bf16_rows(x, tuple(x.shape), "aligner input")
++        r = self.downsample_ratio
++        rows = ((n_vit_h + r - 1) // r) * ((n_vit_w + r - 1) // r)
++        if out is None:
++            out = torch.empty(
++                (rows, self.out_dim), dtype=torch.bfloat16, device=x.device
++            )
++        _bf16_rows(out, (rows, self.out_dim), "aligner output")
++        launch, ws = self._kernels, self._workspace
++        merged, hidden = ws.merged[:rows], ws.hidden[:rows]
++        launch["merge"](x, merged, n_vit_h, n_vit_w)
++        launch["w1"](merged, self.w1.weight, self.w1.bias, hidden)
++        launch["w2"](hidden, self.w2.weight, self.w2.bias, out)
++        return out
++
++
++def run_dp_sharded_vision_tower(vision_model, aligner, patches, vit_grid):
++    """Shard images across replicated TP ranks and perform a real all-gather."""
++    from vllm.distributed import (
++        get_tensor_model_parallel_rank,
++        get_tensor_model_parallel_world_size,
++        tensor_model_parallel_all_gather,
++    )
++    from vllm.model_executor.models.vision import get_load_balance_assignment
++
++    if not vit_grid:
++        if patches.shape[0] != 0:
++            raise ValueError("nonempty patches require image grids")
++        return []
++    sizes = [h * w for h, w in vit_grid]
++    if any(h <= 0 or w <= 0 for h, w in vit_grid) or sum(sizes) != patches.shape[0]:
++        raise ValueError("image grids do not partition patches")
++    world, rank = (
++        get_tensor_model_parallel_world_size(),
++        get_tensor_model_parallel_rank(),
++    )
++    offsets = [0, *itertools.accumulate(sizes)]
++    assignments, counts, _ = get_load_balance_assignment(sizes, world)
++    rank_offsets = [0, *itertools.accumulate(counts)]
++    r = aligner.downsample_ratio
++    output_rows = [((h + r - 1) // r) * ((w + r - 1) // r) for h, w in vit_grid]
++
++    def images(g):
++        return assignments[rank_offsets[g] : rank_offsets[g + 1]]
++
++    max_rows = max(sum(output_rows[i] for i in images(g)) for g in range(world))
++    # Rows past a rank's images are gathered but never read: no fill.
++    local = torch.empty(
++        (max_rows, aligner.out_dim), dtype=patches.dtype, device=patches.device
++    )
++    offset = 0
++    for i in images(rank):
++        h, w = vit_grid[i]
++        encoded = vision_model(patches[offsets[i] : offsets[i + 1]], h, w)
++        aligner(encoded, h, w, out=local[offset : offset + output_rows[i]])
++        offset += output_rows[i]
++    gathered = tensor_model_parallel_all_gather(local, dim=0) if world > 1 else local
++    result = [None] * len(vit_grid)
++    for g in range(world):
++        offset = g * max_rows
++        for i in images(g):
++            result[i] = gathered[offset : offset + output_rows[i]]
++            offset += output_rows[i]
++    return result
++
++
++__all__ = ["DeepseekV4Aligner", "DeepseekV4ViT", "run_dp_sharded_vision_tower"]
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index 0a9977fe2..d917bd2b7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -29,17 +29,31 @@ from vllm.models.deepseek_v41.nvidia.vl_model import (
+ )
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ 
+-from .b12x_vision import (
+-    DeepseekV4Aligner,
+-    DeepseekV4ViT,
+-    run_dp_sharded_vision_tower,
+-)
++from .. import kernels
+ from .model import (
+     DeepseekV41LLMForCausalLM,
+     _linear_scale_param_name,
+ )
+ 
+ 
++def _vision_tower():
++    """The kernel family's ViT, aligner and data-parallel image runner. Both
++    families keep the checkpoint's parameter tree, so loading is the same."""
++    if kernels.uses_tilelang():
++        from .tilelang_vision import (
++            DeepseekV4Aligner,
++            DeepseekV4ViT,
++            run_dp_sharded_vision_tower,
++        )
++    else:
++        from .b12x_vision import (
++            DeepseekV4Aligner,
++            DeepseekV4ViT,
++            run_dp_sharded_vision_tower,
++        )
++    return DeepseekV4ViT, DeepseekV4Aligner, run_dp_sharded_vision_tower
++
++
+ @MULTIMODAL_REGISTRY.register_processor(
+     DeepseekV4VLMultiModalProcessor,
+     info=DeepseekV4VLProcessingInfo,
+@@ -67,10 +81,11 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+ 
+         # The tower is always built; _mark_tower_model stubs it out
+         # (StageMissingLayer, weights skipped) when the image limit is 0.
++        vit, aligner, self._run_dp_sharded_vision_tower = _vision_tower()
+         with self._mark_tower_model(vllm_config, {"image"}):
+             self.use_data_parallel = True
+-            self.vision = DeepseekV4ViT(config)
+-            self.aligner = DeepseekV4Aligner(config)
++            self.vision = vit(config)
++            self.aligner = aligner(config)
+             self.image_start = nn.Parameter(
+                 torch.empty(config.hidden_size, dtype=torch.float32)
+             )
+@@ -113,7 +128,7 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+         if self.use_data_parallel and get_tensor_model_parallel_world_size() > 1:
+             # Data-parallel ViT: shard images across TP ranks and all-gather
+             # the per-image embeddings (weights are replicated on every rank).
+-            image_embeds_list = run_dp_sharded_vision_tower(
++            image_embeds_list = self._run_dp_sharded_vision_tower(
+                 self.vision, self.aligner, patches, vit_grid
+             )
+         else:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/vision.py b/vllm/models/deepseek_v4_1/tilelang/vision.py
+new file mode 100644
+index 000000000..1708a9623
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/vision.py
+@@ -0,0 +1,640 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""TileLang kernels of DeepSeek-V4.1's vision tower: the ViT and the aligner.
++
++One image is evaluated per call; every kernel takes the image's live rows as a
++dynamic dimension, so a capacity-sized workspace serves any grid and one compiled
++kernel serves every image size. The arithmetic of each elementwise and row-wise
++operation is B12X's (``b12x.norm.vision`` and ``b12x.norm.hyperconnection``), with
++each rounding written out (``T.fma``, ``T.fmul``, ``T.ieee_*``) so the compiler
++cannot contract or reorder it:
++
++- ``pad_columns``: rows of ``width`` BF16 values copied into ``padded``-wide rows
++  whose tail is zero (the patch embedding's 588 columns become 640, whole K tiles,
++  16-byte rows). Exact.
++- ``linear``: ``A @ W^T`` on BF16 tensor cores, FP32 accumulation over K in
++  sequential 16-wide MMA steps (so a row's bits do not depend on the tile); with
++  ``bias`` the BF16 bias is added in FP32 before the one rounding to BF16; with
++  ``gelu`` the rounded biased value then goes through exact GELU, B12X's
++  ``0.5 * x * (1 + erf(x * 0.70710677))`` in FP32 with the accurate ``erff``, and
++  rounds again (the aligner's first projection and its GELU in one launch).
++- ``swiglu_linear``: the MLP's gate and up projections of one column block in one
++  CTA (two accumulators sharing the activation tile), each rounded to BF16 as
++  B12X's GEMM stores them, then B12X's vision SwiGLU (limit infinite, so no clamp):
++  ``silu = g * (1 / (1 + __expf(-g)))`` (CuTe's ``exp(..., fastmath=True)``, an IEEE
++  reciprocal), rounded to BF16, times ``u``, rounded to BF16. The ``[rows, 2I]``
++  gate/up tensor is never stored.
++- ``rope_qkv``: B12X's 2-D split-half rotation of q and k, in place in the fused
++  projection's output (v stays where it is; attention reads all three there). Pair
++  ``j`` of a head (columns ``j`` and ``j + head_dim / 2``) rotates by
++  ``position * inv_freq[j % (head_dim / 4)]``, the position being the patch's row
++  for ``j < head_dim / 4`` and its column otherwise, with the accurate ``cosf`` and
++  ``sinf`` of that FP32 product (a row's 32 angles are computed once, in shared
++  memory). Each output is one FMA over the other term's rounded product, as nvcc
++  and libNVVM contract B12X's ``q0 * cos + sign * q1 * sin`` (the left product is
++  fused): ``first' = fma(first, cos, -(second * sin))``,
++  ``second' = fma(second, cos, first * sin)``, each rounded to BF16.
++- ``attention``: bidirectional softmax attention over the image's rows, one CTA a
++  query tile and head: FP32 scores, an online softmax in base 2 (scale folded),
++  BF16 probabilities into the value MMA, FP32 accumulation, one division at the
++  end. Key columns past the live rows are masked after the score MMA, and loads
++  past the live rows read zeros, so stale capacity rows (NaN included) never
++  contribute. Not B12X's bits (its accumulation order is its own): gated against
++  DeepSeek's FP64 softmax attention.
++- ``add_norm``: B12X's residual add (``bf16(float(x) + float(branch))``) and its
++  grouped RMSNorm (eps 1e-6, no zero-centering) of the rounded sum, in one launch.
++  The reduction is B12X's to the rounding: 256 threads a row; thread ``t`` adds
++  the squares of columns ``t, t + 256, ...`` in order with FMAs from zero; a
++  butterfly over the warp's lanes (xor 1, 2, 4, 8, 16); the eight warp sums
++  through shared memory into one warp's lanes 0-7 (zeros elsewhere) and the same
++  butterfly; ``rsqrt(sum / width + eps)`` (``rsqrtf``, the MUFU approximation, as
++  CuTe's ``rsqrt``); each output ``bf16((x * inverse) * (0 + weight))``.
++  TileKernels' RMSNorm (``tilelang/norm.py``) sums in another order (128 threads,
++  even/odd accumulators over 16-byte vectors), so it is not used here. Without
++  ``add`` the kernel normalizes its input (the first block's first norm).
++- ``spatial_merge``: the aligner's channel-major ``unfold`` of each
++  ``ratio x ratio`` window (output column ``c * ratio^2 + ki * ratio + kj``), rows
++  and columns past the image zero, staged through shared memory so both the reads
++  and the writes are 16-byte vectors. Exact.
++
++``*_call`` give each kernel as the ``prepare.call`` its owner declares and binds;
++the tower (``nvidia/tilelang_vision.py``) launches nothing else.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++import tilelang
++import tilelang.language as T
++
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++EPS = 1e-6  # B12X's (and DeepSeek's) vision RMSNorm epsilon
++_SQRT_HALF = 0.7071067811865476  # B12X's GELU constant, rounded to FP32 in-kernel
++_LOG2E = 1.4426950408889634
++_VEC = 8  # BF16 values in one 16-byte vector
++_PIECE = 4  # BF16 values in one 8-byte piece (a patch row is 8-byte aligned)
++_NORM_THREADS = 256  # B12X's grouped RMSNorm block
++_K_ALIGN = 64  # K tiles of the GEMMs
++
++# Elementwise and row-wise kernels index every access themselves.
++_ELEMENTWISE = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++
++# Tiles by kernel. A GEMM's tile changes its speed only (each output adds K in
++# sequential 16-wide MMA steps, whatever the tile); the attention's tiles change
++# the grouping of its online softmax, so its bits (within the reference tolerance).
++# ``benchmarks/kernels/benchmark_tilelang_vision.py --sweep`` times alternatives.
++LINEAR_TILE = dict(block_M=128, block_N=128, block_K=64, num_stages=2, threads=256)
++SWIGLU_TILE = dict(block_M=128, block_N=64, block_K=64, num_stages=2, threads=256)
++ATTENTION_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=128)
++
++
++def padded_width(width: int) -> int:
++    """``width`` rounded up to whole K tiles (the patch embedding's padded K)."""
++    return -(-width // _K_ALIGN) * _K_ALIGN
++
++
++def _zero_bf16():
++    return T.cast(T.float32(0), T.bfloat16)
++
++
++@tilelang.jit(pass_configs=_ELEMENTWISE)
++def pad_columns_kernel(width: int, padded: int, threads: int = 128):
++    """``dst[r] = [src[r] | 0 ...]`` for ``src`` rows of ``width`` BF16 (8-byte
++    aligned: ``width`` is a multiple of four) into ``padded``-wide rows."""
++    if width % _PIECE or padded % _VEC or padded < width:
++        raise ValueError(f"cannot pad {width} columns to {padded}")
++    pieces = padded // _PIECE
++    rows = T.dynamic("rows")
++
++    @T.prim_func
++    def vision_pad_columns(
++        src: T.Tensor((rows, width), T.bfloat16),
++        dst: T.Tensor((rows, padded), T.bfloat16),
++    ):
++        with T.Kernel(T.ceildiv(pieces, threads), rows, threads=threads) as (bx, row):
++            piece = bx * threads + T.get_thread_binding()
++            values = T.alloc_local((_PIECE,), T.bfloat16)
++            if piece < pieces:
++                if piece * _PIECE < width:
++                    for v in T.vectorized(_PIECE):
++                        values[v] = src[row, piece * _PIECE + v]
++                else:
++                    for v in T.vectorized(_PIECE):
++                        values[v] = _zero_bf16()
++                for v in T.vectorized(_PIECE):
++                    dst[row, piece * _PIECE + v] = values[v]
++
++    return vision_pad_columns
++
++
++def _gelu(value):
++    """B12X's exact GELU of a BF16 value, in FP32, rounded to BF16."""
++    x = T.cast(value, T.float32)
++    inner = T.erf(T.fmul(x, T.float32(_SQRT_HALF)))
++    return T.cast(
++        T.fmul(T.fmul(T.float32(0.5), x), T.ieee_add(T.float32(1), inner)),
++        T.bfloat16,
++    )
++
++
++@tilelang.jit
++def linear_kernel(
++    N: int,
++    K: int,
++    bias: bool,
++    gelu: bool = False,
++    block_M: int = 128,
++    block_N: int = 128,
++    block_K: int = 64,
++    num_stages: int = 2,
++    threads: int = 256,
++):
++    """``C[M, N] = bf16(A @ W^T (+ bias))`` for BF16 ``A[M, K]``, ``W[N, K]`` and
++    ``bias[N]``, accumulated in FP32; with ``gelu``, ``bf16(gelu(C))``."""
++    if N % block_N or K % block_K:
++        raise ValueError(f"[{N}, {K}] is not whole {block_N} x {block_K} tiles")
++    if gelu and not bias:
++        raise ValueError("the GELU epilogue follows a biased projection")
++    k_blocks = K // block_K
++    num_stages = min(num_stages, k_blocks)  # a narrow K has fewer tiles than stages
++    M = T.dynamic("M")
++
++    @T.macro
++    def body(A, W, Bias, C):
++        with T.Kernel(N // block_N, T.ceildiv(M, block_M), threads=threads) as (
++            bx,
++            by,
++        ):
++            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
++            W_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
++            acc = T.alloc_fragment((block_M, block_N), T.float32)
++            T.clear(acc)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(W[bx * block_N, ko * block_K], W_shared)
++                T.gemm(A_shared, W_shared, acc, transpose_B=True)
++            if bias:
++                out = T.alloc_fragment((block_M, block_N), T.bfloat16)
++                for i, j in T.Parallel(block_M, block_N):
++                    bias_value = T.cast(Bias[bx * block_N + j], T.float32)
++                    biased = T.cast(T.ieee_add(acc[i, j], bias_value), T.bfloat16)
++                    if gelu:
++                        out[i, j] = _gelu(biased)
++                    else:
++                        out[i, j] = biased
++                T.copy(out, C[by * block_M, bx * block_N])
++            else:
++                T.copy(acc, C[by * block_M, bx * block_N])
++
++    if bias:
++
++        @T.prim_func
++        def vision_linear(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, K), T.bfloat16),
++            Bias: T.Tensor((N,), T.bfloat16),
++            C: T.Tensor((M, N), T.bfloat16),
++        ):
++            body(A, W, Bias, C)
++
++    else:
++
++        @T.prim_func
++        def vision_linear(
++            A: T.Tensor((M, K), T.bfloat16),
++            W: T.Tensor((N, K), T.bfloat16),
++            C: T.Tensor((M, N), T.bfloat16),
++        ):
++            body(A, W, None, C)
++
++    return vision_linear
++
++
++@tilelang.jit
++def swiglu_linear_kernel(
++    inter: int,
++    K: int,
++    block_M: int = 128,
++    block_N: int = 64,
++    block_K: int = 64,
++    num_stages: int = 2,
++    threads: int = 256,
++):
++    """``Y[M, I] = swiglu(bf16(A @ W[:I]^T), bf16(A @ W[I:]^T))`` for BF16 ``A[M, K]``
++    and the gate-then-up weight ``W[2I, K]``, with B12X's vision SwiGLU."""
++    if inter % block_N or K % block_K:
++        raise ValueError(f"[{inter}, {K}] is not whole {block_N} x {block_K} tiles")
++    k_blocks = K // block_K
++    num_stages = min(num_stages, k_blocks)
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vision_swiglu_linear(
++        A: T.Tensor((M, K), T.bfloat16),
++        W: T.Tensor((2 * inter, K), T.bfloat16),
++        Y: T.Tensor((M, inter), T.bfloat16),
++    ):
++        with T.Kernel(inter // block_N, T.ceildiv(M, block_M), threads=threads) as (
++            bx,
++            by,
++        ):
++            A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
++            G_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
++            U_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
++            gate = T.alloc_fragment((block_M, block_N), T.float32)
++            up = T.alloc_fragment((block_M, block_N), T.float32)
++            out = T.alloc_fragment((block_M, block_N), T.bfloat16)
++            T.clear(gate)
++            T.clear(up)
++            for ko in T.Pipelined(k_blocks, num_stages=num_stages):
++                T.copy(A[by * block_M, ko * block_K], A_shared)
++                T.copy(W[bx * block_N, ko * block_K], G_shared)
++                T.copy(W[inter + bx * block_N, ko * block_K], U_shared)
++                T.gemm(A_shared, G_shared, gate, transpose_B=True)
++                T.gemm(A_shared, U_shared, up, transpose_B=True)
++            for i, j in T.Parallel(block_M, block_N):
++                g = T.cast(T.cast(gate[i, j], T.bfloat16), T.float32)
++                u = T.cast(T.cast(up[i, j], T.bfloat16), T.float32)
++                sigmoid = T.ieee_fdiv(
++                    T.float32(1),
++                    T.ieee_add(T.float32(1), T.call_extern(T.float32, "__expf", -g)),
++                )
++                silu = T.cast(T.cast(T.fmul(g, sigmoid), T.bfloat16), T.float32)
++                out[i, j] = T.cast(T.fmul(silu, u), T.bfloat16)
++            T.copy(out, Y[by * block_M, bx * block_N])
++
++    return vision_swiglu_linear
++
++
++@tilelang.jit(pass_configs=_ELEMENTWISE)
++def rope_qkv_kernel(heads: int, head_dim: int, threads: int = 128):
++    """Rotate q and k of ``qkv`` ([M, 3 * heads * head_dim], q | k | v) in place for
++    an image ``image_width`` patches wide; row ``r`` is patch
++    ``(r // image_width, r % image_width)``. ``inv_freq`` is FP32
++    ``[head_dim / 4]``."""
++    half, quarter = head_dim // 2, head_dim // 4
++    if half % _VEC or half > threads:
++        raise ValueError(f"head_dim {head_dim} is not whole 16-column halves")
++    width = heads * head_dim
++    chunks = half // _VEC
++    units = 2 * heads * chunks
++    M = T.dynamic("M")
++
++    @T.prim_func
++    def vision_rope_qkv(
++        qkv: T.Tensor((M, 3 * width), T.bfloat16),
++        inv_freq: T.Tensor((quarter,), T.float32),
++        image_width: T.int32,
++    ):
++        with T.Kernel(M, threads=threads) as row:
++            tx = T.get_thread_binding()
++            table = T.alloc_shared((2, half), T.float32)
++            first = T.alloc_local((_VEC,), T.bfloat16)
++            second = T.alloc_local((_VEC,), T.bfloat16)
++            first_out = T.alloc_local((_VEC,), T.bfloat16)
++            second_out = T.alloc_local((_VEC,), T.bfloat16)
++            if tx < half:
++                position = T.if_then_else(
++                    tx < quarter, row // image_width, row % image_width
++                )
++                angle = T.fmul(T.cast(position, T.float32), inv_freq[tx % quarter])
++                table[0, tx] = T.cos(angle)
++                table[1, tx] = T.sin(angle)
++            T.sync_threads()
++            for step in T.unroll(-(-units // threads)):
++                unit = step * threads + tx
++                if unit < units:
++                    part = unit // (heads * chunks)
++                    head = unit // chunks % heads
++                    chunk = unit % chunks
++                    col = part * width + head * head_dim + chunk * _VEC
++                    for v in T.vectorized(_VEC):
++                        first[v] = qkv[row, col + v]
++                    for v in T.vectorized(_VEC):
++                        second[v] = qkv[row, col + half + v]
++                    for v in T.unroll(_VEC):
++                        x1 = T.cast(first[v], T.float32)
++                        x2 = T.cast(second[v], T.float32)
++                        cosine = table[0, chunk * _VEC + v]
++                        sine = table[1, chunk * _VEC + v]
++                        first_out[v] = T.cast(
++                            T.fma(x1, cosine, -T.fmul(x2, sine)), T.bfloat16
++                        )
++                        second_out[v] = T.cast(
++                            T.fma(x2, cosine, T.fmul(x1, sine)), T.bfloat16
++                        )
++                    for v in T.vectorized(_VEC):
++                        qkv[row, col + v] = first_out[v]
++                    for v in T.vectorized(_VEC):
++                        qkv[row, col + half + v] = second_out[v]
++
++    return vision_rope_qkv
++
++
++@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
++def attention_kernel(
++    heads: int,
++    head_dim: int,
++    block_M: int = 128,
++    block_N: int = 64,
++    num_stages: int = 2,
++    threads: int = 128,
++):
++    """``O[:, h] = softmax(Q_h K_h^T / sqrt(head_dim)) V_h`` over all ``M`` rows, for
++    each head ``h``, with Q, K and V the three ``heads * head_dim`` column blocks of
++    ``QKV`` ([M, 3 * heads * head_dim]); ``Out`` is [M, heads * head_dim]."""
++    if head_dim % 16 or block_M % 16 or block_N % 16:
++        raise ValueError("attention tiles are whole 16-row MMA atoms")
++    width = heads * head_dim
++    scale = head_dim**-0.5 * _LOG2E
++    M = T.dynamic("M")
++    accum = T.float32
++
++    @T.prim_func
++    def vision_attention(
++        QKV: T.Tensor((M, 3 * width), T.bfloat16),
++        Out: T.Tensor((M, width), T.bfloat16),
++    ):
++        with T.Kernel(T.ceildiv(M, block_M), heads, threads=threads) as (bx, h):
++            Q_shared = T.alloc_shared((block_M, head_dim), T.bfloat16)
++            K_shared = T.alloc_shared((block_N, head_dim), T.bfloat16)
++            V_shared = T.alloc_shared((block_N, head_dim), T.bfloat16)
++            O_shared = T.alloc_shared((block_M, head_dim), T.bfloat16)
++            scores = T.alloc_fragment((block_M, block_N), accum)
++            probs = T.alloc_fragment((block_M, block_N), T.bfloat16)
++            acc = T.alloc_fragment((block_M, head_dim), accum)
++            row_max = T.alloc_fragment((block_M,), accum)
++            prev_max = T.alloc_fragment((block_M,), accum)
++            rescale = T.alloc_fragment((block_M,), accum)
++            row_sum = T.alloc_fragment((block_M,), accum)
++            denom = T.alloc_fragment((block_M,), accum)
++
++            T.copy(QKV[bx * block_M, h * head_dim], Q_shared)
++            T.fill(acc, 0)
++            T.fill(denom, 0)
++            T.fill(row_max, -T.infinity(accum))
++            for kb in T.Pipelined(T.ceildiv(M, block_N), num_stages=num_stages):
++                T.copy(QKV[kb * block_N, width + h * head_dim], K_shared)
++                T.gemm(
++                    Q_shared,
++                    K_shared,
++                    scores,
++                    transpose_B=True,
++                    clear_accum=True,
++                    policy=T.GemmWarpPolicy.FullRow,
++                )
++                # Columns past the live rows are masked whatever their scores hold.
++                for i, j in T.Parallel(block_M, block_N):
++                    scores[i, j] = T.if_then_else(
++                        kb * block_N + j < M, scores[i, j] * scale, -T.infinity(accum)
++                    )
++                T.copy(row_max, prev_max)
++                T.reduce_max(scores, row_max, dim=1, clear=True)
++                for i in T.Parallel(block_M):
++                    row_max[i] = T.max(row_max[i], prev_max[i])
++                    rescale[i] = T.exp2(prev_max[i] - row_max[i])
++                for i, j in T.Parallel(block_M, block_N):
++                    scores[i, j] = T.exp2(scores[i, j] - row_max[i])
++                T.reduce_sum(scores, row_sum, dim=1)
++                for i in T.Parallel(block_M):
++                    denom[i] = denom[i] * rescale[i] + row_sum[i]
++                T.copy(scores, probs)
++                for i, j in T.Parallel(block_M, head_dim):
++                    acc[i, j] *= rescale[i]
++                T.copy(QKV[kb * block_N, 2 * width + h * head_dim], V_shared)
++                T.gemm(probs, V_shared, acc, policy=T.GemmWarpPolicy.FullRow)
++            for i, j in T.Parallel(block_M, head_dim):
++                acc[i, j] /= denom[i]
++            T.copy(acc, O_shared)
++            T.copy(O_shared, Out[bx * block_M, h * head_dim])
++
++    return vision_attention
++
++
++@tilelang.jit(pass_configs=_ELEMENTWISE)
++def add_norm_kernel(width: int, add: bool, eps: float = EPS):
++    """With ``add``: ``Sum = bf16(X + Branch)`` and ``Out = rmsnorm(Sum) * Weight``;
++    without: ``Out = rmsnorm(X) * Weight``. B12X's reduction order (module
++    docstring); one 256-thread block a row."""
++    threads = _NORM_THREADS
++    warps = threads // 32
++    items = -(-width // threads)
++    M = T.dynamic("M")
++
++    @T.macro
++    def body(X, Branch, Weight, Sum, Out):
++        with T.Kernel(M, threads=threads) as row:
++            tx = T.get_thread_binding()
++            lane = tx % 32
++            values = T.alloc_local((items,), T.float32)
++            partial = T.alloc_shared((warps,), T.float32)
++            inverse = T.alloc_shared((1,), T.float32)
++            total = T.alloc_var(T.float32)
++            block = T.alloc_var(T.float32)
++            total = T.float32(0)
++            for item in T.unroll(items):
++                col = item * threads + tx
++                values[item] = T.float32(0)
++                if col < width:
++                    if add:
++                        summed = T.cast(
++                            T.ieee_add(
++                                T.cast(X[row, col], T.float32),
++                                T.cast(Branch[row, col], T.float32),
++                            ),
++                            T.bfloat16,
++                        )
++                        Sum[row, col] = summed
++                        values[item] = T.cast(summed, T.float32)
++                    else:
++                        values[item] = T.cast(X[row, col], T.float32)
++                total = T.fma(values[item], values[item], total)
++            for level in T.unroll(5):
++                total = total + T.shfl_xor(total, T.shift_left(1, level))
++            if lane == 0:
++                partial[tx // 32] = total
++            T.sync_threads()
++            block = T.if_then_else(
++                lane < warps, partial[T.min(lane, warps - 1)], T.float32(0)
++            )
++            for level in T.unroll(5):
++                block = block + T.shfl_xor(block, T.shift_left(1, level))
++            if tx == 0:
++                inverse[0] = T.rsqrt(
++                    T.ieee_add(T.ieee_fdiv(block, T.float32(width)), T.float32(eps))
++                )
++            T.sync_threads()
++            for item in T.unroll(items):
++                col = item * threads + tx
++                if col < width:
++                    learned = T.ieee_add(T.float32(0), T.cast(Weight[col], T.float32))
++                    Out[row, col] = T.cast(
++                        T.fmul(T.fmul(values[item], inverse[0]), learned), T.bfloat16
++                    )
++
++    if add:
++
++        @T.prim_func
++        def vision_add_norm(
++            X: T.Tensor((M, width), T.bfloat16),
++            Branch: T.Tensor((M, width), T.bfloat16),
++            Weight: T.Tensor((width,), T.bfloat16),
++            Sum: T.Tensor((M, width), T.bfloat16),
++            Out: T.Tensor((M, width), T.bfloat16),
++        ):
++            body(X, Branch, Weight, Sum, Out)
++
++    else:
++
++        @T.prim_func
++        def vision_add_norm(
++            X: T.Tensor((M, width), T.bfloat16),
++            Weight: T.Tensor((width,), T.bfloat16),
++            Out: T.Tensor((M, width), T.bfloat16),
++        ):
++            body(X, None, Weight, None, Out)
++
++    return vision_add_norm
++
++
++@tilelang.jit(pass_configs=_ELEMENTWISE)
++def spatial_merge_kernel(channels: int, ratio: int, threads: int = 256):
++    """``y[m, c * ratio^2 + ki * ratio + kj] = x[(i * ratio + ki) * width +
++    (j * ratio + kj), c]`` for merged row ``m = i * ceil(width / ratio) + j``, zero
++    past the ``height x width`` image (``x`` is [height * width, channels])."""
++    if channels % _VEC:
++        raise ValueError(f"{channels} channels are not whole 16-byte vectors")
++    window = ratio * ratio
++    vectors = channels // _VEC
++    loads = window * vectors
++    out_width = channels * window
++    stores = out_width // _VEC
++    # A window row padded by one vector spreads the gather over the banks.
++    stride = channels + _VEC
++    rows = T.dynamic("rows")
++    merged = T.dynamic("merged")
++
++    @T.prim_func
++    def vision_spatial_merge(
++        x: T.Tensor((rows, channels), T.bfloat16),
++        y: T.Tensor((merged, out_width), T.bfloat16),
++        height: T.int32,
++        width: T.int32,
++    ):
++        with T.Kernel(merged, threads=threads) as row:
++            tx = T.get_thread_binding()
++            tile = T.alloc_shared((window, stride), T.bfloat16)
++            values = T.alloc_local((_VEC,), T.bfloat16)
++            gathered = T.alloc_local((_VEC,), T.bfloat16)
++            merged_width = (width + ratio - 1) // ratio
++            top = row // merged_width * ratio
++            left = row % merged_width * ratio
++            for step in T.unroll(-(-loads // threads)):
++                e = step * threads + tx
++                if e < loads:
++                    k = e // vectors
++                    c = e % vectors * _VEC
++                    ih = top + k // ratio
++                    iw = left + k % ratio
++                    if (ih < height) & (iw < width):
++                        for v in T.vectorized(_VEC):
++                            values[v] = x[ih * width + iw, c + v]
++                    else:
++                        for v in T.vectorized(_VEC):
++                            values[v] = _zero_bf16()
++                    for v in T.vectorized(_VEC):
++                        tile[k, c + v] = values[v]
++            T.sync_threads()
++            for step in T.unroll(-(-stores // threads)):
++                e = step * threads + tx
++                if e < stores:
++                    for v in T.unroll(_VEC):
++                        gathered[v] = tile[
++                            (e * _VEC + v) % window, (e * _VEC + v) // window
++                        ]
++                    for v in T.vectorized(_VEC):
++                        y[row, e * _VEC + v] = gathered[v]
++
++    return vision_spatial_merge
++
++
++def _tile(N: int, tile: dict, overrides: dict) -> dict:
++    """``tile`` with ``overrides``, its block_N the widest of block_N, 64, 32 and 16
++    that divides ``N`` (a narrow test projection)."""
++    config = {**tile, **overrides}
++    preferred = config["block_N"]
++    for block_N in (preferred, 64, 32, 16):
++        if block_N <= preferred and N % block_N == 0:
++            config["block_N"] = block_N
++            return config
++    raise ValueError(f"{N} output columns are not a multiple of 16")
++
++
++def pad_call(width: int) -> prepare.TileLangCall:
++    return prepare.call(pad_columns_kernel, width, padded_width(width))
++
++
++def linear_call(
++    N: int, K: int, *, bias: bool, gelu: bool = False, **overrides
++) -> prepare.TileLangCall:
++    return prepare.call(
++        linear_kernel, N, K, bias, gelu, **_tile(N, LINEAR_TILE, overrides)
++    )
++
++
++def swiglu_call(inter: int, K: int, **overrides) -> prepare.TileLangCall:
++    return prepare.call(
++        swiglu_linear_kernel, inter, K, **_tile(inter, SWIGLU_TILE, overrides)
++    )
++
++
++def rope_call(heads: int, head_dim: int) -> prepare.TileLangCall:
++    return prepare.call(rope_qkv_kernel, heads, head_dim)
++
++
++def attention_call(heads: int, head_dim: int, **overrides) -> prepare.TileLangCall:
++    return prepare.call(
++        attention_kernel, heads, head_dim, **{**ATTENTION_TILE, **overrides}
++    )
++
++
++def norm_call(width: int, *, add: bool) -> prepare.TileLangCall:
++    return prepare.call(add_norm_kernel, width, add, EPS)
++
++
++def merge_call(channels: int, ratio: int) -> prepare.TileLangCall:
++    return prepare.call(spatial_merge_kernel, channels, ratio)
++
++
++def resolve(call: prepare.TileLangCall):
++    """The kernel of a declared call (after the kernel cache freezes, an undeclared
++    call raises ``KernelNotPreparedError``)."""
++    function, args, kwargs = call
++    return function(*args, **kwargs)
++
++
++__all__ = [
++    "ATTENTION_TILE",
++    "EPS",
++    "LINEAR_TILE",
++    "SWIGLU_TILE",
++    "add_norm_kernel",
++    "attention_call",
++    "attention_kernel",
++    "linear_call",
++    "linear_kernel",
++    "merge_call",
++    "norm_call",
++    "pad_call",
++    "pad_columns_kernel",
++    "padded_width",
++    "resolve",
++    "rope_call",
++    "rope_qkv_kernel",
++    "spatial_merge_kernel",
++    "swiglu_call",
++    "swiglu_linear_kernel",
++]

@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:41:16 +0100
+Subject: [PATCH 478/488] [DS4.1] SP exchange and rank-order all-reduce: pad
+ rows are not filled
+
+Prefill SP's unreduced exchange zero-filled the pad rows of the last rank's
+block (two BF16 fills a layer when the token count is not a multiple of the TP
+size), and the rank-order all-reduce zero-padded its buffer. Neither value
+reaches a real row: every op on SP local rows is row-wise and every gather
+keeps the first T rows, and the all-reduce drops its padding rows after the
+gather. The fills are gone; the documented invariant now says pad rows are
+arbitrary after unreduced parts.
+
+The tests poison or refuse the fills and check the real rows bit for bit.
+---
+ .../test_deepseek_v41_tilelang_collectives.py | 26 +++++++++++++++++
+ ..._deepseek_v41_sp_project_reduce_scatter.py | 29 ++++++++++++++-----
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 15 +++++-----
+ .../deepseek_v4_1/tilelang/collectives.py     |  8 +++--
+ 4 files changed, 60 insertions(+), 18 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index ce3cf956d..a1f9ea3df 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -165,6 +165,32 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+         assert torch.equal(out[rank], want)
+ 
+ 
++@pytest.mark.parametrize("world", [2, 3, 4])
++@pytest.mark.parametrize("rows", [1, 5, 13])
++def test_all_reduce_pads_without_a_fill(monkeypatch, world, rows):
++    """The padding rows are summed, gathered and dropped, never filled: with the
++    padded buffer's rows NaN (whatever the allocator left), every real row is still
++    the one-shot sum, bit for bit."""
++    allocate = torch.Tensor.new_empty
++
++    def poisoned(self, *args, **kwargs):
++        return allocate(self, *args, **kwargs).fill_(float("nan"))
++
++    def refuse(self, *args, **kwargs):
++        raise AssertionError("the padded buffer was zero-filled")
++
++    monkeypatch.setattr(torch.Tensor, "new_empty", poisoned)
++    monkeypatch.setattr(torch.Tensor, "new_zeros", refuse)
++    torch.manual_seed(world * 1000 + rows)
++    width = 24
++    inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
++    out = _run(inputs, all_reduce_rank_order)
++    want = _reference(inputs)
++    for rank in range(world):
++        assert out[rank].shape == (rows, width)
++        assert torch.equal(out[rank], want)
++
++
+ def test_row_bits_do_not_depend_on_owner_or_batch():
+     # One row's partials at every position of batches of two sizes: the reduced
+     # row has the same bits wherever it lands and whichever rank owns it.
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index 8b4f02503..a159cb3a0 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -66,7 +66,9 @@ def test_wo_slices():
+ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per_block):
+     """Unreduced rows send every other rank's block, slice by slice, and keep this
+     rank's own block in its slot of the parts (the other ranks stood in by
+-    copies of it)."""
++    copies of it). Only real rows are projected; the pad rows of the last rank's
++    block are not filled (nothing is zeroed), and whatever they hold stays in
++    them: the real rows' parts and sums are the zero-padded projection's."""
+     from types import SimpleNamespace
+ 
+     from vllm.models.deepseek_v4_1.tilelang import collectives
+@@ -77,6 +79,11 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+     )
+     group = SimpleNamespace(device_communicator=SimpleNamespace(pynccl_comm="comm"))
+     monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
++
++    def refuse(self, *args, **kwargs):
++        raise AssertionError("a pad row was filled")
++
++    monkeypatch.setattr(torch.Tensor, "zero_", refuse)
+     sent = []
+ 
+     def exchange_into(comm, chunks, parts, r, w):
+@@ -104,25 +111,31 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+         per_block=per_block,
+     )
+     torch.cuda.synchronize()
++    monkeypatch.undo()
+     if slices == 1 and not per_block:
+         assert calls == [(0, tokens)]  # one projection
+     padded = torch.zeros(rows.padded_rows, 8, device="cuda")
+     padded[:tokens] = source
+     blocks = padded.view(world, rows.local_rows, 8)
+-    assert parts.shape == (world, rows.local_rows, 8)
++    local = rows.local_rows
++
++    def real(owner):  # the real rows of the owner's block
++        return max(0, min(local, tokens - owner * local))
++
++    assert parts.shape == (world, local, 8)
+     for peer in range(world):
+-        assert torch.equal(parts[peer], blocks[rank])
++        assert torch.equal(parts[peer, : real(rank)], blocks[rank, : real(rank)])
+     sent = torch.cat(sent, dim=1)
+     for peer in range(world):
+         if peer != rank:
+-            assert torch.equal(sent[peer], blocks[peer])
++            assert torch.equal(sent[peer, : real(peer)], blocks[peer, : real(peer)])
+     projected = sorted(i for start, stop in calls for i in range(start, stop))
+     assert projected == list(range(tokens))
+     assert order == [len(calls)]
+-    assert torch.equal(
+-        sp_prefill.materialize(sp_prefill.unreduced_parts(parts)),
+-        collectives.rank_order_sum(list(parts)),
+-    )
++    total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
++    assert torch.equal(total, collectives.rank_order_sum(list(parts)))
++    zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
++    assert torch.equal(total[: real(rank)], zero_padded[: real(rank)])
+ 
+ 
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 7b728f379..7245b809a 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -37,9 +37,11 @@ row and then compacts.
+ - Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
+   rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
+ - Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
+-- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero.
+-- The last rank's local rows can include pad rows. They stay finite and are
+-  never read back into real outputs.
++- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero; unreduced
++  parts (see "Unreduced results") leave their pad rows unwritten.
++- The last rank's local rows can include pad rows. Every op on local rows is
++  row-wise and every gather keeps the first T rows, so a pad row's values,
++  whatever they are (arbitrary after unreduced parts), never reach a real row.
+ 
+ ## Where each op runs
+ 
+@@ -74,7 +76,9 @@ sum: every rank's partial of this rank's rows is exchanged into one
+ ``(N, L, hidden)`` buffer, this rank's own written in place, and the decoder layer
+ hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
+ rank order as it loads them, the same arithmetic and the same bits as the
+-rank-order reduce-scatter; any other consumer calls ``sum()``.
++rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
++projected into the buffers: the pad rows of the last rank's block are neither
++projected nor filled (``Rows``).
+ """
+ 
+ from collections.abc import Iterator
+@@ -332,7 +336,6 @@ class SPRows:
+         if slices == 1 and not per_block:
+             flat = send.view(world * local, *row_shape)
+             project(0, tokens, flat[:tokens])
+-            flat[tokens:].zero_()
+             parts[self.rank].copy_(send[self.rank])
+             if then is not None:
+                 then()
+@@ -350,8 +353,6 @@ class SPRows:
+                 real = max(0, min(stop, tokens) - start)
+                 if real:
+                     project(start, start + real, dest[owner, lo : lo + real])
+-                if real < hi - lo:
+-                    dest[owner, lo + real : hi].zero_()
+             if side is not None:
+                 side.wait_stream(main)
+                 with torch.cuda.stream(side):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index ad8175dd7..d2113b753 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -326,14 +326,16 @@ def all_reduce_rank_order(
+     comm, input_tensor: torch.Tensor, rank: int, world: int
+ ) -> torch.Tensor:
+     """The sum over ranks of ``input_tensor`` at any size, with the one-shot
+-    all-reduce's arithmetic: its rows (zero-padded to a multiple of ``world``) are
++    all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
+     reduce-scattered in rank order, then all-gathered, which moves bits without
+-    arithmetic. A row has the same bits as the one-shot path would give it."""
++    arithmetic. A row has the same bits as the one-shot path would give it. The
++    padding rows are summed and gathered like the others and then dropped, so
++    they are not filled: whatever they hold reaches no real row."""
+     rows = input_tensor.shape[0]
+     flat = input_tensor.reshape(rows, -1)
+     padded = -(-rows // world) * world
+     if padded != rows or not flat.is_contiguous():
+-        buffer = flat.new_zeros((padded, flat.shape[1]))
++        buffer = flat.new_empty((padded, flat.shape[1]))
+         buffer[:rows].copy_(flat)
+     else:
+         buffer = flat

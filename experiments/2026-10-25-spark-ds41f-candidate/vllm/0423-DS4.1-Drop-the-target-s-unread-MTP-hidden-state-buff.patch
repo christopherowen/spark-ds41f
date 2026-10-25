@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:31:56 +0200
+Subject: [PATCH 423/488] [DS4.1] Drop the target's unread MTP hidden-state
+ buffer
+
+With any hidden-state drafter (DSpark included), the target allocated
+_mtp_hidden_buffer, max_num_batched_tokens rows of the four residual
+streams (hc_dim, BF16: 671 MB at 16384 tokens), and copied every
+forward's streams into it outside sequence-parallel prefill (3.9 MB a
+c16 decode step, up to 655 MB a 16K prefill chunk). No DS4.1 model
+defines get_mtp_target_hidden_states, so nothing reads it: the runner
+hands the drafter the collapsed states. The buffer, its copy and the
+prefill gather of the full streams it forced go; the collapse and norm
+stay per row, so outputs are unchanged.
+---
+ tests/models/test_deepseek_v4_1_ced_model.py  |  8 ----
+ tests/models/test_deepseek_v4_1_sp_prefill.py | 18 ++-------
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 38 +------------------
+ 3 files changed, 6 insertions(+), 58 deletions(-)
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index c0a743de9..2f23981b8 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -250,7 +250,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+     indices = torch.tensor([2, 3, 6, 7, -1, -1]) if compact else None
+     shared: dict[str, torch.Tensor | int] = {}
+     row_work: list[tuple[str, int, int]] = []
+-    buffer = torch.empty(8, 8)
+     target = SimpleNamespace(
+         embed_input_ids=lambda _: inputs,
+         use_mega_moe=False,
+@@ -263,7 +262,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         ced_decoder_start=2,
+         layers=nn.ModuleList(_Layer(i, shared, row_work) for i in range(4)),
+         aux_hidden_state_layers={3, 4},
+-        _mtp_hidden_buffer=buffer,
+         # The sink detector's column buffer: none, the detector is off here.
+         _sink_columns=None,
+         # GLP steering: none, unset here.
+@@ -302,12 +300,6 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+     torch.testing.assert_close(output, expected, rtol=1e-6, atol=1e-6)
+     for actual, value in zip(aux, expected_aux, strict=True):
+         torch.testing.assert_close(actual, value, rtol=1e-6, atol=1e-6)
+-    torch.testing.assert_close(
+-        buffer.view(8, 4, 2),
+-        expected[:, None, :].expand(-1, 4, -1),
+-        rtol=1e-6,
+-        atol=1e-6,
+-    )
+     assert shared["global_rows"] == 8
+     decoder_rows = len(indices) if indices is not None else 8
+     assert row_work == [
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 15a235eb6..90a98be56 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -497,10 +497,7 @@ class _Embedding:
+ 
+ @pytest.mark.parametrize("num_tokens", (9, 10, 11))
+ @pytest.mark.parametrize("use_embeds", (False, True))
+-@pytest.mark.parametrize("skip_mtp_buffer", (False, True))
+-def test_model_forward_matches_full_rows(
+-    monkeypatch, num_tokens, use_embeds, skip_mtp_buffer
+-):
++def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+     pytest.importorskip("b12x")
+     from vllm.models.deepseek_v4_1.nvidia import model as native
+ 
+@@ -525,7 +522,6 @@ def test_model_forward_matches_full_rows(
+     positions = torch.arange(100, 100 + num_tokens)
+ 
+     def run(min_rows, local_rows):
+-        buffer = torch.full((16, 8), -7.0, dtype=torch.float64)
+         target = SimpleNamespace(
+             embed_input_ids=lambda input_ids: table[input_ids],
+             embed_tokens=_Embedding(table, world),
+@@ -533,7 +529,6 @@ def test_model_forward_matches_full_rows(
+             use_sequence_parallel=False,
+             prefill_sp_min_rows=min_rows,
+             prefill_sp_unreduced=False,
+-            prefill_sp_skips_mtp_buffer=skip_mtp_buffer,
+             disk_engram=False,
+             engram_hash=None,
+             start_layer=0,
+@@ -541,7 +536,6 @@ def test_model_forward_matches_full_rows(
+             ced_decoder_start=None,
+             layers=nn.ModuleList(_Layer(i, world, local_rows) for i in range(3)),
+             aux_hidden_state_layers={2, 3},
+-            _mtp_hidden_buffer=buffer,
+             # L2 prefetch is on by default on SM121; its plans are built.
+             _l2pf_ready=True,
+             # The sink detector's column buffer: none, the detector is off here.
+@@ -557,20 +551,16 @@ def test_model_forward_matches_full_rows(
+             None,
+             inputs_embeds=table[ids] if use_embeds else None,
+         )
+-        return output, aux, buffer
++        return output, aux
+ 
+-    expected, expected_aux, expected_buffer = run(0, [])
++    expected, expected_aux = run(0, [])
+     local_rows = [[] for _ in range(3)]
+     results = world.run(lambda rank: run(4, local_rows[rank]))
+     layout = sp_prefill.SPRows(num_tokens, 3, 0)
+-    for rank, (output, aux, buffer) in enumerate(results):
++    for rank, (output, aux) in enumerate(results):
+         # Attention received only this rank's rows in every layer.
+         assert local_rows[rank] == [layout.local_rows] * 3
+         torch.testing.assert_close(output, expected, rtol=1e-9, atol=1e-9)
+         assert len(aux) == len(expected_aux) == 2
+         for actual, value in zip(aux, expected_aux):
+             torch.testing.assert_close(actual, value, rtol=1e-9, atol=1e-9)
+-        if skip_mtp_buffer:
+-            assert (buffer == -7).all()
+-        else:
+-            torch.testing.assert_close(buffer, expected_buffer, rtol=1e-9, atol=1e-9)
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 344c2caa0..565c34325 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -543,22 +543,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         else:
+             self.norm = PPMissingLayer()
+ 
+-        spec_config = vllm_config.speculative_config
+-        needs_mtp_hidden_states = spec_config is not None and (
+-            spec_config.use_eagle() or spec_config.uses_draft_model()
+-        )
+-        if get_pp_group().is_last_rank and needs_mtp_hidden_states:
+-            self._mtp_hidden_buffer = torch.empty(
+-                vllm_config.scheduler_config.max_num_batched_tokens,
+-                self.hc_dim,
+-                dtype=vllm_config.model_config.dtype,
+-            )
+-        else:
+-            self._mtp_hidden_buffer = None
+-        # DSpark drafts from the aux hidden states only; SP leaves this buffer.
+-        self.prefill_sp_skips_mtp_buffer = (
+-            spec_config is not None and spec_config.use_dspark()
+-        )
+         # The attention-sink detector (vllm.v1.sample.sink) watches one column
+         # of the pre-norm residual: each forward keeps that column of every
+         # residual stream, [tokens, hc_mult] (float32), for every token.
+@@ -872,31 +856,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
+             self._sink_columns[:full_num_tokens].copy_(columns)
+ 
+-        # MTP needs full HC states; otherwise collapse and normalize locally
+-        # before gathering to reduce communication.
+-        if self._mtp_hidden_buffer is not None and not (
+-            sp is not None and self.prefill_sp_skips_mtp_buffer
+-        ):
+-            if self.use_sequence_parallel:
+-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+-                pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
+-            elif sp is not None:
+-                hidden_states, pre_mix = sp.gather(hidden_states), sp.gather(pre_mix)
+-                sp = None  # every row from here on
+-            buffer_states = (
+-                scatter_rows(hidden_states, ced_indices, full_num_tokens)
+-                if decoder_compacted
+-                else hidden_states
+-            )
+-            self._mtp_hidden_buffer[:full_num_tokens].copy_(buffer_states.flatten(1))
+-
+         # Collapse the hc copies with the pre-mix from the last layer's FFN
+         # mixes — the mix the reference applies via
+         # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+         hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
+         hidden_states = self.norm(hidden_states)
+-        if self.use_sequence_parallel and self._mtp_hidden_buffer is None:
+-            # Without MTP, gather only the collapsed and normalized hidden states.
++        if self.use_sequence_parallel:
++            # Gather only the collapsed and normalized hidden states.
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+         if sp is not None:
+             hidden_states = sp.gather(hidden_states)

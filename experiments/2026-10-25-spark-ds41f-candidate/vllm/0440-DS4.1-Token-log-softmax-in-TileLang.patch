@@ -1,0 +1,989 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:33:10 +0200
+Subject: [PATCH 440/488] [DS4.1] Token log-softmax in TileLang
+
+compute_token_logprobs ran Triton's _topk_log_softmax_kernel: each row's
+max and log-sum-exp over the vocabulary, then the requested tokens'
+logprobs. The TileLang kernel is its contract bit for bit, with the
+arithmetic read from the cached Triton 3.7 kernels' PTX and SASS on the
+nodes (16-byte-aligned layouts: FP32 4 + 4 elements a thread 512 apart,
+BF16 8 consecutive; exponentials in register order, warp XOR 16..1,
+warps as (w0 + w2) + (w1 + w3), blocks in order; non-FTZ ex2.approx and
+__nv_logf; no FMA). register_topk_scores_warmup declares it; the Triton
+kernel stays as the tests' reference.
+---
+ .../benchmark_tilelang_logprob_softmax.py     | 143 +++++++
+ .../test_gpu_tilelang_logprob_softmax.py      | 373 ++++++++++++++++++
+ vllm/v1/worker/gpu/sample/logprob.py          |  65 +--
+ vllm/v1/worker/gpu/sample/tilelang_logprob.py | 305 +++++++++++++-
+ 4 files changed, 835 insertions(+), 51 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
+ create mode 100644 tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py b/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
+new file mode 100644
+index 000000000..8a4d79578
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_tilelang_logprob_softmax.py
+@@ -0,0 +1,143 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of the TileLang log-softmax of selected tokens
++(``tilelang_logprob.topk_log_softmax``) against the Triton kernel it replaces
++(``logprob._topk_log_softmax_kernel``, launched as production launched it), at
++DeepSeek V4.1's logprob shapes: one request, sixteen and 96 rows of FP32 and bf16
++logits (129280 columns of the LM head's 131072-wide rows), one requested token (the
++sampled one) and twenty.
++
++Each case is measured on eight fresh inputs; on each, CUDA graphs of 100 calls of
++both run back to back, alternating which goes first, and the case's 95% interval
++comes from the eight per-input differences. The gate (``--gate``) is that the
++TileLang kernel is never slower (the interval's lower bound above zero). Before
++timing, each pair's outputs are compared bit for bit.
++"""
++
++import argparse
++import json
++import math
++import statistics
++from collections.abc import Callable
++
++import torch
++
++from vllm.v1.worker.gpu.sample import logprob, tilelang_logprob
++
++DEVICE = torch.device("cuda")
++CALLS = 100
++VOCAB = 129280
++PADDED = 131072
++SHAPES = {"1 request": 1, "16 rows": 16, "96 rows": 96}
++DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16}
++TOPKS = (1, 20)
++
++
++def graph(function: Callable[[], None]) -> torch.cuda.CUDAGraph:
++    """A CUDA graph of ``CALLS`` calls of ``function``, after one warm-up call."""
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        function()
++    torch.cuda.current_stream().wait_stream(side)
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(CALLS):
++            function()
++    return capture
++
++
++def elapsed(capture: torch.cuda.CUDAGraph) -> float:
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 1000 / CALLS
++
++
++def case(dtype: torch.dtype, rows: int, topk: int, seed: int):
++    """(Triton call, TileLang call, outputs to compare) on fresh inputs."""
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    # The LM head's padded rows, the real vocabulary in view.
++    backing = torch.randn(rows, PADDED, generator=gen, device=DEVICE) * 4
++    logits = backing.to(dtype)[:, :VOCAB]
++    ids = torch.randint(VOCAB, (rows, topk), generator=gen, device=DEVICE)
++    expected = torch.empty(rows, topk, device=DEVICE)
++    actual = torch.empty(rows, topk, device=DEVICE)
++
++    def reference():
++        logprob._topk_log_softmax_kernel[(rows,)](
++            expected,
++            logits,
++            logits.stride(0),
++            ids,
++            topk,
++            VOCAB,
++            BLOCK_SIZE=1024,
++            TOPK_BLOCK_SIZE=logprob._MAX_TOPK_BLOCK,
++        )
++
++    def candidate():
++        tilelang_logprob.topk_log_softmax(logits, ids, actual)
++
++    return reference, candidate, lambda: (expected, actual)
++
++
++def measure(dtype: torch.dtype, rows: int, topk: int, samples: int) -> dict:
++    ours, theirs = [], []
++    for sample in range(samples):
++        reference, candidate, outputs = case(dtype, rows, topk, 7919 + sample)
++        reference()
++        candidate()
++        expected, actual = outputs()
++        if not torch.equal(expected.view(torch.int32), actual.view(torch.int32)):
++            raise SystemExit(
++                f"{dtype} at {rows} rows, {topk} tokens: outputs differ from Triton's"
++            )
++        a, b = graph(candidate), graph(reference)
++        order = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(g): elapsed(g) for g in order}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++    paired = [x - y for x, y in zip(ours, theirs)]
++    mean = statistics.fmean(paired)
++    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++    return {
++        "dtype": str(dtype).removeprefix("torch."),
++        "rows": rows,
++        "topk": topk,
++        "tilelang_us": statistics.median(ours),
++        "triton_us": statistics.median(theirs),
++        "difference_us": mean,
++        "interval_us": [mean - half, mean + half],
++        "slower": mean - half > 0,
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--samples", type=int, default=8)
++    args = parser.parse_args()
++    results = []
++    for dtype in DTYPES.values():
++        for name, rows in SHAPES.items():
++            for topk in TOPKS:
++                result = measure(dtype, rows, topk, args.samples)
++                result["shape"] = name
++                results.append(result)
++                print(json.dumps(result), flush=True)
++    slower = [
++        f"{r['dtype']} at {r['shape']}, {r['topk']} tokens"
++        for r in results
++        if r["slower"]
++    ]
++    print(json.dumps({"summary": "logprob log-softmax", "slower": slower}), flush=True)
++    if args.gate and slower:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+new file mode 100644
+index 000000000..d62ed6afd
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_tilelang_logprob_softmax.py
+@@ -0,0 +1,373 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``tilelang_logprob.topk_log_softmax`` against the Triton kernel it replaces,
++``logprob._topk_log_softmax_kernel`` launched as production launched it, bit for bit
++(outputs compared as FP32 bit patterns): FP32 and bf16 logits; rows at 16-byte
++addresses and strides (Triton's 16-byte runs), at an odd stride and at a base past
++16 bytes (one element a thread); the DeepSeek V4.1 vocabulary, a tensor-parallel
++shard and odd widths; 0 to 2100 requested tokens; rows of infinities, NaN, ties,
++signed zeros, extreme and subnormal magnitudes, and exponentials that underflow to
++subnormals. Then the call sites: ``compute_token_logprobs`` and
++``compute_topk_scores`` launch the TileLang kernel only, a CUDA graph replays it,
++and the runner declares the calls it launches."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang logprob kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++pytest.importorskip("triton")
++
++from vllm.v1.worker.gpu.sample import logprob, tilelang_logprob  # noqa: E402
++from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
++
++DEVICE = torch.device("cuda")
++VOCAB = 129280  # DeepSeek V4.1
++SHARD = 32320  # a quarter of it
++PADDED = 131072  # the LM head's padded rows
++DTYPES = (torch.float32, torch.bfloat16)
++# "aligned": a 16-byte base and a stride of 16 elements, Triton's 16-byte runs;
++# "odd_stride" and "shifted_base" (one element past a 16-byte base): one element a
++# thread.
++LAYOUTS = ("aligned", "odd_stride", "shifted_base")
++CASES = ("random", "wide", "ties", "peaked", "special")
++# What the padding past each row holds: a read of it would win the maximum.
++PAD = 1.0e4
++SENTINEL = 12345.0
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    if x.dtype == torch.float32:
++        return x.view(torch.int32)
++    if x.dtype in (torch.bfloat16, torch.float16):
++        return x.view(torch.int16)
++    return x
++
++
++def _assert_same(ours: torch.Tensor, theirs: torch.Tensor, what: str) -> None:
++    a, b = _bits(ours), _bits(theirs)
++    if torch.equal(a, b):
++        return
++    differ = (a != b).nonzero()
++    first = differ[:5].tolist()
++    raise AssertionError(
++        f"{what}: {differ.shape[0]} of {a.numel()} elements differ, first at "
++        f"{first}: ours {[ours[tuple(i)].item() for i in first]}, "
++        f"Triton's {[theirs[tuple(i)].item() for i in first]}"
++    )
++
++
++# --- Inputs -------------------------------------------------------------------
++
++
++def _values(rows: int, vocab: int, case: str, seed: int) -> torch.Tensor:
++    """FP32 logits ([rows, vocab]). "random": normal, sd 4; "wide": sd 40, most
++    exponentials underflow; "ties": few distinct values; "peaked": one 0 a row,
++    the rest about -12 (a sum near 1, its log near 0); "special": -inf, +inf and NaN
++    scattered, and each row r one of
++    (r % 12): all -inf but one; all NaN; all -inf; zeros of both signs; all equal;
++    +inf and NaN; magnitudes up to 3e38; subnormal magnitudes; exponentials that
++    are subnormal (the maximum 0, the rest in [-103, -87]); all NaN but one; two
++    +inf; scattered only."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(rows, vocab, generator=g, device=DEVICE) * 4
++    if case == "wide":
++        x = x * 10
++    elif case == "ties":
++        x = torch.round(x / 4)
++    elif case == "peaked":
++        x = x / 4 - 12
++        x[:, vocab // 2] = 0.0
++    elif case == "special":
++        n = x.numel()
++        pick = torch.randperm(n, generator=g, device=DEVICE)
++        flat = x.view(-1)
++        a, b, c = n // 97, n // 97 + n // 211, n // 97 + n // 211 + n // 307
++        flat[pick[:a]] = float("-inf")
++        flat[pick[a:b]] = float("inf")
++        flat[pick[b:c]] = float("nan")
++        for r in range(rows):
++            row = x[r]
++            kind = r % 12
++            if kind == 0:
++                row.fill_(float("-inf"))
++                row[vocab // 2] = 3.0
++            elif kind == 1:
++                row.fill_(float("nan"))
++            elif kind == 2:
++                row.fill_(float("-inf"))
++            elif kind == 3:
++                row.zero_()
++                row[1::2] = -0.0
++            elif kind == 4:
++                row.fill_(5.0)
++            elif kind == 5:
++                row[0] = float("inf")
++                row[vocab - 1] = float("nan")
++            elif kind == 6:
++                # uniform_'s range width (6e38) would overflow.
++                unit = torch.rand(vocab, generator=g, device=DEVICE)
++                row.copy_((unit * 2 - 1) * 3.0e38)
++            elif kind == 7:
++                row.copy_(torch.randn(vocab, generator=g, device=DEVICE) * 1.0e-39)
++            elif kind == 8:
++                row.uniform_(-103.0, -87.0, generator=g)
++                row[vocab // 3] = 0.0
++            elif kind == 9:
++                row.fill_(float("nan"))
++                row[vocab - 1] = -2.0
++            elif kind == 10:
++                row[0] = float("inf")
++                row[vocab // 2] = float("inf")
++    return x
++
++
++def _logits(values: torch.Tensor, dtype: torch.dtype, layout: str) -> torch.Tensor:
++    """``values`` in ``dtype`` rows of ``layout``, the padding past each row ``PAD``."""
++    rows, vocab = values.shape
++    odd = layout == "odd_stride"
++    stride = vocab + 3 if odd else (vocab + 64 + 15) // 16 * 16
++    flat = torch.full((rows * stride + 1,), PAD, dtype=dtype, device=DEVICE)
++    start = 1 if layout == "shifted_base" else 0
++    logits = flat[start : start + rows * stride].view(rows, stride)[:, :vocab]
++    logits.copy_(values.to(dtype))
++    run = 16 // logits.element_size() if layout == "aligned" else 1
++    assert tls._triton_run(logits) == run
++    return logits
++
++
++def _ids(values: torch.Tensor, topk: int, seed: int) -> torch.Tensor:
++    """Random requested tokens ([rows, topk], int64), the first three the first
++    column, the last and the row's maximum."""
++    rows, vocab = values.shape
++    g = torch.Generator(device=DEVICE).manual_seed(seed + 1)
++    ids = torch.randint(vocab, (rows, topk), generator=g, device=DEVICE)
++    fixed = [
++        torch.zeros(rows, dtype=torch.int64, device=DEVICE),
++        torch.full((rows,), vocab - 1, dtype=torch.int64, device=DEVICE),
++        values.nan_to_num(nan=float("-inf")).argmax(dim=1),
++    ]
++    for k, column in enumerate(fixed[:topk]):
++        ids[:, k] = column
++    return ids
++
++
++# --- The two launches ----------------------------------------------------------
++
++
++def _triton(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    rows, vocab = logits.shape
++    out = torch.full((rows, ids.shape[1]), SENTINEL, device=DEVICE)
++    logprob._topk_log_softmax_kernel[(rows,)](
++        out,
++        logits,
++        logits.stride(0),
++        ids,
++        ids.shape[1],
++        vocab,
++        BLOCK_SIZE=1024,
++        TOPK_BLOCK_SIZE=logprob._MAX_TOPK_BLOCK,
++    )
++    return out
++
++
++def _tilelang(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
++    out = torch.full((logits.shape[0], ids.shape[1]), SENTINEL, device=DEVICE)
++    tilelang_logprob.topk_log_softmax(logits, ids, out)
++    return out
++
++
++def _check(logits: torch.Tensor, ids: torch.Tensor, what: str) -> torch.Tensor:
++    before = logits.clone()
++    ours = _tilelang(logits, ids)
++    theirs = _triton(logits, ids)
++    _assert_same(ours, theirs, what)
++    _assert_same(logits, before, f"{what}: logits")
++    return ours
++
++
++# --- Bits ---------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("case", CASES)
++@pytest.mark.parametrize(
++    "vocab", [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391], ids=lambda v: f"v{v}"
++)
++@pytest.mark.parametrize("layout", LAYOUTS)
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_log_softmax_matches_triton(dtype, layout, vocab, case):
++    """A sampled token and twenty logprobs a row."""
++    values = _values(12, vocab, case, seed=vocab + len(case))
++    logits = _logits(values, dtype, layout)
++    _check(logits, _ids(values, 21, vocab), f"{dtype} {layout} {vocab} {case}")
++
++
++@pytest.mark.parametrize("topk", [1, 2, 5, 20, 128, 129, 1024, 1025, 2100])
++@pytest.mark.parametrize("layout", LAYOUTS)
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_requested_counts(dtype, layout, topk):
++    """Every count, past one 1024-token tile and its 128-token slices included,
++    and ids that repeat."""
++    values = _values(12, SHARD, "special", seed=topk)
++    logits = _logits(values, dtype, layout)
++    _check(logits, _ids(values, topk, topk), f"{dtype} {layout} topk {topk}")
++
++
++@pytest.mark.parametrize("rows", [1, 2, 16, 96, 300])
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_batch_sizes(dtype, rows):
++    """Decode and prefill batches at the LM head's padded stride."""
++    values = _values(rows, VOCAB, "random", seed=rows)
++    flat = torch.full((rows, PADDED), PAD, dtype=dtype, device=DEVICE)
++    logits = flat[:, :VOCAB]
++    logits.copy_(values.to(dtype))
++    _check(logits, _ids(values, 21, rows), f"{dtype} {rows} rows")
++
++
++@pytest.mark.parametrize("vocab", [1024, 8192], ids=lambda v: f"v{v}")
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_layout_decides_the_bits(dtype, vocab):
++    """The tests see the layout: on 16-byte rows the one-element layout adds the
++    exponentials in another order, and some log probability differs from Triton's
++    (one block: the guarded chunk; eight: one chunk of vector loads). Few blocks,
++    so a block sum's last bits reach the row's."""
++    values = _values(256, vocab, "random", seed=5)
++    logits = _logits(values, dtype, "aligned")
++    ids = _ids(values, 21, 5)
++    theirs = _triton(logits, ids)
++    _assert_same(_tilelang(logits, ids), theirs, "vector layout")
++    other = torch.full_like(theirs, SENTINEL)
++    tls._kernel(
++        tilelang_logprob.topk_log_softmax_kernel,
++        *tilelang_logprob.topk_log_softmax_key(dtype, 1),
++    )(other, logits, ids)
++    assert not torch.equal(_bits(other), _bits(theirs))
++
++
++# --- Call sites ------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_compute_token_logprobs_launches_tilelang(dtype, monkeypatch):
++    values = _values(5, VOCAB, "random", seed=11)
++    logits = _logits(values, dtype, "aligned")
++    ids = _ids(values, 21, 11)
++    expected = _triton(logits, ids)
++    calls = []
++    launch = tilelang_logprob.topk_log_softmax
++
++    def spy(*args):
++        calls.append(args)
++        launch(*args)
++
++    # A launch of the Triton kernel would fail.
++    monkeypatch.setattr(logprob, "_topk_log_softmax_kernel", None)
++    monkeypatch.setattr(tilelang_logprob, "topk_log_softmax", spy)
++    _assert_same(logprob.compute_token_logprobs(logits, ids), expected, "logprobs")
++    # int32 ids are widened, as before.
++    _assert_same(
++        logprob.compute_token_logprobs(logits, ids.int()), expected, "int32 ids"
++    )
++    assert len(calls) == 2
++    # No requested token, or no row: nothing to launch.
++    empty = logprob.compute_token_logprobs(logits, ids[:, :0])
++    assert empty.shape == (5, 0)
++    none = logprob.compute_token_logprobs(logits[:0], ids[:0])
++    assert none.shape == (0, 21)
++
++
++@pytest.mark.parametrize("num_logprobs", [0, 5, 20])
++@pytest.mark.parametrize("dtype", DTYPES, ids=str)
++def test_compute_topk_scores(dtype, num_logprobs):
++    """The fast path's scores: the sampled token, then the top ``num_logprobs``."""
++    values = _values(6, VOCAB, "special", seed=num_logprobs)
++    logits = _logits(values, dtype, "aligned")
++    g = torch.Generator(device=DEVICE).manual_seed(num_logprobs)
++    sampled = torch.randint(VOCAB, (6,), generator=g, device=DEVICE)
++    result = logprob.compute_topk_scores(logits, num_logprobs, sampled)
++    assert result.logprob_token_ids.shape == (6, 1 + num_logprobs)
++    _assert_same(
++        result.logprobs,
++        _triton(logits, result.logprob_token_ids.contiguous()),
++        f"topk scores {num_logprobs}",
++    )
++
++
++def test_cuda_graph_replay():
++    """A captured launch replays on new values in the same tensors."""
++    values = _values(16, VOCAB, "random", seed=3)
++    logits = _logits(values, torch.float32, "aligned")
++    ids = _ids(values, 21, 3)
++    out = torch.full((16, 21), SENTINEL, device=DEVICE)
++    tilelang_logprob.topk_log_softmax(logits, ids, out)
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        graph = torch.cuda.CUDAGraph()
++        with torch.cuda.graph(graph):
++            tilelang_logprob.topk_log_softmax(logits, ids, out)
++    torch.cuda.current_stream().wait_stream(side)
++    fresh = _values(16, VOCAB, "special", seed=4)
++    logits.copy_(fresh)
++    ids.copy_(_ids(fresh, 21, 4))
++    out.fill_(SENTINEL)
++    graph.replay()
++    _assert_same(out, _triton(logits, ids), "graph replay")
++
++
++# --- Preparation --------------------------------------------------------------
++
++
++def _declared(registry):
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    # JIT functions are not hashable: a call is its function's identity and key.
++    return {
++        (id(function), args) for function, args, _ in prepare.declared_calls(registry)
++    }
++
++
++@pytest.mark.parametrize("logits_mode", [False, True])
++def test_runner_declares_the_launched_calls(logits_mode):
++    """register_topk_scores_warmup declares the log-softmax of each logits dtype in
++    both layouts (the stride is an argument), unless only logits are reported; the
++    declared calls compile and serve both layouts."""
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++
++    pairs = [(torch.bfloat16, PADDED), (torch.float32, VOCAB), (torch.float32, PADDED)]
++    registry = JitWarmupRegistry(None)
++    with registry.activate():
++        logprob.register_topk_scores_warmup(
++            logits=pairs, vocab_size=VOCAB, logits_mode=logits_mode
++        )
++    expected = {
++        (
++            id(tilelang_logprob.topk_log_softmax_kernel),
++            tilelang_logprob.topk_log_softmax_key(dtype, run),
++        )
++        for dtype in (torch.bfloat16, torch.float32)
++        for run in tls._runs(dtype)
++    }
++    declared = _declared(registry)
++    softmax = {
++        call
++        for call in declared
++        if call[0] == id(tilelang_logprob.topk_log_softmax_kernel)
++    }
++    if logits_mode:
++        assert not softmax
++        return
++    assert softmax == expected
++    prepare.prepare_declared(registry)
++    for dtype in (torch.bfloat16, torch.float32):
++        values = _values(3, VOCAB, "random", seed=9)
++        for layout in ("aligned", "odd_stride"):
++            logits = _logits(values, dtype, layout)
++            _check(logits, _ids(values, 21, 9), f"declared {dtype} {layout}")
+diff --git a/vllm/v1/worker/gpu/sample/logprob.py b/vllm/v1/worker/gpu/sample/logprob.py
+index c1d6e60bf..f6e60db97 100644
+--- a/vllm/v1/worker/gpu/sample/logprob.py
++++ b/vllm/v1/worker/gpu/sample/logprob.py
+@@ -2,16 +2,10 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Sequence
+-from typing import Any
+ 
+ import numpy as np
+ import torch
+ 
+-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
+-    TritonWarmupTensor,
+-    triton_kernel_dispatcher_with_warmup,
+-    triton_warmup_inputs,
+-)
+ from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+@@ -22,6 +16,9 @@ from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+ _MAX_TOPK_BLOCK = 1024
+ 
+ 
++# The reference the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``) is
++# tested against, launched as production launched it (BLOCK_SIZE=1024,
++# TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no longer launches it.
+ @triton.jit(do_not_specialize=["topk"])
+ def _topk_log_softmax_kernel(
+     output_ptr,
+@@ -89,44 +86,20 @@ def _ranks_kernel(
+     tl.store(output_ptr + req_idx, n)
+ 
+ 
+-def _topk_log_softmax_warmup_inputs(
+-    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
+-) -> dict[str, Any]:
+-    return triton_warmup_inputs(
+-        _topk_log_softmax_kernel,
+-        TritonWarmupTensor(torch.float32),
+-        TritonWarmupTensor(logits_dtype),
+-        logits_stride,
+-        TritonWarmupTensor(torch.int64),
+-        1,
+-        vocab_size,
+-        grid=(1,),
+-        BLOCK_SIZE=1024,
+-        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
+-    )
+-
+-
+-_topk_log_softmax_launcher = triton_kernel_dispatcher_with_warmup(
+-    warmup_inputs=_topk_log_softmax_warmup_inputs
+-)(_topk_log_softmax_kernel)
+-
+-
+ def register_topk_scores_warmup(
+     *, logits: Sequence[tuple[torch.dtype, int]], vocab_size: int, logits_mode: bool
+ ) -> None:
+     """Register ``compute_topk_scores`` (without per-request token ids) for
+     ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
+     selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
+-    from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
++    from vllm.v1.worker.gpu.sample.tilelang_logprob import (
++        register_log_softmax,
++        register_ranks,
++    )
+ 
+     register_ranks(logits, vocab_size)
+-    for logits_dtype, logits_stride in logits:
+-        if not logits_mode:
+-            _topk_log_softmax_launcher.register_warmup(
+-                logits_dtype=logits_dtype,
+-                logits_stride=logits_stride,
+-                vocab_size=vocab_size,
+-            )
++    if not logits_mode:
++        register_log_softmax(logits)
+ 
+ 
+ def compute_token_logprobs(
+@@ -135,23 +108,15 @@ def compute_token_logprobs(
+     # NOTE(woosuk): To save GPU memory, we do not materialize the full
+     # [batch_size, vocab_size] logprobs tensor. The kernel computes
+     # max + logsumexp per row and only emits logprobs at `token_ids`.
+-    batch_size, vocab_size = logits.shape
+-    token_ids = token_ids.to(torch.int64)
++    from vllm.v1.worker.gpu.sample.tilelang_logprob import topk_log_softmax
++
++    batch_size = logits.shape[0]
++    token_ids = token_ids.to(torch.int64).contiguous()
+     num_logprobs = token_ids.shape[1]
+     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
+     # The requested count is runtime data, including the single selected token
+-    # for prompt_logprobs=0. One bounded gather tile covers every count without
+-    # creating inference-time JIT specializations.
+-    _topk_log_softmax_launcher[(batch_size,)](
+-        logprobs,
+-        logits,
+-        logits.stride(0),
+-        token_ids,
+-        num_logprobs,
+-        vocab_size,
+-        BLOCK_SIZE=1024,  # type: ignore
+-        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
+-    )
++    # for prompt_logprobs=0: one kernel serves every count.
++    topk_log_softmax(logits, token_ids, logprobs)
+     return logprobs
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_logprob.py b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+index 1c3210fba..bd3d99e1f 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_logprob.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_logprob.py
+@@ -1,13 +1,64 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Selected-token ranks over the real vocabulary, including ties."""
++"""The selected tokens' ranks and log probabilities over the real vocabulary.
+ 
++- ``token_ranks``: each row's selected-token rank, ties included
++  (``logprob._ranks_kernel`` without its phantom padding columns)
++- ``topk_log_softmax``: ``logprob._topk_log_softmax_kernel``, bit for bit, NaN and
++  infinite logits included (the Triton kernel stays importable as the tests'
++  reference)
++
++``topk_log_softmax``'s arithmetic is Triton 3.7.1's for sm_121a, read from the PTX
++and SASS of the image's cached specializations (FP32: cache entry
++KYOO2UC5JP6EBVTSY75OOJE5ZXFRIGKV6WFOJYRUR4SAK4V3UBDQ, bf16:
++I3S7WK7AC43HFSJJKZZRSDS4GPL6K6SRZ4CZBOPEA2EPC5RXPGNQ, both with 16-byte logits and
++a row stride of 16 elements):
++
++- ``max_val`` is ``max.f32`` (a NaN gives way) of every logit and -inf, so any
++  order gives it: here each thread folds its columns of every block, the row read
++  last block first, and the block reduces once (``_block_reduce``). Triton reduces
++  each 1024-column block in turn, three barriers a block. (The PTX ISA orders -0
++  below +0; were the sign of a zero maximum to depend on the order, it could not
++  reach an output: two zero maxima add 2 to ``se``, so ``lse`` is not 0.)
++- ``se`` is the blocks' sums of ``tl.exp(logit - max_val)`` added to 0 in block
++  order. ``tl.exp`` is ``ex2.approx.f32`` (subnormals kept) of the product with
++  log2(e) (``vllm_exp_from``); a column past the row adds 0. A block's sum is
++  Triton's: a thread adds its eight exponentials in register order (``_element``:
++  Triton 3.7.1 lays the block out by the load's specialization, ``_triton_run``),
++  the warp adds at XOR distances 16 to 1, and the warps' sums ``w`` combine as
++  threads 0-3 do, ``(w0 + w2) + (w1 + w3)``. Here a chunk of eight blocks is
++  loaded at once and its sums cross the warps through one barrier.
++- ``lse`` is libdevice's ``__nv_logf`` as Triton bundles it
++  (``vllm_control_log``), and a token's log probability ``(logit - max_val) -
++  lse``, each rounded.
++
++Every add, product and difference is the header's, rounded to nearest as Triton
++writes it (nvcc would contract them otherwise).
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
+ from collections.abc import Sequence
+ 
+ import tilelang
+ import tilelang.language as T
+ import torch
+ 
++from vllm.v1.worker.gpu.sample import tilelang_sampling
++from vllm.v1.worker.gpu.sample.tilelang_sampling import (
++    _THREADS,
++    _call,
++    _element,
++    _kernel,
++    _runs,
++    _triton_run,
++    declare,
++)
++from vllm.v1.worker.gpu.spec_decode.tilelang_rejection import (
++    _HEADER,
++    _block_reduce,
++)
++
+ _PASS = {
+     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+ }
+@@ -98,3 +149,255 @@ def token_ranks(
+         logits.dtype, logits.stride(0), logits.shape[1], token_ids.dtype
+     )
+     ranks_kernel(*args, **kwargs)(logits, token_ids, output)
++
++
++# --- Log probabilities of the selected tokens -----------------------------------
++
++# logprob._topk_log_softmax_kernel's BLOCK_SIZE and TOPK_BLOCK_SIZE, at Triton's
++# default four warps (_THREADS).
++SOFTMAX_BLOCK = 1024
++_SOFTMAX_PER_THREAD = SOFTMAX_BLOCK // _THREADS
++# Vocabulary blocks a thread loads before it reduces them: a chunk.
++_SOFTMAX_UNROLL = 8
++_SOFTMAX_CHUNK = SOFTMAX_BLOCK * _SOFTMAX_UNROLL
++
++
++def _softmax_column(block, j: int, tx, run: int):
++    """The column of thread ``tx``'s ``j``-th element of vocabulary block ``block``
++    in Triton's layout (``_element``)."""
++    return block * SOFTMAX_BLOCK + _element(j, tx, run)
++
++
++def _masked(value, column, vocab, guarded: bool, other):
++    """``value``, or ``other`` where a guarded block's ``column`` is past the row."""
++    if guarded:
++        return T.if_then_else(column < vocab, value, other)
++    return value
++
++
++@tilelang.jit(pass_configs=tilelang_sampling._PASS)
++def topk_log_softmax_kernel(logits_dtype: str, run: int):
++    """``_topk_log_softmax_kernel`` (BLOCK_SIZE and TOPK_BLOCK_SIZE 1024, four
++    warps): one block of 128 threads a row, whose ``topk`` selected tokens' log
++    probabilities it writes. A thread holds its eight columns of each 1024-column
++    block in runs of ``run`` (``_triton_run``); chunks of eight whole blocks load
++    their runs as vectors (the launch checked the alignment), and the row's last
++    chunk loads each column clamped to the row, the columns past it masked."""
++    rows, vocab, topk = T.dynamic("rows, vocab, topk")
++    logits_stride = T.dynamic("logits_stride", "int64")
++    per = _SOFTMAX_PER_THREAD
++    unroll = _SOFTMAX_UNROLL
++
++    @T.macro
++    def load_blocks(logits, raw, row, block0, tx, guarded):
++        """The thread's columns of blocks ``block0`` to ``block0 + unroll - 1``,
++        block ``u``'s at ``raw[u * per:]`` in register order."""
++        for u in tuple(range(unroll)):
++            if guarded:
++                for j in tuple(range(per)):
++                    raw[u * per + j] = logits[
++                        row, T.min(_softmax_column(block0 + u, j, tx, run), vocab - 1)
++                    ]
++            elif run == 1:
++                for j in tuple(range(per)):
++                    raw[u * per + j] = logits[
++                        row, _softmax_column(block0 + u, j, tx, run)
++                    ]
++            else:
++                for r in tuple(range(per // run)):
++                    col0 = _softmax_column(block0 + u, r * run, tx, run)
++                    for k in T.vectorized(run):
++                        raw[u * per + r * run + k] = logits[row, col0 + k]
++
++    @T.macro
++    def max_blocks(raw, peak, best, block0, tx, guarded):
++        """Fold the loaded blocks into the thread's maximum ``best[0]``; a column
++        past the row is -inf."""
++        for u in tuple(range(unroll)):
++            for j in tuple(range(per)):
++                value = _masked(
++                    T.cast(raw[u * per + j], T.float32),
++                    _softmax_column(block0 + u, j, tx, run),
++                    vocab,
++                    guarded,
++                    -T.infinity(T.float32),
++                )
++                if j == 0:
++                    peak[u] = value
++                else:
++                    peak[u] = T.call_extern("float32", "vllm_max", peak[u], value)
++        for u in tuple(range(unroll)):
++            best[0] = T.call_extern("float32", "vllm_max", best[0], peak[u])
++
++    @T.macro
++    def sum_blocks(raw, total, sums, se, maximum, block0, buf, blocks, tx, guarded):
++        """Add the loaded blocks' sums of exponentials to ``se[0]`` in block order,
++        each block's summed as Triton sums it (``_block_reduce`` with ``vllm_add``,
++        the blocks' warp sums crossing in one barrier through ``sums[buf]``); a
++        column past the row adds 0, a block past it nothing."""
++        for u in tuple(range(unroll)):
++            for j in tuple(range(per)):
++                term = _masked(
++                    T.call_extern(
++                        "float32",
++                        "vllm_exp_from",
++                        T.cast(raw[u * per + j], T.float32),
++                        maximum,
++                    ),
++                    _softmax_column(block0 + u, j, tx, run),
++                    vocab,
++                    guarded,
++                    T.float32(0),
++                )
++                if j == 0:
++                    total[u] = term
++                else:
++                    total[u] = T.call_extern("float32", "vllm_add", total[u], term)
++        for distance in (16, 8, 4, 2, 1):
++            for u in tuple(range(unroll)):
++                total[u] = T.call_extern(
++                    "float32", "vllm_add", total[u], T.shfl_xor(total[u], distance)
++                )
++        if tx % 32 == 0:
++            for u in tuple(range(unroll)):
++                sums[buf, u, tx // 32] = total[u]
++        T.sync_threads()
++        # Threads 0-3 add the warps' sums at XOR distances 2 and 1; every thread
++        # takes thread 0's.
++        for u in tuple(range(unroll)):
++            block_sum = T.call_extern(
++                "float32",
++                "vllm_add",
++                T.call_extern("float32", "vllm_add", sums[buf, u, 0], sums[buf, u, 2]),
++                T.call_extern("float32", "vllm_add", sums[buf, u, 1], sums[buf, u, 3]),
++            )
++            if guarded:
++                se[0] = T.if_then_else(
++                    block0 + u < blocks,
++                    T.call_extern("float32", "vllm_add", se[0], block_sum),
++                    se[0],
++                )
++            else:
++                se[0] = T.call_extern("float32", "vllm_add", se[0], block_sum)
++
++    @T.prim_func
++    def topk_log_softmax(
++        output: T.Tensor((rows, topk), T.float32),
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), logits_dtype),
++        token_ids: T.Tensor((rows, topk), T.int64),
++    ):
++        with T.Kernel(rows, threads=_THREADS) as row:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            raw = T.alloc_local((unroll * per,), logits_dtype)
++            peak = T.alloc_local((unroll,), T.float32)
++            total = T.alloc_local((unroll,), T.float32)
++            best = T.alloc_local((1,), T.float32)
++            se = T.alloc_local((1,), T.float32)
++            tokens = T.alloc_local((per,), T.int64)
++            picked = T.alloc_local((per,), T.float32)
++            partial = T.alloc_shared((_THREADS // 32,), T.float32)
++            row_max = T.alloc_shared((1,), T.float32)
++            # Two chunks' warp sums: a chunk writes one while the last is read.
++            sums = T.alloc_shared((2, unroll, _THREADS // 32), T.float32)
++            if run > 1:
++                # The launch checked it: a 16-byte base and a stride of 16 elements.
++                T.assume(logits_stride % 16 == 0)
++
++            blocks = T.ceildiv(vocab, SOFTMAX_BLOCK)
++            # Whole chunks; the rest of the row (up to eight blocks, the last of
++            # them partial) is the guarded chunk.
++            full = vocab // _SOFTMAX_CHUNK
++
++            # max_val, the row read last block first: the sum then starts on the
++            # blocks most recently read.
++            best[0] = -T.infinity(T.float32)
++            if full * unroll < blocks:
++                load_blocks(logits, raw, row, full * unroll, tx, True)
++                max_blocks(raw, peak, best, full * unroll, tx, True)
++            for step in T.serial(full):
++                load_blocks(logits, raw, row, (full - 1 - step) * unroll, tx, False)
++                max_blocks(raw, peak, best, (full - 1 - step) * unroll, tx, False)
++            _block_reduce(best, partial, tx, "vllm_max")
++            if tx == 0:
++                row_max[0] = best[0]
++            T.sync_threads()
++            maximum = T.alloc_var(T.float32, init=row_max[0])
++
++            # se, in block order.
++            se[0] = T.float32(0)
++            for chunk in T.serial(full):
++                load_blocks(logits, raw, row, chunk * unroll, tx, False)
++                sum_blocks(raw, total, sums, se, maximum, chunk * unroll, chunk % 2,
++                           blocks, tx, False)  # fmt: skip
++            if full * unroll < blocks:
++                load_blocks(logits, raw, row, full * unroll, tx, True)
++                sum_blocks(raw, total, sums, se, maximum, full * unroll, full % 2,
++                           blocks, tx, True)  # fmt: skip
++            lse = T.alloc_var(
++                T.float32, init=T.call_extern("float32", "vllm_control_log", se[0])
++            )
++
++            # The selected tokens, 1024 at a time: the ids (clamped to the last),
++            # then their logits, then the stores of the requested ones. Row offsets
++            # are 64-bit, as Triton's req_idx * topk.
++            row64 = T.cast(row, T.int64)
++            for c in T.serial(T.ceildiv(topk, SOFTMAX_BLOCK)):
++                for u in tuple(range(per)):
++                    tokens[u] = token_ids[
++                        row64, T.min(c * SOFTMAX_BLOCK + u * _THREADS + tx, topk - 1)
++                    ]
++                for u in tuple(range(per)):
++                    picked[u] = T.cast(logits[row, tokens[u]], T.float32)
++                for u in tuple(range(per)):
++                    if c * SOFTMAX_BLOCK + u * _THREADS + tx < topk:
++                        output[row64, c * SOFTMAX_BLOCK + u * _THREADS + tx] = (
++                            T.call_extern(
++                                "float32",
++                                "vllm_sub",
++                                T.call_extern(
++                                    "float32", "vllm_sub", picked[u], maximum
++                                ),
++                                lse,
++                            )
++                        )
++
++    return topk_log_softmax
++
++
++def topk_log_softmax_key(logits_dtype: torch.dtype, run: int = 1) -> tuple:
++    return (_DTYPES[logits_dtype], run)
++
++
++def log_softmax_calls(logits_dtypes: Sequence[torch.dtype]) -> list:
++    """``topk_log_softmax``'s calls for logits of each of ``logits_dtypes``, in both
++    layouts a launch may take (``_runs``)."""
++    return [
++        _call(topk_log_softmax_kernel, *topk_log_softmax_key(dtype, run))
++        for dtype in dict.fromkeys(logits_dtypes)
++        for run in _runs(dtype)
++    ]
++
++
++def register_log_softmax(logits: Sequence[tuple[torch.dtype, int]]) -> None:
++    """Declare ``log_softmax_calls`` for logits given as ``(dtype, row stride)``
++    pairs with the runner's JIT registry (a no-op where none collects). The stride
++    is the launch's argument, not part of the key."""
++    dtypes = tuple(dtype for dtype, _ in logits)
++    declare(lambda: log_softmax_calls(dtypes))
++
++
++def topk_log_softmax(
++    logits: torch.Tensor,  # [rows, vocab_size]
++    token_ids: torch.Tensor,  # [rows, topk], int64, contiguous
++    output: torch.Tensor,  # [rows, topk], FP32, contiguous
++) -> None:
++    """``_topk_log_softmax_kernel``'s launch: each row's log-softmax at its
++    ``token_ids``, into ``output``."""
++    if logits.shape[0] == 0 or token_ids.shape[1] == 0:
++        return
++    kernel = _kernel(
++        topk_log_softmax_kernel,
++        *topk_log_softmax_key(logits.dtype, _triton_run(logits)),
++    )
++    kernel(output, logits, token_ids)

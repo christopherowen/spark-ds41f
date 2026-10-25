@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:45:24 +0200
+Subject: [PATCH 396/488] Load a combine request's drafts only when it has them
+
+Predicated loads (as Triton's masked loads) keep the drafts and
+confidences in the first round of loads at decode, and a prefill chunk's
+request no longer waits on rows it never uses.
+---
+ vllm/v1/worker/gpu/tilelang_inputs.py | 42 +++++++++++++++++++++++----
+ 1 file changed, 36 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index ab7df67c7..3c5678e85 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -675,8 +675,9 @@ def combine_sampled_and_draft_tokens_kernel(
+     """A request's logits indices, and for a decoding request its last sampled
+     token and its drafts into the input ids; ``drafts`` is the draft tokens' width
+     (Triton's BLOCK_SIZE is the next power of two of ``drafts + num_new``). Every
+-    scalar the request needs, its drafts and confidences included, is read up
+-    front, so the loads issue together. With dead rows the drafts' survival is the
++    scalar the request needs is read up front, so the loads issue together; its
++    drafts and confidences are predicated loads of the drafts it has (``_LOAD_IF``).
++    With dead rows the drafts' survival is the
+     running sum of log confidences in Triton's warp-scan order (Kogge-Stone,
+     strides 1, 2, 4, ...), the cut counts the drafts whose survival is at least
+     ``log_tau``, and rows of drafts past it become padding. Without dead rows a
+@@ -715,15 +716,22 @@ def combine_sampled_and_draft_tokens_kernel(
+         seq = T.alloc_var(T.int32, init=seq_lens[b])
+         prefill = T.alloc_var(T.int32, init=prefill_len[req])
+         last = T.alloc_var(T.int64, init=last_sampled[req])
++        num_logits = end - first
++        num_drafts = num_logits - num_new
++        # Only the drafts there are: a prefill chunk's request waits on none.
+         tokens = T.alloc_local((drafts,), T.int64)
+         for j in T.unroll(drafts):
+-            tokens[j] = draft_tokens[req, j]
++            tokens[j] = T.call_extern(
++                "int64", "vllm_load_if_b64", T.address_of(draft_tokens[req, j]),
++                T.int64(0), j < num_drafts,
++            )  # fmt: skip
+         if dead_rows:
+             confs = T.alloc_local((drafts,), T.float32)
+             for j in T.unroll(drafts):
+-                confs[j] = confidence[req, j]
+-        num_logits = end - first
+-        num_drafts = num_logits - num_new
++                confs[j] = T.call_extern(
++                    "float32", "vllm_load_if_f32", T.address_of(confidence[req, j]),
++                    T.float32(1.0), j < num_drafts,
++                )  # fmt: skip
+         for j in T.unroll(block):
+             if j < num_logits:
+                 logits_indices[first + j] = T.cast(query_end - num_logits + j, T.int64)
+@@ -777,6 +785,7 @@ def combine_sampled_and_draft_tokens_kernel(
+             logits_indices: T.Tensor((logits_len,), T.int64),
+         ):
+             with T.Kernel(T.ceildiv(num_reqs, _REQUESTS), threads=_REQUESTS) as bx:
++                T.import_source(_LOAD_IF)
+                 b = bx * _REQUESTS + T.get_thread_binding()
+                 if b < num_reqs:
+                     request(
+@@ -806,6 +815,7 @@ def combine_sampled_and_draft_tokens_kernel(
+         log_tau: T.float32,
+     ):
+         with T.Kernel(num_reqs, threads=32) as b:
++            T.import_source(_LOAD_IF)
+             if T.get_thread_binding() == 0:
+                 request(
+                     b, input_ids, idx_mapping, last_sampled, query_start_loc, seq_lens,
+@@ -838,6 +848,26 @@ __device__ __forceinline__ void vllm_store_if_f32(void* p, float v, bool ok) {
+ }
+ """
+ 
++# Triton's masked loads, likewise: a lane whose mask is off keeps ``other`` and never
++# waits on memory.
++_LOAD_IF = r"""
++__device__ __forceinline__ long long vllm_load_if_b64(const void* p, long long other,
++                                                      bool ok) {
++  long long v = other;
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q ld.global.b64 %0, [%1];\n}"
++               : "+l"(v) : "l"(p), "r"((int)ok));
++  return v;
++}
++__device__ __forceinline__ float vllm_load_if_f32(const void* p, float other, bool ok) {
++  float v = other;
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q ld.global.f32 %0, [%1];\n}"
++               : "+f"(v) : "l"(p), "r"((int)ok));
++  return v;
++}
++"""
++
+ _STORE_BITS = {"int32": 32, "int64": 64}
+ 
+ 

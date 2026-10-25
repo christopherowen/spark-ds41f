@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 07:00:24 +0100
+Subject: [PATCH 470/488] V2 runner warmup: drop Triton's top-k/top-p compile
+
+The runner's sampling states apply top-k and top-p with the TileLang kernels
+(tilelang_topk_topp), which preparation compiles; the warmup compiled
+Triton's four kernels, which nothing launches, and the JIT monitor reported
+them as compiles during inference.
+---
+ vllm/v1/worker/gpu/warmup.py | 9 ---------
+ 1 file changed, 9 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index d7efd302a..556f0f1a7 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -26,7 +26,6 @@ from vllm.v1.kv_cache_interface import (
+     UniformTypeKVCacheSpecs,
+ )
+ from vllm.v1.request import Request
+-from vllm.v1.sample.ops.topk_topp_sampler import warmup_top_k_top_p
+ from vllm.v1.worker.gpu.input_batch import (
+     combine_sampled_and_draft_tokens,
+     get_num_sampled_and_rejected,
+@@ -578,12 +577,4 @@ def _warmup_kernels(
+             model_runner.device,
+             use_fp64=model_runner.model_config.use_fp64_gumbel,
+         )
+-        warmup_top_k_top_p(
+-            model_runner.model_config.get_vocab_size(),
+-            min(
+-                model_runner.scheduler_config.max_num_batched_tokens,
+-                model_runner.max_num_reqs * decode_query_len,
+-            ),
+-            model_runner.device,
+-        )
+     torch.accelerator.synchronize()

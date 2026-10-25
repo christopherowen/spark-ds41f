@@ -1,0 +1,1110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:11:05 +0100
+Subject: [PATCH 453/488] [DS4.1] Sampler-side glue in TileLang: Gumbel finish,
+ row clears, draft gather
+
+- Gumbel-max sampling's finish (torch's argmax over the blocks and the
+  gather of the winner) as one warp-a-token kernel, torch.argmax's order.
+- The penalties' bincount rows cleared in one launch (an int64 cast and
+  two index_fill_ before).
+- The thinking budget's marker caches reset in one launch (three
+  index_fill_ before).
+- The consumed drafts gathered into a persistent buffer for the
+  scheduler's grammar check (an ATen index before).
+---
+ .../benchmark_runner_inputs_tilelang.py       | 19 ++++
+ .../kernels/benchmark_sampling_controls.py    | 30 ++++--
+ .../kernels/benchmark_tilelang_sampling.py    | 24 ++++-
+ tests/v1/worker/test_draft_tokens_handler.py  | 33 +++++++
+ tests/v1/worker/test_gpu_sampling_controls.py | 81 +++++++++++++++++
+ tests/v1/worker/test_gpu_thinking_budget.py   | 67 ++++++++++++++
+ tests/v1/worker/test_gpu_tilelang_inputs.py   | 24 +++++
+ tests/v1/worker/test_gpu_tilelang_sampling.py | 91 ++++++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            |  7 ++
+ vllm/v1/worker/gpu/sample/gumbel.py           | 11 ++-
+ vllm/v1/worker/gpu/sample/penalties.py        | 10 +-
+ vllm/v1/worker/gpu/sample/thinking_budget.py  |  7 +-
+ .../v1/worker/gpu/sample/tilelang_controls.py | 64 ++++++++++++-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 79 +++++++++++++++-
+ .../v1/worker/gpu/sample/tilelang_thinking.py | 36 ++++++++
+ vllm/v1/worker/gpu/spec_decode/utils.py       | 36 ++++++--
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 51 +++++++++++
+ 17 files changed, 636 insertions(+), 34 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+index 24df2fbbe..243664140 100644
+--- a/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
++++ b/benchmarks/kernels/benchmark_runner_inputs_tilelang.py
+@@ -558,6 +558,24 @@ def case_gather_lookback(gen, num_reqs, prefill, widths):
+     return triton_call, tilelang_call
+ 
+ 
++def case_gather_consumed_drafts(gen, num_reqs, prefill, widths):
++    """The drafts a step's inputs consumed, which the async-scheduling hand-off
++    copies to the host for structured-output requests: before the port, torch's
++    ``draft_tokens[idx_mapping, :drafts]``."""
++    reqs = 1 if prefill else num_reqs
++    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
++    drafts = _randint(0, VOCAB, (MAX_REQS, DRAFTS), gen, torch.int64)
++    out = torch.empty(reqs, DRAFTS, dtype=torch.int64, device=DEVICE)
++
++    def torch_call():
++        drafts[idx, :DRAFTS]
++
++    def tilelang_call():
++        tli.gather_rows(idx, drafts, out)
++
++    return torch_call, tilelang_call
++
++
+ CASES = {
+     "gather_block_tables": case_gather_block_tables,
+     "compute_slot_mappings": case_compute_slot_mappings,
+@@ -574,6 +592,7 @@ CASES = {
+     "post_update": case_post_update,
+     "prepare_dflash_inputs": case_prepare_dflash_inputs,
+     "gather_lookback": case_gather_lookback,
++    "gather_consumed_drafts": case_gather_consumed_drafts,
+ }
+ 
+ 
+diff --git a/benchmarks/kernels/benchmark_sampling_controls.py b/benchmarks/kernels/benchmark_sampling_controls.py
+index 5976b4056..37bbab697 100644
+--- a/benchmarks/kernels/benchmark_sampling_controls.py
++++ b/benchmarks/kernels/benchmark_sampling_controls.py
+@@ -40,14 +40,29 @@ def make_case(kind, rows, width, seed, count):
+             for _ in range(count)
+         ]
+ 
++        if kind == "bincount_clear":
++            # The runner's int32 request indices (the torch clear widened them).
++            mapping = mapping.int()
++
+         def reset():
+             for mask, counts in buffers:
+-                mask.zero_()
+-                counts.zero_()
++                if kind == "bincount_clear":
++                    mask.fill_(-1)
++                    counts.fill_(5)
++                else:
++                    mask.zero_()
++                    counts.zero_()
+ 
+         def invoke(index, ours):
+             mask, counts = buffers[index]
+-            if ours:
++            if kind == "bincount_clear":
++                if ours:
++                    candidate.clear_bincount_rows(mapping, mask, counts)
++                else:
++                    idx_long = mapping.long()
++                    mask.index_fill_(0, idx_long, 0)
++                    counts.index_fill_(0, idx_long, 0)
++            elif ours:
+                 candidate.accumulate_bincount(
+                     mapping, tokens, prompt, prefill, mask, counts, width
+                 )
+@@ -239,7 +254,8 @@ def main():
+     parser.add_argument("--gate", action="store_true")
+     parser.add_argument("--seed", type=int, default=48291)
+     parser.add_argument(
+-        "--kernels", default="min_p,penalties,bincount,bincount_repeated"
++        "--kernels",
++        default="min_p,penalties,bincount,bincount_repeated,bincount_clear",
+     )
+     args = parser.parse_args()
+     cases = [
+@@ -252,9 +268,9 @@ def main():
+     for kind in args.kernels.split(","):
+         if not kind.startswith("bincount"):
+             continue
+-        cases += [
+-            (kind, rows, width) for rows in (1, 16) for width in (128, 8192, 131072)
+-        ]
++        # The clear's work is the vocabulary's, whatever the token history's length.
++        widths = (128,) if kind == "bincount_clear" else (128, 8192, 131072)
++        cases += [(kind, rows, width) for rows in (1, 16) for width in widths]
+     results = [measure(*case, args.seed) for case in cases]
+     failed = [(r["kernel"], r["rows"], r["width"]) for r in results if r["slower"]]
+     print(json.dumps({"summary": "sampling controls", "slower": failed}), flush=True)
+diff --git a/benchmarks/kernels/benchmark_tilelang_sampling.py b/benchmarks/kernels/benchmark_tilelang_sampling.py
+index 7d34b580c..73d8230a6 100644
+--- a/benchmarks/kernels/benchmark_tilelang_sampling.py
++++ b/benchmarks/kernels/benchmark_tilelang_sampling.py
+@@ -1,6 +1,8 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""The TileLang sampling kernels against the Triton kernels they replace, per call.
++"""The TileLang sampling kernels against the Triton kernels they replace, per call
++(and the Gumbel finish against the torch argmax and gather it replaced, reported in
++the "triton_us" column).
+ 
+ Each kernel runs at the shapes a DeepSeek V4.1 deployment launches it (vocabulary
+ 129280; tensor-parallel shards of 32320; five drafts, so six rows per request;
+@@ -223,6 +225,25 @@ def gumbel_case(tokens: int, dtype: torch.dtype):
+     return make
+ 
+ 
++def gumbel_finish_case(tokens: int):
++    """Each token's id from its blocks' argmax and maximum: one warp a token against
++    torch's argmax over the blocks and gather of its argmax."""
++    blocks = triton.cdiv(VOCAB, tls.GUMBEL_BLOCK)
++
++    def make(sample: int):
++        g = generator(sample)
++        best = torch.randn(tokens, blocks, generator=g, device=DEVICE)
++        argmax = torch.randint(0, VOCAB, (tokens, blocks), generator=g, device=DEVICE)
++
++        def theirs():
++            max_block_idx = best.argmax(dim=-1, keepdim=True)
++            argmax.gather(dim=-1, index=max_block_idx).view(-1)
++
++        return (lambda: tls.gumbel_finish(argmax, best)), theirs
++
++    return make
++
++
+ def temperature_case(tokens: int):
+     def make(sample: int):
+         g = generator(sample)
+@@ -482,6 +503,7 @@ CASES = {
+         for d in (torch.bfloat16, torch.float32)
+         for t in (1, 6, 16, 96)
+     ],
++    "gumbel_finish": [(f"{t} tokens", gumbel_finish_case(t)) for t in (1, 6, 16, 96)],
+     "temperature": [(f"{t} tokens", temperature_case(t)) for t in (1, 16, 96)],
+     "sink_candidates": [
+         (f"{r} requests t={temp}", candidates_case(r, temp))
+diff --git a/tests/v1/worker/test_draft_tokens_handler.py b/tests/v1/worker/test_draft_tokens_handler.py
+index ffa7bdc51..00ddbe33a 100644
+--- a/tests/v1/worker/test_draft_tokens_handler.py
++++ b/tests/v1/worker/test_draft_tokens_handler.py
+@@ -13,11 +13,20 @@ import numpy as np
+ import pytest
+ import torch
+ 
++from vllm.platforms import current_platform
++from vllm.utils.import_utils import has_tilelang
+ from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+ 
+ pytestmark = pytest.mark.skipif(
+     not torch.cuda.is_available(), reason="DraftTokensHandler copies on CUDA streams"
+ )
++# The consumed drafts are gathered by a TileLang kernel.
++_TILELANG = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or not current_platform.is_device_capability_family(120)
++    or not has_tilelang(),
++    reason="the consumed drafts' gather is a TileLang kernel for SM120/SM121",
++)
+ 
+ 
+ def _batch(req_ids, slots, num_drafts, structured=True):
+@@ -38,6 +47,7 @@ def _draft_slots():
+     )
+ 
+ 
++@_TILELANG
+ def test_consumed_drafts_include_requests_that_skipped_the_proposing_step():
+     handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
+     drafts = _draft_slots()
+@@ -54,6 +64,7 @@ def test_consumed_drafts_include_requests_that_skipped_the_proposing_step():
+     assert draft_token_ids.draft_token_ids == [[1, 2, 3], [7, 8, 9]]
+ 
+ 
++@_TILELANG
+ def test_step_without_drafts_clears_the_hand_off():
+     handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
+     drafts = _draft_slots()
+@@ -66,6 +77,28 @@ def test_step_without_drafts_clears_the_hand_off():
+     assert draft_token_ids.draft_token_ids == [[]]
+ 
+ 
++@_TILELANG
++def test_consecutive_hand_offs_share_the_gather_buffer():
++    """Each step's hand-off is its own consumed drafts, though the gather reuses one
++    buffer: rows in any order, a narrower step after a wider one, and a draft count
++    past the buffer's columns clamped as the slice clamps it."""
++    handler = DraftTokensHandler(torch.device("cuda"), track_consumed_drafts=True)
++    drafts = _draft_slots()
++
++    handler.set_consumed_draft_tokens(
++        _batch(["a", "b", "c"], [2, 0, 1], [3] * 3), drafts
++    )
++    assert handler.get_draft_tokens().draft_token_ids == [
++        [7, 8, 9],
++        [1, 2, 3],
++        [4, 5, 6],
++    ]
++    handler.set_consumed_draft_tokens(_batch(["b", "c"], [0, 1], [1, 2]), drafts)
++    assert handler.get_draft_tokens().draft_token_ids == [[1, 2], [4, 5]]
++    handler.set_consumed_draft_tokens(_batch(["c"], [1], [5]), drafts)
++    assert handler.get_draft_tokens().draft_token_ids == [[4, 5, 6]]
++
++
+ def test_synchronous_scheduling_hands_back_proposals():
+     handler = DraftTokensHandler(torch.device("cuda"))
+     drafts = _draft_slots()
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 28c0739a4..4cf7cc729 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -6,14 +6,22 @@ import pytest
+ import torch
+ 
+ pytest.importorskip("triton")
++pytest.importorskip("tilelang")
+ if not torch.cuda.is_available():
+     pytest.skip("CUDA required for sampling controls", allow_module_level=True)
+ 
++from vllm.platforms import current_platform
++from vllm.v1.worker.gpu.sample import penalties
+ from vllm.v1.worker.gpu.sample import tilelang_auxiliary as auxiliary
+ from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
+ from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
+ from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
+ 
++_SM12X = pytest.mark.skipif(
++    not current_platform.is_device_capability_family(120),
++    reason="TileLang sampling controls target SM120/SM121",
++)
++
+ 
+ def assert_bits(actual, expected):
+     if actual.is_floating_point():
+@@ -189,6 +197,79 @@ def test_bincount_distinguishes_prompt_bits_and_output_counts(
+     assert_bits(counts, expected_counts)
+ 
+ 
++def _bin_buffers(states, vocab, padded):
++    """Prompt bits and output counts of garbage, rows padded past the vocabulary
++    or not."""
++    pad = 13 if padded else 0
++    mask = torch.randint(
++        -(2**31), 2**31 - 1, (states, (vocab + 31) // 32 + pad), device="cuda"
++    ).int()[:, : (vocab + 31) // 32]
++    counts = torch.randint(0, 1 << 20, (states, vocab + pad), device="cuda").int()
++    return mask, counts[:, :vocab]
++
++
++@_SM12X
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
++@pytest.mark.parametrize(
++    "rows", [[0], [8], [-1], [3, 7, 3], [-9, 2, -1, 0], list(range(9))]
++)
++@pytest.mark.parametrize("padded", [False, True])
++def test_bincount_rows_cleared_as_index_fill(index_dtype, vocab, rows, padded):
++    """The rows the bincount accumulates into, cleared as the int64 cast and two
++    index_fill_ calls cleared them: repeated rows, the last, a negative index
++    wrapping (-9 is the first of nine); every other element kept."""
++    torch.manual_seed(len(rows) + vocab)
++    mask, counts = _bin_buffers(9, vocab, padded)
++    mapping = torch.tensor(rows, dtype=index_dtype, device="cuda")
++    expected_mask, expected_counts = mask.clone(), counts.clone()
++    idx_long = mapping.long()
++    expected_mask.index_fill_(0, idx_long, 0)
++    expected_counts.index_fill_(0, idx_long, 0)
++    candidate.clear_bincount_rows(mapping, mask, counts)
++    assert_bits(mask, expected_mask)
++    assert_bits(counts, expected_counts)
++
++
++@_SM12X
++@pytest.mark.parametrize("length", [0, 1, 1025, 8192])
++@pytest.mark.parametrize("num_rows", [1, 4])
++def test_bincount_clears_then_accumulates(length, num_rows):
++    """``penalties.bincount`` (the clear, then the accumulation) against the torch
++    clear it replaced followed by the Triton kernel, from garbage rows, at the
++    runner's int32 request indices (a request with no prefill tokens cleared)."""
++    torch.manual_seed(length + num_rows)
++    states, vocab = 9, 129280
++    tokens = torch.randint(
++        vocab, (states, length + 11), dtype=torch.int32, device="cuda"
++    )
++    tokens[:, ::3] = 31
++    mapping = torch.tensor([8, 1, 5, 2][:num_rows], dtype=torch.int32, device="cuda")
++    prompt = torch.full((states,), length // 2, dtype=torch.int32, device="cuda")
++    prefill = torch.full((states,), length, dtype=torch.int32, device="cuda")
++    mask, counts = _bin_buffers(states, vocab, False)
++    expected_mask, expected_counts = mask.clone(), counts.clone()
++    idx_long = mapping.long()
++    expected_mask.index_fill_(0, idx_long, 0)
++    expected_counts.index_fill_(0, idx_long, 0)
++    if length:
++        _bincount_kernel[(num_rows, (length + 1023) // 1024)](
++            mapping,
++            tokens,
++            tokens.stride(0),
++            prompt,
++            prefill,
++            expected_mask,
++            mask.stride(0),
++            expected_counts,
++            counts.stride(0),
++            BLOCK_SIZE=1024,
++        )
++    penalties.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
++    assert_bits(mask, expected_mask)
++    assert_bits(counts, expected_counts)
++
++
+ @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+ @pytest.mark.parametrize("word_count", [1, 7, 33, 129])
+ def test_bad_words_match_across_committed_and_draft_boundary(index_dtype, word_count):
+diff --git a/tests/v1/worker/test_gpu_thinking_budget.py b/tests/v1/worker/test_gpu_thinking_budget.py
+index 20c09cb01..d98e8c078 100644
+--- a/tests/v1/worker/test_gpu_thinking_budget.py
++++ b/tests/v1/worker/test_gpu_thinking_budget.py
+@@ -5,13 +5,16 @@ import pytest
+ import torch
+ 
+ pytest.importorskip("triton")
++pytest.importorskip("tilelang")
+ if not torch.cuda.is_available():
+     pytest.skip(
+         "CUDA required for Model Runner V2 thinking budget tests",
+         allow_module_level=True,
+     )
+ 
++from vllm.platforms import current_platform
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu.sample import tilelang_thinking
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
+ from vllm.v1.worker.gpu.states import RequestState
+@@ -23,6 +26,11 @@ END_A = 92
+ END_B = 93
+ VOCAB_SIZE = 128
+ 
++_SM12X = pytest.mark.skipif(
++    not current_platform.is_device_capability_family(120),
++    reason="TileLang thinking-budget kernels target SM120/SM121",
++)
++
+ 
+ def triton_apply_thinking_budget(
+     logits,
+@@ -372,3 +380,62 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
+ 
+     assert out[0, END_B] == pytest.approx(1.0e9)
+     assert out[0, END_A] == 0
++
++
++def _reset_rows(case: str, states: int, gen: torch.Generator) -> list[int]:
++    if case == "one":
++        return [states - 1]
++    if case == "repeated":
++        return [0, 3, 0]
++    if case == "negative":
++        return [-1, 2, -states]
++    # More requests than a block's threads, negative ones and repeats among them.
++    return torch.randint(-states, states, (300,), generator=gen).tolist()
++
++
++@_SM12X
++@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
++@pytest.mark.parametrize("states", [4, 512])
++@pytest.mark.parametrize("case", ["one", "repeated", "negative", "many"])
++def test_marker_cache_reset_matches_index_fill(index_dtype, states, case):
++    """New budgeted requests' marker caches, reset as the three index_fill_ calls
++    reset them (start and end -1, scan position 0): repeated requests, a negative
++    index wrapping, every other slot kept."""
++    gen = torch.Generator().manual_seed(states)
++    caches = [
++        torch.randint(-5, 1 << 20, (states,), generator=gen, dtype=torch.int32).to(
++            DEVICE
++        )
++        for _ in range(3)
++    ]
++    idx = torch.tensor(_reset_rows(case, states, gen), dtype=index_dtype)
++    idx = idx.to(DEVICE)
++    expected = [cache.clone() for cache in caches]
++    expected[0].index_fill_(0, idx.long(), -1)
++    expected[1].index_fill_(0, idx.long(), -1)
++    expected[2].index_fill_(0, idx.long(), 0)
++    tilelang_thinking.reset_markers(idx, *caches)
++    for name, ours, theirs in zip(("start", "end", "scan"), caches, expected):
++        assert torch.equal(ours, theirs), name
++
++
++@_SM12X
++def test_new_budgeted_requests_reset_only_their_marker_cache():
++    """``apply_staged_writes`` resets the marker cache of each request added with a
++    budget, and no other slot's."""
++    req_states = _make_req_states([1, START, 10, 11])
++    state = ThinkingBudgetState(req_states, MockReasoningConfig())
++    stale = torch.arange(7, 11, dtype=torch.int32, device=DEVICE)
++    for cache in (
++        state.cached_last_start,
++        state.cached_last_end,
++        state.cached_scan_pos,
++    ):
++        cache.copy_(stale)
++    state.add_request(1, SamplingParams(thinking_token_budget=4))
++    state.add_request(3, SamplingParams(thinking_token_budget=None))
++    state.add_request(2, SamplingParams(thinking_token_budget=8))
++    state.apply_staged_writes()
++    assert state.cached_last_start.tolist() == [7, -1, -1, 10]
++    assert state.cached_last_end.tolist() == [7, -1, -1, 10]
++    assert state.cached_scan_pos.tolist() == [7, 0, 0, 10]
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 4e32ee032..331684024 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -764,6 +764,28 @@ def test_scatter_rows(num_reqs, width, dtype, gather):
+         assert out is None
+ 
+ 
++@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
++@pytest.mark.parametrize("width", [1, 3, DRAFTS])
++@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
++def test_gather_rows(num_reqs, width, idx_dtype):
++    """The drafts a step's inputs consumed (``DraftTokensHandler``):
++    ``state[idx, :width]`` against torch's indexing, from a state of wider rows, a
++    repeated row and -1 (the last row) among the indices, into the front of a
++    larger buffer whose tail keeps its contents."""
++    gen = _gen(num_reqs * 5 + width)
++    idx = _idx(num_reqs, gen, idx_dtype)
++    if num_reqs > 2:
++        idx[1] = idx[0]
++        idx[2] = -1
++    state = _garbage((MAX_REQS, DRAFTS + 2), torch.int64, gen)[:, :DRAFTS]
++    flat = _garbage((MAX_REQS * DRAFTS,), torch.int64, gen)
++    expected = flat.clone()
++    expected[: num_reqs * width] = state[idx, :width].reshape(-1)
++    tli.gather_rows(idx, state, flat[: num_reqs * width].view(num_reqs, width))
++    torch.accelerator.synchronize()
++    assert torch.equal(flat, expected)
++
++
+ def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
+     """reallocate_drafts' torch chain before the port."""
+     num_reqs = capacities.shape[0]
+@@ -1191,6 +1213,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
+     drafts = _randint(0, 1 << 17, (MAX_REQS, DRAFTS), gen, torch.int64)
+     state = torch.zeros_like(drafts)
+     tli.scatter_rows(idx, drafts[:4], state, gather=True)
++    tli.gather_rows(idx, state, torch.empty_like(drafts[:4]))
+     confidences = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
+     tli.scatter_rows(idx, confidences[:4], torch.zeros_like(confidences))
+     capacities = _randint(0, DRAFTS + 1, (4,), gen)
+@@ -1228,6 +1251,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
+         tli.flatten_sampled_calls()
+         + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
++        + tli.gather_rows_calls(torch.int64, torch.int64)
+         + tli.adaptive_offsets_calls(DRAFTS + 1)
+         + tli.assign_draft_budget_calls(DRAFTS)
+         + tli.padding_rows_calls()
+diff --git a/tests/v1/worker/test_gpu_tilelang_sampling.py b/tests/v1/worker/test_gpu_tilelang_sampling.py
+index bbf6ec0e5..45d53374a 100644
+--- a/tests/v1/worker/test_gpu_tilelang_sampling.py
++++ b/tests/v1/worker/test_gpu_tilelang_sampling.py
+@@ -3,7 +3,8 @@
+ """The TileLang sampling kernels against the Triton kernels they replace, bit for
+ bit: the FP32 Gumbel noise of every one of the 2**32 Philox words, Triton's
+ randint streams, and every kernel's outputs (including the elements a launch
+-leaves alone) on logits with ties, infinities and NaN."""
++leaves alone) on logits with ties, infinities and NaN. The Gumbel finish is
++compared with the torch argmax and gather it replaced."""
+ 
+ import itertools
+ 
+@@ -16,6 +17,7 @@ pytest.importorskip("tilelang")
+ import triton.language as tl  # noqa: E402
+ from triton.language.extra import libdevice as tldevice  # noqa: E402
+ 
++from vllm.platforms import current_platform  # noqa: E402
+ from vllm.tilelang_utils import T, tilelang  # noqa: E402
+ from vllm.v1.worker.gpu.sample import gumbel, sink  # noqa: E402
+ from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
+@@ -25,6 +27,11 @@ from vllm.v1.worker.gpu.spec_decode.dspark import greedy  # noqa: E402
+ pytestmark = pytest.mark.skipif(
+     not torch.cuda.is_available(), reason="requires a CUDA device"
+ )
++_SM12X = pytest.mark.skipif(
++    not torch.cuda.is_available()
++    or not current_platform.is_device_capability_family(120),
++    reason="TileLang sampling kernels target SM120/SM121",
++)
+ 
+ DEVICE = torch.device("cuda")
+ VOCAB = 129280  # DeepSeek V4.1
+@@ -382,6 +389,88 @@ def test_gumbel_rows_do_not_depend_on_the_batch():
+         assert alone.item() == whole[i].item()
+ 
+ 
++# --- Gumbel sampling's finish ---------------------------------------------------
++
++
++def _finish_inputs(tokens: int, blocks: int, case: str, seed: int):
++    """Per-block maxima and argmaxes as the Gumbel kernel leaves them, as views of
++    wider rows. The argmaxes are random ids, not increasing with the block, so a tie
++    broken by id instead of by block shows. The "special" rows: all -inf, all NaN,
++    NaN in the last block only, +inf twice, -0 before +0, NaN twice after +inf, the
++    maximum in the last block, one value throughout; then scattered NaN and
++    infinities in the rest."""
++    g = torch.Generator(device=DEVICE).manual_seed(seed)
++    wide = torch.randn(tokens, blocks + 5, generator=g, device=DEVICE) * 4
++    best = wide[:, :blocks]
++    if case == "ties":
++        best.copy_(torch.round(best / 4))  # equal maxima across blocks
++    elif case == "special":
++        n = best.numel()
++        pick = torch.randperm(n, generator=g, device=DEVICE)
++        flat = best.reshape(-1).clone()
++        flat[pick[: n // 13]] = float("-inf")
++        flat[pick[n // 13 : n // 13 + n // 29]] = float("inf")
++        flat[pick[n // 13 + n // 29 : n // 13 + n // 29 + n // 31]] = float("nan")
++        best.copy_(flat.view(tokens, blocks))
++        last = blocks - 1
++        rows = [
++            lambda r: r.fill_(float("-inf")),
++            lambda r: r.fill_(float("nan")),
++            lambda r: (r.fill_(float("inf")), r[last:].fill_(float("nan"))),
++            lambda r: (r.fill_(-1.0), r[last // 2 :].fill_(float("inf"))),
++            lambda r: (r.fill_(-1.0), r[last // 3 :].fill_(-0.0), r[last:].fill_(0.0)),
++            lambda r: (
++                r.fill_(1.0),
++                r[:1].fill_(float("inf")),
++                r[last // 2 :].fill_(float("nan")),
++            ),
++            lambda r: (r.fill_(2.0), r[last:].fill_(3.0)),
++            lambda r: r.fill_(0.5),
++        ]
++        for i in range(min(tokens, len(rows))):
++            rows[i](best[i])
++    argmax = torch.randint(
++        0, 1 << 40, (tokens, blocks + 3), generator=g, device=DEVICE
++    )[:, :blocks]
++    return argmax, best
++
++
++@_SM12X
++@pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049, 32768, 32769, 200000])
++@pytest.mark.parametrize("tokens", [1, 37, 600])
++@pytest.mark.parametrize("case", CASES)
++def test_gumbel_finish(vocab, tokens, case):
++    """``gumbel_finish`` against the torch argmax and gather it replaced, every
++    block count's lanes (one block, a lane's 32 and 33, DeepSeek V4.1's 127, 196)."""
++    blocks = triton.cdiv(vocab, tls.GUMBEL_BLOCK)
++    argmax, best = _finish_inputs(tokens, blocks, case, vocab + tokens)
++    ours = tls.gumbel_finish(argmax, best)
++    theirs = argmax.gather(dim=-1, index=best.argmax(dim=-1, keepdim=True)).view(-1)
++    assert ours.dtype == torch.int64 and ours.shape == (tokens,)
++    _assert_same(ours, theirs, "sampled tokens")
++
++
++@_SM12X
++@pytest.mark.parametrize("vocab", [VOCAB, 1000, 200000])
++def test_gumbel_finish_is_declared(vocab, monkeypatch):
++    """The finish ``gumbel_sample`` launches is the call its declaration lists for
++    the vocabulary (after the kernel cache freezes, an undeclared one raises)."""
++    launched = set()
++    original = tls._kernel
++
++    def record(factory, *key):
++        launched.add((id(factory), key))
++        return original(factory, *key)
++
++    monkeypatch.setattr(tls, "_kernel", record)
++    logits = _logits(3, vocab, torch.float32, "random", 7)
++    mapping, temperature, seeds, pos = _sampling_inputs(3, 4, "mixed", 7)
++    tls.gumbel_sample(logits, mapping, temperature, seeds, pos, False, False)
++    finish = id(tls.gumbel_finish_kernel)
++    declared = {(id(f), args) for f, args, _ in tls.gumbel_finish_calls(vocab)}
++    assert {key for key in launched if key[0] == finish} == declared
++
++
+ @pytest.mark.parametrize("vocab", [VOCAB, 100, 8193])
+ @pytest.mark.parametrize("stride", STRIDES)
+ @pytest.mark.parametrize("case", CASES)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index eeaf8773e..90d589404 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2128,6 +2128,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     else []
+                 )
+             )
++            if self.draft_tokens_handler.track_consumed_drafts:
++                # The drafts a step's inputs consumed, handed back to the
++                # scheduler for grammar validation (set_consumed_draft_tokens).
++                tilelang_inputs.declare(
++                    lambda: tilelang_inputs.gather_rows_calls(torch.int64, draft_dtype)
++                )
+         if envs.VLLM_MOE_SKIP_PADDING:
+             # The target's padding rows (prepare_inputs).
+             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
+@@ -2238,6 +2244,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     if dtype is not None
+                 ),
+                 cache_dtype=draft_logits.dtype,
++                vocab_size=draft_logits.shape[-1],
+                 use_fp64=self.model_config.use_fp64_gumbel,
+             )
+ 
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index cb7864645..deaacbb73 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -288,8 +288,8 @@ def register_sampling_warmups(
+     use_fp64: bool,
+ ) -> None:
+     """Declare the target sampler's temperature scaling of processed FP32 logits
+-    and its Gumbel-max sampling without a logits cache of logits of each
+-    ``(dtype, row stride)``; the TileLang kernels take any stride."""
++    and its Gumbel-max sampling without a logits cache of ``vocab_size``-wide
++    logits of each ``(dtype, row stride)``; the TileLang kernels take any stride."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     if use_fp64:
+@@ -300,6 +300,7 @@ def register_sampling_warmups(
+         lambda: tilelang_sampling.sampling_calls(
+             [dtype for dtype, _ in logits], temperature=bool(processed_logits_strides)
+         )
++        + tilelang_sampling.gumbel_finish_calls(vocab_size)
+     )
+ 
+ 
+@@ -307,12 +308,13 @@ def register_drafting_warmups(
+     *,
+     logits_dtypes: Sequence[torch.dtype],
+     cache_dtype: torch.dtype,
++    vocab_size: int,
+     use_fp64: bool,
+ ) -> None:
+     """Declare a speculator's probabilistic draft sampling: the temperature in the
+     kernel, the drafting noise stream and the logits cache of ``cache_dtype``, for
+-    logits of each of ``logits_dtypes`` and a step column of either index type,
+-    one per token or shared."""
++    ``vocab_size``-wide logits of each of ``logits_dtypes`` and a step column of
++    either index type, one per token or shared."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     if use_fp64:
+@@ -329,6 +331,7 @@ def register_drafting_warmups(
+                 dtype, cache_dtype, col_dtype, per_token_col
+             )
+         ]
++        + tilelang_sampling.gumbel_finish_calls(vocab_size)
+     )
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/sample/penalties.py b/vllm/v1/worker/gpu/sample/penalties.py
+index 4b7075264..24253fc96 100644
+--- a/vllm/v1/worker/gpu/sample/penalties.py
++++ b/vllm/v1/worker/gpu/sample/penalties.py
+@@ -289,11 +289,11 @@ def bincount(
+     output_bin_counts: torch.Tensor,
+     max_prefill_len: int,
+ ) -> None:
+-    # The kernel only accumulates: the selected rows are cleared here first. Use
+-    # index_fill_ instead of `tensor[idx] = 0` to avoid sync.
+-    idx_long = expanded_idx_mapping.long()
+-    prompt_bin_mask.index_fill_(0, idx_long, 0)
+-    output_bin_counts.index_fill_(0, idx_long, 0)
++    # The kernel only accumulates: the selected rows are cleared here first, in one
++    # launch (the int64 cast and two index_fill_ calls before).
++    tilelang_controls.clear_bincount_rows(
++        expanded_idx_mapping, prompt_bin_mask, output_bin_counts
++    )
+     tilelang_controls.accumulate_bincount(
+         expanded_idx_mapping,
+         all_token_ids,
+diff --git a/vllm/v1/worker/gpu/sample/thinking_budget.py b/vllm/v1/worker/gpu/sample/thinking_budget.py
+index f42656c3c..f5c84fe8f 100644
+--- a/vllm/v1/worker/gpu/sample/thinking_budget.py
++++ b/vllm/v1/worker/gpu/sample/thinking_budget.py
+@@ -102,9 +102,10 @@ class ThinkingBudgetState:
+             idx = async_tensor_h2d(
+                 self._reset_reqs, dtype=torch.int64, device=self.device
+             )
+-            self.cached_last_start.index_fill_(0, idx, -1)
+-            self.cached_last_end.index_fill_(0, idx, -1)
+-            self.cached_scan_pos.index_fill_(0, idx, 0)
++            # The three caches' rows at idx in one launch (three index_fill_ before).
++            tilelang_thinking.reset_markers(
++                idx, self.cached_last_start, self.cached_last_end, self.cached_scan_pos
++            )
+             self._reset_reqs.clear()
+         if self._budget_dirty:
+             self.thinking_token_budget.copy_to_uva()
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 14a45089c..31f0fa7e8 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -422,6 +422,48 @@ def bincount_kernel(
+     return bincount
+ 
+ 
++_CLEAR_BLOCK = 1024  # columns of a row a block clears in each tensor
++
++
++@tilelang.jit(pass_configs=_PASS)
++def clear_bincount_rows_kernel(
++    mask_stride: int, counts_stride: int, index_dtype: str, threads: int = 128
++):
++    """``mask.index_fill_(0, idx, 0)`` and ``counts.index_fill_(0, idx, 0)`` for
++    ``idx = mapping.long()``, in one launch: the rows ``bincount_kernel`` then
++    accumulates into. A negative index wraps as index_fill_'s does, each tensor by
++    its own rows. A block clears ``_CLEAR_BLOCK`` columns of a row of each, its
++    threads on consecutive columns."""
++    rows, mask_rows, mask_cols, count_rows, count_cols = T.dynamic(
++        "rows, mask_rows, mask_cols, count_rows, count_cols"
++    )
++
++    @T.prim_func
++    def clear_rows(
++        mapping: T.Tensor((rows,), index_dtype),
++        mask: T.StridedTensor((mask_rows, mask_cols), (mask_stride, 1), "int32"),
++        counts: T.StridedTensor((count_rows, count_cols), (counts_stride, 1), "int32"),
++    ):
++        with T.Kernel(
++            rows, T.ceildiv(T.max(mask_cols, count_cols), _CLEAR_BLOCK), threads=threads
++        ) as (row, blk):
++            tx = T.get_thread_binding()
++            req = T.alloc_local((1,), "int64")
++            mask_row = T.alloc_local((1,), "int64")
++            count_row = T.alloc_local((1,), "int64")
++            req[0] = T.cast(mapping[row], "int64")
++            mask_row[0] = T.if_then_else(req[0] < 0, req[0] + mask_rows, req[0])
++            count_row[0] = T.if_then_else(req[0] < 0, req[0] + count_rows, req[0])
++            for k in T.unroll(_CLEAR_BLOCK // threads):
++                col = blk * _CLEAR_BLOCK + k * threads + tx
++                if col < mask_cols:
++                    mask[mask_row[0], col] = 0
++                if col < count_cols:
++                    counts[count_row[0], col] = 0
++
++    return clear_rows
++
++
+ def register_bincount(
+     *,
+     all_token_ids_stride: int,
+@@ -440,12 +482,32 @@ def register_bincount(
+             for dtype in _DTYPES.values()
+         ],
+     )
++    _declare(
++        clear_bincount_rows_kernel,
++        [
++            (prompt_bin_mask_stride, output_bin_counts_stride, dtype)
++            for dtype in _DTYPES.values()
++        ],
++    )
++
++
++def clear_bincount_rows(mapping, mask, counts):
++    """The prompt bits and output counts of the requests at ``mapping``, zeroed."""
++    if mapping.numel():
++        _launch(
++            clear_bincount_rows_kernel,
++            (mask.stride(0), counts.stride(0), _DTYPES[mapping.dtype]),
++            mapping,
++            mask,
++            counts,
++        )
+ 
+ 
+ def accumulate_bincount(
+     mapping, tokens, prompt, prefill, mask, counts, max_prefill_len
+ ):
+-    """Kernel portion only; the owner still clears selected rows before accumulation."""
++    """Kernel portion only; the owner clears the selected rows first
++    (``clear_bincount_rows``)."""
+     if mapping.numel() and max_prefill_len:
+         _launch(
+             bincount_kernel,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index 59f88f6d6..b5d17d5c0 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -5,7 +5,8 @@
+ Each kernel is the contract of the Triton kernel it replaces, bit for bit, NaN
+ scores included (the Triton kernels stay importable as the tests' reference):
+ 
+-- ``gumbel_sample``: ``gumbel._gumbel_sample_kernel``
++- ``gumbel_sample``: ``gumbel._gumbel_sample_kernel``, then the torch argmax and
++  gather that finished it (``gumbel_finish``)
+ - ``apply_temperature``: ``gumbel._temperature_kernel``
+ 
+ The random stream is Triton 3.5's, so seeded outputs do not move: ``tl.randint``
+@@ -541,6 +542,72 @@ def gumbel_sample_kernel(
+     return gumbel_sample
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def gumbel_finish_kernel(per_lane: int):
++    """``gumbel.gumbel_sample``'s finish, ``local_argmax.gather(-1,
++    local_max.argmax(-1, keepdim=True))``, a warp a token: torch.argmax's first
++    maximum of the blocks' scores (NaN above everything, the lowest block among
++    equals or among NaNs: the greedy section's ``_first_keep_or_take`` on the block
++    index), then the winning block's token. Lane ``k`` reads blocks ``k``, ``k +
++    32``, ... (``per_lane`` of them, all loaded before any is combined; past
++    ``blocks``, -inf at an index past every block, which any block outranks); the
++    combine is a total order, so the pairing does not matter."""
++    tokens, blocks = T.dynamic("tokens, blocks")
++    argmax_stride, max_stride = T.dynamic("argmax_stride, max_stride", "int64")
++
++    @T.prim_func
++    def gumbel_finish(
++        local_argmax: T.StridedTensor((tokens, blocks), (argmax_stride, 1), T.int64),
++        local_max: T.StridedTensor((tokens, blocks), (max_stride, 1), T.float32),
++        sampled: T.Tensor((tokens,), T.int64),
++    ):
++        with T.Kernel(tokens, threads=32) as t:
++            T.import_source(_HEADER)
++            tx = T.get_thread_binding()
++            v = T.alloc_local((per_lane,), T.float32)
++            ix = T.alloc_local((per_lane,), T.int32)
++            best = T.alloc_local((1,), T.float32)
++            best_index = T.alloc_local((1,), T.int32)
++            other = T.alloc_local((1,), T.float32)
++            other_index = T.alloc_local((1,), T.int32)
++            for k in T.unroll(per_lane):
++                blk = tx + k * 32
++                v[k] = T.if_then_else(
++                    blk < blocks,
++                    local_max[t, T.min(blk, blocks - 1)],
++                    -T.infinity(T.float32),
++                )
++                ix[k] = T.if_then_else(blk < blocks, blk, _INT32_MAX)
++            best[0] = v[0]
++            best_index[0] = ix[0]
++            for k in T.unroll(1, per_lane):
++                _first_keep_or_take(best, best_index, v[k], ix[k])
++            _warp_first_argmax(best, best_index, other, other_index)
++            if tx == 0:
++                sampled[t] = local_argmax[t, best_index[0]]
++
++    return gumbel_finish
++
++
++def gumbel_finish_key(num_blocks: int) -> tuple:
++    """``gumbel_finish_kernel``'s ``per_lane`` for ``num_blocks`` blocks a token,
++    ``ceil(num_blocks / 32)``: 4 for DeepSeek V4.1's 127."""
++    return (max(-(-num_blocks // 32), 1),)
++
++
++def gumbel_finish(local_argmax: torch.Tensor, local_max: torch.Tensor) -> torch.Tensor:
++    """``local_argmax.gather(-1, local_max.argmax(-1, keepdim=True)).view(-1)``: each
++    token's id ([num_tokens], int64) from its blocks' argmax and maximum."""
++    num_tokens, num_blocks = local_max.shape
++    # NOTE(woosuk): Use int64 for later indexing.
++    sampled = local_argmax.new_empty(num_tokens)
++    if num_tokens > 0:
++        _kernel(gumbel_finish_kernel, *gumbel_finish_key(num_blocks))(
++            local_argmax, local_max, sampled
++        )
++    return sampled
++
++
+ def gumbel_sample_key(
+     logits_dtype: torch.dtype,
+     idx_dtype: torch.dtype,
+@@ -624,9 +691,7 @@ def gumbel_sample(
+             logits_cache if cached else local_max.unsqueeze(1),
+             logits_cache_col.view(-1) if cached else local_argmax.view(-1),
+         )
+-    # NOTE(woosuk): Use int64 for later indexing.
+-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+-    return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
++    return gumbel_finish(local_argmax, local_max)
+ 
+ 
+ # --- Sink detector ------------------------------------------------------------
+@@ -2470,6 +2535,12 @@ def sampling_calls(
+     return calls
+ 
+ 
++def gumbel_finish_calls(vocab_size: int) -> list:
++    """The finish of Gumbel-max sampling of ``vocab_size``-wide logits."""
++    num_blocks = -(-vocab_size // GUMBEL_BLOCK)
++    return [_call(gumbel_finish_kernel, *gumbel_finish_key(num_blocks))]
++
++
+ def drafting_calls(
+     logits_dtype: torch.dtype,
+     cache_dtype: torch.dtype | None,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_thinking.py b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+index a9aabdce6..106b079cc 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_thinking.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_thinking.py
+@@ -9,6 +9,7 @@ from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
+ def register_thinking(
+     *, logits_strides, tokens_stride, start_len, natural_len, end_len
+ ):
++    _declare(reset_markers_kernel, [(dtype,) for dtype in _DTYPES.values()])
+     _declare(
+         marker_cache_kernel,
+         [(tokens_stride, dtype, start_len, natural_len) for dtype in _DTYPES.values()],
+@@ -23,6 +24,41 @@ def register_thinking(
+     )
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def reset_markers_kernel(index_dtype: str, threads: int = 128):
++    """``cached_start`` and ``cached_end`` -1 and ``cached_pos`` 0 at each of
++    ``req_ids`` (three index_fill_ calls before), a thread a request, a negative
++    index wrapping as index_fill_'s does: a new budgeted request's marker cache,
++    which its next update then scans cold."""
++    reqs, states = T.dynamic("reqs, states")
++
++    @T.prim_func
++    def reset_markers(
++        req_ids: T.Tensor((reqs,), index_dtype),
++        cached_start: T.Tensor((states,), "int32"),
++        cached_end: T.Tensor((states,), "int32"),
++        cached_pos: T.Tensor((states,), "int32"),
++    ):
++        with T.Kernel(T.ceildiv(reqs, threads), threads=threads) as b:
++            i = b * threads + T.get_thread_binding()
++            req = T.alloc_local((1,), "int64")
++            req[0] = T.cast(req_ids[T.min(i, reqs - 1)], "int64")
++            req[0] = T.if_then_else(req[0] < 0, req[0] + states, req[0])
++            if i < reqs:
++                cached_start[req[0]] = -1
++                cached_end[req[0]] = -1
++                cached_pos[req[0]] = 0
++
++    return reset_markers
++
++
++def reset_markers(req_ids, cached_start, cached_end, cached_pos):
++    if req_ids.numel():
++        reset_markers_kernel(_DTYPES[req_ids.dtype])(
++            req_ids, cached_start, cached_end, cached_pos
++        )
++
++
+ @tilelang.jit(pass_configs=_PASS)
+ def marker_cache_kernel(
+     tokens_stride: int, index_dtype: str, start_len: int, end_len: int
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index 98964a72b..85ba7103c 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -80,6 +80,9 @@ class DraftTokensHandler:
+         self.req_ids: list[str] = []
+         self.draft_tokens_np: np.ndarray | None = None
+         self.num_draft_tokens: int = 0
++        # The consumed drafts' rows for the copy, flat; allocated on first use as
++        # large as the per-request draft buffer.
++        self._consumed: torch.Tensor | None = None
+ 
+     def set_draft_tokens(
+         self, input_batch: InputBatch, draft_tokens: torch.Tensor
+@@ -107,11 +110,28 @@ class DraftTokensHandler:
+         if num_drafts is None or not input_batch.has_structured_output_reqs:
+             self._set(input_batch.req_ids, draft_tokens[:0, :0], False)
+             return
+-        self._set(
+-            input_batch.req_ids,
+-            draft_tokens[input_batch.idx_mapping, : int(num_drafts.max())],
+-            True,
+-        )
++        from vllm.v1.worker.gpu import tilelang_inputs
++
++        # draft_tokens[input_batch.idx_mapping, :max drafts], the slice's clamp
++        # included, gathered in TileLang into the persistent buffer.
++        num_reqs = input_batch.idx_mapping.shape[0]
++        width = min(int(num_drafts.max()), draft_tokens.shape[1])
++        consumed = self._consumed
++        if (
++            consumed is None
++            or consumed.dtype != draft_tokens.dtype
++            or consumed.numel() < num_reqs * width
++        ):
++            consumed = self._consumed = torch.empty(
++                max(draft_tokens.numel(), num_reqs * width),
++                dtype=draft_tokens.dtype,
++                device=draft_tokens.device,
++            )
++        rows = consumed[: num_reqs * width].view(num_reqs, width)
++        # The previous step's copy may still be reading the buffer.
++        torch.cuda.current_stream(self.device).wait_event(self.copy_event)
++        tilelang_inputs.gather_rows(input_batch.idx_mapping, draft_tokens, rows)
++        self._set(input_batch.req_ids, rows, True)
+ 
+     def _set(self, req_ids: list[str], draft_tokens: torch.Tensor, copy: bool) -> None:
+         self.req_ids = req_ids
+@@ -128,9 +148,9 @@ class DraftTokensHandler:
+         self.copy_stream.wait_stream(current_stream)
+         with torch.cuda.stream(self.copy_stream):
+             self.draft_tokens_np = async_copy_to_np(draft_tokens)
+-            # draft_tokens is a temporary allocation on the main stream and read here on
+-            # copy_stream; without record_stream, the caching allocator may reuse its
+-            # memory before the async copy executes.
++            # draft_tokens may be a temporary allocation on the main stream (the
++            # proposals), read here on copy_stream; without record_stream, the caching
++            # allocator may reuse its memory before the async copy executes.
+             draft_tokens.record_stream(self.copy_stream)
+             self.copy_event.record()
+ 
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index 49b4a51f1..e3869f3f1 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -847,6 +847,57 @@ def scatter_rows_calls(
+     return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def gather_rows_kernel(idx_dtype: str, dtype: str):
++    """``out = state[idx_mapping, :width]`` for the batch's ``[num_reqs, width]``
++    rows, a negative index wrapping as torch's indexing does: the drafts a step's
++    inputs consumed, which the async-scheduling hand-off copies to the host. A
++    thread an element, its index load clamped into the batch and its store
++    guarded."""
++    num_reqs, width = T.dynamic("num_reqs, width")
++    state_rows, state_cols, state_stride = T.dynamic(
++        "state_rows, state_cols, state_stride"
++    )
++    grid = T.ceildiv(num_reqs * width, _SCATTER_THREADS)
++
++    @T.prim_func
++    def gather_rows(
++        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
++        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
++        out: T.Tensor((num_reqs, width), dtype),
++    ):
++        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
++            e = b * _SCATTER_THREADS + T.get_thread_binding()
++            r = T.min(e // width, num_reqs - 1)
++            j = e % width
++            index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
++            if e < num_reqs * width:
++                out[r, j] = state[
++                    T.if_then_else(index < 0, index + state_rows, index), j
++                ]
++
++    return gather_rows
++
++
++def gather_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype) -> tuple:
++    return (_DTYPES[idx_dtype], _DTYPES[dtype])
++
++
++def gather_rows(
++    idx_mapping: torch.Tensor, state: torch.Tensor, out: torch.Tensor
++) -> None:
++    """``out[:] = state[idx_mapping, :out.shape[1]]``, into a contiguous ``out`` of
++    ``[num_reqs, width]``."""
++    if out.numel():
++        _kernel(gather_rows_kernel, *gather_rows_key(idx_mapping.dtype, state.dtype))(
++            idx_mapping, state, out
++        )
++
++
++def gather_rows_calls(idx_dtype: torch.dtype, dtype: torch.dtype) -> list:
++    return [_call(gather_rows_kernel, *gather_rows_key(idx_dtype, dtype))]
++
++
+ # --- Adaptive verification's draft budget -----------------------------------------
+ 
+ _BUDGET_THREADS = 256

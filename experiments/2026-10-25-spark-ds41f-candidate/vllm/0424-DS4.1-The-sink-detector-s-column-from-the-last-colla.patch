@@ -1,0 +1,373 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:33:56 +0200
+Subject: [PATCH 424/488] [DS4.1] The sink detector's column from the last
+ collapse
+
+Every forward took the sink detector's column of the residual streams
+with a strided cast copy and copied it into the detector's buffer. The
+last collapse reads every stream anyway: its sink-column variant has the
+thread holding that column write each stream's value as FP32, straight
+into the buffer when every row is on this rank (gathered after
+otherwise). Two kernels a step go; the collapse is unchanged bit for
+bit. B12X's collapse takes the same arguments with a torch copy.
+---
+ .../kernels/test_deepseek_v41_tilelang_mhc.py |  15 ++
+ vllm/models/deepseek_v4_1/b12x_layers.py      |   8 +-
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  49 +++++-
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 158 ++++++++++++++----
+ 4 files changed, 191 insertions(+), 39 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_mhc.py b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+index 111a670ca..57c2433f4 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_mhc.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_mhc.py
+@@ -341,6 +341,21 @@ def test_collapse_bits_match_tile_kernels(mhc, tokens):
+     assert (_bits(mhc.collapse(state, mix)[:, :8]) == 0).all()
+ 
+ 
++@pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
++@pytest.mark.parametrize("column", [0, 7, 1029, HIDDEN - 1])
++def test_collapse_writes_the_sink_column(mhc, tokens, column):
++    """The last collapse's sink-column variant: the same collapse, bit for bit, and
++    each stream's ``column`` as FP32 (the detector's buffer, written whole)."""
++    _, state, _, _ = _post_inputs(tokens, seed=800 + tokens)
++    state[0, 2, column] = float("nan")
++    state[-1, 1, column] = -0.0
++    mix = _pre_mix(tokens, seed=900 + tokens)
++    columns = torch.full((tokens, 4), -7.0, device=DEVICE)
++    out = mhc.collapse(state, mix, columns=columns, column=column)
++    _assert_bits_equal(out, mhc.collapse(state, mix), "collapse: ")
++    _assert_bits_equal(columns, state[:, :, column].float(), "columns: ")
++
++
+ @pytest.mark.parametrize("world", [2, 3, 4])
+ @pytest.mark.parametrize("tokens", [1, 6, 96, 2048])
+ def test_post_of_rank_order_parts_matches_tile_kernels(mhc, world, tokens):
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index a30779771..be4a0f86e 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -953,8 +953,14 @@ class B12xMHC(nn.Module):
+         return out
+ 
+     def collapse(
+-        self, state: torch.Tensor, pre: torch.Tensor | None = None
++        self,
++        state: torch.Tensor,
++        pre: torch.Tensor | None = None,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
+     ) -> torch.Tensor:
++        if columns is not None:
++            columns.copy_(state[:, :, column])
+         out = torch.empty(
+             (state.shape[0], state.shape[-1]),
+             dtype=state.dtype,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 565c34325..6d1c076ce 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -640,11 +640,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+ 
+     def declare_kernels(self) -> None:
+         """Declare the TileLang kernels the forward reaches outside its modules: the
+-        rank-order sum of the TP group's collectives and the L2 prefetch."""
++        rank-order sum of the TP group's collectives, the L2 prefetch and the last
++        collapse's sink-column variant."""
+         from ..tilelang import collectives, prepare
++        from ..tilelang.mhc import TileKernelsMHC
+ 
++        # The last collapse with the sink detector's column (forward).
++        collapse = (
++            TileKernelsMHC.collapse_column_calls(
++                self.config.hidden_size, self._sink_column
++            )
++            if self._sink_columns is not None
++            else []
++        )
+         prepare.declare(
+-            lambda: [*collectives.rank_order_sum_calls(), *l2_prefetch.kernel_calls()]
++            lambda: [
++                *collectives.rank_order_sum_calls(),
++                *l2_prefetch.kernel_calls(),
++                *collapse,
++            ]
+         )
+ 
+     def _build_l2_prefetch(self) -> None:
+@@ -845,9 +859,33 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                 {"hidden_states": hidden_states, "pre_mix": pre_mix}
+             )
+ 
++        # The sink detector's column of every residual stream comes from the last
++        # collapse, which reads the streams anyway: straight into its buffer when
++        # every row is here, else gathered after.
++        columns: torch.Tensor | None = None
++        rows_here = sp is None and not decoder_compacted
+         if self._sink_columns is not None:
++            columns = (
++                self._sink_columns[:full_num_tokens]
++                if rows_here and not self.use_sequence_parallel
++                else torch.empty(
++                    (hidden_states.shape[0], self.hc_mult),
++                    dtype=torch.float32,
++                    device=hidden_states.device,
++                )
++            )
++        # Collapse the hc copies with the pre-mix from the last layer's FFN
++        # mixes — the mix the reference applies via
++        # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
++        hidden_states = (
++            layer.mhc.collapse(hidden_states, pre_mix)
++            if columns is None
++            else layer.mhc.collapse(
++                hidden_states, pre_mix, columns=columns, column=self._sink_column
++            )
++        )
++        if columns is not None and not (rows_here and not self.use_sequence_parallel):
+             # A gather of hc_mult values per token under sequence parallelism.
+-            columns = hidden_states[:, :, self._sink_column].float().contiguous()
+             if self.use_sequence_parallel:
+                 columns = sp_all_gather(columns)[:full_num_tokens]
+             elif sp is not None:
+@@ -855,11 +893,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if decoder_compacted:
+                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
+             self._sink_columns[:full_num_tokens].copy_(columns)
+-
+-        # Collapse the hc copies with the pre-mix from the last layer's FFN
+-        # mixes — the mix the reference applies via
+-        # ``last_layer.hc_pre(h, pre_mix)`` (v4.1 has no learned hc_head).
+-        hidden_states = layer.mhc.collapse(hidden_states, pre_mix)
+         hidden_states = self.norm(hidden_states)
+         if self.use_sequence_parallel:
+             # Gather only the collapsed and normalized hidden states.
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 449b963d1..37f291ca4 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -481,7 +481,30 @@ _COLLAPSE_RESERVE = 24 * 1024
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS_CONFIGS)
+-def collapse_streams(hidden_size: int, threads: int = 128):
++@T.macro
++def _collapse_rows(state, mix, out, sv, token, col, tx, reserve):
++    """One thread's ``VEC`` columns of a token: the streams' weighted sum, as
++    ``collapse_streams`` describes it. Leaves the streams' values in ``sv``."""
++    ov = T.alloc_local((VEC,), T.bfloat16)
++    mv = T.alloc_local((MULT,), T.float32)
++    acc = T.alloc_var(T.float32)
++    if tx == 0:
++        reserve[0] = T.float32(0)
++    for m in T.vectorized(MULT):
++        mv[m] = mix[token, m]
++    for m in T.unroll(MULT):
++        for v in T.vectorized(VEC):
++            sv[m * VEC + v] = state[token, m, col + v]
++    for v in T.unroll(VEC):
++        acc = T.float32(0)
++        for m in T.unroll(MULT):
++            acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
++        ov[v] = T.Cast(T.bfloat16, acc)
++    for v in T.vectorized(VEC):
++        out[token, col + v] = ov[v]
++
++
++def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
+     """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
+     ``out = bf16(sum_m mix[m] * state[m])``.
+ 
+@@ -491,43 +514,76 @@ def collapse_streams(hidden_size: int, threads: int = 128):
+     matters only in sign: four negative-zero products sum to positive zero, as
+     TileKernels' do. The thread mapping is ``post_streams``'; each block holds
+     ``_COLLAPSE_RESERVE`` bytes of shared memory.
++
++    With ``column`` (the sink detector's), the thread that reads it also writes
++    each stream's value there, as FP32, to ``columns`` ([tokens, MULT]): the
++    forward's last collapse hands the detector its column in the same launch.
+     """
+     assert hidden_size % (threads * VEC) == 0
++    assert column < hidden_size
+     blocks = hidden_size // (threads * VEC)
+     M = T.dynamic("M")
+ 
++    if column < 0:
++
++        @T.prim_func
++        def mhc_collapse(
++            state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
++            mix: T.Tensor((M, MULT), T.float32),
++            out: T.Tensor((M, hidden_size), T.bfloat16),
++        ):
++            with T.Kernel(M * blocks, threads=threads) as pid:
++                tx = T.get_thread_binding()
++                sv = T.alloc_local((MULT * VEC,), T.bfloat16)
++                # Held, not used: the one write keeps the allocation, and with it
++                # the cap.
++                reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
++                _collapse_rows(
++                    state,
++                    mix,
++                    out,
++                    sv,
++                    pid // blocks,
++                    (pid % blocks * threads + tx) * VEC,
++                    tx,
++                    reserve,
++                )
++
++        return mhc_collapse
++
++    # The block, thread and vector element that read ``column``.
++    column_block = column // (threads * VEC)
++    column_thread = column % (threads * VEC) // VEC
++    column_element = column % VEC
++
+     @T.prim_func
+-    def mhc_collapse(
++    def mhc_collapse_column(
+         state: T.Tensor((M, MULT, hidden_size), T.bfloat16),
+         mix: T.Tensor((M, MULT), T.float32),
+         out: T.Tensor((M, hidden_size), T.bfloat16),
++        columns: T.Tensor((M, MULT), T.float32),
+     ):
+         with T.Kernel(M * blocks, threads=threads) as pid:
+             tx = T.get_thread_binding()
+-            token = pid // blocks
+-            col = (pid % blocks * threads + tx) * VEC
+             sv = T.alloc_local((MULT * VEC,), T.bfloat16)
+-            ov = T.alloc_local((VEC,), T.bfloat16)
+-            mv = T.alloc_local((MULT,), T.float32)
+-            acc = T.alloc_var(T.float32)
+-            # Held, not used: the one write keeps the allocation, and with it the cap.
+             reserve = T.alloc_shared((_COLLAPSE_RESERVE // 4,), T.float32)
+-            if tx == 0:
+-                reserve[0] = T.float32(0)
+-            for m in T.vectorized(MULT):
+-                mv[m] = mix[token, m]
+-            for m in T.unroll(MULT):
+-                for v in T.vectorized(VEC):
+-                    sv[m * VEC + v] = state[token, m, col + v]
+-            for v in T.unroll(VEC):
+-                acc = T.float32(0)
++            _collapse_rows(
++                state,
++                mix,
++                out,
++                sv,
++                pid // blocks,
++                (pid % blocks * threads + tx) * VEC,
++                tx,
++                reserve,
++            )
++            if (pid % blocks == column_block) & (tx == column_thread):
+                 for m in T.unroll(MULT):
+-                    acc = T.fma(mv[m], T.Cast(T.float32, sv[m * VEC + v]), acc)
+-                ov[v] = T.Cast(T.bfloat16, acc)
+-            for v in T.vectorized(VEC):
+-                out[token, col + v] = ov[v]
++                    columns[pid // blocks, m] = T.Cast(
++                        T.float32, sv[m * VEC + column_element]
++                    )
+ 
+-    return mhc_collapse
++    return mhc_collapse_column
+ 
+ 
+ def _project_call(hidden: int, mode: str, world: int) -> prepare.TileLangCall:
+@@ -547,9 +603,12 @@ def _post_call(hidden: int) -> prepare.TileLangCall:
+     return prepare.call(post_streams, hidden)
+ 
+ 
+-def _collapse_call(hidden: int) -> prepare.TileLangCall:
+-    """The stream collapse's call."""
+-    return prepare.call(collapse_streams, hidden)
++def _collapse_call(hidden: int, column: int = -1) -> prepare.TileLangCall:
++    """The stream collapse's call, and with ``column`` its variant that also writes
++    that column of every stream."""
++    if column < 0:
++        return prepare.call(collapse_streams, hidden)
++    return prepare.call(collapse_streams, hidden, column=column)
+ 
+ 
+ def _make(call: prepare.TileLangCall):
+@@ -573,8 +632,8 @@ def _post(hidden: int):
+ 
+ 
+ @cache
+-def _collapse(hidden: int):
+-    return _make(_collapse_call(hidden))
++def _collapse(hidden: int, column: int = -1):
++    return _make(_collapse_call(hidden, column))
+ 
+ 
+ @torch.library.custom_op(
+@@ -713,6 +772,32 @@ def _mhc_collapse_fake(state, mix, out):
+     return None
+ 
+ 
++@torch.library.custom_op(
++    "vllm::dsv41_tilelang_mhc_collapse_column", mutates_args=("out", "columns")
++)
++def _mhc_collapse_column(
++    state: torch.Tensor,
++    mix: torch.Tensor,
++    out: torch.Tensor,
++    columns: torch.Tensor,
++    column: int,
++) -> None:
++    tokens, hidden = int(state.shape[0]), int(state.shape[-1])
++    if tokens == 0:
++        return
++    _collapse(hidden, column)(
++        state.view(tokens, MULT, hidden),
++        mix.view(tokens, MULT),
++        out.view(tokens, hidden),
++        columns.view(tokens, MULT),
++    )
++
++
++@_mhc_collapse_column.register_fake
++def _mhc_collapse_column_fake(state, mix, out, columns, column):
++    return None
++
++
+ # Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's
+ # mean), and every earlier, shorter pair (a captured graph may still read one).
+ _MIXES: dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+@@ -867,17 +952,30 @@ class TileKernelsMHC(nn.Module):
+         return out
+ 
+     def collapse(
+-        self, state: torch.Tensor, pre: torch.Tensor | None = None
++        self,
++        state: torch.Tensor,
++        pre: torch.Tensor | None = None,
++        columns: torch.Tensor | None = None,
++        column: int = -1,
+     ) -> torch.Tensor:
+-        """The streams' weighted sum with ``pre``, or their mean."""
++        """The streams' weighted sum with ``pre``, or their mean; with ``columns``
++        ([tokens, MULT] FP32), also each stream's ``column``, in the same launch."""
+         if pre is None:
+             pre = _constant_mixes(int(state.shape[0]), state.device)[1]
+         out = torch.empty(
+             (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
+         )
+-        _mhc_collapse(state, pre, out)
++        if columns is None:
++            _mhc_collapse(state, pre, out)
++        else:
++            _mhc_collapse_column(state, pre, out, columns, column)
+         return out
+ 
++    @staticmethod
++    def collapse_column_calls(hidden: int, column: int) -> list:
++        """The declared call of ``collapse`` with ``columns`` for ``column``."""
++        return [_collapse_call(hidden, column)]
++
+ 
+ __all__ = [
+     "TileKernelsMHC",

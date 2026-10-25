@@ -1,0 +1,25 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:37:39 +0100
+Subject: [PATCH 457/488] [DS4.1] The fill benchmark's reference includes the
+ zeros it replaces
+
+---
+ benchmarks/kernels/benchmark_sampling_auxiliary.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/benchmarks/kernels/benchmark_sampling_auxiliary.py b/benchmarks/kernels/benchmark_sampling_auxiliary.py
+index cdcbfed7b..07231856b 100644
+--- a/benchmarks/kernels/benchmark_sampling_auxiliary.py
++++ b/benchmarks/kernels/benchmark_sampling_auxiliary.py
+@@ -514,6 +514,10 @@ def make_logprob_ids(rows, variant, size, count):
+                 output, valid, sampled, top_ids, mapping, num_custom, custom, size
+             )
+         else:
++            # The zeros compute_topk_scores allocated the outputs with: the
++            # TileLang fill writes every column instead.
++            output.zero_()
++            valid.zero_()
+             _fill_logprob_token_ids_kernel[(rows,)](
+                 output,
+                 output.stride(0),

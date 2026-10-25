@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:25:06 +0200
+Subject: [PATCH 421/488] [DS4.1] Test that the step glue's declarations cover
+ its launches
+
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py | 41 +++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 23905df93..7aaa231b8 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -1081,6 +1081,47 @@ def test_gather_lookback(num_reqs, depth):
+ # --- Preparation --------------------------------------------------------------
+ 
+ 
++def test_step_glue_declarations_cover_their_launches(monkeypatch):
++    """The step's glue kernels with the runner's dtypes (int64 request indices,
++    int64 drafts, float32 confidences, int64 logits indices and a dummy batch's
++    int32 ones) launch exactly the calls the runner declares for them."""
++    launched = set()
++    original = tli._kernel
++
++    def record(factory, *key):
++        launched.add((id(factory), key))
++        return original(factory, *key)
++
++    monkeypatch.setattr(tli, "_kernel", record)
++    gen = _gen(1)
++    idx = _idx(4, gen)
++    drafts = _randint(0, 1 << 17, (MAX_REQS, DRAFTS), gen, torch.int64)
++    state = torch.zeros_like(drafts)
++    tli.scatter_rows(idx, drafts[:4], state, gather=True)
++    confidences = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
++    tli.scatter_rows(idx, confidences[:4], torch.zeros_like(confidences))
++    capacities = _randint(0, DRAFTS + 1, (4,), gen)
++    starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
++    tli.adaptive_offsets(
++        capacities, _randint(1, 2, (4,), gen), starts.clone(), starts, 1, 24, True
++    )
++    tli.padding_rows(torch.zeros(32, dtype=torch.bool, device=DEVICE), 24, 32)
++    ids = _randint(0, 1 << 17, (64,), gen)
++    positions = _randint(0, 1 << 20, (64,), gen, torch.int64)
++    for index_dtype in (torch.int64, torch.int32):
++        tli.logits_rows(ids, positions, _randint(0, 64, (24,), gen, index_dtype))
++    torch.accelerator.synchronize()
++    declared = (
++        tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
++        + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
++        + tli.adaptive_offsets_calls()
++        + tli.padding_rows_calls()
++        + tli.logits_rows_calls(torch.int64)
++        + tli.logits_rows_calls(torch.int32)
++    )
++    assert launched == {(id(function), args) for function, args, _ in declared}
++
++
+ def test_declared_calls_cover_the_call_sites(monkeypatch):
+     """Every kernel the runner's call sites launch, with the runner's buffers and
+     dtypes, is a call its declarations list (after the kernel cache freezes, an

@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 04:36:32 +0100
+Subject: [PATCH 467/488] [DS4.1] The sink declares ranks for its alternates'
+ dense rows
+
+alternate_logprobs_of ranks each alternate in a dense copy of its row,
+vocab_size apart. The declarations covered the logits' padded row stride
+only, equal to the vocabulary at TP4 but 129408 at TP3, where the first
+logprobs request with an alternate would hit the frozen cache.
+---
+ tests/v1/worker/test_prepare_kernels.py | 28 +++++++++++++++++++++++++
+ vllm/v1/worker/gpu/model_runner.py      |  1 +
+ vllm/v1/worker/gpu/sample/sink.py       |  7 +++++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 3be04eb09..978a89157 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -157,3 +157,31 @@ def test_adaptive_verification_kernels_are_declared_before_the_manager_exists(
+     budget = (tilelang_inputs.assign_draft_budget_kernel, (steps, "int64"))
+     assert budget in calls
+     assert (tilelang_inputs.fill_rows_kernel, ("int64", "float32")) in calls
++
++
++def test_sink_declares_ranks_for_dense_alternate_rows(monkeypatch):
++    """The sink ranks its alternates in dense copies of their rows: at TP3 the
++    logits' padded row stride (129408) is not the vocabulary (129280), so the
++    dense stride needs its own declaration."""
++    import torch
++
++    from vllm.v1.worker.gpu.sample import tilelang_logprob, tilelang_sampling
++    from vllm.v1.worker.gpu.sample.sink import SinkSampler
++
++    declared: list = []
++    monkeypatch.setattr(tilelang_sampling, "declare", lambda calls: None)
++    monkeypatch.setattr(
++        tilelang_logprob,
++        "register_ranks",
++        lambda logits, vocab_size: declared.append((list(logits), vocab_size)),
++    )
++    vocab, padded = 129280, 129408
++    SinkSampler.register_warmups(
++        SimpleNamespace(num_alternates=4, rejection=True),
++        logits=((torch.bfloat16, padded),),
++        processed_logits_strides=(vocab, padded),
++        sampled_widths=(1, 6),
++        bin_counts_stride=vocab,
++        vocab_size=vocab,
++    )
++    assert declared == [([(torch.bfloat16, vocab), (torch.float32, vocab)], vocab)]
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 3d14f43e3..eb5b66a41 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2227,6 +2227,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                     bin_counts_stride=self.sampler.penalties_state.output_bin_counts.stride(
+                         0
+                     ),
++                    vocab_size=vocab_size,
+                 )
+         if self.rejection_sampler is not None and self._greedy_verification_available():
+             assert head is not None and processor is not None
+diff --git a/vllm/v1/worker/gpu/sample/sink.py b/vllm/v1/worker/gpu/sample/sink.py
+index 004c4603a..4e0c167c0 100644
+--- a/vllm/v1/worker/gpu/sample/sink.py
++++ b/vllm/v1/worker/gpu/sample/sink.py
+@@ -669,15 +669,22 @@ class SinkSampler:
+         processed_logits_strides: tuple[int, ...],
+         sampled_widths: tuple[int, ...],
+         bin_counts_stride: int,
++        vocab_size: int,
+     ) -> None:
+         """Declare the kernels a step launches: the policy for each sampled
+         width, and the alternates of the raw and processed target logits
+         (``(dtype, row stride)``; the TileLang kernels take any stride)."""
+         from vllm.v1.worker.gpu.sample import tilelang_sampling
++        from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
+ 
+         logits_dtypes = [dtype for dtype, _ in logits]
+         if processed_logits_strides:
+             logits_dtypes.append(torch.float32)
++        # alternate_logprobs_of ranks the alternates in dense copies of their rows,
++        # vocab_size apart whatever the logits' (padded) row stride.
++        register_ranks(
++            [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)], vocab_size
++        )
+         tilelang_sampling.declare(
+             lambda: tilelang_sampling.sink_calls(
+                 logits_dtypes=logits_dtypes,

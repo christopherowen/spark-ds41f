@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:30:04 +0200
+Subject: [PATCH 422/488] [DS4.1] mHC's constant mixes built once, not filled
+ every forward
+
+The first sublayer's pre-mix (stream 0 alone) and the collapse's mean
+were torch fills inside every forward: five kernels a target step (the
+first layer's zeros and fill, and the three auxiliary collapses' fills).
+Every layer now slices buffers built for the batch limit when the layers
+bind their kernels, before any graph captures; outside capture a longer
+batch grows them. The kernels read the same values.
+---
+ vllm/models/deepseek_v4_1/tilelang/mhc.py | 41 ++++++++++++++++++++---
+ 1 file changed, 36 insertions(+), 5 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 0098f3d01..449b963d1 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -46,6 +46,7 @@ import tilelang.language as T
+ import torch
+ from torch import nn
+ 
++from vllm.config import get_current_vllm_config
+ from vllm.distributed import get_tensor_model_parallel_world_size
+ from vllm.models.deepseek_v4_1 import sp_prefill
+ from vllm.models.deepseek_v4_1.tilelang import prepare
+@@ -712,6 +713,34 @@ def _mhc_collapse_fake(state, mix, out):
+     return None
+ 
+ 
++# Every layer's constant mixes, by device: (first sublayer's pre-mix, the collapse's
++# mean), and every earlier, shorter pair (a captured graph may still read one).
++_MIXES: dict[torch.device, list[tuple[torch.Tensor, torch.Tensor]]] = {}
++
++
++def _constant_mixes(
++    tokens: int, device: torch.device
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """``tokens`` rows of the first sublayer's pre-mix (stream 0 alone) and of the
++    collapse's mean, slices of buffers every layer shares. torch would otherwise fill
++    them inside every forward (five kernels a target step: the first layer's zeros and
++    fill, and the three auxiliary collapses' fills). The layers build them for the
++    batch limit before CUDA graph capture (``declare_kernels``' bind); a longer batch
++    outside capture (a kernel test) grows them."""
++    built = _MIXES.setdefault(device, [])
++    if not built or built[-1][0].shape[0] < tokens:
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                f"mHC constant mixes of {tokens} rows must be built before capture"
++            )
++        first = torch.zeros((tokens, MULT), dtype=torch.float32, device=device)
++        first[:, 0] = 1
++        mean = torch.full((tokens, MULT), 0.25, dtype=torch.float32, device=device)
++        built.append((first, mean))
++    first, mean = built[-1]
++    return first[:tokens], mean[:tokens]
++
++
+ class TileKernelsMHC(nn.Module):
+     """V4.1 lagged mHC for a decoder layer, with ``B12xMHC``'s interface."""
+ 
+@@ -757,6 +786,11 @@ class TileKernelsMHC(nn.Module):
+                 _finalize(hidden, k, *mix)
+             _post(hidden)
+             _collapse(hidden)
++            # The constant mixes for the batch limit, before any graph captures.
++            _constant_mixes(
++                get_current_vllm_config().scheduler_config.max_num_batched_tokens,
++                torch.device("cuda", torch.cuda.current_device()),
++            )
+ 
+         prepare.declare(calls, bind=bind)
+ 
+@@ -778,8 +812,7 @@ class TileKernelsMHC(nn.Module):
+             # Added inside the projection kernel, in rank order.
+             previous_output = previous_output.packed
+         if pre is None:
+-            pre = torch.zeros((tokens, MULT), dtype=torch.float32, device=device)
+-            pre[:, 0].fill_(1)
++            pre = _constant_mixes(tokens, device)[0]
+         unchanged = previous_output is None and residual.ndim == 3
+         residual_out = (
+             None
+@@ -838,9 +871,7 @@ class TileKernelsMHC(nn.Module):
+     ) -> torch.Tensor:
+         """The streams' weighted sum with ``pre``, or their mean."""
+         if pre is None:
+-            pre = torch.full(
+-                (state.shape[0], MULT), 0.25, dtype=torch.float32, device=state.device
+-            )
++            pre = _constant_mixes(int(state.shape[0]), state.device)[1]
+         out = torch.empty(
+             (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
+         )

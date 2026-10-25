@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:36:43 +0200
+Subject: [PATCH 360/488] DeepSeek-V4.1: Score DSpark's drafts with the
+ TileLang confidence head
+
+The DS4.1 drafter builds its confidence head through
+kernels.dspark_confidence_head(), so under the TileLang family every draft
+step's acceptance probabilities come from one TileLang launch instead of
+ATen's concatenation, FP32 copy and sigmoid around cuBLAS's dot product and
+reduction (one stream) or GEMV (sixteen streams). The head's weight loads as
+before; the module declares its kernel for preparation.
+
+The sum is FP32 in a fixed order per draft, so a draft's probability, and the
+draft budget and dead rows adaptive verification derives from rank 0's, no
+longer depend on how many requests the step drafts for. It is not cuBLAS's
+order: a probability may differ from the previous release's in its last bits
+(within 2^-18 in the tests), which can change which drafts a step verifies but
+not a temperature-0 token.
+---
+ vllm/models/deepseek_v4_1/nvidia/dspark.py | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 01827bfb3..230cf4b60 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -431,8 +431,9 @@ class DSparkDeepseekV4Model(nn.Module):
+         )
+         self.confidence_head: DSparkConfidenceHead | None = None
+         if getattr(config, "enable_confidence_head", True):
+-            self.confidence_head = DSparkConfidenceHead(
+-                config.hidden_size + config.dspark_markov_rank,
++            self.confidence_head = kernels.dspark_confidence_head(
++                config.hidden_size,
++                config.dspark_markov_rank,
+                 prefix=maybe_prefix(prefix, "confidence_head"),
+             )
+ 

@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:25:22 +0200
+Subject: [PATCH 392/488] Match Triton libdevice log at the min-p threshold and
+ cover zero-top-k alias
+
+The benchmark reproducer differs at one token of seed 48294: approximate log2 times ln(2) moves the threshold by one ULP. Use the same inline libdevice arithmetic as the sampling family. The unused top-k pointer can have state-capacity rows.
+---
+ tests/v1/worker/test_gpu_sampling_controls.py |  3 ++
+ .../worker/gpu/sample/tilelang_auxiliary.py   |  6 +--
+ .../v1/worker/gpu/sample/tilelang_controls.py | 40 +++++++++++++++++--
+ 3 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index de147f5bb..03194b2b2 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -275,6 +275,9 @@ def test_custom_logprob_ids_override_topk_without_touching_padding(index_dtype,
+     count = torch.zeros(states, device="cuda", dtype=torch.int32)
+     count[mapping[::2]] = 17
+     custom = torch.randint(129280, (states, 17), device="cuda", dtype=torch.int32)
++    if topk == 0:
++        # The owner reuses the state-capacity tensor as an unused pointer.
++        top_ids = custom
+     expected, expected_valid = output.clone(), valid.clone()
+     _fill_logprob_token_ids_kernel[(rows,)](
+         expected,
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index b7bcb38d9..4a1b3ace5 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -190,8 +190,8 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
+     output_stride, mask_stride, topk_stride, custom_stride = T.dynamic(
+         "output_stride, mask_stride, topk_stride, custom_stride", "int64"
+     )
+-    rows, out_cols, mask_cols, topk_cols, states, custom_cols = T.dynamic(
+-        "rows, out_cols, mask_cols, topk_cols, states, custom_cols"
++    rows, out_cols, mask_cols, topk_rows, topk_cols, states, custom_cols = T.dynamic(
++        "rows, out_cols, mask_cols, topk_rows, topk_cols, states, custom_cols"
+     )
+ 
+     @T.prim_func
+@@ -199,7 +199,7 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
+         output: T.StridedTensor((rows, out_cols), (output_stride, 1), "int64"),
+         valid: T.StridedTensor((rows, mask_cols), (mask_stride, 1), "bool"),
+         sampled: T.Tensor((rows,), sampled_dtype),
+-        topk_ids: T.StridedTensor((rows, topk_cols), (topk_stride, 1), topk_dtype),
++        topk_ids: T.StridedTensor((topk_rows, topk_cols), (topk_stride, 1), topk_dtype),
+         mapping: T.Tensor((rows,), index_dtype),
+         num_custom: T.Tensor((states,), "int32"),
+         custom_ids: T.StridedTensor((states, custom_cols), (custom_stride, 1), "int32"),
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 6ba31c931..9c48b3c5d 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -12,10 +12,44 @@ _PASS = {
+ }
+ _DTYPES = {torch.int32: "int32", torch.int64: "int64"}
+ _HEADER = r"""
++// Triton's bundled libdevice __nv_logf, as used by the sampling family.
++// CUDA's logf and lg2.approx * ln(2) can move a min-p threshold by one ULP.
+ __device__ __forceinline__ float vllm_control_log(float x) {
+-  float y;
+-  asm("lg2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+-  return __fmul_rn(y, 0.693147182464599609375f);
++  float result;
++  asm("{\n"
++      ".reg .pred tiny, fin, zero;\n"
++      ".reg .b32 z, o, e, m, f, r, p, q, l, w;\n"
++      "setp.lt.f32 tiny, %1, 0f00800000;\n"
++      "mul.rn.f32 z, %1, 0f4B000000;\n"
++      "selp.f32 z, z, %1, tiny;\n"
++      "selp.f32 o, 0fC1B80000, 0f00000000, tiny;\n"
++      "add.s32 e, z, -1059760811;\n"
++      "and.b32 e, e, -8388608;\n"
++      "sub.s32 m, z, e;\n"
++      "cvt.rn.f32.s32 f, e;\n"
++      "fma.rn.ftz.f32 f, f, 0f34000000, o;\n"
++      "add.rn.f32 r, m, 0fBF800000;\n"
++      "fma.rn.ftz.f32 p, 0fBE055027, r, 0f3E1039F6;\n"
++      "fma.rn.ftz.f32 p, p, r, 0fBDF8CDCC;\n"
++      "fma.rn.ftz.f32 p, p, r, 0f3E0F2955;\n"
++      "fma.rn.ftz.f32 p, p, r, 0fBE2AD8B9;\n"
++      "fma.rn.ftz.f32 p, p, r, 0f3E4CED0B;\n"
++      "fma.rn.ftz.f32 p, p, r, 0fBE7FFF22;\n"
++      "fma.rn.ftz.f32 p, p, r, 0f3EAAAA78;\n"
++      "fma.rn.ftz.f32 p, p, r, 0fBF000000;\n"
++      "mul.rn.f32 q, r, p;\n"
++      "fma.rn.ftz.f32 q, q, r, r;\n"
++      "fma.rn.ftz.f32 l, f, 0f3F317218, q;\n"
++      // Not finite non-negative: fma(z, inf, inf). The noise is 0 - logf(y), or
++      // +inf where z is zero.
++      "setp.lt.u32 fin, z, 2139095040;\n"
++      "fma.rn.ftz.f32 w, z, 0f7F800000, 0f7F800000;\n"
++      "selp.f32 l, l, w, fin;\n"
++      "setp.eq.f32 zero, z, 0f00000000;\n"
++      "selp.f32 %0, 0fFF800000, l, zero;\n"
++      "}"
++      : "=f"(result) : "f"(x));
++  return result;
+ }
+ __device__ __forceinline__ float vllm_control_reciprocal(float x) {
+   float y;

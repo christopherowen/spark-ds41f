@@ -1,0 +1,677 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 11:36:03 +0200
+Subject: [PATCH 357/488] DeepSeek-V4.1: Add a TileLang vocabulary-parallel
+ embedding lookup
+
+The decode step's last kernels outside TileLang and Triton are vLLM's CUDA
+vocabulary embedding and three cuBLAS launches (the torch-profiled decode of
+image -next-2 on the ring, every rank: 26 one-stream steps, 109 sixteen-stream
+steps; spark-ds41f experiments/2026-10-24-tilelang-completion). This commit adds
+the TileLang lookup; the next ones add the confidence head, switch both call
+sites and time each against what it replaces.
+
+Findings
+
+vllm::vocab_embedding::vocab_parallel_embedding_kernel<int, uint4>: 208 calls at
+one stream, 872 at sixteen, two a step on each rank (2.7 and 4.5 us a call).
+- Call site: VocabParallelEmbedding.forward, through ops.vocab_parallel_embedding,
+  which a TP > 1 layer with the unquantized embedding method takes
+  (use_fused_embedding); kernels.embedding_method() returns that method under
+  the TileLang family. The two calls are the target's embed_tokens
+  (DeepseekV4Model.forward -> embed_input_ids) and the DSpark drafter's
+  (DSparkDeepseekV4Model.forward -> embed_input_ids; the drafter aliases the
+  target's embed_tokens). Prefill SP's forward_reduce_scatter launches it too.
+- Shapes: int32 ids; the rank's BF16 shard, 32320 x 5120 at TP4 (129280 / 4),
+  43136 x 5120 at TP3 (129408 padded / 3); 10240-byte rows, copied as uint4.
+  One stream: the target embeds 1 + up to 5 drafts (capture sizes 1-4, 6) and
+  the drafter one query block of 5. Sixteen streams: up to 96 and 80 rows.
+  Prefill: up to 8192 (TP4) or 4096 (TP3) tokens.
+- Computes: each token's shard row when the rank owns its id, zeros otherwise
+  (LoRA's added vocabulary, empty here, maps after the padded base rows). The
+  all-reduce adds one row to zeros, so the lookup is exact.
+
+void dot_kernel<float, 128, 0, cublasDotParams<cublasGemvTensorStridedBatched
+<float const>, ...>> and void reduce_1Block_kernel<float, 128, 7, ...>: 104
+calls each at one stream (3.0 and 1.3 us), 20 at sixteen; and
+internal::gemvx::kernel<int, int, float, float, float, float, false, true, ...>:
+416 calls at sixteen streams only (5.4 us). One FP32 product a draft step on
+each rank: dot and its reduction at one stream; at sixteen streams the GEMV on
+104 of the 109 steps and the dot pair on the other 5 (20 = 5 x 4 ranks).
+- Call site: DSparkSpeculator._sample_sequential -> compute_confidence
+  (models/deepseek_v4_1/nvidia/dspark.py) -> DSparkConfidenceHead.forward
+  (model_executor/models/qwen3_dspark.py): torch.cat([h, e]).float(), then
+  ReplicatedLinear(5376 -> 1, FP32 weight, no bias), whose
+  UnquantizedLinearMethod under linear backend tilelang is F.linear, a cuBLAS
+  SGEMM with one output column; then torch.sigmoid. Adaptive verification, on
+  in the recipe, runs it on every draft step.
+- Shapes: h is the drafter's head hidden (BF16, R x 5120), e the Markov
+  embedding of the token before each draft (BF16, R x 256), w one FP32 row of
+  5376; R = requests x 5 drafts. One stream: R = 5, which cuBLAS runs as dot
+  products plus their reduction. Sixteen streams: R = 80, a GEMV; the steps
+  with few requests take the dot path again.
+- Computes: each draft's acceptance probability sigmoid(w . [h | e]), which
+  rank 0 broadcasts; it sets the step's draft budget (running products of the
+  confidences, ranked) and its dead rows (survival below 0.2).
+- Batch dependence: cuBLAS picks dot or GEMV by R, so a draft's FP32 sum, and
+  possibly its last bits, depend on how many requests the step drafts for.
+  That can move a confidence across the budget's cut or the dead-row
+  threshold, changing which drafts a step verifies and how many tokens it
+  commits. It cannot change a temperature-0 token, which the target's
+  verification decides.
+- Around it: ATen's concatenation, FP32 copy and sigmoid, which the TileLang
+  head folds into its launch (the stack of the five Markov embeddings stays).
+
+Not ported: the Markov head's own lookup (markov_w1, an nn.Embedding: ATen's
+index_select, five a step), which belongs with the ATen glue; and the TP = 1
+path (F.embedding), which the deployment never runs.
+
+The lookup
+
+tilelang/embedding.py: vocab_embedding (a custom op with the arguments of
+ops.vocab_parallel_embedding) is one launch. A block covers one token's 2 KiB of
+row (five blocks a token at DS4.1's width), 128 threads each copying sixteen
+bytes as 32-bit words, or writing zeros for an id the rank does not own, so any
+dtype's bits copy exactly; the ids and table load on the coherent path, which
+GB10 serves faster for a load whose address depends on the one before (as CED's
+row copies measured). TileLangEmbeddingMethod is the unquantized method with
+this lookup; it declares both id dtypes' kernels for kernel preparation.
+
+VocabParallelEmbedding's fused lookup (forward and forward_reduce_scatter) now
+asks its method: UnquantizedEmbeddingMethod.parallel_embedding runs
+ops.vocab_parallel_embedding as before, so nothing changes until a model's
+method supplies its own.
+
+Tests (tests/kernels/test_deepseek_v41_tilelang_embedding.py, SM12x with
+TileLang): bit-identical to the CUDA kernel on tables of random bit patterns
+(NaN payloads and signed zeros included) for DS4.1's TP3 and TP4 shards at
+decode and prefill token counts with int32 and int64 ids, ids owned by other
+ranks, padding rows and ids past the vocabulary on both sides; LoRA's added rows
+at TP2 to TP8; FP32, FP16 and FP8 rows; the ranks' partials sum to the full
+lookup; a slice of the reduce-scatter buffer; the method against the unquantized
+method's; no tokens; refused layouts; the declared calls.
+---
+ .../test_deepseek_v41_tilelang_embedding.py   | 226 ++++++++++++++++
+ .../layers/vocab_parallel_embedding.py        |  52 ++--
+ .../deepseek_v4_1/tilelang/embedding.py       | 250 ++++++++++++++++++
+ 3 files changed, 509 insertions(+), 19 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_embedding.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/embedding.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_embedding.py b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+new file mode 100644
+index 000000000..77dd35e56
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_embedding.py
+@@ -0,0 +1,226 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The TileLang vocabulary-parallel embedding against vLLM's CUDA kernel
++(``ops.vocab_parallel_embedding``), which it replaces: the same bits for every
++rank's shard, including ids another rank owns, ids no rank owns and LoRA's added
++vocabulary."""
++
++import math
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm import _custom_ops as ops  # noqa: E402
++from vllm.model_executor.layers.vocab_parallel_embedding import (  # noqa: E402
++    UnquantizedEmbeddingMethod,
++    VocabParallelEmbedding,
++    pad_vocab_size,
++)
++from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry  # noqa: E402
++from vllm.models.deepseek_v4_1.tilelang import embedding, prepare  # noqa: E402
++
++# DeepSeek-V4.1: a 129280-token vocabulary of 5120-wide BF16 rows.
++VOCAB, HIDDEN = 129280, 5120
++
++
++def _shard_indices(vocab: int, org_vocab: int, rank: int, tp: int):
++    """A rank's indices as VocabParallelEmbedding lays them out (its padding is
++    ``lcm(64, tp)``)."""
++    pad = math.lcm(64, tp)
++    org_padded = pad_vocab_size(org_vocab, pad)
++    padded = pad_vocab_size(org_padded + vocab - org_vocab, pad)
++    return (
++        VocabParallelEmbedding._get_indices(
++            padded, org_padded, vocab, org_vocab, rank, tp
++        ),
++        padded // tp,
++    )
++
++
++def _random_bits(rows: int, width: int, dtype: torch.dtype, seed: int):
++    """A table of random bit patterns: NaN payloads, infinities, subnormals and
++    signed zeros included, so only a bit copy reproduces it."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    nbytes = rows * width * dtype.itemsize
++    bits = torch.randint(
++        0, 256, (nbytes,), generator=generator, dtype=torch.uint8, device="cuda"
++    )
++    return bits.view(dtype).view(rows, width)
++
++
++def _ids(tokens: int, vocab: int, dtype: torch.dtype, seed: int):
++    """Ids over the whole vocabulary and past it on both sides (no rank's)."""
++    generator = torch.Generator(device="cuda").manual_seed(seed)
++    return torch.randint(
++        -8, vocab + 200, (tokens,), generator=generator, dtype=dtype, device="cuda"
++    )
++
++
++def _cuda(ids, weight, shard, out=None):
++    return ops.vocab_parallel_embedding(
++        ids,
++        weight,
++        shard.org_vocab_start_index,
++        shard.org_vocab_end_index,
++        shard.num_org_vocab_padding,
++        shard.added_vocab_start_index,
++        shard.added_vocab_end_index,
++        out=out,
++    )
++
++
++def _tilelang(ids, weight, shard, out=None):
++    if out is None:
++        out = torch.empty(
++            (ids.shape[0], weight.shape[1]), dtype=weight.dtype, device=weight.device
++        )
++    embedding.vocab_embedding(
++        ids,
++        weight,
++        out,
++        shard.org_vocab_start_index,
++        shard.org_vocab_end_index,
++        shard.num_org_vocab_padding,
++        shard.added_vocab_start_index,
++        shard.added_vocab_end_index,
++    )
++    return out
++
++
++def _bits(x: torch.Tensor) -> torch.Tensor:
++    return x.contiguous().view(torch.uint8)
++
++
++@pytest.mark.parametrize("tp,rank", [(4, 0), (4, 3), (3, 1), (3, 2)])
++@pytest.mark.parametrize("tokens", [1, 5, 6, 80, 96, 8192])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++def test_serving_shard_bit_identical_to_the_cuda_kernel(tp, rank, tokens, id_dtype):
++    """DS4.1's own shards (TP3's last rank has padding rows), decode and prefill
++    token counts, ids from every rank and from none."""
++    shard, rows = _shard_indices(VOCAB, VOCAB, rank, tp)
++    weight = _random_bits(rows, HIDDEN, torch.bfloat16, seed=tp * 10 + rank)
++    ids = _ids(tokens, VOCAB, id_dtype, seed=tokens)
++    # The ids this rank owns, at both ends of its range, among the others.
++    ends = torch.tensor(
++        [shard.org_vocab_start_index, shard.org_vocab_end_index - 1], dtype=id_dtype
++    )[:tokens]
++    ids[: ends.numel()] = ends
++    want = _cuda(ids, weight, shard)
++    got = _tilelang(ids, weight, shard)
++    assert got.dtype == want.dtype and got.shape == want.shape
++    assert torch.equal(_bits(got), _bits(want))
++
++
++@pytest.mark.parametrize("tp", [2, 3, 4, 8])
++@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
++def test_added_vocabulary_bit_identical_to_the_cuda_kernel(tp, id_dtype):
++    """LoRA's added rows sit after the padded base rows of each shard."""
++    vocab, org_vocab, width = 32256, 32000, 1024
++    for rank in range(tp):
++        shard, rows = _shard_indices(vocab, org_vocab, rank, tp)
++        weight = _random_bits(rows, width, torch.bfloat16, seed=rank)
++        ids = _ids(1031, vocab, id_dtype, seed=rank)
++        ids[:64] = torch.randint(org_vocab, vocab, (64,), dtype=id_dtype)
++        assert torch.equal(
++            _bits(_tilelang(ids, weight, shard)), _bits(_cuda(ids, weight, shard))
++        ), rank
++
++
++@pytest.mark.parametrize(
++    "dtype,width",
++    [(torch.float32, 1028), (torch.float16, 2056), (torch.float8_e4m3fn, 4112)],
++)
++def test_every_dtype_is_a_bit_copy(dtype, width):
++    """Rows copy as words: any dtype whose rows are whole 16-byte pieces, rows not a
++    multiple of the block's 2 KiB included."""
++    shard, rows = _shard_indices(VOCAB, VOCAB, 1, 4)
++    weight = _random_bits(rows, width, dtype, seed=3)
++    ids = _ids(257, VOCAB, torch.int32, seed=4)
++    assert torch.equal(
++        _bits(_tilelang(ids, weight, shard)), _bits(_cuda(ids, weight, shard))
++    )
++
++
++@pytest.mark.parametrize("tp", [3, 4])
++def test_rank_sum_is_the_full_lookup(tp):
++    """What the all-reduce sees: one rank's row plus the others' zeros, per token."""
++    vocab, width = 4099, 512
++    generator = torch.Generator(device="cuda").manual_seed(tp)
++    table = torch.randn(vocab, width, generator=generator, device="cuda").bfloat16()
++    ids = torch.randint(0, vocab, (333,), dtype=torch.int32, device="cuda")
++    total = torch.zeros(ids.shape[0], width, dtype=torch.float32, device="cuda")
++    for rank in range(tp):
++        shard, rows = _shard_indices(vocab, vocab, rank, tp)
++        weight = torch.zeros(rows, width, dtype=torch.bfloat16, device="cuda")
++        owned = shard.org_vocab_end_index - shard.org_vocab_start_index
++        weight[:owned] = table[shard.org_vocab_start_index : shard.org_vocab_end_index]
++        total += _tilelang(ids, weight, shard).float()
++    assert torch.equal(total.bfloat16(), table[ids.long()])
++
++
++def test_writes_only_its_rows_of_a_larger_buffer():
++    """Prefill SP's reduce-scatter embeds into the head of a padded buffer."""
++    shard, rows = _shard_indices(VOCAB, VOCAB, 2, 4)
++    weight = _random_bits(rows, HIDDEN, torch.bfloat16, seed=5)
++    ids = _ids(1000, VOCAB, torch.int32, seed=6)
++    buffer = torch.full((1024, HIDDEN), 7.0, dtype=torch.bfloat16, device="cuda")
++    _tilelang(ids, weight, shard, out=buffer[:1000])
++    assert torch.equal(_bits(buffer[:1000]), _bits(_cuda(ids, weight, shard)))
++    assert (buffer[1000:] == 7.0).all()
++
++
++def test_the_method_matches_the_unquantized_method():
++    """``TileLangEmbeddingMethod.parallel_embedding`` reads the layer's shard as
++    the CUDA kernel's method does."""
++    shard, rows = _shard_indices(VOCAB, VOCAB, 3, 4)
++    layer = SimpleNamespace(
++        weight=_random_bits(rows, HIDDEN, torch.bfloat16, seed=7), shard_indices=shard
++    )
++    ids = _ids(96, VOCAB, torch.int32, seed=8)
++    got = embedding.TileLangEmbeddingMethod().parallel_embedding(layer, ids)
++    want = UnquantizedEmbeddingMethod().parallel_embedding(layer, ids)
++    assert torch.equal(_bits(got), _bits(want))
++
++
++def test_no_tokens_launch_nothing():
++    shard, rows = _shard_indices(VOCAB, VOCAB, 0, 4)
++    weight = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
++    ids = torch.empty(0, dtype=torch.int32, device="cuda")
++    assert _tilelang(ids, weight, shard).shape == (0, HIDDEN)
++
++
++def test_refuses_layouts_it_cannot_copy_in_pieces():
++    shard, rows = _shard_indices(VOCAB, VOCAB, 0, 4)
++    ids = _ids(4, VOCAB, torch.int32, seed=9)
++    narrow = torch.zeros(rows, 12, dtype=torch.bfloat16, device="cuda")  # 24 bytes
++    with pytest.raises(ValueError):
++        _tilelang(ids, narrow, shard)
++    weight = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
++    shifted = torch.empty(4 * HIDDEN + 2, dtype=torch.bfloat16, device="cuda")
++    with pytest.raises(ValueError):  # rows 4 bytes off a 16-byte boundary
++        _tilelang(ids, weight, shard, out=shifted[2:].view(4, HIDDEN))
++    with pytest.raises(ValueError):
++        _tilelang(ids.float(), weight, shard)
++
++
++def test_declared_as_the_lookup_calls_it():
++    registry = JitWarmupRegistry(vllm_config=None)
++    layer = SimpleNamespace(weight=torch.empty(16, HIDDEN, dtype=torch.bfloat16))
++    with registry.activate():
++        embedding.TileLangEmbeddingMethod().declare_layer_kernels(layer)
++    calls = list(prepare.declared_calls(registry))
++    words = HIDDEN * 2 // 4
++    assert calls == [
++        (embedding.vocab_embedding_kernel, (words, "int32"), {}),
++        (embedding.vocab_embedding_kernel, (words, "int64"), {}),
++    ]
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index 41ad86023..022c4dca8 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -4,7 +4,7 @@
+ import math
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+-from typing import Literal
++from typing import Literal, cast
+ 
+ import torch
+ import torch.nn.functional as F
+@@ -166,6 +166,27 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+         return F.embedding(input_, layer.weight)
+ 
++    def parallel_embedding(
++        self,
++        layer: torch.nn.Module,
++        input_ids: torch.Tensor,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """This rank's partial embeddings of the 1-D ``input_ids`` (the layer's
++        fused tensor-parallel lookup): its shard's row for each id it owns, zeros
++        for every other id. A model's kernel family may supply its own kernel."""
++        shard = layer.shard_indices
++        return ops.vocab_parallel_embedding(
++            input_ids,
++            layer.weight,
++            shard.org_vocab_start_index,
++            shard.org_vocab_end_index,
++            shard.num_org_vocab_padding,
++            shard.added_vocab_start_index,
++            shard.added_vocab_end_index,
++            out=out,
++        )
++
+     def tie_weights(
+         self, layer: torch.nn.Module, embed_tokens: "VocabParallelEmbedding"
+     ):
+@@ -691,19 +712,21 @@ class VocabParallelEmbedding(PluggableLayer):
+         copy_weight(param[: loaded_weight.shape[0]].data, loaded_weight)
+         param[loaded_weight.shape[0] :].data.fill_(0)
+ 
++    def _fused_embedding(
++        self, input_ids: torch.Tensor, out: torch.Tensor | None = None
++    ) -> torch.Tensor:
++        """The fused lookup of this rank's shard (``use_fused_embedding``), by the
++        unquantized embedding method's kernel."""
++        method = cast(UnquantizedEmbeddingMethod, self.quant_method)
++        return method.parallel_embedding(self, input_ids, out=out)
++
+     def forward(self, input_):
+         if self.tp_size == 1:
+             return self.quant_method.embedding(self, input_.long())
+ 
+         if self.use_fused_embedding:
+-            output_parallel = ops.vocab_parallel_embedding(
+-                input_ if input_.ndim == 1 else input_.reshape(-1),
+-                self.weight,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                self.shard_indices.num_org_vocab_padding,
+-                self.shard_indices.added_vocab_start_index,
+-                self.shard_indices.added_vocab_end_index,
++            output_parallel = self._fused_embedding(
++                input_ if input_.ndim == 1 else input_.reshape(-1)
+             )
+             if input_.ndim != 1:
+                 output_parallel = output_parallel.view(
+@@ -768,16 +791,7 @@ class VocabParallelEmbedding(PluggableLayer):
+                 dtype=self.weight.dtype,
+                 device=self.weight.device,
+             )
+-            ops.vocab_parallel_embedding(
+-                input_,
+-                self.weight,
+-                self.shard_indices.org_vocab_start_index,
+-                self.shard_indices.org_vocab_end_index,
+-                self.shard_indices.num_org_vocab_padding,
+-                self.shard_indices.added_vocab_start_index,
+-                self.shard_indices.added_vocab_end_index,
+-                out=output_parallel[:rows],
+-            )
++            self._fused_embedding(input_, out=output_parallel[:rows])
+         else:
+             masked_input, input_mask = get_masked_input_and_mask(
+                 input_,
+diff --git a/vllm/models/deepseek_v4_1/tilelang/embedding.py b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+new file mode 100644
+index 000000000..9ff2daad2
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/embedding.py
+@@ -0,0 +1,250 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The vocabulary-parallel embedding lookup in TileLang.
++
++Each rank of the tensor-parallel group holds a shard of the token table; its partial
++embeddings are the shard's row for every id it owns and zeros for every other id, so
++the group's all-reduce (or prefill SP's reduce-scatter) adds exactly one row to zeros.
++vLLM's CUDA kernel (``csrc/libtorch_stable/vocab_parallel_embedding_kernels.cu``)
++does this in one pass; this kernel does the same thing, for the same arguments:
++
++- an id in ``[org_start, org_end)`` reads shard row ``id - org_start``;
++- an id in ``[added_start, added_end)`` (LoRA's added vocabulary, empty for
++  DeepSeek-V4.1) reads row ``id + added_offset``;
++- any other id, another rank's or none at all (negative, padding), writes zeros.
++
++A row is copied as 32-bit words, sixteen bytes a thread, whatever the table's dtype,
++so the output carries the table's bits exactly (NaN payloads, signed zeros); rows
++must be sixteen-byte aligned and a multiple of sixteen bytes wide, as DS4.1's
++10240-byte BF16 rows are. A token's row is spread over ``ceil(width / (16 *
++threads))`` blocks (five for DS4.1 at 128 threads), one block per piece of the row,
++so a decode step's few tokens still put every load of their rows in flight at once.
++The table and the ids are not marked restrict: their loads take the coherent path,
++which on GB10 is faster for a load whose address depends on the load before it
++(measured for CED's row copies, ``ced.py``).
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shape must resolve.
++from functools import cache
++
++import tilelang
++import tilelang.language as T
++import torch
++from torch import nn
++
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    UnquantizedEmbeddingMethod,
++)
++from vllm.models.deepseek_v4_1.tilelang import prepare
++
++# 32-bit words in one sixteen-byte piece of a row.
++_WORDS = 4
++_ID_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
++
++
++@tilelang.jit(
++    pass_configs={
++        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++        # Rows are in the table by construction (the shard bounds come from the
++        # layer); the CUDA kernel does not guard them either.
++        tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++    }
++)
++def vocab_embedding_kernel(
++    words: int, id_dtype: str, threads: int = 128, coherent: bool = True
++):
++    """``out[t] = table[row(ids[t])]`` or zeros, for rows of ``words`` 32-bit words.
++
++    ``coherent`` leaves the table and the ids unmarked (plain loads); False marks
++    them restrict, as the CUDA kernel does (read-only loads). A benchmark variant.
++    """
++    assert words % _WORDS == 0 and threads % 32 == 0
++    pieces = words // _WORDS
++    blocks = -(-pieces // threads)
++    tokens = T.dynamic("tokens")
++    span = T.dynamic("span")
++
++    @T.prim_func
++    def vocab_embedding(
++        ids: T.Tensor((tokens,), id_dtype),
++        table: T.Tensor((span,), T.int32),
++        out: T.Tensor((tokens, words), T.int32),
++        org_start: T.int64,
++        org_end: T.int64,
++        added_start: T.int64,
++        added_end: T.int64,
++        added_offset: T.int64,
++    ):
++        with T.Kernel(tokens, blocks, threads=threads) as (t, bx):
++            if coherent:
++                T.annotate_restrict_buffers(ids, table)
++            piece = bx * threads + T.get_thread_binding()
++            data = T.alloc_local((_WORDS,), T.int32)
++            token = T.alloc_var(T.int64, init=T.cast(ids[t], T.int64))
++            # The shard row, or -1 for an id this rank does not own.
++            row = T.alloc_var(
++                T.int64,
++                init=T.if_then_else(
++                    (token >= org_start) & (token < org_end),
++                    token - org_start,
++                    T.if_then_else(
++                        (token >= added_start) & (token < added_end),
++                        token + added_offset,
++                        T.int64(-1),
++                    ),
++                ),
++            )
++            if piece < pieces:
++                if row >= 0:
++                    for i in T.vectorized(_WORDS):
++                        data[i] = table[row * words + piece * _WORDS + i]
++                else:
++                    for i in T.vectorized(_WORDS):
++                        data[i] = T.int32(0)
++                for i in T.vectorized(_WORDS):
++                    out[t, piece * _WORDS + i] = data[i]
++
++    return vocab_embedding
++
++
++@cache
++def _kernel(words: int, id_dtype: str):
++    return vocab_embedding_kernel(words, id_dtype)
++
++
++def row_words(weight: torch.Tensor) -> int:
++    """32-bit words in one row of ``weight``; rows must be whole sixteen-byte pieces."""
++    row_bytes = weight.shape[1] * weight.element_size()
++    if row_bytes % (4 * _WORDS):
++        raise ValueError(
++            f"TileLang vocabulary embedding needs rows of whole 16-byte pieces, got "
++            f"{row_bytes} bytes"
++        )
++    return row_bytes // 4
++
++
++def kernel_calls(words: int) -> list[prepare.TileLangCall]:
++    """The calls ``vocab_embedding`` makes for rows of ``words`` words: int32 ids
++    (the model runner's) and int64 ids."""
++    return [prepare.call(vocab_embedding_kernel, words, d) for d in _ID_DTYPES.values()]
++
++
++def declare(words: int) -> None:
++    """Declare the lookups of rows of ``words`` words, and keep them."""
++    prepare.declare(
++        lambda: kernel_calls(words),
++        bind=lambda: [_kernel(words, d) for d in _ID_DTYPES.values()],
++    )
++
++
++@torch.library.custom_op("vllm::dsv41_tilelang_vocab_embedding", mutates_args=("out",))
++def vocab_embedding(
++    input_ids: torch.Tensor,
++    weight: torch.Tensor,
++    out: torch.Tensor,
++    org_vocab_start_index: int,
++    org_vocab_end_index: int,
++    num_org_vocab_padding: int,
++    added_vocab_start_index: int,
++    added_vocab_end_index: int,
++) -> None:
++    """This rank's partial embeddings of ``input_ids`` ([T] int32 or int64) from its
++    shard ``weight`` into ``out`` ([T, width], the weight's dtype): the arguments of
++    ``ops.vocab_parallel_embedding``, the same result bit for bit."""
++    tokens = input_ids.shape[0]
++    if (
++        input_ids.dim() != 1
++        or input_ids.dtype not in _ID_DTYPES
++        or weight.dim() != 2
++        or out.shape != (tokens, weight.shape[1])
++        or out.dtype != weight.dtype
++        or not (input_ids.is_contiguous() and weight.is_contiguous())
++        or not out.is_contiguous()
++    ):
++        raise ValueError(
++            "TileLang vocabulary embedding needs 1-D int32/int64 ids, a contiguous "
++            f"2-D table and a contiguous [ids, width] output of its dtype: ids "
++            f"{tuple(input_ids.shape)} {input_ids.dtype}, table "
++            f"{tuple(weight.shape)} {weight.dtype}, output {tuple(out.shape)} "
++            f"{out.dtype}"
++        )
++    words = row_words(weight)
++    if weight.data_ptr() % 16 or out.data_ptr() % 16:
++        raise ValueError("TileLang vocabulary embedding needs 16-byte aligned rows")
++    if tokens == 0:
++        return
++    # Maps an added-vocabulary id onto its shard row, as get_masked_input_and_mask().
++    added_offset = (
++        org_vocab_end_index
++        - org_vocab_start_index
++        + num_org_vocab_padding
++        - added_vocab_start_index
++    )
++    _kernel(words, _ID_DTYPES[input_ids.dtype])(
++        input_ids,
++        weight.view(torch.int32).view(-1),
++        out.view(torch.int32),
++        org_vocab_start_index,
++        org_vocab_end_index,
++        added_vocab_start_index,
++        added_vocab_end_index,
++        added_offset,
++    )
++
++
++@vocab_embedding.register_fake
++def _vocab_embedding_fake(
++    input_ids,
++    weight,
++    out,
++    org_vocab_start_index,
++    org_vocab_end_index,
++    num_org_vocab_padding,
++    added_vocab_start_index,
++    added_vocab_end_index,
++):
++    return None
++
++
++class TileLangEmbeddingMethod(UnquantizedEmbeddingMethod):
++    """The unquantized embedding's sharded weights and ties, with the tensor-parallel
++    lookup in TileLang (``VocabParallelEmbedding``'s fused path)."""
++
++    def declare_layer_kernels(self, layer: nn.Module) -> None:
++        declare(row_words(layer.weight))
++
++    def parallel_embedding(
++        self,
++        layer: nn.Module,
++        input_ids: torch.Tensor,
++        out: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if out is None:
++            out = torch.empty(
++                (input_ids.shape[0], layer.weight.shape[1]),
++                dtype=layer.weight.dtype,
++                device=layer.weight.device,
++            )
++        shard = layer.shard_indices
++        vocab_embedding(
++            input_ids,
++            layer.weight,
++            out,
++            shard.org_vocab_start_index,
++            shard.org_vocab_end_index,
++            shard.num_org_vocab_padding,
++            shard.added_vocab_start_index,
++            shard.added_vocab_end_index,
++        )
++        return out
++
++
++__all__ = [
++    "TileLangEmbeddingMethod",
++    "declare",
++    "kernel_calls",
++    "row_words",
++    "vocab_embedding",
++    "vocab_embedding_kernel",
++]

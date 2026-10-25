@@ -1,0 +1,378 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:52:35 +0200
+Subject: [PATCH 429/488] [DS4.1] Captured forwards write their outputs into
+ the graph buffers
+
+The model graph manager copied every replay's hidden states and three
+auxiliary hidden states into its persistent buffers: four copies a
+decode step. The DS4.1 target now declares buffers for a captured
+forward's outputs (rows: the largest CUDA graph) and, while a graph is
+being captured, its last norm and the auxiliary collapses write into
+them. The manager uses a model's declared buffers as its persistent
+outputs and skips the copy when a captured forward wrote there; other
+models are unchanged.
+---
+ tests/models/test_deepseek_v4_1_ced_model.py  |  2 +
+ tests/models/test_deepseek_v4_1_sp_prefill.py |  2 +
+ tests/v1/worker/test_graph_output_buffers.py  | 38 +++++++++++
+ vllm/models/deepseek_v4_1/b12x_layers.py      | 16 +++--
+ vllm/models/deepseek_v4_1/nvidia/model.py     | 67 ++++++++++++++++++-
+ vllm/models/deepseek_v4_1/nvidia/vl_model.py  |  5 ++
+ vllm/models/deepseek_v4_1/tilelang/mhc.py     | 15 +++--
+ vllm/models/deepseek_v4_1/tilelang/norm.py    |  8 ++-
+ vllm/v1/worker/gpu/cudagraph_utils.py         | 43 ++++++++++--
+ 9 files changed, 175 insertions(+), 21 deletions(-)
+ create mode 100644 tests/v1/worker/test_graph_output_buffers.py
+
+diff --git a/tests/models/test_deepseek_v4_1_ced_model.py b/tests/models/test_deepseek_v4_1_ced_model.py
+index 2f23981b8..9debe2a21 100644
+--- a/tests/models/test_deepseek_v4_1_ced_model.py
++++ b/tests/models/test_deepseek_v4_1_ced_model.py
+@@ -264,6 +264,8 @@ def test_ced_global_context_and_full_row_output_abi(monkeypatch, compact):
+         aux_hidden_state_layers={3, 4},
+         # The sink detector's column buffer: none, the detector is off here.
+         _sink_columns=None,
++        # Graph output buffers: none, nothing is captured here.
++        _graph_out=lambda index, rows: None,
+         # GLP steering: none, unset here.
+         glp=None,
+         norm=lambda hidden: hidden,
+diff --git a/tests/models/test_deepseek_v4_1_sp_prefill.py b/tests/models/test_deepseek_v4_1_sp_prefill.py
+index 90a98be56..551a9df57 100644
+--- a/tests/models/test_deepseek_v4_1_sp_prefill.py
++++ b/tests/models/test_deepseek_v4_1_sp_prefill.py
+@@ -540,6 +540,8 @@ def test_model_forward_matches_full_rows(monkeypatch, num_tokens, use_embeds):
+             _l2pf_ready=True,
+             # The sink detector's column buffer: none, the detector is off here.
+             _sink_columns=None,
++            # Graph output buffers: none, nothing is captured here.
++            _graph_out=lambda index, rows: None,
+             # GLP steering: none, unset here.
+             glp=None,
+             norm=lambda hidden: hidden * 2,
+diff --git a/tests/v1/worker/test_graph_output_buffers.py b/tests/v1/worker/test_graph_output_buffers.py
+new file mode 100644
+index 000000000..c34f18f35
+--- /dev/null
++++ b/tests/v1/worker/test_graph_output_buffers.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The model graph manager's persistent outputs: a model's declared buffers are
++adopted when their rows fit the output, and a captured forward that wrote its
++output into them needs no copy; anything else is copied as before."""
++
++import torch
++
++from vllm.v1.worker.gpu.cudagraph_utils import _output_buffer, _store_output
++
++
++def test_declared_buffer_is_adopted_when_it_fits():
++    declared = torch.zeros(8, 4, dtype=torch.bfloat16)
++    output = torch.ones(6, 4, dtype=torch.bfloat16)
++    assert _output_buffer(declared, output) is declared
++    for other in (
++        torch.zeros(5, 4, dtype=torch.bfloat16),  # too few rows
++        torch.zeros(8, 3, dtype=torch.bfloat16),  # another width
++        torch.zeros(8, 4, dtype=torch.float32),  # another dtype
++    ):
++        buffer = _output_buffer(other, output)
++        assert buffer is not other and buffer.shape == output.shape
++    assert _output_buffer(None, output).shape == output.shape
++
++
++def test_output_written_in_place_is_not_copied():
++    buffer = torch.zeros(8, 4)
++    in_place = buffer[:6]
++    in_place.fill_(3.0)
++    _store_output(buffer, in_place, 6)
++    assert (buffer[:6] == 3.0).all() and (buffer[6:] == 0).all()
++    fresh = torch.full((6, 4), 5.0)
++    _store_output(buffer, fresh, 6)
++    assert (buffer[:6] == 5.0).all() and (buffer[6:] == 0).all()
++    # A view at the buffer's start with other strides is still copied.
++    column_major = torch.full((4, 6), 7.0).t()
++    _store_output(buffer, column_major, 6)
++    assert (buffer[:6] == 7.0).all()
+diff --git a/vllm/models/deepseek_v4_1/b12x_layers.py b/vllm/models/deepseek_v4_1/b12x_layers.py
+index be4a0f86e..c7a9a131e 100644
+--- a/vllm/models/deepseek_v4_1/b12x_layers.py
++++ b/vllm/models/deepseek_v4_1/b12x_layers.py
+@@ -486,14 +486,14 @@ class B12xRMSNorm(nn.Module):
+             ),
+         )
+ 
+-    def forward(self, x: torch.Tensor) -> torch.Tensor:
++    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+         if self._plan is None:
+             raise PreparationResourceUnavailableError(
+                 "V4.1 RMSNorm has no declared plan"
+             )
+         shape = x.shape
+         x = x.reshape(-1, shape[-1]).contiguous()
+-        out = torch.empty_like(x)
++        out = torch.empty_like(x) if out is None else out.view(x.shape)
+         _rmsnorm(
+             x,
+             self.weight,
+@@ -958,14 +958,16 @@ class B12xMHC(nn.Module):
+         pre: torch.Tensor | None = None,
+         columns: torch.Tensor | None = None,
+         column: int = -1,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         if columns is not None:
+             columns.copy_(state[:, :, column])
+-        out = torch.empty(
+-            (state.shape[0], state.shape[-1]),
+-            dtype=state.dtype,
+-            device=state.device,
+-        )
++        if out is None:
++            out = torch.empty(
++                (state.shape[0], state.shape[-1]),
++                dtype=state.dtype,
++                device=state.device,
++            )
+         return mhc.run_collapse(
+             state,
+             pre,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 6d1c076ce..1d506023a 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -560,6 +560,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+         self.glp = glp_steering(
+             config.num_hidden_layers, config.hidden_size, config.hc_mult
+         )
++        # A captured forward's outputs, written in place: the hidden states and one
++        # row block per auxiliary layer (set with them), for the CUDA graph sizes.
++        # The graph manager adopts them rather than copying every replay's outputs.
++        graph_rows = (
++            vllm_config.compilation_config.max_cudagraph_capture_size or 0
++            if get_pp_group().is_last_rank
++            else 0
++        )
++        self._graph_outputs: tuple[torch.Tensor, list[torch.Tensor]] | None = (
++            (
++                torch.empty(
++                    graph_rows,
++                    config.hidden_size,
++                    dtype=vllm_config.model_config.dtype,
++                ),
++                [],
++            )
++            if graph_rows
++            else None
++        )
++
++    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
++        super()._set_aux_hidden_state_layers(layers)
++        if self._graph_outputs is not None:
++            hidden = self._graph_outputs[0]
++            self._graph_outputs = (
++                hidden,
++                [torch.empty_like(hidden) for _ in self.aux_hidden_state_layers],
++            )
++
++    def _graph_out(self, index: int | None, rows: int) -> torch.Tensor | None:
++        """Rows of a captured forward's output buffer (``index`` None: the hidden
++        states, else that auxiliary layer's), or None outside capture."""
++        if self._graph_outputs is None or not torch.cuda.is_current_stream_capturing():
++            return None
++        hidden, aux = self._graph_outputs
++        buffer = hidden if index is None else aux[index]
++        return buffer[:rows] if rows <= buffer.shape[0] else None
+ 
+     def prepare_disk_engram(
+         self, input_ids, query_start_loc, lookback_token_ids, early=None
+@@ -828,7 +866,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+                     if residual is None
+                     else layer.mhc.post(hidden_states, residual, post_mix, res_mix)
+                 )
+-                aux_hidden_state = layer.mhc.collapse(aux_recon)
++                aux_out = (
++                    self._graph_out(len(aux_hidden_states), full_num_tokens)
++                    if sp is None
++                    and not decoder_compacted
++                    and not self.use_sequence_parallel
++                    else None
++                )
++                aux_hidden_state = (
++                    layer.mhc.collapse(aux_recon)
++                    if aux_out is None
++                    else layer.mhc.collapse(aux_recon, out=aux_out)
++                )
+                 if self.use_sequence_parallel:
+                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
+                 elif sp is not None:
+@@ -893,7 +942,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             if decoder_compacted:
+                 columns = scatter_rows(columns, ced_indices, full_num_tokens)
+             self._sink_columns[:full_num_tokens].copy_(columns)
+-        hidden_states = self.norm(hidden_states)
++        out = (
++            self._graph_out(None, full_num_tokens)
++            if rows_here and not self.use_sequence_parallel
++            else None
++        )
++        hidden_states = (
++            self.norm(hidden_states) if out is None else self.norm(hidden_states, out)
++        )
+         if self.use_sequence_parallel:
+             # Gather only the collapsed and normalized hidden states.
+             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+@@ -1122,6 +1178,13 @@ class DeepseekV41LLMForCausalLM(UpstreamDeepseekV41LLMForCausalLM):
+         the last forward; None without the detector (vllm.v1.sample.sink)."""
+         return self.model._sink_columns
+ 
++    def get_graph_output_buffers(
++        self,
++    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
++        """The buffers a captured forward writes its hidden states and auxiliary
++        hidden states into (rows: the largest CUDA graph); None without graphs."""
++        return self.model._graph_outputs
++
+     def forward(
+         self,
+         input_ids: torch.Tensor,
+diff --git a/vllm/models/deepseek_v4_1/nvidia/vl_model.py b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+index a2508b509..0a9977fe2 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/vl_model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/vl_model.py
+@@ -147,6 +147,11 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
+         """The attention-sink detector's residual column per stream."""
+         return self.language_model.get_sink_residual_columns()
+ 
++    def get_graph_output_buffers(
++        self,
++    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
++        return self.language_model.get_graph_output_buffers()
++
+     @staticmethod
+     def get_model_state_cls():
+         from .model_state import DeepseekV41ModelState
+diff --git a/vllm/models/deepseek_v4_1/tilelang/mhc.py b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+index 37f291ca4..be8714268 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/mhc.py
++++ b/vllm/models/deepseek_v4_1/tilelang/mhc.py
+@@ -957,14 +957,19 @@ class TileKernelsMHC(nn.Module):
+         pre: torch.Tensor | None = None,
+         columns: torch.Tensor | None = None,
+         column: int = -1,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """The streams' weighted sum with ``pre``, or their mean; with ``columns``
+-        ([tokens, MULT] FP32), also each stream's ``column``, in the same launch."""
++        """The streams' weighted sum with ``pre``, or their mean, into ``out``
++        (contiguous [tokens, hidden]) when given; with ``columns`` ([tokens, MULT]
++        FP32), also each stream's ``column``, in the same launch."""
+         if pre is None:
+             pre = _constant_mixes(int(state.shape[0]), state.device)[1]
+-        out = torch.empty(
+-            (state.shape[0], state.shape[-1]), dtype=state.dtype, device=state.device
+-        )
++        if out is None:
++            out = torch.empty(
++                (state.shape[0], state.shape[-1]),
++                dtype=state.dtype,
++                device=state.device,
++            )
+         if columns is None:
+             _mhc_collapse(state, pre, out)
+         else:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 9733384b0..570743d96 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -53,12 +53,14 @@ class TileLangRMSNorm(nn.Module):
+         )
+         prepare.declare(warm=lambda: _warm(hidden, eps, dtype))
+ 
+-    def forward(self, x: torch.Tensor) -> torch.Tensor:
++    def forward(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
++        """The normalized rows, into ``out`` (contiguous, ``x``'s rows) when given."""
+         # TileKernels reads each row by its stride (a contiguous last dimension, rows
+         # 16 elements apart): the q and kv halves of the fused projection's output are
+         # normalized where they lie, with no copy.
+         shape = x.shape
+         x = x.reshape(-1, shape[-1])
+-        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+-        _rmsnorm(x, self.weight, out, self.variance_epsilon)
++        if out is None:
++            out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
++        _rmsnorm(x, self.weight, out.view(x.shape), self.variance_epsilon)
+         return out.view(shape)
+diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
+index b4897e282..5072157e1 100644
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -906,6 +906,12 @@ class ModelCudaGraphManager(CudaGraphManager):
+                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 or cudagraph_mode=NONE/FULL."
+             )
+ 
++        # A model may write a captured forward's outputs into persistent buffers of
++        # its own (rows: the largest graph): they become the persistent buffers
++        # here, and a replay's outputs need no copy.
++        get_buffers = getattr(model, "get_graph_output_buffers", None)
++        declared = get_buffers() if get_buffers is not None else None
++
+         def store_capture_output(num_tokens: int, model_output: Any) -> None:
+             """Copy outputs to persistent buffers, allocating on first use."""
+             if self.is_last_pp_rank:
+@@ -916,14 +922,18 @@ class ModelCudaGraphManager(CudaGraphManager):
+                     hidden_states = model_output
+                     aux_hidden_states = []
+                 if self.hidden_states is None:
+-                    self.hidden_states = torch.empty_like(hidden_states)
+-                self.hidden_states[:num_tokens] = hidden_states
++                    self.hidden_states = _output_buffer(
++                        declared[0] if declared is not None else None, hidden_states
++                    )
++                _store_output(self.hidden_states, hidden_states, num_tokens)
+                 if self.use_aux_hidden_state_outputs and not self.aux_hidden_states:
++                    own = declared[1] if declared is not None else []
+                     self.aux_hidden_states = [
+-                        torch.empty_like(x) for x in aux_hidden_states
++                        _output_buffer(own[i] if i < len(own) else None, x)
++                        for i, x in enumerate(aux_hidden_states)
+                     ]
+                 for i, aux in enumerate(aux_hidden_states):
+-                    self.aux_hidden_states[i][:num_tokens] = aux
++                    _store_output(self.aux_hidden_states[i], aux, num_tokens)
+             else:
+                 # Non-last PP rank.
+                 assert isinstance(model_output, IntermediateTensors)
+@@ -1064,6 +1074,31 @@ class ModelCudaGraphManager(CudaGraphManager):
+         return hidden_states, [x[: desc.num_tokens] for x in self.aux_hidden_states]
+ 
+ 
++def _output_buffer(declared: torch.Tensor | None, output: torch.Tensor) -> torch.Tensor:
++    """The persistent buffer for a captured output: the model's own when it
++    declares one of the output's row shape and dtype, else a new one."""
++    if (
++        declared is not None
++        and declared.shape[1:] == output.shape[1:]
++        and declared.dtype == output.dtype
++        and declared.device == output.device
++        and declared.shape[0] >= output.shape[0]
++    ):
++        return declared
++    return torch.empty_like(output)
++
++
++def _store_output(buffer: torch.Tensor, output: torch.Tensor, num_tokens: int) -> None:
++    """``buffer[:num_tokens] = output``, unless the forward wrote it there."""
++    if (
++        output.data_ptr() == buffer.data_ptr()
++        and output.stride() == buffer.stride()
++        and output.shape[0] == num_tokens
++    ):
++        return
++    buffer[:num_tokens] = output
++
++
+ def prepare_inputs_to_capture(
+     num_reqs: int,
+     num_tokens: int,

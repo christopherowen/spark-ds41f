@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 00:14:49 +0200
+Subject: [PATCH 409/488] DeepSeek-V4.1 RMSNorm: normalize the fused
+ projection's halves in place
+
+TileKernels' norm reads rows by their stride (contiguous last dimension,
+rows 16 elements apart); the q and kv halves of fused_wqa_wkv's output
+(1280 + 512 columns) meet that, so the two copies a layer that made them
+contiguous (83 kernels a decode step) are gone. Same elements, same bits.
+---
+ .../test_deepseek_v41_tilelang_linear.py          | 15 +++++++++++++++
+ vllm/models/deepseek_v4_1/tilelang/norm.py        |  7 +++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+index 12b5367b1..b82662b29 100644
+--- a/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
++++ b/tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py
+@@ -358,3 +358,18 @@ def test_rmsnorm(hidden, rows=33, eps=1e-6):
+     xf = x.float()
+     ref = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * norm.weight.float()
+     torch.testing.assert_close(out.float(), ref, rtol=1e-2, atol=1e-2)
++
++
++@pytest.mark.parametrize("width", [1280, 512])
++def test_rmsnorm_of_a_fused_projections_half(width, rows=33, eps=1e-6):
++    """The q and kv halves of ``fused_wqa_wkv``'s output (1280 + 512 columns),
++    normalized where they lie, equal the norm of their contiguous copies bit for bit."""
++    gen = _gen(5)
++    fused = torch.randn((rows, 1280 + 512), generator=gen, device=DEVICE).bfloat16()
++    half = fused[:, :1280] if width == 1280 else fused[:, 1280:]
++    norm = TileLangRMSNorm(width, eps).to(DEVICE)
++    norm.weight.data.copy_(torch.rand((width,), generator=gen, device=DEVICE) + 0.5)
++    assert not half.is_contiguous()
++    out = norm(half)
++    assert out.is_contiguous()
++    assert torch.equal(out.view(torch.int16), norm(half.contiguous()).view(torch.int16))
+diff --git a/vllm/models/deepseek_v4_1/tilelang/norm.py b/vllm/models/deepseek_v4_1/tilelang/norm.py
+index 6c2d0e5e3..9733384b0 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/norm.py
++++ b/vllm/models/deepseek_v4_1/tilelang/norm.py
+@@ -54,8 +54,11 @@ class TileLangRMSNorm(nn.Module):
+         prepare.declare(warm=lambda: _warm(hidden, eps, dtype))
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
++        # TileKernels reads each row by its stride (a contiguous last dimension, rows
++        # 16 elements apart): the q and kv halves of the fused projection's output are
++        # normalized where they lie, with no copy.
+         shape = x.shape
+-        x = x.reshape(-1, shape[-1]).contiguous()
+-        out = torch.empty_like(x)
++        x = x.reshape(-1, shape[-1])
++        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+         _rmsnorm(x, self.weight, out, self.variance_epsilon)
+         return out.view(shape)

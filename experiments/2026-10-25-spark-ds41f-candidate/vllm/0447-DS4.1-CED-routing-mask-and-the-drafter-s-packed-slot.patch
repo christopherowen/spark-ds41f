@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:03:20 +0100
+Subject: [PATCH 447/488] [DS4.1] CED routing mask and the drafter's packed
+ slots in TileLang
+
+Each is one launch at the CED indices: the decoder's MoE routing mask
+(a valid index whose row is not padding) and the drafter's context slots
+(PAD_SLOT_ID at an invalid index), where torch compared, negated and
+masked around a TileLang gather.
+---
+ .../kernels/test_deepseek_v41_tilelang_ced.py | 23 ++++++
+ vllm/models/deepseek_v4_1/ced.py              |  2 +
+ .../deepseek_v4_1/nvidia/model_state.py       |  6 +-
+ vllm/models/deepseek_v4_1/tilelang/ced.py     | 78 +++++++++++++++++++
+ .../gpu/spec_decode/dflash/speculator.py      |  7 +-
+ 5 files changed, 108 insertions(+), 8 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_ced.py b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+index b02cdbd1a..ac327a90a 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_ced.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_ced.py
+@@ -318,3 +318,26 @@ def test_ced_token_metadata_matches_the_torch_chain(rows):
+     actual = ced.token_metadata(indices, positions, reqs, slots, lengths)
+     for a, e in zip(actual, expected):
+         assert a.dtype == e.dtype and torch.equal(a, e)
++
++
++@pytest.mark.parametrize("rows", [1, 22, 158, 4096])
++def test_ced_slots_and_routing_mask_match_the_torch_chain(rows):
++    """The drafter's packed context slots (-1 at a negative index, 0 past the
++    step's rows) and the decoder's routing mask (a valid index whose row is not
++    padding; a row past the step's rows routes), each in one launch."""
++    from vllm.models.deepseek_v4_1.ced import gather_rows
++    from vllm.models.deepseek_v4_1.tilelang import ced
++    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
++
++    g = torch.Generator(device="cuda").manual_seed(rows + 7)
++    tokens = 4200
++    slots = torch.randint(-1, 1 << 24, (2, tokens), generator=g, device="cuda")
++    is_padding = torch.rand(tokens, generator=g, device="cuda") < 0.3
++    indices = torch.randint(-1, tokens + 3, (rows,), generator=g, device="cuda")
++    for group in slots:
++        expected = gather_rows(group, indices).masked_fill(indices < 0, PAD_SLOT_ID)
++        actual = ced.gather_slots(group, indices)
++        assert actual.dtype == expected.dtype and torch.equal(actual, expected)
++    expected = (indices >= 0) & ~gather_rows(is_padding, indices)
++    actual = ced.routing_mask(indices, is_padding)
++    assert actual.dtype == torch.bool and torch.equal(actual, expected)
+diff --git a/vllm/models/deepseek_v4_1/ced.py b/vllm/models/deepseek_v4_1/ced.py
+index 978e22aef..8833cc2b8 100644
+--- a/vllm/models/deepseek_v4_1/ced.py
++++ b/vllm/models/deepseek_v4_1/ced.py
+@@ -208,6 +208,8 @@ class CEDState:
+             lambda: [
+                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
+                 prepare.call(ced_kernels.token_metadata_kernel),
++                prepare.call(ced_kernels.routing_mask_kernel),
++                prepare.call(ced_kernels.slots_kernel),
+                 # Packed rows of each layout. A source view of wider rows would
+                 # stop its first CED step with KernelNotPreparedError.
+                 *(
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 784331da4..03e042bfc 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -14,9 +14,9 @@ from vllm.models.deepseek_v4_1.ced import (
+     CED_WINDOW,
+     CEDState,
+     ced_decoder_start,
+-    gather_rows,
+     nonfinal_limits,
+ )
++from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+ from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
+@@ -365,9 +365,7 @@ class DeepseekV41ModelState(DefaultModelState):
+             if indices is not None:
+                 if cudagraph_mode != CUDAGraphMode.NONE:
+                     raise RuntimeError("CED decoder routing requires eager execution")
+-                routing_mask = (indices >= 0) & ~gather_rows(
+-                    input_batch.is_padding, indices
+-                )
++                routing_mask = ced_kernels.routing_mask(indices, input_batch.is_padding)
+             seen: set[int] = set()
+             for value in metadata.values():
+                 if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/ced.py b/vllm/models/deepseek_v4_1/tilelang/ced.py
+index 81224928a..1ae020986 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/ced.py
++++ b/vllm/models/deepseek_v4_1/tilelang/ced.py
+@@ -279,6 +279,84 @@ def token_metadata(indices, positions, reqs, slots, lengths):
+     return outs
+ 
+ 
++@tilelang.jit(pass_configs=_PASS)
++def slots_kernel():
++    """Slots at the CED indices, a thread a decoder row: -1 (``PAD_SLOT_ID``) at an
++    invalid index and 0 past the step's rows, as ``gather_rows`` then
++    ``masked_fill`` wrote them for the drafter's packed context slots."""
++    rows, tokens = T.dynamic("rows, tokens")
++
++    @T.prim_func
++    def ced_slots(
++        indices: T.Tensor((rows,), T.int64),
++        slots: T.Tensor((tokens,), T.int64),
++        out: T.Tensor((rows,), T.int64),
++    ):
++        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
++            row = bx * 128 + T.get_thread_binding()
++            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
++            slot = T.alloc_var(T.int64, init=slots[T.max(T.min(index, tokens - 1), 0)])
++            if row < rows:
++                out[row] = T.if_then_else(
++                    index >= 0,
++                    T.if_then_else(index < tokens, slot, T.int64(0)),
++                    T.int64(-1),
++                )
++
++    return ced_slots
++
++
++def gather_slots(slots, indices):
++    """``gather_rows(slots, indices).masked_fill(indices < 0, PAD_SLOT_ID)``."""
++    out = slots.new_empty(indices.shape[0])
++    if out.numel():
++        slots_kernel()(indices, slots, out)
++    return out
++
++
++@tilelang.jit(pass_configs=_PASS)
++def routing_mask_kernel():
++    """The CED decoder's MoE routing mask, a thread a decoder row: a row routes when
++    its index is valid and the step's row there is not padding (a row past the
++    step's rows routes, ``gather_rows`` reading its padding as false).
++    ``prepare_attn`` wrote it as a comparison, a gather, a negation and a
++    conjunction."""
++    rows, tokens = T.dynamic("rows, tokens")
++
++    @T.prim_func
++    def ced_routing_mask(
++        indices: T.Tensor((rows,), T.int64),
++        is_padding: T.Tensor((tokens,), T.bool),
++        mask: T.Tensor((rows,), T.bool),
++    ):
++        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
++            row = bx * 128 + T.get_thread_binding()
++            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
++            padding = T.alloc_var(
++                T.bool, init=is_padding[T.max(T.min(index, tokens - 1), 0)]
++            )
++            if row < rows:
++                mask[row] = T.if_then_else(
++                    index < 0,
++                    T.bool(False),
++                    T.if_then_else(
++                        index < tokens,
++                        T.if_then_else(padding, T.bool(False), T.bool(True)),
++                        T.bool(True),
++                    ),
++                )
++
++    return ced_routing_mask
++
++
++def routing_mask(indices, is_padding):
++    """``(indices >= 0) & ~gather_rows(is_padding, indices)``."""
++    mask = is_padding.new_empty(indices.shape[0])
++    if mask.numel():
++        routing_mask_kernel()(indices, is_padding, mask)
++    return mask
++
++
+ _ITEMSIZE = {
+     "bool": 1,
+     "int8": 1,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 086b79db1..291dcb422 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -15,7 +15,6 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.attention.backend import AttentionCGSupport
+-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.kv_cache_interface import (
+     KVCacheConfig,
+     get_kv_cache_spec_sliding_window,
+@@ -709,10 +708,10 @@ class DFlashSpeculator(DraftModelSpeculator):
+             # Keep query anchors and rejection masking in the ORIGINAL target
+             # coordinates. Only the prepared context inputs are packed afterward.
+             context_positions = gather_rows(self.context_positions, ced_indices)
++            from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
++
+             packed_context_slots = [
+-                gather_rows(slots, ced_indices).masked_fill(
+-                    ced_indices < 0, PAD_SLOT_ID
+-                )
++                ced_kernels.gather_slots(slots, ced_indices)
+                 for slots in self._context_slot_mappings
+             ]
+         # Each layer uses the context slots of its own KV-cache group. V4.1 can

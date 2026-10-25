@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:55:34 +0100
+Subject: [PATCH 486/488] [DS4.1] SP and rank-order pad rows: zeros from
+ TileLang's fill
+
+721317853 dropped the torch zero fills of prefill SP's pad rows and left
+them arbitrary. They reach no real row, but uninitialized values (NaN among
+them) would still be normalized, routed and sent to experts, and the work
+they cause would change from run to run. The pad rows are zeroed again, by
+TileLang's 16-byte fill (columns.zero_), declared with the collectives, so
+no torch fill returns. The tests require the zeros and refuse torch's fill.
+---
+ .../test_deepseek_v41_tilelang_collectives.py | 23 ++++++++++++++-----
+ ..._deepseek_v41_sp_project_reduce_scatter.py | 16 +++++--------
+ vllm/models/deepseek_v4_1/nvidia/model.py     |  7 ++++--
+ vllm/models/deepseek_v4_1/sp_prefill.py       | 17 ++++++++------
+ .../deepseek_v4_1/tilelang/collectives.py     |  7 ++++--
+ 5 files changed, 43 insertions(+), 27 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index a1f9ea3df..09f951bb2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -50,7 +50,7 @@ class _Comm:
+         self.recvs.append((peer, tensor))
+ 
+     def all_gather(self, output, tensor):
+-        """Every rank's ``tensor`` into ``output`` in rank order (data movement only)."""
++        """Every rank's ``tensor`` into ``output`` in rank order (data movement)."""
+         fabric = self.fabric
+         with fabric.lock:
+             fabric.gathered[self.rank] = tensor.clone()
+@@ -167,25 +167,36 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
+ 
+ @pytest.mark.parametrize("world", [2, 3, 4])
+ @pytest.mark.parametrize("rows", [1, 5, 13])
+-def test_all_reduce_pads_without_a_fill(monkeypatch, world, rows):
+-    """The padding rows are summed, gathered and dropped, never filled: with the
+-    padded buffer's rows NaN (whatever the allocator left), every real row is still
+-    the one-shot sum, bit for bit."""
++def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
++    """The padding rows are zeroed by TileLang's fill (stood in for on the host),
++    then summed, gathered and dropped: with the padded buffer NaN where the
++    allocator left it, only the padding rows are filled, by that fill alone, and
++    every real row is the one-shot sum, bit for bit."""
++    from vllm.models.deepseek_v4_1.tilelang import columns
++
+     allocate = torch.Tensor.new_empty
++    zeroed = []
+ 
+     def poisoned(self, *args, **kwargs):
+         return allocate(self, *args, **kwargs).fill_(float("nan"))
+ 
+     def refuse(self, *args, **kwargs):
+-        raise AssertionError("the padded buffer was zero-filled")
++        raise AssertionError("the padded buffer was zero-filled by torch")
++
++    def zero_(out):
++        zeroed.append(out.shape[0])
++        return out.fill_(0)
+ 
+     monkeypatch.setattr(torch.Tensor, "new_empty", poisoned)
+     monkeypatch.setattr(torch.Tensor, "new_zeros", refuse)
++    monkeypatch.setattr(columns, "zero_", zero_)
+     torch.manual_seed(world * 1000 + rows)
+     width = 24
+     inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
+     out = _run(inputs, all_reduce_rank_order)
+     want = _reference(inputs)
++    padding = -(-rows // world) * world - rows
++    assert zeroed == ([padding] * world if padding else [])
+     for rank in range(world):
+         assert out[rank].shape == (rows, width)
+         assert torch.equal(out[rank], want)
+diff --git a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+index a159cb3a0..af66c7eb8 100644
+--- a/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
++++ b/tests/models/test_deepseek_v41_sp_project_reduce_scatter.py
+@@ -67,8 +67,8 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+     """Unreduced rows send every other rank's block, slice by slice, and keep this
+     rank's own block in its slot of the parts (the other ranks stood in by
+     copies of it). Only real rows are projected; the pad rows of the last rank's
+-    block are not filled (nothing is zeroed), and whatever they hold stays in
+-    them: the real rows' parts and sums are the zero-padded projection's."""
++    block are zeroed by TileLang's fill (never torch's), so the parts and their
++    sums are the zero-padded projection's, pad rows included."""
+     from types import SimpleNamespace
+ 
+     from vllm.models.deepseek_v4_1.tilelang import collectives
+@@ -81,7 +81,7 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+     monkeypatch.setattr(sp_prefill, "get_tp_group", lambda: group)
+ 
+     def refuse(self, *args, **kwargs):
+-        raise AssertionError("a pad row was filled")
++        raise AssertionError("a pad row was zeroed by torch")
+ 
+     monkeypatch.setattr(torch.Tensor, "zero_", refuse)
+     sent = []
+@@ -118,24 +118,20 @@ def test_unreduced_parts_hold_every_block(monkeypatch, tokens, rank, slices, per
+     padded[:tokens] = source
+     blocks = padded.view(world, rows.local_rows, 8)
+     local = rows.local_rows
+-
+-    def real(owner):  # the real rows of the owner's block
+-        return max(0, min(local, tokens - owner * local))
+-
+     assert parts.shape == (world, local, 8)
+     for peer in range(world):
+-        assert torch.equal(parts[peer, : real(rank)], blocks[rank, : real(rank)])
++        assert torch.equal(parts[peer], blocks[rank])
+     sent = torch.cat(sent, dim=1)
+     for peer in range(world):
+         if peer != rank:
+-            assert torch.equal(sent[peer, : real(peer)], blocks[peer, : real(peer)])
++            assert torch.equal(sent[peer], blocks[peer])
+     projected = sorted(i for start, stop in calls for i in range(start, stop))
+     assert projected == list(range(tokens))
+     assert order == [len(calls)]
+     total = sp_prefill.materialize(sp_prefill.unreduced_parts(parts))
+     assert torch.equal(total, collectives.rank_order_sum(list(parts)))
+     zero_padded = collectives.rank_order_sum([blocks[rank]] * world)
+-    assert torch.equal(total[: real(rank)], zero_padded[: real(rank)])
++    assert torch.equal(total, zero_padded)
+ 
+ 
+ @pytest.mark.parametrize("tokens", [37, 40, 205])
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index e38d3e5d8..3b2dfd7a2 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -692,8 +692,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+     def declare_kernels(self) -> None:
+         """Declare the TileLang kernels the forward reaches outside its modules: the
+         rank-order sum and the NCCL all-gathers' concatenation of the TP group's
+-        collectives, the L2 prefetch and the last collapse's sink-column variant."""
+-        from ..tilelang import collectives, prepare
++        collectives, prefill SP's pad-row zeros, the L2 prefetch and the last
++        collapse's sink-column variant."""
++        from ..tilelang import collectives, columns, prepare
+         from ..tilelang.mhc import TileKernelsMHC
+ 
+         # The last collapse with the sink detector's column (forward).
+@@ -708,6 +709,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
+             lambda: [
+                 *collectives.rank_order_sum_calls(),
+                 *collectives.rank_rows_calls(),
++                # Prefill SP's and the rank-order all-reduce's pad rows.
++                prepare.call(columns.zero_packs_kernel),
+                 *l2_prefetch.kernel_calls(),
+                 *collapse,
+             ]
+diff --git a/vllm/models/deepseek_v4_1/sp_prefill.py b/vllm/models/deepseek_v4_1/sp_prefill.py
+index 7245b809a..5a885b64d 100644
+--- a/vllm/models/deepseek_v4_1/sp_prefill.py
++++ b/vllm/models/deepseek_v4_1/sp_prefill.py
+@@ -37,11 +37,12 @@ row and then compacts.
+ - Collectives see ``Tp = N * ceil(T / N)`` rows; each rank owns ``L = Tp / N``
+   rows, rank r the padded rows ``[r * L, (r + 1) * L)``.
+ - Kernels never see more than T rows: gathered tensors are used as ``[:T]``.
+-- Reduce-scatter inputs are Tp-row buffers whose pad rows are zero; unreduced
+-  parts (see "Unreduced results") leave their pad rows unwritten.
+-- The last rank's local rows can include pad rows. Every op on local rows is
+-  row-wise and every gather keeps the first T rows, so a pad row's values,
+-  whatever they are (arbitrary after unreduced parts), never reach a real row.
++- Reduce-scatter inputs and unreduced parts are Tp-row buffers whose pad rows
++  are zero (TileLang's zero fill).
++- The last rank's local rows can include pad rows. They stay finite and are
++  never read back into real outputs: every op on local rows is row-wise and every
++  gather keeps the first T rows. Zeros keep their values, and the routing and
++  expert work they cause, the same in every run.
+ 
+ ## Where each op runs
+ 
+@@ -77,8 +78,7 @@ sum: every rank's partial of this rank's rows is exchanged into one
+ hands it on as ``RankOrderParts``. TileLang mHC's ``post_pre`` adds the parts in
+ rank order as it loads them, the same arithmetic and the same bits as the
+ rank-order reduce-scatter; any other consumer calls ``sum()``. Only real rows are
+-projected into the buffers: the pad rows of the last rank's block are neither
+-projected nor filled (``Rows``).
++projected into the buffers; the pad rows of the last rank's block are zeroed.
+ """
+ 
+ from collections.abc import Iterator
+@@ -326,6 +326,7 @@ class SPRows:
+         the parts, and the chunks are exchanged into the parts; with ``slices``
+         > 1 each slice is exchanged on the side stream while the next is
+         projected."""
++        from vllm.models.deepseek_v4_1.tilelang import columns
+         from vllm.models.deepseek_v4_1.tilelang.collectives import exchange_into
+ 
+         local, world, tokens = self.local_rows, self.world_size, self.num_tokens
+@@ -336,6 +337,7 @@ class SPRows:
+         if slices == 1 and not per_block:
+             flat = send.view(world * local, *row_shape)
+             project(0, tokens, flat[:tokens])
++            columns.zero_(flat[tokens:])
+             parts[self.rank].copy_(send[self.rank])
+             if then is not None:
+                 then()
+@@ -353,6 +355,7 @@ class SPRows:
+                 real = max(0, min(stop, tokens) - start)
+                 if real:
+                     project(start, start + real, dest[owner, lo : lo + real])
++                columns.zero_(dest[owner, lo + real : hi])
+             if side is not None:
+                 side.wait_stream(main)
+                 with torch.cuda.stream(side):
+diff --git a/vllm/models/deepseek_v4_1/tilelang/collectives.py b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+index d2113b753..5ed772e5c 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/collectives.py
++++ b/vllm/models/deepseek_v4_1/tilelang/collectives.py
+@@ -329,14 +329,17 @@ def all_reduce_rank_order(
+     all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
+     reduce-scattered in rank order, then all-gathered, which moves bits without
+     arithmetic. A row has the same bits as the one-shot path would give it. The
+-    padding rows are summed and gathered like the others and then dropped, so
+-    they are not filled: whatever they hold reaches no real row."""
++    padding rows (zeros, TileLang's fill) are summed and gathered like the others,
++    then dropped."""
+     rows = input_tensor.shape[0]
+     flat = input_tensor.reshape(rows, -1)
+     padded = -(-rows // world) * world
+     if padded != rows or not flat.is_contiguous():
++        from vllm.models.deepseek_v4_1.tilelang import columns
++
+         buffer = flat.new_empty((padded, flat.shape[1]))
+         buffer[:rows].copy_(flat)
++        columns.zero_(buffer[rows:])
+     else:
+         buffer = flat
+     own = reduce_scatter_rank_order(comm, buffer, rank, world)

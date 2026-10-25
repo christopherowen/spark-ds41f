@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:21:07 +0200
+Subject: [PATCH 389/488] Capture min-p boundary reproducer and reference
+ arithmetic on mismatch
+
+The full serving-batch allocation exposed a threshold-boundary difference missed by the smaller matrix; retain all eight benchmark seeds as regression cases.
+---
+ .../kernels/benchmark_sampling_controls.py    | 45 ++++++++++++++++++-
+ tests/v1/worker/test_gpu_sampling_controls.py | 14 ++++++
+ 2 files changed, 57 insertions(+), 2 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_sampling_controls.py b/benchmarks/kernels/benchmark_sampling_controls.py
+index b4584adc0..2ebf030ab 100644
+--- a/benchmarks/kernels/benchmark_sampling_controls.py
++++ b/benchmarks/kernels/benchmark_sampling_controls.py
+@@ -95,7 +95,7 @@ def make_case(kind, rows, width, seed, count):
+             if ours:
+                 candidate.apply_min_p(logits, mapping, thresholds)
+             else:
+-                _min_p_kernel[(rows,)](
++                return _min_p_kernel[(rows,)](
+                     logits,
+                     logits.stride(0),
+                     mapping,
+@@ -158,11 +158,52 @@ def measure(kind, rows, width, seed):
+     for sample in range(8):
+         reset, invoke, output = make_case(kind, rows, width, seed + sample, count)
+         reset()
+-        invoke(0, False)
++        compiled = invoke(0, False)
+         expected = [value.clone() for value in output(0)]
+         reset()
+         invoke(0, True)
+         if any(not torch.equal(a, b) for a, b in zip(output(0), expected)):
++            if compiled is not None:
++                ptx = compiled.asm["ptx"]
++                print(
++                    json.dumps(
++                        {
++                            "ptx_arithmetic": [
++                                line.strip()
++                                for line in ptx.splitlines()
++                                if any(
++                                    op in line
++                                    for op in (
++                                        "lg2.",
++                                        "fma.",
++                                        "max.",
++                                        "mul.f32",
++                                        "add.f32",
++                                    )
++                                )
++                            ]
++                        }
++                    ),
++                    flush=True,
++                )
++            for actual, target in zip(output(0), expected):
++                indices = (actual != target).nonzero()[:8]
++                print(
++                    json.dumps(
++                        {
++                            "sample": sample,
++                            "differences": [
++                                [
++                                    index.tolist(),
++                                    actual[tuple(index)].item(),
++                                    target[tuple(index)].item(),
++                                ]
++                                for index in indices
++                            ],
++                        }
++                    ),
++                    flush=True,
++                )
+             raise RuntimeError(f"outputs differ: {kind} rows={rows} width={width}")
+         reset()
+         a = capture(invoke, True, count)
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index d3ba5e991..de147f5bb 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -68,6 +68,20 @@ def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfi
+     assert_bits(logits, expected)
+ 
+ 
++@pytest.mark.parametrize("seed", range(48291, 48299))
++def test_min_p_preserves_threshold_boundary_at_full_serving_batch(seed):
++    rows, vocab, states = 96, 129280, 105
++    torch.manual_seed(seed)
++    mapping = torch.randperm(states, device="cuda")[:rows]
++    logits = torch.randn((rows, vocab), device="cuda")
++    thresholds = torch.full((states,), 0.1, device="cuda")
++    thresholds[::5] = 0
++    expected = logits.clone()
++    _min_p_kernel[(rows,)](expected, vocab, mapping, thresholds, vocab, BLOCK_SIZE=1024)
++    candidate.apply_min_p(logits, mapping, thresholds)
++    assert_bits(logits, expected)
++
++
+ def penalties_case(rows, vocab, index_dtype, *, padded=False):
+     torch.manual_seed(31037)
+     states = rows + 7

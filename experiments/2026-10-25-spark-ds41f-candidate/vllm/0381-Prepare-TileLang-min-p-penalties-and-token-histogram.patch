@@ -1,0 +1,727 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:00:15 +0200
+Subject: [PATCH 381/488] Prepare TileLang min-p, penalties and token histogram
+ candidates
+
+Keep the existing runtime dispatch while bit equivalence and paired graph timing qualify these candidates. Tests cover real DS41F vocabulary sizes, padded row strides, draft prefixes, request-slot mapping and non-finite logits.
+---
+ .../kernels/benchmark_sampling_controls.py    | 211 ++++++++++++
+ tests/v1/worker/test_gpu_sampling_controls.py | 159 +++++++++
+ .../v1/worker/gpu/sample/tilelang_controls.py | 323 ++++++++++++++++++
+ 3 files changed, 693 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_sampling_controls.py
+ create mode 100644 tests/v1/worker/test_gpu_sampling_controls.py
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_controls.py
+
+diff --git a/benchmarks/kernels/benchmark_sampling_controls.py b/benchmarks/kernels/benchmark_sampling_controls.py
+new file mode 100644
+index 000000000..59a586f99
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_sampling_controls.py
+@@ -0,0 +1,211 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired CUDA graph timings of V2 controls, with fresh inputs per graph node.
++
++In-place filtering and penalties must not feed their own outputs into later
++iterations: that changes both the workload and the branch paths. Each of the
++graph's calls gets its own initialized logits/output buffers. Copies and resets
++are outside event timing. Both implementations see the same tensor addresses.
++"""
++
++import argparse
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
++from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
++from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
++
++
++def make_case(kind, rows, width, seed, count):
++    torch.manual_seed(seed)
++    states = rows + 9
++    mapping = torch.randperm(states, device="cuda")[:rows]
++    if kind == "bincount":
++        tokens = torch.randint(
++            129280, (states, width), device="cuda", dtype=torch.int32
++        )
++        prompt = torch.full((states,), width // 2, device="cuda", dtype=torch.int32)
++        prefill = torch.full_like(prompt, width)
++        buffers = [
++            (
++                torch.zeros((states, 4040), device="cuda", dtype=torch.int32),
++                torch.zeros((states, 129280), device="cuda", dtype=torch.int32),
++            )
++            for _ in range(count)
++        ]
++
++        def reset():
++            for mask, counts in buffers:
++                mask.zero_()
++                counts.zero_()
++
++        def invoke(index, ours):
++            mask, counts = buffers[index]
++            if ours:
++                candidate.bincount(
++                    mapping, tokens, prompt, prefill, mask, counts, width
++                )
++            else:
++                _bincount_kernel[(rows, (width + 1023) // 1024)](
++                    mapping,
++                    tokens,
++                    tokens.stride(0),
++                    prompt,
++                    prefill,
++                    mask,
++                    mask.stride(0),
++                    counts,
++                    counts.stride(0),
++                    BLOCK_SIZE=1024,
++                )
++
++        return reset, invoke
++
++    source = torch.randn((rows, width), device="cuda")
++    buffers = [source.clone() for _ in range(count)]
++    thresholds = torch.full((states,), 0.1, device="cuda")
++    thresholds[::5] = 0
++    positions = (torch.arange(rows, device="cuda") % 6).int()
++    tokens = torch.randint(width, (rows,), device="cuda", dtype=torch.int32)
++    rep = torch.full((states,), 1.3, device="cuda")
++    freq = torch.full_like(rep, 0.25)
++    pres = torch.full_like(rep, -0.1)
++    mask = torch.randint(
++        -(2**31),
++        2**31 - 1,
++        (states, (width + 31) // 32),
++        device="cuda",
++        dtype=torch.int32,
++    )
++    counts = torch.randint(0, 8, (states, width), device="cuda", dtype=torch.int32)
++
++    def reset():
++        for logits in buffers:
++            logits.copy_(source)
++
++    def invoke(index, ours):
++        logits = buffers[index]
++        if kind == "min_p":
++            if ours:
++                candidate.apply_min_p(logits, mapping, thresholds)
++            else:
++                _min_p_kernel[(rows,)](
++                    logits,
++                    logits.stride(0),
++                    mapping,
++                    thresholds,
++                    width,
++                    BLOCK_SIZE=1024,
++                )
++        elif ours:
++            candidate.apply_penalties(
++                logits, mapping, tokens, positions, rep, freq, pres, mask, counts
++            )
++        else:
++            _penalties_kernel[(rows, (width + 8191) // 8192)](
++                logits,
++                logits.stride(0),
++                mapping,
++                tokens,
++                positions,
++                rep,
++                freq,
++                pres,
++                mask,
++                mask.stride(0),
++                counts,
++                counts.stride(0),
++                width,
++                BLOCK_SIZE=8192,
++            )
++
++    return reset, invoke
++
++
++def capture(invoke, ours, count):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        invoke(0, ours)
++    torch.cuda.current_stream().wait_stream(side)
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        for index in range(count):
++            invoke(index, ours)
++    return graph
++
++
++def elapsed(graph, reset, count):
++    reset()
++    begin = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    begin.record()
++    graph.replay()
++    end.record()
++    end.synchronize()
++    return begin.elapsed_time(end) * 1000 / count
++
++
++def measure(kind, rows, width, seed):
++    count = 8
++    ours, theirs = [], []
++    for sample in range(8):
++        reset, invoke = make_case(kind, rows, width, seed + sample, count)
++        a = capture(invoke, True, count)
++        reset()
++        b = capture(invoke, False, count)
++        order = (a, b) if sample % 2 == 0 else (b, a)
++        times = {id(graph): elapsed(graph, reset, count) for graph in order}
++        ours.append(times[id(a)])
++        theirs.append(times[id(b)])
++        del a, b, order, reset, invoke
++    paired = [a - b for a, b in zip(ours, theirs)]
++    mean = statistics.fmean(paired)
++    half = 2.365 * statistics.stdev(paired) / math.sqrt(len(paired))
++    result = dict(
++        kernel=kind,
++        rows=rows,
++        width=width,
++        tilelang_us=statistics.median(ours),
++        triton_us=statistics.median(theirs),
++        interval_us=[mean - half, mean + half],
++        slower=mean - half > 0,
++        tilelang_samples_us=ours,
++        triton_samples_us=theirs,
++    )
++    print(json.dumps(result), flush=True)
++    return result
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--gate", action="store_true")
++    parser.add_argument("--seed", type=int, default=48291)
++    parser.add_argument("--kernels", default="min_p,penalties,bincount")
++    args = parser.parse_args()
++    cases = [
++        (kind, rows, width)
++        for kind in args.kernels.split(",")
++        for rows in (1, 16, 96)
++        if kind != "bincount"
++        for width in (129280,)
++    ]
++    if "bincount" in args.kernels.split(","):
++        cases += [
++            ("bincount", rows, width)
++            for rows in (1, 16)
++            for width in (128, 8192, 131072)
++        ]
++    results = [measure(*case, args.seed) for case in cases]
++    failed = [(r["kernel"], r["rows"], r["width"]) for r in results if r["slower"]]
++    print(json.dumps({"summary": "sampling controls", "slower": failed}), flush=True)
++    if args.gate and failed:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+new file mode 100644
+index 000000000..136a678c0
+--- /dev/null
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -0,0 +1,159 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Request-slot, draft-prefix and vocabulary-boundary contracts for V2 controls."""
++
++import pytest
++import torch
++
++pytest.importorskip("triton")
++if not torch.cuda.is_available():
++    pytest.skip("CUDA required for sampling controls", allow_module_level=True)
++
++from vllm.v1.worker.gpu.sample import tilelang_controls as candidate
++from vllm.v1.worker.gpu.sample.min_p import _min_p_kernel
++from vllm.v1.worker.gpu.sample.penalties import _bincount_kernel, _penalties_kernel
++
++
++def assert_bits(actual, expected):
++    if actual.is_floating_point():
++        # NaN payloads are not part of the logits-processor contract.
++        assert torch.equal(torch.isnan(actual), torch.isnan(expected))
++        valid = ~torch.isnan(expected)
++        assert torch.equal(
++            actual[valid].view(torch.int32), expected[valid].view(torch.int32)
++        )
++    else:
++        assert torch.equal(actual, expected)
++
++
++def min_p_case(rows, vocab, index_dtype, *, padded=False, nonfinite=False):
++    torch.manual_seed(18093)
++    logits = torch.randn((rows, vocab + (19 if padded else 0)), device="cuda")
++    logits = logits[:, :vocab]
++    mapping = torch.randperm(rows + 7, device="cuda")[:rows].to(index_dtype)
++    thresholds = torch.tensor(
++        [0.0, 0.01, 0.1, 0.7, 1.0] * ((rows + 11) // 5), device="cuda"
++    )[: rows + 7]
++    if nonfinite:
++        logits[0].fill_(-float("inf"))
++        if rows > 1:
++            logits[1, 0] = float("nan")
++        if rows > 2:
++            logits[2, -1] = float("inf")
++    return logits, mapping, thresholds
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("vocab", [1, 33, 1023, 1025, 129280])
++@pytest.mark.parametrize("nonfinite", [False, True])
++def test_min_p_matches_triton_at_vocabulary_boundaries(index_dtype, vocab, nonfinite):
++    logits, mapping, thresholds = min_p_case(
++        6, vocab, index_dtype, padded=True, nonfinite=nonfinite
++    )
++    expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
++    expected.copy_(logits)
++    _min_p_kernel[(logits.shape[0],)](
++        expected, expected.stride(0), mapping, thresholds, vocab, BLOCK_SIZE=1024
++    )
++    candidate.apply_min_p(logits, mapping, thresholds)
++    assert_bits(logits, expected)
++
++
++def penalties_case(rows, vocab, index_dtype, *, padded=False):
++    torch.manual_seed(31037)
++    states = rows + 7
++    stride = vocab + (17 if padded else 0)
++    logits = torch.randn((rows, stride), device="cuda")[:, :vocab]
++    mapping = (torch.arange(rows, device="cuda") // 6 + 2).to(index_dtype)
++    positions = (torch.arange(rows, device="cuda") % 6).int()
++    tokens = torch.randint(vocab, (rows,), dtype=torch.int32, device="cuda")
++    rep = torch.tensor([1.0, 0.5, 1.3, 2.0] * ((states + 3) // 4), device="cuda")[
++        :states
++    ]
++    freq = torch.tensor([0.0, 0.25, -0.3] * ((states + 2) // 3), device="cuda")[:states]
++    pres = torch.tensor([0.0, -0.5, 0.75] * ((states + 2) // 3), device="cuda")[:states]
++    mask = torch.randint(
++        -(2**31),
++        2**31 - 1,
++        (states, (vocab + 31) // 32),
++        dtype=torch.int32,
++        device="cuda",
++    )
++    counts = torch.randint(0, 8, (states, vocab), dtype=torch.int32, device="cuda")
++    # One completely disabled request alongside requests with every penalty enabled.
++    rep[2], freq[2], pres[2] = 1, 0, 0
++    return logits, mapping, tokens, positions, rep, freq, pres, mask, counts
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("vocab", [33, 8191, 8193, 129280])
++@pytest.mark.parametrize("nonfinite", [False, True])
++def test_penalties_count_only_preceding_drafts(index_dtype, vocab, nonfinite):
++    args = penalties_case(17, vocab, index_dtype, padded=True)
++    logits, mapping, tokens, pos, rep, freq, pres, mask, counts = args
++    if nonfinite:
++        logits[:, :8] = torch.tensor(
++            [
++                -float("inf"),
++                float("inf"),
++                float("nan"),
++                0.0,
++                -0.0,
++                1.17549435e-38,
++                1.40129846e-45,
++                -1.40129846e-45,
++            ],
++            device="cuda",
++        )
++    expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
++    expected.copy_(logits)
++    _penalties_kernel[(17, (vocab + 8191) // 8192)](
++        expected,
++        expected.stride(0),
++        mapping,
++        tokens,
++        pos,
++        rep,
++        freq,
++        pres,
++        mask,
++        mask.stride(0),
++        counts,
++        counts.stride(0),
++        vocab,
++        BLOCK_SIZE=8192,
++    )
++    candidate.apply_penalties(*args)
++    assert_bits(logits, expected)
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("length", [1, 1023, 1025, 8192])
++def test_bincount_distinguishes_prompt_bits_and_output_counts(index_dtype, length):
++    torch.manual_seed(29401)
++    states, rows, vocab = 9, 4, 129280
++    tokens = torch.randint(
++        vocab, (states, length + 11), dtype=torch.int32, device="cuda"
++    )
++    tokens[:, ::3] = 31
++    mapping = torch.tensor([8, 1, 5, 2], dtype=index_dtype, device="cuda")
++    prompt = torch.full((states,), length // 2, dtype=torch.int32, device="cuda")
++    prefill = torch.full((states,), length, dtype=torch.int32, device="cuda")
++    mask = torch.zeros((states, (vocab + 31) // 32), dtype=torch.int32, device="cuda")
++    counts = torch.zeros((states, vocab), dtype=torch.int32, device="cuda")
++    expected_mask, expected_counts = mask.clone(), counts.clone()
++    _bincount_kernel[(rows, (length + 1023) // 1024)](
++        mapping,
++        tokens,
++        tokens.stride(0),
++        prompt,
++        prefill,
++        expected_mask,
++        mask.stride(0),
++        expected_counts,
++        counts.stride(0),
++        BLOCK_SIZE=1024,
++    )
++    candidate.bincount(mapping, tokens, prompt, prefill, mask, counts, length)
++    assert_bits(mask, expected_mask)
++    assert_bits(counts, expected_counts)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+new file mode 100644
+index 000000000..867b74866
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -0,0 +1,323 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Request-dependent logits processors with the V2 sampler's tensor layouts."""
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++_DTYPES = {torch.int32: "int32", torch.int64: "int64"}
++_HEADER = r"""
++__device__ __forceinline__ float vllm_control_log(float x) {
++  float y;
++  asm("lg2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return __fmul_rn(y, 0.693147182464599609375f);
++}
++__device__ __forceinline__ float vllm_control_reciprocal(float x) {
++  float y;
++  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
++  return y;
++}
++__device__ __forceinline__ float vllm_control_penalty(float x, float scale,
++    float freq, int count, float presence) {
++  x = __fmul_rn(x, scale);
++  x = __fmaf_rn(-freq, (float)count, x);
++  return __fmaf_rn(-presence, (float)(count > 0), x);
++}
++"""
++
++
++def _launch(factory, key, *tensors):
++    factory(*key)(*tensors)
++
++
++def _declare(factory, keys):
++    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
++
++    if JitWarmupRegistry.active() is None:
++        return
++    from vllm.models.deepseek_v4_1.tilelang.prepare import call, declare
++
++    declare(lambda: [call(factory, *key) for key in keys])
++
++
++@tilelang.jit(pass_configs=_PASS)
++def min_p_kernel(vocab: int, stride: int, index_dtype: str, threads: int = 128):
++    rows, states = T.dynamic("rows, states")
++    block = 1024
++
++    @T.prim_func
++    def min_p(
++        logits: T.StridedTensor((rows, vocab), (stride, 1), "float32"),
++        mapping: T.Tensor((rows,), index_dtype),
++        thresholds: T.Tensor((states,), "float32"),
++    ):
++        with T.Kernel(rows, threads=threads) as row:
++            T.import_source(_HEADER)
++            maximum = T.alloc_fragment((block,), "float32")
++            invalid = T.alloc_fragment((block,), "int32")
++            reduced = T.alloc_fragment((1,), "float32")
++            any_nan = T.alloc_fragment((1,), "int32")
++            value = T.alloc_local((1,), "float32")
++            minimum = T.alloc_local((1,), "float32")
++            minimum[0] = thresholds[mapping[row]]
++            if minimum[0] != 0:
++                T.fill(maximum, -T.infinity("float32"))
++                T.clear(invalid)
++                for start in T.serial(T.ceildiv(vocab, block)):
++                    for col in T.Parallel(block):
++                        index = start * block + col
++                        value[0] = -T.infinity("float32")
++                        if index < vocab:
++                            value[0] = logits[T.cast(row, "int64"), index]
++                        maximum[col] = T.max(maximum[col], value[0])
++                        invalid[col] |= T.cast(value[0] != value[0], "int32")
++                T.reduce_max(maximum, reduced, dim=0)
++                T.reduce_max(invalid, any_nan, dim=0)
++                minimum[0] = reduced[0] + T.call_extern(
++                    "float32", "vllm_control_log", minimum[0]
++                )
++                # Triton's maximum propagates NaNs. A NaN threshold filters nothing.
++                if any_nan[0] == 0:
++                    for start in T.serial(T.ceildiv(vocab, block)):
++                        for col in T.Parallel(block):
++                            index = start * block + col
++                            if index < vocab:
++                                value[0] = logits[T.cast(row, "int64"), index]
++                                logits[T.cast(row, "int64"), index] = T.if_then_else(
++                                    value[0] < minimum[0],
++                                    -T.infinity("float32"),
++                                    value[0],
++                                )
++
++    return min_p
++
++
++def register_min_p(*, logits_stride: int, vocab_size: int):
++    _declare(
++        min_p_kernel,
++        [(vocab_size, logits_stride, dtype) for dtype in _DTYPES.values()],
++    )
++
++
++def apply_min_p(logits, mapping, thresholds):
++    if logits.shape[0]:
++        _launch(
++            min_p_kernel,
++            (logits.shape[1], logits.stride(0), _DTYPES[mapping.dtype]),
++            logits,
++            mapping,
++            thresholds,
++        )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def penalties_kernel(
++    vocab: int,
++    logits_stride: int,
++    mask_stride: int,
++    counts_stride: int,
++    index_dtype: str,
++    threads: int = 256,
++):
++    rows, states, mask_rows, count_rows = T.dynamic(
++        "rows, states, mask_rows, count_rows"
++    )
++    block = 8192
++
++    @T.prim_func
++    def penalties(
++        logits: T.StridedTensor((rows, vocab), (logits_stride, 1), "float32"),
++        mapping: T.Tensor((rows,), index_dtype),
++        token_ids: T.Tensor((rows,), "int32"),
++        local_pos: T.Tensor((rows,), "int32"),
++        repetition: T.Tensor((states,), "float32"),
++        frequency: T.Tensor((states,), "float32"),
++        presence: T.Tensor((states,), "float32"),
++        prompt_mask: T.StridedTensor(
++            (mask_rows, T.ceildiv(vocab, 32)), (mask_stride, 1), "int32"
++        ),
++        output_counts: T.StridedTensor(
++            (count_rows, vocab), (counts_stride, 1), "int32"
++        ),
++    ):
++        with T.Kernel(rows, T.ceildiv(vocab, block), threads=threads) as (row, blk):
++            T.import_source(_HEADER)
++            req = T.alloc_local((1,), "int64")
++            rep = T.alloc_local((1,), "float32")
++            freq = T.alloc_local((1,), "float32")
++            pres = T.alloc_local((1,), "float32")
++            scale = T.alloc_local((1,), "float32")
++            values = T.alloc_fragment((block,), "float32")
++            counts = T.alloc_fragment((block,), "int32")
++            req[0] = mapping[row]
++            rep[0] = repetition[req[0]]
++            freq[0] = frequency[req[0]]
++            pres[0] = presence[req[0]]
++            if (rep[0] != 1) | (freq[0] != 0) | (pres[0] != 0):
++                for col in T.Parallel(block):
++                    index = blk * block + col
++                    values[col] = T.if_then_else(
++                        index < vocab, logits[T.cast(row, "int64"), index], 0
++                    )
++                    counts[col] = T.if_then_else(
++                        index < vocab, output_counts[req[0], index], 0
++                    )
++                for prev in T.serial(local_pos[row]):
++                    for col in T.Parallel(block):
++                        counts[col] += T.cast(
++                            blk * block + col
++                            == token_ids[row - local_pos[row] + prev + 1],
++                            "int32",
++                        )
++                for col in T.Parallel(block):
++                    index = blk * block + col
++                    if index < vocab:
++                        scale[0] = 1
++                        if rep[0] != 1:
++                            appeared = (
++                                (prompt_mask[req[0], index // 32] >> (index % 32)) & 1
++                            ) | T.cast(counts[col] > 0, "int32")
++                            scale[0] = T.if_then_else(appeared != 0, rep[0], 1)
++                            if values[col] > 0:
++                                scale[0] = T.call_extern(
++                                    "float32", "vllm_control_reciprocal", scale[0]
++                                )
++                        logits[T.cast(row, "int64"), index] = T.call_extern(
++                            "float32",
++                            "vllm_control_penalty",
++                            values[col],
++                            scale[0],
++                            freq[0],
++                            counts[col],
++                            pres[0],
++                        )
++
++    return penalties
++
++
++def register_penalties(
++    *,
++    logits_stride: int,
++    prompt_bin_mask_stride: int,
++    output_bin_counts_stride: int,
++    vocab_size: int,
++):
++    _declare(
++        penalties_kernel,
++        [
++            (
++                vocab_size,
++                logits_stride,
++                prompt_bin_mask_stride,
++                output_bin_counts_stride,
++                dtype,
++            )
++            for dtype in _DTYPES.values()
++        ],
++    )
++
++
++def apply_penalties(logits, mapping, tokens, positions, rep, freq, pres, mask, counts):
++    if logits.shape[0]:
++        _launch(
++            penalties_kernel,
++            (
++                logits.shape[1],
++                logits.stride(0),
++                mask.stride(0),
++                counts.stride(0),
++                _DTYPES[mapping.dtype],
++            ),
++            logits,
++            mapping,
++            tokens,
++            positions,
++            rep,
++            freq,
++            pres,
++            mask,
++            counts,
++        )
++
++
++@tilelang.jit(pass_configs=_PASS)
++def bincount_kernel(
++    tokens_stride: int,
++    mask_stride: int,
++    counts_stride: int,
++    index_dtype: str,
++    threads: int = 128,
++):
++    rows, states, columns, mask_cols, counts_cols = T.dynamic(
++        "rows, states, columns, mask_cols, counts_cols"
++    )
++
++    @T.prim_func
++    def bincount(
++        mapping: T.Tensor((rows,), index_dtype),
++        tokens: T.StridedTensor((states, columns), (tokens_stride, 1), "int32"),
++        prompt_len: T.Tensor((states,), "int32"),
++        prefill_len: T.Tensor((states,), "int32"),
++        mask: T.StridedTensor((states, mask_cols), (mask_stride, 1), "int32"),
++        counts: T.StridedTensor((states, counts_cols), (counts_stride, 1), "int32"),
++        num_blocks: T.int32,
++    ):
++        with T.Kernel(rows, num_blocks, threads=threads) as (row, blk):
++            req = T.alloc_local((1,), "int64")
++            token = T.alloc_local((1,), "int32")
++            req[0] = mapping[row]
++            for i in T.Parallel(1024):
++                pos = blk * 1024 + i
++                if pos < prefill_len[req[0]]:
++                    token[0] = tokens[req[0], pos]
++                    if pos < prompt_len[req[0]]:
++                        T.atomic_or(mask[req[0], token[0] // 32], 1 << (token[0] % 32))
++                    else:
++                        T.atomic_add(counts[req[0], token[0]], 1)
++
++    return bincount
++
++
++def register_bincount(
++    *,
++    all_token_ids_stride: int,
++    prompt_bin_mask_stride: int,
++    output_bin_counts_stride: int,
++):
++    _declare(
++        bincount_kernel,
++        [
++            (
++                all_token_ids_stride,
++                prompt_bin_mask_stride,
++                output_bin_counts_stride,
++                dtype,
++            )
++            for dtype in _DTYPES.values()
++        ],
++    )
++
++
++def bincount(mapping, tokens, prompt, prefill, mask, counts, max_prefill_len):
++    if mapping.numel() and max_prefill_len:
++        _launch(
++            bincount_kernel,
++            (
++                tokens.stride(0),
++                mask.stride(0),
++                counts.stride(0),
++                _DTYPES[mapping.dtype],
++            ),
++            mapping,
++            tokens,
++            prompt,
++            prefill,
++            mask,
++            counts,
++            (max_prefill_len + 1023) // 1024,
++        )

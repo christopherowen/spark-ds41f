@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:45:39 +0100
+Subject: [PATCH 481/488] Tests: verification's dead-row caps are declared
+ before the manager exists
+
+---
+ tests/v1/worker/test_prepare_kernels.py | 78 +++++++++++++++++++++++++
+ 1 file changed, 78 insertions(+)
+
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 978a89157..850bdc0a4 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -185,3 +185,81 @@ def test_sink_declares_ranks_for_dense_alternate_rows(monkeypatch):
+         vocab_size=vocab,
+     )
+     assert declared == [([(torch.bfloat16, vocab), (torch.float32, vocab)], vocab)]
++
++
++def test_dead_row_caps_are_declared_before_the_manager_exists(monkeypatch):
++    """Verification caps its counts at the dead-row cut inside the resampled-token
++    insertion; whether a step can have dead rows comes from the speculator's flag
++    and the environment, so the capped insertion is declared during preparation,
++    before ``initialize_kv_cache`` builds the adaptive verification manager."""
++    import torch
++
++    import vllm.v1.core.kv_cache_utils as kv_cache_utils
++    import vllm.v1.worker.gpu.model_runner as runner_module
++    from vllm.model_executor.layers.logits_processor import LogitsProcessor
++    from vllm.model_executor.layers.vocab_parallel_embedding import (
++        VocabParallelEmbedding,
++    )
++    from vllm.v1.worker.gpu import tilelang_inputs
++    from vllm.v1.worker.gpu.sample.sampler import Sampler
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
++
++    monkeypatch.setattr(kv_cache_utils, "get_kv_cache_groups", lambda *_: [])
++    for name in (
++        "add_kv_sharing_layers_to_kv_cache_groups",
++        "get_shared_kv_cache_layers",
++        "select_kernel_block_sizes",
++        "declare_input_batch_kernels",
++        "register_input_batch_warmups",
++    ):
++        monkeypatch.setattr(runner_module, name, lambda *_, **__: None)
++    monkeypatch.setattr(runner_module.envs, "VLLM_MOE_SKIP_PADDING", False)
++    monkeypatch.setattr(tilelang_inputs, "declare", lambda calls: None)
++    monkeypatch.setattr(Sampler, "register_warmups", lambda self, **_: None)
++    declared: list[dict] = []
++    monkeypatch.setattr(
++        RejectionSampler,
++        "register_warmups",
++        lambda self, **kwargs: declared.append(kwargs),
++    )
++    head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
++    head.num_embeddings_padded = 129408
++    processor = LogitsProcessor.__new__(LogitsProcessor)
++    processor.org_vocab_size = 129280
++    processor.head_dtype = torch.bfloat16
++    language_model = SimpleNamespace(lm_head=head, logits_processor=processor)
++    steps = 5
++    for enabled in (True, False):
++        monkeypatch.setattr(runner_module, "dead_rows_enabled", lambda e=enabled: e)
++        runner = SimpleNamespace(
++            vllm_config=SimpleNamespace(use_request_boundary_checkpoints=False),
++            get_kv_cache_spec=dict,
++            _register_kv_cache_warmups=lambda *_: None,
++            speculator=SimpleNamespace(
++                enable_adaptive_verification=True, draft_logits=None
++            ),
++            adaptive_verification=None,  # built later, by initialize_kv_cache
++            batch_sharder=None,
++            num_speculative_steps=steps,
++            draft_tokens_handler=SimpleNamespace(track_consumed_drafts=False),
++            req_states=SimpleNamespace(
++                next_prefill_tokens=torch.zeros(4, dtype=torch.int32),
++                draft_tokens=torch.zeros(16, steps, dtype=torch.int32),
++                register_warmups=lambda: None,
++            ),
++            model_state=SimpleNamespace(num_new_sampled_tokens_per_step=1),
++            is_last_pp_rank=True,
++            is_pooling_model=False,
++            sampler=Sampler.__new__(Sampler),
++            rejection_sampler=RejectionSampler.__new__(RejectionSampler),
++            model_config=SimpleNamespace(get_hidden_size=lambda: 4096),
++            dtype=torch.bfloat16,
++            _language_model=lambda: language_model,
++            prompt_logprobs_worker=None,
++            structured_outputs_worker=None,
++            sink=None,
++            _greedy_verification_available=lambda: False,
++        )
++        runner_module.GPUModelRunner.declare_step_kernels(runner)
++        assert declared.pop()["dead_rows"] is enabled
++    assert not declared

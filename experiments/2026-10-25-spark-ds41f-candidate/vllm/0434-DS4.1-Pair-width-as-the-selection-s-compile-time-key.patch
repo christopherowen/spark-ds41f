@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:07:06 +0200
+Subject: [PATCH 434/488] [DS4.1] Pair width as the selection's compile-time
+ key; graph-safe cut reference
+
+Run 17 timed select_first_argmax at 96 rows 0.05 us slower than Triton:
+the pair width had become a runtime argument. It is a key again, and the
+width-2 (Triton layout) kernel keeps its original key and code; the
+runner's 16-byte pairs declare width 4.
+
+The sink glue benchmark's torch cut reference set its start flags with a
+CPU scalar, which graph capture refuses; it uses index_fill_.
+---
+ benchmarks/kernels/benchmark_sink_glue.py     |  2 +-
+ .../v1/worker/gpu/sample/tilelang_sampling.py | 55 ++++++++++++-------
+ .../worker/gpu/spec_decode/dspark/greedy.py   |  9 ++-
+ 3 files changed, 41 insertions(+), 25 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_sink_glue.py b/benchmarks/kernels/benchmark_sink_glue.py
+index 2f9c5a856..1fe56204f 100644
+--- a/benchmarks/kernels/benchmark_sink_glue.py
++++ b/benchmarks/kernels/benchmark_sink_glue.py
+@@ -81,7 +81,7 @@ def torch_flags(columns, logits_indices, cu, num_reqs, dead_cut):
+ def torch_cut(logits, flags, drafts, cu, num_reqs):
+     num_logits, num_cols = logits.shape
+     starts = torch.zeros(num_logits + 1, dtype=torch.bool, device=DEVICE)
+-    starts[cu[:num_reqs].long()] = True
++    starts.index_fill_(0, cu[:num_reqs].long(), True)
+     cols = drafts[1:num_logits].long()
+     cut = flags[1:num_logits].bool() & ~starts[1:num_logits] & (cols >= 0)
+     cut &= cols < num_cols
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_sampling.py b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+index ca2400582..59f88f6d6 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_sampling.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_sampling.py
+@@ -1899,7 +1899,9 @@ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+-def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int = 0):
++def select_first_argmax_kernel(
++    output_dtype: str, ranks: int, embed_width: int = 0, pair_width: int = 2
++):
+     """``dspark.greedy._select_first_argmax``: the first maximum's global index
+     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
+     ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
+@@ -1925,7 +1927,6 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int =
+             pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+             out: T.Tensor((out_len,), output_dtype),
+             out_stride: T.int64,
+-            pair_width: T.int32,
+         ):
+             with T.Kernel(rows, threads=32) as row:
+                 T.import_source(_HEADER)
+@@ -1956,7 +1957,6 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int =
+         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
+         out: T.Tensor((out_len,), output_dtype),
+         out_stride: T.int64,
+-        pair_width: T.int32,
+         table: T.Tensor((table_rows, embed_width), T.bfloat16),
+         step_out: T.StridedTensor((rows, embed_width), (step_stride, 1), T.bfloat16),
+         confidence_out: T.StridedTensor(
+@@ -2180,22 +2180,29 @@ def select_first_argmax(
+         return
+     ranks = pairs.shape[1] // pair_width
+     if embed is None:
+-        kernel = _kernel(select_first_argmax_kernel, _DTYPES[output.dtype], ranks)
+-        kernel(pairs, _flat(output), output.stride(0), pair_width)
++        kernel = _kernel(
++            select_first_argmax_kernel,
++            *select_first_argmax_key(output, ranks, 0, pair_width),
++        )
++        kernel(pairs, _flat(output), output.stride(0))
+         return
+     table, step_out, confidence_out = embed
+     kernel = _kernel(
+-        select_first_argmax_kernel, _DTYPES[output.dtype], ranks, table.shape[1]
+-    )
+-    kernel(
+-        pairs,
+-        _flat(output),
+-        output.stride(0),
+-        pair_width,
+-        table,
+-        step_out,
+-        confidence_out,
++        select_first_argmax_kernel,
++        *select_first_argmax_key(output, ranks, table.shape[1], pair_width),
+     )
++    kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
++
++
++def select_first_argmax_key(
++    output: torch.Tensor | torch.dtype, ranks: int, embed_width: int, pair_width: int
++) -> tuple:
++    """``select_first_argmax_kernel``'s key: the width-2 pairs (Triton's layout)
++    keep the original kernel's key."""
++    dtype = _DTYPES[output if isinstance(output, torch.dtype) else output.dtype]
++    if pair_width == 2:
++        return (dtype, ranks, embed_width) if embed_width else (dtype, ranks)
++    return (dtype, ranks, embed_width, pair_width)
+ 
+ 
+ def markov_anchor_embed(
+@@ -2233,7 +2240,10 @@ def markov_embed_calls(
+             _DTYPES[index_dtype],
+             embed_width,
+         ),
+-        _call(select_first_argmax_kernel, _DTYPES[output_dtype], ranks, embed_width),
++        _call(
++            select_first_argmax_kernel,
++            *select_first_argmax_key(output_dtype, ranks, embed_width, 4),
++        ),
+     ]
+ 
+ 
+@@ -2565,7 +2575,7 @@ def greedy_calls(
+     *,
+     markov: Sequence[tuple[torch.dtype, torch.dtype]] = (),
+     logits: Sequence[torch.dtype] = (),
+-    select: Sequence[tuple[torch.dtype, int]] = (),
++    select: Sequence[tuple[torch.dtype, int, int]] = (),
+     finish_outputs: Sequence[torch.dtype] = (),
+     rejection_widths: Sequence[int] = (),
+ ) -> list:
+@@ -2574,8 +2584,9 @@ def greedy_calls(
+     ``greedy_shard_pair`` for each logits dtype (both the 16-byte and the
+     element-wise reads, which the launch picks from the rows' alignment); the
+     pair finish when there is a pair, ``select_first_argmax`` for each
+-    ``(output dtype, ranks)``, ``sample_greedy_markov``'s index finish for each of
+-    ``finish_outputs``, and greedy verification for each sampled width."""
++    ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
++    for each of ``finish_outputs``, and greedy verification for each sampled
++    width."""
+     calls = [
+         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
+         for base, bias in markov
+@@ -2594,8 +2605,10 @@ def greedy_calls(
+         for lanes in _FINISH_LANES
+     ]
+     calls += [
+-        _call(select_first_argmax_kernel, _DTYPES[dtype], ranks)
+-        for dtype, ranks in select
++        _call(
++            select_first_argmax_kernel, *select_first_argmax_key(dtype, ranks, 0, width)
++        )
++        for dtype, ranks, width in select
+     ]
+     calls += [
+         _call(greedy_rejection_kernel, width, _DTYPES[dtype])
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+index f73edef78..fbcf7e526 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/greedy.py
+@@ -166,13 +166,16 @@ def register_select_first_argmax_warmup(
+     output_dtype: torch.dtype,
+     output_stride: int,
+     output_aligned: bool,
++    pair_width: int = 4,
+ ) -> None:
+-    """Declare ``select_first_argmax`` for an output column of
+-    ``output_dtype``."""
++    """Declare ``select_first_argmax`` for an output column of ``output_dtype``
++    over pairs of ``pair_width`` columns (the runner's 16-byte rows)."""
+     from vllm.v1.worker.gpu.sample import tilelang_sampling
+ 
+     tilelang_sampling.declare(
+-        lambda: tilelang_sampling.greedy_calls(select=[(output_dtype, ranks)])
++        lambda: tilelang_sampling.greedy_calls(
++            select=[(output_dtype, ranks, pair_width)]
++        )
+     )
+ 
+ 

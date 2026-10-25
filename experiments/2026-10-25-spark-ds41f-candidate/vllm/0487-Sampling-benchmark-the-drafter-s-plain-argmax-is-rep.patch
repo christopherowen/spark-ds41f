@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 09:19:59 +0100
+Subject: [PATCH 487/488] Sampling benchmark: the drafter's plain argmax is
+ reported, not gated
+
+The owner accepted the plain select_first_argmax's gap to Triton (about
+0.05 us at 1-16 rows, one launch a decode step, about 0.0001% of a step)
+after two layout rewrites did not close it. Its 96-row shape is gone:
+verification's rows go through greedy_rejection, which selects its targets
+itself. Every other kernel stays gated.
+---
+ .../kernels/benchmark_tilelang_sampling.py    | 29 +++++++++++++++++--
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/benchmarks/kernels/benchmark_tilelang_sampling.py b/benchmarks/kernels/benchmark_tilelang_sampling.py
+index a62975efa..303540dad 100644
+--- a/benchmarks/kernels/benchmark_tilelang_sampling.py
++++ b/benchmarks/kernels/benchmark_tilelang_sampling.py
+@@ -541,13 +541,23 @@ CASES = {
+         (f"{r} rows", markov_pair_case(r)) for r in (1, 6, 16, 96)
+     ],
+     "greedy_shard_pair": [(f"{r} rows", shard_pair_case(r)) for r in (6, 36, 96, 384)],
+-    "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16, 96)],
++    # The DSpark drafter's last step (a request a row; verification's rows go
++    # through greedy_rejection, which selects its targets itself).
++    "select_first_argmax": [(f"{r} rows", select_case(r)) for r in (1, 16)],
+     "sample_greedy_markov": [(f"{r} rows", markov_full_case(r)) for r in (1, 16)],
+     # The fused selection and verification against Triton's two launches.
+     "greedy_rejection": [(f"{r} requests", rejection_case(r)) for r in (1, 16, 64)],
+ }
+ 
+ 
++# Kernels reported but not gated, each with the owner's acceptance. The plain
++# select_first_argmax runs once a decode step (the drafter's last step, 0.86 us at
++# c1) and has trailed Triton's by about 0.05 us at 1-16 rows since run 20; two
++# layout rewrites did not close it, and the gap is about 0.0001% of a step
++# (accepted 2026-10-25, experiments/2026-10-24-tilelang-completion).
++ACCEPTED = {"select_first_argmax"}
++
++
+ def main() -> None:
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--gate", action="store_true")
+@@ -557,10 +567,23 @@ def main() -> None:
+     for name in args.only or CASES:
+         for shape, make in CASES[name]:
+             rows.append(measure(name, shape, make))
+-    slower = [f"{r['kernel']} {r['shape']}" for r in rows if r["slower"]]
++    slower = [
++        f"{r['kernel']} {r['shape']}"
++        for r in rows
++        if r["slower"] and r["kernel"] not in ACCEPTED
++    ]
++    accepted = [
++        f"{r['kernel']} {r['shape']}"
++        for r in rows
++        if r["slower"] and r["kernel"] in ACCEPTED
++    ]
+     print(
+         json.dumps(
+-            {"summary": "slower" if slower else "level or faster", "slower": slower}
++            {
++                "summary": "slower" if slower else "level or faster",
++                "slower": slower,
++                "accepted": accepted,
++            }
+         ),
+         flush=True,
+     )

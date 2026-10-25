@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 20:48:39 +0200
+Subject: [PATCH 397/488] Optionally take min-p's threshold pass last tile
+ first
+
+The tiles the maximum's pass read last are the likeliest still in L2.
+---
+ .../v1/worker/gpu/sample/tilelang_controls.py | 48 +++++++++++--------
+ 1 file changed, 29 insertions(+), 19 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index 84bed8541..e40749225 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -97,11 +97,14 @@ def min_p_kernel(
+     run: int,
+     threads: int = 128,
+     tile: int = 1024,
++    reverse: bool = True,
+ ):
+     """One row a block, in tiles of ``tile`` columns. Each tile's loads are issued
+     before its values are used: with ``run`` 4 (16-byte aligned rows, the launch
+     checked) as vectors, and in the last, partial tile at columns clamped to the row
+-    (a repeated column does not change the maximum; its stores are predicated)."""
++    (a repeated column does not change the maximum; its stores are predicated).
++    ``reverse``: the threshold pass takes the tiles last to first, starting with
++    those the maximum's pass read last, which are likeliest still in L2."""
+     rows, states = T.dynamic("rows, states")
+     per_thread = tile // threads
+     full = vocab // tile
+@@ -114,6 +117,25 @@ def min_p_kernel(
+             for k in T.vectorized(run):
+                 values[r * run + k] = src[row, col0 + k]
+ 
++    # The last, partial tile's threshold pass: loads at clamped columns, the stores
++    # predicated.
++    @T.macro
++    def threshold_tail(values, minimum, src, row, tx):
++        for j in T.unroll(per_thread):
++            col = _min_p_column(full, j, tx, tile, threads, run)
++            values[j] = src[row, T.min(col, vocab - 1)]
++        for j in T.unroll(per_thread):
++            col = _min_p_column(full, j, tx, tile, threads, run)
++            T.call_extern(
++                "handle",
++                "vllm_control_store_if",
++                T.address_of(src[row, col]),
++                T.if_then_else(
++                    values[j] < minimum[0], -T.infinity("float32"), values[j]
++                ),
++                col < vocab,
++            )
++
+     @T.prim_func
+     def min_p(
+         logits: T.StridedTensor((rows, vocab), (stride, 1), "float32"),
+@@ -156,7 +178,10 @@ def min_p_kernel(
+                 minimum[0] = best[0] + T.call_extern(
+                     "float32", "vllm_control_log", minimum[0]
+                 )
+-                for start in T.serial(full):
++                if reverse and vocab % tile:
++                    threshold_tail(values, minimum, logits, row, tx)
++                for step in T.serial(full):
++                    start = full - 1 - step if reverse else step
+                     load_tile(values, logits, row, start, tx)
+                     for r in T.unroll(per_thread // run):
+                         col0 = _min_p_column(start, r * run, tx, tile, threads, run)
+@@ -166,23 +191,8 @@ def min_p_kernel(
+                                 -T.infinity("float32"),
+                                 values[r * run + k],
+                             )
+-                if vocab % tile:
+-                    for j in T.unroll(per_thread):
+-                        col = _min_p_column(full, j, tx, tile, threads, run)
+-                        values[j] = logits[row, T.min(col, vocab - 1)]
+-                    for j in T.unroll(per_thread):
+-                        col = _min_p_column(full, j, tx, tile, threads, run)
+-                        T.call_extern(
+-                            "handle",
+-                            "vllm_control_store_if",
+-                            T.address_of(logits[row, col]),
+-                            T.if_then_else(
+-                                values[j] < minimum[0],
+-                                -T.infinity("float32"),
+-                                values[j],
+-                            ),
+-                            col < vocab,
+-                        )
++                if not reverse and vocab % tile:
++                    threshold_tail(values, minimum, logits, row, tx)
+ 
+     return min_p
+ 

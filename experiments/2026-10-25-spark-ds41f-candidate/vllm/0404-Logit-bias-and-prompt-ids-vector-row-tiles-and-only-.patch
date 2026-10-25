@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:34:51 +0200
+Subject: [PATCH 404/488] Logit bias and prompt ids: vector row tiles, and only
+ the groups a chunk reaches
+
+The bias kernel fills and scans whole 8192-column tiles as 16-byte vectors
+when its rows are aligned (a run key, as min-p's); the prompt-id gather
+skips the 1024-token groups a chunk does not reach, on its length alone,
+so a short chunk issues Triton's eight loads a thread, not thirty-two.
+---
+ .../worker/gpu/sample/tilelang_auxiliary.py   | 62 +++++++++++--------
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    | 29 ++++++---
+ 2 files changed, 58 insertions(+), 33 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+index a03f8cd14..7d293ab34 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_auxiliary.py
+@@ -155,19 +155,21 @@ def apply_bad_words(
+ 
+ 
+ _PROMPT_THREADS = 128
+-_PROMPT_PER_THREAD = 32  # 4096 tokens a pass: a 16K chunk in four
++_PROMPT_GROUP = 1024  # tokens a group: eight a thread
++_PROMPT_GROUPS = 4  # groups a pass: a 16K chunk in four passes
+ 
+ 
+ @tilelang.jit(pass_configs=_PASS)
+ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
+-    """A block a request: the token after each of its chunk's positions. Each pass
+-    issues all of its loads before its stores (both predicated on the chunk's
+-    length), so a long chunk waits on memory once a pass, not once a thread's
+-    element."""
++    """A block a request: the token after each of its chunk's positions. A pass
++    covers four 1024-token groups and issues all of its loads before its stores
++    (both predicated on the chunk's length), so a long chunk waits on memory once a
++    pass; a group the chunk does not reach is skipped, on the length alone."""
+     rows, output_len, states, token_cols = T.dynamic(
+         "rows, output_len, states, token_cols"
+     )
+-    tile = _PROMPT_THREADS * _PROMPT_PER_THREAD
++    per = _PROMPT_GROUP // _PROMPT_THREADS
++    tile = _PROMPT_GROUP * _PROMPT_GROUPS
+ 
+     @T.prim_func
+     def prompt_ids(
+@@ -184,26 +186,36 @@ def prompt_ids_kernel(tokens_stride: int, index_dtype: str):
+             start = T.alloc_var(T.int32, init=query_starts[row])
+             length = T.alloc_var(T.int32, init=query_starts[row + 1] - start)
+             first = T.alloc_var(T.int32, init=computed[req] + 1)
+-            values = T.alloc_local((_PROMPT_PER_THREAD,), "int32")
++            values = T.alloc_local((per * _PROMPT_GROUPS,), "int32")
+             for block in T.serial(T.ceildiv(length, tile)):
+-                for k in T.unroll(_PROMPT_PER_THREAD):
+-                    pos = block * tile + k * _PROMPT_THREADS + tx
+-                    values[k] = T.call_extern(
+-                        "int32",
+-                        "vllm_control_load_if_b32",
+-                        T.address_of(tokens[req, first + pos]),
+-                        0,
+-                        pos < length,
+-                    )
+-                for k in T.unroll(_PROMPT_PER_THREAD):
+-                    pos = block * tile + k * _PROMPT_THREADS + tx
+-                    T.call_extern(
+-                        "handle",
+-                        "vllm_control_store_if_b64",
+-                        T.address_of(output[start + pos]),
+-                        T.cast(values[k], "int64"),
+-                        pos < length,
+-                    )
++                for g in T.unroll(_PROMPT_GROUPS):
++                    if block * tile + g * _PROMPT_GROUP < length:
++                        for k in T.unroll(per):
++                            pos = (
++                                block * tile + g * _PROMPT_GROUP
++                                + k * _PROMPT_THREADS + tx
++                            )  # fmt: skip
++                            values[g * per + k] = T.call_extern(
++                                "int32",
++                                "vllm_control_load_if_b32",
++                                T.address_of(tokens[req, first + pos]),
++                                0,
++                                pos < length,
++                            )
++                for g in T.unroll(_PROMPT_GROUPS):
++                    if block * tile + g * _PROMPT_GROUP < length:
++                        for k in T.unroll(per):
++                            pos = (
++                                block * tile + g * _PROMPT_GROUP
++                                + k * _PROMPT_THREADS + tx
++                            )  # fmt: skip
++                            T.call_extern(
++                                "handle",
++                                "vllm_control_store_if_b64",
++                                T.address_of(output[start + pos]),
++                                T.cast(values[g * per + k], "int64"),
++                                pos < length,
++                            )
+ 
+     return prompt_ids
+ 
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+index 1fc770911..7d1795f89 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_bias.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -35,11 +35,13 @@ def register_bias(
+                 restore,
+                 index_dtype,
+                 position_dtype,
++                run,
+             )
+             for stride in logits_strides
+             for restore in (False, True)
+             for index_dtype in _DTYPES.values()
+             for position_dtype in _DTYPES.values()
++            for run in (1, 4)
+         ],
+     )
+ 
+@@ -62,13 +64,16 @@ def bias_kernel(
+     restore: bool,
+     index_dtype: str,
+     position_dtype: str,
++    run: int,
+ ):
+     """``_bias_kernel`` in its tile form: a block a row, each list's ids and values
+     loaded (predicated on the list's length) before the gathered logits, and those
+     before any store, every masked store predicated. The row's -inf fill and the
+     all-masked scan take 8192 columns a tile; only the last, partial tile clamps
+-    its loads and predicates its stores. As Triton's maximum, the scan ignores NaN:
+-    a row is alive when some logit is above -inf."""
++    its loads and predicates its stores; with ``run`` 4 (16-byte aligned rows, the
++    launch checked) the whole tiles are filled and read as vectors in Triton's
++    layout. As Triton's maximum, the scan ignores NaN: a row is alive when some
++    logit is above -inf."""
+     rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
+         "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
+     )
+@@ -91,10 +96,10 @@ def bias_kernel(
+     @T.macro
+     def fill_row(logits, row, tx):
+         for tile in T.serial(full):
+-            for j in T.unroll(row_per):
+-                logits[row, tile * _ROW_TILE + j * _THREADS + tx] = -T.infinity(
+-                    "float32"
+-                )
++            for r in T.unroll(row_per // run):
++                col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
++                for k in T.vectorized(run):
++                    logits[row, col0 + k] = -T.infinity("float32")
+         if vocab % _ROW_TILE:
+             for j in T.unroll(row_per):
+                 col = full * _ROW_TILE + j * _THREADS + tx
+@@ -105,8 +110,10 @@ def bias_kernel(
+     @T.macro
+     def scan_row(logits, row, tx, row_values, alive):
+         for tile in T.serial(full):
+-            for j in T.unroll(row_per):
+-                row_values[j] = logits[row, tile * _ROW_TILE + j * _THREADS + tx]
++            for r in T.unroll(row_per // run):
++                col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
++                for k in T.vectorized(run):
++                    row_values[r * run + k] = logits[row, col0 + k]
+             for j in T.unroll(row_per):
+                 alive[0] = alive[0] | T.cast(
+                     row_values[j] > -T.infinity("float32"), "int32"
+@@ -254,6 +261,11 @@ def bias_kernel(
+     return bias
+ 
+ 
++def _run(logits) -> int:
++    """4 when every row starts 16-byte aligned, else 1."""
++    return 4 if logits.data_ptr() % 16 == 0 and logits.stride(0) % 4 == 0 else 1
++
++
+ def apply_logit_bias(
+     logits,
+     mapping,
+@@ -287,6 +299,7 @@ def apply_logit_bias(
+             check_all_masked_rows,
+             _DTYPES[mapping.dtype],
+             _DTYPES[positions.dtype],
++            _run(logits),
+         )(
+             logits,
+             mapping,

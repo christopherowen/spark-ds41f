@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 01:49:08 +0200
+Subject: [PATCH 428/488] [DS4.1] The drafter's confidences written straight
+ into their rows
+
+The confidence head wrote a fresh tensor that every draft step then
+copied into draft_token_confidence_probs. With the fused Markov
+lookups, the head writes the probabilities' rows directly (the TileLang
+head's out, sigmoid's out for the torch head).
+---
+ vllm/model_executor/models/qwen3_dspark.py          | 10 +++++++---
+ vllm/models/deepseek_v4_1/nvidia/dspark.py          | 10 +++++++---
+ vllm/models/deepseek_v4_1/tilelang/confidence.py    | 12 ++++++++++--
+ vllm/v1/worker/gpu/spec_decode/dspark/speculator.py | 13 +++++++++----
+ 4 files changed, 33 insertions(+), 12 deletions(-)
+
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+index f37e81acd..fa1c0e7c1 100644
+--- a/vllm/model_executor/models/qwen3_dspark.py
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -217,10 +217,14 @@ class DSparkConfidenceHead(nn.Module):
+         return self.proj(x).squeeze(-1)
+ 
+     def probability(
+-        self, hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """The acceptance probability, ``sigmoid`` of the head's logit."""
+-        return torch.sigmoid(self(hidden, markov_embed))
++        """The acceptance probability, ``sigmoid`` of the head's logit (into
++        ``out`` when given)."""
++        return torch.sigmoid(self(hidden, markov_embed), out=out)
+ 
+ 
+ class Qwen3DSparkModel(DFlashQwen3Model):
+diff --git a/vllm/models/deepseek_v4_1/nvidia/dspark.py b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+index 6cecfc741..a827fbcf7 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4_1/nvidia/dspark.py
+@@ -745,11 +745,15 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+         return logits.scatter_(1, index, (values + bias).to(logits.dtype))
+ 
+     def compute_confidence(
+-        self, head_hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        head_hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        """Per-position acceptance probability for each drafted token."""
++        """Per-position acceptance probability for each drafted token, into
++        ``out`` when given."""
+         assert self.model.confidence_head is not None
+-        return self.model.confidence_head.probability(head_hidden, markov_embed)
++        return self.model.confidence_head.probability(head_hidden, markov_embed, out)
+ 
+     # --- Weight loading ----------------------------------------------------
+ 
+diff --git a/vllm/models/deepseek_v4_1/tilelang/confidence.py b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+index cfc5be692..bb2197dbb 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/confidence.py
++++ b/vllm/models/deepseek_v4_1/tilelang/confidence.py
+@@ -198,9 +198,17 @@ class TileLangConfidenceHead(DSparkConfidenceHead):
+         )
+ 
+     def probability(
+-        self, hidden: torch.Tensor, markov_embed: torch.Tensor
++        self,
++        hidden: torch.Tensor,
++        markov_embed: torch.Tensor,
++        out: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+-        out = torch.empty(hidden.shape[0], dtype=torch.float32, device=hidden.device)
++        """Each row's acceptance probability, into ``out`` (FP32 [rows],
++        contiguous) when given."""
++        if out is None:
++            out = torch.empty(
++                hidden.shape[0], dtype=torch.float32, device=hidden.device
++            )
+         dspark_confidence(hidden, markov_embed, self.proj.weight.view(-1), out)
+         return out
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 7d7c1dea5..1ea566194 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -426,12 +426,17 @@ class DSparkSpeculator(DFlashSpeculator):
+                 self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 
+-        if self.use_confidence_head:
++        if self.use_confidence_head and table is not None:
++            # Straight into the probabilities' rows (contiguous: [:num_reqs]).
++            self.model.compute_confidence(
++                sample_hidden,
++                confidence_embeds.flatten(0, 1),
++                out=self.draft_token_confidence_probs[:num_reqs].view(-1),
++            )
++        elif self.use_confidence_head:
+             confidence = self.model.compute_confidence(
+                 sample_hidden,
+-                confidence_embeds.flatten(0, 1)
+-                if table is not None
+-                else torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
++                torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
+             )
+             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                 num_reqs, n_spec

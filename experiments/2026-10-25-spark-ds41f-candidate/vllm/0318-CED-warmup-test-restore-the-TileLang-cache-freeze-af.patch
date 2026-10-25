@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 09:37:18 +0200
+Subject: [PATCH 318/488] CED warmup test: restore the TileLang cache freeze
+ after the check
+
+---
+ tests/v1/attention/test_b12x_v41_ced_metadata.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index a0f50ff4c..ec7c22955 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -516,13 +516,18 @@ def test_large_full_capture_decodes_small_live_prefix(monkeypatch):
+ 
+ @cuda
+ def test_startup_warmup_covers_live_compaction_without_jit(monkeypatch):
++    import importlib
+     from collections import defaultdict
+ 
++    import tilelang.cache
+     from triton import knobs
+ 
+     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+     from vllm.models.deepseek_v4_1 import ced
+ 
++    # Freeze only this test's scope; another kernel test must be able to prepare.
++    cache_module = importlib.import_module(tilelang.cache.freeze.__module__)
++    monkeypatch.setattr(cache_module, "_frozen_reason", None)
+     # Isolate compilation state so earlier tests cannot hide a missing warmup.
+     for kernel in (ced._decoder_requests, ced._copy_rows):
+         monkeypatch.setattr(

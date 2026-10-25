@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:01:29 +0100
+Subject: [PATCH 446/488] [DS4.1] Dummy batches index logits rows in int64, as
+ real steps do
+
+The dummy runs the kernels a serving step runs: no int32 logits-rows
+variant to declare, and the heads' hidden-row gather takes int64
+indices only (its widening cast is gone).
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py |  9 +++++----
+ vllm/v1/worker/gpu/input_batch.py           |  3 ++-
+ vllm/v1/worker/gpu/model_runner.py          |  9 +++------
+ vllm/v1/worker/gpu/tilelang_inputs.py       | 13 ++++++++-----
+ 4 files changed, 18 insertions(+), 16 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index a2f039066..4e32ee032 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -654,14 +654,15 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
+ 
+ 
+ @pytest.mark.parametrize("num_rows", [1, 6, 96, 1000])
+-@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+-def test_gather_hidden_rows(num_rows, index_dtype):
++def test_gather_hidden_rows(num_rows):
+     """The hidden rows the heads project, against torch's indexing: repeated rows,
+-    any order, a dummy batch's int32 indices."""
++    any order. Indices are int64, a dummy batch's too; others are refused."""
+     gen = _gen(num_rows + 9)
+     hidden = torch.randn(MAX_TOKENS // 8, 5120, generator=gen, device=DEVICE)
+     hidden = hidden.to(torch.bfloat16)
+-    indices = _randint(0, hidden.shape[0], (num_rows,), gen, index_dtype)
++    with pytest.raises(TypeError, match="int64"):
++        tli.gather_hidden_rows(hidden, torch.zeros(1, dtype=torch.int32, device=DEVICE))
++    indices = _randint(0, hidden.shape[0], (num_rows,), gen, torch.int64)
+     if num_rows > 1:
+         indices[1] = indices[0]
+     out = tli.gather_hidden_rows(hidden, indices)
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index fcc3f5933..eded49aea 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -198,7 +198,8 @@ class InputBatch:
+         input_buffers.is_padding[:num_tokens].fill_(True)
+         is_padding = input_buffers.is_padding[:num_tokens]
+ 
+-        logits_indices = query_start_loc[1:] - 1
++        # int64, as a real step's: the dummy runs the kernels serving runs.
++        logits_indices = (query_start_loc[1:] - 1).long()
+         cu_num_logits = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
+         cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
+         # Copy so set_dummy_context can add context in place without touching
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index b95b2e30a..c4b9c147c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -2155,12 +2155,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         tilelang_inputs.declare(
+             lambda: tilelang_inputs.gather_hidden_rows_calls(self.dtype, hidden_size)
+         )
+-        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
+-        # indices are int64, a dummy batch's int32.
+-        tilelang_inputs.declare(
+-            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
+-            + tilelang_inputs.logits_rows_calls(torch.int32)
+-        )
++        # The logits rows' inputs (InputBatch.logits_rows): every batch's logits
++        # indices are int64, a dummy's too.
++        tilelang_inputs.declare(lambda: tilelang_inputs.logits_rows_calls(torch.int64))
+ 
+         language_model = self._language_model()
+         head = getattr(language_model, "lm_head", None)
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index c1dd9b310..49b4a51f1 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -632,15 +632,18 @@ def logits_rows_calls(index_dtype: torch.dtype) -> list:
+ 
+ 
+ def gather_hidden_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+-    """``source[indices]`` for in-range indices: the hidden rows the LM head and the
+-    drafter's head project, through the CED decoder's TileLang row copy (packed
+-    rows, 16-byte pieces). A dummy batch's int32 indices are widened first."""
++    """``source[indices]`` for in-range int64 indices: the hidden rows the LM head
++    and the drafter's head project, through the CED decoder's TileLang row copy
++    (packed rows, 16-byte pieces)."""
+     from vllm.models.deepseek_v4_1.tilelang import ced
+ 
++    if indices.dtype != torch.int64:
++        raise TypeError(
++            f"hidden rows are gathered by int64 indices, not {indices.dtype}"
++        )
+     out = source.new_empty((indices.shape[0], *source.shape[1:]))
+     if out.numel():
+-        rows = indices if indices.dtype == torch.int64 else indices.long()
+-        ced.copy_rows(source, rows, out, scatter=False)
++        ced.copy_rows(source, indices, out, scatter=False)
+     return out
+ 
+ 

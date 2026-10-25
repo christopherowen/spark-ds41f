@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:00:26 +0200
+Subject: [PATCH 431/488] [DS4.1] The verified tokens' logits rows in TileLang
+
+The rejection sampler's logprobs laid each request's verified tokens out
+at its logits rows with a torch zeros and the Triton flatten kernel. One
+TileLang launch now writes every row: a request's sampled tokens, and 0
+past them and past the last request. Tested against the Triton kernel
+on its zeros.
+---
+ tests/v1/worker/test_gpu_tilelang_inputs.py   | 32 +++++++++-
+ .../gpu/spec_decode/rejection_sampler.py      | 19 ++----
+ vllm/v1/worker/gpu/tilelang_inputs.py         | 64 +++++++++++++++++++
+ 3 files changed, 101 insertions(+), 14 deletions(-)
+
+diff --git a/tests/v1/worker/test_gpu_tilelang_inputs.py b/tests/v1/worker/test_gpu_tilelang_inputs.py
+index 7aaa231b8..2cab49092 100644
+--- a/tests/v1/worker/test_gpu_tilelang_inputs.py
++++ b/tests/v1/worker/test_gpu_tilelang_inputs.py
+@@ -671,6 +671,31 @@ def test_logits_rows(num_logits, index_dtype):
+     assert torch.equal(pos, positions[indices])
+ 
+ 
++@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:])
++@pytest.mark.parametrize("tail", [0, 5])
++def test_flatten_sampled(num_reqs, tail):
++    """The verified tokens at their logits rows, against the Triton kernel and
++    the zeros it wrote into: requests with 1 to 1 + 5 rows, any number of them
++    sampled, rows past the last request (``tail``) zero."""
++    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
++        _flatten_sampled_kernel,
++    )
++
++    gen = _gen(num_reqs * 3 + tail)
++    rows = _randint(1, DRAFTS + 2, (num_reqs,), gen)
++    cu = _starts(rows.tolist())
++    num_sampled = torch.minimum(_randint(0, DRAFTS + 2, (num_reqs,), gen), rows)
++    sampled = _randint(0, 1 << 17, (num_reqs + 2, DRAFTS + 3), gen, torch.int64)
++    num_logits = int(cu[-1]) + tail
++    expected = torch.zeros(num_logits, dtype=torch.int64, device=DEVICE)
++    _flatten_sampled_kernel[(num_reqs,)](
++        expected, sampled, sampled.stride(0), num_sampled, cu, num_warps=1
++    )
++    actual = tli.flatten_sampled(sampled, num_sampled, cu, num_logits)
++    torch.accelerator.synchronize()
++    assert torch.equal(actual, expected)
++
++
+ @pytest.mark.parametrize(
+     "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
+ )
+@@ -1111,8 +1136,13 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
+     for index_dtype in (torch.int64, torch.int32):
+         tli.logits_rows(ids, positions, _randint(0, 64, (24,), gen, index_dtype))
+     torch.accelerator.synchronize()
++    tli.flatten_sampled(
++        drafts[:4], _randint(0, DRAFTS, (4,), gen), _starts([3, 2, 6, 1]), 12
++    )
++    torch.accelerator.synchronize()
+     declared = (
+-        tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
++        tli.flatten_sampled_calls()
++        + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
+         + tli.adaptive_offsets_calls()
+         + tli.padding_rows_calls()
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index e13d91696..7bbb700d5 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -18,6 +18,7 @@ from vllm.triton_utils import tl, triton
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+ from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
++from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.input_batch import (
+     InputBatch,
+     get_num_sampled_and_rejected,
+@@ -102,6 +103,8 @@ def _flatten_sampled_warmup_inputs(*, sampled_stride: int) -> dict[str, Any]:
+     )
+ 
+ 
++# The reference ``tilelang_inputs.flatten_sampled_kernel`` is tested against; the
++# rejection sampler no longer launches it.
+ _flatten_sampled_launcher = triton_kernel_dispatcher_with_warmup(
+     warmup_inputs=_flatten_sampled_warmup_inputs
+ )(_flatten_sampled_kernel)
+@@ -182,9 +185,7 @@ class RejectionSampler:
+             use_block_verification=self.use_block_verification,
+             use_fp64=self.sampler.use_fp64_gumbel,
+         )
+-        _flatten_sampled_launcher.register_warmup(
+-            sampled_stride=self.num_speculative_steps + 1
+-        )
++        tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
+         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+         register_topk_scores_warmup(
+             logits=processed_logits if use_processed else logits,
+@@ -207,16 +208,8 @@ class RejectionSampler:
+ 
+         num_reqs = cu_num_logits.shape[0] - 1
+         num_logits = logits.shape[0]
+-        flat_sampled = torch.zeros(
+-            num_logits, dtype=sampled.dtype, device=sampled.device
+-        )
+-        _flatten_sampled_launcher[(num_reqs,)](
+-            flat_sampled,
+-            sampled,
+-            sampled.stride(0),
+-            num_sampled,
+-            cu_num_logits,
+-            num_warps=1,
++        flat_sampled = tilelang_inputs.flatten_sampled(
++            sampled, num_sampled, cu_num_logits[: num_reqs + 1], num_logits
+         )
+         expanded_logits = num_logits != num_reqs
+         cu_num_generated_tokens: list[int] | torch.Tensor | None = None
+diff --git a/vllm/v1/worker/gpu/tilelang_inputs.py b/vllm/v1/worker/gpu/tilelang_inputs.py
+index d58461ad4..1c4099844 100644
+--- a/vllm/v1/worker/gpu/tilelang_inputs.py
++++ b/vllm/v1/worker/gpu/tilelang_inputs.py
+@@ -664,6 +664,70 @@ def padding_rows_calls() -> list:
+     return [_call(padding_rows_kernel)]
+ 
+ 
++# --- Verified tokens, one a logits row ----------------------------------------------
++
++_FLATTEN_THREADS = 128
++
++
++@tilelang.jit(pass_configs=_PASS)
++def flatten_sampled_kernel():
++    """``rejection_sampler._flatten_sampled_kernel`` and the zeros it wrote into:
++    logits row ``cu_num_logits[r] + i`` takes request ``r``'s ``i``-th sampled
++    token while ``i < num_sampled[r]``, every other row 0. A thread a row, its
++    request found by a search over the request starts."""
++    num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride = T.dynamic(
++        "num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride"
++    )
++
++    @T.prim_func
++    def flatten_sampled(
++        flat: T.Tensor((num_logits,), T.int64),
++        sampled: T.StridedTensor((sampled_rows, width), (sampled_stride, 1), T.int64),
++        num_sampled: T.Tensor((num_reqs,), T.int32),
++        cu_num_logits: T.Tensor((cu_len,), T.int32),
++    ):
++        with T.Kernel(
++            T.ceildiv(num_logits, _FLATTEN_THREADS), threads=_FLATTEN_THREADS
++        ) as b:
++            row = b * _FLATTEN_THREADS + T.get_thread_binding()
++            req = T.alloc_var(T.int32, init=-1)
++            for r in T.serial(num_reqs):
++                if (cu_num_logits[r] <= row) & (row < cu_num_logits[r + 1]):
++                    req = r
++            if row < num_logits:
++                if req >= 0:
++                    i = row - cu_num_logits[req]
++                    flat[row] = T.if_then_else(
++                        i < num_sampled[req],
++                        sampled[req, T.min(i, width - 1)],
++                        T.int64(0),
++                    )
++                else:
++                    flat[row] = T.int64(0)
++
++    return flatten_sampled
++
++
++def flatten_sampled(
++    sampled: torch.Tensor,
++    num_sampled: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    num_logits: int,
++) -> torch.Tensor:
++    """Each request's sampled tokens at its logits rows, 0 elsewhere ([num_logits]
++    int64)."""
++    flat = torch.empty(num_logits, dtype=sampled.dtype, device=sampled.device)
++    if num_logits:
++        _kernel(flatten_sampled_kernel)(
++            flat, sampled, num_sampled, _as(cu_num_logits, torch.int32)
++        )
++    return flat
++
++
++def flatten_sampled_calls() -> list:
++    return [_call(flatten_sampled_kernel)]
++
++
+ # --- Per-request row scatters ---------------------------------------------------
+ 
+ _SCATTER_THREADS = 128

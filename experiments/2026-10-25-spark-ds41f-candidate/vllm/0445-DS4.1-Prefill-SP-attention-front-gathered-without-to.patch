@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:58:17 +0200
+Subject: [PATCH 445/488] [DS4.1] Prefill SP attention front gathered without
+ torch copies
+
+The norms write the Q and KV halves into the all-gather's buffer in
+place, a TileLang copy puts the index head weights beside them, and one
+TileLang launch splits the gathered rows into contiguous parts: torch's
+cat and three contiguous copies gone.
+---
+ .../test_deepseek_v41_tilelang_columns.py     |  83 ++++++++
+ vllm/models/deepseek_v4_1/attention.py        |  54 ++++-
+ vllm/models/deepseek_v4_1/tilelang/columns.py | 191 ++++++++++++++++++
+ 3 files changed, 319 insertions(+), 9 deletions(-)
+ create mode 100644 tests/kernels/test_deepseek_v41_tilelang_columns.py
+ create mode 100644 vllm/models/deepseek_v4_1/tilelang/columns.py
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_columns.py b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+new file mode 100644
+index 000000000..441c5dea2
+--- /dev/null
++++ b/tests/kernels/test_deepseek_v41_tilelang_columns.py
+@@ -0,0 +1,83 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Prefill SP's attention front glue against torch, bit for bit: the head weights
++copied beside the normalized halves (torch's cat) and the gathered rows split into
++contiguous parts (torch's split and contiguous copies), NaN and infinities copied
++as bits, every buffer compared whole from identical garbage."""
++
++import pytest
++import torch
++
++from vllm.platforms import current_platform
++
++if not (
++    current_platform.is_cuda() and current_platform.is_device_capability_family(120)
++):
++    pytest.skip("TileLang V4.1 kernels target SM120/SM121", allow_module_level=True)
++
++pytest.importorskip("tilelang")
++
++from vllm.models.deepseek_v4_1.tilelang import columns  # noqa: E402
++
++DEVICE = torch.device("cuda")
++Q, KV, HEADS = 1280, 512, 64  # DeepSeek-V4.1 Flash: q_lora_rank, KV, index heads
++
++
++def _rows(rows, width, seed, dtype=torch.bfloat16):
++    gen = torch.Generator(device=DEVICE).manual_seed(seed)
++    x = torch.randn(rows, width, generator=gen, device=DEVICE).to(dtype)
++    if rows:
++        x[0, :3] = torch.tensor([float("nan"), float("inf"), -float("inf")])
++    return x
++
++
++def _bits(x):
++    return x.view(torch.int16) if x.element_size() == 2 else x.view(torch.int32)
++
++
++@pytest.mark.parametrize("rows", [1, 7, 2048, 8193])
++def test_copy_columns_beside_the_normalized_halves(rows):
++    weights = _rows(rows, HEADS, rows)
++    front = _rows(rows, Q + KV + HEADS, rows + 1)
++    expected = front.clone()
++    expected[:, Q + KV :] = weights
++    columns.copy_columns(weights, front[:, Q + KV :])
++    assert torch.equal(_bits(front), _bits(expected))
++
++
++def test_copy_columns_between_strided_views():
++    wide = _rows(33, 4096, 3)
++    out = _rows(40, 2048, 4)
++    expected = out.clone()
++    expected[5:38, 512:1536] = wide[:, 1024:2048]
++    columns.copy_columns(wide[:, 1024:2048], out[5:38, 512:1536])
++    assert torch.equal(_bits(out), _bits(expected))
++
++
++@pytest.mark.parametrize("widths", [(Q, KV, HEADS), (Q, KV), (1024, 512, 64)])
++@pytest.mark.parametrize("rows", [1, 6, 4097, 16384])
++def test_split_columns_like_torch(widths, rows):
++    gathered = _rows(rows, sum(widths), rows + len(widths))
++    expected = [part.contiguous() for part in gathered.split(widths, dim=-1)]
++    parts = columns.split_columns(gathered, widths)
++    assert len(parts) == len(widths)
++    for part, reference in zip(parts, expected):
++        assert part.is_contiguous() and part.shape == reference.shape
++        assert torch.equal(_bits(part), _bits(reference))
++
++
++def test_float32_parts():
++    gathered = _rows(9, 64 + 32 + 16, 5, torch.float32)
++    expected = [p.contiguous() for p in gathered.split((64, 32, 16), dim=-1)]
++    for part, reference in zip(columns.split_columns(gathered, (64, 32, 16)), expected):
++        assert torch.equal(_bits(part), _bits(reference))
++
++
++def test_refuses_what_it_cannot_copy_in_vectors():
++    x = _rows(4, 64, 6)
++    with pytest.raises(ValueError, match="16-byte"):
++        columns.copy_columns(x[:, 1:9], _rows(4, 8, 7))
++    with pytest.raises(ValueError, match="16-byte"):
++        columns.split_columns(_rows(4, 12, 8), (4, 8))
++    with pytest.raises(ValueError, match="contiguous"):
++        columns.split_columns(_rows(4, 128, 9)[:, :64], (32, 32))
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 83e82ea5b..7e909fcb8 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -848,6 +848,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         calls.append(writer_call("swa", self.swa_cache_layer.block_size, SLOT_DTYPE))
+         if self.compressor is not None:
+             calls.append(writer_call("indexed", self._main_page, SLOT_DTYPE))
++        else:
++            # _gather_front: prefill SP's BF16 front, the index head weights beside
++            # the normalized halves.
++            from vllm.models.deepseek_v4_1.tilelang import columns
++
++            widths = (self.q_lora_rank, 512)
++            if self.indexer is not None:
++                widths += (self.indexer.heads,)
++                key = columns.copy_columns_key(self.indexer.heads, torch.bfloat16)
++                calls.append(prepare.call(columns.copy_columns_kernel, *key))
++            key = columns.split_columns_key(widths, torch.bfloat16)
++            calls.append(prepare.call(columns.split_columns_kernel, *key))
+         return calls
+ 
+     def _declare_mla(self, mode: str, capacity: int, metadata_specs, device):
+@@ -1445,6 +1457,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             return torch.empty_like(hidden_states)
+         return _attention(hidden_states, positions, self.prefix, global_kv_ready)
+ 
++    def _gather_front(self, sp_rows, hidden_states, qr, kv):
++        """Sequence-parallel prefill's row-wise front of every row, as contiguous
++        parts (normalized Q, normalized KV, the indexer's head weights, all BF16):
++        one all-gather of this rank's rows side by side. The norms write their
++        halves into the gather's buffer in place and the head weights are copied
++        beside them."""
++        from vllm.models.deepseek_v4_1.tilelang import columns
++
++        q = self.q_lora_rank
++        widths = (q, 512) + (() if self.indexer is None else (self.indexer.heads,))
++        front = qr.new_empty(qr.shape[0], sum(widths))
++        self.q_norm(qr, out=front[:, :q])
++        self.kv_norm(kv, out=front[:, q : q + 512])
++        if self.indexer is not None:
++            weights = self.indexer.weights_proj(hidden_states)
++            columns.copy_columns(weights, front[:, q + 512 :])
++        return columns.split_columns(sp_rows.gather(front), widths)
++
+     def _forward(self, positions, hidden_states):
+         if not self._ready:
+             raise PreparationResourceUnavailableError(
+@@ -1458,17 +1488,23 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             # its product, narrower than the hidden state, is gathered.
+             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+             qr, kv = qr_kv.split((self.q_lora_rank, 512), dim=-1)
+-            parts = [self.q_norm(qr), self.kv_norm(kv)]
+-            if self.indexer is not None:
+-                parts.append(self.indexer.weights_proj(hidden_states))
+-            if len({part.dtype for part in parts}) == 1:
+-                widths = [part.shape[-1] for part in parts]
+-                parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(widths, dim=-1)
++            if kernels.uses_tilelang():
++                parts = self._gather_front(sp_rows, hidden_states, qr, kv)
+             else:
+-                parts = [sp_rows.gather(part) for part in parts]
+-            qr, kv = parts[0].contiguous(), parts[1].contiguous()
++                parts = [self.q_norm(qr), self.kv_norm(kv)]
++                if self.indexer is not None:
++                    parts.append(self.indexer.weights_proj(hidden_states))
++                if len({part.dtype for part in parts}) == 1:
++                    widths = [part.shape[-1] for part in parts]
++                    parts = sp_rows.gather(torch.cat(parts, dim=-1)).split(
++                        widths, dim=-1
++                    )
++                else:
++                    parts = [sp_rows.gather(part) for part in parts]
++                parts = [part.contiguous() for part in parts]
++            qr, kv = parts[0], parts[1]
+             if self.indexer is not None:
+-                index_weights = parts[2].contiguous()
++                index_weights = parts[2]
+             hidden_states = None
+             rows = sp_rows.num_tokens
+         else:
+diff --git a/vllm/models/deepseek_v4_1/tilelang/columns.py b/vllm/models/deepseek_v4_1/tilelang/columns.py
+new file mode 100644
+index 000000000..d4c547035
+--- /dev/null
++++ b/vllm/models/deepseek_v4_1/tilelang/columns.py
+@@ -0,0 +1,191 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Column blocks of row-major tensors, copied in 16-byte vectors.
++
++Prefill sequence parallelism gathers an attention layer's row-wise front (the
++normalized Q and KV halves of the fused projection and the indexer's head weights)
++in one all-gather: the norms write their halves into the gather's buffer in place,
++``copy_columns`` puts the head weights beside them, and ``split_columns`` cuts the
++gathered rows into one contiguous tensor a part. Torch's cat and three contiguous
++copies, as two TileLang launches. A thread copies 16 bytes; the block widths are
++whole vectors, so no vector straddles two parts.
++"""
++
++# No `from __future__ import annotations`: TileLang reads the prim_func
++# annotations eagerly, and the symbolic shapes must resolve.
++from functools import cache
++
++import torch
++
++from vllm.tilelang_utils import T, tilelang
++
++_THREADS = 128
++_VECTOR_BYTES = 16
++_DTYPES = {
++    torch.bfloat16: "bfloat16",
++    torch.float16: "float16",
++    torch.float32: "float32",
++}
++_PASS = {
++    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
++    tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
++}
++
++_HEADER = r"""
++__device__ __forceinline__ void vllm_columns_b128(void* d, const void* s) {
++  *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
++}
++"""
++
++
++def _vector(dtype: str) -> int:
++    return _VECTOR_BYTES // {"bfloat16": 2, "float16": 2, "float32": 4}[dtype]
++
++
++@tilelang.jit(pass_configs=_PASS)
++def copy_columns_kernel(width: int, dtype: str):
++    """``dst[r, :width] = src[r, :width]`` for the first ``rows`` rows, either side
++    a view of wider rows."""
++    vector = _vector(dtype)
++    if width % vector:
++        raise ValueError(f"a width of {width} is not whole 16-byte vectors")
++    span = _THREADS * vector
++    src_rows, dst_rows, src_stride, dst_stride = T.dynamic(
++        "src_rows, dst_rows, src_stride, dst_stride"
++    )
++
++    @T.prim_func
++    def copy_columns(
++        src: T.StridedTensor((src_rows, width), (src_stride, 1), dtype),
++        dst: T.StridedTensor((dst_rows, width), (dst_stride, 1), dtype),
++        rows: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(width, span), rows, threads=_THREADS) as (bx, row):
++            T.import_source(_HEADER)
++            col = bx * span + T.get_thread_binding() * vector
++            if col < width:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_b128",
++                    T.address_of(dst[row, col]),
++                    T.address_of(src[row, col]),
++                )
++
++    return copy_columns
++
++
++@tilelang.jit(pass_configs=_PASS)
++def split_columns_kernel(widths: tuple[int, int, int], dtype: str):
++    """Row ``r`` of ``src`` ([rows, sum(widths)], contiguous) cut into ``out0``,
++    ``out1`` and ``out2`` (contiguous, ``widths[i]`` wide; a zero width has no
++    part)."""
++    vector = _vector(dtype)
++    if any(width % vector for width in widths) or not widths[0] or not widths[1]:
++        raise ValueError(f"widths {widths} are not whole 16-byte vectors")
++    w0, w1, w2 = widths
++    total = w0 + w1 + w2
++    span = _THREADS * vector
++    src_rows, rows0, rows1, rows2 = T.dynamic("src_rows, rows0, rows1, rows2")
++
++    @T.prim_func
++    def split_columns(
++        src: T.Tensor((src_rows, total), dtype),
++        out0: T.Tensor((rows0, w0), dtype),
++        out1: T.Tensor((rows1, w1), dtype),
++        out2: T.Tensor((rows2, max(w2, vector)), dtype),
++        rows: T.int32,
++    ):
++        with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
++            T.import_source(_HEADER)
++            col = bx * span + T.get_thread_binding() * vector
++            if col < w0:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_b128",
++                    T.address_of(out0[row, col]),
++                    T.address_of(src[row, col]),
++                )
++            elif col < w0 + w1:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_b128",
++                    T.address_of(out1[row, col - w0]),
++                    T.address_of(src[row, col]),
++                )
++            elif col < total:
++                T.call_extern(
++                    "handle",
++                    "vllm_columns_b128",
++                    T.address_of(out2[row, col - w0 - w1]),
++                    T.address_of(src[row, col]),
++                )
++
++    return split_columns
++
++
++@cache
++def _bound(split: bool, *key):
++    """The kernel of ``key``, resolved once (after the kernel cache freezes, an
++    undeclared key raises by name). TileLang's JIT functions are not hashable."""
++    return (split_columns_kernel if split else copy_columns_kernel)(*key)
++
++
++def _check(*tensors: torch.Tensor) -> str:
++    dtype = tensors[0].dtype
++    vector = _VECTOR_BYTES // tensors[0].element_size()
++    for tensor in tensors:
++        if (
++            tensor.dim() != 2
++            or tensor.dtype != dtype
++            or tensor.stride(-1) != 1
++            or tensor.stride(0) % vector
++            or tensor.data_ptr() % _VECTOR_BYTES
++        ):
++            raise ValueError("column blocks must be 16-byte aligned rows of one dtype")
++    return _DTYPES[dtype]
++
++
++def copy_columns_key(width: int, dtype: torch.dtype) -> tuple:
++    return (width, _DTYPES[dtype])
++
++
++def split_columns_key(widths: tuple[int, ...], dtype: torch.dtype) -> tuple:
++    return (tuple(widths) + (0,) * (3 - len(widths)), _DTYPES[dtype])
++
++
++def copy_columns(src: torch.Tensor, dst: torch.Tensor) -> None:
++    """``dst.copy_(src)`` for 2-D views of 16-byte aligned rows."""
++    if src.shape != dst.shape:
++        raise ValueError(f"cannot copy {tuple(src.shape)} into {tuple(dst.shape)}")
++    dtype = _check(src, dst)
++    if src.shape[0]:
++        _bound(False, src.shape[1], dtype)(src, dst, src.shape[0])
++
++
++def split_columns(src: torch.Tensor, widths: tuple[int, ...]) -> list[torch.Tensor]:
++    """``src`` ([rows, sum(widths)], contiguous) as two or three contiguous column
++    blocks: ``[part.contiguous() for part in src.split(widths, -1)]``."""
++    if len(widths) not in (2, 3) or src.shape[-1] != sum(widths):
++        raise ValueError(f"cannot split {tuple(src.shape)} into {widths}")
++    if not src.is_contiguous():
++        raise ValueError("split_columns reads contiguous rows")
++    rows = src.shape[0]
++    parts = [src.new_empty(rows, width) for width in widths]
++    dtype = _check(src, *parts)
++    if rows:
++        # A two-way split has no third part: the kernel never writes it, and any
++        # contiguous rows of a vector serve as the argument.
++        third = parts[2] if len(widths) == 3 else parts[0].view(-1, _vector(dtype))
++        key = split_columns_key(widths, src.dtype)
++        _bound(True, *key)(src, parts[0], parts[1], third, rows)
++    return parts
++
++
++__all__ = [
++    "copy_columns",
++    "copy_columns_kernel",
++    "copy_columns_key",
++    "split_columns",
++    "split_columns_kernel",
++    "split_columns_key",
++]

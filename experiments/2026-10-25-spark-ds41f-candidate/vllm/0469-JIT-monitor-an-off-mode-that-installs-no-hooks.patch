@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 06:59:00 +0100
+Subject: [PATCH 469/488] JIT monitor: an off mode that installs no hooks
+
+Where every kernel is prepared and the kernel caches are frozen, a compile
+fails by name anyway; the TileLang hook only re-parses each eager launch's
+cache key (82 launches a DS4.1 decode step). Also formats a long line from
+c626d6a4d.
+---
+ tests/engine/test_arg_utils.py  |  2 +-
+ tests/jit_monitor/test_hooks.py |  9 +++++++++
+ vllm/config/observability.py    |  7 +++++--
+ vllm/engine/arg_utils.py        |  4 +++-
+ vllm/utils/jit_monitor.py       | 11 +++++++----
+ 5 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/tests/engine/test_arg_utils.py b/tests/engine/test_arg_utils.py
+index c133a7dd0..688216944 100644
+--- a/tests/engine/test_arg_utils.py
++++ b/tests/engine/test_arg_utils.py
+@@ -350,7 +350,7 @@ def test_jit_monitor_verbose_arg():
+     assert EngineArgs(model="test", jit_monitor_verbose=True).jit_monitor_verbose
+ 
+ 
+-@pytest.mark.parametrize("mode", ["warn", "error"])
++@pytest.mark.parametrize("mode", ["off", "warn", "error"])
+ def test_jit_monitor_mode_arg(mode):
+     parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+     args = parser.parse_args(["--jit-monitor-mode", mode])
+diff --git a/tests/jit_monitor/test_hooks.py b/tests/jit_monitor/test_hooks.py
+index 48cd9fd0f..97f8e6d02 100644
+--- a/tests/jit_monitor/test_hooks.py
++++ b/tests/jit_monitor/test_hooks.py
+@@ -147,6 +147,15 @@ def test_activate_logs_info():
+     assert "Kernel JIT monitor activated" in m.call_args[0][0]
+ 
+ 
++def test_activate_off_installs_nothing():
++    fake = _make_fake_knobs()
++    with _patch_jit_modules(fake):
++        jit_monitor.activate(mode="off")
++    assert not jit_monitor.is_active()
++    assert fake.runtime.jit_post_compile_hook is None
++    assert not jit_monitor._tilelang_hook_installed
++
++
+ def test_activate_rejects_unknown_mode():
+     with pytest.raises(ValueError, match="Unsupported JIT monitor mode"):
+         jit_monitor.activate(mode="panic")  # type: ignore[arg-type]
+diff --git a/vllm/config/observability.py b/vllm/config/observability.py
+index 0394245f3..80ad0c824 100644
+--- a/vllm/config/observability.py
++++ b/vllm/config/observability.py
+@@ -88,8 +88,11 @@ class ObservabilityConfig:
+     This includes number of context/generation requests and tokens
+     and the elapsed cpu time for the iteration."""
+ 
+-    jit_monitor_mode: Literal["warn", "error"] = "warn"
+-    """How to handle post-warmup JIT compilation events."""
++    jit_monitor_mode: Literal["off", "warn", "error"] = "warn"
++    """How to handle post-warmup JIT compilation events. ``off`` installs no
++    hooks: where every kernel is prepared and the kernel caches are frozen, a
++    compile fails by name anyway, and the TileLang hook re-parses each eager
++    launch's cache key."""
+ 
+     jit_monitor_verbose: bool = False
+     """Log every monitored JIT compile with runtime details. This can emit many
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index a1fc5f5e0..b1fffb787 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -770,7 +770,9 @@ class EngineArgs:
+     enable_logging_iteration_details: bool = (
+         ObservabilityConfig.enable_logging_iteration_details
+     )
+-    jit_monitor_mode: Literal["warn", "error"] = ObservabilityConfig.jit_monitor_mode
++    jit_monitor_mode: Literal["off", "warn", "error"] = (
++        ObservabilityConfig.jit_monitor_mode
++    )
+     jit_monitor_verbose: bool = ObservabilityConfig.jit_monitor_verbose
+     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
+     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
+diff --git a/vllm/utils/jit_monitor.py b/vllm/utils/jit_monitor.py
+index 4611f3634..95e286ea5 100644
+--- a/vllm/utils/jit_monitor.py
++++ b/vllm/utils/jit_monitor.py
+@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils.importing import HAS_TRITON
+ 
+ logger = init_logger(__name__)
+-JitMonitorMode = Literal["warn", "error"]
++JitMonitorMode = Literal["off", "warn", "error"]
+ 
+ _active: bool = False
+ _mode: JitMonitorMode = "warn"
+@@ -58,14 +58,15 @@ def activate(*, mode: JitMonitorMode = "warn", verbose: bool = False) -> None:
+     compilation or autotuning benchmark that happens during inference will be
+     logged as a warning or raised as an error, depending on ``mode``.
+ 
+-    Safe to call multiple times; subsequent calls are no-ops.
++    Safe to call multiple times; subsequent calls are no-ops. ``off`` installs
++    nothing.
+ 
+     If the user has explicitly set ``TRITON_PRINT_AUTOTUNING=0`` in
+     their environment, autotuning printing is left disabled; the JIT
+     compilation hook is still registered regardless.
+     """
+     global _active, _mode, _verbose
+-    if _active:
++    if _active or mode == "off":
+         return
+     if mode not in ("warn", "error"):
+         raise ValueError(f"Unsupported JIT monitor mode: {mode!r}")
+@@ -134,7 +135,9 @@ def _setup_dynamo_compile_hook() -> None:
+     try:
+         from torch._dynamo.callback import on_compile_start
+     except Exception:
+-        logger.debug("torch._dynamo callbacks are unavailable; skipping the Dynamo monitor.")
++        logger.debug(
++            "torch._dynamo callbacks are unavailable; skipping the Dynamo monitor."
++        )
+         return
+ 
+     def _on_compile_start(*args, **kwargs) -> None:

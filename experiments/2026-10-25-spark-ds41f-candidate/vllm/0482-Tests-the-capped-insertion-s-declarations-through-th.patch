@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 08:46:11 +0100
+Subject: [PATCH 482/488] Tests: the capped insertion's declarations through
+ the early returns only
+
+RejectionSampler.register_warmups goes on to the Triton warmups unless draft
+logits or a watermark make it return; the declaration test takes those two
+returns, as the uncapped insertion's test does.
+---
+ tests/v1/spec_decode/test_rejection_sampler_utils.py | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/tests/v1/spec_decode/test_rejection_sampler_utils.py b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+index e51c266f7..8a1074923 100644
+--- a/tests/v1/spec_decode/test_rejection_sampler_utils.py
++++ b/tests/v1/spec_decode/test_rejection_sampler_utils.py
+@@ -1437,8 +1437,8 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+     assert torch.equal(capped_sampled, sampled)
+ 
+ 
+-@pytest.mark.parametrize("draft_logits", [False, True])
+-def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
++@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
++def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, watermark):
+     """A step that can have dead rows declares the capped insertion beside the
+     uncapped one, for every index dtype, before the cache freezes."""
+     from types import SimpleNamespace
+@@ -1458,7 +1458,7 @@ def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
+     owner = module.RejectionSampler.__new__(module.RejectionSampler)
+     owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
+     owner.num_speculative_steps = 5
+-    owner.watermark_key = None
++    owner.watermark_key = watermark
+     registry = JitWarmupRegistry(None)
+     with registry.activate():
+         owner.register_warmups(

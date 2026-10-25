@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 19:08:40 +0200
+Subject: [PATCH 384/488] Prepare allowed-token, sparse-bias and minimum-length
+ candidate
+
+Retain stop-logit restoration semantics, including barriers between gather, overwrite and restore.
+---
+ tests/v1/worker/test_gpu_logit_bias.py        |  10 ++
+ tests/v1/worker/test_gpu_sampling_controls.py |  67 ++++++++
+ vllm/v1/worker/gpu/sample/tilelang_bias.py    | 155 ++++++++++++++++++
+ 3 files changed, 232 insertions(+)
+ create mode 100644 vllm/v1/worker/gpu/sample/tilelang_bias.py
+
+diff --git a/tests/v1/worker/test_gpu_logit_bias.py b/tests/v1/worker/test_gpu_logit_bias.py
+index 3bf62380b..3e7b77c0d 100644
+--- a/tests/v1/worker/test_gpu_logit_bias.py
++++ b/tests/v1/worker/test_gpu_logit_bias.py
+@@ -26,6 +26,16 @@ MIN_TOKENS = 10
+ POS = 5
+ 
+ 
++@pytest.fixture(params=["triton", "tilelang"], autouse=True)
++def bias_implementation(request, monkeypatch):
++    if request.param == "tilelang":
++        from vllm.v1.worker.gpu.sample import logit_bias, tilelang_bias
++
++        monkeypatch.setattr(
++            logit_bias, "apply_logit_bias", tilelang_bias.apply_logit_bias
++        )
++
++
+ def _params(structured: bool) -> SamplingParams:
+     return SamplingParams(
+         min_tokens=MIN_TOKENS,
+diff --git a/tests/v1/worker/test_gpu_sampling_controls.py b/tests/v1/worker/test_gpu_sampling_controls.py
+index 0fd19d710..3db1db3b7 100644
+--- a/tests/v1/worker/test_gpu_sampling_controls.py
++++ b/tests/v1/worker/test_gpu_sampling_controls.py
+@@ -290,3 +290,70 @@ def test_nan_count_ignores_padded_columns(dtype, vocab):
+     output = auxiliary.count_nans(logits)
+     assert_bits(output, expected)
+     assert torch.equal(output, torch.isnan(logits).sum(-1))
++
++
++@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
++@pytest.mark.parametrize("vocab", [128, 8193, 129280])
++@pytest.mark.parametrize("restore", [False, True])
++def test_bias_preserves_allowed_logits_and_applies_bias_before_stop_mask(
++    index_dtype, vocab, restore
++):
++    from vllm.v1.worker.gpu.sample import tilelang_bias
++    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
++
++    torch.manual_seed(81419)
++    states, rows, width = 11, 6, 32
++    logits = torch.randn((rows, vocab + 13), device="cuda")[:, :vocab]
++    mapping = torch.tensor([8, 2, 4, 7, 1, 5], device="cuda", dtype=index_dtype)
++    positions = torch.arange(rows, device="cuda", dtype=torch.int64) + 3
++    num_allowed = torch.zeros(states, device="cuda", dtype=torch.int32)
++    num_allowed[mapping[::2]] = width
++    allowed = torch.arange(width, device="cuda", dtype=torch.int32).repeat(states, 1)
++    num_bias = torch.full_like(num_allowed, width)
++    bias_ids = allowed.clone()
++    biases = torch.randn((states, width), device="cuda")
++    min_lens = torch.full_like(num_allowed, 5)
++    num_stops = torch.full_like(num_allowed, 3)
++    restore_rows = torch.ones_like(num_allowed)
++    stops = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32).repeat(states, 1)
++    expected = torch.empty_strided(logits.shape, logits.stride(), device="cuda")
++    expected.copy_(logits)
++    _bias_kernel[(rows,)](
++        expected,
++        expected.stride(0),
++        vocab,
++        mapping,
++        num_allowed,
++        allowed,
++        allowed.stride(0),
++        num_bias,
++        bias_ids,
++        bias_ids.stride(0),
++        biases,
++        biases.stride(0),
++        positions,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        stops.stride(0),
++        BLOCK_SIZE=width,
++        LOGITS_BLOCK_SIZE=8192,
++        CHECK_ALL_MASKED_ROWS=restore,
++    )
++    tilelang_bias.apply_logit_bias(
++        logits,
++        mapping,
++        positions,
++        num_allowed,
++        allowed,
++        num_bias,
++        bias_ids,
++        biases,
++        min_lens,
++        num_stops,
++        restore_rows,
++        stops,
++        restore,
++    )
++    assert_bits(logits, expected)
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_bias.py b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+new file mode 100644
+index 000000000..02319f674
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sample/tilelang_bias.py
+@@ -0,0 +1,155 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Allowed-token, sparse-bias and minimum-length candidate."""
++
++from vllm.tilelang_utils import T, tilelang
++from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS
++
++
++@tilelang.jit(pass_configs=_PASS)
++def bias_kernel(
++    vocab: int,
++    stride: int,
++    allowed_stride: int,
++    bias_ids_stride: int,
++    bias_stride: int,
++    stop_stride: int,
++    width: int,
++    restore: bool,
++    index_dtype: str,
++    position_dtype: str,
++):
++    rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
++        "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
++    )
++
++    @T.prim_func
++    def bias(
++        logits: T.StridedTensor((rows, vocab), (stride, 1), "float32"),
++        mapping: T.Tensor((rows,), index_dtype),
++        positions: T.Tensor((rows,), position_dtype),
++        num_allowed: T.Tensor((states,), "int32"),
++        allowed: T.StridedTensor((states, allowed_cols), (allowed_stride, 1), "int32"),
++        num_bias: T.Tensor((states,), "int32"),
++        bias_ids: T.StridedTensor(
++            (states, bias_ids_cols), (bias_ids_stride, 1), "int32"
++        ),
++        biases: T.StridedTensor((states, bias_cols), (bias_stride, 1), "float32"),
++        min_lens: T.Tensor((states,), "int32"),
++        num_stops: T.Tensor((states,), "int32"),
++        restore_row: T.Tensor((states,), "int32"),
++        stops: T.StridedTensor((states, stop_cols), (stop_stride, 1), "int32"),
++    ):
++        with T.Kernel(rows, threads=128) as row:
++            req = mapping[row]
++            saved = T.alloc_fragment((width,), "float32")
++            saved_ids = T.alloc_fragment((width,), "int32")
++            alive = T.alloc_fragment((8192,), "int32")
++            any_alive = T.alloc_fragment((1,), "int32")
++            if num_allowed[req] > 0:
++                for col in T.Parallel(width):
++                    if col < num_allowed[req]:
++                        saved_ids[col] = allowed[req, col]
++                        saved[col] = logits[T.cast(row, "int64"), saved_ids[col]]
++                T.sync_threads()
++                for block in T.serial(T.ceildiv(vocab, 8192)):
++                    for col in T.Parallel(8192):
++                        index = block * 8192 + col
++                        if index < vocab:
++                            logits[T.cast(row, "int64"), index] = -T.infinity("float32")
++                T.sync_threads()
++                for col in T.Parallel(width):
++                    if col < num_allowed[req]:
++                        logits[T.cast(row, "int64"), saved_ids[col]] = saved[col]
++                T.sync_threads()
++            if num_bias[req] > 0:
++                for col in T.Parallel(width):
++                    if col < num_bias[req]:
++                        token = bias_ids[req, col]
++                        logits[T.cast(row, "int64"), token] += biases[req, col]
++                T.sync_threads()
++            if (num_stops[req] > 0) & (positions[row] + 1 < min_lens[req]):
++                for col in T.Parallel(width):
++                    if col < num_stops[req]:
++                        saved_ids[col] = stops[req, col]
++                        if restore:
++                            saved[col] = logits[T.cast(row, "int64"), saved_ids[col]]
++                T.sync_threads()
++                for col in T.Parallel(width):
++                    if col < num_stops[req]:
++                        logits[T.cast(row, "int64"), saved_ids[col]] = -T.infinity(
++                            "float32"
++                        )
++                T.sync_threads()
++                if restore and restore_row[req] != 0:
++                    T.clear(alive)
++                    for block in T.serial(T.ceildiv(vocab, 8192)):
++                        for col in T.Parallel(8192):
++                            index = block * 8192 + col
++                            if index < vocab:
++                                alive[col] |= T.cast(
++                                    logits[T.cast(row, "int64"), index]
++                                    != -T.infinity("float32"),
++                                    "int32",
++                                )
++                    T.reduce_max(alive, any_alive, dim=0)
++                    if any_alive[0] == 0:
++                        for col in T.Parallel(width):
++                            if col < num_stops[req]:  # noqa: SIM102
++                                if (saved[col] > -T.infinity("float32")) & (
++                                    saved[col] < T.infinity("float32")
++                                ):
++                                    logits[T.cast(row, "int64"), saved_ids[col]] = (
++                                        saved[col]
++                                    )
++
++    return bias
++
++
++def apply_logit_bias(
++    logits,
++    mapping,
++    positions,
++    num_allowed,
++    allowed,
++    num_bias,
++    bias_ids,
++    biases,
++    min_lens,
++    num_stops,
++    restore_row,
++    stops,
++    check_all_masked_rows=False,
++):
++    if logits.shape[0]:
++        width = (
++            1
++            << (
++                max(allowed.shape[1], bias_ids.shape[1], stops.shape[1]) - 1
++            ).bit_length()
++        )
++        bias_kernel(
++            logits.shape[1],
++            logits.stride(0),
++            allowed.stride(0),
++            bias_ids.stride(0),
++            biases.stride(0),
++            stops.stride(0),
++            width,
++            check_all_masked_rows,
++            _DTYPES[mapping.dtype],
++            _DTYPES[positions.dtype],
++        )(
++            logits,
++            mapping,
++            positions,
++            num_allowed,
++            allowed,
++            num_bias,
++            bias_ids,
++            biases,
++            min_lens,
++            num_stops,
++            restore_row,
++            stops,
++        )

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 02:17:43 +0200
+Subject: [PATCH 438/488] [DS4.1] 0267's host test stubs the ports' TileLang
+ launches
+
+On the host the verified-logprob test reaches two launches the ports
+moved to TileLang: the verified tokens' logits rows and the logits rows'
+input ids and positions. Its fixture stubs them with torch, as it does
+the Triton launches.
+---
+ .../v1/worker/test_gpu_verified_logprob_token_ids.py | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+index 6920e766e..4a520e2e3 100644
+--- a/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
++++ b/tests/v1/worker/test_gpu_verified_logprob_token_ids.py
+@@ -23,6 +23,7 @@ import torch
+ 
+ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
+ from vllm.sampling_params import SamplingParams
++from vllm.v1.worker.gpu import tilelang_inputs
+ from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+ from vllm.v1.worker.gpu.sample import logprob, states
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+@@ -111,6 +112,12 @@ def _flatten_sampled(flat, sampled, _, num_sampled, cu_num_logits, num_warps):
+         flat[start : start + n] = sampled[req, :n]
+ 
+ 
++def _flatten_sampled_rows(sampled, num_sampled, cu_num_logits, num_logits):
++    flat = torch.zeros(num_logits, dtype=sampled.dtype)
++    _flatten_sampled(flat, sampled, None, num_sampled, cu_num_logits, 1)
++    return flat
++
++
+ @pytest.fixture(autouse=True)
+ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+     monkeypatch.setattr(states, "UvaBackedTensor", HostTensor)
+@@ -134,6 +141,11 @@ def host_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+     monkeypatch.setattr(
+         rejection_sampler, "_flatten_sampled_launcher", HostKernel(_flatten_sampled)
+     )
++    # The TileLang launches the samplers reach, as torch on the host.
++    monkeypatch.setattr(tilelang_inputs, "flatten_sampled", _flatten_sampled_rows)
++    monkeypatch.setattr(
++        tilelang_inputs, "logits_rows", lambda ids, pos, rows: (ids[rows], pos[rows])
++    )
+     monkeypatch.setattr(
+         rejection_sampler,
+         "get_num_sampled_and_rejected",

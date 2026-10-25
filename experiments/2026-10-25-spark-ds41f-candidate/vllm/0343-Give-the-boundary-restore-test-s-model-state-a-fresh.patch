@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 13:11:33 +0200
+Subject: [PATCH 343/488] Give the boundary restore test's model state a fresh
+ flag
+
+efcd03d6a made BoundaryCheckpointState.add_request clear the selector fresh
+flag of a restored slot, through get_recurrent_checkpoint_fresh(), but the
+test's stub model state has no such method, so the restore test failed with
+AttributeError. The stub now carries a fresh flag, and the test checks that
+the restore clears it for the restored slot only.
+---
+ tests/v1/worker/test_gpu_input_batch_v2.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/v1/worker/test_gpu_input_batch_v2.py b/tests/v1/worker/test_gpu_input_batch_v2.py
+index 4b107955a..a951d1054 100644
+--- a/tests/v1/worker/test_gpu_input_batch_v2.py
++++ b/tests/v1/worker/test_gpu_input_batch_v2.py
+@@ -136,6 +136,7 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
+     raw_state = torch.arange(6, dtype=torch.float32, device=device).reshape(2, 3)
+     anchors = torch.tensor([100, 200], dtype=torch.int64, device=device)
+     accepted = torch.tensor([3, 4], dtype=torch.int32, device=device)
++    fresh = torch.ones(2, dtype=torch.bool, device=device)
+     expected_state = raw_state[1].clone()
+     cache = (
+         torch.arange(16, dtype=torch.uint8, device=device)[:, None]
+@@ -152,6 +153,7 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
+         model=model,
+         get_recurrent_checkpoint_tensors=lambda: (raw_state, anchors, accepted),
+         get_recurrent_checkpoint_acceptance=lambda: accepted,
++        get_recurrent_checkpoint_fresh=lambda: fresh,
+         model_config=SimpleNamespace(max_model_len=128),
+     )
+     draft_state = torch.arange(8, dtype=torch.float32, device=device).reshape(2, 4)
+@@ -235,6 +237,8 @@ def test_boundary_auxiliary_restore_survives_slot_reuse_and_virtual_attention_pa
+     torch.testing.assert_close(raw_state[restore_slot], expected_state)
+     assert anchors[restore_slot].item() == 6
+     assert accepted[restore_slot].item() == 1
++    # The restored pools are not re-zeroed: only the restored slot is not fresh.
++    assert fresh.tolist() == [slot != restore_slot for slot in range(2)]
+     assert state.seen[restore_slot, 3].item() == 1
+     torch.testing.assert_close(state.get_hidden_states(auxiliary_block), hidden[:1])
+     torch.testing.assert_close(

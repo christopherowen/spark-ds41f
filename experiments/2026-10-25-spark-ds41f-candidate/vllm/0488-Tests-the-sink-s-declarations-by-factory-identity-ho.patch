@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 09:38:47 +0100
+Subject: [PATCH 488/488] Tests: the sink's declarations by factory identity;
+ host fills for host collectives
+
+Run 25: the sink's declaration test put TileLang's JIT functions in a set
+(not hashable), and the collectives' host-thread tests reached the
+padding rows' TileLang fill with host tensors. Package files are unchanged.
+---
+ .../test_deepseek_v41_tilelang_collectives.py       | 13 +++++++++++++
+ tests/v1/worker/test_gpu_sink.py                    |  9 +++++----
+ 2 files changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_collectives.py b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+index 09f951bb2..3ed7ba2f2 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_collectives.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_collectives.py
+@@ -70,6 +70,19 @@ class _Comm:
+         fabric.barrier.wait()
+ 
+ 
++@pytest.fixture(autouse=True)
++def _host_zero_fill(monkeypatch):
++    """The rank-order all-reduce zeroes its padding rows with TileLang's 16-byte
++    fill, a CUDA kernel. These tests run the collectives on host tensors, where a
++    host fill stands in for it; on CUDA tensors the kernel itself runs."""
++    from vllm.models.deepseek_v4_1.tilelang import columns
++
++    zero_ = columns.zero_
++    monkeypatch.setattr(
++        columns, "zero_", lambda out: zero_(out) if out.is_cuda else out.fill_(0)
++    )
++
++
+ def _run(inputs, collective=None):
+     world = len(inputs)
+     fabric = _Fabric(world)
+diff --git a/tests/v1/worker/test_gpu_sink.py b/tests/v1/worker/test_gpu_sink.py
+index 2337ee68d..9c6e5431d 100644
+--- a/tests/v1/worker/test_gpu_sink.py
++++ b/tests/v1/worker/test_gpu_sink.py
+@@ -1243,19 +1243,20 @@ def test_alternate_logprobs_kernels_are_declared():
+                 logits_mode=logits_mode,
+             )
+         calls = prepare.declared_calls(registry)
+-        keys = {(f, args) for f, args, _ in calls}
++        # By the factory's identity: TileLang's JIT functions are not hashable.
++        keys = {(id(f), args) for f, args, _ in calls}
+         for dtype in (torch.bfloat16, torch.float32):
+             assert (
+-                tilelang_sampling.sink_rows_kernel,
++                id(tilelang_sampling.sink_rows_kernel),
+                 tilelang_sampling.sink_rows_key(dtype, 3, logits_mode),
+             ) in keys
+             _, rank_args, _ = tilelang_logprob.rank_call(
+                 dtype, vocab, vocab, torch.int64
+             )
+-            assert (tilelang_logprob.ranks_kernel, rank_args) in keys
++            assert (id(tilelang_logprob.ranks_kernel), rank_args) in keys
+             dense = torch.empty((1, vocab), dtype=dtype, device=DEVICE)
+             softmax = (
+-                tilelang_logprob.topk_log_softmax_kernel,
++                id(tilelang_logprob.topk_log_softmax_kernel),
+                 tilelang_logprob.topk_log_softmax_key(
+                     dtype, tilelang_sampling._triton_run(dense)
+                 ),

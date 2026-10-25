@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 08:44:03 +0200
+Subject: [PATCH 302/488] CED metadata: paired per-call benchmark at serving
+ request counts
+
+---
+ .../kernels/benchmark_deepseek_v41_ced.py     | 112 ++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_ced.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_ced.py b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+new file mode 100644
+index 000000000..9de76a7c1
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_ced.py
+@@ -0,0 +1,112 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Paired per-call timing of CED integer metadata at serving request counts."""
++
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.models.deepseek_v4_1.ced import _decoder_requests
++from vllm.models.deepseek_v4_1.tilelang import ced
++from vllm.triton_utils import triton
++
++
++def graph(function):
++    side = torch.cuda.Stream()
++    side.wait_stream(torch.cuda.current_stream())
++    with torch.cuda.stream(side):
++        for _ in range(3):
++            function()
++    torch.cuda.current_stream().wait_stream(side)
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(100):
++            function()
++    return capture
++
++
++def elapsed(capture):
++    start = torch.cuda.Event(enable_timing=True)
++    end = torch.cuda.Event(enable_timing=True)
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 10  # ms / 100 calls to microseconds
++
++
++def main():
++    rows = []
++    for requests in (1, 8, 16, 32):
++        for length in (1, 6, 129, 4096):
++            starts = torch.arange(requests + 1, dtype=torch.int32, device="cuda")
++            starts *= length
++            seq = torch.full((requests,), 100000, dtype=torch.int32, device="cuda")
++            full = torch.arange(requests, device="cuda") % 2 == 0
++            limits = torch.where(full, 2**31 - 1, 128).to(torch.int32)
++            prefix = torch.zeros(requests, dtype=torch.int64, device="cuda")
++            outputs = [
++                (
++                    torch.empty(requests + 1, dtype=torch.int32, device="cuda"),
++                    torch.empty(requests, dtype=torch.int64, device="cuda"),
++                    torch.empty(requests, dtype=torch.int64, device="cuda"),
++                    torch.empty(2, dtype=torch.int32, device="cuda"),
++                )
++                for _ in range(2)
++            ]
++
++            def reference(
++                starts=starts,
++                seq=seq,
++                full=full,
++                prefix=prefix,
++                outputs=outputs,
++                requests=requests,
++            ):
++                _decoder_requests[(1,)](
++                    starts,
++                    seq,
++                    full,
++                    prefix,
++                    *outputs[0],
++                    requests,
++                    requests,
++                    triton.next_power_of_2(requests + 1),
++                    128,
++                )
++
++            def candidate(
++                starts=starts,
++                seq=seq,
++                limits=limits,
++                prefix=prefix,
++                outputs=outputs,
++                requests=requests,
++            ):
++                ced.requests(starts, seq, limits, prefix, *outputs[1], requests)
++
++            captures = [graph(reference), graph(candidate)]
++            assert all(torch.equal(a, b) for a, b in zip(*outputs))
++            samples = [[], []]
++            for repeat in range(15):
++                for i in (0, 1) if repeat % 2 == 0 else (1, 0):
++                    samples[i].append(elapsed(captures[i]))
++            differences = [b / a - 1 for a, b in zip(*samples)]
++            row = dict(
++                requests=requests,
++                query_rows=length,
++                reference_us=statistics.mean(samples[0]),
++                candidate_us=statistics.mean(samples[1]),
++                change_pct=100 * statistics.mean(differences),
++                ci95_pct=100 * 2.145 * statistics.stdev(differences) / math.sqrt(15),
++            )
++            print(json.dumps(row), flush=True)
++            rows.append(row)
++    print(json.dumps({"summary": "CED requests per call", "rows": rows}))
++
++
++if __name__ == "__main__":
++    main()

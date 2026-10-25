@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 21:23:19 +0200
+Subject: [PATCH 400/488] Min-p: 256 threads, 2048-column tiles, the threshold
+ pass last tile first
+
+At 96 rows the batch's 50 MB do not fit in L2; starting the threshold pass
+on the tiles the maximum's pass read last makes it 12-14% faster than
+Triton's second forward pass, bit for bit. The controls' header gains
+predicated loads and an int64 predicated store for the tile forms.
+---
+ .../v1/worker/gpu/sample/tilelang_controls.py | 41 +++++++++++++++----
+ 1 file changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/vllm/v1/worker/gpu/sample/tilelang_controls.py b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+index e40749225..14a45089c 100644
+--- a/vllm/v1/worker/gpu/sample/tilelang_controls.py
++++ b/vllm/v1/worker/gpu/sample/tilelang_controls.py
+@@ -50,6 +50,30 @@ __device__ __forceinline__ float vllm_control_log(float x) {
+       : "=f"(result) : "f"(x));
+   return result;
+ }
++// Triton's masked loads and stores: a masked lane keeps ``other`` and never waits on
++// memory, and nothing branches, so a tile's loads issue together.
++__device__ __forceinline__ int vllm_control_load_if_b32(const void* p, int other,
++                                                       bool ok) {
++  int v = other;
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q ld.global.b32 %0, [%1];\n}"
++               : "+r"(v) : "l"(p), "r"((int)ok));
++  return v;
++}
++__device__ __forceinline__ float vllm_control_load_if_f32(const void* p, float other,
++                                                         bool ok) {
++  float v = other;
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q ld.global.f32 %0, [%1];\n}"
++               : "+f"(v) : "l"(p), "r"((int)ok));
++  return v;
++}
++__device__ __forceinline__ void vllm_control_store_if_b64(void* p, long long v,
++                                                          bool ok) {
++  asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
++               " @q st.global.b64 [%0], %1;\n}"
++               :: "l"(p), "l"(v), "r"((int)ok) : "memory");
++}
+ __device__ __forceinline__ void vllm_control_store_if(void* p, float v, bool ok) {
+   asm volatile("{\n .reg .pred q;\n setp.ne.b32 q, %2, 0;\n"
+                " @q st.global.f32 [%0], %1;\n}"
+@@ -95,16 +119,17 @@ def min_p_kernel(
+     stride: int,
+     index_dtype: str,
+     run: int,
+-    threads: int = 128,
+-    tile: int = 1024,
+-    reverse: bool = True,
++    threads: int = 256,
++    tile: int = 2048,
+ ):
+     """One row a block, in tiles of ``tile`` columns. Each tile's loads are issued
+     before its values are used: with ``run`` 4 (16-byte aligned rows, the launch
+     checked) as vectors, and in the last, partial tile at columns clamped to the row
+     (a repeated column does not change the maximum; its stores are predicated).
+-    ``reverse``: the threshold pass takes the tiles last to first, starting with
+-    those the maximum's pass read last, which are likeliest still in L2."""
++    The threshold pass takes the tiles last to first, starting with those the
++    maximum's pass read last, which are likeliest still in L2: at 96 rows, whose
++    50 MB the L2 cannot hold, that is 12-14% faster than Triton's second forward
++    pass (experiments/2026-10-24-tilelang-completion, min-p round 2)."""
+     rows, states = T.dynamic("rows, states")
+     per_thread = tile // threads
+     full = vocab // tile
+@@ -178,10 +203,10 @@ def min_p_kernel(
+                 minimum[0] = best[0] + T.call_extern(
+                     "float32", "vllm_control_log", minimum[0]
+                 )
+-                if reverse and vocab % tile:
++                if vocab % tile:
+                     threshold_tail(values, minimum, logits, row, tx)
+                 for step in T.serial(full):
+-                    start = full - 1 - step if reverse else step
++                    start = full - 1 - step
+                     load_tile(values, logits, row, start, tx)
+                     for r in T.unroll(per_thread // run):
+                         col0 = _min_p_column(start, r * run, tx, tile, threads, run)
+@@ -191,8 +216,6 @@ def min_p_kernel(
+                                 -T.infinity("float32"),
+                                 values[r * run + k],
+                             )
+-                if not reverse and vocab % tile:
+-                    threshold_tail(values, minimum, logits, row, tx)
+ 
+     return min_p
+ 
