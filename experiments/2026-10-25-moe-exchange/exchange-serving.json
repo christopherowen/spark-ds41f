@@ -1,0 +1,75 @@
+{
+ "experiment": "experiments/2026-10-25-moe-exchange",
+ "run": "moe-exchange-serving",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "profile": "lean",
+   "bench": false,
+   "extras": [
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide"
+     ],
+     "determinism"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "700",
+      "--wide",
+      "--no-logprobs"
+     ],
+     "greedy"
+    ],
+    [
+     "experiments/2026-10-12-r6g/token_determinism_text.py",
+     [
+      "--tokens",
+      "192",
+      "--long-lines",
+      "1100"
+     ],
+     "determinism-16k"
+    ],
+    [
+     "scripts/servebench_suite.py",
+     [
+      "--suite",
+      "experiments/2026-10-25-moe-exchange/prefill-suite.json",
+      "--out",
+      "results/private/lab/{run}/suite-{label}",
+      "--label",
+      "{label}"
+     ],
+     "suite"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "exchange-tp4.json",
+     "label": "exchange"
+    },
+    {
+     "config": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json",
+     "label": "candidate6"
+    },
+    {
+     "config": "exchange-tp4.json",
+     "label": "exchange-2"
+    }
+   ]
+  }
+ ]
+}
