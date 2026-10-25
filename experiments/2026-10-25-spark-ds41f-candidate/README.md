@@ -50,8 +50,8 @@ published release benchmark. Promotion needs the owner's go.
      - the generation controls with logprob ids, prompt logprobs, seeded sampling and
        images;
      - the startup log: no B12X preparation, no temporary KV cache, no Triton compile.
-2. **[release-tp4.json](release-tp4.json), the release comparison:** the `release`,
-   `single-stream` and `sampled` suites on candidate 5, spark-ds41f-1022 and candidate 5
+2. **[release-tp4.json](release-tp4.json), the release comparison:** the `release` and
+   `single-stream` suites (the optional `sampled` suite left out to fit the owner's window) on candidate 5, spark-ds41f-1022 and candidate 5
    again, on dev arms. The single-stream suite is the published single-stream figure
    (~74 tok/s), a different measurement from the tilelang-completion checks' c1-distinct
    (~95 tok/s: 12 prompts, 256 tokens).
