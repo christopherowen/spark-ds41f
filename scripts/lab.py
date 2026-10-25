@@ -1439,8 +1439,6 @@ def fabric_command(cluster: dict, nodes: dict, node: dict, script: str, args: li
     """The collective probe's container (image, per-node environment, devices, limits) with the
     arm's mounts and ``environment`` over its variables, running ``script`` with the probe's
     rank arguments followed by ``args``."""
-    if spark.topology.transport(cluster) == "rocenante-mesh4":
-        raise SystemExit("fabric scripts do not run on the mesh4 transport")
     base = spark.collective_probe_command(cluster, nodes, node, FABRIC_PORT)
     repo = spark.repository_path(cluster)
     start = base.index("python3")

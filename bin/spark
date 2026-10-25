@@ -32,13 +32,10 @@ from typing import NamedTuple
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CLUSTER_CONFIG = "config/cluster.json"
 sys.path.insert(0, str(ROOT / "scripts"))
-import mesh_fabric
 import source_labels
 import kernel_backend
 import kernel_readiness
 import topology
-import transport_profiles
-import model_layout
 import recipe as cluster_recipe
 
 
@@ -541,16 +538,7 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
     for name in (*listed, *(n for n in INDEPENDENT_BUILD_PROJECTS if n in upstreams["sources"])):
         if not upstreams["sources"][name].get("version"):
             problems.append(f"{name}: package version is not recorded in the lock")
-    if topology.transport(cluster) in ("rocenante-ring4", "rocenante-mesh4"):
-        mode = topology.transport(cluster)
-        record = source_manifest["b12x"]
-        if mode not in record.get("capabilities", []):
-            problems.append(f"{mode} requires a source manifest with its transport patch")
-        label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "b12x.tree")
-        if label != record["expected_tree"]:
-            problems.append(f"{mode} image tree does not match its source manifest")
-    # sparknet's transports run only on an image built with sparknet's
-    # collectives, and such an image serves only sparknet's transports.
+    # sparknet's transports run only on an image built with sparknet's collectives.
     sparknet_image = SPARKNET_CAPABILITY in source_manifest.get("vllm", {}).get("capabilities", [])
     if topology.is_sparknet(topology.transport(cluster)):
         if not sparknet_image or "sparknet" not in upstreams["sources"] or "sparknet" not in source_manifest:
@@ -559,14 +547,6 @@ def local_doctor(cluster: dict, nodes: dict, upstreams: dict) -> list[str]:
             label = source_labels.get(cluster.get("container", {}).get("expected_labels", {}), "sparknet.tree")
             if label != source_manifest["sparknet"]["expected_tree"]:
                 problems.append("sparknet image tree does not match its source manifest")
-    elif sparknet_image and topology.one_shot_topology(topology.transport(cluster)) is not None:
-        problems.append(f"an image with {SPARKNET_CAPABILITY} serves sparknet's oneshot-* transports, not {topology.transport(cluster)}")
-    if topology.transport(cluster) == "rocenante-mesh4":
-        if cluster.get("fabric", {}).get("mesh_paths", 2) == 4 and "rocenante-mesh4-fourpaths" not in source_manifest["b12x"].get("capabilities", []):
-            problems.append("four-path mesh requires its source capability")
-        problems.extend(mesh_fabric.site_problems(nodes))
-        if cluster.get("deployment", {}).get("launch_enabled"):
-            problems.append("mesh4 is available for bounded collective qualification only; serving lifecycle is not qualified")
     for name in build_projects(upstreams["sources"]):
         source = upstreams["sources"][name]
         if missing_patches(source):
@@ -1048,10 +1028,9 @@ def fan_control_problems(node_name: str, facts: dict[str, str],
 
 
 def roce_gid_setting(cluster: dict, node: dict) -> tuple[int, list[str]]:
-    """The GID index B12X and NCCL are configured to use, and the node's HCAs."""
+    """The GID index sparknet and NCCL are configured to use, and the node's HCAs."""
     env = expected_environment(cluster, node)
-    mode = topology.transport(cluster)
-    key = f"{topology.ONE_SHOT[mode][0]}_GID_INDEX" if mode in topology.ONE_SHOT else "NCCL_IB_GID_INDEX"
+    key = "SPARKNET_ROCE_GID_INDEX" if topology.is_sparknet(topology.transport(cluster)) else "NCCL_IB_GID_INDEX"
     index = int(env.get(key) or env.get("NCCL_IB_GID_INDEX") or 3)
     hcas = sorted({hca for peers in node["roce_peer_hcas"].values() for hca in peers})
     return index, hcas
@@ -1072,7 +1051,7 @@ def roce_gid_query(hcas: list[str]) -> str:
 def roce_gid_problems(node_name: str, index: int, hcas: list[str], output: str) -> list[str]:
     """Problems when an HCA's configured GID slot is not its IPv4 RoCE v2 address.
 
-    B12X and NCCL both use one fixed GID index. The kernel files a re-added
+    sparknet and NCCL both use one fixed GID index. The kernel files a re-added
     address in the lowest free slot, so a link flap while RDMA resources still
     hold the old entry moves the IPv4 RoCE v2 GID (dgx3 moved from 3 to 4 when
     its peers rebooted under a starting service), and NCCL then fails with an
@@ -1167,18 +1146,6 @@ def live_doctor(cluster: dict, nodes: dict) -> list[str]:
     corrections = []
     name = cluster["container"]["name"]
     for node in nodes["nodes"]:
-        if topology.transport(cluster) == "rocenante-mesh4":
-            query = shlex.join(["python3", "-c", (ROOT / "scripts/mesh_fabric.py").read_text(),
-                                "inventory", "--node-json", json.dumps(node)])
-            result = remote_shell(nodes, node, query)
-            try:
-                if result.returncode:
-                    raise ValueError(result.stderr.strip())
-                errors, fixes = mesh_fabric.findings(node, json.loads(result.stdout))
-                problems.extend(errors)
-                corrections.extend(fixes)
-            except (ValueError, TypeError) as error:
-                problems.append(f"{node['name']}: mesh NIC inventory failed: {error}")
         if trial:
             inventory = node_kernel_inventory(nodes, node, trial)
             kernel_inventories[node["name"]] = inventory
@@ -1329,41 +1296,6 @@ def command_site_shape(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_tuning(args: argparse.Namespace) -> int:
-    if args.cluster_config not in (None, DEFAULT_CLUSTER_CONFIG):
-        raise SystemExit("tuning profiles select their pinned base; omit --cluster-config")
-    try:
-        profile, resolved = transport_profiles.resolve(ROOT, args.profiles_config, args.profile)
-        layout = model_layout.describe(ROOT, resolved, transport_profiles.size_bytes(
-            resolved["environment"]["VLLM_ROCE_ALLREDUCE_MAX_SIZE"]))
-        if args.tuning_command == "show":
-            print(json.dumps({**profile, "derived_layout": layout}, indent=2))
-            return 0
-        nodes_path = repository_config_path(args.nodes_config)
-        output = repository_config_path(args.output)
-        if not output.is_relative_to((ROOT / "experiments").resolve()):
-            raise ValueError("new tuning candidates belong under experiments/")
-        nodes = json.loads(nodes_path.read_text())
-        candidate = transport_profiles.materialize(
-            profile, resolved, nodes, nodes_path.relative_to(ROOT.resolve()).as_posix())
-        candidate["tuning_origin"] = {
-            "catalog": args.profiles_config,
-            "catalog_sha256": hashlib.sha256(repository_config_path(args.profiles_config).read_bytes()).hexdigest(),
-            "profile": args.profile,
-            "base_config": profile["base_config"],
-            "base_sha256": profile["base_sha256"],
-            "derived_layout": layout,
-        }
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open("x") as handle:
-            json.dump(candidate, handle, indent=2)
-            handle.write("\n")
-    except (ValueError, OSError) as error:
-        raise SystemExit(f"invalid tuning profile: {error}") from error
-    print(f"created {output.relative_to(ROOT.resolve())} ({args.profile}, launch disabled)")
-    return 0
-
-
 def command_topology_create(args: argparse.Namespace) -> int:
     cluster, _, _ = configuration(args)
     nodes_path = repository_config_path(args.nodes_config)
@@ -1398,12 +1330,6 @@ def collective_probe_command(cluster: dict, nodes: dict, node: dict, port: int) 
                     "python3", "/probe.py", "--rank", str(node["rank"]),
                     "--world-size", str(len(nodes["nodes"])), "--master-addr",
                     cluster["distributed"]["master_addr"], "--master-port", str(port)])
-    if topology.transport(cluster) == "rocenante-mesh4":
-        command = ["sudo", "python3", f"{repository_path(cluster)}/scripts/mesh_probe.py",
-                   "--nodes", f"{repository_path(cluster)}/{cluster['nodes_config']}",
-                   "--rank", str(node["rank"]), "--paths", str(cluster.get("fabric", {}).get("mesh_paths", 2)),
-                   "--serving-container", cluster["container"]["name"],
-                   "--marker", "/usr/local/libexec/spark3-roce-marker", "--"] + command
     return command
 
 
@@ -5849,17 +5775,6 @@ def parser() -> argparse.ArgumentParser:
         help="check remote checkpoint fragmentation and print correction commands only; never execute them",
     )
     doctor.set_defaults(func=command_doctor)
-    tuning = commands.add_parser("tuning", help="inspect or materialize named TP3/TP4 transport settings")
-    tuning.add_argument("--profiles-config", default=transport_profiles.DEFAULT_PROFILES,
-                        help="repository-relative tuning catalog (copy it to create a new experiment)")
-    tuning_commands = tuning.add_subparsers(dest="tuning_command", required=True)
-    for operation in ("show", "create"):
-        action = tuning_commands.add_parser(operation)
-        action.add_argument("profile", help="named profile: tp3 or tp4")
-        if operation == "create":
-            action.add_argument("--nodes-config", required=True, help="site node map for this topology")
-            action.add_argument("--output", required=True, help="new resolved config under experiments/")
-        action.set_defaults(func=command_tuning)
     fabric = commands.add_parser("topology", help="prepare a three- or four-node switchless configuration")
     fabric_commands = fabric.add_subparsers(dest="topology_command", required=True)
     create = fabric_commands.add_parser("create", help="write a launch-disabled candidate from this profile and a node map")

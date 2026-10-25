@@ -19,14 +19,15 @@ loader.exec_module(spark)
 topology = spark.topology
 
 
-# The B12X TP3 configuration the topology tooling generates from: r5p's, kept
-# with r5p's lock when r6 promoted the TileLang family.
+# A configuration recorded before sparknet, without fabric.transport: r5p's B12X
+# TP3 configuration, which ran RoCEnante's direct-peer collectives.
 B12X_BASE = "experiments/2026-10-05-tilelang-r6/r5p/cluster-64k.json"
 
 
 class TopologyTest(unittest.TestCase):
     def setUp(self):
-        self.base = spark.read_json(B12X_BASE)
+        # The recipe's triangle (sparknet's oneshot-direct) is the base the tooling generates from.
+        self.base = spark.read_cluster("config/cluster.json", "tp3-triangle")
         self.three = spark.read_json("config/nodes.json")
         # The site map (or CI's example map) names the API head.
         head = next(node for node in self.three["nodes"] if node.get("head"))
@@ -39,8 +40,12 @@ class TopologyTest(unittest.TestCase):
         for node in self.three["nodes"]:
             expected = {k: str(v) for k, v in self.base["environment"].items()}
             expected.update(VLLM_HOST_IP=node["management_ip"],
-                            B12X_ROCE_PEER_HCAS=json.dumps(node["roce_peer_hcas"], separators=(",", ":")))
-            self.assertEqual(spark.expected_environment(self.base, node), expected)
+                            SPARKNET_ROCE_PEER_HCAS=json.dumps(node["roce_peer_hcas"], separators=(",", ":")),
+                            SPARKNET_ROCE_TOPOLOGY="direct")
+            if "roce_gid_index" in node:
+                expected.update(NCCL_IB_GID_INDEX=str(node["roce_gid_index"]),
+                                SPARKNET_ROCE_GID_INDEX=str(node["roce_gid_index"]))
+            self.assertEqual(topology.node_environment(self.base, node), expected)
             command = spark.expected_command(self.base, node)
             self.assertEqual(command[:len(self.base["serve_args"])], self.base["serve_args"])
 
@@ -55,14 +60,14 @@ class TopologyTest(unittest.TestCase):
         self.assertFalse(self.ring["deployment"]["launch_enabled"])
         self.assertNotIn("branch", self.ring["deployment"])
 
-    def test_fourth_node_is_rendered_headless_without_rocenante_peer_map(self):
+    def test_fourth_node_is_rendered_headless_without_sparknet_settings(self):
         node = self.four["nodes"][3]
         command = spark.rendered_docker_command(self.ring, node)
         self.assertIn("--headless", command)
         self.assertEqual(command[command.index("--node-rank") + 1], "3")
         env = spark.expected_environment(self.ring, node)
-        self.assertNotIn("B12X_ROCE_PEER_HCAS", env)
-        self.assertEqual(env["VLLM_ENABLE_ROCE_ALLREDUCE"], "0")
+        # The NCCL ring runs no one-shot collectives.
+        self.assertFalse([key for key in env if key.startswith("SPARKNET_ROCE_")])
         self.assertTrue(env["NCCL_IB_HCA"].startswith("="))
 
     def test_cli_accepts_a_fourth_node_and_validates_against_selected_map(self):
@@ -81,8 +86,20 @@ class TopologyTest(unittest.TestCase):
         self.assertEqual(candidate["serve_args"], self.base["serve_args"])
 
     def test_four_nodes_cannot_use_direct_peer_transport(self):
-        self.ring.pop("fabric")
-        self.assertTrue(any("requires nccl-ring" in p for p in topology.problems(self.ring, self.four)))
+        self.ring["fabric"]["transport"] = "oneshot-direct"
+        self.assertTrue(any("requires nccl-ring or oneshot-ring4" in p for p in topology.problems(self.ring, self.four)))
+
+    def test_retired_and_missing_transports_are_refused(self):
+        # RoCEnante's transports are retired; a configuration recorded without a
+        # transport ran rocenante-direct.
+        for mode in ("rocenante-direct", "rocenante-ring4", "rocenante-mesh4"):
+            changed = copy.deepcopy(self.base)
+            changed["fabric"]["transport"] = mode
+            self.assertIn(f"unknown fabric transport {mode!r}", topology.problems(changed, self.three))
+        recorded = spark.read_json(B12X_BASE)
+        recorded["distributed"]["master_addr"] = self.base["distributed"]["master_addr"]
+        self.assertIsNone(topology.transport(recorded))
+        self.assertTrue(any("fabric.transport is required" in p for p in topology.problems(recorded, self.three)))
 
     def test_ring_policy_rejects_each_unsafe_override(self):
         for key in topology.RING_ENV:
@@ -183,57 +200,20 @@ class TopologyTest(unittest.TestCase):
                     with self.assertRaises(SystemExit):
                         spark.repository_config_path(path)
 
-    def test_rocenante_ring4_candidate_and_source_lock(self):
-        args = argparse.Namespace(cluster_config="experiments/2026-10-02-rocenante-ring4/cluster.json")
-        cluster, nodes, lock = spark.configuration(args)
-        self.assertEqual(topology.problems(cluster, nodes), [])
-        self.assertEqual(spark.local_doctor(cluster, nodes, lock), [])
-        self.assertIn("2026-10-02-rocenante-ring4", lock["source_manifest"])
-        self.assertFalse(cluster["deployment"]["launch_enabled"])
-        self.assertNotEqual(cluster["container"]["image"], self.base["container"]["image"])
-        for node in nodes["nodes"]:
-            env = spark.expected_environment(cluster, node)
-            self.assertEqual(env["VLLM_ENABLE_ROCE_ALLREDUCE"], "1")
-            self.assertEqual(env["B12X_ROCE_TOPOLOGY"], "ring4")
-            self.assertEqual(set(json.loads(env["B12X_ROCE_PEER_HCAS"])),
-                             {str((node["rank"]-1)%4), str((node["rank"]+1)%4)})
-            self.assertNotIn("--disable-custom-all-reduce", spark.expected_command(cluster, node))
-
-    def test_relay_stripe_order_must_match_the_remote_cable(self):
-        relay = spark.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
+    def test_ring4_stripe_order_must_match_the_remote_cable(self):
+        cluster, _ = self.sparknet()
         self.four["nodes"][0]["roce_peer_hcas"]["1"].reverse()
-        self.assertTrue(any("same stripe position" in p for p in topology.problems(relay, self.four)))
+        self.assertTrue(any("same stripe position" in p for p in topology.problems(cluster, self.four)))
         # NCCL selects by subnet rather than route-list position.
         self.assertEqual(topology.problems(self.ring, self.four), [])
 
-    def test_relay_base_can_generate_nccl_control(self):
-        relay = spark.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
-        control = topology.candidate(relay, self.four, "config/examples/nodes-ring4.json")
+    def test_ring4_base_can_generate_nccl_control(self):
+        cluster, _ = self.sparknet()
+        control = topology.candidate(cluster, self.four, "config/examples/nodes-ring4.json")
         self.assertEqual(topology.problems(control, self.four), [])
-        self.assertEqual(control["container"], relay["container"])
+        self.assertEqual(control["container"], cluster["container"])
         self.assertEqual(topology.transport(control), "nccl-ring")
-        self.assertNotIn("B12X_ROCE_TOPOLOGY", control["environment"])
-
-    def test_rocenante_ring4_rejects_old_image_or_lock(self):
-        args = argparse.Namespace(cluster_config="experiments/2026-10-02-rocenante-ring4/cluster.json")
-        cluster, nodes, lock = spark.configuration(args)
-        cluster["container"]["expected_labels"] = self.base["container"]["expected_labels"]
-        self.assertTrue(any("image tree" in p for p in spark.local_doctor(cluster, nodes, lock)))
-        # r5o's source manifest predates the ring transport patch.
-        old_lock = spark.read_json("upstreams.lock.json")
-        old_lock["source_manifest"] = "manifests/sources/2026-09-30-r5o-candidate-source.json"
-        self.assertTrue(any("transport patch" in p for p in spark.local_doctor(cluster, nodes, old_lock)))
-
-    def test_rocenante_ring4_requires_matching_mode_and_backend(self):
-        cluster = spark.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
-        for key in ("VLLM_ENABLE_ROCE_ALLREDUCE", "B12X_ROCE_TOPOLOGY"):
-            changed = copy.deepcopy(cluster)
-            changed["environment"][key] = "invalid"
-            self.assertTrue(any(key in p for p in topology.problems(changed, self.four)))
-        cluster["serve_args"].append("--disable-custom-all-reduce")
-        self.assertTrue(any("custom all-reduce enabled" in p for p in topology.problems(cluster, self.four)))
-        self.base["environment"]["B12X_ROCE_TOPOLOGY"] = "ring4"
-        self.assertTrue(any("B12X_ROCE_TOPOLOGY" in p for p in topology.problems(self.base, self.three)))
+        self.assertFalse([key for key in control["environment"] if key.startswith("SPARKNET_ROCE_")])
 
     def sparknet(self):
         """The sparknet candidate on the example ring map, with its lock."""
@@ -253,32 +233,21 @@ class TopologyTest(unittest.TestCase):
             self.assertEqual(set(json.loads(env["SPARKNET_ROCE_PEER_HCAS"])),
                              {str((node["rank"] - 1) % 4), str((node["rank"] + 1) % 4)})
             self.assertEqual(env["SPARKNET_ROCE_GID_INDEX"], str(node.get("roce_gid_index", 3)))
-            self.assertFalse([k for k in env if k.startswith("B12X_ROCE_") or k in topology.B12X_VLLM_SETTINGS])
             self.assertNotIn("--disable-custom-all-reduce", spark.expected_command(cluster, node))
         self.assertEqual(spark.roce_gid_setting(cluster, self.four["nodes"][1])[0],
                          self.four["nodes"][1].get("roce_gid_index", 3))
 
-    def test_oneshot_refuses_b12x_settings_and_mismatched_images(self):
+    def test_oneshot_refuses_mismatched_settings_and_images(self):
         cluster, lock = self.sparknet()
-        for key, value in (("VLLM_ENABLE_ROCE_ALLREDUCE", "1"), ("B12X_ROCE_TOPOLOGY", "ring4"),
-                           ("VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB")):
-            changed = copy.deepcopy(cluster)
-            changed["environment"][key] = value
-            self.assertTrue(any(key in p for p in topology.problems(changed, self.four)), key)
         changed = copy.deepcopy(cluster)
         changed["environment"]["SPARKNET_ROCE_TOPOLOGY"] = "direct"
         self.assertTrue(any("SPARKNET_ROCE_TOPOLOGY" in p for p in topology.problems(changed, self.four)))
         changed = copy.deepcopy(cluster)
         changed["serve_args"].append("--disable-custom-all-reduce")
         self.assertTrue(any("custom all-reduce enabled" in p for p in topology.problems(changed, self.four)))
-        relay = spark.read_json("experiments/2026-10-02-rocenante-ring4/cluster.json")
-        relay["environment"]["SPARKNET_ROCE_SPIN_LIMIT"] = "1"
-        self.assertTrue(any("does not run sparknet" in p for p in topology.problems(relay, self.four)))
-        # A sparknet image serves only oneshot-*; oneshot-* needs that image.
-        b12x = copy.deepcopy(cluster)
-        b12x["fabric"]["transport"] = "rocenante-ring4"
-        self.assertTrue(any("serves sparknet's oneshot-* transports" in str(p)
-                            for p in spark.local_doctor(b12x, self.four, lock)))
+        self.ring["environment"]["SPARKNET_ROCE_SPIN_LIMIT"] = "1"
+        self.assertTrue(any("does not run sparknet" in p for p in topology.problems(self.ring, self.four)))
+        # oneshot-* needs an image with sparknet's collectives.
         older = spark.read_json("experiments/2026-10-04-streamed-embeddings/upstreams.lock.json")
         self.assertTrue(any("requires an image with" in str(p) for p in spark.local_doctor(cluster, self.four, older)))
 

@@ -115,13 +115,6 @@ context with 16 sequences, benchmarked at those limits, see
 1,048,576-token context with 8 sequences since r6x). The shapes differ only in their
 cabling (node map, transport, NCCL settings) and their memory sizing.
 
-Named [TP3/TP4 transport tuning profiles](experiments/2026-10-03-transport-profiles/README.md)
-keep B12X's measured RoCEnante limits and NCCL settings together.
-`bin/spark tuning show tp4` shows the B12X TP4 recipe; `tuning create`
-generates a complete B12X configuration for a site node map, with launch
-disabled. The promoted TileLang configuration is the recipe
-[config/cluster.json](config/cluster.json).
-
 This repository is being promoted from a forensic capture of the running cluster
 into its only operational source of truth. Until the transition checklist is
 complete, files are explicit about whether they describe observed state, desired

@@ -618,8 +618,8 @@ The TP4 1M shape on r6 (`tp4-ring` in `config/cluster.json`) is
 benchmarked at its limits: 62.4/76.0 tok/s prose/code at one stream,
 318.4/349.8 at sixteen, prefill 5.8k/5.5k/5.1k/4.4k tok/s at 32K/256K/500K/1M,
 at least 19.35 GiB available on every node. It needs no model-dimension
-padding (16 heads per rank). The B12X recipe (the `tp4` tuning profile, r5p)
-stays benchmarked in `experiments/2026-10-05-r5p-promotion`.
+padding (16 heads per rank). The B12X recipe (r5p) stays
+benchmarked in `experiments/2026-10-05-r5p-promotion`.
 
 - **Long prefill runs hot.** dgx1 and dgx2 reach 83 °C with 3-4 °C of reported
   headroom. The thermal guard aborted a 256K TP3 prefill on the restored
@@ -627,16 +627,13 @@ stays benchmarked in `experiments/2026-10-05-r5p-promotion`.
   (`experiments/2026-10-03-tp3-revalidation`), so it is not specific to TP4 or
   the relay; the cause is open. dgx3 stays near 67 °C.
 - **Collective policy:** sparknet's ring4 one-shot collectives for small
-  transfers (the TileLang family; B12X uses the RoCEnante neighbour relay) and
-  NCCL Ring with four channels for large ones
+  transfers (the TileLang family; B12X used the RoCEnante neighbour relay, now
+  retired) and NCCL Ring with four channels for large ones
   (`experiments/2026-10-03-collective-serving/decision.md`), enforced by vLLM
   0027.
 - **Report TP4 prefill at 32K, 256K, 500K and 1M** (the bench's 1M point is
   size 1,000,000; 1,048,576 exceeds the context once output is added and is
   skipped), beside TP3's 32K, 256K and 500K.
-- **Tuning profiles name B12X's controls.** `bin/spark tuning` reads B12X's
-  RoCEnante environment keys, so its two profiles stay B12X recipes pinned to
-  r5p. Teach it sparknet's keys and point the profiles at r6's recipes.
 - **Open:** sustained-load cooling and a long-context admission and retrieval
   check at 1M (the recipe's benchmark prefilled 1M once per repeat).
 - **Cabling decides the profile.** TP3 needs the dgx1-dgx2-dgx3 triangle and
@@ -645,8 +642,8 @@ stays benchmarked in `experiments/2026-10-05-r5p-promotion`.
   forth since 2026-10-02. Since PR #155 a start refuses a node map whose cable
   subnets do not match the live links, and any change of node count or shape
   without `--change-shape`; every `--apply` names its profile.
-- **Not selected, kept as experiments:** NIC-forwarded mesh4 and four fixed
-  paths (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
+- **Retired with RoCEnante:** NIC-forwarded mesh4 and four fixed paths; the
+  records stay (`experiments/2026-10-02-rocenante-mesh4`, `-mesh4-fourpaths`).
 - **A RoCE broadcast for adaptive verification.** Adaptive verification broadcasts
   rank 0's confidence snapshot every decode step through NCCL
   (`adaptive_verification.py`): the only NCCL collective on every decode step.
