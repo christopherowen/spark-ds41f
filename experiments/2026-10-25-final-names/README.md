@@ -6,14 +6,13 @@ renames the container, image, labels, `/opt` trees, `SPARK3_*` variables, caches
 memory service. This pass finds what is left, renames or deletes the live references, keeps
 history, and plans the B12X pieces serving still uses.
 
-- Base: origin/main 8ee6ce53, where the unit suite passes. The branch also applies to
-  `spark-ds41f-1025` at 6bd43b8d without conflicts. There the suite shows the same three
-  failures with and without this branch: that tip's TP4 benchmark reference,
-  `manifests/suites/2026-10-25-spark-ds41f-1025-tp4`, is not written yet (checked 2026-10-25,
-  16:45 CET).
-- Nothing ran on a GPU or a node: release freeze, and candidate 6's release comparison is on
-  the cluster until about 18:50 CET.
-- The counts and table below are taken at 1025's tip with this branch applied, outside
+- Base: main 39dd4fc8, with spark-ds41f-1025 promoted (#596) and deployed on the ring and the
+  triangle (#597, #603). The branch was first written on 8ee6ce53 and checked against the
+  promotion branch's work-in-progress tip (6bd43b8d); rebasing it onto main changed only the
+  lab's overlay functions, which #604 moved to `spark.host_path`. The unit suite passes.
+- Nothing on this branch ran on a GPU or a node. The direct loader's single-node checks on
+  dgx4 are #594's.
+- The counts and table below are taken at 39dd4fc8 with this branch applied, outside
   `experiments/`, `manifests/`, `results/`, `patches/` and the 2026-10-01 serving-audit snapshot
   (records, whose names stay as written).
 
