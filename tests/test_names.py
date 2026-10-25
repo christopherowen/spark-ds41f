@@ -146,5 +146,21 @@ class StartBesideAnotherEngineTest(unittest.TestCase):
         self.assertEqual(start_problems(self.new, ""), [])
 
 
+class RenamedRecipeTest(unittest.TestCase):
+    """The recipe of the release after spark-ds41f-1022 sets SPARK_DS41F_* variables, which an
+    image built before the rename never reads; its literal expected labels make a start (and
+    doctor --live) refuse such an image instead of serving it under the wrong names."""
+
+    def test_the_renamed_recipe_refuses_an_image_built_before_the_rename(self) -> None:
+        recipe = spark.read_cluster("config/cluster.json", "tp4-ring")
+        self.assertTrue(all(key.startswith(source_labels.PREFIX) for key in recipe["container"]["expected_labels"]))
+        old_image = {key.replace(source_labels.PREFIX, source_labels.LEGACY_PREFIX, 1): value
+                     for key, value in recipe["container"]["expected_labels"].items()}
+        problems = start_problems(recipe, "", image_labels=old_image)
+        self.assertEqual(len(problems), len(old_image), problems)
+        self.assertTrue(all("image label local.spark-ds41f." in p and "=None, expected" in p for p in problems))
+        self.assertEqual(start_problems(recipe, ""), [])
+
+
 if __name__ == "__main__":
     unittest.main()

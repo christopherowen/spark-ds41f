@@ -1369,11 +1369,11 @@ class OverlayArmTest(unittest.TestCase):
 
     def test_the_lab_reads_overlay_arms_resolved(self) -> None:
         files = {"arm.json": {"extends": {"config": "config/cluster.json", "shape": "tp4-ring"},
-                              "set": {"container": {"image": "vllm-ds41f-kkref:overlay"}}}}
+                              "set": {"container": {"image": "spark-ds41f:overlay"}}}}
         read = lab.spark.read_json
         with mock.patch.object(lab.spark, "read_json", lambda path: files[path] if path in files else read(path)):
             arm = lab.spark.read_cluster("arm.json")
-            self.assertEqual(arm["container"]["image"], "vllm-ds41f-kkref:overlay")
+            self.assertEqual(arm["container"]["image"], "spark-ds41f:overlay")
             self.assertTrue(arm["container"]["mounts"])
             files["profiled.json"] = {
                 "extends": {"config": "arm.json"},

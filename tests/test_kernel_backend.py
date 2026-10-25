@@ -480,6 +480,10 @@ class TileLangProfileLabelTest(unittest.TestCase):
         "experiments/2026-10-04-tilelang-1m/diagnostics/seqs12.json",
         "experiments/2026-10-04-tilelang-1m/diagnostics/seqs16-4k.json",
         "experiments/2026-10-04-tilelang-1m/diagnostics/shapes8.json",
+        # The release after spark-ds41f-1022: its candidates' recipes, copies of the renamed
+        # recipe on -1022-4's tree, which their arms extend with their own image and lock.
+        "experiments/2026-10-23-next-release/rc2/cluster.json",
+        "experiments/2026-10-23-next-release/rc3/cluster.json",
     }
 
     def test_tilelang_profiles_expect_their_manifest_trees(self):

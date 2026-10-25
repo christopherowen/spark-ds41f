@@ -60,8 +60,8 @@ and ends with a pytest-style summary for the lab's exit verdict.
 
 - **Clean environment.** The deployment's variables change what modules do at import:
   `VLLM_DS41_KERNEL_BACKEND=tilelang` makes every default `Scheduler` raise,
-  `SPARK3_DSPARK_COST_DIR` makes adaptive verification load pinned curves. Tests set what
-  they need (the kernel family through a fixture or `monkeypatch`), so the bundle exports
+  `SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1` makes the worker require the display carve-out.
+  Tests set what they need (the kernel family through a fixture or `monkeypatch`), so the bundle exports
   only `HF_HUB_OFFLINE=1`, `PYTHONPATH` and a TileLang cache directory.
 - **Offline, DS4.1 weights only, one GPU.** A test whose failure is exactly a missing resource
   (an uncached Hugging Face model or config, ray) is reported as skipped, naming it

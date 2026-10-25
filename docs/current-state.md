@@ -1,7 +1,25 @@
 # Current state
 
 Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
+**spark-ds41f-1024**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4, promoted
+2026-10-24 as [`2026-10-24-spark-ds41f-1024`](../manifests/baselines/2026-10-24-spark-ds41f-1024.json)
+([release record](../experiments/2026-10-23-next-release/README.md)): image
+`spark-ds41f:19f2c20ed4d6-next-4` (sha256:1ae57dac1017), spark-ds41f-1022's sources with vLLM
+0228-0265 (patch head `4cd21d89`, tree `97fc3579`). 0228 draws fresh random numbers in each
+block-verification round (vllm-project/vllm#61161); 0229-0254 move the CED row selection to
+TileLang and 0255 skips its nonfinal rows; 0256-0257 are the tokenizer's generation controls and
+the API's `thinking` switch (#447); 0258, 0261, 0263 and 0265 add GLP steering, off unless
+configured; 0262 reads `SPARK_DS41F_*` variables; 0264 scopes the sink log (#489). The recipe moves
+to the spark-ds41f names (container, image, labels, `/opt/spark-ds41f`, `/cache/spark-ds41f`,
+`spark-ds41f-kernel-memory`), sets the ring's long-prefill budget to 16,384, pins glibc malloc
+(#439) and reports prompt-cache hits (#469). Outputs are identical to spark-ds41f-1022's. Against
+spark-ds41f-1022 in one session: prefill +11.4% at 32K and +12.3% at 131K, decode and sampled
+streams level. Release tests: 2,105 passed. `tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-24-spark-ds41f-1024-tp4](../manifests/suites/2026-10-24-spark-ds41f-1024-tp4/);
+the triangle is not qualified on this image. spark-ds41f-1022's recipe and lock are frozen in
+`experiments/2026-10-23-next-release/1022` as the rollback.
+
+Before spark-ds41f-1024 production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
 2026-10-23 (the `tp3-triangle` shape on dgx1-dgx3 from 2026-10-22), promoted
 2026-10-22 as [`2026-10-22-spark-ds41f-1022`](../manifests/baselines/2026-10-22-spark-ds41f-1022.json)
 ([promotion record](../experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
@@ -152,14 +170,14 @@ pin on every node.
 
 Since r6x DSpark's verifier budgets drafts by a fixed linear step cost and times nothing,
 on both shapes. Before it, the verifier scheduled on cost curves timed on a boot. A profile
-without a pinned directory got its build's own (`bin/spark` derives `SPARK3_DSPARK_COST_DIR`
+without a pinned directory got its build's own (`bin/spark` derived `SPARK3_DSPARK_COST_DIR`
 from the image's source trees, code overlays, environment and serve arguments, all but the
 dev-mode RPC switch): a new build profiled itself on its first boot and reused its curves
 after. `tp3-triangle` did so from 2026-10-15; `tp4-ring` pinned r6h's curves
 (`ring4-r6h-headout-20261012`) through r6n and ran on its build's own from r6v.
 
 TP4 keeps the embedding and head in regular memory
-(`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`); TP3 keeps them in
+(`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=0`, `experiments/2026-10-12-r6h-loss`); TP3 keeps them in
 the display carve-out, which its KV budget needs. TP4's temperature-0 and greedy references
 are r6v's (3eab5112 / db25fde3, c9cf9dbe / c6bb4f4e), which r6x reproduces; TP3's are r6u's
 TP3 path (62313cb5 / 9742ac2c, 4d143977 / 12fd8257), which r6x at 1M reproduces.
@@ -196,7 +214,7 @@ B12X is the alternative backend in the same image.
 | Page-size profiles | 64 KiB selected; 4 KiB retains 2.2 GiB KV and a 262,144-token limit |
 | Output head | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`; B12X 0012, vLLM 0028), bit-identical to the checkpoint; FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`, the reference's `head_dtype`) |
 | Reference precision | the mHC stream projection in FP32 (three exact TF32 parts per weight), the shared expert's SwiGLU in FP32 with one rounding, MoE partials rounded once per rank; WO-A's FP8 activations are the known deviation left |
-| Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK3_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
+| Display carve-out | TP3 profiles (TP4 keeps both in regular memory, above): embedding and packed output-head weights in the firmware scanout reserve, loaded there directly (vLLM 0030) (`SPARK_DS41F_DISPLAY_CARVEOUT_WEIGHTS=1`, the GPU's DRM card by PCI path, `/dev/dri/by-path/pci-000f:01:00.0-card`, as `/dev/dri/card0`); the DRM file closes after the import, so the text console keeps drawing |
 | Sparse attention | TileLang sparse MLA with the MXFP4 indexer; BF16 attention (patch 0023) is available and off pending a fidelity test |
 | Image input | vision tower loaded; up to 4 images per request, the recipe's chosen limit, not the model's ([below](#images-per-request)); no host preprocessing cache |
 | DSpark | 5 draft tokens, draft TP 3, adaptive verification (r6u's TP3 path: cost scale 2.0; r6x: the row cost 0.035, nothing timed), dead verification rows below survival 0.2, block rejection; vocabulary-parallel greedy drafts over the checkpoint's BF16 drafter head (the target head's own tensor) and Markov projection; the drafter marks its padding rows for the MoE routers (vLLM 0042); cost curves profiled for this build with real rows (`build-75cd5b96c4ec4942`); greedy verification from vocabulary shards when no request needs the logits (vLLM 0112-0114) |
@@ -204,12 +222,13 @@ B12X is the alternative backend in the same image.
 | Profiling context | each KV cache group gets its own blocks, in every dummy layout (vLLM 0039, 0041) |
 | CUDA graphs | full, capture sizes 1-48 |
 | Engram projection | sharded across ranks (`projection_tp`) |
-| Engram rows | one native reader thread, rows of host-known tokens read before the step; disk shards on interleaved whole hash columns, joined by an all-gather; one bounded wait per table (`SPARK3_ENGRAM_ROWS_TIMEOUT_MS`, 10 s) |
+| Engram rows | one native reader thread, rows of host-known tokens read before the step; disk shards on interleaved whole hash columns, joined by an all-gather; one bounded wait per table (`SPARK_DS41F_ENGRAM_ROWS_TIMEOUT_MS`, 10 s) |
 | L2 weight prefetch | on (base default on SM121); TileLang scale words prefetched with each weight (vLLM 0044) |
 | B12X autotune | disabled |
 | FlashInfer autotune | disabled (`--no-enable-flashinfer-autotune`) |
 | Memory guards | 5 GiB startup (0.25 s), 3 GiB steady (2 s), each killing on its first sample below; an optional steady warn line (`host.memguard_warn_gib`, off) only logs; hosts set `vm.watermark_boost_factor=0` |
 | Async scheduling | enabled |
+| Prefix caching | enabled, 256-token blocks; cache reuse (`--enable-prefix-caching`) and cache reporting (`--enable-prompt-tokens-details`, `usage.prompt_tokens_details.cached_tokens` in every response) are separate switches, and without the second the key is absent while the cache still works |
 | Reasoning | enabled by default; a request's `thinking` or `enable_thinking` is honored |
 
 The release comparison against r6d is in the
