@@ -1730,3 +1730,27 @@ The owner accepted this as a compatibility change (2026-10-25):
 - a k > 32 path would never run in production.
 
 The release notes for the next release must state it.
+
+Results (run `tilelang-jit-monitor-ab`, off and warn alternating):
+
+| arm    | c1 distinct, tok/s | c8 distinct, tok/s | ready   |
+|--------|-------------------:|-------------------:|--------:|
+| off    |              95.29 |             192.26 |  88.6 s |
+| warn   |              95.17 |             191.72 | 102.4 s |
+| off-2  |              95.18 |             192.94 | 100.1 s |
+| warn-2 |              95.15 |             191.94 | 102.2 s |
+
+- **Outputs are identical:** both temperature-0 digests and the seeded temperature-1
+  digest match across all four arms.
+- **Cost:** the monitor costs 0.4% at c8 in both rounds (192.6 against 191.8 tok/s on
+  average). At c1 the difference is within the spread (+0.07%).
+- **Boot:** the first off boot's 14 s lead did not repeat; the second was 2 s faster.
+
+With nothing left for the monitor to catch, the candidate recipe turns it off.
+
+One control differed between rounds, in every pairing: penalties-sampled at c8. The other
+eleven are equal. Candidate 4 showed the same in serving check 6. Greedy controls and the
+seeded temperature-1 digest are stable, so this is a sampled-request effect common to both
+builds, not the ports'. Adaptive verification shares one draft budget across the batch,
+so a seeded sampled request's random draws can depend on which requests share its steps.
+That remains to be confirmed.
