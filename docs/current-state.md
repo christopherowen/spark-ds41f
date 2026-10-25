@@ -79,7 +79,8 @@ faster (sampled 3.0% and 4.5%), prefill level, one conversation at a time 74.1 t
 [manifests/suites/2026-10-19-karmic-kraken-r6x-tp4](../manifests/suites/2026-10-19-karmic-kraken-r6x-tp4/).
 On the triangle, `tp3-triangle` serves r6x at **1,048,576 tokens** since 2026-10-19
 ([experiments/2026-10-19-r6x-tp3-1m](../experiments/2026-10-19-r6x-tp3-1m/README.md)): a
-4.90625 GiB KV pool, 4,765,898 tokens (4.55 full 1M contexts), outputs identical to r6u's TP3
+4.90625 GiB KV pool that holds five full 1M contexts at once (vLLM's startup line: 4,765,898
+tokens, 4.55x; [KV capacity](memory-profiles.md#kv-capacity)), outputs identical to r6u's TP3
 path; its `benchmark_reference` is
 [manifests/suites/2026-10-19-karmic-kraken-r6x-tp3](../manifests/suites/2026-10-19-karmic-kraken-r6x-tp3/).
 r6v's recipe and lock are frozen in `experiments/2026-10-18-r6x/r6v` as the rollback.
@@ -228,7 +229,7 @@ B12X is the alternative backend in the same image.
 | Indexer under sequence parallelism | each rank scores and selects its own rows and all-gathers the top-k positions (patch 0025) |
 | B12X fixes (alternative backend) | indexer top-k ties by lowest logical position (B12X 0003); async-proxy fences before the TMA refill in the dense GEMM (0004) and in the BF16 and mHC prefill projections and contiguous attention (0005); W4A8 tiny decode off |
 | Explicit KV memory | 3.5 GiB per rank |
-| Reported KV capacity | 2,845,543 tokens (5.43x full 512K windows) |
+| Reported KV capacity | 2,845,543 tokens (5.43x full 512K windows); the pool holds seven full 512K contexts at once ([KV capacity](memory-profiles.md#kv-capacity)) |
 | Memory-saver | signed DKMS 0.4.1 on all nodes; loaded UVM leaf-table packing enabled |
 | Page-size profiles | 64 KiB selected; 4 KiB retains 2.2 GiB KV and a 262,144-token limit |
 | Output head | exact 12-bit packed BF16 (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`; B12X 0012, vLLM 0028), bit-identical to the checkpoint; FP32 logits (`VLLM_DS41_HEAD_DTYPE=float32`, the reference's `head_dtype`) |

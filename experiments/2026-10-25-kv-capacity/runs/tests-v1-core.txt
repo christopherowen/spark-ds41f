@@ -1,0 +1,21 @@
+# tests/v1/core on CPU (macOS arm64, torch 2.14.1), offline, 2026-10-25 15:00 CET (run-tests.sh)
+base 26382f5cf:        106 failed, 1395 passed, 1 warning, 2 errors in 226.23s (0:03:46)
+kv-capacity 44396b03b: 106 failed, 1399 passed, 1 warning, 2 errors in 226.56s (0:03:46)
+the same failing and erroring ids on both trees; their exceptions:
+   91 ModelConfig validation: a hub id not in the offline cache (Invalid repository ID)
+   12 huggingface_hub LocalEntryNotFoundError: an uncached snapshot
+    5 ModuleNotFoundError (CPU build: no vllm._C and similar modules)
+
+# 8bde1c48b (44396b03b's tests with the scheduler test asserting the lone prompt's exact peak):
+# test_kv_cache_utils.py -k 'ds41 or kpool_tail_capacity or swa_capacity or kimi_parallel_draft_full_depth':
+# 12 passed, 170 deselected in 83.63s
+#
+# the new and changed tests (test_kv_cache_utils.py), both trees; the Qwen-config test run
+# through a cached model's config (ModelConfig('facebook/opt-125m'), VLLM_ALLOW_LONG_MAX_MODEL_LEN=1)
+kv-capacity: test_ds41_ring_capacity_charges_unsettled_tokens_once[8192-8.18-11.48] PASSED
+kv-capacity: test_ds41_ring_capacity_charges_unsettled_tokens_once[16384-6.21-11.02] PASSED
+kv-capacity: test_kpool_tail_capacity_stays_one_block PASSED
+kv-capacity: test_swa_capacity_bounds_blocks_held_under_async_chunked_prefill PASSED
+kv-capacity: test_kimi_parallel_draft_full_depth_cache_admission (all parameters) PASSED
+kv-capacity: test_get_max_concurrency_for_kv_cache_config (new expectations) PASSED
+base:        test_get_max_concurrency_for_kv_cache_config (old expectations) PASSED
