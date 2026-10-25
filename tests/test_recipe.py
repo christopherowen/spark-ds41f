@@ -240,6 +240,32 @@ class RecipeTest(unittest.TestCase):
             self.assertEqual(resolved["environment"]["SPARK3_DSPARK_VOCAB_PARALLEL"], "1", arm)
             self.assertTrue(all(key.startswith("local.spark3.") for key in resolved["container"]["expected_labels"]))
 
+    def test_candidate_6_on_the_triangle_is_its_ring_arm(self):
+        """Candidate 6's triangle arm is its ring arm at tp3-triangle (one image, labels and
+        lock), so the triangle qualifies the build the ring did, at the recipe's TP3 sizing;
+        the owner's optional 6,144 budget arm changes only the budget and its threshold."""
+        rc6 = "experiments/2026-10-25-spark-ds41f-candidate/rc6"
+        spark = load_spark()
+        tp3, tp4 = (spark.read_cluster(f"{rc6}/rc-{shape}.json") for shape in ("tp3", "tp4"))
+        candidate = load("experiments/2026-10-25-spark-ds41f-candidate/cluster.json")
+        self.assertEqual({k: v for k, v in load(f"{rc6}/rc-tp3.json").items() if k != "notes"},
+                         {**{k: v for k, v in load(f"{rc6}/rc-tp4.json").items() if k != "notes"},
+                          "extends": {"config": "experiments/2026-10-25-spark-ds41f-candidate/cluster.json",
+                                      "shape": "tp3-triangle"}})
+        self.assertEqual(tp3["container"], tp4["container"])
+        self.assertEqual(tp3["upstreams_config"], tp4["upstreams_config"])
+        at_shape = recipe.resolve(candidate, "tp3-triangle")
+        self.assertEqual(tp3["serve_args"], at_shape["serve_args"])
+        self.assertEqual(tp3["environment"], at_shape["environment"])
+        self.assertEqual((argument(tp3, "--max-num-batched-tokens"), argument(tp3, "--long-prefill-token-threshold")),
+                         ("4096", "4048"))
+        budget = spark.read_cluster(f"{rc6}/budget-6144-tp3.json")
+        self.assertEqual({k for k in budget if budget[k] != tp3.get(k)}, {"serve_args"})
+        changed = {tp3["serve_args"][at - 1]: (old, new)
+                   for at, (old, new) in enumerate(zip(tp3["serve_args"], budget["serve_args"])) if old != new}
+        self.assertEqual(changed, {"--max-num-batched-tokens": ("4096", "6144"),
+                                   "--long-prefill-token-threshold": ("4048", "6096")})
+
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
         the hub's shared store, the snapshot served from inside it); an arm that sets

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Each node's memory once the arm serves (a lab extras script).
 
-usage: mem_snapshot.py URL --label LABEL
+usage: mem_snapshot.py URL --label LABEL [--container NAME]
 
 For every node of the production node map: MemAvailable from /proc/meminfo, and the
 serving container's own memory lines (weight loading, KV cache, CUDA graphs). One JSON line
 per node. Arms with the same KV settings compare by MemAvailable: the difference is what
-their weights and workspaces leave free.
+their weights and workspaces leave free. The log lines are the named container's: the arm's
+own (spark-ds41f since the rename), or they are the stopped production container's.
 """
 import argparse
 import json
@@ -28,11 +29,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("url")
     ap.add_argument("--label", required=True)
+    ap.add_argument("--container", default=CONTAINER, help="the serving container whose memory lines to read")
     args = ap.parse_args()
     for node in NODES:
         meminfo = run(node, "grep -E '^(MemAvailable|MemTotal):' /proc/meminfo")
         kib = {k: int(v) for k, v in re.findall(r"^(\w+):\s+(\d+) kB", meminfo, re.MULTILINE)}
-        logs = run(node, f"docker logs {CONTAINER} 2>&1 | grep -E 'Model loading took|KV cache|CUDA graph' | tail -6")
+        logs = run(node, f"docker logs {args.container} 2>&1 | grep -E 'Model loading took|KV cache|CUDA graph' | tail -6")
         print(json.dumps({
             "label": args.label, "node": node,
             "mem_available_gib": round(kib.get("MemAvailable", 0) / 2**20, 3),

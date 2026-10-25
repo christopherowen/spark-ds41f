@@ -5,8 +5,10 @@ each answer with the response's usage.sink_rejection, then the server's sink cou
 (/metrics) and each rank's last "Sink detector, rank" log line. `Say hi.` and `Thanks!`
 collapse on r6x (`How can\\n can`, `there\\n there's`); the other 14 answer normally.
 
-Usage: python3 probes.py BASE_URL [--max-tokens N] [--nodes dgx1,dgx2,dgx3] [--port P]
-Prints one JSON line per prompt, then {"summary": ...} (lab.py keeps stdout).
+Usage: python3 probes.py BASE_URL [--max-tokens N] [--nodes dgx1,dgx2,dgx3] [--port P] [--container NAME]
+Prints one JSON line per prompt, then {"summary": ...} (lab.py keeps stdout). The rank lines
+come from the serving container's log: name the arm's own (spark-ds41f since the rename), or
+they are the stopped production container's.
 """
 
 import argparse
@@ -37,10 +39,10 @@ def sink_counters(base: str) -> dict[str, float]:
             for line in lines if line.startswith("vllm:sink_")}
 
 
-def rank_lines(nodes: list[str]) -> dict[str, str | None]:
+def rank_lines(nodes: list[str], container: str) -> dict[str, str | None]:
     lines = {}
     for node in nodes:
-        logs = subprocess.run(["ssh", node, "docker", "logs", CONTAINER],
+        logs = subprocess.run(["ssh", node, "docker", "logs", container],
                               capture_output=True, text=True)
         found = [line for line in (logs.stdout + logs.stderr).splitlines()
                  if "Sink detector, rank" in line]
@@ -54,6 +56,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=300)
     parser.add_argument("--nodes", default="dgx1,dgx2,dgx3")
     parser.add_argument("--port", type=int, help="the arm's port, if not BASE_URL's (lab passes :8000)")
+    parser.add_argument("--container", default=CONTAINER, help="the serving container whose log holds the rank lines")
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
     if args.port:
@@ -81,7 +84,7 @@ def main() -> None:
         "flagged": [row["prompt"] for row in rows
                     if (row["sink_rejection"] or {}).get("flagged_rows")],
         "counters": sink_counters(base),
-        "ranks": rank_lines(args.nodes.split(",")),
+        "ranks": rank_lines(args.nodes.split(","), args.container),
     }
     print(json.dumps({"summary": summary}), flush=True)
 
