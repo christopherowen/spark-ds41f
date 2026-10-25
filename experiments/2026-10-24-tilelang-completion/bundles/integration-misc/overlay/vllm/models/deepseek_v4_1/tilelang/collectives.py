@@ -162,9 +162,10 @@ def rank_rows_kernel():
         rows: T.int32,
         packs: T.int32,
     ):
-        with T.Kernel(T.ceildiv(world * packs, threads), rows, threads=threads) as (
-            bx,
+        # Rows on the grid's x axis: a prefill gather's rows pass the y axis' 65535.
+        with T.Kernel(rows, T.ceildiv(world * packs, threads), threads=threads) as (
             r,
+            bx,
         ):
             T.import_source(_RANK_ROWS_HEADER)
             p = bx * threads + T.get_thread_binding()

@@ -8,7 +8,8 @@ The ports arm passes when its temperature-0 references (the eight prompts alone 
 long prompt) and its seeded temperature-1 reference have the same SHA-256 digests as
 the previous candidate's, and each arm is identical within itself. With
 controls_digest.py's records, each generation-control scenario's digests (alone and
-eight at once) are compared with the first arm's too.
+eight at once) are compared with the first arm's too, and with image_digest.py's, the
+image requests' digests, with the texts of any that differ.
 """
 import json
 import sys
@@ -30,6 +31,20 @@ def summary(run: str, stem: str, label: str) -> dict | None:
     return None
 
 
+def image_texts(run: str, label: str) -> dict:
+    """image_digest.py's texts by mode."""
+    path = ROOT / f"results/private/determinism/{run}/images-{label}.jsonl"
+    texts = {}
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if "texts" in record:
+            texts[record["mode"]] = record["texts"]
+    return texts
+
+
 def main(argv: list[str]) -> int:
     run, labels = argv[0], argv[1:]
     digests = {}
@@ -39,10 +54,12 @@ def main(argv: list[str]) -> int:
         c1 = summary(run, "c1-distinct", label)
         c8 = summary(run, "c8-distinct", label)
         controls = summary(run, "controls", label)
+        images = summary(run, "images", label)
         digests[label] = (
             greedy and (greedy["reference_sha256"], greedy["long_sha256"]),
             sampled and sampled["reference_sha256"],
             controls and controls["digests"],
+            images and images["digests"],
         )
         print(f"{label}:")
         print(f"  temperature 0: identical {greedy and greedy['identical']}, "
@@ -62,6 +79,16 @@ def main(argv: list[str]) -> int:
             differ = sorted(k for k in first[2] if digests[label][2].get(k) != first[2][k])
             print(f"  controls: {len(first[2]) - len(differ)}/{len(first[2])} equal"
                   + (f", DIFFER: {', '.join(differ)}" if differ else ""))
+        if digests[label][3] is not None and first[3] is not None:
+            differ = sorted(k for k in first[3] if digests[label][3].get(k) != first[3][k])
+            print(f"  images: {len(first[3]) - len(differ)}/{len(first[3])} equal"
+                  + (f", DIFFER: {', '.join(differ)}" if differ else ""))
+            theirs, ours = image_texts(run, labels[0]), image_texts(run, label)
+            for mode in differ:
+                for index, (a, b) in enumerate(zip(theirs.get(mode, []), ours.get(mode, []))):
+                    if a != b:
+                        print(f"    {mode} image {index}:\n      {labels[0]}: {a!r}"
+                              f"\n      {label}: {b!r}")
     return 0
 
 

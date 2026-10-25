@@ -1550,9 +1550,15 @@ case has no allowed list (the grammar's mask is in the logits), so it takes the 
 not run 19's allowed-ids read-back. The scan now stops at the first tile with a live
 column (below).
 
+The fourth serving check ran again after run 20 and its ports arm failed to start again,
+this time on a launch: the NCCL gathers' concatenation (c34cb748f) put rows on the grid's y
+axis, whose limit is 65535. The startup profile's 16K-token Engram all-gather has 98304
+rows of 256 columns. Run 20's test stopped at 49152 rows. vLLM 462b5028c puts rows on
+the x axis, there and in the column copies, and the test adds the profile's shape.
+
 ## Twenty-first integrated run (run `tilelang-integration-kernels-21`)
 
-vLLM `tilelang-ports` d9305407d completes the port: the last B12X compute on the serving
+vLLM `tilelang-ports` 462b5028c (d9305407d and the grid fix above) completes the port: the last B12X compute on the serving
 path and the image path's torch glue.
 - **The vision tower in TileLang** (870031916). Under the TileLang backend the ViT and
   the aligner launch TileLang kernels only; B12X is not imported. The checkpoint's

@@ -266,6 +266,8 @@ def _assert_same_bits(got, want):
     "shard, dtype",
     [
         ((8192 * 6, 256), torch.bfloat16),  # TP4 disk Engram columns, 8K prefill
+        # The profile run's 16K tokens: rows past the grid's y-axis limit (65535).
+        ((16384 * 6, 256), torch.bfloat16),
         ((17, 3, 2048), torch.bfloat16),
         ((5, 32320), torch.float32),  # vocab-parallel logits
         ((9, 20), torch.int64),

@@ -68,7 +68,8 @@ def copy_columns_kernel(width: int, dtype: str):
         dst: T.StridedTensor((dst_rows, width), (dst_stride, 1), dtype),
         rows: T.int32,
     ):
-        with T.Kernel(T.ceildiv(width, span), rows, threads=_THREADS) as (bx, row):
+        # Rows on the grid's x axis (no 65535 limit), column blocks on y.
+        with T.Kernel(rows, T.ceildiv(width, span), threads=_THREADS) as (row, bx):
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
             if col < width:
@@ -139,7 +140,7 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = 
         out2: T.Tensor((rows2, max(w2, vector)), dtype),
         rows: T.int32,
     ):
-        with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
+        with T.Kernel(rows, T.ceildiv(total, span), threads=_THREADS) as (row, bx):
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
             # The whole row's address inline in each call: bound to a variable it
