@@ -1662,3 +1662,39 @@ Triton `_copy_rows` of its GDS mode never runs.
 
 Run 22b reruns the mHC bundle alone (integration-mhc-22b.json), then the sixth serving
 check and the fourth inventory run follow (`~/spark-lab/run22b` on dgx1, "RUN22B DONE").
+
+Run 22b: the mHC bundle passed every test and gate.
+
+**The sixth serving check is the first in which the ports arm started and served.** It
+started in 100.5 s against candidate 4's 95.5 s (101.3 s for ports-2, 93.3 s for
+candidate4-2).
+- **Text outputs are identical to candidate 4.** The temperature-0 digests are equal in
+  all six scenarios (c8, staggered, mixed, cached, again, mixed15), and so is the seeded
+  temperature-1 digest.
+- **Controls:**
+  - Candidate 4 matches ports in all ten scenarios both builds completed: penalties,
+    penalties-sampled, bad words and the thinking budget, alone and at c8. Min-p and
+    logit bias are refused with speculative decoding on both.
+  - Candidate 4 stopped at logprob-ids with a server-side `IndexError`: the verified
+    tokens' logprob_token_ids bug the ports branch carries the 0267 fix for (71f794e16).
+  - Candidate 4's second round differed from ports and from its own first round in
+    penalties-sampled at c8. Ports matched itself in all 12 digests across both rounds.
+  - The prompt-logprobs scenario, run on ports only, completed.
+- **Images:**
+  - Both ports rounds give the same image digests, alone and at c4.
+  - They differ from candidate 4's, as expected: the TileLang vision tower follows
+    DeepSeek's reference arithmetic (torch's GELU, blocked K sums), where B12X does not
+    bit for bit.
+  - The texts read equally well. Both builds count the 7×7 and 14×14 grids right, and
+    both miss the wide image's 14 columns (13). On the tall one, ports reads 10×25 and
+    candidate 4 reads 10×24 (truth: 10 columns by 22 rows of 48-pixel cells, the last of each partial).
+- **Speed:**
+
+  | arm         | c1 distinct, tok/s | c8 distinct, tok/s |
+  |-------------|-------------------:|-------------------:|
+  | ports       |               95.1 |             191.49 |
+  | ports-2     |               95.2 |             192.04 |
+  | candidate 4 |              93.18 |             190.88 |
+  | candidate4-2 |             93.16 |             191.13 |
+
+  Ports is +2.1% at c1 and +0.3-0.5% at c8.
