@@ -135,7 +135,12 @@ def test_rank_calls_are_prepared_for_both_token_id_types():
         logprob.register_topk_scores_warmup(
             logits=[(torch.float32, 129280)], vocab_size=129280, logits_mode=True
         )
-    calls = prepare.declared_calls(registry)
+    # The ranks' two calls (one a token id type); the top-k ids declare theirs too.
+    calls = [
+        call
+        for call in prepare.declared_calls(registry)
+        if call[0] is tilelang_logprob.ranks_kernel
+    ]
     assert len(calls) == 2
     prepare.prepare_declared(registry)
     logits = torch.randn(3, 129280, device="cuda")

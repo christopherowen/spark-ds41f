@@ -1497,3 +1497,47 @@ in the same driver (`~/spark-lab/integration19` on dgx1, "INTEGRATION19 DONE"):
   the request inventory again at this build. The image scenario now profiles an image
   the encoder cache has not seen, so the vision tower (still B12X; its port is in
   progress) is in the profile, and kernels are named TileLang only positively.
+
+### Nineteenth integrated run (2026-10-25 02:44 CET)
+
+mHC passed: the model-forward, router, CED and sequence-parallel tests, every Engram test
+(the hash and gate reading the sentinel from the ids, the layer planes, the reader's
+compact columns) and the Engram model tests on B12X. Misc passed every logprob test and
+both new gates, failing only a declaration test. Both new kernels are far ahead of what
+they replace, at every size:
+
+| Kernel, µs (TileLang / before) | 1 row | 16 rows | 96 rows |
+|---|---|---|---|
+| log-softmax, FP32, k 20 (Triton) | 24.8 / 91.7 | 25.7 / 92.5 | 197.2 / 351.4 |
+| log-softmax, BF16, k 20 (Triton) | 20.4 / 86.4 | 20.5 / 86.7 | 51.6 / 165.1 |
+| top-k ids, FP32, k 20 (torch.topk) | 26.0 / 55.4 | 27.1 / 93.4 | 214.1 / 1157.8 |
+| top-k ids, BF16, k 20 (torch.topk) | 25.9 / 40.0 | 26.8 / 70.0 | 74.0 / 344.6 |
+
+The failures (vLLM 98f24cd85 fixes them):
+- **dgx1, the column kernels did not compile.** The split bound the row's address to a
+  variable, which TileLang declares `void*` from a read-only (const) buffer; nvcc refuses
+  it. The address now passes inline, and the 16-byte helpers take const destinations.
+  `copy_columns`, the zero fill, CED's kernels and NCCL's concatenation passed.
+- **Host tests reaching the ports' launches on CPU tensors:** adaptive verification's
+  confidence-snapshot test (the row scatter) and DSpark's sequential Markov test (the
+  hidden-row gather). They stub the launches with torch, as other host tests do.
+- **dgx2, the rank declaration test** counted every call `register_topk_scores_warmup`
+  declares; the top-k ids now declare theirs too. It counts the rank calls only.
+- **dgx4, the auxiliary gate:** logit bias with an allowed list, min tokens and restore
+  (the structured min-tokens case) at 96 rows was 221.3 µs against Triton's 219.4 µs,
+  0.9% behind, the interval excluding zero. Runs 16 to 18 measured the same lean
+  (0.5–1.5 µs) inside the noise. With an allowed list the restore check now reads back
+  only the allowed ids: every other column is the fill's -inf, or -inf or NaN where a
+  bias met it, so the second pass over the row is gone. A new test covers biases on ids
+  outside the list (+inf, -inf, NaN, finite) against Triton's kernel.
+
+The fourth serving check booted the ports arm with run 19's build, whose column kernels
+are declared at startup; it was stopped before the request inventory.
+Its ports arm failed to start on that compile error (vLLM's kernel preparation compiles
+every declared kernel at startup), and the window restored production.
+
+## Twentieth integrated run (run `tilelang-integration-kernels-20`)
+
+vLLM `tilelang-ports` 98f24cd85: run 19's fixes above. The same bundles; then the fourth
+serving check and the second request inventory again, on this build
+(`~/spark-lab/integration20` on dgx1, "INTEGRATION20 DONE").

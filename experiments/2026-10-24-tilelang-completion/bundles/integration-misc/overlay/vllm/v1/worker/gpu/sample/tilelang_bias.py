@@ -73,7 +73,9 @@ def bias_kernel(
     its loads and predicates its stores; with ``run`` 4 (16-byte aligned rows, the
     launch checked) the whole tiles are filled and read as vectors in Triton's
     layout. As Triton's maximum, the scan ignores NaN: a row is alive when some
-    logit is above -inf."""
+    logit is above -inf. A row with an allowed list reads back only its allowed ids:
+    every other column is the fill's -inf, or -inf or NaN where a bias met it, so
+    they decide the scan's answer without the row's second pass."""
     rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols = T.dynamic(
         "rows, states, allowed_cols, bias_cols, bias_ids_cols, stop_cols"
     )
@@ -158,6 +160,7 @@ def bias_kernel(
             # Whether this row restores its stop tokens when nothing else is left.
             keep = T.alloc_var(T.int32, init=restore_row[req] if restore else 0)
             ids = T.alloc_local((per,), "int32")
+            allowed_ids = T.alloc_local((per,), "int32")
             values = T.alloc_local((per,), "float32")
             extra = T.alloc_local((per,), "float32")
             row_values = T.alloc_local((row_per,), "float32")
@@ -169,6 +172,8 @@ def bias_kernel(
                     ids[k] = load_if(
                         "int32", T.address_of(allowed[req, col]), 0, col < n_allowed
                     )
+                for k in T.unroll(per):
+                    allowed_ids[k] = ids[k]
                 for k in T.unroll(per):
                     values[k] = load_if(
                         "float32",
@@ -236,7 +241,19 @@ def bias_kernel(
                 if keep != 0:
                     T.sync_threads()
                     alive[0] = 0
-                    scan_row(logits, row, tx, row_values, alive)
+                    if n_allowed > 0:
+                        for k in T.unroll(per):
+                            seen = load_if(
+                                "float32",
+                                T.address_of(logits[row, allowed_ids[k]]),
+                                -T.infinity("float32"),
+                                k * _THREADS + tx < n_allowed,
+                            )
+                            alive[0] = alive[0] | T.cast(
+                                seen > -T.infinity("float32"), "int32"
+                            )
+                    else:
+                        scan_row(logits, row, tx, row_values, alive)
                     alive[0] = alive[0] | T.shfl_xor(alive[0], 16)
                     alive[0] = alive[0] | T.shfl_xor(alive[0], 8)
                     alive[0] = alive[0] | T.shfl_xor(alive[0], 4)

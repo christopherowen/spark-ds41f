@@ -106,6 +106,12 @@ def test_confidence_snapshot_agrees_before_cpu_and_gpu_budgeting(
     monkeypatch.setattr(adaptive_module, "gpu_sync_allowed", nullcontext)
     monkeypatch.setattr(adaptive_module.torch.cuda, "current_stream", lambda _: None)
     monkeypatch.setattr(adaptive_module, "stream", lambda *_: nullcontext())
+
+    def scatter_rows(idx_mapping, source, state, gather=False):
+        """The TileLang row scatter (its own GPU test) as torch, on the host."""
+        state[idx_mapping, : source.shape[1]] = source
+
+    monkeypatch.setattr(adaptive_module.tilelang_inputs, "scatter_rows", scatter_rows)
     batch = SimpleNamespace(num_reqs=1, idx_mapping=torch.tensor([0]))
 
     # Two records expose the completed previous-step snapshot to CPU selection.

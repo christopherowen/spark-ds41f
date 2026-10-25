@@ -33,13 +33,15 @@ _PASS = {
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
 }
 
+# The destinations are const-qualified pointers: TileLang declares a buffer written
+# only through these calls read-only.
 _HEADER = r"""
-__device__ __forceinline__ void vllm_columns_b128(void* d, const void* s) {
-  *reinterpret_cast<uint4*>(d) = *reinterpret_cast<const uint4*>(s);
+__device__ __forceinline__ void vllm_columns_b128(const void* d, const void* s) {
+  *reinterpret_cast<uint4*>(const_cast<void*>(d)) = *reinterpret_cast<const uint4*>(s);
 }
 
-__device__ __forceinline__ void vllm_columns_zero_b128(void* d) {
-  *reinterpret_cast<uint4*>(d) = make_uint4(0u, 0u, 0u, 0u);
+__device__ __forceinline__ void vllm_columns_zero_b128(const void* d) {
+  *reinterpret_cast<uint4*>(const_cast<void*>(d)) = make_uint4(0u, 0u, 0u, 0u);
 }
 """
 
@@ -140,13 +142,22 @@ def split_columns_kernel(widths: tuple[int, int, int], dtype: str, join: bool = 
         with T.Kernel(T.ceildiv(total, span), rows, threads=_THREADS) as (bx, row):
             T.import_source(_HEADER)
             col = bx * span + T.get_thread_binding() * vector
-            whole = T.address_of(src[row, col])
+            # The whole row's address inline in each call: bound to a variable it
+            # is declared void* from a read-only (const) buffer, which nvcc refuses.
             if col < w0:
-                _move(T.address_of(out0[row, col]), whole, join)
+                _move(T.address_of(out0[row, col]), T.address_of(src[row, col]), join)
             elif col < w0 + w1:
-                _move(T.address_of(out1[row, col - w0]), whole, join)
+                _move(
+                    T.address_of(out1[row, col - w0]),
+                    T.address_of(src[row, col]),
+                    join,
+                )
             elif col < total:
-                _move(T.address_of(out2[row, col - w0 - w1]), whole, join)
+                _move(
+                    T.address_of(out2[row, col - w0 - w1]),
+                    T.address_of(src[row, col]),
+                    join,
+                )
 
     return split_columns
 
