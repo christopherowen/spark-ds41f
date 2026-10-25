@@ -1,0 +1,37 @@
+{
+ "name": "c1-acceptance",
+ "version": 1,
+ "description": "The single-stream suite's prompts at one stream: every prompt once, greedily, with the speculative-decoding counters per draft position read before and after (model), then the single-stream closed loop (c1). With every draft verified, accepted / drafted at position k is the drafter's survival P(a >= k) on the text the release generates; temperature-0 text does not depend on the verification policy.",
+ "steps": [
+  {
+   "id": "model",
+   "command": "model",
+   "args": {
+    "concurrency": 1,
+    "max_tokens": 256,
+    "top": 20,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    },
+    "no_score": true
+   }
+  },
+  {
+   "id": "c1",
+   "command": "run",
+   "args": {
+    "mode": "closed",
+    "concurrency": 1,
+    "warmup": 60,
+    "duration": 300,
+    "extra_body": {
+     "chat_template_kwargs": {
+      "thinking": false
+     }
+    }
+   }
+  }
+ ]
+}
