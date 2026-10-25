@@ -1,28 +1,43 @@
 #!/usr/bin/env python3
-"""Write the softmax fix's kernel-lab bundles and its serving arm.
+"""Write the softmax fix's kernel-lab bundles, its serving arm and the serving check.
 
-usage: make_bundles.py VLLM_REPO BASE HEAD
+usage: make_bundles.py VLLM_REPO BASE HEAD [--candidate-arm ARM]
 
-Every file the vLLM branch changes between BASE (the release candidate's source,
-tilelang-ports 26382f5cf, which image -next-5 holds) and HEAD goes into each bundle:
-package files under overlay/vllm (the lab mounts them over the image's tree), tests
-and benchmarks as mounts. Each bundle also carries BASE's tilelang_logprob.py and
-tilelang_rejection.py at /b/release, the baseline the gated benchmarks time the fix
-against (--baseline /b/release), besides Triton's. The package files also go to
-bundles/serving/overlay, and softmax-tp4.json is the serving arm that mounts them
-over the candidate (experiments/2026-10-25-spark-ds41f-candidate/rc-tp4.json).
+Every file the vLLM branch changes between BASE (spark-ds41f-1025's package tree,
+tilelang-ports 26382f5cf, which image -next-6 holds with two test patches) and HEAD
+goes into each bundle: package files under overlay/vllm (the lab mounts them over the
+image's tree), tests and benchmarks as mounts. Each bundle also carries BASE's
+tilelang_logprob.py and tilelang_rejection.py at /b/release, the baseline the gated
+benchmarks time the fix against (--baseline /b/release), besides Triton's.
+
+softmax-serving.json compares a candidate with spark-ds41f-1025 at tp4-ring
+(experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json, labelled "release").
+With ``--candidate-arm``, the candidate is that arm (a release candidate that carries
+the fix); without it, softmax-tp4.json, which mounts the package files
+(bundles/serving/overlay) over spark-ds41f-1025: the fix alone.
 """
+import argparse
 import json
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 EXPERIMENT = "experiments/2026-10-25-softmax-fix"
 ROOT = "/opt/spark-ds41f/candidate/vllm"
-IMAGE = "spark-ds41f:19f2c20ed4d6-next-5"
-CANDIDATE = "experiments/2026-10-25-spark-ds41f-candidate/rc-tp4.json"
+IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
+RELEASE_ARM = "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"
+# The serving check's extras: the determinism gate with and without logprobs, the
+# seeded temperature-1 digest, and the logprobs near 0 position by position.
+EXTRAS = [
+    ["experiments/2026-10-12-r6g/token_determinism_text.py",
+     ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"],
+    ["experiments/2026-10-12-r6g/token_determinism_text.py",
+     ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"], "greedy"],
+    ["experiments/2026-10-24-tilelang-completion/sampled_digest.py", ["--tokens", "192"],
+     "sampled"],
+    ["logprob_margins.py", ["--tokens", "256"], "logprobs"],
+]
 FIXTURES = HERE.parent / "2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 RELEASE = {
     "release_tilelang_logprob.py": "vllm/v1/worker/gpu/sample/tilelang_logprob.py",
@@ -136,7 +151,14 @@ def write_overlay(repo: str, head: str, changed: list[str], bundle: Path) -> Non
 
 
 def main() -> None:
-    repo, base, head = sys.argv[1:4]
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("repo")
+    parser.add_argument("base")
+    parser.add_argument("head")
+    parser.add_argument("--candidate-arm", metavar="ARM",
+                        help="a release candidate's arm that carries the fix")
+    args = parser.parse_args()
+    repo, base, head = args.repo, args.base, args.head
     head_commit = git(repo, "rev-parse", "--short=9", head).strip()
     base_commit = git(repo, "rev-parse", "--short=9", base).strip()
     status = git(repo, "diff", "--name-status", base, head).split("\n")
@@ -165,7 +187,7 @@ def main() -> None:
         candidate = {
             "description": (
                 f"The softmax fix (vLLM branch softmax-fix {head_commit}, {len(changed)} "
-                f"files over the release candidate's {base_commit}) on image -next-5: "
+                f"files over spark-ds41f-1025's {base_commit}) on image -next-6: "
                 f"{what}; GPU tests against FP64 references, then the gated benchmarks "
                 f"against the release's TileLang kernels and against Triton's."),
             "image": IMAGE,
@@ -202,15 +224,30 @@ def main() -> None:
                for path in changed if path.startswith("vllm/")]
     arm = {
         "notes": (f"The softmax fix (vLLM branch softmax-fix {head_commit}) mounted over "
-                  "the release candidate (candidate 5, tilelang-ports 26382f5cf) at "
-                  "tp4-ring: logprobs by Barron et al.'s Eq. 5, block verification from "
-                  "logs. Text at temperature 0 must equal the candidate's; logprobs move "
-                  "by design."),
-        "extends": {"config": CANDIDATE},
+                  "spark-ds41f-1025 (tilelang-ports 26382f5cf) at tp4-ring: logprobs by "
+                  "Barron et al.'s Eq. 5, block verification from logs. Text at "
+                  "temperature 0 must equal the release's; logprobs move by design."),
+        "extends": {"config": RELEASE_ARM},
         "set": {"container": {"mounts": mounts}},
     }
     (HERE / "softmax-tp4.json").write_text(json.dumps(arm, indent=1) + "\n")
     print(f"serving: {len(mounts) - 1} package files of {head_commit}")
+
+    # The candidate first (heat soak never counts against it), then the release.
+    candidate_arm = (
+        {"config": args.candidate_arm, "label": "candidate"} if args.candidate_arm
+        else {"config": "softmax-tp4.json", "label": "softmax"})
+    serving = {
+        "experiment": EXPERIMENT,
+        "run": "softmax-fix-serving",
+        "jobs": [
+            {"kind": "sync"},
+            {"kind": "measure", "profile": "lean", "bench": False, "extras": EXTRAS,
+             "arms": [candidate_arm, {"config": RELEASE_ARM, "label": "release"}]},
+        ],
+    }
+    (HERE / "softmax-serving.json").write_text(json.dumps(serving, indent=1) + "\n")
+    print(f"serving check: {candidate_arm['config']} against {RELEASE_ARM}")
 
 
 if __name__ == "__main__":

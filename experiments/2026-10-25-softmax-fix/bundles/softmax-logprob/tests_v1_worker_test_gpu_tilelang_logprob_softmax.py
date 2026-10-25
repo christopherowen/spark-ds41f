@@ -19,9 +19,9 @@ release's TileLang port matched it bit for bit):
 
 FP32 and bf16 logits; rows at 16-byte addresses and strides (Triton's 16-byte runs),
 at an odd stride and at a base past 16 bytes (one element a thread); the DeepSeek
-V4.1 vocabulary, a tensor-parallel shard and odd widths; 0 to 2100 requested tokens;
-rows of infinities, NaN, ties, signed zeros, extreme and subnormal magnitudes, and
-exponentials that underflow to subnormals. Then the call sites:
+V4.1 vocabulary, a tensor-parallel shard, odd widths and whole steps of the kernel's
+reads; 0 to 2100 requested tokens; rows of infinities, NaN, ties, signed zeros,
+extreme and subnormal magnitudes, and exponentials that underflow to subnormals. Then the call sites:
 ``compute_token_logprobs`` and ``compute_topk_scores`` launch the TileLang kernel
 only, a CUDA graph replays it, and the runner declares the calls it launches."""
 
@@ -293,9 +293,17 @@ def _check(logits: torch.Tensor, ids: torch.Tensor, what: str) -> torch.Tensor:
 # --- Accuracy -----------------------------------------------------------------
 
 
+# Besides DeepSeek V4.1's widths and odd ones, whole steps with no guarded one: a
+# step is 1024 threads x 2 loads x a run of 1 (2048 columns), 4 FP32 (8192) or 8
+# bf16 (16384).
+STEPS = (2048, 8192, 16384)
+
+
 @pytest.mark.parametrize("case", CASES)
 @pytest.mark.parametrize(
-    "vocab", [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391], ids=lambda v: f"v{v}"
+    "vocab",
+    [VOCAB, SHARD, 1, 7, 1023, 1025, 8193, 16391, *STEPS],
+    ids=lambda v: f"v{v}",
 )
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
