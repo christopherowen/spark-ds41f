@@ -145,7 +145,7 @@ def main():
         for mb in (18, 55, 110, 220):
             bufs = [torch.ones((mb << 20) // 4, dtype=torch.float32, device=DEVICE) for _ in range(8)]
             outs = [torch.empty((), dtype=torch.float32, device=DEVICE) for _ in bufs]
-            us, us_min = timed([lambda b=b, o=o: torch.sum(b, out=o) for b, o in zip(bufs, outs)], flush)
+            us, us_min = timed([lambda b=b, o=o: torch.sum(b, dim=0, out=o) for b, o in zip(bufs, outs)], flush)
             print(json.dumps({"case": "read", "mib": mb, "us": round(us, 2),
                               "gbs": round((mb << 20) / us / 1e3, 1),
                               "gbs_best": round((mb << 20) / us_min / 1e3, 1)}), flush=True)
