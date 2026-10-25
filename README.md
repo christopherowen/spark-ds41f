@@ -3,8 +3,9 @@
 Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node or four-node DGX Spark fabric.
 
-Production is **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
-profile on the ring ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
+Production is **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the three-node TP3 1M
+profile on the triangle the site is cabled as, and qualified on the four-node TP4 1M profile on
+the ring as well ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
 [release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). The release name is
 the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1022 with
 every serving kernel in TileLang (except NCCL and a few rare-path ATen copies), the CED row
@@ -20,6 +21,9 @@ vision tower follows DeepSeek's reference arithmetic) and score the same on publ
 most 32 top logprobs are served (the default is 20). Against spark-ds41f-1022 in one session: prefill is 11.8-13.9% faster from
 32K to 1M (the 16,384 budget with the CED skip), decode grid steps are 2.4% shorter, and c16,
 c8, Poisson and one-stream throughput are the same (75.3 tok/s at one stream, 194.9 at eight).
+On the triangle, with its budget doubled to 8,192: prefill 25.5-28.2% faster from 32K to 500K
+and 22.5% at 1M, decode grid steps 1.65% shorter, and the rest the same (60.5 tok/s at one
+stream, 154.7 at eight).
 spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`.
 
 Before spark-ds41f-1025, production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4

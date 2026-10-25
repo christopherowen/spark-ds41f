@@ -1,7 +1,9 @@
 # Current state
 
-Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4, promoted
+Production is **spark-ds41f-1025** ([config/cluster.json](../config/cluster.json)), serving
+DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. Since the evening of 2026-10-25 it runs the
+`tp3-triangle` shape on dgx1-dgx3, the cabling the site has; it was qualified on the
+`tp4-ring` shape (dgx1-dgx4) first and served there from 18:31. It was promoted
 2026-10-25 as [`2026-10-25-spark-ds41f-1025`](../manifests/baselines/2026-10-25-spark-ds41f-1025.json)
 ([release record](../experiments/2026-10-25-spark-ds41f-candidate/README.md),
 [release notes](../experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)): image
@@ -27,8 +29,13 @@ Against spark-ds41f-1022 in candidate 6's release comparison (one session, 2026-
 identical, teacher-forced KL 0.
 `tp4-ring`'s `benchmark_reference` is
 [manifests/suites/2026-10-25-spark-ds41f-1025-tp4](../manifests/suites/2026-10-25-spark-ds41f-1025-tp4/)
-(candidate 6's first arm of its release comparison); the triangle is not qualified on this
-image. spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`
+(candidate 6's first arm of its release comparison). `tp3-triangle` runs an 8,192-token
+prefill budget (spark-ds41f-1022: 4,096), and its `benchmark_reference` is
+[manifests/suites/2026-10-25-spark-ds41f-1025-tp3](../manifests/suites/2026-10-25-spark-ds41f-1025-tp3/)
+(candidate 6's arm of its two-arm TP3 comparison). Against spark-ds41f-1022 on the triangle:
+prefill +25.5% to +28.2% from 32K to 500K and +22.5% at 1M; decode grid -1.65% (better); c8,
+c4, Poisson and one stream the same; greedy 256/256 identical, KL 0. The 4 KiB-page triangle
+is not qualified on this image. spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`
 as the rollback.
 
 Before spark-ds41f-1025 production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since

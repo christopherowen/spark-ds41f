@@ -13,7 +13,9 @@ published release benchmark. Promotion needs the owner's go.
 - **Boot memory service:** `spark-ds41f-kernel-memory` replaced `spark3-kernel-memory` and is
   active on every node.
 - **First-prefill probe** (step 5b, below): a fresh boot's first long prefill costs about 0.1 s, once.
-- **Not qualified yet:** the triangle on this image (#582, after the re-wire).
+- **The triangle (2026-10-25, after the owner's re-wire):** qualified at an 8,192 budget and
+  promoted on TP3 ([The triangle's results](#the-triangles-results-2026-10-25)). The 4 KiB-page
+  triangle stays unqualified.
 
 The sections below record how the candidate got there.
 
@@ -756,3 +758,59 @@ What 8,192 buys and costs:
 
 Not changed: the pool and the 5/3 GiB guards. The arena fix addresses the growth, and the pool is
 a capacity choice. A smaller pool at 8,192 is the owner's choice if the fit check falls short.
+
+## The triangle's results (2026-10-25)
+
+The owner re-cabled the four-node ring into the dgx1-dgx2-dgx3 triangle at about 18:45 CET; dgx4
+stays out. On dgx1 and dgx3, `40-cx7.yaml` moved the dgx1-dgx3 link to 10.13.x, the cabling
+LLDP reports (dgx-spark-fleet 8b235dd). All twelve path directions passed plain and jumbo
+pings, and GID 3 is RoCE v2 IPv4 on every port. Production on the triangle was spark-ds41f-1022
+TP3 from 18:51 until this promotion.
+
+**The fit check at 8,192** (run `candidate-6-prefill-tp3`, 19:02-19:29 CET) passed all three
+criteria:
+- the boot passed dgx1's 5 GiB startup guard: ready in 110.7 s, cold, compiles included;
+- dgx1's lowest MemAvailable through three cold 1M prefills was 6.67 GiB (dgx2 7.53, dgx3 7.94;
+  no halt), against the sweep's 4.57;
+- the KV line read 4,009,281 tokens, as planned.
+
+Prefill ran 1-3% above the 2026-10-19 sweep's 8,192 arm: 5,631 / 5,645 / 5,338 / 4,823 tok/s at
+32K / 131K / 262K / 500K, and 3,952 at 1M (three cold runs, ±0.6%). The step beside a cold 131K
+prefill was 1.44 s, level with the sweep.
+
+**Qualification** (run `candidate-6-tp3`, 19:31-20:12 CET) passed every criterion:
+- **Determinism:** temperature-0 outputs identical to spark-ds41f-1022's on the triangle in all six
+  scenarios, mixed15 included: `62313cb5` / `9742ac2c`, `4d143977` / `12fd8257`.
+- **Distinct streams:** 8 and 4 streams at 151.8 / 115.7 tok/s.
+- **Time to first token:** 145 ms isolated; p50 262 / 347 ms at 4 / 8 streams (1022: 148, 266,
+  355).
+- **Controls:** control spellings plain in all eight places; the controls probe passes; logprob
+  ids and prompt logprobs give one digest alone and at eight streams.
+- **Images:** one digest alone and at four.
+- **Sink:** zero flags on ordinary text; `Say hi.`, `Thanks!` and `ok` corrected, every rank agreeing.
+- **Memory serving:** 7.36 / 8.52 / 8.52 GiB (1022: 6.54 / 7.93 / 8.14).
+- **Startup:** 246 TileLang calls prepared in 11.4 s; no B12X or JIT lines.
+
+**The release comparison** (run `candidate-6-release-tp3`, 19:52-21:47 CET; suites release-tp3
+version 1, single-stream and sampled). It ran two arms, candidate 6 then spark-ds41f-1022: the
+owner shortened it, since the same build's repeat had been measured on the ring that afternoon
+(throughput within 0.3%, grid 1.1%). The verdicts are the intervals alone, no repeat column. The
+stop came after 1022's sampled c16, so sampled c8 and c1 exist for candidate 6 only.
+
+| Metric | 1022 → candidate 6 | ±95% | Verdict |
+| --- | ---: | ---: | --- |
+| Greedy responses (256), teacher-forced KL | identical, 0 | | same |
+| Decode grid, geometric mean of 15 shapes | -1.65% | 0.16% | better |
+| c8 / c4 output tok/s | +0.22% / +0.59% | 1.34 / 1.99% | same |
+| Poisson 0.42/s output tok/s | -0.03% | 22.29% | same |
+| Prefill 32,768 / 131,072 / 262,144 / 500,000 | +26.1% / +28.2% / +26.8% / +25.5% | 0.3-0.7% | better |
+| One stream (c1) output tok/s | +1.85% (60.5 against 59.4) | 7.06% | same |
+| Sampled c16 output tok/s | +0.72% | 1.43% | same |
+
+**1M on the triangle** (release-tp3 version 1 stops at 500K; version 2 in #600 prefills to 1M as
+the ring does): 1022 measured three cold 1M prefills on production after the comparison (21:52-22:09
+CET, under a hold) at 3,225.5 tok/s (±0.35%). Against candidate 6's fit-check 3,952.3 the same
+evening, that is +22.5%. These are two runs, not one session.
+
+The suite references are candidate 6's arm: `manifests/suites/2026-10-25-spark-ds41f-1025-tp3`
+(`-single-stream`, `-sampled`), with the two-arm tables as `release-table.txt`.

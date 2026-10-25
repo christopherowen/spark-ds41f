@@ -26,6 +26,22 @@ candidate 5's release tests asked for (vLLM 0489-0490; package files unchanged).
 | KV capacity | vLLM's startup figure: 6,512,700 tokens, 6.21 full 1M contexts (the 16,384 budget's; 8.18 at 8,192). The figure charges every request the unsettled batches; the corrected count (#586, next release) is 11.02 full 1M contexts at 16,384 |
 | Speed against spark-ds41f-1022 (one session, verdicts against the repeat) | prefill +11.8% to +13.9% from 32K to 1M; decode grid -2.38% (better); c16, c8, Poisson and one stream the same (+0.1%, +0.9%, +0.0%, +2.1%); sampled the same; greedy 256/256 identical, KL 0 |
 
+## Results (2026-10-25, the triangle)
+
+The owner re-cabled to the dgx1-dgx2-dgx3 triangle the same evening. tp3-triangle ships with an
+8,192-token prefill budget (spark-ds41f-1022: 4,096); the fit check passed with dgx1 at 6.67 GiB
+lowest through three cold 1M prefills. Details are in the
+[release record](README.md#the-triangles-results-2026-10-25).
+
+| Check | Result |
+| --- | --- |
+| Temperature-0 outputs | identical to spark-ds41f-1022's on the triangle in all six scenarios: `62313cb5` / `9742ac2c` with log probabilities, `4d143977` / `12fd8257` as text |
+| Controls, logprobs, images, sink probes | as on the ring: no failures, one digest alone and under load, `Say hi.` / `Thanks!` / `ok` corrected on every rank |
+| Startup | API ready in 103-111 s (first boots, compiles included); 246 TileLang calls in 11.4 s a rank; no B12X or JIT lines |
+| Memory serving | dgx1 / dgx2 / dgx3 at 7.36 / 8.52 / 8.52 GiB (1022: 6.54 / 7.93 / 8.14) |
+| KV capacity | vLLM's startup figure: 4,009,281 tokens (3.82x at 1M); the pool still holds 5 full 1M contexts (#586's count) |
+| Speed against spark-ds41f-1022 (one session, two arms) | prefill +26.1% / +28.2% / +26.8% / +25.5% at 32K / 131K / 262K / 500K, and +22.5% at 1M (3,952 against 3,226 tok/s, two runs the same evening); decode grid -1.65% (better); c8, c4, Poisson and one stream the same (+0.2%, +0.6%, level, +1.9%; 60.5 tok/s at one stream); greedy 256/256 identical, KL 0 |
+
 ## What changes for users
 
 - **Fixed: one request with `prompt_logprobs` killed the engine.** Under sink rejection (on by
@@ -100,9 +116,15 @@ candidate 5's release tests asked for (vLLM 0489-0490; package files unchanged).
   128-token window plus two whole prefill chunks in flight (`max_in_flight_tokens`), and the
   chunk doubled. The pool and its full-attention blocks are unchanged. (spark-ds41f-1024's
   draft recorded 8.18 for candidate 4; that memory record's log lines predate its image.)
-- **The ring only.** tp3-triangle is not qualified on this image (its last release is
-  spark-ds41f-1022); `cluster start` refuses it without `--unqualified-shape`. The owner will
-  qualify TP3 after re-cabling.
+- **The 4 KiB-page triangle is not qualified** on this image (tp3-triangle-4k keeps its 4,096
+  budget); `cluster start` refuses it without `--unqualified-shape`. The ring and the triangle
+  both are.
+- **The triangle's comparison ran two arms** (the owner's shortcut; the same build's repeat was
+  measured on the ring). Sampled c8 and c1 exist for this release only. The triangle's 1M figure
+  comes from two runs the same evening, not one session; release-tp3 version 2 (#600) prefills
+  to 1M from the next release on.
+- **The triangle's stall:** at 8,192 the other streams' decode step is about 1.7 times as long
+  while a long prompt prefills (the ring's 16,384: +78%).
 
 ## Reports triaged for this release
 
@@ -124,9 +146,9 @@ a decision only the owner can make.
 | #484 the rename to spark-ds41f (PR) | **In** | Replayed on the promotion branch (two of #549's lab tests adapted to the renamed recipe); the candidate's recipe and image carry the names. Close after the deploy. |
 | #503 promote spark-ds41f-1024 (draft PR) | **Superseded** | Candidate 5 contains candidate 4 and replaces it. Close when this promotion merges. |
 | #503 comments: TP3 triangle results on `-next-4` (JordiPosthumus) | **Not a blocker** | TP3 is out of this release's scope (the owner re-wires later); tp3-triangle stays unqualified on this image. Jordi's identical TP3 hashes and the malloc pinning's headroom are useful evidence for the TP3 release. |
-| #503 comments: Jordi's open questions (is `rc-tp3.json` the arm for `-next-4` on TP3; what to watch on the triangle) and offers (a ports-only arm, the release-tests bundle) | **Deferred** (owner, 2026-10-25) | No reply until TP3 is qualified on this release's image (after the triangle is re-cabled); TP3 sites stay on spark-ds41f-1022 meanwhile. |
+| #503 comments: Jordi's open questions (is `rc-tp3.json` the arm for `-next-4` on TP3; what to watch on the triangle) and offers (a ports-only arm, the release-tests bundle) | **Deferred** (owner, 2026-10-25), now unblocked | No reply until TP3 is qualified on this release's image. It was qualified on 2026-10-25 at 8,192 (the triangle's results above), so the reply can go out with the release announcement. |
 | #503 comments: `cluster start` refusal should mention `--unqualified-shape`; site patches make the checkout dirty | **Not a blocker**, follow-up | Tooling ergonomics in `bin/spark`, not the served image or recipe; the scope freeze excludes unrelated improvements. Worth a small PR after the release. |
-| #503 comments: a 6,144-token chunk budget beats 4,096 on TP3 | **Not a blocker**, for the TP3 release | A TP3 recipe change; nothing in the ring's recipe changes. |
+| #503 comments: a 6,144-token chunk budget beats 4,096 on TP3 | **In**, at 8,192 | The triangle's qualification (2026-10-25) ships 8,192 (owner: "if 8k fits"); the fit check passed. |
 | #509, #506, #504, #524 TileLang ports (draft PRs) | **In** (superseded) | Their patches are in candidate 5's series: 0345 (counts), 0351 and 0473 (verification insert), 0352-0353 (ranks, padding), 0381-0401 (controls). Close after the deploy. #509's "eight vocabulary-parallel draft-seed mismatches" do not reproduce: `tests/v1/spec_decode/test_dspark_vocab_parallel.py` passes in candidate 5's release tests. |
 | #504's rank fix: a selected `-inf` token ranked 131,072 | **In** (fixed) | 0353 excludes the vocabulary padding (129,280 at most). A reporting change for forced or prompt scoring only. |
 | Prompt logprobs kill the engine (#546; found in the lab) | **In** (fixed) | vLLM 0266 (here 0408). Production 1022 is affected. Candidate 5's prompt-logprobs scenario succeeds, alone and at eight streams alike. |
