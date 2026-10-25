@@ -184,4 +184,39 @@ Whoever lands second reruns `exchange-kernels.json`.
 
 ## Runs
 
-None yet.
+### 2026-10-25 19:09 CET: the kernel bundle on dgx4: pass
+
+The kernel bundle ran on dgx4, which is uncabled and opened for single-node testing while
+dgx1-3 serve the TP3 triangle. The cluster specs (serving, profile) stay queued.
+
+- Command, on dgx4 in its own checkout:
+  `scripts/lab.py kernel-local experiments/2026-10-25-moe-exchange/bundles/exchange --out ~/spark-lab/agents/moe-exchange/out/exchange`.
+  The checkout is `~/spark-lab/agents/moe-exchange/spark-ds41f`, branch `moe-exchange` at
+  7afddf79.
+- Bundle: vLLM f18ccfda0, eight files over 26382f5cf, on image `spark-ds41f:19f2c20ed4d6-next-6`
+  (`sha256:82b071b57485`, candidate 6).
+- Output: `~/spark-lab/agents/moe-exchange/out/exchange/{output.txt,verdict.json}` on dgx4.
+- Verdict: **pass**, exit 0, 72 s.
+  - MoE kernel tests: 66 passed.
+  - SP prefill tests: 175 passed, none skipped (the real-combine slot test ran on the GPU).
+  - Benchmark gate: holds at every shape.
+
+The benchmark measures the copies removed; the exchange is stubbed, so the overlap is not
+measured here.
+
+| Shape | Slices | 26382f5cf: combine + copies (µs) | The combine into the slots (µs) | Difference (95% interval) | One slice (µs) |
+|---|---:|---:|---:|---:|---:|
+| TP4 16,384, rank 0 | 4 | 6,999.1 | 5,680.5 | −1,332.0 (−1,380.5, −1,283.5), −19.0% | 5,589.0 |
+| TP4 15,395, rank 0 | 3 | 6,569.8 | 5,282.2 | −1,274.4 (−1,312.4, −1,236.3), −19.4% | 5,262.4 |
+| TP4 15,395, rank 3 | 3 | 6,564.5 | 5,309.9 | −1,267.5 (−1,292.1, −1,242.9), −19.3% | 5,247.7 |
+| TP4 8,192, rank 0 | 2 | 3,519.8 | 2,829.7 | −693.8 (−717.6, −670.0), −19.7% | 2,822.5 |
+| TP3 15,395, rank 0 | 3 | 6,562.5 | 5,274.4 | −1,290.4 (−1,311.2, −1,269.6), −19.7% | 5,262.3 |
+| TP3 15,395, rank 2 | 3 | 6,557.4 | 5,266.6 | −1,287.9 (−1,301.9, −1,274.0), −19.6% | 5,248.7 |
+
+- The 15,395-token baseline (6.57 ms) matches the trace's combine plus copies
+  (5.42 + 1.31 ms).
+- Removing the copies saves 1.27 ms a layer: 25.5 ms over the 20 SP layers, 1.19% of the
+  2,140 ms prefill on one rank, before any overlap.
+- Splitting the combine into slices costs 20 µs at three slices and 91 µs at four, against
+  one slice; the exchange each slice starts early is what that buys, on the cluster.
+- Next: exchange-serving.json and exchange-profile.json need the full cluster.
