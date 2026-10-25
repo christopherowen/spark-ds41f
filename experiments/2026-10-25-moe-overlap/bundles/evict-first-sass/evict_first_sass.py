@@ -115,23 +115,30 @@ kernel()
 
 
 def sass(cache: Path, function: str) -> list[str]:
-    tool = shutil.which("cuobjdump") or "/usr/local/cuda/bin/cuobjdump"
-    lines = []
-    for lib in sorted(
-        p for p in cache.rglob("*") if p.suffix in (".so", ".cubin", ".fatbin")
-    ):
-        out = subprocess.run(
-            [tool, "-sass", str(lib)], capture_output=True, text=True
-        ).stdout
-        if function in out:
-            lines = out.splitlines()
-            break
-    else:
-        print(
-            "  no SASS found; files:",
-            [str(p.relative_to(cache)) for p in cache.rglob("*") if p.is_file()][:40],
-        )
-    return lines
+    tools = [
+        t for t in (shutil.which("cuobjdump"), "/usr/local/cuda/bin/cuobjdump") if t
+    ]
+    tools += [
+        t for t in (shutil.which("nvdisasm"), "/usr/local/cuda/bin/nvdisasm") if t
+    ]
+    for cubin in sorted(cache.rglob("kernel.cubin")):
+        for tool in tools:
+            if not Path(tool).exists():
+                continue
+            argv = (
+                [tool, "-sass", str(cubin)]
+                if "cuobjdump" in tool
+                else [tool, "-c", str(cubin)]
+            )
+            run = subprocess.run(argv, capture_output=True, text=True)
+            if function in run.stdout:
+                return run.stdout.splitlines()
+            print(
+                f"  {Path(tool).name} on {cubin.parent.name[:12]}: exit {run.returncode}, "
+                f"{len(run.stdout)} bytes, stderr {run.stderr.strip()[:300]!r}"
+            )
+    print("  no SASS for", function, "tools", tools)
+    return []
 
 
 def show(lines: list[str], function: str) -> None:
