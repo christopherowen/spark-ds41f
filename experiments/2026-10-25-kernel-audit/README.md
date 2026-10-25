@@ -329,22 +329,49 @@ the dynamic one, and costs about 0.3 µs at short contexts. Each extra iteration
 about 0.14 µs, as if the iterations ran one after another. The diagnostics bundle times
 the loop's forms and writes their CUDA sources.
 
-### Diagnostics: `audit-diagnostics`, queued
+### Diagnostics: `audit-diagnostics`, 20:20-20:28 CET (branch a2fe7bc6, image's 26382f5cf kernels): PASSED
 
+Output `~/spark-lab/agents/kernel-audit/out/audit-diagnostics/`; CUDA sources in
+`~/.cache/spark-lab/compile/kernel-audit-diagnostics/` on dgx4.
 [bundles/audit-diagnostics](bundles/audit-diagnostics) runs on the image's own
-26382f5cf kernels. [make_diagnostics.py](make_diagnostics.py) writes its variant modules
-from 26382f5cf's sources.
+26382f5cf kernels, and [make_diagnostics.py](make_diagnostics.py) writes its variant
+modules from 26382f5cf's sources. Every form's outputs equal the 26382f5cf form's (the
+live columns; the projection's every bit).
 
-- **Five page-part forms of `decode_metadata`** at c1 4K, c1 1M, c16 64K and a 16K
-  prefill chunk:
-  - `old`, every column;
-  - `dyn`, 3cd92e872;
-  - `static_var`, 1072d662b;
-  - `static_expr`, the live pages inline;
-  - `select`, the old loop with the store predicated.
-- **Five forms of `project_streams`** (A-E above) at decode c1/c8/c16 and an 8K prefill,
-  for `post_pre` and `pre`.
+**decode_metadata's page part**, µs a call (main page 256):
 
-Every form's outputs are checked against the 26382f5cf form before timing. Each form's
-generated CUDA source goes to the node's compile cache
-(`~/.cache/spark-lab/compile/kernel-audit-diagnostics/`).
+| Form | c1 4K | c1 1M | c16 64K | prefill 16K |
+|---|---:|---:|---:|---:|
+| old (every column, 26382f5cf) | 2.86 | 2.84 | 3.63 | 1,436 |
+| dyn (3cd92e872) | 1.29 | 6.36 | 1.36 | 40.2 |
+| static_var (1072d662b) | 1.67 | 6.28 | 1.91 | 70.2 |
+| static_expr | 2.32 | 6.91 | 2.59 | 109.5 |
+| select | 5.01 | 5.17 | 5.15 | 148.0 |
+
+Root cause of the 1M case, from the generated CUDA: the live-page forms bind
+`page_id = main_table[req, col]` as an alias, so `T.if_then_else(page_id > 0, page_id,
+-1)` emits the load twice. The second load sits inside the branch on the first's value:
+two dependent round trips a column. The old form's load sits inside its select and is
+bound once (`condval_10`). vLLM a71368f70 loads each entry into a `T.alloc_var` in both
+`decode_metadata` and `pages`. The same aliasing is worth a search through the other
+TileLang kernels.
+
+**project_streams**, µs a call:
+
+| Entry and shape | A (26382f5cf) | B (ahead, scalar split) | C (ahead, vector split) | D (scalar split only) | E (ahead into a fragment) |
+|---|---:|---:|---:|---:|---:|
+| post_pre decode c1 | 5.48 | 6.27 | 5.54 | 6.24 | 5.54 |
+| post_pre decode c8 | 16.41 | 18.91 | 16.88 | 19.12 | 16.82 |
+| post_pre decode c16 | 28.27 | 32.39 | 28.67 | 32.14 | 28.65 |
+| post_pre prefill 8K | 3,799 | 3,850 | 3,790 | 3,829 | 3,818 |
+| pre decode c1 | 5.45 | 6.00 | 5.42 | 6.00 | 5.42 |
+| pre decode c8 | 15.08 | 16.76 | 15.10 | 16.68 | 15.08 |
+| pre decode c16 | 25.93 | 28.04 | 25.40 | 28.00 | 25.40 |
+| pre prefill 8K | 2,663 | 2,838 | 2,677 | 2,825 | 2,654 |
+
+- **The scalar split is the whole slowdown.** B and D are equally slow, and the sources
+  bear it out: A's `post_pre` source has 33 `float4` accesses, B's 12.
+- **Loading ahead gains nothing in isolation.** C and E sit within about ±2.5% of A:
+  0.4-0.5 µs slower at `post_pre` c8 and c16, 0.5 µs faster at `pre` c16. With `fn` hot
+  in L2 there is no latency to hide.
+- Fix 3 stays reverted.

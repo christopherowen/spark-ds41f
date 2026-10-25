@@ -300,6 +300,9 @@ def decode_metadata_kernel(
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
             live = T.alloc_var(T.int32)  # the page part's columns
+            # One load a column: as an alias, the select below would load it twice, the
+            # second load waiting on the first's value.
+            entry = T.alloc_var(T.int32)
             if part == 0:
                 window_row(
                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
@@ -315,8 +318,8 @@ def decode_metadata_kernel(
                 for k in T.serial(main_per_thread):
                     col = k * threads + tx
                     if col < live:
-                        page_id = main_table[req, col]
-                        main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+                        entry = main_table[req, col]
+                        main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
 
     return metadata_decode
 
@@ -341,13 +344,14 @@ def pages_kernel(width: int, page: int):
         read_width: T.int32,
     ):
         with T.Kernel(rows, T.ceildiv(width, _BLOCK), threads=_BLOCK) as (row, cb):
+            entry = T.alloc_var(T.int32)  # one load (decode_metadata_kernel's entry)
             col = cb * _BLOCK + T.get_thread_binding()
             req = reqs[offset + row]
             live = _live_pages(lengths[offset + row], page, T.min(read_width, width))
             if (req >= 0) & (col < live):
                 # vLLM reserves physical block zero; page tables use -1 for holes.
-                page_id = table[req, col]
-                out[row, col] = T.if_then_else(page_id > 0, page_id, -1)
+                entry = table[req, col]
+                out[row, col] = T.if_then_else(entry > 0, entry, -1)
 
     return metadata_pages
 
