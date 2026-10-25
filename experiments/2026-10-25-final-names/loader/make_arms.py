@@ -14,13 +14,17 @@ Every package file BASE..REV changes goes into bundles/digest, every one BASE..b
 changes into bundles/direct, under overlay/<path in the vLLM tree>; the arms mount them
 over the image's tree. For the shape (the recipe's, config/cluster.json):
 
-- b12x-<shape>.json: production's loader with the digest;
+- b12x-<shape>.json: B12X's loader (production's until the direct loader replaces it)
+  with the digest;
 - direct-<shape>.json: the direct loader with the digest, VLLM_PLUGINS naming no plugin;
 - safetensors-<shape>.json: vLLM's own safetensors loader with the digest (the evidence
   arm), VLLM_PLUGINS naming no plugin.
 
 An unset VLLM_PLUGINS would load every installed general plugin, B12X's b12x_fp6 among
-them; an empty value loads none.
+them; an empty value loads none. Each arm names its load format in ``serve_options``, so
+it changes that one argument and follows every other argument of the recipe at run time;
+the mounts are the recipe's own (the cache) and the bundle's files. The bundles mount
+over SOURCE_ROOT, the vLLM tree of spark-ds41f-1025's image and later ones.
 """
 import argparse
 import importlib.machinery
@@ -77,12 +81,6 @@ def mounts(recipe: dict, bundle: str, files: list[str]) -> list[list[str]]:
             *([f"{source}/{path}", f"{SOURCE_ROOT}/{path}", "ro"] for path in files)]
 
 
-def with_load_format(serve_args: list[str], load_format: str) -> list[str]:
-    args = list(serve_args)
-    args[args.index("--load-format") + 1] = load_format
-    return args
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("vllm", type=Path)
@@ -95,29 +93,31 @@ def main() -> int:
     direct_files = write_bundle(args.vllm, args.branch, "direct")
     spark = spark_module()
     recipe = spark.read_json(RECIPE)
-    resolved = spark.read_cluster(RECIPE, args.shape)
+    spark.read_cluster(RECIPE, args.shape)  # the shape is the recipe's
     short = {"tp3-triangle": "tp3", "tp4-ring": "tp4"}.get(args.shape, args.shape)
     arms = {
         f"b12x-{short}.json": (
-            f"Production's loader (--load-format b12x) at {args.shape} with the weight digest "
-            f"({DIGEST_ENV}=1, bundles/digest).",
-            {"environment": {DIGEST_ENV: "1"},
-             "container": {"mounts": mounts(recipe, "digest", digest_files)}}),
+            f"B12X's loader (--load-format b12x, VLLM_PLUGINS=b12x_loader) at {args.shape} with "
+            f"the weight digest ({DIGEST_ENV}=1, bundles/digest).",
+            {"environment": {DIGEST_ENV: "1", "VLLM_PLUGINS": "b12x_loader"},
+             "container": {"mounts": mounts(recipe, "digest", digest_files)}},
+            "b12x"),
         f"direct-{short}.json": (
             f"The direct loader (--load-format direct, bundles/direct) at {args.shape} with the weight "
             "digest; VLLM_PLUGINS names no plugin.",
             {"environment": {DIGEST_ENV: "1", "VLLM_PLUGINS": ""},
-             "container": {"mounts": mounts(recipe, "direct", direct_files)},
-             "serve_args": with_load_format(resolved["serve_args"], "direct")}),
+             "container": {"mounts": mounts(recipe, "direct", direct_files)}},
+            "direct"),
         f"safetensors-{short}.json": (
             f"vLLM's safetensors loader (memory-mapped reads through the page cache) at {args.shape} "
             "with the weight digest; VLLM_PLUGINS names no plugin. The evidence arm.",
             {"environment": {DIGEST_ENV: "1", "VLLM_PLUGINS": ""},
-             "container": {"mounts": mounts(recipe, "digest", digest_files)},
-             "serve_args": with_load_format(resolved["serve_args"], "safetensors")}),
+             "container": {"mounts": mounts(recipe, "digest", digest_files)}},
+            "safetensors"),
     }
-    for name, (notes, values) in arms.items():
-        arm = {"notes": notes, "extends": {"config": RECIPE, "shape": args.shape}, "set": values}
+    for name, (notes, values, load_format) in arms.items():
+        arm = {"notes": notes, "extends": {"config": RECIPE, "shape": args.shape}, "set": values,
+               "serve_options": {"--load-format": load_format}}
         (HERE / name).write_text(json.dumps(arm, indent=1) + "\n")
         print(f"wrote {EXPERIMENT}/{name}")
     return 0

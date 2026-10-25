@@ -1,0 +1,3102 @@
+From 6d5881d9cc967cb6b5b21868893cade9a6e595fe Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:26:40 +0100
+Subject: [PATCH] Model loading: --load-format direct, B12X's bounce-mode
+ O_DIRECT loader in vLLM
+
+The production recipe loads with B12X's checkpoint loader through its
+b12x_loader plugin. This moves the path GB10 takes into the tree, so the
+reads, copies and transforms stay the same and vLLM owns the code:
+
+- direct_loader.DirectModelLoader (from b12x/integration/vllm/loader.py and
+  the in-tree b12x_loader.py): meta tensors that carry checkpoint ranges,
+  routed by the model's weight loaders through weight_transfer; tables the
+  model routes as files (checkpoint_file_weight_filter, DS4.1's Engram)
+  yielded as vLLM's file-source descriptors, merged by name, never read.
+- direct_io/ (from b12x/loader at 236ddff04a5f): DirectWeightSession's bounce
+  path and the C helper's direct, batch and bounce readers. io_uring
+  O_DIRECT reads into a 16-slot ring of 1 MiB registered host slots, a
+  copier thread's cudaMemcpy2DAsync into the destinations, BF16->FP32
+  expanded in the slot, other dtype conversions through an 8 MiB GPU
+  scratch. Nothing is memory-mapped or read through the page cache.
+
+Dropped: GDS, the shared read group, the PLE reader, the IPC-exportable
+allocations and the progress panel. The loader refuses a device without
+host page tables instead of falling back to GDS, and logs one summary line
+("Direct loader: weights loaded, ..."). liburing is now required to build
+the helper, which is otherwise B12X's code: it builds at first use into
+$XDG_CACHE_HOME/vllm/direct_io/<digest>. The descriptor planning is moved
+into functions of its own (view_offset, view_records, scratch_chunks) so
+it can be checked without a GPU. B12X is Apache-2.0; every ported file
+names its source and what changed.
+
+Tests without a GPU (test_direct_loader.py): descriptors for TP column
+and row shards, padded and transposed destinations, expert slices, byte
+casts, E8M0 views, scalars and BF16 expansion, executed on host memory
+with _batch.c's semantics, equal Torch's copies; scratch reads cover a
+conversion exactly; refused views; header checks, name/prefix/index/skip
+selection and coalesced metadata reads with preads in place of the helper;
+registration and options; the refusal without host page tables; Engram
+file-backed descriptors beside routed weights in a mixed shard, a table-
+only shard never opened, the index and the expert filter on both; the
+helper built once into the XDG cache, and refused without liburing.
+
+Tests on a GPU (test_direct_loader_cuda.py, under DIRECT_IO_TEST_DIR,
+/cache/direct-io-test by default, since O_DIRECT needs a real filesystem):
+B12X's test_direct.py for the bounce ring, the helper's capabilities, a
+loader-routed module whose weight digest equals a Torch copy's, and file-
+backed tables beside routed weights. Not run: no GPU during the freeze.
+---
+ .../model_loader/test_direct_loader.py        | 645 ++++++++++++++++++
+ .../model_loader/test_direct_loader_cuda.py   | 539 +++++++++++++++
+ vllm/config/load.py                           |   4 +
+ vllm/model_executor/model_loader/__init__.py  |   4 +
+ .../model_loader/direct_io/__init__.py        |  33 +
+ .../model_loader/direct_io/_batch.c           | 217 ++++++
+ .../model_loader/direct_io/_bounce.c          | 294 ++++++++
+ .../model_loader/direct_io/_checkpoint.py     | 549 +++++++++++++++
+ .../model_loader/direct_io/_cuda_range.h      |  35 +
+ .../model_loader/direct_io/_direct.c          | 131 ++++
+ .../model_loader/direct_io/_native.py         | 136 ++++
+ .../model_loader/direct_io/_storage.c         | 110 +++
+ .../model_loader/direct_loader.py             | 218 ++++++
+ 13 files changed, 2915 insertions(+)
+ create mode 100644 tests/model_executor/model_loader/test_direct_loader.py
+ create mode 100644 tests/model_executor/model_loader/test_direct_loader_cuda.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/__init__.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_batch.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_bounce.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_checkpoint.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_cuda_range.h
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_direct.c
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_native.py
+ create mode 100644 vllm/model_executor/model_loader/direct_io/_storage.c
+ create mode 100644 vllm/model_executor/model_loader/direct_loader.py
+
+diff --git a/tests/model_executor/model_loader/test_direct_loader.py b/tests/model_executor/model_loader/test_direct_loader.py
+new file mode 100644
+index 000000000..75743fcbb
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_direct_loader.py
+@@ -0,0 +1,645 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The direct loader (--load-format direct) without a GPU.
++
++- Descriptor planning: the descriptors the session records for tensor-parallel slices,
++  padded and strided destinations, expert slices, byte casts and BF16 to FP32
++  expansion, executed on host memory with _batch.c's semantics, equal Torch's own
++  copies; the scratch reads of a dtype conversion cover the view exactly; views the
++  descriptors cannot express are refused.
++- Checkpoint metadata: the session's safetensors header checks, its name, prefix,
++  index and skip selection, and its coalesced metadata reads, with the native helper's
++  O_DIRECT reads replaced by plain preads.
++- The loader: its registration and options, its refusal of a device without host page
++  tables, and the file-backed descriptors it yields for tensors the model routes as
++  files (DS4.1's Engram tables), which never reach the session's reader.
++
++The session's own copies (the bounce ring, CUDA destinations) are in
++test_direct_loader_cuda.py, which needs a GPU.
++"""
++
++import ctypes
++import json
++import os
++import typing
++
++import numpy as np
++import pytest
++import regex as re
++import torch
++from safetensors import safe_open
++from safetensors.torch import save_file
++
++from vllm.config.load import LoadConfig
++from vllm.model_executor import model_loader
++from vllm.model_executor.model_loader import direct_loader, weight_utils
++from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_io import (
++    DirectWeightSession,
++    scratch_chunks,
++    view_offset,
++    view_records,
++)
++from vllm.model_executor.model_loader.direct_io._checkpoint import (
++    EXPAND_BF16,
++    HOST_COPY,
++)
++from vllm.model_executor.weight_transfer import get_file_tensor_source
++
++
++class _PreadNative:
++    """The helper's header and metadata reads as plain preads, counted."""
++
++    def __init__(self):
++        self.reads = 0
++
++    def direct_bytes(self, reader, fd, offset, nbytes):
++        self.reads += 1
++        data = os.pread(fd, nbytes, offset)
++        if len(data) != nbytes:
++            raise RuntimeError("short read")
++        return data
++
++
++@pytest.fixture
++def session(monkeypatch):
++    """A session for metadata and routing only: no CUDA, no native helper, and files
++    opened without O_DIRECT (so any filesystem serves)."""
++    monkeypatch.setattr(os, "O_DIRECT", 0, raising=False)
++    session = DirectWeightSession.__new__(DirectWeightSession)
++    session.native = _PreadNative()
++    session.reader = None
++    session.device = 0
++    session.files = []
++    session.sources = {}
++    session.metadata_bytes = 0
++    yield session
++    for fd in session.files:
++        os.close(fd)
++
++
++def _execute_on_host(records, backing):
++    """_batch.c's descriptors on host memory: each row of a read copies `bytes` from the
++    file (BF16 expansion writes each value as FP32 with the same bits above 16 zero
++    bits); a host copy copies `bytes` from the address `offset`. Every write must stay
++    in ``backing``, as the helper checks against the CUDA allocation."""
++    low, high = backing.data_ptr(), backing.data_ptr() + backing.nbytes
++    for (
++        fd,
++        offset,
++        nbytes,
++        pointer,
++        transform,
++        rows,
++        source_stride,
++        dest_stride,
++    ) in records:
++        for row in range(rows):
++            if transform == HOST_COPY:
++                data = ctypes.string_at(offset, nbytes)
++            else:
++                data = os.pread(fd, nbytes, offset + row * source_stride)
++                assert len(data) == nbytes
++            if transform == EXPAND_BF16:
++                data = (np.frombuffer(data, "<u2").astype("<u4") << 16).tobytes()
++            target = pointer + row * dest_stride
++            assert low <= target and target + len(data) <= high
++            ctypes.memmove(target, data, len(data))
++
++
++def _bytes(tensor):
++    return tensor.reshape(-1).view(torch.uint8)
++
++
++def _source(session, path, name):
++    return dict(session.weights([path]))[name]
++
++
++def _entry(session, source):
++    return session.sources[source.untyped_storage()._cdata][1]
++
++
++def _routed(session, source, destination):
++    entry = _entry(session, source)
++    expand = source.dtype == torch.bfloat16 and destination.dtype == torch.float32
++    return view_records(
++        entry, view_offset(entry, source, destination), source, destination, expand
++    )
++
++
++def _checkpoint(tmp_path, tensors, name="model.safetensors"):
++    path = tmp_path / name
++    save_file(tensors, path)
++    with safe_open(path, framework="pt") as archive:
++        real = {key: archive.get_tensor(key) for key in archive.keys()}  # noqa: SIM118
++    return path, real
++
++
++# Each case: the checkpoint tensor, the view a weight loader takes, and the
++# destination's backing, dtype and the destination view within it.
++VIEWS = {
++    "tp column shard": (
++        lambda: torch.arange(2 * 16 * 32, dtype=torch.float32).reshape(2, 16, 32),
++        lambda w: w[:, :, 16:],
++        lambda: torch.full((2, 16, 16), -7.0),
++        lambda d: d,
++    ),
++    "tp column shard, padded rows": (
++        lambda: torch.arange(2 * 16 * 32, dtype=torch.float32).reshape(2, 16, 32),
++        lambda w: w[:, :, :16],
++        lambda: torch.full((2, 16, 18), -7.0),
++        lambda d: d[:, :, 1:-1],
++    ),
++    "tp row shard": (
++        lambda: torch.arange(64 * 24, dtype=torch.int32).reshape(64, 24),
++        lambda w: w[16:48],
++        lambda: torch.full((40, 24), -7, dtype=torch.int32),
++        lambda d: d[4:36],
++    ),
++    "expert slice": (
++        lambda: torch.arange(8 * 12 * 6, dtype=torch.int16).reshape(8, 12, 6),
++        lambda w: w[2:6, 4:10],
++        lambda: torch.full((4, 6, 6), -7, dtype=torch.int16),
++        lambda d: d,
++    ),
++    "transposed destination": (
++        lambda: torch.arange(12 * 20, dtype=torch.float32).reshape(12, 20),
++        lambda w: w,
++        lambda: torch.full((20, 12), -7.0),
++        lambda d: d.t(),
++    ),
++    "bf16 expanded to fp32": (
++        lambda: (
++            torch.arange(-3000, 3000, 3, dtype=torch.float32)
++            .reshape(40, 50)
++            .to(torch.bfloat16)
++        ),
++        lambda w: w[:, 25:],
++        lambda: torch.full((40, 27), -7.0),
++        lambda d: d[:, 1:-1],
++    ),
++    "int8 bytes into uint8": (
++        lambda: (
++            torch.arange(-128, 128, dtype=torch.int16).to(torch.int8).reshape(16, 16)
++        ),
++        lambda w: w[:, 8:],
++        lambda: torch.zeros((16, 8), dtype=torch.uint8),
++        lambda d: d,
++    ),
++    "e8m0 exponents viewed as bytes": (
++        lambda: (
++            torch.arange(256, dtype=torch.uint8)
++            .reshape(16, 16)
++            .view(torch.float8_e8m0fnu)
++        ),
++        lambda w: w.view(torch.uint8)[:, 4:12],
++        lambda: torch.zeros((16, 8), dtype=torch.uint8),
++        lambda d: d,
++    ),
++    "scalar": (
++        lambda: torch.tensor(3.5),
++        lambda w: w,
++        lambda: torch.zeros(()),
++        lambda d: d,
++    ),
++}
++
++
++@pytest.mark.parametrize("case", list(VIEWS))
++def test_descriptors_copy_what_torch_copies(tmp_path, session, case):
++    make, view, make_backing, place = VIEWS[case]
++    path, real = _checkpoint(tmp_path, {"w": make()})
++    backing = make_backing()
++    destination = place(backing)
++    expected = backing.clone()
++    place(expected).copy_(view(real["w"]))
++    records = _routed(session, view(_source(session, path, "w")), destination)
++    _execute_on_host(records, backing)
++    assert torch.equal(_bytes(backing), _bytes(expected)), case
++
++
++def test_contiguous_rows_make_one_strided_descriptor_per_outer_index(tmp_path, session):
++    path, _ = _checkpoint(
++        tmp_path, {"w": torch.zeros((3, 64, 128), dtype=torch.bfloat16)}
++    )
++    source = _source(session, path, "w")[:, :, 64:]
++    destination = torch.empty((3, 64, 64), dtype=torch.bfloat16)
++    records = _routed(session, source, destination)
++    entry = _entry(session, source)
++    assert [r[1] for r in records] == [
++        entry.offset + 64 * 2 + i * 64 * 128 * 2 for i in range(3)
++    ]
++    assert {r[2:3] + r[4:] for r in records} == {(64 * 2, 0, 64, 128 * 2, 64 * 2)}
++
++
++def test_whole_tensors_are_one_contiguous_row(tmp_path, session):
++    path, _ = _checkpoint(tmp_path, {"w": torch.zeros((5, 7, 9))})
++    source = _source(session, path, "w")
++    (record,) = _routed(session, source, torch.empty((5, 7, 9)))
++    assert record[1:3] == (_entry(session, source).offset, 5 * 7 * 9 * 4)
++    assert record[4:] == (0, 1, 0, 0)
++
++
++@pytest.mark.parametrize("capacity", [1, 7, 64, 4096])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64, torch.float16])
++def test_scratch_reads_cover_a_conversion_exactly(tmp_path, session, capacity, dtype):
++    values = torch.arange(1000, dtype=torch.float32) / 7 - 50
++    path, real = _checkpoint(tmp_path, {"w": values})
++    source = _source(session, path, "w")[37:911]
++    entry = _entry(session, source)
++    destination = torch.full((874,), -7.0, dtype=dtype)
++    offset = view_offset(entry, source, destination)
++    scratch = torch.empty(capacity, dtype=source.dtype)
++    covered = 0
++    for start, count, position, nbytes in scratch_chunks(
++        entry, offset, source, capacity
++    ):
++        assert start == covered and 0 < count <= capacity
++        assert nbytes == count * 4
++        ctypes.memmove(scratch.data_ptr(), os.pread(entry.fd, nbytes, position), nbytes)
++        destination[start : start + count].copy_(scratch[:count])
++        covered += count
++    assert covered == source.numel()
++    assert torch.equal(destination, real["w"][37:911].to(dtype))
++
++
++def test_views_the_descriptors_cannot_express_are_refused(tmp_path, session):
++    path, _ = _checkpoint(
++        tmp_path, {"w": torch.zeros((8, 8), dtype=torch.bfloat16), "s": torch.ones(4)}
++    )
++    sources = dict(session.weights([path]))
++    w = sources["w"]
++    destination = torch.empty((8, 8), dtype=torch.bfloat16)
++    with pytest.raises(NotImplementedError, match="unsupported data transformation"):
++        session(destination, w + 1)
++    with pytest.raises(NotImplementedError, match="explicit transform for w"):
++        view_offset(_entry(session, w), w.view(torch.uint8), destination)
++    with pytest.raises(NotImplementedError, match="explicit transform for w"):
++        view_offset(_entry(session, w), w[:4], destination)
++    beyond = torch.as_strided(sources["s"], (4,), (2,))
++    with pytest.raises(ValueError, match="source view exceeds checkpoint range: s"):
++        view_offset(_entry(session, beyond), beyond, torch.empty(4))
++    with pytest.raises(ValueError, match="session CUDA device"):
++        session(destination, w)
++    w.add_(1)  # an in-place op on the meta view: its values are no longer the file's
++    with pytest.raises(NotImplementedError, match="explicit transform for w"):
++        session(destination, w)
++
++
++def test_weights_select_by_name_prefix_index_and_skip(tmp_path, session):
++    path, _ = _checkpoint(
++        tmp_path,
++        {
++            "mtp.b": torch.ones(2),
++            "mtp.a": torch.ones(3),
++            "mtp.elsewhere": torch.ones(4),
++            "mtp.skipped": torch.ones(5),
++            "model.c": torch.ones(6),
++        },
++    )
++    (tmp_path / "other.safetensors").write_bytes(b"")
++    index = tmp_path / "model.safetensors.index.json"
++    index.write_text(
++        json.dumps(
++            {
++                "weight_map": {
++                    "mtp.a": "model.safetensors",
++                    "mtp.b": "model.safetensors",
++                    "mtp.skipped": "model.safetensors",
++                    "mtp.elsewhere": "other.safetensors",
++                    "model.c": "model.safetensors",
++                }
++            }
++        )
++    )
++    loaded = list(
++        session.weights(
++            [path],
++            prefixes=("mtp.",),
++            prefix="draft.",
++            index_path=index,
++            skip=lambda name: name == "mtp.skipped",
++        )
++    )
++    assert [name for name, _ in loaded] == ["draft.mtp.a", "draft.mtp.b"]
++    for (_, tensor), shape in zip(loaded, ((3,), (2,)), strict=True):
++        assert tensor.device.type == "meta" and tensor.shape == shape
++    assert sorted(entry.name for _, entry in session.sources.values()) == [
++        "mtp.a",
++        "mtp.b",
++    ]
++
++
++def test_declared_metadata_reads_coalesce_and_keep_their_values(tmp_path, session):
++    values = {f"scale_{i:04d}": torch.tensor(float(i)) for i in range(2048)}
++    values["layer_multipliers"] = torch.arange(6, dtype=torch.float32)
++    values["empty"] = torch.zeros((0, 4))
++    path, _ = _checkpoint(tmp_path, values)
++    loaded = dict(session.weights([path], needs_values=lambda entry: True))
++    assert session.native.reads < 2 + 10  # the header's two reads, then the values
++    for name, expected in values.items():
++        assert loaded[name].device.type == "cpu"
++        assert torch.equal(loaded[name], expected), name
++    assert not session.sources
++    session.metadata_bytes = 64 << 20
++    with pytest.raises(ValueError, match="64 MiB session budget"):
++        dict(session.weights([path], needs_values=lambda entry: True))
++
++
++def _raw_checkpoint(path, header, payload_bytes, length=None):
++    encoded = json.dumps(header).encode()
++    head = (len(encoded) if length is None else length).to_bytes(8, "little")
++    path.write_bytes(head + encoded + bytes(payload_bytes))
++    return path
++
++
++@pytest.mark.parametrize(
++    "header,payload,length,error",
++    [
++        (
++            {"a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}},
++            8,
++            1 << 40,
++            "invalid safetensors header length",
++        ),
++        (
++            {"a": {"dtype": "F4", "shape": [2], "data_offsets": [0, 1]}},
++            1,
++            None,
++            "invalid tensor metadata: a",
++        ),
++        (
++            {"a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 4]}},
++            4,
++            None,
++            "invalid tensor file range: a",
++        ),
++        (
++            {"a": {"dtype": "F32", "shape": [2], "data_offsets": [8, 16]}},
++            16,
++            None,
++            "overlap or hole in safetensors payload: a",
++        ),
++        (
++            {"a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}},
++            12,
++            None,
++            "payload does not cover file",
++        ),
++        ({"__metadata__": {"format": 1}}, 0, None, "invalid safetensors metadata"),
++        ([1, 2], 0, None, "header must be an object"),
++    ],
++)
++def test_invalid_headers_are_refused(tmp_path, session, header, payload, length, error):
++    path = _raw_checkpoint(tmp_path / "bad.safetensors", header, payload, length)
++    with pytest.raises(ValueError, match=error):
++        session.manifest(path)
++
++
++def test_duplicate_header_keys_are_refused(tmp_path, session):
++    entry = '{"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}'
++    encoded = f'{{"a": {entry}, "a": {entry}}}'.encode()
++    path = tmp_path / "duplicate.safetensors"
++    path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + bytes(4))
++    with pytest.raises(ValueError, match="duplicate safetensors key: a"):
++        session.manifest(path)
++
++
++def test_direct_is_a_registered_load_format():
++    assert "direct" in typing.get_args(model_loader.LoadFormats)
++    config = LoadConfig(load_format="direct")
++    loader = model_loader.get_model_loader(config)
++    assert isinstance(loader, direct_loader.DirectModelLoader)
++    assert loader.io_threads == 8
++    assert loader.load_config.load_format == "safetensors"
++    assert config.load_format == "direct"
++    custom = LoadConfig(
++        load_format="direct", model_loader_extra_config={"io_threads": 3}
++    )
++    assert model_loader.get_model_loader(custom).io_threads == 3
++
++
++@pytest.mark.parametrize(
++    "options,strategy,error",
++    [
++        ({"enable_multithread_load": True}, None, "in one thread"),
++        ({}, "eager", "no safetensors read strategy"),
++        ({"read_mode": "gds"}, None, "Unexpected extra config keys"),
++    ],
++)
++def test_options_the_direct_loader_does_not_take(options, strategy, error):
++    config = LoadConfig(
++        load_format="direct",
++        model_loader_extra_config=options,
++        safetensors_load_strategy=strategy,
++    )
++    with pytest.raises(ValueError, match=error):
++        direct_loader.DirectModelLoader(config)
++
++
++def _no_session(*args, **kwargs):
++    raise AssertionError("the loader opened a session")
++
++
++def test_devices_without_host_page_tables_are_refused(monkeypatch):
++    from types import SimpleNamespace
++
++    monkeypatch.setattr(direct_loader, "DirectWeightSession", _no_session)
++    monkeypatch.setattr(
++        direct_loader, "capabilities", lambda device: {"host_page_tables": 0}
++    )
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    config = SimpleNamespace(device_config=SimpleNamespace(device="cuda:1"))
++    with pytest.raises(RuntimeError, match="CUDA device 1 does not; it has no GPU"):
++        loader.load_model(config, SimpleNamespace())
++    cpu = SimpleNamespace(device_config=SimpleNamespace(device="cpu"))
++    with pytest.raises(ValueError, match="requires a CUDA device"):
++        loader.load_model(cpu, SimpleNamespace())
++
++
++def test_weights_are_read_only_inside_load_model(tmp_path):
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    source = DefaultModelLoader.Source(str(tmp_path), revision=None)
++    with pytest.raises(RuntimeError, match="only in load_model"):
++        next(loader._get_weights_iterator(source))
++
++
++def test_draft_weights_follow_the_index_and_never_open_other_shards(tmp_path, session):
++    save_file({"mtp.weight": torch.arange(16)}, tmp_path / "draft.safetensors")
++    save_file({"mtp.bias": torch.arange(4) + 100}, tmp_path / "bias.safetensors")
++    (tmp_path / "target.safetensors").write_bytes(b"must not be opened")
++    (tmp_path / "model.safetensors.index.json").write_text(
++        json.dumps(
++            {
++                "weight_map": {
++                    "mtp.weight": "draft.safetensors",
++                    "mtp.bias": "bias.safetensors",
++                    "model.weight": "target.safetensors",
++                }
++            }
++        )
++    )
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    loader._session = session
++    source = DefaultModelLoader.Source(
++        str(tmp_path), revision=None, prefix="draft.", weight_name_prefixes=("mtp.",)
++    )
++    loaded = dict(loader._get_weights_iterator(source))
++    assert set(loaded) == {"draft.mtp.weight", "draft.mtp.bias"}
++    assert sorted(entry.name for _, entry in session.sources.values()) == [
++        "mtp.bias",
++        "mtp.weight",
++    ]
++    assert loader.counter_before_loading_weights > 0
++
++
++ENGRAM = re.compile(r"layers\.\d+\.engram\.embed\.(?:weight|scale)")
++
++
++def test_file_backed_tables_are_descriptors_and_never_reach_the_reader(
++    tmp_path, session
++):
++    """DS4.1's filter on a mixed shard, a table-only shard and a shard without tables:
++    tables become file-source descriptors, the rest routes through the session, all
++    in name order per file, with the index and the expert filter applied to both."""
++    mixed = {
++        "layers.1.engram.embed.weight": torch.arange(64, dtype=torch.uint8).reshape(
++            8, 8
++        ),
++        "layers.1.engram.embed.scale": torch.ones((8, 1), dtype=torch.uint8),
++        "layers.1.engram.layer_multipliers": torch.tensor([0.5, 2.0]),
++        "layers.1.attn.wq.weight": torch.zeros((4, 4), dtype=torch.bfloat16),
++        "layers.1.ffn.experts.1.w1.weight": torch.zeros((2, 2)),
++        "layers.1.ffn.experts.0.w1.weight": torch.zeros((2, 2)),
++        "layers.1.stale.weight": torch.zeros(3),
++    }
++    tables = {
++        "layers.2.engram.embed.weight": torch.zeros((4, 8), dtype=torch.uint8),
++        "layers.2.engram.embed.scale": torch.zeros((4, 1), dtype=torch.uint8),
++    }
++    plain = {
++        "layers.0.norm.weight": torch.ones(4),
++        "layers.1.stale.weight": torch.ones(3),
++    }
++    for name, tensors in (("a", mixed), ("b", tables), ("c", plain)):
++        save_file(tensors, tmp_path / f"{name}.safetensors")
++    weight_map = {name: "a.safetensors" for name in mixed}
++    weight_map.update({name: "b.safetensors" for name in tables})
++    weight_map.update({name: "c.safetensors" for name in plain})
++    index = tmp_path / "model.safetensors.index.json"
++    index.write_text(json.dumps({"weight_map": weight_map}))
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    loader._session = session
++    loader.local_expert_ids = {0}
++    opened = []
++    manifest = session.manifest
++
++    def recorded(path):
++        opened.append(os.path.basename(path))
++        return manifest(path)
++
++    session.manifest = recorded
++    source = DefaultModelLoader.Source(
++        str(tmp_path),
++        revision=None,
++        prefix="model.",
++        file_weight_filter=lambda name: ENGRAM.fullmatch(name) is not None,
++    )
++    paths = [str(tmp_path / f"{name}.safetensors") for name in "abc"]
++    loaded = list(loader._file_backed_weights_iterator(paths, source, index))
++    assert [name for name, _ in loaded] == [
++        "model.layers.1.attn.wq.weight",
++        "model.layers.1.engram.embed.scale",
++        "model.layers.1.engram.embed.weight",
++        "model.layers.1.engram.layer_multipliers",
++        "model.layers.1.ffn.experts.0.w1.weight",
++        "model.layers.2.engram.embed.scale",
++        "model.layers.2.engram.embed.weight",
++        "model.layers.0.norm.weight",
++        "model.layers.1.stale.weight",
++    ]
++    assert opened == ["a.safetensors", "c.safetensors"]  # b holds only tables
++    loaded = dict(loaded)
++    for name in (*mixed, *tables):
++        if ENGRAM.fullmatch(name) is None:
++            continue
++        path = tmp_path / ("a.safetensors" if name in mixed else "b.safetensors")
++        expected = weight_utils.safetensors_file_sources(str(path))[name]
++        assert get_file_tensor_source(loaded[f"model.{name}"]) == expected
++        assert loaded[f"model.{name}"].device.type == "meta"
++    assert {entry.name for _, entry in session.sources.values()} == {
++        "layers.1.attn.wq.weight",
++        "layers.1.ffn.experts.0.w1.weight",
++        "layers.0.norm.weight",
++        "layers.1.stale.weight",
++    }
++    assert torch.equal(
++        loaded["model.layers.1.engram.layer_multipliers"], torch.tensor([0.5, 2.0])
++    )
++    # The index maps the stale name to c, so a's copy is never routed.
++    stale = _entry(session, loaded["model.layers.1.stale.weight"])
++    assert os.fstat(stale.fd).st_ino == os.stat(tmp_path / "c.safetensors").st_ino
++
++
++def _fake_build_tools(root, *, liburing=True):
++    """A compiler that writes its -o file and logs its arguments, pkg-config, and a
++    CUDA_HOME with the headers the build checks for."""
++    tools = root / "bin"
++    tools.mkdir()
++    (tools / "cc").write_text(
++        "#!/bin/sh\n"
++        '[ "$1" = --version ] && { echo "fake cc 1"; exit 0; }\n'
++        'echo "$@" >> "$FAKE_CC_LOG"\n'
++        'while [ "$#" -gt 1 ]; do [ "$1" = -o ] && echo built > "$2"; shift; done\n'
++    )
++    (tools / "pkg-config").write_text(
++        "#!/bin/sh\n"
++        f"[ {int(liburing)} = 1 ] || exit 1\n"
++        'case "$1" in --cflags) echo -I/fake/uring;; --libs) echo -luring;;'
++        " --modversion) echo 2.5;; esac\n"
++    )
++    for tool in tools.iterdir():
++        tool.chmod(0o755)
++    cuda = root / "cuda"
++    (cuda / "include").mkdir(parents=True)
++    for header in ("cuda_runtime_api.h", "driver_types.h"):
++        (cuda / "include" / header).write_text(f"/* {header} */\n")
++    return tools, cuda
++
++
++def test_the_helper_builds_once_into_the_xdg_cache(tmp_path, monkeypatch):
++    from vllm.model_executor.model_loader.direct_io import _native
++
++    tools, cuda = _fake_build_tools(tmp_path)
++    log = tmp_path / "cc.log"
++    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
++    monkeypatch.setenv("CUDA_HOME", str(cuda))
++    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
++    monkeypatch.setenv("FAKE_CC_LOG", str(log))
++    monkeypatch.delenv("CC", raising=False)
++    target = _native._build()
++    assert target.parent.parent == tmp_path / "cache" / "vllm" / "direct_io"
++    assert re.fullmatch(r"[0-9a-f]{24}", target.parent.name)
++    assert target.name.startswith("_direct_io_storage") and target.is_file()
++    (command,) = log.read_text().splitlines()
++    arguments = command.split()
++    assert str(_native._SOURCE) in arguments and "-Werror" in arguments
++    assert arguments[-5:-2] == ["-lcudart", "-lcuda", "-luring"]
++    assert "-I/fake/uring" in arguments and f"-I{cuda / 'include'}" in arguments
++    assert _native._build() == target
++    assert len(log.read_text().splitlines()) == 1
++
++
++def test_the_helper_refuses_to_build_without_liburing(tmp_path, monkeypatch):
++    from vllm.model_executor.model_loader.direct_io import _native
++
++    tools, cuda = _fake_build_tools(tmp_path, liburing=False)
++    monkeypatch.setenv("PATH", f"{tools}{os.pathsep}{os.environ['PATH']}")
++    monkeypatch.setenv("CUDA_HOME", str(cuda))
++    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
++    monkeypatch.delenv("CC", raising=False)
++    with pytest.raises(RuntimeError, match="needs liburing and pkg-config"):
++        _native._build()
++    monkeypatch.setenv("CC", str(tmp_path / "no-such-compiler"))
++    with pytest.raises(RuntimeError, match="needs a C99 compiler"):
++        _native._build()
+diff --git a/tests/model_executor/model_loader/test_direct_loader_cuda.py b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+new file mode 100644
+index 000000000..4a97995bd
+--- /dev/null
++++ b/tests/model_executor/model_loader/test_direct_loader_cuda.py
+@@ -0,0 +1,539 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""The direct loader's reads and copies on a GPU: O_DIRECT input only, final
++destinations, padding and neighbours untouched, bounded alignment and scratch,
++ownership of retained views, failures without buffered retries, and the loader's
++routing into CUDA parameters with the weight digest of a Torch copy.
++
++Ported from local-inference-lab/b12x tests/loader/test_direct.py and
++tests/loader/test_vllm.py at 236ddff04a5f (Apache-2.0), for the bounce ring only.
++O_DIRECT needs a real filesystem (not tmpfs or overlayfs): the checkpoints are
++written under DIRECT_IO_TEST_DIR, /cache/direct-io-test by default (the fleet's
++cache mount). Needs the native helper's build tools (direct_io/_native.py).
++"""
++
++import json
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import textwrap
++from array import array
++from pathlib import Path
++
++import pytest
++import torch
++from safetensors.torch import save_file
++
++from vllm.config.load import LoadConfig
++from vllm.model_executor.model_loader import direct_loader, weight_digest
++from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_io import (
++    DirectWeightSession,
++    capabilities,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.weight_transfer import (
++    copy_weight,
++    get_file_tensor_source,
++    weight_transfer,
++)
++
++pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
++
++RING_BYTES = 16 << 20
++METADATA_SCRATCH_BYTES = 64 << 10
++
++
++@pytest.fixture
++def tmp_path():
++    """A fresh directory where O_DIRECT works, in place of pytest's tmp_path."""
++    root = Path(os.environ.get("DIRECT_IO_TEST_DIR", "/cache/direct-io-test"))
++    root.mkdir(parents=True, exist_ok=True)
++    path = Path(tempfile.mkdtemp(dir=root))
++    yield path
++    shutil.rmtree(path)
++
++
++@pytest.mark.parametrize("rank", [0, 1])
++@pytest.mark.parametrize("padded", [False, True])
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
++def test_tp_column_slices_preserve_padding_and_expand_bf16(
++    tmp_path, rank, padded, dtype
++):
++    """TP rows must read the selected columns without overwriting row padding."""
++    expected = torch.arange(2 * 128 * 256, dtype=torch.float32).to(torch.bfloat16)
++    expected = expected.reshape(2, 128, 256)
++    path = tmp_path / "tp.safetensors"
++    save_file({"weight": expected}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["weight"][
++            :, :, rank * 128 : (rank + 1) * 128
++        ]
++        backing = torch.full(
++            (2, 128, 130 if padded else 128), -17.0, dtype=dtype, device="cuda"
++        )
++        target = backing[:, :, 1:-1] if padded else backing
++        assert session(target, source)
++        stats = session.stats()
++        if not padded:
++            assert stats["strided_copy_bytes"] == source.nbytes
++            assert stats["reads"] < 8
++        assert stats["descriptors"] == 2
++    torch.testing.assert_close(
++        target.cpu(),
++        expected[:, :, rank * 128 : (rank + 1) * 128].to(dtype),
++        rtol=0,
++        atol=0,
++    )
++    if padded:
++        assert torch.all(backing[:, :, 0] == -17)
++        assert torch.all(backing[:, :, -1] == -17)
++
++
++def test_transform_materialization_owns_values_after_session_close(tmp_path):
++    expected = torch.arange(4096, dtype=torch.float32).reshape(32, 128)
++    path = tmp_path / "transform.safetensors"
++    save_file({"weight": expected}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["weight"][:, 64:]
++        actual = session.materialize(source)
++    path.unlink()
++    torch.testing.assert_close(actual.cpu(), expected[:, 64:], rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("offset", [0, 4103, 2**32 + 4103])
++def test_ring_reads_exact_bytes_with_large_file_offsets(tmp_path, offset):
++    path = tmp_path / "payload"
++    expected = bytes(range(256)) * 65537
++    with path.open("wb") as output:
++        output.seek(offset)
++        output.write(expected)
++    with DirectWeightSession() as session:
++        backing = torch.full(
++            (len(expected) + 514,), 199, device="cuda", dtype=torch.uint8
++        )
++        target = backing[257:-257]
++        record = (offset, len(expected), target.data_ptr(), 0, 1, 0, 0)
++        with (
++            path.open("rb") as buffered,
++            pytest.raises(RuntimeError, match="requires O_DIRECT"),
++        ):
++            session._execute(array("Q", (buffered.fileno(), *record)))
++        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++        try:
++            session._execute(array("Q", (fd, *record)))
++        finally:
++            os.close(fd)
++        stats = session.stats()
++        assert stats["scratch_bytes"] == RING_BYTES + METADATA_SCRATCH_BYTES
++        assert stats["bounced_bytes"] == len(expected)
++    path.unlink()
++    assert target.cpu().numpy().tobytes() == expected
++    assert torch.all(backing[:257] == 199)
++    assert torch.all(backing[-257:] == 199)
++
++
++def test_descriptor_views_read_the_selected_source_into_fused_parameters(tmp_path):
++    path = tmp_path / "model.safetensors"
++    expected = torch.arange(128 * 64, dtype=torch.float32).reshape(128, 64)
++    save_file({"layer.weight": expected, "layer.scale": torch.tensor(2.0)}, path)
++    with DirectWeightSession() as session:
++        sources = dict(
++            session.weights([path], needs_values=lambda entry: entry.shape == ())
++        )
++        assert sources["layer.weight"].device.type == "meta"
++        assert sources["layer.scale"].item() == 2
++        destination = torch.full((128, 64), -1.0, device="cuda")
++        assert session(destination[64:], sources["layer.weight"][32:96])
++        with pytest.raises(
++            NotImplementedError, match="unsupported data transformation"
++        ):
++            session(destination, sources["layer.weight"] + 1)
++        sources["layer.weight"].add_(1)
++        with pytest.raises(NotImplementedError, match="explicit transform"):
++            session(destination, sources["layer.weight"])
++    torch.testing.assert_close(destination[64:].cpu(), expected[32:96])
++    torch.testing.assert_close(destination[:64].cpu(), torch.full((64, 64), -1.0))
++
++
++@pytest.mark.parametrize("tp_size", [2, 4])
++@pytest.mark.parametrize("dtype", [torch.int8, torch.float8_e8m0fnu])
++def test_mxfp4_tp_shards_preserve_packed_bytes_and_exponents(tmp_path, tp_size, dtype):
++    """Signed FP4 payloads and E8M0 views must not undergo numeric FP8 casts."""
++    bits = torch.arange(256, dtype=torch.uint8).repeat(64).reshape(256, 64)
++    path = tmp_path / "packed.safetensors"
++    save_file({"weight": bits.view(dtype)}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["weight"]
++        if dtype == torch.float8_e8m0fnu:
++            source = source.view(torch.uint8)
++        width = bits.shape[1] // tp_size
++        targets = []
++        for rank in range(tp_size):
++            shard = source[:, rank * width : (rank + 1) * width]
++            target = torch.empty(shard.shape, dtype=torch.uint8, device="cuda")
++            session(target, shard)
++            targets.append(target)
++        with pytest.raises(
++            NotImplementedError, match="unsupported data transformation"
++        ):
++            session(targets[0], source[:, :width].to(torch.float32))
++        session.flush()
++        assert session.stats()["transform_scratch_bytes"] == 0
++    assert torch.equal(torch.cat([t.cpu() for t in targets], dim=1), bits)
++
++
++def test_truncated_direct_input_fails_without_buffered_retry(tmp_path):
++    path = tmp_path / "short"
++    path.write_bytes(bytes(4096))
++    with DirectWeightSession() as session:
++        target = torch.empty(8192, device="cuda", dtype=torch.uint8)
++        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
++        try:
++            with pytest.raises(RuntimeError, match="file range"):
++                session._execute(
++                    array("Q", (fd, 0, 8192, target.data_ptr(), 0, 1, 0, 0))
++                )
++        finally:
++            os.close(fd)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float64])
++def test_dtype_conversion_reuses_bounded_gpu_scratch(tmp_path, dtype):
++    path = tmp_path / "model.safetensors"
++    expected = torch.arange((8 << 20) + 128, dtype=torch.float32) / 1024
++    save_file({"weight": expected}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["weight"]
++        target = torch.empty(source.shape, dtype=dtype, device="cuda")
++        pointer = target.data_ptr()
++        assert session(target, source)
++        assert target.data_ptr() == pointer
++        stats = session.stats()
++        assert stats["transform_scratch_bytes"] == 8 << 20
++        assert stats["transform_bytes"] == expected.nbytes
++    torch.testing.assert_close(target.cpu(), expected.to(dtype), rtol=0, atol=0)
++
++
++@pytest.mark.parametrize("count", [0, 1, 48, 65536, (8 << 20) + 2])
++def test_bf16_expands_in_ring_without_extra_transform_scratch(tmp_path, count):
++    path = tmp_path / "model.safetensors"
++    # Include every BF16 bit pattern, including signed zeros, subnormals and NaNs.
++    bits = torch.arange(count, dtype=torch.int32).to(torch.int16)
++    expected = bits.view(torch.bfloat16)
++    save_file({"A_log": expected}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["A_log"]
++        backing = torch.full((count + 130,), -17.0, device="cuda")
++        target = backing[65 : 65 + count]
++        pointer = target.data_ptr()
++        assert session(target, source)
++        assert target.data_ptr() == pointer
++        stats = session.stats()
++        assert stats["transform_scratch_bytes"] == 0
++        assert stats["transform_bytes"] == 0
++        assert stats["bf16_expansion_bytes"] == expected.nbytes
++    actual = backing.cpu()
++    torch.testing.assert_close(actual[:65], torch.full((65,), -17.0))
++    torch.testing.assert_close(actual[-65:], torch.full((65,), -17.0))
++    assert torch.equal(
++        actual[65 : 65 + count].view(torch.int32), bits.to(torch.int32) << 16
++    )
++
++
++def test_batch_reorders_disjoint_destinations_and_retains_views_until_completion(
++    tmp_path,
++):
++    path = tmp_path / "weights.safetensors"
++    expected = torch.arange(1024 * 1024, dtype=torch.float32).reshape(256, -1)
++    save_file({"weight": expected}, path)
++    with DirectWeightSession(io_threads=4) as session:
++        source = dict(session.weights([path]))["weight"]
++        target = torch.full_like(expected, -1, device="cuda")
++        before = session.native.direct_stats(session.reader)["reads"]
++        for row in reversed(range(256)):
++            session(target[row], source[row])
++        assert session.native.direct_stats(session.reader)["reads"] == before
++        session.flush()
++        stats = session.stats()
++        assert stats["batches"] == 1
++        assert stats["descriptors"] == 256
++        assert stats["scratch_bytes"] == RING_BYTES + METADATA_SCRATCH_BYTES
++        assert stats["bounced_bytes"] == expected.nbytes
++    torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
++
++
++def test_batch_rejects_overlaps_before_writing_any_destination(tmp_path):
++    path = tmp_path / "weights.safetensors"
++    save_file({"weight": torch.ones(128)}, path)
++    with DirectWeightSession() as session:
++        source = dict(session.weights([path]))["weight"]
++        target = torch.zeros(128, device="cuda")
++        session(target, source)
++        session(target[64:], source[:64])
++        with pytest.raises(RuntimeError, match="overlapping batch destinations"):
++            session.flush()
++    assert torch.count_nonzero(target) == 0
++
++
++def test_failed_batch_drains_workers_and_allows_an_independent_next_batch(tmp_path):
++    path = tmp_path / "weights.safetensors"
++    save_file({"weight": torch.arange(4096, dtype=torch.float32)}, path)
++    with DirectWeightSession(io_threads=4) as session:
++        source = dict(session.weights([path]))["weight"]
++        target = torch.zeros(4096, device="cuda")
++        session(target, source)
++        with path.open("r+b") as file:
++            file.truncate(512)
++        with pytest.raises(RuntimeError, match="file range"):
++            session.flush()
++        replacement = tmp_path / "replacement.safetensors"
++        expected = torch.arange(4096, dtype=torch.float32) + 10
++        save_file({"weight": expected}, replacement)
++        source = dict(session.weights([replacement]))["weight"]
++        session(target, source)
++        session.flush()
++    torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
++
++
++def test_scalar_metadata_reads_are_coalesced_and_keep_independent_values(tmp_path):
++    path = tmp_path / "scales.safetensors"
++    values = {f"scale_{i:04d}": torch.tensor(float(i)) for i in range(2048)}
++    save_file(values, path)
++    with DirectWeightSession() as session:
++        loaded = dict(session.weights([path], needs_values=lambda entry: True))
++        assert session.stats()["reads"] < 10
++    for name, expected in values.items():
++        assert loaded[name].item() == expected.item()
++
++
++def test_cpu_scale_descriptors_keep_sources_alive_and_write_in_one_batch():
++    with DirectWeightSession(io_threads=4) as session:
++        destination = torch.zeros(2048, device="cuda")
++        for index in range(2048):
++            assert session(destination[index], torch.tensor(float(index)))
++        session.flush()
++        stats = session.stats()
++        assert stats["batches"] == 1
++        assert stats["reads"] == 0
++        assert stats["metadata_host_copy_bytes"] == 2048 * 4
++    torch.testing.assert_close(
++        destination.cpu(), torch.arange(2048, dtype=torch.float32)
++    )
++
++
++@pytest.mark.parametrize("io_threads", [1, 8, 16])
++def test_bounce_ring_recycles_slots_without_changing_final_weights(
++    tmp_path, io_threads
++):
++    """A payload larger than both the ring and batch chunk must survive reuse."""
++    path = tmp_path / "large.safetensors"
++    expected = torch.arange((18 << 20) + 129, dtype=torch.int32)
++    save_file({"weight": expected}, path)
++    with DirectWeightSession(io_threads=io_threads) as session:
++        source = dict(session.weights([path]))["weight"]
++        backing = torch.full(
++            (expected.numel() + 2,), -1, device="cuda", dtype=expected.dtype
++        )
++        target = backing[1:-1]
++        session(target, source)
++        session.flush()
++        stats = session.stats(flush=False)
++        assert stats["bounce_buffer_bytes"] == RING_BYTES
++        assert stats["scratch_bytes"] == RING_BYTES + METADATA_SCRATCH_BYTES
++        assert stats["bounced_bytes"] == expected.nbytes
++        assert stats["io_uring_submits"] > 0
++        assert stats["max_inflight_reads"] == io_threads
++        # Flush is the publication boundary, before destroying the executor.
++        torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
++    assert backing[0].item() == backing[-1].item() == -1
++
++
++def test_preexisting_cuda_storage_survives_session_and_orders_loading_stream(
++    tmp_path,
++):
++    """The loader must accept ordinary preexisting tensors and keep their lifetime."""
++    expected = torch.arange(1 << 20, dtype=torch.int32)
++    path = tmp_path / "ordinary.safetensors"
++    save_file({"weight": expected}, path)
++    target = torch.empty(expected.shape, dtype=expected.dtype, device="cuda")
++    pointer = target.data_ptr()
++    stream = torch.cuda.Stream()
++    with torch.cuda.stream(stream), DirectWeightSession() as session:
++        target.fill_(-1)
++        source = dict(session.weights([path]))["weight"]
++        session(target, source)
++        session.flush()
++        output = target.clone()
++    stream.synchronize()
++    path.unlink()
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph, stream=stream):
++        output.copy_(target)
++    output.zero_()
++    graph.replay()
++    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
++    assert target.data_ptr() == pointer
++
++
++def test_expandable_weights_span_cuda_mappings_and_reject_unmapped_tail(tmp_path):
++    """Large ordinary weights cross mapping boundaries; reserved VA is not storage."""
++    subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            textwrap.dedent("""
++            import ctypes as c
++            import sys
++            from array import array
++            import torch
++            from safetensors.torch import save_file
++            from vllm.model_executor.model_loader.direct_io import DirectWeightSession
++
++            expected = torch.arange(40 << 20, dtype=torch.uint8)
++            path = sys.argv[1]
++            save_file({"weight": expected}, path)
++            target = torch.empty_like(expected, device="cuda")
++            driver = c.CDLL("libcuda.so.1")
++            base, size = c.c_uint64(), c.c_size_t()
++            assert driver.cuMemGetAddressRange_v2(
++                c.byref(base), c.byref(size), c.c_uint64(target.data_ptr())
++            ) == 0
++            assert target.nbytes > size.value - (target.data_ptr() - base.value)
++            with DirectWeightSession() as session:
++                source = dict(session.weights([path]))["weight"]
++                session(target, source)
++                session.flush()
++                torch.testing.assert_close(target.cpu(), expected, rtol=0, atol=0)
++                assert driver.cuMemGetAddressRange_v2(
++                    c.byref(base), c.byref(size),
++                    c.c_uint64(target.data_ptr() + target.nbytes - 1)
++                ) == 0
++                extent = base.value + size.value - target.data_ptr() + 1
++                try:
++                    session._execute(array("Q", (
++                        session.files[0], 0, extent, target.data_ptr(), 0, 1, 0, 0
++                    )))
++                except RuntimeError as error:
++                    assert "CUDA device allocation" in str(error), error
++                else:
++                    raise AssertionError("accepted an unmapped destination tail")
++        """),
++            str(tmp_path / "expandable.safetensors"),
++        ],
++        env={
++            **os.environ,
++            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
++            "PYTORCH_ALLOC_CONF": "expandable_segments:True",
++        },
++        check=True,
++        timeout=120,
++    )
++
++
++def test_capabilities_report_the_attributes_the_loader_checks():
++    reported = capabilities(torch.accelerator.current_device_index())
++    assert set(reported) == {
++        "integrated",
++        "can_map_host_memory",
++        "managed_memory",
++        "concurrent_managed_access",
++        "pageable_memory_access",
++        "host_page_tables",
++        "host_register_supported",
++        "registered_host_pointer",
++    }
++    assert set(reported.values()) <= {0, 1}
++
++
++class _Tiny(torch.nn.Module):
++    """Parameters of the dtypes and shards a DS4.1 rank loads, with vLLM's default
++    weight loader (Torch semantics for a declined copy)."""
++
++    def __init__(self):
++        super().__init__()
++        self.wq = torch.nn.Parameter(
++            torch.empty((64, 48), dtype=torch.bfloat16), requires_grad=False
++        )
++        self.norm = torch.nn.Parameter(torch.empty(48), requires_grad=False)
++        self.codes = torch.nn.Parameter(
++            torch.empty((32, 16), dtype=torch.uint8), requires_grad=False
++        )
++        self.scale = torch.nn.Parameter(torch.empty(()), requires_grad=False)
++
++    def load_weights(self, weights):
++        params = dict(self.named_parameters())
++        loaded = set()
++        for name, tensor in weights:
++            name = name.removeprefix("model.")
++            if name == "wq":
++                tensor = tensor[64:]  # rank 1 of a TP2 row shard
++            if name == "codes":
++                tensor = tensor.view(torch.uint8)[:, 16:]
++            default_weight_loader(params[name], tensor)
++            loaded.add(name)
++        return loaded
++
++
++def test_loaded_weights_digest_equal_to_a_torch_copy(tmp_path):
++    checkpoint = {
++        "wq": (torch.arange(128 * 48, dtype=torch.float32) / 64).to(torch.bfloat16),
++        "norm": torch.arange(48, dtype=torch.bfloat16),  # expanded to FP32
++        "codes": torch.arange(32 * 32, dtype=torch.uint8).view(torch.float8_e8m0fnu),
++        "scale": torch.tensor(0.125),
++    }
++    checkpoint["wq"] = checkpoint["wq"].reshape(128, 48)
++    checkpoint["codes"] = checkpoint["codes"].reshape(32, 32)
++    save_file(checkpoint, tmp_path / "model.safetensors")
++    (tmp_path / "model.safetensors.index.json").write_text(
++        json.dumps({"weight_map": dict.fromkeys(checkpoint, "model.safetensors")})
++    )
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    source = DefaultModelLoader.Source(str(tmp_path), revision=None, prefix="model.")
++    with torch.device("cuda"):
++        direct, reference = _Tiny(), _Tiny()
++    with (
++        DirectWeightSession() as session,
++        weight_transfer(session),
++    ):
++        loader._session = session
++        assert direct.load_weights(loader._get_weights_iterator(source)) == set(
++            checkpoint
++        )
++        session.flush()
++        stats = session.stats()
++        loader._session = None
++    assert stats["payload_bytes"] > 0 and stats["bf16_expansion_bytes"] == 48 * 2
++    reference.load_weights((name, tensor) for name, tensor in checkpoint.items())
++    assert weight_digest.weight_digest(direct) == weight_digest.weight_digest(reference)
++
++
++def test_file_backed_tables_stay_descriptors_beside_routed_weights(tmp_path):
++    table = torch.arange(64, dtype=torch.uint8).reshape(8, 8)
++    weight = torch.arange(32, dtype=torch.float32).reshape(4, 8)
++    path = tmp_path / "model.safetensors"
++    save_file({"layers.1.engram.embed.weight": table, "layers.1.w": weight}, path)
++    loader = direct_loader.DirectModelLoader(LoadConfig(load_format="direct"))
++    source = DefaultModelLoader.Source(
++        str(tmp_path),
++        revision=None,
++        file_weight_filter=lambda name: name.endswith("engram.embed.weight"),
++    )
++    with (
++        DirectWeightSession() as session,
++        weight_transfer(session),
++    ):
++        loader._session = session
++        loaded = dict(loader._get_weights_iterator(source))
++        destination = torch.empty((4, 8), device="cuda")
++        copy_weight(destination, loaded["layers.1.w"])
++        session.flush()
++        loader._session = None
++    descriptor = get_file_tensor_source(loaded["layers.1.engram.embed.weight"])
++    assert descriptor is not None and descriptor.shape == (8, 8)
++    with path.open("rb") as checkpoint:
++        checkpoint.seek(descriptor.offset)
++        assert checkpoint.read(table.nbytes) == table.numpy().tobytes()
++    torch.testing.assert_close(destination.cpu(), weight, rtol=0, atol=0)
+diff --git a/vllm/config/load.py b/vllm/config/load.py
+index d9f03707e..2e3db8acc 100644
+--- a/vllm/config/load.py
++++ b/vllm/config/load.py
+@@ -37,6 +37,10 @@ class LoadConfig:
+     - "safetensors" will load the weights in the safetensors format.
+     - "b12x" will load safetensors weights directly into CUDA tensors using
+       the b12x checkpoint loader provided by `flashinfer-python[b12x]`.
++    - "direct" will read safetensors weights with O_DIRECT through a
++      registered host ring straight into CUDA tensors, without the page cache.
++      It needs a GPU that reads pageable memory through the host page tables,
++      such as GB10.
+     - "mxfp4_csf" reads losslessly compressed Kimi/DS4.1/DS4-Flash
+       MXFP4 expert scales and retains file-backed loading for Engram tables.
+     - "instanttensor" will load the Safetensors weights on CUDA devices using
+diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
+index 631945e20..3fd6d5102 100644
+--- a/vllm/model_executor/model_loader/__init__.py
++++ b/vllm/model_executor/model_loader/__init__.py
+@@ -10,6 +10,7 @@ from vllm.config.load import LoadConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_loader import DirectModelLoader
+ from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+ from vllm.model_executor.model_loader.modelexpress_loader import (
+     ModelExpressModelLoader,
+@@ -34,6 +35,7 @@ logger = init_logger(__name__)
+ LoadFormats = Literal[
+     "auto",
+     "b12x",
++    "direct",
+     "hf",
+     "dummy",
+     "fastsafetensors",
+@@ -52,6 +54,7 @@ LoadFormats = Literal[
+ ]
+ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
+     "auto": DefaultModelLoader,
++    "direct": DirectModelLoader,
+     "hf": DefaultModelLoader,
+     "dummy": DummyModelLoader,
+     "fastsafetensors": DefaultModelLoader,
+@@ -160,6 +163,7 @@ __all__ = [
+     "BaseModelLoader",
+     "ModelExpressModelLoader",
+     "DefaultModelLoader",
++    "DirectModelLoader",
+     "DummyModelLoader",
+     "IpcModelLoader",
+     "RunaiModelStreamerLoader",
+diff --git a/vllm/model_executor/model_loader/direct_io/__init__.py b/vllm/model_executor/model_loader/direct_io/__init__.py
+new file mode 100644
+index 000000000..da5727a36
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/__init__.py
+@@ -0,0 +1,33 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""O_DIRECT checkpoint reads into ordinary CUDA tensors, for ``--load-format direct``
++(``direct_loader``). Importing this package neither initializes CUDA nor builds the
++native helper."""
++
++import operator
++
++from vllm.model_executor.model_loader.direct_io._checkpoint import (
++    DirectWeightSession,
++    TensorRange,
++    scratch_chunks,
++    view_offset,
++    view_records,
++)
++
++
++def capabilities(device: int = 0) -> dict[str, int]:
++    """The CUDA device attributes that decide whether the direct loader can run on
++    ``device`` (``cudaDeviceGetAttribute``)."""
++    from vllm.model_executor.model_loader.direct_io._native import load
++
++    return load().capabilities(operator.index(device))
++
++
++__all__ = [
++    "DirectWeightSession",
++    "TensorRange",
++    "capabilities",
++    "scratch_chunks",
++    "view_offset",
++    "view_records",
++]
+diff --git a/vllm/model_executor/model_loader/direct_io/_batch.c b/vllm/model_executor/model_loader/direct_io/_batch.c
+new file mode 100644
+index 000000000..51c4426d4
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_batch.c
+@@ -0,0 +1,217 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Read descriptors into CUDA destinations: validated, split into jobs of at
++ * most 64 MiB, checked for overlapping destinations, ordered by source and run
++ * through the bounce ring (_bounce.c). Descriptor destinations are ordinary
++ * CUDA tensors retained by Python. Included by _storage.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_batch.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the capsule is direct_io.batch_executor.
++ */
++#include <limits.h>
++#include <time.h>
++#include "_cuda_range.h"
++
++#define BATCH_CHUNK_BYTES (64 << 20)
++typedef struct {
++    int fd;
++    int64_t offset, bytes;
++    char *destination;
++    bool expand_bf16;
++    bool host_copy;
++    int64_t rows, source_stride, destination_stride;
++} read_job_t;
++
++#include "_bounce.c"
++
++typedef struct {
++    pthread_mutex_t mutex;
++    bounce_ring_t *bounce;
++    int device;
++    uint64_t batches, descriptors;
++    double execution_seconds;
++} batch_executor_t;
++
++static void delete_batch(PyObject *capsule) {
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) return;
++    bounce_release(executor->bounce);
++    pthread_mutex_destroy(&executor->mutex);
++    free(executor);
++}
++
++static PyObject *py_batch_executor(PyObject *self, PyObject *args) {
++    (void)self;
++    int device, workers;
++    if (!PyArg_ParseTuple(args, "ii", &device, &workers)) return NULL;
++    if (workers < 1 || workers > 16)
++        return PyErr_Format(PyExc_ValueError, "io_threads must be between 1 and 16");
++    batch_executor_t *executor = calloc(1, sizeof(*executor));
++    if (!executor) return PyErr_NoMemory();
++    executor->device = device;
++    pthread_mutex_init(&executor->mutex, NULL);
++    failure_t failure = {{0}};
++    executor->bounce = bounce_create(device, (unsigned)workers, &failure);
++    if (!executor->bounce) {
++        pthread_mutex_destroy(&executor->mutex);
++        free(executor);
++        return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    }
++    PyObject *capsule = PyCapsule_New(executor, "direct_io.batch_executor", delete_batch);
++    if (!capsule) {
++        bounce_release(executor->bounce);
++        pthread_mutex_destroy(&executor->mutex);
++        free(executor);
++    }
++    return capsule;
++}
++
++static int job_destination_order(const void *a, const void *b) {
++    uintptr_t x = (uintptr_t)((const read_job_t *)a)->destination;
++    uintptr_t y = (uintptr_t)((const read_job_t *)b)->destination;
++    return (x > y) - (x < y);
++}
++
++static int job_source_order(const void *a, const void *b) {
++    const read_job_t *x = a, *y = b;
++    if (x->fd != y->fd) return (x->fd > y->fd) - (x->fd < y->fd);
++    return (x->offset > y->offset) - (x->offset < y->offset);
++}
++
++static PyObject *py_batch_execute(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule;
++    Py_buffer records;
++    unsigned long long stream;
++    if (!PyArg_ParseTuple(args, "Oy*K", &capsule, &records, &stream)) return NULL;
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) { PyBuffer_Release(&records); return NULL; }
++    failure_t failure = {{0}};
++    read_job_t *jobs = NULL;
++    size_t count = 0, capacity = 0;
++    if (records.len % (8 * sizeof(uint64_t))) {
++        snprintf(failure.message, sizeof(failure.message), "invalid read descriptor byte size");
++        goto done;
++    }
++    size_t descriptors = records.len / (8 * sizeof(uint64_t));
++    for (size_t i = 0; i < descriptors; i++) {
++        uint64_t record[8];
++        memcpy(record, (char *)records.buf + i * sizeof(record), sizeof(record));
++        uint64_t fd = record[0], offset = record[1], bytes = record[2];
++        uint64_t pointer = record[3], transform = record[4];
++        uint64_t rows = record[5], source_stride = record[6], destination_stride = record[7];
++        bool expand_bf16 = transform == 1;
++        if (fd > INT_MAX || transform > 2 || offset > INT64_MAX ||
++            bytes > (uint64_t)INT64_MAX - offset ||
++            (expand_bf16 && (bytes % 2 || bytes > INT64_MAX / 2)) ||
++            (transform == 2 && ((!offset && bytes) || rows != 1)) || !rows || rows > INT64_MAX ||
++            source_stride > INT64_MAX || destination_stride > INT64_MAX ||
++            (source_stride && rows - 1 > ((uint64_t)INT64_MAX - offset - bytes) / source_stride) ||
++            (destination_stride && rows - 1 > ((uint64_t)INT64_MAX - bytes * (1 + expand_bf16)) / destination_stride)) {
++            snprintf(failure.message, sizeof(failure.message), "invalid read descriptor");
++            goto done;
++        }
++        if (rows > 1 && destination_stride < bytes * (1 + expand_bf16)) {
++            snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
++            goto done;
++        }
++        uint64_t extent = (rows - 1) * destination_stride + bytes * (1 + expand_bf16);
++        if (!device_range(pointer, extent, executor->device)) {
++            snprintf(failure.message, sizeof(failure.message), "batch destination exceeds CUDA device allocation");
++            goto done;
++        }
++        char *destination = (char *)(uintptr_t)pointer;
++        while (rows && bytes) {
++            if (count == capacity) {
++                size_t next = capacity ? capacity * 2 : 1024;
++                read_job_t *grown = realloc(jobs, next * sizeof(*jobs));
++                if (!grown) { snprintf(failure.message, sizeof(failure.message), "read descriptor allocation failed"); goto done; }
++                jobs = grown;
++                capacity = next;
++            }
++            int64_t chunk = bytes > BATCH_CHUNK_BYTES ? BATCH_CHUNK_BYTES : (int64_t)bytes;
++            uint64_t chunk_rows = 1;
++            if (bytes <= BATCH_CHUNK_BYTES && destination_stride == bytes * (1 + expand_bf16)) {
++                uint64_t stride = source_stride > destination_stride ? source_stride : destination_stride;
++                chunk_rows = stride ? BATCH_CHUNK_BYTES / stride : 1;
++                if (!chunk_rows) chunk_rows = 1;
++                if (chunk_rows > rows) chunk_rows = rows;
++            }
++            jobs[count++] = (read_job_t){(int)fd, (int64_t)offset, chunk, destination,
++                expand_bf16, transform == 2, (int64_t)chunk_rows,
++                (int64_t)source_stride, (int64_t)destination_stride};
++            if (chunk < (int64_t)bytes) {
++                /* Large contiguous rows can still be divided into independent jobs. */
++                if (rows != 1) {
++                    snprintf(failure.message, sizeof(failure.message), "strided rows exceed batch chunk size");
++                    goto done;
++                }
++                offset += chunk;
++                bytes -= chunk;
++                destination += chunk * (1 + expand_bf16);
++            } else {
++                rows -= chunk_rows;
++                if (rows) {
++                    offset += chunk_rows * source_stride;
++                    destination += chunk_rows * destination_stride;
++                }
++            }
++        }
++    }
++    qsort(jobs, count, sizeof(*jobs), job_destination_order);
++    for (size_t i = 1; i < count; i++) {
++        read_job_t *previous = &jobs[i - 1];
++        if ((uintptr_t)previous->destination + previous->bytes * (1 + previous->expand_bf16) +
++            (previous->rows - 1) * previous->destination_stride >
++            (uintptr_t)jobs[i].destination) {
++            snprintf(failure.message, sizeof(failure.message), "overlapping batch destinations need an explicit dependency");
++            goto done;
++        }
++    }
++    qsort(jobs, count, sizeof(*jobs), job_source_order);
++    Py_BEGIN_ALLOW_THREADS
++    pthread_mutex_lock(&executor->mutex);
++    if (cuda_ok(cudaSetDevice(executor->device), "select batch device", &failure) &&
++        cuda_ok(cudaStreamSynchronize((cudaStream_t)(uintptr_t)stream),
++                "synchronize batch destinations", &failure)) {
++        struct timespec start, stop;
++        clock_gettime(CLOCK_MONOTONIC, &start);
++        bounce_execute(executor->bounce, jobs, count, &failure);
++        clock_gettime(CLOCK_MONOTONIC, &stop);
++        executor->execution_seconds += stop.tv_sec - start.tv_sec +
++                                       (stop.tv_nsec - start.tv_nsec) * 1e-9;
++        executor->batches++;
++        executor->descriptors += descriptors;
++    }
++    pthread_mutex_unlock(&executor->mutex);
++    Py_END_ALLOW_THREADS
++done:
++    free(jobs);
++    PyBuffer_Release(&records);
++    if (failure.message[0]) return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    Py_RETURN_NONE;
++}
++
++static PyObject *py_batch_stats(PyObject *self, PyObject *capsule) {
++    (void)self;
++    batch_executor_t *executor = PyCapsule_GetPointer(capsule, "direct_io.batch_executor");
++    if (!executor) return NULL;
++    pthread_mutex_lock(&executor->mutex);
++    bounce_ring_t *ring = executor->bounce;
++    PyObject *result = Py_BuildValue("{s:K,s:K,s:K,s:i,s:K,s:K,s:d,s:i,s:K,s:K,s:I}",
++        "physical_bytes", (unsigned long long)ring->physical_bytes,
++        "strided_copy_bytes", (unsigned long long)ring->strided_bytes,
++        "reads", (unsigned long long)ring->reads,
++        "scratch_bytes", BOUNCE_BYTES,
++        "batches", (unsigned long long)executor->batches,
++        "descriptors", (unsigned long long)executor->descriptors,
++        "execution_seconds", executor->execution_seconds,
++        "bounce_buffer_bytes", BOUNCE_BYTES,
++        "bounced_bytes", (unsigned long long)ring->bounced_bytes,
++        "io_uring_submits", (unsigned long long)ring->submits,
++        "max_inflight_reads", ring->max_inflight);
++    pthread_mutex_unlock(&executor->mutex);
++    return result;
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_bounce.c b/vllm/model_executor/model_loader/direct_io/_bounce.c
+new file mode 100644
+index 000000000..6da3332ce
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_bounce.c
+@@ -0,0 +1,294 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * The bounce ring: io_uring O_DIRECT reads into 16 registered 1 MiB host slots, and
++ * a copier thread that copies each read slot into its CUDA destination with
++ * cudaMemcpy2DAsync (strided rows as one 2-D copy, BF16 expanded to FP32 in the
++ * slot first) while reads into the other slots stay in flight. Fixed read slots stay
++ * owned until their CUDA copy finishes. Included by _batch.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_bounce.c at 236ddff04a5f
++ * (Apache-2.0). Changed: liburing is required (_native.py refuses to build
++ * without it), so the builds without io_uring support are gone.
++ */
++#define BOUNCE_SLOTS 16
++#define BOUNCE_SLOT_BYTES (1 << 20)
++#define BOUNCE_BYTES (BOUNCE_SLOTS * BOUNCE_SLOT_BYTES)
++#include <liburing.h>
++
++typedef struct {
++    read_job_t job;
++    size_t delta, required;
++} bounce_slot_t;
++
++typedef struct {
++    char *buffers;
++    int device;
++    cudaStream_t stream;
++    bool registered;
++    failure_t copy_failure;
++    bounce_slot_t slots[BOUNCE_SLOTS];
++    pthread_mutex_t mutex;
++    pthread_cond_t ready, available, drained;
++    pthread_t copier;
++    bool copier_started, stopping, poisoned;
++    unsigned free_slots[BOUNCE_SLOTS], free_count;
++    unsigned ready_slots[BOUNCE_SLOTS], head, tail, ready_count, copying;
++    unsigned depth, max_inflight;
++    uint64_t reads, physical_bytes, bounced_bytes, strided_bytes, submits;
++    struct io_uring ring;
++    bool ring_ready;
++} bounce_ring_t;
++
++static void bounce_release(bounce_ring_t *ring) {
++    if (!ring) return;
++    if (ring->copier_started) {
++        pthread_mutex_lock(&ring->mutex);
++        ring->stopping = true;
++        pthread_cond_signal(&ring->ready);
++        pthread_mutex_unlock(&ring->mutex);
++        pthread_join(ring->copier, NULL);
++    }
++    if (ring->ring_ready) io_uring_queue_exit(&ring->ring);
++    int previous = ring->device;
++    cudaGetDevice(&previous);
++    cudaSetDevice(ring->device);
++    if (ring->stream) { cudaStreamSynchronize(ring->stream); cudaStreamDestroy(ring->stream); }
++    if (ring->registered) cudaHostUnregister(ring->buffers);
++    free(ring->buffers);
++    cudaSetDevice(previous);
++    pthread_cond_destroy(&ring->ready);
++    pthread_cond_destroy(&ring->available);
++    pthread_cond_destroy(&ring->drained);
++    pthread_mutex_destroy(&ring->mutex);
++    free(ring);
++}
++
++static void expand_bf16_inplace(char *destination, int64_t bytes) {
++    for (int64_t i = bytes / 2; i > 0;) {
++        --i;
++        uint16_t bf16;
++        memcpy(&bf16, destination + 2 * i, sizeof(bf16));
++        uint32_t fp32 = (uint32_t)bf16 << 16;
++        memcpy(destination + 4 * i, &fp32, sizeof(fp32));
++    }
++}
++
++static void *bounce_copy_worker(void *opaque) {
++    bounce_ring_t *ring = opaque;
++    failure_t failure = {{0}};
++    cuda_ok(cudaSetDevice(ring->device), "select ring copy device", &failure);
++    pthread_mutex_lock(&ring->mutex);
++    for (;;) {
++        while (!ring->ready_count && !ring->stopping)
++            pthread_cond_wait(&ring->ready, &ring->mutex);
++        if (!ring->ready_count) break;
++        unsigned index = ring->ready_slots[ring->head++ % BOUNCE_SLOTS];
++        ring->ready_count--;
++        bounce_slot_t slot = ring->slots[index];
++        pthread_mutex_unlock(&ring->mutex);
++        char *buffer = ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES;
++        char *source = buffer + slot.delta;
++        size_t width = slot.job.bytes;
++        size_t pitch = slot.job.rows > 1 ? (size_t)slot.job.source_stride : width;
++        if (slot.job.expand_bf16) {
++            for (int64_t row = 0; row < slot.job.rows; row++)
++                memmove(buffer + row * width, source + row * pitch, width);
++            expand_bf16_inplace(buffer, slot.job.rows * width);
++            source = buffer;
++            width *= 2;
++            pitch = width;
++        }
++        if (!failure.message[0])
++            cuda_ok(cudaMemcpy2DAsync(slot.job.destination,
++                slot.job.rows > 1 ? (size_t)slot.job.destination_stride : width,
++                source, pitch, width, slot.job.rows, cudaMemcpyHostToDevice,
++                ring->stream), "copy checkpoint ring to CUDA weights", &failure);
++        /* Reads into other slots remain in flight while this slot is on the GPU. */
++        cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint ring copy", &failure);
++        pthread_mutex_lock(&ring->mutex);
++        if (failure.message[0]) ring->copy_failure = failure;
++        ring->bounced_bytes += slot.job.rows * slot.job.bytes;
++        if (slot.job.rows > 1) ring->strided_bytes += slot.job.rows * slot.job.bytes;
++        ring->free_slots[ring->free_count++] = index;
++        ring->copying--;
++        pthread_cond_signal(&ring->available);
++        if (!ring->copying) pthread_cond_signal(&ring->drained);
++    }
++    pthread_mutex_unlock(&ring->mutex);
++    return NULL;
++}
++
++static bounce_ring_t *bounce_create(int device, unsigned depth, failure_t *failure) {
++    bounce_ring_t *ring = calloc(1, sizeof(*ring));
++    if (!ring) { snprintf(failure->message, sizeof(failure->message), "bounce ring allocation failed"); return NULL; }
++    pthread_mutex_init(&ring->mutex, NULL);
++    pthread_cond_init(&ring->ready, NULL);
++    pthread_cond_init(&ring->available, NULL);
++    pthread_cond_init(&ring->drained, NULL);
++    ring->device = device;
++    ring->depth = depth;
++    int error = posix_memalign((void **)&ring->buffers, IO_ALIGNMENT, BOUNCE_BYTES);
++    if (error) goto failed;
++    if (!cuda_ok(cudaSetDevice(device), "select ring device", failure) ||
++        !cuda_ok(cudaHostRegister(ring->buffers, BOUNCE_BYTES, cudaHostRegisterDefault),
++                 "pin checkpoint ring for CUDA copies", failure)) goto failed;
++    ring->registered = true;
++    if (!cuda_ok(cudaStreamCreateWithFlags(&ring->stream, cudaStreamNonBlocking),
++                 "create checkpoint copy stream", failure)) goto failed;
++    error = io_uring_queue_init(BOUNCE_SLOTS, &ring->ring, 0);
++    if (error < 0) { error = -error; goto failed; }
++    ring->ring_ready = true;
++    struct iovec buffers[BOUNCE_SLOTS];
++    for (unsigned i = 0; i < BOUNCE_SLOTS; i++) {
++        buffers[i] = (struct iovec){ring->buffers + (size_t)i * BOUNCE_SLOT_BYTES, BOUNCE_SLOT_BYTES};
++        ring->free_slots[ring->free_count++] = i;
++    }
++    error = io_uring_register_buffers(&ring->ring, buffers, BOUNCE_SLOTS);
++    if (error < 0) { error = -error; goto failed; }
++    error = pthread_create(&ring->copier, NULL, bounce_copy_worker, ring);
++    if (error) goto failed;
++    ring->copier_started = true;
++    return ring;
++failed:
++    if (!failure->message[0]) snprintf(failure->message, sizeof(failure->message),
++             "io_uring bounce initialization failed: %s; check liburing, kernel/container policy and locked-memory limits",
++             strerror(error));
++    bounce_release(ring);
++    return NULL;
++}
++
++static bool bounce_execute(bounce_ring_t *ring, read_job_t *jobs, size_t count,
++                            failure_t *failure) {
++    if (ring->poisoned) {
++        snprintf(failure->message, sizeof(failure->message), "io_uring bounce executor is unusable after a submission/completion failure");
++        return false;
++    }
++    for (size_t i = 0; i < count; i++) {
++        read_job_t *job = &jobs[i];
++        if (!job->host_copy && !validate_direct_range(job->fd, job->offset,
++                (job->rows - 1) * job->source_stride + job->bytes, failure)) return false;
++    }
++    size_t next = 0;
++    int64_t row = 0, within = 0;
++    unsigned outstanding = 0;
++    while ((!failure->message[0] && next < count) || outstanding) {
++        unsigned pending = 0;
++        while (!failure->message[0] && next < count && outstanding + pending < ring->depth) {
++            read_job_t *job = &jobs[next];
++            if (job->host_copy) {
++                cuda_ok(cudaMemcpyAsync(job->destination, (void *)(uintptr_t)job->offset,
++                    job->bytes, cudaMemcpyHostToDevice, ring->stream),
++                    "copy checkpoint metadata", failure);
++                next++;
++                continue;
++            }
++            pthread_mutex_lock(&ring->mutex);
++            if (ring->copy_failure.message[0]) {
++                *failure = ring->copy_failure;
++                pthread_mutex_unlock(&ring->mutex);
++                break;
++            }
++            if (!ring->free_count) { pthread_mutex_unlock(&ring->mutex); break; }
++            unsigned index = ring->free_slots[--ring->free_count];
++            pthread_mutex_unlock(&ring->mutex);
++            bounce_slot_t *slot = &ring->slots[index];
++            slot->job = *job;
++            int64_t offset = job->offset + row * job->source_stride + within;
++            int64_t aligned = offset & ~(int64_t)(IO_ALIGNMENT - 1);
++            slot->delta = offset - aligned;
++            slot->job.destination += row * job->destination_stride + within * (1 + job->expand_bf16);
++            slot->job.bytes = job->bytes - within;
++            if (slot->job.bytes > BOUNCE_SLOT_BYTES - (int64_t)slot->delta)
++                slot->job.bytes = BOUNCE_SLOT_BYTES - slot->delta;
++            if (job->expand_bf16) {
++                if (slot->job.bytes > BOUNCE_SLOT_BYTES / 2)
++                    slot->job.bytes = BOUNCE_SLOT_BYTES / 2;
++                slot->job.bytes &= ~(int64_t)1;
++            }
++            slot->job.rows = 1;
++            if (!within && job->bytes < IO_ALIGNMENT && job->source_stride >= job->bytes) {
++                slot->job.rows += (BOUNCE_SLOT_BYTES - (int64_t)slot->delta - job->bytes) / job->source_stride;
++                if (slot->job.rows > job->rows - row) slot->job.rows = job->rows - row;
++            }
++            if (job->expand_bf16 && slot->job.rows > BOUNCE_SLOT_BYTES / (2 * slot->job.bytes))
++                slot->job.rows = BOUNCE_SLOT_BYTES / (2 * slot->job.bytes);
++            slot->required = slot->delta + (slot->job.rows - 1) * job->source_stride + slot->job.bytes;
++            unsigned length = (slot->required + IO_ALIGNMENT - 1) & ~(size_t)(IO_ALIGNMENT - 1);
++            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring->ring);
++            if (!sqe) {
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce SQ capacity exhausted");
++                ring->poisoned = true;
++                break;
++            }
++            io_uring_prep_read_fixed(sqe, job->fd,
++                ring->buffers + (size_t)index * BOUNCE_SLOT_BYTES, length, aligned, index);
++            io_uring_sqe_set_data64(sqe, index);
++            pending++;
++            within += slot->job.bytes;
++            if (within == job->bytes) { row += slot->job.rows; within = 0; }
++            if (row == job->rows) { next++; row = 0; }
++        }
++        while (pending && !failure->message[0]) {
++            ring->submits++;
++            int submitted = io_uring_submit(&ring->ring);
++            if (submitted == -EINTR) continue;
++            if (submitted <= 0) {
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce submit: %s", strerror(submitted < 0 ? -submitted : EIO));
++                ring->poisoned = true;
++                break;
++            }
++            outstanding += submitted;
++            pending -= submitted;
++            if (outstanding > ring->max_inflight) ring->max_inflight = outstanding;
++        }
++        if (outstanding) {
++            struct io_uring_cqe *cqe = NULL;
++            int status = io_uring_wait_cqe(&ring->ring, &cqe);
++            if (status < 0) {
++                if (status != -EINTR && status != -EAGAIN) {
++                    if (!failure->message[0]) snprintf(failure->message, sizeof(failure->message), "io_uring bounce wait: %s", strerror(-status));
++                    ring->poisoned = true;
++                }
++                continue;
++            }
++            unsigned index = (unsigned)io_uring_cqe_get_data64(cqe);
++            status = cqe->res;
++            io_uring_cqe_seen(&ring->ring, cqe);
++            outstanding--;
++            ring->reads++;
++            if (status > 0) ring->physical_bytes += status;
++            bool success = status >= 0 && (size_t)status >= ring->slots[index].required;
++            if (!success && !failure->message[0])
++                snprintf(failure->message, sizeof(failure->message), "io_uring bounce read: %s", status < 0 ? strerror(-status) : "short O_DIRECT read");
++            pthread_mutex_lock(&ring->mutex);
++            if (success) {
++                ring->ready_slots[ring->tail++ % BOUNCE_SLOTS] = index;
++                ring->ready_count++;
++                ring->copying++;
++                pthread_cond_signal(&ring->ready);
++            } else ring->free_slots[ring->free_count++] = index;
++            pthread_mutex_unlock(&ring->mutex);
++        } else if (!failure->message[0] && next < count) {
++            pthread_mutex_lock(&ring->mutex);
++            while (!ring->free_count) pthread_cond_wait(&ring->available, &ring->mutex);
++            pthread_mutex_unlock(&ring->mutex);
++        }
++    }
++    pthread_mutex_lock(&ring->mutex);
++    while (ring->copying) pthread_cond_wait(&ring->drained, &ring->mutex);
++    if (ring->copy_failure.message[0]) {
++        if (!failure->message[0]) *failure = ring->copy_failure;
++        ring->poisoned = true;
++    }
++    pthread_mutex_unlock(&ring->mutex);
++    if (!cuda_ok(cudaStreamSynchronize(ring->stream), "complete checkpoint metadata copies", failure))
++        ring->poisoned = true;
++    if (ring->poisoned) {
++        /* Drain submitted reads above; never submit SQEs left by a failed submit. */
++        io_uring_queue_exit(&ring->ring);
++        ring->ring_ready = false;
++    }
++    return !failure->message[0];
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_checkpoint.py b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+new file mode 100644
+index 000000000..f625ffe28
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_checkpoint.py
+@@ -0,0 +1,549 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Safetensors metadata routing with O_DIRECT reads into ordinary CUDA tensors.
++
++The weights iterator yields meta tensors that carry each checkpoint tensor's file
++range. Model weight loaders slice, narrow and view them as they would real tensors and
++hand each copy to the session through vLLM's ``weight_transfer`` hook, which records
++it as descriptors (``view_records``): a file range, a destination pointer, and the
++rows and strides of a strided copy. ``flush`` runs the recorded descriptors through the
++native helper's bounce ring (``_bounce.c``): O_DIRECT reads into registered host slots,
++each copied into its destination by the copy engine. No payload is memory-mapped or
++read through the page cache, and no kernel runs.
++
++Plain copies, strided slices (tensor-parallel shards) and BF16 to FP32 expansion (done
++by the CPU in the ring slot) are recorded. A view the descriptors cannot express fails
++closed. Another dtype conversion of a contiguous tensor reads it through an 8 MiB GPU
++scratch and converts it with Torch (``scratch_chunks``). Scalars and declared metadata
++are read with O_DIRECT into CPU tensors, and a copy from a CPU tensor whose layout
++matches its destination is queued as a host copy. The session declines every other
++copy from a real tensor, and the copy goes to Torch.
++
++Ported from local-inference-lab/b12x b12x/loader/_checkpoint.py at 236ddff04a5f
++(Apache-2.0). Changed: only the bounce ring is kept (no GDS transport, shared read
++group or progress callbacks), and the descriptor planning is in functions of its own
++so it can be checked without a GPU.
++"""
++
++from __future__ import annotations
++
++import json
++import math
++import os
++from array import array
++from dataclasses import dataclass
++from itertools import product
++from pathlib import Path
++
++from vllm.model_executor.model_loader.direct_io._native import load
++
++# A descriptor is eight unsigned 64-bit words, as _batch.c reads them: (fd, offset,
++# bytes, destination, transform, rows, source stride, destination stride). Transform
++# READ copies `rows` rows of `bytes` from the file, EXPAND_BF16 also expands each BF16
++# value to FP32 (destination rows twice as wide), and HOST_COPY copies `bytes` from the
++# host address `offset` (fd 0, one row).
++READ, EXPAND_BF16, HOST_COPY = 0, 1, 2
++SCRATCH_BYTES = 8 << 20
++
++
++def _unique_object(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise ValueError(f"duplicate safetensors key: {key}")
++        result[key] = value
++    return result
++
++
++@dataclass(frozen=True)
++class TensorRange:
++    name: str
++    fd: int
++    offset: int
++    nbytes: int
++    shape: tuple[int, ...]
++    dtype: object
++
++
++def view_offset(entry: TensorRange, source, destination) -> int:
++    """The byte offset of ``source``, a view of the checkpoint tensor ``entry``, in the
++    tensor's range; refuses a copy the descriptors cannot express."""
++    if (
++        source._version != 0
++        or source.element_size() != entry.dtype.itemsize
++        or source.is_neg()
++        or source.is_conj()
++        or destination.is_neg()
++        or destination.is_conj()
++        or source.shape != destination.shape
++        or any(stride < 0 for stride in (*source.stride(), *destination.stride()))
++    ):
++        raise NotImplementedError(
++            f"direct load needs an explicit transform for {entry.name}: "
++            f"{source.shape}/{source.stride()}/{source.dtype} -> "
++            f"{destination.shape}/{destination.stride()}/{destination.dtype}"
++        )
++    offset = source.storage_offset() * source.element_size()
++    source_extent = (
++        1
++        + sum(
++            (size - 1) * stride
++            for size, stride in zip(source.shape, source.stride(), strict=False)
++        )
++    ) * source.element_size()
++    if source.numel() and offset + source_extent > entry.nbytes:
++        raise ValueError(f"source view exceeds checkpoint range: {entry.name}")
++    return offset
++
++
++def view_records(
++    entry: TensorRange, offset: int, source, destination, expand: bool
++) -> list[tuple[int, ...]]:
++    """Descriptors that copy ``source``, a view at byte ``offset`` of ``entry``, into
++    ``destination`` of the same shape (and dtype, or FP32 for a BF16 source when
++    ``expand``). The innermost axes that both lay out contiguously make one row, the
++    next axis the rows of one strided copy, and each index of the axes outside it one
++    descriptor."""
++    elements = 1
++    axis = source.ndim - 1
++    while axis >= 0:
++        size = source.shape[axis]
++        if size != 1 and (
++            source.stride(axis) != elements or destination.stride(axis) != elements
++        ):
++            break
++        elements *= size
++        axis -= 1
++    rows = source.shape[axis] if axis >= 0 else 1
++    source_stride = source.stride(axis) * source.element_size() if axis >= 0 else 0
++    destination_stride = (
++        destination.stride(axis) * destination.element_size() if axis >= 0 else 0
++    )
++    outer = source.shape[:axis] if axis >= 0 else ()
++    records = []
++    for index in product(*(range(size) for size in outer)):
++        source_delta = (
++            sum(i * s for i, s in zip(index, source.stride(), strict=False))
++            * source.element_size()
++        )
++        destination_delta = (
++            sum(i * s for i, s in zip(index, destination.stride(), strict=False))
++            * destination.element_size()
++        )
++        records.append(
++            (
++                entry.fd,
++                entry.offset + offset + source_delta,
++                elements * source.element_size(),
++                destination.data_ptr() + destination_delta,
++                EXPAND_BF16 if expand else READ,
++                rows,
++                source_stride,
++                destination_stride,
++            )
++        )
++    return records
++
++
++def scratch_chunks(entry: TensorRange, offset: int, source, capacity: int):
++    """``(start, count, file offset, bytes)`` of each read that passes the contiguous
++    view ``source`` (at byte ``offset`` of ``entry``) through a scratch of ``capacity``
++    elements of its dtype, ``count`` elements from element ``start``."""
++    for start in range(0, source.numel(), capacity):
++        count = min(capacity, source.numel() - start)
++        yield (
++            start,
++            count,
++            entry.offset + offset + start * source.element_size(),
++            count * source.element_size(),
++        )
++
++
++class DirectWeightSession:
++    """Retain source metadata and destination owners through synchronous reads.
++
++    Meta tensors carry only shape, dtype and view offsets through model routing.
++    They never substitute for numerical input: unregistered transformations fail
++    closed. Scalars and explicitly declared metadata are read for value access.
++    No checkpoint payload is mapped or read through the page cache.
++    """
++
++    def __init__(self, device=0, io_threads=8):
++        import torch
++
++        if not 1 <= io_threads <= 16:
++            raise ValueError("io_threads must be between 1 and 16")
++        torch.cuda.init()
++        self.native = load()
++        self.reader = self.native.direct_reader(device)
++        self.device = device
++        self.io_threads = io_threads
++        self.executor = None
++        self.records = array("Q")
++        self.destinations = []
++        self.files = []
++        self.sources = {}
++        self.torch_copy_bytes = 0
++        self.payload_bytes = 0
++        self.metadata_bytes = 0
++        self.metadata_copy_bytes = 0
++        self.loaded_tensors = 0
++        self.transform_bytes = 0
++        self.bf16_expansion_bytes = 0
++        self.transform_scratch = None
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        try:
++            if exc[0] is None:
++                self.flush()
++        finally:
++            self._close()
++
++    def _close(self):
++        self.records = array("Q")
++        self.destinations.clear()
++        self.executor = None
++        self.transform_scratch = None
++        self.sources.clear()
++        for fd in self.files:
++            os.close(fd)
++        self.files.clear()
++        self.reader = None
++
++    def flush(self):
++        """Complete accepted destinations before a numerical consumer runs."""
++        if not self.records:
++            return
++        try:
++            self._execute(self.records)
++        finally:
++            self.records = array("Q")
++            self.destinations.clear()
++
++    def _execute(self, records):
++        import torch
++
++        with torch.accelerator.device_index(self.device):
++            if self.executor is None:
++                self.executor = self.native.batch_executor(self.device, self.io_threads)
++            self.native.batch_execute(
++                self.executor,
++                records,
++                torch.cuda.current_stream(self.device).cuda_stream,
++            )
++
++    def materialize(self, source):
++        """Read owned transform inputs without routing arithmetic through metadata."""
++        import torch
++
++        if source.device.type != "meta":
++            return source.clone()
++        destination = torch.empty(
++            source.shape, dtype=source.dtype, device=torch.device("cuda", self.device)
++        )
++        self(destination, source)
++        self.flush()
++        return destination
++
++    def _metadata_values(self, entries):
++        import torch
++
++        values = {}
++        ordered = sorted(entries, key=lambda entry: entry.offset)
++        start = 0
++        while start < len(ordered):
++            first = ordered[start]
++            end = first.offset + first.nbytes
++            stop = start + 1
++            while stop < len(ordered):
++                following = ordered[stop]
++                if following.offset - end > 4096 or (
++                    following.offset + following.nbytes - first.offset > 8 << 20
++                ):
++                    break
++                end = following.offset + following.nbytes
++                stop += 1
++            self.metadata_bytes += end - first.offset
++            if self.metadata_bytes > 64 << 20:
++                raise ValueError(
++                    "declared metadata spans exceed the 64 MiB session budget"
++                )
++            raw = bytearray(
++                self.native.direct_bytes(
++                    self.reader, first.fd, first.offset, end - first.offset
++                )
++            )
++            for entry in ordered[start:stop]:
++                values[entry.name] = (
++                    torch.frombuffer(
++                        raw,
++                        dtype=entry.dtype,
++                        count=math.prod(entry.shape),
++                        offset=entry.offset - first.offset,
++                    ).reshape(entry.shape)
++                    if entry.nbytes
++                    else torch.empty(entry.shape, dtype=entry.dtype, device="cpu")
++                )
++            start = stop
++        return values
++
++    def manifest(self, path):
++        import torch
++
++        fd = os.open(path, os.O_RDONLY | os.O_DIRECT | os.O_CLOEXEC)
++        self.files.append(fd)
++        size = os.fstat(fd).st_size
++        length = int.from_bytes(
++            self.native.direct_bytes(self.reader, fd, 0, 8), "little"
++        )
++        if length > 100 << 20 or length > size - 8:
++            raise ValueError(f"invalid safetensors header length in {path}")
++        header = json.loads(
++            self.native.direct_bytes(self.reader, fd, 8, length),
++            object_pairs_hook=_unique_object,
++        )
++        if not isinstance(header, dict):
++            raise ValueError("safetensors header must be an object")
++        dtypes = {
++            "BOOL": torch.bool,
++            "U8": torch.uint8,
++            "I8": torch.int8,
++            "I16": torch.int16,
++            "I32": torch.int32,
++            "I64": torch.int64,
++            "U16": torch.uint16,
++            "U32": torch.uint32,
++            "U64": torch.uint64,
++            "F16": torch.float16,
++            "BF16": torch.bfloat16,
++            "F32": torch.float32,
++            "F64": torch.float64,
++            "F8_E4M3": torch.float8_e4m3fn,
++            "F8_E5M2": torch.float8_e5m2,
++            "F8_E8M0": torch.float8_e8m0fnu,
++        }
++        result = []
++        for name, entry in header.items():
++            if name == "__metadata__":
++                if not isinstance(entry, dict) or not all(
++                    isinstance(k, str) and isinstance(v, str) for k, v in entry.items()
++                ):
++                    raise ValueError("invalid safetensors metadata")
++                continue
++            if not isinstance(entry, dict):
++                raise ValueError(f"invalid tensor entry: {name}")
++            shape = entry.get("shape")
++            offsets = entry.get("data_offsets")
++            dtype = dtypes.get(entry.get("dtype"))
++            if (
++                dtype is None
++                or not isinstance(shape, list)
++                or any(type(d) is not int or d < 0 for d in shape)
++                or not isinstance(offsets, list)
++                or len(offsets) != 2
++                or any(type(d) is not int or d < 0 for d in offsets)
++            ):
++                raise ValueError(f"invalid tensor metadata: {name}")
++            start, end = offsets
++            nbytes = math.prod(shape) * dtype.itemsize
++            if end - start != nbytes or end > size - length - 8:
++                raise ValueError(f"invalid tensor file range: {name}")
++            result.append(
++                TensorRange(name, fd, 8 + length + start, nbytes, tuple(shape), dtype)
++            )
++        end = 8 + length
++        for tensor in sorted(result, key=lambda t: (t.offset, t.nbytes)):
++            if tensor.offset != end:
++                raise ValueError(
++                    f"overlap or hole in safetensors payload: {tensor.name}"
++                )
++            end += tensor.nbytes
++        if end != size:
++            raise ValueError("safetensors payload does not cover file")
++        return result
++
++    def weights(
++        self,
++        files,
++        *,
++        prefixes=None,
++        prefix="",
++        index_path=None,
++        needs_values=None,
++        skip=None,
++    ):
++        import torch
++
++        weight_map = None
++        if index_path is not None and Path(index_path).is_file():
++            weight_map = json.loads(Path(index_path).read_text())["weight_map"]
++        indexed_paths = {}
++        for path in files:
++            manifest = self.manifest(path)
++            resolved_path = Path(path).resolve()
++            selected = []
++            for entry in sorted(manifest, key=lambda t: t.name):
++                if prefixes and not entry.name.startswith(prefixes):
++                    continue
++                if weight_map is not None:
++                    indexed_file = weight_map.get(entry.name)
++                    if indexed_file is None:
++                        continue
++                    if indexed_file not in indexed_paths:
++                        indexed_paths[indexed_file] = (
++                            Path(index_path).parent / indexed_file
++                        ).resolve()
++                    if indexed_paths[indexed_file] != resolved_path:
++                        continue
++                if skip is not None and skip(entry.name):
++                    continue
++                selected.append(entry)
++            values = self._metadata_values(
++                [
++                    entry
++                    for entry in selected
++                    if needs_values is not None and needs_values(entry)
++                ]
++            )
++            for entry in selected:
++                if entry.name in values:
++                    tensor = values[entry.name]
++                else:
++                    tensor = torch.empty(entry.shape, dtype=entry.dtype, device="meta")
++                    storage = tensor.untyped_storage()
++                    self.sources[storage._cdata] = (storage, entry)
++                yield prefix + entry.name, tensor
++
++    def __call__(self, destination, source):
++        import torch
++
++        if source.device.type != "meta":
++            if (
++                source.device.type == "cpu"
++                and source.dtype == destination.dtype
++                and (
++                    source.shape == destination.shape
++                    or source.numel() == destination.numel() == 1
++                )
++                and source.is_contiguous()
++                and not source.is_neg()
++                and not source.is_conj()
++                and not destination.is_neg()
++                and not destination.is_conj()
++                and destination.device.index == self.device
++                and destination.is_cuda
++                and destination.is_contiguous()
++            ):
++                if source.nbytes:
++                    self.records.extend(
++                        (
++                            0,
++                            source.data_ptr(),
++                            source.nbytes,
++                            destination.data_ptr(),
++                            HOST_COPY,
++                            1,
++                            0,
++                            0,
++                        )
++                    )
++                    self.destinations.extend((destination, source))
++                    self.metadata_copy_bytes += source.nbytes
++                    torch.autograd.graph.increment_version(destination)
++                return True
++            self.flush()
++            self.torch_copy_bytes += destination.nbytes
++            return False
++        item = self.sources.get(source.untyped_storage()._cdata)
++        if item is None:
++            raise NotImplementedError(
++                "checkpoint routing performed an unsupported data transformation"
++            )
++        _, entry = item
++        offset = view_offset(entry, source, destination)
++        if source.nbytes == 0:
++            return True
++        if destination.device.type != "cuda" or destination.device.index != self.device:
++            raise ValueError("destination must use the session CUDA device")
++        storage = destination.untyped_storage()
++        extent = destination.element_size() * (
++            1
++            + sum(
++                (size - 1) * stride
++                for size, stride in zip(
++                    destination.shape, destination.stride(), strict=True
++                )
++            )
++        )
++        if destination.data_ptr() - storage.data_ptr() + extent > storage.nbytes():
++            raise ValueError(f"destination exceeds tensor storage: {entry.name}")
++        with torch.accelerator.device_index(destination.device.index):
++            expand = (
++                source.dtype == torch.bfloat16 and destination.dtype == torch.float32
++            )
++            byte_cast = {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
++            if destination.dtype == source.dtype or expand or byte_cast:
++                for record in view_records(entry, offset, source, destination, expand):
++                    self.records.extend(record)
++                self.destinations.append(destination)
++                if expand:
++                    self.bf16_expansion_bytes += source.nbytes
++            else:
++                if not source.is_contiguous() or not destination.is_contiguous():
++                    raise NotImplementedError(f"strided dtype conversion: {entry.name}")
++                self.flush()
++                if self.transform_scratch is None:
++                    self.transform_scratch = torch.empty(
++                        SCRATCH_BYTES, dtype=torch.uint8, device=destination.device
++                    )
++                scratch = self.transform_scratch.view(source.dtype)
++                flat = destination.view(-1)
++                for start, count, position, nbytes in scratch_chunks(
++                    entry, offset, source, scratch.numel()
++                ):
++                    self._execute(
++                        array(
++                            "Q",
++                            (
++                                entry.fd,
++                                position,
++                                nbytes,
++                                scratch.data_ptr(),
++                                READ,
++                                1,
++                                0,
++                                0,
++                            ),
++                        )
++                    )
++                    flat[start : start + count].copy_(scratch[:count])
++                self.transform_bytes += source.nbytes
++        torch.autograd.graph.increment_version(destination)
++        self.payload_bytes += source.nbytes
++        self.loaded_tensors += 1
++        return True
++
++    def stats(self, *, flush=True):
++        if flush:
++            self.flush()
++        io = self.native.direct_stats(self.reader)
++        if self.executor is not None:
++            for name, value in self.native.batch_stats(self.executor).items():
++                io[name] = io.get(name, 0) + value
++        return {
++            **io,
++            "payload_bytes": self.payload_bytes,
++            "metadata_bytes": self.metadata_bytes,
++            "loaded_tensors": self.loaded_tensors,
++            "transform_bytes": self.transform_bytes,
++            "bf16_expansion_bytes": self.bf16_expansion_bytes,
++            "transform_scratch_bytes": (
++                0 if self.transform_scratch is None else self.transform_scratch.nbytes
++            ),
++            "metadata_host_copy_bytes": self.metadata_copy_bytes,
++            "torch_copy_bytes": self.torch_copy_bytes,
++        }
+diff --git a/vllm/model_executor/model_loader/direct_io/_cuda_range.h b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+new file mode 100644
+index 000000000..75bdd9e14
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_cuda_range.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Whether a pointer range lies in CUDA device allocations of one device.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_cuda_range.h at 236ddff04a5f
++ * (Apache-2.0). Changed: the include guard's name.
++ */
++#ifndef VLLM_DIRECT_IO_CUDA_RANGE_H
++#define VLLM_DIRECT_IO_CUDA_RANGE_H
++#include <cuda.h>
++
++/* Expandable tensors can span several adjacent CUDA mappings. */
++static bool device_range(uintptr_t pointer, uint64_t bytes, int device) {
++    if (bytes > UINTPTR_MAX - pointer) return false;
++    do {
++        CUmemorytype kind;
++        int ordinal;
++        CUdeviceptr base;
++        size_t size;
++        if (cuPointerGetAttribute(&kind, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, pointer) != CUDA_SUCCESS ||
++            kind != CU_MEMORYTYPE_DEVICE ||
++            cuPointerGetAttribute(&ordinal, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, pointer) != CUDA_SUCCESS ||
++            ordinal != device ||
++            cuMemGetAddressRange(&base, &size, pointer) != CUDA_SUCCESS ||
++            pointer < base || pointer - base >= size) return false;
++        size_t available = size - (pointer - base);
++        if (bytes <= available) return true;
++        pointer += available;
++        bytes -= available;
++    } while (bytes);
++    return true;
++}
++#endif
+diff --git a/vllm/model_executor/model_loader/direct_io/_direct.c b/vllm/model_executor/model_loader/direct_io/_direct.c
+new file mode 100644
+index 000000000..7dadc977d
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_direct.c
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * Small O_DIRECT reads for safetensors headers and CPU metadata. Included by
++ * _storage.c.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_direct.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the capsule is direct_io.reader.
++ */
++#include <fcntl.h>
++#define IO_ALIGNMENT 4096
++#define IO_SCRATCH_BYTES (64 << 10)
++typedef struct {
++    void *scratch;
++    int scratch_bytes;
++    pthread_mutex_t mutex;
++    uint64_t physical_bytes, reads;
++} direct_reader_t;
++
++static void delete_reader(PyObject *capsule) {
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return;
++    free(reader->scratch);
++    pthread_mutex_destroy(&reader->mutex);
++    free(reader);
++}
++static PyObject *py_direct_reader(PyObject *self, PyObject *args) {
++    (void)self;
++    int device;
++    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
++    direct_reader_t *reader = calloc(1, sizeof(*reader));
++    if (!reader) return PyErr_NoMemory();
++    reader->scratch_bytes = IO_SCRATCH_BYTES;
++    int error = posix_memalign(&reader->scratch, IO_ALIGNMENT, IO_SCRATCH_BYTES);
++    if (error) { free(reader); return PyErr_Format(PyExc_RuntimeError, "metadata scratch: %s", strerror(error)); }
++    pthread_mutex_init(&reader->mutex, NULL);
++    PyObject *capsule = PyCapsule_New(reader, "direct_io.reader", delete_reader);
++    if (!capsule) { free(reader->scratch); pthread_mutex_destroy(&reader->mutex); free(reader); }
++    return capsule;
++}
++
++static bool validate_direct_range(int fd, int64_t offset, int64_t bytes,
++                                  failure_t *failure) {
++    struct stat status;
++    int flags = fcntl(fd, F_GETFL);
++    if (flags < 0 || !(flags & O_DIRECT)) {
++        snprintf(failure->message, sizeof(failure->message), "direct reader requires O_DIRECT");
++        return false;
++    }
++    if (fstat(fd, &status) != 0) {
++        system_error(failure, "fstat direct input");
++        return false;
++    }
++    if (offset < 0 || bytes < 0 || offset > INT64_MAX - bytes ||
++        !S_ISREG(status.st_mode) || offset + bytes > status.st_size) {
++        snprintf(failure->message, sizeof(failure->message), "invalid direct input file range");
++        return false;
++    }
++    return true;
++}
++
++static bool direct_read_range(direct_reader_t *reader, int fd, int64_t offset,
++                              int64_t bytes, char *destination, bool allow_direct,
++                              failure_t *failure) {
++    if (!validate_direct_range(fd, offset, bytes, failure)) return false;
++    while (bytes) {
++        int64_t aligned_offset = offset & ~(int64_t)(IO_ALIGNMENT - 1);
++        size_t delta = offset - aligned_offset;
++        (void)allow_direct;
++        size_t payload = bytes < reader->scratch_bytes - (int64_t)delta ?
++                         (size_t)bytes : reader->scratch_bytes - delta;
++        size_t length = (payload + delta + IO_ALIGNMENT - 1) & ~(size_t)(IO_ALIGNMENT - 1);
++        void *buffer = reader->scratch;
++        ssize_t count;
++        do {
++            count = pread(fd, buffer, length, aligned_offset);
++        } while (count < 0 && errno == EINTR);
++        if (count < 0) {
++            system_error(failure, "O_DIRECT pread (no buffered fallback)");
++            return false;
++        }
++        if ((size_t)count < delta + payload) {
++            snprintf(failure->message, sizeof(failure->message), "short O_DIRECT read");
++            return false;
++        }
++        reader->physical_bytes += count;
++        reader->reads++;
++        memcpy(destination, (char *)buffer + delta, payload);
++        destination += payload;
++        offset += payload;
++        bytes -= payload;
++    }
++    return true;
++}
++
++static PyObject *py_direct_bytes(PyObject *self, PyObject *args) {
++    (void)self;
++    PyObject *capsule;
++    int fd;
++    long long offset, bytes;
++    if (!PyArg_ParseTuple(args, "OiLL", &capsule, &fd, &offset, &bytes)) return NULL;
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return NULL;
++    if (bytes < 0 || bytes > 100 * (1 << 20))
++        return PyErr_Format(PyExc_ValueError, "header/metadata read exceeds 100 MiB");
++    PyObject *result = PyBytes_FromStringAndSize(NULL, bytes);
++    if (!result) return NULL;
++    bool success;
++    failure_t failure = {{0}};
++    char *destination = PyBytes_AS_STRING(result);
++    Py_BEGIN_ALLOW_THREADS
++    pthread_mutex_lock(&reader->mutex);
++    success = direct_read_range(reader, fd, offset, bytes, destination, false, &failure);
++    pthread_mutex_unlock(&reader->mutex);
++    Py_END_ALLOW_THREADS
++    if (!success) {
++        Py_DECREF(result);
++        return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++    }
++    return result;
++}
++
++static PyObject *py_direct_stats(PyObject *self, PyObject *capsule) {
++    (void)self;
++    direct_reader_t *reader = PyCapsule_GetPointer(capsule, "direct_io.reader");
++    if (!reader) return NULL;
++    return Py_BuildValue("{s:K,s:K,s:i}",
++        "physical_bytes", (unsigned long long)reader->physical_bytes,
++        "reads", (unsigned long long)reader->reads, "scratch_bytes", reader->scratch_bytes);
++}
+diff --git a/vllm/model_executor/model_loader/direct_io/_native.py b/vllm/model_executor/model_loader/direct_io/_native.py
+new file mode 100644
+index 000000000..488d5ea92
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_native.py
+@@ -0,0 +1,136 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Build and load the direct loader's C99 helper (``_storage.c``) with the system C
++compiler, without linking the PyTorch C++ ABI.
++
++It needs the Python and CUDA headers (``CUDA_HOME``, default /usr/local/cuda), the CUDA
++runtime and driver libraries, and liburing with pkg-config. It is built on first use
++into ``$XDG_CACHE_HOME/vllm/direct_io/<digest>``, where the digest covers the C sources
++and the build identity, so a changed source rebuilds.
++
++Ported from local-inference-lab/b12x b12x/loader/_native.py at 236ddff04a5f
++(Apache-2.0). Changed: liburing is required, the cache directory and module name are
++vLLM's, and the build identity no longer names the PyTorch version (the helper does
++not link it).
++"""
++
++import functools
++import hashlib
++import importlib.util
++import json
++import os
++import platform
++import shlex
++import shutil
++import subprocess
++import sys
++import sysconfig
++import tempfile
++import threading
++from pathlib import Path
++
++_LOCK = threading.Lock()
++_SOURCE = Path(__file__).with_name("_storage.c")
++_NAME = "_direct_io_storage"
++ABI_VERSION = 1
++
++
++def _pkg_config(*args: str) -> str:
++    return subprocess.check_output(["pkg-config", *args, "liburing"], text=True).strip()
++
++
++def _build() -> Path:
++    compiler = shlex.split(os.environ.get("CC", "cc"))
++    if not compiler or not shutil.which(compiler[0]):
++        raise RuntimeError("the direct loader needs a C99 compiler (CC or cc)")
++    compiler[0] = shutil.which(compiler[0])
++    if (
++        not shutil.which("pkg-config")
++        or subprocess.run(
++            ["pkg-config", "--exists", "liburing"], capture_output=True
++        ).returncode
++    ):
++        raise RuntimeError("the direct loader needs liburing and pkg-config")
++    cuda = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda")).resolve()
++    includes = [Path(sysconfig.get_path("include")), cuda / "include"]
++    headers = [
++        includes[0] / "Python.h",
++        includes[1] / "cuda_runtime_api.h",
++        includes[1] / "driver_types.h",
++    ]
++    for path in headers:
++        if not path.is_file():
++            raise RuntimeError(f"the direct loader's build needs {path}")
++    flags = [
++        "-O2",
++        "-std=c99",
++        "-shared",
++        "-fPIC",
++        "-pthread",
++        "-D_FILE_OFFSET_BITS=64",
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        *shlex.split(_pkg_config("--cflags")),
++    ]
++    ldflags = shlex.split(_pkg_config("--libs"))
++    identity = {
++        "abi": ABI_VERSION,
++        "python": sys.version,
++        "soabi": sysconfig.get_config_var("SOABI"),
++        "machine": platform.machine(),
++        "compiler": compiler,
++        "version": subprocess.check_output([*compiler, "--version"], text=True),
++        "flags": flags,
++        "ldflags": ldflags,
++        "liburing": _pkg_config("--modversion"),
++        "cuda": str(cuda),
++        "headers": {
++            str(path.resolve()): hashlib.sha256(path.read_bytes()).hexdigest()
++            for path in headers
++        },
++    }
++    sources = sorted(_SOURCE.parent.glob("*.[ch]"))
++    digest = hashlib.sha256(
++        b"".join(path.read_bytes() for path in sources)
++        + json.dumps(identity, sort_keys=True).encode()
++    ).hexdigest()[:24]
++    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
++    cache = root / "vllm" / "direct_io" / digest
++    cache.mkdir(parents=True, exist_ok=True)
++    target = cache / (_NAME + sysconfig.get_config_var("EXT_SUFFIX"))
++    if not target.exists():
++        with tempfile.TemporaryDirectory(dir=cache) as temporary:
++            output = Path(temporary) / target.name
++            command = [
++                *compiler,
++                *flags,
++                *(f"-I{path}" for path in includes),
++                str(_SOURCE),
++                f"-L{cuda / 'lib64'}",
++                f"-Wl,-rpath,{cuda / 'lib64'}",
++                "-lcudart",
++                "-lcuda",
++                *ldflags,
++                "-o",
++                str(output),
++            ]
++            result = subprocess.run(command, capture_output=True, text=True)
++            if result.returncode:
++                raise RuntimeError(
++                    "the direct loader's helper did not build:\n" + result.stderr
++                )
++            os.replace(output, target)
++    return target
++
++
++@functools.cache
++def load():
++    with _LOCK:
++        spec = importlib.util.spec_from_file_location(_NAME, _build())
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        if module.ABI_VERSION != ABI_VERSION:
++            raise RuntimeError("the direct loader helper's ABI does not match")
++        return module
+diff --git a/vllm/model_executor/model_loader/direct_io/_storage.c b/vllm/model_executor/model_loader/direct_io/_storage.c
+new file mode 100644
+index 000000000..e9a989c51
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_io/_storage.c
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * SPDX-FileCopyrightText: Copyright contributors to the b12x project
++ * SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++ *
++ * The direct loader's native helper (--load-format direct): O_DIRECT reads of
++ * safetensors headers and metadata (_direct.c), and the batch executor that reads
++ * checkpoint ranges through a registered host ring into CUDA tensors (_batch.c,
++ * _bounce.c). One translation unit; _native.py builds it with the system compiler.
++ *
++ * Ported from local-inference-lab/b12x b12x/loader/_storage.c at 236ddff04a5f
++ * (Apache-2.0). Changed: the module is _direct_io_storage, and the PLE reader
++ * (_ple_reader.c) and its methods are gone.
++ */
++#define _GNU_SOURCE
++#define PY_SSIZE_T_CLEAN
++#include <Python.h>
++#include <cuda_runtime_api.h>
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++typedef char require_64_bit_offsets[(sizeof(off_t) == 8 && sizeof(size_t) == 8) ? 1 : -1];
++
++typedef struct {
++    char message[512];
++} failure_t;
++
++static bool cuda_ok(cudaError_t status, const char *operation, failure_t *failure) {
++    if (status == cudaSuccess) return true;
++    snprintf(failure->message, sizeof(failure->message), "%s: %s",
++             operation, cudaGetErrorString(status));
++    return false;
++}
++
++static void system_error(failure_t *failure, const char *operation) {
++    snprintf(failure->message, sizeof(failure->message), "%s: %s",
++             operation, strerror(errno));
++}
++
++static PyObject *py_capabilities(PyObject *self, PyObject *args) {
++    (void)self;
++    int device;
++    if (!PyArg_ParseTuple(args, "i", &device)) return NULL;
++    static const struct {
++        const char *name;
++        enum cudaDeviceAttr attribute;
++    } keys[] = {
++        {"integrated", cudaDevAttrIntegrated},
++        {"can_map_host_memory", cudaDevAttrCanMapHostMemory},
++        {"managed_memory", cudaDevAttrManagedMemory},
++        {"concurrent_managed_access", cudaDevAttrConcurrentManagedAccess},
++        {"pageable_memory_access", cudaDevAttrPageableMemoryAccess},
++        {"host_page_tables", cudaDevAttrPageableMemoryAccessUsesHostPageTables},
++        {"host_register_supported", cudaDevAttrHostRegisterSupported},
++        {"registered_host_pointer", cudaDevAttrCanUseHostPointerForRegisteredMem},
++    };
++    PyObject *result = PyDict_New();
++    if (!result) return NULL;
++    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++        int value;
++        failure_t failure;
++        if (!cuda_ok(cudaDeviceGetAttribute(&value, keys[i].attribute, device),
++                     "cudaDeviceGetAttribute", &failure)) {
++            Py_DECREF(result);
++            return PyErr_Format(PyExc_RuntimeError, "%s", failure.message);
++        }
++        PyObject *number = PyLong_FromLong(value);
++        if (!number || PyDict_SetItemString(result, keys[i].name, number) != 0) {
++            Py_XDECREF(number);
++            Py_DECREF(result);
++            return NULL;
++        }
++        Py_DECREF(number);
++    }
++    return result;
++}
++
++#include "_direct.c"
++#include "_batch.c"
++
++static PyMethodDef methods[] = {
++    {"batch_executor", py_batch_executor, METH_VARARGS, NULL},
++    {"batch_execute", py_batch_execute, METH_VARARGS, NULL},
++    {"batch_stats", py_batch_stats, METH_O, NULL},
++    {"direct_reader", py_direct_reader, METH_VARARGS, NULL},
++    {"direct_bytes", py_direct_bytes, METH_VARARGS, NULL},
++    {"direct_stats", py_direct_stats, METH_O, NULL},
++    {"capabilities", py_capabilities, METH_VARARGS, NULL},
++    {NULL, NULL, 0, NULL},
++};
++static PyModuleDef module = {
++    PyModuleDef_HEAD_INIT, .m_name = "_direct_io_storage", .m_size = -1,
++    .m_methods = methods,
++};
++
++PyMODINIT_FUNC PyInit__direct_io_storage(void) {
++    PyObject *result = PyModule_Create(&module);
++    if (result && PyModule_AddIntConstant(result, "ABI_VERSION", 1) < 0) {
++        Py_DECREF(result);
++        return NULL;
++    }
++    return result;
++}
+diff --git a/vllm/model_executor/model_loader/direct_loader.py b/vllm/model_executor/model_loader/direct_loader.py
+new file mode 100644
+index 000000000..c2232f17b
+--- /dev/null
++++ b/vllm/model_executor/model_loader/direct_loader.py
+@@ -0,0 +1,218 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the b12x project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""``--load-format direct``: safetensors weights read with O_DIRECT through a registered
++host ring and copied straight into the model's CUDA parameters.
++
++The loader is for unified-memory GPUs such as GB10, where the GPU reads pageable
++memory through the host page tables. There a load through the page cache costs twice:
++
++- every byte read stays in the page cache, which counts as available memory but takes
++  the free memory the CUDA allocator needs for the KV cache and graphs allocated after
++  loading;
++- a copy from a memory-mapped checkpoint page the process has not touched can hang
++  (driver R580, 64 KiB pages); ``weight_transfer.copy_weight`` copies such sources into
++  anonymous memory first.
++
++So nothing here maps the checkpoint or reads it through the page cache:
++
++- The weights iterator yields meta tensors that carry each tensor's checkpoint range
++  (``direct_io.DirectWeightSession``). Model weight loaders route them into parameter
++  views as usual, and ``weight_transfer`` hands each copy to the session, which
++  records it and later reads it with O_DIRECT through a 16 MiB registered ring into
++  its destination. Scalars and the model's declared metadata are read into CPU
++  tensors, and copies the session declines go to Torch.
++- Tensors the model reads from the checkpoint files while serving
++  (``checkpoint_file_weight_filter``, such as DeepSeek-V4.1's Engram tables) never pass
++  through the reader: the iterator yields vLLM's file-source descriptors for them
++  (``weight_utils.file_source_tensor``), in name order with the file's other tensors.
++
++The device must report pageable memory access through the host page tables; the
++loader refuses others, since it has no GPU-direct-storage path. The native helper
++(``direct_io/_native.py``) is built on first use. ``model_loader_extra_config`` takes
++``io_threads``, the reads in flight (1-16, default 8). The loader logs one summary line
++once the weights are loaded.
++
++Ported from local-inference-lab/b12x b12x/integration/vllm/loader.py at 236ddff04a5f
++(Apache-2.0) and vLLM's copy of it (``b12x_loader.py``). Changed: no GDS transport,
++shared read group, IPC-exportable allocations or progress panel.
++"""
++
++import dataclasses
++import heapq
++import json
++import math
++import time
++from pathlib import Path
++
++import torch
++from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
++
++from vllm.logger import init_logger
++from vllm.model_executor.model_loader import weight_utils
++from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
++from vllm.model_executor.model_loader.direct_io import (
++    DirectWeightSession,
++    capabilities,
++)
++from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
++from vllm.model_executor.weight_transfer import weight_transfer
++
++logger = init_logger(__name__)
++
++
++class DirectModelLoader(DefaultModelLoader):
++    """Route checkpoint views through an asynchronous O_DIRECT read ring."""
++
++    def __init__(self, load_config):
++        options = dict(load_config.model_loader_extra_config)
++        self.io_threads = options.pop("io_threads", 8)
++        if options.get("enable_multithread_load"):
++            raise ValueError("the direct loader routes checkpoint shards in one thread")
++        if load_config.safetensors_load_strategy not in (None, "lazy"):
++            raise ValueError(
++                "the direct loader's O_DIRECT reads use no safetensors read strategy"
++            )
++        super().__init__(
++            dataclasses.replace(
++                load_config,
++                load_format="safetensors",
++                model_loader_extra_config=options,
++            )
++        )
++        self._session = None
++
++    def load_model(self, vllm_config, model_config, prefix=""):
++        device = torch.device(
++            self.load_config.device or vllm_config.device_config.device
++        )
++        if device.type != "cuda":
++            raise ValueError("the direct loader requires a CUDA device")
++        index = (
++            torch.accelerator.current_device_index()
++            if device.index is None
++            else device.index
++        )
++        if not capabilities(index)["host_page_tables"]:
++            raise RuntimeError(
++                f"--load-format direct needs a GPU that reads pageable memory through "
++                f"the host page tables, such as GB10, and CUDA device {index} does "
++                f"not; it has no GPU-direct-storage path"
++            )
++        with (
++            DirectWeightSession(index, io_threads=self.io_threads) as session,
++            weight_transfer(session),
++        ):
++            self._session = session
++            try:
++                model = super().load_model(vllm_config, model_config, prefix)
++                stats = session.stats()
++            finally:
++                self._session = None
++        seconds = (
++            self.counter_after_loading_weights - self.counter_before_loading_weights
++        )
++        payload = stats["payload_bytes"] / 1e9
++        logger.info(
++            "Direct loader: weights loaded, %.2f GB of checkpoint payload in %.2f s "
++            "(%.2f GB/s); %.2f GB read from disk, %.2f GB BF16 expanded in the ring, "
++            "%.2f GB converted in the GPU scratch, %.2f GB copied by Torch",
++            payload,
++            seconds,
++            payload / seconds if seconds > 0 else 0.0,
++            stats["physical_bytes"] / 1e9,
++            stats["bf16_expansion_bytes"] / 1e9,
++            stats["transform_bytes"] / 1e9,
++            stats["torch_copy_bytes"] / 1e9,
++        )
++        logger.debug("Direct loader I/O counters: %s", stats)
++        return model
++
++    @staticmethod
++    def _needs_values(entry):
++        return math.prod(entry.shape) == 1 or entry.name.rsplit(".", 1)[-1] in {
++            "layer_multipliers",
++            "ngram_heads_offsets",
++            "ngram_heads_vocab_sizes",
++        }
++
++    def _file_backed_weights_iterator(self, files, source, index_path):
++        session = self._session
++        if session is None:
++            raise RuntimeError("the direct loader reads weights only in load_model")
++        weight_map = None
++        if index_path.is_file():
++            weight_map = json.loads(index_path.read_text())["weight_map"]
++        indexed_paths = {}
++        for path in files:
++            sources = weight_utils.safetensors_file_sources(path)
++            file_names = {name for name in sources if source.file_weight_filter(name)}
++            resolved_path = Path(path).resolve()
++            selected = []
++            for name in sorted(sources):
++                if source.weight_name_prefixes and not name.startswith(
++                    source.weight_name_prefixes
++                ):
++                    continue
++                if weight_map is not None:
++                    indexed_file = weight_map.get(name)
++                    if indexed_file is None:
++                        continue
++                    if indexed_file not in indexed_paths:
++                        indexed_paths[indexed_file] = (
++                            index_path.parent / indexed_file
++                        ).resolve()
++                    if indexed_paths[indexed_file] != resolved_path:
++                        continue
++                if not should_skip_weight(name, self.local_expert_ids):
++                    selected.append(name)
++            file_backed = (
++                (source.prefix + name, weight_utils.file_source_tensor(sources[name]))
++                for name in selected
++                if name in file_names
++            )
++            # File-backed entries never enter the checkpoint direct reader, even
++            # for mixed files or before metadata-value reads and routing.
++            ordinary = (
++                session.weights(
++                    [path],
++                    prefixes=source.weight_name_prefixes,
++                    prefix=source.prefix,
++                    index_path=index_path,
++                    needs_values=self._needs_values,
++                    skip=lambda name, file_names=file_names: (
++                        name in file_names
++                        or should_skip_weight(name, self.local_expert_ids)
++                    ),
++                )
++                if any(name not in file_names for name in selected)
++                else ()
++            )
++            yield from heapq.merge(file_backed, ordinary, key=lambda item: item[0])
++
++    def _get_weights_iterator(self, source):
++        session = self._session
++        if session is None:
++            raise RuntimeError("the direct loader reads weights only in load_model")
++        folder, files, _ = self._prepare_weights(
++            source.model_or_path,
++            source.subfolder,
++            source.revision,
++            False,
++            source.allow_patterns_overrides,
++            source.weight_name_prefixes,
++        )
++        if self.counter_before_loading_weights == 0.0:
++            self.counter_before_loading_weights = time.perf_counter()
++        index_path = Path(folder) / SAFE_WEIGHTS_INDEX_NAME
++        if source.file_weight_filter is not None:
++            yield from self._file_backed_weights_iterator(files, source, index_path)
++            return
++        yield from session.weights(
++            files,
++            prefixes=source.weight_name_prefixes,
++            prefix=source.prefix,
++            index_path=index_path,
++            needs_values=self._needs_values,
++            skip=lambda name: should_skip_weight(name, self.local_expert_ids),
++        )
+-- 
+2.54.0 (Apple Git-157)
+
