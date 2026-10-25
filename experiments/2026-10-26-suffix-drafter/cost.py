@@ -8,19 +8,23 @@ A step, per rank (the c1 model of experiments/2026-10-26-c1-100tps, PR #598, ext
 blocks, to TP3 and to eight streams):
 
     step = overhead + (dense + drafter_routed + 40 * U * expert) / rate
-           + (dead + padding) * dead_row
+           + (rows + padding - suite rows) * row
 
 - U is the distinct routed experts a target layer reads. One request's r consecutive rows reach
   N(r); eight independent requests reach E * (1 - prod(1 - N_i / E)) of the E = 384 experts.
 - dense and expert are bytes a rank, from floor.py's shapes (#598) with the TP3 shards 4/3 as
   wide (Q-A/KV, router, mHC fn, compressors and the Markov head replicated).
 - rate is FC1's marginal stream rate, 266.6 GB/s (#598's expert-rate bundle on dgx4).
-- dead_row is the engine grid's price of a row that reaches no new expert (identical dummy
+- row is the engine grid's price of a row that reaches no new expert (identical dummy
   tokens): 0.366 ms at TP4 (r6v static table, #598), 0.435 ms at TP3 (1022 grid, 1x2 -> 1x6
-  rows). Padding is the rows a step's CUDA graph adds to reach its capture size.
+  rows). Every row past the release suite's (4.07 at c1, 8 x 2.97 at c8) pays it, routed or
+  not; padding is the rows a step's CUDA graph adds to reach its capture size.
 - overhead is solved per shape and concurrency from the release suites (1022 c1 on both
   shapes, 1025 c8 at TP4 and 1022 c8 at TP3), at #598's split of today's rows into live and
   dead (2.89 live of 4.07 at c1).
+- The wide-verify bundle (runs/wide-verify-dgx4.txt) checks the expert price at wide blocks:
+  FC1 and FC2 keep their per-expert time from 6 to 65 rows, with the rows spread evenly or
+  piled on three experts.
 
 N(r) has three sources: the reference routes of copied and ordinary text (routes_probe.py, when
 its run is present), json-count's eight-token reference routes extended at 2.4 experts a row
@@ -134,8 +138,8 @@ class Shape:
         self.prose_rows = 1 + drafts
         self.prose_live = 1 + drafts * LIVE_SHARE
         u = self.union([prose(self.prose_live)] * reqs)
-        dead = reqs * (self.prose_rows - self.prose_live)
-        self.overhead = self.suite_step - self.stream_ms(u, reqs) - dead * self.dead_row
+        self.base_rows = reqs * self.prose_rows  # the rows whose per-row costs the overhead holds
+        self.overhead = self.suite_step - self.stream_ms(u, reqs)
 
     def stream_ms(self, u: float, reqs: int) -> float:
         drafter = DRAFTER_LAYERS * self.union([DRAFTER_EXPERTS] * reqs, experts=128) * self.expert
@@ -153,12 +157,14 @@ class Shape:
         return -rows % 8
 
     def step_ms(self, requests) -> float:
-        """``requests``: (routed rows, their routes, other rows) per request; the step's rows
-        are padded once to its capture size."""
+        """``requests``: (routed rows, their routes, other rows) per request. Every row past
+        the suite's pays the grid's per-row price (routed or not, padding included: the
+        wide-verify bundle's per-row FC1/FC2 term is part of it), and routed rows bring their
+        new experts' bytes."""
         u = self.union([routes(live) for live, routes, _ in requests])
         rows = sum(live + other for live, _, other in requests)
-        dead = sum(other for _, _, other in requests)
-        return self.overhead + self.stream_ms(u, len(requests)) + (dead + self.padding(round(rows))) * self.dead_row
+        extra = rows + self.padding(round(rows)) - self.base_rows
+        return self.overhead + self.stream_ms(u, len(requests)) + extra * self.dead_row
 
 
 def request_rows(kind: str, alloc: int, live: int, shape: Shape, copy: Routes):

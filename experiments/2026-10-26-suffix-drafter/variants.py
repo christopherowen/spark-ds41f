@@ -244,26 +244,31 @@ def variants(ms=(8, 16, 24), ks=(16, 32, 64), policies=("full", "grow", "full-no
                                          for pol in policies]
 
 
-def global_predictions(streams: list[np.ndarray], ms=(8, 16, 24)) -> dict[int, list[np.ndarray]]:
+def global_predictions(streams: list[np.ndarray], ms=(8, 16, 24),
+                       times: list[np.ndarray] | None = None) -> dict[int, list[np.ndarray]]:
     """The chained table shared by every stream: for each stream position, the token after the
-    latest earlier occurrence of its preceding n-gram in this stream or any stream before it
-    (streams in the order given), -1 where there is none. Windows across a stream boundary
-    never match."""
+    latest earlier occurrence of its preceding n-gram in any stream, -1 where there is none.
+    "Earlier" is the streams in the order given, or with ``times`` (a time for every token)
+    the time each token was written, so a table entry exists only once its token does: a
+    stream's later turns never predict another stream's earlier output. Windows never cross a
+    stream's ends."""
     lengths = np.array([len(s) for s in streams], dtype=np.int64)
     starts = np.concatenate(([0], np.cumsum(lengths)))
     S = np.concatenate(streams)
-    owner_start = np.repeat(starts[:-1], lengths)
-    ends = np.arange(len(S) + 1)
+    if times is None:
+        order = np.arange(len(S))
+    else:
+        stream_id = np.repeat(np.arange(len(streams)), lengths)
+        position = np.arange(len(S)) - np.repeat(starts[:-1], lengths)
+        order = np.lexsort((position, stream_id, np.concatenate(times)))
     out = {}
     for m in ms:
-        h = window_hashes(S, [m])[m]
-        valid = np.zeros(len(S) + 1, dtype=bool)
-        # window S[e-m:e] lies inside one stream: e - m >= the start of the stream holding e - 1
-        valid[1:] = (ends[1:] - m) >= owner_start
-        prev = prev_occurrence(h, valid)[: len(S)]
-        pred = np.where(prev >= 0, S[np.clip(prev, 0, len(S) - 1)], -1)
-        del h, valid, prev
+        h = np.concatenate([window_hashes(s, [m])[m][: len(s)] for s in streams])
+        valid = np.concatenate([np.arange(len(s)) >= m for s in streams])
+        prev = prev_occurrence(h[order], valid[order])  # an index into ``order``
+        pred_ordered = np.where(prev >= 0, S[order][np.clip(prev, 0, len(S) - 1)], -1)
+        pred = np.empty(len(S), dtype=np.int64)
+        pred[order] = pred_ordered
+        del h, valid, prev, pred_ordered
         out[m] = [pred[starts[i] : starts[i + 1]] for i in range(len(streams))]
     return out
-
-
