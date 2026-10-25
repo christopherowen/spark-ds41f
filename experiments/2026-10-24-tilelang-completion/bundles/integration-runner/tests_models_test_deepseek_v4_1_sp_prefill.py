@@ -309,6 +309,8 @@ def test_engram_gates_only_the_real_local_rows(monkeypatch):
 
     monkeypatch.setattr(engram_ops.hyperconnection, "run_engram_mix", mix)
     monkeypatch.setattr(engram_ops, "tensor_model_parallel_all_reduce", lambda x: x)
+    # The B12X mix, stubbed above, whatever backend the process selects.
+    monkeypatch.setattr(engram_ops.kernels, "uses_tilelang", lambda: False)
     staged = torch.randn(tokens, 6)
     engram = SimpleNamespace(
         embed_tokens=SimpleNamespace(table_memory="device", columns=None),

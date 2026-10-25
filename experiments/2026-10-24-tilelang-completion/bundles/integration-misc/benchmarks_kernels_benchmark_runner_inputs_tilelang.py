@@ -558,6 +558,24 @@ def case_gather_lookback(gen, num_reqs, prefill, widths):
     return triton_call, tilelang_call
 
 
+def case_gather_consumed_drafts(gen, num_reqs, prefill, widths):
+    """The drafts a step's inputs consumed, which the async-scheduling hand-off
+    copies to the host for structured-output requests: before the port, torch's
+    ``draft_tokens[idx_mapping, :drafts]``."""
+    reqs = 1 if prefill else num_reqs
+    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
+    drafts = _randint(0, VOCAB, (MAX_REQS, DRAFTS), gen, torch.int64)
+    out = torch.empty(reqs, DRAFTS, dtype=torch.int64, device=DEVICE)
+
+    def torch_call():
+        drafts[idx, :DRAFTS]
+
+    def tilelang_call():
+        tli.gather_rows(idx, drafts, out)
+
+    return torch_call, tilelang_call
+
+
 CASES = {
     "gather_block_tables": case_gather_block_tables,
     "compute_slot_mappings": case_compute_slot_mappings,
@@ -574,6 +592,7 @@ CASES = {
     "post_update": case_post_update,
     "prepare_dflash_inputs": case_prepare_dflash_inputs,
     "gather_lookback": case_gather_lookback,
+    "gather_consumed_drafts": case_gather_consumed_drafts,
 }
 
 

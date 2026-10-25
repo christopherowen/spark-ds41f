@@ -40,14 +40,29 @@ def make_case(kind, rows, width, seed, count):
             for _ in range(count)
         ]
 
+        if kind == "bincount_clear":
+            # The runner's int32 request indices (the torch clear widened them).
+            mapping = mapping.int()
+
         def reset():
             for mask, counts in buffers:
-                mask.zero_()
-                counts.zero_()
+                if kind == "bincount_clear":
+                    mask.fill_(-1)
+                    counts.fill_(5)
+                else:
+                    mask.zero_()
+                    counts.zero_()
 
         def invoke(index, ours):
             mask, counts = buffers[index]
-            if ours:
+            if kind == "bincount_clear":
+                if ours:
+                    candidate.clear_bincount_rows(mapping, mask, counts)
+                else:
+                    idx_long = mapping.long()
+                    mask.index_fill_(0, idx_long, 0)
+                    counts.index_fill_(0, idx_long, 0)
+            elif ours:
                 candidate.accumulate_bincount(
                     mapping, tokens, prompt, prefill, mask, counts, width
                 )
@@ -239,7 +254,8 @@ def main():
     parser.add_argument("--gate", action="store_true")
     parser.add_argument("--seed", type=int, default=48291)
     parser.add_argument(
-        "--kernels", default="min_p,penalties,bincount,bincount_repeated"
+        "--kernels",
+        default="min_p,penalties,bincount,bincount_repeated,bincount_clear",
     )
     args = parser.parse_args()
     cases = [
@@ -252,9 +268,9 @@ def main():
     for kind in args.kernels.split(","):
         if not kind.startswith("bincount"):
             continue
-        cases += [
-            (kind, rows, width) for rows in (1, 16) for width in (128, 8192, 131072)
-        ]
+        # The clear's work is the vocabulary's, whatever the token history's length.
+        widths = (128,) if kind == "bincount_clear" else (128, 8192, 131072)
+        cases += [(kind, rows, width) for rows in (1, 16) for width in widths]
     results = [measure(*case, args.seed) for case in cases]
     failed = [(r["kernel"], r["rows"], r["width"]) for r in results if r["slower"]]
     print(json.dumps({"summary": "sampling controls", "slower": failed}), flush=True)

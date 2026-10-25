@@ -422,6 +422,48 @@ def bincount_kernel(
     return bincount
 
 
+_CLEAR_BLOCK = 1024  # columns of a row a block clears in each tensor
+
+
+@tilelang.jit(pass_configs=_PASS)
+def clear_bincount_rows_kernel(
+    mask_stride: int, counts_stride: int, index_dtype: str, threads: int = 128
+):
+    """``mask.index_fill_(0, idx, 0)`` and ``counts.index_fill_(0, idx, 0)`` for
+    ``idx = mapping.long()``, in one launch: the rows ``bincount_kernel`` then
+    accumulates into. A negative index wraps as index_fill_'s does, each tensor by
+    its own rows. A block clears ``_CLEAR_BLOCK`` columns of a row of each, its
+    threads on consecutive columns."""
+    rows, mask_rows, mask_cols, count_rows, count_cols = T.dynamic(
+        "rows, mask_rows, mask_cols, count_rows, count_cols"
+    )
+
+    @T.prim_func
+    def clear_rows(
+        mapping: T.Tensor((rows,), index_dtype),
+        mask: T.StridedTensor((mask_rows, mask_cols), (mask_stride, 1), "int32"),
+        counts: T.StridedTensor((count_rows, count_cols), (counts_stride, 1), "int32"),
+    ):
+        with T.Kernel(
+            rows, T.ceildiv(T.max(mask_cols, count_cols), _CLEAR_BLOCK), threads=threads
+        ) as (row, blk):
+            tx = T.get_thread_binding()
+            req = T.alloc_local((1,), "int64")
+            mask_row = T.alloc_local((1,), "int64")
+            count_row = T.alloc_local((1,), "int64")
+            req[0] = T.cast(mapping[row], "int64")
+            mask_row[0] = T.if_then_else(req[0] < 0, req[0] + mask_rows, req[0])
+            count_row[0] = T.if_then_else(req[0] < 0, req[0] + count_rows, req[0])
+            for k in T.unroll(_CLEAR_BLOCK // threads):
+                col = blk * _CLEAR_BLOCK + k * threads + tx
+                if col < mask_cols:
+                    mask[mask_row[0], col] = 0
+                if col < count_cols:
+                    counts[count_row[0], col] = 0
+
+    return clear_rows
+
+
 def register_bincount(
     *,
     all_token_ids_stride: int,
@@ -440,12 +482,32 @@ def register_bincount(
             for dtype in _DTYPES.values()
         ],
     )
+    _declare(
+        clear_bincount_rows_kernel,
+        [
+            (prompt_bin_mask_stride, output_bin_counts_stride, dtype)
+            for dtype in _DTYPES.values()
+        ],
+    )
+
+
+def clear_bincount_rows(mapping, mask, counts):
+    """The prompt bits and output counts of the requests at ``mapping``, zeroed."""
+    if mapping.numel():
+        _launch(
+            clear_bincount_rows_kernel,
+            (mask.stride(0), counts.stride(0), _DTYPES[mapping.dtype]),
+            mapping,
+            mask,
+            counts,
+        )
 
 
 def accumulate_bincount(
     mapping, tokens, prompt, prefill, mask, counts, max_prefill_len
 ):
-    """Kernel portion only; the owner still clears selected rows before accumulation."""
+    """Kernel portion only; the owner clears the selected rows first
+    (``clear_bincount_rows``)."""
     if mapping.numel() and max_prefill_len:
         _launch(
             bincount_kernel,

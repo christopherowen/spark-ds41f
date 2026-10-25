@@ -14,9 +14,9 @@ from vllm.models.deepseek_v4_1.ced import (
     CED_WINDOW,
     CEDState,
     ced_decoder_start,
-    gather_rows,
     nonfinal_limits,
 )
+from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
 from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV41B12xMetadata
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.compressor_utils import get_dspark_swa_index_width
@@ -365,9 +365,7 @@ class DeepseekV41ModelState(DefaultModelState):
             if indices is not None:
                 if cudagraph_mode != CUDAGraphMode.NONE:
                     raise RuntimeError("CED decoder routing requires eager execution")
-                routing_mask = (indices >= 0) & ~gather_rows(
-                    input_batch.is_padding, indices
-                )
+                routing_mask = ced_kernels.routing_mask(indices, input_batch.is_padding)
             seen: set[int] = set()
             for value in metadata.values():
                 if isinstance(value, DeepseekV41B12xMetadata) and id(value) not in seen:

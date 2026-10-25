@@ -3,7 +3,8 @@
 """The TileLang sampling kernels against the Triton kernels they replace, bit for
 bit: the FP32 Gumbel noise of every one of the 2**32 Philox words, Triton's
 randint streams, and every kernel's outputs (including the elements a launch
-leaves alone) on logits with ties, infinities and NaN."""
+leaves alone) on logits with ties, infinities and NaN. The Gumbel finish is
+compared with the torch argmax and gather it replaced."""
 
 import itertools
 
@@ -16,6 +17,7 @@ pytest.importorskip("tilelang")
 import triton.language as tl  # noqa: E402
 from triton.language.extra import libdevice as tldevice  # noqa: E402
 
+from vllm.platforms import current_platform  # noqa: E402
 from vllm.tilelang_utils import T, tilelang  # noqa: E402
 from vllm.v1.worker.gpu.sample import gumbel, sink  # noqa: E402
 from vllm.v1.worker.gpu.sample import tilelang_sampling as tls  # noqa: E402
@@ -24,6 +26,11 @@ from vllm.v1.worker.gpu.spec_decode.dspark import greedy  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
+)
+_SM12X = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform.is_device_capability_family(120),
+    reason="TileLang sampling kernels target SM120/SM121",
 )
 
 DEVICE = torch.device("cuda")
@@ -380,6 +387,88 @@ def test_gumbel_rows_do_not_depend_on_the_batch():
             False,
         )
         assert alone.item() == whole[i].item()
+
+
+# --- Gumbel sampling's finish ---------------------------------------------------
+
+
+def _finish_inputs(tokens: int, blocks: int, case: str, seed: int):
+    """Per-block maxima and argmaxes as the Gumbel kernel leaves them, as views of
+    wider rows. The argmaxes are random ids, not increasing with the block, so a tie
+    broken by id instead of by block shows. The "special" rows: all -inf, all NaN,
+    NaN in the last block only, +inf twice, -0 before +0, NaN twice after +inf, the
+    maximum in the last block, one value throughout; then scattered NaN and
+    infinities in the rest."""
+    g = torch.Generator(device=DEVICE).manual_seed(seed)
+    wide = torch.randn(tokens, blocks + 5, generator=g, device=DEVICE) * 4
+    best = wide[:, :blocks]
+    if case == "ties":
+        best.copy_(torch.round(best / 4))  # equal maxima across blocks
+    elif case == "special":
+        n = best.numel()
+        pick = torch.randperm(n, generator=g, device=DEVICE)
+        flat = best.reshape(-1).clone()
+        flat[pick[: n // 13]] = float("-inf")
+        flat[pick[n // 13 : n // 13 + n // 29]] = float("inf")
+        flat[pick[n // 13 + n // 29 : n // 13 + n // 29 + n // 31]] = float("nan")
+        best.copy_(flat.view(tokens, blocks))
+        last = blocks - 1
+        rows = [
+            lambda r: r.fill_(float("-inf")),
+            lambda r: r.fill_(float("nan")),
+            lambda r: (r.fill_(float("inf")), r[last:].fill_(float("nan"))),
+            lambda r: (r.fill_(-1.0), r[last // 2 :].fill_(float("inf"))),
+            lambda r: (r.fill_(-1.0), r[last // 3 :].fill_(-0.0), r[last:].fill_(0.0)),
+            lambda r: (
+                r.fill_(1.0),
+                r[:1].fill_(float("inf")),
+                r[last // 2 :].fill_(float("nan")),
+            ),
+            lambda r: (r.fill_(2.0), r[last:].fill_(3.0)),
+            lambda r: r.fill_(0.5),
+        ]
+        for i in range(min(tokens, len(rows))):
+            rows[i](best[i])
+    argmax = torch.randint(
+        0, 1 << 40, (tokens, blocks + 3), generator=g, device=DEVICE
+    )[:, :blocks]
+    return argmax, best
+
+
+@_SM12X
+@pytest.mark.parametrize("vocab", [VOCAB, 1000, 2049, 32768, 32769, 200000])
+@pytest.mark.parametrize("tokens", [1, 37, 600])
+@pytest.mark.parametrize("case", CASES)
+def test_gumbel_finish(vocab, tokens, case):
+    """``gumbel_finish`` against the torch argmax and gather it replaced, every
+    block count's lanes (one block, a lane's 32 and 33, DeepSeek V4.1's 127, 196)."""
+    blocks = triton.cdiv(vocab, tls.GUMBEL_BLOCK)
+    argmax, best = _finish_inputs(tokens, blocks, case, vocab + tokens)
+    ours = tls.gumbel_finish(argmax, best)
+    theirs = argmax.gather(dim=-1, index=best.argmax(dim=-1, keepdim=True)).view(-1)
+    assert ours.dtype == torch.int64 and ours.shape == (tokens,)
+    _assert_same(ours, theirs, "sampled tokens")
+
+
+@_SM12X
+@pytest.mark.parametrize("vocab", [VOCAB, 1000, 200000])
+def test_gumbel_finish_is_declared(vocab, monkeypatch):
+    """The finish ``gumbel_sample`` launches is the call its declaration lists for
+    the vocabulary (after the kernel cache freezes, an undeclared one raises)."""
+    launched = set()
+    original = tls._kernel
+
+    def record(factory, *key):
+        launched.add((id(factory), key))
+        return original(factory, *key)
+
+    monkeypatch.setattr(tls, "_kernel", record)
+    logits = _logits(3, vocab, torch.float32, "random", 7)
+    mapping, temperature, seeds, pos = _sampling_inputs(3, 4, "mixed", 7)
+    tls.gumbel_sample(logits, mapping, temperature, seeds, pos, False, False)
+    finish = id(tls.gumbel_finish_kernel)
+    declared = {(id(f), args) for f, args, _ in tls.gumbel_finish_calls(vocab)}
+    assert {key for key in launched if key[0] == finish} == declared
 
 
 @pytest.mark.parametrize("vocab", [VOCAB, 100, 8193])

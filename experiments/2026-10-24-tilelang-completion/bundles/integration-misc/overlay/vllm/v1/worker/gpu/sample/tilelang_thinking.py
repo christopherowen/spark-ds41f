@@ -9,6 +9,7 @@ from vllm.v1.worker.gpu.sample.tilelang_controls import _DTYPES, _PASS, _declare
 def register_thinking(
     *, logits_strides, tokens_stride, start_len, natural_len, end_len
 ):
+    _declare(reset_markers_kernel, [(dtype,) for dtype in _DTYPES.values()])
     _declare(
         marker_cache_kernel,
         [(tokens_stride, dtype, start_len, natural_len) for dtype in _DTYPES.values()],
@@ -21,6 +22,41 @@ def register_thinking(
             for dtype in _DTYPES.values()
         ],
     )
+
+
+@tilelang.jit(pass_configs=_PASS)
+def reset_markers_kernel(index_dtype: str, threads: int = 128):
+    """``cached_start`` and ``cached_end`` -1 and ``cached_pos`` 0 at each of
+    ``req_ids`` (three index_fill_ calls before), a thread a request, a negative
+    index wrapping as index_fill_'s does: a new budgeted request's marker cache,
+    which its next update then scans cold."""
+    reqs, states = T.dynamic("reqs, states")
+
+    @T.prim_func
+    def reset_markers(
+        req_ids: T.Tensor((reqs,), index_dtype),
+        cached_start: T.Tensor((states,), "int32"),
+        cached_end: T.Tensor((states,), "int32"),
+        cached_pos: T.Tensor((states,), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(reqs, threads), threads=threads) as b:
+            i = b * threads + T.get_thread_binding()
+            req = T.alloc_local((1,), "int64")
+            req[0] = T.cast(req_ids[T.min(i, reqs - 1)], "int64")
+            req[0] = T.if_then_else(req[0] < 0, req[0] + states, req[0])
+            if i < reqs:
+                cached_start[req[0]] = -1
+                cached_end[req[0]] = -1
+                cached_pos[req[0]] = 0
+
+    return reset_markers
+
+
+def reset_markers(req_ids, cached_start, cached_end, cached_pos):
+    if req_ids.numel():
+        reset_markers_kernel(_DTYPES[req_ids.dtype])(
+            req_ids, cached_start, cached_end, cached_pos
+        )
 
 
 @tilelang.jit(pass_configs=_PASS)

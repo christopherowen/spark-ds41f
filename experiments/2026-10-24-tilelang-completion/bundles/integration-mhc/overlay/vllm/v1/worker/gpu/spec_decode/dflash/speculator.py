@@ -15,7 +15,6 @@ from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_sliding_window,
@@ -624,16 +623,21 @@ class DFlashSpeculator(DraftModelSpeculator):
                     ]
                 else:
                     last_hidden_states = gather_rows(last_hidden_states, ced_indices)
+            combine_into = getattr(self.model, "combine_aux_hidden_states_into", None)
             if context_states_are_streamed:
                 assert aux_hidden_states is not None
                 context_states = aux_hidden_states[0]
-            elif aux_hidden_states:
-                hidden_states = self.model.combine_hidden_states(
-                    torch.cat(aux_hidden_states, dim=-1)
-                )
+            elif aux_hidden_states and combine_into is not None:
+                # The model joins the aux states and writes the combined rows
+                # into the context buffer itself.
+                combine_into(aux_hidden_states, context_states)
             else:
-                hidden_states = last_hidden_states
-            if not context_states_are_streamed:
+                if aux_hidden_states:
+                    hidden_states = self.model.combine_hidden_states(
+                        torch.cat(aux_hidden_states, dim=-1)
+                    )
+                else:
+                    hidden_states = last_hidden_states
                 context_states.copy_(hidden_states[:num_context_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -709,10 +713,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             # Keep query anchors and rejection masking in the ORIGINAL target
             # coordinates. Only the prepared context inputs are packed afterward.
             context_positions = gather_rows(self.context_positions, ced_indices)
+            from vllm.models.deepseek_v4_1.tilelang import ced as ced_kernels
+
             packed_context_slots = [
-                gather_rows(slots, ced_indices).masked_fill(
-                    ced_indices < 0, PAD_SLOT_ID
-                )
+                ced_kernels.gather_slots(slots, ced_indices)
                 for slots in self._context_slot_mappings
             ]
         # Each layer uses the context slots of its own KV-cache group. V4.1 can

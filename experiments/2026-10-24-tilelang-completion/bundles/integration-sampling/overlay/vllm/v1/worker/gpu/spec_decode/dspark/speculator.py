@@ -35,6 +35,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
@@ -283,6 +284,11 @@ class DSparkSpeculator(DFlashSpeculator):
                 output_stride=self.draft_tokens.stride(0),
                 output_aligned=i * self.draft_tokens.element_size() % 16 == 0,
             )
+        tilelang_inputs.declare(
+            lambda: tilelang_inputs.gather_hidden_rows_calls(
+                self.hidden_states.dtype, self.hidden_states.shape[1]
+            )
+        )
         table = self._markov_table()
         if table is not None:
             from vllm.v1.worker.gpu.sample import tilelang_sampling
@@ -319,7 +325,9 @@ class DSparkSpeculator(DFlashSpeculator):
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = tilelang_inputs.gather_hidden_rows(
+            head_hidden, self.sample_indices[:num_sample]
+        )
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
         local_head = getattr(self.model, "supports_local_draft_argmax", lambda: False)()
         vocab_parallel = self._vocab_parallel_greedy(local_head)
@@ -453,7 +461,9 @@ class DSparkSpeculator(DFlashSpeculator):
         assert self._draft_topk is not None
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
-        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = tilelang_inputs.gather_hidden_rows(
+            head_hidden, self.sample_indices[:num_sample]
+        )
         base_logits = self.model.compute_draft_logits(sample_hidden)
         base_logits = base_logits.view(num_reqs, n_spec, -1)
         base_values, draft_indices = base_logits.topk(self._draft_topk, dim=-1)

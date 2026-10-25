@@ -628,6 +628,32 @@ def logits_rows_calls(index_dtype: torch.dtype) -> list:
     return [_call(logits_rows_kernel, *logits_rows_key(index_dtype))]
 
 
+# --- Rows the heads project ------------------------------------------------------
+
+
+def gather_hidden_rows(source: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+    """``source[indices]`` for in-range int64 indices: the hidden rows the LM head
+    and the drafter's head project, through the CED decoder's TileLang row copy
+    (packed rows, 16-byte pieces)."""
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    if indices.dtype != torch.int64:
+        raise TypeError(
+            f"hidden rows are gathered by int64 indices, not {indices.dtype}"
+        )
+    out = source.new_empty((indices.shape[0], *source.shape[1:]))
+    if out.numel():
+        ced.copy_rows(source, indices, out, scatter=False)
+    return out
+
+
+def gather_hidden_rows_calls(dtype: torch.dtype, width: int) -> list:
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    key = ced.packed_copy_rows_key(str(dtype).removeprefix("torch."), (width,), False)
+    return [_call(ced.copy_rows_kernel, *key)]
+
+
 # --- Padding rows -----------------------------------------------------------------
 
 _PADDING_THREADS = 256
@@ -732,6 +758,52 @@ def flatten_sampled_calls() -> list:
 
 _SCATTER_THREADS = 128
 
+_SCALARS = {"int32": T.int32, "int64": T.int64, "float32": T.float32}
+
+
+@tilelang.jit(pass_configs=_PASS)
+def fill_rows_kernel(idx_dtype: str, dtype: str):
+    """``state[rows] = value``, whole rows, a negative index wrapping as torch's
+    indexing does: the new requests' rows reset (the request state's drafts to 0,
+    adaptive verification's confidences to 1), where torch filled each request's
+    row as it was added. A thread an element."""
+    count, state_rows, state_cols, state_stride = T.dynamic(
+        "count, state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(count * state_cols, _SCATTER_THREADS)
+
+    @T.prim_func
+    def fill_rows(
+        rows: T.Tensor((count,), idx_dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+        value: _SCALARS[dtype],
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // state_cols, count - 1)
+            j = e % state_cols
+            index = T.alloc_var(T.int64, init=T.cast(rows[r], T.int64))
+            if e < count * state_cols:
+                state[T.if_then_else(index < 0, index + state_rows, index), j] = value
+
+    return fill_rows
+
+
+def fill_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype])
+
+
+def fill_rows(rows: torch.Tensor, state: torch.Tensor, value: float) -> None:
+    """``state[rows] = value`` for a 2-D ``state`` of contiguous rows."""
+    if rows.numel() and state.shape[1]:
+        _kernel(fill_rows_kernel, *fill_rows_key(rows.dtype, state.dtype))(
+            rows, state, value
+        )
+
+
+def fill_rows_calls(idx_dtype: torch.dtype, dtype: torch.dtype) -> list:
+    return [_call(fill_rows_kernel, *fill_rows_key(idx_dtype, dtype))]
+
 
 @tilelang.jit(pass_configs=_PASS)
 def scatter_rows_kernel(idx_dtype: str, dtype: str, gather: bool):
@@ -819,6 +891,57 @@ def scatter_rows_calls(
     idx_dtype: torch.dtype, dtype: torch.dtype, gather: bool
 ) -> list:
     return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
+
+
+@tilelang.jit(pass_configs=_PASS)
+def gather_rows_kernel(idx_dtype: str, dtype: str):
+    """``out = state[idx_mapping, :width]`` for the batch's ``[num_reqs, width]``
+    rows, a negative index wrapping as torch's indexing does: the drafts a step's
+    inputs consumed, which the async-scheduling hand-off copies to the host. A
+    thread an element, its index load clamped into the batch and its store
+    guarded."""
+    num_reqs, width = T.dynamic("num_reqs, width")
+    state_rows, state_cols, state_stride = T.dynamic(
+        "state_rows, state_cols, state_stride"
+    )
+    grid = T.ceildiv(num_reqs * width, _SCATTER_THREADS)
+
+    @T.prim_func
+    def gather_rows(
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        state: T.StridedTensor((state_rows, state_cols), (state_stride, 1), dtype),
+        out: T.Tensor((num_reqs, width), dtype),
+    ):
+        with T.Kernel(grid, threads=_SCATTER_THREADS) as b:
+            e = b * _SCATTER_THREADS + T.get_thread_binding()
+            r = T.min(e // width, num_reqs - 1)
+            j = e % width
+            index = T.alloc_var(T.int64, init=T.cast(idx_mapping[r], T.int64))
+            if e < num_reqs * width:
+                out[r, j] = state[
+                    T.if_then_else(index < 0, index + state_rows, index), j
+                ]
+
+    return gather_rows
+
+
+def gather_rows_key(idx_dtype: torch.dtype, dtype: torch.dtype) -> tuple:
+    return (_DTYPES[idx_dtype], _DTYPES[dtype])
+
+
+def gather_rows(
+    idx_mapping: torch.Tensor, state: torch.Tensor, out: torch.Tensor
+) -> None:
+    """``out[:] = state[idx_mapping, :out.shape[1]]``, into a contiguous ``out`` of
+    ``[num_reqs, width]``."""
+    if out.numel():
+        _kernel(gather_rows_kernel, *gather_rows_key(idx_mapping.dtype, state.dtype))(
+            idx_mapping, state, out
+        )
+
+
+def gather_rows_calls(idx_dtype: torch.dtype, dtype: torch.dtype) -> list:
+    return [_call(gather_rows_kernel, *gather_rows_key(idx_dtype, dtype))]
 
 
 # --- Adaptive verification's draft budget -----------------------------------------

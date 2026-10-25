@@ -102,9 +102,10 @@ class ThinkingBudgetState:
             idx = async_tensor_h2d(
                 self._reset_reqs, dtype=torch.int64, device=self.device
             )
-            self.cached_last_start.index_fill_(0, idx, -1)
-            self.cached_last_end.index_fill_(0, idx, -1)
-            self.cached_scan_pos.index_fill_(0, idx, 0)
+            # The three caches' rows at idx in one launch (three index_fill_ before).
+            tilelang_thinking.reset_markers(
+                idx, self.cached_last_start, self.cached_last_end, self.cached_scan_pos
+            )
             self._reset_reqs.clear()
         if self._budget_dirty:
             self.thinking_token_budget.copy_to_uva()

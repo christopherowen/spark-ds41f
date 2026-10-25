@@ -27,6 +27,7 @@ import pytest
 import torch
 
 from vllm.entrypoints.generate.base.serving import build_sink_usage
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import (
     RequestOutputKind,
@@ -75,6 +76,12 @@ def logprob_of(rank: int) -> float:
     return -0.6931471805599453 * rank
 
 
+def logprob_of_id(position: int, token_id: int) -> float:
+    """The scripted logprob of a requested ``logprob_token_ids`` entry in
+    the draw at output ``position`` (-1: a sunk row's)."""
+    return -(position + 2) - token_id / 10000
+
+
 @dataclass
 class WorkerRequest:
     committed: list[int] = field(default_factory=list)
@@ -87,8 +94,9 @@ class WorkerRequest:
     drafts: list[int] = field(default_factory=list)
 
 
-# One logprobs row per sampled token: (token, its rank, the draw's best).
-Row = tuple[int, int, int]
+# One logprobs row per sampled token: (token, its rank, the draw's best, the
+# draw's output position).
+Row = tuple[int, int, int, int]
 
 
 def scripted_prompt_logprobs(
@@ -119,6 +127,7 @@ class ScriptedWorker:
         draft_errors: dict[tuple[str, int], int] | None = None,
         no_drafts: frozenset[str] = frozenset(),
         logprobs: bool = False,
+        logprob_token_ids: list[int] | None = None,
     ):
         self.scheduler = scheduler
         self.scripts = scripts
@@ -127,6 +136,9 @@ class ScriptedWorker:
         self.draft_errors = draft_errors or {}
         self.no_drafts = no_drafts
         self.logprobs = logprobs
+        # As the V2 runner's samplers: each row holds the sampled token, then
+        # these ids (instead of the draw's best), scored in its draw.
+        self.logprob_token_ids = logprob_token_ids
         self.requests: dict[str, WorkerRequest] = {}
         # (req_id, output position, token) of every draw, in order.
         self.draws: list[tuple[str, int, int]] = []
@@ -150,7 +162,7 @@ class ScriptedWorker:
         st.alternate_ranks = ranks[1 : 1 + self.max_retries]
         st.tries = 0
         self.draws.append((req_id, position, candidates[0]))
-        return candidates[0], ranks[0], everything[0]
+        return candidates[0], ranks[0], everything[0], position
 
     def _propose(self, req_id: str, st: WorkerRequest) -> None:
         if req_id in self.no_drafts:
@@ -222,17 +234,23 @@ class ScriptedWorker:
                 self._propose(req_id, self.requests[req_id])
         self.consumed_drafts[id(so)] = consumed
         logprobs = None
-        if self.logprobs:
+        if self.logprobs or self.logprob_token_ids:
             flat = [row for step_rows in rows for row in step_rows]
+            ids = self.logprob_token_ids
+            if ids:
+                columns = [[t, *ids] for t, *_ in flat]
+                values = [
+                    [logprob_of(rank), *(logprob_of_id(q, k) for k in ids)]
+                    for _, rank, _, q in flat
+                ]
+            else:
+                columns = [[t, best] for t, _, best, _ in flat]
+                values = [[logprob_of(rank), logprob_of(1)] for _, rank, _, _ in flat]
+            width = 1 + (len(ids) if ids else 1)
             logprobs = LogprobsLists(
-                np.array([[t, best] for t, _, best in flat], dtype=np.int64).reshape(
-                    -1, 2
-                ),
-                np.array(
-                    [[logprob_of(rank), logprob_of(1)] for _, rank, _ in flat],
-                    dtype=np.float32,
-                ).reshape(-1, 2),
-                np.array([rank for _, rank, _ in flat], dtype=np.int64),
+                np.array(columns, dtype=np.int64).reshape(-1, width),
+                np.array(values, dtype=np.float32).reshape(-1, width),
+                np.array([rank for _, rank, *_ in flat], dtype=np.int64),
                 np.cumsum([0] + [len(r) for r in rows]).tolist(),
             )
         return ModelRunnerOutput(
@@ -271,7 +289,7 @@ class ScriptedWorker:
             )
             # The step's own row for it is the sunk row's: the scheduler
             # must not use it.
-            return [alternate], [(alternate, 99, -1)], event
+            return [alternate], [(alternate, 99, -1, -1)], event
         outcome = SinkOutcome.FALLTHROUGH if draft_zero in SUNK else SinkOutcome.NONE
         st.committed.append(draft_zero)
         drafts = st.drafts[: len(spec) - 1]
@@ -283,7 +301,7 @@ class ScriptedWorker:
             best = self.candidates(req_id, q)[0]
             if draft == best and draft not in SUNK:
                 out.append(draft)
-                step_rows.append((draft, 1, best))
+                step_rows.append((draft, 1, best, q))
                 st.committed.append(draft)
                 continue
             if draft == best:
@@ -364,6 +382,7 @@ def _make_request(
     max_tokens: int = 32,
     logprobs: int | None = None,
     prompt_logprobs: int | None = None,
+    logprob_token_ids: list[int] | None = None,
     stop_token_ids: list[int] | None = None,
     prompt_len: int = 20,
     structured: bool = False,
@@ -373,6 +392,7 @@ def _make_request(
         max_tokens=max_tokens,
         logprobs=logprobs,
         prompt_logprobs=prompt_logprobs,
+        logprob_token_ids=logprob_token_ids,
         stop_token_ids=stop_token_ids,
         temperature=0.0,
         structured_outputs=StructuredOutputsParams(regex=".*") if structured else None,
@@ -761,6 +781,84 @@ def test_logprobs_of_committed_provisional_tokens(async_scheduling):
     # best (top-1 column) is `` can``.
     assert rows[1] == (I_, pytest.approx(logprob_of(2)), 2, CAN)
     assert all(rank == 1 for i, (_, _, rank, _) in enumerate(rows) if i != 1)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_logprob_token_ids_of_every_token(async_scheduling):
+    """With ``logprob_token_ids`` (as the chat API sends them, ``logprobs``
+    unset), every committed token carries the requested ids' logprobs from
+    the draw that chose it, through the held token and a rejected draft zero's
+    replacement. The response then has one logprobs entry per token: with
+    fewer, the chat completion fails with HTTP 500."""
+    ids = [100, 1000, 3000]
+    scheduler = _scheduler(async_scheduling, 2)
+    request = _make_request("a", max_tokens=8, logprob_token_ids=ids)
+    assert request.sampling_params is not None
+    assert request.sampling_params.logprobs is None
+    scheduler.add_request(request)
+    worker = ScriptedWorker(
+        scheduler,
+        {"a": SAY_HI},
+        2,
+        draft_errors={("a", 1): 999},
+        logprob_token_ids=ids,
+    )
+    run = drive(scheduler, worker, async_scheduling=async_scheduling)
+
+    processor = OutputProcessor(None, log_stats=False)
+    processor.add_request(
+        EngineCoreRequest(
+            request_id="a",
+            external_req_id="a",
+            prompt_token_ids=list(request.prompt_token_ids or ()),
+            mm_features=None,
+            sampling_params=SamplingParams(
+                max_tokens=8,
+                logprob_token_ids=ids,
+                output_kind=RequestOutputKind.FINAL_ONLY,
+                detokenize=False,
+            ),
+            pooling_params=None,
+            arrival_time=0,
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+        ),
+        None,
+    )
+    final = None
+    for out in run.outputs["a"]:
+        for request_output in processor.process_outputs(
+            [out], engine_core_timestamp=0
+        ).request_outputs:
+            final = request_output.outputs[0]
+    assert final is not None and final.logprobs is not None
+    tokens = list(final.token_ids)
+    assert tokens == expected_reply(SAY_HI, 8)
+    assert len(final.logprobs) == len(tokens)
+    for q, (token, position) in enumerate(zip(tokens, final.logprobs)):
+        assert set(position) == {token, *ids}
+        for token_id in ids:
+            assert position[token_id].logprob == pytest.approx(
+                logprob_of_id(q, token_id)
+            )
+    # `` I`` replaced `` can`` at position 1: rank 2 of `` can``'s draw.
+    assert final.logprobs[1][I_].rank == 2
+    assert final.logprobs[1][I_].logprob == pytest.approx(logprob_of(2))
+
+    chat = object.__new__(OpenAIServingChat)
+    content = chat._create_chat_logprobs(
+        token_ids=tokens,
+        top_logprobs=final.logprobs,
+        tokenizer=None,
+        num_output_top_logprobs=0,
+        logprob_token_ids=ids,
+        return_as_token_id=True,
+    ).content
+    assert [entry.token for entry in content] == [f"token_id:{t}" for t in tokens]
+    for entry in content:
+        listed = {top.token for top in entry.top_logprobs}
+        assert {f"token_id:{token_id}" for token_id in ids} <= listed
 
 
 def _assert_prompt_logprobs_once(run: Run, request: Request) -> None:

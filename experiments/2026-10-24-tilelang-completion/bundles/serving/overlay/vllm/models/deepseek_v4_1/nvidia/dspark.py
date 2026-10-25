@@ -67,7 +67,7 @@ from .. import kernels, l2_prefetch
 from ..b12x_layers import (
     _execution_capacities,
 )
-from ..tilelang import dspark_context, prepare
+from ..tilelang import columns, dspark_context, prepare
 from .model import (
     DeepseekV4DecoderLayer,
     _linear_scale_param_name,
@@ -352,8 +352,17 @@ class DSparkDeepseekV4Model(nn.Module):
         context_key = dspark_context.context_inputs_key(
             self.hidden_size, vllm_config.model_config.dtype
         )
+        # combine_aux_hidden_states_into: the eager context step's join.
+        join_key = columns.split_columns_key(
+            (self.hidden_size,) * len(self.target_layer_ids),
+            vllm_config.model_config.dtype,
+            join=True,
+        )
         prepare.declare(
-            lambda: [prepare.call(dspark_context.context_inputs_kernel, *context_key)]
+            lambda: [
+                prepare.call(dspark_context.context_inputs_kernel, *context_key),
+                prepare.call(columns.split_columns_kernel, *join_key),
+            ]
         )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         self.context_capacity = vllm_config.scheduler_config.max_num_batched_tokens
@@ -465,6 +474,18 @@ class DSparkDeepseekV4Model(nn.Module):
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
+
+    def combine_aux_hidden_states_into(
+        self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
+    ) -> None:
+        """``combine_hidden_states`` of the target aux hidden states' first
+        ``out.shape[0]`` rows, written into ``out``: the states joined side by side
+        in one TileLang launch and the norm writing ``out`` (torch's cat, and the
+        speculator's copy into its context buffer, gone)."""
+        rows = out.shape[0]
+        joined = out.new_empty(rows, len(aux_hidden_states) * self.hidden_size)
+        columns.join_columns([aux[:rows] for aux in aux_hidden_states], joined)
+        self.main_norm(self.main_proj(joined), out=out)
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -602,6 +623,11 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         return self.model.combine_hidden_states(aux_hidden_states)
+
+    def combine_aux_hidden_states_into(
+        self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
+    ) -> None:
+        self.model.combine_aux_hidden_states_into(aux_hidden_states, out)
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         # DSV4 MLA path: each draft layer's sliding-window cache is a separate

@@ -1479,3 +1479,21 @@ Bundle changes:
 - mHC (dgx3): the Engram kernel tests (hash, gate, the reader's rows, io_uring on) and
   the Engram model tests with the B12X backend they drive.
 - misc (dgx2): the logprob tests and the log-softmax and top-k id gates.
+- **Logprob top-k ids in TileLang** (4677cad98): `compute_topk_scores`' `torch.topk` on
+  both paths is one kernel, in PyTorch 2.13's order (radix keys with NaN first, ties to
+  the lower column, then the k ≤ 32 bitonic network's tie order), for k up to 32. A
+  `--max-logprobs` above 32, or -1, is refused at startup; there is no torch.topk path.
+  The custom-ids fill writes every column and the log-softmax writes -inf in invalid
+  columns, so the zeros and the `masked_fill` are gone (f08dfc079, 98347c19d).
+
+The run is vLLM `tilelang-ports` 98347c19d, 123 files over candidate 4's source. After it,
+in the same driver (`~/spark-lab/integration19` on dgx1, "INTEGRATION19 DONE"):
+- [serving-ports-4.json](serving-ports-4.json): the fourth serving check, as the third
+  (determinism, sampled, controls and distinct-prompt digests beside candidate 4,
+  bracketed), plus prompt logprobs on the ports arm alone. Candidate 4's engine dies on
+  them, so they have no candidate 4 digest; the arm must serve them, and alone and c8
+  must agree.
+- [../2026-10-25-request-inventory/inventory-2.json](../2026-10-25-request-inventory/inventory-2.json):
+  the request inventory again at this build. The image scenario now profiles an image
+  the encoder cache has not seen, so the vision tower (still B12X; its port is in
+  progress) is in the profile, and kernels are named TileLang only positively.

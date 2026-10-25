@@ -289,11 +289,11 @@ def bincount(
     output_bin_counts: torch.Tensor,
     max_prefill_len: int,
 ) -> None:
-    # The kernel only accumulates: the selected rows are cleared here first. Use
-    # index_fill_ instead of `tensor[idx] = 0` to avoid sync.
-    idx_long = expanded_idx_mapping.long()
-    prompt_bin_mask.index_fill_(0, idx_long, 0)
-    output_bin_counts.index_fill_(0, idx_long, 0)
+    # The kernel only accumulates: the selected rows are cleared here first, in one
+    # launch (the int64 cast and two index_fill_ calls before).
+    tilelang_controls.clear_bincount_rows(
+        expanded_idx_mapping, prompt_bin_mask, output_bin_counts
+    )
     tilelang_controls.accumulate_bincount(
         expanded_idx_mapping,
         all_token_ids,

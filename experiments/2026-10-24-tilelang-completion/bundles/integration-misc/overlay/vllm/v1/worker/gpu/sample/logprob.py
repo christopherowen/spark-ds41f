@@ -2,26 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from typing import Any
 
 import numpy as np
 import torch
 
-from vllm.model_executor.warmup.jit_warmup_triton_helper import (
-    TritonWarmupTensor,
-    triton_kernel_dispatcher_with_warmup,
-    triton_warmup_inputs,
-)
 from vllm.sampling_params import MAX_LOGPROB_TOKEN_IDS, SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_ids
 
 # Upper bound on the topk kernel's per-iteration gather width.
 _MAX_TOPK_BLOCK = 1024
 
 
+# The reference the TileLang log-softmax (``tilelang_logprob.topk_log_softmax``) is
+# tested against, launched as production launched it (BLOCK_SIZE=1024,
+# TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK, four warps); the sampler no longer launches it.
 @triton.jit(do_not_specialize=["topk"])
 def _topk_log_softmax_kernel(
     output_ptr,
@@ -89,69 +86,51 @@ def _ranks_kernel(
     tl.store(output_ptr + req_idx, n)
 
 
-def _topk_log_softmax_warmup_inputs(
-    *, logits_dtype: torch.dtype, logits_stride: int, vocab_size: int
-) -> dict[str, Any]:
-    return triton_warmup_inputs(
-        _topk_log_softmax_kernel,
-        TritonWarmupTensor(torch.float32),
-        TritonWarmupTensor(logits_dtype),
-        logits_stride,
-        TritonWarmupTensor(torch.int64),
-        1,
-        vocab_size,
-        grid=(1,),
-        BLOCK_SIZE=1024,
-        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
-    )
-
-
-_topk_log_softmax_launcher = triton_kernel_dispatcher_with_warmup(
-    warmup_inputs=_topk_log_softmax_warmup_inputs
-)(_topk_log_softmax_kernel)
-
-
 def register_topk_scores_warmup(
     *, logits: Sequence[tuple[torch.dtype, int]], vocab_size: int, logits_mode: bool
 ) -> None:
-    """Register ``compute_topk_scores`` (without per-request token ids) for
-    ``vocab_size``-wide logits given as ``(dtype, row stride)`` pairs: the
+    """Register ``compute_topk_scores`` for ``vocab_size``-wide logits given as
+    ``(dtype, row stride)`` pairs: the top-k token ids (both paths' layouts), the
     selected tokens' ranks, and their log-softmax unless ``logits_mode``."""
-    from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.v1.worker.gpu.sample.tilelang_logprob import (
+        register_log_softmax,
+        register_ranks,
+    )
 
+    # The top-k ids kernel takes k up to TOPK_IDS_MAX: a larger --max-logprobs
+    # (or -1, the whole vocabulary) is refused here rather than at its request.
+    config = get_current_vllm_config_or_none()
+    model_config = None if config is None else config.model_config
+    if model_config is not None and not (
+        0 <= model_config.max_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX
+    ):
+        raise ValueError(
+            f"--max-logprobs {model_config.max_logprobs} is outside the TileLang "
+            f"top-k logprobs' range 0..{tilelang_topk_ids.TOPK_IDS_MAX}"
+        )
+    tilelang_topk_ids.register_topk_ids(logits)
     register_ranks(logits, vocab_size)
-    for logits_dtype, logits_stride in logits:
-        if not logits_mode:
-            _topk_log_softmax_launcher.register_warmup(
-                logits_dtype=logits_dtype,
-                logits_stride=logits_stride,
-                vocab_size=vocab_size,
-            )
+    if not logits_mode:
+        register_log_softmax(logits)
 
 
 def compute_token_logprobs(
-    logits: torch.Tensor, token_ids: torch.Tensor
+    logits: torch.Tensor, token_ids: torch.Tensor, valid: torch.Tensor | None = None
 ) -> torch.Tensor:
     # NOTE(woosuk): To save GPU memory, we do not materialize the full
     # [batch_size, vocab_size] logprobs tensor. The kernel computes
     # max + logsumexp per row and only emits logprobs at `token_ids`.
-    batch_size, vocab_size = logits.shape
-    token_ids = token_ids.to(torch.int64)
+    from vllm.v1.worker.gpu.sample.tilelang_logprob import topk_log_softmax
+
+    batch_size = logits.shape[0]
+    token_ids = token_ids.to(torch.int64).contiguous()
     num_logprobs = token_ids.shape[1]
     logprobs = logits.new_empty((batch_size, num_logprobs), dtype=torch.float32)
     # The requested count is runtime data, including the single selected token
-    # for prompt_logprobs=0. One bounded gather tile covers every count without
-    # creating inference-time JIT specializations.
-    _topk_log_softmax_launcher[(batch_size,)](
-        logprobs,
-        logits,
-        logits.stride(0),
-        token_ids,
-        num_logprobs,
-        vocab_size,
-        BLOCK_SIZE=1024,  # type: ignore
-        TOPK_BLOCK_SIZE=_MAX_TOPK_BLOCK,
-    )
+    # for prompt_logprobs=0: one kernel serves every count. With ``valid``, its
+    # false columns are -inf.
+    topk_log_softmax(logits, token_ids, logprobs, valid)
     return logprobs
 
 
@@ -165,15 +144,19 @@ def compute_topk_scores(
     max_per_req_token_ids: int = 0,
     logits_mode: bool = False,
 ) -> LogprobsTensors:
-    assert num_logprobs >= 0
+    if not 0 <= num_logprobs <= tilelang_topk_ids.TOPK_IDS_MAX:
+        raise ValueError(f"{num_logprobs} logprobs a token: --max-logprobs bounds them")
     batch_size, vocab_size = logits.shape
 
     if max_per_req_token_ids == 0:
         # Fast path: no request asked for custom logprob_token_ids.
-        logprob_token_ids = sampled_token_ids.unsqueeze(-1)
         if num_logprobs > 0:
-            topk_indices = torch.topk(logits, num_logprobs, dim=-1).indices
-            logprob_token_ids = torch.cat((logprob_token_ids, topk_indices), dim=1)
+            # [sampled, top-k...] in torch.topk's order, one launch.
+            logprob_token_ids = tilelang_topk_ids.logprob_token_ids(
+                logits, num_logprobs, sampled_token_ids
+            )
+        else:
+            logprob_token_ids = sampled_token_ids.unsqueeze(-1)
         if logits_mode:
             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
         else:
@@ -187,15 +170,15 @@ def compute_topk_scores(
         assert expanded_idx_mapping is not None
 
         if num_logprobs > 0:
-            topk_token_ids = torch.topk(logits, num_logprobs, dim=-1).indices
-            topk_token_ids = topk_token_ids.to(torch.int32)
+            topk_token_ids = tilelang_topk_ids.topk_token_ids(logits, num_logprobs)
         else:
             # This tensor just used as an int32 pointer, data not accessed.
             topk_token_ids = logprob_token_ids_state.token_ids.gpu
 
         num_cols = max(num_logprobs, max_per_req_token_ids)
-        logprob_token_ids = sampled_token_ids.new_zeros((batch_size, 1 + num_cols))
-        valid_mask = torch.zeros_like(logprob_token_ids, dtype=torch.bool)
+        # The fill writes every column (0 and invalid where unused).
+        logprob_token_ids = sampled_token_ids.new_empty((batch_size, 1 + num_cols))
+        valid_mask = torch.empty_like(logprob_token_ids, dtype=torch.bool)
         tilelang_auxiliary.fill_token_ids(
             logprob_token_ids,
             valid_mask,
@@ -208,9 +191,9 @@ def compute_topk_scores(
         )
         if logits_mode:
             scores = logits.gather(-1, logprob_token_ids).to(torch.float32)
+            scores = scores.masked_fill(~valid_mask, float("-inf"))
         else:
-            scores = compute_token_logprobs(logits, logprob_token_ids)
-        scores = scores.masked_fill(~valid_mask, float("-inf"))
+            scores = compute_token_logprobs(logits, logprob_token_ids, valid_mask)
 
     token_ranks = torch.empty(batch_size, dtype=torch.int64, device=logits.device)
     from vllm.v1.worker.gpu.sample.tilelang_logprob import token_ranks as fill_ranks

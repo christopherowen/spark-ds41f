@@ -32,7 +32,6 @@ from vllm.v1.worker.gpu.sample.logprob import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     _RESAMPLE_BLOCK_SIZE,
     register_rejection_sample_warmups,
@@ -202,11 +201,15 @@ class RejectionSampler:
         logits: torch.Tensor,
         cu_num_logits: torch.Tensor,
         cu_num_logits_np: np.ndarray,
-        max_num_logprobs: int,
+        expanded_idx_mapping: torch.Tensor,
+        logprobs_dims: tuple[int, int] | None,
     ) -> LogprobsTensors | None:
-        if max_num_logprobs == NO_LOGPROBS:
+        """Each logits row's scores, as the sampler's: the top logprobs, or
+        the request's own ``logprob_token_ids``."""
+        if logprobs_dims is None:
             return None
 
+        num_logprobs, max_per_req_token_ids = logprobs_dims
         num_reqs = cu_num_logits.shape[0] - 1
         num_logits = logits.shape[0]
         flat_sampled = tilelang_inputs.flatten_sampled(
@@ -224,9 +227,12 @@ class RejectionSampler:
                 cu_num_generated_tokens = cu_num_logits_np.tolist()
         return compute_topk_scores(
             logits,
-            max_num_logprobs,
+            num_logprobs,
             flat_sampled,
             cu_num_generated_tokens,
+            logprob_token_ids_state=self.sampler.logprob_token_ids_state,
+            expanded_idx_mapping=expanded_idx_mapping,
+            max_per_req_token_ids=max_per_req_token_ids,
             logits_mode=self.sampler.logprobs_mode
             in ("raw_logits", "processed_logits"),
         )
@@ -329,7 +335,7 @@ class RejectionSampler:
         draft_sampled: torch.Tensor,
         pos: torch.Tensor,
         max_chunk_logits: int,
-        max_num_logprobs: int,
+        logprobs_dims: tuple[int, int] | None,
         max_sampled: torch.Tensor | None = None,
         sink_flags: torch.Tensor | None = None,
         sink_alternates: list[SinkAlternates] | None = None,
@@ -381,7 +387,7 @@ class RejectionSampler:
             if sink is not None:
                 alternates = sink.alternates
                 assert self.sink is not None and alternates is not None
-                if max_num_logprobs != NO_LOGPROBS:
+                if logprobs_dims is not None:
                     alternates_chunks.append(
                         self.sink.alternate_logprobs_of(
                             processed_logits if use_processed_logits else logits[lo:hi],
@@ -400,7 +406,8 @@ class RejectionSampler:
                 processed_logits if use_processed_logits else logits[lo:hi],
                 chunk_cu_num_logits,
                 chunk_cu_num_logits_np,
-                max_num_logprobs,
+                input_batch.expanded_idx_mapping[lo:hi],
+                logprobs_dims,
             )
             if chunk_logprobs is not None:
                 logprobs_chunks.append(chunk_logprobs)
@@ -443,9 +450,9 @@ class RejectionSampler:
 
         draft_sampled, pos = logits_rows(input_batch)
 
-        max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
-            input_batch.idx_mapping_np
-        )
+        # As the sampler's: requests with logprob_token_ids get those ids'
+        # logprobs for every verified token too.
+        logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
         sink_rejection = sink_flags is not None and self.sink is not None
         alternates_chunks: list[SinkAlternates] = []
@@ -456,13 +463,13 @@ class RejectionSampler:
             draft_sampled,
             pos,
             chunk_logit_limit,
-            max_num_logprobs,
+            logprobs_dims,
             # Logprobs (and the sink alternates) take their token counts
             # inside the chunks; clamp there too so they match the committed
             # tokens.
             dead_row_cut + 1
             if dead_row_cut is not None
-            and (max_num_logprobs != NO_LOGPROBS or sink_rejection)
+            and (logprobs_dims is not None or sink_rejection)
             else None,
             sink_flags if sink_rejection else None,
             alternates_chunks,

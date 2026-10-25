@@ -252,6 +252,8 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
             if T.get_thread_binding() == 0:
                 output[row, 0] = T.cast(sampled[row], "int64")
                 valid[row, 0] = True
+            # Every column is written: an unused one is 0 and invalid (the zeros
+            # the outputs were allocated with before).
             for i in T.serial(T.ceildiv(out_cols - 1, 128)):
                 col = i * 128 + T.get_thread_binding()
                 if col + 1 < out_cols:
@@ -259,9 +261,15 @@ def fill_ids_kernel(index_dtype: str, sampled_dtype: str, topk_dtype: str):
                         if col < num_custom[req]:
                             output[row, col + 1] = T.cast(custom_ids[req, col], "int64")
                             valid[row, col + 1] = True
+                        else:
+                            output[row, col + 1] = T.int64(0)
+                            valid[row, col + 1] = False
                     elif col < topk:
                         output[row, col + 1] = T.cast(topk_ids[row, col], "int64")
                         valid[row, col + 1] = True
+                    else:
+                        output[row, col + 1] = T.int64(0)
+                        valid[row, col + 1] = False
 
     return fill_ids
 

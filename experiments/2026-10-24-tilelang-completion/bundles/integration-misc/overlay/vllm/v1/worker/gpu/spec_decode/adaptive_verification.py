@@ -166,6 +166,8 @@ class AdaptiveVerificationManager:
         ]
         self._copy_events = [torch.cuda.Event(blocking=True) for _ in range(2)]
         self._pending_resets: list[int] = []
+        # The new requests' confidence rows, set to 1 together (apply_staged_writes).
+        self._new_rows: list[int] = []
         self._stale_idx = 0
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
@@ -173,7 +175,16 @@ class AdaptiveVerificationManager:
     def add_request(self, req_idx: int) -> None:
         self._stale_confidences[self._stale_idx].np[req_idx].fill(1.0)
         self._pending_resets.append(req_idx)
-        self._confidence_probs[req_idx].fill_(1.0)
+        self._new_rows.append(req_idx)
+
+    def apply_staged_writes(self) -> None:
+        """Set the new requests' confidences to 1 in one launch."""
+        if self._new_rows:
+            rows = async_tensor_h2d(
+                self._new_rows, dtype=torch.int64, device=self._confidence_probs.device
+            )
+            tilelang_inputs.fill_rows(rows, self._confidence_probs, 1.0)
+            self._new_rows.clear()
 
     def warm_tail_shapes(
         self, run_dummy: Callable[..., object], capture_sizes: list[int]

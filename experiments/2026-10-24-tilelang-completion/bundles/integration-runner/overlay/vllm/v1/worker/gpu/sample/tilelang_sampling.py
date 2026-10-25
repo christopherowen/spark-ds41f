@@ -5,7 +5,8 @@
 Each kernel is the contract of the Triton kernel it replaces, bit for bit, NaN
 scores included (the Triton kernels stay importable as the tests' reference):
 
-- ``gumbel_sample``: ``gumbel._gumbel_sample_kernel``
+- ``gumbel_sample``: ``gumbel._gumbel_sample_kernel``, then the torch argmax and
+  gather that finished it (``gumbel_finish``)
 - ``apply_temperature``: ``gumbel._temperature_kernel``
 
 The random stream is Triton 3.5's, so seeded outputs do not move: ``tl.randint``
@@ -541,6 +542,72 @@ def gumbel_sample_kernel(
     return gumbel_sample
 
 
+@tilelang.jit(pass_configs=_PASS)
+def gumbel_finish_kernel(per_lane: int):
+    """``gumbel.gumbel_sample``'s finish, ``local_argmax.gather(-1,
+    local_max.argmax(-1, keepdim=True))``, a warp a token: torch.argmax's first
+    maximum of the blocks' scores (NaN above everything, the lowest block among
+    equals or among NaNs: the greedy section's ``_first_keep_or_take`` on the block
+    index), then the winning block's token. Lane ``k`` reads blocks ``k``, ``k +
+    32``, ... (``per_lane`` of them, all loaded before any is combined; past
+    ``blocks``, -inf at an index past every block, which any block outranks); the
+    combine is a total order, so the pairing does not matter."""
+    tokens, blocks = T.dynamic("tokens, blocks")
+    argmax_stride, max_stride = T.dynamic("argmax_stride, max_stride", "int64")
+
+    @T.prim_func
+    def gumbel_finish(
+        local_argmax: T.StridedTensor((tokens, blocks), (argmax_stride, 1), T.int64),
+        local_max: T.StridedTensor((tokens, blocks), (max_stride, 1), T.float32),
+        sampled: T.Tensor((tokens,), T.int64),
+    ):
+        with T.Kernel(tokens, threads=32) as t:
+            T.import_source(_HEADER)
+            tx = T.get_thread_binding()
+            v = T.alloc_local((per_lane,), T.float32)
+            ix = T.alloc_local((per_lane,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            other = T.alloc_local((1,), T.float32)
+            other_index = T.alloc_local((1,), T.int32)
+            for k in T.unroll(per_lane):
+                blk = tx + k * 32
+                v[k] = T.if_then_else(
+                    blk < blocks,
+                    local_max[t, T.min(blk, blocks - 1)],
+                    -T.infinity(T.float32),
+                )
+                ix[k] = T.if_then_else(blk < blocks, blk, _INT32_MAX)
+            best[0] = v[0]
+            best_index[0] = ix[0]
+            for k in T.unroll(1, per_lane):
+                _first_keep_or_take(best, best_index, v[k], ix[k])
+            _warp_first_argmax(best, best_index, other, other_index)
+            if tx == 0:
+                sampled[t] = local_argmax[t, best_index[0]]
+
+    return gumbel_finish
+
+
+def gumbel_finish_key(num_blocks: int) -> tuple:
+    """``gumbel_finish_kernel``'s ``per_lane`` for ``num_blocks`` blocks a token,
+    ``ceil(num_blocks / 32)``: 4 for DeepSeek V4.1's 127."""
+    return (max(-(-num_blocks // 32), 1),)
+
+
+def gumbel_finish(local_argmax: torch.Tensor, local_max: torch.Tensor) -> torch.Tensor:
+    """``local_argmax.gather(-1, local_max.argmax(-1, keepdim=True)).view(-1)``: each
+    token's id ([num_tokens], int64) from its blocks' argmax and maximum."""
+    num_tokens, num_blocks = local_max.shape
+    # NOTE(woosuk): Use int64 for later indexing.
+    sampled = local_argmax.new_empty(num_tokens)
+    if num_tokens > 0:
+        _kernel(gumbel_finish_kernel, *gumbel_finish_key(num_blocks))(
+            local_argmax, local_max, sampled
+        )
+    return sampled
+
+
 def gumbel_sample_key(
     logits_dtype: torch.dtype,
     idx_dtype: torch.dtype,
@@ -624,9 +691,7 @@ def gumbel_sample(
             logits_cache if cached else local_max.unsqueeze(1),
             logits_cache_col.view(-1) if cached else local_argmax.view(-1),
         )
-    # NOTE(woosuk): Use int64 for later indexing.
-    max_block_idx = local_max.argmax(dim=-1, keepdim=True)
-    return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
+    return gumbel_finish(local_argmax, local_max)
 
 
 # --- Sink detector ------------------------------------------------------------
@@ -2468,6 +2533,12 @@ def sampling_calls(
             for block in _TEMPERATURE_BLOCKS
         ]
     return calls
+
+
+def gumbel_finish_calls(vocab_size: int) -> list:
+    """The finish of Gumbel-max sampling of ``vocab_size``-wide logits."""
+    num_blocks = -(-vocab_size // GUMBEL_BLOCK)
+    return [_call(gumbel_finish_kernel, *gumbel_finish_key(num_blocks))]
 
 
 def drafting_calls(

@@ -527,16 +527,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             and self.engram_layout.table_memory in ("ram", "disk")
         )
         if self.disk_engram:
-            caps = self.engram_layout.caps[0]
-            self.register_buffer(
-                "prepared_engram_hashes",
-                torch.empty(
-                    (caps.max_tokens, len(self.engram_layout.layer_ids), 24),
-                    dtype=torch.int64,
-                    device=caps.device,
-                ),
-                persistent=False,
-            )
+            self.register_engram_hashes()
 
         if get_pp_group().is_last_rank:
             self.norm = kernels.rms_norm(config.hidden_size, self.rms_norm_eps)
@@ -599,6 +590,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         buffer = hidden if index is None else aux[index]
         return buffer[:rows] if rows <= buffer.shape[0] else None
 
+    def register_engram_hashes(self) -> None:
+        """The step's disk Engram row IDs, ``prepared_engram_hashes`` [max_tokens,
+        layers, 24]: a view of a layer-major buffer whose planes are the local disk
+        Engram layers' own IDs, the hash writing them (and the live token count) in
+        place for every layer's reader and gather."""
+        caps = self.engram_layout.caps[0]
+        planes = torch.full(
+            (len(self.engram_layout.layer_ids), caps.max_tokens, 24),
+            -1,
+            dtype=torch.int64,
+            device=caps.device,
+        )
+        self.register_buffer(
+            "prepared_engram_hashes", planes.permute(1, 0, 2), persistent=False
+        )
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                engram.embed_tokens.share_hashes(
+                    planes[engram.layer_hash_index], self.engram_hash.num_tokens
+                )
+
     def prepare_disk_engram(
         self, input_ids, query_start_loc, lookback_token_ids, early=None
     ):
@@ -618,20 +631,20 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         )
         if self.engram_hash is None:
             raise RuntimeError("Disk Engram requires initialized hash state")
-        hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-        image_mask = image_sentinel_mask(input_ids)
+        tokens = input_ids.shape[0]
+        # Each layer's IDs land in its own plane; the TileLang hash finds the image
+        # sentinel in the ids itself.
         self.engram_hash.run_native(
             input_ids,
-            image_mask if kernels.uses_tilelang() else ~image_mask,
+            None if kernels.uses_tilelang() else ~image_sentinel_mask(input_ids),
             query_start_loc,
             lookback_token_ids,
-            hashes,
+            self.prepared_engram_hashes[:tokens],
         )
         stream = torch.cuda.current_stream()
         for engram in engrams:
             engram.stage_rows(
-                hashes[:, engram.layer_hash_index],
-                self.engram_hash.num_tokens,
+                tokens,
                 stream,
                 None if early is None else early[:, engram.layer_hash_index],
             )
@@ -678,8 +691,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
     def declare_kernels(self) -> None:
         """Declare the TileLang kernels the forward reaches outside its modules: the
-        rank-order sum of the TP group's collectives, the L2 prefetch and the last
-        collapse's sink-column variant."""
+        rank-order sum and the NCCL all-gathers' concatenation of the TP group's
+        collectives, the L2 prefetch and the last collapse's sink-column variant."""
         from ..tilelang import collectives, prepare
         from ..tilelang.mhc import TileKernelsMHC
 
@@ -694,6 +707,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         prepare.declare(
             lambda: [
                 *collectives.rank_order_sum_calls(),
+                *collectives.rank_rows_calls(),
                 *l2_prefetch.kernel_calls(),
                 *collapse,
             ]
@@ -751,9 +765,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         engram_mask: torch.Tensor | None = None
         if self.disk_engram and input_ids is not None:
             engram_hashes = self.prepared_engram_hashes[: input_ids.shape[0]]
-            image_mask = image_sentinel_mask(input_ids)
-            # The TileLang gate takes DeepSeek's mask: True passes an image through.
-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
+            # The TileLang gate takes the ids: the image sentinel's rows pass.
+            engram_mask = (
+                input_ids
+                if kernels.uses_tilelang()
+                else ~image_sentinel_mask(input_ids)
+            )
         elif self.engram_hash is not None and input_ids is not None:
             attn_metadata = (
                 get_forward_context().attn_metadata
@@ -777,8 +794,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 query_start_loc[1] = input_ids.shape[0]
                 lookback_token_ids = input_ids.new_full((1, 3), -1)
-            image_mask = image_sentinel_mask(input_ids)
-            engram_mask = image_mask if kernels.uses_tilelang() else ~image_mask
+            image_mask = (
+                None if kernels.uses_tilelang() else image_sentinel_mask(input_ids)
+            )
+            engram_mask = input_ids if image_mask is None else ~image_mask
             engram_hashes = self.engram_hash(
                 input_ids,
                 positions,

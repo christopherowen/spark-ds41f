@@ -189,7 +189,6 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.sink import SinkAlternates, SinkSampler
-from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
@@ -1159,7 +1158,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.step_timing.drafter_end()
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
+        sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+            hidden_states, input_batch.logits_indices
+        )
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
@@ -1556,6 +1557,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if scheduler_output.scheduled_new_reqs:
             self.req_states.apply_staged_writes()
             self.model_state.apply_staged_writes()
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.apply_staged_writes()
         if self.sampler is not None:
             self.sampler.apply_staged_writes()
 
@@ -1699,13 +1702,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
             cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(
-                num_reqs + 1, device=self.device, dtype=torch.int32
-            )
+            cu_num_logits = self.input_buffers.one_logit_cu[: num_reqs + 1]
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(
-                num_reqs, dtype=torch.int32, device=self.device
-            )
+            expanded_local_pos = self.input_buffers.zero_local_pos[:num_reqs]
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -1955,7 +1954,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            sample_hidden_states = tilelang_inputs.gather_hidden_rows(
+                hidden_states, input_batch.logits_indices
+            )
             if self._verifies_greedily(input_batch, grammar_output):
                 output = self._verify_greedily(
                     sample_hidden_states, input_batch, sink_flags
@@ -2017,12 +2018,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 local_batch=input_batch,
                 gather_num_nans=self.sampler.compute_nans,
                 logprobs_dims=self.sampler.get_logprobs_dims(
-                    global_input_batch.idx_mapping_np,
-                    # Rejection sampler does not return logprob token ids.
-                    include_token_ids=(
-                        global_input_batch.num_draft_tokens == 0
-                        or self.rejection_sampler is None
-                    ),
+                    global_input_batch.idx_mapping_np
                 ),
             )
 
@@ -2134,6 +2130,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     else []
                 )
             )
+            if self.draft_tokens_handler.track_consumed_drafts:
+                # The drafts a step's inputs consumed, handed back to the
+                # scheduler for grammar validation (set_consumed_draft_tokens).
+                tilelang_inputs.declare(
+                    lambda: tilelang_inputs.gather_rows_calls(torch.int64, draft_dtype)
+                )
         if envs.VLLM_MOE_SKIP_PADDING:
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
@@ -2146,18 +2148,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 + tilelang_inputs.scatter_rows_calls(
                     torch.int64, torch.float32, gather=False
                 )
+                # The new requests' confidences (apply_staged_writes).
+                + tilelang_inputs.fill_rows_calls(torch.int64, torch.float32)
             )
         self.req_states.register_warmups()
         if not samples:
             return
         assert self.sampler is not None
         register_input_batch_warmups(dead_rows=dead_rows)
-        # The logits rows' inputs (InputBatch.logits_rows): a step's logits
-        # indices are int64, a dummy batch's int32.
+        # The hidden rows the LM head projects (gather_hidden_rows).
+        hidden_size = self.model_config.get_hidden_size()
         tilelang_inputs.declare(
-            lambda: tilelang_inputs.logits_rows_calls(torch.int64)
-            + tilelang_inputs.logits_rows_calls(torch.int32)
+            lambda: tilelang_inputs.gather_hidden_rows_calls(self.dtype, hidden_size)
         )
+        # The logits rows' inputs (InputBatch.logits_rows): every batch's logits
+        # indices are int64, a dummy's too.
+        tilelang_inputs.declare(lambda: tilelang_inputs.logits_rows_calls(torch.int64))
 
         language_model = self._language_model()
         head = getattr(language_model, "lm_head", None)
@@ -2242,6 +2248,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     if dtype is not None
                 ),
                 cache_dtype=draft_logits.dtype,
+                vocab_size=draft_logits.shape[-1],
                 use_fp64=self.model_config.use_fp64_gumbel,
             )
 
@@ -2330,10 +2337,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         assert self.sampler is not None
         idx = input_batch.idx_mapping_np
         states = self.sampler.sampling_states
+        # No logprobs: neither top logprobs nor logprob_token_ids.
         return bool(
             np.all(states.temperature.np[idx] == 0.0)
             and not np.any(self.sampler.needs_logits_processing[idx])
-            and states.max_num_logprobs(idx) == NO_LOGPROBS
+            and self.sampler.get_logprobs_dims(idx) is None
         )
 
     def _verify_greedily(

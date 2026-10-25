@@ -5,13 +5,16 @@ import pytest
 import torch
 
 pytest.importorskip("triton")
+pytest.importorskip("tilelang")
 if not torch.cuda.is_available():
     pytest.skip(
         "CUDA required for Model Runner V2 thinking budget tests",
         allow_module_level=True,
     )
 
+from vllm.platforms import current_platform
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu.sample import tilelang_thinking
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.states import RequestState
@@ -22,6 +25,11 @@ END = 91
 END_A = 92
 END_B = 93
 VOCAB_SIZE = 128
+
+_SM12X = pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120),
+    reason="TileLang thinking-budget kernels target SM120/SM121",
+)
 
 
 def triton_apply_thinking_budget(
@@ -372,3 +380,62 @@ def test_v2_thinking_budget_continues_end_prefix_from_prompt():
 
     assert out[0, END_B] == pytest.approx(1.0e9)
     assert out[0, END_A] == 0
+
+
+def _reset_rows(case: str, states: int, gen: torch.Generator) -> list[int]:
+    if case == "one":
+        return [states - 1]
+    if case == "repeated":
+        return [0, 3, 0]
+    if case == "negative":
+        return [-1, 2, -states]
+    # More requests than a block's threads, negative ones and repeats among them.
+    return torch.randint(-states, states, (300,), generator=gen).tolist()
+
+
+@_SM12X
+@pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("states", [4, 512])
+@pytest.mark.parametrize("case", ["one", "repeated", "negative", "many"])
+def test_marker_cache_reset_matches_index_fill(index_dtype, states, case):
+    """New budgeted requests' marker caches, reset as the three index_fill_ calls
+    reset them (start and end -1, scan position 0): repeated requests, a negative
+    index wrapping, every other slot kept."""
+    gen = torch.Generator().manual_seed(states)
+    caches = [
+        torch.randint(-5, 1 << 20, (states,), generator=gen, dtype=torch.int32).to(
+            DEVICE
+        )
+        for _ in range(3)
+    ]
+    idx = torch.tensor(_reset_rows(case, states, gen), dtype=index_dtype)
+    idx = idx.to(DEVICE)
+    expected = [cache.clone() for cache in caches]
+    expected[0].index_fill_(0, idx.long(), -1)
+    expected[1].index_fill_(0, idx.long(), -1)
+    expected[2].index_fill_(0, idx.long(), 0)
+    tilelang_thinking.reset_markers(idx, *caches)
+    for name, ours, theirs in zip(("start", "end", "scan"), caches, expected):
+        assert torch.equal(ours, theirs), name
+
+
+@_SM12X
+def test_new_budgeted_requests_reset_only_their_marker_cache():
+    """``apply_staged_writes`` resets the marker cache of each request added with a
+    budget, and no other slot's."""
+    req_states = _make_req_states([1, START, 10, 11])
+    state = ThinkingBudgetState(req_states, MockReasoningConfig())
+    stale = torch.arange(7, 11, dtype=torch.int32, device=DEVICE)
+    for cache in (
+        state.cached_last_start,
+        state.cached_last_end,
+        state.cached_scan_pos,
+    ):
+        cache.copy_(stale)
+    state.add_request(1, SamplingParams(thinking_token_budget=4))
+    state.add_request(3, SamplingParams(thinking_token_budget=None))
+    state.add_request(2, SamplingParams(thinking_token_budget=8))
+    state.apply_staged_writes()
+    assert state.cached_last_start.tolist() == [7, -1, -1, 10]
+    assert state.cached_last_end.tolist() == [7, -1, -1, 10]
+    assert state.cached_scan_pos.tolist() == [7, 0, 0, 10]

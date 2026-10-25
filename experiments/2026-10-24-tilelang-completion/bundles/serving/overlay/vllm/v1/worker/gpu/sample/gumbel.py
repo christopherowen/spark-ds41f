@@ -288,8 +288,8 @@ def register_sampling_warmups(
     use_fp64: bool,
 ) -> None:
     """Declare the target sampler's temperature scaling of processed FP32 logits
-    and its Gumbel-max sampling without a logits cache of logits of each
-    ``(dtype, row stride)``; the TileLang kernels take any stride."""
+    and its Gumbel-max sampling without a logits cache of ``vocab_size``-wide
+    logits of each ``(dtype, row stride)``; the TileLang kernels take any stride."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
     if use_fp64:
@@ -300,6 +300,7 @@ def register_sampling_warmups(
         lambda: tilelang_sampling.sampling_calls(
             [dtype for dtype, _ in logits], temperature=bool(processed_logits_strides)
         )
+        + tilelang_sampling.gumbel_finish_calls(vocab_size)
     )
 
 
@@ -307,12 +308,13 @@ def register_drafting_warmups(
     *,
     logits_dtypes: Sequence[torch.dtype],
     cache_dtype: torch.dtype,
+    vocab_size: int,
     use_fp64: bool,
 ) -> None:
     """Declare a speculator's probabilistic draft sampling: the temperature in the
     kernel, the drafting noise stream and the logits cache of ``cache_dtype``, for
-    logits of each of ``logits_dtypes`` and a step column of either index type,
-    one per token or shared."""
+    ``vocab_size``-wide logits of each of ``logits_dtypes`` and a step column of
+    either index type, one per token or shared."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
     if use_fp64:
@@ -329,6 +331,7 @@ def register_drafting_warmups(
                 dtype, cache_dtype, col_dtype, per_token_col
             )
         ]
+        + tilelang_sampling.gumbel_finish_calls(vocab_size)
     )
 
 

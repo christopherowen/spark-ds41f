@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The TileLang sampling kernels against the Triton kernels they replace, per call.
+"""The TileLang sampling kernels against the Triton kernels they replace, per call
+(and the Gumbel finish against the torch argmax and gather it replaced, reported in
+the "triton_us" column).
 
 Each kernel runs at the shapes a DeepSeek V4.1 deployment launches it (vocabulary
 129280; tensor-parallel shards of 32320; five drafts, so six rows per request;
@@ -219,6 +221,25 @@ def gumbel_case(tokens: int, dtype: torch.dtype):
             )
 
         return ours, theirs
+
+    return make
+
+
+def gumbel_finish_case(tokens: int):
+    """Each token's id from its blocks' argmax and maximum: one warp a token against
+    torch's argmax over the blocks and gather of its argmax."""
+    blocks = triton.cdiv(VOCAB, tls.GUMBEL_BLOCK)
+
+    def make(sample: int):
+        g = generator(sample)
+        best = torch.randn(tokens, blocks, generator=g, device=DEVICE)
+        argmax = torch.randint(0, VOCAB, (tokens, blocks), generator=g, device=DEVICE)
+
+        def theirs():
+            max_block_idx = best.argmax(dim=-1, keepdim=True)
+            argmax.gather(dim=-1, index=max_block_idx).view(-1)
+
+        return (lambda: tls.gumbel_finish(argmax, best)), theirs
 
     return make
 
@@ -482,6 +503,7 @@ CASES = {
         for d in (torch.bfloat16, torch.float32)
         for t in (1, 6, 16, 96)
     ],
+    "gumbel_finish": [(f"{t} tokens", gumbel_finish_case(t)) for t in (1, 6, 16, 96)],
     "temperature": [(f"{t} tokens", temperature_case(t)) for t in (1, 16, 96)],
     "sink_candidates": [
         (f"{r} requests t={temp}", candidates_case(r, temp))

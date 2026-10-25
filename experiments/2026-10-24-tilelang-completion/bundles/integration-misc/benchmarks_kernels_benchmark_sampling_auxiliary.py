@@ -514,6 +514,10 @@ def make_logprob_ids(rows, variant, size, count):
                 output, valid, sampled, top_ids, mapping, num_custom, custom, size
             )
         else:
+            # The zeros compute_topk_scores allocated the outputs with: the
+            # TileLang fill writes every column instead.
+            output.zero_()
+            valid.zero_()
             _fill_logprob_token_ids_kernel[(rows,)](
                 output,
                 output.stride(0),

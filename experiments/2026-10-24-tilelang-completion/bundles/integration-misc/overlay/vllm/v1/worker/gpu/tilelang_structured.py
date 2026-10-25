@@ -97,8 +97,8 @@ def apply_grammar_bitmask(
     mask_stride: int,
 ) -> None:
     """``StructuredOutputsWorker.apply_grammar_bitmask``'s launch. Without
-    ``input_ids`` (no invalid draft inputs to mark), ``keys`` and ``cu_num_logits``
-    stand in for the unread input tensors."""
+    ``input_ids`` (no invalid draft inputs to mark), ``keys`` and an empty int64
+    tensor stand in for the unread input tensors (no conversion is launched)."""
     if keys.shape[0] == 0:
         return
     invalid = input_ids is not None
@@ -107,6 +107,8 @@ def apply_grammar_bitmask(
         keys,
         cu_num_logits,
         input_ids if invalid else keys,
-        input_logits_indices if invalid else cu_num_logits.long(),
+        input_logits_indices
+        if invalid
+        else torch.empty(1, dtype=torch.int64, device=keys.device),
         bitmask,
     )

@@ -653,6 +653,28 @@ def test_expand_idx_mapping(num_reqs, idx_dtype):
     assert torch.equal(ref_pos, ours_pos)
 
 
+@pytest.mark.parametrize("num_rows", [1, 6, 96, 1000])
+def test_gather_hidden_rows(num_rows):
+    """The hidden rows the heads project, against torch's indexing: repeated rows,
+    any order. Indices are int64, a dummy batch's too; others are refused."""
+    gen = _gen(num_rows + 9)
+    hidden = torch.randn(MAX_TOKENS // 8, 5120, generator=gen, device=DEVICE)
+    hidden = hidden.to(torch.bfloat16)
+    with pytest.raises(TypeError, match="int64"):
+        tli.gather_hidden_rows(hidden, torch.zeros(1, dtype=torch.int32, device=DEVICE))
+    indices = _randint(0, hidden.shape[0], (num_rows,), gen, torch.int64)
+    if num_rows > 1:
+        indices[1] = indices[0]
+    out = tli.gather_hidden_rows(hidden, indices)
+    torch.accelerator.synchronize()
+    assert torch.equal(out.view(torch.int16), hidden[indices].view(torch.int16))
+    # The launch's key (CED's, from the source layout) is the declared one.
+    from vllm.models.deepseek_v4_1.tilelang import ced
+
+    ((_, declared, _),) = tli.gather_hidden_rows_calls(torch.bfloat16, 5120)
+    assert declared == ced.copy_rows_key("bfloat16", (5120,), (1,), 5120, False)
+
+
 @pytest.mark.parametrize("num_logits", [0, 1, 6, 96, 1000])
 @pytest.mark.parametrize("index_dtype", [torch.int64, torch.int32])
 def test_logits_rows(num_logits, index_dtype):
@@ -740,6 +762,28 @@ def test_scatter_rows(num_reqs, width, dtype, gather):
         assert torch.equal(out, gathered)
     else:
         assert out is None
+
+
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS)
+@pytest.mark.parametrize("width", [1, 3, DRAFTS])
+@pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
+def test_gather_rows(num_reqs, width, idx_dtype):
+    """The drafts a step's inputs consumed (``DraftTokensHandler``):
+    ``state[idx, :width]`` against torch's indexing, from a state of wider rows, a
+    repeated row and -1 (the last row) among the indices, into the front of a
+    larger buffer whose tail keeps its contents."""
+    gen = _gen(num_reqs * 5 + width)
+    idx = _idx(num_reqs, gen, idx_dtype)
+    if num_reqs > 2:
+        idx[1] = idx[0]
+        idx[2] = -1
+    state = _garbage((MAX_REQS, DRAFTS + 2), torch.int64, gen)[:, :DRAFTS]
+    flat = _garbage((MAX_REQS * DRAFTS,), torch.int64, gen)
+    expected = flat.clone()
+    expected[: num_reqs * width] = state[idx, :width].reshape(-1)
+    tli.gather_rows(idx, state, flat[: num_reqs * width].view(num_reqs, width))
+    torch.accelerator.synchronize()
+    assert torch.equal(flat, expected)
 
 
 def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, drafted):
@@ -1169,6 +1213,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
     drafts = _randint(0, 1 << 17, (MAX_REQS, DRAFTS), gen, torch.int64)
     state = torch.zeros_like(drafts)
     tli.scatter_rows(idx, drafts[:4], state, gather=True)
+    tli.gather_rows(idx, state, torch.empty_like(drafts[:4]))
     confidences = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
     tli.scatter_rows(idx, confidences[:4], torch.zeros_like(confidences))
     capacities = _randint(0, DRAFTS + 1, (4,), gen)
@@ -1206,6 +1251,7 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
         tli.flatten_sampled_calls()
         + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
+        + tli.gather_rows_calls(torch.int64, torch.int64)
         + tli.adaptive_offsets_calls(DRAFTS + 1)
         + tli.assign_draft_budget_calls(DRAFTS)
         + tli.padding_rows_calls()
@@ -1343,3 +1389,26 @@ def test_declared_calls_cover_the_call_sites(monkeypatch):
     )
     lookback.gather_lookback(window, idx, computed, history)
     assert used == [lookback.gather_lookback_key(3, tli.RUNNER_IDX_DTYPE)]
+
+
+@pytest.mark.parametrize("num_rows", [1, 3, 64])
+@pytest.mark.parametrize(
+    "dtype, width, value", [(torch.int64, 5, 0), (torch.float32, 5, 1.0)]
+)
+def test_fill_rows(num_rows, dtype, width, value):
+    """New requests' rows reset as torch's row fills did: the request state's
+    drafts to 0 and adaptive verification's confidences to 1, whole rows, a
+    repeated and a negative (wrapping) index included."""
+    gen = _gen(num_rows + width)
+    state = _randint(-(1 << 20), 1 << 20, (128, width), gen, torch.int64).to(dtype)
+    rows = _randint(0, state.shape[0], (num_rows,), gen, torch.int64)
+    if num_rows > 2:
+        rows[1] = rows[0]
+        rows[2] = -1
+    expected = state.clone()
+    expected[rows] = value
+    tli.fill_rows(rows, state, value)
+    torch.accelerator.synchronize()
+    assert torch.equal(state, expected)
+    ((_, declared, _),) = tli.fill_rows_calls(torch.int64, dtype)
+    assert declared == tli.fill_rows_key(torch.int64, dtype)

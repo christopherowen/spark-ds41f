@@ -318,3 +318,26 @@ def test_ced_token_metadata_matches_the_torch_chain(rows):
     actual = ced.token_metadata(indices, positions, reqs, slots, lengths)
     for a, e in zip(actual, expected):
         assert a.dtype == e.dtype and torch.equal(a, e)
+
+
+@pytest.mark.parametrize("rows", [1, 22, 158, 4096])
+def test_ced_slots_and_routing_mask_match_the_torch_chain(rows):
+    """The drafter's packed context slots (-1 at a negative index, 0 past the
+    step's rows) and the decoder's routing mask (a valid index whose row is not
+    padding; a row past the step's rows routes), each in one launch."""
+    from vllm.models.deepseek_v4_1.ced import gather_rows
+    from vllm.models.deepseek_v4_1.tilelang import ced
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+    g = torch.Generator(device="cuda").manual_seed(rows + 7)
+    tokens = 4200
+    slots = torch.randint(-1, 1 << 24, (2, tokens), generator=g, device="cuda")
+    is_padding = torch.rand(tokens, generator=g, device="cuda") < 0.3
+    indices = torch.randint(-1, tokens + 3, (rows,), generator=g, device="cuda")
+    for group in slots:
+        expected = gather_rows(group, indices).masked_fill(indices < 0, PAD_SLOT_ID)
+        actual = ced.gather_slots(group, indices)
+        assert actual.dtype == expected.dtype and torch.equal(actual, expected)
+    expected = (indices >= 0) & ~gather_rows(is_padding, indices)
+    actual = ced.routing_mask(indices, is_padding)
+    assert actual.dtype == torch.bool and torch.equal(actual, expected)

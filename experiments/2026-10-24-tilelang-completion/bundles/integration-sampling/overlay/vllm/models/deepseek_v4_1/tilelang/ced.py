@@ -279,6 +279,84 @@ def token_metadata(indices, positions, reqs, slots, lengths):
     return outs
 
 
+@tilelang.jit(pass_configs=_PASS)
+def slots_kernel():
+    """Slots at the CED indices, a thread a decoder row: -1 (``PAD_SLOT_ID``) at an
+    invalid index and 0 past the step's rows, as ``gather_rows`` then
+    ``masked_fill`` wrote them for the drafter's packed context slots."""
+    rows, tokens = T.dynamic("rows, tokens")
+
+    @T.prim_func
+    def ced_slots(
+        indices: T.Tensor((rows,), T.int64),
+        slots: T.Tensor((tokens,), T.int64),
+        out: T.Tensor((rows,), T.int64),
+    ):
+        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding()
+            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
+            slot = T.alloc_var(T.int64, init=slots[T.max(T.min(index, tokens - 1), 0)])
+            if row < rows:
+                out[row] = T.if_then_else(
+                    index >= 0,
+                    T.if_then_else(index < tokens, slot, T.int64(0)),
+                    T.int64(-1),
+                )
+
+    return ced_slots
+
+
+def gather_slots(slots, indices):
+    """``gather_rows(slots, indices).masked_fill(indices < 0, PAD_SLOT_ID)``."""
+    out = slots.new_empty(indices.shape[0])
+    if out.numel():
+        slots_kernel()(indices, slots, out)
+    return out
+
+
+@tilelang.jit(pass_configs=_PASS)
+def routing_mask_kernel():
+    """The CED decoder's MoE routing mask, a thread a decoder row: a row routes when
+    its index is valid and the step's row there is not padding (a row past the
+    step's rows routes, ``gather_rows`` reading its padding as false).
+    ``prepare_attn`` wrote it as a comparison, a gather, a negation and a
+    conjunction."""
+    rows, tokens = T.dynamic("rows, tokens")
+
+    @T.prim_func
+    def ced_routing_mask(
+        indices: T.Tensor((rows,), T.int64),
+        is_padding: T.Tensor((tokens,), T.bool),
+        mask: T.Tensor((rows,), T.bool),
+    ):
+        with T.Kernel(T.ceildiv(rows, 128), threads=128) as bx:
+            row = bx * 128 + T.get_thread_binding()
+            index = T.alloc_var(T.int64, init=indices[T.min(row, rows - 1)])
+            padding = T.alloc_var(
+                T.bool, init=is_padding[T.max(T.min(index, tokens - 1), 0)]
+            )
+            if row < rows:
+                mask[row] = T.if_then_else(
+                    index < 0,
+                    T.bool(False),
+                    T.if_then_else(
+                        index < tokens,
+                        T.if_then_else(padding, T.bool(False), T.bool(True)),
+                        T.bool(True),
+                    ),
+                )
+
+    return ced_routing_mask
+
+
+def routing_mask(indices, is_padding):
+    """``(indices >= 0) & ~gather_rows(is_padding, indices)``."""
+    mask = is_padding.new_empty(indices.shape[0])
+    if mask.numel():
+        routing_mask_kernel()(indices, is_padding, mask)
+    return mask
+
+
 _ITEMSIZE = {
     "bool": 1,
     "int8": 1,

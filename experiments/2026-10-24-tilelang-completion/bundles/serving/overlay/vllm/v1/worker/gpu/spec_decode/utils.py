@@ -1,0 +1,190 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import numpy as np
+import torch
+
+from vllm.config import LoadConfig, replace
+from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
+from vllm.v1.outputs import DraftTokenIds
+from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.input_batch import InputBatch
+
+logger = init_logger(__name__)
+
+
+def get_pp_safe_draft_load_config(load_config: LoadConfig) -> LoadConfig:
+    """Avoid collectives that include PP ranks without a draft model."""
+    if get_pp_group().world_size > 1 and load_config.load_format == "fastsafetensors":
+        logger.warning_once(
+            "fastsafetensors cannot load a draft model instantiated on only "
+            "one pipeline stage; falling back to the standard safetensors "
+            "loader for the draft model. The target model still uses "
+            "fastsafetensors."
+        )
+        return replace(load_config, load_format="auto")
+    return load_config
+
+
+def limit_draft_tokens(
+    draft_tokens: torch.Tensor,
+    num_speculative_tokens: int,
+    max_num_speculative_tokens: int,
+) -> torch.Tensor:
+    """Limit a speculator's output to the scheduler-selected depth."""
+    if draft_tokens.ndim != 2:
+        raise RuntimeError(
+            "Speculator returned unsupported draft shape "
+            f"{tuple(draft_tokens.shape)}; expected a 2D tensor."
+        )
+    if not 1 <= num_speculative_tokens <= max_num_speculative_tokens:
+        raise RuntimeError(
+            "Scheduler selected an invalid speculative-token count "
+            f"{num_speculative_tokens}; expected a value between 1 and "
+            f"{max_num_speculative_tokens}."
+        )
+    if draft_tokens.shape[1] == 0:
+        return draft_tokens
+    if draft_tokens.shape[1] < num_speculative_tokens:
+        raise RuntimeError(
+            "Speculator returned too few draft tokens "
+            f"({draft_tokens.shape[1]}); expected at least "
+            f"{num_speculative_tokens}."
+        )
+    return draft_tokens[:, :num_speculative_tokens]
+
+
+class DraftTokensHandler:
+    """Hands draft tokens back to the scheduler for grammar validation.
+
+    With synchronous scheduling the scheduler takes the drafts proposed for the
+    next step. With async scheduling (``track_consumed_drafts``) it takes them
+    only to back-fill the -1 placeholders of a step whose inputs were already
+    prepared, so the handler records the drafts that step's inputs consumed.
+    The drafts of the last proposing step would miss every request that
+    skipped it, and the scheduler would then build unconstrained grammar rows
+    for drafts that the model still verifies.
+    """
+
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        track_consumed_drafts: bool = False,
+    ):
+        self.device = device
+        self.track_consumed_drafts = track_consumed_drafts
+        self.copy_stream = torch.cuda.Stream(device)
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+        self.copy_event = torch.cuda.Event(blocking=True)
+
+        self.req_ids: list[str] = []
+        self.draft_tokens_np: np.ndarray | None = None
+        self.num_draft_tokens: int = 0
+        # The consumed drafts' rows for the copy, flat; allocated on first use as
+        # large as the per-request draft buffer.
+        self._consumed: torch.Tensor | None = None
+
+    def set_draft_tokens(
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+    ) -> None:
+        """Record the drafts proposed for the next step."""
+        if self.track_consumed_drafts:
+            return
+        self._set(
+            input_batch.req_ids, draft_tokens, input_batch.has_structured_output_reqs
+        )
+
+    def set_consumed_draft_tokens(
+        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+    ) -> None:
+        """Record the drafts that this step's inputs were built from.
+
+        Args:
+            input_batch: The prepared step.
+            draft_tokens: The persistent per-request draft buffer, read on the
+                current stream after the step's input ids were built from it.
+        """
+        if not self.track_consumed_drafts:
+            return
+        num_drafts = input_batch.num_draft_tokens_per_req
+        if num_drafts is None or not input_batch.has_structured_output_reqs:
+            self._set(input_batch.req_ids, draft_tokens[:0, :0], False)
+            return
+        from vllm.v1.worker.gpu import tilelang_inputs
+
+        # draft_tokens[input_batch.idx_mapping, :max drafts], the slice's clamp
+        # included, gathered in TileLang into the persistent buffer.
+        num_reqs = input_batch.idx_mapping.shape[0]
+        width = min(int(num_drafts.max()), draft_tokens.shape[1])
+        consumed = self._consumed
+        if (
+            consumed is None
+            or consumed.dtype != draft_tokens.dtype
+            or consumed.numel() < num_reqs * width
+        ):
+            consumed = self._consumed = torch.empty(
+                max(draft_tokens.numel(), num_reqs * width),
+                dtype=draft_tokens.dtype,
+                device=draft_tokens.device,
+            )
+        rows = consumed[: num_reqs * width].view(num_reqs, width)
+        # The previous step's copy may still be reading the buffer.
+        torch.cuda.current_stream(self.device).wait_event(self.copy_event)
+        tilelang_inputs.gather_rows(input_batch.idx_mapping, draft_tokens, rows)
+        self._set(input_batch.req_ids, rows, True)
+
+    def _set(self, req_ids: list[str], draft_tokens: torch.Tensor, copy: bool) -> None:
+        self.req_ids = req_ids
+        self.num_draft_tokens = draft_tokens.shape[1]
+        if not copy:
+            # No draft token validation needs to be performed by
+            # the scheduler for this batch.
+            self.draft_tokens_np = None
+            return
+
+        # For spec decoding + structured outputs, we must transfer the
+        # draft tokens back to the scheduler for grammar validation.
+        current_stream = torch.cuda.current_stream(self.device)
+        self.copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.copy_stream):
+            self.draft_tokens_np = async_copy_to_np(draft_tokens)
+            # draft_tokens may be a temporary allocation on the main stream (the
+            # proposals), read here on copy_stream; without record_stream, the caching
+            # allocator may reuse its memory before the async copy executes.
+            draft_tokens.record_stream(self.copy_stream)
+            self.copy_event.record()
+
+    def get_draft_tokens(self) -> DraftTokenIds | None:
+        if self.draft_tokens_np is not None:
+            self.copy_event.synchronize()
+            draft_token_ids = self.draft_tokens_np.tolist()
+        else:
+            # The batch carried no structured-output request, so its drafts
+            # need no grammar validation.
+            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+        return DraftTokenIds(self.req_ids, draft_token_ids)
+
+
+def get_parallel_drafting_token_id(hf_config) -> int:
+    """Resolve the mask token id used for parallel drafting slots.
+
+    Checks (in order): `dflash_config.mask_token_id`, top-level `mask_token_id`,
+    `dspark_noise_token_id`, `pard_token`, `ptd_token_id`. Raises ValueError if
+    none are present.
+    """
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    if "mask_token_id" in dflash_config:
+        return int(dflash_config["mask_token_id"])
+    if getattr(hf_config, "mask_token_id", None) is not None:
+        return int(hf_config.mask_token_id)
+    if hasattr(hf_config, "dspark_noise_token_id"):
+        return int(hf_config.dspark_noise_token_id)
+    if hasattr(hf_config, "pard_token"):
+        return int(hf_config.pard_token)
+    if hasattr(hf_config, "ptd_token_id"):
+        return int(hf_config.ptd_token_id)
+    raise ValueError(
+        "Model config must specify `dflash_config.mask_token_id`,"
+        " `mask_token_id`, `dspark_noise_token_id`, `pard_token`, or"
+        " `ptd_token_id` for parallel drafting."
+    )

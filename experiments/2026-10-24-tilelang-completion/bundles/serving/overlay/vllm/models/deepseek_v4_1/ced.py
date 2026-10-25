@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from .tilelang import ced as ced_kernels
-from .tilelang import prepare
+from .tilelang import columns, prepare
 
 if TYPE_CHECKING:
     from .sparse_mla import DeepseekV41B12xMetadata
@@ -54,7 +54,7 @@ def scatter_rows(
     source: torch.Tensor, indices: torch.Tensor, full_rows: int
 ) -> torch.Tensor:
     """Restore the full-row ABI; discarded rows are always zero."""
-    output = source.new_zeros((full_rows, *source.shape[1:]))
+    output = columns.zero_(source.new_empty((full_rows, *source.shape[1:])))
     if source.numel():
         ced_kernels.copy_rows(source, indices, output, scatter=True)
     return output
@@ -208,6 +208,9 @@ class CEDState:
             lambda: [
                 prepare.call(ced_kernels.indices_kernel, self.max_requests),
                 prepare.call(ced_kernels.token_metadata_kernel),
+                prepare.call(ced_kernels.routing_mask_kernel),
+                prepare.call(ced_kernels.slots_kernel),
+                prepare.call(columns.zero_packs_kernel),
                 # Packed rows of each layout. A source view of wider rows would
                 # stop its first CED step with KernelNotPreparedError.
                 *(
