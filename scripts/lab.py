@@ -40,9 +40,10 @@ A run spec is JSON: {"experiment": "experiments/<dir>", "run": "rec6", "jobs": [
 jobs of kind "measure" (arms booted in turn and measured; profile "lean" or "full";
 "bracket" re-measures the first arm at the end; scripts/lab_sweep.py writes one for a
 one-variable environment sweep), "validate" (a trace arm: boot A, scenario
-traces, optional restart, per-node analysis in parallel while stopped) and "kernel" (a
+traces, optional restart, per-node analysis in parallel while stopped), "kernel" (a
 kernel-lab bundle per node, run concurrently on the named nodes while the cluster is
-stopped). Results keep the layout tables_arms.py reads.
+stopped) and "agentx" (SemiAnalysis AgentX's agent-trace replay at each concurrency point,
+each on a fresh boot after a clean-traffic check). Results keep the layout tables_arms.py reads.
 """
 from __future__ import annotations
 
@@ -73,6 +74,9 @@ _loader = importlib.machinery.SourceFileLoader("spark", str(ROOT / "bin" / "spar
 _spec = importlib.util.spec_from_loader("spark", _loader)
 spark = importlib.util.module_from_spec(_spec)
 _loader.exec_module(spark)
+_agentx_loader = importlib.machinery.SourceFileLoader("agentx", str(ROOT / "scripts" / "agentx.py"))
+agentx = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentx", _agentx_loader))
+_agentx_loader.exec_module(agentx)
 
 HOLD = Path.home() / "spark-hold.json"
 LAB_HOME = Path.home() / "spark-lab"
@@ -1136,6 +1140,137 @@ def gpu_clocks_steps(spec: dict, job: dict) -> list[dict]:
     return [{"kind": "gpu_clocks", "lock": [low, high]}]
 
 
+AGENTX_CLEAN_SECONDS = 15  # bin/spark workload --duration before every point: no request may run
+
+
+def agentx_steps(spec: dict, job: dict) -> list[dict]:
+    """SemiAnalysis AgentX on one arm at each concurrency in "points" (in that order). Every
+    point boots the arm afresh (an empty prefix cache, counters from zero), checks that the
+    server saw no request for AGENTX_CLEAN_SECONDS (bin/spark workload), then runs the pinned
+    harness inside bin/spark workload for its warm-up and "duration" seconds (AgentX: 3600).
+    Results go to results/private/agentx/<run>/<label>-c<N>; the table compares the points.
+    A failed point keeps its evidence and the next point boots and runs."""
+    experiment, run = spec["experiment"], spec["run"]
+    arm = job["arm"]
+    config = arm_config_path(experiment, arm["config"])
+    points = [int(point) for point in job["points"]]
+    if not points or min(points) < 1 or len(set(points)) != len(points):
+        raise SystemExit(f"agentx points must be distinct positive concurrencies, got {job['points']}")
+    dataset = job.get("dataset", agentx.DATASET)
+    if dataset not in agentx.DATASETS:
+        raise SystemExit(f"agentx dataset {dataset} is not pinned in scripts/agentx.py")
+    out = f"results/private/agentx/{run}"
+    seed = int(job.get("seed", agentx.SEED))
+    # The corpus is rebuilt once per dataset, seed and tokenizer, with serving stopped (tens of
+    # GiB); a host that has it skips the step and never stops serving for it.
+    steps, labels = [{"kind": "agentx_prepare", "config": config, "dataset": dataset, "seed": seed,
+                      "out": f"{out}/prepare.log"}], []
+    for concurrency in points:
+        label = f"{arm['label']}-c{concurrency}"
+        labels.append(label)
+        steps.append(boot_step(run, {**arm, "label": label}, config))
+        steps.append({"kind": "clean", "config": config, "label": label, "seconds": AGENTX_CLEAN_SECONDS,
+                      "out": f"{out}/{label}/clean.json"})
+        steps.append({"kind": "agentx", "config": config, "label": label, "concurrency": concurrency,
+                      "duration": int(job.get("duration", agentx.DURATION)), "seed": seed,
+                      "dataset": dataset, "harness_args": [str(a) for a in job.get("harness_args", [])],
+                      "out": f"{out}/{label}"})
+    steps.append({"kind": "table", "argv": ["scripts/agentx.py", "table", run, *labels],
+                  "out": f"results/private/lab/{run}-table.txt"})
+    return steps
+
+
+def agentx_target(config: str) -> dict:
+    """What the harness needs from an arm: the server's URL and served name, the checkpoint
+    (repository and revision, from its hub snapshot) whose tokenizer it uses, the hub cache,
+    and the cores the serving container is pinned to (the client stays off them)."""
+    cluster = spark.read_cluster(config)
+    head = next(node for node in nodes_config()["nodes"] if node["head"])
+    snapshot = spark.cluster_recipe.model_snapshot(cluster).format(home=cluster["host"]["home"])
+    found = re.search(r"(.*)/models--([^/]+?)--([^/]+)/snapshots/([0-9a-f]{40})/?$", snapshot)
+    if not found:
+        raise SystemExit(f"{config}: the model snapshot {snapshot} is not a hub cache snapshot")
+    pinned = [arg.split("=", 1)[1] for arg in cluster["container"].get("docker_run_args", [])
+              if arg.startswith("--cpuset-cpus=")]
+    return {"url": f"http://{head['management_ip']}:{spark.serve_arg(cluster, '--port')}",
+            "model": spark.serve_arg(cluster, "--served-model-name"),
+            "tokenizer": f"{found.group(2)}/{found.group(3)}", "revision": found.group(4),
+            "hub": found.group(1), "avoid_cpus": pinned[0] if pinned else None}
+
+
+def agentx_command(step: dict) -> list[str]:
+    """bin/spark workload (the server's view of the whole run) around scripts/agentx.py run."""
+    target = agentx_target(step["config"])
+    out = step["out"]
+    command = [sys.executable, "scripts/agentx.py", "run", target["url"], "--model", target["model"],
+               "--tokenizer", target["tokenizer"], "--tokenizer-revision", target["revision"],
+               "--hf-hub-cache", target["hub"], "--concurrency", str(step["concurrency"]),
+               "--duration", str(step["duration"]), "--seed", str(step["seed"]), "--dataset", step["dataset"],
+               "--out", out, "--require-prepared"]
+    if target["avoid_cpus"]:
+        command += ["--avoid-cpus", target["avoid_cpus"]]
+    if step.get("harness_args"):
+        command += ["--", *step["harness_args"]]
+    return [sys.executable, "bin/spark", "--cluster-config", step["config"], "workload", "--interval", "30",
+            "--label", step["label"], "--json", f"{out}/server-workload.json", "--", *command]
+
+
+def agentx_prepare_command(step: dict) -> list[str]:
+    """scripts/agentx.py prepare inside our window, with serving stopped and every core free."""
+    target = agentx_target(step["config"])
+    return [sys.executable, "scripts/agentx.py", "prepare", "--in-window", "--tokenizer", target["tokenizer"],
+            "--tokenizer-revision", target["revision"], "--hf-hub-cache", target["hub"],
+            "--dataset", step["dataset"], "--seed", str(step["seed"]), "--model", target["model"]]
+
+
+def agentx_prepared(step: dict) -> bool:
+    """This host rebuilt the dataset for this seed and the arm's tokenizer."""
+    marker = agentx.prepared_marker(step["dataset"], step["seed"])
+    if not marker.exists():
+        return False
+    record = json.loads(marker.read_text())
+    target = agentx_target(step["config"])
+    return (record.get("tokenizer"), record.get("tokenizer_revision"), record.get("harness")) == (
+        target["tokenizer"], target["revision"], agentx.HARNESS_VERSION)
+
+
+def clean_command(step: dict) -> list[str]:
+    return [sys.executable, "bin/spark", "--cluster-config", step["config"], "workload",
+            "--duration", str(step["seconds"]), "--label", f"{step['label']} clean", "--json", step["out"]]
+
+
+def clean_problems(summary: dict) -> list[str]:
+    """A clean window: nothing finished, ran or waited on the server during it."""
+    problems = []
+    finished = summary.get("requests", {}).get("finished", 0)
+    if finished:
+        problems.append(f"{finished} requests finished")
+    for gauge in ("num_requests_running", "num_requests_waiting"):
+        peak = summary.get("load", {}).get(gauge, {}).get("max", 0)
+        if peak:
+            problems.append(f"{gauge} reached {peak:g}")
+    return problems
+
+
+def agentx_problems(step: dict) -> list[str]:
+    """What would fail only inside the window: the harness not installed here, the dataset not
+    fetched (a download: never inside a window), the tokenizer's snapshot missing."""
+    problems = []
+    if not (agentx.VENV / "bin" / "agentx").exists():
+        problems.append(f"the AgentX harness is not installed at {agentx.VENV} (scripts/agentx.py install)")
+    if (ROOT / step["config"]).is_file():
+        target = agentx_target(step["config"])
+        missing = [path for path in agentx.fetched_paths(step["dataset"], target["hub"]) if not path.exists()]
+        if missing:
+            problems.append(f"{step['dataset']} is not fetched on this host ({missing[0]}): "
+                            "scripts/agentx.py fetch, between windows")
+        snapshot = (Path(target["hub"]) / f"models--{target['tokenizer'].replace('/', '--')}" / "snapshots"
+                    / target["revision"] / "tokenizer.json")
+        if not snapshot.exists():
+            problems.append(f"the tokenizer {snapshot} is not on this host")
+    return problems
+
+
 # Lab extras that are servebench commands; their arguments are checked with its parser.
 SERVEBENCH_SHIMS = {"scripts/servebench_run.py": "run", "scripts/servebench_engine.py": "engine",
                     "scripts/servebench_model.py": "model", "scripts/servebench_suite.py": "suite"}
@@ -1155,6 +1290,8 @@ def plan_problems(steps: list[dict]) -> list[str]:
             problems.extend(suite_problems(step))
         if step["kind"] == "table" and "reference" in step:
             problems.extend(reference_problems(step))
+        if step["kind"] == "agentx_prepare":
+            problems.extend(agentx_problems(step))
         if step["kind"] not in ("script", "profile"):
             continue
         script, args = step["argv"][0], step["argv"][1:]
@@ -1214,7 +1351,7 @@ def suite_problems(step: dict) -> list[str]:
 def plan(spec: dict) -> list[dict]:
     builders = {"measure": measure_steps, "validate": validate_steps, "kernel": kernel_steps,
                 "profile": profile_steps, "sync": sync_steps, "fabric": fabric_steps, "image": image_steps,
-                "gpu_clocks": gpu_clocks_steps}
+                "gpu_clocks": gpu_clocks_steps, "agentx": agentx_steps}
     steps = []
     for job in spec["jobs"]:
         if job["kind"] not in builders:
@@ -1253,6 +1390,15 @@ def describe_step(step: dict) -> str:
         return f"fabric {step['script']} on every node ({step['config']})"
     if step["kind"] == "image":
         return f"image of {step['config']} built on {step['node']}, copied {len(step['copies'])} times"
+    if step["kind"] == "clean":
+        return "bin/spark " + shlex.join(clean_command(step)[2:]) + ": no request may finish, run or wait"
+    if step["kind"] == "agentx_prepare":
+        return (f"unless this host has rebuilt {step['dataset']} for seed {step['seed']}: stop serving, then "
+                + shlex.join(agentx_prepare_command(step)[1:]) if (ROOT / step["config"]).is_file()
+                else f"rebuild {step['dataset']} (arm {step['config']} missing)")
+    if step["kind"] == "agentx":
+        return (f"agentx {step['label']}: {step['concurrency']} sessions, {step['duration']} s measured, "
+                f"{step['dataset']} seed {step['seed']} > {step['out']}")
     if step["kind"] == "gpu_clocks":
         lock = step["lock"]
         return f"lock GPU SM clocks to {lock[0]}-{lock[1]} MHz on every node" if lock else "reset GPU clocks on every node"
@@ -1267,6 +1413,14 @@ def run_script(step: dict) -> int:
     with out.open("w") as handle:
         return subprocess.run([sys.executable, *step["argv"]], cwd=ROOT, stdout=handle,
                               stderr=subprocess.STDOUT).returncode
+
+
+def run_logged(argv: list[str], log_path: str) -> int:
+    """A repository command with its output in ``log_path`` (a long run is followed there)."""
+    path = ROOT / log_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        return subprocess.run(argv, cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT).returncode
 
 
 def fresh_inventory(config: str | None = None) -> None:
@@ -1748,6 +1902,7 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
     validated = False
     restart = False
     booted = None  # the arm serving now: its container is the one sampled and whose logs are kept
+    failed_points = []  # agentx points that failed; the job goes on to the next point's boot
     for step in steps:
         hold = read_hold()
         if not hold_is_ours(hold):
@@ -1821,6 +1976,33 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                 log(f"{Path(step['argv'][0]).name} {step.get('label', '')} exit {code}")
                 if code:
                     save_engine_logs(step["out"], config=booted)
+            elif step["kind"] == "agentx_prepare":
+                if agentx_prepared(step):
+                    log(f"{step['dataset']} seed {step['seed']} already rebuilt on this host")
+                else:
+                    if container_running() and not stop_cluster():
+                        failed = "stop before the AgentX rebuild failed"
+                        break
+                    code = run_logged(agentx_prepare_command(step), step["out"])
+                    log(f"agentx prepare exit {code}")
+                    if code or not agentx_prepared(step):
+                        failed = f"the AgentX rebuild failed (exit {code}); see {step['out']}"
+                        break
+            elif step["kind"] == "clean":
+                code = run_logged(clean_command(step), f"{step['out']}.log")
+                summary = json.loads((ROOT / step["out"]).read_text()) if (ROOT / step["out"]).exists() else {}
+                problems = clean_problems(summary) if code == 0 and summary else [f"workload exited {code}"]
+                if problems:
+                    failed = f"{step['label']}: the server was not idle before the point ({'; '.join(problems)})"
+                    break
+                log(f"{step['label']}: no request in {step['seconds']} s before the point")
+            elif step["kind"] == "agentx":
+                with Telemetry(f"{step['out']}/point", booted):
+                    code = run_logged(agentx_command(step), f"{step['out']}/lab.log")
+                log(f"agentx {step['label']} exit {code}")
+                if code:
+                    failed_points.append(step["label"])
+                    save_engine_logs(f"{step['out']}/point", config=booted)
             elif step["kind"] == "sync":
                 if not sync_checkouts():
                     failed = "sync failed"
@@ -1886,6 +2068,8 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             failed = f"{describe_step(step)} raised {type(error).__name__}: {error}"
             break
     stop_beating.set()
+    if failed_points and not failed:
+        failed = f"agentx points failed: {', '.join(failed_points)}"
     if restart:
         log("sync moved the checkout to another commit: the job restarts on it")
         return RESTART_ON_NEW_COMMIT
