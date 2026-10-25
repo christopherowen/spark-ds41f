@@ -93,25 +93,6 @@ def _rotated(x, positions, cos_sin_cache, **kwargs):
     return out
 
 
-def _write_v41_cache(x, cache, slots, *, page_size, cache_kind, plan):
-    """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
-    if kernels.uses_tilelang():
-        # The same bytes as B12X's writer; its plans stay declared.
-        from .tilelang.cache_writer import write_cache
-
-        write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
-        return
-    mla.write_cache(
-        x,
-        cache,
-        slots,
-        page_size=page_size,
-        cache_kind=cache_kind,
-        cache_format="deepseek_v41",
-        plan=plan,
-    )
-
-
 class _AttentionHelpers:
     """Loaded-resource owner, independent of unpublished attention caches."""
 
@@ -121,26 +102,26 @@ class _AttentionHelpers:
     def get_b12x_preparation_units(
         self, layer: object, workload: B12xWorkload
     ) -> tuple[B12xPreparationUnit, ...]:
+        # The TileLang kernels launch no helper plan; binding them prepares the
+        # attention staging (DeepseekV41TileLangAttention._bind_plans).
+        if kernels.uses_tilelang():
+            return ()
         from b12x.preparation import FrozenMapping, MemoryRequirements, PreparedCall
 
         attn = self.attention
         table = attn.rotary_emb.cos_sin_cache
         device = table.device
         attn._declare_attention(device)
-        roles = [("kv", 1, 512, 1)]
-        # TileLang RoPE needs no plan; the kv plan stays for the attention staging
-        # memory it carries and materializes.
-        if not kernels.uses_tilelang():
-            roles.append(("q", attn.n_local_heads, 512, 1))
-            if attn.indexer is not None:
-                roles.append(("index_query", attn.indexer.heads, 128, 1))
-            if attn.compressor is not None:
-                roles.extend(
-                    (
-                        ("index_key", 1, 128, attn.compress_ratio),
-                        ("latent", 1, 512, attn.compress_ratio),
-                    )
+        roles = [("kv", 1, 512, 1), ("q", attn.n_local_heads, 512, 1)]
+        if attn.indexer is not None:
+            roles.append(("index_query", attn.indexer.heads, 128, 1))
+        if attn.compressor is not None:
+            roles.extend(
+                (
+                    ("index_key", 1, 128, attn.compress_ratio),
+                    ("latent", 1, 512, attn.compress_ratio),
                 )
+            )
         plans: dict[str, object] = {}
         requests = []
         for role, heads, dim, ratio in roles:
@@ -194,8 +175,7 @@ class _AttentionHelpers:
                     prepare_call=prepare,
                 )
             )
-        # The TileLang indexer folds the head-weight scale into its projection.
-        if attn.indexer is not None and not kernels.uses_tilelang():
+        if attn.indexer is not None:
             declaration = weight_scale.plan(
                 weight_scale.Query(max_elements=attn.capacity * attn.indexer.heads),
                 device=device,
@@ -258,8 +238,6 @@ class _AttentionHelpers:
             requests=tuple(requests),
             stage="weights",
         )
-        if kernels.uses_tilelang():  # the TileLang WO projection needs no plan
-            return (helpers,)
         return (helpers, attn._wo_preparation_unit(workload))
 
 
@@ -1310,6 +1288,24 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             return x
         return _rotated(x, positions, table, plan=self._helper_plan(role))
 
+    def _write_v41_cache(self, x, cache, slots, *, page_size, cache_kind):
+        """Write ``x``'s V4.1 records (``cache_kind`` swa or indexed) at ``slots``."""
+        if kernels.uses_tilelang():
+            # The same bytes as B12X's writer.
+            from .tilelang.cache_writer import write_cache
+
+            write_cache(x, cache, slots, page_size=page_size, cache_kind=cache_kind)
+            return
+        mla.write_cache(
+            x,
+            cache,
+            slots,
+            page_size=page_size,
+            cache_kind=cache_kind,
+            cache_format="deepseek_v41",
+            plan=self._helper_plan(f"{cache_kind}_cache_write"),
+        )
+
     def _helper_plan(self, role: str):
         try:
             return self._helper_plans[role]
@@ -1386,13 +1382,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
                 "V4.1 attention metadata is not prepared"
             )
         rotated = self._rope(kv, positions, "kv")
-        _write_v41_cache(
+        self._write_v41_cache(
             rotated,
             self.swa_cache_layer.kv_cache,
             slot_mapping,
             page_size=self.swa_cache_layer.block_size,
             cache_kind="swa",
-            plan=self._helper_plan("swa_cache_write"),
         )
 
     def _query_metadata(self, metadata):
@@ -1441,13 +1436,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
         index_meta = cast(DeepseekV41B12xMetadata, metadata[indexer.k_cache.prefix])
         self._write_index_keys(key, index_meta.slot_mapping[:rows])
         latent = self._rope(latent, positions, "latent")
-        _write_v41_cache(
+        self._write_v41_cache(
             latent,
             self.kv_cache,
             slots,
             page_size=self._main_page,
             cache_kind="indexed",
-            plan=self._helper_plan("indexed_cache_write"),
         )
 
     def forward(

@@ -19,10 +19,12 @@ logprobs, then a summary of every digest. Two builds whose controls are the same
 bit print the same digests. A scenario vLLM rejects by design (HTTP 400 for min_p and
 logit_bias under speculative decoding, REJECTABLE) is recorded with the server's message,
 and its digest is the message's. Any other HTTP error is a failure: it is recorded, the
-remaining scenarios still run, and the script exits 1.
+remaining scenarios still run, and the script exits 1; so is a refused or dropped
+connection.
 """
 import argparse
 import hashlib
+import http.client
 import json
 import threading
 import urllib.error
@@ -136,14 +138,17 @@ def main() -> None:
             alone = [client.complete(p, args.tokens, s, controls)
                      for p, s in zip(PROMPTS, seeds)]
             c8 = together(client, args.tokens, seeds, controls)
-        except urllib.error.HTTPError as error:
-            message = error.read().decode(errors="replace")
-            if error.code == 400 and name in REJECTABLE:
-                print(json.dumps({"scenario": name, "rejected": error.code, "message": message}),
+        except (OSError, http.client.HTTPException) as error:
+            # HTTPError is an OSError; a refused or dropped connection is a failure too.
+            code = getattr(error, "code", None)
+            message = (error.read().decode(errors="replace")
+                       if isinstance(error, urllib.error.HTTPError) else repr(error))
+            if code == 400 and name in REJECTABLE:
+                print(json.dumps({"scenario": name, "rejected": code, "message": message}),
                       flush=True)
                 digests[f"{name}/rejected"] = hashlib.sha256(message.encode()).hexdigest()
             else:
-                print(json.dumps({"scenario": name, "failed": error.code, "message": message}),
+                print(json.dumps({"scenario": name, "failed": code, "message": message}),
                       flush=True)
                 failed.append(name)
             continue

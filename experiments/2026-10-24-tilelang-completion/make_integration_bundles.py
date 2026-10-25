@@ -66,6 +66,20 @@ PARTS = {
                 "--basetemp", "/c/pytest-integration-sink-scheduler",
                 "tests/v1/core/test_sink_draft_zero.py"], 1800,
              {"VLLM_DS41_KERNEL_BACKEND": None}),
+            # Startup without unused kernels (2026-10-25): the JIT monitor's off mode,
+            # no B12X preparation unit or temporary KV cache under TileLang, the
+            # runner warm-up without Triton's top-k/top-p. The tests pick each backend
+            # themselves; the files' other tests are B12X's, so the variable is unset.
+            ("startup tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-startup",
+                "tests/jit_monitor/test_hooks.py",
+                "tests/engine/test_arg_utils.py",
+                "tests/models/test_deepseek_v4_1_attention.py",
+                "tests/models/test_deepseek_v4_1_compressor_prepare.py",
+                "tests/model_executor/test_b12x_warmup.py",
+                "tests/v1/worker/test_mixed_warmup_gate.py",
+                "tests/v1/worker/test_gpu_warmup_blocks.py"], 3600,
+             {"VLLM_DS41_KERNEL_BACKEND": None}),
             ("runner benchmark", ["benchmarks/kernels/benchmark_runner_inputs_tilelang.py",
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",

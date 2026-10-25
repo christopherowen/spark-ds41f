@@ -39,7 +39,10 @@ def serve(status_for):
             self.reply(200, {"choices": [{"message": {"content": "x"}, "logprobs": None,
                                           "finish_reason": "length"}]})
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(http.server.ThreadingHTTPServer):
+        request_queue_size = 64  # eight requests at once, with room under load
+
+    server = Server(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -86,6 +89,17 @@ class ControlsDigestTest(unittest.TestCase):
         result = run(status)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(json.loads(result.stdout.splitlines()[-1])["failed"], ["penalties"])
+
+
+    def test_a_refused_connection_fails_the_scenario(self):
+        server = serve(lambda body: 200)
+        port = server.server_port
+        server.shutdown()
+        server.server_close()
+        result = subprocess.run([sys.executable, str(SCRIPT), f"http://127.0.0.1:{port}"],
+                                capture_output=True, text=True, timeout=60)
+        # /v1/models itself is refused: the script fails before any scenario.
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

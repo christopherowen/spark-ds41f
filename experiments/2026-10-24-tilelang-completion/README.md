@@ -1754,3 +1754,51 @@ seeded temperature-1 digest are stable, so this is a sampled-request effect comm
 builds, not the ports'. Adaptive verification shares one draft budget across the batch,
 so a seeded sampled request's random draws can depend on which requests share its steps.
 That remains to be confirmed.
+
+## Startup without unused kernels
+
+An audit of the candidate recipe and the startup path against inventory 5 found:
+- **B12X preparation still ran under the TileLang backend.** The attention helpers' kv
+  rotary and cache-writer plans and the compressor's grouped RMSNorm were compiled and
+  launched in four stages: weights, profile, state and bind. The state stage built a whole
+  temporary KV cache, 66 blocks, to re-prime them.
+- **Serving launches none of those kernels.** RoPE and cache writes are TileLang's, and the
+  compressor applies the norm weight inside its TileLang compression.
+- **Their only effect was allocating the attention staging buffers.**
+
+vLLM 1bd5f0c59 declares no B12X unit under TileLang. The TileLang binding allocates the
+staging, at the same point before memory profiling, and the compressor's norm is a plain
+weight holder. 4d7056d83 builds the temporary KV cache only for a model that declares
+units.
+
+[ports-clean-tp4.json](ports-clean-tp4.json) is the ports arm with the JIT monitor off,
+and without the recipe's settings for kernels serving does not use:
+
+| removed | why |
+|---------|-----|
+| `B12X_AUTOTUNE`, `B12X_{WEIGHTS,STATE,BIND}_COMPILE_WORKERS`, `B12X_COMPILE_CACHE_DIR`, `B12X_CUTE_COMPILE_CACHE_DIR`, `B12X_DENSE_SPLITK_TURBO`, `B12X_W4A8_TINY_DECODE`, `CUTE_DSL_ARCH`, `CUTE_DSL_CACHE_DIR` | no B12X preparation, GEMM or MoE runs; the CuTe DSL compiled only B12X preparation units |
+| `VLLM_USE_FLASHINFER_SAMPLER`, `FLASHINFER_WORKSPACE_BASE` | sink rejection forces the FlashInfer sampler off; no FlashInfer kernel runs |
+| `VLLM_USE_AOT_COMPILE`, `VLLM_USE_MEGA_AOT_ARTIFACT`, `VLLM_USE_STANDALONE_COMPILE`, `TORCHINDUCTOR_CACHE_DIR` | the model does not support torch.compile; nothing compiles through Inductor |
+| `VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD`, `VLLM_DS41_ATTENTION_COMPUTE` | read only by attention code the TileLang backend does not run |
+| `VLLM_DS41_DRAFT_NVFP4_HEAD`, `VLLM_DS41_MARKOV_NVFP4` | defaults (0): the NVFP4 heads are not used |
+| `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` | a fixed `--kv-cache-memory-bytes` skips the estimate |
+
+Kept, because they still do something:
+- `TRITON_CACHE_DIR`: three Triton kernels pack the BF16 LM head at load.
+- `--no-enable-flashinfer-autotune`: without it the autotuner's dummy runs start.
+- The backend flags, which spark's validator requires.
+
+Other inert settings that configure no kernel are left as they are, for example
+`VLLM_ALLOW_LONG_MAX_MODEL_LEN` and `SAFETENSORS_FAST_GPU`. So are settings that only
+restate a default, such as `--block-size 256`.
+
+The packed head's load-time Triton kernels are the last Triton in the deployment: a port
+for later.
+
+Check: run 23's bundles first, including the runner bundle's new startup tests. Then
+[cleanup-check.json](cleanup-check.json): the clean arm against candidate 4, twice each,
+with outputs, controls, images, c1 and c8. [startup_lines.py](startup_lines.py) records
+from each arm's log:
+- B12X preparation lines and temporary KV blocks;
+- JIT monitor reports;
+- TileLang preparation time and engine init time.
