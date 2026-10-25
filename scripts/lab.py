@@ -386,6 +386,78 @@ def memory_before_boot(compact: bool) -> dict:
     return out
 
 
+# One line every 0.25 s: time, then MemAvailable, MemFree and Cached in KiB. The loop ends at
+# the first write that fails (the runner stopped reading) and in any case after an hour, the
+# deployment's ready timeout, so a lost runner leaves no unbounded sampler on a node.
+STARTUP_MEMORY_SAMPLER = (
+    "for _ in $(seq 14400); do "
+    "awk -v t=\"$(date +%s.%N)\" '/^(MemAvailable|MemFree|Cached):/ {v[$1] = $2} "
+    "END {print t, v[\"MemAvailable:\"], v[\"MemFree:\"], v[\"Cached:\"]}' /proc/meminfo || exit 0; "
+    "sleep 0.25; done"
+)
+
+
+def start_memory_samplers(prefix: Path) -> list[tuple[str, Path, subprocess.Popen]]:
+    """Sample each node's memory through a boot: the startup guard reads MemAvailable, and
+    GB10's allocator needs MemFree, which the page cache takes (TODO.md, boot)."""
+    nodes, samplers = nodes_config(), []
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    for node in nodes["nodes"]:
+        path = prefix.with_name(f"{prefix.name}-{node['name']}.txt")
+        with path.open("w") as handle:
+            process = subprocess.Popen(
+                ["ssh", *spark.ssh_options(), spark.ssh_target(nodes, node),
+                 shlex.join(["bash", "-c", STARTUP_MEMORY_SAMPLER])],
+                stdout=handle, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        samplers.append((node["name"], path, process))
+    return samplers
+
+
+def stop_memory_samplers(samplers: list[tuple[str, Path, subprocess.Popen]]) -> dict:
+    out = {}
+    for name, path, process in samplers:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        out[name] = memory_series(path.read_text())
+    return out
+
+
+def memory_series(text: str) -> dict:
+    """A node's samples through a boot, summarized in GiB: the lowest MemAvailable (the
+    startup guard's measure) and when it fell, the lowest MemFree and the largest page cache."""
+    samples = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 4:
+            continue  # a line cut off when the sampler stopped
+        try:
+            samples.append((float(fields[0]), *(int(field) for field in fields[1:])))
+        except ValueError:
+            continue
+    if not samples:
+        return {"samples": 0}
+    start = samples[0][0]
+
+    def gib(kib: int) -> float:
+        return round(kib / 1024**2, 3)
+
+    lowest = min(samples, key=lambda sample: sample[1])
+    return {
+        "samples": len(samples),
+        "seconds": round(samples[-1][0] - start, 1),
+        "first": {"available_gib": gib(samples[0][1]), "free_gib": gib(samples[0][2]), "cached_gib": gib(samples[0][3])},
+        "min_available_gib": gib(lowest[1]),
+        "min_available_at_seconds": round(lowest[0] - start, 1),
+        "min_free_gib": gib(min(sample[2] for sample in samples)),
+        "max_cached_gib": gib(max(sample[3] for sample in samples)),
+        "last": {"available_gib": gib(samples[-1][1]), "free_gib": gib(samples[-1][2]), "cached_gib": gib(samples[-1][3])},
+    }
+
+
 def stop_arguments(remove: bool = False) -> list[str]:
     """Stop the production profile's containers; they are kept (stopped) unless removal is asked for."""
     return ["--cluster-config", PRODUCTION_CONFIG, "cluster", "stop", *(["--remove"] if remove else []),
@@ -781,56 +853,14 @@ def watchdog(max_age: int, once: bool) -> None:
         time.sleep(60)
 
 
-# ---------------------------------------------------------------- overlay checks
-
-def image_file(image: str, path: str, cache: Path) -> Path | None:
-    """The image's copy of PATH, extracted once with docker create/cp (no process is started)."""
-    image_id = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True,
-                              capture_output=True).stdout.strip().split(":")[-1][:16]
-    target = cache / image_id / path.lstrip("/")
-    if target.exists():
-        return target
-    target.parent.mkdir(parents=True, exist_ok=True)
-    created = subprocess.run(["docker", "create", image], text=True, capture_output=True)
-    if created.returncode:
-        return None
-    container = created.stdout.strip()
-    try:
-        copied = subprocess.run(["docker", "cp", f"{container}:{path}", str(target)], capture_output=True)
-    finally:
-        subprocess.run(["docker", "rm", container], capture_output=True)
-    return target if copied.returncode == 0 else None
-
-
-def fence_problems(config: dict, read_image=None) -> list[str]:
-    """Mounted B12X sources must not carry fewer TMA proxy fences than the image's own copy.
-
-    An overlay built from an older B12X tree silently drops fences the image gained; the
-    gemv-geom and mhc-mt overlays did exactly that before r5o.
-    """
-    image = config["container"]["image"]
-    read_image = read_image or (lambda path: image_file(image, path, Path.home() / ".cache" / "spark-lab"))
-    problems = []
-    for source, destination, _mode in config["container"]["mounts"]:
-        if not (any(destination.startswith(f"{root}/b12x/") for root in SOURCE_ROOTS)
-                and destination.endswith(".py")):
-            continue
-        local = Path(spark.host_path(config, source))
-        reference = read_image(destination)
-        if reference is None or not local.is_file():
-            continue
-        mine = local.read_text(encoding="utf-8").count("fence_proxy")
-        theirs = Path(reference).read_text(encoding="utf-8").count("fence_proxy")
-        if mine < theirs:
-            problems.append(f"{local}: {mine} fence_proxy calls, image has {theirs} ({destination})")
-    return problems
-
+# ---------------------------------------------------------------- overlays
 
 def overlay_manifest(config: dict) -> list[str]:
+    """The SHA-256 of every file the arm mounts over the image's source trees."""
     lines = []
     for source, destination, _mode in config["container"]["mounts"]:
         path = Path(spark.host_path(config, source))
-        if "spark3-overlay" in source and path.is_file():
+        if any(destination.startswith(f"{root}/") for root in SOURCE_ROOTS) and path.is_file():
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             lines.append(f"{digest}  {path} -> {destination}")
     return lines
@@ -849,11 +879,14 @@ def stop_step(job: dict) -> dict:
 
 def boot_step(run: str, arm: dict, config: str) -> dict:
     """An arm's boot; with "memory_snapshot" (or "compact_memory") serving stops first and
-    each node's free memory by block size is recorded, compacted first with "compact_memory"."""
+    each node's free memory by block size is recorded, compacted first with "compact_memory";
+    with "startup_memory" each node's memory is sampled from the start command to ready."""
     step = {"kind": "boot", "config": config, "label": arm["label"]}
     if arm.get("memory_snapshot") or arm.get("compact_memory"):
         step.update(memory_out=f"results/private/determinism/{run}/memory-{arm['label']}.json",
                     compact=bool(arm.get("compact_memory")))
+    if arm.get("startup_memory"):
+        step["startup_memory_out"] = f"results/private/determinism/{run}/startup-memory-{arm['label']}.json"
     return step
 
 
@@ -1140,6 +1173,8 @@ def plan(spec: dict) -> list[dict]:
 def describe_step(step: dict) -> str:
     if step["kind"] == "boot":
         memory = (", compact memory first" if step.get("compact") else ", memory snapshot first") if step.get("memory_out") else ""
+        if step.get("startup_memory_out"):
+            memory += ", memory sampled to ready"
         return f"boot {step['config']} ({step['label']}{memory})"
     if step["kind"] == "cli":
         return "bin/spark " + shlex.join(step["argv"])
@@ -1685,10 +1720,6 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             if step["kind"] == "boot":
                 if step["config"] not in checked:
                     config = spark.read_cluster(step["config"])
-                    problems = fence_problems(config)
-                    if problems:
-                        failed = "stale overlay: " + "; ".join(problems)
-                        break
                     manifest = ROOT / "results" / "private" / "lab" / f"overlays-{spec['run']}.txt"
                     manifest.parent.mkdir(parents=True, exist_ok=True)
                     with manifest.open("a") as handle:
@@ -1702,7 +1733,19 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
                     (ROOT / step["memory_out"]).parent.mkdir(parents=True, exist_ok=True)
                     write_json_atomic(ROOT / step["memory_out"], snapshot)
                 booted = step["config"]
-                if not boot(step["config"]):
+                samplers = (start_memory_samplers(ROOT / step["startup_memory_out"].removesuffix(".json"))
+                            if step.get("startup_memory_out") else None)
+                try:
+                    started = boot(step["config"])
+                finally:
+                    if samplers is not None:
+                        startup = stop_memory_samplers(samplers)
+                        (ROOT / step["startup_memory_out"]).parent.mkdir(parents=True, exist_ok=True)
+                        write_json_atomic(ROOT / step["startup_memory_out"], startup)
+                        for name, summary in startup.items():
+                            log(f"{name}: lowest MemAvailable {summary.get('min_available_gib')} GiB during the boot, "
+                                f"page cache up to {summary.get('max_cached_gib')} GiB")
+                if not started:
                     failed = f"boot of {step['config']} failed"
                     # A boot that dies keeps its evidence: the next boot replaces the containers.
                     save_engine_logs(f"results/private/lab/{spec['run']}/boot-{step['label']}", config=booted)

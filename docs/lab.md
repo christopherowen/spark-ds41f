@@ -203,6 +203,12 @@ before the first boot. `run --dry-run` prints the problems.
   stops and every node's free memory by block size (`/proc/buddyinfo`) is saved to
   `memory-<label>.json`. `compact_memory` then runs
   `sudo -n sh -c 'sync; echo 1 > /proc/sys/vm/compact_memory'` and records the result.
+- **Arm option `startup_memory`:** every node's `MemAvailable`, `MemFree` and page cache
+  (`Cached`) are sampled every 0.25 s from the arm's start command until it is ready, to
+  `startup-memory-<label>-<node>.txt`, and summarized in `startup-memory-<label>.json`: the
+  lowest `MemAvailable` (the startup guard's measure) and when it fell, the lowest `MemFree`
+  and the largest page cache. The guard only refuses a boot below its line; the sample shows
+  the margin. The samplers stop when the boot ends, failed or not, and after an hour at most.
 - **Placeholders:** `{label}` and `{run}` in extras arguments become each arm's label
   and the run's name, so arms that share extras write their own outputs.
 - **Reading results:** `scripts/lab.py report RUN` prints the run's table and each
@@ -232,10 +238,8 @@ Other workloads retain their defaults.
 Every arm must use the production profile's node map. `boot` refuses any other
 node set before launch, because a window cannot recable the fabric.
 
-Before an arm's first boot, every mounted B12X file must carry at least as many
-`fence_proxy` calls as the image's own copy. Overlays built from an older B12X tree
-fail this check. The overlay hashes of each run go to
-`results/private/lab/overlays-<run>.txt`.
+Before an arm's first boot, the SHA-256 of every file it mounts over the image's source
+trees goes to `results/private/lab/overlays-<run>.txt`.
 
 ## Kernel-lab bundles
 

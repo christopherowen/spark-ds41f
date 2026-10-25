@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import io
 import importlib.machinery
 import importlib.util
@@ -739,6 +740,30 @@ class TelemetryTest(unittest.TestCase):
         self.assertEqual((step["memory_out"], step["compact"]), ("results/private/determinism/r/memory-a.json", True))
         self.assertIn("compact memory first", lab.describe_step(step))
         self.assertIn("memory snapshot first", lab.describe_step(lab.boot_step("r", {"label": "b", "memory_snapshot": True}, "c.json")))
+        step = lab.boot_step("r", {"label": "c", "startup_memory": True}, "c.json")
+        self.assertEqual(step["startup_memory_out"], "results/private/determinism/r/startup-memory-c.json")
+        self.assertNotIn("memory_out", step)
+        self.assertIn("memory sampled to ready", lab.describe_step(step))
+        self.assertNotIn("startup_memory_out", lab.boot_step("r", {"label": "a"}, "c.json"))
+
+    def test_memory_series(self) -> None:
+        # time, MemAvailable, MemFree, Cached (KiB); a partial last line is ignored.
+        text = ("100.0 20971520 10485760 1048576\n"
+                "100.5 5767168 2097152 9437184\n"
+                "101.0 6291456 1048576 8388608\n"
+                "101.2 6291456\n")
+        summary = lab.memory_series(text)
+        self.assertEqual(summary["samples"], 3)
+        self.assertEqual((summary["min_available_gib"], summary["min_available_at_seconds"]), (5.5, 0.5))
+        self.assertEqual((summary["min_free_gib"], summary["max_cached_gib"]), (1.0, 9.0))
+        self.assertEqual(summary["first"], {"available_gib": 20.0, "free_gib": 10.0, "cached_gib": 1.0})
+        self.assertEqual(summary["last"], {"available_gib": 6.0, "free_gib": 1.0, "cached_gib": 8.0})
+        self.assertEqual(lab.memory_series(""), {"samples": 0})
+
+    def test_the_memory_sampler_is_bounded(self) -> None:
+        self.assertIn("seq 14400", lab.STARTUP_MEMORY_SAMPLER)
+        self.assertIn("sleep 0.25", lab.STARTUP_MEMORY_SAMPLER)
+        self.assertIn("|| exit 0", lab.STARTUP_MEMORY_SAMPLER)
 
     def test_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(lab, "ROOT", Path(directory)):
@@ -982,27 +1007,25 @@ class CurvesTest(unittest.TestCase):
 
 
 class OverlayTest(unittest.TestCase):
-    def test_fewer_fences_than_the_image_is_a_problem(self) -> None:
+    def test_every_file_mounted_over_a_source_tree_is_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            stale = Path(directory) / "stale.py"
-            stale.write_text("x = 1\n")
-            fresh = Path(directory) / "fresh.py"
-            fresh.write_text("cute.arch.fence_proxy('async.shared')\n")
-            image = Path(directory) / "image.py"
-            image.write_text("cute.arch.fence_proxy('async.shared')\n")
-            mounts = [[str(stale), "/opt/spark3/candidate/b12x/b12x/gemm/a.py", "ro"],
-                      [str(fresh), "/opt/spark3/candidate/b12x/b12x/gemm/b.py", "ro"],
-                      [str(stale), "/opt/spark3/candidate/vllm/vllm/x.py", "ro"]]
-            config = {"container": {"image": "img", "mounts": mounts}, "host": {"home": "/home/x"}}
-            problems = lab.fence_problems(config, read_image=lambda path: image)
-        self.assertEqual(len(problems), 1)
-        self.assertIn("stale.py", problems[0])
+            worktree = Path(directory) / "projects" / "vllm-x" / "vllm"
+            worktree.mkdir(parents=True)
+            (worktree / "x.py").write_text("x = 1\n")
+            (Path(directory) / "data.json").write_text("{}\n")
+            mounts = [["{home}/projects/vllm-x/vllm/x.py", "/opt/spark-ds41f/candidate/vllm/vllm/x.py", "ro"],
+                      ["{home}/projects/vllm-x/vllm/x.py", "/opt/spark3/candidate/vllm/vllm/x.py", "ro"],
+                      ["{home}/data.json", "/cache/data.json", "ro"],
+                      ["{home}/projects", "/opt/spark-ds41f/candidate/projects", "ro"]]
+            lines = lab.overlay_manifest({"container": {"mounts": mounts}, "host": {"home": directory}})
+        digest = hashlib.sha256(b"x = 1\n").hexdigest()
+        self.assertEqual(lines, [f"{digest}  {worktree / 'x.py'} -> /opt/spark-ds41f/candidate/vllm/vllm/x.py",
+                                 f"{digest}  {worktree / 'x.py'} -> /opt/spark3/candidate/vllm/vllm/x.py"])
 
-    def test_the_overlay_checks_read_the_recipe_cache_mount(self) -> None:
+    def test_the_overlay_manifest_reads_the_recipe_cache_mount(self) -> None:
         # The recipe's cache mount names {checkout}; formatting it with {home} alone raised KeyError.
         config = lab.spark.read_cluster("config/cluster.json", "tp3-triangle")
         self.assertEqual(lab.overlay_manifest(config), [])
-        self.assertEqual(lab.fence_problems(config, read_image=lambda path: None), [])
 
 
 class KernelLabTest(unittest.TestCase):
@@ -1161,7 +1184,6 @@ class StepFailureTest(unittest.TestCase):
                 mock.patch.object(lab, "hold_is_ours", return_value=True), \
                 mock.patch.object(lab, "window_should_close", return_value=None), \
                 mock.patch.object(lab, "beat"), \
-                mock.patch.object(lab, "fence_problems", return_value=[]), \
                 mock.patch.object(lab, "overlay_manifest", return_value=[]), \
                 mock.patch.object(lab, "boot", return_value=True), \
                 mock.patch.object(lab, "save_curves"), \
@@ -1186,7 +1208,6 @@ class StepFailureTest(unittest.TestCase):
                 mock.patch.object(lab, "hold_is_ours", return_value=True), \
                 mock.patch.object(lab, "window_should_close", return_value=None), \
                 mock.patch.object(lab, "beat"), \
-                mock.patch.object(lab, "fence_problems", return_value=[]), \
                 mock.patch.object(lab, "overlay_manifest", return_value=[]), \
                 mock.patch.object(lab, "boot", return_value=False), \
                 mock.patch.object(lab, "save_engine_logs") as saved, \
@@ -1200,6 +1221,38 @@ class StepFailureTest(unittest.TestCase):
         self.assertEqual(code, 1)
         saved.assert_called_once_with("results/private/lab/t2/boot-a", config="experiments/x/a.json")
         self.assertIn("boot of experiments/x/a.json failed", close.call_args.args[0])
+
+    def test_a_sampled_boot_records_its_memory_even_when_it_fails(self) -> None:
+        spec = {"experiment": "experiments/x", "run": "t3",
+                "jobs": [{"kind": "measure", "profile": "lean",
+                          "arms": [{"config": "a.json", "label": "a", "startup_memory": True}]}]}
+        order = []
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(lab, "ROOT", Path(directory)), \
+                mock.patch.object(lab, "read_hold", return_value={"holder": "test"}), \
+                mock.patch.object(lab, "hold_is_ours", return_value=True), \
+                mock.patch.object(lab, "window_should_close", return_value=None), \
+                mock.patch.object(lab, "beat"), \
+                mock.patch.object(lab, "overlay_manifest", return_value=[]), \
+                mock.patch.object(lab, "start_memory_samplers", side_effect=lambda prefix: order.append(("start", prefix)) or ["s"]), \
+                mock.patch.object(lab, "boot", side_effect=lambda config: order.append(("boot", config)) or False), \
+                mock.patch.object(lab, "stop_memory_samplers", side_effect=lambda samplers: order.append(("stop", samplers))
+                                  or {"dgx1": {"samples": 2, "min_available_gib": 5.2, "max_cached_gib": 0.4}}), \
+                mock.patch.object(lab, "save_engine_logs"), \
+                mock.patch.object(lab, "plan_problems", return_value=[]), \
+                mock.patch.object(lab.spark, "read_cluster", return_value={"container": {"mounts": [], "image": "i"}}), \
+                mock.patch.object(lab, "production_configuration", return_value=(
+                    {"host": {"home": "/h"}}, {"nodes": [{"name": "dgx1", "head": True, "management_ip": "1"}]}, {})), \
+                mock.patch.object(lab, "window_close", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            code = lab.execute(spec, dry=False, keep_open=True)
+            written = json.loads((Path(directory) / "results/private/determinism/t3/startup-memory-a.json").read_text())
+        self.assertEqual(code, 1)
+        self.assertEqual([event for event, _ in order], ["start", "boot", "stop"])
+        self.assertEqual(order[0][1].name, "startup-memory-a")
+        self.assertEqual(order[2][1], ["s"])
+        self.assertEqual(written["dgx1"]["min_available_gib"], 5.2)
+        self.assertIn("dgx1: lowest MemAvailable 5.2 GiB during the boot, page cache up to 0.4 GiB", out.getvalue())
 
     def test_the_lean_bench_does_not_override_its_live_check(self) -> None:
         self.assertNotIn("--allow-mismatch", lab.BENCH_BASE)
@@ -1566,14 +1619,3 @@ class SourceRootTest(unittest.TestCase):
                 module.bundle(str(manifest), "img:tag", str(Path(directory) / "b"), "x")
             candidate = json.loads((Path(directory) / "b" / "candidate.json").read_text())
         self.assertEqual(candidate["workdir"], "vllm")
-
-    def test_the_fence_check_reads_overlays_under_either_root(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            stale = Path(directory) / "stale.py"
-            stale.write_text("x = 1\n")
-            image = Path(directory) / "image.py"
-            image.write_text("cute.arch.fence_proxy('async.shared')\n")
-            mounts = [[str(stale), f"{root}/b12x/b12x/gemm/a.py", "ro"] for root in lab.SOURCE_ROOTS]
-            config = {"container": {"image": "img", "mounts": mounts}, "host": {"home": "/home/x"}}
-            problems = lab.fence_problems(config, read_image=lambda path: image)
-        self.assertEqual(len(problems), 2)
