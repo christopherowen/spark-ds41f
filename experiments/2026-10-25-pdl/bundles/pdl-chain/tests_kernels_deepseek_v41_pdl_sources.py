@@ -119,9 +119,13 @@ def violations(source: str, warp_specialized: bool) -> list[str]:
 
 
 def pytest_configure(config):
-    import tilelang.jit.kernel as kernel_module
+    import importlib
 
     from vllm.models.deepseek_v4_1.tilelang import pdl
+
+    # ``tilelang.jit`` is also the decorator tilelang re-exports, so the module is
+    # imported by name.
+    kernel_module = importlib.import_module("tilelang.jit.kernel")
 
     pdl.tile_kernels()
     launch = kernel_module.JITKernel.__call__
