@@ -664,8 +664,7 @@ frozen recipes (spark-ds41f-1022's is `experiments/2026-10-23-next-release/1022`
 The tools read either label prefix and source root, and their guards recognise
 either container. Each node keeps `cache/kkref` as a link to `cache/spark-ds41f`,
 so those recipes keep their warm caches. Experiments, manifests and patches are
-records and keep their names, as do the hosts' RoCE marker
-(`/usr/local/libexec/spark3-roce-marker`) and Local Inference Lab's
+records and keep their names, as does Local Inference Lab's
 `integration/karmic-kraken-beta` branch.
 
 Lab windows also honour holds and requests written as `~/spark3-hold.json`
