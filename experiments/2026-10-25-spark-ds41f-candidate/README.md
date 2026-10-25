@@ -4,6 +4,19 @@ Owner, 2026-10-25: shift to release stabilization and freeze the scope; build on
 reproducible candidate, validate it, and benchmark it against production with the
 published release benchmark. Promotion needs the owner's go.
 
+**Status (2026-10-25 18:32 CET): promoted as `spark-ds41f-1025` and serving on the ring at 1M**
+(owner: "start with TP=4 and promote when ready"; merged as 2831bc8a, #596).
+- **Deployed 18:28-18:32 CET** under a deploy hold. spark-ds41f-1022 stopped at 18:28:15, and
+  the API was ready at 18:31:08: 88.7 s after launch, about 3 minutes of downtime.
+- **Checks:** `doctor --live` OK (its only warnings are the weight-shard extent counts);
+  KV 6,512,700 tokens (vLLM's startup figure, 6.21x at 1M).
+- **Boot memory service:** `spark-ds41f-kernel-memory` replaced `spark3-kernel-memory` and is
+  active on every node.
+- **First-prefill probe** (step 5b, below): a fresh boot's first long prefill costs about 0.1 s, once.
+- **Not qualified yet:** the triangle on this image (#582, after the re-wire).
+
+The sections below record how the candidate got there.
+
 ## What it is
 
 - **vLLM:** production's series (spark-ds41f-1022, patch head 8fc15c18f), then the
@@ -416,7 +429,7 @@ then (the live cluster no longer matches main's recipe), so the deploy takes the
 
    ```sh
    for host in dgx1 dgx2 dgx3 dgx4; do
-     ssh "$host" 'cd ~/projects/spark-ds41f && sudo -n experiments/2026-10-02-kernel-64k/install-boot-support.sh &&
+     ssh "$host" 'cd ~/projects/spark-ds41f && sudo -n bash experiments/2026-10-02-kernel-64k/install-boot-support.sh &&
        sudo -n systemctl start spark-ds41f-kernel-memory.service && systemctl is-active spark-ds41f-kernel-memory.service'
    done
    ```
@@ -427,6 +440,10 @@ then (the live cluster no longer matches main's recipe), so the deploy takes the
    bin/spark --cluster-config config/cluster.json cluster start
    bin/spark --cluster-config config/cluster.json cluster start --apply
    ```
+
+   The installer is not executable (mode 664), so `bash` runs it. A stopped lab container named
+   `spark-ds41f`, such as a release comparison's last candidate arm, makes the start refuse;
+   `cluster start --replace --apply` replaces it. Both happened in this deploy.
 
    5b. Run the first-prefill probe as soon as the API is ready, before any other request
    (doctor --live included). Reports say the first prefill after a boot is slower than later
@@ -442,6 +459,23 @@ then (the live cluster no longer matches main's recipe), so the deploy takes the
    traffic from another client is visible. It then lists any kernel compile or preparation line
    logged during the probe. Compare its rates with candidate 6's warm prefill in the release
    comparison (32K 6,762 tok/s, 128K 6,796). Record the result here even if the probe is level.
+
+   **Result (18:31-18:32 CET, no other traffic: the prompt-token counter started at 0):**
+
+   | Request | Time to first token | Rate |
+   | --- | ---: | ---: |
+   | First 32K | 4.931 s | 6,644 tok/s |
+   | Second 32K | 4.832 s | 6,780 tok/s |
+   | Third 32K | 4.831 s | 6,782 tok/s |
+   | First 128K | 19.190 s | 6,800 tok/s (the comparison's warm figure: 6,796) |
+
+   - **Effect:** the first long prefill after a boot costs about 0.1 s (2%), once.
+   - **Not memory:** free memory moved by under 10 MiB on any node.
+   - **Not disk:** every 32K request read the same 1.8 GB of Engram rows from NVMe
+     (O_DIRECT, so there is no page cache to warm).
+   - **Not compiling:** the containers logged no compile or kernel-preparation line.
+   - **Conclusion:** a much slower first prefill, as reported, is not this boot's behaviour.
+     A repeated prompt hitting the prefix cache would explain a large difference.
 6. `bin/spark --cluster-config config/cluster.json doctor --live` must report the live cluster
    matching (`spark-ds41f`, `spark-ds41f-memguard`), with no kernel memory service warning.
 7. Release the hold (`rm ~/spark-hold.json`) and record the deploy (time, API ready, KV
