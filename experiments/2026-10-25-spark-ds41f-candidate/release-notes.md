@@ -172,6 +172,9 @@ a decision only the owner can make.
 
 ## Thanks
 
+- justincasey, for the CED decoder keeping one row on a prompt's non-final chunks (the CED
+  skip) and the larger long-prefill budget, both from his four-Spark recipe. Together they are
+  most of this release's prefill gain.
 - msuiche, for GLP steering (#401), reworked into this release.
 - JordiPosthumus, for:
   - the prompt-cache report (#455);
