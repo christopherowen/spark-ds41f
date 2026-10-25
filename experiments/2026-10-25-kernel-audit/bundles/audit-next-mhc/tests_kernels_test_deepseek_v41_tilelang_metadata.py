@@ -108,7 +108,8 @@ def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
     """Rows ``offset:offset + rows``: each row's window of physical SWA slots (-1 in
     holes and past its length), its length (clamped to ``width``; 0 when its
     request or position is invalid) and its indexed length (visible, at most 512).
-    A draft row's window is its request's: prefix plus the request's rows."""
+    A draft row's window is its request's: prefix plus the request's rows. Either
+    starts no earlier than the request's replay start, when one is given."""
     pos, reqs, table, visible, qsl, request_positions = _host(
         pos, reqs, table, visible, qsl, request_positions
     )
@@ -120,12 +121,13 @@ def _ref_chunk(pos, reqs, table, visible, qsl, request_positions, offset, rows,
         first, end = qsl[r] * valid, qsl[r + 1] * valid
         prefix = request_positions[r] * valid
         start = (prefix - window).clamp(min=0)
-        length = prefix + end - first - start
     else:
         start = (p + 1 - window).clamp(min=0)
-        if replay_start is not None:
-            start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
-        length = p + 1 - start
+    if replay_start is not None:
+        # A window holds nothing written before its request's replay start; a
+        # drafter's context rows are the CED decoder's kept rows.
+        start = torch.maximum(start, replay_start.cpu().long()[r] * valid)
+    length = prefix + end - first - start if draft else p + 1 - start
     length = torch.where(valid, length.clamp(0, width), 0)
     col = torch.arange(width)
     logical = start[:, None] + col

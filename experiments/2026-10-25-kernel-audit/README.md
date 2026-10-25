@@ -547,18 +547,20 @@ the old kernel and run 4's ef611d4a9:
 The coordinator includes the audit ninth in the next candidate. vLLM `next-candidate`
 was at 4209a1903 (1025 plus 0492, 0500-0503, the softmax fix, 0491, the direct loader,
 the conditionals 0493-0496, 0497, the mHC cast and the SP exchange). The port is vLLM
-branch `kernel-audit-next` (worktree `~/projects/vllm-kernel-audit-next`), the seven
-commits cherry-picked onto 4209a1903 in order; 8e596b329 and its revert are skipped.
+branch `kernel-audit-next` (worktree `~/projects/vllm-kernel-audit-next`) on 4209a1903:
+one test fix for next-candidate itself, then the seven audit commits cherry-picked in
+order; 8e596b329 and its revert are skipped.
 
 | kernel-audit | kernel-audit-next | Resolution |
 |---|---|---|
-| 3cd92e872 | 7fac29e45 | The conditionals removed the Triton `_pages` and `_chunk` and rewrote the metadata tests as torch references. The live-page tests now compare `_ref_pages` on each row's live columns and keep the sentinel elsewhere (`_live_columns`, `_live_equal`). The decode-metadata test's main rows hold the step's requests in reverse and -1 past them. kv-zeroing's `replay = replay_start is not None` is kept with the `main_page` argument. |
-| bb2fb46ee | fc3f51e41 | `test_requests` and `test_tokens` become `test_builder` against `_ref_requests` and `_ref_tokens`; `_token_metadata` calls `metadata.builder`. |
-| 1072d662b | 1485c99f6 | The kernel change only; its test fixes are in 7fac29e45. |
-| a71368f70 | 4d8d0f28d | Clean. |
-| ef611d4a9 | 2c1ae9df6 | Clean. |
-| 26f3c89d6 | 259e54eca | The wide-table test compares `_ref_chunk` and `_ref_pages`. |
-| fb73c80cf | 3072e1838 | The same test change as on `kernel-audit`. |
+| — | 47185fe76 | Not the audit's: next-candidate's chunk reference, fixed (run 7). |
+| 3cd92e872 | dab4f4d51 | The conditionals removed the Triton `_pages` and `_chunk` and rewrote the metadata tests as torch references. The live-page tests now compare `_ref_pages` on each row's live columns and keep the sentinel elsewhere (`_live_columns`, `_live_equal`). The decode-metadata test's main rows hold the step's requests in reverse and -1 past them. kv-zeroing's `replay = replay_start is not None` is kept with the `main_page` argument. The conditionals had moved the compressor test's page-table check onto `tl_metadata.pages`; it passes its visible lengths, every column live. |
+| bb2fb46ee | d2f9c9c46 | `test_requests` and `test_tokens` become `test_builder` against `_ref_requests` and `_ref_tokens`; `_token_metadata` calls `metadata.builder`. |
+| 1072d662b | c6455133e | The kernel change only; its test fixes are in dab4f4d51. |
+| a71368f70 | 5348569e3 | Clean. |
+| ef611d4a9 | 094d86f0b | Clean. |
+| 26f3c89d6 | e3e8241ed | The wide-table test compares `_ref_chunk` and `_ref_pages`. |
+| fb73c80cf | 3f8b928b6 | The same test change as on `kernel-audit`. |
 
 The kernels' bodies are as on `kernel-audit`; `metadata.py` differs from it only in
 next-candidate's own changes (its docstrings, and 0501's draft replay start).
@@ -567,6 +569,32 @@ next-candidate's own changes (its docstrings, and 0501's draft replay start).
 `bundles/audit-next-attention` and `bundles/audit-next-mhc`. They use the same image and
 steps; the overlay carries every package file between 26382f5cf and the port (98
 files), and next-candidate's 4 deleted modules as modules that fail to import. The
-attention layer step runs the whole layer file.
+attention layer step runs the whole layer file, and the compressor tests follow it.
 
-### Run 7: both next bundles (vLLM kernel-audit-next 3072e1838): queued
+### Run 7: both next bundles, 00:23-00:29 CET (branch 4ba40de4, vLLM 3072e1838): attention FAILED
+
+Outputs `~/spark-lab/agents/kernel-audit/out/audit-next-attention-7/` and
+`audit-next-mhc-7/` on dgx4.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 1 | 158 passed, 15 failed, 1 skipped (compute-sanitizer not on the image), 1 xfailed |
+| attention layer tests | 0 | 5 passed |
+| live-page benchmark | 0 | Gate held |
+| one-launch builder benchmark | 0 | Gate held |
+| mHC tests | 0 | 96 passed |
+| model-forward tests | 0 | 76 passed |
+
+**Root cause: next-candidate's, not the audit's.** All 15 failures are the draft-and-replay cases
+of `test_chunk` and `test_decode_metadata_equals_chunk_and_pages`; their window part is
+untouched by the audit. 0501 (c35ac6c69) starts a DSpark draft window at CED's replay
+start and added those cases. The torch reference that replaced Triton's `_chunk`
+(306d4eb38, the conditionals) was written without 0501: it applied the replay start to
+non-draft rows only. 47185fe76 bounds a draft window's start in the reference as the
+kernel does.
+
+Run 7 also missed a call the conditionals moved onto `tl_metadata.pages`: the compressor
+test's page-table check, which the audit's signature change breaks. dab4f4d51 passes it
+its visible lengths. The next attention bundle now runs the compressor tests.
+
+### Run 8: both next bundles (vLLM kernel-audit-next 3f8b928b6): queued

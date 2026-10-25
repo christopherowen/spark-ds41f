@@ -16,9 +16,9 @@ the torch profiler (the request inventory's settings without Python stacks).
 defaults to ``kernel-audit-next``) as bundles/audit-next-*, on the same image: the
 overlay then carries every package file next-candidate changes too, and each one it
 deletes as a module that fails to import, as a missing one does. Its attention layer
-step runs the whole layer test file (the B12X tests in it are gone), without the
-kernel-family variable or B12X's path (both gone). It writes no serving arms: the
-candidate's own serving check covers them.
+step runs the whole layer test file (the B12X tests in it are gone), and the compressor
+tests follow it; neither has the kernel-family variable or B12X's path (both gone). It
+writes no serving arms: the candidate's own serving check covers them.
 """
 import argparse
 import json
@@ -115,10 +115,15 @@ print(json.dumps({"steps": codes}), flush=True)
 sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
 
-# The next port's attention layer step: the whole file.
+# The next port's attention layer step: the whole file. Its attention bundle also runs
+# the compressor tests: next-candidate's conditionals commit moved their page-table
+# check onto tl_metadata.pages, whose signature the audit changes.
 NEXT_LAYER_STEP = ("attention layer tests", PYTEST + [
     "--basetemp", "/c/pytest-audit-attention-layer",
     "tests/models/test_deepseek_v4_1_attention.py"], 1800)
+NEXT_ATTENTION_STEPS = [("compressor tests", PYTEST + [
+    "--basetemp", "/c/pytest-audit-compressor",
+    "tests/models/test_deepseek_v4_1_compressor.py"], 1800)]
 
 MISSING = '''# Deleted by vLLM next-candidate; mounted over the image's copy so that importing it
 # fails as importing a missing module does.
@@ -162,6 +167,8 @@ def write_bundle(repo: str, head: str, commit: str, changed: list[str], part: st
     if port:
         steps = [NEXT_LAYER_STEP if step[0] == NEXT_LAYER_STEP[0] else step
                  for step in steps]
+        if part == "attention":
+            steps[2:2] = NEXT_ATTENTION_STEPS  # after the layer tests, before benchmarks
     bundle = HERE / "bundles" / name
     if bundle.exists():
         shutil.rmtree(bundle)

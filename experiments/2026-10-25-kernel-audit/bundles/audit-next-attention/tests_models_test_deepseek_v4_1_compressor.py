@@ -406,10 +406,20 @@ def test_compressor_rejection_reorder_padding_and_page_boundaries(
             expected += [-1] * (16 - len(expected))
             assert sparse[0].tolist() == expected
 
-        # Compressed/index page tables use the same null-block convention.
+        # Compressed/index page tables use the same null-block convention. A row
+        # writes only its live pages; here every column is live (``width`` visible
+        # entries, one a page).
         pages = torch.empty((1, width), device=device, dtype=torch.int32)
+        visible = torch.full((1,), width, device=device, dtype=torch.int32)
         tl_metadata.pages(
-            candidate.state.req_id_per_token, candidate.table, pages, 0, 1, width
+            candidate.state.req_id_per_token,
+            visible,
+            candidate.table,
+            pages,
+            0,
+            1,
+            width,
+            page=1,
         )
         expected_pages = list(range(1, width + 1))
         expected_pages[1] = -1
