@@ -1,0 +1,46 @@
+{
+ "notes": "candidate 6 at tp4-ring with VLLM_KV_CACHE_POISON alone (vLLM 341928840, 0500 without 0501), the positive control: DSpark's draft rows of nonfinal prefill chunks read window slots nobody wrote, now NaN, and the drafter's router refuses non-finite logits.",
+ "extends": {
+  "config": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"
+ },
+ "set": {
+  "container": {
+   "mounts": [
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-25-kv-zeroing/bundles/serving-unfixed/overlay/vllm/envs.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/envs.py",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-25-kv-zeroing/bundles/serving-unfixed/overlay/vllm/v1/core/single_type_kv_cache_manager.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/core/single_type_kv_cache_manager.py",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-25-kv-zeroing/bundles/serving-unfixed/overlay/vllm/v1/kv_cache_interface.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/kv_cache_interface.py",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-25-kv-zeroing/bundles/serving-unfixed/overlay/vllm/v1/worker/gpu/tilelang_inputs.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu/tilelang_inputs.py",
+     "ro"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-25-kv-zeroing/bundles/serving-unfixed/overlay/vllm/v1/worker/utils.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/utils.py",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "VLLM_COMPUTE_NANS_IN_LOGITS": "1",
+   "VLLM_KV_CACHE_POISON": "1"
+  }
+ }
+}

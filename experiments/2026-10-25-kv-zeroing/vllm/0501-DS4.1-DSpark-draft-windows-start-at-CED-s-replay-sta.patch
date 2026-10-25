@@ -1,0 +1,287 @@
+From 009ad2699246c77c82574ca49d263f27a2d5767f Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 17:48:23 +0100
+Subject: [PATCH 501/501] [DS4.1] DSpark draft windows start at CED's replay
+ start
+
+With a CED decoder, DSpark's context KV is written for the decoder's kept
+rows only (CEDState's indices pack the drafter's context), and the
+drafter's three caches are not prefix-cached. Its window metadata
+(TileLang chunk / decode_metadata, Triton _chunk, DRAFT) started a window
+before the anchor regardless, so two steps' draft rows read slots nothing
+had written in the blocks' current ownership:
+
+- a one-row nonfinal chunk (nonfinal_limits): only its last row has draft
+  context, and the window read the 127 positions before it;
+- a short first chunk after a prefix hit at L: the window read back into
+  [L - 128, L), freshly allocated and never written.
+
+Both chunks are nonfinal, so their drafts are dropped (update_draft_token_ids
+ignores prefill chunks) and no output or acceptance changed. But the rows
+are routed: zeroing made those records finite, and stale bytes (NaN as E4M3
+0x7F/0xFF or a UE8M0 0xFF scale) would trip the router's non-finite
+device_assert.
+
+CED's replay start is exactly where a request's draft context begins (the
+first kept row, or its admission prefix), so draft windows now start no
+earlier, as the decoder's do. The model state binds its persistent
+replay_start buffer to the drafter's attention layers, so captured draft
+graphs read each step's values; the drafter declares only the replay
+variant. Decode and final chunks are unchanged: their windows already lie
+inside written rows (the final chunk keeps at least 128).
+
+Tests: the TileLang window metadata equals the Triton reference for draft
+rows with a replay start, and the two cases' draft windows begin at the
+hit and at the kept row (CUDA).
+---
+ .../test_deepseek_v41_tilelang_metadata.py    |  4 +-
+ .../attention/test_b12x_v41_ced_metadata.py   | 56 +++++++++++++++++++
+ vllm/models/deepseek_v4_1/attention.py        | 32 +++++++++--
+ .../deepseek_v4_1/nvidia/model_state.py       | 12 +++-
+ vllm/models/deepseek_v4_1/sparse_mla.py       |  3 +
+ .../models/deepseek_v4_1/tilelang/metadata.py | 10 +++-
+ 6 files changed, 108 insertions(+), 9 deletions(-)
+
+diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+index 92d598e8c..7b6bfcdd9 100644
+--- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
++++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
+@@ -107,7 +107,7 @@ def _token_metadata(s, nr, nt, page):
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+ @pytest.mark.parametrize(
+-    "draft, replay", [(False, False), (False, True), (True, False)]
++    "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
+ )
+ @pytest.mark.parametrize("width", [128, 136])
+ def test_chunk(lengths, draft, replay, width):
+@@ -163,7 +163,7 @@ def test_pages(lengths, width, read_width):
+ 
+ @pytest.mark.parametrize("lengths", STEPS)
+ @pytest.mark.parametrize(
+-    "draft, replay", [(False, False), (False, True), (True, False)]
++    "draft, replay", [(False, False), (False, True), (True, False), (True, True)]
+ )
+ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay):
+     page, window, width, main_width = 64, 128, 128, 256
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index bc52f85c6..2f5042075 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -236,6 +236,62 @@ def test_prefix_hit_short_chunk_has_no_unwritten_decoder_history():
+     assert state.replay_start.tolist() == [4096, 0, 0, 0]
+ 
+ 
++@cuda
++@pytest.mark.parametrize(
++    "chunk, seq_len, prefix, limit, first",
++    [
++        # A 17-row first chunk after a prefix hit at 4096: [4096 - 111, 4096)
++        # precedes the hit, and the drafter's caches are not prefix-cached.
++        (17, 4096 + 17, 4096, None, 4096),
++        # A one-row nonfinal chunk: the decoder, and with it the drafter's
++        # context, kept the chunk's last row only.
++        (4096, 8192, 0, 1, 8191),
++    ],
++    ids=["prefix-hit-short-chunk", "one-row-nonfinal-chunk"],
++)
++def test_draft_window_starts_where_the_drafter_has_context(
++    chunk, seq_len, prefix, limit, first
++):
++    """The drafter's context rows are the CED decoder's kept rows, so a draft
++    window starts at CED's replay start: before it, nothing of the request's draft
++    window was written in its current blocks."""
++    from vllm.models.deepseek_v4_1.attention import _chunk
++    from vllm.triton_utils import triton
++
++    state, starts, seq = _state([chunk], [seq_len], prefix=[prefix])
++    if limit is not None:
++        state.stage(starts, seq, [chunk], [False], [prefix], [limit])
++    assert state.replay_start[0].item() == first
++    drafts, page, window, width = 6, 128, 128, 136
++    draft_prefix = seq_len  # the step's anchor: drafts follow its last row
++    positions = torch.arange(
++        draft_prefix, draft_prefix + drafts, device="cuda", dtype=torch.int64
++    )
++    reqs = torch.zeros(drafts, dtype=torch.int32, device="cuda")
++    table = torch.arange(1, 129, dtype=torch.int32, device="cuda").repeat(4, 1)
++    draft_starts = torch.tensor([0, drafts, drafts, drafts, drafts], device="cuda")
++    request_positions = torch.tensor([draft_prefix, -1, -1, -1], device="cuda")
++    for replay_start, start in ((state.replay_start, first), (None, None)):
++        swa = torch.full((drafts, width), 7, dtype=torch.int32, device="cuda")
++        lengths = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
++        top = torch.full((drafts,), 7, dtype=torch.int32, device="cuda")
++        visible = torch.zeros(drafts, dtype=torch.int32, device="cuda")
++        _chunk[(drafts,)](
++            positions, reqs, table, swa, lengths, top, visible, draft_starts,
++            request_positions, 0, table.stride(0), page, window, width, True,
++            triton.next_power_of_2(width), swa_replay_start=replay_start,
++        )  # fmt: skip
++        if start is None:
++            # Unbounded, the window reaches back a whole window from the anchor.
++            start = draft_prefix - window
++        length = draft_prefix + drafts - start
++        assert lengths.tolist() == [length] * drafts
++        logical = torch.arange(start, start + length, device="cuda")
++        expected = table[0, logical // page].long() * page + logical % page
++        assert torch.equal(swa[:, :length].long(), expected.expand(drafts, -1))
++        assert torch.all(swa[:, length:] == -1)
++
++
+ @cuda
+ def test_nonfinal_chunk_keeps_its_last_row():
+     state, starts, seq = _state([7, 4096], [900, 4096])
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 8c3bf8958..b5c020525 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -463,6 +463,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         self.is_ced_decoder = (
+             not self.is_draft and boundary is not None and self.layer_id >= boundary
+         )
++        # With a CED decoder the drafter's context rows are its kept rows, so a
++        # draft window starts at CED's replay start (bind_draft_replay_start).
++        self._draft_replays = self.is_draft and boundary is not None
++        self._draft_replay_start: torch.Tensor | None = None
+         self.swa_width = self.window_size
+         if self.is_draft:
+             from vllm.v1.attention.backends.mla.compressor_utils import (
+@@ -770,9 +774,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+         calls = []
+         # _write_decode_metadata: the window metadata, with the main page table in
+         # the same launch on compressed layers. A CED decoder's rows start no
+-        # earlier than their request's replay start when the step has one.
++        # earlier than their request's replay start when the step has one; a
++        # drafter's beside a CED decoder always do.
+         replays = (
+-            (False, True) if self.is_ced_decoder and not self.is_draft else (False,)
++            (True,)
++            if self._draft_replays
++            else (False, True)
++            if self.is_ced_decoder
++            else (False,)
+         )
+         for replay in replays:
+             args = (
+@@ -2003,6 +2012,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             cache_format="deepseek_v41",
+         )
+ 
++    def bind_draft_replay_start(self, replay_start: torch.Tensor) -> None:
++        """A drafter layer's window bound: CED's per-request replay start (the
++        model state's persistent buffer, rewritten every step before the drafter
++        runs). Before it, the request's draft window was never written: the
++        decoder kept no rows there, or they precede a prefix hit."""
++        assert self._draft_replays
++        self._draft_replay_start = replay_start
++
++    def _replay_start(self, swa):
++        if self.is_ced_decoder:
++            return swa.swa_replay_start
++        if self._draft_replays:
++            return self._draft_replay_start
++        return None
++
+     def _write_decode_metadata(self, buffers, swa, main, rows):
+         swa_indices, swa_lengths, top_lengths = buffers[:3]
+         visible = main.cache_lengths if main is not None else swa.cache_lengths
+@@ -2013,7 +2037,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+                 page=self.swa_cache_layer.block_size,
+                 window=self.window_size,
+                 draft=self.is_draft,
+-                replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
++                replay_start=self._replay_start(swa),
+             )
+             common = (
+                 swa.positions,
+@@ -2058,7 +2082,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             self.swa_width,
+             self.is_draft,
+             triton.next_power_of_2(self.swa_width),
+-            swa_replay_start=swa.swa_replay_start if self.is_ced_decoder else None,
++            swa_replay_start=self._replay_start(swa),
+         )
+         if main is not None:
+             _pages[(rows, triton.cdiv(self._main_width, 128))](
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 03e042bfc..735684a61 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -8,7 +8,7 @@ import torch.nn as nn
+ 
+ import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+-from vllm.config import VllmConfig
++from vllm.config import VllmConfig, get_layers_from_vllm_config
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.models.deepseek_v4_1.ced import (
+     CED_WINDOW,
+@@ -173,6 +173,16 @@ class DeepseekV41ModelState(DefaultModelState):
+                 pipeline=parallel.pipeline_parallel_size > 1,
+                 sink_columns=model.get_sink_residual_columns() is not None,
+             )
++            # The drafter (loaded before the model state) keeps context only for
++            # the decoder's kept rows: its windows start at the same replay bound,
++            # read from the buffer its captured graphs were recorded with.
++            from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
++
++            for layer in get_layers_from_vllm_config(
++                vllm_config, DeepseekV4Attention
++            ).values():
++                if layer.is_draft:
++                    layer.bind_draft_replay_start(self.ced_state.replay_start)
+             if (
+                 is_breakable_cudagraph_enabled()
+                 and self.max_num_tokens == 4096
+diff --git a/vllm/models/deepseek_v4_1/sparse_mla.py b/vllm/models/deepseek_v4_1/sparse_mla.py
+index 0a855352c..b00f01e6f 100644
+--- a/vllm/models/deepseek_v4_1/sparse_mla.py
++++ b/vllm/models/deepseek_v4_1/sparse_mla.py
+@@ -125,6 +125,9 @@ def _chunk(
+         end = tl.load(Starts + req + 1, valid, other=0).to(tl.int64)
+         prefix = tl.load(RequestPositions + req, valid, other=0).to(tl.int64)
+         start = tl.maximum(prefix - WINDOW, 0)
++        if swa_replay_start is not None:
++            replay = tl.load(swa_replay_start + req, valid, other=0).to(tl.int64)
++            start = tl.maximum(start, replay)
+         length = prefix + end - first - start
+     else:
+         start = tl.maximum(pos + 1 - WINDOW, 0)
+diff --git a/vllm/models/deepseek_v4_1/tilelang/metadata.py b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+index 332cd731a..9b2174920 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/metadata.py
++++ b/vllm/models/deepseek_v4_1/tilelang/metadata.py
+@@ -156,6 +156,12 @@ def _window_macro(page, window, width, draft, replay, threads, per_thread):
+             end = T.if_then_else(valid, T.Cast(T.int64, starts[req + 1]), T.int64(0))
+             prefix = T.if_then_else(valid, request_positions[req], T.int64(0))
+             info[0] = T.max(prefix - window, T.int64(0))
++            if replay:
++                # The drafter's context rows are the CED decoder's kept rows:
++                # before the replay start its window holds nothing written.
++                info[0] = T.max(
++                    info[0], T.if_then_else(valid, replay_start[req], T.int64(0))
++                )
+             length = prefix + end - first - info[0]
+         else:
+             info[0] = T.max(pos + 1 - window, T.int64(0))
+@@ -357,7 +363,7 @@ def chunk(
+ ) -> None:  # fmt: skip
+     """``attention._chunk`` for ``rows`` rows from source row ``offset``."""
+     width = swa.shape[1]
+-    replay = replay_start is not None and not draft
++    replay = replay_start is not None
+     chunk_kernel(page, window, width, draft, replay)(
+         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+         visible, starts, request_positions,
+@@ -372,7 +378,7 @@ def decode_metadata(
+ ) -> None:  # fmt: skip
+     """``chunk`` then ``pages`` of the main cache for ``rows`` rows, one launch."""
+     width, main_width = swa.shape[1], main_pages.shape[1]
+-    replay = replay_start is not None and not draft
++    replay = replay_start is not None
+     decode_metadata_kernel(page, window, width, draft, replay, main_width)(
+         positions, reqs, table, swa[:rows], lengths[:rows], top_lengths[:rows],
+         visible, starts, request_positions,
+-- 
+2.54.0 (Apple Git-157)
+
