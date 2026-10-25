@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The poison check's verdicts: each arm's records against the release's references and
 against the zero arm of its job (zero-*: new blocks zeroed, the reference; nofill-*: not
-zeroed, the end state after vLLM 0502; poison-*: filled with NaN bytes, the gate).
+zeroed, the end state after vLLM 0502-0503; poison-*: filled with NaN bytes, the gate).
 
 usage: tables_arms.py RUN LABEL [LABEL...]
 

@@ -4,21 +4,26 @@ the vLLM branch.
 
 usage: make_bundles.py VLLM_REPO
 
-The vLLM branch ``kv-zeroing-poison`` holds three commits on candidate 6's vLLM (BASE,
+The vLLM branch ``kv-zeroing-poison`` holds four commits on candidate 6's vLLM (BASE,
 26382f5cf with the 0489-0490 test patches; package files those of the image
 spark-ds41f:19f2c20ed4d6-next-6): POISON (0500, VLLM_KV_CACHE_POISON), FIX (0501,
-DSpark draft windows start at CED's replay start) and REMOVAL (0502, DS4.1's caches use
-only written slots, so new blocks are not zeroed).
+DSpark draft windows start at CED's replay start), REMOVAL (0502, DS4.1's caches use
+only written slots, so new blocks are not zeroed) and BOUND (0503, the indexer reads no
+key past the visible positions).
 
-- bundles/poison-tests: the GPU tests of the three commits on candidate 6's image, the
-  package files of BASE..REMOVAL mounted over its tree.
+- bundles/poison-tests: the GPU tests of the four commits on candidate 6's image, the
+  package files of BASE..BOUND mounted over its tree, and the indexer benchmark against
+  the release's indexer.
+- bundles/indexer-initcheck: the indexer's read bound under compute-sanitizer's
+  initcheck (the nodes' host sanitizer mounted), with the release's kernel as the
+  positive control.
 - bundles/serving, bundles/serving-zeroing and bundles/serving-unfixed: the package
-  files of BASE..REMOVAL, BASE..FIX and BASE..POISON, which the serving arms mount over
+  files of BASE..BOUND, BASE..FIX and BASE..POISON, which the serving arms mount over
   the image's tree.
 - Arms (``extends`` candidate 6's own arms; every arm counts NaN logits with
   VLLM_COMPUTE_NANS_IN_LOGITS=1):
   zero-*: 0500-0501, poison off: new blocks zeroed, as in candidate 6 (the reference);
-  nofill-*: 0500-0502, poison off: new blocks neither zeroed nor filled (the end
+  nofill-*: 0500-0503, poison off: new blocks neither zeroed nor filled (the end
   state); poison-*: nofill with VLLM_KV_CACHE_POISON=1, every new block filled with NaN
   bytes (the gate); *-dev: with the dev-mode RPC for the release suite's engine grid;
   *-pressure: a 262,144-token context and a small KV pool, so 16 (TP3: 8) concurrent
@@ -46,7 +51,11 @@ CANDIDATE = "experiments/2026-10-25-spark-ds41f-candidate"
 ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BRANCH = "kv-zeroing-poison"
-BASE, POISON, FIX, REMOVAL = "3bdf9558c", "341928840", "009ad2699", "8d2842981"
+BASE, POISON, FIX, REMOVAL, BOUND = (
+    "3bdf9558c", "341928840", "009ad2699", "8d2842981", "57e5e748f",
+)
+# The nodes' host CUDA toolkit's sanitizer (the container image's tools are not relied on).
+SANITIZER = "/usr/local/cuda-13.0/compute-sanitizer"
 TP3_REF = "origin/tp3-candidate-6"  # spark-ds41f PR #582, until it is on main
 FIXTURES = REPO / "experiments/2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 CACHE_MOUNT = ["{home}/projects/spark-ds41f/cache", "/cache", "rw"]
@@ -71,27 +80,57 @@ STEPS = [
         "--basetemp", "/c/pytest-kv-zeroing-windows",
         "tests/kernels/test_deepseek_v41_tilelang_metadata.py",
         "tests/v1/attention/test_b12x_v41_ced_metadata.py"], 3600),
+    ("the TileLang attention kernels, the indexer's read bound included", PYTEST + [
+        "--basetemp", "/c/pytest-kv-zeroing-attention",
+        "tests/kernels/attention/test_deepseek_v41_tilelang.py"], 3600),
+    ("the bounded indexer against the release's: bits, then time (gated)", [
+        "benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py",
+        "--baseline", "/b/baseline/indexer.py", "--gate"], 5400),
+]
+READS = "tests/kernels/attention/deepseek_v41_indexer_reads.py"
+# initcheck exits 86 when it reports an error, so a positive control that fails any
+# other way (the script, the sanitizer) does not pass.
+INITCHECK = ["/opt/compute-sanitizer/compute-sanitizer", "--tool", "initcheck",
+             "--error-exitcode", "86", "{python}", READS]
+NO_CACHING = {"env": {"PYTORCH_NO_CUDA_MEMORY_CACHING": "1"}}
+INITCHECK_STEPS = [
+    ("initcheck: the bounded indexer reads no unwritten key or scale", INITCHECK, 3600,
+     NO_CACHING),
+    ("initcheck: the release's indexer reads its last tile's unwritten rows (expected)",
+     INITCHECK + ["--module", "/b/baseline/indexer.py"], 3600,
+     {**NO_CACHING, "expect_exit": 86}),
 ]
 
 RUN = '''#!/usr/bin/env python3
 """Run this bundle's steps in order; each step's exit status is printed, and the bundle
-fails if any step failed. Every step runs whatever came before it."""
+fails if any step failed. Every step runs whatever came before it. A step is python's
+arguments, or a command when its first word is a path ("{python}" names python); its
+options set environment variables and expect an exit code (a positive control)."""
 import json
+import os
 import subprocess
 import sys
 
 STEPS = json.load(open("/b/steps.json"))
 codes = []
-for label, argv, timeout in STEPS:
+for label, argv, timeout, *rest in STEPS:
+    options = rest[0] if rest else {}
+    command = [sys.executable if a == "{python}" else a for a in argv]
+    if not command[0].startswith("/"):
+        command = [sys.executable, *command]
     print(f"=== {label}", flush=True)
     try:
-        code = subprocess.run([sys.executable, *argv], timeout=timeout).returncode
+        code = subprocess.run(command, timeout=timeout,
+                              env={**os.environ, **options.get("env", {})}).returncode
     except subprocess.TimeoutExpired:
         code = "timeout"
-    print(f"=== {label}: exit {code}", flush=True)
-    codes.append((label, code))
+    except FileNotFoundError:
+        code = f"missing {command[0]}"
+    passed = code == options.get("expect_exit", 0)
+    print(f"=== {label}: exit {code}" + ("" if passed else " (FAILED)"), flush=True)
+    codes.append((label, code, passed))
 print(json.dumps({"steps": codes}), flush=True)
-sys.exit(0 if all(code == 0 for _, code in codes) else 1)
+sys.exit(0 if all(passed for _, _, passed in codes) else 1)
 '''
 
 # Pool pressure: a 262,144-token context keeps vLLM's one-request startup check below
@@ -149,14 +188,17 @@ def write_overlay(repo: str, end: str, name: str) -> list[str]:
     return package
 
 
-def write_tests_bundle(repo: str) -> None:
-    bundle = HERE / "bundles" / "poison-tests"
+def write_bundle(repo: str, name: str, steps: list, what: str, mounts_extra=()) -> None:
+    """A kernel-lab bundle: the package files of BASE..BOUND over the image's tree, the
+    changed tests and benchmarks mounted, and the release's indexer as the baseline."""
+    bundle = HERE / "bundles" / name
     if bundle.exists():
         shutil.rmtree(bundle)
     (bundle / "overlay").mkdir(parents=True)
     mounts = [["prepare_fixtures.py", "/b/prepare_fixtures.py"],
-              ["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"]]
-    files = changed(repo, BASE, REMOVAL)
+              ["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
+              ["baseline_indexer.py", "/b/baseline/indexer.py"], *mounts_extra]
+    files = changed(repo, BASE, BOUND)
     for path in files:
         if path.startswith("vllm/"):
             target = bundle / "overlay" / path
@@ -164,21 +206,20 @@ def write_tests_bundle(repo: str) -> None:
             target = bundle / path.replace("/", "_")
             mounts.append([target.name, f"{ROOT}/{path}"])
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(show(repo, REMOVAL, path))
+        target.write_bytes(show(repo, BOUND, path))
+    (bundle / "baseline_indexer.py").write_bytes(
+        show(repo, BASE, "vllm/models/deepseek_v4_1/tilelang/indexer.py"))
     shutil.copy(FIXTURES, bundle / "prepare_fixtures.py")
     (bundle / "run.py").write_text(RUN)
-    (bundle / "steps.json").write_text(json.dumps(STEPS, indent=1) + "\n")
+    (bundle / "steps.json").write_text(json.dumps(steps, indent=1) + "\n")
     candidate = {
         "description": (
-            f"VLLM_KV_CACHE_POISON, the DSpark draft-window bound and DS4.1 without "
-            f"per-allocation zeroing (vLLM branch {BRANCH} {REMOVAL}, {len(files)} files "
-            f"over candidate 6's {BASE}) on candidate 6's image: the GPU tests of the "
-            "zeroing and fill kernels, the zeroing rule and DS4.1's specs, the ring's "
-            "recorded blocks and the window metadata."),
+            f"{what} (vLLM branch {BRANCH} {BOUND}, {len(files)} files over candidate 6's "
+            f"{BASE}) on candidate 6's image."),
         "image": IMAGE,
         "env": {
             "HF_HUB_OFFLINE": "1",
-            "TILELANG_CACHE_DIR": "/c/tilelang-kv-zeroing",
+            "TILELANG_CACHE_DIR": f"/c/tilelang-kv-zeroing-{name}",
             "VLLM_DS41_KERNEL_BACKEND": "tilelang",
             "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
         },
@@ -188,6 +229,22 @@ def write_tests_bundle(repo: str) -> None:
         "mounts": mounts,
     }
     (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
+
+
+def write_tests_bundles(repo: str) -> None:
+    write_bundle(
+        repo, "poison-tests", STEPS,
+        "VLLM_KV_CACHE_POISON, the DSpark draft-window bound, DS4.1 without "
+        "per-allocation zeroing and the indexer's read bound: the GPU tests of the zeroing "
+        "and fill kernels, the zeroing rule and DS4.1's specs, the ring's recorded blocks, "
+        "the window metadata and the attention kernels, then the bounded indexer against "
+        "the release's (bit for bit, then timed and gated)")
+    write_bundle(
+        repo, "indexer-initcheck", INITCHECK_STEPS,
+        "The indexer's read bound under compute-sanitizer's initcheck: the score kernel "
+        "over a cache written only at the visible positions reports no read of the rest, "
+        "and the release's kernel, the positive control, does",
+        mounts_extra=[[SANITIZER, "/opt/compute-sanitizer"]])
 
 
 def mounts(bundle: str, package: list[str]) -> list[list[str]]:
@@ -224,10 +281,11 @@ def write_arms(final: list[str], zeroing: list[str], unfixed: list[str]) -> None
                   base, {"container": {"mounts": mounts("serving-zeroing", zeroing)},
                          "environment": counting})
         write_arm(f"nofill-{shape}",
-                  f"{what} with vLLM {BRANCH} {REMOVAL} (0500-0502) mounted, the poison "
+                  f"{what} with vLLM {BRANCH} {BOUND} (0500-0503) mounted, the poison "
                   "off: DS4.1 declares that its caches use only written slots, so new KV "
                   "blocks are neither zeroed nor filled and keep their previous owner's "
-                  "bytes (the end state). Counts NaN logits.",
+                  "bytes, and the indexer reads no key past the visible positions (the "
+                  "end state). Counts NaN logits.",
                   base, {"container": {"mounts": mounts("serving", final)},
                          "environment": counting})
         write_arm(f"poison-{shape}",
@@ -289,7 +347,8 @@ def write_specs() -> None:
         gate_jobs = [{"kind": "sync"}]
         if shape == "tp4":
             gate_jobs.append({"kind": "kernel", "bundles": [
-                {"node": "dgx2", "bundle": f"{EXPERIMENT}/bundles/poison-tests"}]})
+                {"node": "dgx2", "bundle": f"{EXPERIMENT}/bundles/poison-tests"},
+                {"node": "dgx3", "bundle": f"{EXPERIMENT}/bundles/indexer-initcheck"}]})
         gate_jobs.append(
             {"kind": "measure", "bench": False, "bracket": False, "extras": gate(shape),
              "arms": [{"config": f"{mode}-{shape}.json", "label": f"{mode}-{shape}"}
@@ -324,16 +383,18 @@ def write_specs() -> None:
 def main() -> None:
     repo = sys.argv[1]
     heads = {name: git(repo, "rev-parse", "--short=9", ref).strip()
-             for name, ref in (("base", f"{BRANCH}~3"), ("poison", f"{BRANCH}~2"),
-                               ("fix", f"{BRANCH}~1"), ("removal", BRANCH))}
-    assert heads == {"base": BASE, "poison": POISON, "fix": FIX, "removal": REMOVAL}, heads
-    final = write_overlay(repo, REMOVAL, "serving")
+             for name, ref in (("base", f"{BRANCH}~4"), ("poison", f"{BRANCH}~3"),
+                               ("fix", f"{BRANCH}~2"), ("removal", f"{BRANCH}~1"),
+                               ("bound", BRANCH))}
+    assert heads == {"base": BASE, "poison": POISON, "fix": FIX, "removal": REMOVAL,
+                     "bound": BOUND}, heads
+    final = write_overlay(repo, BOUND, "serving")
     zeroing = write_overlay(repo, FIX, "serving-zeroing")
     unfixed = write_overlay(repo, POISON, "serving-unfixed")
-    write_tests_bundle(repo)
+    write_tests_bundles(repo)
     write_arms(final, zeroing, unfixed)
     write_specs()
-    print(f"{BRANCH}: {len(final)} package files with 0502, {len(zeroing)} with 0501, "
+    print(f"{BRANCH}: {len(final)} package files with 0503, {len(zeroing)} with 0501, "
           f"{len(unfixed)} with 0500 alone; arms and specs written")
 
 

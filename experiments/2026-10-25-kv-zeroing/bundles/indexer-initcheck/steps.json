@@ -1,0 +1,41 @@
+[
+ [
+  "initcheck: the bounded indexer reads no unwritten key or scale",
+  [
+   "/opt/compute-sanitizer/compute-sanitizer",
+   "--tool",
+   "initcheck",
+   "--error-exitcode",
+   "86",
+   "{python}",
+   "tests/kernels/attention/deepseek_v41_indexer_reads.py"
+  ],
+  3600,
+  {
+   "env": {
+    "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"
+   }
+  }
+ ],
+ [
+  "initcheck: the release's indexer reads its last tile's unwritten rows (expected)",
+  [
+   "/opt/compute-sanitizer/compute-sanitizer",
+   "--tool",
+   "initcheck",
+   "--error-exitcode",
+   "86",
+   "{python}",
+   "tests/kernels/attention/deepseek_v41_indexer_reads.py",
+   "--module",
+   "/b/baseline/indexer.py"
+  ],
+  3600,
+  {
+   "env": {
+    "PYTORCH_NO_CUDA_MEMORY_CACHING": "1"
+   },
+   "expect_exit": 86
+  }
+ ]
+]

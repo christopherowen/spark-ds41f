@@ -280,9 +280,9 @@ class _Cache(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, config):
         # No V4.1 kernel uses a slot its block's owner has not written, as in
         # DeepSeek's reference: windows start at the request's replay start, the
-        # sparse MLA never loads a masked entry, the indexer stores no score past
-        # the visible positions (its last tile's stale rows are discarded), and
-        # the compressor reads only a slot it wrote. Reused blocks need no zeros.
+        # sparse MLA never loads a masked entry, the indexer reads no key past the
+        # visible positions, and the compressor reads only a slot it wrote.
+        # Reused blocks need no zeros.
         common = dict(
             block_size=self.block_size,
             num_kv_heads=1,
