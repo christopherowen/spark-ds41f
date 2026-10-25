@@ -1,8 +1,9 @@
-# tests/v1/core, tests/v1/worker, tests/test_envs.py on CPU (macOS arm64, torch 2.14.1, no TileLang),
-# offline, 2026-10-25 17:46-17:52 CET (run-cpu-tests.sh)
-base 3bdf9558c:              124 failed, 1674 passed, 222 skipped, 1 warning, 35 errors in 319.86s (0:05:19)
-kv-zeroing-poison 009ad2699: 124 failed, 1689 passed, 222 skipped, 1 warning, 35 errors in 321.99s (0:05:21)
-the same 159 failing and erroring ids on both trees; by file (top):
+# tests/v1/core, tests/v1/worker, tests/test_envs.py on CPU (macOS arm64, torch 2.14.1, no TileLang or B12X),
+# offline, 2026-10-25 CET (run-cpu-tests.sh)
+base 3bdf9558c:                  124 failed, 1674 passed, 222 skipped, 1 warning, 35 errors in 319.86s (0:05:19)
+0500-0501 009ad2699:             124 failed, 1689 passed, 222 skipped, 1 warning, 35 errors in 321.99s (0:05:21)
+0500-0502 8d2842981:             124 failed, 1692 passed, 222 skipped, 1 warning, 35 errors in 301.66s (0:05:01)
+the same 159 failing and erroring ids on all three trees; by file (top):
   39 FAILED tests/v1/core/test_scheduler.py
   39 FAILED tests/v1/core/test_kv_cache_utils.py
   12 FAILED tests/v1/core/test_priority_scheduler_random.py
@@ -16,7 +17,7 @@ the same 159 failing and erroring ids on both trees; by file (top):
    1 FAILED tests/v1/worker/test_cp_utils.py
    1 FAILED tests/v1/core/test_reset_prefix_cache_e2e.py
 
-# the poison and zeroing tests, branch (-k "poison or zeroing or ds41_shaped": 15 new, 3 existing)
+# the poison, zeroing and written-slot tests on 0500-0502 (-k "poison or zeroing or ds41_shaped or written_slot")
 PASSED tests/v1/worker/test_kv_block_zeroer.py::test_poison_fills_new_blocks_where_zeroing_would_zero
 PASSED tests/v1/worker/test_kv_block_zeroer.py::test_poison_warmup_compiles_the_fill_on_a_zero_null_block
 PASSED tests/v1/worker/test_kv_block_zeroer.py::test_poison_declares_the_kernel_it_launches[False]
@@ -30,9 +31,14 @@ PASSED tests/v1/worker/test_kv_block_zeroer.py::test_poison_bytes_are_nan_in_eve
 PASSED tests/v1/worker/test_kv_block_zeroer.py::test_poison_nibbles_are_the_largest_e2m1_magnitude
 PASSED tests/v1/core/test_kv_cache_utils.py::test_wrapped_mamba_group_requires_block_zeroing
 PASSED tests/v1/core/test_kv_cache_utils.py::test_ds41_shaped_cache_zeroing_comes_from_the_fp32_compressor_ring
+PASSED tests/v1/core/test_kv_cache_utils.py::test_caches_using_only_written_slots_skip_per_allocation_zeroing
+PASSED tests/v1/core/test_kv_cache_utils.py::test_written_slot_declaration_survives_group_merges[False]
+PASSED tests/v1/core/test_kv_cache_utils.py::test_written_slot_declaration_survives_group_merges[True]
 PASSED tests/v1/core/test_kv_cache_utils.py::test_kv_cache_poison_forces_the_fill
 PASSED tests/v1/core/test_single_type_kv_cache_manager.py::test_kv_cache_poison_records_the_circular_buffer_block[False]
 PASSED tests/v1/core/test_single_type_kv_cache_manager.py::test_kv_cache_poison_records_the_circular_buffer_block[True]
 PASSED tests/v1/core/test_single_type_kv_cache_manager.py::test_sliding_window_records_new_blocks_for_zeroing
 PASSED tests/v1/core/test_single_type_kv_cache_manager.py::test_chunked_local_attention_records_new_blocks_for_zeroing
-18 passed, 213 deselected, 1 warning in 2.59s
+21 passed, 213 deselected, 1 warning in 2.71s
+
+# tests/models/test_deepseek_v4_1_compressor.py imports DS4.1's attention (B12X): it runs in the image (bundles/poison-tests)

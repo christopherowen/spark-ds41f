@@ -4,22 +4,25 @@ the vLLM branch.
 
 usage: make_bundles.py VLLM_REPO
 
-The vLLM branch ``kv-zeroing-poison`` holds two commits on candidate 6's vLLM (BASE,
+The vLLM branch ``kv-zeroing-poison`` holds three commits on candidate 6's vLLM (BASE,
 26382f5cf with the 0489-0490 test patches; package files those of the image
-spark-ds41f:19f2c20ed4d6-next-6): POISON (0500, VLLM_KV_CACHE_POISON) and FIX (0501,
-DSpark draft windows start at CED's replay start).
+spark-ds41f:19f2c20ed4d6-next-6): POISON (0500, VLLM_KV_CACHE_POISON), FIX (0501,
+DSpark draft windows start at CED's replay start) and REMOVAL (0502, DS4.1's caches use
+only written slots, so new blocks are not zeroed).
 
-- bundles/poison-tests: the GPU tests of both commits on candidate 6's image, the
-  package files of BASE..FIX mounted over its tree.
-- bundles/serving and bundles/serving-unfixed: the package files of BASE..FIX and of
-  BASE..POISON, which the serving arms mount over the image's tree.
+- bundles/poison-tests: the GPU tests of the three commits on candidate 6's image, the
+  package files of BASE..REMOVAL mounted over its tree.
+- bundles/serving, bundles/serving-zeroing and bundles/serving-unfixed: the package
+  files of BASE..REMOVAL, BASE..FIX and BASE..POISON, which the serving arms mount over
+  the image's tree.
 - Arms (``extends`` candidate 6's own arms; every arm counts NaN logits with
   VLLM_COMPUTE_NANS_IN_LOGITS=1):
-  zero-*: the overlay with the poison off; poison-*: the same with
-  VLLM_KV_CACHE_POISON=1; *-dev: with the dev-mode RPC for the release suite's engine
-  grid; *-pressure: a 262,144-token context and a small KV pool, so 16 (TP3: 8)
-  concurrent prompts exhaust it; poison-unfixed-tp4: POISON alone, the positive
-  control.
+  zero-*: 0500-0501, poison off: new blocks zeroed, as in candidate 6 (the reference);
+  nofill-*: 0500-0502, poison off: new blocks neither zeroed nor filled (the end
+  state); poison-*: nofill with VLLM_KV_CACHE_POISON=1, every new block filled with NaN
+  bytes (the gate); *-dev: with the dev-mode RPC for the release suite's engine grid;
+  *-pressure: a 262,144-token context and a small KV pool, so 16 (TP3: 8) concurrent
+  prompts exhaust it; poison-unfixed-tp4: POISON alone, the positive control.
 - Lab specs, one a job (README "Lab spec"): tp4-gate.json, tp4-pressure.json,
   tp4-suite.json, tp4-control.json; tp3-gate.json, tp3-pressure.json, tp3-suite.json.
 
@@ -43,7 +46,7 @@ CANDIDATE = "experiments/2026-10-25-spark-ds41f-candidate"
 ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BRANCH = "kv-zeroing-poison"
-BASE, POISON, FIX = "3bdf9558c", "341928840", "009ad2699"
+BASE, POISON, FIX, REMOVAL = "3bdf9558c", "341928840", "009ad2699", "8d2842981"
 TP3_REF = "origin/tp3-candidate-6"  # spark-ds41f PR #582, until it is on main
 FIXTURES = REPO / "experiments/2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 CACHE_MOUNT = ["{home}/projects/spark-ds41f/cache", "/cache", "rw"]
@@ -56,10 +59,14 @@ STEPS = [
         "--basetemp", "/c/pytest-kv-zeroing-fill",
         "tests/v1/worker/test_kv_block_zeroer.py",
         "tests/v1/worker/test_gpu_tilelang_inputs.py"], 3600),
-    ("the zeroing predicate and the ring's recorded blocks", PYTEST + [
-        "--basetemp", "/c/pytest-kv-zeroing-core",
-        "tests/v1/core/test_kv_cache_utils.py", "-k", "zeroing or poison",
-        "tests/v1/core/test_single_type_kv_cache_manager.py"], 1800),
+    ("the zeroing rule and the declaration's merges", PYTEST + [
+        "--basetemp", "/c/pytest-kv-zeroing-rule",
+        "tests/v1/core/test_kv_cache_utils.py", "-k", "zeroing or poison or written_slot"],
+     1800),
+    ("the ring's recorded blocks and DS4.1's specs", PYTEST + [
+        "--basetemp", "/c/pytest-kv-zeroing-specs",
+        "tests/v1/core/test_single_type_kv_cache_manager.py",
+        "tests/models/test_deepseek_v4_1_compressor.py"], 1800),
     ("window metadata: TileLang against Triton, CED and the draft windows", PYTEST + [
         "--basetemp", "/c/pytest-kv-zeroing-windows",
         "tests/kernels/test_deepseek_v41_tilelang_metadata.py",
@@ -149,7 +156,7 @@ def write_tests_bundle(repo: str) -> None:
     (bundle / "overlay").mkdir(parents=True)
     mounts = [["prepare_fixtures.py", "/b/prepare_fixtures.py"],
               ["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"]]
-    files = changed(repo, BASE, FIX)
+    files = changed(repo, BASE, REMOVAL)
     for path in files:
         if path.startswith("vllm/"):
             target = bundle / "overlay" / path
@@ -157,15 +164,16 @@ def write_tests_bundle(repo: str) -> None:
             target = bundle / path.replace("/", "_")
             mounts.append([target.name, f"{ROOT}/{path}"])
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(show(repo, FIX, path))
+        target.write_bytes(show(repo, REMOVAL, path))
     shutil.copy(FIXTURES, bundle / "prepare_fixtures.py")
     (bundle / "run.py").write_text(RUN)
     (bundle / "steps.json").write_text(json.dumps(STEPS, indent=1) + "\n")
     candidate = {
         "description": (
-            f"VLLM_KV_CACHE_POISON and the DSpark draft-window bound (vLLM branch {BRANCH} "
-            f"{FIX}, {len(files)} files over candidate 6's {BASE}) on candidate 6's image: "
-            "the GPU tests of the zeroing and fill kernels, the predicate, the ring's "
+            f"VLLM_KV_CACHE_POISON, the DSpark draft-window bound and DS4.1 without "
+            f"per-allocation zeroing (vLLM branch {BRANCH} {REMOVAL}, {len(files)} files "
+            f"over candidate 6's {BASE}) on candidate 6's image: the GPU tests of the "
+            "zeroing and fill kernels, the zeroing rule and DS4.1's specs, the ring's "
             "recorded blocks and the window metadata."),
         "image": IMAGE,
         "env": {
@@ -201,7 +209,7 @@ def pressure_args(base: str, shape: str) -> list[str]:
     return args
 
 
-def write_arms(fixed: list[str], unfixed: list[str]) -> None:
+def write_arms(final: list[str], zeroing: list[str], unfixed: list[str]) -> None:
     here = lambda name: f"{EXPERIMENT}/{name}.json"  # noqa: E731
     counting = {"VLLM_COMPUTE_NANS_IN_LOGITS": "1"}
     for shape, base, what in (
@@ -211,21 +219,29 @@ def write_arms(fixed: list[str], unfixed: list[str]) -> None:
     ):
         write_arm(f"zero-{shape}",
                   f"{what} with vLLM {BRANCH} {FIX} (0500-0501) mounted, the poison off: "
-                  "new KV blocks are zeroed as in candidate 6. Counts NaN logits.",
-                  base, {"container": {"mounts": mounts("serving", fixed)},
+                  "new KV blocks are zeroed as in candidate 6, the reference. Counts NaN "
+                  "logits.",
+                  base, {"container": {"mounts": mounts("serving-zeroing", zeroing)},
+                         "environment": counting})
+        write_arm(f"nofill-{shape}",
+                  f"{what} with vLLM {BRANCH} {REMOVAL} (0500-0502) mounted, the poison "
+                  "off: DS4.1 declares that its caches use only written slots, so new KV "
+                  "blocks are neither zeroed nor filled and keep their previous owner's "
+                  "bytes (the end state). Counts NaN logits.",
+                  base, {"container": {"mounts": mounts("serving", final)},
                          "environment": counting})
         write_arm(f"poison-{shape}",
-                  f"zero-{shape} with VLLM_KV_CACHE_POISON=1: every new KV block, compressor "
-                  "rings included, is filled with all-ones bytes (NaN in every float format "
-                  "the pages hold) instead of zeros.",
-                  here(f"zero-{shape}"), {"environment": {"VLLM_KV_CACHE_POISON": "1"}})
+                  f"nofill-{shape} with VLLM_KV_CACHE_POISON=1: every new KV block, "
+                  "compressor rings included, is filled with all-ones bytes (NaN in every "
+                  "float format the pages hold) before its first step: the gate.",
+                  here(f"nofill-{shape}"), {"environment": {"VLLM_KV_CACHE_POISON": "1"}})
         write_arm(f"poison-{shape}-dev",
                   f"poison-{shape} with the dev-mode collective RPC, for the release suite's "
                   "engine grid.",
                   here(f"poison-{shape}"), {"environment": {"VLLM_SERVER_DEV_MODE": "1"}})
         context, pool = PRESSURE[shape]["max_model_len"], PRESSURE[shape]["kv_cache_memory_bytes"]
         blocks = pool // 227840
-        for mode in ("zero", "poison"):
+        for mode in ("zero", "nofill", "poison"):
             write_arm(f"{mode}-pressure-{shape}",
                       f"{mode}-{shape} with a {context:,}-token context and a {pool:,}-byte KV "
                       f"pool ({blocks:,} blocks of 227,840 bytes), so pool_pressure.py's "
@@ -276,8 +292,8 @@ def write_specs() -> None:
                 {"node": "dgx2", "bundle": f"{EXPERIMENT}/bundles/poison-tests"}]})
         gate_jobs.append(
             {"kind": "measure", "bench": False, "bracket": False, "extras": gate(shape),
-             "arms": [{"config": f"poison-{shape}.json", "label": f"poison-{shape}"},
-                      {"config": f"zero-{shape}.json", "label": f"zero-{shape}"}]})
+             "arms": [{"config": f"{mode}-{shape}.json", "label": f"{mode}-{shape}"}
+                      for mode in ("poison", "nofill", "zero")]})
         specs = {
             "gate": gate_jobs,
             "pressure": [
@@ -285,10 +301,9 @@ def write_specs() -> None:
                     ["pool_pressure.py", ["--streams", streams, "--documents", documents,
                                           "--tokens", tokens, "--max-tokens", max_tokens],
                      "pool-pressure"], counters],
-                 "arms": [{"config": f"poison-pressure-{shape}.json",
-                           "label": f"poison-pressure-{shape}"},
-                          {"config": f"zero-pressure-{shape}.json",
-                           "label": f"zero-pressure-{shape}"}]}],
+                 "arms": [{"config": f"{mode}-pressure-{shape}.json",
+                           "label": f"{mode}-pressure-{shape}"}
+                          for mode in ("poison", "nofill", "zero")]}],
             "suite": [
                 {"kind": "measure", "suite": [suite, "single-stream"],
                  "arms": [{"config": f"poison-{shape}-dev.json", "label": f"poison-{shape}"}]}],
@@ -309,15 +324,17 @@ def write_specs() -> None:
 def main() -> None:
     repo = sys.argv[1]
     heads = {name: git(repo, "rev-parse", "--short=9", ref).strip()
-             for name, ref in (("base", f"{BRANCH}~2"), ("poison", f"{BRANCH}~1"), ("fix", BRANCH))}
-    assert heads == {"base": BASE, "poison": POISON, "fix": FIX}, heads
-    fixed = write_overlay(repo, FIX, "serving")
+             for name, ref in (("base", f"{BRANCH}~3"), ("poison", f"{BRANCH}~2"),
+                               ("fix", f"{BRANCH}~1"), ("removal", BRANCH))}
+    assert heads == {"base": BASE, "poison": POISON, "fix": FIX, "removal": REMOVAL}, heads
+    final = write_overlay(repo, REMOVAL, "serving")
+    zeroing = write_overlay(repo, FIX, "serving-zeroing")
     unfixed = write_overlay(repo, POISON, "serving-unfixed")
     write_tests_bundle(repo)
-    write_arms(fixed, unfixed)
+    write_arms(final, zeroing, unfixed)
     write_specs()
-    print(f"{BRANCH}: {len(fixed)} package files with 0501, {len(unfixed)} without; "
-          f"arms and specs written")
+    print(f"{BRANCH}: {len(final)} package files with 0502, {len(zeroing)} with 0501, "
+          f"{len(unfixed)} with 0500 alone; arms and specs written")
 
 
 if __name__ == "__main__":

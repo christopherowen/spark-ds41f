@@ -507,6 +507,13 @@ class AttentionSpec(KVCacheSpec):
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
     dcp_replicated: bool = False
     """Whether every DCP rank stores the complete KV cache for this layer."""
+    uses_only_written_slots: bool = False
+    """Whether no value of a slot unwritten in the block's current ownership
+    reaches a result of any kernel reading this cache: reads bounded to the
+    written positions, entries skipped by index (DeepSeek V4.1's reference does
+    both), or work on loaded stale rows discarded whole. A cache whose layers
+    all declare it needs no per-allocation zeroing: a reused block's stale
+    bytes, of whatever precision, never matter."""
 
     def __post_init__(self):
         if self.head_size_v is None:
@@ -641,6 +648,7 @@ class FullAttentionSpec(AttentionSpec):
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
             dcp_replicated=dcp_replicated.pop(),
+            uses_only_written_slots=specs[0].uses_only_written_slots,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -755,6 +763,7 @@ class MLAAttentionSpec(FullAttentionSpec):
                 spec.non_causal_multi_token_decode for spec in specs
             ),
             dcp_replicated=dcp_replicated_set.pop(),
+            uses_only_written_slots=specs[0].uses_only_written_slots,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -811,6 +820,7 @@ class RSWASpec(FullAttentionSpec):
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
             dcp_replicated=base.dcp_replicated,
+            uses_only_written_slots=base.uses_only_written_slots,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1005,6 +1015,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         prefix_policy_set = {
             (spec.prefix_cache_enabled, spec.prefill_replay_window) for spec in specs
         }
+        bounded_reads_set = {spec.uses_only_written_slots for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
@@ -1014,11 +1025,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(dcp_replicated_set) == 1
             and len(non_causal_set) == 1
             and len(prefix_policy_set) == 1
+            and len(bounded_reads_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
             "window size, retained token count, DCP replication mode, "
-            "non-causal mode, and prefix policy."
+            "non-causal mode, prefix policy and written-slot use."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -1037,6 +1049,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             non_causal_multi_token_decode=non_causal_set.pop(),
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,
+            uses_only_written_slots=bounded_reads_set.pop(),
         )
 
     def is_uniform_with_collection(
@@ -1292,6 +1305,7 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
             dcp_replicated=dcp_replicated.pop(),
+            uses_only_written_slots=specs[0].uses_only_written_slots,
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -1678,18 +1692,37 @@ class KVCacheConfig:
         return len(kv_cache_precisions) > 1
 
     @property
+    def attention_uses_only_written_slots(self) -> bool:
+        """Whether every device attention layer declares that no value of a slot
+        unwritten in the block's current ownership reaches its kernels' results
+        (``AttentionSpec.uses_only_written_slots``)."""
+        specs = [
+            spec
+            for group in self.kv_cache_groups
+            if not group.host_resident
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, AttentionSpec)
+        ]
+        return bool(specs) and all(spec.uses_only_written_slots for spec in specs)
+
+    @property
     def needs_kv_cache_zeroing(self) -> bool:
         """Whether newly allocated KV cache blocks must be zeroed before use.
 
         Required for Mamba layers, whose state is read before it is fully written
         (#35219), and for mixed-precision caches, where a block reused across
         groups can be reinterpreted under a different precision and decode stale
-        bytes to NaN/Inf. Uniform-precision caches skip zeroing.
+        bytes to NaN/Inf. Uniform-precision caches skip zeroing, and so do caches
+        whose readers use only written slots: their reused blocks' stale bytes
+        never reach a result. The pool itself starts zeroed either way.
         ``VLLM_KV_CACHE_POISON`` (debug) runs the fill for every cache, with
         NaN bytes in place of zeros.
         """
         return (
             self.has_mamba_layers
-            or self.has_mixed_precision_kv_cache
+            or (
+                self.has_mixed_precision_kv_cache
+                and not self.attention_uses_only_written_slots
+            )
             or envs.VLLM_KV_CACHE_POISON
         )

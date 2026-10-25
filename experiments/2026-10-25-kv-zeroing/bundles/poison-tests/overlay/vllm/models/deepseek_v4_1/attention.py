@@ -278,6 +278,11 @@ class _Cache(nn.Module, AttentionLayerBase):
         self.kv_cache = cache.view(cache.shape[0], -1)
 
     def get_kv_cache_spec(self, config):
+        # No V4.1 kernel uses a slot its block's owner has not written, as in
+        # DeepSeek's reference: windows start at the request's replay start, the
+        # sparse MLA never loads a masked entry, the indexer stores no score past
+        # the visible positions (its last tile's stale rows are discarded), and
+        # the compressor reads only a slot it wrote. Reused blocks need no zeros.
         common = dict(
             block_size=self.block_size,
             num_kv_heads=1,
@@ -287,6 +292,7 @@ class _Cache(nn.Module, AttentionLayerBase):
             tokens_per_state=self.ratio,
             cache_dtype_str="b12x_dsv41",
             alignment=None,
+            uses_only_written_slots=True,
         )
         if self.kind == "swa":
             boundary = ced_decoder_start(config.model_config.hf_config)
@@ -644,6 +650,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
             tokens_per_state=self.compress_ratio,
             cache_dtype_str="b12x_dsv41",
             alignment=None,
+            uses_only_written_slots=True,
         )
 
     def bind_kv_cache(self, cache):

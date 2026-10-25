@@ -5143,6 +5143,47 @@ def test_ds41_shaped_cache_zeroing_comes_from_the_fp32_compressor_ring():
     ).needs_kv_cache_zeroing
 
 
+def test_caches_using_only_written_slots_skip_per_allocation_zeroing(monkeypatch):
+    """A mixed-precision cache whose layers all declare that no unwritten slot
+    reaches a result (DeepSeek V4.1, as its reference) needs no zeroing; one layer
+    without the declaration, or a Mamba layer, keeps it. The poison check still
+    fills."""
+    monkeypatch.delenv("VLLM_KV_CACHE_POISON", raising=False)
+    common = dict(num_kv_heads=1, head_size=1, uses_only_written_slots=True)
+    window = SlidingWindowMLASpec(
+        block_size=4, sliding_window=8, dtype=torch.uint8, **common
+    )
+    compressed = MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common)
+    ring = CircularBufferSpec(block_size=4, dtype=torch.float32, **common)
+    bounded = _zeroing_config(window=window, compressed=compressed, ring=ring)
+    assert bounded.has_mixed_precision_kv_cache
+    assert bounded.attention_uses_only_written_slots
+    assert not bounded.needs_kv_cache_zeroing
+
+    unbounded = replace(ring, uses_only_written_slots=False)
+    assert _zeroing_config(
+        window=window, compressed=compressed, ring=unbounded
+    ).needs_kv_cache_zeroing
+    mamba = MambaSpec(block_size=4, shapes=((4, 1),), dtypes=(torch.float32,))
+    assert _zeroing_config(window=window, ring=ring, mamba=mamba).needs_kv_cache_zeroing
+    monkeypatch.setenv("VLLM_KV_CACHE_POISON", "1")
+    assert bounded.needs_kv_cache_zeroing
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_written_slot_declaration_survives_group_merges(bounded):
+    """Each merge that rebuilds a spec field by field keeps the declaration."""
+    common = dict(num_kv_heads=1, head_size=1, uses_only_written_slots=bounded)
+    for spec in (
+        SlidingWindowMLASpec(
+            block_size=4, sliding_window=8, dtype=torch.uint8, **common
+        ),
+        MLAAttentionSpec(block_size=4, dtype=torch.uint8, **common),
+        FullAttentionSpec(block_size=4, dtype=torch.bfloat16, **common),
+    ):
+        assert type(spec).merge([spec, spec]).uses_only_written_slots == bounded
+
+
 def test_kv_cache_poison_forces_the_fill(monkeypatch):
     """``VLLM_KV_CACHE_POISON`` runs the new-block fill for a cache that skips
     zeroing (it fills with NaN bytes, never zeros)."""
