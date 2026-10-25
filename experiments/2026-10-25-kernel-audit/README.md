@@ -354,7 +354,7 @@ Root cause of the 1M case, from the generated CUDA: the live-page forms bind
 two dependent round trips a column. The old form's load sits inside its select and is
 bound once (`condval_10`). vLLM a71368f70 loads each entry into a `T.alloc_var` in both
 `decode_metadata` and `pages`. The same aliasing is worth a search through the other
-TileLang kernels.
+TileLang kernels. Run 3 showed it was not the whole cause.
 
 **project_streams**, µs a call:
 
@@ -375,3 +375,27 @@ TileLang kernels.
   0.4-0.5 µs slower at `post_pre` c8 and c16, 0.5 µs faster at `pre` c16. With `fn` hot
   in L2 there is no latency to hide.
 - Fix 3 stays reverted.
+
+### Run 3: both bundles, 20:34-20:40 CET (branch 665a14be, vLLM a71368f70)
+
+Outputs `~/spark-lab/agents/kernel-audit/out/audit-attention-3/` and `audit-mhc-3/`.
+
+- **`audit-mhc`: PASSED.** 76 mHC tests and 73 model-forward tests passed, with fixes 1
+  and 2 in place.
+- **`audit-attention`: FAILED, on the 1M gate alone.**
+  - The tests passed: 144 kernel tests with 1 xfailed, and 4 layer tests.
+  - The builder gate passed.
+  - The page tables were still 6.4-6.5 against 3.1-3.2 µs at a full 1M context. Every
+    other shape was as in run 2.
+- **The cause, from the generated CUDA in the bundle's TileLang cache.**
+  - a71368f70 did load each entry once (`entry = condval_10`).
+  - But each column's load and its store sit under one branch. Scheduling stays inside
+    the branch, so each store waits for its load before the next column's load can
+    issue: about one L2 round trip, 0.15 µs, per column.
+  - The kernel that writes every column loads inside a select and stores
+    unconditionally, so all 32 of its loads issue back to back.
+  - vLLM ef611d4a9 loads the thread's columns into registers first, each load a select,
+    then stores the live ones.
+- **Next.** Run 4 checks that form in the attention bundle. Diagnostics round 2 times it
+  (`two_loop`) against `grid8`, an alternative that spreads the page part over eight
+  blocks a row.

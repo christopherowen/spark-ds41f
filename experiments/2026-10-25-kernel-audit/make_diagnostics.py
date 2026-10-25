@@ -16,7 +16,9 @@ kernel it is timed against only where its name says:
   26382f5cf); dyn (the live pages as the loop bound, vLLM 3cd92e872); static_var (the
   table width's trip count, the live pages in a T.alloc_var, 1072d662b); static_expr
   (the same with the live pages as an expression); select (the old loop and select, the
-  store under the live pages).
+  store under the live pages); round 2, after the first diagnostics: two_loop (each
+  column's load a select, then the live columns' stores) and grid8 (the page part over
+  eight blocks a row).
 """
 import re
 import subprocess
@@ -190,7 +192,37 @@ PAGES = {
                         if col < {LIVE}:
                             main_pages[row, col] = T.if_then_else(page_id > 0, page_id, -1)
 ''',
+    # Round 2: every column's load a select first, then the live columns' stores
+    # (vLLM's form after the diagnostics); and the page part spread over eight blocks
+    # a row, four columns of 128 a block, each block's column loads and stores in one
+    # branch (static_var's body).
+    "two_loop": f'''                req = main_reqs[offset + row]
+                live = {LIVE}
+                if req < 0:
+                    live = 0
+                for k in T.unroll(main_per_thread):
+                    entries[k] = T.if_then_else(
+                        k * threads + tx < live, main_table[req, k * threads + tx], 0
+                    )
+                for k in T.unroll(main_per_thread):
+                    if k * threads + tx < live:
+                        main_pages[row, k * threads + tx] = T.if_then_else(
+                            entries[k] > 0, entries[k], -1
+                        )
+''',
+    "grid8": f'''                req = main_reqs[offset + row]
+                live = {LIVE}
+                if req < 0:
+                    live = 0
+                for k in T.unroll(GRID_COLS):
+                    col = ((part - 1) * GRID_COLS + k) * threads + tx
+                    if col < live:
+                        entry = main_table[req, col]
+                        main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
+''',
 }
+# Columns of `threads` a page block of grid8 handles.
+GRID_COLS = 4
 
 
 def metadata_variants(repo: str) -> str:
@@ -207,10 +239,22 @@ def metadata_variants(repo: str) -> str:
                             "main_width: int, main_page: int\n", 1)
         assert code.count(PAGE_OLD) == 1, name
         code = code.replace(PAGE_OLD, page_part)
-        if name in ("dyn", "static_var"):
-            anchor = "            info = T.alloc_local((2,), T.int64)  # window start, clamped length\n"
-            assert code.count(anchor) == 1
+        anchor = "            info = T.alloc_local((2,), T.int64)  # window start, clamped length\n"
+        assert code.count(anchor) == 1
+        if name in ("dyn", "static_var", "two_loop", "grid8"):
             code = code.replace(anchor, anchor + "            live = T.alloc_var(T.int32)\n")
+        if name == "two_loop":
+            code = code.replace(anchor, anchor + "            entries = T.alloc_local("
+                                "(main_per_thread,), T.int32)\n")
+        if name == "grid8":
+            code = code.replace(anchor, anchor + "            entry = T.alloc_var(T.int32)\n")
+            grid = "        with T.Kernel(rows, 2, threads=threads) as (row, part):\n"
+            assert code.count(grid) == 1
+            code = code.replace(grid, "        with T.Kernel(rows, 1 + (main_per_thread + GRID_COLS - 1)"
+                                " // GRID_COLS, threads=threads) as (row, part):\n")
+            code = code.replace("    main_per_thread = (main_width + threads - 1) // threads\n",
+                                "    main_per_thread = (main_width + threads - 1) // threads\n"
+                                f"    GRID_COLS = {GRID_COLS}\n", 1)
         out.append(code + "\n\n")
     return "".join(out)
 

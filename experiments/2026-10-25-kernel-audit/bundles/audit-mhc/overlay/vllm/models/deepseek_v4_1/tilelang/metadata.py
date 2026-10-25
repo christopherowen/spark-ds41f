@@ -269,10 +269,11 @@ def decode_metadata_kernel(
     req_count = T.dynamic("req_count")
     starts_len = T.dynamic("starts_len")
     replay_len = T.dynamic("replay_len")
-    # Blocks as wide as the window part; the page part loops over the row's live
-    # pages (idle threads cost the prefill rows' blocks). The loop keeps the table
-    # width's trip count, so it unrolls and a long context's loads overlap; past the
-    # live pages an iteration is a compare.
+    # Blocks as wide as the window part; the page part covers the row's live pages
+    # (idle threads cost the prefill rows' blocks). It loads the thread's columns
+    # first, each load a select (predicated, no branch), then stores the live ones,
+    # so a long context's loads issue back to back as the full-width kernel's did. A
+    # load and its store under one branch per column wait a round trip each.
     threads, per_thread = _threads(width)
     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
     main_per_thread = (main_width + threads - 1) // threads
@@ -300,9 +301,7 @@ def decode_metadata_kernel(
             tx = T.get_thread_binding()
             info = T.alloc_local((2,), T.int64)  # window start, clamped length
             live = T.alloc_var(T.int32)  # the page part's columns
-            # One load a column: as an alias, the select below would load it twice, the
-            # second load waiting on the first's value.
-            entry = T.alloc_var(T.int32)
+            entries = T.alloc_local((main_per_thread,), T.int32)
             if part == 0:
                 window_row(
                     row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
@@ -315,11 +314,15 @@ def decode_metadata_kernel(
                 )
                 if req < 0:
                     live = 0
-                for k in T.serial(main_per_thread):
-                    col = k * threads + tx
-                    if col < live:
-                        entry = main_table[req, col]
-                        main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
+                for k in T.unroll(main_per_thread):
+                    entries[k] = T.if_then_else(
+                        k * threads + tx < live, main_table[req, k * threads + tx], 0
+                    )
+                for k in T.unroll(main_per_thread):
+                    if k * threads + tx < live:
+                        main_pages[row, k * threads + tx] = T.if_then_else(
+                            entries[k] > 0, entries[k], -1
+                        )
 
     return metadata_decode
 

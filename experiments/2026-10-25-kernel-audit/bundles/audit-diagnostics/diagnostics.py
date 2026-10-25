@@ -106,7 +106,7 @@ def page_step(requests, rows_each, context, main_page):
 def pages() -> dict:
     results = {}
     main_page = 256
-    names = ("old", "dyn", "static_var", "static_expr", "select")
+    names = ("old", "dyn", "static_var", "static_expr", "select", "two_loop", "grid8")
     kernels = {}
     for name in names:
         try:
