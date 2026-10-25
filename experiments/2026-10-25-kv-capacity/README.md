@@ -148,9 +148,14 @@ It applies cleanly on candidate 6's series (0489-0490 touch two unrelated test f
 - Unchanged: `max_admission_blocks_per_request` (one request's own peak), the startup check,
   the full-sequence gate, pool sizing.
 
-The ring's startup line becomes 11,554,187 tokens, 11.02x at 16,384 (12,040,221, 11.48x at
-8,192); the triangle's 5,609,893, 5.35x. It sits 0.01-0.02 below the exact model above,
-which counts whole blocks.
+The ring's startup line becomes 11,554,122 tokens, 11.02x at 16,384 (12,040,153, 11.48x at
+8,192); the triangle's 5,609,861, 5.35x. These are with 0492 before 0491, the next
+candidate's order: 0492 makes the three window groups holding a drafter layer retain one
+more token ([drafter window retention](../2026-10-25-drafter-window-retention/README.md)),
+which costs 65 tokens of the figure (0491 alone: 11,554,187). vLLM's own grouping and
+capacity code on 0492, 0500-0503 and 0491 over the next candidate's base (e0ccc837d) gives
+these numbers, and `scripts/kv_capacity.py` reproduces them. The figure sits 0.01-0.02 below
+the exact model above, which counts whole blocks.
 
 Tests, in `tests/v1/core/test_kv_cache_utils.py` (a gate file of `config/release-tests.json`,
 CPU tests, no model download):

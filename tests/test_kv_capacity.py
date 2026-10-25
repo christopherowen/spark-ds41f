@@ -32,6 +32,8 @@ class GeometryTest(unittest.TestCase):
         # decoder (7 groups), 23 from it (8 groups); the boot log's 17 groups.
         self.assertEqual(kv_capacity.ced_decoder_start(MODEL), 20)
         self.assertEqual(geo.window_groups, 15)
+        # The drafter's three windows land in three of the decoder's eight groups.
+        self.assertEqual(geo.drafter_groups, 3)
         self.assertEqual(geo.ring_groups, 1)
 
 
@@ -74,10 +76,13 @@ class CapacityTest(unittest.TestCase):
         self.assertEqual(small["every_sequence_tokens"], 262_144)
 
     def test_vllm_kv_capacity_figure(self):
-        # vLLM's kv-capacity branch: the window per request, both batches once.
+        # vLLM 0491 after 0492: the window per request, both batches once, and the
+        # drafter's groups one more token (the next candidate's startup line, computed
+        # with vLLM's grouping and capacity code on 0492 + 0500-0503 + 0491).
         self.assertAlmostEqual(row("tp4-ring", max_num_batched_tokens=8192)["vllm_capacity_contexts"], 11.48, 2)
         self.assertAlmostEqual(row("tp4-ring", max_num_batched_tokens=16384)["vllm_capacity_contexts"], 11.02, 2)
-        self.assertEqual(row("tp4-ring", max_num_batched_tokens=16384)["vllm_capacity_tokens"], 11_554_187)
+        self.assertEqual(row("tp4-ring", max_num_batched_tokens=16384)["vllm_capacity_tokens"], 11_554_122)
+        self.assertEqual(row("tp3-triangle")["vllm_capacity_tokens"], 5_609_861)
 
     def test_budget_override(self):
         rows = kv_capacity.report(RECIPE, MODEL, ["tp4-ring"], budget=16384)

@@ -25,8 +25,9 @@ the longest context at which all ``max_num_seqs`` fit at once.
 
 The layout follows vLLM's DS4.1 caches (``vllm/models/deepseek_v4_1``) and its
 block-outermost packing (``_get_packed_kv_cache_groups``). ``reported`` is the figure the
-startup line printed up to spark-ds41f-1025; ``vllm_capacity`` the one vLLM's kv-capacity
-branch prints (each request its window, the pool the two batches once).
+startup line printed up to spark-ds41f-1025; ``vllm_capacity`` the one it prints with vLLM
+0491 (each request its window, the pool the two batches once) after 0492 (a window group
+holding a drafter layer retains the drafter's extra token).
 """
 from __future__ import annotations
 
@@ -59,6 +60,7 @@ class Geometry:
     window: int  # sliding-window tokens
     pool_block_bytes: int
     window_groups: int
+    drafter_groups: int  # window groups holding a drafter layer
     ring_groups: int
 
 
@@ -91,11 +93,14 @@ def geometry(text: dict, block_size: int, drafts: int) -> Geometry:
     drafter = text.get("n_mtp_layers") or text.get("num_nextn_predict_layers") or 3  # DSpark's
     buckets = [layers, drafter] if boundary is None else [boundary, layers - boundary + drafter]
     per_block = pool_block // window_page
+    # Packing deals a bucket's layers round-robin over its groups, the drafter's last.
+    drafter_groups = cdiv(drafter, per_block) if boundary is None else min(drafter, cdiv(buckets[1], per_block))
     return Geometry(
         block_size=block_size,
         window=text["sliding_window"],
         pool_block_bytes=pool_block,
         window_groups=sum(cdiv(n, per_block) for n in buckets if n),
+        drafter_groups=drafter_groups,
         ring_groups=cdiv(rings, pool_block // ring_page) if rings else 0,
     )
 
@@ -124,9 +129,10 @@ def capacity(geo: Geometry, sizing: dict, drafts: int) -> dict:
     each = ((usable - transient) // seqs - (resident - full)) * geo.block_size
     # vLLM kv-capacity: each request its window ((n - 2) / block + 2 blocks for n tokens),
     # the pool both batches once, and never below the per-request-peak figure.
-    window_share = (kept + drafts - 2) / WINDOW_BLOCK + 2
+    window_shares = (geo.window_groups * ((kept + drafts - 2) / WINDOW_BLOCK + 2)
+                     + geo.drafter_groups / WINDOW_BLOCK)
     shared = geo.window_groups * STEPS_IN_FLIGHT * budget / WINDOW_BLOCK
-    vllm_capacity = max(reported, (blocks - shared) / (full + geo.window_groups * window_share + geo.ring_groups))
+    vllm_capacity = max(reported, (blocks - shared) / (full + window_shares + geo.ring_groups))
     return {
         "max_model_len": length,
         "max_num_batched_tokens": budget,
@@ -194,7 +200,7 @@ def main() -> int:
               f"{row['prompt_blocks_in_flight']:,} more")
         print(f"  vLLM's startup line: {row['reported_tokens']:,} tokens ({row['reported_contexts']:.2f}x) "
               f"up to spark-ds41f-1025; {row['vllm_capacity_tokens']:,} ({row['vllm_capacity_contexts']:.2f}x) "
-              f"with kv-capacity")
+              f"with vLLM 0491 and 0492")
     return 0
 
 
