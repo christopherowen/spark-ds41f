@@ -554,13 +554,13 @@ order; 8e596b329 and its revert are skipped.
 | kernel-audit | kernel-audit-next | Resolution |
 |---|---|---|
 | — | 47185fe76 | Not the audit's: next-candidate's chunk reference, fixed (run 7). |
-| 3cd92e872 | dab4f4d51 | The conditionals removed the Triton `_pages` and `_chunk` and rewrote the metadata tests as torch references. The live-page tests now compare `_ref_pages` on each row's live columns and keep the sentinel elsewhere (`_live_columns`, `_live_equal`). The decode-metadata test's main rows hold the step's requests in reverse and -1 past them. kv-zeroing's `replay = replay_start is not None` is kept with the `main_page` argument. The conditionals had moved the compressor test's page-table check onto `tl_metadata.pages`; it passes its visible lengths, every column live. |
-| bb2fb46ee | d2f9c9c46 | `test_requests` and `test_tokens` become `test_builder` against `_ref_requests` and `_ref_tokens`; `_token_metadata` calls `metadata.builder`. |
-| 1072d662b | c6455133e | The kernel change only; its test fixes are in dab4f4d51. |
-| a71368f70 | 5348569e3 | Clean. |
-| ef611d4a9 | 094d86f0b | Clean. |
-| 26f3c89d6 | e3e8241ed | The wide-table test compares `_ref_chunk` and `_ref_pages`. |
-| fb73c80cf | 3f8b928b6 | The same test change as on `kernel-audit`. |
+| 3cd92e872 | 1dad52cc1 | The conditionals removed the Triton `_pages` and `_chunk` and rewrote the metadata tests as torch references. The live-page tests now compare `_ref_pages` on each row's live columns and keep the sentinel elsewhere (`_live_columns`, `_live_equal`). The decode-metadata test's main rows hold the step's requests in reverse and -1 past them. kv-zeroing's `replay = replay_start is not None` is kept with the `main_page` argument. The conditionals had moved the compressor test's page-table check onto `tl_metadata.pages`; it passes its visible lengths (one per source row, as the kernel declares), every column live. |
+| bb2fb46ee | a2127c62b | `test_requests` and `test_tokens` become `test_builder` against `_ref_requests` and `_ref_tokens`; `_token_metadata` calls `metadata.builder`. |
+| 1072d662b | 83c074866 | The kernel change only; its test fixes are in 1dad52cc1. |
+| a71368f70 | f17ca13fb | Clean. |
+| ef611d4a9 | 273e99a74 | Clean. |
+| 26f3c89d6 | 3a61daab6 | The wide-table test compares `_ref_chunk` and `_ref_pages`. |
+| fb73c80cf | 83be1f379 | The same test change as on `kernel-audit`. |
 
 The kernels' bodies are as on `kernel-audit`; `metadata.py` differs from it only in
 next-candidate's own changes (its docstrings, and 0501's draft replay start).
@@ -594,7 +594,30 @@ non-draft rows only. 47185fe76 bounds a draft window's start in the reference as
 kernel does.
 
 Run 7 also missed a call the conditionals moved onto `tl_metadata.pages`: the compressor
-test's page-table check, which the audit's signature change breaks. dab4f4d51 passes it
+test's page-table check, which the audit's signature change breaks. 1dad52cc1 passes it
 its visible lengths. The next attention bundle now runs the compressor tests.
 
-### Run 8: both next bundles (vLLM kernel-audit-next 3f8b928b6): queued
+### Run 8: both next bundles, 00:34-00:41 CET (branch 1013036d, vLLM 3f8b928b6): attention FAILED
+
+Outputs `~/spark-lab/agents/kernel-audit/out/audit-next-attention-8/` and
+`audit-next-mhc-8/` on dgx4.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 0 | 173 passed, 1 skipped (compute-sanitizer), 1 xfailed |
+| attention layer tests | 0 | 5 passed |
+| compressor tests | 1 | 4 passed, 1 failed |
+| live-page benchmark | 0 | Gate held |
+| one-launch builder benchmark | 0 | Gate held |
+| mHC tests | 0 | 96 passed |
+| model-forward tests | 0 | 76 passed |
+
+**Root cause: my port of the compressor test.** It passed one visible length, but
+`pages_kernel` declares `lengths` with the same rows as `reqs` (the state's 96): "input
+lengths shape[0] violates packed ABI constraint; expected: 96, got: 1". The port now
+passes one length per source row (`torch.full_like(req_id_per_token, width)`), folded
+into 1dad52cc1; the series' other commits are unchanged and renumbered. The mHC bundle's
+pass stands for the new head: only the compressor test file differs, and that bundle
+does not run it.
+
+### Run 9: the next attention bundle (vLLM kernel-audit-next 83be1f379): queued

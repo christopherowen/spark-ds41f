@@ -410,7 +410,7 @@ def test_compressor_rejection_reorder_padding_and_page_boundaries(
         # writes only its live pages; here every column is live (``width`` visible
         # entries, one a page).
         pages = torch.empty((1, width), device=device, dtype=torch.int32)
-        visible = torch.full((1,), width, device=device, dtype=torch.int32)
+        visible = torch.full_like(candidate.state.req_id_per_token, width)
         tl_metadata.pages(
             candidate.state.req_id_per_token,
             visible,
