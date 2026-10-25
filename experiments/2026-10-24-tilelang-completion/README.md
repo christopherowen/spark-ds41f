@@ -1616,3 +1616,11 @@ the driver stopped before the serving check, as it now does on any failed bundle
 The fifth serving check and the third request inventory run at af4ab248f now. The text
 paths are complete and tested; the image digests record what the tower produces before
 its rework (`~/spark-lab/serving5` on dgx1, "SERVING5 DONE").
+
+The fifth serving check's ports arm failed to start: the profile run's dummy step sliced
+`get_mtp_target_hidden_states()`, which returned None. Run 17's note was wrong that no
+DS4.1 model defines that method: the DS4.1 VL model inherits it from the upstream VL
+class, which returns the language model's MTP buffer, and 58a492841 removed the buffer.
+The drafter never read those states (DSpark takes the auxiliary states), so outputs are
+unaffected. vLLM b441fcf88 makes the runner read a None override as none. The serving
+check and the inventory run again at b441fcf88 (`~/spark-lab/serving5b`, "SERVING5B DONE").

@@ -50,6 +50,8 @@ PARTS = {
                 # The consumed drafts' gather, the new requests' row resets and the
                 # constant offsets of a step without drafts (run 19).
                 "tests/v1/worker/test_draft_tokens_handler.py",
+                # A target without an MTP override buffer (DS4.1 since 58a492841).
+                "tests/v1/worker/test_mtp_target_states.py",
                 "tests/v1/spec_decode/test_adaptive_verification.py",
                 # Prefill's glue: SP attention's front, CED's routing mask and slots,
                 # NCCL's last-dimension all-gathers, CED's zeroed full rows (run 19).
