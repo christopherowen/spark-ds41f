@@ -514,4 +514,30 @@ and `audit-mhc-5/` on dgx4; every bundle exit 0.
   ms, 0.11% of the 15K prefill. They cost 0.36 µs a c1 decode call at a full 1M
   context: 15 calls, 5 µs, about 0.02% of a step; nothing at 64K.
 
-### Run 6: both bundles (vLLM fb73c80cf): queued
+### Run 6: both bundles, 23:27-23:29 CET (branch d4be58f1, vLLM fb73c80cf): PASSED
+
+Outputs `~/spark-lab/agents/kernel-audit/out/audit-attention-6/` and `audit-mhc-6/` on
+dgx4; both bundles exit 0.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 0 | 150 passed, 1 xfailed |
+| attention layer tests | 0 | 4 passed |
+| live-page benchmark | 0 | Gate held at every shape |
+| one-launch builder benchmark | 0 | Gate held |
+| mHC tests | 0 | 76 passed |
+| model-forward tests | 0 | 73 passed (CED, SP prefill) |
+
+`decode_metadata` in the live-page benchmark, µs a call (both main page sizes), against
+the old kernel and run 4's ef611d4a9:
+
+| Shape | fb73c80cf | Every column (26382f5cf) | ef611d4a9 (run 4) |
+|---|---:|---:|---:|
+| c1, 4K-64K context | 1.7-1.8 | 3.3 | 1.7-1.8 |
+| c1, 1M context | 2.3 | 3.1-3.2 | 1.9-2.0 |
+| c16, 4K-64K context | 1.5-1.7 | 3.8-4.1 | 1.5-1.9 |
+| prefill chunk of 16,384 rows at 16K | 47-48 | 1,405-1,420 | 105 |
+| same chunk 48K into a prompt | 120-121 | 1,405-1,410 | 125-130 |
+
+`pages` is unchanged: 1.51 against 1.58 µs (c1), 2.96 against 3.91 (c16), 5.76 against
+7.56 (a 256-row prefill chunk).
