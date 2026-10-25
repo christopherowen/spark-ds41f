@@ -61,7 +61,13 @@ on the cluster is not measured.
 branch `drafter-window-retention` of `~/projects/vllm-ds41-tilelang-migration`, commit
 `5c5a204bf` on `26382f5cf` (worktree `~/projects/vllm-drafter-window`, local only like the
 other vLLM branches). It applies on candidate 6's series alone and after 0491 (the
-kv-capacity patch); [vllm/series](vllm/series) is candidate 6's with 0492.
+kv-capacity patch); [vllm/series](vllm/series) is candidate 6's with 0492. In the next
+candidate's order on its base `e0ccc837d` (0492, 0500-0503, 0491) every patch applies with
+`git am`, and the shared test files (`test_kv_cache_utils.py`,
+`test_single_type_kv_cache_manager.py`, `test_swa_inflight_window_free.py`) fail only the
+base's offline ids on CPU. 0501 (draft windows start at CED's replay start) bounds the same
+window from below; in decode the replay start lies behind `prefix - 128`, so it does not
+cover this case, and the two are complementary.
 
 - `UniformTypeKVCacheSpecs.scheduler_spec`: the first layer's spec, with the group's
   largest `extra_retained_tokens` for a window group. One block table serves every layer
