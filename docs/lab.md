@@ -186,6 +186,38 @@ before the first boot. `run --dry-run` prints the problems.
   Every other suite decodes greedily (temperature 0); `sampled` runs closed loops at 16, 8
   and 1 streams at the recipe's temperature 1 with a fixed seed, so a change to draft
   acceptance under sampling (probabilistic drafting, the draft budget) is measured there.
+- **`agentx`:** SemiAnalysis AgentX's agent-trace replay (agentx-harness 1.0.7, pinned in
+  `requirements/agentx-harness.txt`) on one arm at each concurrency of `"points"`, in order:
+
+  ```json
+  {"kind": "agentx", "arm": {"config": "production-agentx.json", "label": "1022"},
+   "points": [8, 16], "duration": 3600, "seed": 42, "dataset": "semianalysis_cc_traces_weka_062126"}
+  ```
+
+  - Every point boots the arm afresh (an empty prefix cache), then runs
+    `bin/spark workload --duration 15`: a request that finishes, runs or waits in it ends the job.
+  - `scripts/agentx.py run` then replays inside `bin/spark workload` (the server's view of the
+    whole run), with the step's node telemetry. The client runs on the cores the serving container
+    is not pinned to, inside a memory-capped user scope (12 GiB, no swap), and samples `/metrics`
+    every 5 s.
+  - Results land in `results/private/agentx/<run>/<label>-c<N>/`: the harness's files, `agentx.json`
+    (its verdicts and latency, the server's prefix-cache hits, cached prompt tokens, preemptions and
+    KV use over the profiling window, and time to first token against uncached prompt tokens) and
+    the clean check. The table is `results/private/lab/<run>-table.txt`.
+  - A failed point keeps its evidence and the next point boots and runs; the job then fails.
+  - Not a release gate: closed-loop replay drifts with the server's speed, so two builds never
+    replay quite the same mix.
+  - Before the first window on a host, between windows (never under a hold), install the harness
+    and rebuild the corpus once. The first replay of a corpus tokenizes every trace for minutes;
+    `prepare` does it against a local stub server, and runs refuse a dataset and seed that were not
+    prepared:
+
+    ```sh
+    scripts/agentx.py install
+    scripts/agentx.py prepare --tokenizer deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+      --tokenizer-revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+      --hf-hub-cache ~/.cache/huggingface/hub --avoid-cpus 5-9,15-19
+    ```
 - **Telemetry:** every bench and script step of a `measure` job samples, on each node:
   - GPU SM and memory clocks, power, temperature and clock-event reasons, once a second
     (`nvidia-smi` over SSH);
