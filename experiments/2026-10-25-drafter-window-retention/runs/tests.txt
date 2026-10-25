@@ -1,0 +1,25 @@
+# CPU (macOS arm64, torch 2.14.1), offline, 2026-10-25 ~15:50 CET; environment as in
+# experiments/2026-10-25-kv-capacity/runs/run-tests.sh
+
+# the new tests before the fix (26382f5cf's code), tests/v1/core/test_kv_cache_utils.py:
+FAILED test_ds41_scheduler_window_groups_retain_the_drafters_token
+  assert group.kv_cache_spec.extra_retained_tokens == retained: assert 0 == 1
+  (group layers 24, 32, 40: the scheduler spec is layer 24's)
+FAILED test_ds41_drafter_window_survives_a_step_whose_rows_are_all_rejected
+  held[(q0 - 128) // 128] is the null block: block 2 (positions 256-383) freed at q0 = 511
+
+# with 0492 (5c5a204bf):
+test_ds41_scheduler_window_groups_retain_the_drafters_token PASSED
+test_ds41_drafter_window_survives_a_step_whose_rows_are_all_rejected PASSED
+
+# tests/v1/core, both trees:
+base 26382f5cf:                106 failed, 1395 passed, 1 warning, 2 errors in 226.23s (0:03:46)
+drafter-window-retention:      106 failed, 1397 passed, 1 warning, 2 errors in 214.99s (0:03:34)
+the same failing and erroring ids on both trees (hub ids not in the offline cache, the CPU
+build's missing modules); the branch's run had 0492's test imports at module level, moved
+into the test since (the two new tests re-run: 2 passed).
+
+# test_get_kv_cache_capacity_after_scheduler_unwrap (generate_scheduler_kv_cache_config;
+# builds Qwen/Qwen3-0.6B's config, so run through ModelConfig('facebook/opt-125m')):
+drafter-window-retention: PASSED
+base 26382f5cf:           PASSED
