@@ -1,7 +1,8 @@
 """The routed experts of copied and ordinary text, from DeepSeek's V4.1 reference forward on CPU.
 
 usage (inside the serving image, repository at /repo, snapshot read-only):
-  python3 -I routes_probe.py SNAPSHOT OUT.json [--cases copy,edit,tool,prose] [--tokens 1000]
+  python3 -I routes_probe.py SNAPSHOT OUT.json [--cases copy,prose,tool,edit] [--tokens 1000]
+                             [--deadline 2026-10-25T22:30:00Z]
 
 Each case is one conversation rendered by the checkpoint's own encoding: a user turn and the
 assistant reply a copy-heavy request produces (copy_probe.py's categories, 2026-10-23). The
@@ -31,7 +32,8 @@ SHIM = HERE.parents[1] / "2026-10-18-json-count" / "reference" / "shim"
 parser = argparse.ArgumentParser()
 parser.add_argument("snapshot")
 parser.add_argument("out")
-parser.add_argument("--cases", default="copy,edit,tool,prose")
+parser.add_argument("--cases", default="copy,prose,tool,edit")
+parser.add_argument("--deadline", help="UTC time (ISO 8601) after which no further case starts")
 parser.add_argument("--tokens", type=int, default=1000, help="source tokens of the copied file")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--repo", default="/repo", help="spark-ds41f checkout (servebench prompts)")
@@ -244,12 +246,18 @@ load_module(final_norm, "norm.")
 
 def render(name: str) -> tuple[list[int], int]:
     """Token ids of prompt + reply, and where the reply starts."""
-    code = cases.document(prompts, ARGV.tokens, ARGV.seed * 1000)
     prose = None
     if name == "prose":
         text = (Path(ARGV.repo) / "docs" / "methodology.md").read_text(encoding="utf-8")
         prose = tokenizer.decode(tokenizer.encode(text, add_special_tokens=False)[: ARGV.tokens])
-    messages, reply = cases.conversation(name, code, prose_text=prose)
+    seed = ARGV.seed * 1000
+    while True:  # a document with no function cannot make a tool case: the next seed
+        code = cases.document(prompts, ARGV.tokens, seed)
+        try:
+            messages, reply = cases.conversation(name, code, prose_text=prose)
+            break
+        except ValueError:
+            seed += 1
     ids, start = cases.render(encode_messages, tokenizer.encode, messages, reply)
     assert len(ids) <= ARGS.max_seq_len, (name, len(ids))
     return ids, start
@@ -300,7 +308,15 @@ def greedy(hidden: torch.Tensor, positions: list[int]) -> list[int]:
 
 records = []
 t_start = time.time()
+deadline = None
+if ARGV.deadline:
+    from datetime import datetime
+
+    deadline = datetime.fromisoformat(ARGV.deadline.replace("Z", "+00:00")).timestamp()
 for name in ARGV.cases.split(","):
+    if deadline is not None and time.time() > deadline:
+        print(f"deadline passed: {name} and later cases not started", flush=True)
+        break
     ids, reply_start = render(name)
     print(f"{name}: {len(ids)} tokens, reply from {reply_start} ({len(ids) - reply_start} tokens)", flush=True)
     ROUTES.clear()
