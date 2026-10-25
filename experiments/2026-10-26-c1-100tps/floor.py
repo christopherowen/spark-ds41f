@@ -25,9 +25,13 @@ Three things per window:
   rows. busy - floor is streaming below the attainable rate; idle is what
   overlap (fusion, PDL, collectives) could hand back at most.
 
-The attainable rate is the best weight stream measured in these traces: the
-packed LM head (248 MB a call, one read of each byte). GB10's LPDDR5x is
-specified at 273 GB/s; nothing on this stack has been measured at that rate.
+The attainable rate, first estimate: the best weight stream measured in these
+traces, the packed LM head (248 MB a call, one read of each byte), with FC1's
+rate assumed (by_eta). With --expert-rate (the expert-rate bundle's output.txt) the
+"measured" block replaces both assumptions: FC1 and FC2 at six rows are fitted to
+a + b * experts on cold weights, the rate is FC1's marginal one (its bytes an expert
+over b), and each window's experts a layer come from inverting that fit at its
+traced FC1 time. GB10's LPDDR5x is specified at 273 GB/s.
 """
 import argparse
 import gzip
@@ -157,7 +161,21 @@ def idle_split(ks, start, end):
     return out
 
 
-def window(ks, skip, last):
+def linfit(xs, ys):
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
+    return my - b * mx, b
+
+
+def expert_fits(path):
+    """{rows: {"fc1": (a, b), "fc2": (a, b)}} in us, from the expert-rate bundle's output."""
+    cases = [json.loads(line) for line in open(path) if line.startswith('{"case": "experts"')]
+    return {r: {k: linfit([c["experts"] for c in cases if c["rows"] == r],
+                          [c[k + "_us"] for c in cases if c["rows"] == r]) for k in ("fc1", "fc2")}
+            for r in sorted({c["rows"] for c in cases})}
+
+
+def window(ks, skip, last, fits=None):
     sp = steps(ks)[skip:last]
     n = len(sp)
     acc = defaultdict(float)
@@ -207,6 +225,26 @@ def window(ks, skip, last):
             "floor_ms": round(floor, 2), "floor_ms_at_spec": round(total / (SPEC_GBS * 1e3) / 1e3, 2),
             "busy_minus_floor_ms": round(out["dram_busy_ms"] - floor, 2),
             "floor_share_of_step": round(floor / out["step_ms"], 3)}
+    if fits:
+        # the target's buckets: the six-row fit unless most steps routed three rows
+        routed_rows = sum(r * len(v) for r, v in rows.items()) / n
+        (a1, b1), (a2, b2) = (fits[3] if routed_rows <= 4.5 and 3 in fits else fits[6]).values()
+        (da1, db1), (da2, db2) = fits[6].values()  # the drafter: 5 rows, 15 routes
+        rate = FC1_BYTES / fits[6]["fc1"][1] / 1e3  # GB/s: FC1's marginal stream at six rows
+        experts = (out["fc1_ms"] * 1e3 / 40 - a1) / b1
+        d_experts = (out["drafter_fc1_ms"] * 1e3 / 3 - da1) / db1
+        routed = (40 * experts + 3 * d_experts) * (FC1_BYTES + FC2_BYTES)
+        total = sum(DENSE.values()) + routed
+        floor = total / (rate * 1e3) / 1e3
+        out["measured"] = {
+            "rate_gbs (FC1 marginal, six rows)": round(rate, 1), "fit_rows": 3 if routed_rows <= 4.5 else 6,
+            "experts_per_target_layer": round(experts, 1), "experts_per_drafter_layer": round(d_experts, 1),
+            "routed_mb": round(routed / 1e6, 1), "total_mb": round(total / 1e6, 1),
+            "floor_ms": round(floor, 2), "floor_ms_at_spec": round(total / (SPEC_GBS * 1e3) / 1e3, 2),
+            "busy_minus_floor_ms": round(out["dram_busy_ms"] - floor, 2),
+            "floor_share_of_step": round(floor / out["step_ms"], 3),
+            "moe_launch_fixed_ms": round((40 * (a1 + a2) + 3 * (da1 + da2)) / 1e3, 3),
+            "head_excess_ms": round((per["head_us"] - HEAD * per["head_calls"] / (rate * 1e3)) / 1e3, 3)}
     for k in ("step_ms", "dram_busy_ms", "fc1_ms", "fc2_ms", "fc2_rate_vs_fc1", "drafter_fc1_ms", "drafter_fc2_ms"):
         out[k] = round(out[k], 3)
     return out
@@ -216,13 +254,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("traces", nargs="?", default="results/private/determinism/request-inventory-5/ports")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "floor.json"))
+    ap.add_argument("--expert-rate", help="the expert-rate bundle's output.txt")
     args = ap.parse_args()
+    fits = expert_fits(args.expert_rate) if args.expert_rate else None
     folder = os.path.join(args.traces, "decode-trace/dgx1")
     trace = dict(zip(DECODE, (os.path.join(folder, f) for f in sorted(os.listdir(folder)))))
-    out = {"source": args.traces, "dense_bytes": {k: v for k, v in DENSE.items()},
+    out = {"source": args.traces, "expert_rate": args.expert_rate, "dense_bytes": {k: v for k, v in DENSE.items()},
            "fc1_bytes_per_expert": FC1_BYTES, "fc2_bytes_per_expert": FC2_BYTES, "windows": {}}
     for name, (skip, last) in (("greedy", (1, None)), ("sampled", (1, 24)), ("mixed-c8", (2, 19))):
-        out["windows"][name] = window(load(trace[name]), skip, last)
+        out["windows"][name] = window(load(trace[name]), skip, last, fits)
     with open(args.out, "w") as handle:
         json.dump(out, handle, indent=1)
         handle.write("\n")
@@ -230,6 +270,11 @@ def main():
         e = w["by_eta"]["1.00"]
         print(f"{name}: step {w['step_ms']} ms, DRAM busy {w['dram_busy_ms']} ms, "
               f"floor {e['floor_ms']} ms at {w['attainable_gbs (LM head)']} GB/s ({e['total_mb']} MB)")
+        m = w.get("measured")
+        if m:
+            print(f"  measured: {m['experts_per_target_layer']} experts a layer, floor {m['floor_ms']} ms at "
+                  f"{m['rate_gbs (FC1 marginal, six rows)']} GB/s ({m['total_mb']} MB), busy - floor "
+                  f"{m['busy_minus_floor_ms']} ms, MoE launch fixed {m['moe_launch_fixed_ms']} ms")
 
 
 if __name__ == "__main__":
