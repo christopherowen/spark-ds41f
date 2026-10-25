@@ -14,8 +14,14 @@ published release benchmark. Promotion needs the owner's go.
   active on every node.
 - **First-prefill probe** (step 5b, below): a fresh boot's first long prefill costs about 0.1 s, once.
 - **The triangle (2026-10-25, after the owner's re-wire):** qualified at an 8,192 budget and
-  promoted on TP3 ([The triangle's results](#the-triangles-results-2026-10-25)). The 4 KiB-page
-  triangle stays unqualified.
+  promoted on TP3 ([The triangle's results](#the-triangles-results-2026-10-25); merged as
+  d3637761, #602). The 4 KiB-page triangle stays unqualified.
+  - **Deployed 22:16-22:19 CET** under a deploy hold: spark-ds41f-1022 TP3 stopped at 22:17:01,
+    and the API was ready at 22:18:49, 88.7 s after launch (about 1 min 48 s of downtime).
+  - **Checks:** `doctor --live` OK (the weight-shard extent warnings only); KV 4,009,281 tokens
+    (vLLM's startup figure, 3.82x at 1M), as planned.
+  - **Rollback:** stop with `config/cluster.json`, then start
+    `experiments/2026-10-23-next-release/1022/cluster.json` with `--replace`.
 
 The sections below record how the candidate got there.
 

@@ -1,7 +1,7 @@
 # Current state
 
 Production is **spark-ds41f-1025** ([config/cluster.json](../config/cluster.json)), serving
-DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. Since the evening of 2026-10-25 it runs the
+DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens. Since 2026-10-25 22:18 CET it runs the
 `tp3-triangle` shape on dgx1-dgx3, the cabling the site has; it was qualified on the
 `tp4-ring` shape (dgx1-dgx4) first and served there from 18:31. It was promoted
 2026-10-25 as [`2026-10-25-spark-ds41f-1025`](../manifests/baselines/2026-10-25-spark-ds41f-1025.json)
