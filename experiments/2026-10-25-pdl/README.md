@@ -59,8 +59,10 @@ profile need the cluster and stay queued.
   first consumer starts; the consumers' time above their L2 speed is 4.67% of a c1 greedy step
   on the critical path. Issuing FFN and NEXT earlier inside their windows is bounded at 0.30%,
   and a PDL prologue prefetch at 0.01% (window consumers) and 0.08% (weight GEMMs in no window).
-  The limit is DRAM time where the windows sit, not launch order. The prefetch join never
-  binds; the forks cost about 0.04%.
+  The limit is DRAM time where the windows sit, not launch order. Splitting each window into
+  fills placed in the latency-bound stretches before it is bounded at 1.51% at c1 (2.04%
+  sampled, 0.60% c8, plus 0.55% for WO); evict-last lines survive the GEMMs in between on GB10
+  (moe-overlap's probe). The prefetch join never binds; the forks cost about 0.04%.
 - **Built:** every kernel on the layer chain begins with `pdl.chain()`, TileKernels' casts and
   norms take DeepSeek's PDL switch, the warp-specialized GEMMs keep their launch (vLLM `pdl`
   0b7952de4 and 62538a5d8, with tests in 75e6d02c7, 59b72eb81 and 352b07b52, over 26382f5cf). Scheduling only: the tests require identical bits.
@@ -221,6 +223,17 @@ Bounds:
   bytes move from the consumer to that GEMM, and the time does not shrink. If DRAM were free
   during the side stream's idle time (the MoE, mostly), the bound would be 1.98 / 2.70 / 0.75%.
   That is unrealizable while the routed experts stream at bandwidth.
+- **Splitting a window into fills placed in each latency-bound stretch** since the side stream
+  came free, across the weight GEMMs in between: at most **1.51% c1 greedy, 2.04% sampled,
+  0.60% c8** for FFN and NEXT, and 0.55 / 0.75 / 0.24% more for WO (`split_fills`).
+  - It needs the early fills' lines to survive those GEMMs until their consumer runs. The
+    moe-overlap session's GB10 probe (2026-10-25 20:07 CET, PR #587) shows evict-last lines do,
+    at the recipe's set-aside of 0: 0.91-0.96 of the prefetch kernel's lines survive a 96 MB
+    default stream. A persisting set-aside adds nothing.
+  - The cost to watch, from the same probe: evict-last lines that are no longer needed crowd out
+    default reuse until they are evicted (a 16 MB default re-read at DRAM speed beside 20 MB of
+    stale lines). Each fill should hold only lines whose consumer has not yet run.
+  - It is the one schedule change here with a ceiling above 0.5%; it is not built.
 - **PDL-coordinated prefetch**, a consumer issuing its own weight's L2 prefetch in its prologue:
   at most 0.01% for window consumers, and 0.08 / 0.10 / 0.05% for the weight GEMMs in no window.
   With `pdl.chain()` a kernel's prologue overlaps only the kernel before it, usually a 1-2 us
@@ -436,11 +449,11 @@ The cluster checks stay queued as [screen.json](screen.json) and [profile.json](
   entry's fn tile loads. Its `mhc.py` and `metadata.py` edits and this branch's one-line
   `pdl.chain()` insertions touch the same kernels: a textual merge, and its merged metadata
   kernel needs `pdl.chain()` too. Every kernel it removes takes a PDL boundary with it.
-- **moe-overlap** (vLLM `moe-overlap`): `evict_first` on the routed experts' weights is
-  independent of PDL. Its cache-priority hints and the persisting-L2 set-aside are what could
-  let a fill start earlier, across a weight GEMM, and keep its lines; the windows' lateness
-  (above) sizes that: 77-87% of instances late by a median 27-48 us, 4.67% of the step in
-  excess at c1. The act-quant fold into `mhc_finalize` removes the cast between finalize
+- **moe-overlap** (vLLM `moe-overlap`): its GB10 probe settles the cache-priority question for
+  the windows. Evict-last prefetched lines survive the GEMMs between a fill and its consumer
+  at set-aside 0; the set-aside adds nothing; routed evict-first is dropped. That makes split
+  fills (at most 1.5% at c1, above) possible without a set-aside; the windows' lateness sizes
+  the pool (77-87% of instances late by a median 27-48 us, 4.67% of the step). The act-quant fold into `mhc_finalize` removes the cast between finalize
   and the projections (two boundaries become one, about 0.5 us a sublayer saved by either); the
   new finalize keeps `pdl.chain()`.
 - **fusion-survey**: its "PDL across the decode graphs" ceiling (1.9 / 2.4 / 1.1%) counted gaps up

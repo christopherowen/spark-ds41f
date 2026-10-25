@@ -76,6 +76,24 @@ def dram_idle(path_kernels: list[dict], on_path: dict, w: dict) -> float:
     return total
 
 
+def latency_bound_since(path_kernels: list[dict], on_path: dict, w: dict) -> float:
+    """All latency-bound path time between the side stream coming free and this
+    window's issue, weight GEMMs in between or not: what a window split into fills
+    placed in those stretches could use, if its lines survive the GEMMs between them
+    and the consumer (evict_last lines do on GB10: moe-overlap's probe, PR #587)."""
+    if w["idle_before"] is None:
+        return 0.0
+    lo, hi = w["issue"] - w["idle_before"], w["issue"]
+    total = 0.0
+    for k in path_kernels:
+        if k["end"] <= lo or k["ts"] >= hi or not latency_bound(k):
+            continue
+        own, pred = on_path[id(k)]
+        start = k["end"] - own if pred is None else min(k["ts"], pred["end"])
+        total += max(0.0, min(k["end"], hi) - max(start, lo))
+    return total
+
+
 def windows_of(step: list[dict]) -> list[dict]:
     """Every prefetch of the step's graph launches, with its window and consumers."""
     out = []
@@ -213,6 +231,7 @@ def analyse(ks, windows_steps):
         path_kernels = sorted((k for _, k, _ in edges), key=lambda k: k["ts"])
         for w in found:
             w["dram_idle_before"] = dram_idle(path_kernels, on_path, w)
+            w["latency_bound_since"] = latency_bound_since(path_kernels, on_path, w)
         for w in found:
             w["step"] = n
         instances.extend(found)
@@ -252,6 +271,7 @@ def analyse(ks, windows_steps):
     pdl_covered = 0.0
     side_idle = defaultdict(float)
     proportional = defaultdict(float)
+    split = defaultdict(float)
     for w in instances:
         if w["late"] > 0:
             # finishing d earlier saves at most d and at most the excess; if the fill and
@@ -261,6 +281,7 @@ def analyse(ks, windows_steps):
                 1.0, w["dram_idle_before"] / w["late"]
             )
             side_idle[w["kind"]] += min(w["late"], w["idle_before"] or 0.0, w["excess"])
+            split[w["kind"]] += min(w["latency_bound_since"], w["excess"])
         for name, c in w["consumers"].items():
             own, pred = on_path.get(id(c), (0.0, None))
             if pred is None or c["ts"] >= w["prefetch"]["end"]:
@@ -378,6 +399,10 @@ def analyse(ks, windows_steps):
             proportional["FFN"] + proportional["NEXT"]
         ),
         "earlier_if_dram_were_free_percent": pct(side_idle["FFN"] + side_idle["NEXT"]),
+        # fills split over every latency-bound stretch since the side stream came free
+        "split_fills_us": {k: round(v / n, 1) for k, v in split.items()},
+        "split_fills_ffn_next_percent": pct(split["FFN"] + split["NEXT"]),
+        "split_fills_wo_percent": pct(split["WO"]),
         "pdl_prologue_covered_us": round(pdl_covered / n, 1),
         "pdl_prologue_covered_percent": pct(pdl_covered),
         "pdl_prologue_uncovered_us": round(
