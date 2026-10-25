@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the kernel-audit bundles and arms from the vLLM branch.
 
-usage: make_audit_bundles.py VLLM_REPO [BASE] [HEAD]
+usage: make_audit_bundles.py VLLM_REPO [BASE] [HEAD] [--next]
 
 BASE defaults to 26382f5cf (the package files of candidate 6's image, spark-ds41f-1025)
 and HEAD to the branch ``kernel-audit``. Every file the branch changes between them goes
@@ -11,7 +11,16 @@ gated benchmarks against the kernels the branch replaces (bundles/audit-*). The 
 files also go to bundles/serving/overlay, which audit-tp4.json mounts over candidate 6
 (the serving check), and prof-audit.json / prof-candidate6.json are the two arms under
 the torch profiler (the request inventory's settings without Python stacks).
+
+--next writes the bundles of the audit's port onto vLLM ``next-candidate`` (HEAD
+defaults to ``kernel-audit-next``) as bundles/audit-next-*, on the same image: the
+overlay then carries every package file next-candidate changes too, and each one it
+deletes as a module that fails to import, as a missing one does. Its attention layer
+step runs the whole layer test file (the B12X tests in it are gone), without the
+kernel-family variable or B12X's path (both gone). It writes no serving arms: the
+candidate's own serving check covers them.
 """
+import argparse
 import json
 import shutil
 import subprocess
@@ -106,6 +115,16 @@ print(json.dumps({"steps": codes}), flush=True)
 sys.exit(0 if all(code == 0 for _, code in codes) else 1)
 '''
 
+# The next port's attention layer step: the whole file.
+NEXT_LAYER_STEP = ("attention layer tests", PYTEST + [
+    "--basetemp", "/c/pytest-audit-attention-layer",
+    "tests/models/test_deepseek_v4_1_attention.py"], 1800)
+
+MISSING = '''# Deleted by vLLM next-candidate; mounted over the image's copy so that importing it
+# fails as importing a missing module does.
+raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
+'''
+
 PROFILER = {
     "profiler": "torch",
     "torch_profiler_dir": "/cache/spark-ds41f/profiles/kernel-audit",
@@ -136,9 +155,14 @@ def read_cluster(relative: str, shape: str | None = None) -> dict:
     return recipe.resolve(cluster, shape) if recipe.is_recipe(cluster) else cluster
 
 
-def write_bundle(repo: str, head: str, commit: str, changed: list[str], part: str) -> None:
+def write_bundle(repo: str, head: str, commit: str, changed: list[str], part: str,
+                 deleted: list[str], port: bool) -> None:
     what, steps = PARTS[part]
-    bundle = HERE / "bundles" / f"audit-{part}"
+    name = f"audit-next-{part}" if port else f"audit-{part}"
+    if port:
+        steps = [NEXT_LAYER_STEP if step[0] == NEXT_LAYER_STEP[0] else step
+                 for step in steps]
+    bundle = HERE / "bundles" / name
     if bundle.exists():
         shutil.rmtree(bundle)
     (bundle / "overlay").mkdir(parents=True)
@@ -153,21 +177,31 @@ def write_bundle(repo: str, head: str, commit: str, changed: list[str], part: st
             mounts.append([name, f"{ROOT}/{path}"])
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(show(repo, head, path))
+    for path in deleted:
+        target = bundle / "overlay" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(MISSING)
     shutil.copy(FIXTURES, bundle / "prepare_fixtures.py")
     (bundle / "run.py").write_text(RUN)
     (bundle / "steps.json").write_text(json.dumps(steps, indent=1) + "\n")
+    branch = "kernel-audit-next (the audit's port onto next-candidate)" if port else "kernel-audit"
+    gone = f" and {len(deleted)} deleted modules that fail to import" if deleted else ""
+    env = {
+        "HF_HUB_OFFLINE": "1",
+        "TILELANG_CACHE_DIR": f"/c/tilelang-{bundle.name}",
+        "VLLM_DS41_KERNEL_BACKEND": "tilelang",
+        "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
+    }
+    if port:
+        del env["VLLM_DS41_KERNEL_BACKEND"]
+        env["PYTHONPATH"] = "/b:/opt/spark-ds41f/candidate/vllm"
     candidate = {
         "description": (
-            f"The kernel audit (vLLM branch kernel-audit {commit}, {len(changed)} files over "
-            f"26382f5cf) on image -next-6 (candidate 6, spark-ds41f-1025): {what}; GPU tests, "
-            "then the gated benchmarks against the kernels the branch replaces."),
+            f"The kernel audit (vLLM branch {branch} {commit}, {len(changed)} files{gone} "
+            f"over 26382f5cf) on image -next-6 (candidate 6, spark-ds41f-1025): {what}; GPU "
+            "tests, then the gated benchmarks against the kernels the branch replaces."),
         "image": IMAGE,
-        "env": {
-            "HF_HUB_OFFLINE": "1",
-            "TILELANG_CACHE_DIR": f"/c/tilelang-audit-{part}",
-            "VLLM_DS41_KERNEL_BACKEND": "tilelang",
-            "PYTHONPATH": "/b:/opt/spark-ds41f/candidate/vllm:/opt/spark-ds41f/candidate/b12x",
-        },
+        "env": env,
         "workdir": "vllm",
         "argv": ["/b/run.py"],
         "verdict": "exit",
@@ -220,16 +254,26 @@ def write_arms(repo: str, head: str, commit: str, changed: list[str]) -> None:
 
 
 def main() -> None:
-    repo = sys.argv[1]
-    base = sys.argv[2] if len(sys.argv) > 2 else "26382f5cf"
-    head = sys.argv[3] if len(sys.argv) > 3 else "kernel-audit"
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("repo")
+    parser.add_argument("base", nargs="?", default="26382f5cf")
+    parser.add_argument("head", nargs="?")
+    parser.add_argument("--next", action="store_true", dest="port")
+    args = parser.parse_args()
+    repo, base = args.repo, args.base
+    head = args.head or ("kernel-audit-next" if args.port else "kernel-audit")
     commit = git(repo, "rev-parse", "--short=9", head).strip()
-    status = [line for line in git(repo, "diff", "--name-status", base, head).split("\n") if line]
-    assert all(line.split("\t")[0] in ("A", "M") for line in status), status
-    changed = [line.split("\t")[-1] for line in status]
+    status = [line.split("\t") for line in
+              git(repo, "diff", "--name-status", "--no-renames", base, head).split("\n")
+              if line]
+    allowed = ("A", "M", "D") if args.port else ("A", "M")
+    assert all(line[0] in allowed for line in status), status
+    changed = [line[-1] for line in status if line[0] != "D"]
+    deleted = [line[-1] for line in status if line[0] == "D" and line[-1].startswith("vllm/")]
     for part in PARTS:
-        write_bundle(repo, head, commit, changed, part)
-    write_arms(repo, head, commit, changed)
+        write_bundle(repo, head, commit, changed, part, deleted, args.port)
+    if not args.port:
+        write_arms(repo, head, commit, changed)
 
 
 if __name__ == "__main__":

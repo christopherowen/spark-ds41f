@@ -541,3 +541,32 @@ the old kernel and run 4's ef611d4a9:
 
 `pages` is unchanged: 1.51 against 1.58 µs (c1), 2.96 against 3.91 (c16), 5.76 against
 7.56 (a 256-row prefill chunk).
+
+## The port onto vLLM `next-candidate`
+
+The coordinator includes the audit ninth in the next candidate. vLLM `next-candidate`
+was at 4209a1903 (1025 plus 0492, 0500-0503, the softmax fix, 0491, the direct loader,
+the conditionals 0493-0496, 0497, the mHC cast and the SP exchange). The port is vLLM
+branch `kernel-audit-next` (worktree `~/projects/vllm-kernel-audit-next`), the seven
+commits cherry-picked onto 4209a1903 in order; 8e596b329 and its revert are skipped.
+
+| kernel-audit | kernel-audit-next | Resolution |
+|---|---|---|
+| 3cd92e872 | 7fac29e45 | The conditionals removed the Triton `_pages` and `_chunk` and rewrote the metadata tests as torch references. The live-page tests now compare `_ref_pages` on each row's live columns and keep the sentinel elsewhere (`_live_columns`, `_live_equal`). The decode-metadata test's main rows hold the step's requests in reverse and -1 past them. kv-zeroing's `replay = replay_start is not None` is kept with the `main_page` argument. |
+| bb2fb46ee | fc3f51e41 | `test_requests` and `test_tokens` become `test_builder` against `_ref_requests` and `_ref_tokens`; `_token_metadata` calls `metadata.builder`. |
+| 1072d662b | 1485c99f6 | The kernel change only; its test fixes are in 7fac29e45. |
+| a71368f70 | 4d8d0f28d | Clean. |
+| ef611d4a9 | 2c1ae9df6 | Clean. |
+| 26f3c89d6 | 259e54eca | The wide-table test compares `_ref_chunk` and `_ref_pages`. |
+| fb73c80cf | 3072e1838 | The same test change as on `kernel-audit`. |
+
+The kernels' bodies are as on `kernel-audit`; `metadata.py` differs from it only in
+next-candidate's own changes (its docstrings, and 0501's draft replay start).
+
+`make_audit_bundles.py ~/projects/vllm-kernel-audit --next` writes
+`bundles/audit-next-attention` and `bundles/audit-next-mhc`. They use the same image and
+steps; the overlay carries every package file between 26382f5cf and the port (98
+files), and next-candidate's 4 deleted modules as modules that fail to import. The
+attention layer step runs the whole layer file.
+
+### Run 7: both next bundles (vLLM kernel-audit-next 3072e1838): queued
