@@ -53,7 +53,7 @@ merged.
   binds; the forks cost about 0.04%.
 - **Built:** every kernel on the layer chain begins with `pdl.chain()`, TileKernels' casts and
   norms take DeepSeek's PDL switch, the warp-specialized GEMMs keep their launch (vLLM `pdl`
-  0b7952de4 and 75e6d02c7 over 26382f5cf). Scheduling only: the tests require identical bits.
+  0b7952de4, with tests in 75e6d02c7 and 59b72eb81, over 26382f5cf). Scheduling only: the tests require identical bits.
 
 ## How the critical path was computed
 
@@ -255,7 +255,8 @@ load instructions, not arithmetic. The tests check the bits anyway.
 
 ## Tests and benchmarks
 
-In vLLM `pdl` (75e6d02c7), run on GB10 by the bundles below; none has run yet.
+In vLLM `pdl` (75e6d02c7; 59b72eb81 adds the graph-edge and eager checks), run on GB10 by the
+bundles below.
 
 - `tests/kernels/test_deepseek_v41_tilelang_pdl.py`:
   - a reader that loads before its wait, after a producer that spins tens of microseconds,
@@ -263,7 +264,11 @@ In vLLM `pdl` (75e6d02c7), run on GB10 by the bundles below; none has run yet.
     programmatic and PDL does nothing); a reader that waits first never does, in 20 replays;
   - the layer chain (below) at 6, 24 and 48 rows, every intermediate buffer set to NaN before
     each of 20 graph replays, gives its eager digests every time;
-  - TileKernels' switch is on.
+  - TileKernels' switch is on;
+  - the early and waiting readers also as eager launches;
+  - the captured graphs read back through the driver (`cuGraphGetEdges_v2`): a waiting
+    reader's edge from its producer is programmatic and a torch kernel's is not; in the layer
+    chain every chain kernel whose one predecessor is a kernel has a programmatic edge.
 - `tests/kernels/deepseek_v41_pdl_sources.py`, a pytest plugin: every kernel a session launches
   is checked in its CUDA source. A chain kernel calls `cudaGridDependencySynchronize()` outside
   any block before any statement naming one of its pointer parameters, then
