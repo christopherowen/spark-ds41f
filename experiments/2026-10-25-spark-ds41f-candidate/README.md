@@ -570,39 +570,49 @@ Each spec at 8,192 has a twin at 6,144 (the same jobs on the 6,144 arms, run nam
 
 ### Run order
 
-Before re-cabling:
-1. candidate-6-tp4 has passed: one image ID on dgx1-dgx4, 0 failed release tests, and the
-   ring's gate. If the release tests fail, nothing here runs.
-2. This branch is in main. The lab runs only origin/main's specs, and its `sync` job moves the
-   node checkouts to origin/main, so merge it once the ring's release window has ended.
+**Done (2026-10-25):**
+- Candidate 6 is promoted on the ring as spark-ds41f-1025 (#596, deployed in #597). So
+  `config/cluster.json` is candidate 6's recipe, and its `tp3-triangle` carries no
+  `benchmark_reference` (and 4,096) until this qualification passes.
+- The owner re-cabled the triangle:
+  - dgx1's and dgx3's `40-cx7.yaml` are readdressed to 10.13.x from LLDP;
+  - every path direction passes a jumbo ping;
+  - GID index 3 is RoCE v2 IPv4 on every port;
+  - dgx4 is out.
+- `bin/spark site shape tp3-triangle --apply` has run, and dgx1-dgx3 are synced.
+- Production on the triangle is spark-ds41f-1022 at TP3, from 1022's frozen recipe.
 
-After re-cabling:
-1. The fabric:
-   - `scripts/cx7-config.py dgx1 dgx2 dgx3` (dgx-spark-fleet) finds the cables 1-2, 2-3 and
-     3-1 by LLDP.
-   - On dgx1 and dgx3, the two nodes the ring changed on 2026-10-23, install the triangle's
-     saved `40-cx7.yaml` (`~/spark-lab/topology-tp3/` on dgx1) and `netplan apply`.
-   - `ping -M do -s 8972` reaches both neighbours on both paths.
-   - GID index 3 is RoCE v2 `::ffff:<address>` on every port; a reboot can shift it.
-   - dgx4 stays out.
-2. `bin/spark site shape tp3-triangle --apply`, then `bin/spark cluster sync --apply`.
-3. Production at TP3 is spark-ds41f-1022:
-   - If main's `config/cluster.json` is still 1022's recipe, its tp3-triangle names
-     `manifests/suites/2026-10-22-spark-ds41f-1022-tp3` and the lab's default production
-     profile is right.
-   - If candidate 6 was promoted on the ring first, its recipe carries no TP3 reference until
-     this qualification passes. Pass every window command
-     `--production-config experiments/2026-10-23-next-release/1022/cluster.json` (1022 frozen).
-   - Start it and run `doctor --live`.
-4. On dgx1-dgx3, `docker image inspect spark-ds41f:19f2c20ed4d6-next-6 --format '{{.Id}}'` gives
+**The production profile is 1022 frozen in every lab command.** It is
+`experiments/2026-10-23-next-release/1022/cluster.json`. The default, `config/cluster.json` at
+the triangle, is not what serves. A window records its profile when it opens, restores it when
+it closes, and refuses a different one later. So the runner below opens the window with the
+frozen profile, and the other commands pass it too, so that they agree.
+`scripts/lab_idle_start.sh` hard-codes `config/cluster.json`, so do not use it here; it would
+fail to open the window, because `doctor --live` fails on that profile.
+
+1. This branch is in main: the lab runs only origin/main's specs, and its `sync` job moves the
+   node checkouts there.
+2. On dgx1-dgx3, `docker image inspect spark-ds41f:19f2c20ed4d6-next-6 --format '{{.Id}}'` gives
    candidate-6-tp4's image ID.
-5. `bin/spark workload --duration 15` shows no foreign requests. Dry-run each spec
-   (`scripts/lab.py run <spec> --dry-run`: 5, 20 and 19 steps, the same for the twins, no
-   problems).
-6. **The fit check at 8,192.** Queue it alone:
+3. `bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json doctor --live`
+   passes. `bin/spark workload --duration 15` shows no foreign requests.
+4. Dry-run each spec with the profile (5, 20 and 19 steps, the same for the twins, no
+   problems), for example:
 
 ```bash
-python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/prefill-tp3.json
+python3 scripts/lab.py run experiments/2026-10-25-spark-ds41f-candidate/rc6/prefill-tp3.json --dry-run --production-config experiments/2026-10-23-next-release/1022/cluster.json
+```
+
+5. **The fit check at 8,192.** Queue it alone:
+
+```bash
+python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/prefill-tp3.json --production-config experiments/2026-10-23-next-release/1022/cluster.json
+```
+
+   Then start the queue runner on dgx1, detached, with the profile:
+
+```bash
+ssh dgx1 'cd ~/projects/spark-ds41f && setsid -f python3 scripts/lab.py queue run --production-config experiments/2026-10-23-next-release/1022/cluster.json >> results/private/lab/queue-tp3.log 2>&1 < /dev/null'
 ```
 
    On dgx1, read the boot's KV line:
@@ -614,33 +624,39 @@ python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc
    - the KV line reads 4,009,281 tokens (below).
 
    The guards stay 5/3 GiB.
-7. **If it fits:** queue the qualification:
+6. **If it fits:** queue the qualification:
 
 ```bash
-python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/candidate-tp3.json
+python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/candidate-tp3.json --production-config experiments/2026-10-23-next-release/1022/cluster.json
 ```
 
    Once its two determinism hash pairs equal 1022's, queue the comparison:
 
 ```bash
-python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/release-tp3.json
+python3 scripts/lab.py queue add experiments/2026-10-25-spark-ds41f-candidate/rc6/release-tp3.json --production-config experiments/2026-10-23-next-release/1022/cluster.json
 ```
 
    Every boot at 8,192 must pass the startup guard: the fit check, the qualification and the
    comparison's two candidate boots. dgx1's start-up low varies by up to 0.76 GiB between boots
    of one build, so a later failure also means 8,192 does not fit.
-8. **If it does not fit:**
+7. **If it does not fit:**
    - Report to the owner: dgx1's lowest MemAvailable, the shortfall to 4.5 GiB, and the pool that
      would cover it. A full 1M context is 4,142 blocks, 0.88 GiB of pool.
    - The owner chooses between 8,192 with a smaller pool (a recipe change and a new fit check)
      and 6,144 at this pool. Nothing shrinks the pool without that choice.
    - The 6,144 path needs no new work. Queue `rc6/prefill-tp3-6144.json`, which passes on the
      same criteria with the KV line at 4,354,971 tokens. Then queue `rc6/candidate-tp3-6144.json`
-     and, once its hashes equal 1022's, `rc6/release-tp3-6144.json`. The promotion then sets
-     tp3-triangle to 6,144.
+     and, once its hashes equal 1022's, `rc6/release-tp3-6144.json`. Each takes
+     `--production-config experiments/2026-10-23-next-release/1022/cluster.json`.
 
-An empty queue keeps the window held, so each spec starts once it is queued. In total: about
-5 h 10 min at 8,192, 30 min more through the fallback.
+An empty queue keeps the window held, so each spec starts once it is queued. When the queue is
+done, `scripts/lab.py window close` restores 1022 at TP3. It takes the same `--production-config`;
+the hold's record wins anyway. In total: about 5 h 10 min at 8,192, 30 min more through the
+fallback.
+
+After a pass, the TP3 promotion carries two things into `config/cluster.json`'s `tp3-triangle`:
+the budget that qualified (8,192, or 6,144) and the candidate arm's release-tp3 run as
+`benchmark_reference`. Until then production on the triangle stays the frozen 1022.
 
 **The first boot compiles.** The triangle has not booted any build since the JIT caches moved
 to `/cache/spark-ds41f/jit`. It has not run the completion's TP3-shaped kernels or an 8,192
