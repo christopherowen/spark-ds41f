@@ -134,12 +134,10 @@ PROFILES["release"] = {
                (f"{_LATENCY}/mixed_latency.py", ["--rounds", "3"], "mixed")],
     "table": "scripts/release_table.py",
 }
-# TP3's recipe limits: eight streams, 512K context (sizes below max-model-len - 64).
+# TP3's recipe limits: eight streams; 1M context, as the ring (prefill at the ring's sizes).
 PROFILES["release-tp3"] = {
     **PROFILES["release"],
-    "bench_args": [{"1,2,4,8,16": "1,2,4,8",
-                    "1024,32768,131072,262144,524288,1000000": "1024,32768,131072,262144,500000"}.get(a, a)
-                   for a in PROFILES["release"]["bench_args"]],
+    "bench_args": [{"1,2,4,8,16": "1,2,4,8"}.get(a, a) for a in PROFILES["release"]["bench_args"]],
     "extras": [extra for extra in PROFILES["release"]["extras"] if extra[2] != "c16-distinct"],
 }
 BENCH_BASE = ["--compare", "none", "--suites", "decode,prefill",

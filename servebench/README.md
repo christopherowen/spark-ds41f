@@ -83,9 +83,10 @@ Built in:
   Poisson arrivals at 0.7 requests/s (about 80% of sixteen streams' rate) with goodput
   under a 2 s time to first token and 100 ms per output token, and prefill from 32K to
   1M. Version 1 had no Poisson step.
-- `screen-tp3` and `release-tp3`: the same for a server of eight streams and 512K of
+- `screen-tp3` and `release-tp3`: the same for a server of eight streams and 1M of
   context. They run eight (and four) streams, the grid up to eight requests
-  (`--max-requests`), Poisson at 0.42 requests/s and prefill to 500K.
+  (`--max-requests`), Poisson at 0.42 requests/s and prefill at the ring's sizes, to 1M.
+  `release-tp3` version 1 stopped at 500K, from when the triangle served 512K.
 
 Every built-in suite times the engine grid, so it needs a development server (below).
 
