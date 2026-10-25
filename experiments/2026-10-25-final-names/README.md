@@ -91,9 +91,11 @@ Every remaining line belongs to a class below.
 | node state: `cache/kkref -> spark-ds41f`, the stopped `dsv41-karmic-kraken` containers, `experiments/2026-10-23-next-release/1022/cluster.json` | dgx1-4, repository | kept | 1022 rollback, until the owner retires 1022. |
 | **B12X, live in serving** | config/cluster.json (`--load-format b12x`, `VLLM_PLUGINS=b12x_loader`, `local.spark-ds41f.b12x.tree`); docker/Dockerfile (source copy, install, import and io_uring checks, labels, `PYTHONPATH`); bin/spark build projects, parts, contexts and image tag; the lock's `b12x` source and the source manifest; validate.yml's B12X series job; docs/setup.md, docker/README.md | kept, plan below | The checkpoint loader. vLLM also imports B12X modules at load time, and B12X's preparation coordinator still runs. |
 | `VLLM_ENABLE_PCIE_ALLREDUCE=0` | recipe, `topology.RING_ENV` | kept | It turns the B12X PCIe all-reduce off explicitly; vLLM's default is off too. Both go when the conditionals branch removes the option. |
-| `kernel_backend` B12X default and profile | scripts/kernel_backend.py, tests/test_kernel_backend.py, bin/spark (bench identity default), scripts/model_layout.py (default), README (backend policy), docs/doctor.md (backend row), docs/current-state.md ("alternative backend") | conditionals session | It removes `VLLM_DS41_KERNEL_BACKEND` and the B12X paths, and has said it changes test_kernel_backend.py and the recipe's backend setting. |
-| B12X tests in `config/release-tests.json`, `scripts/release_tests.py` patterns, docs/testing.md's B12X classes | release tests | conditionals session | They follow the vLLM tree's tests, which that session removes. |
-| B12X modules in bin/spark's GPU import smoke (`b12x_roce_all_reduce`, `b12x_mla_sparse`) | bin/spark | conditionals session | The smoke must change in the same change that deletes the modules. |
+| `kernel_backend` B12X default and profile | scripts/kernel_backend.py, tests/test_kernel_backend.py, docs/doctor.md (backend row) | conditionals session (#591) | It removes `VLLM_DS41_KERNEL_BACKEND` and the B12X paths. |
+| what follows the backend policy | README (backend paragraph), bin/spark (bench identity default), docs/current-state.md ("alternative backend") | kept until #591 lands, then edit | The text describes the policy #591 changes. |
+| B12X tests in `config/release-tests.json` | release tests | conditionals session (#591) | They follow the vLLM tree's tests, which that session removes. |
+| `b12x` in `scripts/release_tests.py`'s patterns, docs/testing.md's B12X test classes | release tests | kept until the vLLM tree's B12X tests are gone | Both describe test files the tree still has. #591 edits only docs/testing.md's environment contract. |
+| B12X modules in bin/spark's GPU import smoke (`b12x_roce_all_reduce`, `b12x_mla_sparse`) | bin/spark (`SMOKE_SCRIPT`, `smoke_script()`) | conditionals session (#591) | Its vLLM 0494 deletes `b12x_roce_all_reduce.py`, so the smoke drops that import for a series with the `tilelang-only` capability. |
 | **RoCEnante transports**: `rocenante-direct/ring4/mesh4`, `B12X_VLLM_SETTINGS`, `B12X_ROCE_*` | scripts/topology.py; scripts/mesh_fabric.py and mesh_probe.py; bin/spark's RoCEnante checks, mesh4 probe and NIC inventory; scripts/probe_collectives.py's B12X branch; docs/switchless-topology.md, docs/doctor.md; tests (test_topology's B12X base, test_mesh_fabric) | delete after the conditionals branch (follow-up 1) | B12X-only, and dead: doctor already refuses them on every sparknet image. tests/test_kernel_backend.py still resolves its 10-03 twins through them, so they go after that file changes. |
 | **B12X tuning**: `bin/spark tuning`, scripts/transport_profiles.py, scripts/model_layout.py | bin/spark, scripts, tests/test_transport_profiles.py, README, TODO.md | delete after the conditionals branch (follow-up 1) | The catalog's two profiles are B12X recipes (`B12X_ROCE_SPIN_LIMIT` required), and test_kernel_backend.py's tuning test reads them. |
 | B12X lab fence check, `state/nan_probe.py` | scripts/lab.py, docs/lab.md, tests | **deleted** | B12X kernels only. |
@@ -104,10 +106,15 @@ Every remaining line belongs to a class below.
 ## Handed to the conditionals session
 
 `local_c364fbfd` removes `VLLM_DS41_KERNEL_BACKEND`, the B12X model and worker paths and config
-options, and the B12X test oracles. In spark-ds41f that leaves it the `kernel_backend` rows and
-the release-test rows above, plus bin/spark's import smoke. The RoCEnante and tuning deletions
-are follow-up 1. They wait for that branch's tests/test_kernel_backend.py, so the two branches
-never edit the same file.
+options, and the B12X test oracles (vLLM 0493-0496). It leaves the loader alone. Its spark-ds41f
+change is draft PR #591 (branch `retire-conditionals`):
+- scripts/kernel_backend.py, tests/test_kernel_backend.py, config/release-tests.json;
+- docs/doctor.md's Kernel backend row and docs/testing.md's environment contract;
+- bin/spark's import smoke.
+
+The RoCEnante and tuning deletions are follow-up 1, built on #591's tests/test_kernel_backend.py
+so the two branches never edit the same file. On #591's series vLLM refuses
+`VLLM_ENABLE_ROCE_ALLREDUCE=1` at startup, so the `rocenante-*` transports cannot start at all.
 
 ## vLLM
 
@@ -119,8 +126,7 @@ never edit the same file.
   it and no test reads it.
 - The patch is [vllm/0497](vllm/0497-spark-ds41f-names-the-indexer-s-split-check-is-SPARK.patch),
   numbered after the series in use: candidate 6 (to 0490), the KV capacity session's 0491, the
-  drafter window's 0492, and the conditionals session's 0493-0496 (its plan at 16:42 CET;
-  renumber if that block grows).
+  drafter window's 0492, and the conditionals session's 0493-0496 (confirmed by that session).
 - [vllm/series](vllm/series) is candidate 6's series with 0497. The patch applies on candidate
   6's tree (6f8e062f), and also on the conditionals session's working copy of `attention.py`.
 - The branch is not pushed. Pushing it would publish the frozen `tilelang-ports` history, as
