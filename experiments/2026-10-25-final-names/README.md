@@ -235,7 +235,7 @@ does. Concretely, as vLLM patches on the next release's base:
    `liburing` stays: vLLM's Engram reader uses it. That is a new image, so it is a release
    candidate of its own.
 
-### The direct loader: implemented, not run (2026-10-25, 17:40 CET)
+### The direct loader: implemented, checked on one node (2026-10-25, CET)
 
 Items 1 and 2 are the vLLM branch `direct-loader` on 26382f5cf (worktree
 ~/projects/vllm-direct-loader; local, not pushed, like the other research branches). The
@@ -280,13 +280,78 @@ conditionals, final names).
   file-backed descriptors in mixed and table-only shards, and the helper's build into the
   XDG cache. The rest of `tests/model_executor/model_loader/` still passes (168; the tests
   that need the conftest's fixtures do not run without it).
-- **Not run, needs a GPU:** the 38 tests in `test_direct_loader_cuda.py`. They are B12X's
-  `test_direct.py` for the bounce ring, the helper's capabilities, a loader-routed module
-  whose digest equals a Torch copy's, and file-backed tables beside routed weights. They
-  write under `DIRECT_IO_TEST_DIR` (default `/cache/direct-io-test`), because O_DIRECT needs
-  a real filesystem. Run them in a lab window with serving stopped, never beside a serving
-  container. The C helper was only compiled for syntax, against stub CUDA and liburing
-  headers with B12X's `-Wall -Wextra -Werror`.
+- **GPU tests:** the 38 tests in `test_direct_loader_cuda.py` are B12X's `test_direct.py`
+  for the bounce ring, the helper's capabilities, a loader-routed module whose digest equals
+  a Torch copy's, and file-backed tables beside routed weights. They write under
+  `DIRECT_IO_TEST_DIR` (default `/cache/direct-io-test`), because O_DIRECT needs a real
+  filesystem. They ran on dgx4 (below). Never run them beside a serving container.
+
+### Single-node checks on dgx4 (2026-10-25, CET)
+
+The owner opened dgx4 (uncabled, serving nothing) to sub-agents' GPU tests on 2026-10-25.
+dgx1-dgx3 were not touched. Both checks are kernel-lab bundles (docs/lab.md,
+`kernel-local`), written by [make_kernel_bundles.py](loader/make_kernel_bundles.py):
+- they mount bundles/direct (vLLM 6d5881d9c, 0498-0499) over candidate 6's image,
+  `spark-ds41f:19f2c20ed4d6-next-6` (`sha256:82b071b57485`);
+- they ran from this branch at e3def993, checked out in `~/spark-lab/agents/direct-loader/spark-ds41f`;
+- the command was `scripts/lab.py kernel-local experiments/2026-10-25-final-names/loader/kernel/<bundle> --out ~/spark-lab/agents/direct-loader/out/<bundle>`;
+- their output.txt and verdict.json are in [loader/runs/2026-10-25-dgx4/](loader/runs/2026-10-25-dgx4/).
+
+| Check | Bundle | Finished | Verdict |
+| --- | --- | --- | --- |
+| The branch's loader tests: test_direct_loader_cuda.py, test_direct_loader.py, test_weight_digest.py | [kernel/gpu-tests](loader/kernel/gpu-tests/) | 20:02 (12 s, after 52 min queued for the GPU lock) | **pass**: 93 passed, 0 skipped. The 14 warnings are Torch's `torch.jit` deprecation. |
+| One TP4 rank's share of DeepSeek-V4.1-Flash-1017, the direct loader against B12X's | [kernel/rank-load](loader/kernel/rank-load/) | 20:15 (149 s) | **pass**: equal digests, tensors, descriptors and samples |
+
+The helper built at first use, as serving would, into the bundle's XDG cache
+(`~/.cache/spark-lab/compile/xdg-direct-loader/vllm/direct_io/ca191a8547dad4fe7b46d9b9`).
+
+**rank-load** ([rank_load.py](loader/kernel/rank-load/rank_load.py),
+[rank_compare.py](loader/kernel/rank-load/rank_compare.py)) loads a stand-in for a TP4
+rank's shard set, not the model's own shard set: the model cannot be built without every
+rank.
+- **The plan:** rank 0's quarter of every 2-D tensor whose dimensions both divide, by rows
+  or by columns (every other name), and the rest whole.
+  - BF16 vectors are expanded to FP32 and FP32 tensors converted to BF16.
+  - The Engram tables become descriptors.
+- **The path:** each loader's own weights iterator (`DirectModelLoader`, and B12X's
+  `B12xModelLoader` with its bounce-mode session) and `copy_weight`, as weight loaders call
+  it. Each load runs in a process of its own.
+- **Outputs:** per-tensor SHA-256 lists on dgx4,
+  `~/spark-lab/agents/direct-loader/out/rank-load/tensors-{direct,b12x}-tp4-rank0.json`.
+
+| | direct | B12X |
+| --- | ---: | ---: |
+| tensors loaded / Engram descriptors | 96,081 / 4 | 96,081 / 4 |
+| loaded (GPU) | 71.585 GiB | 71.585 GiB |
+| weight digest | `a4893a5e…290c6fd` | `a4893a5e…290c6fd` |
+| tensors whose SHA-256 differ | 0 | |
+| sample checked against safetensors' reads | 89/89 equal | 89/89 equal |
+| load, routing 96,081 tensors included | 23.71 s | 23.89 s |
+| ring execution | 17.38 s | 17.21 s |
+| payload, physical reads | 76.88 GB, 191.86 GB | 76.88 GB, 191.86 GB |
+| strided copies, BF16 expansion, GPU scratch | 38.06 GB, 1.5 MB, 42.4 MB | the same |
+| MemAvailable before, lowest | 116.10, 43.82 GiB | 117.04, 44.48 GiB |
+| loader overhead (MemAvailable drop beyond Torch's 71.60 GiB reserved) | 0.68 GiB | 0.96 GiB |
+| lowest MemFree | 17.61 GiB | 18.07 GiB |
+| page cache before, highest, after | 25.730, 25.732, 25.732 GiB | 25.924, 25.928, 25.927 GiB |
+| weight digest time | 33.6 s | 33.5 s |
+
+Reading the table:
+- **The same reads:** reads, submissions within 1%, batches and descriptors are equal.
+  The direct loader is B12X's loader in bits, reads and speed.
+- **No page cache:** the page cache grows by under 5 MiB while 77 GB is read.
+- **Memory:** the overhead counts this script's Python objects for 96,081 tensors as well as
+  the loader's 16 MiB ring and 8 MiB scratch. The direct loader's is the smaller of the two,
+  so it adds nothing B12X does not to the 5 GiB startup guard on dgx1-dgx3.
+- **The digest's cost:** about 34 s per TP4 rank on the CPU, the time `SPARK_DS41F_WEIGHT_DIGEST=1`
+  adds to every boot of the loader spec (all arms alike, after "Loading weights took").
+- **Read amplification:** physical reads are 2.5 times the payload in both loaders. When a
+  strided shard's row is narrower than 4 KiB, B12X's ring packs rows into one read that
+  spans the full stride, so a column shard of a narrow-row tensor reads the other ranks'
+  columns too (`_bounce.c`, slot rows). Half of this plan's 2-D tensors are column shards.
+  Production's ratio depends on the model's own column shards; the loader spec's bytes-read
+  figure measures it. This is not something the port changes: it is the same bytes in both.
+
 
 ### Lab spec ([loader/](loader/))
 
@@ -359,8 +424,8 @@ Queued only; nothing runs during the freeze.
 - **vLLM:** the variable rename changes nothing while the variable is unset. It goes into the
   next candidate's series, and that candidate's gate (temperature-0 digests equal to 1025's)
   covers it.
-- **The direct loader:** `test_direct_loader_cuda.py` on a GB10 node (above), then the loader
-  spec.
+- **The direct loader:** its GPU tests and a one-rank load against B12X's passed on dgx4
+  (above). The loader spec needs the cluster.
 
 ## Follow-ups
 
@@ -372,8 +437,9 @@ Queued only; nothing runs during the freeze.
    - transport_profiles.py, model_layout.py and `bin/spark tuning`;
    - probe_collectives.py's B12X branch;
    - their tests and docs, and the RoCE marker reference.
-2. **The direct loader:** items 1 and 2 are implemented (vLLM 0498-0499). Next its GPU tests
-   and the loader spec, then the recipe (item 3), then the image without B12X (item 4).
+2. **The direct loader:** items 1 and 2 are implemented (vLLM 0498-0499), and its GPU tests
+   and a one-rank load equal to B12X's passed on dgx4. Next the loader spec (the cluster),
+   then the recipe (item 3), then the image without B12X (item 4).
 3. **dgx-spark-networking's AGENTS.md** still says `~/spark3-hold.json`. Once it says
    `~/spark-hold.json` (it is a public repository: the owner's call), lab.py's legacy hold and
    request names can go.
