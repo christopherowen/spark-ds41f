@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The generation controls' outputs, as digests two builds can compare bit for bit.
 
-usage: controls_digest.py BASE_URL [--tokens T] [--seed S]
+usage: controls_digest.py BASE_URL [--tokens T] [--seed S] [--scenarios NAME,...]
 
 token_determinism.py's eight prompts, thinking off unless a scenario turns it on, fresh
 cache salts, a fixed number of tokens. Each scenario sets one control the default
@@ -53,10 +53,13 @@ SCENARIOS = {
     "bad-words": {"temperature": 0.0, "bad_words": [" the", " and", "ing"]},
     "thinking-budget": {"temperature": 0.0, "thinking_token_budget": 48,
                         "chat_template_kwargs": {"thinking": True}},
-    # "prompt_logprobs" kills the engine in candidate 4 as well (scheduler.py's "no
-    # partial prefill outputs" assertion, 2026-10-24 run tilelang-ports-controls); it
-    # returns here with its fix.
     "logprob-ids": {"temperature": 0.0, "logprob_token_ids": LOGPROB_IDS},
+}
+# Prompt logprobs kill candidate 4's engine (scheduler.py's "no partial prefill outputs"
+# assertion, 2026-10-24 run tilelang-ports-controls; fixed by 0266): named only with
+# --scenarios, for a build that carries the fix.
+OPT_IN = {
+    "prompt-logprobs": {"temperature": 0.0, "prompt_logprobs": 5},
 }
 
 
@@ -106,11 +109,19 @@ def main() -> None:
     parser.add_argument("base_url")
     parser.add_argument("--tokens", type=int, default=96)
     parser.add_argument("--seed", type=int, default=20261024)
+    parser.add_argument("--scenarios", help="comma-separated scenario names "
+                        f"(default: {', '.join(SCENARIOS)}; also {', '.join(OPT_IN)})")
     args = parser.parse_args()
+    known = {**SCENARIOS, **OPT_IN}
+    names = args.scenarios.split(",") if args.scenarios else list(SCENARIOS)
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        raise SystemExit(f"unknown scenarios: {', '.join(unknown)}")
     client = Client(args.base_url.rstrip("/"))
     seeds = [args.seed + i for i in range(len(PROMPTS))]
     digests = {}
-    for name, controls in SCENARIOS.items():
+    for name in names:
+        controls = known[name]
         try:
             client.complete(PROMPTS[0], 1, seeds[0], controls)
         except urllib.error.HTTPError as error:

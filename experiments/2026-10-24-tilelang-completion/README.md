@@ -1324,9 +1324,10 @@ rejection sampler:
   the first sublayer's pre-mix and the collapses' mean.
 - **The target's MTP hidden-state buffer is gone** (58a492841). Nothing in DS4.1 reads
   it: no DS4.1 model defines `get_mtp_target_hidden_states`. Every forward copied the
-  four residual streams into it: 3.9 MB a c16 decode step, up to 655 MB a 16K prefill
-  chunk outside sequence-parallel prefill. Removing it frees
-  `max_num_batched_tokens × 40 KiB` a rank: 671 MB at 16384 tokens.
+  four residual streams into it: 3.9 MB a c16 decode step, and a whole prefill chunk's
+  rows outside sequence-parallel prefill. Removing it frees
+  `max_num_batched_tokens × 40 KiB` a rank (a rank is one GPU of the tensor-parallel
+  group): 335 MB on TP4 (8192 batched tokens) and 168 MB on TP3 (4096).
 - **The sink detector's column comes from the last collapse** (5998c7916). Before, a
   strided cast copy and a copy produced it.
 - **Greedy shard pairs in 16-byte rows** (955975341). The one-shot all-gather now
@@ -1411,3 +1412,70 @@ Bundle changes:
 - dgx4 gains the top-k/top-p tests and their benchmark gate.
 - The runner benchmark gains the draft budget case. Its offsets case now includes the
   Triton expand launch it replaces.
+
+### Eighteenth integrated run (2026-10-25 02:22 CEST)
+
+Misc passed: the rejection sampler's port, its gate and the other misc steps. The other
+three bundles failed, none on a kernel result:
+- **dgx1, runner:** `test_gpu_input_batch_v2.py` failed. The `logits_rows` helpers were
+  inserted between `InputBatch`'s fields and `make_dummy`, so `make_dummy` and the DCP
+  helpers became dead code inside a function.
+- **dgx3, mHC:** `test_engram_gates_only_the_real_local_rows` (sequence-parallel prefill)
+  stubs the B12X Engram mix. Under the TileLang backend the gate it never stubbed ran.
+  The test now pins the B12X path.
+- **dgx4, sampling:** every test passed (the sampling tests and the 83 top-k/top-p
+  tests). The sink-glue gate failed: the grammar bitmask was 1.2 µs slower at one
+  request. Its unread input-index stand-in was `cu_num_logits` converted to int64 on
+  every call, one more launch; an empty int64 tensor stands in now.
+
+All three are fixed in vLLM 44d2c45c1.
+
+## Nineteenth integrated run (run `tilelang-integration-kernels-19`)
+
+The owner, 2026-10-25: fix all failures and complete the TileLang porting before the
+comparison with the fused-kernel implementations. vLLM `tilelang-ports` adds, after
+run 18's fixes:
+- **Custom logprob token ids** (0267, 71f794e16, from `custom-logprob-token-ids`), with
+  its host test on the ports' launches (cda961641, c8a4d8ac6).
+- **The token log-softmax in TileLang** (b895a3f66): `logprob.py`'s Triton kernel.
+- **The heads' hidden rows** (2d43f872b): the LM head's and the drafter's
+  `hidden[indices]` gathers.
+- **Disk Engram without staging copies** (3b843753a, 530e7608b):
+  - The hash and the gate read the image sentinel from the token ids, so the two mask
+    kernels a step (one for the hash, one for the gate) are gone.
+  - The step's row IDs are hashed into layer-major planes. Each layer's reader stages
+    and gathers its own plane in place, as does the hash's live token count, so the
+    per-layer ID and count copies are gone.
+  - A rank's row gather writes only its own hash columns, side by side. The all-gather
+    takes them as 256-wide rows along the last dimension, which lands them in column
+    order. That removes the strided slice before the collective and the transpose
+    after it: two copies a layer a step.
+- **Prefill's glue:**
+  - sequence-parallel attention's front (31063d4ff): the norms write into the
+    all-gather's buffer, and one launch splits the gathered rows. Torch's cat and three
+    contiguous copies are gone.
+  - CED's routing mask and the drafter's packed context slots, one launch each
+    (c5a4a7c78).
+  - DSpark's eager context step joins the auxiliary states and stores the combined rows
+    in place (59d019164).
+  - NCCL's last-dimension all-gathers, when too large for the one-shot path, are
+    concatenated by one TileLang launch instead of torch's movedim copy (c34cb748f).
+  - CED's full-row output is zeroed in TileLang (ba1e1575f).
+  - Engram's sequence-parallel pad rows are copied in TileLang (1dfd6c6b7).
+- **The runner and the sampler:**
+  - dummy batches index logits rows in int64, as real steps do (bd408018c). The dummy
+    runs serving's kernels, and the heads' gather has no widening cast.
+  - a step without drafts slices constant offsets instead of building them
+    (fde639200).
+  - Gumbel-max sampling's finish (torch's argmax over the blocks and the gather of the
+    winner) is one kernel. The penalties' bincount rows are cleared in one launch, the
+    thinking budget's marker caches are reset in one, and the consumed drafts are
+    gathered for the grammar check (7059dafd4).
+  - new requests' draft and confidence rows are reset in one launch each (ce152b00e).
+
+Bundle changes:
+- runner (dgx1): the draft-token handler, adaptive verification, and the column,
+  CED and collective kernels.
+- mHC (dgx3): the Engram kernel tests (hash, gate, the reader's rows, io_uring on) and
+  the Engram model tests with the B12X backend they drive.
+- misc (dgx2): the logprob tests and the log-softmax and top-k id gates.

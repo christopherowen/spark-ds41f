@@ -6,7 +6,9 @@ usage: profile_prefill.py BASE_URL [--tokens N]
 
 The long prompt is about N tokens of numbered sentences (fresh cache salt, a few output
 tokens); the image request sends one generated 448x448 PNG with a question. Each is warmed
-once, then profiled; one JSON line a scenario in profiling order.
+once, then profiled; one JSON line a scenario in profiling order. The profiled image differs
+from the warm-up's (another grid), so the encoder cache misses and the profile holds the
+vision tower.
 """
 import base64
 import json
@@ -30,13 +32,14 @@ def post(path, body=None):
         return json.loads(text) if text.startswith(b"{") else None
 
 
-def png(width=448, height=448):
-    """A colour gradient with a grid, as a PNG (no imaging library needed)."""
+def png(width=448, height=448, cell=64):
+    """A colour gradient with a grid of ``cell`` pixels, as a PNG (no imaging library
+    needed)."""
     rows = bytearray()
     for y in range(height):
         rows.append(0)
         for x in range(width):
-            grid = 255 if (x % 64 == 0 or y % 64 == 0) else 0
+            grid = 255 if (x % cell == 0 or y % cell == 0) else 0
             rows += bytes((x * 255 // width, y * 255 // height, grid))
 
     def chunk(kind, data):
@@ -50,11 +53,18 @@ def png(width=448, height=448):
 with urllib.request.urlopen(BASE + "/v1/models", timeout=60) as response:
     MODEL = json.load(response)["data"][0]["id"]
 LONG = " ".join(f"Sentence {i} says that the river bends {i % 7} times before the sea." for i in range(TOKENS // 16))
-IMAGE = "data:image/png;base64," + base64.b64encode(png()).decode()
+
+
+def image_message(cell):
+    url = "data:image/png;base64," + base64.b64encode(png(cell=cell)).decode()
+    return [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}},
+                                         {"type": "text", "text": "Describe this image in one sentence."}]}]
+
+
+# name: (warm-up messages, profiled messages)
 SCENARIOS = {
-    "long-prefill": [{"role": "user", "content": LONG + "\nHow many sentences mention the sea?"}],
-    "image": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": IMAGE}},
-                                           {"type": "text", "text": "Describe this image in one sentence."}]}],
+    "long-prefill": ([{"role": "user", "content": LONG + "\nHow many sentences mention the sea?"}],) * 2,
+    "image": (image_message(64), image_message(56)),
 }
 
 
@@ -64,9 +74,9 @@ def chat(messages):
                                          "cache_salt": uuid.uuid4().hex})
 
 
-for name, messages in SCENARIOS.items():
+for name, (warm, messages) in SCENARIOS.items():
     try:
-        chat(messages)
+        chat(warm)
     except urllib.error.HTTPError as error:
         print(json.dumps({"scenario": name, "status": error.code,
                           "message": error.read().decode(errors="replace")[:300]}), flush=True)

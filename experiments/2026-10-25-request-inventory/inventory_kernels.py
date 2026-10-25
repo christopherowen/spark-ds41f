@@ -2,13 +2,17 @@
 """Each profiled request type's kernels by family, and every kernel that is not TileLang with
 the vLLM line that launched it.
 
-usage: inventory_kernels.py RUN_DIR LABEL [--node dgx1]
+usage: inventory_kernels.py RUN_DIR LABEL [--node dgx1] [--sources DIR,...]
 
 RUN_DIR is results/private/determinism/<run>; the traces are LABEL/<workload>-trace/<node>/,
 one a profiler window, in the order the workload printed its scenarios (LABEL/<workload>.json,
 one JSON line a scenario; rejected scenarios have no window). Families by kernel name: ATen
-(and CUB), NCCL, cuBLAS and CUTLASS, vLLM's CUDA kernels, Triton (vLLM names its Triton
-kernels with a leading underscore), and the rest, which are TileLang's (ours and TileKernels').
+(and CUB), NCCL, cuBLAS and CUTLASS, vLLM's CUDA kernels and Triton (vLLM names its Triton
+kernels with a leading underscore). The rest are named positively, never by elimination:
+TileLang when the name is a ``@T.prim_func``'s in the --sources trees (the vLLM checkout,
+TileKernels, sparknet; TileLang names a kernel after its function plus ``_kernel``), else
+by the engine whose Python frames launched it eagerly (tilelang/, triton/, cutlass/ or
+b12x/), else ``unknown``.
 An eagerly launched kernel's call site is the innermost vllm/ Python frame around the op that
 launched it (the arm records stacks); a kernel replayed from a CUDA graph has no stack and is
 placed by the TileLang kernels launched just before and after it on its stream.
@@ -27,6 +31,29 @@ node = sys.argv[sys.argv.index("--node") + 1] if "--node" in sys.argv else "dgx1
 # order (a run still in progress).
 traces_dir = Path(sys.argv[sys.argv.index("--traces") + 1]) if "--traces" in sys.argv else None
 trace_names = sys.argv[sys.argv.index("--names") + 1].split(",") if "--names" in sys.argv else []
+sources = sys.argv[sys.argv.index("--sources") + 1].split(",") if "--sources" in sys.argv else []
+
+
+def prim_func_names(roots: list[str]) -> set[str]:
+    """``<name>_kernel`` of every ``@T.prim_func def <name>`` under ``roots``."""
+    names = set()
+    pattern = re.compile(r"@T\.prim_func[^\n]*\n(?:\s*@[^\n]*\n)*\s*def\s+(\w+)\s*\(")
+    for root in roots:
+        for path in Path(root).expanduser().rglob("*.py"):
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if "prim_func" in text:
+                names.update(f"{name}_kernel" for name in pattern.findall(text))
+    return names
+
+
+TILELANG = prim_func_names(sources)
+# Kernel name -> engine, from eager launches' Python frames (analyze fills it per trace).
+ENGINES: dict[str, str] = {}
+ENGINE_FRAMES = (("tilelang", ("tilelang/",)), ("triton", ("triton/",)),
+                 ("cute/b12x", ("cutlass/", "b12x/", "/cute/")))
 
 
 def family(name: str) -> str:
@@ -43,7 +70,9 @@ def family(name: str) -> str:
         return "triton"
     if name.startswith(("void ", "memcpy", "memset")):
         return "other-cuda"
-    return "tilelang"
+    if re.sub(r"_\d+$", "", name) in TILELANG:
+        return "tilelang"
+    return ENGINES.get(name, "unknown")
 
 
 def short(name: str) -> str:
@@ -57,6 +86,7 @@ def short(name: str) -> str:
 def analyze(trace: Path) -> dict:
     events = json.load(gzip.open(trace))["traceEvents"]
     ops, launches, frames = {}, {}, collections.defaultdict(list)
+    engine_frames = collections.defaultdict(list)
     for e in events:
         if e.get("ph") != "X":
             continue
@@ -64,11 +94,31 @@ def analyze(trace: Path) -> dict:
             ops[e["args"]["External id"]] = e
         elif e.get("cat") in ("cuda_runtime", "cuda_driver") and "correlation" in e.get("args", {}):
             launches[e["args"]["correlation"]] = e
-        elif e.get("cat") == "python_function" and "vllm/" in e["name"]:
-            frames[e["tid"]].append((e["ts"], e["ts"] + e["dur"], e["name"]))
-    for row in frames.values():
+        elif e.get("cat") == "python_function":
+            if "vllm/" in e["name"]:
+                frames[e["tid"]].append((e["ts"], e["ts"] + e["dur"], e["name"]))
+            engine = next((engine for engine, marks in ENGINE_FRAMES
+                           if any(mark in e["name"] for mark in marks)), None)
+            if engine:
+                engine_frames[e["tid"]].append((e["ts"], e["ts"] + e["dur"], engine))
+    for row in (*frames.values(), *engine_frames.values()):
         row.sort()
     starts = {tid: [f[0] for f in row] for tid, row in frames.items()}
+    engine_starts = {tid: [f[0] for f in row] for tid, row in engine_frames.items()}
+    # An eagerly launched kernel's engine: the innermost engine frame around its launch.
+    for e in events:
+        if e.get("cat") != "kernel" or e["name"] in ENGINES:
+            continue
+        launch = launches.get(e.get("args", {}).get("correlation"))
+        if launch is None:
+            continue
+        row = engine_frames.get(launch["tid"], [])
+        i = bisect.bisect_right(engine_starts.get(launch["tid"], []), launch["ts"])
+        for j in range(i - 1, max(i - 5000, -1), -1):
+            begin, end, engine = row[j]
+            if begin <= launch["ts"] <= end:
+                ENGINES[e["name"]] = engine
+                break
 
     def site(op: dict) -> str:
         row, ts = frames.get(op["tid"], []), op["ts"]

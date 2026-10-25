@@ -26,8 +26,9 @@ IMAGE = "spark-ds41f:19f2c20ed4d6-next-4"
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
           "-p", "prepare_fixtures"]
 
-# name: (description, [(label, argv after python, timeout seconds[, env])]): env sets
-# a step's environment variables over the bundle's (None unsets one).
+# name: (description, [(label, argv after python, timeout seconds[, env])][, candidate]):
+# env sets a step's environment variables over the bundle's (None unsets one); candidate
+# adds keys to the bundle's candidate.json (io_uring for the disk Engram reader).
 PARTS = {
     "runner": (
         "the V2 runner's input preparation and token counts",
@@ -45,7 +46,16 @@ PARTS = {
                 # The grammar bitmask in TileLang (structured output).
                 "tests/v1/worker/test_gpu_tilelang_structured.py",
                 # Captured outputs written in place (vLLM ed9dae5ae).
-                "tests/v1/worker/test_graph_output_buffers.py"], 3600),
+                "tests/v1/worker/test_graph_output_buffers.py",
+                # The consumed drafts' gather, the new requests' row resets and the
+                # constant offsets of a step without drafts (run 19).
+                "tests/v1/worker/test_draft_tokens_handler.py",
+                "tests/v1/spec_decode/test_adaptive_verification.py",
+                # Prefill's glue: SP attention's front, CED's routing mask and slots,
+                # NCCL's last-dimension all-gathers, CED's zeroed full rows (run 19).
+                "tests/kernels/test_deepseek_v41_tilelang_columns.py",
+                "tests/kernels/test_deepseek_v41_tilelang_ced.py",
+                "tests/kernels/test_deepseek_v41_tilelang_collectives.py"], 3600),
             # Prompt logprobs under sink rejection (0266,
             # experiments/2026-10-24-prompt-logprobs-sink): scheduler tests, run without
             # the TileLang backend, whose aligned prefill chunks their test scheduler
@@ -112,9 +122,27 @@ PARTS = {
                 "tests/kernels/moe/test_deepseek_v41_tilelang_router.py",
                 "tests/models/test_deepseek_v4_1_ced_model.py",
                 "tests/models/test_deepseek_v4_1_sp_prefill.py"], 3600),
+            # Disk Engram (run 19): the hash and gate read the image sentinel from the
+            # ids, the IDs land in layer planes in place, the columns all-gather
+            # without copies, the reader's rows against b12x's lookup.
+            ("Engram tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-engram",
+                "tests/kernels/test_deepseek_v41_tilelang_engram.py",
+                "tests/kernels/test_deepseek_v41_tilelang_engram_hash.py",
+                "tests/kernels/test_deepseek_v41_engram_rows.py"], 3600,
+             {"ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test"}),
+            # The Engram model tests drive B12X's native hash and lookup (the masks
+            # in their B12X form): the TileLang backend unset.
+            ("Engram model tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-engram-model",
+                "-o", "faulthandler_timeout=240",
+                "tests/models/test_deepseek_v4_1_engram.py"], 3600,
+             {"VLLM_DS41_KERNEL_BACKEND": None,
+              "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test"}),
             ("mHC benchmark", ["benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py",
                                "--gate"], 3600),
         ],
+        {"io_uring": True},
     ),
     "misc": (
         "the embedding, DSpark's confidence head and context inputs, logprob ranks, the "
@@ -132,6 +160,17 @@ PARTS = {
                 "::test_rmsnorm_of_a_fused_projections_half",
                 # DSpark's context-graph inputs in one launch (vLLM 2b6d4613c).
                 "tests/kernels/test_deepseek_v41_tilelang_dspark_context.py"], 3600),
+            # Logprobs in TileLang (run 19): the token log-softmax, the top-k ids,
+            # and the verified tokens' custom-id logprobs (0267).
+            ("logprob tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-logprob",
+                "tests/v1/worker/test_gpu_tilelang_logprob_softmax.py",
+                "tests/v1/worker/test_gpu_tilelang_topk_ids.py",
+                "tests/v1/worker/test_gpu_verified_logprob_token_ids.py"], 3600),
+            ("logprob softmax benchmark",
+             ["benchmarks/kernels/benchmark_tilelang_logprob_softmax.py", "--gate"], 1800),
+            ("logprob top-k ids benchmark",
+             ["benchmarks/kernels/benchmark_tilelang_topk_ids.py", "--gate"], 1800),
             # The rejection sampler's block verification in TileLang (vLLM 4c7261200).
             ("rejection-sampler tests", PYTEST + [
                 "--basetemp", "/c/pytest-integration-rejection",
@@ -232,7 +271,7 @@ def main() -> None:
             print(f"{name}: overlay of {head_commit}")
         return
     fixtures = HERE / "bundles/sampling/prepare_fixtures.py"
-    for part, (what, steps) in PARTS.items():
+    for part, (what, steps, *extra) in PARTS.items():
         bundle = HERE / "bundles" / f"integration-{part}"
         if bundle.exists():
             shutil.rmtree(bundle)
@@ -269,6 +308,7 @@ def main() -> None:
             "argv": ["/b/run.py"],
             "verdict": "exit",
             "mounts": mounts,
+            **(extra[0] if extra else {}),
         }
         (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
         print(f"{bundle.name}: {len(changed)} files, {len(steps)} steps")
