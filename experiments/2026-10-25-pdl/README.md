@@ -36,7 +36,7 @@ merged.
   | Same-stream boundaries in the graphs (all) | 3.70 / 4.79 / 1.71% | measured gaps; PDL leaves the wait's release latency |
   | ... of which the prototype chains | 3.36 / 4.36 / 1.50% | receiving kernel begins with `pdl.chain()` or is TileKernels' |
   | Eager boundaries the prototype chains | 0.40 / 0.50 / 0.20% | measured; host-paced in part |
-  | Weight prologue before the wait (not built) | +0.80 / 0.99 / 0.43% | model: 1 us a weight GEMM boundary, capped by the predecessor |
+  | Weight prologue before the wait (not built) | < 0.80 / 0.99 / 0.43% | model: 1 us a weight GEMM boundary, capped by the predecessor; [the windows](#the-l2-weight-prefetch-windows) lower it |
   | Restructuring cross-stream joins | <= 0.21 / 0.15 / 0.08% | the shared expert's fork, SM contention and join |
   | Removing tiny kernels | (kernel-audit) | 790 kernels under 5 us on the c1 path, 1.81 ms (5.3%) |
 
@@ -44,6 +44,13 @@ merged.
   `griddepcontrol.wait`, so the boundary costs the wait's release instead of a launch. What part
   of the 0.51 us that is on GB10 is the first thing the lab measures
   ([benchmark_deepseek_v41_pdl_mechanism](#benchmarks)).
+- **The L2 prefetch windows are late, and neither PDL nor an earlier issue fixes that**
+  ([below](#the-l2-weight-prefetch-windows)). 77-87% of window instances still run when their
+  first consumer starts; the consumers' time above their L2 speed is 4.67% of a c1 greedy step
+  on the critical path. Issuing FFN and NEXT earlier inside their windows is bounded at 0.30%,
+  and a PDL prologue prefetch at 0.01% (window consumers) and 0.08% (weight GEMMs in no window).
+  The limit is DRAM time where the windows sit, not launch order. The prefetch join never
+  binds; the forks cost about 0.04%.
 - **Built:** every kernel on the layer chain begins with `pdl.chain()`, TileKernels' casts and
   norms take DeepSeek's PDL switch, the warp-specialized GEMMs keep their launch (vLLM `pdl`
   0b7952de4 and 75e6d02c7 over 26382f5cf). Scheduling only: the tests require identical bits.
@@ -127,10 +134,11 @@ all-reduces 4.71, LM heads 2.06, other small kernels 2.14, mHC 1.60, sparse MLA 
    start overlaps the predecessor. A weight GEMM could load its first weight tiles before the
    wait (weights never depend on the predecessor). Modelled at 1 us (a DRAM round trip and a
    first tile) per chained weight-GEMM boundary, capped by the predecessor's duration: +0.80 /
-   0.99 / 0.43%. It is a model, and an optimistic one for the dense GEMMs whose weights the L2
-   prefetch windows already bring in (WO, the FFN mixes, router and shared expert, the next
-   layer's attention projections): their first tile comes from L2. The routed experts' weights
-   (FC1, FC2) are the ones that come from DRAM. Not built.
+   0.99 / 0.43%. It is a model, and the window analysis below shows it is optimistic. Where a
+   window has finished, the first tile comes from L2 (about half the latency). Where it is
+   late, its own fill holds DRAM while the predecessor runs. Prefetching a consumer's weight in
+   its prologue is bounded at 0.01% (window consumers) and 0.08% (weight GEMMs in no window).
+   What remains is the first tile's latency, under about 0.4% at c1. Not built.
 3. **Restructuring cross-stream joins.** The shared expert's fork, its SM contention and the
    combine's join: at most 0.21 / 0.15 / 0.08%. The join itself never binds at c1 and costs 0.07% at c8. Not worth a
    restructure now; at c16, where FC1 holds the GPU longer, the c8 join cost would grow and is
@@ -140,6 +148,84 @@ all-reduces 4.71, LM heads 2.06, other small kernels 2.14, mHC 1.60, sparse MLA 
    one PDL boundary, so the two gains overlap by about 0.5 us a removed kernel.
 
 The ceiling is well above 0.5% at c1, so the prototype was built.
+
+## The L2 weight prefetch windows
+
+Owner's addition, 2026-10-25: coordinate the L2 weight prefetch with PDL. Prefetch the next
+operation's weights in the overlap windows, communication included, so they are resident when
+the next kernel starts; with PDL, the next kernel's prologue could issue or overlap those loads.
+[prefetch_windows.py](prefetch_windows.py) places every `l2_prefetch_kernel` on the critical
+path ([prefetch_windows.json](prefetch_windows.json); same traces and steps):
+
+```sh
+python3 -I experiments/2026-10-25-pdl/prefetch_windows.py results/private/determinism/request-inventory-5/ports
+```
+
+Each prefetch is placed by capture order (the graph node id): it is forked from the main
+kernel captured just before it. `l2_prefetch.py`'s three windows a layer are:
+- **WO**, forked after Q-B: WO-A and WO-B;
+- **FFN**, forked after WO-B, before the attention all-reduce: the FFN entry's mHC
+  projection, the router, the shared expert's gate/up and down;
+- **NEXT**, forked after the combine, before the MoE all-reduce: the next layer's mHC
+  projection, fused Q-A/KV and Q-B.
+
+A consumer's excess is its time above the median of its calls that started after their
+prefetch had finished, counted up to its share of the path.
+
+| c1 greedy (sampled, c8) | WO | FFN | NEXT |
+| --- | ---: | ---: | ---: |
+| Instances a step | 43 | 43 | 41 |
+| Prefetch kernel, p50 | 92 us (81, 104) | 72 us (60, 88) | 92 us (79, 104) |
+| Wait for the side stream at issue, p50 | 0.5 us | 0.5 us | 0.5 us |
+| Side stream idle before the issue, p50 | 27 us | 6 us | 406 us (241, 946) |
+| ... of it latency-bound path time just before the issue, p50 | 0 | 0 | 2.9 us |
+| Instances still running at the first consumer's start | 77% (65, 77) | 86% (75, 78) | 86% (87, 87) |
+| Lateness when late, p50 | 47 us | 27 us | 48 us |
+| Consumers' excess on the path | 722 us, 2.10% | 389 us, 1.13% | 493 us, 1.44% |
+
+- **The excess is 1.60 ms a c1 greedy step, 4.67%** (4.56% sampled, 1.39% at c8). The
+  moe-overlap session found the same (1.67 ms a step over the whole trace). By consumer at c1:
+  WO-B 529 us, fused Q-A/KV 269, the FFN entry's mHC projection 246, WO-A 193, the NEXT
+  window's mHC projection 149, the router 123, Q-B 75. The shared expert's down projection is
+  never late, and its gate/up mostly runs off the path.
+- **The windows are shorter than the fills.** At one stream a window has 27-57 us of
+  communication, or about 45 us of RoPE, cache writes, metadata and sparse MLA before WO-A,
+  against 72-92 us of fill. Over a c1 step the fills take 10.8 ms (126 a step) and the
+  latency-bound path time is 9.8 ms (all-reduce waits, small kernels, mHC, sparse MLA). The
+  idle DRAM time is there, but not where the windows' consumers need it.
+- **Joins and forks.** The prefetch join before the final mHC post never binds (0 to 0.12 us a
+  step). The 127 forks a step are where the graph executor switches the main chain's stream:
+  0.61 us median at a fork against 0.51 us elsewhere, about 13 us a step (0.04%). The busiest
+  stream's 2.1 us gaps are between the prefetch kernels themselves, off the path.
+- **Contention.** Latency-bound path kernels beside a fill take up to 1.0 ms a c1 step
+  (2.9%) longer than calls of the same kernel and grid alone. That figure mixes layer types:
+  the SWA-only layers' sparse MLA always runs beside the WO fill. The clean comparison is the
+  indexer layers' sparse MLA: 14.8 us beside the fill against 11.3 us alone. The recorded A/B
+  (the WO window alone nearly neutral) is the measured net.
+
+Bounds:
+- **Issuing FFN and NEXT earlier inside their windows** (never after their all-reduce): at most
+  0.30% c1 greedy, 0.37% sampled, 0.27% c8. An even fill gives about a third of that (0.09 /
+  0.15 / 0.08%). FFN is forked right after WO-B; NEXT right after FC2 and the 3 us combine. An
+  earlier issue runs the fill beside WO-B or FC2, which already read DRAM at bandwidth: the
+  bytes move from the consumer to that GEMM, and the time does not shrink. If DRAM were free
+  during the side stream's idle time (the MoE, mostly), the bound would be 1.98 / 2.70 / 0.75%.
+  That is unrealizable while the routed experts stream at bandwidth.
+- **PDL-coordinated prefetch**, a consumer issuing its own weight's L2 prefetch in its prologue:
+  at most 0.01% for window consumers, and 0.08 / 0.10 / 0.05% for the weight GEMMs in no window.
+  With `pdl.chain()` a kernel's prologue overlaps only the kernel before it, usually a 1-2 us
+  cast or norm. Where the window is late, its own prefetch already holds DRAM then. PDL cannot
+  reach back the 45-100 us a fill needs. It does not replace the side-stream windows.
+- **What would move the excess:**
+  - fewer bytes per window, in consumer order, so what lands first is read first;
+  - lines that survive the weight GEMMs between an earlier fill and its consumer: the
+    moe-overlap session's cache-priority hints and persisting-L2 set-aside;
+  - fills in latency-bound stretches no window uses now: the Engram layers' row wait and
+    all-gather (about 145 us) before the Engram projection (`gemm_mxfp8` 200 CTAs, 180 us,
+    two a step, in no window), and the indexer's Q-B (`gemm_mxfp8` 64 CTAs, about 10 a c1 step
+    on the path, 384 us, in no window).
+
+  Together they are bounded by the 4.67% excess pool and by L2's 24 MB.
 
 ## The prototype (vLLM `pdl`, two commits over 26382f5cf)
 
@@ -242,7 +328,10 @@ least 0.5%, no suite row slower beyond the run's own repeat. The specs need this
   `pdl.chain()` insertions touch the same kernels: a textual merge, and its merged metadata
   kernel needs `pdl.chain()` too. Every kernel it removes takes a PDL boundary with it.
 - **moe-overlap** (vLLM `moe-overlap`): `evict_first` on the routed experts' weights is
-  independent of PDL. The act-quant fold into `mhc_finalize` removes the cast between finalize
+  independent of PDL. Its cache-priority hints and the persisting-L2 set-aside are what could
+  let a fill start earlier, across a weight GEMM, and keep its lines; the windows' lateness
+  (above) sizes that: 77-87% of instances late by a median 27-48 us, 4.67% of the step in
+  excess at c1. The act-quant fold into `mhc_finalize` removes the cast between finalize
   and the projections (two boundaries become one, about 0.5 us a sublayer saved by either); the
   new finalize keeps `pdl.chain()`.
 - **fusion-survey**: its "PDL across the decode graphs" ceiling (1.9 / 2.4 / 1.1%) counted gaps up
@@ -264,6 +353,8 @@ least 0.5%, no suite row slower beyond the run's own repeat. The specs need this
 
 - [critical_path.py](critical_path.py), [critical_path.json](critical_path.json),
   [layer-c1.json](layer-c1.json): the analysis and its output.
+- [prefetch_windows.py](prefetch_windows.py), [prefetch_windows.json](prefetch_windows.json):
+  the L2 prefetch windows on the critical path.
 - [make_bundles.py](make_bundles.py), [run_steps.py](run_steps.py),
   [pdl_chain_ab.py](pdl_chain_ab.py), [bundles/](bundles), [overlay/](overlay): the bundles and
   the serving overlay, generated from vLLM `pdl`.

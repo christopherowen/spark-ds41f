@@ -171,6 +171,8 @@ def load(path):
                 end=e["ts"] + e["dur"],
                 name=e["name"],
                 grid=tuple(a.get("grid", ())),
+                # capture order inside a graph (the node id's low word)
+                node=a.get("graph node id", 0) & 0xFFFFFFFF,
                 block=tuple(a.get("block", ())),
                 stream=a.get("stream"),
                 launch=("G", a.get("correlation")) if graph else ("E", a.get("stream")),
