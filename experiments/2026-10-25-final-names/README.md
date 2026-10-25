@@ -301,6 +301,7 @@ dgx1-dgx3 were not touched. Both checks are kernel-lab bundles (docs/lab.md,
 | --- | --- | --- | --- |
 | The branch's loader tests: test_direct_loader_cuda.py, test_direct_loader.py, test_weight_digest.py | [kernel/gpu-tests](loader/kernel/gpu-tests/) | 20:02 (12 s, after 52 min queued for the GPU lock) | **pass**: 93 passed, 0 skipped. The 14 warnings are Torch's `torch.jit` deprecation. |
 | One TP4 rank's share of DeepSeek-V4.1-Flash-1017, the direct loader against B12X's | [kernel/rank-load](loader/kernel/rank-load/) | 20:15 (149 s) | **pass**: equal digests, tensors, descriptors and samples |
+| What `VLLM_PLUGINS` loads in the image (branch at aae32888) | [kernel/plugins](loader/kernel/plugins/) | 23:25 (16 s) | **pass**: empty loads no plugin (next section) |
 
 The helper built at first use, as serving would, into the bundle's XDG cache
 (`~/.cache/spark-lab/compile/xdg-direct-loader/vllm/direct_io/ca191a8547dad4fe7b46d9b9`).
@@ -352,6 +353,88 @@ Reading the table:
   Production's ratio depends on the model's own column shards; the loader spec's bytes-read
   figure measures it. This is not something the port changes: it is the same bytes in both.
 
+### For the next candidate (2026-10-25, 23:30 CET)
+
+The candidate includes the direct loader fifth, in the cleanup group, as the first step of
+retiring B12X.
+
+- **vLLM:** branch `direct-loader` (local, on 26382f5cf), head 6d5881d9c. Two commits, in
+  order: 9b04f1797 (0498, the weight digest), then 6d5881d9c (0499, `--load-format direct`).
+  - **Replay in the candidate's order:** on `next-candidate` (e0ccc837d), after 0492,
+    0500-0503, the softmax fix (53b741efc) and 0491, both apply without conflicts.
+  - **The next cleanup step conflicts:** the conditionals' first commit (a9b9addd2) conflicts
+    with 0501-0503 (kv-zeroing) in `vllm/models/deepseek_v4_1/attention.py`. 0498-0499 do
+    not touch that file.
+- **The recipe change** is two values:
+  - `serve_args`: `--load-format b12x` becomes `--load-format direct`;
+  - `environment.VLLM_PLUGINS`: `b12x_loader` becomes `""` (empty), not removed.
+
+  **Why empty, not removed:** while B12X is installed, an unset `VLLM_PLUGINS` loads every
+  general plugin in the image ([kernel/plugins](loader/kernel/plugins/), below).
+  - That is B12X's `b12x_fp6` and `b12x_loader` and vLLM's two LoRA resolvers.
+  - Every vLLM process then imports 64 B12X modules. Production's `b12x_loader` imports 54.
+  - An empty value loads none. Remove it once B12X leaves the image.
+
+  `SPARK_DS41F_WEIGHT_DIGEST` stays unset in production. Nothing else changes:
+  - the helper builds at each node's first boot into `XDG_CACHE_HOME`
+    (`/cache/spark-ds41f/jit`), with the compiler, liburing, pkg-config and CUDA headers that
+    B12X's build checks already require in the image;
+  - the serving container already runs with `--ulimit=memlock=-1:-1`, `IPC_LOCK` and
+    `seccomp=unconfined`, as B12X's ring needs.
+- **B12X cannot leave this candidate's image.** After the conditionals removal (0493-0496)
+  and the direct loader, DS4.1 serving still needs it for two things:
+  1. **The packed BF16 LM head** (`VLLM_DS41_PACKED_BF16_LM_HEAD=1`).
+     - `PackedBf16LmHeadMethod` (`model_executor/layers/quantization/online/packed_bf16.py`)
+       packs the head at load with `b12x.gemm.packed_bf16_vocab_projection.pack` and checks
+       its `is_supported`. That is B12X's local patch 0012: about 980 lines, its Triton
+       packing kernels included.
+     - Its `PackedBf16Weight` goes to the logits processor and the TileLang vocabulary
+       projection.
+     - Without B12X, `vocab_parallel_embedding` refuses the packed head.
+  2. **Engram** (`models/deepseek_v4_1/common/engram.py`).
+     - It imports `b12x.preparation.PreparedCall` and `b12x.sequence.engram` at module level.
+     - Disk tables (the recipe's) still call B12X's `build_compressed_token_map`,
+       `build_geometry` (which uses `b12x.sequence.ple_hash.reference.is_prime_64`) and
+       `Caps`, about 80 lines of Python. They also register a B12X preparation provider.
+     - Resident tables (device or RAM) use B12X's planned lookup.
+
+  Not in the recipe:
+  - `--load-format mxfp4_csf` (`b12x.moe.fused_moe`);
+  - the in-tree `b12x_loader.py` (the A/B's B12X arm uses the B12X package's plugin, not
+    this copy).
+
+  `vllm/utils/b12x.py` imports about 25 B12X modules whenever B12X is installed. Every DS4.1
+  TileLang path tolerates their absence (`has_b12x()`, the preparation coordinator, the
+  kernel getters).
+
+  **Once 1 and 2 are ported into vLLM,** the image change is:
+  - docker/Dockerfile:
+    - drop B12X's source copy, install, `PYTHONPATH` entry and `local.spark-ds41f.b12x.*`
+      labels;
+    - its loader-helper build check becomes the direct helper's (`_build()` under
+      `LIBRARY_PATH=/usr/local/cuda/lib64/stubs`, `liburing.so` linked).
+  - The recipe: `local.spark-ds41f.b12x.tree` leaves `expected_labels`, and `VLLM_PLUGINS`
+    goes.
+  - bin/spark: `b12x` leaves the build projects, parts, contexts and image tag.
+  - The lock's `b12x` source, and validate.yml's series job.
+  - The lab's B12X bundle support and `workdir` default.
+  - The "keep B12X" text in AGENTS.md and CONTRIBUTING.md.
+
+  `liburing` stays: the Engram reader and the direct loader use it.
+- **spark-ds41f:** PR #594, branch `direct-loader`, stacked on #590 (`final-names`).
+  - Records: this README, `loader/vllm` (patches and series), `bundles/`, the arms,
+    `loader/kernel` and `loader/runs`.
+  - Lab tooling: the arm key `serve_options` (scripts/recipe.py, tests/test_recipe.py,
+    docs/lab.md).
+  - No recipe or image change. The recipe change above is made in the candidate.
+  - Its own commits merge cleanly with every open PR branch. It inherits #590's conflict with
+    main in `scripts/lab.py` and `tests/test_lab.py`, from main's 1025 deployment. #590
+    lands first.
+- **Verified on dgx4 (above):** the GPU tests, a one-rank load bit-identical to B12X's, and
+  the plugin settings.
+- **Needs the cluster:** the serving boot A/B (loader-tp3/-tp4). It compares weight digests
+  across boots and loaders and temperature-0 digests, and measures the startup guard, load
+  time and API time.
 
 ### Lab spec ([loader/](loader/))
 
