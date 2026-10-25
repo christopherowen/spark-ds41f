@@ -1243,19 +1243,20 @@ def test_alternate_logprobs_kernels_are_declared():
                 logits_mode=logits_mode,
             )
         calls = prepare.declared_calls(registry)
-        keys = {(f, args) for f, args, _ in calls}
+        # By the factory's identity: TileLang's JIT functions are not hashable.
+        keys = {(id(f), args) for f, args, _ in calls}
         for dtype in (torch.bfloat16, torch.float32):
             assert (
-                tilelang_sampling.sink_rows_kernel,
+                id(tilelang_sampling.sink_rows_kernel),
                 tilelang_sampling.sink_rows_key(dtype, 3, logits_mode),
             ) in keys
             _, rank_args, _ = tilelang_logprob.rank_call(
                 dtype, vocab, vocab, torch.int64
             )
-            assert (tilelang_logprob.ranks_kernel, rank_args) in keys
+            assert (id(tilelang_logprob.ranks_kernel), rank_args) in keys
             dense = torch.empty((1, vocab), dtype=dtype, device=DEVICE)
             softmax = (
-                tilelang_logprob.topk_log_softmax_kernel,
+                id(tilelang_logprob.topk_log_softmax_kernel),
                 tilelang_logprob.topk_log_softmax_key(
                     dtype, tilelang_sampling._triton_run(dense)
                 ),

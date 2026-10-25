@@ -1902,3 +1902,13 @@ Run 25, one window:
 Then the release build (candidate 4's patch series plus the ports, built in an image
 job), the release tests, and the release comparison against production. That is the
 `release` profile with the single-stream suite behind the published tok/s figure.
+
+Run 25: misc and mHC passed, and so did the sampling gate (the drafter's argmax reported,
+not gated). Two harness bugs in tests failed runner and sampling; no kernel failed:
+- **The sink's declaration test** put TileLang's JIT functions in a set, and they are not
+  hashable. It now keys them by identity.
+- **The collectives' host-thread tests** reached the padding rows' TileLang fill with host
+  tensors. A host fill stands in for host tensors; on CUDA the kernel runs.
+
+vLLM 26382f5cf changes tests only. Run 26 repeats run 25's plan at it
+(`~/spark-lab/run26`, "RUN26 DONE").

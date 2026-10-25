@@ -70,6 +70,19 @@ class _Comm:
         fabric.barrier.wait()
 
 
+@pytest.fixture(autouse=True)
+def _host_zero_fill(monkeypatch):
+    """The rank-order all-reduce zeroes its padding rows with TileLang's 16-byte
+    fill, a CUDA kernel. These tests run the collectives on host tensors, where a
+    host fill stands in for it; on CUDA tensors the kernel itself runs."""
+    from vllm.models.deepseek_v4_1.tilelang import columns
+
+    zero_ = columns.zero_
+    monkeypatch.setattr(
+        columns, "zero_", lambda out: zero_(out) if out.is_cuda else out.fill_(0)
+    )
+
+
 def _run(inputs, collective=None):
     world = len(inputs)
     fabric = _Fabric(world)
