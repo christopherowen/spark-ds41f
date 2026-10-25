@@ -254,6 +254,8 @@ serve. Every run used `scripts/lab.py kernel-local BUNDLE --out OUT` on dgx4 its
 | vision-b12x-error, 20:36-20:40 | 7c3f538c | [bundles/vision-b12x-error](bundles/vision-b12x-error) | pass: 23 passed, 38 B12X error records |
 | targeted-2, 20:50-20:51 | 354066f8 (vLLM b9d7e37b6) | the vision, metadata, compressor and Engram files | pass: 206 passed |
 | release-tests-2, 20:52-21:17 | 354066f8 (vLLM b9d7e37b6) | [bundles/release-tests](bundles/release-tests), 97 files | **pass**: 5721 passed, 161 skipped, 0 failed (1476 s) |
+| review-nc, 10-26 00:16-00:18 | vLLM `next-candidate` 4209a1903 | metadata and CED metadata tests (below) | **FAIL**: 11 failed, 120 passed |
+| review-fix, 10-26 00:17-00:18 | vLLM `retire-conditionals-replay-ref` e20c47020 | the same two files | **pass**: 131 passed |
 
 The first run's failures, all in test files this branch changed. Serving code was not
 involved: the same TileLang kernels run in candidate 6.
@@ -273,6 +275,25 @@ involved: the same TileLang kernels run in candidate 6.
   rows without slots, and the TileLang ring ignores the input slots (as the deleted
   Triton `_tokens` did for ring groups). That step does not occur in serving. The
   scenario now pads as the runner does, and the pages stay untouched.
+
+**The next candidate's integration (review runs).** The vLLM branch `next-candidate` puts
+0493-0496 after 0500-0503, so 0501's draft-window bound meets 0495's removal of the Triton
+originals.
+- **The mismatch:** 0501 bounds draft windows by CED's replay start in the Triton `_chunk`
+  and in TileLang's chunk, and adds the `(draft, replay)` case to `test_chunk` and
+  `test_decode_metadata_equals_chunk_and_pages`. After 0495 those tests compare TileLang
+  with the torch `_ref_chunk`, whose draft branch had no replay bound.
+- **The run:** [make_review_bundle.py](make_review_bundle.py) builds a bundle of a vLLM head
+  over image -next-6, whose tree is 3bdf9558c's. It runs
+  `tests/kernels/test_deepseek_v41_tilelang_metadata.py` and
+  `tests/v1/attention/test_b12x_v41_ced_metadata.py`.
+  - next-candidate fails exactly the 11 `(draft, replay)` cases.
+  - `retire-conditionals-replay-ref` e20c47020 is next-candidate plus one test commit: the
+    reference bounds every row by the replay start, as 0501's Triton `_chunk` did. It
+    passes all 131 tests, including the coordinator's port of 0501's CED draft-window test
+    to TileLang's chunk (9730c7b62).
+- **CPU check:** a transliteration of 0501's Triton `_chunk` matches the fixed reference in
+  80 cases, the draft-replay ones included. The old reference fails the first.
 
 The release-test gate passes on the branch with its deleted modules failing to import:
 no gate test reaches them.
