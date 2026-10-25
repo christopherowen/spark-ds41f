@@ -64,7 +64,7 @@ Inputs:
   - 100 needs 2.74 tokens a step with half the overhead gone (+21%), or 3.31 at today's
     overhead.
   - The levers that would give it are a stronger drafter, suffix drafting on copy-heavy
-    agent text (about +6-15% tok/s there, nothing on the suite), or a stretch set that
+    agent text (+4.9% at c1 there as #601 measured, nothing on the suite), or a stretch set that
     needs an owner decision and a research item (110 tok/s, below).
 - **Measured on dgx4:**
   - FC1 costs about 14 µs a launch plus 11.4 µs an expert at six rows: 208 GB/s at 6
@@ -250,6 +250,10 @@ Notes:
   about +6-15% tok/s, not the +7-17% tokens a step quoted before row costs. The suite's
   distinct prompts barely copy. AgentX (#574) has no window yet.
 
+  **Superseded by #601** ([suffix-drafter](../2026-10-26-suffix-drafter/README.md)). That
+  record measured routes and wide-verification costs. It puts the go variant at +4.9% at c1
+  and +2.8% at c8 on agent traffic at TP4, and its 17-row step at 59.4 ms.
+
 ## Communication
 
 - **Totals at c1 greedy.** The one-shot all-reduces and all-gathers run 4.71 ms of kernels
@@ -291,7 +295,7 @@ communication, fusion, PDL and the fixed costs.
 | 10 | Every byte at 273 GB/s (the specification) | +1.7% (75.6) | measured marginal 266.6 GB/s | none in reach | - |
 | 11 | FC2 at FC1's per-byte rate (inside 2a) | +0.9% (75.0) | FC2 at 91.7% of FC1 traced, 90-97% bench | S-M (retile probe) | none |
 | 12 | LM heads at the marginal rate (inside 2a) | +0.7% (74.8) | 240.7 against 266.6 GB/s | M | none |
-| 13 | Suffix drafting (agent traffic only) | suite ~0; agents +6-15% | copy probe with row prices | L (hybrid drafter, variable blocks) | none to outputs |
+| 13 | Suffix drafting (agent traffic only) | suite ~0; agents +4.9% c1, +2.8% c8 (measured, #601) | copy probe with measured routes and wide-verify costs | L (hybrid drafter, variable blocks) | none to outputs |
 | 14 | Draft trees at c1 | +1.3% at best, −3.7% likely | row price against second-candidate odds | XL | none to outputs |
 | - | mHC `fn` as BF16 | 0 | measured: 42,270,042 of 42,270,720 values are not exactly BF16 | - | would change arithmetic |
 
@@ -327,6 +331,32 @@ three quarters of the non-byte time is 21%.
 Every lever within our constraints adds at most a few percent of tokens a step on the suite.
 Only the oracle-policy bound (2.41-2.60) and a stronger drafter reach the range.
 
+## What is built or coming for the next candidate (2026-10-26, CET)
+
+Each item is the effect its own record measured or estimated at c1, set against the levers
+above. The c1 decode items consume part of row 2, the 8.7 ms non-byte time.
+
+| Item | Status | Effect at c1 on the suite | Lever row |
+| --- | --- | --- | --- |
+| mHC finalize writes the MXFP8 cast (#587) | on `next-candidate` | −4.3 µs a decode layer (−6.2 at c16): about 0.17 ms a step, +0.6% | 2b |
+| SP prefill exchange under the combine (#593) | on `next-candidate` | prefill only; 0 at c1 decode | - |
+| Kernel audit: decode metadata in one launch over live pages (#585) | coming | 1.5-1.8 against 3.3-4.1 µs a call. That is 23 calls a step in the traces, 35-60 µs, +0.1-0.2%. The audit's whole estimate, with the mHC projection fix, is 1.1-1.6%. | 2b |
+| 64-row prefill tiles, memory cuts (0504-0507) | coming | prefill and memory; 0 at c1 decode | - |
+| PDL along the layer chain (#589) | coming | c1 layer chain −1.3 to −1.8%, so +1.3-1.8% | 2a, 2b |
+| Suffix drafter beside DSpark (#601, record) | design merged, build next | suite ~0; agent traffic +4.9% c1, +2.8% c8 (go variant, TP4) | 13 |
+
+- **On the suite,** the c1 decode items together are +2.0-2.6%, or +3.0-4.0% if the audit's
+  full estimate holds: about 76-77 tok/s. That is 0.6-1.2 ms of the 8.7 ms non-byte time.
+- **The credible set** removes half of the non-byte time (4.35 ms), so 3.2-3.8 ms of it is
+  still unclaimed.
+- **The largest unclaimed items** are:
+  - one continuous FC1+FC2 stream (row 5: 1.24 ms of launch fixed costs);
+  - the prefetch and consumer timing (about 3.5 ms of row 2a);
+  - the mHC boundary restructure (fusion survey rows 2-4).
+- **100 tok/s** still needs 83% of the non-byte time at today's tokens a step, or 2.74
+  tokens a step with half of it gone. Nothing built or coming moves tokens a step on the
+  suite.
+
 ## Review of the 2026-10-24 plan ("Toward 100 tokens a second", [tilelang-completion](../2026-10-24-tilelang-completion/README.md))
 
 - **The routed MoE is 49% of the main stream.** Holds. In bytes it is 44% of the floor.
@@ -344,12 +374,16 @@ Only the oracle-policy bound (2.41-2.60) and a stronger drafter reach the range.
   trees can wait for a higher-concurrency study.
 - **"Suffix drafting on agent traffic, +7-17% at one stream."** That is tokens a step
   before verification. In tok/s it is about +6-15% on agent traffic, and nothing on the
-  suite.
+  suite. #601 since measured +4.9% at c1.
 - **"Measure each kernel's achieved bandwidth against GB10's roofline at one and sixteen
   streams."** Done here for c1 and c8 from the existing traces (floor.py) with the
   expert-rate bundle.
 
 ## Runs on dgx4 (2026-10-25, CET)
+
+The commits below are the ones the runs checked out, from before the branch was rebased onto
+main on 2026-10-26. Their experiment folders are identical to the rebased commits':
+8aeb9c4f is 78f83d8a, 1d06aab0 is 455f9c57 and 562301b4 is cabecef7.
 
 dgx4 is uncabled and serves nothing. Every run used its own checkout of this branch,
 `~/spark-lab/agents/c1-100tps/spark-ds41f`, and the image `spark-ds41f:19f2c20ed4d6-next-6`
@@ -412,7 +446,14 @@ dgx4 is uncabled and serves nothing. Every run used its own checkout of this bra
    - **Entropy:** E4M3 codes 6.579 of 8 bits; E2M1 nibbles 3.895 of 4; the BF16 sign and
      exponent byte 2.88 of 8.
 
-## Lab specs (prepared, not queued)
+## Lab specs
+
+Status on 2026-10-26 (CET): nothing of this record is queued or running.
+- **c1-acceptance.json is still to run.** It needs the TP4 ring, and the owner re-cabled the
+  cluster to the TP3 triangle on 2026-10-25. Queue it when the ring is back.
+- **expert-rate.json** ran as `kernel-local` on dgx4 (pass, above); the cluster form is an
+  optional repeat on another node.
+- **weight_stats.py** is done.
 
 1. **[c1-acceptance.json](c1-acceptance.json)** runs a `measure` job with the suite file
    [c1-acceptance-suite.json](c1-acceptance-suite.json), on arms spark-ds41f-1025,
@@ -439,7 +480,8 @@ dgx4 is uncabled and serves nothing. Every run used its own checkout of this bra
 
 - **The routing sample is small.** It is one prompt and eight tokens, so three windows of
   six rows a layer. The traced windows' expert counts (19.9 at mostly six-row buckets,
-  11.3 at three rows) fall where it predicts for 4-5 and 3 live rows.
+  11.3 at three rows) fall where it predicts for 4-5 and 3 live rows. #601's reference runs
+  over four conversations since found 22-24 experts at six rows, as here.
 - **The overhead comes from the traced greedy window.** It assumes the suite's step has
   the same absolute non-byte time. The stacked traces may overstate host gaps.
 - **Survival past position 3 at c1 is bracketed, not measured.** c1-acceptance.json
