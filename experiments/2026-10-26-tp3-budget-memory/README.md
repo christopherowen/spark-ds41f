@@ -1,5 +1,17 @@
 # What limits TP3's long-prefill budget, and what would raise it
 
+**Status (owner, 2026-10-25 evening CET): the cluster measurement is dropped.**
+- The study was asked for on the belief that the triangle's 4,096 → 8,192 step bought only 1-3%
+  prefill. It bought +10-13% (experiments/2026-10-19-prefill-budget-tp3), and candidate 6 at
+  8,192 is about +26-29% over spark-ds41f-1022 on the triangle.
+- So the TP3 budget sweep below ([tp3-budget-memory.json](tp3-budget-memory.json)) is not queued,
+  and this record is not merged for it. It stays as a draft record for next week.
+- **Still worth pursuing, whatever the budget:**
+  - the 64-row MoE tiles for prefill forwards (lever 1): +3.5-5% prefill on both shapes, outputs
+    bit-identical on dgx4;
+  - the memory cuts (levers 2-4): layer 20's candidates as block ids, the drafter's workspace lane
+    without the target's indexer scratch, the two unread buffers.
+
 Owner, 2026-10-25: why can the ring's long-prefill budget (`max_num_batched_tokens`) go so
 much higher than the triangle's, and should the implementation improve?
 
@@ -288,8 +300,8 @@ its own branch.
 
 ### Queued: nothing
 
-The cluster is busy with candidate 6's TP3 qualification and release comparison. Queue these
-afterwards, with the coordinator's go:
+The cluster sweep (item 1) was dropped by the owner on 2026-10-25 (see the status at the top). It
+is kept here, ready, in case candidate 6's own cost per budget token is wanted later.
 
 1. **[tp3-budget-memory.json](tp3-budget-memory.json): the TP3 budget sweep with the allocator
    trace.**
