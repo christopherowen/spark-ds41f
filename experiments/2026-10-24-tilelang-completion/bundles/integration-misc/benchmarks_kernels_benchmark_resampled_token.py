@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Paired graph timings for DS41F's resampled-token insertion, against Triton.
 
+With --dead-rows, the insertion that caps each count at its dead-row cut plus one,
+against what the rejection sampler launched before it took the cap: the uncapped
+insertion, then torch's ``dead_row_cut + 1`` and ``torch.minimum``.
+
 Eight allocations per case, alternating measurement order, and a paired 95%
 interval. --gate rejects a slowdown; --threads screens fixed launch layouts.
 """
@@ -50,7 +54,7 @@ def elapsed(capture, reset):
     return begin.elapsed_time(end) * 10
 
 
-def measure(requests, blocks, threads, seed, mixed):
+def measure(requests, blocks, threads, seed, mixed, dead_rows=False):
     ours, theirs, differences = [], [], []
     for sample in range(8):
         torch.manual_seed(seed + sample)
@@ -69,10 +73,35 @@ def measure(requests, blocks, threads, seed, mixed):
         if mixed:
             temp[mapping[::12]] = 0
         kernel = port.insert_kernel(
-            blocks, "float32", "int64", threads, 6, blocks, blocks
+            blocks, "float32", "int64", threads, 6, blocks, blocks, dead_rows
+        )
+        # Cuts from -1 to past the last row.
+        cut = torch.randint(-1, 7, (requests,), device="cuda", dtype=torch.int32)
+        capped = torch.empty_like(counts)
+        capped_views = list(capped.unbind())
+        uncapped = port.insert_kernel(
+            blocks, "float32", "int64", threads, 6, blocks, blocks, False
         )
 
-        def original(
+        def torch_capped(
+            i,
+            uncapped=uncapped,
+            sampled=sampled,
+            count_views=count_views,
+            capped_views=capped_views,
+            ids=ids,
+            values=values,
+            cu=cu,
+            mapping=mapping,
+            temp=temp,
+            cut=cut,
+        ):
+            uncapped(
+                sampled, count_views[i], ids, values, cu, mapping, temp, count_views[i]
+            )
+            torch.minimum(count_views[i], cut + 1, out=capped_views[i])
+
+        def triton_insert(
             i,
             sampled=sampled,
             count_views=count_views,
@@ -107,14 +136,26 @@ def measure(requests, blocks, threads, seed, mixed):
             cu=cu,
             mapping=mapping,
             temp=temp,
+            cut=cut,
         ):
-            kernel(sampled, count_views[i], ids, values, cu, mapping, temp)
+            kernel(
+                sampled,
+                count_views[i],
+                ids,
+                values,
+                cu,
+                mapping,
+                temp,
+                cut if dead_rows else count_views[i],
+            )
 
         def reset(counts=counts, initial=initial):
             counts.copy_(initial.expand_as(counts))
 
+        original = torch_capped if dead_rows else triton_insert
         original(0)
-        expected, expected_counts = sampled.clone(), counts[0].clone()
+        expected = sampled.clone()
+        expected_counts = (capped if dead_rows else counts)[0].clone()
         sampled.fill_(-1)
         reset()
         candidate(0)
@@ -135,6 +176,10 @@ def measure(requests, blocks, threads, seed, mixed):
         "requests": requests,
         "blocks": blocks,
         "mixed": mixed,
+        "dead_rows": dead_rows,
+        # The "triton_us" timings are the reference's: with dead_rows, the uncapped
+        # insertion and torch's cap.
+        "reference": "insertion + torch cap" if dead_rows else "triton",
         "threads": threads,
         "tilelang_us": statistics.median(ours),
         "triton_us": statistics.median(theirs),
@@ -156,6 +201,7 @@ def main():
     parser.add_argument("--requests", default="1,8,16,96")
     parser.add_argument("--blocks", default="3,4,127")
     parser.add_argument("--mixed", action="store_true")
+    parser.add_argument("--dead-rows", action="store_true")
     args = parser.parse_args()
     layouts = (
         [None] if args.threads == "auto" else list(map(int, args.threads.split(",")))
@@ -167,6 +213,7 @@ def main():
             (1 if blocks <= 4 else port._THREADS) if threads is None else threads,
             args.seed,
             args.mixed,
+            args.dead_rows,
         )
         for threads in layouts
         for blocks in map(int, args.blocks.split(","))

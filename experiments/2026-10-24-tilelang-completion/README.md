@@ -1802,3 +1802,27 @@ from each arm's log:
 - B12X preparation lines and temporary KV blocks;
 - JIT monitor reports;
 - TileLang preparation time and engine init time.
+
+Run 23 stopped before the cleanup check. Misc and mHC passed. Runner and sampling failed:
+- **The sampling gate flagged `select_first_argmax` at 16 rows**: TileLang 1.346 µs
+  against Triton 1.291 µs (+0.07 µs, interval [0.025, 0.112]).
+  - Runs 20-22 show the same lean, 1-9% behind at 16 and 96 rows, just under the gate's
+    threshold until now.
+  - The kernel launched a warp a row, a block for each. vLLM 5d6fcb05d gives a thread a
+    row: its pairs are loaded before the first combine, then combined in rank order. The
+    combine is a total order, so the result is unchanged, and one block covers a
+    verification batch.
+- **The runner's new startup-tests step failed, on the test harness.**
+  - Under `--noconftest`, `tests/jit_monitor/test_hooks.py` lost the conftest that resets
+    the monitor between tests.
+  - `tests/engine/test_arg_utils.py` needs Hugging Face access the bundle does not have.
+  - The attention file's older B12X-path tests are stale: bare modules without
+    `_decode_capacity` and `_main_width`, and fixtures from the repository's conftest.
+    They were never in a bundle before.
+
+  The step now runs only the new startup tests. The monitor's tests get a step of their
+  own with their conftest (`--confcutdir tests/jit_monitor`). The new tests that did run
+  in run 23 passed: compressor, B12X warm-up gate, warm-up blocks and mixed warm-up.
+
+Run 24 runs the bundles at 5d6fcb05d; if they pass, the cleanup check follows
+(`~/spark-lab/run24` on dgx1, "RUN24 DONE").

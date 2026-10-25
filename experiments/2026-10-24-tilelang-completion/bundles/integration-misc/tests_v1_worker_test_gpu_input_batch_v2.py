@@ -153,19 +153,79 @@ def test_token_counts_owner_declares_both_index_and_dead_row_variants():
     with registry.activate():
         register_input_batch_warmups(dead_rows=True)
     calls = [c for c in prepare.declared_calls(registry) if c[0] is counts_kernel]
-    assert len(calls) == 4
+    # Both dead-row variants, and the sampler's one-token counts, by either index.
+    assert {(args[0], args[1], args[3]) for _, args, _ in calls} == {
+        (dead, index, one)
+        for dead, one in ((False, False), (True, False), (False, True))
+        for index in ("int32", "int64")
+    }
     prepare.prepare_declared(registry)
-    for dead_rows in (False, True):
+    for dead_rows, one in ((False, False), (True, False), (False, True)):
         for dtype in (torch.int32, torch.int64):
             ones = torch.ones(1, device="cuda", dtype=torch.int32)
+            sampled = torch.full_like(ones, -5) if one else ones
             rejected = torch.empty_like(ones)
             idx = torch.zeros(1, device="cuda", dtype=dtype)
             cu = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
             count_tokens(
-                ones, rejected, ones, cu, idx, ones, ones if dead_rows else None
+                sampled,
+                rejected,
+                ones,
+                cu,
+                idx,
+                ones,
+                ones if dead_rows else None,
+                one,
             )
-            assert ones.item() == 1
+            assert sampled.item() == 1
             assert rejected.item() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("requests", [1, 8, 16, 127, 128, 129, 257])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_one_sampled_token_counts_without_a_fill(requests, index_dtype):
+    """The sampler's counts (one token a request, none for a request still
+    prefilling): ``get_num_sampled_and_rejected(None, ...)`` writes what the counts
+    of ``seq_lens.new_ones(num_reqs)`` were, the Triton kernel's too, into a fresh
+    tensor, its inputs untouched, in one launch."""
+    from vllm.v1.worker.gpu.input_batch import (
+        _get_num_sampled_and_rejected_kernel,
+        get_num_sampled_and_rejected,
+    )
+
+    torch.manual_seed(97 + requests)
+    capacity = requests + 19
+    idx = torch.randperm(capacity, device="cuda")[:requests].to(index_dtype)
+    prefill = torch.randint(1, 1048577, (capacity,), device="cuda", dtype=torch.int32)
+    seq = (
+        prefill[idx.long()]
+        + torch.arange(requests, device="cuda", dtype=torch.int32) % 3
+        - 1
+    )
+    cu = torch.arange(requests + 1, device="cuda", dtype=torch.int32) + 7
+    read_only = [seq, cu, idx, prefill]
+    before = [x.clone() for x in read_only]
+
+    expected, expected_rejected = get_num_sampled_and_rejected(
+        seq.new_ones(requests), seq, cu, idx, prefill
+    )
+    triton_sampled = seq.new_ones(requests)
+    triton_rejected = torch.empty_like(triton_sampled)
+    _get_num_sampled_and_rejected_kernel[(requests,)](
+        triton_sampled, triton_rejected, seq, cu, idx, prefill, triton_sampled
+    )
+    actual, rejected = get_num_sampled_and_rejected(None, seq, cu, idx, prefill)
+    assert actual.dtype == rejected.dtype == torch.int32
+    assert actual.shape == rejected.shape == (requests,)
+    assert torch.equal(actual, expected)
+    assert torch.equal(rejected, expected_rejected)
+    assert torch.equal(actual, triton_sampled)
+    assert torch.equal(rejected, triton_rejected)
+    assert torch.equal(actual, (seq >= prefill[idx.long()]).int())
+    assert not rejected.any()
+    for x, saved in zip(read_only, before):
+        assert torch.equal(x, saved)
 
 
 @pytest.mark.parametrize(

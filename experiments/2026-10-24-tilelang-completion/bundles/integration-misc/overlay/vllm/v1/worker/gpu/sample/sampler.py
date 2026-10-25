@@ -119,7 +119,9 @@ class Sampler:
         )
         for logits_stride in processed_logits_strides:
             register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
-        # Top-k / top-p over the processed logits, at up to every request's rows.
+        # Top-k / top-p over the processed logits, at up to every request's rows,
+        # and the gathers of their per-request values (get_top_k_top_p).
+        self.sampling_states.register_warmups()
         tilelang_topk_topp.register_top_k_top_p(
             logits_strides=processed_logits_strides,
             vocab_size=vocab_size,
@@ -225,8 +227,9 @@ class Sampler:
         # 1 sampled token per request, except chunked-prefill requests
         # (seq_len < prefill_len) which aren't done prefilling and produce no
         # output token. num_rejected is always 0 here (one logit per request).
+        # None: the count kernel takes one token a request itself.
         num_sampled, num_rejected = get_num_sampled_and_rejected(
-            input_batch.seq_lens.new_ones(input_batch.num_reqs),
+            None,
             input_batch.seq_lens,
             input_batch.cu_num_logits,
             input_batch.idx_mapping,

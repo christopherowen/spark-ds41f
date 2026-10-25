@@ -1970,11 +1970,12 @@ def select_first_argmax_kernel(
     """``dspark.greedy._select_first_argmax``: the first maximum's global index
     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
     ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
-    exact in FP32), into ``out[row * out_stride]``, a warp a row.
+    exact in FP32), into ``out[row * out_stride]``.
     As in Triton, the number of ranks is fixed when the kernel is built and every
-    load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
-    the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
-    over the next power of two (the combine is a total order).
+    load is issued before any combine. Alone, a thread reduces its row; with the
+    embedding, a warp a row: lane ``k < ranks`` reads rank ``k``'s pair, the other
+    lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce over the
+    next power of two (the combine is a total order).
 
     With ``embed_width``, the drafter's next step: the selected token's row of the
     Markov embedding ``table`` ([vocab, embed_width] BF16) into ``step_out[row]``
@@ -1986,6 +1987,10 @@ def select_first_argmax_kernel(
     span = 1 << max(ranks - 1, 0).bit_length()
 
     if not embed_width:
+        # A thread a row (rows on grid x, _THREADS a block): every pair is loaded
+        # before the first combine, then combined in rank order. The combine is a
+        # total order, so the result is the warp reduction's; one block covers a
+        # verification batch where a warp a row scheduled a block a row.
 
         @T.prim_func
         def select_first_argmax(
@@ -1993,18 +1998,21 @@ def select_first_argmax_kernel(
             out: T.Tensor((out_len,), output_dtype),
             out_stride: T.int64,
         ):
-            with T.Kernel(rows, threads=32) as row:
+            with T.Kernel(T.ceildiv(rows, _THREADS), threads=_THREADS) as bx:
                 T.import_source(_HEADER)
-                tx = T.get_thread_binding()
+                row = bx * _THREADS + T.get_thread_binding()
+                values = T.alloc_local((ranks,), T.float32)
+                indices = T.alloc_local((ranks,), T.int32)
                 best = T.alloc_local((1,), T.float32)
                 best_index = T.alloc_local((1,), T.int32)
-                other = T.alloc_local((1,), T.float32)
-                other_index = T.alloc_local((1,), T.int32)
-                _select_pairs(
-                    pairs, best, best_index, other, other_index, row, tx, ranks,
-                    span, pair_width,
-                )  # fmt: skip
-                if tx == 0:
+                if row < rows:
+                    for k in tuple(range(ranks)):
+                        values[k] = pairs[row, pair_width * k]
+                        indices[k] = T.cast(pairs[row, pair_width * k + 1], T.int32)
+                    best[0] = values[0]
+                    best_index[0] = indices[0]
+                    for k in tuple(range(1, ranks)):
+                        _first_keep_or_take(best, best_index, values[k], indices[k])
                     out[T.cast(row, T.int64) * out_stride] = T.cast(
                         best_index[0], output_dtype
                     )

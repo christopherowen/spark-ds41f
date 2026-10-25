@@ -652,16 +652,23 @@ def _get_num_sampled_and_rejected_kernel(
 
 
 def get_num_sampled_and_rejected(
-    num_sampled: torch.Tensor,
+    num_sampled: torch.Tensor | None,
     seq_lens: torch.Tensor,
     cu_num_logits: torch.Tensor,
     idx_mapping: torch.Tensor,
     prefill_len: torch.Tensor,
     dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_rejected = torch.empty_like(num_sampled)
+    """Each request's committed and rejected token counts (int32), ``num_sampled``
+    updated in place. ``num_sampled`` None: every request sampled one token (the
+    sampler's step), which the count kernel takes as its count, so no tensor of
+    ones is filled first."""
     from vllm.v1.worker.gpu.tilelang_token_counts import count_tokens
 
+    one = num_sampled is None
+    if num_sampled is None:
+        num_sampled = seq_lens.new_empty(idx_mapping.shape[0])
+    num_rejected = torch.empty_like(num_sampled)
     count_tokens(
         num_sampled,
         num_rejected,
@@ -670,6 +677,7 @@ def get_num_sampled_and_rejected(
         idx_mapping,
         prefill_len,
         dead_row_cut,
+        one,
     )
     return num_sampled, num_rejected
 
@@ -889,11 +897,13 @@ def expand_idx_mapping(
 
 
 def register_input_batch_warmups(*, dead_rows: bool) -> None:
-    """Declare sampled/rejected counts with each enabled dead-row variant."""
+    """Declare sampled/rejected counts with each enabled dead-row variant, and the
+    sampler's one-token counts (no dead rows)."""
     from vllm.v1.worker.gpu.tilelang_token_counts import register_counts
 
     for dead in (False, True) if dead_rows else (False,):
         register_counts(dead_rows=dead)
+    register_counts(dead_rows=False, one=True)
 
 
 def declare_input_batch_kernels(

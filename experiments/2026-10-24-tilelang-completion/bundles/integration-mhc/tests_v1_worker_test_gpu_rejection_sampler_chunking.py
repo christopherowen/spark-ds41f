@@ -54,6 +54,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
     )
     rejection_sampler.num_speculative_steps = 3
     rejection_sampler.enable_adaptive_verification = False
+    chunk_offsets: list[torch.Tensor] = []
 
     def fake_verify(
         self,
@@ -65,6 +66,7 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         idx_mapping,
         *_mappings,
     ):
+        chunk_offsets.append(cu_num_logits)
         num_sampled = torch.diff(cu_num_logits).to(torch.int32)
         sampled = (
             idx_mapping.to(torch.int64).unsqueeze(1) + torch.arange(4, device=device)
@@ -94,6 +96,12 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         logprobs_dims=(2, 0),
     )
 
+    # Chunks (0, 2), (2, 3), (3, 4): the first chunk's offsets are a view of the
+    # batch's (no launch), the later ones the host's uploaded, from 0.
+    assert [c.tolist() for c in chunk_offsets] == [[0, 3, 4], [0, 4], [0, 2]]
+    assert all(c.dtype == torch.int32 and c.is_cuda for c in chunk_offsets)
+    first = chunk_offsets[0]
+    assert first.data_ptr() == input_batch.cu_num_logits.data_ptr()
     assert sampled[:, 0].tolist() == idx_mapping_np.tolist()
     assert num_sampled.tolist() == num_logits_per_req.tolist()
     assert chunked_logprobs is not None

@@ -1334,3 +1334,147 @@ def test_insert_resampled_prepared_before_optional_warmup_return(
     assert {args[0] for _, args, _ in calls} == ({127, tp} if draft_logits else {127})
     assert len(calls) == (4 if draft_logits else 2)
     prepare.prepare_declared(registry)
+
+
+def _insert_inputs(blocks: int, index_dtype: torch.dtype, seed: int):
+    """A batch of 17 requests for ``insert_resampled``: counts below each request's
+    logits, winners with NaN, ties and infinities, a strided sampled view."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    n = 17
+    widths = torch.randint(1, 7, (n,), generator=g, device="cuda", dtype=torch.int32)
+    counts = torch.arange(n, device="cuda", dtype=torch.int32) % widths
+    cu = torch.cat((widths.new_zeros(1), widths.cumsum(0).int()))
+    states = torch.randperm(n + 11, generator=g, device="cuda")[:n].to(index_dtype)
+    mapping = states.repeat_interleave(widths.long())
+    temp = torch.ones(n + 11, device="cuda")
+    temp[states[9::2].long()] = 0
+    values = torch.randn(n, blocks, generator=g, device="cuda")
+    values[0] = float("nan")
+    values[1, 0] = float("inf")
+    ids = torch.randint(0, 129280, (n, blocks), generator=g, device="cuda")
+    storage = torch.full((n, 9), -999, device="cuda", dtype=torch.int64)
+    storage[:, 1:7] = torch.randint(0, 129280, (n, 6), generator=g, device="cuda")
+    # Cuts from 0 (only the first row is live) to past every count, and -1.
+    cut = torch.randint(-1, 7, (n,), generator=g, device="cuda", dtype=torch.int32)
+    return storage, counts, ids, values, cu, mapping, temp, cut
+
+
+@pytest.mark.parametrize("blocks", [1, 4, 127, 129])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_insert_resampled_caps_counts_at_the_dead_row_cut(blocks, index_dtype):
+    """With a dead-row cut, the insertion stores ``torch.minimum(count + 1, cut +
+    1)``, which the rejection sampler computed after it with two torch launches; the
+    token goes where the uncapped count puts it, every other element untouched, and
+    the cut is read on each graph replay."""
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
+
+    storage, counts, ids, values, cu, mapping, temp, cut = _insert_inputs(
+        blocks, index_dtype, 4111 + blocks
+    )
+    saved_storage, saved_counts, saved_cut = (
+        storage.clone(),
+        counts.clone(),
+        cut.clone(),
+    )
+    expected_storage = storage.clone()
+    expected_counts = counts.clone()
+    insert_resampled(
+        expected_storage[:, 1:7], expected_counts, ids, values, cu, mapping, temp
+    )
+    expected_counts = torch.minimum(expected_counts, cut + 1)
+    insert_resampled(storage[:, 1:7], counts, ids, values, cu, mapping, temp, cut)
+    assert torch.equal(storage, expected_storage)
+    assert torch.equal(counts, expected_counts)
+    assert counts.dtype == torch.int32
+    assert torch.equal(cut, saved_cut)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph):
+        insert_resampled(storage[:, 1:7], counts, ids, values, cu, mapping, temp, cut)
+    torch.cuda.current_stream().wait_stream(side)
+    for shift in (0, 1, 3):
+        storage.copy_(saved_storage)
+        counts.copy_(saved_counts)
+        cut.copy_((saved_cut + shift) % 7 - 1)
+        expected_storage = saved_storage.clone()
+        expected_counts = saved_counts.clone()
+        insert_resampled(
+            expected_storage[:, 1:7], expected_counts, ids, values, cu, mapping, temp
+        )
+        expected_counts = torch.minimum(expected_counts, cut + 1)
+        graph.replay()
+        assert torch.equal(storage, expected_storage)
+        assert torch.equal(counts, expected_counts)
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
+    """``rejection_sample(..., dead_row_cut=cut)`` is ``torch.minimum(num_sampled,
+    cut + 1)`` of the uncapped verification, the sampled tokens unchanged, on the
+    production path (block verification, one-hot drafts, FP32 draws)."""
+    torch.manual_seed(5309)
+    inputs = _build_rejection_sample_inputs(
+        torch.randn(129280, device="cuda"),
+        torch.randn(129280, device="cuda"),
+        5,
+        temperature,
+        num_trials=9,
+    )
+    inputs["draft_logits"] = None
+    sampled, num_sampled = rejection_sample(
+        **inputs, num_speculative_steps=5, use_block_verification=True
+    )
+    cut = torch.tensor([0, 1, 2, 3, 4, 5, -1, 2, 0], dtype=torch.int32, device="cuda")
+    capped_sampled, capped = rejection_sample(
+        **inputs,
+        num_speculative_steps=5,
+        use_block_verification=True,
+        dead_row_cut=cut,
+    )
+    assert torch.equal(capped, torch.minimum(num_sampled, cut + 1))
+    assert torch.equal(capped_sampled, sampled)
+
+
+@pytest.mark.parametrize("draft_logits", [False, True])
+def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
+    """A step that can have dead rows declares the capped insertion beside the
+    uncapped one, for every index dtype, before the cache freezes."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
+    from vllm.models.deepseek_v4_1.tilelang import prepare
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler as module
+    from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_kernel
+
+    monkeypatch.setattr(
+        module,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_size=4)
+        ),
+    )
+    owner = module.RejectionSampler.__new__(module.RejectionSampler)
+    owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
+    owner.num_speculative_steps = 5
+    owner.watermark_key = None
+    registry = JitWarmupRegistry(None)
+    with registry.activate():
+        owner.register_warmups(
+            logits=[(torch.float32, 129280)],
+            processed_logits=[(torch.float32, 129280)],
+            vocab_size=129280,
+            has_draft_logits=draft_logits,
+            dead_rows=True,
+        )
+    calls = [c for c in prepare.declared_calls(registry) if c[0] is insert_kernel]
+    keys = {(args[0], args[2], args[-1]) for _, args, _ in calls}
+    blocks = {127, 4} if draft_logits else {127}
+    assert keys == {
+        (b, index, limited)
+        for b in blocks
+        for index in ("int32", "int64")
+        for limited in (False, True)
+    }
+    prepare.prepare_declared(registry)

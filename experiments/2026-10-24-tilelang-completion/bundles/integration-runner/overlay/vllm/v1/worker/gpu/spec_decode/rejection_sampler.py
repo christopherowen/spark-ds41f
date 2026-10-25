@@ -15,6 +15,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     triton_warmup_inputs,
 )
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -159,21 +160,26 @@ class RejectionSampler:
         processed_logits: Sequence[tuple[torch.dtype, int]],
         vocab_size: int,
         has_draft_logits: bool,
+        dead_rows: bool = False,
     ) -> None:
         """Register verification of target logits given as ``(dtype, row stride)``
         pairs, raw (``logits``) or after sampling parameters (``processed_logits``),
         and the logprobs of verified tokens. Draft logits and watermarking are not
-        covered by Triton warmup; the TileLang insertion is always declared."""
+        covered by Triton warmup; the TileLang insertion is always declared, also
+        capped at a dead-row cut when the step can have dead rows (``dead_rows``)."""
+        limits = (False, True) if dead_rows else (False,)
         register_insert(
             triton.cdiv(vocab_size, _RESAMPLE_BLOCK_SIZE),
             self.sampler.use_fp64_gumbel,
             self.num_speculative_steps + 1,
+            limits,
         )
         if has_draft_logits:
             register_insert(
                 get_current_vllm_config().parallel_config.tensor_parallel_size,
                 self.sampler.use_fp64_gumbel,
                 self.num_speculative_steps + 1,
+                limits,
             )
         if has_draft_logits or self.watermark_key is not None:
             return
@@ -265,9 +271,11 @@ class RejectionSampler:
         idx_mapping_np: np.ndarray,
         expanded_idx_mapping: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-        max_sampled: torch.Tensor | None = None,
+        dead_row_cut: torch.Tensor | None = None,
         sink: _SinkChunk | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """With ``dead_row_cut`` ([num_reqs] int32), each request's count is capped
+        at its cut plus one (the insertion of the resampled token stores it so)."""
         processed_logits = self.sampler.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -302,12 +310,11 @@ class RejectionSampler:
             self.synthetic_conditional_rates,
             use_fp64=self.sampler.use_fp64_gumbel,
             use_block_verification=self.use_block_verification,
+            dead_row_cut=dead_row_cut,
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
         )
-        if max_sampled is not None:
-            num_sampled = torch.minimum(num_sampled, max_sampled)
         if cut is not None:
             assert self.sink is not None and sink is not None
             # From the scores the last tokens were drawn from: the cut stays
@@ -336,13 +343,14 @@ class RejectionSampler:
         pos: torch.Tensor,
         max_chunk_logits: int,
         logprobs_dims: tuple[int, int] | None,
-        max_sampled: torch.Tensor | None = None,
+        dead_row_cut: torch.Tensor | None = None,
         sink_flags: torch.Tensor | None = None,
         sink_alternates: list[SinkAlternates] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, LogprobsTensors | None]:
         """With ``sink_flags`` (sink rejection), cuts the verification at
         flagged drafter rows and appends the alternates of each request's last
-        draw to ``sink_alternates``."""
+        draw to ``sink_alternates``. With ``dead_row_cut``, the counts are capped
+        at it (``_verify``)."""
         cu_num_logits_np = input_batch.cu_num_logits_np
         use_processed_logits = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         num_reqs = input_batch.num_reqs
@@ -368,7 +376,17 @@ class RejectionSampler:
             lo = int(cu_num_logits_np[start])
             hi = int(cu_num_logits_np[end])
             chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
-            chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
+            if lo == 0:
+                # The first chunk's offsets are the batch's own: a view, no launch.
+                # (Adaptive verification's compacted offsets exist on the device
+                # only, and its batch is always one chunk.)
+                chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1]
+            else:
+                # A later chunk (never adaptive, so the host's offsets are the
+                # device's): its offsets uploaded from the host, no kernel.
+                chunk_cu_num_logits = async_tensor_h2d(
+                    chunk_cu_num_logits_np, device=input_batch.cu_num_logits.device
+                )
             # draft_logits uses persistent request-state indices and stays global.
             sink = None if sink_flags is None else _SinkChunk(sink_flags[lo:hi])
             processed_logits, sampled, num_sampled = self._verify(
@@ -381,7 +399,7 @@ class RejectionSampler:
                 input_batch.idx_mapping_np[start:end],
                 input_batch.expanded_idx_mapping[lo:hi],
                 input_batch.expanded_local_pos[lo:hi],
-                None if max_sampled is None else max_sampled[start:end],
+                None if dead_row_cut is None else dead_row_cut[start:end],
                 sink,
             )
             if sink is not None:
@@ -418,6 +436,8 @@ class RejectionSampler:
         if len(sampled_chunks) == 1:
             logprobs_tensors = logprobs_chunks[0] if logprobs_chunks else None
             return sampled_chunks[0], num_sampled_chunks[0], logprobs_tensors
+        # Several chunks (more than get_max_chunk_logits rows; never at DS4.1's
+        # decode shapes): torch concatenates their results.
 
         logprobs_tensors = None
         if logprobs_chunks:
@@ -467,7 +487,7 @@ class RejectionSampler:
             # Logprobs (and the sink alternates) take their token counts
             # inside the chunks; clamp there too so they match the committed
             # tokens.
-            dead_row_cut + 1
+            dead_row_cut
             if dead_row_cut is not None
             and (logprobs_dims is not None or sink_rejection)
             else None,
@@ -475,7 +495,9 @@ class RejectionSampler:
             alternates_chunks,
         )
         alternates = None
-        if alternates_chunks:
+        if len(alternates_chunks) == 1:
+            alternates = alternates_chunks[0]
+        elif alternates_chunks:
             first = alternates_chunks[0]
             alternates = SinkAlternates(
                 torch.cat([a.tokens for a in alternates_chunks]),

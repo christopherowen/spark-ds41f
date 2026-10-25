@@ -2201,6 +2201,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     vocab_size=vocab_size,
                     has_draft_logits=getattr(self.speculator, "draft_logits", None)
                     is not None,
+                    dead_rows=dead_rows,
                 )
             if self.prompt_logprobs_worker is not None:
                 self.prompt_logprobs_worker.register_warmups(

@@ -1328,6 +1328,8 @@ def rejection_sample(
     contexts: torch.Tensor | None = None,
     watermarking: torch.Tensor | None = None,
     watermark_key: int | None = None,
+    # [num_reqs] int32: with it, each request's count is capped at its cut + 1.
+    dead_row_cut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     assert draft_logits is None or (
@@ -1372,6 +1374,7 @@ def rejection_sample(
             cu_num_logits,
             expanded_idx_mapping,
             temperature,
+            dead_row_cut,
         )
         return sampled, num_sampled
     contexts_stride = 0
@@ -1612,6 +1615,7 @@ def rejection_sample(
             cu_num_logits,
             expanded_idx_mapping,
             temperature,
+            dead_row_cut,
         )
         return sampled, num_sampled
 
@@ -1669,5 +1673,6 @@ def rejection_sample(
         cu_num_logits,
         expanded_idx_mapping,
         temperature,
+        dead_row_cut,
     )
     return sampled, num_sampled

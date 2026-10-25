@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import apply_temperature
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
@@ -96,9 +97,21 @@ class SamplingStates:
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         do_top_k = np.any(self.top_k.np[idx_mapping_np] != self.vocab_size)
         do_top_p = np.any(self.top_p.np[idx_mapping_np] != 1.0)
-        top_k = self.top_k.gpu[expanded_idx_mapping] if do_top_k else None
-        top_p = self.top_p.gpu[expanded_idx_mapping] if do_top_p else None
+        top_k = _gather(self.top_k.gpu, expanded_idx_mapping) if do_top_k else None
+        top_p = _gather(self.top_p.gpu, expanded_idx_mapping) if do_top_p else None
         return top_k, top_p
+
+    def register_warmups(self) -> None:
+        """Declare ``get_top_k_top_p``'s gathers: int32 top-k and FP32 top-p, by the
+        runner's int64 request indices or another caller's int32."""
+        tilelang_inputs.declare(
+            lambda: [
+                call
+                for index_dtype in (torch.int32, torch.int64)
+                for dtype in (self.top_k.dtype, self.top_p.dtype)
+                for call in tilelang_inputs.gather_rows_calls(index_dtype, dtype)
+            ]
+        )
 
     def apply_top_k_top_p(
         self,
@@ -119,3 +132,11 @@ class SamplingStates:
 
     def max_num_logprobs(self, idx_mapping_np: np.ndarray) -> int:
         return int(np.max(self.num_logprobs[idx_mapping_np]))
+
+
+def _gather(state: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """``state[index]`` of a per-request state (1-D), as a new tensor, through the
+    runner's TileLang row gather: a negative index wraps, as torch's indexing does."""
+    out = torch.empty((index.shape[0], 1), dtype=state.dtype, device=index.device)
+    tilelang_inputs.gather_rows(index, state.view(-1, 1), out)
+    return out.view(-1)

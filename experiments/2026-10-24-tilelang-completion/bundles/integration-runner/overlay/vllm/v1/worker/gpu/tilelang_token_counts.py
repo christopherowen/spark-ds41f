@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Commit counts after sampling or speculative verification, one block per request."""
+"""Commit counts after sampling or speculative verification, one block per request.
+
+With ``one``, every request sampled one token (the sampler's step): the kernel takes
+1 as the count instead of reading it, so ``sampled`` is written only, where the
+sampler filled it with ones first (``seq_lens.new_ones``).
+"""
 
 import tilelang
 import tilelang.language as T
@@ -15,7 +20,7 @@ _THREADS = 128
 
 
 @tilelang.jit(pass_configs=_PASS)
-def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
+def counts_kernel(dead_rows: bool, index_dtype: str, threads: int, one: bool):
     requests = T.dynamic("requests")
     sampled_len = T.dynamic("sampled_len")
     seq_len = T.dynamic("seq_len")
@@ -37,7 +42,7 @@ def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
             if T.get_thread_binding() == 0:
                 req = idx_mapping[row]
                 active = T.cast(seq_lens[row] >= prefill_len[req], "int32")
-                count = sampled[row]
+                count = T.int32(1) if one else sampled[row]
                 if dead_rows:
                     count = T.min(count, dead_cut[row] + 1)
                 sampled[row] = active * count
@@ -48,7 +53,7 @@ def counts_kernel(dead_rows: bool, index_dtype: str, threads: int):
     return token_counts
 
 
-def counts_call(dead_rows: bool, index_dtype: torch.dtype):
+def counts_call(dead_rows: bool, index_dtype: torch.dtype, one: bool):
     from vllm.models.deepseek_v4_1.tilelang.prepare import call
 
     return call(
@@ -56,10 +61,11 @@ def counts_call(dead_rows: bool, index_dtype: torch.dtype):
         dead_rows,
         "int64" if index_dtype == torch.int64 else "int32",
         _THREADS,
+        one,
     )
 
 
-def register_counts(dead_rows: bool) -> None:
+def register_counts(dead_rows: bool, one: bool = False) -> None:
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     if JitWarmupRegistry.active() is None:
@@ -67,7 +73,9 @@ def register_counts(dead_rows: bool) -> None:
     from vllm.models.deepseek_v4_1.tilelang.prepare import declare
 
     declare(
-        lambda: [counts_call(dead_rows, dtype) for dtype in (torch.int32, torch.int64)]
+        lambda: [
+            counts_call(dead_rows, dtype, one) for dtype in (torch.int32, torch.int64)
+        ]
     )
 
 
@@ -79,10 +87,13 @@ def count_tokens(
     idx_mapping: torch.Tensor,
     prefill_len: torch.Tensor,
     dead_cut: torch.Tensor | None,
+    one: bool = False,
 ) -> None:
+    """The committed and rejected counts of each request, in place; with ``one``,
+    each request sampled one token, and ``sampled`` is only written."""
     if idx_mapping.numel() == 0:
         return
-    _, args, kwargs = counts_call(dead_cut is not None, idx_mapping.dtype)
+    _, args, kwargs = counts_call(dead_cut is not None, idx_mapping.dtype, one)
     counts_kernel(*args, **kwargs)(
         sampled,
         rejected,

@@ -66,20 +66,31 @@ PARTS = {
                 "--basetemp", "/c/pytest-integration-sink-scheduler",
                 "tests/v1/core/test_sink_draft_zero.py"], 1800,
              {"VLLM_DS41_KERNEL_BACKEND": None}),
-            # Startup without unused kernels (2026-10-25): the JIT monitor's off mode,
-            # no B12X preparation unit or temporary KV cache under TileLang, the
-            # runner warm-up without Triton's top-k/top-p. The tests pick each backend
-            # themselves; the files' other tests are B12X's, so the variable is unset.
+            # Startup without unused kernels (2026-10-25): no B12X preparation unit or
+            # temporary KV cache under TileLang, the runner warm-up without Triton's
+            # top-k/top-p. The tests pick each backend themselves; the files' other
+            # tests are B12X's, so the variable is unset. Run 23 found the attention
+            # file's older B12X-path tests stale (bare modules missing _decode_capacity
+            # and _main_width, fixtures that need the repository's conftest): only the
+            # new tests run here.
             ("startup tests", PYTEST + [
                 "--basetemp", "/c/pytest-integration-startup",
-                "tests/jit_monitor/test_hooks.py",
-                "tests/engine/test_arg_utils.py",
-                "tests/models/test_deepseek_v4_1_attention.py",
+                *(f"tests/models/test_deepseek_v4_1_attention.py::{name}" for name in (
+                    "test_tilelang_attention_declares_no_b12x_unit",
+                    "test_tilelang_binding_prepares_the_attention_staging",
+                    "test_tilelang_context_kv_write_needs_no_helper_plan",
+                    "test_b12x_cache_writes_use_the_helper_plan_of_their_kind")),
                 "tests/models/test_deepseek_v4_1_compressor_prepare.py",
                 "tests/model_executor/test_b12x_warmup.py",
                 "tests/v1/worker/test_mixed_warmup_gate.py",
                 "tests/v1/worker/test_gpu_warmup_blocks.py"], 3600,
              {"VLLM_DS41_KERNEL_BACKEND": None}),
+            # The JIT monitor's hooks (its off mode among them) need their own
+            # conftest, which resets the monitor's process-global state between tests.
+            ("JIT monitor tests", ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider",
+                                   "--confcutdir", "tests/jit_monitor",
+                                   "--basetemp", "/c/pytest-integration-jit-monitor",
+                                   "tests/jit_monitor/test_hooks.py"], 1200),
             ("runner benchmark", ["benchmarks/kernels/benchmark_runner_inputs_tilelang.py",
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",
