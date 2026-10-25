@@ -1,0 +1,69 @@
+{
+ "experiment": "experiments/2026-10-26-site-landmines",
+ "run": "image-cap-tp3",
+ "jobs": [
+  {
+   "kind": "sync"
+  },
+  {
+   "kind": "measure",
+   "bench": false,
+   "bracket": false,
+   "extras": [
+    [
+     "experiments/2026-10-24-tilelang-completion/startup_lines.py",
+     [],
+     "startup"
+    ],
+    [
+     "experiments/2026-10-18-scale-codes/mem_snapshot.py",
+     [
+      "--label",
+      "{label}"
+     ],
+     "memory"
+    ],
+    [
+     "image_cap.py",
+     [
+      "--nodes",
+      "dgx1,dgx2,dgx3",
+      "--container",
+      "spark-ds41f",
+      "--counts",
+      "4,8,16,32",
+      "--streams",
+      "1,4,8",
+      "--repeats",
+      "2",
+      "--floor-gib",
+      "4.5"
+     ],
+     "image-cap"
+    ],
+    [
+     "experiments/2026-10-24-tilelang-completion/image_digest.py",
+     [
+      "--tokens",
+      "96"
+     ],
+     "images"
+    ],
+    [
+     "experiments/2026-10-18-scale-codes/mem_snapshot.py",
+     [
+      "--label",
+      "{label}-after"
+     ],
+     "memory-after"
+    ]
+   ],
+   "arms": [
+    {
+     "config": "image-cap-32-tp3.json",
+     "label": "image-cap-32"
+    }
+   ]
+  }
+ ]
+}

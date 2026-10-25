@@ -192,6 +192,21 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
+    def test_the_image_cap_arm_changes_only_the_cap(self):
+        """experiments/2026-10-26-site-landmines measures 4-32 images a request on one boot: the
+        recipe at tp3-triangle with 32 images a prompt and nothing else changed. Regenerate the arm
+        (make_arms.py) when the recipe's triangle changes."""
+        arm = load_spark().read_cluster("experiments/2026-10-26-site-landmines/image-cap-32-tp3.json")
+        base = recipe.resolve(self.recipe, "tp3-triangle")
+        args = list(base["serve_args"])
+        self.assertEqual(args[args.index("--limit-mm-per-prompt") + 1], '{"image":4}')
+        args[args.index("--limit-mm-per-prompt") + 1] = '{"image":32}'
+        self.assertEqual(arm["serve_args"], args)
+        # An arm carries neither the recipe's shape nor its qualifying benchmark.
+        skip = ("serve_args", "shape", "benchmark_reference")
+        self.assertEqual({k: v for k, v in arm.items() if k not in skip},
+                         {k: v for k, v in base.items() if k not in skip})
+
     def test_the_recipe_keeps_no_old_live_name(self):
         """No old name is left."""
         text = json.dumps(self.recipe)
