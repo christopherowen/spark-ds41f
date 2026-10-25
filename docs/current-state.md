@@ -1,7 +1,37 @@
 # Current state
 
 Production is the recipe's `tp4-ring` shape ([config/cluster.json](../config/cluster.json)) on
-**spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
+**spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4, promoted
+2026-10-25 as [`2026-10-25-spark-ds41f-1025`](../manifests/baselines/2026-10-25-spark-ds41f-1025.json)
+([release record](../experiments/2026-10-25-spark-ds41f-candidate/README.md),
+[release notes](../experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)): image
+`spark-ds41f:19f2c20ed4d6-next-6`, spark-ds41f-1022's sources with candidate 4's vLLM 0228-0265, the
+TileLang completion (vLLM `tilelang-ports` through 26382f5cf, here 0300-0488) and two test fixes,
+0489-0490 (patch head `11171760`, tree `6f8e062f`). Every kernel serving launches is TileLang except
+NCCL and a few rare-path ATen copies; no B12X preparation runs (B12X keeps the checkpoint loader).
+0228 draws fresh random numbers in each block-verification round (vllm-project/vllm#61161);
+0229-0255 move the CED row selection to TileLang and skip its nonfinal rows; 0256-0257 are the
+tokenizer's generation controls and the API's `thinking` switch (#447); GLP steering is available,
+off unless configured (#401); `SPARK_DS41F_*` variables; the sink log states its scope (#489); a
+`prompt_logprobs` request no longer kills the engine under sink rejection (0266) and
+`logprob_token_ids` work under speculative decoding (0267); at most 32 top logprobs. The recipe
+moves to the spark-ds41f names (container, image, labels, `/opt/spark-ds41f`, `/cache/spark-ds41f`,
+`spark-ds41f-kernel-memory`), sets the ring's long-prefill budget to 16,384 (6.21 full 1M contexts
+admitted, from 8.18), pins glibc malloc (#439), reports prompt-cache hits (#469), turns the JIT
+monitor off and drops 21 settings for kernels serving does not run. Temperature-0 text outputs are
+identical to spark-ds41f-1022's; image answers differ and score the same.
+Against spark-ds41f-1022 in candidate 6's release comparison (one session, 2026-10-25
+14:46-18:20 CET, verdicts against the repeat): prefill +12.8% / +13.9% / +13.7% / +12.9% /
++11.8% at 32K / 131K / 262K / 524K / 1M (better), decode grid -2.38% (better); c16 +0.12%, c8
++0.88%, Poisson +0.01% and one stream +2.11% the same; sampled the same; greedy 256/256
+identical, teacher-forced KL 0.
+`tp4-ring`'s `benchmark_reference` is
+[manifests/suites/2026-10-25-spark-ds41f-1025-tp4](../manifests/suites/2026-10-25-spark-ds41f-1025-tp4/)
+(candidate 6's first arm of its release comparison); the triangle is not qualified on this
+image. spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`
+as the rollback.
+
+Before spark-ds41f-1025 production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 at 1,048,576 tokens on dgx1-dgx4 since
 2026-10-23 (the `tp3-triangle` shape on dgx1-dgx3 from 2026-10-22), promoted
 2026-10-22 as [`2026-10-22-spark-ds41f-1022`](../manifests/baselines/2026-10-22-spark-ds41f-1022.json)
 ([promotion record](../experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named

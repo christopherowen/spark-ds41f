@@ -4,7 +4,26 @@ Reproducible Docker/vLLM deployment, tuning, and benchmarks for DeepSeek V4.1
 Flash on a switchless three-node DGX Spark fabric, and the same deployment on
 a four-node ring.
 
-Production is **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4
+Production is **spark-ds41f-1025**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4 1M
+profile on the ring ([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md),
+[release notes](experiments/2026-10-25-spark-ds41f-candidate/release-notes.md)). The release name is
+the date it was promoted; the model is DeepSeek's checkpoint, unchanged. It is spark-ds41f-1022 with
+every serving kernel in TileLang (except NCCL and a few rare-path ATen copies), the CED row
+selection's nonfinal row skip with the ring's long-prefill budget at 16,384, fresh random draws in
+each block-verification round (a backport of vllm-project/vllm#61161), fixes for a `prompt_logprobs`
+request that killed the engine and for `logprob_token_ids` under speculative decoding, the
+tokenizer's generation controls and the DeepSeek API's `thinking` switch (#447), every response's
+prompt-cache hits in its usage (#469), glibc malloc pinned in every process (#439's memory growth),
+GLP steering available but off unless configured (#401, msuiche's, reworked), the JIT monitor off,
+and the live names moved to spark-ds41f (container, image, labels, paths, variables and caches).
+Temperature-0 text outputs are identical to spark-ds41f-1022's; image answers differ (the TileLang
+vision tower follows DeepSeek's reference arithmetic) and score the same on public benchmarks. At
+most 32 top logprobs are served (the default is 20). Against spark-ds41f-1022 in one session: prefill is 11.8-13.9% faster from
+32K to 1M (the 16,384 budget with the CED skip), decode grid steps are 2.4% shorter, and c16,
+c8, Poisson and one-stream throughput are the same (75.3 tok/s at one stream, 194.9 at eight).
+spark-ds41f-1022's recipe and lock are frozen in `experiments/2026-10-23-next-release/1022`.
+
+Before spark-ds41f-1025, production was **spark-ds41f-1022**, serving DeepSeek-V4.1-Flash-1017 on the four-node TP4
 1M profile on the ring the site is cabled as (2026-10-23; the three-node TP3 1M profile on the
 triangle since 2026-10-22,
 [promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), the first release named
@@ -151,9 +170,9 @@ unless told to ([launch preflight](docs/doctor.md#launch-preflight)).
 ## Current baseline
 
 The baseline is
-[manifests/baselines/2026-10-22-spark-ds41f-1022.json](manifests/baselines/2026-10-22-spark-ds41f-1022.json)
-([promotion record](experiments/2026-10-22-spark-ds41f-1022/README.md)), on the triangle since
-2026-10-22 and on the ring since 2026-10-23, both at 1M context; see
+[manifests/baselines/2026-10-25-spark-ds41f-1025.json](manifests/baselines/2026-10-25-spark-ds41f-1025.json)
+([release record](experiments/2026-10-25-spark-ds41f-candidate/README.md)), on the ring at 1M context;
+the triangle's last release is spark-ds41f-1022. See
 [docs/current-state.md](docs/current-state.md). The three-node deployment (the four-node ring
 differs only in cabling, transport and memory sizing):
 

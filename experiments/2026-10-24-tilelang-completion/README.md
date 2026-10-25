@@ -1912,3 +1912,15 @@ not gated). Two harness bugs in tests failed runner and sampling; no kernel fail
 
 vLLM 26382f5cf changes tests only. Run 26 repeats run 25's plan at it
 (`~/spark-lab/run26`, "RUN26 DONE").
+
+**The seeded penalties variation, result (2026-10-25, run `seeded-penalties-variation`): an
+existing limitation.** In this run spark-ds41f-1022 repeated its eight-at-once digest three times
+where the candidate gave three different ones, and adaptive verification off made the candidate
+repeat. The follow-up bisection, diagnosis and budget traces
+([candidate 5's record](../2026-10-25-spark-ds41f-candidate/README.md#the-seeded-penalties-variation-run-seeded-penalties-variation-1206-1215-cet))
+show spark-ds41f-1022 varying too once the same requests are sent eight at once without
+`controls_digest.py`'s preceding alone runs. The batch's composition in its first decode steps
+varies with arrival timing; adaptive verification's batch-wide draft budget then decides how each
+request's positions fall into verified blocks, and block verification's sampled tokens depend on
+that split. With candidate 4's 0228 (fresh draws per round) neutralized, candidate 4 equals
+spark-ds41f-1022 bit for bit. Temperature 0 is unaffected.

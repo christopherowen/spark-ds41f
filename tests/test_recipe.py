@@ -24,14 +24,22 @@ def load(relative: str) -> dict:
 BUDGET_KEYS = ("adaptive_verification_cost_scale", "adaptive_verification_row_cost")
 # Flags that change only what a response reports, added after the archived records.
 REPORTING_ARGS = ("--enable-prompt-tokens-details",)
+# The JIT monitor installs hooks and reports compiles; it computes nothing. spark-ds41f-1025
+# turns it off: under TileLang it has nothing left to report.
+MONITOR_ARGS = ("--jit-monitor-mode",)
 
 
 def serving_arguments(cluster: dict) -> list[str]:
     """``serve_args`` without what selects the checkpoint and its sampling defaults (the
     model path and ``--override-generation-config``), without the draft budget's
-    constant (r6x replaced the boot-timed cost model's scale with a row cost) and
-    without the reporting flags (#455 added the prompt-cache report)."""
+    constant (r6x replaced the boot-timed cost model's scale with a row cost),
+    without the reporting flags (#455 added the prompt-cache report) and without the JIT
+    monitor's mode (off since spark-ds41f-1025)."""
     args = [arg for arg in cluster["serve_args"][1:] if arg not in REPORTING_ARGS]
+    for flag in MONITOR_ARGS:
+        if flag in args:
+            at = args.index(flag)
+            del args[at : at + 2]
     if "--override-generation-config" in args:
         at = args.index("--override-generation-config")
         del args[at : at + 2]
@@ -116,40 +124,65 @@ class RecipeTest(unittest.TestCase):
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
 
+    # The 21 settings for kernels serving does not run, which spark-ds41f-1025 removes
+    # (experiments/2026-10-24-tilelang-completion, "Startup without unused kernels").
+    UNUSED_KERNEL_SETTINGS = (
+        "B12X_AUTOTUNE", "B12X_BIND_COMPILE_WORKERS", "B12X_COMPILE_CACHE_DIR", "B12X_CUTE_COMPILE_CACHE_DIR",
+        "B12X_DENSE_SPLITK_TURBO", "B12X_STATE_COMPILE_WORKERS", "B12X_W4A8_TINY_DECODE",
+        "B12X_WEIGHTS_COMPILE_WORKERS", "CUTE_DSL_ARCH", "CUTE_DSL_CACHE_DIR", "FLASHINFER_WORKSPACE_BASE",
+        "VLLM_USE_FLASHINFER_SAMPLER", "VLLM_USE_AOT_COMPILE", "VLLM_USE_MEGA_AOT_ARTIFACT",
+        "VLLM_USE_STANDALONE_COMPILE", "TORCHINDUCTOR_CACHE_DIR", "VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD",
+        "VLLM_DS41_ATTENTION_COMPUTE", "VLLM_DS41_DRAFT_NVFP4_HEAD", "VLLM_DS41_MARKOV_NVFP4",
+        "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS")
+
     def test_each_shape_is_its_1022_arm_renamed(self):
         """Each shape resolves to spark-ds41f-1022's arm at that shape under the names of the
-        release after it (the owner's decision of 2026-10-19), and nothing else: the container,
-        label prefix, variables and cache paths are renamed, PYTHONPATH is left to the image
-        (which sets it to the same trees) and the boot-profile variable nothing reads since
-        vLLM 0184 is gone. The image is still -1022-4's tag; the promotion moves it. The release
-        also changes three things on purpose: the ring's long-prefill budget is 16,384 (the owner,
-        2026-10-23, "do 16"; experiments/2026-10-23-next-release, budget sweeps), glibc malloc
-        keeps two arenas and a fixed 1 MiB mmap threshold (#439's growth; the memory window), and
-        every response reports its prompt-cache hits (#469)."""
+        release after it (the owner's decision of 2026-10-19), on spark-ds41f-1025's image, and
+        nothing else: the container, label prefix, variables and cache paths are renamed,
+        PYTHONPATH is left to the image (which sets it to the same trees) and the boot-profile
+        variable nothing reads since vLLM 0184 is gone. The release also changes five things on
+        purpose: the ring's long-prefill budget is 16,384 (the owner, 2026-10-23, "do 16";
+        experiments/2026-10-23-next-release, budget sweeps), glibc malloc keeps two arenas and a
+        fixed 1 MiB mmap threshold (#439's growth; the memory window), every response reports its
+        prompt-cache hits (#469), the JIT monitor is off, and the 21 settings for kernels serving
+        does not run are gone (experiments/2026-10-24-tilelang-completion)."""
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        self.assertEqual(len(self.UNUSED_KERNEL_SETTINGS), 21)
         for shape in ("tp4-ring", "tp3-triangle"):
             arm = f"experiments/2026-10-22-spark-ds41f-1022/spark-ds41f-1022-{shape.split('-')[0]}.json"
             resolved = recipe.resolve(self.recipe, shape)
             released = renamed(load_spark().read_cluster(arm))
-            released["environment"] = {**released["environment"], "MALLOC_ARENA_MAX": "2",
-                                       "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            released["environment"] = {**{k: v for k, v in released["environment"].items()
+                                          if k not in self.UNUSED_KERNEL_SETTINGS},
+                                       "MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "1048576"}
+            released["container"]["image"] = "spark-ds41f:19f2c20ed4d6-next-6"
+            released["container"]["expected_labels"]["local.spark-ds41f.vllm.tree"] = (
+                "6f8e062f0cfb5b5fe016df9ef965499ed5ea8519")
             # The prompt-cache report (#469), where the recipe renders it.
             args = released["serve_args"] = list(released["serve_args"])
             args.insert(resolved["serve_args"].index("--enable-prompt-tokens-details"),
                         "--enable-prompt-tokens-details")
+            args[args.index("--jit-monitor-mode") + 1] = "off"
             if shape == "tp4-ring":
                 for flag, value in (("--max-num-batched-tokens", "16384"),
                                     ("--long-prefill-token-threshold", "16288")):
                     args[args.index(flag) + 1] = value
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
-        self.assertEqual(self.recipe["container"]["image"], "vllm-ds41f-kkref:19f2c20ed4d6-1022-4")
+        self.assertEqual(self.recipe["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-6")
+
+    def test_the_ring_is_candidate_6s_arm(self):
+        """Promotion runs what the release measured: tp4-ring resolves to candidate 6's arm,
+        apart from the baseline, lock and reference that name it."""
+        resolved = recipe.resolve(self.recipe, "tp4-ring")
+        released = load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json")
+        naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
+        self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
+                         {k: v for k, v in released.items() if k not in naming})
 
     def test_the_recipe_keeps_no_old_live_name(self):
-        """Apart from the image tag (the promotion's image moves it), no old name is left."""
-        recipe_ = json.loads(json.dumps(self.recipe))
-        del recipe_["container"]["image"]
-        text = json.dumps(recipe_)
+        """No old name is left."""
+        text = json.dumps(self.recipe)
         for old in ("spark3", "SPARK3_", "kkref", "karmic", "dsv41-", "vllm-r5o", "PYTHONPATH"):
             self.assertNotIn(old, text)
         self.assertEqual(self.recipe["container"]["name"], "spark-ds41f")
@@ -278,9 +311,9 @@ class RecipeTest(unittest.TestCase):
         # Every shape budgets drafts by the row cost; nothing is timed at boot (since r6x).
         self.assertEqual(draft_budget(resolved), {"adaptive_verification_row_cost": 0.035})
         self.assertEqual(draft_budget(tp4), draft_budget(resolved))
-        # spark-ds41f-1022 was released on the triangle, then on the ring: each shape has its own run.
-        self.assertEqual(resolved["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp3")
-        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-22-spark-ds41f-1022-tp4")
+        # spark-ds41f-1025 was released on the ring; the triangle waits for its own run.
+        self.assertNotIn("benchmark_reference", resolved)
+        self.assertEqual(tp4["benchmark_reference"], "manifests/suites/2026-10-25-spark-ds41f-1025-tp4")
         self.assertNotIn("benchmark_reference", recipe.resolve(self.recipe, "tp3-triangle-4k"))  # not benched
 
     def test_every_shape_reports_prompt_cache_hits(self):

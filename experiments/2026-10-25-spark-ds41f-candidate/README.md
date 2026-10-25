@@ -74,7 +74,10 @@ with every anomaly root-caused.
   reference arithmetic. On 2283 public benchmark items its scores match B12X's within
   about one point (experiments/2026-10-25-vision-eval).
 - **Seeded sampled outputs and batching:** see the seeded penalties investigation
-  (tilelang-completion README, run 26).
+  (tilelang-completion README, run 26) and this record's "The seeded penalties variation": an
+  existing limitation of adaptive verification, spark-ds41f-1022's too.
+- **6.21 full 1M contexts on the ring, not 8.18:** the 16,384 budget's admission bound (see
+  candidate 5's window); the release notes explain it.
 
 ## Candidate 5's window (2026-10-25 10:30 CET, run `candidate-5-tp4`)
 
@@ -172,3 +175,280 @@ copies: 336 passed, 40 skipped, 0 failed (candidate 5's chunk 5: 330 passed, 40 
 failures). The bundle is outside the repository (`~/spark-release-driver/bundles/c6-tests-preview`
 on dgx1), since the lab runs only origin/main's specs; candidate 6's own release tests run in its
 window.
+
+### Candidate 6's window (run `candidate-6-tp4`, 2026-10-25 13:43-14:43 CET)
+
+The build, release tests, gate and qualification ran on candidate 6's own image,
+`spark-ds41f:19f2c20ed4d6-next-6` (image `sha256:82b071b57485`, built 12:54 UTC, the same ID on
+all four nodes), at deployment commit `8ee6ce53`:
+- **Release tests (dgx2):** 5,730 passed, 160 skipped (each with its reason), 0 failed.
+- **Determinism and greedy gate:** identical to spark-ds41f-1022's: `3eab5112` / `db25fde3`
+  with log probabilities, `c9cf9dbe` / `c6bb4f4e` as text.
+- **Controls:** no failure; logprob ids and prompt logprobs pass.
+- **Images:** the digest is the overlay's (`92679390`).
+- **Startup:** 247 TileLang calls prepared in 11 s a rank; API ready in 87 s; no B12X
+  preparation and no compile lines.
+
+### Candidate 6's release comparison (run `candidate-6-release-tp4`, 2026-10-25 14:46-18:20 CET)
+
+[rc6/release-tp4.json](rc6/release-tp4.json): suites release, single-stream and sampled in one
+session. The arms ran in this order: candidate 6, spark-ds41f-1022 (its frozen recipe, dev
+mode), candidate 6 again. Verdicts are against the session's own repeat (candidate 6 → candidate
+6 again).
+
+| Metric | 1022 → candidate 6 | ±95% | Repeat | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| Greedy responses (256) | identical | | identical | same |
+| Teacher-forced KL (65,536 positions) | 0 | | 0 | same |
+| Decode grid, geometric mean of 20 shapes | -2.38% | 0.15% | +1.14% | better |
+| c16 output tok/s | +0.12% | 0.81% | +0.00% | same |
+| c8 output tok/s | +0.88% | 0.79% | -0.29% | same |
+| Poisson 0.7/s output tok/s | +0.01% | 17.72% | -0.01% | same |
+| Prefill 32,768 | +12.80% | 0.95% | +0.16% | better |
+| Prefill 131,072 | +13.85% | 0.87% | +0.26% | better |
+| Prefill 262,144 | +13.73% | 0.79% | +0.16% | better |
+| Prefill 524,288 | +12.89% | 0.34% | +0.30% | better |
+| Prefill 1,000,000 | +11.81% | 0.49% | +0.26% | better |
+| One stream (c1) output tok/s | +2.11% | 3.82% | -0.06% | same |
+| Sampled c16 / c8 / c1 | +0.40% / +0.70% / +2.65% | 0.90 / 1.10 / 4.94% | 0.00 / +0.37 / -0.03% | same |
+
+- **Rates:** candidate 6's decode grid steps are 1.4-3.5% shorter. At one stream it runs 75.3
+  tok/s against 73.8, at 33.0 engine steps a second (+1.95%, better); its tokens a step are
+  unchanged (2.28).
+- **Prefill:** 6,762 / 6,796 / 6,482 / 5,863 / 4,942 tok/s from 32K to 1M, against
+  5,994 / 5,969 / 5,700 / 5,194 / 4,420. This is the ring's 16,384 budget (8,192 on 1022) with
+  the CED skip.
+- **Time to first token:** at eight streams it is level, 297 ms against 295 (p50). The earlier
+  watch item (281 ms) came from another session's 1022 run. Under Poisson the p50 is 280 ms
+  against 292.
+
+Full tables: `release-table.txt` in each suite reference, below.
+
+The suite references are candidate 6's first arm, without the model step's generated text, plus
+each suite's table:
+- [manifests/suites/2026-10-25-spark-ds41f-1025-tp4](../../manifests/suites/2026-10-25-spark-ds41f-1025-tp4/)
+- [-single-stream](../../manifests/suites/2026-10-25-spark-ds41f-1025-tp4-single-stream/)
+- [-sampled](../../manifests/suites/2026-10-25-spark-ds41f-1025-tp4-sampled/)
+
+## Vision on the built image (run `vision-eval-candidate5`, 2026-10-25 11:45-12:07 CET)
+
+Candidate 5's image against spark-ds41f-1022, the 2,283 public-benchmark items of
+[experiments/2026-10-25-vision-eval](../2026-10-25-vision-eval/README.md), concurrency 16, every
+request answered:
+
+| benchmark   | items | candidate 5 | spark-ds41f-1022 | answers differ | 1022 better / worse | difference, 95% interval |
+|-------------|------:|------------:|-----------------:|---------------:|--------------------:|-------------------------:|
+| ChartQA     |   300 | 86.00 | 85.67 |  14 |   1 / 2 | -0.33 [-1.67, +0.67] |
+| DocVQA      |   300 | 94.01 | 94.74 |  27 |   6 / 7 | +0.73 [-0.31, +2.01] |
+| OCRBench    |  1000 | 81.10 | 81.80 | 549 |  16 / 9 | +0.70 [-0.30, +1.70] |
+| RealWorldQA |   383 | 77.02 | 77.02 |  13 |   6 / 6 | +0.00 [-1.83, +1.83] |
+| TextVQA     |   300 | 85.67 | 86.20 |  10 |   3 / 2 | +0.53 [-0.73, +2.00] |
+| all         |  2283 | 83.36 | 83.79 | 613 | 32 / 26 | +0.43 [-0.14, +1.02] |
+
+**No benchmark separates the two towers**, as in the overlay run. The table is that run's to the
+digit because the answers are: the built image's 2,283 answers are identical to the ports
+overlay's (at concurrency 16 here, 8 there, so they do not depend on the batch), and 1022's are
+identical to candidate 4's (both B12X's tower). The image ships the tower that was evaluated.
+
+## The seeded penalties variation (run `seeded-penalties-variation`, 12:06-12:15 CET)
+
+[penalties-variation.json](../2026-10-24-tilelang-completion/penalties-variation.json): the
+penalties-sampled scenario (temperature 1, repetition 1.15, frequency 0.2, presence -0.1, seed
+20261024 + i, 96 tokens) three times a boot, alone and eight at once:
+
+| arm | alone, three runs | eight at once, three runs |
+| --- | --- | --- |
+| candidate (overlay `ports-nomon-tp4.json`) | `a75947f7` x3 | `79de80d9`, `dca91313`, `105c3a9f` |
+| candidate, adaptive verification off | `8207f323` x3 | `8207f323` x3 (= alone) |
+| spark-ds41f-1022 (`production-tp4.json`) | `b75be6b4` x3 | `ba4480ec` x3 |
+
+**Production is stable where the candidate is not: by the brief's rule, a regression.** Without
+adaptive verification the candidate is stable and batch-invariant (eight at once equal alone).
+Production depends on the batch (its eight-at-once digest differs from its alone digest) but
+repeats. The candidate's eight-at-once digests are drawn from a few recurring values
+(`79de80d9` also in candidate 5's window, `dca91313` in release check round 1).
+**Root cause: an existing limitation, which the test procedure hid on spark-ds41f-1022.** Four runs
+followed (`seeded-penalties-bisect`, `-diagnosis`, `-budget-trace`; scripts and arms in
+`~/spark-release-driver/` on dgx1, arms under `results/private/lab/arms/`):
+
+1. **Bisection** (three penalties runs a boot, `controls_digest.py`'s procedure):
+
+   | arm | alone | eight at once |
+   | --- | --- | --- |
+   | candidate 5, 16,384 budget | `a75947f7` | `1f94f42d`, `cd8cc5b6`, `cd8cc5b6` |
+   | candidate 5, 8,192 | `a75947f7` | `cd8cc5b6`, `cd8cc5b6`, `1bd37da7` |
+   | candidate 4, 16,384 | `a75947f7` | `e5844620`, `1bd37da7`, `cd8cc5b6` |
+   | candidate 4, 8,192 | `a75947f7` | `cd8cc5b6`, `79de80d9`, `cd8cc5b6` |
+   | candidate 4, 0228's `spec_step_seed` returning the seed | `b75be6b4` | `ba4480ec` x3 |
+   | spark-ds41f-1022, 16,384 | `b75be6b4` | `ba4480ec` x3 |
+   | spark-ds41f-1022, 8,192 | `b75be6b4` | `ba4480ec` x3 |
+
+   The budget does not matter, and candidates 4 and 5 behave alike (same digests): the TileLang
+   ports are not involved. With 0228's draw keying neutralized, candidate 4 equals
+   spark-ds41f-1022 bit for bit. 0228 (vllm-project/vllm#61161's backport) keys block
+   verification's uniform draw by the draft's index in its block, `u = rand(seed ^ (i << 32),
+   pos)`, where spark-ds41f-1022 used `rand(seed, pos)`, which re-used a draw when a later round
+   re-verified a position (the bias #61161 fixes). Its residual-mass bound is never read.
+2. **Diagnosis** (`probe_seeded.py`: the same request bodies, four runs back to back with every
+   token kept): **spark-ds41f-1022 varies too.** Eight at once, 7 of 8 requests differ between
+   runs with penalties, 7 of 8 when staggered 300 ms apart, 6 of 8 at plain temperature 1;
+   candidate 5: 6, 7 and 8 of 8.
+3. **Budget trace** (the adaptive budget's DEBUG line per step, four runs eight at once): every
+   build's output follows the batch's composition when its first decode steps run.
+
+   | build | draft rows of the first decode step, runs 0-3 | outputs |
+   | --- | --- | --- |
+   | spark-ds41f-1022 | 10, 20, 15, 10 | three different; runs 0 and 3 identical (`b5f27305`) |
+   | candidate 4, 0228 neutralized | 5, 10, 10, 10 | runs 1-3 identical, and equal to 1022's 10-row runs (`b5f27305`) |
+   | candidate 5 | 5, 10, 5, 25 | runs 0 and 2 identical |
+
+   How many of the eight requests have finished their prefill when the first decode steps run
+   depends on arrival timing. Adaptive verification sizes each step's drafts over the whole
+   batch (best-first over every request's draft slots, `1 + 0.035 x rows`), so the batch decides
+   how a request's positions fall into verified blocks, and block verification's sampled
+   tokens depend on that split. With the same composition every build is deterministic; with
+   adaptive verification off the split is fixed and eight at once equal alone.
+
+**Classification: an existing limitation, not a regression.** Seeded sampled requests are
+reproducible alone, not under concurrency with adaptive verification, in spark-ds41f-1022 as in
+this release. The penalties-variation procedure (probe, eight alone, then eight at once) happens to
+give spark-ds41f-1022 the same outcome each time; under 0228's keying the compositions it meets
+no longer coincide in output. Reverting 0228 would bring the bias back to make one test repeat.
+Temperature 0 is unaffected (greedy verification accepts a draft only where it is the argmax, so
+the split cannot change it; the gate shows it).
+
+**Validation** (`seeded-penalties-validation`, 12:57-13:09 CET, a fourth set of boots):
+
+| arm | probe alone x3 | `controls_digest.py` x3 | probe, penalties, eight at once x4 | probe, temperature 1, eight at once x4 |
+| --- | --- | --- | --- | --- |
+| spark-ds41f-1022 | stable | stable (`ba4480ec`) | 6 of 8 requests vary | 7 of 8 vary |
+| candidate (overlay), adaptive verification off | stable | stable | none vary | none vary |
+| candidate 5 | stable | `79de80d9`, `66514015`, `a8d79ab9` | 7 of 8 vary | 7 of 8 vary |
+
+The probe repeats alone; spark-ds41f-1022 does not repeat under concurrency; without adaptive
+verification nothing varies.
+
+## A fresh boot of the built image (run `candidate-5-recheck-tp4`, 13:09-13:19 CET)
+
+Candidate 5 booted again (API ready in 98.6 s; spark-ds41f-1022's TP4 boots today: 75-94 s) and
+checked again:
+- **Determinism gate: identical** with zero differences, the same four hashes as spark-ds41f-1022's.
+- Controls without a failure, 11 of 12 digests as the overlay's (the twelfth is
+  `penalties-sampled/c8`, above); prompt logprobs, the seeded reference digest and the image
+  digests as before.
+- Every rank prepared 247 TileLang calls in 10.9-11.1 s; no error line on any rank.
+- **#455's prompt-cache report, live:** a 2,710-token request reports `cached_tokens` 0 (2,560
+  created); its repeat with the same cache salt reports `cached_tokens` 2,560.
+- Penalties, three runs: alone `a75947f7` x3; eight at once `79de80d9`, `cd8cc5b6`, `cd8cc5b6`.
+
+## GLP steering on (run `candidate-5-glp-tp4`, 13:19-13:26 CET)
+
+Candidate 5 with the synthetic GLP file (`experiments/2026-10-23-next-release/glp/make_glp.py`,
+seed 0, at `/cache/glp/synthetic-0.gguf` on every node), as candidate 4's window ran it: every rank
+logs "GLP steering on: alpha 0.75, layers [1, ..., 39]" and prepares 248 TileLang calls (one more
+than without steering) in 11.0-11.3 s, no error line on any rank. The determinism gate with
+steering on is **identical** in all six scenarios, with and without log probabilities (hashes
+`7ae204c2` / `f2bbcf45`, as text `893e8b24` / `c6bb4f4e`: steering changes the outputs, and they
+repeat). One stream: 109.2 tok/s on the steered text.
+
+## Reports triaged for this release
+
+Every open issue and pull request, the recently closed ones, their comments and the NVIDIA forum
+thread (384438) were read on 2026-10-25; the table with each decision is in
+[release-notes.md](release-notes.md#reports-triaged-for-this-release).
+
+## Promotion: spark-ds41f-1025
+
+`config/cluster.json` becomes candidate 6's recipe ([rc6/rc-tp4.json](rc6/rc-tp4.json) resolved):
+- candidate 5's [cluster.json](cluster.json): spark-ds41f-1022's recipe under the spark-ds41f
+  names (#484, replayed), the ring's 16,384 budget and glibc malloc pinned, the prompt-cache
+  report (#469, replayed), the JIT monitor off and 21 settings for unused kernels removed;
+- image `spark-ds41f:19f2c20ed4d6-next-6` and vLLM tree `6f8e062f`;
+- the lock `upstreams.lock.json` names candidate 6's series ([rc6/vllm/series](rc6/vllm/series),
+  patch head `11171760`), its source manifest
+  `manifests/sources/2026-10-25-spark-ds41f-1025-source.json`.
+
+The baseline is `manifests/baselines/2026-10-25-spark-ds41f-1025.json`. `tp4-ring`'s
+`benchmark_reference` is `manifests/suites/2026-10-25-spark-ds41f-1025-tp4`: candidate 6's first
+arm of its own release comparison (run `candidate-6-release-tp4`). `tp3-triangle` is not qualified on this image (its last
+release is spark-ds41f-1022). spark-ds41f-1022's recipe and lock stay frozen in
+`experiments/2026-10-23-next-release/1022` as the rollback.
+
+### Deploying (with the rename)
+
+The rename goes live with the promotion: the new recipe names container `spark-ds41f`, labels
+`local.spark-ds41f.*` and `SPARK_DS41F_*` variables, and refuses image -1022-4 (whose labels are
+`local.spark3.*`). Already done on every node (2026-10-23 21:09 CET): the cache moved to
+`cache/spark-ds41f` with a relative link `cache/kkref -> spark-ds41f`. Still to do: the boot memory
+service (`spark3-kernel-memory` is active, `spark-ds41f-kernel-memory` is not installed).
+
+From dgx1, after origin/main carries the promotion commit. `scripts/lab.py window open` refuses
+then (the live cluster no longer matches main's recipe), so the deploy takes the hold by hand
+(AGENTS.md, shared cluster windows) and removes it at the end:
+
+0. With no other `~/spark-hold.json` and no pending `~/spark-request.json` or
+   `~/spark3-request.json`, take the hold:
+
+   ```sh
+   python3 -c 'import json,datetime,pathlib; t=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"); pathlib.Path.home().joinpath("spark-hold.json").write_text(json.dumps({"holder": "deploy spark-ds41f-1025", "since": t, "expected_end": None, "heartbeat": t, "rule": "promotion deploy: no GPU work, cluster start, stop or sync by anyone else"}) + "\n")'
+   ```
+1. Stop spark-ds41f-1022 with its frozen recipe, which names the running container
+   (`dsv41-karmic-kraken` and its memory guard); the stopped container is kept for the rollback:
+
+   ```sh
+   bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster stop --apply --parallel
+   ```
+2. Sync every node to the promotion commit:
+
+   ```sh
+   bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster sync --revision origin/main --apply
+   ```
+3. Check the cache link on every node: each must show `kkref -> spark-ds41f` and the
+   directory (moved on 2026-10-23; checked again on 2026-10-25). If a node shows a `kkref`
+   directory instead, run #503's move there:
+   `cd ~/projects/spark-ds41f/cache && mv kkref spark-ds41f && ln -s spark-ds41f kkref`.
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do ssh "$host" 'ls -ld ~/projects/spark-ds41f/cache/kkref ~/projects/spark-ds41f/cache/spark-ds41f'; done
+   ```
+4. Replace the boot memory service on every node; the installer does not reboot or touch swap,
+   and starting the service applies the values already in force:
+
+   ```sh
+   for host in dgx1 dgx2 dgx3 dgx4; do
+     ssh "$host" 'cd ~/projects/spark-ds41f && sudo -n experiments/2026-10-02-kernel-64k/install-boot-support.sh &&
+       sudo -n systemctl start spark-ds41f-kernel-memory.service && systemctl is-active spark-ds41f-kernel-memory.service'
+   done
+   ```
+5. Start the promoted recipe, plan first (`live:` names no engine, since the stopped container
+   has the old name), then apply:
+
+   ```sh
+   bin/spark --cluster-config config/cluster.json cluster start
+   bin/spark --cluster-config config/cluster.json cluster start --apply
+   ```
+
+   5b. Run the first-prefill probe as soon as the API is ready, before any other request
+   (doctor --live included). Reports say the first prefill after a boot is slower than later
+   ones. Our release suites can't show that: their prefill scenario runs after other traffic,
+   and there the first prefill of each size is level with its repeats (r6n through 1022).
+
+   ```sh
+   experiments/2026-10-25-spark-ds41f-candidate/rc6/first-prefill-probe.sh ~/spark-lab/c6/first-prefill
+   ```
+
+   It sends three cold 32K prefills of one document, then one cold 128K. Around each request it
+   records every node's MemAvailable and NVMe reads, plus the server's prompt-token counter, so
+   traffic from another client is visible. It then lists any kernel compile or preparation line
+   logged during the probe. Compare its rates with candidate 6's warm prefill in the release
+   comparison (32K 6,762 tok/s, 128K 6,796). Record the result here even if the probe is level.
+6. `bin/spark --cluster-config config/cluster.json doctor --live` must report the live cluster
+   matching (`spark-ds41f`, `spark-ds41f-memguard`), with no kernel memory service warning.
+7. Release the hold (`rm ~/spark-hold.json`) and record the deploy (time, API ready, KV
+   tokens, `doctor --live`) in this README, as spark-ds41f-1022's record does.
+
+Rollback: `bin/spark --cluster-config config/cluster.json cluster stop --apply --parallel`, then
+`bin/spark --cluster-config experiments/2026-10-23-next-release/1022/cluster.json cluster start --replace --apply`
+and `doctor --live` with that profile; it reads its caches through `cache/kkref`. Remove the kept
+`dsv41-karmic-kraken` containers only once the rollback is no longer wanted, and keep the
+`cache/kkref` link while any recipe names it.
