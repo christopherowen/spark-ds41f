@@ -161,25 +161,36 @@ def indexer_score_v41(
             W_shared[h] = T.cast(Weights[row, h], accum_dtype)
         for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
             p0 = (cta + i * ctas) * block_P
-            # The last tile's rows past the extent load the tile's last row inside
-            # it, so no load reaches past the visible positions (DeepSeek's reference
-            # reads ``index_k[:, : end_pos // ratio]``); the store drops their scores.
-            # A masked candidate loads position 0, which is visible; its score is
+            # Rows past the extent load no key or scale: their loads are predicated
+            # off and they score zeros, which the store drops, so no load reaches
+            # past the visible positions (DeepSeek's reference reads
+            # ``index_k[:, : end_pos // ratio]``). Only the key and scale loads are
+            # predicated: the page read stays unconditional, so a dense tile's
+            # addresses stay affine and its loads issue together. A masked or
+            # padding candidate is position 0, which is visible; its score is
             # masked at the end.
             for p, d in T.Parallel(block_P, D):
-                pos = position(p0, T.min(p, extent - 1 - p0))
+                pos = position(p0, p)
                 page = T.min(
                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
                     pool_pages - 1,
                 )
-                K_shared[p, d] = KPool[page, (pos % page_size) * D + d]
+                K_shared[p, d] = T.if_then_else(
+                    p0 + p < extent,
+                    KPool[page, (pos % page_size) * D + d],
+                    T.cast(0, fp4),
+                )
             for p in T.Parallel(block_P):
-                pos = position(p0, T.min(p, extent - 1 - p0))
+                pos = position(p0, p)
                 page = T.min(
                     T.max(PageTable[row, T.min(pos // page_size, table_width - 1)], 0),
                     pool_pages - 1,
                 )
-                SFK_shared[p, 0] = KScale[page, scale_word0 + pos % page_size]
+                SFK_shared[p, 0] = T.if_then_else(
+                    p0 + p < extent,
+                    KScale[page, scale_word0 + pos % page_size],
+                    T.cast(0, T.uint32),
+                )
             T.mma_gemm_blockscaled(
                 K_shared,
                 Q_shared,

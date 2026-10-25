@@ -4,12 +4,13 @@
 the visible positions against the release's (``--baseline``, the release's
 ``tilelang/indexer.py``), which loads that tile's rows past them.
 
-The bound changes which rows the last tile loads, not how many: rows past the extent
-reload the tile's last visible row. It costs one integer ``min`` per row index, in
-every tile. Cases are decode steps (6 rows: one stream's 1 + 5 drafts; 96: sixteen
-streams') at extents ending inside a tile, on the ratio-2 caches' 128-row pages and
-layer 20's 256-row pages, up to a 1M-token context's 524,288 and 1,048,576 compressed
-positions.
+The bound predicates the key and scale loads of rows past the extent off; addresses,
+the page read and the load count are the release's. Cases are decode steps (6 rows:
+one stream's 1 + 5 drafts; 96: sixteen streams') at extents ending inside a tile, on
+the ratio-2 caches' 128-row pages and layer 20's 256-row pages, up to a 1M-token
+context's 524,288 and 1,048,576 compressed positions. Candidate cases score a reindex
+layer's candidate list (``CANDIDATE_BLOCKS * CANDIDATE_BLOCK`` sorted positions with
+-1 padding, one masked) at the deepest extents.
 
 For each case both kernels first score the same inputs, compared bit for bit over the
 visible positions. CUDA graphs of 20 launches of each then run back to back on eight
@@ -40,6 +41,7 @@ EXTENTS = [
     (256, 1048576, 8229),
     (256, 1048576, 1048549),
 ]
+CANDIDATE_EXTENTS = [(128, 524288, 524261), (256, 1048576, 1048549)]
 T_95 = 2.365  # Student's t, 7 degrees of freedom
 
 
@@ -89,6 +91,25 @@ def inputs(rows: int, page_size: int, width: int, extent: int, seed: int) -> lis
     ]
 
 
+def candidate_inputs(
+    rows: int, page_size: int, width: int, extent: int, seed: int
+) -> list:
+    """``inputs`` plus each row's candidate list: sorted visible positions, one of them
+    masked (-1), -1 padded, with lengths ending inside a tile."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed + 1)
+    span = indexer.CANDIDATE_BLOCKS * indexer.CANDIDATE_BLOCK
+    count = span - 3
+    chosen = torch.full((rows, span), -1, dtype=torch.int32, device=DEVICE)
+    for r in range(rows):
+        picked = torch.randperm(extent, generator=gen, device=DEVICE)[:count]
+        chosen[r, :count] = picked.sort().values.int()
+        chosen[r, count // 3] = -1
+    lengths = torch.tensor(
+        [count - 37 * r for r in range(rows)], dtype=torch.int32, device=DEVICE
+    )
+    return inputs(rows, page_size, width, extent, seed) + [chosen, lengths]
+
+
 def graph(score, args, scores) -> torch.cuda.CUDAGraph:
     score(*args, scores)  # warm
     torch.accelerator.synchronize()
@@ -111,21 +132,28 @@ def timed(g: torch.cuda.CUDAGraph) -> float:
     return start.elapsed_time(end) * 1e3 / CALLS  # us a launch
 
 
-def case(release, rows: int, page_size: int, width: int, extent: int) -> dict:
-    bounded = indexer.IndexerV41Plan(width, page_size).score
-    unbounded = release.IndexerV41Plan(width, page_size).score
+def case(
+    release, rows: int, page_size: int, width: int, extent: int, candidates: bool
+) -> dict:
+    # Candidate plans score a list as wide as the candidate blocks; both kernels leave
+    # the same zeros past each row's length, so whole rows compare.
+    span = indexer.CANDIDATE_BLOCKS * indexer.CANDIDATE_BLOCK if candidates else width
+    compared = span if candidates else extent
+    bounded = indexer.IndexerV41Plan(span, page_size, candidates=candidates).score
+    unbounded = release.IndexerV41Plan(span, page_size, candidates=candidates).score
+    make = candidate_inputs if candidates else inputs
     differences, times = [], {"bounded": [], "release": []}
     for i in range(INPUTS):
-        args = inputs(rows, page_size, width, extent, seed=1000 * i + extent)
-        mine = torch.zeros((rows, width), dtype=torch.bfloat16, device=DEVICE)
+        args = make(rows, page_size, width, extent, seed=1000 * i + extent)
+        mine = torch.zeros((rows, span), dtype=torch.bfloat16, device=DEVICE)
         theirs = torch.zeros_like(mine)
         bounded(*args, mine)
         unbounded(*args, theirs)
         torch.accelerator.synchronize()
         same = torch.equal(
-            mine[:, :extent].view(torch.int16), theirs[:, :extent].view(torch.int16)
+            mine[:, :compared].view(torch.int16), theirs[:, :compared].view(torch.int16)
         )
-        assert same, (rows, extent)
+        assert same, (rows, extent, candidates)
         graphs = {"bounded": graph(bounded, args, mine),
                   "release": graph(unbounded, args, theirs)}  # fmt: skip
         order = ("bounded", "release") if i % 2 == 0 else ("release", "bounded")
@@ -136,7 +164,8 @@ def case(release, rows: int, page_size: int, width: int, extent: int) -> dict:
     mean = statistics.fmean(differences)
     half = T_95 * statistics.stdev(differences) / math.sqrt(INPUTS)
     return {
-        "rows": rows, "page_size": page_size, "extent": extent,
+        "rows": rows, "candidates": candidates, "page_size": page_size,
+        "extent": extent,
         "bounded_us": statistics.median(times["bounded"]),
         "release_us": statistics.median(times["release"]),
         "difference_us": mean, "ci95_us": half,
@@ -151,9 +180,13 @@ def main() -> int:
     args = parser.parse_args()
     release = baseline_module(args.baseline)
     results = []
+    cases = [(False, *e) for e in EXTENTS] + [(True, *e) for e in CANDIDATE_EXTENTS]
     for name, rows in ROWS.items():
-        for page_size, width, extent in EXTENTS:
-            result = {"case": name, **case(release, rows, page_size, width, extent)}
+        for candidates, page_size, width, extent in cases:
+            result = {
+                "case": name,
+                **case(release, rows, page_size, width, extent, candidates),
+            }
             results.append(result)
             print(json.dumps(result), flush=True)
     slower = [r for r in results if r["slower"]]

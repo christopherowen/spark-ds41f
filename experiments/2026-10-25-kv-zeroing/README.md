@@ -1,9 +1,9 @@
 # KV block zeroing: DS4.1 drops it, as DeepSeek's reference does
 
 2026-10-25, CET. For the release after spark-ds41f-1025; nothing here touches candidate 6.
-**Nothing has run on a GPU yet.** The release freeze holds the cluster, and the laptop has
-no docker. The numbers below come from existing traces and the code. The vLLM changes ran
-in CPU tests only. The lab specs are queued work.
+The single-node GPU checks ran on dgx4 (below: the tests, the indexer's initcheck and its
+benchmark gate). Serving has not run: the lab specs are queued for the full cluster. The
+gain bound comes from existing traces and the code.
 
 ## Question, direction and answer
 
@@ -29,9 +29,9 @@ skipped by a -1 index.
   **0501** bounds those windows at CED's replay start, as REF bounds its windows.
 - **The indexer read slightly wider than REF.** It stored no score past the visible
   positions, but its last 64-row tile loaded the rows past them, which REF never reads,
-  then discarded their results. **0503** has those rows reload the tile's last visible
-  row, so no key or scale is read past the visible positions. Outputs are bit-identical,
-  and the cost is one integer `min` per row index.
+  then discarded their results. **0503** predicates those rows' key and scale loads off,
+  so no key or scale is read past the visible positions. Outputs are bit-identical, and on
+  dgx4 the bounded kernel is faster than the release's, not slower (below).
 - **Every other reader already matches REF**:
   - the sparse MLA skips -1 entries without loading them;
   - the compressor pools only slots the request wrote;
@@ -64,7 +64,7 @@ under `vllm/models/deepseek_v4_1/` in candidate 6's vLLM 3bdf9558c unless noted.
 | Window, DSpark drafter layers 40-42 | REF's draft layers read the same window ring by -1 indices | window `[prefix - 128, prefix + 6)` with no replay bound (:154): reads unwritten slots in nonfinal chunks (below) | **no; 0501 bounds it at `replay_start`** |
 | Compressed latents (top-k) | `Indexer.forward` returns -1 for `idxs >= compress_lens` (L577-580); `sparse_attn` skips -1 | top-k pads -1; `gather_idx` selects -1 past `IdxLengths` (`tilelang/sparse_mla.py:220`); a -1 entry's cp.async copies 0 bytes and zero-fills shared memory (:260), with no global read | yes: -1 skipped |
 | Window records (sparse MLA) | as above | `gather_swa` selects -1 past the length (:211), staged the same way | yes |
-| Index keys, scores | reads `index_k[:bsz, : end_pos // ratio]` (L554); prefill masks positions `>= compress_lens` to -inf (L563-567) | extent `min(visible, Active, width)`, with `visible = (pos + 1) // ratio` (`tilelang/metadata.py:125-137`); scores are stored only for positions below it (`tilelang/indexer.py:202`). Before 0503 the last 64-row tile loaded its rows past the extent (:164) and discarded their results; since 0503 they reload the tile's last visible row | **after 0503**: no key or scale read past the visible positions |
+| Index keys, scores | reads `index_k[:bsz, : end_pos // ratio]` (L554); prefill masks positions `>= compress_lens` to -inf (L563-567) | extent `min(visible, Active, width)`, with `visible = (pos + 1) // ratio` (`tilelang/metadata.py:125-137`); scores are stored only for positions below it (`tilelang/indexer.py:202`). Before 0503 the last 64-row tile loaded its rows past the extent (:164) and discarded their results; since 0503 their loads are predicated off | **after 0503**: no key or scale read past the visible positions |
 | Index candidates (two-level top-k) | `select_candidate_blocks` (L583-610) on scores already at -inf where unreachable; keeps `top.values > -inf` | candidate scores select `-inf` for -1 candidates (`tilelang/indexer.py:270`, :203); top-k pads -1 | yes |
 | Compressor state | `kv_state` zeros and `score_state` -inf at construction; prefill writes the trailing partial group into the state, decode fills slots and pools only a completed group (L458-490) | ring slot per row; the gather reads the previous slot only at an odd first position, under a select (`tilelang/compress.py:79-85`); every ring ownership starts at an even position, so that slot was written by the request's previous step | yes: bounded |
 | Writers (window and compressed records, index keys, ring) | slice assignments of what was computed | whole records, pad slots (-1) skipped (`tilelang/cache_writer.py:124`, `tilelang/indexer.py:341`, `tilelang/compress.py:234`) | yes |
@@ -147,25 +147,32 @@ keys and UE8M0 scale words at a time.
   tile. The keys past the extent are slots nobody had written: the rest of the last
   visible position's page. The MMA computed their scores, and the predicated store
   dropped them.
-- **Now:** both loads use `position(p0, T.min(p, extent - 1 - p0))`, so those rows reload
-  the tile's last visible row.
-  - In candidate mode the index is into the candidate list. A masked candidate (-1) still
-    loads position 0, which is visible, and its score is masked to -inf as before.
+- **Now:** the key and scale loads of rows past the extent are predicated off, and those
+  rows score zeros: `T.if_then_else(p0 + p < extent, KPool[...], 0)`, and the same for
+  the scale word.
+  - Only the loads are predicated. The page read stays unconditional, so a dense tile's
+    page read stays uniform and its addresses affine, as in the release.
+  - The extent joins the bounds check TileLang already puts on each load (`page` within
+    the pool): the generated CUDA is the release's with one more term in that predicate.
+  - In candidate mode the index is into the candidate list, which its source layer writes
+    whole with -1 padding. A masked or padding candidate loads position 0, which is
+    visible, and its score is masked to -inf as before.
   - Rows are independent in the block-scaled MMA, and the store drops exactly the rows
     that changed, so **every stored score is bit for bit as before**.
 
-**Cost bound.**
-- **Loads:** the count and pattern are unchanged: block_P × 64 key bytes and block_P scale
-  words a tile, contiguous along the key dimension. Only the last tile's rows past the
-  extent change address, and they hit the row its visible part just loaded, which is
-  cache-resident. DRAM bytes can only fall.
-- **Instructions:** one integer `min` per row index, in every tile; per-row work the
-  compiler can hoist out of the key dimension.
+**Cost.** The first form of 0503 clamped the row index instead,
+`position(p0, T.min(p, extent - 1 - p0))`. It was bit-identical but 28-64% slower on
+dgx4, because it doubled the kernel's registers and halved its occupancy (below). The
+predicated form keeps the release's registers (127 dense, 96 by candidates; the release's
+124 and 102) and compiles its load phase straight-line, where nvcc had split the release's
+into branches. On dgx4 it is up to 20% faster than the release's kernel at 128-row pages,
+and level by candidates.
 - **Gate:** `benchmark_deepseek_v41_indexer_bound.py` measures it. It times the kernel
   against the release's at 6 and 96 decode rows, on the ratio-2 caches' 128-row pages
-  (extents up to 524,261 positions) and layer 20's 256-row pages (up to 1,048,549). Each
-  case first compares the two kernels bit for bit, then times eight paired CUDA-graph
-  runs. `--gate` fails if any case is slower beyond its 95% interval.
+  (extents up to 524,261 positions) and layer 20's 256-row pages (up to 1,048,549), dense
+  and by candidates. Each case first compares the two kernels bit for bit, then times
+  eight paired CUDA-graph runs. `--gate` fails if any case is slower beyond its 95%
+  interval.
 
 **Tests** (vLLM, `tests/kernels/attention/`):
 - `test_indexer_reads_only_visible_rows` runs `deepseek_v41_indexer_reads.py` under
@@ -180,8 +187,8 @@ keys and UE8M0 scale words at a time.
 - `test_indexer_scores_ignore_rows_past_the_extent` puts NaN bytes in every slot past
   each row's extent (UE8M0 0xFF scales) and checks that every stored score stays
   bit-identical.
-- **The [indexer-initcheck](bundles/indexer-initcheck) bundle** (`tp4-gate.json`, dgx3)
-  runs the script under the nodes' host `compute-sanitizer`
+- **The [indexer-initcheck](bundles/indexer-initcheck) bundle** (`tp4-gate.json`; run on
+  dgx4, below) runs the script under the nodes' host `compute-sanitizer`
   (`/usr/local/cuda-13.0/compute-sanitizer`, as the 2026-09-29 determinism experiment
   mounted it):
   - the bounded kernel must report no error;
@@ -219,9 +226,10 @@ candidate 6's vLLM `3bdf9558c` (26382f5cf plus the test patches 0489-0490):
 - [0502](vllm/0502-DS4.1-No-per-allocation-KV-zeroing-every-cache-uses-.patch) `8d2842981`:
   DS4.1 without per-allocation zeroing. It adds `uses_only_written_slots`, the rule
   change, and the declaration on the window, compressed, index and ring specs.
-- [0503](vllm/0503-DS4.1-Indexer-scores-read-no-key-past-the-visible-po.patch) `57e5e748f`:
-  the indexer reads no key past the visible positions. Its tests are the initcheck
-  script and its wrapper and the NaN-tail test; it adds the gated benchmark.
+- [0503](vllm/0503-DS4.1-Indexer-scores-read-no-key-past-the-visible-po.patch) `33b748994`:
+  the indexer reads no key past the visible positions: those rows' loads are predicated
+  off. Its tests are the initcheck script and its wrapper and the NaN-tail test; it adds
+  the gated benchmark, dense and by candidates.
 - [vllm/series](vllm/series): candidate 6's series plus 0500-0503. 0491-0499 are other
   drafts'.
 
@@ -263,6 +271,113 @@ under initcheck, and the release's kernel as the positive control (0503 above).
 
 `tests/v1/core/test_single_type_kv_cache_manager.py` joins `config/release-tests.json`'s
 gate. `scripts/release_tests.py check` reports 0 problems.
+
+## GPU checks on dgx4 (2026-10-25, CET)
+
+The owner opened dgx4 to single-node checks while the triangle serves TP3. Every run below
+used `scripts/lab.py kernel-local` on dgx4 and nothing else. Each ran from a checkout of
+this branch at `~/spark-lab/agents/kv-zeroing/spark-ds41f`, on the
+`spark-ds41f:19f2c20ed4d6-next-6` image (`sha256:82b071b57485…`), and wrote its output
+under `~/spark-lab/agents/kv-zeroing/out/` on dgx4:
+
+```sh
+python3 scripts/lab.py kernel-local experiments/2026-10-25-kv-zeroing/bundles/BUNDLE --out ~/spark-lab/agents/kv-zeroing/out/OUTPUT
+```
+
+| Bundle | Commit | Output | Verdict |
+| --- | --- | --- | --- |
+| indexer-initcheck | `329cebf2` | `indexer-initcheck` | **pass**, 53 s |
+| poison-tests | `6eed8307` | `poison-tests` | **fail**, 315 s: every test passed, the benchmark gate failed |
+| indexer-variants | `b679dbad` | `indexer-variants` | diagnosis: v1-v3 |
+| indexer-variants | `0b41a754` | `indexer-variants-v4` | diagnosis: v1-v4 |
+| indexer-variants | `64a303eb` | `indexer-variants-v5` | diagnosis: v5 and v4, dense and by candidates |
+
+**indexer-initcheck** (0503 as first committed, `57e5e748f`):
+- the bounded kernel: `ERROR SUMMARY: 0 errors` over the four cases (dense and candidate
+  mode, 128- and 256-row pages);
+- the release's kernel: 12,480 uninitialized `__global__` reads, exit 86. The positive
+  control holds: the check sees the reads 0503 removes.
+
+**poison-tests**, step by step:
+
+| Step | Result |
+| --- | --- |
+| zeroing, the poison fill and the runner's declared calls | 686 passed, 1 skipped (`test_gpu_tilelang_inputs.py:942`, an existing skip: no budget below the scheduled drafts) |
+| the zeroing rule and the declaration's merges | 6 passed |
+| the ring's recorded blocks and DS4.1's specs | 28 passed (2 deselected, as the release tests deselect them) |
+| window metadata: TileLang against Triton, CED and the draft windows | 131 passed |
+| the TileLang attention kernels, the indexer's read bound included | 32 passed, 1 skipped (the in-image initcheck test: the image has no `compute-sanitizer`; the initcheck bundle runs it with the host's), 1 xfailed (the known score-ReLU NaN, strict) |
+| the bounded indexer against the release's: bits, then time (gated) | **exit 1**: bits equal in all 10 cases, slower in all 10 |
+
+The gate's timings, µs a call (median of eight paired CUDA-graph runs):
+
+| Case | Pages | Extent | 0503 | Release | Slower |
+| --- | --- | --- | --- | --- | --- |
+| c1, 6 rows | 128 | 4,133 | 14.9 | 11.7 | 28% |
+| c1 | 128 | 65,573 | 182 | 132 | 38% |
+| c1 | 128 | 524,261 | 1,604 | 1,069 | 50% |
+| c1 | 256 | 8,229 | 25.5 | 19.4 | 32% |
+| c1 | 256 | 1,048,549 | 3,516 | 2,260 | 56% |
+| c16, 96 rows | 128 | 4,133 | 214 | 146 | 47% |
+| c16 | 128 | 65,573 | 3,074 | 2,113 | 45% |
+| c16 | 128 | 524,261 | 25,840 | 16,697 | 55% |
+| c16 | 256 | 8,229 | 486 | 297 | 64% |
+| c16 | 256 | 1,048,549 | 56,467 | 35,672 | 58% |
+
+**Root cause: registers, not instructions.** The cost bound above assumed one integer
+`min` per row index. Instead the clamp cost half the kernel's occupancy:
+- **Release:** each thread issues 32 one-byte key loads a tile. With 64-aligned tiles that
+  never straddle a page, TileLang proves the page read uniform per tile and each load's
+  address affine: one base register plus immediate offsets.
+- **0503:** `min(p, extent - 1 - p0)` makes every one of the 32 addresses a separate
+  64-bit value. Its page index changes per load too. nvcc keeps all 32 loads in flight, so
+  it needs all of those addresses live at once.
+
+Register counts, from `cuobjdump -res-usage` on dgx4's compile cache, with blocks of 128
+threads an SM out of 64K registers:
+
+| Kernel | Dense | Candidates | Blocks an SM by registers (dense) |
+| --- | --- | --- | --- |
+| release | 124 | 102 | 4 |
+| v1: 0503 as committed | 198 | 174 | 2 |
+| v2: v1 with one page read a tile | 202 | 174 | 2 |
+| v3: release loads, the whole load guarded by the extent | 127 | 70 | 4 |
+| v4: release loads for whole tiles, v1's for the last | 255 | 178 | 2 |
+| v5: release addresses, only the key and scale loads predicated | 127 | 96 | 4 |
+
+The [indexer-variants](bundles/indexer-variants) bundle compiled each variant, printed
+its CUDA, compared bits and timed it:
+
+| Variant | Bits | c1, 128-row pages, 4,133 | c1, 524,261 | c16, 524,261 | c16, 256-row pages, 1,048,549 |
+| --- | --- | --- | --- | --- | --- |
+| v1 | equal | +28% | +49% | +56% | +57% |
+| v2 | equal | +7% | +10% | +16% | +17% |
+| v3 | equal | +87% | +186% | +180% | +212% |
+| v4 | equal | +4% | +3% | +11% | +16% |
+| **v5** | equal | **-20%** | **-20%** | **-20%** | **-3%** |
+
+- **v3** keeps the release's registers but puts the page read inside the guard. A
+  conditional load cannot be hoisted, so every one of the 32 iterations waits on two
+  dependent loads.
+- **v4**'s whole-tile path compiles to exactly the release's CUDA, and its clamped path
+  runs at most once a row. It is still slower: a kernel's registers are allocated for its
+  worse path.
+- **v5** is the release's CUDA with the extent added to the bounds predicate of each load.
+  In SASS the release's load phase has 48 byte loads and 112 byte stores across three
+  branches: nvcc unswitched its uniform page-range check. v5's per-row predicate cannot
+  be unswitched, so its 32 loads and 32 stores run straight-line (2,169 SASS lines to
+  2,361). The load phase is the only place the CUDA differs, so its gain most likely
+  comes from there.
+
+By candidates (the reindex layers), from the v5 run, µs a call:
+
+| Variant | c1, 128-row pages, 524,261 | c16, 256-row pages, 1,048,549 |
+| --- | --- | --- |
+| v4 | 43.8 vs 33.3: +32% | 990 vs 675: +47% |
+| **v5** | 34.2 vs 33.3: level (+0.0 ± 2.0) | 676 vs 709: level (-17 ± 30) |
+
+**0503 now has v5's form** (`33b748994`), and the benchmark gate covers candidate mode
+too. Its re-runs of both bundles are the last rows of the first table.
 
 ## Lab spec: the gate before the removal is promoted
 
@@ -373,6 +488,7 @@ The poison specs become the recurring check for any release that changes:
 | [make_bundles.py](make_bundles.py) | bundles, arms and specs from the vLLM branch (`python3 make_bundles.py ~/projects/vllm-kv-zeroing`) |
 | [bundles/poison-tests](bundles/poison-tests) | the kernel-lab GPU tests and the indexer benchmark |
 | [bundles/indexer-initcheck](bundles/indexer-initcheck) | the indexer's read bound under initcheck, with the positive control |
+| [bundles/indexer-variants](bundles/indexer-variants) | the read bound's diagnosis: five bounded variants against the release's kernel (hand-made; v1-v3 from [make_variants.py](bundles/indexer-variants/make_variants.py)) |
 | [bundles/serving](bundles/serving), [bundles/serving-zeroing](bundles/serving-zeroing), [bundles/serving-unfixed](bundles/serving-unfixed) | package files the arms mount (0500-0503; 0500-0501; 0500 alone) |
 | `zero-*.json`, `nofill-*.json`, `poison-*.json` | arms |
 | `tp4-*.json`, `tp3-*.json` | lab specs |
@@ -387,8 +503,9 @@ The poison specs become the recurring check for any release that changes:
 - **retire-conditionals** (0495) deletes the Triton `_chunk` that 0501 also edits. Whichever
   lands second gives its torch reference the draft branch's replay bound.
 - **The initcheck bundle** mounts the nodes' host sanitizer at
-  `/usr/local/cuda-13.0/compute-sanitizer`, the path the 2026-09-29 experiment used. If
-  the hosts' toolkit has moved since, point `SANITIZER` in make_bundles.py at it.
+  `/usr/local/cuda-13.0/compute-sanitizer`, the path the 2026-09-29 experiment used and
+  dgx4 still has. If a host's toolkit has moved, point `SANITIZER` in make_bundles.py at
+  it.
 - **ruff** reports two problems that already exist at the base, both outside this change:
   `nvidia/model_state.py`'s import block, and `single_type_kv_cache_manager.py:2680`.
 - **Upstream:** the declaration is upstreamable as it stands. vLLM's rule otherwise sees
