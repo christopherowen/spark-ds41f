@@ -18,8 +18,10 @@ below is from existing traces; every fix still needs its window.
 
 - **vLLM:** `tilelang-ports` 26382f5cf, the package files of candidate 6's image
   (`spark-ds41f:19f2c20ed4d6-next-6`, spark-ds41f-1025). The fixes are on the local
-  branch `kernel-audit` (worktree `~/projects/vllm-kernel-audit`): 3cd92e872,
-  bb2fb46ee, 8e596b329, and 1072d662b (fix 1's loop and tests, after the first dgx4 run).
+  branch `kernel-audit` (worktree `~/projects/vllm-kernel-audit`): 3cd92e872 and
+  bb2fb46ee (fixes 1 and 2 below), 1072d662b (fix 1's loop and tests, after run 1), and
+  8e596b329 (the mHC projection's fn prefetch), reverted by d9fa7d939 after run 1 measured
+  it slower.
 - **Traces:** request inventory 5
   ([experiments/2026-10-25-request-inventory](../2026-10-25-request-inventory/README.md)),
   `results/private/determinism/request-inventory-5/ports/`: TP4 ring, rank 0 (dgx1), the
@@ -72,11 +74,11 @@ c1 decode step, a c8 step and the 15K prefill; estimates are of what the fix rem
 
 | # | Kernel (call site) | Unnecessary work | c1 | c8 | prefill | Estimate | Status |
 |---|---|---|---:|---:|---:|---|---|
-| 1 | `mhc_project_streams` (`tilelang/mhc.py` `_mhc_pre`: every sublayer entry, 86 a step) | Each stream's [24, 128] FP32 `fn` tile is loaded only after the previous stream's GEMM barrier, then split straight into shared memory: four exposed L2 round trips in every decode CTA (12 µs a call at 6 rows, 40 CTAs) | 3.18% | 2.62% | 5.09% | c1 0.5-0.8%, c8 0.3-0.5% (2-3 µs a call), prefill ~0 (bound by the streams' bytes) | **Fixed**, 8e596b329 |
-| 2 | `metadata_decode` (`attention.py` `_write_decode_metadata`) | At `--max-model-len` 1M and 256-token blocks it writes all 4,096 page-table columns of every row (a 32-step loop a thread in 12 CTAs at decode, 268 MB a layer at a 16K chunk). Readers use ceil(visible / page) of them | 0.70% | 0.41% | 1.19% | c1 ~0.45%, c8 ~0.25%, prefill ~1.1% | **Fixed**, 3cd92e872 |
+| 1 | `mhc_project_streams` (`tilelang/mhc.py` `_mhc_pre`: every sublayer entry, 86 a step) | Each stream's [24, 128] FP32 `fn` tile is loaded only after the previous stream's GEMM barrier, then split straight into shared memory: four exposed L2 round trips in every decode CTA (12 µs a call at 6 rows, 40 CTAs) | 3.18% | 2.62% | 5.09% | Was c1 0.5-0.8%. Measured: the prefetch made the kernel 0.5-2.9 µs slower at decode (run 1) | **Reverted** (d9fa7d939); diagnostics queued |
+| 2 | `metadata_decode` (`attention.py` `_write_decode_metadata`) | At `--max-model-len` 1M and 256-token blocks it writes all 4,096 page-table columns of every row (a 32-step loop a thread in 12 CTAs at decode, 268 MB a layer at a 16K chunk). Readers use ceil(visible / page) of them | 0.70% | 0.41% | 1.19% | c1 ~0.45%, c8 ~0.25%, prefill >2% (measured: 1.2-1.9 µs a decode call, 1.35 ms a 16K prefill call) | **Fixed**, 3cd92e872 + 1072d662b; slower at a full 1M context, diagnostics queued |
 | 3 | SP prefill's MoE exchange copy (a device copy: `moe_runner` `write` in `sp_prefill._project_exchange`) | Each sequence-parallel layer's combined MoE output (157 MB) is copied into the exchange's send and parts buffers rather than written there: 80 copies of 39 MB, 345 µs each | — | — | 1.29% | ~1% (three quarters, with the combine writing the peers' blocks in place) | Follow-up |
 | 4 | Router chain on the routed side stream: `gemm_bf16_partials` (router gate, split-K), `router_partials`, `moe_dispatch`, `moe_swiglu_cast` (`tilelang/router.py`, `moe.py`) | On the critical path at decode. Each runs 1-4 µs above the launch floor (7.3, 6.2, 3.4, 3.0 µs at c1). Reading found nothing redundant. Candidates to measure: `router_partials`' serial shard loop, dispatch's per-expert padding loops | 2.92% together | 1.98% | 1.14% | Unknown until measured | Lab variant sweep |
-| 5 | Metadata builders (`sparse_mla.py`: every KV-cache group, every step, eager) | 26 groups (23 target, 3 drafter), each with a `requests` launch (one 1.2 µs CTA) beside its `tokens` launch: 52 eager launches a step | 0.09% (+0.13% tokens) | 0.07% (+0.11%) | 0% | ~0.1% device, plus 26 host launches a step | **Fixed**, bb2fb46ee |
+| 5 | Metadata builders (`sparse_mla.py`: every KV-cache group, every step, eager) | 26 groups (23 target, 3 drafter), each with a `requests` launch (one 1.2 µs CTA) beside its `tokens` launch: 52 eager launches a step | 0.09% (+0.13% tokens) | 0.07% (+0.11%) | 0% | ~0.1% device; measured 2.8 µs a builder eagerly, ~70 µs a step | **Fixed**, bb2fb46ee |
 | 6 | `split_columns` (`attention.py` `_gather_front`: SP prefill, layers without a compressor) | The gathered front is split into contiguous parts. Its q part (1,024 of 1,568 columns) feeds `wq_b`'s per-token cast, which reads strided rows (TileKernels takes a token stride) | — | — | 0.37% | ~0.25% | Follow-up |
 | 7 | `metadata_pages` (`attention.py` `forward_mqa`: the indexer's page table) | Same as #2 for the index cache | 0.10% | 0.07% | 0.004% | ~0.04% | **Fixed**, 3cd92e872 |
 | 8 | `zero_kv_blocks` (`model_runner.update_requests` → `zero_block_ids`) | Zeroes every newly allocated KV block (4.3 ms for the 15K prompt). The readers checked here (the sparse MLA, the indexer) never use an unwritten record: masked lanes are zero-filled or discarded | ~0 | ~0 | 0.20% | 0.2% | Not changed: vLLM's safety default, the owner's call |
@@ -138,28 +140,48 @@ pair's packed steps, paged and ring geometries.
 **Benchmark:** `benchmark_deepseek_v41_metadata_builder.py --gate`, eagerly (with the
 host's launch cost: the builders run eagerly) and under graphs.
 
-### 3. The mHC entry projection's fn tiles load ahead (8e596b329)
+### 3. The mHC entry projection's fn tiles loaded ahead (8e596b329): reverted
 
-`project_streams` loads each stream's `fn` tile into registers first: the first
-stream's while the token's columns load, each next stream's under the current stream's
-GEMMs. The split into three TF32 parts, the shared tiles and the GEMMs are unchanged.
+`project_streams` loaded each stream's `fn` tile into registers first: the first stream's
+while the token's columns load, each next stream's under the current stream's GEMMs.
 
-**Test:** `test_project_streams_bits_match_26382f5cf` checks every output (updated streams,
-partials, both sums of squares, the collapse) bit for bit against the 26382f5cf kernel:
+**What run 1 measured.** The outputs kept their bits: every output (updated streams,
+partials, both sums of squares, the collapse) matched the 26382f5cf kernel for every
+entry, 1-1000 tokens and both token tiles, in 124 mHC tests and 73 model-forward tests.
+But the benchmark's gate failed: the change was slower at every decode shape and at the
+`pre` entry's prefill.
 
-- every entry: `pre`, `post_pre` of one and of four rank parts, `broadcast`;
-- 1-1000 tokens;
-- both token tiles.
+| Entry | Shape | Loaded ahead | 26382f5cf |
+|---|---|---:|---:|
+| `post_pre` | decode c1 | 6.75 µs | 5.95 µs |
+| `post_pre` | decode c8 | 19.1 µs | 16.8 µs |
+| `post_pre` | decode c16 | 32.5 µs | 28.5 µs |
+| `pre` | decode c1 | 6.50 µs | 5.96 µs |
+| `pre` | prefill 16K | 5,692 µs | 5,355 µs |
 
-**Benchmark:** `benchmark_deepseek_v41_mhc_project.py --gate`, decode c1/c8/c16 and 8K/16K
-prefill, every entry.
+`broadcast` and the four-part entry were level. d9fa7d939 reverts it.
 
-### Estimated together
+**Why, so far a hypothesis.** In isolation `fn` is hot in L2, so there was little load
+latency to hide. And the register tile's split stored to shared memory four scalars at a
+time, where the `T.Parallel` split stores 16-byte vectors. The diagnostics bundle (Runs)
+times four other forms against the 26382f5cf kernel to separate the two effects. A form
+returns only if it is no slower anywhere:
 
-The three fixes are worth about **1.1-1.6% of a c1 decode step, 0.7-1.0% at c8 and 1.1%
-of the 15K prefill**, at the inventory's short contexts. Fix 1 saves the most there, where
-a row's live pages are a few of 4,096, and nothing at a full 1M context; fixes 2 and 3 do
-not depend on the context.
+- B, this change;
+- C, loaded ahead with vector stores;
+- D, the scalar split without loading ahead;
+- E, loaded ahead into a fragment and split by `T.Parallel`.
+
+### Measured so far (dgx4, kernel benchmarks in isolation)
+
+- **Fix 1:** 1.2-1.9 µs a decode call at 4K-64K contexts. At the inventory's 15 calls a
+  step that is 0.06-0.09% of a c1 step in isolation. The traced serving kernel ran at
+  15 µs against 3.3 µs here, so serving's saving depends on what slows it there; the
+  profile run measures it. A 16K prefill chunk takes 70 against 1,420 µs: at 38 calls a
+  prefill, about 51 ms, 2.4% of the 15K prefill. Still slower at a full 1M context (6.7
+  against 3.2 µs a call).
+- **Fix 2:** 1.3 µs a builder under graphs, 2.8 µs eagerly: about 70 µs a decode step.
+- **Fix 3:** reverted.
 
 ## Not changed, and why
 
@@ -185,11 +207,9 @@ not depend on the context.
 ## Coordination
 
 The `moe-overlap` session (branch `moe-overlap`) changes the MoE expert weights' cache
-hints and folds `per_token_cast` into mHC's finalize. Fix 3 edits only `project_streams`
-in `tilelang/mhc.py`; that session edits `finalize` and `_mhc_pre` in the same file.
-Textual conflicts are unlikely, but whichever lands second must rerun the mHC tests
-(`test_project_streams_bits_match_26382f5cf` compares `project_streams` alone). Neither
-change touches the other's kernels.
+hints and folds `per_token_cast` into mHC's finalize. With fix 3 reverted, the audit
+changes nothing in `tilelang/mhc.py`, so the two branches no longer meet. A form of fix 3
+that returns would edit only `project_streams`.
 
 ## Lab plan (next week's windows)
 
@@ -204,11 +224,10 @@ It writes `bundles/audit-*`, `bundles/serving/overlay`, `audit-tp4.json`,
 it after any change to the branch.
 
 1. **[audit-kernels.json](audit-kernels.json)**, run `kernel-audit-kernels`: two bundles
-   in parallel on candidate 6's image, with all three fixes mounted in each.
+   in parallel on candidate 6's image, with fixes 1 and 2 mounted in each.
    - `audit-attention` on dgx1: the metadata and attention kernel tests, the layer's
      declaration tests, then the live-page and builder benchmarks.
-   - `audit-mhc` on dgx2: the mHC tests, the CED and SP model-forward tests, then the
-     projection benchmark.
+   - `audit-mhc` on dgx2: the mHC tests and the CED and SP model-forward tests.
    - Pass: every test passes and every gate holds.
 2. **[audit-serving.json](audit-serving.json)**, run `kernel-audit-serving`: the serving
    check at tp4-ring, arms audit / candidate 6 / audit / candidate 6.
@@ -272,3 +291,60 @@ Root causes, both fixed in vLLM 1072d662b:
     held uninitialized request ids and both kernels read past the table; the kernels that
     wrote every column happened to agree on it. The main rows now hold the step's
     requests in reverse, and -1 past them.
+
+### Run 1: `audit-mhc`, 19:08-20:02 CET (branch e88dba66, vLLM 8e596b329): FAILED
+
+Output `~/spark-lab/agents/kernel-audit/out/audit-mhc/`; most of the hour was the
+queue for the GPU lock.
+
+| Step | Exit | Result |
+|---|---|---|
+| mHC tests | 0 | 124 passed, `test_project_streams_bits_match_26382f5cf` among them |
+| model-forward tests | 0 | 73 passed |
+| mHC projection benchmark | 1 | Gate failed: slower at every decode shape and at `pre`'s prefill (fix 3's table) |
+
+Root cause: fix 3 itself is slower. It is reverted (vLLM d9fa7d939), and the
+diagnostics bundle times the other forms.
+
+### Run 2: `audit-attention`, 19:16-20:03 CET (branch cf191082, vLLM 1072d662b): FAILED
+
+Output `~/spark-lab/agents/kernel-audit/out/audit-attention-2/`, from a second checkout
+(`spark-ds41f-r2`), so the running bundle's files were untouched.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 0 | 144 passed, 1 xfailed |
+| attention layer tests | 0 | 4 passed |
+| live-page benchmark | 1 | Gate failed again at c1 on a full 1M context: 6.7 against 3.2 µs |
+| one-launch builder benchmark | 0 | 2.0-2.4 against 3.3-3.7 µs under graphs, 9.9-10.0 against 12.5-12.9 µs eagerly |
+
+The page tables are otherwise as in run 1:
+
+- decode at 4K-64K: 2.0-2.4 against 3.3-4.0 µs;
+- a 16K prefill chunk: 67-70 against 1,419-1,431 µs;
+- the chunk 48K into a prompt: 120-123 against 1,426-1,436 µs.
+
+The fixed trip count did not explain the 1M case: 1072d662b's loop is as slow there as
+the dynamic one, and costs about 0.3 µs at short contexts. Each extra iteration costs
+about 0.14 µs, as if the iterations ran one after another. The diagnostics bundle times
+the loop's forms and writes their CUDA sources.
+
+### Diagnostics: `audit-diagnostics`, queued
+
+[bundles/audit-diagnostics](bundles/audit-diagnostics) runs on the image's own
+26382f5cf kernels. [make_diagnostics.py](make_diagnostics.py) writes its variant modules
+from 26382f5cf's sources.
+
+- **Five page-part forms of `decode_metadata`** at c1 4K, c1 1M, c16 64K and a 16K
+  prefill chunk:
+  - `old`, every column;
+  - `dyn`, 3cd92e872;
+  - `static_var`, 1072d662b;
+  - `static_expr`, the live pages inline;
+  - `select`, the old loop with the store predicated.
+- **Five forms of `project_streams`** (A-E above) at decode c1/c8/c16 and an 8K prefill,
+  for `post_pre` and `pre`.
+
+Every form's outputs are checked against the 26382f5cf form before timing. Each form's
+generated CUDA source goes to the node's compile cache
+(`~/.cache/spark-lab/compile/kernel-audit-diagnostics/`).

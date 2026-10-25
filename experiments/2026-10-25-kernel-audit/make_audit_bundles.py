@@ -61,9 +61,11 @@ PARTS = {
              ["benchmarks/kernels/benchmark_deepseek_v41_metadata_builder.py", "--gate"], 1800),
         ],
     ),
+    # Fix 2 (the mHC projection's fn tiles loaded ahead) was reverted after run 1: the
+    # bundle keeps the mHC and model-forward tests, run with the other changes in place.
     "mhc": (
-        "the mHC entry projection with its fn tiles loaded ahead, and the model forwards "
-        "that run it",
+        "the mHC kernels and the model forwards (CED, SP prefill) with the audit's "
+        "metadata changes in place",
         [
             ("mHC tests", PYTEST + [
                 "--basetemp", "/c/pytest-audit-mhc",
@@ -72,8 +74,6 @@ PARTS = {
                 "--basetemp", "/c/pytest-audit-forward",
                 "tests/models/test_deepseek_v4_1_ced_model.py",
                 "tests/models/test_deepseek_v4_1_sp_prefill.py"], 3600),
-            ("mHC projection benchmark",
-             ["benchmarks/kernels/benchmark_deepseek_v41_mhc_project.py", "--gate"], 3600),
         ],
     ),
 }
