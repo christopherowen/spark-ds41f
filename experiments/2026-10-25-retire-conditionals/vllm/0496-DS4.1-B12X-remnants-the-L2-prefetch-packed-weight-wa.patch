@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:37:48 +0100
+Subject: [PATCH 496/496] [DS4.1] B12X remnants: the L2 prefetch packed-weight
+ walk; attention's hooks
+
+linear_segments read a linear's b12x_weight and build_l2_prefetch walked a
+packed B12X WO through object_segments. B12X's linear methods and WO packing
+set those; with them gone nothing does, and the TileLang WO names its bytes
+(l2_segments) whenever the plans are built (only once every layer's WO is
+set up). object_segments goes with its two callers.
+
+DeepseekV4Attention's docstring names the kernel hooks that only the TileLang
+layer defines now that the base class's B12X implementations are gone.
+---
+ vllm/models/deepseek_v4_1/attention.py    |  6 +++
+ vllm/models/deepseek_v4_1/l2_prefetch.py  | 54 +----------------------
+ vllm/models/deepseek_v4_1/nvidia/model.py |  7 +--
+ 3 files changed, 9 insertions(+), 58 deletions(-)
+
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 818e1e4b9..eecc02540 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -228,6 +228,12 @@ def _prepare_global_kv_fake(hidden, positions, prefix):
+ 
+ 
+ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
++    """The V4.1 attention layer: caches, metadata, projections and ownership. Its
++    kernels are the TileLang layer's (``DeepseekV41TileLangAttention``), which
++    defines ``_check_attention_rows``, ``_attention_scratch_specs``,
++    ``_quantize_index_query``, ``_write_index_keys``, ``_index_chunk`` and
++    ``_attend``."""
++
+     backend_cls = DeepseekV41B12xBackend
+     # Index scores need bounded row scratch; attention handles the whole batch.
+     INDEX_CHUNK = 256
+diff --git a/vllm/models/deepseek_v4_1/l2_prefetch.py b/vllm/models/deepseek_v4_1/l2_prefetch.py
+index 063fbaa26..b234260e5 100644
+--- a/vllm/models/deepseek_v4_1/l2_prefetch.py
++++ b/vllm/models/deepseek_v4_1/l2_prefetch.py
+@@ -27,9 +27,7 @@ Environment:
+ 
+ from __future__ import annotations
+ 
+-import dataclasses
+ import os
+-from collections.abc import Iterable
+ 
+ import torch
+ 
+@@ -56,60 +54,10 @@ BUDGET_FFN = _l2pf._mb("VLLM_DS41_L2_PREFETCH_FFN_MB", "16")
+ BUDGET_NEXT = _l2pf._mb("VLLM_DS41_L2_PREFETCH_NEXT_MB", "20")
+ 
+ 
+-def object_segments(name: str, obj: object, depth: int = 4) -> list[Segment]:
+-    """CUDA tensor ranges reachable from a packed-weight object, deduplicated.
+-
+-    Packed b12x weights are dataclasses or plain objects holding the device
+-    tensors their kernels read; walking them prefetches exactly those bytes.
+-    """
+-    out: list[Segment] = []
+-    seen: set[int] = set()
+-
+-    def visit(label: str, value: object, level: int) -> None:
+-        if isinstance(value, torch.Tensor):
+-            segment = _l2pf.tensor_segment(label, value)
+-            if segment is not None and segment[1] not in seen:
+-                seen.add(segment[1])
+-                out.append(segment)
+-            return
+-        if level <= 0 or value is None or isinstance(value, (str, bytes, int, float)):
+-            return
+-        if isinstance(value, (list, tuple)):
+-            for i, item in enumerate(value):
+-                visit(f"{label}[{i}]", item, level - 1)
+-            return
+-        if isinstance(value, dict):
+-            for key, item in value.items():
+-                visit(f"{label}.{key}", item, level - 1)
+-            return
+-        items: Iterable[tuple[str, object]]
+-        if dataclasses.is_dataclass(value):
+-            items = (
+-                (f.name, getattr(value, f.name, None))
+-                for f in dataclasses.fields(value)
+-            )
+-        elif hasattr(value, "__dict__"):
+-            items = vars(value).items()
+-        else:
+-            items = (
+-                (s, getattr(value, s, None))
+-                for s in getattr(type(value), "__slots__", ())
+-            )
+-        for key, item in items:
+-            if not key.startswith("__"):
+-                visit(f"{label}.{key}", item, level - 1)
+-
+-    visit(name, obj, depth)
+-    return out
+-
+-
+ def linear_segments(name: str, linear: torch.nn.Module | None) -> list[Segment]:
+-    """Bytes read by a V4.1 linear: its packed b12x weight, else its weight."""
++    """Bytes read by a V4.1 linear: its weight, and its scale words."""
+     if linear is None:
+         return []
+-    packed = getattr(linear, "b12x_weight", None)
+-    if packed is not None:
+-        return object_segments(f"{name}.b12x_weight", packed)
+     segments = [
+         _l2pf.tensor_segment(f"{name}.weight", getattr(linear, "weight", None)),
+         # The TileLang block-32 projections read per-row scale words beside it.
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model.py b/vllm/models/deepseek_v4_1/nvidia/model.py
+index 1e1568997..be9eb0ad0 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model.py
+@@ -234,11 +234,8 @@ class DeepseekV4DecoderLayer(nn.Module):
+     def build_l2_prefetch(self, nxt: "DeepseekV4DecoderLayer | None") -> str:
+         """Install this layer's L2 prefetch windows; see ``l2_prefetch``."""
+         attn, device = self.attn, self.hc_attn_fn.device
+-        weights = attn._wo_projection_weights
+-        if hasattr(weights, "l2_segments"):  # the TileLang projection names its bytes
+-            wo = weights.l2_segments()
+-        else:
+-            wo = l2_prefetch.object_segments("wo", weights)
++        # The WO projection names the bytes it reads.
++        wo = attn._wo_projection_weights.l2_segments()
+         attn._l2pf_wo = l2_prefetch.make_plan(wo, l2_prefetch.BUDGET_WO, device)
+         ffn = l2_prefetch.param_segments(
+             "mhc", self, ("hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base")

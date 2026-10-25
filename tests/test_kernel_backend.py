@@ -141,7 +141,13 @@ class KernelBackendTest(unittest.TestCase):
                 self.assertEqual(cluster["promoted_baseline"], lock["generated_from_baseline"])
                 cluster["distributed"]["master_addr"] = self.base["distributed"]["master_addr"]
                 self.assertEqual(cluster["kernel_backend"], "tilelang")
-                self.assertEqual(cluster["environment"][kernel_backend.ENVIRONMENT], "tilelang")
+                # The variable is the series': required while vLLM has the switch, gone
+                # once the series records tilelang-only.
+                capabilities = spark.read_json(lock["source_manifest"])["vllm"]["capabilities"]
+                if kernel_backend.TILELANG_ONLY in capabilities:
+                    self.assertNotIn(kernel_backend.ENVIRONMENT, cluster["environment"])
+                else:
+                    self.assertEqual(cluster["environment"][kernel_backend.ENVIRONMENT], "tilelang")
                 self.assertEqual(kernel_backend.problems(cluster), [])
                 self.assertEqual(self.errors(cluster, lock), [])
 
@@ -284,6 +290,23 @@ class KernelBackendTest(unittest.TestCase):
             inputs = spark.build_inputs(lock, ["tilelang", "tile_kernels"])
             self.assertIn("missing_patches", inputs["vllm"])
 
+    def test_a_series_without_the_switch_refuses_its_variable(self):
+        """A vLLM series that retired VLLM_DS41_KERNEL_BACKEND (capability
+        tilelang-only) runs TileLang without it; a configuration that still sets it
+        names a variable that vLLM no longer reads."""
+        cluster, lock, manifest, patch = self.ready()
+        manifest["vllm"]["capabilities"].append(kernel_backend.TILELANG_ONLY)
+        with patch:
+            errors = self.errors(cluster, lock)
+            self.assertTrue(any("is gone from this vLLM series" in e for e in errors), errors)
+            cluster["environment"].pop(kernel_backend.ENVIRONMENT)
+            self.assertEqual(self.errors(cluster, lock), [])
+        # Its other requirements are unchanged.
+        for flag in FLAGS:
+            changed = copy.deepcopy(cluster)
+            spark.topology.set_argument(changed, flag, kernel_backend.BACKENDS["b12x"][flag])
+            self.assertTrue(any(flag in e for e in kernel_backend.problems(changed)))
+
     def test_missing_capability_fails(self):
         cluster, lock, manifest, patch = self.ready()
         manifest["vllm"]["capabilities"] = []
@@ -332,14 +355,19 @@ class KernelBackendTest(unittest.TestCase):
             self.assertTrue(any("speculative attention_backend" in e for e in kernel_backend.problems(cluster)))
 
     def test_environment_must_match_the_backend(self):
-        for cluster, wrong in ((self.candidate, "b12x"), (self.candidate, None), (self.base, "tilelang")):
+        # A value that is present must name the selected backend.
+        for cluster, wrong in ((self.candidate, "b12x"), (self.base, "tilelang")):
             with self.subTest(backend=kernel_backend.backend(cluster), value=wrong):
                 changed = copy.deepcopy(cluster)
-                if wrong is None:
-                    changed["environment"].pop(kernel_backend.ENVIRONMENT, None)
-                else:
-                    changed["environment"][kernel_backend.ENVIRONMENT] = wrong
+                changed["environment"][kernel_backend.ENVIRONMENT] = wrong
                 self.assertTrue(any(kernel_backend.ENVIRONMENT in e for e in kernel_backend.problems(changed)))
+        # A series that still has the switch defaults to B12X without it.
+        cluster, lock, _, patch = self.ready()
+        cluster["environment"].pop(kernel_backend.ENVIRONMENT)
+        self.assertEqual(kernel_backend.problems(cluster), [])
+        with patch:
+            self.assertTrue(any(f"requires {kernel_backend.ENVIRONMENT}=tilelang" in e
+                                for e in self.errors(cluster, lock)))
         for value in (None, "/tmp/tilelang", "/cache", "cache/tilelang"):
             with self.subTest(cache=value):
                 changed = copy.deepcopy(self.candidate)
@@ -426,6 +454,21 @@ class KernelBackendTest(unittest.TestCase):
                 self.assertIn(expected, script)
             manifest["vllm"]["capabilities"] = []
             self.assertNotIn("deepseek_v4_1.tilelang", spark.smoke_script(lock))
+
+    def test_a_tilelang_only_series_smoke_skips_b12x_roce(self):
+        """A TileLang-only series deletes B12X's RoCE collectives: the smoke must not
+        import them, and imports the rest as before."""
+        _, lock, manifest, patch = self.ready()
+        with patch:
+            self.assertIn(spark.B12X_ROCE_IMPORT, spark.SMOKE_SCRIPT)
+            self.assertIn(spark.B12X_ROCE_IMPORT, spark.smoke_script(lock))
+            manifest["vllm"]["capabilities"].append(kernel_backend.TILELANG_ONLY)
+            script = spark.smoke_script(lock)
+            compile(script, "smoke", "exec")
+            self.assertNotIn("b12x_roce_all_reduce", script)
+            for expected in ("import vllm.models.deepseek_v4_1.nvidia.model",
+                             "import vllm.models.deepseek_v4_1.tilelang", "import tilelang\n"):
+                self.assertIn(expected, script)
 
     def test_existing_profiles_and_locks_are_unaffected(self):
         for path in sorted(glob.glob(str(ROOT / "experiments/**/*.json"), recursive=True)):

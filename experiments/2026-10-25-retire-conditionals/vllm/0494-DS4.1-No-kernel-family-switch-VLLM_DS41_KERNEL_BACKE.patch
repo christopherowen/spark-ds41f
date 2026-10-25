@@ -1,0 +1,1275 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:29:17 +0100
+Subject: [PATCH 494/496] [DS4.1] No kernel-family switch:
+ VLLM_DS41_KERNEL_BACKEND goes
+
+VLLM_DS41_KERNEL_BACKEND defaulted to b12x and serving set it to tilelang.
+With the B12X family gone from the model, every engine conditional on it
+collapses to its TileLang branch:
+
+- envs.py: the variable goes, and VLLM_DS41_ATTENTION_COMPUTE, whose only
+  reader was the B12X sparse MLA;
+- DeepseekV41ForCausalLMConfig: the TILELANG attention backend and the tilelang
+  linear and MoE backends, an explicit other backend fails as before; it also
+  sets the new SchedulerConfig.align_prefill_chunks;
+- scheduler: aligned prefill chunks are that flag (the module constant read
+  the variable), so they stay DeepSeek V4.1's as under serving's setting, and
+  the CED skip policy reads the same flag;
+- CudaCommunicator: tensor-parallel groups always build sparknet's one-shot
+  collectives (a single-node group skips them, as sparknet decides) with the
+  rank-order all-reduce past the one-shot limit, rank-order reduce-scatter,
+  one-shot broadcast and the TileLang shard concat; VLLM_ENABLE_ROCE_ALLREDUCE,
+  which selected B12X's RoCE collectives, is refused; b12x_roce_all_reduce.py
+  goes (nothing else in vLLM imports it), with PyNCCL's all-reduce past the
+  one-shot limit that only that policy used, and its two size variables
+  (VLLM_ROCE_ALLREDUCE_MAX_SIZE, VLLM_ROCE_ALLGATHER_MAX_SIZE);
+- gpu_worker: the TileLang preparation and startup progress always run;
+- comments and docstrings that named the variable.
+
+Tests: the RoCE policy's broadcast tests are the one-shot all-gather's (the
+B12X policy's PyNCCL broadcast goes); the config, CED skip-policy, aligned
+chunk and kernel-preparation tests run without the variable.
+---
+ .../test_roce_policy_no_fallback.py           |  39 +-
+ tests/models/test_deepseek_v4_1_config.py     |  22 +-
+ .../attention/test_b12x_v41_ced_metadata.py   |  24 +-
+ tests/v1/core/test_aligned_prefill_chunks.py  |   8 +-
+ tests/v1/worker/test_prepare_kernels.py       |  66 ++--
+ vllm/config/scheduler.py                      |   6 +
+ .../b12x_roce_all_reduce.py                   | 342 ------------------
+ .../device_communicators/cuda_communicator.py | 100 ++---
+ vllm/envs.py                                  |  36 +-
+ vllm/model_executor/models/config.py          |  27 +-
+ .../deepseek_v4_1/nvidia/model_state.py       |  16 +-
+ .../models/deepseek_v4_1/tilelang/__init__.py |   5 +-
+ vllm/v1/attention/backends/registry.py        |   2 +-
+ vllm/v1/core/sched/scheduler.py               |  18 +-
+ vllm/v1/worker/gpu_worker.py                  |  26 +-
+ 15 files changed, 170 insertions(+), 567 deletions(-)
+ delete mode 100644 vllm/distributed/device_communicators/b12x_roce_all_reduce.py
+
+diff --git a/tests/distributed/test_roce_policy_no_fallback.py b/tests/distributed/test_roce_policy_no_fallback.py
+index ac37d59eb..e8d34cd54 100644
+--- a/tests/distributed/test_roce_policy_no_fallback.py
++++ b/tests/distributed/test_roce_policy_no_fallback.py
+@@ -12,7 +12,6 @@ import pytest
+ import torch
+ import torch.distributed
+ 
+-import vllm.envs as envs
+ from vllm.distributed.device_communicators import cuda_communicator
+ from vllm.distributed.device_communicators.base_device_communicator import (
+     DeviceCommunicatorBase,
+@@ -81,13 +80,6 @@ def test_gather_is_not_part_of_the_policy():
+         _policy_communicator().gather(torch.zeros(4))
+ 
+ 
+-def test_broadcast_runs_on_pynccl():
+-    pynccl = _PyNccl()
+-    tensor = torch.zeros(4)
+-    assert _policy_communicator(pynccl).broadcast(tensor, src=0) is tensor
+-    assert pynccl.calls == [("broadcast", 0)]
+-
+-
+ def test_batch_isend_irecv_runs_on_pynccl():
+     pynccl = _PyNccl()
+     _policy_communicator(pynccl).batch_isend_irecv([object(), object()])
+@@ -129,8 +121,7 @@ class _SparknetAdapter(_OneShot):
+         return self.report
+ 
+ 
+-def test_failure_report_comes_from_the_one_shot_runtime(monkeypatch):
+-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
++def test_failure_report_comes_from_the_one_shot_runtime():
+     comm = _policy_communicator()
+     comm.b12x_ar_comm = _SparknetAdapter(report="saw nothing from rank 2")
+     assert comm.roce_failure() == "saw nothing from rank 2"
+@@ -156,18 +147,15 @@ class _GatheringAdapter(_OneShot):
+         return torch.cat([base + 100 * r for r in range(self.world)])
+ 
+ 
+-def _tilelang_communicator(monkeypatch, rank, eligible=True):
+-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
+-    comm = _policy_communicator()
++def _one_shot_communicator(rank, eligible=True, pynccl=None):
++    comm = _policy_communicator(pynccl)
+     comm.rank_in_group = rank
+     comm.b12x_ar_comm = _GatheringAdapter(comm.world_size, eligible)
+     return comm
+ 
+ 
+-def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
+-    monkeypatch,
+-):
+-    comm = _tilelang_communicator(monkeypatch, rank=1)
++def test_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather():
++    comm = _one_shot_communicator(rank=1)
+     tensor = torch.full((2, 3), -1.0)
+     assert comm.broadcast(tensor, src=2) is tensor
+     assert torch.equal(tensor, (torch.arange(6.0) + 200).view(2, 3))
+@@ -175,8 +163,8 @@ def test_tilelang_broadcast_keeps_the_source_copy_of_the_one_shot_all_gather(
+     assert comm.pynccl_comm.calls == []
+ 
+ 
+-def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
+-    comm = _tilelang_communicator(monkeypatch, rank=2)
++def test_broadcast_source_keeps_its_own_bytes():
++    comm = _one_shot_communicator(rank=2)
+     tensor = torch.full((2, 3), 7.0)
+     comm.broadcast(tensor, src=2)
+     assert torch.equal(tensor, torch.full((2, 3), 7.0))
+@@ -184,8 +172,8 @@ def test_tilelang_broadcast_source_keeps_its_own_bytes(monkeypatch):
+     assert comm.b12x_ar_comm.gathers == [((6,), 0)]
+ 
+ 
+-def test_tilelang_broadcast_refuses_what_the_all_gather_cannot_take(monkeypatch):
+-    comm = _tilelang_communicator(monkeypatch, rank=1, eligible=False)
++def test_broadcast_refuses_what_the_all_gather_cannot_take():
++    comm = _one_shot_communicator(rank=1, eligible=False)
+     with pytest.raises(RuntimeError, match="one-shot broadcast cannot take"):
+         comm.broadcast(torch.zeros(4), src=0)
+     assert comm.pynccl_comm.calls == []
+@@ -202,11 +190,14 @@ def _group(device_communicator):
+ 
+ def test_group_broadcast_goes_through_the_policy():
+     """The TP group's broadcast (DSpark's per-step confidences) never reaches
+-    the PyTorch process group under the policy."""
++    the PyTorch process group under the policy: the one-shot all-gather takes it."""
+     pynccl = _PyNccl()
++    comm = _one_shot_communicator(rank=1, pynccl=pynccl)
+     tensor = torch.zeros(4)
+-    assert _group(_policy_communicator(pynccl)).broadcast(tensor, src=0) is tensor
+-    assert pynccl.calls == [("broadcast", 0)]
++    assert _group(comm).broadcast(tensor, src=0) is tensor
++    assert torch.equal(tensor, torch.arange(4.0))
++    assert comm.b12x_ar_comm.gathers == [((4,), 0)]
++    assert pynccl.calls == []
+ 
+ 
+ def test_group_broadcast_without_a_policy_keeps_the_process_group(monkeypatch):
+diff --git a/tests/models/test_deepseek_v4_1_config.py b/tests/models/test_deepseek_v4_1_config.py
+index 71f5ea9be..a7f8e0861 100644
+--- a/tests/models/test_deepseek_v4_1_config.py
++++ b/tests/models/test_deepseek_v4_1_config.py
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek V4.1 configuration on GB10: kernel-family routing and TP3 head padding."""
++"""DeepSeek V4.1 configuration on GB10: kernel routing and TP3 head padding."""
+ 
+ from types import SimpleNamespace
+ 
+@@ -12,28 +12,34 @@ from vllm.models.deepseek_v4_1.nvidia.model import _select_dsv4_attn_cls
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+ 
+-def test_kernel_family_routes_deepseek_v41(monkeypatch) -> None:
+-    """VLLM_DS41_KERNEL_BACKEND picks one kernel family for the whole model: its
+-    attention backend and class, and the linear and MoE backends."""
+-    from vllm import envs
++@pytest.mark.parametrize("component", ["linear_backend", "moe_backend"])
++def test_tilelang_runs_deepseek_v41(component) -> None:
++    """TileLang's kernels run the whole model: its attention backend and class, the
++    linear and MoE backends, and aligned prefill chunks; another backend fails."""
+     from vllm.models.deepseek_v4_1.tilelang.attention import (
+         DeepseekV41TileLangAttention,
+     )
+ 
+-    monkeypatch.setattr(envs, "VLLM_DS41_KERNEL_BACKEND", "tilelang", raising=False)
+-    backend, attention_cls = AttentionBackendEnum.TILELANG, DeepseekV41TileLangAttention
++    backend = AttentionBackendEnum.TILELANG
+     kernel = SimpleNamespace(linear_backend="auto", moe_backend="auto")
+     config = SimpleNamespace(
+         attention_config=SimpleNamespace(backend=None),
+         kernel_config=kernel,
++        scheduler_config=SimpleNamespace(align_prefill_chunks=False),
+         speculative_config=None,
+     )
+ 
+     DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
+ 
+     assert config.attention_config.backend is backend
+-    assert _select_dsv4_attn_cls(config) is attention_cls
++    assert _select_dsv4_attn_cls(config) is DeepseekV41TileLangAttention
+     assert kernel.linear_backend == kernel.moe_backend == "tilelang"
++    assert config.scheduler_config.align_prefill_chunks
++
++    setattr(kernel, component, "b12x")
++    with pytest.raises(ValueError, match="requires the tilelang"):
++        DeepseekV41ForCausalLMConfig.verify_and_update_config(config)
++    setattr(kernel, component, "tilelang")
+ 
+     config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
+     with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
+diff --git a/tests/v1/attention/test_b12x_v41_ced_metadata.py b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+index bc52f85c6..5225c9569 100644
+--- a/tests/v1/attention/test_b12x_v41_ced_metadata.py
++++ b/tests/v1/attention/test_b12x_v41_ced_metadata.py
+@@ -75,23 +75,23 @@ def test_nonfinal_limits_skip_only_unread_chunks():
+ 
+ 
+ @pytest.mark.parametrize(
+-    ("backend", "spec", "align", "aligned", "expected"),
++    ("spec", "align", "aligned", "expected"),
+     [
+-        ("tilelang", "dspark", 4048, True, (199, 4048)),
+-        ("tilelang", None, 4048, True, None),
+-        ("b12x", "dspark", 4048, True, None),
+-        ("tilelang", "mtp", 4048, True, None),
+-        ("tilelang", "dspark", 198, True, None),
+-        ("tilelang", "dspark", 4048, False, None),
++        ("dspark", 4048, True, (199, 4048)),
++        (None, 4048, True, None),
++        ("mtp", 4048, True, None),
++        ("dspark", 198, True, None),
++        ("dspark", 4048, False, None),
+     ],
+ )
+-def test_nonfinal_skip_policy(monkeypatch, backend, spec, align, aligned, expected):
++def test_nonfinal_skip_policy(spec, align, aligned, expected):
+     from vllm.models.deepseek_v4_1.nvidia.model_state import _nonfinal_skip_policy
+ 
+-    monkeypatch.setenv("VLLM_DS41_KERNEL_BACKEND", backend)
+     config = SimpleNamespace(
+         scheduler_config=SimpleNamespace(
+-            long_prefill_token_threshold=align, enable_chunked_prefill=True
++            long_prefill_token_threshold=align,
++            enable_chunked_prefill=True,
++            align_prefill_chunks=aligned,
+         ),
+         model_config=SimpleNamespace(hf_config=SimpleNamespace(sliding_window=128)),
+         speculative_config=None
+@@ -106,9 +106,9 @@ def test_nonfinal_skip_policy(monkeypatch, backend, spec, align, aligned, expect
+     )
+     if expected is None:
+         with pytest.raises(ValueError):
+-            _nonfinal_skip_policy(config, aligned_chunks=aligned)
++            _nonfinal_skip_policy(config)
+     else:
+-        assert _nonfinal_skip_policy(config, aligned_chunks=aligned) == expected
++        assert _nonfinal_skip_policy(config) == expected
+ 
+ 
+ def _state(lengths, seq_lens=None, full=None, prefix=None):
+diff --git a/tests/v1/core/test_aligned_prefill_chunks.py b/tests/v1/core/test_aligned_prefill_chunks.py
+index 208fe77b6..32ede688b 100644
+--- a/tests/v1/core/test_aligned_prefill_chunks.py
++++ b/tests/v1/core/test_aligned_prefill_chunks.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Aligned prefill chunks: a chunk ends at an absolute multiple of the threshold."""
+ 
++import functools
+ import json
+ from types import SimpleNamespace
+ 
+@@ -67,7 +68,12 @@ def _scheduled(monkeypatch, tmp_path, aligned):
+     # The scheduler fixtures live in the source tree's tests, not in every image.
+     utils = pytest.importorskip("tests.v1.core.utils")
+     create_requests, create_scheduler = utils.create_requests, utils.create_scheduler
+-    monkeypatch.setattr(scheduler_module, "ALIGN_PREFILL_CHUNKS", aligned)
++    # DeepSeek V4.1's configuration sets the flag; this OPT model takes it here.
++    monkeypatch.setattr(
++        utils,
++        "SchedulerConfig",
++        functools.partial(utils.SchedulerConfig, align_prefill_chunks=aligned),
++    )
+     (tmp_path / "config.json").write_text(json.dumps(_OPT_CONFIG))
+     scheduler = create_scheduler(
+         model=str(tmp_path),
+diff --git a/tests/v1/worker/test_prepare_kernels.py b/tests/v1/worker/test_prepare_kernels.py
+index 850bdc0a4..f7d24a3cc 100644
+--- a/tests/v1/worker/test_prepare_kernels.py
++++ b/tests/v1/worker/test_prepare_kernels.py
+@@ -30,7 +30,7 @@ class _Registry:
+         self._trace.append("compile")
+ 
+ 
+-def _worker(monkeypatch, runner, family: str = "b12x") -> Worker:
++def _worker(monkeypatch, runner) -> Worker:
+     worker = Worker.__new__(Worker)  # no GPU, no init: only preparation is used
+     worker.model_runner = runner
+     worker.vllm_config = None
+@@ -41,66 +41,82 @@ def _worker(monkeypatch, runner, family: str = "b12x") -> Worker:
+     monkeypatch.setattr(
+         gpu_worker_module, "set_current_vllm_config", lambda _: contextlib.nullcontext()
+     )
+-    monkeypatch.setattr(
+-        gpu_worker_module.envs, "VLLM_DS41_KERNEL_BACKEND", family, raising=False
+-    )
+     return worker
+ 
+ 
++def _record_preparation(monkeypatch, trace: list[str], registry, calls: int = 0):
++    """The TileLang preparation steps, recorded; ``calls`` declared calls."""
++    from vllm.models.deepseek_v4_1.tilelang import prepare
++    from vllm.utils import jit_monitor
++
++    def declare_modules(model, draft):
++        trace.append("declare")
++
++    def prepare_declared(active):
++        assert active is registry
++        trace.append("prepare")
++        return calls
++
++    record = lambda name: lambda *args, **kwargs: trace.append(name)  # noqa: E731
++    monkeypatch.setattr(prepare, "declare_modules", declare_modules)
++    monkeypatch.setattr(prepare, "prepare_declared", prepare_declared)
++    monkeypatch.setattr(prepare, "warm_declared", record("warm"))
++    monkeypatch.setattr(prepare, "release_host_memory", record("release"))
++    monkeypatch.setattr(prepare, "freeze", record("freeze"))
++    monkeypatch.setattr(prepare, "bind_declared", record("bind"))
++    monkeypatch.setattr(jit_monitor, "activate", record("monitor"))
++
++
+ def test_step_kernels_register_while_collecting_before_the_registry_compiles(
+     monkeypatch,
+ ):
+     trace: list[str] = []
++    registry = _Registry(trace)
+     runner = SimpleNamespace(
+-        jit_warmup_registry=_Registry(trace),
++        jit_warmup_registry=registry,
++        model=object(),
+         declare_step_kernels=lambda: trace.append("step kernels"),
+     )
++    _record_preparation(monkeypatch, trace, registry)
+     _worker(monkeypatch, runner)._prepare_kernels()
+-    assert trace == ["collect", "step kernels", "collected", "compile"]
++    assert trace == [
++        "collect", "declare", "collected", "prepare", "warm",
++        "collect", "step kernels", "collected", "compile",
++    ]  # fmt: skip
+ 
+ 
+ def test_a_runner_without_step_kernels_still_compiles_its_registry(monkeypatch):
+     trace: list[str] = []
+-    runner = SimpleNamespace(jit_warmup_registry=_Registry(trace))
++    registry = _Registry(trace)
++    runner = SimpleNamespace(jit_warmup_registry=registry, model=object())
++    _record_preparation(monkeypatch, trace, registry)
+     _worker(monkeypatch, runner)._prepare_kernels()
+-    assert trace == ["compile"]
++    assert trace == ["collect", "declare", "collected", "prepare", "warm", "compile"]
+ 
+ 
+ def test_tilelang_kernels_compile_and_freeze_before_binding(monkeypatch):
+-    """TileLang: declare from the loaded model, compile, warm, add the step's
+-    kernels, compile the registry, return the compile heap, freeze, bind, and
+-    only then watch for compiles."""
++    """Declare from the loaded model, compile, warm, add the step's kernels, compile
++    the registry, return the compile heap, freeze, bind, and only then watch for
++    compiles."""
+     from vllm.models.deepseek_v4_1.tilelang import prepare
+-    from vllm.utils import jit_monitor
+ 
+     trace: list[str] = []
+     registry = _Registry(trace)
+     target, drafter = object(), object()
++    _record_preparation(monkeypatch, trace, registry, calls=3)
+ 
+     def declare_modules(model, draft):
+         assert (model, draft) == (target, drafter)
+         trace.append("declare")
+ 
+-    def prepare_declared(active):
+-        assert active is registry
+-        trace.append("prepare")
+-        return 3
+-
+-    record = lambda name: lambda *args, **kwargs: trace.append(name)  # noqa: E731
+     monkeypatch.setattr(prepare, "declare_modules", declare_modules)
+-    monkeypatch.setattr(prepare, "prepare_declared", prepare_declared)
+-    monkeypatch.setattr(prepare, "warm_declared", record("warm"))
+-    monkeypatch.setattr(prepare, "release_host_memory", record("release"))
+-    monkeypatch.setattr(prepare, "freeze", record("freeze"))
+-    monkeypatch.setattr(prepare, "bind_declared", record("bind"))
+-    monkeypatch.setattr(jit_monitor, "activate", record("monitor"))
+     runner = SimpleNamespace(
+         jit_warmup_registry=registry,
+         model=target,
+         speculator=SimpleNamespace(model=drafter),
+         declare_step_kernels=lambda: trace.append("step kernels"),
+     )
+-    _worker(monkeypatch, runner, "tilelang")._prepare_kernels()
++    _worker(monkeypatch, runner)._prepare_kernels()
+     assert trace == [
+         "collect", "declare", "collected", "prepare", "warm",
+         "collect", "step kernels", "collected", "compile",
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index f00b8dae2..20ae75c3b 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -79,6 +79,12 @@ class SchedulerConfig:
+     """For chunked prefill, a request is considered long if the prompt is
+     longer than this number of tokens. 0 disables the cap (default)."""
+ 
++    align_prefill_chunks: bool = False
++    """Prefill chunks end at absolute multiples of `long_prefill_token_threshold`,
++    whatever else the step holds; otherwise a chunk takes whatever budget the
++    step's other requests leave. Set by models whose temperature-0 determinism
++    needs it (DeepSeek V4.1)."""
++
+     max_num_queued_reqs: int | None = Field(default=None, ge=0)
+     """Maximum number of requests that can be in-flight (waiting or running)
+     at the same time, or None for no limit. When the limit is reached, new
+diff --git a/vllm/distributed/device_communicators/b12x_roce_all_reduce.py b/vllm/distributed/device_communicators/b12x_roce_all_reduce.py
+deleted file mode 100644
+index 0d647aa55..000000000
+--- a/vllm/distributed/device_communicators/b12x_roce_all_reduce.py
++++ /dev/null
+@@ -1,342 +0,0 @@
+-# SPDX-License-Identifier: Apache-2.0
+-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""RoCEnante: adapter for the b12x one-shot RoCE collectives (multi-node DGX Spark TP).
+-
+-Thin shim: capability voting, construction, and size gating live here; the
+-protocol lives in ``b12x.comm.roce``.  Enabled with
+-``VLLM_ENABLE_ROCE_ALLREDUCE=1`` for tensor-parallel groups whose ranks span
+-nodes; single-node groups keep their existing backends.
+-
+-Contract with the runtime (``b12x.comm.roce.API_VERSION`` ==
+-``REQUIRED_B12X_ROCE_API_VERSION``):
+-
+-- Every rank parses the size limits and checks the API version before the
+-  vote; the parsed limits are exchanged and must be identical, and the
+-  runtime itself refuses ranks whose ABI, HCA count, slot geometry, spin
+-  limit or launch geometry differ.  Any rank that cannot take part aborts
+-  initialization on every rank. Explicit multi-node selection is required,
+-  not a request to try other backends on failure.
+-- Dispatch is rank-invariant: eligibility depends on dtype, shape, contiguity
+-  and size, never on pointer values, so all ranks route the same collective.
+-- Failures are fail-stop, never a fallback: a wait that times out freezes the
+-  runtime, later launches do nothing, and ``check_health`` (called by the
+-  worker after each step's host synchronization) raises so the step's output
+-  never leaves the worker.  Peers starve on the stalled rank and raise too.
+-- The runtime orders collectives across streams with an event and requires a
+-  single stream inside a CUDA graph capture, which is how vLLM captures.
+-"""
+-
+-from __future__ import annotations
+-
+-from collections.abc import Sequence
+-from contextlib import contextmanager
+-
+-import torch
+-import torch.distributed as dist
+-from torch.distributed import ProcessGroup
+-
+-import vllm.envs as envs
+-from vllm.distributed.device_communicators.b12x_pcie_all_reduce import (
+-    _parse_byte_size,
+-)
+-from vllm.distributed.parallel_state import in_the_same_node_as
+-from vllm.logger import init_logger
+-from vllm.utils.b12x import (
+-    B12xPreparationUnit,
+-    B12xWorkload,
+-    PreparationResourceUnavailableError,
+-    register_b12x_unit_provider,
+-)
+-
+-logger = init_logger(__name__)
+-
+-
+-REQUIRED_B12X_ROCE_API_VERSION = 1
+-
+-
+-class B12xRoceAllReduce:
+-    """Route eligible tensor-parallel all-reduces to ``b12x.comm.roce``."""
+-
+-    backend_name = "B12X_ROCENANTE"
+-
+-    def __init__(
+-        self,
+-        group: ProcessGroup,
+-        device_group: ProcessGroup | None,
+-        device: torch.device,
+-        *,
+-        global_ranks: Sequence[int] | None = None,
+-        nccl_available: bool = True,
+-    ) -> None:
+-        self.disabled = True
+-        self.group = group
+-        self.device_group = device_group
+-        self.device = device
+-        self.rank = dist.get_rank(group=group)
+-        self.world_size = dist.get_world_size(group=group)
+-        self._runtime = None
+-        self._announced = False
+-        self._announced_gather = False
+-        self.global_ranks = tuple(
+-            int(rank)
+-            for rank in (
+-                global_ranks if global_ranks is not None else range(self.world_size)
+-            )
+-        )
+-        if len(self.global_ranks) != self.world_size:
+-            raise ValueError("RoCE global ranks must match the process group")
+-        self._plan = None
+-
+-        if device_group is None:
+-            raise RuntimeError("RoCEnante requires a CUDA process group.")
+-        if all(in_the_same_node_as(group, source_rank=0)):
+-            logger.info("RoCEnante skipped: group is single-node.")
+-            return
+-
+-        # Vote before the collective constructor so a rank that cannot take
+-        # part (missing package, wrong API version, unsupported device, or an
+-        # unparsable limit) fails initialization on every rank instead of
+-        # leaving peers in the runtime's setup exchange.  The parsed limits
+-        # travel with the vote and must be identical everywhere.
+-        reason, limits = self._local_capability()
+-        if not nccl_available:
+-            reason = "RoCEnante policy requires an available PyNCCL communicator"
+-        verdict = self._exchange_vote(reason, limits)
+-        if verdict is not None:
+-            raise RuntimeError(f"RoCEnante policy unavailable: {verdict}")
+-        max_size, max_gather = limits
+-
+-        from b12x.comm import roce
+-
+-        try:
+-            # Exchange setup over the CPU (gloo) group: using the torch NCCL
+-            # group would create a torch NCCL communicator that vLLM otherwise
+-            # never needs, costing ~3.4 GB of unified memory per rank on Spark.
+-            self._runtime = roce.AllReduce.from_exchange_group(
+-                exchange_group=group,
+-                device=device,
+-                max_size=max_size,
+-                max_gather_bytes=max_gather,
+-            )
+-        except Exception as exc:  # noqa: BLE001 - the runtime already coordinated ranks
+-            raise RuntimeError("RoCEnante policy initialization failed") from exc
+-        self.disabled = False
+-        register_b12x_unit_provider(self)
+-        if self.rank == 0:
+-            logger.info(
+-                "Using RoCEnante (b12x one-shot RoCE collectives): world=%d, hcas=%s, "
+-                "all-reduce dispatch <=%d bytes, registered all-reduce capacity=%d "
+-                "bytes, all-gather input shard <=%d bytes. NCCL handles "
+-                "ineligible inputs and reduce-scatter; backend failures are fatal.",
+-                self.world_size,
+-                ",".join(self._runtime.hca_names),
+-                self.all_reduce_max_bytes,
+-                self.all_reduce_capacity_bytes,
+-                self.all_gather_max_bytes,
+-            )
+-
+-    def _local_capability(self) -> tuple[str | None, tuple[int, int] | None]:
+-        """Evaluate this rank's ability to take part, without any collective.
+-
+-        Returns:
+-            A pair of the reason this rank cannot take part (None when it can)
+-            and the parsed ``(max_size, max_gather)`` limits (None on failure).
+-        """
+-        try:
+-            from b12x.comm import roce
+-        except ImportError as exc:  # missing package or a broken native build
+-            return f"b12x.comm.roce is not importable: {exc}", None
+-        api = getattr(roce, "API_VERSION", None)
+-        if api != REQUIRED_B12X_ROCE_API_VERSION:
+-            needed = REQUIRED_B12X_ROCE_API_VERSION
+-            return f"b12x.comm.roce API version {api}, adapter needs {needed}", None
+-        if not roce.is_supported(self.device):
+-            return "needs an integrated GPU with an active RDMA device", None
+-        try:
+-            limits = (
+-                _parse_byte_size(envs.VLLM_ROCE_ALLREDUCE_MAX_SIZE),
+-                _parse_byte_size(envs.VLLM_ROCE_ALLGATHER_MAX_SIZE),
+-            )
+-        except Exception as exc:  # noqa: BLE001 - reported through the vote
+-            return f"invalid RoCEnante size limit: {exc}", None
+-        return None, limits
+-
+-    def _exchange_vote(
+-        self, reason: str | None, limits: tuple[int, int] | None
+-    ) -> str | None:
+-        """Gather every rank's capability result over the CPU group.
+-
+-        Args:
+-            reason: This rank's reason for not taking part, or None.
+-            limits: This rank's parsed ``(max_size, max_gather)``, or None.
+-
+-        Returns:
+-            None when every rank can proceed with identical limits, else the
+-            text naming the ranks that cannot or whose limits differ.
+-        """
+-        votes: list[tuple[str | None, tuple[int, int] | None]] = [
+-            (None, None)
+-        ] * self.world_size
+-        dist.all_gather_object(votes, (reason, limits), group=self.group)
+-        failures = [f"rank {i}: {r}" for i, (r, _) in enumerate(votes) if r]
+-        if failures:
+-            return "; ".join(failures)
+-        reference = votes[0][1]
+-        differing = [
+-            f"rank {i}: {lim}" for i, (_, lim) in enumerate(votes) if lim != reference
+-        ]
+-        if differing:
+-            return (
+-                f"size limits differ across ranks (rank 0: {reference}; "
+-                + "; ".join(differing)
+-                + ")"
+-            )
+-        return None
+-
+-    def _request_name(self) -> str:
+-        ranks = "-".join(map(str, self.global_ranks))
+-        return f"distributed.roce.{ranks}.collectives"
+-
+-    def get_b12x_preparation_units(
+-        self, owner: object, workload: B12xWorkload
+-    ) -> Sequence[B12xPreparationUnit]:
+-        """Declare the already-connected RDMA runtime; never discover a transport."""
+-        if owner is not self:
+-            raise ValueError("RoCE preparation owner mismatch")
+-        if workload.stage != "weights" or self.disabled or self._runtime is None:
+-            return ()
+-        from b12x.comm import roce
+-        from b12x.comm.roce import _preparation
+-        from b12x.preparation import CollectiveRequirement
+-
+-        query = roce.query_from_runtime(
+-            self._runtime,
+-            surface="AllReduce.all_reduce",
+-            call={"dtypes": ("float16", "bfloat16", "float32")},
+-            topology="roce_rdma",
+-            peer_hosts=tuple(f"rank:{rank}" for rank in self.global_ranks),
+-        )
+-        self._plan = roce.plan(query, runtime=self._runtime)
+-
+-        def prepare(state):
+-            # These buffers occupy the already-owned RoCE slots only while the
+-            # session primes the concrete native protocol. They are not a
+-            # serving fallback or a substitute for caller outputs.
+-            buffers = [
+-                torch.zeros(16 // dtype.itemsize, dtype=dtype, device=self.device)
+-                for dtype in (torch.float16, torch.bfloat16, torch.float32)
+-            ]
+-            calls = [
+-                _preparation.prepared_call(state, inp=buffer) for buffer in buffers
+-            ]
+-            gather = _preparation.prepared_gather_call(state, inp=buffers[1])
+-            return calls[0].__class__(
+-                run=lambda: [call.run() for call in (*calls, gather)],
+-                output=tuple(call.output for call in (*calls, gather)),
+-            )
+-
+-        request = self._plan.request(
+-            name=self._request_name(),
+-            prepare_call=prepare,
+-            collective=CollectiveRequirement(
+-                key=self._request_name(),
+-                ranks=tuple(sorted(self.global_ranks)),
+-            ),
+-        )
+-        return (
+-            B12xPreparationUnit(
+-                name="ROCE_ALL_REDUCE",
+-                key=(self.global_ranks,),
+-                requests=(request,),
+-                stage="weights",
+-            ),
+-        )
+-
+-    def _prepared_plan(self):
+-        if self._plan is None:
+-            raise PreparationResourceUnavailableError(
+-                "RoCE all-reduce has no declared plan"
+-            )
+-        return self._plan
+-
+-    def check_health(self) -> None:
+-        """Fail-stop check of the runtime.
+-
+-        Raises:
+-            RuntimeError: When a RoCEnante wait timed out or its proxy died.
+-        """
+-        if not self.disabled and self._runtime is not None:
+-            self._runtime.check_health()
+-
+-    @property
+-    def all_reduce_max_bytes(self) -> int:
+-        """The largest message ``should_custom_ar`` accepts; 0 when disabled."""
+-        return 0 if self.disabled else int(self._runtime.dispatch_max_bytes)
+-
+-    @property
+-    def all_reduce_capacity_bytes(self) -> int:
+-        """Registered/primed capacity, independent of the dispatch cutoff."""
+-        return 0 if self.disabled else int(self._runtime.max_size)
+-
+-    @property
+-    def all_gather_max_bytes(self) -> int:
+-        """Largest eligible input shard, not the gathered output size."""
+-        return 0 if self.disabled else int(self._runtime.max_gather_bytes)
+-
+-    def should_custom_ar(self, inp: torch.Tensor) -> bool:
+-        return not self.disabled and self._runtime.should_allreduce(inp)
+-
+-    def custom_all_reduce(self, inp: torch.Tensor) -> torch.Tensor | None:
+-        if not self.should_custom_ar(inp):
+-            return None
+-        if not self._announced:
+-            self._announced = True
+-            # One confirmation line, rank 0 only; workers keep it at debug.
+-            log = logger.info if self.rank == 0 else logger.debug
+-            log(
+-                "RoCEnante all-reduce is live: first routed all-reduce is %d bytes "
+-                "(%s); dispatch limit=%d bytes, registered capacity=%d bytes.",
+-                inp.numel() * inp.element_size(),
+-                str(inp.dtype).replace("torch.", ""),
+-                self.all_reduce_max_bytes,
+-                self.all_reduce_capacity_bytes,
+-            )
+-        return self._runtime.all_reduce(inp, plan=self._prepared_plan())
+-
+-    def should_all_gather(self, inp: torch.Tensor, dim: int) -> bool:
+-        return not self.disabled and self._runtime.should_all_gather(inp, dim)
+-
+-    def all_gather(self, inp: torch.Tensor, dim: int) -> torch.Tensor:
+-        """Concatenate along ``dim`` (0 or last) directly in the output layout."""
+-
+-        if not self._announced_gather:
+-            self._announced_gather = True
+-            log = logger.info if self.rank == 0 else logger.debug
+-            log(
+-                "RoCEnante all-gather is live: first routed shard is %s %s "
+-                "along dim %d; input shard dispatch limit=%d bytes.",
+-                tuple(inp.shape),
+-                str(inp.dtype).replace("torch.", ""),
+-                dim,
+-                self.all_gather_max_bytes,
+-            )
+-        return self._runtime.all_gather(inp, dim=dim, plan=self._prepared_plan())
+-
+-    def supports_fused_add_rms_norm(self) -> bool:
+-        return False
+-
+-    @contextmanager
+-    def capture(self, stream: torch.cuda.Stream | None = None):
+-        if self.disabled:
+-            yield
+-            return
+-        self._prepared_plan()
+-        with self._runtime.capture(stream=stream):
+-            yield
+-
+-    def close(self) -> None:
+-        if self._runtime is not None:
+-            self._runtime.close()
+-            self._runtime = None
+-        self._plan = None
+-        self.disabled = True
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+index 439d2bb40..c67e1cc70 100644
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -28,8 +28,9 @@ from .base_device_communicator import DeviceCommunicatorBase
+ logger = init_logger(__name__)
+ 
+ if TYPE_CHECKING:
++    from sparknet.integration.vllm import SparknetOneShotAllReduce
++
+     from .b12x_pcie_all_reduce import B12xPcieAllReduce
+-    from .b12x_roce_all_reduce import B12xRoceAllReduce
+ 
+ 
+ # PyNCCL communicators shared by groups over the same ranks and device
+@@ -79,7 +80,7 @@ def _release_pynccl(comm, key: tuple | None) -> None:
+ 
+ 
+ class CudaCommunicator(DeviceCommunicatorBase):
+-    b12x_ar_comm: "B12xPcieAllReduce | B12xRoceAllReduce | None"
++    b12x_ar_comm: "B12xPcieAllReduce | SparknetOneShotAllReduce | None"
+ 
+     def __init__(
+         self,
+@@ -132,29 +133,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 and envs.VLLM_ENABLE_PCIE_ALLREDUCE
+                 and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+             )
+-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+-                # DS4.1's TileLang family always runs sparknet's one-shot
+-                # collectives; vLLM's RoCE switch is not read for it.
+-                if envs.VLLM_ENABLE_ROCE_ALLREDUCE:
+-                    raise ValueError(
+-                        "VLLM_ENABLE_ROCE_ALLREDUCE does not apply to the TileLang "
+-                        "kernel family, whose one-shot collectives are always on"
+-                    )
+-                if not use_custom_allreduce:
+-                    raise ValueError(
+-                        "sparknet's one-shot collectives need custom all-reduce"
+-                    )
+-                use_roce_allreduce = True
+-            else:
+-                if envs.VLLM_ENABLE_ROCE_ALLREDUCE and not use_custom_allreduce:
+-                    raise ValueError(
+-                        "RoCEnante was requested but custom all-reduce is disabled"
+-                    )
+-                use_roce_allreduce = (
+-                    use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
++            # Tensor-parallel groups always run sparknet's one-shot collectives
++            # (a single-node group skips them); vLLM's RoCE switch selected
++            # B12X's, which is gone.
++            if envs.VLLM_ENABLE_ROCE_ALLREDUCE:
++                raise ValueError(
++                    "VLLM_ENABLE_ROCE_ALLREDUCE selected B12X's RoCE collectives, "
++                    "which are gone; sparknet's one-shot collectives are always on"
++                )
++            if not use_custom_allreduce:
++                raise ValueError(
++                    "sparknet's one-shot collectives need custom all-reduce"
+                 )
+-            if use_b12x_allreduce or use_roce_allreduce:
+-                use_flashinfer_allreduce = False
++            use_roce_allreduce = True
++            use_flashinfer_allreduce = False
+ 
+         self.use_custom_allreduce = use_custom_allreduce
+         self.use_torch_symm_mem = use_torch_symm_mem
+@@ -213,25 +205,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 global_ranks=self.ranks,
+             )
+         elif self.use_roce_allreduce and self.world_size > 1:
+-            # Multi-node DGX Spark one-shot RDMA collectives: sparknet's for
+-            # DS4.1's TileLang kernel family (configured by its SPARKNET_ROCE_*
+-            # settings), b12x.comm.roce's for B12X. Both carry the same
+-            # protocol (B12X's with spark-ds41f's RoCE patches).
+-            roce_options = {}
+-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+-                from sparknet.integration.vllm import (
+-                    SparknetOneShotAllReduce as RoceAllReduce,
+-                )
+-
+-                from vllm.distributed.parallel_state import in_the_same_node_as
++            # Multi-node DGX Spark one-shot RDMA collectives: sparknet's
++            # (configured by its SPARKNET_ROCE_* settings).
++            from sparknet.integration.vllm import SparknetOneShotAllReduce
+ 
+-                roce_options["in_the_same_node"] = in_the_same_node_as(
+-                    self.cpu_group, source_rank=0
+-                )
+-            else:
+-                from .b12x_roce_all_reduce import B12xRoceAllReduce as RoceAllReduce
++            from vllm.distributed.parallel_state import in_the_same_node_as
+ 
+-            self.b12x_ar_comm = RoceAllReduce(
++            self.b12x_ar_comm = SparknetOneShotAllReduce(
+                 group=self.cpu_group,
+                 device_group=self.device_group,
+                 device=self.device,
+@@ -239,7 +219,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 nccl_available=(
+                     self.pynccl_comm is not None and not self.pynccl_comm.disabled
+                 ),
+-                **roce_options,
++                in_the_same_node=in_the_same_node_as(self.cpu_group, source_rank=0),
+             )
+             self._roce_policy = not self.b12x_ar_comm.disabled
+             if self._roce_policy:
+@@ -485,10 +465,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+ 
+     @property
+     def rank_order_reduce_scatter(self) -> bool:
+-        """Whether ``reduce_scatter`` is DS4.1's rank-order one (its TileLang
+-        family on the RoCE policy), so an exchange of unreduced chunks plus the
+-        rank-order sum may stand in for it."""
+-        return self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
++        """Whether ``reduce_scatter`` is the rank-order one (the RoCE policy), so an
++        exchange of unreduced chunks plus the rank-order sum may stand in for it."""
++        return self._roce_policy
+ 
+     def roce_failure(self) -> str | None:
+         """The one-shot collectives' failure report, or None.
+@@ -498,7 +477,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         waited for. Readable after the stop (the record is in pinned host
+         memory).
+         """
+-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++        if self._roce_policy:
+             return self.b12x_ar_comm.failure()
+         return None
+ 
+@@ -524,7 +503,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+                 raise RuntimeError("Selected B12X all-reduce returned None")
+             return out
+ 
+-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++        if self._roce_policy:
+             # Past the one-shot dispatch limit (CED decoder steps of 205 rows or
+             # more), keep its arithmetic: NCCL's ring rounds every hop and adds
+             # in another order, so a row's bits would depend on its step's size.
+@@ -535,11 +514,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             return all_reduce_rank_order(
+                 self.pynccl_comm, input_, self.rank_in_group, self.world_size
+             )
+-        if self._roce_policy:
+-            out = self.pynccl_comm.all_reduce(input_)
+-            if out is None:
+-                raise RuntimeError("RoCEnante policy: PyNCCL all-reduce returned None")
+-            return out
+ 
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+@@ -685,13 +659,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
+             output_size, dtype=input_.dtype, device=input_.device
+         )
+         pynccl_comm.all_gather(output_tensor, input_.contiguous())
+-        if (
+-            dim > 0
+-            and dim == input_.dim() - 1
+-            and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+-        ):
+-            # DS4.1's TileLang family: the rank-major shards side by side in one
+-            # TileLang launch, not torch's movedim and reshape copy.
++        if dim > 0 and dim == input_.dim() - 1:
++            # The rank-major shards side by side in one TileLang launch, not
++            # torch's movedim and reshape copy.
+             from vllm.models.deepseek_v4_1.tilelang.collectives import (
+                 concat_rank_shards,
+             )
+@@ -739,10 +709,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         chunk_size = input_tensor.shape[0] // world_size
+         output_shape = (chunk_size,) + input_tensor.shape[1:]
+ 
+-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+-            # DS4.1's TileLang family: the one-shot all-reduce's arithmetic, so a
+-            # row reduces to the same bits whether its step was reduce-scattered
+-            # (prefill sequence parallelism) or all-reduced.
++        if self._roce_policy:
++            # The one-shot all-reduce's arithmetic, so a row reduces to the same
++            # bits whether its step was reduce-scattered (prefill sequence
++            # parallelism) or all-reduced.
+             from vllm.models.deepseek_v4_1.tilelang.collectives import (
+                 reduce_scatter_rank_order,
+             )
+@@ -951,7 +921,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
+         if self.world_size == 1:
+             return tensor
+ 
+-        if self._roce_policy and envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
++        if self._roce_policy:
+             return self._broadcast_one_shot(tensor, src)
+ 
+         pynccl_comm = self.pynccl_comm
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b83105166..eedd3ce7f 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -222,9 +222,7 @@ if TYPE_CHECKING:
+     VLLM_DS41_MARKOV_NVFP4: bool = False
+     VLLM_DS41_DRAFT_NVFP4_HEAD: bool = False
+     VLLM_DS41_PACKED_BF16_LM_HEAD: bool = False
+-    VLLM_DS41_ATTENTION_COMPUTE: Literal["bf16", "reference", "auto"] = "bf16"
+     VLLM_DS41_HEAD_DTYPE: Literal["float32", "model"] = "float32"
+-    VLLM_DS41_KERNEL_BACKEND: Literal["b12x", "tilelang"] = "b12x"
+     VLLM_STARTUP_HEARTBEAT_TIMEOUT_S: float = 120.0
+     VLLM_DS41_ENGRAM_OVERLAP: bool = True
+     WEIGHTLESS_STEER_PATH: str | None = None
+@@ -292,8 +290,6 @@ if TYPE_CHECKING:
+     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x"] = "b12x"
+     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+     VLLM_ENABLE_ROCE_ALLREDUCE: bool = False
+-    VLLM_ROCE_ALLREDUCE_MAX_SIZE: str = "2MB"
+-    VLLM_ROCE_ALLGATHER_MAX_SIZE: str = "16MB"
+     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+     VLLM_PCIE_TWOSHOT_ALLREDUCE_MAX_SIZE: str = "off"
+     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
+@@ -1900,18 +1896,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DS41_PACKED_BF16_LM_HEAD": lambda: bool(
+         int(os.getenv("VLLM_DS41_PACKED_BF16_LM_HEAD", "0"))
+     ),
+-    # Arithmetic of the DeepSeek V4.1 b12x sparse attention. "bf16" computes
+-    # like DeepSeek's reference sparse_attn (BF16 Q, KV dequantized to BF16,
+-    # BF16 P, FP32 accumulation) with split-K decode; "reference" also runs
+-    # decode rows single-pass, which reproduces the reference kernel's
+-    # tile-ordered softmax bit for bit at some low-concurrency decode speed;
+-    # "auto" lets the b12x tuner pick FP8 internals (Q and P quantized, KV
+-    # re-encoded; about 3% relative error) or BF16 per plan.
+-    "VLLM_DS41_ATTENTION_COMPUTE": env_with_choices(
+-        "VLLM_DS41_ATTENTION_COMPUTE",
+-        "bf16",
+-        ["bf16", "reference", "auto"],
+-    ),
+     # Default output-head dtype of DeepSeek V4.1 and its DSpark drafter when
+     # hf_overrides names none. "float32" computes the logits in FP32 like
+     # DeepSeek's reference head; "model" keeps the model dtype, which the exact
+@@ -1922,13 +1906,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         "float32",
+         ["float32", "model"],
+     ),
+-    # DeepSeek V4.1 kernel family on SM12x: "b12x" or "tilelang". It selects
+-    # the attention, linear and MoE backends; explicit flags must agree.
+-    "VLLM_DS41_KERNEL_BACKEND": env_with_choices(
+-        "VLLM_DS41_KERNEL_BACKEND",
+-        "b12x",
+-        ["b12x", "tilelang"],
+-    ),
+     # A startup rendezvous waits for the other ranks as long as they are alive,
+     # however long they take to load and prepare kernels. A missing rank whose
+     # heartbeat (a daemon thread, every 2 s) has not changed for this long is dead
+@@ -2308,19 +2285,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+         "VLLM_PCIE_ALLREDUCE_BACKEND", "b12x", ["b12x"]
+     ),
+-    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+-    # Enable the b12x one-shot RoCE all-reduce for multi-node TP (DGX Spark).
++    # Selected b12x's one-shot RoCE all-reduce, which is gone: tensor-parallel
++    # groups refuse it (sparknet's one-shot collectives serve multi-node TP).
+     "VLLM_ENABLE_ROCE_ALLREDUCE": lambda: bool(
+         int(os.getenv("VLLM_ENABLE_ROCE_ALLREDUCE", "0"))
+     ),
+-    "VLLM_ROCE_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+-        "VLLM_ROCE_ALLREDUCE_MAX_SIZE", "2MB"
+-    ),
+-    # Largest per-rank shard routed to the RoCE all-gather
+-    # (e.g. logits [rows, vocab/tp]).
+-    "VLLM_ROCE_ALLGATHER_MAX_SIZE": lambda: os.getenv(
+-        "VLLM_ROCE_ALLGATHER_MAX_SIZE", "16MB"
+-    ),
++    # Maximum input sizes dispatched to the low-latency one-shot kernels.
+     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+     ),
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index d18085481..37bdb7512 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -545,7 +545,6 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+ 
+     @staticmethod
+     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
+-        from vllm import envs
+         from vllm.platforms import current_platform
+         from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+@@ -554,14 +553,9 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+             and current_platform.is_device_capability_family(120)
+         ):
+             return
+-        # One kernel family runs the whole model, drafter included; explicit
+-        # per-component backends must name the same family.
+-        family = envs.VLLM_DS41_KERNEL_BACKEND
+-        backend = (
+-            AttentionBackendEnum.TILELANG
+-            if family == "tilelang"
+-            else AttentionBackendEnum.B12X
+-        )
++        # TileLang's kernels run the whole model, drafter included; explicit
++        # per-component backends must name them.
++        backend = AttentionBackendEnum.TILELANG
+         requested = {"attention backend": vllm_config.attention_config.backend}
+         kernel = vllm_config.kernel_config
+         components = {"linear backend": kernel.linear_backend}
+@@ -573,18 +567,19 @@ class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+         for name, value in requested.items():
+             if value not in (None, backend):
+                 raise ValueError(
+-                    f"DeepSeek V4.1 with VLLM_DS41_KERNEL_BACKEND={family} requires "
+-                    f"the {backend.name} {name}, got {value.name}."
++                    f"DeepSeek V4.1 requires the {backend.name} {name}, "
++                    f"got {value.name}."
+                 )
+         for name, value in components.items():
+-            if value not in (None, "auto", family):
++            if value not in (None, "auto", "tilelang"):
+                 raise ValueError(
+-                    f"DeepSeek V4.1 with VLLM_DS41_KERNEL_BACKEND={family} requires "
+-                    f"the {family} {name}, got {value}."
++                    f"DeepSeek V4.1 requires the tilelang {name}, got {value}."
+                 )
+         vllm_config.attention_config.backend = backend
+-        if family == "tilelang":
+-            kernel.linear_backend = kernel.moe_backend = family
++        kernel.linear_backend = kernel.moe_backend = "tilelang"
++        # Prefill chunks end at absolute multiples of long_prefill_token_threshold
++        # (temperature-0 determinism), whatever else the step holds.
++        vllm_config.scheduler_config.align_prefill_chunks = True
+ 
+ 
+ class Glm5NextForCausalLMConfig(VerifyAndUpdateConfig):
+diff --git a/vllm/models/deepseek_v4_1/nvidia/model_state.py b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+index 03e042bfc..1252a2539 100644
+--- a/vllm/models/deepseek_v4_1/nvidia/model_state.py
++++ b/vllm/models/deepseek_v4_1/nvidia/model_state.py
+@@ -6,7 +6,6 @@ import numpy as np
+ import torch
+ import torch.nn as nn
+ 
+-import vllm.envs as envs
+ from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
+@@ -63,22 +62,17 @@ def _gather_lookback_kernel(
+     tl.store(lookback_ptr + batch_idx * DEPTH + offs, ids, mask=offs < DEPTH)
+ 
+ 
+-def _nonfinal_skip_policy(
+-    vllm_config: VllmConfig, *, aligned_chunks: bool
+-) -> tuple[int, int]:
++def _nonfinal_skip_policy(vllm_config: VllmConfig) -> tuple[int, int]:
+     """Validate the serving contract before enabling CED's nonfinal row skip."""
+     scheduler = vllm_config.scheduler_config
+     spec = vllm_config.speculative_config
+     if (
+-        envs.VLLM_DS41_KERNEL_BACKEND != "tilelang"
+-        or not aligned_chunks
++        not scheduler.align_prefill_chunks
+         or not scheduler.enable_chunked_prefill
+         or spec is None
+         or not spec.use_dspark()
+     ):
+-        raise ValueError(
+-            "CED skip requires TileLang, aligned chunked prefill and DSpark"
+-        )
++        raise ValueError("CED skip requires aligned chunked prefill and DSpark")
+     align = scheduler.long_prefill_token_threshold
+     hf = vllm_config.model_config.hf_config
+     window = getattr(spec.draft_model_config.hf_config, "sliding_window", None)
+@@ -160,10 +154,8 @@ class DeepseekV41ModelState(DefaultModelState):
+             self.ced_state = CEDState(
+                 self.max_num_reqs, self.max_num_tokens, capacities, device
+             )
+-            from vllm.v1.core.sched.scheduler import ALIGN_PREFILL_CHUNKS
+-
+             self._ced_skip_min_rows, self._ced_chunk_align = _nonfinal_skip_policy(
+-                vllm_config, aligned_chunks=ALIGN_PREFILL_CHUNKS
++                vllm_config
+             )
+             hf = self.model_config.hf_config
+             parallel = vllm_config.parallel_config
+diff --git a/vllm/models/deepseek_v4_1/tilelang/__init__.py b/vllm/models/deepseek_v4_1/tilelang/__init__.py
+index 9731140b6..97e6eae4f 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/__init__.py
++++ b/vllm/models/deepseek_v4_1/tilelang/__init__.py
+@@ -1,9 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""DeepSeek-V4.1 kernels in TileLang for SM120 / SM121.
+-
+-Selected by ``VLLM_DS41_KERNEL_BACKEND=tilelang``:
+-
++"""DeepSeek-V4.1 kernels in TileLang for SM120 / SM121:
+ 
+ - ``sparse_mla``: compressed sparse MLA over the SWA and indexed caches;
+ - ``indexer``: MXFP4 index scores, exact top-k and candidate lists;
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 0ae982f53..cb445528c 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -116,7 +116,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+     )
+     B12X = "vllm.v1.attention.backends.b12x.B12xPagedAttentionBackend"
+     # DeepSeek V4.1 TileLang sparse MLA (model-driven; selected via the V4.1
+-    # layer when VLLM_DS41_KERNEL_BACKEND=tilelang).
++    # layer).
+     TILELANG = "vllm.models.deepseek_v4_1.tilelang.attention.DeepseekV41TileLangBackend"
+     FLASH_ATTN_MLA = "vllm.v1.attention.backends.mla.flashattn_mla.FlashAttnMLABackend"
+     FLASH_ATTN_MLA_SPARSE = (
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 0500a656e..8373b6d08 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -102,12 +102,6 @@ from vllm.v1.utils import record_function_or_nullcontext
+ 
+ logger = init_logger(__name__)
+ 
+-# Prefill chunks that end at absolute multiples of long_prefill_token_threshold,
+-# whatever else the step holds (DeepSeek V4.1 temperature-0 determinism, under
+-# its TileLang kernel family). Otherwise a chunk takes whatever budget the step's
+-# other requests leave.
+-ALIGN_PREFILL_CHUNKS = envs.VLLM_DS41_KERNEL_BACKEND == "tilelang"
+-
+ 
+ def _build_kv_connector_block_state(
+     kv_cache_config: KVCacheConfig,
+@@ -363,7 +357,7 @@ class Scheduler(SchedulerInterface):
+         self.use_eagle_block_drop = False
+         self.num_spec_tokens = vllm_config.num_speculative_tokens
+         self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
+-        if ALIGN_PREFILL_CHUNKS:
++        if self.scheduler_config.align_prefill_chunks:
+             self._check_aligned_prefill_chunks()
+         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
+         self.dynamic_sd_lookup: list[int] | None = None
+@@ -1201,7 +1195,10 @@ class Scheduler(SchedulerInterface):
+                 ):
+                     num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+                 aligned_chunk = None
+-                if ALIGN_PREFILL_CHUNKS and request.is_prefill_chunk:
++                if (
++                    self.scheduler_config.align_prefill_chunks
++                    and request.is_prefill_chunk
++                ):
+                     aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+                         request.num_computed_tokens, num_new_tokens
+                     )
+@@ -1814,7 +1811,10 @@ class Scheduler(SchedulerInterface):
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+                     aligned_chunk = None
+-                    if ALIGN_PREFILL_CHUNKS and num_new_tokens > 1:
++                    if (
++                        self.scheduler_config.align_prefill_chunks
++                        and num_new_tokens > 1
++                    ):
+                         aligned_chunk = num_new_tokens = self._aligned_prefill_chunk(
+                             num_computed_tokens, num_new_tokens
+                         )
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index e1c2d5ec0..9f101d6c8 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -1419,8 +1419,6 @@ class Worker(WorkerBase):
+ 
+     def _startup_progress(self) -> str:
+         """What this rank's heartbeat reports besides its phase."""
+-        if envs.VLLM_DS41_KERNEL_BACKEND != "tilelang":
+-            return ""
+         from vllm.models.deepseek_v4_1.tilelang.prepare import PROGRESS
+ 
+         done, total = PROGRESS.snapshot()
+@@ -1433,8 +1431,8 @@ class Worker(WorkerBase):
+     def _prepare_kernels(self) -> None:
+         """Compile every declared JIT kernel before any distributed work.
+ 
+-        DeepSeek V4.1's TileLang family declares each call its loaded modules can
+-        make; the runner's JIT registry holds the Triton kernels its samplers and
++        DeepSeek V4.1 declares each TileLang call its loaded modules can make;
++        the runner's JIT registry holds the Triton kernels its samplers and
+         model state registered, and the runner adds its step's kernels here, once
+         the KV cache layout is set. They compile here on this rank alone,
+         TileLang's in one thread pool, and TileLang's kernel cache is then frozen,
+@@ -1446,20 +1444,18 @@ class Worker(WorkerBase):
+             return
+         self._set_startup_phase("preparing kernels")
+         started = time.monotonic()
+-        tilelang_calls = 0
+         # Declarations read the scheduler sizing and model configuration.
+         with set_current_vllm_config(self.vllm_config):
+-            if envs.VLLM_DS41_KERNEL_BACKEND == "tilelang":
+-                from vllm.models.deepseek_v4_1.tilelang import prepare
++            from vllm.models.deepseek_v4_1.tilelang import prepare
+ 
+-                speculator = getattr(self.model_runner, "speculator", None)
+-                with registry.activate():
+-                    prepare.declare_modules(
+-                        self.model_runner.model, getattr(speculator, "model", None)
+-                    )
+-                tilelang_calls = prepare.prepare_declared(registry)
+-                with torch.inference_mode():
+-                    prepare.warm_declared(registry)
++            speculator = getattr(self.model_runner, "speculator", None)
++            with registry.activate():
++                prepare.declare_modules(
++                    self.model_runner.model, getattr(speculator, "model", None)
++                )
++            tilelang_calls = prepare.prepare_declared(registry)
++            with torch.inference_mode():
++                prepare.warm_declared(registry)
+             # A step's Triton kernels (input preparation, sampling, verification,
+             # drafting), specialized on the runner's buffers, the loaded heads and
+             # the block tables of the KV cache groups (the layout is set by now).

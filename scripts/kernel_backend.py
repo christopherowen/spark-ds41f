@@ -3,10 +3,14 @@
 TileLang is the promoted backend (r6): it selects the TileLang compiler,
 DeepSeek's TileKernels and the DS4.1 TileLang kernels in the vLLM patch stack,
 with sparknet's one-shot collectives. The promoted configurations name it
-explicitly. B12X remains the alternative; a configuration without
-``kernel_backend`` means B12X, as every configuration recorded before r6 does.
-NCCL and the B12X checkpoint loader are outside this policy: both backends
-keep them.
+explicitly. A configuration without ``kernel_backend`` means B12X, as every
+configuration recorded before r6 does. NCCL and the B12X checkpoint loader are
+outside this policy: both backends keep them.
+
+Until the vLLM series retired its kernel-family switch, TileLang also needed
+``VLLM_DS41_KERNEL_BACKEND=tilelang`` (vLLM defaulted to B12X). A series without
+the switch records the ``tilelang-only`` capability; its configurations must not
+set the variable, which that vLLM no longer reads.
 """
 
 from __future__ import annotations
@@ -38,6 +42,9 @@ CACHE_ENVIRONMENT = "TILELANG_CACHE_DIR"
 # the vLLM source manifest record, and an image built from them.
 SOURCES = ("tilelang", "tile_kernels")
 CAPABILITY = "tilelang-kernels"
+# A vLLM series whose DS4.1 model has no kernel-family switch: TileLang is its only
+# family and VLLM_DS41_KERNEL_BACKEND is gone.
+TILELANG_ONLY = "tilelang-only"
 
 
 def backend(cluster: dict) -> str:
@@ -74,10 +81,10 @@ def problems(cluster: dict) -> list[str]:
                 f"got {spec.get('attention_backend')}"
             )
     env = cluster.get("environment", {})
-    # vLLM defaults to B12X when the variable is absent, so only TileLang
-    # requires it; a value that is present must name the selected backend.
+    # A value that is present must name the selected backend; whether TileLang
+    # needs the variable at all is its vLLM series' (source_problems).
     value = env.get(ENVIRONMENT)
-    if (selected != DEFAULT or value is not None) and value != selected:
+    if value is not None and value != selected:
         errors.append(f"kernel_backend {selected} requires {ENVIRONMENT}={selected}")
     if selected == "tilelang":
         cache = PurePosixPath(str(env.get(CACHE_ENVIRONMENT, "")))
@@ -95,8 +102,19 @@ def source_problems(cluster: dict, upstreams: dict, manifest: dict) -> list[str]
         if name not in upstreams.get("sources", {}):
             errors.append(f"kernel_backend tilelang requires source {name} in its upstreams lock")
     vllm = manifest.get("vllm", {})
-    if CAPABILITY not in vllm.get("capabilities", []):
+    capabilities = vllm.get("capabilities", [])
+    if CAPABILITY not in capabilities:
         errors.append(f"kernel_backend tilelang requires a vLLM source manifest with capability {CAPABILITY}")
+    value = cluster.get("environment", {}).get(ENVIRONMENT)
+    if TILELANG_ONLY in capabilities:
+        if value is not None:
+            errors.append(
+                f"{ENVIRONMENT} is gone from this vLLM series (capability {TILELANG_ONLY}): "
+                "drop it from the environment"
+            )
+    elif value != "tilelang":
+        # The series still has the switch, which defaults to B12X.
+        errors.append(f"kernel_backend tilelang requires {ENVIRONMENT}=tilelang")
     labels = cluster.get("container", {}).get("expected_labels", {})
     for name in ("vllm", *SOURCES):
         tree = manifest.get(name, {}).get("expected_tree")

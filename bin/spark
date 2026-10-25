@@ -2467,6 +2467,9 @@ print("DS4.1 SM12x class:", DeepseekV41ForCausalLM.__module__)
 assert DeepseekV41ForCausalLM.__module__.startswith("vllm.models.deepseek_v4_1")
 print("GPU import smoke passed")
 """
+# A TileLang-only vLLM series (kernel_backend.TILELANG_ONLY) deletes B12X's RoCE
+# collectives with the kernel-family switch.
+B12X_ROCE_IMPORT = "import vllm.distributed.device_communicators.b12x_roce_all_reduce  # noqa: F401\n"
 
 
 def build_projects(sources: dict) -> tuple[str, ...]:
@@ -2511,15 +2514,19 @@ def smoke_script(upstreams: dict) -> str:
     if "tilelang" not in upstreams["sources"]:
         return SMOKE_SCRIPT
     version = upstreams["sources"]["tilelang"]["version"]
-    script = SMOKE_SCRIPT + (
+    manifest = read_json(upstreams["source_manifest"])
+    capabilities = manifest["vllm"].get("capabilities", [])
+    script = SMOKE_SCRIPT
+    if kernel_backend.TILELANG_ONLY in capabilities:
+        script = script.replace(B12X_ROCE_IMPORT, "")
+    script += (
         "import importlib.metadata\n\n"
         "import tilelang\n"
         "import tile_kernels  # noqa: F401\n\n"
         f"assert importlib.metadata.version(\"tilelang\") == {version!r}, tilelang.__version__\n"
         "print(\"TileLang\", tilelang.__version__)\n"
     )
-    manifest = read_json(upstreams["source_manifest"])
-    if kernel_backend.CAPABILITY in manifest["vllm"].get("capabilities", []):
+    if kernel_backend.CAPABILITY in capabilities:
         script += "import vllm.models.deepseek_v4_1.tilelang  # noqa: F401\n"
     script += "print(\"TileLang import smoke passed\")\n"
     if "sparknet" in upstreams["sources"]:
