@@ -279,8 +279,17 @@ no gate test reaches them.
 
 ## Serving check (queued, not run)
 
-[retire-check.json](retire-check.json), written by [make_bundles.py](make_bundles.py). Its
-kernel job repeats the release-test gate above on dgx2; its measure job needs the cluster.
+Two specs, written by [make_bundles.py](make_bundles.py), one per cabling. Each measure job
+needs the cluster.
+- **Ring:** [retire-check.json](retire-check.json), TP4. Its kernel job repeats the
+  release-test gate above on dgx2.
+- **Triangle:** [retire-check-tp3.json](retire-check-tp3.json), TP3: the site's cabling
+  since 2026-10-25, where spark-ds41f-1025 serves.
+  - Arms: [retire-tp3.json](retire-tp3.json) against candidate 6 at the triangle
+    ([rc6/rc-tp3.json](../2026-10-25-spark-ds41f-candidate/rc6/rc-tp3.json), the 8,192
+    budget).
+  - Labels `retire-tp3` and `candidate6-tp3`; the same extras and the same
+    [tables_arms.py](tables_arms.py) pass criteria.
 - **Image:** `spark-ds41f:19f2c20ed4d6-next-6` as it is, with nothing built.
 - **When it can run:** the lab runs origin/main's specs, so it runs after this PR merges.
   The owner can also run it outside the repository, as candidate 6's test preview ran.
@@ -315,5 +324,6 @@ kernel job repeats the release-test gate above on dgx2; its measure job needs th
    - Candidate 5's window digests (candidate 6's package files), for the record:
      `3eab5112` / `db25fde3`, text `c9cf9dbe` / `c6bb4f4e`, seeded `80b3b3f3`, images
      `92679390`.
-   - **TP3:** an arm over `rc6/rc-tp3.json` can join once #582 merges; that arm is not on
-     main yet.
+   - **TP3:** the triangle spec's arms run the same checks. Candidate 5's window digests
+     above are the ring's; the triangle's comparison is its own candidate-6 arm in the
+     same window.

@@ -139,20 +139,9 @@ def main() -> None:
     (bundle / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
     vision_error_bundle(repo, base)
 
-    overlay =f"{{home}}/projects/spark-ds41f/{EXPERIMENT}/bundles/release-tests/overlay"
+    overlay = f"{{home}}/projects/spark-ds41f/{EXPERIMENT}/bundles/release-tests/overlay"
     mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]]
     mounts += [[f"{overlay}/{path}", f"{ROOT}/{path}", "ro"] for _, path in package]
-    arm = {
-        "notes": (f"Candidate 6 at tp4-ring ({CANDIDATE}/rc-tp4.json) with the vLLM branch "
-                  f"retire-conditionals ({head_commit}) mounted over the image's package files, "
-                  "its deleted modules failing to import. VLLM_DS41_KERNEL_BACKEND stays set: "
-                  "candidate 6's source manifest has the switch, and the branch's vLLM no "
-                  "longer reads it. Outputs must equal candidate 6's bit for bit."),
-        "extends": {"config": f"{CANDIDATE}/rc-tp4.json"},
-        "set": {"container": {"mounts": mounts}},
-    }
-    (HERE / "retire-tp4.json").write_text(json.dumps(arm, indent=1) + "\n")
-
     extras = [
         [DETERMINISM, ["--tokens", "192", "--long-lines", "700", "--wide"], "determinism"],
         [DETERMINISM, ["--tokens", "192", "--long-lines", "700", "--wide", "--no-logprobs"],
@@ -164,20 +153,33 @@ def main() -> None:
         [f"{DIGESTS}/image_digest.py", ["--tokens", "96"], "images"],
         [f"{DIGESTS}/startup_lines.py", [], "startup"],
     ]
-    spec = {
-        "experiment": EXPERIMENT,
-        "run": "retire-conditionals-check",
-        "jobs": [
-            {"kind": "sync"},
-            {"kind": "kernel",
-             "bundles": [{"node": "dgx2", "bundle": f"{EXPERIMENT}/bundles/release-tests"}]},
-            {"kind": "measure", "profile": "lean", "bench": False, "bracket": False,
-             "extras": extras,
-             "arms": [{"config": "retire-tp4.json", "label": "retire"},
-                      {"config": f"{CANDIDATE}/rc-tp4.json", "label": "candidate6"}]},
-        ],
-    }
-    (HERE / "retire-check.json").write_text(json.dumps(spec, indent=1) + "\n")
+    # One serving check per cabling: the ring (tp4) and the triangle (tp3). The ring's
+    # also repeats the release-test gate on dgx2 (it passed on dgx4, the same image).
+    for shape, tp, suffix, kernel in (("tp4-ring", "tp4", "", True),
+                                      ("tp3-triangle", "tp3", "-tp3", False)):
+        arm = {
+            "notes": (f"Candidate 6 at {shape} ({CANDIDATE}/rc-{tp}.json) with the vLLM branch "
+                      f"retire-conditionals ({head_commit}) mounted over the image's package "
+                      "files, its deleted modules failing to import. VLLM_DS41_KERNEL_BACKEND "
+                      "stays set: candidate 6's source manifest has the switch, and the "
+                      "branch's vLLM no longer reads it. Outputs must equal candidate 6's bit "
+                      "for bit."),
+            "extends": {"config": f"{CANDIDATE}/rc-{tp}.json"},
+            "set": {"container": {"mounts": mounts}},
+        }
+        (HERE / f"retire-{tp}.json").write_text(json.dumps(arm, indent=1) + "\n")
+        jobs = [{"kind": "sync"}]
+        if kernel:
+            jobs.append({"kind": "kernel", "bundles": [
+                {"node": "dgx2", "bundle": f"{EXPERIMENT}/bundles/release-tests"}]})
+        jobs.append({"kind": "measure", "profile": "lean", "bench": False, "bracket": False,
+                     "extras": extras,
+                     "arms": [{"config": f"retire-{tp}.json", "label": f"retire{suffix}"},
+                              {"config": f"{CANDIDATE}/rc-{tp}.json",
+                               "label": f"candidate6{suffix}"}]})
+        spec = {"experiment": EXPERIMENT, "run": f"retire-conditionals-check{suffix}",
+                "jobs": jobs}
+        (HERE / f"retire-check{suffix}.json").write_text(json.dumps(spec, indent=1) + "\n")
     print(f"{head_commit}: {len(package) - deleted} package files, {deleted} deleted, "
           f"{len(others)} test and benchmark files; serving arm {len(mounts) - 1} mounts")
 
