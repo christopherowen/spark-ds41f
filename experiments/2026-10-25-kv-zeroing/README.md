@@ -147,9 +147,9 @@ keys and UE8M0 scale words at a time.
   tile. The keys past the extent are slots nobody had written: the rest of the last
   visible position's page. The MMA computed their scores, and the predicated store
   dropped them.
-- **Now:** the key and scale loads of rows past the extent are predicated off, and those
-  rows score zeros: `T.if_then_else(p0 + p < extent, KPool[...], 0)`, and the same for
-  the scale word.
+- **Now:** in a dense row, the key and scale loads of rows past the extent are predicated
+  off, and those rows score zeros: `T.if_then_else(p0 + p < extent, KPool[...], 0)`, and
+  the same for the scale word.
   - Only the loads are predicated. The page read stays unconditional, so a dense tile's
     page read stays uniform and its addresses affine, as in the release.
   - The extent joins the bounds check TileLang already puts on each load (`page` within
@@ -229,9 +229,9 @@ candidate 6's vLLM `3bdf9558c` (26382f5cf plus the test patches 0489-0490):
 - [0502](vllm/0502-DS4.1-No-per-allocation-KV-zeroing-every-cache-uses-.patch) `8d2842981`:
   DS4.1 without per-allocation zeroing. It adds `uses_only_written_slots`, the rule
   change, and the declaration on the window, compressed, index and ring specs.
-- [0503](vllm/0503-DS4.1-Indexer-scores-read-no-key-past-the-visible-po.patch) `33b748994`:
-  the indexer reads no key past the visible positions: those rows' loads are predicated
-  off. Its tests are the initcheck script and its wrapper and the NaN-tail test; it adds
+- [0503](vllm/0503-DS4.1-Indexer-scores-read-no-key-past-the-visible-po.patch) `169078a4c`:
+  the indexer reads no key past the visible positions: a dense row's loads past its
+  extent are predicated off. Its tests are the initcheck script and its wrapper and the NaN-tail test; it adds
   the gated benchmark, dense and by candidates.
 - [vllm/series](vllm/series): candidate 6's series plus 0500-0503. 0491-0499 are other
   drafts'.
@@ -296,6 +296,8 @@ python3 scripts/lab.py kernel-local experiments/2026-10-25-kv-zeroing/bundles/BU
 | indexer-variants | `64a303eb` | | `indexer-variants-v5` | diagnosis: v5 and v4, dense and by candidates |
 | poison-tests | `1f180481` | `33b748994`, predicated | `poison-tests-2` | **fail**, 105 s: every test passed; the gate: dense faster in 10 of 10, candidate mode slower in 2 of 4 |
 | indexer-initcheck | `1f180481` | `33b748994`, predicated | `indexer-initcheck-2` | **pass**, 38 s |
+| **poison-tests** | `93df83d5` | `169078a4c`, dense rows predicated | `poison-tests-3` | **pass**, 83 s: every test passed; the gate: slower in 0 of 14 |
+| **indexer-initcheck** | `93df83d5` | `169078a4c`, dense rows predicated | `indexer-initcheck-3` | **pass**, 28 s: 0 errors; the release's kernel 12,480, exit 86 |
 
 **indexer-initcheck** (0503 as first committed, `57e5e748f`):
 - the bounded kernel: `ERROR SUMMARY: 0 errors` over the four cases (dense and candidate
@@ -413,7 +415,34 @@ nothing there:
 
 So 0503 (`169078a4c`) predicates only dense rows, through a per-mode `loads(p0, p)`
 beside the kernel's `position` and `slot_valid`. Candidate mode passes `True`, which TVM
-folds away, so its kernel is the release's.
+folds away, so its kernel is the release's. The compile cache shows it: in the third
+poison-tests run the benchmark's candidate kernels were cache hits on the release's own
+entries, and the only new candidate kernel was the tests' 64-row-page one.
+
+**Third run, both bundles pass.**
+- poison-tests: every step as in the first run, 686 / 6 / 28 / 131 / 32 passed (the same
+  skips and xfail).
+- The gate, slower in 0 of 14 cases:
+
+| Case | Pages | Extent | 0503 | Release | Change |
+| --- | --- | --- | --- | --- | --- |
+| c1 | 128 | 4,133 | 9.41 | 11.62 | -19% |
+| c1 | 128 | 65,573 | 99.1 | 130.5 | -24% |
+| c1 | 128 | 524,261 | 866 | 1,105 | -22% |
+| c1 | 256 | 8,229 | 15.1 | 19.3 | -22% |
+| c1 | 256 | 1,048,549 | 1,987 | 2,281 | -13% |
+| c16 | 128 | 4,133 | 113 | 145 | -22% |
+| c16 | 128 | 65,573 | 1,632 | 2,122 | -23% |
+| c16 | 128 | 524,261 | 13,460 | 16,711 | -19% |
+| c16 | 256 | 8,229 | 253 | 298 | -15% |
+| c16 | 256 | 1,048,549 | 35,432 | 36,383 | -3% |
+| c1, candidates | 128 | 524,261 | 32.7 | 32.8 | level (-1.3 ± 3.1) |
+| c1, candidates | 256 | 1,048,549 | 34.1 | 34.1 | level (+1.0 ± 2.4) |
+| c16, candidates | 128 | 524,261 | 557 | 535 | level (+13 ± 32) |
+| c16, candidates | 256 | 1,048,549 | 599 | 640 | level (-15 ± 26) |
+
+- indexer-initcheck: the bounded kernel `ERROR SUMMARY: 0 errors` over the four cases; the
+  release's 12,480 errors, exit 86.
 
 ## Lab spec: the gate before the removal is promoted
 
@@ -506,7 +535,8 @@ scripts/lab.py queue add experiments/2026-10-25-kv-zeroing/tp4-gate.json   # the
 
 When tp4-gate, tp4-pressure and tp4-suite pass, and the TP3 specs after the re-wire:
 
-1. 0500-0503 go into the next candidate's series. 0503 also needs its benchmark gate.
+1. 0500-0503 go into the next candidate's series. 0503's benchmark gate and initcheck
+   already passed on dgx4 (above).
 2. The recipe needs no change: the removal is the model's declaration, not a flag.
 3. The candidate's release comparison then runs on the end state.
 
