@@ -938,10 +938,11 @@ def test_gelu_epilogue_is_the_reference_everywhere(real, gemv):
 
 def test_gelu_differs_from_b12x_only_in_erf(real, b12x_real):
     """B12X's GELU (the same FP32 formula with CuTe's ``erf``) on every BF16 input
-    against ours (the reference, CUDA's ``erff``): where they differ, it is in the
-    last bit of a value whose FP32 GELU lies within a few ``erf`` ulps of a BF16
-    rounding boundary. The count is printed: DeepSeek's reference semantics over
-    production's bits, measured."""
+    against ours (the reference, CUDA's ``erff``): where they differ, it is by what
+    an ``erf`` ulp moves ``0.5 * x * (1 + erf(x))`` (in the negative tail, where
+    ``1 + erf`` cancels, that is many output ulps of a tiny value) plus the BF16
+    rounding of the result. The count is printed: DeepSeek's reference semantics
+    over production's bits, measured."""
     from b12x.norm.vision import run_gelu
 
     _, aligner = real
@@ -952,10 +953,12 @@ def test_gelu_differs_from_b12x_only_in_erf(real, b12x_real):
     _assert_bits(ours, _reference_gelu(table), "GELU on every BF16 input")
     differ = _bits(ours) != _bits(theirs)
     print(f"ours differs from B12X's GELU on {int(differ.sum())} of {table.numel()}")
-    # One BF16 step at most, and only where both are finite.
+    # Two FP32 ulps of erf near +-1 (2**-23 each) through 0.5 * x, plus one BF16
+    # step of the output, and only where both are finite.
     step = (ours.float() - theirs.float()).abs()
     ulp = torch.maximum(ours.float().abs(), theirs.float().abs()) * 2.0**-7
-    assert bool((step[differ] <= ulp[differ]).all())
+    erf_ulps = 0.5 * table.float().abs() * 2.0**-22
+    assert bool((step[differ] <= (ulp + erf_ulps)[differ]).all())
 
 
 def _mlp_in(vit, rows: int, seed: int):

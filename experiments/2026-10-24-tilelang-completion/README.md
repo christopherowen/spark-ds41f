@@ -1644,3 +1644,21 @@ projection at up to 8 rows, blocked K sums, torch's GELU arithmetic), and the ne
 declaration tests. If every bundle passes, the sixth serving check
 (serving-ports-6.json, with image digests) and the fourth inventory run follow
 (`~/spark-lab/run22` on dgx1, "RUN22 DONE").
+
+Run 22: runner, misc and sampling passed every test and gate. In the mHC bundle every
+step passed except one test:
+- **The vision tower passed** its accuracy tests (the GELU is torch's bit for bit on
+  every BF16 input; the SIMT projection is B12X's bit for bit at up to 8 rows) and its
+  speed gate: no grid is slower than B12X, the smallest image 27.0 against 30.2 ms.
+- **The failing test measured our GELU against B12X's** with the wrong bound. They
+  differ in 7 of 66560 values, all in the negative tail, where `1 + erf` cancels: one
+  FP32 ulp of `erf` near -1 moves an output of ~1e-7 by more than its BF16 step.
+  vLLM 9554a406c bounds the difference by two `erf` ulps through `0.5 * x` plus one
+  BF16 step. Package files are unchanged, so the serving overlay is still b8c07e209's.
+
+The `--load-format b12x` loader needs no port: the nodes address memory through ATS, so
+its `auto` mode reads by bounce buffer (`cudaMemcpy` on the copy engine, no kernels). The
+Triton `_copy_rows` of its GDS mode never runs.
+
+Run 22b reruns the mHC bundle alone (integration-mhc-22b.json), then the sixth serving
+check and the fourth inventory run follow (`~/spark-lab/run22b` on dgx1, "RUN22B DONE").
