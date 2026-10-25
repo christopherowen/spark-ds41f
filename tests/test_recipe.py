@@ -242,8 +242,9 @@ class RecipeTest(unittest.TestCase):
 
     def test_candidate_6_on_the_triangle_is_its_ring_arm(self):
         """Candidate 6's triangle arm is its ring arm at tp3-triangle (one image, labels and
-        lock), so the triangle qualifies the build the ring did, at the recipe's TP3 sizing;
-        the owner's optional 6,144 budget arm changes only the budget and its threshold."""
+        lock), so the triangle qualifies the build the ring did, at the recipe's TP3 sizing.
+        The triangle's budget is 6,144 from this release (owner, 2026-10-25); the ring and the
+        4 KiB variant keep theirs."""
         rc6 = "experiments/2026-10-25-spark-ds41f-candidate/rc6"
         spark = load_spark()
         tp3, tp4 = (spark.read_cluster(f"{rc6}/rc-{shape}.json") for shape in ("tp3", "tp4"))
@@ -257,14 +258,15 @@ class RecipeTest(unittest.TestCase):
         at_shape = recipe.resolve(candidate, "tp3-triangle")
         self.assertEqual(tp3["serve_args"], at_shape["serve_args"])
         self.assertEqual(tp3["environment"], at_shape["environment"])
+        budgets = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("6144", "6096"),
+                   "tp3-triangle-4k": ("4096", "4048")}
+        self.assertEqual(set(candidate["shapes"]), set(budgets))
+        for name, budget in budgets.items():
+            values = recipe.values(candidate, recipe.shape_entry(candidate, name))
+            self.assertEqual((values["max_num_batched_tokens"], values["long_prefill_token_threshold"]),
+                             budget, name)
         self.assertEqual((argument(tp3, "--max-num-batched-tokens"), argument(tp3, "--long-prefill-token-threshold")),
-                         ("4096", "4048"))
-        budget = spark.read_cluster(f"{rc6}/budget-6144-tp3.json")
-        self.assertEqual({k for k in budget if budget[k] != tp3.get(k)}, {"serve_args"})
-        changed = {tp3["serve_args"][at - 1]: (old, new)
-                   for at, (old, new) in enumerate(zip(tp3["serve_args"], budget["serve_args"])) if old != new}
-        self.assertEqual(changed, {"--max-num-batched-tokens": ("4096", "6144"),
-                                   "--long-prefill-token-threshold": ("4048", "6096")})
+                         budgets["tp3-triangle"])
 
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
