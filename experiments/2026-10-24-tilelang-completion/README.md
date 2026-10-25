@@ -1867,3 +1867,38 @@ launches it.
 
 Run 25 runs the bundles at f914092be, including the glue tests and benchmarks; if they
 pass, the cleanup check follows (`~/spark-lab/run25`, "RUN25 DONE").
+
+## Release stabilization (owner, 2026-10-25)
+
+Scope is frozen: the current verification and padding fixes go in, and further fusions,
+kernel tuning and optional cleanup wait for a later release. The candidate is candidate
+4 (patch head 4cd21d89) plus vLLM `tilelang-ports` through f914092be, if run 25's bundles
+pass.
+
+Its recipe is candidate 4's (rc3) with one change, `--jit-monitor-mode off`. The owner
+asked for that (the A/B above: identical outputs, +0.4% at c8). The other recipe cleanup
+([ports-clean-tp4.json](ports-clean-tp4.json), 21 settings for unused kernels) is
+deferred.
+
+Run 25, one window:
+1. **The bundles at f914092be.**
+2. **[release-check.json](release-check.json): the candidate in its release
+   configuration** ([ports-nomon-tp4.json](ports-nomon-tp4.json)) against candidate 4,
+   twice each. It covers:
+   - temperature-0 and seeded outputs, controls and prompt logprobs;
+   - images, c1 and c8;
+   - the startup log ([startup_lines.py](startup_lines.py)).
+3. **[penalties-variation.json](penalties-variation.json): the seeded penalties
+   variation.** Penalties-sampled at c8, three times a boot, on three arms:
+   - the candidate;
+   - the candidate with adaptive verification off
+     ([ports-noadapt-tp4.json](ports-noadapt-tp4.json));
+   - production 1022 ([production-tp4.json](production-tp4.json)).
+
+   It is a regression only if production is stable where the candidate is not. If the
+   arm without adaptive verification is stable, adaptive verification is the cause: its
+   budget, shared across the batch, decides how many drafts each seeded request verifies.
+
+Then the release build (candidate 4's patch series plus the ports, built in an image
+job), the release tests, and the release comparison against production. That is the
+`release` profile with the single-stream suite behind the published tok/s figure.
