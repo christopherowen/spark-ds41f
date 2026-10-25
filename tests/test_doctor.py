@@ -575,6 +575,40 @@ class LiveMountsTest(unittest.TestCase):
         )
 
 
+class CheckoutPlaceholderTest(unittest.TestCase):
+    """The JIT cache mount names {checkout}: it follows deployment.path, so a site that clones
+    elsewhere mounts its own cache instead of one under our path, which a start refuses as an
+    unavailable rw source."""
+
+    def site(self, path: str) -> dict:
+        base = spark.read_cluster("config/cluster.json", "tp3-triangle")
+        return spark.cluster_recipe.overlay({"extends": {}, "set": {"deployment": {"path": path}}}, base)
+
+    def test_our_recipe_resolves_to_the_production_binds_at_every_shape(self) -> None:
+        for shape in ("tp4-ring", "tp3-triangle", "tp3-triangle-4k"):
+            cluster = spark.read_cluster("config/cluster.json", shape)
+            self.assertIn(["{checkout}/cache", "/cache", "rw"], cluster["container"]["mounts"])
+            self.assertEqual(spark.expected_binds(cluster), PRODUCTION_BINDS)
+            self.assertEqual(spark.repository_path(cluster), "/home/swank/projects/spark-ds41f")
+
+    def test_a_site_checkout_elsewhere_mounts_its_own_cache(self) -> None:
+        cluster = self.site("{home}/src/ds41f")
+        cache = "/home/swank/src/ds41f/cache"
+        self.assertEqual(spark.expected_binds(cluster),
+                         ["/home/swank/.cache/huggingface/hub:/hub:ro", f"{cache}:/cache:rw"])
+        self.assertIn(f"test -w {cache} || printf '%s %s\\n' rw {cache}", spark.mount_test_script(cluster))
+        # The cache is still inside the checkout, so the checkout's cleanliness check skips it.
+        self.assertIn("':(exclude)cache'", spark.remote_status_command(cluster))
+
+    def test_an_absolute_checkout_needs_no_home(self) -> None:
+        cluster = self.site("/srv/ds41f")
+        self.assertEqual(spark.expected_binds(cluster)[1], "/srv/ds41f/cache:/cache:rw")
+
+    def test_the_checkout_cannot_name_itself(self) -> None:
+        with self.assertRaises(SystemExit):
+            spark.repository_path(self.site("{checkout}/nested"))
+
+
 # Config.Env of the r6 image (sha256:b5225c98...) as dgx1 reported it on 2026-10-06, abridged.
 IMAGE_ENV = [
     "PATH=/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:"

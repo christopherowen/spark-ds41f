@@ -993,9 +993,16 @@ class OverlayTest(unittest.TestCase):
             mounts = [[str(stale), "/opt/spark3/candidate/b12x/b12x/gemm/a.py", "ro"],
                       [str(fresh), "/opt/spark3/candidate/b12x/b12x/gemm/b.py", "ro"],
                       [str(stale), "/opt/spark3/candidate/vllm/vllm/x.py", "ro"]]
-            problems = lab.fence_problems(mounts, "img", "/home/x", read_image=lambda path: image)
+            config = {"container": {"image": "img", "mounts": mounts}, "host": {"home": "/home/x"}}
+            problems = lab.fence_problems(config, read_image=lambda path: image)
         self.assertEqual(len(problems), 1)
         self.assertIn("stale.py", problems[0])
+
+    def test_the_overlay_checks_read_the_recipe_cache_mount(self) -> None:
+        # The recipe's cache mount names {checkout}; formatting it with {home} alone raised KeyError.
+        config = lab.spark.read_cluster("config/cluster.json", "tp3-triangle")
+        self.assertEqual(lab.overlay_manifest(config), [])
+        self.assertEqual(lab.fence_problems(config, read_image=lambda path: None), [])
 
 
 class KernelLabTest(unittest.TestCase):
@@ -1567,5 +1574,6 @@ class SourceRootTest(unittest.TestCase):
             image = Path(directory) / "image.py"
             image.write_text("cute.arch.fence_proxy('async.shared')\n")
             mounts = [[str(stale), f"{root}/b12x/b12x/gemm/a.py", "ro"] for root in lab.SOURCE_ROOTS]
-            problems = lab.fence_problems(mounts, "img", "/home/x", read_image=lambda path: image)
+            config = {"container": {"image": "img", "mounts": mounts}, "host": {"home": "/home/x"}}
+            problems = lab.fence_problems(config, read_image=lambda path: image)
         self.assertEqual(len(problems), 2)

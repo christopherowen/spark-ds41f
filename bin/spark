@@ -167,9 +167,8 @@ def expected_command(cluster: dict, node: dict) -> list[str]:
 
 def expected_binds(cluster: dict) -> list[str]:
     """The --volume values; docker inspect keeps them verbatim in HostConfig.Binds."""
-    home = cluster["host"]["home"]
     return [
-        f"{source.format(home=home)}:{destination}:{mode}"
+        f"{host_path(cluster, source)}:{destination}:{mode}"
         for source, destination, mode in cluster["container"]["mounts"]
     ]
 
@@ -344,7 +343,20 @@ def write_remote_file(nodes: dict, node: dict, path: str, text: str) -> subproce
 
 
 def repository_path(cluster: dict) -> str:
-    return cluster["deployment"]["path"].format(home=cluster["host"]["home"])
+    path = cluster["deployment"]["path"]
+    if "{checkout}" in path:
+        raise SystemExit("deployment.path is the checkout itself: it may name {home}, not {checkout}")
+    return path.format(home=cluster["host"]["home"])
+
+
+def host_path(cluster: dict, template: str) -> str:
+    """A node path from the profile: ``{home}`` is ``host.home`` and ``{checkout}`` the
+    deployment checkout (``deployment.path``), so what a site keeps in its checkout, such
+    as the JIT cache, follows the checkout wherever the site clones it."""
+    fields = {"home": cluster["host"]["home"]}
+    if "{checkout}" in template:
+        fields["checkout"] = repository_path(cluster)
+    return template.format(**fields)
 
 
 def repository_revision(revision: str = "HEAD") -> str:
@@ -1446,7 +1458,7 @@ def weight_fragmentation_findings(cluster: dict, nodes: dict, commands: bool = F
     )
     if source is None:
         return [Warn("cannot check weight fragmentation: no model mount")]
-    root = source.format(home=cluster["host"]["home"])
+    root = host_path(cluster, source)
     code = (ROOT / "scripts/weight_fragmentation.py").read_text()
 
     def inspect(node: dict) -> dict:
@@ -1539,7 +1551,7 @@ def remote_status_command(cluster: dict) -> str:
     for source, _, mode in cluster["container"]["mounts"]:
         if mode != "rw":
             continue
-        source_path = Path(source.format(home=cluster["host"]["home"]))
+        source_path = Path(host_path(cluster, source))
         try:
             relative = source_path.relative_to(repo)
         except ValueError:
@@ -1607,7 +1619,7 @@ def mount_test_script(cluster: dict) -> str:
     """One remote script testing every mount source (writable for rw, readable for ro)."""
     lines = []
     for source, _, mode in cluster["container"]["mounts"]:
-        source = source.format(home=cluster["host"]["home"])
+        source = host_path(cluster, source)
         test = "-w" if mode == "rw" else "-r"
         lines.append(
             f"test {test} {shlex.quote(source)} || printf '%s %s\\n' {mode} {shlex.quote(source)}"

@@ -434,12 +434,20 @@ Two files describe your site and stay out of git:
   then resolves the recipe at that shape; `--shape NAME` overrides it. A site
   that names none gets the recipe's `default_shape`, `tp4-ring`.
 - **The recipe.** In `config/cluster.json`, set `distributed.master_addr` to the head's management IP, `host.home`,
-  `deployment.repository` if you use a fork (the launch checks every node's
+  `deployment.path` if every node keeps this checkout somewhere other than
+  `{home}/projects/spark-ds41f`, `deployment.repository` if you use a fork (the launch checks every node's
   `origin` against it), and the interface names in `GLOO_SOCKET_IFNAME`, `NCCL_SOCKET_IFNAME`,
   `TP_SOCKET_IFNAME` and `NCCL_IB_HCA`. Keep `distributed.master_port` below
   the head's ephemeral port range (`sysctl net.ipv4.ip_local_port_range`);
   inside it, an outgoing connection can take the port and the head fails to
   start.
+
+Node paths in a profile take two placeholders: `{home}` is `host.home`, and
+`{checkout}` is `deployment.path`, which itself names only `{home}`. The JIT
+cache mount is `{checkout}/cache`, so it follows the checkout wherever you
+clone it. A start refuses a read-write mount whose source a node cannot write
+(`rw mount source is unavailable`); a mount you add that lives in the checkout
+should name `{checkout}` too.
 
 `bin/spark --cluster-config <profile> cluster sync --apply` moves every node's checkout to the head's
 commit and copies the head's node map to the others.

@@ -802,19 +802,20 @@ def image_file(image: str, path: str, cache: Path) -> Path | None:
     return target if copied.returncode == 0 else None
 
 
-def fence_problems(mounts: list, image: str, home: str, read_image=None) -> list[str]:
+def fence_problems(config: dict, read_image=None) -> list[str]:
     """Mounted B12X sources must not carry fewer TMA proxy fences than the image's own copy.
 
     An overlay built from an older B12X tree silently drops fences the image gained; the
     gemv-geom and mhc-mt overlays did exactly that before r5o.
     """
+    image = config["container"]["image"]
     read_image = read_image or (lambda path: image_file(image, path, Path.home() / ".cache" / "spark-lab"))
     problems = []
-    for source, destination, _mode in mounts:
+    for source, destination, _mode in config["container"]["mounts"]:
         if not (any(destination.startswith(f"{root}/b12x/") for root in SOURCE_ROOTS)
                 and destination.endswith(".py")):
             continue
-        local = Path(source.format(home=home))
+        local = Path(spark.host_path(config, source))
         reference = read_image(destination)
         if reference is None or not local.is_file():
             continue
@@ -825,10 +826,10 @@ def fence_problems(mounts: list, image: str, home: str, read_image=None) -> list
     return problems
 
 
-def overlay_manifest(config: dict, home: str) -> list[str]:
+def overlay_manifest(config: dict) -> list[str]:
     lines = []
     for source, destination, _mode in config["container"]["mounts"]:
-        path = Path(source.format(home=home))
+        path = Path(spark.host_path(config, source))
         if "spark3-overlay" in source and path.is_file():
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             lines.append(f"{digest}  {path} -> {destination}")
@@ -1642,7 +1643,6 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
     hold = read_hold()
     if not hold_is_ours(hold):
         window_open(spec.get("minutes", DEFAULT_MINUTES), f"run {spec['run']}")
-    home = production_configuration()[0]["host"]["home"]
     checked = set()
     failed = None
     window_ending = None  # a reason the window itself must close, not just this run
@@ -1685,14 +1685,14 @@ def execute(spec: dict, dry: bool, keep_open: bool, close_on_failure: bool = Tru
             if step["kind"] == "boot":
                 if step["config"] not in checked:
                     config = spark.read_cluster(step["config"])
-                    problems = fence_problems(config["container"]["mounts"], config["container"]["image"], home)
+                    problems = fence_problems(config)
                     if problems:
                         failed = "stale overlay: " + "; ".join(problems)
                         break
                     manifest = ROOT / "results" / "private" / "lab" / f"overlays-{spec['run']}.txt"
                     manifest.parent.mkdir(parents=True, exist_ok=True)
                     with manifest.open("a") as handle:
-                        handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config, home)))
+                        handle.write(f"# {step['config']}\n" + "".join(l + "\n" for l in overlay_manifest(config)))
                     checked.add(step["config"])
                 if step.get("memory_out"):
                     if not stop_cluster():

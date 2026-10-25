@@ -102,6 +102,16 @@ def load_spark():
     return spark
 
 
+def host_mounts(cluster: dict) -> dict:
+    """``cluster`` with its mount sources as the paths the nodes get. The recipe names its
+    cache ``{checkout}/cache`` (2026-10-26), the path the archived arms write out under
+    ``{home}``: their ``deployment.path`` is ``{home}/projects/spark-ds41f``."""
+    out = json.loads(json.dumps(cluster))
+    host_path = load_spark().host_path
+    out["container"]["mounts"] = [[host_path(out, source), *rest] for source, *rest in out["container"]["mounts"]]
+    return out
+
+
 class RecipeTest(unittest.TestCase):
     def setUp(self):
         self.recipe = load("config/cluster.json")
@@ -168,6 +178,7 @@ class RecipeTest(unittest.TestCase):
             budget = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("8192", "8144")}[shape]
             for flag, value in zip(("--max-num-batched-tokens", "--long-prefill-token-threshold"), budget):
                 args[args.index(flag) + 1] = value
+            resolved, released = host_mounts(resolved), host_mounts(released)
             self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                              {k: v for k, v in released.items() if k not in naming}, shape)
         self.assertEqual(self.recipe["container"]["image"], "spark-ds41f:19f2c20ed4d6-next-6")
@@ -175,8 +186,8 @@ class RecipeTest(unittest.TestCase):
     def test_the_ring_is_candidate_6s_arm(self):
         """Promotion runs what the release measured: tp4-ring resolves to candidate 6's arm,
         apart from the baseline, lock and reference that name it."""
-        resolved = recipe.resolve(self.recipe, "tp4-ring")
-        released = load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json")
+        resolved = host_mounts(recipe.resolve(self.recipe, "tp4-ring"))
+        released = host_mounts(load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"))
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})
