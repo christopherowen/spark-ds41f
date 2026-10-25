@@ -9,9 +9,9 @@ the whole decode step from the critical path, and prototypes it.
 Rules: bound each idea's gain from traces before building it; bit-identical outputs; correctness
 before speed; no fallback paths.
 
-Status: **analysis done, prototype committed, not run.** No GPU or cluster time was used (a
-release window holds the cluster). The lab specs below are ready to queue once this branch is
-merged.
+Status: **analysis done, prototype committed, kernel checks run on dgx4** ([results](#results-on-dgx4-2026-10-25-cet)):
+bits identical, 0 source violations, 1.3-1.8% faster per c1 layer chain. The serving screen and
+profile need the cluster and stay queued.
 
 ## The short answer
 
@@ -44,6 +44,16 @@ merged.
   `griddepcontrol.wait`, so the boundary costs the wait's release instead of a launch. What part
   of the 0.51 us that is on GB10 is the first thing the lab measures
   ([benchmark_deepseek_v41_pdl_mechanism](#benchmarks)).
+- **Measured on dgx4, kernel level (2026-10-25):**
+  - outputs are bit-identical: kernel tests, layer-chain digests across builds, and replays;
+  - the source check finds 0 violations;
+  - the captured graphs carry programmatic edges;
+  - a boundary costs 0.25-0.36 us less with `pdl.chain()`;
+  - the traced c1 layer is 1.42% shorter, and the real c1 layer chain 1.81% warm and 1.30%
+    cold;
+  - at 24-48 rows the chain is within noise.
+
+  That is roughly 1.0-1.5% of a c1 step, if serving confirms it.
 - **The L2 prefetch windows are late, and neither PDL nor an earlier issue fixes that**
   ([below](#the-l2-weight-prefetch-windows)). 77-87% of window instances still run when their
   first consumer starts; the consumers' time above their L2 speed is 4.67% of a c1 greedy step
@@ -361,6 +371,63 @@ and profile checks stay queued: they need the cluster.
        DeepSeek's switch for their call only, and every other TileKernels kernel keeps its
        default (no PDL). A new test checks that a cast through `pdl` has a programmatic edge
        and a direct call does not.
+
+   - **d5eab5d8 (vLLM 62538a5d8; `out/pdl-tests`, 116 s, pass;
+     [runs/tests-d5eab5d8.txt](runs/tests-d5eab5d8.txt)):** PDL tests 10 passed. That includes
+     the scoped TileKernels switch and the layer chain's graph, where every chain kernel whose
+     one predecessor is a kernel has a programmatic edge from it. Kernel tests: 416 passed, 1
+     xfailed. **Source check: 0 violations** over 305 launched kernels, 230 of them with PDL.
+3. **pdl-mechanism**, spark-ds41f 4de3d223 (`out/pdl-mechanism`, 92 s, pass;
+   [runs/mechanism-4de3d223.txt](runs/mechanism-4de3d223.txt)). Synthetic dependent kernels,
+   64 a CUDA graph, microseconds per kernel:
+
+   | CTAs | work | plain | wait only | `chain()` | late trigger | saved by `chain()` |
+   | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+   | 1 | none | 0.704 | 0.613 | 0.551 | 0.579 | 0.15 |
+   | 6 | none | 0.811 | 0.709 | 0.538 | 0.651 | 0.27 |
+   | 48 | none | 0.812 | 0.683 | 0.495 | 0.651 | 0.32 |
+   | 192 | none | 0.845 | 0.715 | 0.595 | 0.796 | 0.25 |
+   | 1 / 6 / 48 / 192 | about 2 us | 2.58 / 2.25 / 2.32 / 2.44 | | 2.28 / 1.93 / 1.96 / 2.09 | | 0.31 / 0.32 / 0.36 / 0.35 |
+   | 1 / 6 / 48 / 192 | about 10 us | 10.09 / 9.93 / 9.74 / 9.80 | | 9.80 / 9.71 / 9.42 / 9.49 | | 0.29 / 0.22 / 0.32 / 0.31 |
+
+   - A boundary costs 0.7-0.85 us in a graph. The wait alone recovers about 0.1 us of it;
+     triggering after the wait (`chain()`) recovers 0.25-0.36 us; TileKernels' trigger after
+     its stores, 0.1-0.2 us. So triggering early is what pays.
+   - The fork/join (A, B on a side stream, C after both) saves 0.09 us of 29.0 us.
+   - **The traced c1 layer** ([layer-c1.json](layer-c1.json): target layer 10's 28 path
+     kernels as spins of their traced CTAs, threads and durations, 25 chained) takes 503.3 us
+     plain and 496.1 us chained: **7.2 us saved, 1.42% of the layer**, 0.29 us per chained
+     boundary, 57% of the trace's 0.51 us median gap.
+   - At 0.29 us across the 1,244 chained graph boundaries of a c1 greedy step, that is about
+     360 us: **about 1.0% of a c1 greedy step, 1.3% c1 sampled, 0.6% at c8**, from launches
+     alone, before the eager boundaries and any prologue overlap. The serving screen measures
+     it end to end.
+
+4. **pdl-chain**, spark-ds41f d5eab5d8, vLLM 62538a5d8 (`out/pdl-chain`, 116 s, pass;
+   [runs/chain-d5eab5d8.txt](runs/chain-d5eab5d8.txt)). The 23-kernel layer chain, four layers
+   a graph, on candidate 6's build (the image's tree) against the same tree with the branch's 14
+   package files. Three rounds, alternating which build goes first, 50 replays each; a probe
+   confirmed which build each tree imports.
+   - **Bits: identical.** Every written buffer's digest matches across builds, rounds and
+     replays at all three shapes, and every replay matches its eager run.
+   - Time per layer (median of rounds; per-round values in the receipt):
+
+     | Rows | warm, image / PDL | saved | cold, image / PDL | saved | per round, image - PDL (warm) |
+     | ---: | ---: | ---: | ---: | ---: | --- |
+     | 6 (c1) | 961.9 / 944.5 us | **17.4 us, 1.81%** | 951.7 / 939.3 us | **12.4 us, 1.30%** | +17.4, +23.8, +6.7 |
+     | 24 | 2629.1 / 2633.2 us | -0.16% | 2626.1 / 2626.0 us | 0.01% | +17.2, -10.1, +22.2 |
+     | 48 | 3928.0 / 3937.2 us | -0.23% | 3926.7 / 3937.8 us | -0.28% | +4.0, -36.0, -9.2 |
+
+   - At one stream PDL is faster in every round, warm and cold, by more than the synthetic
+     estimate (17 us against about 21 x 0.29 = 6 us). The real kernels start up more slowly
+     than the spins: grid launch, shared-memory and barrier set-up, first loads.
+   - At 24 and 48 rows the rounds disagree in sign, and their spread (about 20-40 us) is larger
+     than the 6-17 us a layer's boundaries can give. Random routes make these chains 2.6-3.9 ms
+     a layer of expert weight streaming (144 to 288 routes), much longer than a serving layer at
+     c8 (about 1.5 ms), so a 0.2-0.6% gain is below this benchmark's resolution. The serving
+     screen measures c8 on real routes.
+
+The cluster checks stay queued as [screen.json](screen.json) and [profile.json](profile.json).
 
 ## Interactions with the other sessions
 
