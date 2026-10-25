@@ -669,15 +669,22 @@ class SinkSampler:
         processed_logits_strides: tuple[int, ...],
         sampled_widths: tuple[int, ...],
         bin_counts_stride: int,
+        vocab_size: int,
     ) -> None:
         """Declare the kernels a step launches: the policy for each sampled
         width, and the alternates of the raw and processed target logits
         (``(dtype, row stride)``; the TileLang kernels take any stride)."""
         from vllm.v1.worker.gpu.sample import tilelang_sampling
+        from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
 
         logits_dtypes = [dtype for dtype, _ in logits]
         if processed_logits_strides:
             logits_dtypes.append(torch.float32)
+        # alternate_logprobs_of ranks the alternates in dense copies of their rows,
+        # vocab_size apart whatever the logits' (padded) row stride.
+        register_ranks(
+            [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)], vocab_size
+        )
         tilelang_sampling.declare(
             lambda: tilelang_sampling.sink_calls(
                 logits_dtypes=logits_dtypes,

@@ -255,21 +255,22 @@ def per_op(ours, theirs, config, grid) -> dict:
 
 # --- Tile sweep (ungated) ---------------------------------------------------------
 
+# K tiles stay 64: each is a blocked FP32 partial sum, so they set the bits.
 _LINEAR_TILES = [
-    dict(block_M=128, block_N=128, block_K=64, num_stages=2, threads=256),
-    dict(block_M=128, block_N=128, block_K=32, num_stages=3, threads=256),
-    dict(block_M=128, block_N=128, block_K=64, num_stages=3, threads=128),
-    dict(block_M=128, block_N=256, block_K=32, num_stages=3, threads=256),
-    dict(block_M=256, block_N=128, block_K=32, num_stages=3, threads=256),
-    dict(block_M=64, block_N=128, block_K=64, num_stages=3, threads=128),
-    dict(block_M=128, block_N=64, block_K=64, num_stages=3, threads=128),
+    dict(block_M=128, block_N=128, num_stages=2, threads=256),
+    dict(block_M=128, block_N=128, num_stages=3, threads=256),
+    dict(block_M=128, block_N=128, num_stages=2, threads=128),
+    dict(block_M=128, block_N=256, num_stages=2, threads=256),
+    dict(block_M=256, block_N=128, num_stages=2, threads=256),
+    dict(block_M=64, block_N=128, num_stages=3, threads=128),
+    dict(block_M=128, block_N=64, num_stages=3, threads=128),
 ]
 _SWIGLU_TILES = [
-    dict(block_M=128, block_N=64, block_K=64, num_stages=2, threads=256),
-    dict(block_M=128, block_N=64, block_K=32, num_stages=3, threads=256),
-    dict(block_M=128, block_N=128, block_K=32, num_stages=2, threads=256),
-    dict(block_M=64, block_N=64, block_K=64, num_stages=3, threads=128),
-    dict(block_M=128, block_N=32, block_K=64, num_stages=3, threads=128),
+    dict(block_M=128, block_N=64, num_stages=2, threads=256),
+    dict(block_M=128, block_N=64, num_stages=3, threads=256),
+    dict(block_M=128, block_N=128, num_stages=2, threads=256),
+    dict(block_M=64, block_N=64, num_stages=3, threads=128),
+    dict(block_M=128, block_N=32, num_stages=3, threads=128),
 ]
 _ATTENTION_TILES = [
     dict(block_M=128, block_N=64, num_stages=2, threads=128),

@@ -4,12 +4,15 @@
 reference.
 
 Bit for bit (compared as bits): the patch padding and the spatial merge (copies),
-the residual add with RMSNorm, the 2-D RoPE, the exact GELU epilogue and the bias
-epilogue's single rounding, against torch models of B12X's arithmetic (``_b12x_*``,
-read from its CuTe kernels: the same reduction tree, FMAs where libNVVM contracts,
-the same FP32 constants). Where b12x is importable, the same operations and the
-SwiGLU epilogue against B12X's own kernels, bit for bit; a mismatch names the
-arithmetic B12X's kernel matched instead.
+the residual add with RMSNorm, the 2-D RoPE and the bias epilogue's single
+rounding, against torch models of B12X's arithmetic (``_b12x_*``, read from its
+CuTe kernels: the same reduction tree, FMAs where libNVVM contracts, the same FP32
+constants); the GELU epilogue against DeepSeek's reference GELU (torch's
+``F.gelu``), on every BF16 input. Where b12x is importable, the same operations,
+the SwiGLU epilogue and the few-row GEMVs (B12X's SIMT projection) against B12X's
+own kernels, bit for bit (GELU's difference from B12X's, which uses CuTe's ``erf``,
+measured and bounded to one BF16 step); a mismatch names the arithmetic B12X's
+kernel matched instead.
 
 Against FP64 references, with tolerances no looser than B12X's own error on the
 same inputs (both measured and reported): the projections, attention, and the whole
@@ -332,11 +335,10 @@ def _b12x_rope(qkv, height, width, inv_freq, heads, form: str = "left"):
     return out
 
 
-def _b12x_gelu(h: torch.Tensor) -> torch.Tensor:
-    """B12X's exact GELU of BF16 values: ``(0.5 * x) * (1 + erff(x * 0.70710677))``
-    in FP32 (the constant rounded to FP32), rounded to BF16."""
-    x = h.float()
-    return ((0.5 * x) * (1.0 + torch.erf(x * 0.7071067811865476))).bfloat16()
+def _reference_gelu(h: torch.Tensor) -> torch.Tensor:
+    """DeepSeek's reference GELU of BF16 values: ``F.gelu`` on the BF16 tensor (torch
+    evaluates it in FP32 with CUDA's ``erff`` and rounds to BF16)."""
+    return F.gelu(h)
 
 
 def _reference_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
@@ -691,30 +693,49 @@ def _check_projection(name, ours, theirs):
     assert off <= 1.5 * b12x_off + 4, message
 
 
-def _projection_cases(vit, aligner):
-    """Each projection: its TileLang kernel (the declared one, or for the two with
-    an epilogue the plain GEMM their epilogues start from), its layer, and its
-    module path (the same in B12X's tower)."""
+def _projection_cases(vit, aligner, rows: int):
+    """Each projection at ``rows`` rows: the TileLang kernel the tower launches (the
+    GEMV up to GEMV_ROWS rows, else the GEMM; for the two with an epilogue, the
+    plain projection their epilogues start from), its layer, and its module path
+    (the same in B12X's tower)."""
     block, out_dim = vit.blocks[0], aligner.out_dim
-    gate_up = block.mlp.w1.weight.shape
+    small = rows <= vision.GEMV_ROWS
+
+    def declared(module, role):
+        return _kernel(module, role + "_rows" if small else role)
+
+    def plain(n, k, bias):
+        if small:
+            return vision.resolve(vision.gemv_call(n, k, "bias" if bias else "none"))
+        return vision.resolve(vision.linear_call(n, k, bias=bias))
+
     return {
-        "qkv": (_kernel(vit, "qkv"), block.attn.wqkv, "blocks.0.attn.wqkv"),
-        "wo": (_kernel(vit, "wo"), block.attn.wo, "blocks.0.attn.wo"),
+        "qkv": (declared(vit, "qkv"), block.attn.wqkv, "blocks.0.attn.wqkv"),
+        "wo": (declared(vit, "wo"), block.attn.wo, "blocks.0.attn.wo"),
         "mlp gate/up": (
-            vision.resolve(vision.linear_call(*gate_up, bias=False)),
+            plain(*block.mlp.w1.weight.shape, False),
             block.mlp.w1,
             "blocks.0.mlp.w1",
         ),
-        "mlp down": (_kernel(vit, "mlp_out"), block.mlp.w2, "blocks.0.mlp.w2"),
+        "mlp down": (declared(vit, "mlp_out"), block.mlp.w2, "blocks.0.mlp.w2"),
         "aligner w1": (
-            vision.resolve(
-                vision.linear_call(out_dim, aligner.w1.weight.shape[1], bias=True)
-            ),
+            plain(out_dim, aligner.w1.weight.shape[1], True),
             aligner.w1,
             "w1",
         ),
-        "aligner w2": (_kernel(aligner, "w2"), aligner.w2, "w2"),
+        "aligner w2": (declared(aligner, "w2"), aligner.w2, "w2"),
     }
+
+
+def _project(kernel, layer, a: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        a.shape[0], layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE
+    )
+    if layer.bias is None:
+        kernel(a, layer.weight, out)
+    else:
+        kernel(a, layer.weight, layer.bias, out)
+    return out
 
 
 def _optional(request, name: str):
@@ -730,15 +751,9 @@ def _optional(request, name: str):
 def test_projections_against_fp64(real, rows, request):
     vit, aligner = real
     b12x = _optional(request, "b12x_real")
-    for name, (kernel, layer, path) in _projection_cases(vit, aligner).items():
+    for name, (kernel, layer, path) in _projection_cases(vit, aligner, rows).items():
         a = _randn(rows, layer.weight.shape[1], seed=rows + layer.weight.shape[0])
-        out = torch.empty(
-            rows, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE
-        )
-        if layer.bias is None:
-            kernel(a, layer.weight, out)
-        else:
-            kernel(a, layer.weight, layer.bias, out)
+        out = _project(kernel, layer, a)
         ours = _projection_error(out, a, layer.weight, layer.bias)
         theirs = None
         if b12x is not None:
@@ -749,20 +764,32 @@ def test_projections_against_fp64(real, rows, request):
         _check_projection(f"{name} at {rows} rows", ours, theirs)
 
 
+def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
+    """The tower's patch embedding of ``patches``: the GEMV on the 588-wide rows up
+    to GEMV_ROWS rows, else the GEMM on rows and weight padded to 640."""
+    proj, rows = vit.patch_embed.proj, patches.shape[0]
+    flat = patches.reshape(rows, -1)
+    if rows <= vision.GEMV_ROWS:
+        return _project(_kernel(vit, "patch_rows"), proj, flat)
+    padded = torch.empty(rows, 640, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.empty(proj.weight.shape[0], 640, dtype=torch.bfloat16, device=DEVICE)
+    _kernel(vit, "pad")(flat, padded)
+    _kernel(vit, "pad")(proj.weight, weight)
+    out = torch.empty(rows, proj.weight.shape[0], dtype=torch.bfloat16, device=DEVICE)
+    _kernel(vit, "patch")(padded, weight, proj.bias, out)
+    return out
+
+
 @pytest.mark.parametrize("rows", [1, 77, 300])
 def test_patch_embedding_against_fp64(real, rows, request):
-    """The padded patch GEMM: 588 columns as 640 (zero tail, zero-padded weight)."""
+    """The patch embedding: the GEMV on the 588-wide rows for one row, the GEMM on
+    rows and weight padded to 640 (zero tails) for more."""
     vit, _ = real
     b12x = _optional(request, "b12x_real")
     proj = vit.patch_embed.proj
     patches = _patches(REAL, rows + 1, seed=rows)[1:]
-    padded = torch.empty(rows, 640, dtype=torch.bfloat16, device=DEVICE)
-    weight = torch.empty(proj.weight.shape[0], 640, dtype=torch.bfloat16, device=DEVICE)
-    _kernel(vit, "pad")(patches.reshape(rows, -1), padded)
-    _kernel(vit, "pad")(proj.weight, weight)
-    out = torch.empty(rows, proj.weight.shape[0], dtype=torch.bfloat16, device=DEVICE)
-    _kernel(vit, "patch")(padded, weight, proj.bias, out)
     flat = patches.reshape(rows, -1)
+    out = _patch_embedding(vit, patches)
     ours = _projection_error(out, flat, proj.weight, proj.bias)
     theirs = None
     if b12x is not None:
@@ -772,14 +799,16 @@ def test_patch_embedding_against_fp64(real, rows, request):
     _check_projection(f"patch embedding at {rows} rows", ours, theirs)
 
 
-def test_bias_is_added_before_the_one_rounding(small):
+@pytest.mark.parametrize("role, k", [("patch", 64), ("patch_rows", 12)])
+def test_bias_is_added_before_the_one_rounding(small, role, k):
     """``acc = 257`` (exact in FP32) plus a bias of 0.5 rounds to 258 in BF16; rounding
-    the accumulator first (257 ties to 256) and then adding would give 256."""
+    the accumulator first (257 ties to 256) and then adding would give 256. The GEMM
+    (K padded to 64) and the GEMV (the 12-wide patches)."""
     vit, _ = small
-    kernel = _kernel(vit, "patch")  # [128, 64] with bias
-    a = torch.zeros(5, 64, dtype=torch.bfloat16, device=DEVICE)
+    kernel = _kernel(vit, role)  # [128, k] with bias
+    a = torch.zeros(5, k, dtype=torch.bfloat16, device=DEVICE)
     a[:, :3] = 1
-    weight = torch.zeros(128, 64, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.zeros(128, k, dtype=torch.bfloat16, device=DEVICE)
     weight[:, 0], weight[:, 1], weight[:, 2] = 128, 128, 1
     bias = torch.full((128,), 0.5, dtype=torch.bfloat16, device=DEVICE)
     out = torch.empty(5, 128, dtype=torch.bfloat16, device=DEVICE)
@@ -787,78 +816,174 @@ def test_bias_is_added_before_the_one_rounding(small):
     assert bool((out == 258).all()), out.unique().tolist()
 
 
-def test_projection_nonfinite_rows(small):
+@pytest.mark.parametrize("rows", [5, 9])
+def test_projection_nonfinite_rows(small, rows):
     vit, _ = small
     layer = vit.blocks[0].attn.wqkv
-    kernel = _kernel(vit, "qkv")
-    a = _randn(9, layer.weight.shape[1], seed=9)
-    out = torch.empty(9, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE)
-    kernel(a, layer.weight, layer.bias, out)
-    clean = out.clone()
+    kernel = _kernel(vit, "qkv_rows" if rows <= vision.GEMV_ROWS else "qkv")
+    a = _randn(rows, layer.weight.shape[1], seed=rows)
+    clean = _project(kernel, layer, a)
     a[4, 3] = NAN
-    kernel(a, layer.weight, layer.bias, out)
+    out = _project(kernel, layer, a)
     assert bool(out[4].isnan().all())
     assert_other_rows_equal(out, clean, [4])
+
+
+def test_gemv_is_b12x_simt_projection(real, b12x_real):
+    """At one row B12X runs its SIMT projection (its plan below nine rows); the GEMVs
+    reproduce it bit for bit: 8-wide vectors, and single elements for the 588-wide
+    patch rows."""
+    vit, aligner = real
+    for name, (kernel, layer, path) in _projection_cases(vit, aligner, 1).items():
+        a = _randn(1, layer.weight.shape[1], seed=layer.weight.shape[0])
+        root = b12x_real.aligner if name.startswith("aligner") else b12x_real.vit
+        theirs = torch.empty(
+            1, layer.weight.shape[0], dtype=torch.bfloat16, device=DEVICE
+        )
+        root.get_submodule(path)(a, out=theirs)
+        _assert_bits(_project(kernel, layer, a), theirs, f"{name} against B12X")
+    patches = _patches(REAL, 2, seed=3)[1:]
+    theirs = torch.empty(1, REAL.vision_dim, dtype=torch.bfloat16, device=DEVICE)
+    b12x_real.vit.patch_embed(patches, out=theirs)
+    _assert_bits(_patch_embedding(vit, patches), theirs, "patch embedding vs B12X")
 
 
 # --- Epilogues: GELU and SwiGLU ---------------------------------------------------
 
 
 def _aligner_w1(aligner, merged: torch.Tensor, gelu: bool) -> torch.Tensor:
-    """The aligner's first projection of ``merged``: with the GELU epilogue (the
-    declared kernel) or without (biased, rounded)."""
-    out = torch.empty(
-        merged.shape[0], aligner.out_dim, dtype=torch.bfloat16, device=DEVICE
-    )
-    if gelu:
-        kernel = _kernel(aligner, "w1")
+    """The aligner's first projection of ``merged`` on the tower's path for its rows
+    (the GEMV up to GEMV_ROWS): with the GELU epilogue (the declared kernels) or
+    without (biased, rounded)."""
+    rows, k = merged.shape
+    if rows <= vision.GEMV_ROWS:
+        call = vision.gemv_call(aligner.out_dim, k, "gelu" if gelu else "bias")
     else:
-        call = vision.linear_call(aligner.out_dim, merged.shape[1], bias=True)
-        kernel = vision.resolve(call)
-    kernel(merged, aligner.w1.weight, aligner.w1.bias, out)
+        call = vision.linear_call(aligner.out_dim, k, bias=True, gelu=gelu)
+    out = torch.empty(rows, aligner.out_dim, dtype=torch.bfloat16, device=DEVICE)
+    vision.resolve(call)(merged, aligner.w1.weight, aligner.w1.bias, out)
     return out
 
 
 @pytest.mark.parametrize("rows", [1, 33, 144])
-def test_gelu_epilogue_is_b12x_arithmetic(small, rows):
-    """The GELU epilogue is exact GELU of the rounded biased projection: B12X's
-    arithmetic, which is also torch's ``F.gelu`` on BF16."""
+def test_gelu_epilogue_is_the_reference(small, rows):
+    """The GELU epilogue is DeepSeek's reference GELU (torch's ``F.gelu``) of the
+    rounded biased projection, bit for bit, on the GEMV and the GEMM; a NaN row
+    stays NaN."""
     _, aligner = small
     merged = _randn(rows, aligner.w1.weight.shape[1], seed=rows)
     activated = _aligner_w1(aligner, merged, gelu=True)
     hidden = _aligner_w1(aligner, merged, gelu=False)
-    _assert_bits(activated, _b12x_gelu(hidden), "GELU epilogue")
-    _assert_bits(activated, F.gelu(hidden, approximate="none"), "torch F.gelu")
+    _assert_bits(activated, _reference_gelu(hidden), "GELU epilogue")
     merged[rows // 2, 0] = NAN
     poisoned = _aligner_w1(aligner, merged, gelu=True)
     assert bool(poisoned[rows // 2].isnan().all())
     assert_other_rows_equal(poisoned, activated, [rows // 2])
 
 
-def test_gelu_epilogue_matches_b12x(real, b12x_real):
+def _every_bf16() -> torch.Tensor:
+    """Every BF16 value that is zero or normal, but negative zero: the inputs GELU
+    sees from a projection (sums of zeros are positive; subnormal inputs depend on
+    the tensor cores' denormal handling, not on GELU)."""
+    values = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+    values = values.view(torch.bfloat16).float()
+    keep = torch.isfinite(values) & ((values.abs() >= 2.0**-126) | (values == 0))
+    keep &= ~torch.signbit(values) | (values != 0)
+    return values[keep].bfloat16().to(DEVICE)
+
+
+def _gelu_table(aligner, values: torch.Tensor) -> torch.Tensor:
+    """``values`` laid out as whole rows of the aligner's width, zeros after."""
+    n = aligner.out_dim
+    table = torch.zeros(-(-values.numel() // n) * n, dtype=torch.bfloat16)
+    table = table.to(DEVICE)
+    table[: values.numel()] = values
+    return table.view(-1, n)
+
+
+def _gelu_through_epilogue(aligner, table: torch.Tensor, gemv: bool) -> torch.Tensor:
+    """GELU of each value of ``table`` through the fused epilogue: one-hot activation
+    rows select a weight column holding a row of values, the bias is zero, so each
+    output is GELU of a value exactly; the GEMV takes GEMV_ROWS rows a launch."""
+    n, k = aligner.out_dim, aligner.w1.weight.shape[1]
+    call = (
+        vision.gemv_call(n, k, "gelu")
+        if gemv
+        else vision.linear_call(n, k, bias=True, gelu=True)
+    )
+    kernel, bias = vision.resolve(call), torch.zeros(n, device=DEVICE).bfloat16()
+    step = vision.GEMV_ROWS if gemv else table.shape[0]
+    outs = []
+    for start in range(0, table.shape[0], step):
+        rows = table[start : start + step]
+        a = torch.zeros(rows.shape[0], k, dtype=torch.bfloat16, device=DEVICE)
+        a[torch.arange(rows.shape[0]), torch.arange(rows.shape[0])] = 1
+        weight = torch.zeros(n, k, dtype=torch.bfloat16, device=DEVICE)
+        weight[:, : rows.shape[0]] = rows.T
+        out = torch.empty(rows.shape, dtype=torch.bfloat16, device=DEVICE)
+        kernel(a, weight, bias, out)
+        outs.append(out)
+    return torch.cat(outs)
+
+
+@pytest.mark.parametrize("gemv", [False, True], ids=["gemm", "gemv"])
+def test_gelu_epilogue_is_the_reference_everywhere(real, gemv):
+    """Every BF16 input a projection can produce, through each fused epilogue,
+    against torch's ``F.gelu``."""
+    _, aligner = real
+    table = _gelu_table(aligner, _every_bf16())
+    got = _gelu_through_epilogue(aligner, table, gemv)
+    _assert_bits(got, _reference_gelu(table), "GELU on every BF16 input")
+
+
+def test_gelu_differs_from_b12x_only_in_erf(real, b12x_real):
+    """B12X's GELU (the same FP32 formula with CuTe's ``erf``) on every BF16 input
+    against ours (the reference, CUDA's ``erff``): where they differ, it is in the
+    last bit of a value whose FP32 GELU lies within a few ``erf`` ulps of a BF16
+    rounding boundary. The count is printed: DeepSeek's reference semantics over
+    production's bits, measured."""
     from b12x.norm.vision import run_gelu
 
     _, aligner = real
-    for rows in (1, 64, 192):
-        merged = _randn(rows, aligner.w1.weight.shape[1], seed=rows)
-        activated = _aligner_w1(aligner, merged, gelu=True)
-        hidden = _aligner_w1(aligner, merged, gelu=False)
-        theirs = torch.empty_like(hidden)
-        run_gelu(hidden, out=theirs, plan=b12x_real.aligner._gelu_plan)
-        _assert_bits(activated, theirs, f"GELU of {rows} rows against B12X")
+    table = _gelu_table(aligner, _every_bf16())
+    ours = _gelu_through_epilogue(aligner, table, gemv=False)
+    theirs = torch.empty_like(table)
+    run_gelu(table, out=theirs, plan=b12x_real.aligner._gelu_plan)
+    _assert_bits(ours, _reference_gelu(table), "GELU on every BF16 input")
+    differ = _bits(ours) != _bits(theirs)
+    print(f"ours differs from B12X's GELU on {int(differ.sum())} of {table.numel()}")
+    # One BF16 step at most, and only where both are finite.
+    step = (ours.float() - theirs.float()).abs()
+    ulp = torch.maximum(ours.float().abs(), theirs.float().abs()) * 2.0**-7
+    assert bool((step[differ] <= ulp[differ]).all())
 
 
 def _mlp_in(vit, rows: int, seed: int):
     """The MLP's fused gate/up projection with SwiGLU, and the unfused projection's
-    BF16 gate/up of the same rows."""
+    BF16 gate/up of the same rows (the GEMVs up to GEMV_ROWS rows, else the GEMMs:
+    the fused and unfused accumulate alike)."""
     mlp = vit.blocks[0].mlp
     inter2, k = mlp.w1.weight.shape
     x = _randn(rows, k, seed=seed)
-    activated = torch.empty(rows, inter2 // 2, dtype=torch.bfloat16, device=DEVICE)
-    _kernel(vit, "mlp_in")(x, mlp.w1.weight, activated)
+    activated = _mlp_activated(vit, x)
     gate_up = torch.empty(rows, inter2, dtype=torch.bfloat16, device=DEVICE)
-    vision.resolve(vision.linear_call(inter2, k, bias=False))(x, mlp.w1.weight, gate_up)
+    if rows <= vision.GEMV_ROWS:
+        call = vision.gemv_call(inter2, k, "none")
+    else:
+        call = vision.linear_call(inter2, k, bias=False)
+    vision.resolve(call)(x, mlp.w1.weight, gate_up)
     return x, activated, gate_up
+
+
+def _mlp_activated(vit, x: torch.Tensor) -> torch.Tensor:
+    """The tower's fused gate/up projection and SwiGLU of ``x``."""
+    mlp, rows = vit.blocks[0].mlp, x.shape[0]
+    role = "mlp_in_rows" if rows <= vision.GEMV_ROWS else "mlp_in"
+    activated = torch.empty(
+        rows, mlp.w1.weight.shape[0] // 2, dtype=torch.bfloat16, device=DEVICE
+    )
+    _kernel(vit, role)(x, mlp.w1.weight, activated)
+    return activated
 
 
 @pytest.mark.parametrize("rows", [1, 33, 144])
@@ -895,13 +1020,12 @@ def test_swiglu_epilogue_matches_b12x(real, b12x_real):
         _assert_bits(activated, theirs, f"SwiGLU of {rows} rows against B12X")
 
 
-def test_swiglu_epilogue_nonfinite_rows(small):
+@pytest.mark.parametrize("rows", [5, 9])
+def test_swiglu_epilogue_nonfinite_rows(small, rows):
     vit, _ = small
-    mlp = vit.blocks[0].mlp
-    x, clean, _ = _mlp_in(vit, 9, 9)
+    x, clean, _ = _mlp_in(vit, rows, rows)
     x[2, 1] = NAN
-    out = torch.empty_like(clean)
-    _kernel(vit, "mlp_in")(x, mlp.w1.weight, out)
+    out = _mlp_activated(vit, x)
     assert bool(out[2].isnan().all())
     assert_other_rows_equal(out, clean, [2])
 
@@ -1118,7 +1242,8 @@ class _Recording:
 def test_declarations_cover_every_launch(monkeypatch):
     """The worker's entry point declares exactly the calls the modules bind (after
     the kernel cache freezes, an undeclared one raises KernelNotPreparedError), and
-    one image launches every bound kernel and nothing else."""
+    a small image (the GEMVs) and a large one (the GEMMs) launch every bound kernel
+    and nothing else."""
     from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 
     vit, aligner = _build(SMALL, seed=2)
@@ -1150,7 +1275,9 @@ def test_declarations_cover_every_launch(monkeypatch):
             name: _Recording(kernel, f"{type(module).__name__}.{name}", launched)
             for name, kernel in module._kernels.items()
         }
-    aligner(vit(_patches(SMALL, 28, seed=2), 4, 7), 4, 7)
+    for height, width in ((2, 3), (12, 12)):
+        rows = height * width
+        aligner(vit(_patches(SMALL, rows, seed=2), height, width), height, width)
     assert launched == {
         f"{type(module).__name__}.{name}"
         for module in (vit, aligner)

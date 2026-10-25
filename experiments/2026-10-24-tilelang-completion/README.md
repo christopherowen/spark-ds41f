@@ -1624,3 +1624,23 @@ class, which returns the language model's MTP buffer, and 58a492841 removed the 
 The drafter never read those states (DSpark takes the auxiliary states), so outputs are
 unaffected. vLLM b441fcf88 makes the runner read a None override as none. The serving
 check and the inventory run again at b441fcf88 (`~/spark-lab/serving5b`, "SERVING5B DONE").
+
+It failed to start again, after CUDA-graph capture: the draft budget's warm-up asked for
+`assign_draft_budget(5, int64)`, which was never declared. The runner declared adaptive
+verification's kernels only once its manager existed, but kernels are prepared during
+memory profiling, before `initialize_kv_cache` builds the manager. vLLM 836325b12
+declares them when the speculator enables adaptive verification, with a test that
+declares the step's kernels before the manager exists. The inventory run failed the
+same way.
+
+A static audit of every TileLang launch at boot and under the serving checks' traffic
+(controls, logprobs, penalties, bias, structured outputs, images) found no other
+undeclared key at TP4. It found one at TP3: the sink ranks its alternates in dense copies
+of their rows, vocab_size (129280) apart, while the declarations covered only the padded
+stride (129408 at TP3). vLLM b8c07e209 declares the dense stride.
+
+Run 22 runs the four bundles at b8c07e209: the vision rework (7805793b3: B12X's SIMT
+projection at up to 8 rows, blocked K sums, torch's GELU arithmetic), and the new
+declaration tests. If every bundle passes, the sixth serving check
+(serving-ports-6.json, with image digests) and the fourth inventory run follow
+(`~/spark-lab/run22` on dgx1, "RUN22 DONE").

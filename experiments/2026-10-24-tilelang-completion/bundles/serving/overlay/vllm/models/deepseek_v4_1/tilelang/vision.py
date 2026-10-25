@@ -12,18 +12,35 @@ cannot contract or reorder it:
 - ``pad_columns``: rows of ``width`` BF16 values copied into ``padded``-wide rows
   whose tail is zero (the patch embedding's 588 columns become 640, whole K tiles,
   16-byte rows). Exact.
-- ``linear``: ``A @ W^T`` on BF16 tensor cores, FP32 accumulation over K in
-  sequential 16-wide MMA steps (so a row's bits do not depend on the tile); with
-  ``bias`` the BF16 bias is added in FP32 before the one rounding to BF16; with
-  ``gelu`` the rounded biased value then goes through exact GELU, B12X's
-  ``0.5 * x * (1 + erf(x * 0.70710677))`` in FP32 with the accurate ``erff``, and
-  rounds again (the aligner's first projection and its GELU in one launch).
+- ``linear``: ``A @ W^T`` on BF16 tensor cores for images of more than
+  ``GEMV_ROWS`` rows. Each 64-wide K block is summed alone, from zero, by four
+  16-wide MMA steps, and the blocks' FP32 sums are added in K order on the CUDA
+  cores: the tensor core's accumulation never chains more than four steps. (One
+  chain of every step rounded 0.7% of the outputs of a K = 9216 row away from the
+  correctly rounded value, and twice as many as cuBLAS's at K = 2816.) A row's bits
+  do not depend on the tile shape. With
+  ``bias`` the BF16 bias is added in FP32 before the one rounding to BF16, as
+  B12X's projections do; with ``gelu`` the rounded biased value goes through GELU
+  (below) in the same epilogue.
 - ``swiglu_linear``: the MLP's gate and up projections of one column block in one
-  CTA (two accumulators sharing the activation tile), each rounded to BF16 as
-  B12X's GEMM stores them, then B12X's vision SwiGLU (limit infinite, so no clamp):
-  ``silu = g * (1 / (1 + __expf(-g)))`` (CuTe's ``exp(..., fastmath=True)``, an IEEE
-  reciprocal), rounded to BF16, times ``u``, rounded to BF16. The ``[rows, 2I]``
-  gate/up tensor is never stored.
+  CTA (two blocked accumulations sharing the activation tile), each rounded to
+  BF16 as B12X's GEMM stores them, then B12X's vision SwiGLU (limit infinite, so no
+  clamp): ``silu = g * (1 / (1 + __expf(-g)))`` (CuTe's ``exp(..., fastmath=True)``,
+  an IEEE reciprocal), rounded to BF16, times ``u``, rounded to BF16. The
+  ``[rows, 2I]`` gate/up tensor is never stored.
+- ``gemv``: images of at most ``GEMV_ROWS`` rows (and merged rows), B12X's SIMT
+  projection (``SmallNGemvKernel``, the plan B12X runs below nine rows) to the
+  rounding: one 128-thread CTA an output column and eight rows; thread ``t`` adds
+  ``w * x`` by FMA from zero over the 8-wide K vectors ``t, t + 128, ...``, elements
+  in order (single elements ``t, t + 128, ...`` when K is not whole vectors, the
+  588-wide patches); a butterfly over each warp, the four warp sums in one warp's
+  butterfly; the bias added in FP32; one rounding. Its epilogues are the MMA
+  kernels' (bias, bias and GELU, SwiGLU of a column's gate and up rows).
+- GELU of a rounded BF16 value ``x`` is DeepSeek's reference, ``F.gelu`` as torch
+  evaluates it on BF16: ``(0.5 * x) * (1 + erff(x * M_SQRT1_2))`` in FP32, rounded
+  to BF16. B12X evaluates the same formula with CuTe's ``erf``, whose last bits are
+  not CUDA's ``erff``: 21 of 327680 aligner outputs differ from B12X's (DeepSeek's
+  reference semantics over production's bits).
 - ``rope_qkv``: B12X's 2-D split-half rotation of q and k, in place in the fused
   projection's output (v stays where it is; attention reads all three there). Pair
   ``j`` of a head (columns ``j`` and ``j + head_dim / 2``) rotates by
@@ -69,12 +86,16 @@ import tilelang.language as T
 from vllm.models.deepseek_v4_1.tilelang import prepare
 
 EPS = 1e-6  # B12X's (and DeepSeek's) vision RMSNorm epsilon
-_SQRT_HALF = 0.7071067811865476  # B12X's GELU constant, rounded to FP32 in-kernel
 _LOG2E = 1.4426950408889634
 _VEC = 8  # BF16 values in one 16-byte vector
 _PIECE = 4  # BF16 values in one 8-byte piece (a patch row is 8-byte aligned)
 _NORM_THREADS = 256  # B12X's grouped RMSNorm block
-_K_ALIGN = 64  # K tiles of the GEMMs
+_K_ALIGN = 64  # the GEMMs' K tile: also each blocked FP32 partial sum's width
+_GEMV_THREADS = 128  # B12X's SIMT projection block
+# Images of at most this many rows (merged rows, for the aligner) project through
+# the GEMV, B12X's SIMT projection: B12X plans it for at most eight rows.
+GEMV_ROWS = 8
+_EPILOGUES = ("none", "bias", "gelu", "swiglu")
 
 # Elementwise and row-wise kernels index every access themselves.
 _ELEMENTWISE = {
@@ -82,13 +103,16 @@ _ELEMENTWISE = {
     tilelang.PassConfigKey.TL_DISABLE_SAFE_MEMORY_ACCESS: True,
 }
 
-# Tiles by kernel. A GEMM's tile changes its speed only (each output adds K in
-# sequential 16-wide MMA steps, whatever the tile); the attention's tiles change
-# the grouping of its online softmax, so its bits (within the reference tolerance).
+# Tiles by kernel. A GEMM's tile changes its speed only (each output adds the same
+# 64-wide K blocks in the same order, whatever the tile; K tiles stay 64); the
+# attention's tiles change the grouping of its online softmax, so its bits (within
+# the reference tolerance).
 # ``benchmarks/kernels/benchmark_tilelang_vision.py --sweep`` times alternatives.
-LINEAR_TILE = dict(block_M=128, block_N=128, block_K=64, num_stages=2, threads=256)
-SWIGLU_TILE = dict(block_M=128, block_N=64, block_K=64, num_stages=2, threads=256)
+LINEAR_TILE = dict(block_M=128, block_N=128, num_stages=2, threads=256)
+SWIGLU_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=256)
 ATTENTION_TILE = dict(block_M=128, block_N=64, num_stages=2, threads=128)
+
+_SQRT_HALF = 0.7071067811865476  # torch's M_SQRT1_2 for GELU, rounded to FP32
 
 
 def padded_width(width: int) -> int:
@@ -131,13 +155,32 @@ def pad_columns_kernel(width: int, padded: int, threads: int = 128):
 
 
 def _gelu(value):
-    """B12X's exact GELU of a BF16 value, in FP32, rounded to BF16."""
+    """DeepSeek's reference GELU of a BF16 value, ``F.gelu`` as torch evaluates it
+    on BF16: ``(0.5 * x) * (1 + erff(x * M_SQRT1_2))`` in FP32, rounded to BF16."""
     x = T.cast(value, T.float32)
     inner = T.erf(T.fmul(x, T.float32(_SQRT_HALF)))
     return T.cast(
         T.fmul(T.fmul(T.float32(0.5), x), T.ieee_add(T.float32(1), inner)),
         T.bfloat16,
     )
+
+
+def _swiglu(gate, up):
+    """B12X's vision SwiGLU of FP32 gate and up sums: each rounded to BF16, then
+    ``bf16(bf16(g * (1 / (1 + __expf(-g)))) * u)``."""
+    g = T.cast(T.cast(gate, T.bfloat16), T.float32)
+    u = T.cast(T.cast(up, T.bfloat16), T.float32)
+    sigmoid = T.ieee_fdiv(
+        T.float32(1),
+        T.ieee_add(T.float32(1), T.call_extern(T.float32, "__expf", -g)),
+    )
+    silu = T.cast(T.cast(T.fmul(g, sigmoid), T.bfloat16), T.float32)
+    return T.cast(T.fmul(silu, u), T.bfloat16)
+
+
+def _biased(total, bias):
+    """The FP32 sum plus the BF16 bias, in FP32, rounded once to BF16."""
+    return T.cast(T.ieee_add(total, T.cast(bias, T.float32)), T.bfloat16)
 
 
 @tilelang.jit
@@ -148,12 +191,13 @@ def linear_kernel(
     gelu: bool = False,
     block_M: int = 128,
     block_N: int = 128,
-    block_K: int = 64,
     num_stages: int = 2,
     threads: int = 256,
 ):
     """``C[M, N] = bf16(A @ W^T (+ bias))`` for BF16 ``A[M, K]``, ``W[N, K]`` and
-    ``bias[N]``, accumulated in FP32; with ``gelu``, ``bf16(gelu(C))``."""
+    ``bias[N]``: each 64-wide K block summed from zero on the tensor cores, the
+    blocks added in FP32 in K order; with ``gelu``, ``bf16(gelu(C))``."""
+    block_K = _K_ALIGN
     if N % block_N or K % block_K:
         raise ValueError(f"[{N}, {K}] is not whole {block_N} x {block_K} tiles")
     if gelu and not bias:
@@ -171,16 +215,18 @@ def linear_kernel(
             A_shared = T.alloc_shared((block_M, block_K), T.bfloat16)
             W_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
             acc = T.alloc_fragment((block_M, block_N), T.float32)
+            part = T.alloc_fragment((block_M, block_N), T.float32)
             T.clear(acc)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(W[bx * block_N, ko * block_K], W_shared)
-                T.gemm(A_shared, W_shared, acc, transpose_B=True)
+                T.gemm(A_shared, W_shared, part, transpose_B=True, clear_accum=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    acc[i, j] = acc[i, j] + part[i, j]
             if bias:
                 out = T.alloc_fragment((block_M, block_N), T.bfloat16)
                 for i, j in T.Parallel(block_M, block_N):
-                    bias_value = T.cast(Bias[bx * block_N + j], T.float32)
-                    biased = T.cast(T.ieee_add(acc[i, j], bias_value), T.bfloat16)
+                    biased = _biased(acc[i, j], Bias[bx * block_N + j])
                     if gelu:
                         out[i, j] = _gelu(biased)
                     else:
@@ -219,12 +265,13 @@ def swiglu_linear_kernel(
     K: int,
     block_M: int = 128,
     block_N: int = 64,
-    block_K: int = 64,
     num_stages: int = 2,
     threads: int = 256,
 ):
     """``Y[M, I] = swiglu(bf16(A @ W[:I]^T), bf16(A @ W[I:]^T))`` for BF16 ``A[M, K]``
-    and the gate-then-up weight ``W[2I, K]``, with B12X's vision SwiGLU."""
+    and the gate-then-up weight ``W[2I, K]``, with B12X's vision SwiGLU; both
+    projections accumulate as ``linear_kernel``'s (64-wide blocks, added in FP32)."""
+    block_K = _K_ALIGN
     if inter % block_N or K % block_K:
         raise ValueError(f"[{inter}, {K}] is not whole {block_N} x {block_K} tiles")
     k_blocks = K // block_K
@@ -246,6 +293,8 @@ def swiglu_linear_kernel(
             U_shared = T.alloc_shared((block_N, block_K), T.bfloat16)
             gate = T.alloc_fragment((block_M, block_N), T.float32)
             up = T.alloc_fragment((block_M, block_N), T.float32)
+            gate_part = T.alloc_fragment((block_M, block_N), T.float32)
+            up_part = T.alloc_fragment((block_M, block_N), T.float32)
             out = T.alloc_fragment((block_M, block_N), T.bfloat16)
             T.clear(gate)
             T.clear(up)
@@ -253,20 +302,140 @@ def swiglu_linear_kernel(
                 T.copy(A[by * block_M, ko * block_K], A_shared)
                 T.copy(W[bx * block_N, ko * block_K], G_shared)
                 T.copy(W[inter + bx * block_N, ko * block_K], U_shared)
-                T.gemm(A_shared, G_shared, gate, transpose_B=True)
-                T.gemm(A_shared, U_shared, up, transpose_B=True)
-            for i, j in T.Parallel(block_M, block_N):
-                g = T.cast(T.cast(gate[i, j], T.bfloat16), T.float32)
-                u = T.cast(T.cast(up[i, j], T.bfloat16), T.float32)
-                sigmoid = T.ieee_fdiv(
-                    T.float32(1),
-                    T.ieee_add(T.float32(1), T.call_extern(T.float32, "__expf", -g)),
+                T.gemm(
+                    A_shared, G_shared, gate_part, transpose_B=True, clear_accum=True
                 )
-                silu = T.cast(T.cast(T.fmul(g, sigmoid), T.bfloat16), T.float32)
-                out[i, j] = T.cast(T.fmul(silu, u), T.bfloat16)
+                T.gemm(A_shared, U_shared, up_part, transpose_B=True, clear_accum=True)
+                for i, j in T.Parallel(block_M, block_N):
+                    gate[i, j] = gate[i, j] + gate_part[i, j]
+                    up[i, j] = up[i, j] + up_part[i, j]
+            for i, j in T.Parallel(block_M, block_N):
+                out[i, j] = _swiglu(gate[i, j], up[i, j])
             T.copy(out, Y[by * block_M, bx * block_N])
 
     return vision_swiglu_linear
+
+
+@tilelang.jit(pass_configs=_ELEMENTWISE)
+def gemv_kernel(N: int, K: int, epilogue: str, rows_per_tile: int = GEMV_ROWS):
+    """``C[M, :] = epilogue(A @ W^T)`` for BF16 ``A[M, K]`` and ``W[N, K]``, a few
+    rows, with B12X's SIMT projection arithmetic (module docstring). ``epilogue``:
+    ``none``; ``bias`` (``Bias[N]``); ``gelu`` (the bias, then GELU); ``swiglu``
+    (``W`` stacks the gate's and the up's ``N / 2`` rows; ``C`` is ``N / 2`` wide)."""
+    if epilogue not in _EPILOGUES:
+        raise ValueError(f"unknown projection epilogue {epilogue!r}")
+    swiglu = epilogue == "swiglu"
+    if swiglu and N % 2:
+        raise ValueError("a SwiGLU projection stacks two equal halves")
+    parts = 2 if swiglu else 1
+    columns = N // parts
+    threads, warps = _GEMV_THREADS, _GEMV_THREADS // 32
+    # B12X reads 8-wide vectors when K is whole vectors, else single elements.
+    vector = K % _VEC == 0
+    units = K // _VEC if vector else K
+    sums = parts * rows_per_tile
+    M = T.dynamic("M")
+
+    @T.macro
+    def body(A, W, Bias, C):
+        with T.Kernel(columns, T.ceildiv(M, rows_per_tile), threads=threads) as (
+            col,
+            tile,
+        ):
+            tx = T.get_thread_binding()
+            lane = tx % 32
+            first = tile * rows_per_tile
+            acc = T.alloc_local((sums,), T.float32)
+            weights = T.alloc_local((parts * _VEC,), T.bfloat16)
+            values = T.alloc_local((_VEC,), T.bfloat16)
+            partial = T.alloc_shared((sums, warps), T.float32)
+            total = T.alloc_var(T.float32)
+            for i in T.unroll(sums):
+                acc[i] = T.float32(0)
+            for step in T.serial(-(-units // threads)):
+                index = step * threads + tx
+                if index < units:
+                    if vector:
+                        for p in T.unroll(parts):
+                            for e in T.vectorized(_VEC):
+                                weights[p * _VEC + e] = W[
+                                    p * columns + col, index * _VEC + e
+                                ]
+                        for r in T.unroll(rows_per_tile):
+                            if first + r < M:
+                                for e in T.vectorized(_VEC):
+                                    values[e] = A[first + r, index * _VEC + e]
+                                for p in T.unroll(parts):
+                                    for e in T.unroll(_VEC):
+                                        acc[p * rows_per_tile + r] = T.fma(
+                                            T.cast(weights[p * _VEC + e], T.float32),
+                                            T.cast(values[e], T.float32),
+                                            acc[p * rows_per_tile + r],
+                                        )
+                    else:
+                        for p in T.unroll(parts):
+                            weights[p] = W[p * columns + col, index]
+                        for r in T.unroll(rows_per_tile):
+                            if first + r < M:
+                                for p in T.unroll(parts):
+                                    acc[p * rows_per_tile + r] = T.fma(
+                                        T.cast(A[first + r, index], T.float32),
+                                        T.cast(weights[p], T.float32),
+                                        acc[p * rows_per_tile + r],
+                                    )
+            # B12X's block reduction: each warp's butterfly, then the warp sums in
+            # one warp's lanes (zeros past them) and the same butterfly.
+            for i in T.unroll(sums):
+                total = acc[i]
+                for level in T.unroll(5):
+                    total = total + T.shfl_xor(total, T.shift_left(1, level))
+                if lane == 0:
+                    partial[i, tx // 32] = total
+            T.sync_threads()
+            if tx < 32:
+                for i in T.unroll(sums):
+                    total = T.if_then_else(
+                        lane < warps, partial[i, T.min(lane, warps - 1)], T.float32(0)
+                    )
+                    for level in T.unroll(5):
+                        total = total + T.shfl_xor(total, T.shift_left(1, level))
+                    acc[i] = total
+                if tx == 0:
+                    for r in T.unroll(rows_per_tile):
+                        if first + r < M:
+                            if swiglu:
+                                C[first + r, col] = _swiglu(
+                                    acc[r], acc[rows_per_tile + r]
+                                )
+                            elif epilogue == "none":
+                                C[first + r, col] = T.cast(acc[r], T.bfloat16)
+                            elif epilogue == "gelu":
+                                C[first + r, col] = _gelu(_biased(acc[r], Bias[col]))
+                            else:
+                                C[first + r, col] = _biased(acc[r], Bias[col])
+
+    if epilogue in ("bias", "gelu"):
+
+        @T.prim_func
+        def vision_gemv(
+            A: T.Tensor((M, K), T.bfloat16),
+            W: T.Tensor((N, K), T.bfloat16),
+            Bias: T.Tensor((N,), T.bfloat16),
+            C: T.Tensor((M, columns), T.bfloat16),
+        ):
+            body(A, W, Bias, C)
+
+    else:
+
+        @T.prim_func
+        def vision_gemv(
+            A: T.Tensor((M, K), T.bfloat16),
+            W: T.Tensor((N, K), T.bfloat16),
+            C: T.Tensor((M, columns), T.bfloat16),
+        ):
+            body(A, W, None, C)
+
+    return vision_gemv
 
 
 @tilelang.jit(pass_configs=_ELEMENTWISE)
@@ -591,6 +760,11 @@ def swiglu_call(inter: int, K: int, **overrides) -> prepare.TileLangCall:
     )
 
 
+def gemv_call(N: int, K: int, epilogue: str) -> prepare.TileLangCall:
+    """The GEMV of an ``[N, K]`` weight (``N`` stacks gate and up for ``swiglu``)."""
+    return prepare.call(gemv_kernel, N, K, epilogue)
+
+
 def rope_call(heads: int, head_dim: int) -> prepare.TileLangCall:
     return prepare.call(rope_qkv_kernel, heads, head_dim)
 
@@ -619,11 +793,14 @@ def resolve(call: prepare.TileLangCall):
 __all__ = [
     "ATTENTION_TILE",
     "EPS",
+    "GEMV_ROWS",
     "LINEAR_TILE",
     "SWIGLU_TILE",
     "add_norm_kernel",
     "attention_call",
     "attention_kernel",
+    "gemv_call",
+    "gemv_kernel",
     "linear_call",
     "linear_kernel",
     "merge_call",

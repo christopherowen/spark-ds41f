@@ -10,13 +10,15 @@ loading); binding them provisions a workspace for the tower's capacity
 (``_capacity``), so a forward allocates nothing but an output the caller did not
 pass, and a capture with outputs passed allocates nothing at all.
 
-A block runs seven launches: the fused q/k/v projection with its bias, the 2-D
+A block runs eight launches: the fused q/k/v projection with its bias, the 2-D
 rotation of q and k in place in it, attention over the image's rows (reading
 q, k and v where the projection wrote them), the output projection with its bias,
 the residual add with the second norm, the gate/up projection with the SwiGLU in
 its epilogue, the down projection, and the residual add with the next block's (or
-the final) norm. The aligner merges each window, projects with the bias and exact
-GELU in one launch, and projects again.
+the final) norm. The aligner merges each window, projects with the bias and GELU
+in one launch, and projects again. Images of at most ``GEMV_ROWS`` rows (merged
+rows, for the aligner) project through the GEMVs (B12X's SIMT projection, as B12X
+plans for so few rows), larger ones through the tensor-core GEMMs.
 """
 
 import itertools
@@ -129,6 +131,17 @@ class _VisionWorkspace:
         self.inv_freq = inv.to(device=device)
 
 
+def _projections(launch: dict, rows: int) -> dict:
+    """The projection kernels by role for ``rows`` rows: the GEMVs (``*_rows``) up
+    to ``GEMV_ROWS``, else the GEMMs."""
+    suffix = "_rows" if rows <= kernels.GEMV_ROWS else ""
+    return {
+        name: launch[name + suffix]
+        for name in launch
+        if not name.endswith("_rows") and name + "_rows" in launch
+    }
+
+
 def _device(module: nn.Module) -> torch.device:
     device = next(module.parameters()).device
     if device.type != "cuda":
@@ -176,6 +189,12 @@ class DeepseekV4ViT(nn.Module):
             "add_norm": kernels.norm_call(hidden, add=True),
             "mlp_in": kernels.swiglu_call(inter, hidden),
             "mlp_out": kernels.linear_call(hidden, inter, bias=False),
+            # Images of at most GEMV_ROWS rows; the patches unpadded.
+            "patch_rows": kernels.gemv_call(hidden, patch, "bias"),
+            "qkv_rows": kernels.gemv_call(3 * hidden, hidden, "bias"),
+            "wo_rows": kernels.gemv_call(hidden, hidden, "bias"),
+            "mlp_in_rows": kernels.gemv_call(2 * inter, hidden, "swiglu"),
+            "mlp_out_rows": kernels.gemv_call(hidden, inter, "none"),
         }
 
     def declare_kernels(self) -> None:
@@ -225,22 +244,26 @@ class DeepseekV4ViT(nn.Module):
         normalized, branch = ws.normalized[:rows], ws.branch[:rows]
         qkv, activated = ws.qkv[:rows], ws.activated[:rows]
         proj = self.patch_embed.proj
+        project = _projections(launch, rows)
 
-        launch["pad"](patches.reshape(rows, -1), ws.patches[:rows])
-        launch["pad"](proj.weight, ws.patch_weight)
-        launch["patch"](ws.patches[:rows], ws.patch_weight, proj.bias, state)
+        if rows <= kernels.GEMV_ROWS:
+            project["patch"](patches.reshape(rows, -1), proj.weight, proj.bias, state)
+        else:
+            launch["pad"](patches.reshape(rows, -1), ws.patches[:rows])
+            launch["pad"](proj.weight, ws.patch_weight)
+            project["patch"](ws.patches[:rows], ws.patch_weight, proj.bias, state)
         # Each block ends with the next block's first norm; the last with the final.
         norms = [block.norm1.weight for block in self.blocks] + [self.norm.weight]
         launch["norm"](state, norms[0], normalized if len(self.blocks) else out)
         for index, block in enumerate(self.blocks):
             attn, mlp = block.attn, block.mlp
-            launch["qkv"](normalized, attn.wqkv.weight, attn.wqkv.bias, qkv)
+            project["qkv"](normalized, attn.wqkv.weight, attn.wqkv.bias, qkv)
             launch["rope"](qkv, ws.inv_freq, n_vit_w)
             launch["attention"](qkv, normalized)
-            launch["wo"](normalized, attn.wo.weight, attn.wo.bias, branch)
+            project["wo"](normalized, attn.wo.weight, attn.wo.bias, branch)
             launch["add_norm"](state, branch, block.norm2.weight, residual, normalized)
-            launch["mlp_in"](normalized, mlp.w1.weight, activated)
-            launch["mlp_out"](activated, mlp.w2.weight, branch)
+            project["mlp_in"](normalized, mlp.w1.weight, activated)
+            project["mlp_out"](activated, mlp.w2.weight, branch)
             last = index + 1 == len(self.blocks)
             launch["add_norm"](
                 residual, branch, norms[index + 1], state, out if last else normalized
@@ -276,12 +299,13 @@ class DeepseekV4Aligner(nn.Module):
 
     def kernel_calls(self) -> dict[str, prepare.TileLangCall]:
         r = self.downsample_ratio
+        merged = self.hidden_size * r * r
         return {
             "merge": kernels.merge_call(self.hidden_size, r),
-            "w1": kernels.linear_call(
-                self.out_dim, self.hidden_size * r * r, bias=True, gelu=True
-            ),
+            "w1": kernels.linear_call(self.out_dim, merged, bias=True, gelu=True),
             "w2": kernels.linear_call(self.out_dim, self.out_dim, bias=True),
+            "w1_rows": kernels.gemv_call(self.out_dim, merged, "gelu"),
+            "w2_rows": kernels.gemv_call(self.out_dim, self.out_dim, "bias"),
         }
 
     def declare_kernels(self) -> None:
@@ -325,10 +349,11 @@ class DeepseekV4Aligner(nn.Module):
             )
         _bf16_rows(out, (rows, self.out_dim), "aligner output")
         launch, ws = self._kernels, self._workspace
+        project = _projections(launch, rows)
         merged, hidden = ws.merged[:rows], ws.hidden[:rows]
         launch["merge"](x, merged, n_vit_h, n_vit_w)
-        launch["w1"](merged, self.w1.weight, self.w1.bias, hidden)
-        launch["w2"](hidden, self.w2.weight, self.w2.bias, out)
+        project["w1"](merged, self.w1.weight, self.w1.bias, hidden)
+        project["w2"](hidden, self.w2.weight, self.w2.bias, out)
         return out
 
 
