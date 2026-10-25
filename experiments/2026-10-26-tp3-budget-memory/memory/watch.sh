@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# The TP3 budget sweep's dgx1 watcher (from experiments/2026-10-23-next-release/memory/watch.sh,
+# The TP3 budget sweep's and memory-cuts check's dgx1 watcher (from experiments/2026-10-23-next-release/memory/watch.sh,
 # for the triangle), started before the sweep is queued:
-#  1. when a queue runner starts <UTC>-tp3-budget-memory.json (queued at or after this
+#  1. when a queue runner starts <UTC>-$SPEC.json (queued at or after this
 #     watcher started), arm the read-only samplers on dgx1-3 and a follower of every
 #     serving container's engine log (`docker logs -f -t`: each arm's container is replaced
 #     by the next arm's, and the workspace slot log and start-up lines live there);
@@ -15,7 +15,7 @@
 #     scp experiments/2026-10-26-tp3-budget-memory/memory/sampler.py $n:spark-lab/tp3-budget-memory/; done
 #   cd ~/spark-lab/tp3-budget-memory && setsid -f bash ~/projects/spark-ds41f/experiments/2026-10-26-tp3-budget-memory/memory/watch.sh >> watch.log 2>&1
 set -uo pipefail
-spec=tp3-budget-memory
+spec=${SPEC:-tp3-budget-memory}  # the spec this window runs (tp3-memory-cuts: SPEC=tp3-memory-cuts)
 dir=$HOME/spark-lab/tp3-budget-memory
 logs=$HOME/projects/spark-ds41f/results/private/lab
 traces=projects/spark-ds41f/cache/tp3-budget-memory

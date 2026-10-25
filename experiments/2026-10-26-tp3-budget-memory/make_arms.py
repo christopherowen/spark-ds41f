@@ -9,6 +9,10 @@ An arm overlays a resolved configuration, so a budget is a whole serve_args list
 rc6/rc-tp3-6144.json is): this script takes the base arm's list and changes only the
 budget and its threshold (budget - streams x 6 rows), the rule scripts/recipe.py applies.
 
+It also writes cuts-8192-tp3.json, the memory-cuts check's arm: budget-8192-tp3.json
+with the package files of bundles/memory-cuts (make_bundles.py: the three memory cuts
+merged over the release's source) mounted as well, tracing into its own directory.
+
 usage (from the repository root): experiments/2026-10-26-tp3-budget-memory/make_arms.py
 """
 import importlib.machinery
@@ -79,6 +83,41 @@ def main() -> None:
         path = ROOT / HERE / f"budget-{budget}-tp3.json"
         path.write_text(json.dumps(arm, indent=1) + "\n")
         print(path.relative_to(ROOT))
+        if budget == 8192:
+            cuts_arm(arm["set"]["container"]["mounts"])
+
+
+def cuts_arm(trace_mounts: list) -> None:
+    overlay = ROOT / HERE / "bundles/memory-cuts/overlay"
+    if not overlay.exists():
+        print("bundles/memory-cuts is not written yet (make_bundles.py --only memory-cuts)")
+        return
+    package = sorted(p.relative_to(overlay).as_posix() for p in overlay.rglob("*.py"))
+    root = WORKER.split("/vllm/v1/")[0]
+    arm = {
+        "notes": (
+            "The memory-cuts check: budget-8192-tp3.json (candidate 6 at 8,192 with the "
+            "diagnostic memory trace) with the three memory cuts' package files mounted "
+            f"({', '.join(package)}), tracing into its own directory."
+        ),
+        "extends": {"config": f"{HERE}/budget-8192-tp3.json"},
+        "set": {
+            "container": {
+                "mounts": [
+                    *trace_mounts,
+                    *(
+                        [f"{{home}}/projects/spark-ds41f/{HERE}/bundles/memory-cuts/overlay/"
+                         f"{path}", f"{root}/{path}", "ro"]
+                        for path in package
+                    ),
+                ]
+            },
+            "environment": {"SPARK_DS41F_MEMORY_TRACE": "/cache/tp3-budget-memory/cuts"},
+        },
+    }
+    path = ROOT / HERE / "cuts-8192-tp3.json"
+    path.write_text(json.dumps(arm, indent=1) + "\n")
+    print(path.relative_to(ROOT))
 
 
 if __name__ == "__main__":

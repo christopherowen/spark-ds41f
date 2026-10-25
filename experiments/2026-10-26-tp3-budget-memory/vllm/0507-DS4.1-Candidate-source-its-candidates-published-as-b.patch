@@ -1,0 +1,721 @@
+From 5473283efd3fc0098958c6d6695e80886a25297a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:31:02 +0100
+Subject: [PATCH] [DS4.1] Candidate source: its candidates published as block
+ ids
+
+The candidate source layer (20) published, a row, the 16,384 positions of
+the 2,048 blocks of 8 it keeps, and the reindex layers (24, 28, 32, 36) read
+them back. Every kept block but the last is wholly visible, and the last
+holds the row's last position (always kept, and the highest), so that list
+is the blocks' positions with -1 only past its count: candidate j < count is
+ids[j // 8] * 8 + j % 8. The source now writes the 2,048 block ids (-1
+padded) and the count of positions; the reindex score kernel computes each
+candidate's position from them (a multiple of the block plus an offset below
+it, so its page arithmetic folds to the block id's), and its top-k maps the
+entries it keeps through them. The candidates are the same, in the same
+order, so every score and selection keeps its bits, and at the serving
+shapes the reindex layer is not slower (dgx4: 243.7 against 247.1 us).
+
+The TileLang attention's candidate staging shrinks from 64 KiB to 8 KiB a
+budget token on every rank (448 MiB less at TP3's 8,192 tokens, 896 MiB at
+the ring's 16,384). B12X's dsa_indexer still exchanges positions: the width
+is the attention class's CANDIDATE_WIDTH.
+
+Tests: the grouped top-k and the source plan against the reference in block
+ids; reindex rows read block-id lists (a partly visible last block, a masked
+block, an empty row); a chain test checks that the source's ids expand to the
+release's position list exactly and that the reindex scores and selection
+equal the reference over it. benchmark_deepseek_v41_candidate_ids.py runs the
+release's indexer and this one on the same inputs at the serving shapes (1M
+positions, pages of 256) and gates on bit equality and no slowdown.
+---
+ .../benchmark_deepseek_v41_candidate_ids.py   | 229 ++++++++++++++++++
+ .../attention/test_deepseek_v41_tilelang.py   | 122 +++++++---
+ vllm/models/deepseek_v4_1/attention.py        |   9 +-
+ .../deepseek_v4_1/tilelang/attention.py       |   3 +
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  93 ++++---
+ 5 files changed, 393 insertions(+), 63 deletions(-)
+ create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py
+
+diff --git a/benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py b/benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py
+new file mode 100644
+index 000000000..f2d7d63f8
+--- /dev/null
++++ b/benchmarks/kernels/benchmark_deepseek_v41_candidate_ids.py
+@@ -0,0 +1,229 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek-V4.1's candidate source and reindex indexers with candidates as block ids
++against the release's (positions; its ``indexer.py`` given as ``--baseline``), at the
++serving shapes: the candidate source scores a 1M-position row (index pages of 256) and
++keeps 2,048 blocks of 8, the reindex layer scores those 16,384 candidates.
++
++Each seed draws random MXFP4 keys and queries and row lengths from empty to 300,000
++positions (most with a partly visible last block). Both chains run on the same inputs:
++- the source's top-512 positions, scores and candidate counts must be equal;
++- the release's candidate positions must equal the block ids expanded
++  (``ids[j // 8] * 8 + j % 8`` below the count, ``-1`` past it);
++- the reindex layer's scores (below the count) and top-512 positions must be equal.
++Then CUDA graphs of each chain's source block selection and reindex (score and top-k)
++run back to back, alternating which goes first, eight times; the 95% interval of the
++differences gates (``--gate``): equal everywhere, and neither step slower.
++"""
++
++import argparse
++import importlib.util
++import json
++import math
++import statistics
++
++import torch
++
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.models.deepseek_v4_1.tilelang import indexer
++
++PAGE, HEADS, MAX_LEN, CONTEXT, ROWS, SEEDS, SAMPLES, CALLS = (
++    256,
++    32,
++    1048576,
++    300000,
++    32,
++    3,
++    8,
++    5,
++)
++BLOCKS, BLOCK = indexer.CANDIDATE_BLOCKS, indexer.CANDIDATE_BLOCK
++
++
++def baseline_module(path: str, name: str):
++    package = "vllm.models.deepseek_v4_1.tilelang"
++    spec = importlib.util.spec_from_file_location(f"{package}.{name}", path)
++    module = importlib.util.module_from_spec(spec)
++    module.__package__ = package
++    spec.loader.exec_module(module)
++    return module
++
++
++def inputs(seed: int):
++    g = torch.Generator(device="cuda").manual_seed(seed)
++    pages = -(-CONTEXT // PAGE)
++    pool = torch.randint(
++        0, 256, (pages * ROWS, indexer.page_bytes(PAGE)), generator=g, device="cuda",
++        dtype=torch.uint8,
++    )  # fmt: skip
++    pool[:, PAGE * 64 :] = torch.randint(
++        118, 126, (pages * ROWS, PAGE * 4), generator=g, device="cuda", dtype=torch.uint8
++    )  # UE8M0 scales of finite keys
++    table = torch.full((ROWS, MAX_LEN // PAGE), -1, dtype=torch.int32, device="cuda")
++    for r in range(ROWS):
++        table[r, :pages] = torch.randperm(pages * ROWS, generator=g, device="cuda")[
++            :pages
++        ].to(torch.int32)
++    lengths = torch.randint(1, CONTEXT + 1, (ROWS,), generator=g, device="cuda")
++    lengths[0], lengths[1], lengths[2] = 0, 1, CONTEXT - 3
++    q = torch.randint(0, 256, (ROWS, HEADS, 64), generator=g, device="cuda",
++                      dtype=torch.uint8)  # fmt: skip
++    q_scales = torch.randint(118, 126, (ROWS, HEADS, 4), generator=g, device="cuda",
++                             dtype=torch.uint8)  # fmt: skip
++    weights = (torch.randn((ROWS, HEADS), generator=g, device="cuda") / 64).bfloat16()
++    active = torch.tensor([MAX_LEN], dtype=torch.int32, device="cuda")
++    return (q, q_scales, weights, pool, table, lengths.to(torch.int32), active)
++
++
++class Chain:
++    """A module's source and reindex plans with their outputs."""
++
++    def __init__(self, module, args, blocks_as_ids: bool):
++        self.args = args
++        self.source = module.IndexerV41Plan(MAX_LEN, PAGE, candidate_blocks=True)
++        self.reindex = module.IndexerV41Plan(BLOCKS * BLOCK, PAGE, candidates=True)
++        width = BLOCKS if blocks_as_ids else BLOCKS * BLOCK
++        self.candidates = torch.full((ROWS, width), -7, dtype=torch.int32, device="cuda")
++        self.counts = torch.full((ROWS,), -7, dtype=torch.int32, device="cuda")
++        self.top = torch.empty((ROWS, indexer.INDEX_TOPK), dtype=torch.int32,
++                               device="cuda")  # fmt: skip
++        self.re_top = torch.empty_like(self.top)
++        self.scratch = [torch.empty(s, dtype=d, device="cuda")
++                        for s, d in self.source.scratch_specs(ROWS)]  # fmt: skip
++        self.re_scratch = [torch.empty(s, dtype=d, device="cuda")
++                           for s, d in self.reindex.scratch_specs(ROWS)]  # fmt: skip
++
++    def run_source(self):
++        return self.source.run(
++            *self.args, out=self.top, candidate_out=self.candidates,
++            candidate_out_lengths=self.counts, scratch=self.scratch,
++        )[1]  # fmt: skip
++
++    def run_reindex(self):
++        return self.reindex.run(
++            *self.args, self.candidates, self.counts, out=self.re_top,
++            scratch=self.re_scratch,
++        )[1]  # fmt: skip
++
++    def _kernel_args(self):
++        q, q_scales, weights, pool, table, lengths, active = self.args
++        nbytes = indexer.page_bytes(PAGE)
++        return (q.view(torch.int8), q_scales.view(torch.uint32).reshape(ROWS, -1),
++                weights, pool.view(torch.int8)[:, :nbytes],
++                pool.view(torch.uint32)[:, : nbytes // 4], table, lengths,
++                active)  # fmt: skip
++
++    def reindex_score(self):
++        """The reindex layer's score kernel alone (diagnostic)."""
++        self.reindex.score(*self._kernel_args(), self.candidates, self.counts,
++                           self.re_scratch[0])  # fmt: skip
++
++    def reindex_select(self):
++        """The reindex layer's top-k alone (diagnostic)."""
++        select = len(self.reindex.select.scratch_specs(ROWS))
++        self.reindex.select.run(
++            self.re_scratch[0], self.counts, None, self.re_top, self.re_scratch[1],
++            gather=self.candidates, scratch=self.re_scratch[2 : 2 + select],
++        )  # fmt: skip
++
++
++def expanded(ids, counts):
++    j = torch.arange(BLOCKS * BLOCK, device="cuda")
++    block = ids[:, j // BLOCK]
++    live = (j[None] < counts[:, None]) & (block >= 0)
++    return torch.where(live, block * BLOCK + j % BLOCK, -1).to(torch.int32)
++
++
++def graph(function):
++    function()
++    torch.cuda.synchronize()
++    capture = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(capture):
++        for _ in range(CALLS):
++            function()
++    return capture
++
++
++def elapsed(capture) -> float:
++    start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
++    start.record()
++    capture.replay()
++    end.record()
++    end.synchronize()
++    return start.elapsed_time(end) * 1000 / CALLS
++
++
++def interval(differences):
++    mean = statistics.fmean(differences)
++    half = 2.365 * statistics.stdev(differences) / math.sqrt(len(differences))
++    return [mean - half, mean + half]
++
++
++def compare(release_module) -> dict:
++    record = {"seeds": []}
++    for seed in range(SEEDS):
++        args = inputs(seed)
++        old, new = Chain(release_module, args, False), Chain(indexer, args, True)
++        old_scores = old.run_source().clone()
++        new_scores = new.run_source().clone()
++        lengths = args[5].clamp(0, MAX_LEN).tolist()
++        for r in range(ROWS):
++            n = lengths[r]
++            assert torch.equal(old_scores[r, :n].view(torch.int16),
++                               new_scores[r, :n].view(torch.int16)), f"seed {seed} row {r}"
++        assert torch.equal(old.top, new.top), f"seed {seed}: source top-512 differ"
++        assert torch.equal(old.counts, new.counts), f"seed {seed}: counts differ"
++        assert torch.equal(old.candidates, expanded(new.candidates, new.counts)), (
++            f"seed {seed}: the release's positions are not the ids expanded"
++        )
++        old_re, new_re = old.run_reindex().clone(), new.run_reindex().clone()
++        for r, n in enumerate(new.counts.tolist()):
++            assert torch.equal(old_re[r, :n].view(torch.int16),
++                               new_re[r, :n].view(torch.int16)), f"seed {seed} row {r}"
++        assert torch.equal(old.re_top, new.re_top), f"seed {seed}: reindex top differ"
++        record["seeds"].append({
++            "seed": seed,
++            "counts": new.counts.tolist()[:6],
++            "partial_last_blocks": int((args[5] % BLOCK != 0).sum()),
++        })
++        print(json.dumps(record["seeds"][-1]), flush=True)
++    timings = {}
++    for step in ("run_source", "run_reindex", "reindex_score", "reindex_select"):
++        captures = {name: graph(getattr(chain, step))
++                    for name, chain in (("release", old), ("ids", new))}  # fmt: skip
++        times, differences = {"release": [], "ids": []}, []
++        for sample in range(SAMPLES):
++            order = ["release", "ids"] if sample % 2 == 0 else ["ids", "release"]
++            measured = {name: elapsed(captures[name]) for name in order}
++            for name in measured:
++                times[name].append(measured[name])
++            differences.append(measured["ids"] - measured["release"])
++        timings[step] = {
++            "release_us": statistics.median(times["release"]),
++            "ids_us": statistics.median(times["ids"]),
++            "interval_us": interval(differences),
++        }
++        print(step, json.dumps(timings[step]), flush=True)
++    record["timings"] = timings
++    return record
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--baseline", required=True,
++                        help="the release's vllm/models/deepseek_v4_1/tilelang/indexer.py")
++    parser.add_argument("--gate", action="store_true")
++    args = parser.parse_args()
++    release = baseline_module(args.baseline, "indexer_release")
++    with set_current_vllm_config(VllmConfig()):
++        record = compare(release)
++    print(json.dumps(record, indent=1))
++    if args.gate:
++        slower = [step for step in ("run_source", "run_reindex")
++                  if record["timings"][step]["interval_us"][0] > 0]
++        if slower:
++            raise SystemExit(f"block-id candidates slower at {slower}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/kernels/attention/test_deepseek_v41_tilelang.py b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+index c166f5a7b..5729eb4db 100644
+--- a/tests/kernels/attention/test_deepseek_v41_tilelang.py
++++ b/tests/kernels/attention/test_deepseek_v41_tilelang.py
+@@ -261,9 +261,11 @@ def _ref_scores(inp, page_size, extent, positions_of):
+ 
+ 
+ def _ref_topk(scores, extent, topk, group=1, gather=None):
+-    """Larger scores first, then lower positions; ascending, ``-1`` padded."""
++    """Larger scores first, then lower positions; ascending, ``-1`` padded. Grouped
++    selections return block ids and their count of positions below the extent;
++    ``gather`` (candidate rows) maps entries to positions."""
+     rows = scores.shape[0]
+-    out = torch.full((rows, topk * group), -1, dtype=torch.int32, device=DEVICE)
++    out = torch.full((rows, topk), -1, dtype=torch.int32, device=DEVICE)
+     counts = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
+     for r in range(rows):
+         n = int(extent[r])
+@@ -278,17 +280,37 @@ def _ref_topk(scores, extent, topk, group=1, gather=None):
+         order = torch.sort(values, descending=True, stable=True).indices
+         chosen = order[values[order] > float("-inf")][:topk].sort().values
+         if group > 1:
+-            pos = (
+-                chosen[:, None] * group + torch.arange(group, device=DEVICE)
+-            ).flatten()
+-            chosen = torch.where(pos < n, pos, -1)
+-            counts[r] = int((chosen >= 0).sum())
++            pos = chosen[:, None] * group + torch.arange(group, device=DEVICE)
++            counts[r] = int((pos < n).sum())
+         elif gather is not None:
+             chosen = gather[r, chosen]
+         out[r, : chosen.numel()] = chosen.to(torch.int32)
+     return out, counts
+ 
+ 
++def _expanded(ids, counts, group=CANDIDATE_BLOCK):
++    """Each block's ``group`` positions below its row's count, ``-1`` elsewhere (and
++    for a masked block): the candidate positions a block-id list stands for."""
++    rows, blocks = ids.shape
++    j = torch.arange(blocks * group, device=DEVICE)
++    block = ids[:, j // group]
++    pos = block * group + j % group
++    live = (j[None] < counts[:, None]) & (block >= 0)
++    return torch.where(live, pos, -1).to(torch.int32)
++
++
++def _release_expansion(ids, extent, group=CANDIDATE_BLOCK):
++    """The release's position list of selected blocks: every block's ``group``
++    positions, ``-1`` from the extent on, then ``-1`` padding (26382f5cf)."""
++    rows, blocks = ids.shape
++    out = torch.full((rows, blocks * group), -1, dtype=torch.int32, device=DEVICE)
++    for r in range(rows):
++        chosen = ids[r][ids[r] >= 0].long()
++        pos = (chosen[:, None] * group + torch.arange(group, device=DEVICE)).flatten()
++        out[r, : pos.numel()] = torch.where(pos < extent[r], pos, -1).to(torch.int32)
++    return out
++
++
+ def _dense_extent(inp, width):
+     return inp["lengths"].clamp(0, int(inp["active"][0])).clamp(max=width).tolist()
+ 
+@@ -365,26 +387,28 @@ def test_indexer_nonfinite_query_scale(page_size=64, rows=4, context=4096):
+             assert torch.equal(scores[i, : extent[i]], clean[i, : extent[i]]), i
+ 
+ 
+-def test_indexer_candidates(page_size=64, rows=3, context=8192):
++def test_indexer_candidates(page_size=64, rows=4, context=8192):
++    """Reindex rows read block-id candidate lists, as the source layer publishes
++    them: candidate ``j`` is position ``ids[j // 8] * 8 + j % 8``, the last block
++    holding the row's last position (here only partly). A masked block's candidates
++    score ``-inf``; an empty row selects nothing."""
+     inp = _index_inputs(rows, context, page_size)
+     width = CANDIDATE_BLOCKS * CANDIDATE_BLOCK
+     gen = _gen(7)
+-    candidate_lengths = torch.randint(
+-        width // 8,
+-        context // 2,
+-        (rows,),
+-        generator=gen,
+-        device=DEVICE,
+-        dtype=torch.int32,
++    candidates = torch.full(
++        (rows, CANDIDATE_BLOCKS), -1, dtype=torch.int32, device=DEVICE
+     )
+-    candidates = torch.full((rows, width), -1, dtype=torch.int32, device=DEVICE)
+-    for r in range(rows):
+-        n = int(candidate_lengths[r])
+-        chosen = torch.randperm(int(inp["lengths"][r]), generator=gen, device=DEVICE)[
+-            :n
+-        ]
+-        candidates[r, :n] = chosen.sort().values.to(torch.int32)
+-    candidates[0, 5] = -1  # masked candidates score -inf
++    candidate_lengths = torch.zeros(rows, dtype=torch.int32, device=DEVICE)
++    for r in range(rows - 1):  # the last row stays empty
++        visible = int(inp["lengths"][r]) - 3  # the last block partly visible
++        last = (visible - 1) // CANDIDATE_BLOCK
++        n = int(torch.randint(64, last + 1, (1,), generator=gen, device=DEVICE))
++        chosen = torch.randperm(last, generator=gen, device=DEVICE)[: n - 1]
++        ids = torch.cat([chosen.sort().values, torch.tensor([last], device=DEVICE)])
++        candidates[r, :n] = ids.to(torch.int32)
++        last_visible = visible - last * CANDIDATE_BLOCK  # 1 to 8 positions
++        candidate_lengths[r] = (n - 1) * CANDIDATE_BLOCK + last_visible
++    candidates[0, 1] = -1  # a masked block: its candidates score -inf
+     plan = IndexerV41Plan(width, page_size, candidates=True)
+     args = (
+         inp[k]
+@@ -400,11 +424,13 @@ def test_indexer_candidates(page_size=64, rows=3, context=8192):
+     )
+     out, scores = plan.run(*args, candidates, candidate_lengths)
+     extent = candidate_lengths.clamp(0, width).tolist()
+-    ref = _ref_scores(inp, page_size, extent, lambda r: candidates[r, : extent[r]])
++    positions = _expanded(candidates, candidate_lengths)
++    ref = _ref_scores(inp, page_size, extent, lambda r: positions[r, : extent[r]])
+     for r in range(rows):
+         assert torch.equal(scores[r, : extent[r]], ref[r]), f"row {r} scores differ"
+-    expected, _ = _ref_topk(scores, extent, INDEX_TOPK, gather=candidates)
++    expected, _ = _ref_topk(scores, extent, INDEX_TOPK, gather=positions)
+     assert torch.equal(out, expected)
++    assert bool((out[rows - 1] == -1).all())
+ 
+ 
+ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+@@ -412,7 +438,7 @@ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+     width = (context + page_size - 1) // page_size * page_size
+     plan = IndexerV41Plan(width, page_size, candidate_blocks=True)
+     candidate_out = torch.full(
+-        (rows, CANDIDATE_BLOCKS * CANDIDATE_BLOCK), -7, dtype=torch.int32, device=DEVICE
++        (rows, CANDIDATE_BLOCKS), -7, dtype=torch.int32, device=DEVICE
+     )
+     counts = torch.full((rows,), -7, dtype=torch.int32, device=DEVICE)
+     args = (
+@@ -438,6 +464,48 @@ def test_indexer_publishes_candidates(page_size=64, rows=2, context=20000):
+     assert torch.equal(counts, block_counts)
+ 
+ 
++def test_candidate_chain_matches_the_release_positions(page_size=64, context=20000):
++    """The source layer's block ids stand for exactly the release's position list
++    (blocks expanded, ``-1`` from the extent on), so the reindex layer that reads
++    them scores and selects the release's positions bit for bit: rows with more
++    visible blocks than are kept, a partly visible last block, few blocks, none."""
++    rows = 4
++    inp = _index_inputs(rows, context, page_size)
++    inp["lengths"] = torch.tensor(
++        [context, context - 3, 1003, 0], dtype=torch.int32, device=DEVICE
++    )
++    width = (context + page_size - 1) // page_size * page_size
++    source = IndexerV41Plan(width, page_size, candidate_blocks=True)
++    names = ("q_packed", "q_scales", "weights", "pool", "page_table", "lengths")
++    ids = torch.full((rows, CANDIDATE_BLOCKS), -7, dtype=torch.int32, device=DEVICE)
++    counts = torch.full((rows,), -7, dtype=torch.int32, device=DEVICE)
++    _, scores = source.run(
++        *(inp[k] for k in names),
++        inp["active"],
++        candidate_out=ids,
++        candidate_out_lengths=counts,
++    )
++    extent = _dense_extent(inp, width)
++    expected_ids, expected_counts = _ref_topk(
++        scores, extent, CANDIDATE_BLOCKS, CANDIDATE_BLOCK
++    )
++    assert torch.equal(ids, expected_ids) and torch.equal(counts, expected_counts)
++    positions = _release_expansion(ids, extent)
++    # No position list of the release has a hole before its count.
++    assert torch.equal(_expanded(ids, counts), positions)
++
++    reindex = IndexerV41Plan(
++        CANDIDATE_BLOCKS * CANDIDATE_BLOCK, page_size, candidates=True
++    )
++    out, re_scores = reindex.run(*(inp[k] for k in names), inp["active"], ids, counts)
++    re_extent = counts.tolist()
++    ref = _ref_scores(inp, page_size, re_extent, lambda r: positions[r, : re_extent[r]])
++    for r in range(rows):
++        assert torch.equal(re_scores[r, : re_extent[r]], ref[r]), f"row {r} scores"
++    expected, _ = _ref_topk(re_scores, re_extent, INDEX_TOPK, gather=positions)
++    assert torch.equal(out, expected)
++
++
+ def _tie_scores(rows, width, seed=3):
+     # Few distinct values force large ties at every selection threshold.
+     gen = _gen(seed)
+@@ -468,7 +536,7 @@ def test_topk_routes(width, topk, group, rows=4):
+     )
+     active = torch.tensor([width], dtype=torch.int32, device=DEVICE)
+     op = IndexerTopK(width, topk, group)
+-    indices = torch.full((rows, topk * group), -7, dtype=torch.int32, device=DEVICE)
++    indices = torch.full((rows, topk), -7, dtype=torch.int32, device=DEVICE)
+     values = torch.empty((rows, topk), dtype=torch.bfloat16, device=DEVICE)
+     counts = (
+         torch.full((rows,), -7, dtype=torch.int32, device=DEVICE) if group > 1 else None
+diff --git a/vllm/models/deepseek_v4_1/attention.py b/vllm/models/deepseek_v4_1/attention.py
+index 8c3bf8958..8f83e0526 100644
+--- a/vllm/models/deepseek_v4_1/attention.py
++++ b/vllm/models/deepseek_v4_1/attention.py
+@@ -425,6 +425,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+     # Index scores need bounded row scratch; attention handles the whole batch.
+     INDEX_CHUNK = 256
+     DECODE_CHUNK = 64
++    # The candidates the candidate source layer publishes for the reindex layers,
++    # a row: B12X's dsa_indexer exchanges 16,384 positions.
++    CANDIDATE_WIDTH = 16384
+ 
+     @classmethod
+     def get_padded_num_q_heads(cls, num_heads):
+@@ -718,7 +721,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase):
+             if self.layer_id == self.candidate_source_layer:
+                 specs.extend(
+                     (
+-                        ("_candidates", (self.capacity, 16384), torch.int32),
++                        (
++                            "_candidates",
++                            (self.capacity, self.CANDIDATE_WIDTH),
++                            torch.int32,
++                        ),
+                         ("_candidate_lens", (self.capacity,), torch.int32),
+                     )
+                 )
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 1e0d6c45e..ce24625fe 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -81,6 +81,9 @@ def _index_calls(width, page_size, candidates, candidate_blocks) -> list:
+ 
+ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+     backend_cls = DeepseekV41TileLangBackend
++    # The TileLang indexer publishes candidates as block ids: 8 KiB a budget token
++    # where 16,384 positions took 64.
++    CANDIDATE_WIDTH = CANDIDATE_BLOCKS
+ 
+     def _declare_mla(self, mode, capacity, metadata_specs, device):
+         return None
+diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+index 19d0c3971..8440050d9 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
++++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
+@@ -30,8 +30,13 @@ shared memory, runs a two-pass 8-bit radix select and an ordered compaction
+ small batches still spread over many CTAs. Positions come back in ascending
+ order, padded with ``-1``.
+ ``group=8`` ranks blocks of eight positions by their maximum, always keeping
+-the block that holds the last visible position, and expands them: V4.1's
+-candidate-domain selection at its candidate source layer.
++the block that holds the last visible position: V4.1's candidate-domain
++selection at its candidate source layer. It returns the blocks' ids, ascending
++and ``-1`` padded, and their count of visible positions. Every selected block
++but the last is wholly visible and the last holds the row's last position, so
++candidate ``j < count`` of such a list is position
++``ids[j // 8] * 8 + j % 8``: the reindex layers read their candidates that way,
++from an eighth of the bytes of a position list.
+ 
+ Selection is deterministic: the same scores give the same positions
+ regardless of thread timing or batch composition.
+@@ -87,6 +92,19 @@ def _row_extent(Lengths, Active, row, width):
+     return T.min(extent, width)
+ 
+ 
++def _candidate_block(Candidates, row, j):
++    """Candidate ``j``'s block id (``-1``: masked). Candidate rows score whole tiles of
++    a width that is a multiple of the tile, so ``j`` never passes the list."""
++    return Candidates[row, j // CANDIDATE_BLOCK]
++
++
++def _candidate_position(Candidates, row, j):
++    """Candidate ``j``'s position, in range for a masked block. As a multiple of the
++    block plus an offset below it, the page arithmetic on it folds to the block id's."""
++    block = T.max(_candidate_block(Candidates, row, j), 0)
++    return block * CANDIDATE_BLOCK + j % CANDIDATE_BLOCK
++
++
+ @tilelang.jit
+ def indexer_score_v41(
+     width: int,
+@@ -108,8 +126,9 @@ def indexer_score_v41(
+     - ``PageTable``: ``[rows, table_width]`` int32 physical page per logical page;
+     - ``Lengths``: ``[rows]`` int32 positions per row;
+     - ``Active``: ``[1]`` int32 width cap;
+-    - candidate mode: ``Candidates`` ``[rows, width]`` int32 positions and
+-      ``CandidateLengths`` ``[rows]``.
++    - candidate mode: ``Candidates`` ``[rows, width // CANDIDATE_BLOCK]`` int32
++      block ids (``-1``: a masked block) and ``CandidateLengths`` ``[rows]``,
++      candidate ``j`` being position ``Candidates[j // 8] * 8 + j % 8``.
+ 
+     Writes ``Scores`` (``[rows, width]`` BF16) up to each row's extent, ``-inf``
+     for masked candidates; entries past the extent are left unwritten and the
+@@ -120,6 +139,8 @@ def indexer_score_v41(
+     assert page_size % block_P == 0 or candidates, (
+         "dense tiles must not straddle a page"
+     )
++    assert not candidates or width % block_P == 0, "candidate rows score whole tiles"
++    blocks = width // CANDIDATE_BLOCK
+     rows, pool_pages, table_width, pool_stride, scale_stride = T.dynamic(
+         "rows, pool_pages, table_width, pool_stride, scale_stride"
+     )
+@@ -251,7 +272,7 @@ def indexer_score_v41(
+         PageTable: T.Tensor([rows, table_width], T.int32),
+         Lengths: T.Tensor([rows], T.int32),
+         Active: T.Tensor([1], T.int32),
+-        Candidates: T.Tensor([rows, width], T.int32),
++        Candidates: T.Tensor([rows, blocks], T.int32),
+         CandidateLengths: T.Tensor([rows], T.int32),
+         Scores: T.Tensor([rows, width], T.bfloat16),
+     ):
+@@ -267,8 +288,8 @@ def indexer_score_v41(
+                 row,
+                 cta,
+                 extent,
+-                lambda p0, p: T.max(Candidates[row, T.min(p0 + p, width - 1)], 0),
+-                lambda p0, p: Candidates[row, T.min(p0 + p, width - 1)] >= 0,
++                lambda p0, p: _candidate_position(Candidates, row, p0 + p),
++                lambda p0, p: _candidate_block(Candidates, row, p0 + p) >= 0,
+                 Scores,
+             )
+ 
+@@ -552,8 +573,10 @@ def _final_writer(threads, topk, group):
+     ):
+         """Write the ``total`` selected entries (``entry(slot)``), ``-1`` padded.
+ 
+-        Grouped entries expand to their positions below ``extent``; ``Counts``
+-        receives how many positions that leaves.
++        Grouped entries are block ids; ``Counts`` receives their positions below
++        ``extent``. ``Gather`` (candidate rows) holds candidate block ids:
++        entry ``e`` is position ``Gather[e // CANDIDATE_BLOCK] * CANDIDATE_BLOCK +
++        e % CANDIDATE_BLOCK``.
+         """
+         tx = T.get_thread_binding()
+         count = T.alloc_var(T.int32)
+@@ -564,21 +587,18 @@ def _final_writer(threads, topk, group):
+                 if slot < total:
+                     e = entry(slot)
+                     Values[row, slot] = _value16(sel_key[slot])
+-                    if group == 1:
+-                        if Gather is not None:
+-                            Indices[row, slot] = Gather[row, e]
+-                        else:
+-                            Indices[row, slot] = e
++                    if Gather is not None:
++                        Indices[row, slot] = (
++                            Gather[row, e // CANDIDATE_BLOCK] * CANDIDATE_BLOCK
++                            + e % CANDIDATE_BLOCK
++                        )
+                     else:
+-                        for o in T.serial(group):
+-                            Indices[row, slot * group + o] = T.if_then_else(
+-                                e * group + o < extent, e * group + o, -1
+-                            )
++                        Indices[row, slot] = e
++                    if group > 1:
+                         count += T.min(group, extent - e * group)
+                 else:
+                     Values[row, slot] = -T.infinity(T.bfloat16)
+-                    for o in T.serial(group):
+-                        Indices[row, slot * group + o] = -1
++                    Indices[row, slot] = -1
+         if Counts is not None:
+             T.sync_threads()
+             if tx == 0:
+@@ -611,10 +631,11 @@ def indexer_topk_segment_v41(
+     entry is a block of ``group`` positions keyed by its maximum; the block
+     holding the last position always ranks first.
+ 
+-    ``final`` (one segment per row) writes ``Indices`` (``[rows, topk * group]``
+-    int32 ascending positions, ``-1`` padded) and ``Values`` (``[rows, topk]``
+-    BF16); ``candidates`` maps entries through ``Gather`` (``[rows, width]``),
+-    and ``group > 1`` also writes ``Counts`` (``[rows]`` positions kept).
++    ``final`` (one segment per row) writes ``Indices`` (``[rows, topk]`` int32
++    ascending positions, or block ids with ``group > 1``, ``-1`` padded) and
++    ``Values`` (``[rows, topk]`` BF16); ``candidates`` maps entries through
++    ``Gather`` (``[rows, width // CANDIDATE_BLOCK]`` block ids), and
++    ``group > 1`` also writes ``Counts`` (``[rows]`` positions kept).
+     Otherwise it writes each live segment's winners, in entry order, to
+     ``WorkValues`` / ``WorkEntries`` (``[rows, segments * topk]``, ``-1``
+     padded); segments past a row's extent are left unwritten.
+@@ -757,7 +778,7 @@ def indexer_topk_segment_v41(
+         def indexer_topk_segment(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+-            Gather: T.Tensor([rows, width], T.int32),
++            Gather: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
+             Indices: T.Tensor([rows, topk], T.int32),
+             Values: T.Tensor([rows, topk], T.bfloat16),
+         ):
+@@ -772,7 +793,7 @@ def indexer_topk_segment_v41(
+             Scores: T.Tensor([rows, width], T.bfloat16),
+             Lengths: T.Tensor([rows], T.int32),
+             Active: T.Tensor([1], T.int32),
+-            Indices: T.Tensor([rows, topk * group], T.int32),
++            Indices: T.Tensor([rows, topk], T.int32),
+             Values: T.Tensor([rows, topk], T.bfloat16),
+             Counts: T.Tensor([rows], T.int32),
+         ):
+@@ -940,7 +961,7 @@ def indexer_topk_merge_v41(
+             WorkValues: T.Tensor([rows, lists * topk], T.bfloat16),
+             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+             Lengths: T.Tensor([rows], T.int32),
+-            Gather: T.Tensor([rows, width], T.int32),
++            Gather: T.Tensor([rows, width // CANDIDATE_BLOCK], T.int32),
+             Indices: T.Tensor([rows, topk], T.int32),
+             Values: T.Tensor([rows, topk], T.bfloat16),
+         ):
+@@ -956,7 +977,7 @@ def indexer_topk_merge_v41(
+             WorkEntries: T.Tensor([rows, lists * topk], T.int32),
+             Lengths: T.Tensor([rows], T.int32),
+             Active: T.Tensor([1], T.int32),
+-            Indices: T.Tensor([rows, topk * group], T.int32),
++            Indices: T.Tensor([rows, topk], T.int32),
+             Values: T.Tensor([rows, topk], T.bfloat16),
+             Counts: T.Tensor([rows], T.int32),
+         ):
+@@ -1003,8 +1024,9 @@ class IndexerTopK:
+     SM120 shared memory. Every route returns the same positions: each merge
+     sees exact winners in entry order and applies the same score-then-position
+     order. Segments and merge groups past a row's extent are skipped.
+-    ``candidates`` rows select from their first ``Lengths`` candidates and
+-    return the candidates' positions.
++    ``candidates`` rows select from their first ``Lengths`` candidates (a list
++    of candidate block ids) and return the candidates' positions; grouped rows
++    return block ids.
+     """
+ 
+     def __init__(self, width, topk=INDEX_TOPK, group=1, candidates=False):
+@@ -1086,7 +1108,7 @@ class IndexerTopK:
+         """Select into ``indices`` / ``values``; grouped selections fill ``counts``.
+ 
+         ``active`` is the ``[1]`` width cap of dense rows; candidate rows take
+-        ``gather`` (their candidate positions) instead.
++        ``gather`` (their candidate block ids) instead.
+         """
+         rows = scores.shape[0]
+         cap = () if self.candidates else (active,)
+@@ -1202,10 +1224,11 @@ class IndexerV41Plan:
+     ):
+         """Select each row's top positions into ``out``; returns ``(out, scores)``.
+ 
+-        Reindex plans take ``candidates`` / ``candidate_lengths``; source plans
+-        write ``candidate_out`` (``[rows, CANDIDATE_BLOCKS * CANDIDATE_BLOCK]``
+-        ascending positions, ``-1`` padded) and ``candidate_out_lengths``
+-        (its count of positions). Scores past a row's extent are unwritten.
++        Reindex plans take ``candidates`` (``[rows, CANDIDATE_BLOCKS]`` block ids)
++        / ``candidate_lengths`` (positions); source plans write ``candidate_out``
++        (``[rows, CANDIDATE_BLOCKS]`` ascending block ids, ``-1`` padded) and
++        ``candidate_out_lengths`` (its count of positions). Scores past a row's
++        extent are unwritten.
+         """
+         rows = q_packed.shape[0]
+         buffers = _take(scratch, self.scratch_specs(rows))
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Attribute the TP3 budget sweep's memory by budget, node and start-up phase.
 
-usage: analyze_sweep.py OUT [--budgets 6144 8192 12288]
+usage: analyze_sweep.py OUT [--arms b6144=6144 b8192=8192 b12288=12288]
 
 OUT is the watcher's output directory (memory/watch.sh): <node>-samples.jsonl from
 sampler.py, engine-<node>-<container>.log from the followers, and
-traces-<node>/b<budget>/{torch,pools}-rank<rank>.{tsv,jsonl} from the overlay. A trace
-file holds one section per boot (each starts with its header line); budget 8,192 has
-two (b8192, b8192-again).
+traces-<node>/<arm>/{torch,pools}-rank<rank>.{tsv,jsonl} from the overlay (an arm's
+SPARK_DS41F_MEMORY_TRACE directory). A trace file holds one section per boot (each
+starts with its header line); an arm that runs twice (b8192 and b8192-again) has two.
+``--arms`` names each trace directory with its budget (the memory-cuts check:
+b8192=8192 cuts=8192).
 
 For every boot and node it prints, at each phase mark of the overlay (weights, profiled:
 after the profile run and its release, kv-pool, warmed: graph capture and the tail-shape
@@ -19,7 +21,8 @@ warm-up done):
 then the boot's lowest MemAvailable (what the 5 GiB start-up guard sees), the serving
 peaks (torch reserved and allocated) and lowest MemAvailable until the next boot, the
 workspace slot lines (VLLM_DEBUG_WORKSPACE) and the allocator pools. Last, per phase,
-the change per 1,024 budget tokens between consecutive budgets on each node.
+the change between consecutive arms on each node: per 1,024 budget tokens where their
+budgets differ, in GiB where they are the same.
 """
 import argparse
 import bisect
@@ -97,9 +100,9 @@ def workspace_lines(out: str, node: str, start: float, stop: float) -> list[str]
     return lines
 
 
-def pools(out: str, node: str, budget: int, start: float, stop: float) -> list[dict]:
+def pools(out: str, node: str, arm: str, start: float, stop: float) -> list[dict]:
     found = []
-    for path in glob.glob(os.path.join(out, f"traces-{node}", f"b{budget}", "pools-rank*.jsonl")):
+    for path in glob.glob(os.path.join(out, f"traces-{node}", arm, "pools-rank*.jsonl")):
         for line in open(path):
             record = json.loads(line)
             if start <= record["t"] < stop:
@@ -110,22 +113,23 @@ def pools(out: str, node: str, budget: int, start: float, stop: float) -> list[d
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("out")
-    parser.add_argument("--budgets", type=int, nargs="+", default=[6144, 8192, 12288])
+    parser.add_argument("--arms", nargs="+", default=["b6144=6144", "b8192=8192", "b12288=12288"])
     args = parser.parse_args()
+    arms = [(name, int(budget)) for name, budget in (a.split("=") for a in args.arms)]
     nodes = sorted(os.path.basename(p).split("-samples")[0]
                    for p in glob.glob(os.path.join(args.out, "*-samples.jsonl")))
-    table = defaultdict(dict)  # (node, budget) -> phase -> values of the budget's first boot
+    table = defaultdict(dict)  # (node, arm) -> phase -> values of the arm's first boot
     for node in nodes:
         sampled = samples(os.path.join(args.out, f"{node}-samples.jsonl"))
         sections = []
-        for budget in args.budgets:
-            for path in glob.glob(os.path.join(args.out, f"traces-{node}", f"b{budget}", "torch-rank*.tsv")):
+        for arm, budget in arms:
+            for path in glob.glob(os.path.join(args.out, f"traces-{node}", arm, "torch-rank*.tsv")):
                 for index, boot in enumerate(boots(path)):
-                    sections.append((boot["rows"][0][0], budget, index, boot))
+                    sections.append((boot["rows"][0][0], arm, index, boot))
         sections.sort(key=lambda s: s[0])
-        for k, (start, budget, index, boot) in enumerate(sections):
+        for k, (start, arm, index, boot) in enumerate(sections):
             stop = sections[k + 1][0] if k + 1 < len(sections) else boot["rows"][-1][0] + 1
-            label = f"b{budget}" + ("-again" if index else "")
+            label = arm + ("-again" if index else "")
             print(f"== {node} {label} (trace from {start:.0f})")
             print(f"  {'phase':10s} {'alloc':>7s} {'reserv':>7s} | {'avail':>6s} {'driver':>6s} {'anon':>5s}")
             times = [r[0] for r in boot["rows"]]
@@ -139,7 +143,7 @@ def main() -> None:
                 if m:
                     values.update(avail=m[1], driver=m[2], anon=m[3])
                 if not index:
-                    table[(node, budget)][phase] = values
+                    table[(node, arm)][phase] = values
                 print(f"  {phase:10s} {values['alloc']:7.2f} {values['reserved']:7.2f} | "
                       f"{values.get('avail', float('nan')):6.2f} {values.get('driver', float('nan')):6.2f} "
                       f"{values.get('anon', float('nan')):5.2f}")
@@ -154,20 +158,20 @@ def main() -> None:
                 "serve_max_alloc": max(r[1] for r in serve) / G if serve else None,
             }
             if not index:
-                table[(node, budget)]["summary"] = summary
+                table[(node, arm)]["summary"] = summary
             print("  " + ", ".join(f"{key} {value:.2f}" for key, value in summary.items() if value is not None))
             for line in workspace_lines(args.out, node, start - 60, stop):
                 print(f"  workspace: {line}")
-            for record in pools(args.out, node, budget, start, stop):
+            for record in pools(args.out, node, arm, start, stop):
                 parts = ", ".join(f"pool {pool}: {v['total_size'] / G:.2f} GiB reserved, "
                                   f"{v['allocated_size'] / G:.2f} allocated, {v['segments']} segments"
                                   for pool, v in record["pools"].items())
                 print(f"  pools {record['label']}: {parts}")
-    print("== change per 1,024 budget tokens (GiB), first boot of each budget")
+    print("== change between consecutive arms (GiB; per 1,024 tokens where budgets differ)")
     for node in nodes:
-        budgets = [b for b in args.budgets if (node, b) in table]
-        for low, high in zip(budgets, budgets[1:]):
-            scale = 1024 / (high - low)
+        present = [(arm, budget) for arm, budget in arms if (node, arm) in table]
+        for (low, low_budget), (high, high_budget) in zip(present, present[1:]):
+            scale = 1024 / (high_budget - low_budget) if high_budget != low_budget else 1.0
             parts = []
             for phase in (*PHASES, "summary"):
                 a, b = table[(node, low)].get(phase, {}), table[(node, high)].get(phase, {})

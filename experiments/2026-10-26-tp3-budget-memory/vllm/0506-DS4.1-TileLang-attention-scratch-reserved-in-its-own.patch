@@ -1,0 +1,138 @@
+From b78a6a7abf10dcd78f6737e53e1da51c5efbe64a Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 21:21:05 +0100
+Subject: [PATCH] [DS4.1] TileLang attention scratch reserved in its own
+ workspace lane
+
+Binding a TileLang attention layer's plans reserved its indexing scratch and
+metadata arena with WorkspaceManager.reserve_all, which sizes every slot of
+every lane to the largest reservation so far. Under DSpark the drafter's lane
+therefore held the target's largest borrow: layer 20's indexing scratch for
+a 256-row chunk of 1M scores, about 0.9 GB a rank, although the drafter's
+window-only layers borrow a few MB. The layer now records its reservations
+when the plans are built and reserves them in reserve_profile_scratch, which
+the V2 model runner calls in the lane of each model that holds the layer
+before profiling, then evening each lane's microbatch slots out. The target
+keeps every byte it borrows; the drafter's lane holds only the drafter's.
+The test drives the runner's reservation with a target index layer and a
+window-only draft layer.
+---
+ tests/v1/worker/test_workspace.py             | 62 +++++++++++++++++++
+ .../deepseek_v4_1/tilelang/attention.py       | 28 ++++++---
+ 2 files changed, 83 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/worker/test_workspace.py b/tests/v1/worker/test_workspace.py
+index 3c89e3036..85df2971d 100644
+--- a/tests/v1/worker/test_workspace.py
++++ b/tests/v1/worker/test_workspace.py
+@@ -470,3 +470,65 @@ def test_dsv4_profile_retains_padded_query_reservation() -> None:
+     assert reserved == [
+         (4096, 32, 512, torch.bfloat16, device, ubatch) for ubatch in range(2)
+     ]
++
++
++def test_v41_tilelang_attention_reserves_scratch_in_its_model_lane(monkeypatch):
++    """A V4.1 TileLang attention layer's indexing scratch and metadata arena are
++    reserved in the lane of the model holding the layer, before profiling: binding
++    the plans reserves nothing, so the drafter's lane does not take the target's
++    indexing scratch."""
++    pytest.importorskip("tilelang")
++    from vllm.models.deepseek_v4_1.tilelang import attention as tl_attention
++    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++
++    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
++    manager = workspace.WorkspaceManager(
++        torch.device("cpu"), num_ubatches=1, num_lanes=2
++    )
++    monkeypatch.setattr(workspace, "_manager", manager)
++    monkeypatch.setattr(tl_attention, "current_workspace_manager", lambda: manager)
++
++    class IndexPlan:
++        def __init__(self, width):
++            self.width = width
++
++        def scratch_specs(self, rows):
++            return (((rows, self.width), torch.bfloat16),)
++
++    mla = SimpleNamespace(
++        decode_max_rows=64, scratch_specs=lambda rows: (((rows, 4), torch.uint8),)
++    )
++    monkeypatch.setattr(tl_attention, "_mla_plan", lambda *args: mla)
++    monkeypatch.setattr(tl_attention, "_index_plan", IndexPlan)
++
++    def layer(index_width, metadata_rows):
++        module = tl_attention.DeepseekV41TileLangAttention.__new__(
++            tl_attention.DeepseekV41TileLangAttention
++        )
++        torch.nn.Module.__init__(module)
++        module.capacity = 1024
++        index = {"prefill": (index_width,)} if index_width else {}
++        module._plan_args = lambda: ((), index, {"prefill": 256})
++        module._attention_workspace_specs = {
++            "extend": (((metadata_rows, 4), torch.int32),)
++        }
++        module._build_tilelang_plans()
++        return module
++
++    target = layer(4096, 512)  # an index layer: 256 rows x 4,096 BF16 scores
++    draft = layer(0, 128)  # window-only
++    assert all(slot is None for slot in manager._current_workspaces)
++    runner = SimpleNamespace(
++        get_model=lambda: target,
++        get_draft_model=lambda: draft,
++        _draft_workspace_lane=1,
++        compilation_config=SimpleNamespace(
++            static_forward_context={"layers.20.attn": target, "layers.40.attn": draft}
++        ),
++    )
++    GPUModelRunner._reserve_profile_scratch(runner)
++
++    sizes = [manager._workspace_size_bytes(s) for s in manager._current_workspaces]
++    # Target: the scores (2 MiB) outgrow its arena; the drafter: its arena (2 KiB)
++    # and the attention scratch of 64 rows, each 256-byte aligned.
++    assert sizes == [256 * 4096 * 2, 128 * 4 * 4 + 256]
+diff --git a/vllm/models/deepseek_v4_1/tilelang/attention.py b/vllm/models/deepseek_v4_1/tilelang/attention.py
+index 1e0d6c45e..3413dddd3 100644
+--- a/vllm/models/deepseek_v4_1/tilelang/attention.py
++++ b/vllm/models/deepseek_v4_1/tilelang/attention.py
+@@ -204,16 +204,30 @@ class DeepseekV41TileLangAttention(DeepseekV4Attention):
+         mla_args, index_args, chunks = self._plan_args()
+         mla = _mla_plan(*mla_args)
+         index = {mode: _index_plan(*args) for mode, args in index_args.items()}
+-        # Reserve the largest scratch each phase borrows: indexing, then the
+-        # attention metadata arena with the decode route's segment workspace.
+-        workspace = current_workspace_manager()
+-        for mode, plan in index.items():
+-            workspace.reserve_all(*plan.scratch_specs(chunks[mode]))
++        # The largest scratch each phase borrows: indexing, then the attention
++        # metadata arena with the decode route's segment workspace. They are
++        # reserved in the workspace lane this layer runs in, before profiling
++        # (``reserve_profile_scratch``), so the drafter's lane does not hold the
++        # target's indexing scratch.
+         split_rows = min(mla.decode_max_rows, self.capacity)
+-        for metadata_specs in self._attention_workspace_specs.values():
+-            workspace.reserve_all(*metadata_specs, *mla.scratch_specs(split_rows))
++        self._scratch_reservations = (
++            *(plan.scratch_specs(chunks[mode]) for mode, plan in index.items()),
++            *(
++                (*metadata_specs, *mla.scratch_specs(split_rows))
++                for metadata_specs in self._attention_workspace_specs.values()
++            ),
++        )
+         return SimpleNamespace(mla=mla, index=index)
+ 
++    def reserve_profile_scratch(self) -> None:
++        """Reserve this layer's largest borrows (``_build_tilelang_plans``) in the
++        current workspace lane: the model runner calls this in the lane of each
++        model that holds the layer, before memory profiling, and then evens every
++        lane's microbatch slots out (``reserve_by_lane``)."""
++        workspace = current_workspace_manager()
++        for specs in self.__dict__.get("_scratch_reservations", ()):
++            workspace.get_simultaneous(*specs)
++
+     def _check_attention_rows(self, mode: str, rows: int) -> None:
+         capacity = self._tilelang().mla.max_rows
+         if rows > capacity:
+-- 
+2.54.0 (Apple Git-157)
+

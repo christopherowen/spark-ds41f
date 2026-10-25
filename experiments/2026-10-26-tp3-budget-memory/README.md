@@ -12,6 +12,198 @@
   - the memory cuts (levers 2-4): layer 20's candidates as block ids, the drafter's workspace lane
     without the target's indexer scratch, the two unread buffers.
 
+## Built and tested for next week (2026-10-25 evening, CET)
+
+Owner direction: "queue up the tests that TP=3 recommends". Nothing else open covered these
+levers, so each is now a vLLM patch with tests, checked on dgx4.
+- **Branches:** local, off the release's 26382f5cf, one variable each, not pushed (the
+  freeze).
+- **Patches:** 0504-0507, after the 0491-0503 other drafts hold.
+- **Bundles:** [make_bundles.py](make_bundles.py) writes them from the branches. They ran
+  with `scripts/lab.py kernel-local` on dgx4, on the `-next-6` image, under this
+  session's own checkout there; nothing ran on dgx1-dgx3.
+- **Records:** [runs/](runs).
+
+| # | Lever (patch, vLLM branch) | dgx4 result | Saving or gain | Still needs the cluster |
+| --- | --- | --- | --- | --- |
+| 1 | 64-row MoE tiles in prefill calls (0504, `prefill-moe-tiles` 8149aa4ad) | 153 tests pass; the gated benchmark passes (outputs identical at every size and routing, faster from 2,048 tokens, nowhere slower) | routed MoE −12.8% at 8,192 and −16% at 12,288 (TP3), −15% at 16,384 (TP4): prefill about +4% / +5% / +4% | determinism gate and prefill suite on both shapes (arms `prefill-tiles-tp3.json`, `prefill-tiles-tp4.json`) |
+| 2 | Drop the two unread buffers (0505, `unread-buffers` 406886c8f) | 80 tests pass (the release's own 12 failures skipped) | exactly 10 KiB per budget token: 80 / 120 / 160 MiB at 8,192 / 12,288 / 16,384 | [tp3-memory-cuts.json](tp3-memory-cuts.json) |
+| 3 | The drafter's workspace lane holds only the drafter's scratch (0506, `drafter-lane-scratch` b78a6a7ab) | 102 tests pass, the new lane test included; the lane check from the release's plan functions | about 0.80 GiB per rank on both shapes at every budget (837.25 → 12.84 MiB at TP3's 8,192): a ceiling, see below | the same spec (its slot log shows each lane's size) |
+| 4 | Layer 20's candidates as block ids (0507, `candidate-block-ids` 5473283ef) | 111 tests pass; the gated check passes: the ids expand to the release's positions exactly, scores and selections are bit-identical, and the re-index call is not slower | 56 KiB per budget token: 448 / 672 / 896 MiB | the same spec |
+
+### Lever 1: 64-row tiles for the routed experts in prefill calls
+
+Each grouped-GEMM tile holds `block_M` routes of one expert and reads that expert's weight
+slab again. At prefill sizes the 32-row decode tile makes the routed GEMMs L2-bound on
+weight re-reads.
+- **The rule:** a call takes 64-row tiles once the average expert has a full 32-row tile of
+  routes. That is `rows × top-k ≥ 32 × experts`: 2,048 tokens for 384 experts at top-6.
+- **What stays at 32:** decode steps and their CUDA graphs (at most 96 rows), the CED
+  decoder's compacted rows and the drafter's MoE.
+- **Declared at start-up:** both heights' GEMMs, fused SwiGLU and dispatch plans.
+- **Workspace:** each call's scratch is laid out at its own height, about 0.16 GiB more at
+  TP3's 8,192 tokens (12,288 more layout rows).
+
+Bits are unchanged: a row's sum over K runs in the same order at either height.
+- **New tests:**
+  - the two heights through the whole plan, at the threshold and above;
+  - the fused SwiGLU against TileKernels at 64-row tiles;
+  - the tile-height rule and the scratch layout.
+- **Existing tests:** the batch-composition checks now cross the two heights (one row alone
+  runs at 32, the batch at 64).
+
+The gated benchmark (`benchmark_deepseek_v41_moe_prefill_tiles.py`) times one layer's routed
+experts as serving calls them (`plan.run`) against the release's own `moe.py`.
+- **Shapes:** TP4's and TP3's widths, uniform and skewed routing, 1,024-24,576 tokens. Under
+  sequence-parallel prefill the MoE runs on the chunk's gathered rows on every rank, so a
+  call's rows are the chunk's tokens on either shape.
+- **Fair memory:** both plans read one weight copy and share one workspace. Its first run
+  gave each plan its own weight copy, and the rows below the threshold, which run the
+  release's kernels in both plans, read 0.3-1.5% apart. That is GB10's memory-placement
+  spread (experiments/2026-10-19-memory-placement); with one shared copy those rows read the
+  same.
+
+| Tokens | TP3 uniform | TP3 skewed | TP4 uniform | TP4 skewed |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,024 (32 rows: the release's kernels) | +0.5% (interval spans 0) | +0.2% (spans 0) | −0.3% (spans 0) | +0.4% (spans 0) |
+| 2,048 | −2.6% | −2.1% | −1.5% | −2.9% |
+| 4,096 | −6.3% | −9.0% | −4.3% | −6.6% |
+| 8,192 | −12.8% (24.09 → 21.04 ms) | −11.9% | −11.0% | −10.4% |
+| 12,288 | −16.1% | −15.2% | −13.3% | −14.2% |
+| 16,384 | −17.4% | −15.7% | −15.2% (33.75 → 28.69 ms) | −14.0% |
+| 24,576 | −18.1% | −18.5% | −16.2% | −16.4% |
+
+What this means for a prefill chunk:
+- 20 full-row layers a chunk turn this into −61 ms at TP3's 8,192 (about +4% prefill),
+  −107 ms at 12,288 (+5%), and −101 ms at TP4's 16,384 (+4%).
+- It shrinks the fixed cost of a chunk and its per-token cost alike, so it helps at every
+  budget without lengthening any decode step.
+
+### Levers 2-4: the memory cuts
+
+**The release's own failures.** Twelve tests in `tests/models/test_deepseek_v4_1_attention.py`
+fail on the release's tree with no overlay at all (7 failures, 5 errors in four test
+functions; [runs/release.json](runs/release.json)). They build attention modules by hand
+without attributes the release's geometry now sets. Every lever bundle skips them
+(`RELEASE_FAILURES` in make_bundles.py), so its verdict reads its own change.
+
+**Lever 2: the two unread buffers (0505).**
+- `DeepseekV4Model.candidate_block_buffer` (budget × 2,048 int32) went to every attention
+  layer. The layer takes the argument and never keeps it: the candidate source, layer 20,
+  publishes its candidates in its own staging (`_candidates`).
+- `DSparkDeepseekV4Model.topk_indices_buffer` (budget × 512 int32) went to the drafter's
+  three layers. They are window-only (compress ratio 0): their attention is its own owner,
+  has no compressed cache, and so reads no top-k buffer. DSpark's loader shares no indexer
+  storage with the target.
+- Both allocations go, and the drafter now refuses a layer that is not window-only.
+- **Saving:** exactly 10 KiB per budget token per rank, 80 / 120 / 160 MiB at 8,192 /
+  12,288 / 16,384.
+- **Tests:** the attention, CED-model, SP-prefill and DSpark context-KV tests, 80 passing on
+  dgx4 ([runs/unread-buffers.json](runs/unread-buffers.json)).
+
+**Lever 3: the drafter's workspace lane (0506).**
+- **Before:** `WorkspaceManager.reserve_all` sizes every slot of every lane to the largest
+  reservation so far. Each TileLang attention layer called it when its plans were bound, so
+  DSpark's lane held layer 20's indexing scratch.
+- **After:** the layer records its reservations when the plans are built and reserves them
+  in `reserve_profile_scratch`. The V2 runner calls that in the lane of each model holding
+  the layer, before profiling, and then evens each lane's microbatch slots out. That is the
+  per-lane design `tests/v1/worker/test_workspace.py` already describes for other models.
+- **The new test** drives the runner's reservation with a target index layer and a
+  window-only draft layer.
+- **The bound** comes from the release's own plan functions on dgx4
+  ([lane_check.py](lane_check.py), [runs/drafter-lane.json](runs/drafter-lane.json)):
+
+| Largest reservation by layer role | TP3 8,192 | TP3 16,384 | TP4 16,384 |
+| --- | ---: | ---: | ---: |
+| candidate source (20): 256 rows × 1M BF16 scores, its top-k and block selection | 837.25 MiB | 837.25 MiB | 837.25 MiB |
+| ratio-2 indexers (2, 8, 14) | 358.25 | 358.25 | 358.25 |
+| compressed layers' metadata arena (budget × (128 + 2 + 4,096) int32) | 138.65 | 270.71 | 268.52 |
+| drafter (40-42): window-only arena | 12.84 | 18.90 | 16.64 |
+| **the drafter's lane: before → after** | **837.25 → 12.84 MiB: −0.80 GiB** | **−0.80 GiB** | **−0.80 GiB** |
+
+  - The saving is about 0.80 GiB per rank on both shapes at every budget: a fixed cost, not
+    one per token.
+  - The lane also holds the drafter's other borrows, such as its MoE scratch for draft rows.
+    DSpark's context-KV projection allocates its own tensors, outside the workspace.
+  - So 0.80 GiB is the ceiling, and the cluster spec's slot log gives the lane's final size.
+- **Tests:** the workspace tests, the new one included, and the model tests, 102 passing on
+  dgx4.
+
+**Lever 4: layer 20's candidates as block ids (0507).**
+- **Before:** the candidate source (layer 20) published, for each row, the 16,384 positions
+  of the 2,048 blocks of 8 it keeps, and the re-index layers (24, 28, 32, 36) read them back.
+- **Why block ids are exact:**
+  - Every kept block but the last is wholly visible.
+  - The last block holds the row's last position, which is always kept and the highest.
+  - So the list is the blocks' positions, with −1 only past its count: candidate `j <
+    count` is `ids[j // 8] * 8 + j % 8`, entry for entry.
+- **After:**
+  - The source writes the 2,048 block ids (−1 padded) and the count of positions.
+  - The re-index score kernel computes each candidate's position from them.
+  - The re-index top-k maps the entries it keeps through them.
+  - A selected entry never lies in a masked block or past the count: those score −inf or
+    lie past the row's length.
+- **B12X:** its indexer still exchanges positions. The width is the attention class's
+  `CANDIDATE_WIDTH`: 16,384 in the base class, 2,048 in the TileLang class.
+- **Tests:**
+  - the grouped top-k and the source plan against the reference, in block ids;
+  - re-index rows reading block-id lists: a partly visible last block, a masked block, an
+    empty row;
+  - a chain test: the source's ids expand to the release's position list exactly, and the
+    re-index scores and selection equal the reference over it.
+- **Gated check** (`benchmark_deepseek_v41_candidate_ids.py`): the release's `indexer.py` and
+  this one on the same inputs at the serving shapes (1M positions, pages of 256, 32 rows,
+  three seeds). Gated on bit equality and no slowdown.
+- **dgx4, 111 tests pass** ([runs/candidate-ids.json](runs/candidate-ids.json)):
+  - bit equality on every seed: the source's top-512, scores, counts, the expanded list, the
+    re-index scores and top-512;
+  - the re-index call 244.7 against 249.0 µs (interval −23.0 to +6.7);
+  - its score kernel 228.5 against 232.7 µs (interval −4.6 to −2.8);
+  - the top-k and the source step level.
+- **Rejected along the way:** two variants were slower. Staging positions in shared memory
+  doubled the re-index time, and a shift-and-OR position formula cost the score kernel
+  6-8%.
+- **Saving:** the TileLang candidate staging goes from 64 KiB to 8 KiB per budget token per
+  rank: 448 / 672 / 896 MiB at 8,192 / 12,288 / 16,384. The workspace scratch is unchanged.
+- **Start-up:** the changed kernels' compile keys differ, so the first boot compiles them
+  again.
+- **B12X tests:** `tests/v1/attention/test_b12x_v41_workspace.py` fails 45 of 50 on the
+  release's own tree, and identically with 0507, so its bundle leaves that file out.
+
+**Together** (levers 2-4, at TP3's 8,192): about 0.08 + 0.80 + 0.44 = 1.3 GiB a rank, and
+1.6 GiB at 12,288.
+- That is more than the 1.0 GiB the first record estimated: lever 3 measures 0.80 GiB
+  against the 0.5 estimated.
+- Lever 1 takes 0.16 GiB of it back.
+- [tp3-memory-cuts.json](tp3-memory-cuts.json) measures it on the triangle (queue nothing
+  until the coordinator schedules it):
+  - candidate 6 at 8,192 with the allocator trace, then the same with the three cuts, then
+    candidate 6 again, on the fit check's suite;
+  - each arm's start-up and steady lows (memory/watch.sh with `SPEC=tp3-memory-cuts`);
+  - the workspace slot log;
+  - and, as a separate spec so its table does not overwrite the suite's
+    ([tp3-memory-cuts-gate.json](tp3-memory-cuts-gate.json)), the determinism gate on the
+    cuts arm against candidate 6's hashes (62313cb5 / 9742ac2c, 4d143977 / 12fd8257).
+
+  Both plan cleanly with `--dry-run`. The merged bundle, `bundles/memory-cuts` (vLLM
+  `memory-cuts` 63f5984f5: the three branches merged over the release), runs every cut's
+  tests together on dgx4: 133 pass, 1 xfailed, the release's own 12 failures skipped
+  ([runs/memory-cuts.json](runs/memory-cuts.json)).
+
+  Its cuts arm, `cuts-8192-tp3.json`, comes from `make_arms.py` once the merged
+  `memory-cuts` bundle exists.
+
+**Overlap with the other drafts** (test merges of the vLLM branches):
+- **#593 (`moe-exchange-direct`) and #585 (`kernel-audit`):** both merge with every lever
+  without a textual conflict.
+- **The one shared function:** #593 defers the combine at the end of
+  `MoeExpertsV41Plan.run`, and lever 1 picks the dispatch plan at its top. The deferred
+  combine then uses the chosen plan, which is correct.
+- **Rule:** whichever lands second reruns the other's MoE tests.
+
+**Display carve-out: no placement work planned.** The 1.27 GiB still free in the carve-out on each triangle node, and the whole 2.1 GiB reserve, are expected back as ordinary memory after NVIDIA's BIOS update, which lets the Spark skip the reservation (owner, 2026-10-25).
+
 Owner, 2026-10-25: why can the ring's long-prefill budget (`max_num_batched_tokens`) go so
 much higher than the triangle's, and should the implementation improve?
 
@@ -52,8 +244,8 @@ Base: candidate 6 (vLLM `tilelang-ports` 26382f5cf, image `spark-ds41f:19f2c20ed
   of about 2.6 s. It does not fit today.
 - **The implementation can improve on both axes.**
   - **Memory:** three low-risk cuts free about 1.0 GiB a rank at 8,192 and 1.3 GiB at 12,288,
-    about what 12,288 needs. The display carve-out has another 1.27 GiB free on every triangle
-    node.
+    about what 12,288 needs. NVIDIA's BIOS update is expected to return the 2.1 GiB display
+    reserve as ordinary memory on every node (owner, 2026-10-25).
   - **Speed:**
     - Each chunk pays a fixed cost of about 196 ms (TP3) and 155 ms (TP4). About 70% of it is
       the routed MoE's size-independent time: about 70% of one read of every expert in the 20
@@ -181,14 +373,7 @@ What could move:
 - **The API server, off the triangle** (vLLM's API-only frontend against a headless engine).
   It pays only until dgx2 becomes the floor: +0.86 GiB at the fit check.
 - **The engine core** stays with the mp executor.
-- **The display carve-out:**
-  - The triangle uses 737.2 MiB of about 2,040 MiB (`docs/current-state.md`,
-    experiments/2026-09-29-display-carveout-kv): 1.27 GiB is idle on every node.
-  - Only data read once a step belongs there: uncached, small pages, no L2 reuse.
-  - The best candidate is the DSpark drafter's routed experts:
-    - 3 layers × 128 experts × 2,304, about 0.80 GB a layer a TP3 rank;
-    - only draft rows ever reach them (the prefill forward launches no drafter MoE).
-  - Their coded scales are read 16 bytes at a time, so they need a decode A/B before anything else.
+- **The display carve-out:** the triangle uses 737.2 MiB of its about 2,040 MiB (the embedding and the packed head). The 1.27 GiB still free, and the whole reserve, are expected back as ordinary memory after NVIDIA's BIOS update (owner, 2026-10-25), so no placement work is planned.
 
 ## 4. What every chunk pays regardless of its size
 
@@ -272,11 +457,11 @@ its own branch.
 
 | # | Lever | Gain | Evidence | Effort | Risk |
 | --- | --- | --- | --- | --- | --- |
-| 1 | 64-row tiles for the routed MoE in prefill forwards (2,048 rows or more; decode keeps 32) | MoE −11% (8,192) / −16% (12,288) / −19% (16,384); prefill about +3.6% at 8,192 and +5% at 12,288 on TP3, about +4% at 16,384 on TP4; no decode change; costs about 0.16 GiB fixed (12,288 more layout rows) | dgx4 sweep, bit-identical outputs at every size | S-M: a second plan by row count, both declared at start-up | low |
-| 2 | Layer 20's candidates as 2,048 block ids a row instead of 16,384 positions | 0.44 / 0.66 / 0.88 GiB at 8,192 / 12,288 / 16,384 | code (`attention.py:721`; the four reindex layers read positions) | M: the producer's top-k writes ids, the consumers expand ×8 on load | low: same candidates in the same order; check outputs bit for bit |
-| 3 | The drafter's workspace lane without the target's indexer scratch (reserve by lane) | about 0.5 GiB fixed, every rank, both shapes | code (`workspace.py:224-251`, `tilelang/attention.py:205-214`); the size comes from the sweep's slot log | S | low: the locked workspace refuses an undersized lane at start-up |
-| 4 | Drop the two unread buffers | 0.08 / 0.12 / 0.16 GiB | code | S | none |
-| 5 | DSpark's routed experts in the display carve-out (about 1.5 of 3 layers fit) | up to 1.27 GiB on every triangle node | experiments/2026-09-29-display-carveout-kv (read-once data streams at full rate, re-read data loses L2); drafter experts see only draft rows | M-L | medium: uncached memory, 16-byte scale reads; needs a decode kernel A/B first |
+| 1 | 64-row tiles for the routed MoE in prefill forwards (2,048 rows or more; decode keeps 32) | MoE −11% (8,192) / −16% (12,288) / −19% (16,384); prefill about +3.6% at 8,192 and +5% at 12,288 on TP3, about +4% at 16,384 on TP4; no decode change; costs about 0.16 GiB fixed (12,288 more layout rows) | dgx4 sweep, bit-identical outputs at every size; built as 0504, gated benchmark passes (above) | S-M: a second plan by row count, both declared at start-up | low |
+| 2 | Layer 20's candidates as 2,048 block ids a row instead of 16,384 positions | 0.44 / 0.66 / 0.88 GiB at 8,192 / 12,288 / 16,384 | code (`attention.py:721`; the four reindex layers read positions); built as 0507, bit-identical on dgx4 (above) | M: the producer's top-k writes ids, the consumers expand ×8 on load | low: same candidates in the same order; check outputs bit for bit |
+| 3 | The drafter's workspace lane without the target's indexer scratch (reserve by lane) | about 0.80 GiB fixed, every rank, both shapes (first estimated at 0.5) | code (`workspace.py:224-251`, `tilelang/attention.py:205-214`); built as 0506, lane check on dgx4 (above); the final size comes from the triangle's slot log | S | low: the locked workspace refuses an undersized lane at start-up |
+| 4 | Drop the two unread buffers | 0.08 / 0.12 / 0.16 GiB | code; built as 0505 (above) | S | none |
+| 5 | The display carve-out | the 1.27 GiB still free (and the whole 2.1 GiB reserve) expected back as ordinary memory after NVIDIA's BIOS update (owner, 2026-10-25) | owner | none: no placement work planned | none |
 | 6 | Hide the routed experts' weight stream under compute (prefetch the next experts' slabs, persistent CTAs) | ceiling 139 ms a chunk on TP3 (about 9% at 8,192), 108 ms on TP4 (about 4.5% at 16,384) | dgx4 sweep: the fixed part is 71% of one full weight read | L | medium: new kernel structure; same arithmetic per row |
 | 7 | API server off the triangle | up to 0.86 GiB on dgx1, until dgx2 is the floor | soak process table | L: deployment topology | medium |
 | 8 | SwiGLU in the gate/up GEMM's epilogue (no BF16 gate/up buffer) | 0.14 / 0.21 / 0.28 GiB, plus about 1% prefill | code; fusion survey row 12 | M-L | medium: the BF16 rounding point must be kept |
@@ -293,7 +478,9 @@ its own branch.
 **Together:**
 - Levers 2-4 free about 1.0 GiB at 8,192 and 1.3 GiB at 12,288: enough for 12,288 at the
   lows the fit check measured.
-- With lever 5 as well, 16,384 (about 2.9 GiB) comes within reach.
+- With the 2.1 GiB reserve back after the BIOS update, 16,384 (about 2.9 GiB) comes within
+  reach. The embedding and head (0.72 GiB) then return to ordinary memory, so the net gain is
+  about 1.4 GiB.
 - Levers 1 and 6 take part of what a larger budget buys without its decode stall.
 
 ## Measurements
@@ -338,11 +525,9 @@ is kept here, ready, in case candidate 6's own cost per budget token is wanted l
      - whether 12,288 clears the start-up guard;
      - lever 3's size.
 2. **Single-node, dgx4:**
-   - **Done:** [bundles/moe-rows](bundles/moe-rows) (the MoE sweep above).
-   - **Next, not written:**
-     - lever 1's tests and gated benchmark;
-     - lever 5's decode A/B: drafter-shaped grouped GEMMs with weights in a dma-buf carve-out
-       buffer against ordinary memory.
+   - **Done:**
+     - [bundles/moe-rows](bundles/moe-rows) (the MoE sweep above);
+     - the levers' bundles ("Built and tested for next week", [runs/](runs)).
 
 ## Files
 
@@ -351,8 +536,20 @@ is kept here, ready, in case candidate 6's own cost per budget token is wanted l
 - [prefill_trace.py](prefill_trace.py): one prefill forward split into full-row and compact
   layers.
 - [process_memory.py](process_memory.py): a node's memory by component and process across an arm.
-- [make_arms.py](make_arms.py): writes `budget-{6144,8192,12288}-tp3.json`.
-- [tp3-budget-memory.json](tp3-budget-memory.json): the sweep spec.
+- [make_arms.py](make_arms.py): writes `budget-{6144,8192,12288}-tp3.json` and, once the merged
+  memory-cuts bundle exists, `cuts-8192-tp3.json`.
+- [tp3-budget-memory.json](tp3-budget-memory.json): the budget sweep spec (dropped, kept ready).
+- [tp3-memory-cuts.json](tp3-memory-cuts.json) and [tp3-memory-cuts-gate.json](tp3-memory-cuts-gate.json):
+  the memory cuts' triangle check and its determinism gate (not queued).
 - [memory/](memory): the trace overlay, sampler (unchanged from 2026-10-23), watcher and
   analysis.
-- [bundles/moe-rows](bundles/moe-rows): the dgx4 kernel bundle and its record.
+- [bundles/moe-rows](bundles/moe-rows): the first dgx4 kernel bundle and its record.
+- [make_bundles.py](make_bundles.py): writes the levers' bundles (`bundles/<lever>`) and their
+  serving arms (`<lever>-tp3.json`, `<lever>-tp4.json`) from the vLLM branches. It writes in
+  place and stops on stale files; it never deletes.
+- [lane_check.py](lane_check.py): each attention layer role's workspace reservation (lever 3's
+  bound).
+- [record_run.py](record_run.py): a kernel-lab output directory as a run record.
+- [runs/](runs): the dgx4 run records.
+- [vllm/](vllm): patches 0504-0507 (`git format-patch` of the four local branches, each on
+  the release's 26382f5cf).
