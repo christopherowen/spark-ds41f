@@ -64,6 +64,21 @@ change.
   consumer fusions and the persistent MoE kernel with its epilogue fusions, which touch the
   collective and the expert GEMMs.
 
+## Status (2026-10-26, CET)
+
+Since this record, other experiments have taken up these rows (numbers from their PRs):
+
+| Rows | Covered by | Where it stands |
+| --- | --- | --- |
+| 1 PDL | #589 | Prototype bit-identical across builds and replays; the c1 layer chain is 1.81% faster warm and 1.30% cold, 24 and 48 rows level. Its same-stream boundary ceiling is 3.70 / 4.79 / 1.71%, above this record's because it counts every graph boundary of the step. The warp-specialized GEMMs keep their launch. The serving screen is queued. |
+| 2 act-quant fold, 23 | #587 | Finalize writes the MXFP8 cast: -4.3 us a decode layer at c1, -0.88 ms a TP4 prefill layer; on the next candidate. |
+| 7 metadata | #585 | Page tables over each row's live pages (0.70 / 0.41 / 1.19% ceiling) and each builder in one launch; one table per index source is still open. |
+| 11 FC2 rate | #598 | FC1 measured at 14.2 us plus 11.41 us an expert (208-256 GB/s); the routed experts' launch fixed costs are 1.24 ms a step. The FC2 retile probe is open. |
+| 13 evict-first | #587 | Dropped: ptxas miscompiles the hinted K-tail copy on sm_121a, the trace ceiling is about 0 at c1, and no L2 priority setting has a ceiling worth a window. |
+| 17, 18 prefill exchange | #593 | The combine writes the exchange slots and the exchange runs under it, sliced: -1.27 ms a layer at 15K; on the next candidate. WO's slices take the same order. |
+
+Still open: rows 3-6, 8-10, 12, 14 and 19-22. #585 found `fn` hot in L2 when `project_streams` reads it, so row 3's note that the kernel is close to DRAM-bound does not hold; row 3's ceiling stands. Outside this record's list: 64-row prefill tiles for the routed experts (#599, routed MoE -12.8 to -16%), and #598's c1 byte floor, which puts all communication at no more than +3.2% at c1.
+
 ## How the ceilings were computed
 
 [ceilings.py](ceilings.py) reads the traces and writes [ceilings.json](ceilings.json):
@@ -220,9 +235,9 @@ parts. Rows 1 and 2-12 share their gap terms, so the ceilings do not add. The se
 layers other than row 11 is bounded by the layers' small-kernel budget (12.5 / 15.8 / 7.5%).
 
 Notes on single rows:
-- Row 3: the projection reads `fn` in FP32 (0.58 ms a step at 273 GB/s), so `project_streams` is
-  close to DRAM-bound already. On a side stream it pays only where the main stream is
-  latency-bound (the all-reduce waits), where the L2 prefetch already runs. A side-stream
+- Row 3: the projection reads `fn` in FP32 (0.58 ms a step at 273 GB/s if it came from DRAM; the
+  kernel audit later found it hot in L2, see Status). A DRAM-bound kernel on a side stream pays
+  only where the main stream is latency-bound (the all-reduce waits). A side-stream
   kernel that shares the SMs with the MoE GEMMs can also run several times slower than alone:
   keep its pipeline shallow and time it beside them.
 - Row 8: the same applies to the 180 us `wkv` GEMM.
