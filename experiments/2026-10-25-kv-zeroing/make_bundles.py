@@ -188,7 +188,8 @@ def write_overlay(repo: str, end: str, name: str) -> list[str]:
     return package
 
 
-def write_bundle(repo: str, name: str, steps: list, what: str, mounts_extra=()) -> None:
+def write_bundle(repo: str, name: str, steps: list, what: str, mounts_extra=(),
+                 verdict: str = "exit") -> None:
     """A kernel-lab bundle: the package files of BASE..BOUND over the image's tree, the
     changed tests and benchmarks mounted, and the release's indexer as the baseline."""
     bundle = HERE / "bundles" / name
@@ -225,7 +226,7 @@ def write_bundle(repo: str, name: str, steps: list, what: str, mounts_extra=()) 
         },
         "workdir": "vllm",
         "argv": ["/b/run.py"],
-        "verdict": "exit",
+        "verdict": verdict,
         "mounts": mounts,
     }
     (bundle / "candidate.json").write_text(json.dumps(candidate, indent=1) + "\n")
@@ -244,7 +245,9 @@ def write_tests_bundles(repo: str) -> None:
         "The indexer's read bound under compute-sanitizer's initcheck: the score kernel "
         "over a cache written only at the visible positions reports no read of the rest, "
         "and the release's kernel, the positive control, does",
-        mounts_extra=[[SANITIZER, "/opt/compute-sanitizer"]])
+        mounts_extra=[[SANITIZER, "/opt/compute-sanitizer"]],
+        # No pytest summary to read: the runner's exit status is the verdict.
+        verdict="status")
 
 
 def mounts(bundle: str, package: list[str]) -> list[list[str]]:
