@@ -205,8 +205,52 @@ chosen logprobs alone and together. Three results are recorded, not gated: the t
 largest gap, the completion's tokens against the chat's, and the ids' logprobs alone against
 beside the seven.
 
-Results: pending. A window held by run `request-inventory` was open when this was written.
-[runs/lab/run.sh](runs/lab/run.sh) waits for it to close.
+### Results (2026-10-25 02:04-02:14 CET, window `dgx1-1792886652`): pass
+
+The records are in [runs/lab/](runs/lab/):
+- the table, [logprob-token-ids-table.txt](runs/lab/logprob-token-ids-table.txt);
+- each arm's record, `logprob-ids-<arm>.jsonl`;
+- the run log, [serving-check.out](runs/lab/serving-check.out);
+- the driver, [run.sh](runs/lab/run.sh), and its log, [run-log.txt](runs/lab/run-log.txt).
+
+The driver waited for run `request-inventory` and integration run 17, which was queued
+behind it, to finish ("INTEGRATION17 DONE" at 02:01 CET). It then waited two quiet minutes
+and synced the nodes to `7dd3d37`.
+
+Boot times, to ready:
+
+| Arm | Ready |
+| --- | ---: |
+| `candidate4-0266` | +80.9 s |
+| `candidate4-0267` | +94.6 s |
+| `production-0266` | +76.5 s |
+| `production-0267` | +88.9 s |
+
+Production stopped at 02:04:35 CET. It served again from `config/cluster.json` at 02:13:58
+(ready +88.9 s). `doctor --live` was OK, with the 5 known warnings, and the hold was removed
+at 02:14:09.
+
+| | `candidate4-0266` | `candidate4-0267` | `production-0266` | `production-0267` |
+| --- | --- | --- | --- | --- |
+| Every request | 200, except the one below | 200 | 200 | 200 |
+| The probe with the ids | HTTP 500 `list index out of range`; the probe right after: 200, the same reply | 200: 96 entries for 96 tokens, each listing the five ids | not sent | the same as `candidate4-0267` |
+| `/v1/completions` with the ids | | 96 entries, the five ids in each; tokens equal to the chat's | | the same |
+| The ids' logprobs, alone and beside the seven | | identical | | identical |
+| Teacher forcing at 8 reply positions: largest gap | | 0.0 | | 0.0 |
+| The probe's tokens and chosen logprobs, with and without the ids, alone and together | same | same | same | same |
+| The seven's replies, alone = beside the probe | yes | yes | yes | yes |
+
+Every arm has the same digests: the seven's replies `63c11777…`, the probe's reply
+`61762157…` and its chosen tokens' logprobs `04efeaf5…`, alone and together. Both fix arms
+give the same ids' logprobs, `e1b7c221…`. So:
+- the 500 reproduces on candidate 4 with 0266, and the engine keeps serving;
+- with 0267 the ids come back for every token, through both APIs;
+- 0267 changes no temperature-0 output and no chosen token's logprob, in either build.
+  That includes the seven verifying through the rejection sampler beside the ids request,
+  against greedy verification alone;
+- the ids' logprobs of verified tokens are the plain sampler's, to the last digit, at every
+  position the teacher scored. The prefill steps of those completions compute them in
+  another forward shape.
 
 ## Production
 
@@ -215,8 +259,8 @@ reply longer than one token. Nothing else breaks: the engine keeps serving every
 request. This session made no production change. The options, for the owner:
 
 1. **Hotfix both:** if the owner takes the pending 0266 hotfix, boot
-   `production-fix-tp4.json` from this experiment instead, once the lab check passes. One
-   restart fixes both.
+   `production-fix-tp4.json` from this experiment instead. It passed the lab check above,
+   with outputs identical to production's with 0266. One restart fixes both.
 2. **Wait for the next release** with 0266 and 0267 (`vllm/series`). Until then, the ids
    fail with HTTP 500 and nothing else is affected.
 3. **Reject at validation:** answer `logprob_token_ids` with HTTP 400 under speculative
