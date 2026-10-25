@@ -42,6 +42,10 @@ from vllm.utils.b12x import B12xWorkload
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
 
+# The smallest width the TileLang gate takes: a multiple of its 256 threads' 4-wide
+# vectors (the model's is 4096).
+HIDDEN = 1024
+
 
 @pytest.fixture
 def tiny_engram_checkpoint(tmp_path, dist_init):
@@ -62,7 +66,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         for layer_id in geometry.layer_ids
     )
     config = SimpleNamespace(
-        hidden_size=64,
+        hidden_size=HIDDEN,
         hc_mult=4,
         rms_norm_eps=1e-6,
         num_attention_heads=1,
@@ -79,10 +83,10 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
             .expand(geometry.num_embeddings[index], -1)
             .contiguous()
             .view(torch.float8_e8m0fnu),
-            prefix + "q_weight": torch.full((4, 64), 0.5, dtype=torch.bfloat16),
-            prefix + "k_weight": torch.full((4, 64), 0.25, dtype=torch.bfloat16),
+            prefix + "q_weight": torch.full((4, HIDDEN), 0.5, dtype=torch.bfloat16),
+            prefix + "k_weight": torch.full((4, HIDDEN), 0.25, dtype=torch.bfloat16),
             prefix + "wkv.weight": torch.full(
-                (320, 6144), (index + 1) / 8192, dtype=torch.bfloat16
+                (5 * HIDDEN, 6144), (index + 1) / 8192, dtype=torch.bfloat16
             ),
         }
         path = tmp_path / f"layer-{index}.safetensors"
@@ -472,7 +476,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
             )
         ),
     )
-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
     def consume():
         # The gate takes the token ids: the image sentinel's rows pass.
@@ -617,7 +621,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
         [prompt, [4, 129264, 6, 8, 10, 12]], dtype=torch.int32, device="cuda"
     )
     slots = {"a": 0, "b": 1}
-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
     # (input ids, [(request, computed tokens, rows, prefilling)], early lookups)
     steps = (
         ([13, 17, 19, 31], [("a", 2, 3, True)], 4 * 24),
@@ -806,7 +810,7 @@ def test_engram_graphs_gate_text_rows_and_pass_the_image_sentinel_rows(dist_init
     from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
 
     device = torch.device("cuda", torch.cuda.current_device())
-    capacity, hidden, streams = 7, 64, 4
+    capacity, hidden, streams = 7, HIDDEN, 4
     geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
     caps = native.Caps(
         device=device,

@@ -37,6 +37,49 @@ MISSING = '''# Deleted by the vLLM branch retire-conditionals; mounted over the 
 # importing it fails as importing a missing module does.
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
+VISION_TEST = "tests/kernels/test_deepseek_v41_tilelang_vision.py"
+# Candidate 6's vision test bounds the TileLang tower by B12X's error on the same inputs;
+# the branch deletes B12X's tower, so its test needs those errors as numbers. Each
+# comparison of the base test also prints both errors (one JSON line, prefix B12X-ERROR).
+PRINT = ('    print("B12X-ERROR", json.dumps({{"check": {check}, "ours": [float(x) for x in ours], '
+         '"b12x": [float(x) for x in theirs]}}), flush=True)\n')
+VISION_PRINTS = [
+    ("    b12x_error, b12x_off, _ = theirs\n", PRINT.format(check="name")),
+    ("    theirs = (_relative(theirs_out, ref), _max_ulps(theirs_out, ref, floor))\n",
+     PRINT.format(check='f"attention at {rows} rows"')),
+    ('    message += f"; B12X {theirs[0]:.3e}, {theirs[1]:.3e}"\n',
+     PRINT.format(check='f"tower {vit.config.vision_dim} {height}x{width}"')),
+]
+
+
+def vision_error_bundle(repo: str, base: str) -> None:
+    """bundles/vision-b12x-error: candidate 6's vision test on its own image (no overlay),
+    printing B12X's error beside the TileLang tower's at every bounded comparison."""
+    bundle = HERE / "bundles" / "vision-b12x-error"
+    if bundle.exists():
+        shutil.rmtree(bundle)
+    bundle.mkdir(parents=True)
+    source = show(repo, base, VISION_TEST).decode()
+    source = source.replace("import math\n", "import json\nimport math\n", 1)
+    for anchor, line in VISION_PRINTS:
+        assert source.count(anchor) == 1, anchor
+        source = source.replace(anchor, anchor + line)
+    name = "test_deepseek_v41_tilelang_vision_b12x_error.py"
+    (bundle / name).write_text(source)
+    candidate = {
+        "description": (
+            "Candidate 6's TileLang vision test on image -next-6 (its own tree, no overlay), "
+            "printing B12X's error beside the TileLang tower's for each FP64 comparison: the "
+            "numbers retire-conditionals' test bounds the tower by once B12X's tower is gone."),
+        "image": IMAGE,
+        "env": {"HF_HUB_OFFLINE": "1", "TILELANG_CACHE_DIR": "/c/tilelang-vision-b12x-error"},
+        "workdir": "vllm",
+        "argv": ["-m", "pytest", "-q", "-s", "-rfEs", "-p", "no:cacheprovider",
+                 f"tests/kernels/{name}", "-k", "against_fp64 or against_reference"],
+        "verdict": "exit",
+        "mounts": [[name, f"{ROOT}/tests/kernels/{name}"]],
+    }
+    (bundle / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
 
 
 def git(repo: str, *args: str) -> str:
@@ -87,8 +130,9 @@ def main() -> None:
     # Its own TileLang cache, as candidate 6's bundle has (the kernels are the same).
     candidate["env"]["TILELANG_CACHE_DIR"] = f"/c/tilelang-{LABEL}"
     (bundle / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
+    vision_error_bundle(repo, base)
 
-    overlay = f"{{home}}/projects/spark-ds41f/{EXPERIMENT}/bundles/release-tests/overlay"
+    overlay =f"{{home}}/projects/spark-ds41f/{EXPERIMENT}/bundles/release-tests/overlay"
     mounts = [["{home}/projects/spark-ds41f/cache", "/cache", "rw"]]
     mounts += [[f"{overlay}/{path}", f"{ROOT}/{path}", "ro"] for _, path in package]
     arm = {

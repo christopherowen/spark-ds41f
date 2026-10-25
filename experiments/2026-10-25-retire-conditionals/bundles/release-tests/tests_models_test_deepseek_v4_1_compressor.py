@@ -206,6 +206,7 @@ def compressor_runners(monkeypatch):
                 self.table[:, null] = 0
             cm = SimpleNamespace(
                 query_start_loc=self.starts,
+                query_start_loc_cpu=self.starts[: len(identities) + 1].cpu(),
                 seq_lens=self.seq,
                 block_table_tensor=self.table,
                 slot_mapping=self.input_slots,

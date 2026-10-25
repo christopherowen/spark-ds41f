@@ -48,10 +48,10 @@ kernels, and its B12X benchmark goes.
  tests/model_executor/test_b12x_warmup.py      |   49 +-
  ..._deepseek_v41_sp_project_reduce_scatter.py |   13 +-
  tests/models/test_deepseek_v4_1_attention.py  |  479 +---
- tests/models/test_deepseek_v4_1_compressor.py |  100 +-
+ tests/models/test_deepseek_v4_1_compressor.py |  101 +-
  .../test_deepseek_v4_1_compressor_prepare.py  |   45 +-
  tests/models/test_deepseek_v4_1_config.py     |   19 +-
- tests/models/test_deepseek_v4_1_engram.py     |   71 +-
+ tests/models/test_deepseek_v4_1_engram.py     |   89 +-
  ...test_deepseek_v4_1_prepared_projections.py |  286 +--
  tests/models/test_deepseek_v4_1_rmsnorm.py    |  111 -
  tests/models/test_deepseek_v4_1_sp_prefill.py |   29 +-
@@ -76,7 +76,7 @@ kernels, and its B12X benchmark goes.
  .../deepseek_v4_1/tilelang/attention.py       |   10 +-
  vllm/models/deepseek_v4_1/tilelang/mhc.py     |    2 +-
  vllm/models/deepseek_v4_1/tilelang/vision.py  |    3 +-
- 35 files changed, 516 insertions(+), 8891 deletions(-)
+ 35 files changed, 528 insertions(+), 8898 deletions(-)
  delete mode 100644 benchmarks/kernels/benchmark_tilelang_vision.py
  delete mode 100644 tests/models/test_deepseek_v4_1_rmsnorm.py
  delete mode 100644 tests/models/test_deepseek_v4_1_vision.py
@@ -504,7 +504,7 @@ index 6fd3e2131..000000000
 -if __name__ == "__main__":
 -    main()
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_metadata.py b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
-index 92d598e8c..9b0279d67 100644
+index 92d598e8c..d4f04ad82 100644
 --- a/tests/kernels/test_deepseek_v41_tilelang_metadata.py
 +++ b/tests/kernels/test_deepseek_v41_tilelang_metadata.py
 @@ -2,6 +2,8 @@
@@ -552,11 +552,11 @@ index 92d598e8c..9b0279d67 100644
 +        seq = torch.tensor([1024, 0], dtype=torch.int32, device=device)
 +        slots = torch.full((padded,), -1, dtype=torch.int64, device=device)
 +        slots[:live] = 1
++        starts = torch.tensor([0, live, live], dtype=torch.int32)
 +        common = SimpleNamespace(
 +            block_table_tensor=table,
-+            query_start_loc=torch.tensor(
-+                [0, live, live], dtype=torch.int32, device=device
-+            ),
++            query_start_loc=starts.to(device),
++            query_start_loc_cpu=starts,
 +            seq_lens=seq,
 +            slot_mapping=slots,
 +            num_reqs=2,
@@ -2329,7 +2329,7 @@ index 2e845ad71..465c2fb3d 100644
 +        # alias-list functionalization used to copy stale clones back here.
 +        torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
 diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
-index ddb9ad232..ff97adb25 100644
+index ddb9ad232..a643541b0 100644
 --- a/tests/models/test_deepseek_v4_1_compressor.py
 +++ b/tests/models/test_deepseek_v4_1_compressor.py
 @@ -1,6 +1,6 @@
@@ -2376,7 +2376,15 @@ index ddb9ad232..ff97adb25 100644
          parallel_config=SimpleNamespace(decode_context_parallel_size=1),
          speculative_config=None,
      )
-@@ -229,53 +231,34 @@ def native_compressor_runners(monkeypatch):
+@@ -204,6 +206,7 @@ def native_compressor_runners(monkeypatch):
+                 self.table[:, null] = 0
+             cm = SimpleNamespace(
+                 query_start_loc=self.starts,
++                query_start_loc_cpu=self.starts[: len(identities) + 1].cpu(),
+                 seq_lens=self.seq,
+                 block_table_tensor=self.table,
+                 slot_mapping=self.input_slots,
+@@ -229,53 +232,34 @@ def native_compressor_runners(monkeypatch):
              n = self.main.num_actual_tokens
              return self.module._latent[:n].clone(), self.module._slots[:n].clone()
  
@@ -2449,7 +2457,7 @@ index ddb9ad232..ff97adb25 100644
      device = original.device
      width = candidate.table.shape[1]
      with torch.no_grad():
-@@ -326,11 +309,11 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -326,11 +310,11 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
  
          # Sparse reads must also preserve holes rather than attending null page0.
          candidate.stage([0], [8], [1], replacement, null=1)
@@ -2463,7 +2471,7 @@ index ddb9ad232..ff97adb25 100644
                  candidate.state.positions,
                  candidate.state.req_id_per_token,
                  candidate.table,
-@@ -341,12 +324,10 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -341,12 +325,10 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
                  candidate.state.query_start_loc,
                  candidate.state.request_positions,
                  0,
@@ -2480,7 +2488,7 @@ index ddb9ad232..ff97adb25 100644
              )
              logical = list(range(0 if draft else 1, 9))
              expected = [
-@@ -357,15 +338,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -357,15 +339,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
  
          # Compressed/index page tables use the same null-block convention.
          pages = torch.empty((1, width), device=device, dtype=torch.int32)
@@ -2498,7 +2506,7 @@ index ddb9ad232..ff97adb25 100644
          )
          expected_pages = list(range(1, width + 1))
          expected_pages[1] = -1
-@@ -378,8 +352,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -378,8 +353,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
          torch.testing.assert_close(candidate.backing, before, atol=0, rtol=0)
  
  
@@ -2670,10 +2678,10 @@ index 78b9519d5..71f5ea9be 100644
      config.attention_config.backend = AttentionBackendEnum.FLASH_ATTN
      with pytest.raises(ValueError, match=f"requires the {backend.name} attention"):
 diff --git a/tests/models/test_deepseek_v4_1_engram.py b/tests/models/test_deepseek_v4_1_engram.py
-index 1a39bf880..b81f4d527 100644
+index 1a39bf880..cc5a379b3 100644
 --- a/tests/models/test_deepseek_v4_1_engram.py
 +++ b/tests/models/test_deepseek_v4_1_engram.py
-@@ -38,7 +38,6 @@ from vllm.models.deepseek_v4_1.nvidia.vl_model import (
+@@ -38,11 +38,14 @@ from vllm.models.deepseek_v4_1.nvidia.vl_model import (
      DeepseekV41ForCausalLM,
      _make_deepseek_v4_vl_weights_mapper,
  )
@@ -2681,7 +2689,38 @@ index 1a39bf880..b81f4d527 100644
  from vllm.utils.b12x import B12xWorkload
  from vllm.v1.worker.gpu.model_states.default import DefaultModelState
  from vllm.v1.worker.workspace import collect_cuda_graph_capture_resources
-@@ -98,10 +97,6 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+ 
++# The smallest width the TileLang gate takes: a multiple of its 256 threads' 4-wide
++# vectors (the model's is 4096).
++HIDDEN = 1024
++
+ 
+ @pytest.fixture
+ def tiny_engram_checkpoint(tmp_path, dist_init):
+@@ -63,7 +66,7 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+         for layer_id in geometry.layer_ids
+     )
+     config = SimpleNamespace(
+-        hidden_size=64,
++        hidden_size=HIDDEN,
+         hc_mult=4,
+         rms_norm_eps=1e-6,
+         num_attention_heads=1,
+@@ -80,10 +83,10 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
+             .expand(geometry.num_embeddings[index], -1)
+             .contiguous()
+             .view(torch.float8_e8m0fnu),
+-            prefix + "q_weight": torch.full((4, 64), 0.5, dtype=torch.bfloat16),
+-            prefix + "k_weight": torch.full((4, 64), 0.25, dtype=torch.bfloat16),
++            prefix + "q_weight": torch.full((4, HIDDEN), 0.5, dtype=torch.bfloat16),
++            prefix + "k_weight": torch.full((4, HIDDEN), 0.25, dtype=torch.bfloat16),
+             prefix + "wkv.weight": torch.full(
+-                (320, 6144), (index + 1) / 8192, dtype=torch.bfloat16
++                (5 * HIDDEN, 6144), (index + 1) / 8192, dtype=torch.bfloat16
+             ),
+         }
+         path = tmp_path / f"layer-{index}.safetensors"
+@@ -98,10 +101,6 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
          )
          layout = SimpleNamespace(
              caps=local_caps,
@@ -2692,7 +2731,7 @@ index 1a39bf880..b81f4d527 100644
              lookup_plans=tuple(
                  None
                  if memory == "disk"
-@@ -204,11 +199,11 @@ def _prepare_engram(session, target):
+@@ -204,11 +203,11 @@ def _prepare_engram(session, target):
          max_seqs=2,
          max_model_len=8,
      )
@@ -2707,8 +2746,12 @@ index 1a39bf880..b81f4d527 100644
      ]
      requests = tuple(request for unit in units for request in unit.requests)
      result = session.prepare(requests, autotune=False)
-@@ -480,9 +475,9 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
-     hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
+@@ -477,12 +476,12 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+             )
+         ),
+     )
+-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
++    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
  
      def consume():
 -        mask = ~image_sentinel_mask(batch.input_ids)
@@ -2719,7 +2762,7 @@ index 1a39bf880..b81f4d527 100644
              for index, engram in enumerate(_engrams(target))
          )
  
-@@ -528,11 +523,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+@@ -528,11 +527,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
                  request, accepted - width : accepted
              ]
              hashes = resident.engram_hash(
@@ -2732,7 +2775,7 @@ index 1a39bf880..b81f4d527 100644
              )
              for index, engram in enumerate(_engrams(resident)):
                  engram.prepare_embeddings(hashes[:, index])
-@@ -540,9 +531,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
+@@ -540,9 +535,7 @@ def test_disk_engram_preparation_refreshes_graph_and_rejects_stale_rows(
              graph.replay()
              assert stats == _settled_reader_stats(target)
              for index, engram in enumerate(_engrams(resident)):
@@ -2743,7 +2786,16 @@ index 1a39bf880..b81f4d527 100644
                  torch.testing.assert_close(immediate[index], expected, rtol=0, atol=0)
                  torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
                  torch.testing.assert_close(
-@@ -671,9 +660,9 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+@@ -628,7 +621,7 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+         [prompt, [4, 129264, 6, 8, 10, 12]], dtype=torch.int32, device="cuda"
+     )
+     slots = {"a": 0, "b": 1}
+-    hidden = torch.ones(4, 4, 64, dtype=torch.bfloat16, device="cuda")
++    hidden = torch.ones(4, 4, HIDDEN, dtype=torch.bfloat16, device="cuda")
+     # (input ids, [(request, computed tokens, rows, prefilling)], early lookups)
+     steps = (
+         ([13, 17, 19, 31], [("a", 2, 3, True)], 4 * 24),
+@@ -671,9 +664,9 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
              )
              before = [s["early_lookups"] for s in _settled_reader_stats(target)]
              state.prepare_inputs(batch, req_states)
@@ -2755,7 +2807,7 @@ index 1a39bf880..b81f4d527 100644
                  for index, engram in enumerate(_engrams(target))
              )
              stats = _settled_reader_stats(target)
-@@ -690,15 +679,11 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
+@@ -690,15 +683,11 @@ def test_disk_engram_rows_the_host_hashed_equal_the_gpu_rows(
                      slots[name], done - width : done
                  ]
              hashes = resident.engram_hash(
@@ -2773,7 +2825,7 @@ index 1a39bf880..b81f4d527 100644
                  torch.testing.assert_close(actual[index], expected, rtol=0, atol=0)
      session.close()
      resident_session.close()
-@@ -817,7 +802,9 @@ def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(
+@@ -817,9 +806,11 @@ def test_ram_engram_budget_reserves_memory_and_survives_worker_serialization(
  
  @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
  @torch.inference_mode()
@@ -2782,9 +2834,12 @@ index 1a39bf880..b81f4d527 100644
 +    from vllm.models.deepseek_v4_1.tilelang.engram_hash import IMAGE_SENTINEL
 +
      device = torch.device("cuda", torch.cuda.current_device())
-     capacity, hidden, streams = 7, 64, 4
+-    capacity, hidden, streams = 7, 64, 4
++    capacity, hidden, streams = 7, HIDDEN, 4
      geometry = native.build_geometry(base_table_size=19, compressed_vocab_size=32)
-@@ -878,8 +865,14 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
+     caps = native.Caps(
+         device=device,
+@@ -878,8 +869,14 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
          device=device,
          dtype=torch.bfloat16,
      ).mul_(0.1)
@@ -2799,7 +2854,7 @@ index 1a39bf880..b81f4d527 100644
  
      def reference(rows, token_mask):
          source = residual[:rows].float()
-@@ -903,18 +896,20 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
+@@ -903,18 +900,20 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
          module.prepare_embeddings(ids)
          launch = torch.compile(module.forward, fullgraph=True)
          for rows in (1, capacity):
@@ -2824,7 +2879,7 @@ index 1a39bf880..b81f4d527 100644
                      actual.fill_(float("nan"))
                      graph.replay()
                      torch.cuda.synchronize(device)
-@@ -945,25 +940,21 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
+@@ -945,25 +944,21 @@ def test_engram_preparation_covers_masked_and_unmasked_graphs(dist_init):
  def test_engram_hash_first_forward_uses_declared_geometry(
      monkeypatch, num_layers, num_tokens
  ):

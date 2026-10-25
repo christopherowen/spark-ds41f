@@ -307,11 +307,11 @@ def test_metadata_refresh_preserves_padded_graph_domain_and_addresses():
         seq = torch.tensor([1024, 0], dtype=torch.int32, device=device)
         slots = torch.full((padded,), -1, dtype=torch.int64, device=device)
         slots[:live] = 1
+        starts = torch.tensor([0, live, live], dtype=torch.int32)
         common = SimpleNamespace(
             block_table_tensor=table,
-            query_start_loc=torch.tensor(
-                [0, live, live], dtype=torch.int32, device=device
-            ),
+            query_start_loc=starts.to(device),
+            query_start_loc_cpu=starts,
             seq_lens=seq,
             slot_mapping=slots,
             num_reqs=2,
