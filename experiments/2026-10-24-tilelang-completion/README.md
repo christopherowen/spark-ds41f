@@ -1717,3 +1717,16 @@ vLLM 8f4512c59 adds `--jit-monitor-mode off`, which installs no hooks, and 4deb7
 the Triton top-k/top-p warm-up. [jit-monitor-ab.json](jit-monitor-ab.json) measures the
 monitor alone, on the same build (4deb7d94b): [ports-nomon-tp4.json](ports-nomon-tp4.json)
 (off) against ports-tp4.json (warn), each twice, with outputs, controls, c1 and c8.
+
+## Compatibility change: at most 32 top logprobs
+
+The TileLang top-k logprobs kernel (`tilelang_topk_ids`) takes k up to 32. The ports
+build refuses to start with `--max-logprobs` above 32 or -1 (the whole vocabulary). Before
+the port, any k up to the vocabulary was served through `torch.topk`.
+
+The owner accepted this as a compatibility change (2026-10-25):
+- production runs the default `--max-logprobs` of 20;
+- the OpenAI API caps `top_logprobs` at 20;
+- a k > 32 path would never run in production.
+
+The release notes for the next release must state it.
