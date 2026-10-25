@@ -4,7 +4,9 @@ variants, compiled, bit-compared and timed against candidate 6's.
 
 - v1: 0503 as committed (the row index clamped into every load's position and page);
 - v2: v1 with a dense tile's page read once a tile;
-- v3: candidate 6's loads, guarded by the extent (rows past it skip the loads).
+- v3: candidate 6's loads, guarded by the extent (rows past it skip the loads);
+- v4: candidate 6's loads for whole tiles, v1's clamped loads only in the tile the
+  extent ends inside (a branch per tile, uniform across the CTA).
 
 For each: the generated CUDA of the dense score kernel (between markers), bits against
 candidate 6's in dense and candidate mode, and paired CUDA-graph timings (eight inputs,
@@ -20,6 +22,7 @@ import torch
 PACKAGE = "vllm.models.deepseek_v4_1.tilelang"
 DEVICE = "cuda"
 CALLS, INPUTS, T_95 = 20, 8, 2.365
+VARIANTS = ("v1", "v2", "v3", "v4")
 TIMED = [(6, 128, 524288, 4133), (6, 128, 524288, 524261), (96, 128, 524288, 524261),
          (96, 256, 1048576, 1048549)]
 BITS = [(6, 128, 524288, 4133), (96, 256, 1048576, 8229)]
@@ -98,7 +101,7 @@ def graph(score, args, out):
 
 def main():
     modules = {"release": load("release", "/b/baseline/indexer.py")}
-    for name in ("v1", "v2", "v3"):
+    for name in VARIANTS:
         modules[name] = load(name, f"/b/variants/{name}.py")
     for name, mod in modules.items():
         score, _ = plan(mod, 128, 524288)
@@ -106,7 +109,7 @@ def main():
         print(score.get_kernel_source())
         print(f"===== END CUDA {name}", flush=True)
     release = modules["release"]
-    for name in ("v1", "v2", "v3"):
+    for name in VARIANTS:
         mod = modules[name]
         for candidates in (False, True):
             for rows, page_size, width, extent in BITS:
