@@ -173,8 +173,14 @@ a decision only the owner can make.
 ## Thanks
 
 - msuiche, for GLP steering (#401), reworked into this release.
-- JordiPosthumus, for the prompt-cache report (#455), the sink scope (#489), the memory growth
-  behind the malloc pinning (#439) and the TP3 results on candidate 4.
+- JordiPosthumus, for:
+  - the prompt-cache report (#455);
+  - the sink scope (#489);
+  - the memory growth behind the malloc pinning (#439);
+  - the capture-size mismatch at other stream counts (#434);
+  - the containerd image IDs (#488, fixed by #492);
+  - the TP3 results on candidate 4, which shaped the triangle's 8,192 budget.
+- @rob01 (forum), for the four-node results on spark-ds41f-1022.
 - Acermax, for the `thinking` switch report (#447) and the control-token fix (#449).
 - DeepSeek, for 1017, the reference implementation and TileKernels.
 - Local Inference Lab, for the vLLM integration branch, B12X (still the checkpoint loader) and
