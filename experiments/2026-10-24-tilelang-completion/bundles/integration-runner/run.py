@@ -2,15 +2,22 @@
 """Run this bundle's steps in order; each step's exit status is printed, and the bundle
 fails if any step failed. Every step runs whatever came before it."""
 import json
+import os
 import subprocess
 import sys
 
 STEPS = json.load(open("/b/steps.json"))
 codes = []
-for label, argv, timeout in STEPS:
+for label, argv, timeout, *rest in STEPS:
     print(f"=== {label}", flush=True)
+    env = dict(os.environ)
+    for name, value in (rest[0] if rest else {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     try:
-        code = subprocess.run([sys.executable, *argv], timeout=timeout).returncode
+        code = subprocess.run([sys.executable, *argv], timeout=timeout, env=env).returncode
     except subprocess.TimeoutExpired:
         code = "timeout"
     print(f"=== {label}: exit {code}", flush=True)

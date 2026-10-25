@@ -9,13 +9,16 @@ from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import (
-    apply_top_k_top_p,
     flashinfer_sample,
     flashinfer_sampler_supported,
 )
-from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    get_num_sampled_and_rejected,
+    logits_rows,
+)
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample import tilelang_auxiliary
+from vllm.v1.worker.gpu.sample import tilelang_auxiliary, tilelang_topk_topp
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample, register_sampling_warmups
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -116,6 +119,12 @@ class Sampler:
         )
         for logits_stride in processed_logits_strides:
             register_min_p_warmup(logits_stride=logits_stride, vocab_size=vocab_size)
+        # Top-k / top-p over the processed logits, at up to every request's rows.
+        tilelang_topk_topp.register_top_k_top_p(
+            logits_strides=processed_logits_strides,
+            vocab_size=vocab_size,
+            max_rows=self.sampling_states.max_num_reqs * self.num_speculative_tokens,
+        )
         register_sampling_warmups(
             logits=(*logits, *processed),
             processed_logits_strides=processed_logits_strides,
@@ -176,7 +185,7 @@ class Sampler:
         idx_mapping_np = input_batch.idx_mapping_np
         cu_num_logits_np = input_batch.cu_num_logits_np
         expanded_local_pos = input_batch.expanded_local_pos
-        input_ids, pos = input_batch.logits_rows()
+        input_ids, pos = logits_rows(input_batch)
 
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -403,7 +412,9 @@ class Sampler:
         if use_flashinfer:
             sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
         else:
-            processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
+            processed_logits = tilelang_topk_topp.apply_top_k_top_p(
+                processed_logits, top_k, top_p
+            )
             sampled = gumbel_sample(
                 processed_logits,
                 expanded_idx_mapping,

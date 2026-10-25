@@ -81,7 +81,7 @@ def torch_flags(columns, logits_indices, cu, num_reqs, dead_cut):
 def torch_cut(logits, flags, drafts, cu, num_reqs):
     num_logits, num_cols = logits.shape
     starts = torch.zeros(num_logits + 1, dtype=torch.bool, device=DEVICE)
-    starts[cu[:num_reqs].long()] = True
+    starts.index_fill_(0, cu[:num_reqs].long(), True)
     cols = drafts[1:num_logits].long()
     cut = flags[1:num_logits].bool() & ~starts[1:num_logits] & (cols >= 0)
     cut &= cols < num_cols

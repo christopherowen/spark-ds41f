@@ -480,7 +480,6 @@ def post_streams(hidden_size: int, threads: int = 128):
 _COLLAPSE_RESERVE = 24 * 1024
 
 
-@tilelang.jit(pass_configs=_PASS_CONFIGS)
 @T.macro
 def _collapse_rows(state, mix, out, sv, token, col, tx, reserve):
     """One thread's ``VEC`` columns of a token: the streams' weighted sum, as
@@ -504,6 +503,7 @@ def _collapse_rows(state, mix, out, sv, token, col, tx, reserve):
         out[token, col + v] = ov[v]
 
 
+@tilelang.jit(pass_configs=_PASS_CONFIGS)
 def collapse_streams(hidden_size: int, threads: int = 128, column: int = -1):
     """The streams' weighted sum, TileKernels' ``mhc_pre_apply_mix_fwd`` to the bit:
     ``out = bf16(sum_m mix[m] * state[m])``.

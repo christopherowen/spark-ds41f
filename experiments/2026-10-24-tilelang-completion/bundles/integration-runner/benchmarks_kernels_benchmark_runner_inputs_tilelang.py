@@ -357,13 +357,18 @@ def case_expand_idx_mapping(gen, num_reqs, prefill, widths):
 
 
 def case_adaptive_offsets(gen, num_reqs, prefill, widths):
-    """Adaptive verification's offsets: before the port, five torch launches
-    (two zeroes, two adds and cumsums, the tail fill)."""
+    """Adaptive verification's offsets and expanded logits rows: before the port,
+    five torch launches (two zeroes, two adds and cumsums, the tail fill) and the
+    Triton expand_idx_mapping launch."""
     reqs = 1 if prefill else num_reqs
     capacities = _randint(0, ROWS, (MAX_REQS,), gen)[:reqs]
     non_draft = _randint(1, 2, (MAX_REQS,), gen)[:reqs]
+    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
     cu = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
     starts = torch.empty(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
+    num_logits = reqs + int(capacities.sum())
+    expanded = torch.empty(num_logits, dtype=torch.int64, device=DEVICE)
+    local = torch.empty(num_logits, dtype=torch.int32, device=DEVICE)
     tokens = reqs * ROWS
 
     def torch_call():
@@ -372,9 +377,40 @@ def case_adaptive_offsets(gen, num_reqs, prefill, widths):
         starts[:1].zero_()
         torch.cumsum(capacities + non_draft, dim=0, out=starts[1 : reqs + 1])
         starts[reqs + 1 :].fill_(tokens)
+        ib._expand_idx_mapping_kernel[(reqs,)](
+            idx, expanded, local, cu, BLOCK_SIZE=triton.next_power_of_2(ROWS)
+        )
 
     def tilelang_call():
-        tli.adaptive_offsets(capacities, non_draft, cu, starts, 1, tokens, True)
+        tli.adaptive_offsets(
+            capacities, non_draft, cu, starts, idx, num_logits, ROWS, 1, tokens, True
+        )
+
+    return torch_call, tilelang_call
+
+
+def case_assign_draft_budget(gen, num_reqs, prefill, widths):
+    """Adaptive verification's draft budget at half the scheduled drafts: before
+    the port, about thirteen torch launches (the gather, cumprod, mask, topk,
+    index_fill and sum)."""
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+        _assign_draft_token_budget,
+    )
+
+    reqs = 1 if prefill else num_reqs
+    probs = torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE)
+    idx = torch.randperm(MAX_REQS, generator=gen, device=DEVICE)[:reqs]
+    scheduled = torch.full((reqs,), DRAFTS, dtype=torch.int32, device=DEVICE)
+    capacities = scheduled.clone()
+    budget = max(1, reqs * DRAFTS // 2)
+
+    def torch_call():
+        capacities.copy_(scheduled)
+        _assign_draft_token_budget(probs, idx, capacities, budget, DRAFTS)
+
+    def tilelang_call():
+        capacities.copy_(scheduled)
+        tli.assign_draft_budget(probs, idx, capacities, budget, DRAFTS)
 
     return torch_call, tilelang_call
 
@@ -533,6 +569,7 @@ CASES = {
     "combine_sampled_and_draft_tokens (dead rows)": case_combine_dead_rows,
     "expand_idx_mapping": case_expand_idx_mapping,
     "adaptive_offsets": case_adaptive_offsets,
+    "assign_draft_budget": case_assign_draft_budget,
     "dspark_context": case_dspark_context,
     "post_update": case_post_update,
     "prepare_dflash_inputs": case_prepare_dflash_inputs,

@@ -94,7 +94,6 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
-from vllm.v1.sample.ops.topk_topp_sampler import register_top_k_top_p_warmups
 from vllm.v1.sample.sink import SinkConfig, SinkOutcome
 from vllm.v1.watermarking import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
@@ -155,6 +154,7 @@ from vllm.v1.worker.gpu.input_batch import (
     declare_input_batch_kernels,
     expand_idx_mapping,
     get_num_sampled_and_rejected,
+    logits_rows,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -551,10 +551,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Initialize samplers. Model states may override via custom_sampler().
         if self.is_last_pp_rank and not self.is_pooling_model:
-            # Seeded and processed-logprob requests use native filtering even
-            # when unseeded warmup requests select FlashInfer sampling.
-            with self.jit_warmup_registry.activate():
-                register_top_k_top_p_warmups()
+            # Top-k / top-p filtering is TileLang's (Sampler.register_warmups).
             sampler_kwargs: dict[str, Any] = {
                 "max_num_reqs": self.max_num_reqs,
                 "vocab_size": self.vocab_size,
@@ -1756,11 +1753,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         query_start_loc = self.input_buffers.query_start_loc
         async_tensor_h2d(query_start_loc_np, out=query_start_loc)
         if adaptive_verification is not None:
-            cu_num_logits, query_start_loc, total_num_draft_tokens = (
-                adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
-            )
+            (
+                cu_num_logits,
+                query_start_loc,
+                total_num_draft_tokens,
+                expanded_idx_mapping,
+                expanded_local_pos,
+            ) = adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
-        if draft_tokens:
+        elif draft_tokens:
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                 idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
             )
@@ -2137,8 +2138,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The target's padding rows (prepare_inputs).
             tilelang_inputs.declare(tilelang_inputs.padding_rows_calls)
         if self.adaptive_verification is not None:
+            steps = self.num_speculative_steps
+            width = steps + self.model_state.num_new_sampled_tokens_per_step
             tilelang_inputs.declare(
-                lambda: tilelang_inputs.adaptive_offsets_calls()
+                lambda: tilelang_inputs.adaptive_offsets_calls(width)
+                + tilelang_inputs.assign_draft_budget_calls(steps)
                 + tilelang_inputs.scatter_rows_calls(
                     torch.int64, torch.float32, gather=False
                 )
@@ -2344,7 +2348,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         shard = self._language_model().lm_head.shard_indices
         tp_size = get_tensor_model_parallel_world_size()
         local_logits = self.model.compute_logits_local(sample_hidden_states)
-        drafts = input_batch.logits_rows()[0]
+        drafts = logits_rows(input_batch)[0]
         rejection = self.sink is not None and self.sink.rejection
         if rejection:
             assert self.sink is not None and sink_flags is not None
@@ -2553,7 +2557,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self._sink_decoding[:num_reqs],
             sink_flags,
-            input_batch.logits_rows()[0],
+            logits_rows(input_batch)[0],
             sampler_output.sink_alternates,
             self.req_states.total_len.gpu,
             self.sampler.penalties_state.output_bin_counts,

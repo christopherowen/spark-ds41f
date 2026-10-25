@@ -671,6 +671,31 @@ def test_logits_rows(num_logits, index_dtype):
     assert torch.equal(pos, positions[indices])
 
 
+@pytest.mark.parametrize("num_reqs", REQUEST_COUNTS[1:])
+@pytest.mark.parametrize("tail", [0, 5])
+def test_flatten_sampled(num_reqs, tail):
+    """The verified tokens at their logits rows, against the Triton kernel and
+    the zeros it wrote into: requests with 1 to 1 + 5 rows, any number of them
+    sampled, rows past the last request (``tail``) zero."""
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+        _flatten_sampled_kernel,
+    )
+
+    gen = _gen(num_reqs * 3 + tail)
+    rows = _randint(1, DRAFTS + 2, (num_reqs,), gen)
+    cu = _starts(rows.tolist())
+    num_sampled = torch.minimum(_randint(0, DRAFTS + 2, (num_reqs,), gen), rows)
+    sampled = _randint(0, 1 << 17, (num_reqs + 2, DRAFTS + 3), gen, torch.int64)
+    num_logits = int(cu[-1]) + tail
+    expected = torch.zeros(num_logits, dtype=torch.int64, device=DEVICE)
+    _flatten_sampled_kernel[(num_reqs,)](
+        expected, sampled, sampled.stride(0), num_sampled, cu, num_warps=1
+    )
+    actual = tli.flatten_sampled(sampled, num_sampled, cu, num_logits)
+    torch.accelerator.synchronize()
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     "live,rows", [(0, 0), (0, 8), (6, 8), (96, 96), (90, 128), (16000, MAX_TOKENS)]
 )
@@ -734,34 +759,80 @@ def _adaptive_offsets_ref(capacities, non_draft, cu, starts, bonus, tokens, draf
 @pytest.mark.parametrize("drafted", [True, False])
 def test_adaptive_offsets(num_reqs, drafted):
     """reallocate_drafts' offsets: both prefix sums, query_start_loc's tail and, on a
-    step without drafts, the zeroed capacities, in buffers longer than the batch."""
+    step without drafts, the zeroed capacities, in buffers longer than the batch;
+    and the expanded state indices and positions of the logits rows, against
+    the Triton expand_idx_mapping launch that followed the torch chain."""
     gen = _gen(num_reqs + 17)
     size = num_reqs + 7
+    width = DRAFTS + 1
     capacities = _randint(0, DRAFTS + 1, (size,), gen)
     non_draft = _randint(0, MAX_TOKENS, (size,), gen)
     cu = _garbage((size + 1,), torch.int32, gen)
     starts = _garbage((size + 1,), torch.int32, gen)
+    idx = torch.randperm(size, generator=gen, device=DEVICE)[:num_reqs]
     bonus, tokens = 1, int(_randint(0, 1 << 20, (1,), gen))
+    num_logits = num_reqs * bonus + (int(capacities[:num_reqs].sum()) if drafted else 0)
     results = []
     for kind in ("ref", "ours"):
         buffers = [capacities.clone(), cu.clone(), starts.clone()]
-        args = (
-            buffers[0][:num_reqs],
-            non_draft[:num_reqs],
-            buffers[1],
-            buffers[2],
-            bonus,
-            tokens,
-            drafted,
-        )
+        args = (buffers[0][:num_reqs], non_draft[:num_reqs], buffers[1], buffers[2])
         if kind == "ref":
-            _adaptive_offsets_ref(*args)
+            _adaptive_offsets_ref(*args, bonus, tokens, drafted)
+            expanded = _garbage((num_logits,), torch.int64, _gen(5))
+            local = _garbage((num_logits,), torch.int32, _gen(6))
+            ib._expand_idx_mapping_kernel[(num_reqs,)](
+                idx,
+                expanded,
+                local,
+                buffers[1],
+                BLOCK_SIZE=triton.next_power_of_2(width),
+            )
         else:
-            tli.adaptive_offsets(*args)
-        results.append(buffers)
+            expanded, local = tli.adaptive_offsets(
+                *args, idx, num_logits, width, bonus, tokens, drafted
+            )
+        results.append((*buffers, expanded, local))
     torch.accelerator.synchronize()
     for r, o in zip(*results):
         assert torch.equal(r, o)
+
+
+def _budget_case(num_reqs, gen, steps=DRAFTS):
+    """Confidences with exact ties, ones, zeros and a NaN, and scheduled counts
+    from none to every step."""
+    probs = torch.rand(MAX_REQS * 2, steps, generator=gen, device=DEVICE) ** 0.25
+    probs[0, :] = 1.0
+    probs[1 % (MAX_REQS * 2), 2] = 0.0
+    probs[2, :2] = probs[3, :2]  # survivals equal across requests
+    probs[5, 1] = float("nan")
+    idx = torch.randperm(MAX_REQS * 2, generator=gen, device=DEVICE)[:num_reqs]
+    capacities = _randint(0, steps + 1, (num_reqs,), gen)
+    return probs, idx, capacities
+
+
+@pytest.mark.parametrize("num_reqs", [1, 2, 3, 7, 16, 32])
+@pytest.mark.parametrize("fraction", [0.1, 0.5, 0.9])
+def test_assign_draft_budget(num_reqs, fraction):
+    """The draft budget against the torch chain it replaces, bit for bit: the
+    survival products in cumprod's order (CUB's sequential scan for one request,
+    the Sklansky scan for several), torch.topk's ranking (ties to the lower slot,
+    NaN first) and each request's admitted count."""
+    from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+        _assign_draft_token_budget,
+    )
+
+    gen = _gen(num_reqs * 13 + int(fraction * 10))
+    probs, idx, capacities = _budget_case(num_reqs, gen)
+    scheduled = int(capacities.sum())
+    budget = max(1, min(scheduled - 1, int(scheduled * fraction)))
+    if scheduled <= 1:
+        pytest.skip("no budget below the scheduled drafts")
+    expected, actual = capacities.clone(), capacities.clone()
+    _assign_draft_token_budget(probs, idx, expected, budget, DRAFTS)
+    tli.assign_draft_budget(probs, idx, actual, budget, DRAFTS)
+    torch.accelerator.synchronize()
+    assert torch.equal(actual, expected)
+    assert int(actual.sum()) == budget
 
 
 def _post_update_case(num_reqs, width, gen, vocab=64):
@@ -1103,7 +1174,23 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
     capacities = _randint(0, DRAFTS + 1, (4,), gen)
     starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=DEVICE)
     tli.adaptive_offsets(
-        capacities, _randint(1, 2, (4,), gen), starts.clone(), starts, 1, 24, True
+        capacities,
+        _randint(1, 2, (4,), gen),
+        starts.clone(),
+        starts,
+        idx,
+        4 + int(capacities.sum()),
+        DRAFTS + 1,
+        1,
+        24,
+        True,
+    )
+    tli.assign_draft_budget(
+        torch.rand(MAX_REQS, DRAFTS, generator=gen, device=DEVICE),
+        idx,
+        torch.full((4,), DRAFTS, dtype=torch.int32, device=DEVICE),
+        7,
+        DRAFTS,
     )
     tli.padding_rows(torch.zeros(32, dtype=torch.bool, device=DEVICE), 24, 32)
     ids = _randint(0, 1 << 17, (64,), gen)
@@ -1111,10 +1198,16 @@ def test_step_glue_declarations_cover_their_launches(monkeypatch):
     for index_dtype in (torch.int64, torch.int32):
         tli.logits_rows(ids, positions, _randint(0, 64, (24,), gen, index_dtype))
     torch.accelerator.synchronize()
+    tli.flatten_sampled(
+        drafts[:4], _randint(0, DRAFTS, (4,), gen), _starts([3, 2, 6, 1]), 12
+    )
+    torch.accelerator.synchronize()
     declared = (
-        tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
+        tli.flatten_sampled_calls()
+        + tli.scatter_rows_calls(torch.int64, torch.int64, gather=True)
         + tli.scatter_rows_calls(torch.int64, torch.float32, gather=False)
-        + tli.adaptive_offsets_calls()
+        + tli.adaptive_offsets_calls(DRAFTS + 1)
+        + tli.assign_draft_budget_calls(DRAFTS)
         + tli.padding_rows_calls()
         + tli.logits_rows_calls(torch.int64)
         + tli.logits_rows_calls(torch.int32)

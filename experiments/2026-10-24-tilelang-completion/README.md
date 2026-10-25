@@ -1350,3 +1350,64 @@ New steps:
 - dgx3: the router tests and the CED and sequence-parallel model-forward tests.
 
 The runner benchmark gains the offsets and DSpark context cases.
+
+### Seventeenth integrated run (2026-10-25 01:59 CET)
+
+All four bundles failed within two minutes. None of the failures was a kernel result.
+- **dgx3, mHC:** `mhc.py` did not import. The sink-column split (5998c7916) left
+  `tilelang.jit` on the new `_collapse_rows` macro instead of `collapse_streams`.
+- **dgx1/dgx4, sink tests:** two separate problems.
+  - The sink tests drive the samplers with `SimpleNamespace` batches, which lack the new
+    `InputBatch.logits_rows()`.
+  - The greedy shard alternates differed from the full-logits path. `sink_merge` read a
+    packed row's `2k` columns as candidates; a packed row holds only `k` (values, then
+    indices).
+- **dgx1, sink scheduler tests (`test_sink_draft_zero.py`):** an environment problem, not
+  a regression. The bundle sets `VLLM_DS41_KERNEL_BACKEND=tilelang`, which turns on the
+  scheduler's aligned prefill chunks, and these host-only tests build a scheduler without
+  `long_prefill_token_threshold`.
+- **dgx2, rejection sampler:** the port's bit-exactness tests and its benchmark gate
+  passed. Four declaration tests failed because they put TileLang JIT functions, which
+  are not hashable, in sets.
+- **dgx4, sampling benchmark:** `select_first_argmax` at 96 rows was 0.05 µs slower than
+  Triton. The 16-byte pairs had made the pair width a runtime argument.
+- **dgx4, sink glue benchmark:** the torch cut reference set its start flags with a CPU
+  scalar, which graph capture refuses.
+- **dgx1, runner benchmark:** `expand_idx_mapping` was still 0.03–0.05 µs slower than
+  Triton. Every other kernel was level or faster. The new kernels measured:
+
+  | Kernel | c1 | c16 | 16K prefill |
+  |---|---|---|---|
+  | adaptive offsets: TileLang / torch, µs | 1.84 / 11.77 | 1.80 / 10.52 | 1.81 / 11.45 |
+  | DSpark context inputs: TileLang / torch, µs | 1.56 / 9.71 | 4.63 / 10.19 | 4.61 / 13.32 |
+
+## Eighteenth integrated run (run `tilelang-integration-kernels-18`)
+
+vLLM `tilelang-ports` 914a15e80. It fixes run 17's failures:
+- 0c5a5b58b: the collapse decorator, the packed merge's candidates, and `logits_rows(batch)`
+  for any batch-like object;
+- 6b4df4ef7: the declaration tests key calls by function identity;
+- 2f6fe9f18: the pair width is the selection's compile-time key, so the Triton-layout
+  kernel is unchanged; the cut reference is graph-safe.
+
+It also adds:
+- **`expand_idx_mapping` folded into the adaptive offsets kernel** (ce3ade860). With
+  adaptive verification, production launches no expand kernel at all.
+- **The draft budget in TileLang** (ce3ade860). It replaces about thirteen torch kernels
+  a step whenever the budget trims drafts. It is bit for bit with the torch chain:
+  - cumprod's order: CUB's sequential scan for one request, the Sklansky scan for
+    several;
+  - torch.topk's radix ranking: NaN first, ties to the lower slot.
+- **The verified tokens' logits rows** (2a1fef46f): Triton's flatten kernel and its zeros
+  become one TileLang launch.
+- **The CED decoder's token metadata** (293cb7cf1): ten torch launches a build become one.
+- **Top-k and top-p filtering in TileLang** (914a15e80). The four Triton kernels (the
+  monolithic one and the split top-p pipeline) each become a TileLang kernel that is its
+  contract bit for bit, read from Triton 3.7's PTX.
+
+Bundle changes:
+- The sink scheduler tests run in their own step, with `VLLM_DS41_KERNEL_BACKEND` unset.
+  A step can now set its own environment.
+- dgx4 gains the top-k/top-p tests and their benchmark gate.
+- The runner benchmark gains the draft budget case. Its offsets case now includes the
+  Triton expand launch it replaces.

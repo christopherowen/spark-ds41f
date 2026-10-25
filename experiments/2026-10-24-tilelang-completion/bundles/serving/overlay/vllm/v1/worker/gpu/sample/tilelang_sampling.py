@@ -965,6 +965,8 @@ def sink_merge_kernel(packed: bool, k: int, num_alternates: int):
         "index_rows, index_width, index_stride"
     )
     threads = _SINK_MERGE_THREADS
+    # A packed row holds each rank's k values, then its k indices.
+    candidates = width // 2 if packed else width
 
     @T.prim_func
     def sink_merge(
@@ -993,9 +995,9 @@ def sink_merge_kernel(packed: bool, k: int, num_alternates: int):
             for rank in T.unroll(num_alternates):
                 best[0] = -T.infinity(T.float32)
                 best_index[0] = _NO_INDEX
-                for step in T.serial(T.ceildiv(width, threads)):
+                for step in T.serial(T.ceildiv(candidates, threads)):
                     j = step * threads + tx
-                    if j < width:
+                    if j < candidates:
                         if packed:
                             value = values[req, (j // k) * 2 * k + j % k]
                             index = T.cast(
@@ -1897,7 +1899,9 @@ def _embed_row(table, token, step_out, confidence_out, row, tx, per_lane, table_
 
 
 @tilelang.jit(pass_configs=_PASS)
-def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int = 0):
+def select_first_argmax_kernel(
+    output_dtype: str, ranks: int, embed_width: int = 0, pair_width: int = 2
+):
     """``dspark.greedy._select_first_argmax``: the first maximum's global index
     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
     ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
@@ -1923,7 +1927,6 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int =
             pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
             out: T.Tensor((out_len,), output_dtype),
             out_stride: T.int64,
-            pair_width: T.int32,
         ):
             with T.Kernel(rows, threads=32) as row:
                 T.import_source(_HEADER)
@@ -1954,7 +1957,6 @@ def select_first_argmax_kernel(output_dtype: str, ranks: int, embed_width: int =
         pairs: T.StridedTensor((rows, width), (pairs_stride, 1), T.float32),
         out: T.Tensor((out_len,), output_dtype),
         out_stride: T.int64,
-        pair_width: T.int32,
         table: T.Tensor((table_rows, embed_width), T.bfloat16),
         step_out: T.StridedTensor((rows, embed_width), (step_stride, 1), T.bfloat16),
         confidence_out: T.StridedTensor(
@@ -2178,22 +2180,29 @@ def select_first_argmax(
         return
     ranks = pairs.shape[1] // pair_width
     if embed is None:
-        kernel = _kernel(select_first_argmax_kernel, _DTYPES[output.dtype], ranks)
-        kernel(pairs, _flat(output), output.stride(0), pair_width)
+        kernel = _kernel(
+            select_first_argmax_kernel,
+            *select_first_argmax_key(output, ranks, 0, pair_width),
+        )
+        kernel(pairs, _flat(output), output.stride(0))
         return
     table, step_out, confidence_out = embed
     kernel = _kernel(
-        select_first_argmax_kernel, _DTYPES[output.dtype], ranks, table.shape[1]
+        select_first_argmax_kernel,
+        *select_first_argmax_key(output, ranks, table.shape[1], pair_width),
     )
-    kernel(
-        pairs,
-        _flat(output),
-        output.stride(0),
-        pair_width,
-        table,
-        step_out,
-        confidence_out,
-    )
+    kernel(pairs, _flat(output), output.stride(0), table, step_out, confidence_out)
+
+
+def select_first_argmax_key(
+    output: torch.Tensor | torch.dtype, ranks: int, embed_width: int, pair_width: int
+) -> tuple:
+    """``select_first_argmax_kernel``'s key: the width-2 pairs (Triton's layout)
+    keep the original kernel's key."""
+    dtype = _DTYPES[output if isinstance(output, torch.dtype) else output.dtype]
+    if pair_width == 2:
+        return (dtype, ranks, embed_width) if embed_width else (dtype, ranks)
+    return (dtype, ranks, embed_width, pair_width)
 
 
 def markov_anchor_embed(
@@ -2231,7 +2240,10 @@ def markov_embed_calls(
             _DTYPES[index_dtype],
             embed_width,
         ),
-        _call(select_first_argmax_kernel, _DTYPES[output_dtype], ranks, embed_width),
+        _call(
+            select_first_argmax_kernel,
+            *select_first_argmax_key(output_dtype, ranks, embed_width, 4),
+        ),
     ]
 
 
@@ -2563,7 +2575,7 @@ def greedy_calls(
     *,
     markov: Sequence[tuple[torch.dtype, torch.dtype]] = (),
     logits: Sequence[torch.dtype] = (),
-    select: Sequence[tuple[torch.dtype, int]] = (),
+    select: Sequence[tuple[torch.dtype, int, int]] = (),
     finish_outputs: Sequence[torch.dtype] = (),
     rejection_widths: Sequence[int] = (),
 ) -> list:
@@ -2572,8 +2584,9 @@ def greedy_calls(
     ``greedy_shard_pair`` for each logits dtype (both the 16-byte and the
     element-wise reads, which the launch picks from the rows' alignment); the
     pair finish when there is a pair, ``select_first_argmax`` for each
-    ``(output dtype, ranks)``, ``sample_greedy_markov``'s index finish for each of
-    ``finish_outputs``, and greedy verification for each sampled width."""
+    ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
+    for each of ``finish_outputs``, and greedy verification for each sampled
+    width."""
     calls = [
         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
         for base, bias in markov
@@ -2592,8 +2605,10 @@ def greedy_calls(
         for lanes in _FINISH_LANES
     ]
     calls += [
-        _call(select_first_argmax_kernel, _DTYPES[dtype], ranks)
-        for dtype, ranks in select
+        _call(
+            select_first_argmax_kernel, *select_first_argmax_key(dtype, ranks, 0, width)
+        )
+        for dtype, ranks, width in select
     ]
     calls += [
         _call(greedy_rejection_kernel, width, _DTYPES[dtype])

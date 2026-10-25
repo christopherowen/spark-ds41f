@@ -61,6 +61,8 @@ def resolve_adaptive_cudagraph_mode(
     return CUDAGraphMode.FULL_AND_PIECEWISE
 
 
+# The reference ``tilelang_inputs.assign_draft_budget`` is tested against; the
+# manager no longer launches it.
 def _assign_draft_token_budget(
     confidence_probs: torch.Tensor,
     idx_mapping: torch.Tensor,
@@ -200,7 +202,7 @@ class AdaptiveVerificationManager:
                 device=device,
             )
             idx_mapping = torch.arange(num_reqs, dtype=torch.int64, device=device)
-            _assign_draft_token_budget(
+            tilelang_inputs.assign_draft_budget(
                 probs, idx_mapping, capacities, draft_budget, steps
             )
         torch.cuda.synchronize(device)
@@ -387,7 +389,10 @@ class AdaptiveVerificationManager:
 
     def reallocate_drafts(
         self, req_ids: list[str], idx_mapping: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, int, torch.Tensor, torch.Tensor]:
+        """The step's logits offsets, query starts and draft budget, and its
+        expanded state indices and positions (``expand_idx_mapping``'s), all
+        from the admitted drafts."""
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
@@ -411,7 +416,7 @@ class AdaptiveVerificationManager:
         if draft_budget:
             async_tensor_h2d(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
-                _assign_draft_token_budget(
+                tilelang_inputs.assign_draft_budget(
                     self._confidence_probs,
                     idx_mapping,
                     capacities,
@@ -421,13 +426,16 @@ class AdaptiveVerificationManager:
 
         num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
         async_tensor_h2d(num_non_draft_tokens, out=num_non_draft_tokens_gpu)
-        # Both prefix sums and query_start_loc's tail in one kernel, which zeroes
-        # capacities on a step without drafts.
-        tilelang_inputs.adaptive_offsets(
+        # Both prefix sums, query_start_loc's tail and the expanded logits rows in
+        # one kernel, which zeroes capacities on a step without drafts.
+        expanded_idx_mapping, expanded_local_pos = tilelang_inputs.adaptive_offsets(
             capacities,
             num_non_draft_tokens_gpu,
             self._cu_num_logits,
             self.query_start_loc,
+            idx_mapping,
+            num_reqs * self.num_bonus_tokens + draft_budget,
+            self.num_speculative_steps + self.num_bonus_tokens,
             self.num_bonus_tokens,
             num_tokens,
             drafted=draft_budget > 0,
@@ -436,6 +444,8 @@ class AdaptiveVerificationManager:
             self._cu_num_logits[: num_reqs + 1],
             self.query_start_loc,
             draft_budget,
+            expanded_idx_mapping,
+            expanded_local_pos,
         )
 
 

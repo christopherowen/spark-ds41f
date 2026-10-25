@@ -166,13 +166,16 @@ def register_select_first_argmax_warmup(
     output_dtype: torch.dtype,
     output_stride: int,
     output_aligned: bool,
+    pair_width: int = 4,
 ) -> None:
-    """Declare ``select_first_argmax`` for an output column of
-    ``output_dtype``."""
+    """Declare ``select_first_argmax`` for an output column of ``output_dtype``
+    over pairs of ``pair_width`` columns (the runner's 16-byte rows)."""
     from vllm.v1.worker.gpu.sample import tilelang_sampling
 
     tilelang_sampling.declare(
-        lambda: tilelang_sampling.greedy_calls(select=[(output_dtype, ranks)])
+        lambda: tilelang_sampling.greedy_calls(
+            select=[(output_dtype, ranks, pair_width)]
+        )
     )
 
 

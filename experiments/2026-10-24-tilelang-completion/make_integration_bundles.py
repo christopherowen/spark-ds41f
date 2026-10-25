@@ -26,7 +26,8 @@ IMAGE = "spark-ds41f:19f2c20ed4d6-next-4"
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
           "-p", "prepare_fixtures"]
 
-# name: (description, [(label, argv after python, timeout seconds)])
+# name: (description, [(label, argv after python, timeout seconds[, env])]): env sets
+# a step's environment variables over the bundle's (None unsets one).
 PARTS = {
     "runner": (
         "the V2 runner's input preparation and token counts",
@@ -41,12 +42,18 @@ PARTS = {
                 "tests/v1/worker/test_gpu_sink.py",
                 "tests/v1/spec_decode/test_dflash_prepare_inputs.py",
                 "tests/v1/worker/test_prepare_kernels.py",
-                # Prompt logprobs under sink rejection (0266, experiments/2026-10-24-prompt-logprobs-sink).
-                "tests/v1/core/test_sink_draft_zero.py",
                 # The grammar bitmask in TileLang (structured output).
                 "tests/v1/worker/test_gpu_tilelang_structured.py",
                 # Captured outputs written in place (vLLM ed9dae5ae).
                 "tests/v1/worker/test_graph_output_buffers.py"], 3600),
+            # Prompt logprobs under sink rejection (0266,
+            # experiments/2026-10-24-prompt-logprobs-sink): scheduler tests, run without
+            # the TileLang backend, whose aligned prefill chunks their test scheduler
+            # (no long_prefill_token_threshold) does not configure.
+            ("sink scheduler tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-sink-scheduler",
+                "tests/v1/core/test_sink_draft_zero.py"], 1800,
+             {"VLLM_DS41_KERNEL_BACKEND": None}),
             ("runner benchmark", ["benchmarks/kernels/benchmark_runner_inputs_tilelang.py",
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",
@@ -85,6 +92,12 @@ PARTS = {
             # bitmask, against the torch chains and the Triton kernel they replace.
             ("sink glue and grammar bitmask benchmark",
              ["benchmarks/kernels/benchmark_sink_glue.py", "--gate"], 1800),
+            # Top-k / top-p filtering in TileLang (vLLM 914a15e80).
+            ("top-k/top-p tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-topk-topp",
+                "tests/v1/worker/test_gpu_tilelang_topk_topp.py"], 5400),
+            ("top-k/top-p benchmark",
+             ["benchmarks/kernels/benchmark_tilelang_topk_topp.py", "--gate"], 3600),
         ],
     ),
     "mhc": (
@@ -148,15 +161,22 @@ RUN = '''#!/usr/bin/env python3
 """Run this bundle's steps in order; each step's exit status is printed, and the bundle
 fails if any step failed. Every step runs whatever came before it."""
 import json
+import os
 import subprocess
 import sys
 
 STEPS = json.load(open("/b/steps.json"))
 codes = []
-for label, argv, timeout in STEPS:
+for label, argv, timeout, *rest in STEPS:
     print(f"=== {label}", flush=True)
+    env = dict(os.environ)
+    for name, value in (rest[0] if rest else {}).items():
+        if value is None:
+            env.pop(name, None)
+        else:
+            env[name] = value
     try:
-        code = subprocess.run([sys.executable, *argv], timeout=timeout).returncode
+        code = subprocess.run([sys.executable, *argv], timeout=timeout, env=env).returncode
     except subprocess.TimeoutExpired:
         code = "timeout"
     print(f"=== {label}: exit {code}", flush=True)

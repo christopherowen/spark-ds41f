@@ -664,6 +664,70 @@ def padding_rows_calls() -> list:
     return [_call(padding_rows_kernel)]
 
 
+# --- Verified tokens, one a logits row ----------------------------------------------
+
+_FLATTEN_THREADS = 128
+
+
+@tilelang.jit(pass_configs=_PASS)
+def flatten_sampled_kernel():
+    """``rejection_sampler._flatten_sampled_kernel`` and the zeros it wrote into:
+    logits row ``cu_num_logits[r] + i`` takes request ``r``'s ``i``-th sampled
+    token while ``i < num_sampled[r]``, every other row 0. A thread a row, its
+    request found by a search over the request starts."""
+    num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride = T.dynamic(
+        "num_logits, num_reqs, cu_len, sampled_rows, width, sampled_stride"
+    )
+
+    @T.prim_func
+    def flatten_sampled(
+        flat: T.Tensor((num_logits,), T.int64),
+        sampled: T.StridedTensor((sampled_rows, width), (sampled_stride, 1), T.int64),
+        num_sampled: T.Tensor((num_reqs,), T.int32),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+    ):
+        with T.Kernel(
+            T.ceildiv(num_logits, _FLATTEN_THREADS), threads=_FLATTEN_THREADS
+        ) as b:
+            row = b * _FLATTEN_THREADS + T.get_thread_binding()
+            req = T.alloc_var(T.int32, init=-1)
+            for r in T.serial(num_reqs):
+                if (cu_num_logits[r] <= row) & (row < cu_num_logits[r + 1]):
+                    req = r
+            if row < num_logits:
+                if req >= 0:
+                    i = row - cu_num_logits[req]
+                    flat[row] = T.if_then_else(
+                        i < num_sampled[req],
+                        sampled[req, T.min(i, width - 1)],
+                        T.int64(0),
+                    )
+                else:
+                    flat[row] = T.int64(0)
+
+    return flatten_sampled
+
+
+def flatten_sampled(
+    sampled: torch.Tensor,
+    num_sampled: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_logits: int,
+) -> torch.Tensor:
+    """Each request's sampled tokens at its logits rows, 0 elsewhere ([num_logits]
+    int64)."""
+    flat = torch.empty(num_logits, dtype=sampled.dtype, device=sampled.device)
+    if num_logits:
+        _kernel(flatten_sampled_kernel)(
+            flat, sampled, num_sampled, _as(cu_num_logits, torch.int32)
+        )
+    return flat
+
+
+def flatten_sampled_calls() -> list:
+    return [_call(flatten_sampled_kernel)]
+
+
 # --- Per-request row scatters ---------------------------------------------------
 
 _SCATTER_THREADS = 128
@@ -757,6 +821,137 @@ def scatter_rows_calls(
     return [_call(scatter_rows_kernel, *scatter_rows_key(idx_dtype, dtype, gather))]
 
 
+# --- Adaptive verification's draft budget -----------------------------------------
+
+_BUDGET_THREADS = 256
+
+_BUDGET_HEADER = r"""
+// torch.topk's radix key of an FP32 value: larger keys rank first, every NaN
+// above +inf (TopKTypeConfig<float>::convert).
+__device__ __forceinline__ unsigned int vllm_topk_key(float v) {
+  unsigned int x = __float_as_uint(v);
+  unsigned int mask = (x & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+  return (v == v) ? (x ^ mask) : 0xffffffffu;
+}
+// A product rounded as torch's scan writes it (no contraction with a neighbour).
+__device__ __forceinline__ float vllm_budget_mul(float a, float b) {
+  return __fmul_rn(a, b);
+}
+"""
+
+
+@tilelang.jit(pass_configs=_PASS)
+def assign_draft_budget_kernel(steps: int, idx_dtype: str):
+    """``adaptive_verification._assign_draft_token_budget``'s torch chain, one
+    block: each request's survival (the running product of its confidences, in
+    the order torch's cumprod takes: sequential through CUB for one request, the
+    Sklansky scan of ``tensor_kernel_scan_innermost_dim`` for several), -inf
+    past its scheduled drafts; the ``draft_budget`` best slots as ``torch.topk``
+    picks them (radix keys, NaN highest, ties to the lower slot); and each
+    request's admitted count into ``capacities``."""
+    num_reqs, prob_rows = T.dynamic("num_reqs, prob_rows")
+    scan_threads = 16  # torch's num_threads_x for these rows (at least 2**4)
+    while 2 * scan_threads < steps:
+        scan_threads *= 2
+    scan_levels = scan_threads.bit_length()  # m = 0 .. log2(scan_threads)
+
+    @T.prim_func
+    def assign_draft_budget(
+        confidence_probs: T.Tensor((prob_rows, steps), T.float32),
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        capacities: T.Tensor((num_reqs,), T.int32),
+        draft_budget: T.int32,
+    ):
+        with T.Kernel(1, threads=_BUDGET_THREADS):
+            T.import_source(_BUDGET_HEADER)
+            tx = T.get_thread_binding()
+            slots = num_reqs * steps
+            keys = T.alloc_shared((_BUDGET_THREADS * 8,), T.uint32)
+            admitted = T.alloc_shared((_BUDGET_THREADS * 8,), T.int32)
+            row = T.alloc_local((steps,), T.float32)
+            for chunk in T.serial(T.ceildiv(num_reqs, _BUDGET_THREADS)):
+                req = chunk * _BUDGET_THREADS + tx
+                if req < num_reqs:
+                    state = T.cast(idx_mapping[req], T.int64)
+                    for j in T.unroll(steps):
+                        row[j] = confidence_probs[state, j]
+                    if num_reqs == 1:
+                        for j in T.unroll(1, steps):
+                            row[j] = T.call_extern(
+                                "float32", "vllm_budget_mul", row[j - 1], row[j]
+                            )
+                    else:
+                        # tensor_kernel_scan_innermost_dim's Sklansky levels over the
+                        # row padded with ones to 2 * scan_threads positions (ones
+                        # past the row: their products are exact and none feeds it).
+                        for m in T.unroll(scan_levels):
+                            for t in T.unroll(scan_threads):
+                                a = ((t >> m) << (m + 1)) | (1 << m)
+                                if a + t % (1 << m) < steps:
+                                    row[a + t % (1 << m)] = T.call_extern(
+                                        "float32",
+                                        "vllm_budget_mul",
+                                        row[a + t % (1 << m)],
+                                        row[a - 1],
+                                    )
+                    limit = capacities[req]
+                    for j in T.unroll(steps):
+                        keys[req * steps + j] = T.call_extern(
+                            "uint32",
+                            "vllm_topk_key",
+                            T.if_then_else(j >= limit, -T.infinity(T.float32), row[j]),
+                        )
+            T.sync_threads()
+            for chunk in T.serial(T.ceildiv(slots, _BUDGET_THREADS)):
+                e = chunk * _BUDGET_THREADS + tx
+                if e < slots:
+                    key = keys[e]
+                    rank = T.alloc_var(T.int32, init=0)
+                    for f in T.serial(slots):
+                        if (keys[f] > key) | ((keys[f] == key) & (f < e)):
+                            rank = rank + 1
+                    admitted[e] = T.if_then_else(rank < draft_budget, 1, 0)
+            T.sync_threads()
+            for chunk in T.serial(T.ceildiv(num_reqs, _BUDGET_THREADS)):
+                req = chunk * _BUDGET_THREADS + tx
+                if req < num_reqs:
+                    count = T.alloc_var(T.int32, init=0)
+                    for j in T.unroll(steps):
+                        count = count + admitted[req * steps + j]
+                    capacities[req] = count
+
+    return assign_draft_budget
+
+
+def assign_draft_budget_key(steps: int, idx_dtype: torch.dtype) -> tuple:
+    return (steps, _DTYPES[idx_dtype])
+
+
+def assign_draft_budget(
+    confidence_probs: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    capacities: torch.Tensor,
+    draft_budget: int,
+    steps: int,
+) -> None:
+    """``_assign_draft_token_budget``: ``capacities`` enters holding each
+    request's scheduled draft count and leaves holding its admitted count."""
+    if idx_mapping.shape[0] * steps > _BUDGET_THREADS * 8:
+        raise ValueError(
+            f"{idx_mapping.shape[0]} requests of {steps} drafts exceed the draft "
+            f"budget kernel's {_BUDGET_THREADS * 8} slots"
+        )
+    _kernel(
+        assign_draft_budget_kernel, *assign_draft_budget_key(steps, idx_mapping.dtype)
+    )(confidence_probs, idx_mapping, capacities, draft_budget)
+
+
+def assign_draft_budget_calls(steps: int) -> list:
+    return [
+        _call(assign_draft_budget_kernel, *assign_draft_budget_key(steps, torch.int64))
+    ]
+
+
 # --- Adaptive verification's offsets ------------------------------------------
 
 _SCAN = 256  # requests a pass of the offsets' scan
@@ -774,16 +969,21 @@ def _scan_step(a, b, tx, offset):
 
 
 @tilelang.jit(pass_configs=_PASS)
-def adaptive_offsets_kernel():
+def adaptive_offsets_kernel(width: int, idx_dtype: str):
     """``AdaptiveVerificationManager.reallocate_drafts``' offsets in one block, the
     torch chain's values: ``cu_num_logits = [0, cumsum(capacities + bonus)]``,
     ``query_start_loc = [0, cumsum(capacities + non_draft)]``, and every later entry
     of ``query_start_loc`` ``num_tokens``. A step without drafts (``drafted`` 0)
     zeroes ``capacities`` first. The scans take 256 requests a pass, each pass
-    carrying the last one's totals."""
+    carrying the last one's totals.
+
+    With the offsets, each request's logits rows (up to ``width``, the decode
+    query length) take its state index and position, ``expand_idx_mapping``'s
+    values, which its own launch wrote after this one."""
     num_reqs, non_draft_len, cu_len, starts_len = T.dynamic(
         "num_reqs, non_draft_len, cu_len, starts_len"
     )
+    expanded_len, local_len = T.dynamic("expanded_len, local_len")
 
     @T.prim_func
     def adaptive_offsets(
@@ -791,6 +991,9 @@ def adaptive_offsets_kernel():
         non_draft: T.Tensor((non_draft_len,), T.int32),
         cu_num_logits: T.Tensor((cu_len,), T.int32),
         query_start_loc: T.Tensor((starts_len,), T.int32),
+        idx_mapping: T.Tensor((num_reqs,), idx_dtype),
+        expanded_idx_mapping: T.Tensor((expanded_len,), idx_dtype),
+        expanded_local_pos: T.Tensor((local_len,), T.int32),
         bonus: T.int32,
         num_tokens: T.int32,
         drafted: T.int32,
@@ -831,8 +1034,14 @@ def adaptive_offsets_kernel():
                 _scan_step(a, b, tx, 64)
                 _scan_step(a, b, tx, 128)
                 if inside:
-                    cu_num_logits[req + 1] = carry_a + a[tx]
+                    end = carry_a + a[tx]
+                    cu_num_logits[req + 1] = end
                     query_start_loc[req + 1] = carry_b + b[tx]
+                    state = T.alloc_var(idx_dtype, init=idx_mapping[req])
+                    for j in T.serial(width):
+                        if j < capacity + bonus:
+                            expanded_idx_mapping[end - capacity - bonus + j] = state
+                            expanded_local_pos[end - capacity - bonus + j] = j
                 carry_a = carry_a + a[_SCAN - 1]
                 carry_b = carry_b + b[_SCAN - 1]
                 T.sync_threads()
@@ -849,26 +1058,40 @@ def adaptive_offsets(
     non_draft: torch.Tensor,
     cu_num_logits: torch.Tensor,
     query_start_loc: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    num_logits: int,
+    width: int,
     bonus: int,
     num_tokens: int,
     drafted: bool,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """``reallocate_drafts``' launch: ``cu_num_logits[: n + 1]`` and all of
     ``query_start_loc`` for the ``n`` requests of ``capacities``, which a step
-    without drafts zeroes."""
-    _kernel(adaptive_offsets_kernel)(
+    without drafts zeroes; returns the expanded state indices and positions of
+    the ``num_logits`` logits rows (``expand_idx_mapping``'s)."""
+    expanded = idx_mapping.new_empty(num_logits)
+    local_pos = torch.empty(num_logits, dtype=torch.int32, device=idx_mapping.device)
+    _kernel(adaptive_offsets_kernel, *adaptive_offsets_key(width, idx_mapping.dtype))(
         capacities,
         non_draft,
         cu_num_logits,
         query_start_loc,
+        idx_mapping,
+        expanded,
+        local_pos,
         bonus,
         num_tokens,
         int(drafted),
     )
+    return expanded, local_pos
 
 
-def adaptive_offsets_calls() -> list:
-    return [_call(adaptive_offsets_kernel)]
+def adaptive_offsets_key(width: int, idx_dtype: torch.dtype) -> tuple:
+    return (width, _DTYPES[idx_dtype])
+
+
+def adaptive_offsets_calls(width: int) -> list:
+    return [_call(adaptive_offsets_kernel, *adaptive_offsets_key(width, torch.int64))]
 
 
 # --- Step inputs --------------------------------------------------------------

@@ -18,9 +18,11 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+from vllm.v1.worker.gpu import tilelang_inputs
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     get_num_sampled_and_rejected,
+    logits_rows,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logprob import (
@@ -102,6 +104,8 @@ def _flatten_sampled_warmup_inputs(*, sampled_stride: int) -> dict[str, Any]:
     )
 
 
+# The reference ``tilelang_inputs.flatten_sampled_kernel`` is tested against; the
+# rejection sampler no longer launches it.
 _flatten_sampled_launcher = triton_kernel_dispatcher_with_warmup(
     warmup_inputs=_flatten_sampled_warmup_inputs
 )(_flatten_sampled_kernel)
@@ -182,9 +186,7 @@ class RejectionSampler:
             use_block_verification=self.use_block_verification,
             use_fp64=self.sampler.use_fp64_gumbel,
         )
-        _flatten_sampled_launcher.register_warmup(
-            sampled_stride=self.num_speculative_steps + 1
-        )
+        tilelang_inputs.declare(tilelang_inputs.flatten_sampled_calls)
         use_processed = self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
         register_topk_scores_warmup(
             logits=processed_logits if use_processed else logits,
@@ -207,16 +209,8 @@ class RejectionSampler:
 
         num_reqs = cu_num_logits.shape[0] - 1
         num_logits = logits.shape[0]
-        flat_sampled = torch.zeros(
-            num_logits, dtype=sampled.dtype, device=sampled.device
-        )
-        _flatten_sampled_launcher[(num_reqs,)](
-            flat_sampled,
-            sampled,
-            sampled.stride(0),
-            num_sampled,
-            cu_num_logits,
-            num_warps=1,
+        flat_sampled = tilelang_inputs.flatten_sampled(
+            sampled, num_sampled, cu_num_logits[: num_reqs + 1], num_logits
         )
         expanded_logits = num_logits != num_reqs
         cu_num_generated_tokens: list[int] | torch.Tensor | None = None
@@ -447,7 +441,7 @@ class RejectionSampler:
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
 
-        draft_sampled, pos = input_batch.logits_rows()
+        draft_sampled, pos = logits_rows(input_batch)
 
         max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
             input_batch.idx_mapping_np

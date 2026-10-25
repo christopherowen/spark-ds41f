@@ -142,12 +142,24 @@ class InputBatch:
         TileLang launch the first time a step asks, shared by every reader (the
         samplers, the sink policy and its cut read them, never write them)."""
         if self._logits_rows is None:
-            from vllm.v1.worker.gpu import tilelang_inputs
-
-            self._logits_rows = tilelang_inputs.logits_rows(
-                self.input_ids, self.positions, self.logits_indices
-            )
+            self._logits_rows = _gather_logits_rows(self)
         return self._logits_rows
+
+
+def _gather_logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
+    from vllm.v1.worker.gpu import tilelang_inputs
+
+    return tilelang_inputs.logits_rows(
+        batch.input_ids, batch.positions, batch.logits_indices
+    )
+
+
+def logits_rows(batch) -> tuple[torch.Tensor, torch.Tensor]:
+    """``batch.logits_rows()`` for an ``InputBatch`` (gathered once a step), and the
+    same gather for any object with its input ids, positions and logits indices."""
+    if isinstance(batch, InputBatch):
+        return batch.logits_rows()
+    return _gather_logits_rows(batch)
 
     @classmethod
     def make_dummy(
