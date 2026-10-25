@@ -34,8 +34,13 @@ def sample(items: list, count: int | None, seed: int) -> list:
 
 def image_file(image: dict, stem: Path) -> Path:
     data = image["bytes"]
-    suffix = ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else ".jpg" if data[:2] == b"\xff\xd8" else ".bin"
-    if suffix == ".bin":
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        suffix = ".png"
+    elif data[:2] == b"\xff\xd8":
+        suffix = ".jpg"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":  # RealWorldQA's
+        suffix = ".webp"
+    else:
         raise SystemExit(f"{stem}: unrecognised image format")
     path = stem.with_suffix(suffix)
     path.write_bytes(data)

@@ -16,7 +16,7 @@ candidate 4 (B12X's), and scores both against the benchmarks' answers:
 | DocVQA      | validation shard 0, `lmms-lab-encoder/DocVQA`    |   300 | questions on scanned documents |
 | ChartQA     | test, `lmms-lab-encoder/ChartQA`                 |   300 | questions on charts, human and generated |
 | TextVQA     | validation shard 0, `lmms-lab-encoder/textvqa`   |   300 | text in real photographs |
-| RealWorldQA | test shard 0, `xai-org/RealworldQA`              |  ~380 | real-world photographs, spatial questions |
+| RealWorldQA | test shard 0, `xai-org/RealworldQA`              |   383 | real-world photographs, spatial questions |
 
 Sampled sets are seeded (extract.py), so every run asks the same items. Questions are asked
 as lmms-eval asks them: at temperature 0, with thinking off, at most 64 tokens. DocVQA,
