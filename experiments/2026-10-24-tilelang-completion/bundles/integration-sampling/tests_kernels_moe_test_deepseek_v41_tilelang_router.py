@@ -376,3 +376,112 @@ def test_gate_router_reads_the_padding_and_ced_masks_itself(plain_scratch, ced_s
         assert (ids[skipped] == -1).all()
         assert torch.equal(ids, expected[1])
         assert torch.equal(weights.view(torch.int32), expected[0].view(torch.int32))
+
+
+# --- The forward's routing masks ----------------------------------------------
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("rows", [1, 6, 255, 256, 257, 16384])
+@pytest.mark.parametrize("count", [1, 3])
+def test_routing_masks_are_torchs(ids_dtype, rows, count):
+    """The image tokens and the rows to route, in one launch or each alone, as
+    torch's comparisons and negation gave them: ids at the sentinels' edges and
+    across the vocabulary, every padding pattern."""
+    generator = torch.Generator(device="cuda").manual_seed(rows * count)
+    ids = torch.randint(LO - 3, LO + 5, (rows,), device="cuda", generator=generator)
+    ids[::7] = torch.randint(0, 129280, ids[::7].shape, device="cuda")
+    ids = ids.to(ids_dtype)
+    is_padding = torch.rand(rows, device="cuda", generator=generator) < 0.3
+    before = (ids.clone(), is_padding.clone())
+    expected_image = (ids >= LO) & (ids < LO + count)
+    image, routed = tilelang_router._masks(ids, LO, count, is_padding)
+    assert image.dtype == routed.dtype == torch.bool
+    assert torch.equal(image, expected_image)
+    assert torch.equal(routed, ~is_padding)
+    image_alone, none = tilelang_router._masks(ids, LO, count, None)
+    assert none is None and torch.equal(image_alone, expected_image)
+    none, routed_alone = tilelang_router._masks(None, 0, 0, is_padding)
+    assert none is None and torch.equal(routed_alone, ~is_padding)
+    assert torch.equal(ids, before[0]) and torch.equal(is_padding, before[1])
+
+
+def test_a_forward_computes_its_routing_masks_once(padded_step, monkeypatch):
+    """The first routing layer of a forward computes the image tokens and the rows
+    to route in one launch; later layers, and the per-mask helpers, find them; a
+    new tensor of ids (a CED decoder's compact rows) takes one launch of its own."""
+    launches = []
+    kernel = tilelang_router.routing_masks_kernel
+
+    def counted(*key):
+        launches.append(key)
+        return kernel(*key)
+
+    monkeypatch.setattr(tilelang_router, "routing_masks_kernel", counted)
+    is_padding = padded_step(96, 5)
+    ids = torch.full((96,), 7, dtype=torch.int32, device="cuda")
+    ids[3::4] = LO
+    image, route = tilelang_router._routing_masks(96, ids, LO, 1)
+    assert launches == [("int32", True)]
+    assert torch.equal(image, ids == LO) and torch.equal(route, ~is_padding)
+    again = tilelang_router._routing_masks(96, ids, LO, 1)
+    assert again[0] is image and torch.equal(again[1], route)
+    assert tilelang_router._image_token_mask(ids, LO, 1) is image
+    assert torch.equal(tilelang_router._routing_mask(96), route)
+    assert torch.equal(tilelang_router._routing_masks(40, None, LO, 1)[1], route[:40])
+    assert len(launches) == 1
+    compact = ids[::2].clone()
+    image2, route2 = tilelang_router._routing_masks(48, compact, LO, 1)
+    assert launches[1:] == [("int32", False)]
+    assert torch.equal(image2, compact == LO) and torch.equal(route2, route[:48])
+
+
+@pytest.mark.parametrize("vision", [False, True])
+def test_gate_router_declares_its_masks(
+    plain_scratch, padded_step, monkeypatch, vision
+):
+    """The gate router's prefill rows (past its split rows) compute the masks it
+    declares: the image tokens with the rows to route for a vision layer, the rows
+    to route for a text layer."""
+    gate = _Gate(384, seed=17)
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    rows = gate.tilelang_split_rows + 9
+    padded_step(rows, 3)
+    x = torch.randn(rows, 5120, device="cuda", generator=generator).to(torch.bfloat16)
+    bias = torch.randn(384, device="cuda", generator=generator) * 0.1
+    kwargs = dict(
+        top_k=6,
+        global_num_experts=384,
+        e_score_correction_bias=bias,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        scoring_func="sqrtsoftplus",
+    )
+    input_ids = None
+    if vision:
+        kwargs.update(
+            bias_vl=torch.nn.Parameter(bias.clone(), requires_grad=False),
+            image_sentinel_lo=LO,
+            image_sentinel_count=1,
+        )
+        input_ids = torch.randint(0, 1000, (rows,), device="cuda", generator=generator)
+    router = tilelang_router.TileLangGateRouter(gate=gate, **kwargs)
+    router.declare_kernels()  # standalone: prepares now
+    declared = {args for _, args, _ in router._mask_calls()}
+    assert declared == (
+        {("int32", False), ("int32", True), ("int64", False), ("int64", True)}
+        | {(None, True)}
+        if vision
+        else {(None, True)}
+    )
+    launches = []
+    kernel = tilelang_router.routing_masks_kernel
+
+    def counted(*key):
+        launches.append(key)
+        return kernel(*key)
+
+    monkeypatch.setattr(tilelang_router, "routing_masks_kernel", counted)
+    router._compute_routing(None, x, None, input_ids=input_ids)
+    assert launches == [("int64", True) if vision else (None, True)]
+    assert set(launches) <= declared

@@ -326,15 +326,20 @@ def all_reduce_rank_order(
     comm, input_tensor: torch.Tensor, rank: int, world: int
 ) -> torch.Tensor:
     """The sum over ranks of ``input_tensor`` at any size, with the one-shot
-    all-reduce's arithmetic: its rows (zero-padded to a multiple of ``world``) are
+    all-reduce's arithmetic: its rows (padded to a multiple of ``world``) are
     reduce-scattered in rank order, then all-gathered, which moves bits without
-    arithmetic. A row has the same bits as the one-shot path would give it."""
+    arithmetic. A row has the same bits as the one-shot path would give it. The
+    padding rows (zeros, TileLang's fill) are summed and gathered like the others,
+    then dropped."""
     rows = input_tensor.shape[0]
     flat = input_tensor.reshape(rows, -1)
     padded = -(-rows // world) * world
     if padded != rows or not flat.is_contiguous():
-        buffer = flat.new_zeros((padded, flat.shape[1]))
+        from vllm.models.deepseek_v4_1.tilelang import columns
+
+        buffer = flat.new_empty((padded, flat.shape[1]))
         buffer[:rows].copy_(flat)
+        columns.zero_(buffer[rows:])
     else:
         buffer = flat
     own = reduce_scatter_rank_order(comm, buffer, rank, world)

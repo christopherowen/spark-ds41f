@@ -268,8 +268,11 @@ class DSparkContextCudaGraphs:
         )
 
     def _forward(self, capacity: int) -> None:
-        main_x = self.model.combine_hidden_states(self.aux[:capacity])
-        self.hidden_states[:capacity].copy_(main_x)
+        # The norm writes the combined rows into the context buffer itself: no
+        # copy between it and the context KV projections.
+        self.model.combine_hidden_states(
+            self.aux[:capacity], out=self.hidden_states[:capacity]
+        )
         slots = (
             self.slot_mappings[0, :capacity]
             if self.layer_group_idx is None
@@ -468,12 +471,15 @@ class DSparkDeepseekV4Model(nn.Module):
         assert self.embed_tokens is not None
         return self.embed_tokens(input_ids)
 
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
+    def combine_hidden_states(
+        self, aux_hidden_states: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """main_x = main_norm(main_proj(concat of target aux hidden states)).
 
-        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
+        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)]. With
+        ``out`` (contiguous, [T, hidden_size]), the norm writes main_x there.
         """
-        return self.main_norm(self.main_proj(aux_hidden_states))
+        return self.main_norm(self.main_proj(aux_hidden_states), out=out)
 
     def combine_aux_hidden_states_into(
         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor
@@ -621,8 +627,10 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.model.combine_hidden_states(aux_hidden_states)
+    def combine_hidden_states(
+        self, aux_hidden_states: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        return self.model.combine_hidden_states(aux_hidden_states, out)
 
     def combine_aux_hidden_states_into(
         self, aux_hidden_states: list[torch.Tensor], out: torch.Tensor

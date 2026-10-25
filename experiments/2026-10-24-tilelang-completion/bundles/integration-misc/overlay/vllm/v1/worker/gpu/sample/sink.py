@@ -311,7 +311,8 @@ class SinkCut:
 class SinkAlternates:
     """The next candidates of each request's last draw: [num_reqs, max_retries]
     tokens (-1 past the possible ones), with logprobs and ranks when the batch
-    returns logprobs."""
+    returns logprobs (``[num_reqs, max_retries]`` each, the ranks possibly a view
+    of alternate-major storage)."""
 
     tokens: torch.Tensor
     logprobs: torch.Tensor | None = None
@@ -524,28 +525,39 @@ class SinkSampler:
         logits_mode: bool,
     ) -> SinkAlternates:
         """The logprob and rank of each alternate in the distribution of the
-        row that drew it, as the sampled token's are computed for logprobs."""
-        from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+        row that drew it, as the sampled token's are computed for logprobs
+        (``compute_topk_scores`` of each alternate, the bits it gives): one launch
+        copies the rows densely and clamps the alternates (``sink_rows``), one
+        log-softmax launch scores every alternate of a row (with ``logits_mode``,
+        the copy takes their logits instead), and the rank kernel ranks one
+        alternate a launch, into its own row of alternate-major ranks."""
+        from vllm.v1.worker.gpu.sample import tilelang_sampling
+        from vllm.v1.worker.gpu.sample.tilelang_logprob import (
+            token_ranks,
+            topk_log_softmax,
+        )
 
         num_reqs = alternates.shape[0]
-        rows = cu_num_logits[:num_reqs].to(torch.int64) + (
-            num_sampled.to(torch.int64) - 1
-        ).clamp(min=0)
-        row_logits = logits[rows]
+        num_alternates = self.num_alternates
+        if alternates.shape[1] != num_alternates:
+            raise ValueError(
+                f"{alternates.shape[1]} alternates a request, not {num_alternates}"
+            )
         logprobs = torch.empty(
-            (num_reqs, self.num_alternates), dtype=torch.float32, device=self.device
+            (num_reqs, num_alternates), dtype=torch.float32, device=self.device
         )
         ranks = torch.empty(
-            (num_reqs, self.num_alternates), dtype=torch.int64, device=self.device
+            (num_alternates, num_reqs), dtype=torch.int64, device=self.device
         )
-        for i in range(self.num_alternates):
-            tokens = alternates[:, i].clamp(min=0)
-            scores = compute_topk_scores(
-                row_logits, 0, tokens, None, logits_mode=logits_mode
+        if num_reqs and num_alternates:
+            rows, tokens, tokens_by_alt = tilelang_sampling.sink_rows(
+                logits, cu_num_logits, num_sampled, alternates, logprobs, logits_mode
             )
-            logprobs[:, i] = scores.logprobs[:, 0]
-            ranks[:, i] = scores.selected_token_ranks
-        return SinkAlternates(alternates, logprobs, ranks)
+            if not logits_mode:
+                topk_log_softmax(rows, tokens, logprobs)
+            for i in range(num_alternates):
+                token_ranks(rows, tokens_by_alt[i], ranks[i])
+        return SinkAlternates(alternates, logprobs, ranks.t())
 
     def apply(
         self,
@@ -585,10 +597,11 @@ class SinkSampler:
                 num_reqs, dtype=torch.int32, device=self.device
             )
             if logprobs:
-                out.recovered_logprobs = torch.zeros(
+                # The policy writes every request's: 0 where nothing was recovered.
+                out.recovered_logprobs = torch.empty(
                     num_reqs, dtype=torch.float32, device=self.device
                 )
-                out.recovered_ranks = torch.zeros(
+                out.recovered_ranks = torch.empty(
                     num_reqs, dtype=torch.int64, device=self.device
                 )
         new_tokens = alternates.tokens if alternates is not None else self.alternates
@@ -670,21 +683,28 @@ class SinkSampler:
         sampled_widths: tuple[int, ...],
         bin_counts_stride: int,
         vocab_size: int,
+        logits_mode: bool = False,
     ) -> None:
         """Declare the kernels a step launches: the policy for each sampled
         width, and the alternates of the raw and processed target logits
-        (``(dtype, row stride)``; the TileLang kernels take any stride)."""
+        (``(dtype, row stride)``; the TileLang kernels take any stride), with
+        their logprobs as ``logits_mode`` (the logprobs mode is a logits mode)
+        computes them."""
         from vllm.v1.worker.gpu.sample import tilelang_sampling
-        from vllm.v1.worker.gpu.sample.tilelang_logprob import register_ranks
+        from vllm.v1.worker.gpu.sample.tilelang_logprob import (
+            register_log_softmax,
+            register_ranks,
+        )
 
         logits_dtypes = [dtype for dtype, _ in logits]
         if processed_logits_strides:
             logits_dtypes.append(torch.float32)
-        # alternate_logprobs_of ranks the alternates in dense copies of their rows,
-        # vocab_size apart whatever the logits' (padded) row stride.
-        register_ranks(
-            [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)], vocab_size
-        )
+        # alternate_logprobs_of ranks and scores the alternates in dense copies of
+        # their rows, vocab_size apart whatever the logits' (padded) row stride.
+        dense = [(dtype, vocab_size) for dtype in dict.fromkeys(logits_dtypes)]
+        register_ranks(dense, vocab_size)
+        if self.rejection and not logits_mode:
+            register_log_softmax(dense)
         tilelang_sampling.declare(
             lambda: tilelang_sampling.sink_calls(
                 logits_dtypes=logits_dtypes,
@@ -692,5 +712,6 @@ class SinkSampler:
                 num_alternates=self.num_alternates,
                 rejection=self.rejection,
                 num_event_fields=NUM_SINK_EVENT_FIELDS,
+                logits_mode=logits_mode,
             )
         )

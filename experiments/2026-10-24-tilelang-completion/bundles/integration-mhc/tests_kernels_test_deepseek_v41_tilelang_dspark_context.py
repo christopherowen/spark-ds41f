@@ -88,3 +88,69 @@ def test_context_inputs_rejects_misaligned_rows():
     slots = torch.zeros(1, 8, dtype=torch.int64, device=DEVICE)
     with pytest.raises(ValueError, match="16-byte aligned"):
         dspark_context.context_inputs(aux, sources, positions, slots, 4, 8)
+
+
+@pytest.mark.parametrize("capacity", [1, 6, 32, LIMIT])
+def test_context_graph_norm_writes_the_context_buffer(monkeypatch, capacity):
+    """The context graph's combine writes main_x straight into the speculator's
+    context buffer (the norm's ``out``), which the context KV projections then read:
+    no copy between the norm and their per-token casts, the buffer's bits the
+    combine's own (TileKernels' norm of a stand-in projection of the joined
+    sources), the rows past the capacity untouched."""
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1.nvidia.dspark import (
+        DSparkContextCudaGraphs,
+        DSparkDeepseekV4Model,
+    )
+    from vllm.models.deepseek_v4_1.tilelang.norm import TileLangRMSNorm
+
+    gen = torch.Generator(device=DEVICE).manual_seed(capacity)
+    norm = TileLangRMSNorm(WIDTH, 1e-6).to(DEVICE)
+    norm.weight.data.copy_(torch.rand(WIDTH, generator=gen, device=DEVICE) + 0.5)
+    joined = dspark_context.NUM_SOURCES * WIDTH
+
+    def main_proj(x):  # a stand-in projection, elementwise, so deterministic
+        return x[:, :WIDTH] * 2 + x[:, WIDTH : 2 * WIDTH]
+
+    model = SimpleNamespace(main_proj=main_proj, main_norm=norm)
+    aux = torch.randn(LIMIT, joined, generator=gen, device=DEVICE).to(torch.bfloat16)
+    aux[0, :8] = float("nan")
+    hidden_states = torch.randn(LIMIT + 4, WIDTH, generator=gen, device=DEVICE)
+    hidden_states = hidden_states.to(torch.bfloat16)
+    before = hidden_states.clone()
+    expected = DSparkDeepseekV4Model.combine_hidden_states(model, aux[:capacity])
+    projected = []
+
+    def combine(x, out):
+        return DSparkDeepseekV4Model.combine_hidden_states(model, x, out)
+
+    def project(states, positions, slots):
+        projected.append((states, slots))
+
+    graphs = DSparkContextCudaGraphs.__new__(DSparkContextCudaGraphs)
+    graphs.model = SimpleNamespace(
+        combine_hidden_states=combine, precompute_and_store_context_kv=project
+    )
+    graphs.aux = aux
+    graphs.hidden_states = hidden_states
+    graphs.positions = torch.zeros(LIMIT, dtype=torch.int64, device=DEVICE)
+    graphs.slot_mappings = torch.zeros(1, LIMIT, dtype=torch.int64, device=DEVICE)
+    graphs.layer_group_idx = None
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("the context graph copied a tensor")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", refuse)
+    graphs._forward(capacity)
+    monkeypatch.undo()
+    torch.accelerator.synchronize()
+    ((states, slots),) = projected
+    assert states.data_ptr() == hidden_states.data_ptr()
+    assert states.shape == (capacity, WIDTH)
+    assert torch.equal(
+        hidden_states[:capacity].view(torch.int16), expected.view(torch.int16)
+    )
+    assert torch.equal(
+        hidden_states[capacity:].view(torch.int16), before[capacity:].view(torch.int16)
+    )

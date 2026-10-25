@@ -95,6 +95,17 @@ PARTS = {
                                   "--gate"], 3600),
             ("token-count benchmark", ["benchmarks/kernels/benchmark_token_counts.py", "--gate",
                                        "--seed", "61027"], 1200),
+            # The last torch glue (2026-10-25): SP's pad rows zeroed in TileLang, the
+            # sampler's one-token counts, and the glue ports against the torch they
+            # replace (router masks, sink rows, verification offsets, top-k gather).
+            ("glue tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-glue",
+                "tests/models/test_deepseek_v41_sp_project_reduce_scatter.py",
+                "tests/v1/worker/test_gpu_sampling_states_gather.py"], 1800),
+            ("one-token count benchmark", ["benchmarks/kernels/benchmark_token_counts.py",
+                                           "--gate", "--one", "--seed", "61029"], 1200),
+            ("glue benchmark", ["benchmarks/kernels/benchmark_glue_ports.py", "--gate"],
+             1800),
         ],
     ),
     "sampling": (
@@ -226,6 +237,10 @@ PARTS = {
             ("resampled-token benchmark, mixed temperatures",
              ["benchmarks/kernels/benchmark_resampled_token.py", "--gate", "--seed", "18443",
               "--mixed"], 600),
+            # The insertion that caps counts at the dead-row cut (vLLM e004b6b34).
+            ("resampled-token benchmark, dead rows",
+             ["benchmarks/kernels/benchmark_resampled_token.py", "--gate", "--seed", "52809",
+              "--dead-rows"], 600),
             ("rejection-sampler benchmark",
              ["benchmarks/kernels/benchmark_tilelang_rejection.py", "--gate"], 1800),
         ],

@@ -1242,7 +1242,9 @@ def test_ds41f_verification_emits_same_tokens_with_insert_port(
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler_utils as utils
     from vllm.v1.worker.gpu.spec_decode.tilelang_resampled import insert_resampled
 
-    def original(sampled, counts, ids, values, cu, mapping, temp):
+    def original(sampled, counts, ids, values, cu, mapping, temp, dead_row_cut):
+        # rejection_sample passes its dead-row cut, None without one.
+        assert dead_row_cut is None
         utils._insert_resampled_kernel[(counts.numel(),)](
             sampled,
             sampled.stride(0),
@@ -1412,7 +1414,7 @@ def test_insert_resampled_caps_counts_at_the_dead_row_cut(blocks, index_dtype):
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
     """``rejection_sample(..., dead_row_cut=cut)`` is ``torch.minimum(num_sampled,
-    cut + 1)`` of the uncapped verification, the sampled tokens unchanged, on the
+    cut + 1)`` of the uncapped verification, the written tokens unchanged, on the
     production path (block verification, one-hot drafts, FP32 draws)."""
     torch.manual_seed(5309)
     inputs = _build_rejection_sample_inputs(
@@ -1434,11 +1436,14 @@ def test_rejection_sample_with_dead_row_cut_is_the_minimum(temperature):
         dead_row_cut=cut,
     )
     assert torch.equal(capped, torch.minimum(num_sampled, cut + 1))
-    assert torch.equal(capped_sampled, sampled)
+    # Both leave the columns past the uncapped count unwritten (``new_empty``), and
+    # the cap moves no token: compare the written columns, which are the same.
+    written = torch.arange(6, device="cuda")[None, :] < num_sampled[:, None]
+    assert torch.equal(capped_sampled[written], sampled[written])
 
 
-@pytest.mark.parametrize("draft_logits", [False, True])
-def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
+@pytest.mark.parametrize("draft_logits,watermark", [(True, None), (False, 42)])
+def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits, watermark):
     """A step that can have dead rows declares the capped insertion beside the
     uncapped one, for every index dtype, before the cache freezes."""
     from types import SimpleNamespace
@@ -1458,7 +1463,7 @@ def test_dead_rows_declare_the_capped_insertion(monkeypatch, draft_logits):
     owner = module.RejectionSampler.__new__(module.RejectionSampler)
     owner.sampler = SimpleNamespace(use_fp64_gumbel=False)
     owner.num_speculative_steps = 5
-    owner.watermark_key = None
+    owner.watermark_key = watermark
     registry = JitWarmupRegistry(None)
     with registry.activate():
         owner.register_warmups(

@@ -208,7 +208,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 from vllm.v1.worker.gpu.spec_decode.greedy_verification import (
     greedy_rejection_sample,
     register_greedy_verification_warmups,
-    vocab_parallel_argmax,
+    vocab_parallel_pairs,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
@@ -1189,14 +1189,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # live path's dtypes and strides.
             assert self.rejection_sampler is not None
             shard = self._language_model().lm_head.shard_indices
-            target_ids = vocab_parallel_argmax(
+            pairs = vocab_parallel_pairs(
                 self.model.compute_logits_local(hidden_states),
                 shard.num_org_elements,
                 shard.org_vocab_start_index,
                 get_tensor_model_parallel_world_size(),
             )
             greedy_rejection_sample(
-                target_ids,
+                pairs,
                 self.input_buffers.input_ids[:num_reqs],
                 dummy_input_batch.cu_num_logits,
                 self.rejection_sampler.num_speculative_steps,
@@ -2229,6 +2229,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         0
                     ),
                     vocab_size=vocab_size,
+                    logits_mode=self.sampler.logprobs_mode
+                    in ("raw_logits", "processed_logits"),
                 )
         if self.rejection_sampler is not None and self._greedy_verification_available():
             assert head is not None and processor is not None
@@ -2379,14 +2381,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 shard.org_vocab_start_index,
                 shard.num_org_elements,
             )
-        target_ids = vocab_parallel_argmax(
+        pairs = vocab_parallel_pairs(
             local_logits,
             shard.num_org_elements,
             shard.org_vocab_start_index,
             tp_size,
         )
         sampled, num_sampled = greedy_rejection_sample(
-            target_ids,
+            pairs,
             drafts,
             input_batch.cu_num_logits,
             self.rejection_sampler.num_speculative_steps,

@@ -1826,3 +1826,44 @@ Run 23 stopped before the cleanup check. Misc and mHC passed. Runner and samplin
 
 Run 24 runs the bundles at 5d6fcb05d; if they pass, the cleanup check follows
 (`~/spark-lab/run24` on dgx1, "RUN24 DONE").
+
+## The last torch glue in TileLang
+
+Run 24: runner and mHC passed. Misc failed five verification tests of the glue port then
+in progress, all in its tests (a stand-in's signature, unwritten columns compared,
+a partly built sampler); they are fixed. Sampling flagged `select_first_argmax` again. The
+thread-a-row rewrite was slower (96 rows 1.333 against Triton's 1.141 µs) and is
+reverted (cde4aa59f).
+
+Inventory 5's remaining torch kernels are ported (vLLM e004b6b34 … 9169d46ad):
+
+| site | now |
+|------|-----|
+| rejection sampler: `+1`, `minimum` (dead-row cap), `sub` (chunk offsets) | folded into the insert kernel; the first chunk's offsets are a view |
+| `get_top_k_top_p` index | the existing row-gather kernel |
+| sink `alternate_logprobs_of` (row gather, clamps, column writes), `apply` fills | one rows-and-clamp kernel; one log-softmax launch scores every alternate; the policy kernel writes the zeros |
+| sampler `fill_` | folded into the counts kernel's one-token variant |
+| router image and routing masks | one TileLang launch a forward |
+| SP exchange and rank-order all-reduce fills | TileLang's 16-byte zero fill (9027bfdf1) |
+| `memcpy32_post` in the decode graph (DSpark context copy) | the norm writes the context buffer |
+| `select_first_argmax` in greedy verification | fused: the rejection kernel selects its targets from the gathered pairs (9169d46ad) |
+
+The port first dropped the SP pad-row fills and left those rows arbitrary. They reach
+no real row, but uninitialized values (NaN among them) would still be normalized, routed
+and sent to experts, and the work would vary between identical runs. 9027bfdf1 zeroes
+them again with TileLang's fill, and the tests require the zeros.
+
+What stays torch, none of it in production decode:
+- verification beyond one chunk (more than 2076 rows);
+- logits-mode logprobs' gather;
+- the rank-order all-reduce's copy into its padded buffer, which needs a ragged NCCL
+  exchange.
+
+The plain `select_first_argmax` still runs once a decode step, on the DSpark drafter's
+last step: 0.86 µs at c1, about 0.05 µs behind Triton at 1-16 rows. The owner accepted
+the gap (2026-10-25), about 0.0001% of a step. The sampling benchmark reports it without
+gating it (f914092be), and its 96-row shape is gone, since verification no longer
+launches it.
+
+Run 25 runs the bundles at f914092be, including the glue tests and benchmarks; if they
+pass, the cleanup check follows (`~/spark-lab/run25`, "RUN25 DONE").

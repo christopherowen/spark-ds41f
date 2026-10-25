@@ -50,7 +50,7 @@ class _Comm:
         self.recvs.append((peer, tensor))
 
     def all_gather(self, output, tensor):
-        """Every rank's ``tensor`` into ``output`` in rank order (data movement only)."""
+        """Every rank's ``tensor`` into ``output`` in rank order (data movement)."""
         fabric = self.fabric
         with fabric.lock:
             fabric.gathered[self.rank] = tensor.clone()
@@ -160,6 +160,43 @@ def test_all_reduce_adds_as_the_one_shot_all_reduce(world, rows):
     inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
     out = _run(inputs, all_reduce_rank_order)
     want = _reference(inputs)
+    for rank in range(world):
+        assert out[rank].shape == (rows, width)
+        assert torch.equal(out[rank], want)
+
+
+@pytest.mark.parametrize("world", [2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 5, 13])
+def test_all_reduce_pads_with_tilelang_zeros(monkeypatch, world, rows):
+    """The padding rows are zeroed by TileLang's fill (stood in for on the host),
+    then summed, gathered and dropped: with the padded buffer NaN where the
+    allocator left it, only the padding rows are filled, by that fill alone, and
+    every real row is the one-shot sum, bit for bit."""
+    from vllm.models.deepseek_v4_1.tilelang import columns
+
+    allocate = torch.Tensor.new_empty
+    zeroed = []
+
+    def poisoned(self, *args, **kwargs):
+        return allocate(self, *args, **kwargs).fill_(float("nan"))
+
+    def refuse(self, *args, **kwargs):
+        raise AssertionError("the padded buffer was zero-filled by torch")
+
+    def zero_(out):
+        zeroed.append(out.shape[0])
+        return out.fill_(0)
+
+    monkeypatch.setattr(torch.Tensor, "new_empty", poisoned)
+    monkeypatch.setattr(torch.Tensor, "new_zeros", refuse)
+    monkeypatch.setattr(columns, "zero_", zero_)
+    torch.manual_seed(world * 1000 + rows)
+    width = 24
+    inputs = [torch.randn(rows, width).to(torch.bfloat16) for _ in range(world)]
+    out = _run(inputs, all_reduce_rank_order)
+    want = _reference(inputs)
+    padding = -(-rows // world) * world - rows
+    assert zeroed == ([padding] * world if padding else [])
     for rank in range(world):
         assert out[rank].shape == (rows, width)
         assert torch.equal(out[rank], want)

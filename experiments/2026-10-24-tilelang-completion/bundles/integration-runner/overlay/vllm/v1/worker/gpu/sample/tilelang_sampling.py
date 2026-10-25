@@ -1154,6 +1154,116 @@ def sink_merge(
     return alternates
 
 
+# The alternates' rows: threads a block, and columns a thread copies.
+_SINK_ROWS_THREADS = 256
+_SINK_ROWS_PER_THREAD = 8
+SINK_ROWS_BLOCK = _SINK_ROWS_THREADS * _SINK_ROWS_PER_THREAD
+
+
+@tilelang.jit(pass_configs=_PASS)
+def sink_rows_kernel(logits_dtype: str, num_alternates: int, logits_mode: bool):
+    """``SinkSampler.alternate_logprobs_of``'s glue, the torch chain it replaces in
+    one launch: each request's row that drew its last sampled token,
+    ``cu_num_logits[r] + max(num_sampled[r] - 1, 0)`` in int64, copied whole into
+    ``rows[r]`` (``logits[rows]``), and its alternates clamped at 0
+    (``alternates.clamp(min=0)``), stored request by request (``tokens``, the
+    log-softmax's ids) and alternate by alternate (``tokens_by_alt``, a rank
+    launch's ids); with ``logits_mode``, also each alternate's logit as FP32 into
+    ``scores`` (``rows.gather(-1, tokens).to(torch.float32)``). Requests are on the
+    grid's x axis and blocks of ``SINK_ROWS_BLOCK`` columns on its y axis; a thread
+    loads its eight columns (``_SINK_ROWS_THREADS`` apart) before it stores them."""
+    alts = num_alternates
+    if not 1 <= alts <= _SINK_ROWS_THREADS:
+        raise ValueError(f"{alts} alternates: a block's threads take one each")
+    per = _SINK_ROWS_PER_THREAD
+    reqs, num_logits, vocab, cu_len, sampled_len = T.dynamic(
+        "reqs, num_logits, vocab, cu_len, sampled_len"
+    )
+    # 64-bit row offsets, for the logits and their dense copies alike.
+    logits_stride, rows_stride = T.dynamic("logits_stride, rows_stride", "int64")
+
+    @T.prim_func
+    def sink_rows(
+        logits: T.StridedTensor((num_logits, vocab), (logits_stride, 1), logits_dtype),
+        cu_num_logits: T.Tensor((cu_len,), T.int32),
+        num_sampled: T.Tensor((sampled_len,), T.int32),
+        alternates: T.Tensor((reqs, alts), T.int64),
+        rows: T.StridedTensor((reqs, vocab), (rows_stride, 1), logits_dtype),
+        tokens: T.Tensor((reqs, alts), T.int64),
+        tokens_by_alt: T.Tensor((alts, reqs), T.int64),
+        scores: T.Tensor((reqs, alts), T.float32),
+    ):
+        with T.Kernel(
+            reqs, T.ceildiv(vocab, SINK_ROWS_BLOCK), threads=_SINK_ROWS_THREADS
+        ) as (req, blk):
+            tx = T.get_thread_binding()
+            raw = T.alloc_local((per,), logits_dtype)
+            row = T.alloc_var(
+                T.int64,
+                init=T.cast(cu_num_logits[req], T.int64)
+                + T.max(T.cast(num_sampled[req], T.int64) - 1, T.int64(0)),
+            )
+            token = T.alloc_var(T.int64, init=T.int64(0))
+            for k in T.unroll(per):
+                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
+                    raw[k] = logits[
+                        row, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx
+                    ]
+            for k in T.unroll(per):
+                if blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx < vocab:
+                    rows[req, blk * SINK_ROWS_BLOCK + k * _SINK_ROWS_THREADS + tx] = (
+                        raw[k]
+                    )
+            if (blk == 0) & (tx < alts):
+                token = T.max(alternates[req, tx], T.int64(0))
+                tokens[req, tx] = token
+                tokens_by_alt[tx, req] = token
+                if logits_mode:
+                    scores[req, tx] = T.cast(logits[row, token], T.float32)
+
+    return sink_rows
+
+
+def sink_rows_key(
+    logits_dtype: torch.dtype, num_alternates: int, logits_mode: bool
+) -> tuple:
+    return (_DTYPES[logits_dtype], num_alternates, logits_mode)
+
+
+def sink_rows(
+    logits: torch.Tensor,
+    cu_num_logits: torch.Tensor,
+    num_sampled: torch.Tensor,
+    alternates: torch.Tensor,
+    scores: torch.Tensor,
+    logits_mode: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``sink_rows_kernel``'s launch for ``[num_reqs, num_alternates]`` alternates
+    (both at least 1): the rows ``[num_reqs, vocab]`` in the logits' dtype, the
+    clamped alternates ``[num_reqs, num_alternates]`` and ``[num_alternates,
+    num_reqs]`` (int64); with ``logits_mode``, their logits into ``scores``."""
+    num_reqs, num_alternates = alternates.shape
+    device = logits.device
+    rows = torch.empty((num_reqs, logits.shape[1]), dtype=logits.dtype, device=device)
+    tokens = torch.empty((num_reqs, num_alternates), dtype=torch.int64, device=device)
+    tokens_by_alt = torch.empty(
+        (num_alternates, num_reqs), dtype=torch.int64, device=device
+    )
+    _kernel(
+        sink_rows_kernel, *sink_rows_key(logits.dtype, num_alternates, logits_mode)
+    )(
+        logits,
+        cu_num_logits,
+        num_sampled,
+        alternates.contiguous(),
+        rows,
+        tokens,
+        tokens_by_alt,
+        scores,
+    )
+    return rows, tokens, tokens_by_alt
+
+
 SINK_CANDIDATE_BLOCK = 1024
 
 
@@ -1400,7 +1510,11 @@ def sink_policy_kernel(
     Triton's order. The flagged-value maximum takes the lowest row among equal
     values (``row_values`` are finite: the detector stores them through
     ``nan_to_num``). Each buffer is passed flat; ``num_alternates`` is at least 1,
-    as the Triton launch's ``NUM_ALTERNATES``."""
+    as the Triton launch's ``NUM_ALTERNATES``. The step's alternate logprobs and
+    ranks are read at their request and alternate strides (the ranks are stored
+    alternate by alternate). With ``logprobs``, every request's recovered logprob
+    and rank is written, 0 where no draft zero was replaced: the zeros the Triton
+    launch's buffers were filled with."""
     alts = num_alternates
     width = sampled_width
     padded = _next_power_of_2(width + 1)
@@ -1450,6 +1564,10 @@ def sink_policy_kernel(
             (count_rows, count_cols), (count_stride, 1), T.int32
         ),
         counts: T.Tensor((3,), T.int64),
+        new_lp_req_stride: T.int64,
+        new_lp_alt_stride: T.int64,
+        new_rank_req_stride: T.int64,
+        new_rank_alt_stride: T.int64,
     ):
         with T.Kernel(reqs, threads=32) as req:
             tx = T.get_thread_binding()
@@ -1481,6 +1599,9 @@ def sink_policy_kernel(
                 sampled_n[0] = num_sampled[req]
                 if sampled_n[0] == 0:
                     # A prefill chunk: its row is not sampled.
+                    if logprobs:
+                        recovered_logprobs[req] = T.float32(0)
+                        recovered_ranks[req] = T.int64(0)
                     num_out[req] = 0
                     events[req, 0] = 0
                     events[req, 1] = 2
@@ -1557,6 +1678,9 @@ def sink_policy_kernel(
                             ]
                             num_out[req] = 1
                         else:
+                            if logprobs:
+                                recovered_logprobs[req] = T.float32(0)
+                                recovered_ranks[req] = T.int64(0)
                             # The last sampled token's draw provides the next
                             # alternates.
                             for a in T.serial(alts):
@@ -1566,12 +1690,14 @@ def sink_policy_kernel(
                                 if logprobs:
                                     alternate_logprobs[state[0] * alts + a] = (
                                         new_alternate_logprobs[
-                                            T.cast(req, T.int64) * alts + a
+                                            T.cast(req, T.int64) * new_lp_req_stride
+                                            + a * new_lp_alt_stride
                                         ]
                                     )
                                     alternate_ranks[state[0] * alts + a] = (
                                         new_alternate_ranks[
-                                            T.cast(req, T.int64) * alts + a
+                                            T.cast(req, T.int64) * new_rank_req_stride
+                                            + a * new_rank_alt_stride
                                         ]
                                     )
                             tries[state[0]] = 0
@@ -1656,10 +1782,15 @@ def sink_policy(
 ) -> None:
     """``SinkSampler.apply``'s launch, with the Triton launch's arguments (the
     placeholders where a variant has no buffer included); the per-slot and step
-    buffers are contiguous."""
+    buffers are contiguous, except the step's alternate logprobs and ranks
+    (``[num_reqs, alternates]``), which may be stored alternate by alternate. With
+    ``logprobs``, the recovered logprobs and ranks need no zeros first: every
+    request's is written."""
     num_reqs, sampled_width = sampled.shape
     if num_reqs == 0:
         return
+    new_lp, new_lp_strides = _alternate_columns(new_alternate_logprobs)
+    new_ranks, new_rank_strides = _alternate_columns(new_alternate_ranks)
     kernel = _kernel(
         sink_policy_kernel,
         *sink_policy_key(
@@ -1687,8 +1818,8 @@ def sink_policy(
         row_values,
         drafts,
         new_alternates.view(-1),
-        new_alternate_logprobs.view(-1),
-        new_alternate_ranks.view(-1),
+        new_lp,
+        new_ranks,
         alternates.view(-1),
         alternate_logprobs.view(-1),
         alternate_ranks.view(-1),
@@ -1696,6 +1827,23 @@ def sink_policy(
         total_len,
         bin_counts,
         counts,
+        *new_lp_strides,
+        *new_rank_strides,
+    )
+
+
+def _alternate_columns(
+    columns: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """A ``[num_reqs, alternates]`` tensor stored request by request or alternate by
+    alternate, as its flat storage and its (request, alternate) strides."""
+    if columns.is_contiguous():
+        return columns.view(-1), (columns.stride(0), columns.stride(1))
+    if columns.t().is_contiguous():
+        return columns.t().view(-1), (columns.stride(0), columns.stride(1))
+    raise ValueError(
+        f"alternate columns of strides {columns.stride()} are neither request- "
+        "nor alternate-major"
     )
 
 
@@ -1970,12 +2118,11 @@ def select_first_argmax_kernel(
     """``dspark.greedy._select_first_argmax``: the first maximum's global index
     over the all-gathered ``(value, index)`` pairs of each row ([rows, pair_width *
     ranks] FP32, a rank's pair at the start of its ``pair_width`` columns; indices
-    exact in FP32), into ``out[row * out_stride]``.
+    exact in FP32), into ``out[row * out_stride]``, a warp a row.
     As in Triton, the number of ranks is fixed when the kernel is built and every
-    load is issued before any combine. Alone, a thread reduces its row; with the
-    embedding, a warp a row: lane ``k < ranks`` reads rank ``k``'s pair, the other
-    lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce over the
-    next power of two (the combine is a total order).
+    load is issued before any combine: lane ``k < ranks`` reads rank ``k``'s pair,
+    the other lanes hold Triton's masked values (-inf, 2**30), and the lanes reduce
+    over the next power of two (the combine is a total order).
 
     With ``embed_width``, the drafter's next step: the selected token's row of the
     Markov embedding ``table`` ([vocab, embed_width] BF16) into ``step_out[row]``
@@ -1987,10 +2134,6 @@ def select_first_argmax_kernel(
     span = 1 << max(ranks - 1, 0).bit_length()
 
     if not embed_width:
-        # A thread a row (rows on grid x, _THREADS a block): every pair is loaded
-        # before the first combine, then combined in rank order. The combine is a
-        # total order, so the result is the warp reduction's; one block covers a
-        # verification batch where a warp a row scheduled a block a row.
 
         @T.prim_func
         def select_first_argmax(
@@ -1998,21 +2141,18 @@ def select_first_argmax_kernel(
             out: T.Tensor((out_len,), output_dtype),
             out_stride: T.int64,
         ):
-            with T.Kernel(T.ceildiv(rows, _THREADS), threads=_THREADS) as bx:
+            with T.Kernel(rows, threads=32) as row:
                 T.import_source(_HEADER)
-                row = bx * _THREADS + T.get_thread_binding()
-                values = T.alloc_local((ranks,), T.float32)
-                indices = T.alloc_local((ranks,), T.int32)
+                tx = T.get_thread_binding()
                 best = T.alloc_local((1,), T.float32)
                 best_index = T.alloc_local((1,), T.int32)
-                if row < rows:
-                    for k in tuple(range(ranks)):
-                        values[k] = pairs[row, pair_width * k]
-                        indices[k] = T.cast(pairs[row, pair_width * k + 1], T.int32)
-                    best[0] = values[0]
-                    best_index[0] = indices[0]
-                    for k in tuple(range(1, ranks)):
-                        _first_keep_or_take(best, best_index, values[k], indices[k])
+                other = T.alloc_local((1,), T.float32)
+                other_index = T.alloc_local((1,), T.int32)
+                _select_pairs(
+                    pairs, best, best_index, other, other_index, row, tx, ranks,
+                    span, pair_width,
+                )  # fmt: skip
+                if tx == 0:
                     out[T.cast(row, T.int64) * out_stride] = T.cast(
                         best_index[0], output_dtype
                     )
@@ -2350,75 +2490,135 @@ def sample_greedy_markov(
     )
 
 
+# select_first_argmax's masked pair: no real pair loses to it.
+_MASKED_INDEX = 1 << 30
+
+
 @tilelang.jit(pass_configs=_PASS)
-def greedy_rejection_kernel(width: int, drafts_dtype: str):
-    """``greedy_verification._greedy_rejection_kernel``: per request, drafts are
-    accepted while they equal the target's argmax (a -1 draft never is); the first
-    mismatch commits the argmax, and a fully accepted block commits the bonus
-    position's argmax. Positions after the first mismatch are not written."""
-    reqs, cu_len, targets_len, drafts_len = T.dynamic(
-        "reqs, cu_len, targets_len, drafts_len"
+def greedy_rejection_kernel(width: int, drafts_dtype: str, ranks: int, pair_width: int):
+    """``dspark.greedy._select_first_argmax`` and
+    ``greedy_verification._greedy_rejection_kernel`` in one launch, from the
+    all-gathered ``(value, index)`` pairs of each logits row ([rows, pair_width *
+    ranks] FP32, a rank's pair first in its ``pair_width`` columns), a warp a
+    request.
+
+    Lane ``j`` of a request with ``num_drafts`` drafts (``j <= num_drafts``) takes
+    position ``start + j``: it loads the row's ``ranks`` pairs, all before the
+    first combine, and reduces them in rank order with ``_first_keep_or_take``
+    (the selection's combine, a total order: NaN first, then the larger value,
+    then the smaller index; with ``ranks`` not a power of two, the masked pair the
+    selection pads with too), so the target is the selection's, bit for bit; the
+    lanes below ``num_drafts`` also stage the draft the position verifies. Lane 0
+    then runs the rejection kernel's loop from shared memory: drafts are accepted
+    while they equal the target (a -1 draft never is); the first mismatch commits
+    the target, and a fully accepted block commits the bonus position's. Positions
+    after the first mismatch are not written; ``num_sampled`` is the accepted
+    count plus one."""
+    if not 1 <= width <= 32:
+        raise ValueError(f"{width} sampled tokens a request: a warp takes them")
+    if not 1 <= ranks <= 32 or pair_width < 2:
+        raise ValueError(f"{ranks} ranks of {pair_width}-column pairs")
+    span = 1 << max(ranks - 1, 0).bit_length()
+    reqs, cu_len, drafts_len, rows, cols = T.dynamic(
+        "reqs, cu_len, drafts_len, rows, cols"
     )
+    pairs_stride = T.dynamic("pairs_stride", "int64")
 
     @T.prim_func
     def greedy_rejection(
         sampled: T.Tensor((reqs, width), T.int64),
         num_sampled: T.Tensor((reqs,), T.int32),
-        target_ids: T.Tensor((targets_len,), T.int64),
+        pairs: T.StridedTensor((rows, cols), (pairs_stride, 1), T.float32),
         draft_sampled: T.Tensor((drafts_len,), drafts_dtype),
         cu_num_logits: T.Tensor((cu_len,), T.int32),
     ):
         with T.Kernel(reqs, threads=32) as req:
+            T.import_source(_HEADER)
             tx = T.get_thread_binding()
-            start = T.alloc_local((1,), T.int64)
-            num_drafts = T.alloc_local((1,), T.int64)
+            values = T.alloc_local((ranks,), T.float32)
+            indices = T.alloc_local((ranks,), T.int32)
+            best = T.alloc_local((1,), T.float32)
+            best_index = T.alloc_local((1,), T.int32)
+            targets = T.alloc_shared((width,), T.int64)
+            drafts = T.alloc_shared((width,), T.int64)
             accepted = T.alloc_local((1,), T.int64)
             verifying = T.alloc_local((1,), T.int32)
-            draft = T.alloc_local((1,), T.int64)
-            target = T.alloc_local((1,), T.int64)
+            start = T.alloc_var(T.int64, init=T.cast(cu_num_logits[req], T.int64))
+            num_drafts = T.alloc_var(
+                T.int64, init=T.cast(cu_num_logits[req + 1], T.int64) - start - 1
+            )
+            if (tx < width) & (T.cast(tx, T.int64) <= num_drafts):
+                for k in tuple(range(ranks)):
+                    values[k] = pairs[start + tx, pair_width * k]
+                    indices[k] = T.cast(pairs[start + tx, pair_width * k + 1], T.int32)
+                best[0] = values[0]
+                best_index[0] = indices[0]
+                for k in tuple(range(1, ranks)):
+                    _first_keep_or_take(best, best_index, values[k], indices[k])
+                if span > ranks:
+                    _first_keep_or_take(
+                        best, best_index, -T.infinity(T.float32), _MASKED_INDEX
+                    )
+                targets[tx] = T.cast(best_index[0], T.int64)
+                if T.cast(tx, T.int64) < num_drafts:
+                    drafts[tx] = T.cast(draft_sampled[start + tx + 1], T.int64)
+            T.sync_threads()
             if tx == 0:
-                start[0] = T.cast(cu_num_logits[req], T.int64)
-                num_drafts[0] = T.cast(cu_num_logits[req + 1], T.int64) - start[0] - 1
                 accepted[0] = 0
                 verifying[0] = 1
-                for i in T.serial(num_drafts[0]):
-                    if verifying[0] != 0:
-                        draft[0] = T.cast(draft_sampled[start[0] + i + 1], T.int64)
-                        target[0] = target_ids[start[0] + i]
+                for i in tuple(range(width - 1)):
+                    if (num_drafts > i) & (verifying[0] != 0):
                         # -1 is a placeholder draft that is always rejected.
-                        if (target[0] == draft[0]) & (draft[0] >= 0):
-                            sampled[req, i] = draft[0]
+                        if (targets[i] == drafts[i]) & (drafts[i] >= 0):
+                            sampled[req, i] = drafts[i]
                             accepted[0] = accepted[0] + 1
                         else:
-                            sampled[req, i] = target[0]
+                            sampled[req, i] = targets[i]
                             verifying[0] = 0
-                if accepted[0] == num_drafts[0]:
-                    # Every draft accepted: the bonus position's argmax.
-                    sampled[req, num_drafts[0]] = target_ids[start[0] + num_drafts[0]]
+                if accepted[0] == num_drafts:
+                    # Every draft accepted: the bonus position's target.
+                    sampled[req, num_drafts] = targets[num_drafts]
                 num_sampled[req] = T.cast(accepted[0] + 1, T.int32)
 
     return greedy_rejection
 
 
+def greedy_rejection_key(
+    width: int, drafts_dtype: torch.dtype, ranks: int, pair_width: int
+) -> tuple:
+    return (width, _DTYPES[drafts_dtype], ranks, pair_width)
+
+
 def greedy_rejection_sample(
-    target_ids: torch.Tensor,
+    pairs: torch.Tensor,
     draft_sampled: torch.Tensor,
     cu_num_logits: torch.Tensor,
     num_speculative_steps: int,
+    pair_width: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``greedy_verification.greedy_rejection_sample``."""
+    """``greedy_verification.greedy_rejection_sample``: the targets selected from
+    the gathered pairs ([rows, pair_width * ranks] FP32) and the drafts verified
+    against them, in one launch."""
     num_reqs = cu_num_logits.shape[0] - 1
     sampled = draft_sampled.new_empty(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     if num_reqs > 0:
+        if pairs.shape[1] % pair_width:
+            raise ValueError(
+                f"{pairs.shape[1]} pair columns are not whole {pair_width}-column pairs"
+            )
         kernel = _kernel(
             greedy_rejection_kernel,
-            num_speculative_steps + 1,
-            _DTYPES[draft_sampled.dtype],
+            *greedy_rejection_key(
+                num_speculative_steps + 1,
+                draft_sampled.dtype,
+                pairs.shape[1] // pair_width,
+                pair_width,
+            ),
         )
-        kernel(sampled, num_sampled, target_ids, draft_sampled, cu_num_logits)
+        kernel(sampled, num_sampled, pairs, draft_sampled, cu_num_logits)
     return sampled, num_sampled
 
 
@@ -2594,12 +2794,14 @@ def sink_calls(
     num_alternates: int,
     rejection: bool,
     num_event_fields: int,
+    logits_mode: bool = False,
 ) -> list:
     """``SinkSampler``'s calls: the flags, with and without dead rows; the policy
     for each sampled width, with and without logprobs; with rejection on, the
     candidates of logits of each of
     ``logits_dtypes`` (a rejected draft masked when more than one row is
-    sampled)."""
+    sampled), and the alternates' rows for their logprobs (with ``logits_mode``,
+    their logits too)."""
     calls = [_call(sink_flags_kernel, dead_rows) for dead_rows in (False, True)]
     if rejection:
         # The cut and its restore, on raw and processed logits and on a rank's
@@ -2620,6 +2822,14 @@ def sink_calls(
             _call(sink_merge_kernel, True, num_alternates + 1, num_alternates),
             _call(sink_merge_kernel, False, 0, num_alternates),
         ]
+        if num_alternates:
+            calls += [
+                _call(
+                    sink_rows_kernel,
+                    *sink_rows_key(dtype, num_alternates, logits_mode),
+                )
+                for dtype in dict.fromkeys(logits_dtypes)
+            ]
     calls += [
         _call(
             sink_policy_kernel,
@@ -2656,7 +2866,7 @@ def greedy_calls(
     logits: Sequence[torch.dtype] = (),
     select: Sequence[tuple[torch.dtype, int, int]] = (),
     finish_outputs: Sequence[torch.dtype] = (),
-    rejection_widths: Sequence[int] = (),
+    rejection: Sequence[tuple[int, int, int]] = (),
 ) -> list:
     """The greedy reductions' calls: ``greedy_markov_shard_pair`` /
     ``sample_greedy_markov`` for each ``(base, bias)`` dtype pair, and
@@ -2664,8 +2874,9 @@ def greedy_calls(
     element-wise reads, which the launch picks from the rows' alignment); the
     pair finish when there is a pair, ``select_first_argmax`` for each
     ``(output dtype, ranks, pair width)``, ``sample_greedy_markov``'s index finish
-    for each of ``finish_outputs``, and greedy verification for each sampled
-    width."""
+    for each of ``finish_outputs``, and greedy verification (its selection of the
+    targets included) for each ``(sampled width, ranks, pair width)`` of
+    ``rejection``."""
     calls = [
         _call(partial_argmax_kernel, *partial_argmax_key(base, bias, vector))
         for base, bias in markov
@@ -2690,8 +2901,10 @@ def greedy_calls(
         for dtype, ranks, width in select
     ]
     calls += [
-        _call(greedy_rejection_kernel, width, _DTYPES[dtype])
-        for width in rejection_widths
+        _call(
+            greedy_rejection_kernel, *greedy_rejection_key(width, dtype, ranks, pairs)
+        )
+        for width, ranks, pairs in rejection
         for dtype in (torch.int32, torch.int64)
     ]
     return _unique(calls)

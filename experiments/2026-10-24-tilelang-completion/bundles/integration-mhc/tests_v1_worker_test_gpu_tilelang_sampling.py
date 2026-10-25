@@ -631,7 +631,12 @@ def _policy_state(reqs, width, slots, alternates, seed):
     "rejection,logprobs", [(True, True), (True, False), (False, False)]
 )
 @pytest.mark.parametrize("width", [6, 1])
-def test_sink_policy(rejection, logprobs, width):
+@pytest.mark.parametrize("alternate_major", [False, True])
+def test_sink_policy(rejection, logprobs, width, alternate_major):
+    """The policy against the Triton kernel. The Triton launch's recovered logprobs
+    and ranks were zero-filled by torch; the TileLang kernel writes every request's
+    (0 where none was recovered) over garbage. The step's alternate logprobs and
+    ranks may be views of alternate-major storage (the sink's ranks are)."""
     reqs, slots, alternates, fields = 23, 40, 3, 6
     cu, drafts, mapping, state = _policy_state(reqs, width, slots, alternates, 9)
     results = []
@@ -640,8 +645,17 @@ def test_sink_policy(rejection, logprobs, width):
         events = torch.full((reqs, fields), -9, dtype=torch.int32, device=DEVICE)
         tokens = torch.full((reqs, width + 1), -9, dtype=torch.int64, device=DEVICE)
         num_out = torch.full((reqs,), -9, dtype=torch.int32, device=DEVICE)
-        rec_lp = torch.full((reqs,), -9.0, device=DEVICE)
-        rec_rk = torch.full((reqs,), -9, dtype=torch.int64, device=DEVICE)
+        # Only a logprobs launch writes them: garbage for ours, zeros for Triton.
+        garbage = ours and logprobs
+        rec_lp = torch.full((reqs,), -9.0 if garbage else 0.0, device=DEVICE)
+        rec_rk = torch.full(
+            (reqs,), -9 if garbage else 0, dtype=torch.int64, device=DEVICE
+        )
+        new_logprobs, new_ranks = s["new_logprobs"], s["new_ranks"]
+        if ours and alternate_major:
+            new_logprobs = new_logprobs.t().contiguous().t()
+            new_ranks = new_ranks.t().contiguous().t()
+            assert not new_ranks.is_contiguous()
         args = (
             s["sampled"],
             s["num_sampled"],
@@ -658,8 +672,8 @@ def test_sink_policy(rejection, logprobs, width):
             s["values"],
             drafts,
             s["new_alternates"] if rejection else s["alternates"],
-            s["new_logprobs"] if logprobs else s["alt_logprobs"],
-            s["new_ranks"] if logprobs else s["alt_ranks"],
+            new_logprobs if logprobs else s["alt_logprobs"],
+            new_ranks if logprobs else s["alt_ranks"],
             s["alternates"],
             s["alt_logprobs"],
             s["alt_ranks"],
@@ -914,21 +928,51 @@ def test_sample_greedy_markov(dtype, case):
 
 @pytest.mark.parametrize("steps", [5, 1])
 @pytest.mark.parametrize("drafts_dtype", [torch.int32, torch.int64])
-def test_greedy_rejection(steps, drafts_dtype):
-    g = torch.Generator(device=DEVICE).manual_seed(steps)
+@pytest.mark.parametrize("ranks", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("pair_width,strided", [(4, False), (4, True), (2, False)])
+def test_greedy_rejection(steps, drafts_dtype, ranks, pair_width, strided):
+    """Greedy verification from the gathered pairs, one launch, against Triton's
+    two: ``_select_first_argmax`` over the packed pairs, then
+    ``_greedy_rejection_kernel`` over its targets. The pairs carry ties within and
+    across ranks, NaN (alone and in every rank) and -inf rows, junk in the columns
+    past each pair, and (strided) a row stride past the pairs; drafts accept, miss,
+    hold -1 and end blocks fully accepted."""
+    g = torch.Generator(device=DEVICE).manual_seed(steps * 100 + ranks)
     counts = [steps + 1 if i % 3 else 1 for i in range(37)]
     cu = torch.tensor(
         [0, *itertools.accumulate(counts)], dtype=torch.int32, device=DEVICE
     )
     rows = int(cu[-1])
-    target = torch.randint(0, 6, (rows,), generator=g, device=DEVICE)
-    drafts = torch.randint(-1, 6, (rows + 1,), generator=g, device=DEVICE).to(
-        drafts_dtype
+    values = torch.round(torch.randn(rows, ranks, generator=g, device=DEVICE))
+    values[2::7, ranks - 1] = float("nan")
+    values[5::13] = float("nan")
+    values[9::11] = -float("inf")
+    index = torch.randint(0, 6, (rows, ranks), generator=g, device=DEVICE).float()
+    index[4::17] = torch.randint(
+        0, 1 << 24, index[4::17].shape, generator=g, device=DEVICE
+    ).float()
+    full = torch.full((rows, ranks, pair_width), 7.5, device=DEVICE)
+    full[..., 0], full[..., 1] = values, index
+    storage = torch.full(
+        (rows, ranks * pair_width + (3 if strided else 0)), -2.0, device=DEVICE
     )
-    drafts[1::2] = target[: drafts[1::2].numel()].to(drafts_dtype)
-    ours = tls.greedy_rejection_sample(target, drafts, cu, steps)
+    pairs = storage[:, : ranks * pair_width]
+    pairs.copy_(full.view(rows, ranks * pair_width))
+    packed = full[..., :2].contiguous().view(rows, 2 * ranks)
+    target = torch.empty(rows, dtype=torch.int64, device=DEVICE)
+    _triton_select(packed, target)
+    # A draft verifies the row before it: most are that row's target (accepted),
+    # some miss or are -1.
+    drafts = torch.empty(rows + 1, dtype=torch.int64, device=DEVICE)
+    drafts[0] = 0
+    drafts[1:] = target
+    drafts[3::5] = (drafts[3::5] + 1) % 6
+    drafts[7::9] = -1
+    drafts = drafts.to(drafts_dtype)
+    ours = tls.greedy_rejection_sample(pairs, drafts, cu, steps, pair_width)
     theirs = _triton_greedy_rejection(target, drafts, cu, steps)
     _assert_same(ours[1], theirs[1], "num_sampled")
+    assert (ours[1] > 1).any() and (ours[1] < steps + 1).any()
     for r in range(len(counts)):
         n = int(theirs[1][r])
         _assert_same(ours[0][r, :n], theirs[0][r, :n], f"request {r}'s tokens")
