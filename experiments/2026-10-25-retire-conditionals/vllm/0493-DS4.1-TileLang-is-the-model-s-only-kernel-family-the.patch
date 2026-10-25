@@ -35,20 +35,25 @@ B12X vision, the B12X workspace file, B12X DS4.1 linear, mHC and embedding
 tests in test_b12x_linear.py, the B12X DSpark context graph test, the
 compressor projection/mHC/context projection preparation tests). Ported to
 TileLang: the compressor's rejection/reorder/page-boundary and high-offset
-tests, the Engram model tests (token ids for the gate), the SP Engram gate
-test, the attention staging tests; moved: the builder's graph-refresh and the
-custom op functionalization tests. The TileLang vision test keeps its torch
-models of the arithmetic and FP64 references (fixed bounds) without B12X's
-kernels, and its B12X benchmark goes.
+tests (their padding as the runner pads a captured step: rows past the step's
+requests, which write nothing; serving gives every row a request owns a
+slot), the Engram model tests (token ids for the gate), the SP Engram gate test
+(the Engram tests' model is 1024 wide, the TileLang gate's smallest), the
+attention staging tests; moved: the builder's graph-refresh and the custom op
+functionalization tests. The TileLang vision test keeps its torch models of the
+arithmetic and FP64 references without B12X's kernels: each FP64 bound is the
+tighter of a fixed one and the test's B12X-relative one, with B12X's errors on
+the same inputs as numbers (B12X_ERROR, measured on candidate 6's image). Its
+B12X benchmark goes.
 ---
  .../kernels/benchmark_tilelang_vision.py      |  412 ----
  .../test_deepseek_v41_tilelang_metadata.py    |   74 +
- .../test_deepseek_v41_tilelang_vision.py      |  348 +--
+ .../test_deepseek_v41_tilelang_vision.py      |  407 +---
  .../kernels/test_b12x_linear.py               |  574 -----
  tests/model_executor/test_b12x_warmup.py      |   49 +-
  ..._deepseek_v41_sp_project_reduce_scatter.py |   13 +-
  tests/models/test_deepseek_v4_1_attention.py  |  479 +---
- tests/models/test_deepseek_v4_1_compressor.py |  101 +-
+ tests/models/test_deepseek_v4_1_compressor.py |  122 +-
  .../test_deepseek_v4_1_compressor_prepare.py  |   45 +-
  tests/models/test_deepseek_v4_1_config.py     |   19 +-
  tests/models/test_deepseek_v4_1_engram.py     |   89 +-
@@ -76,7 +81,7 @@ kernels, and its B12X benchmark goes.
  .../deepseek_v4_1/tilelang/attention.py       |   10 +-
  vllm/models/deepseek_v4_1/tilelang/mhc.py     |    2 +-
  vllm/models/deepseek_v4_1/tilelang/vision.py  |    3 +-
- 35 files changed, 528 insertions(+), 8898 deletions(-)
+ 35 files changed, 603 insertions(+), 8903 deletions(-)
  delete mode 100644 benchmarks/kernels/benchmark_tilelang_vision.py
  delete mode 100644 tests/models/test_deepseek_v4_1_rmsnorm.py
  delete mode 100644 tests/models/test_deepseek_v4_1_vision.py
@@ -593,10 +598,10 @@ index 92d598e8c..d4f04ad82 100644
 +            for name in ("positions", "reqs", "slots", "lengths")
 +        ]
 diff --git a/tests/kernels/test_deepseek_v41_tilelang_vision.py b/tests/kernels/test_deepseek_v41_tilelang_vision.py
-index 67ea136f2..cc12a2814 100644
+index 67ea136f2..78411faf2 100644
 --- a/tests/kernels/test_deepseek_v41_tilelang_vision.py
 +++ b/tests/kernels/test_deepseek_v41_tilelang_vision.py
-@@ -1,26 +1,21 @@
+@@ -1,26 +1,22 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 -"""DeepSeek-V4.1's TileLang vision tower against B12X's arithmetic and DeepSeek's
@@ -627,15 +632,69 @@ index 67ea136f2..cc12a2814 100644
 +DeepSeek's reference activations (torch's ``F.gelu``), on every BF16 input.
 +
 +Against FP64 references (DeepSeek's ``deepseek_v4/common/vision.py`` math in FP64,
-+rounded to BF16 where its modules return BF16), with fixed tolerances: the
-+projections, attention, and the whole tower and aligner at grids from 1x1 to the
-+capacity, odd sizes included for the merge padding. Then non-finite values (the
-+reference's positions), stale capacity rows, CUDA graph replay, the data-parallel
-+runner and declaration coverage.
++rounded to BF16 where its modules return BF16), with tolerances no looser than fixed
++ones nor than B12X's own error on the same inputs (``B12X_ERROR``, measured on the
++tower this one replaced): the projections, attention, and the whole tower and aligner
++at grids from 1x1 to the capacity, odd sizes included for the merge padding. Then
++non-finite values (the reference's positions), stale capacity rows, CUDA graph replay,
++the data-parallel runner and declaration coverage.
  """
  
  import math
-@@ -129,56 +124,6 @@ def real():
+@@ -84,6 +80,52 @@ REAL = _config(
+ SMALL_GRIDS = [(1, 1), (1, 7), (4, 7), (5, 5), (7, 11), (12, 12), (3, 48), (1, 144)]
+ REAL_GRIDS = [(1, 1), (5, 7), (13, 17), (24, 24), (1, 576)]
+ 
++# B12X's error at each FP64 comparison below, on the same inputs: candidate 6's vision
++# test on its image (spark-ds41f experiments/2026-10-25-retire-conditionals,
++# bundles/vision-b12x-error; dgx4, 2026-10-25), which measured both towers. Projections:
++# (worst BF16 steps, values off the correctly rounded); attention: (relative RMS, worst
++# BF16 steps); towers, by width and grid: (ViT, aligner) relative RMS.
++B12X_ERROR = {
++    "qkv at 1 rows": (0.49664192447845906, 0),
++    "wo at 1 rows": (0.49470068153396846, 0),
++    "mlp gate/up at 1 rows": (0.49794636391807, 0),
++    "mlp down at 1 rows": (0.4959321068274381, 0),
++    "aligner w1 at 1 rows": (0.48621282933571575, 0),
++    "aligner w2 at 1 rows": (0.4934345848745577, 2),
++    "qkv at 77 rows": (0.49866283029179753, 130),
++    "wo at 77 rows": (0.49879117582709537, 37),
++    "mlp gate/up at 77 rows": (0.49880283280869087, 198),
++    "mlp down at 77 rows": (0.49676895476923505, 63),
++    "aligner w1 at 77 rows": (0.49089014453706376, 2006),
++    "aligner w2 at 77 rows": (0.4945250258583259, 1170),
++    "qkv at 192 rows": (0.498748932429561, 333),
++    "wo at 192 rows": (121.80086993074598, 80684),
++    "mlp gate/up at 192 rows": (0.4989614576498799, 572),
++    "mlp down at 192 rows": (0.49701668764484325, 291),
++    "aligner w1 at 192 rows": (0.4913324818187672, 5229),
++    "aligner w2 at 192 rows": (0.49501480496989436, 2878),
++    "patch embedding at 1 rows": (0.49650757680379937, 0),
++    "patch embedding at 77 rows": (0.49868921946481376, 29),
++    "patch embedding at 300 rows": (0.4992916210657623, 92),
++    "attention at 1 rows": (0.0, 0.0),
++    "attention at 77 rows": (0.001767753885921865, 10.741378149878534),
++    "attention at 300 rows": (0.0017426768323724874, 14.752147869508457),
++    "attention at 576 rows": (0.0017363360945632515, 12.480541974387345),
++    "tower 128 1x1": (0.0, 0.0),
++    "tower 128 1x7": (0.006624815042978595, 0.0),
++    "tower 128 4x7": (0.005986462518016249, 0.0),
++    "tower 128 5x5": (0.006280779640718641, 0.0),
++    "tower 128 7x11": (0.006553608157130729, 0.004384625869705573),
++    "tower 128 12x12": (0.0063686162131065495, 0.004168449837265123),
++    "tower 128 3x48": (0.006261522709414092, 0.00446008286592595),
++    "tower 128 1x144": (0.006070036114104239, 0.0002476796899654311),
++    "tower 1024 1x1": (0.0, 0.0),
++    "tower 1024 5x7": (0.004482965789398322, 0.00067090285939057),
++    "tower 1024 13x17": (0.003496343115106573, 0.0050644118823980925),
++    "tower 1024 24x24": (0.0030264071165440115, 0.0009215817182229654),
++    "tower 1024 1x576": (0.0030055770167633227, 0.0007788215984908864),
++}
++
+ 
+ # --- Construction ---------------------------------------------------------------
+ 
+@@ -129,56 +171,6 @@ def real():
      return _towers(REAL)
  
  
@@ -692,7 +751,7 @@ index 67ea136f2..cc12a2814 100644
  def _kernel(module, role: str):
      return vision.resolve(module.kernel_calls()[role])
  
-@@ -452,29 +397,6 @@ def test_spatial_merge_matches_unfold(channels, height, width):
+@@ -452,29 +444,6 @@ def test_spatial_merge_matches_unfold(channels, height, width):
      assert bool(out[rows:].isnan().all())
  
  
@@ -722,7 +781,7 @@ index 67ea136f2..cc12a2814 100644
  # --- The residual add and RMSNorm -----------------------------------------------
  
  
-@@ -508,36 +430,6 @@ def test_add_norm_is_b12x_arithmetic(config, rows, add):
+@@ -508,36 +477,6 @@ def test_add_norm_is_b12x_arithmetic(config, rows, add):
      assert _max_ulps(out, ref, 0.0) <= 1.0
  
  
@@ -759,7 +818,7 @@ index 67ea136f2..cc12a2814 100644
  def test_add_norm_nonfinite_like_the_reference():
      width, rows = REAL.vision_dim, 6
      x = _randn(rows, width, seed=5)
-@@ -602,48 +494,6 @@ def test_rope_is_b12x_arithmetic(config, height, width):
+@@ -602,48 +541,6 @@ def test_rope_is_b12x_arithmetic(config, height, width):
          assert _max_ulps(got, ref, 2.0**-12) <= 1.0
  
  
@@ -808,7 +867,7 @@ index 67ea136f2..cc12a2814 100644
  def test_rope_nonfinite_like_the_reference():
      heads, hidden, height, width = 16, 1024, 3, 4
      rows = height * width
-@@ -678,26 +528,19 @@ def _projection_error(out, a, weight, bias):
+@@ -678,26 +575,25 @@ def _projection_error(out, a, weight, bias):
      return error, int((out != ref.bfloat16()).sum()), out.numel()
  
  
@@ -818,7 +877,8 @@ index 67ea136f2..cc12a2814 100644
 -    B12X (1.5x, plus four values for sampling noise)."""
 +def _check_projection(name, ours):
 +    """Ours within one BF16 step of the reference (plus accumulation noise), and off
-+    the correctly rounded value for at most 1% of the outputs (plus four)."""
++    the correctly rounded value no more often than for 1% of the outputs nor than
++    B12X (1.5x), plus four values for sampling noise."""
      error, off, total = ours
 -    message = f"{name}: ours {error:.3f} steps, {off} of {total} off; "
 -    if theirs is None:
@@ -828,8 +888,13 @@ index 67ea136f2..cc12a2814 100644
 -    message += f"B12X {b12x_error:.3f} steps, {b12x_off} off"
 -    assert error <= max(1.0, b12x_error), message
 -    assert off <= 1.5 * b12x_off + 4, message
-+    message = f"{name}: ours {error:.3f} steps, {off} of {total} off"
-+    assert error <= 1.0 and off <= 0.01 * total + 4, message
++    b12x_error, b12x_off = B12X_ERROR[name]
++    message = (
++        f"{name}: ours {error:.3f} steps, {off} of {total} off; "
++        f"B12X {b12x_error:.3f} steps, {b12x_off} off"
++    )
++    assert error <= 1.0, message
++    assert off <= min(0.01 * total, 1.5 * b12x_off) + 4, message
  
  
  def _projection_cases(vit, aligner, rows: int):
@@ -841,7 +906,7 @@ index 67ea136f2..cc12a2814 100644
      block, out_dim = vit.blocks[0], aligner.out_dim
      small = rows <= vision.GEMV_ROWS
  
-@@ -738,30 +581,15 @@ def _project(kernel, layer, a: torch.Tensor) -> torch.Tensor:
+@@ -738,30 +634,15 @@ def _project(kernel, layer, a: torch.Tensor) -> torch.Tensor:
      return out
  
  
@@ -876,7 +941,7 @@ index 67ea136f2..cc12a2814 100644
  
  
  def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
-@@ -781,22 +609,16 @@ def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
+@@ -781,22 +662,16 @@ def _patch_embedding(vit, patches: torch.Tensor) -> torch.Tensor:
  
  
  @pytest.mark.parametrize("rows", [1, 77, 300])
@@ -901,7 +966,7 @@ index 67ea136f2..cc12a2814 100644
  
  
  @pytest.mark.parametrize("role, k", [("patch", 64), ("patch_rows", 12)])
-@@ -829,25 +651,6 @@ def test_projection_nonfinite_rows(small, rows):
+@@ -829,25 +704,6 @@ def test_projection_nonfinite_rows(small, rows):
      assert_other_rows_equal(out, clean, [4])
  
  
@@ -927,7 +992,7 @@ index 67ea136f2..cc12a2814 100644
  # --- Epilogues: GELU and SwiGLU ---------------------------------------------------
  
  
-@@ -936,31 +739,6 @@ def test_gelu_epilogue_is_the_reference_everywhere(real, gemv):
+@@ -936,31 +792,6 @@ def test_gelu_epilogue_is_the_reference_everywhere(real, gemv):
      _assert_bits(got, _reference_gelu(table), "GELU on every BF16 input")
  
  
@@ -959,7 +1024,7 @@ index 67ea136f2..cc12a2814 100644
  def _mlp_in(vit, rows: int, seed: int):
      """The MLP's fused gate/up projection with SwiGLU, and the unfused projection's
      BF16 gate/up of the same rows (the GEMVs up to GEMV_ROWS rows, else the GEMMs:
-@@ -1003,26 +781,6 @@ def test_swiglu_epilogue_against_the_reference(small, rows):
+@@ -1003,26 +834,6 @@ def test_swiglu_epilogue_against_the_reference(small, rows):
      assert (activated != ref).float().mean().item() <= 2e-3
  
  
@@ -986,7 +1051,7 @@ index 67ea136f2..cc12a2814 100644
  @pytest.mark.parametrize("rows", [5, 9])
  def test_swiglu_epilogue_nonfinite_rows(small, rows):
      vit, _ = small
-@@ -1050,25 +808,12 @@ def _split64(qkv: torch.Tensor, heads: int):
+@@ -1050,39 +861,24 @@ def _split64(qkv: torch.Tensor, heads: int):
      ]
  
  
@@ -1006,20 +1071,19 @@ index 67ea136f2..cc12a2814 100644
 -def test_attention_against_fp64(real, rows, request):
 -    """Relative RMS error at most 1.25x B12X's, and the worst element at most one
 -    BF16 step past B12X's worst (FP64 softmax attention, in BF16 steps of the
--    reference plus 2^-12 of its RMS)."""
 +def test_attention_against_fp64(real, rows):
-+    """Relative RMS error at most 2^-8, and the worst element at most four BF16 steps
-+    (FP64 softmax attention, in BF16 steps of the reference plus 2^-12 of its
-+    RMS)."""
++    """Relative RMS error at most 2^-8 and 1.25x B12X's, and the worst element at most
++    one BF16 step past B12X's worst (FP64 softmax attention, in BF16 steps of the
+     reference plus 2^-12 of its RMS)."""
      vit, _ = real
 -    b12x = _optional(request, "b12x_real")
      heads = REAL.vision_n_heads
      qkv = _randn(rows, 3 * REAL.vision_dim, seed=rows, scale=2.0)
      ref = _attention64(*_split64(qkv, heads)).reshape(rows, -1)
-@@ -1076,14 +821,7 @@ def test_attention_against_fp64(real, rows, request):
+     floor = 2.0**-12 * ref.square().mean().sqrt()
      out = _attention(vit, qkv)
      ours = (_relative(out, ref), _max_ulps(out, ref, floor))
-     message = f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps"
+-    message = f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps"
 -    if b12x is None:
 -        assert ours[0] <= 2.0**-8 and ours[1] <= 4.0, message + "; B12X unavailable"
 -        return
@@ -1027,12 +1091,16 @@ index 67ea136f2..cc12a2814 100644
 -    theirs = (_relative(theirs_out, ref), _max_ulps(theirs_out, ref, floor))
 -    message += f"; B12X {theirs[0]:.3e} relative, {theirs[1]:.2f} steps"
 -    assert ours[0] <= 1.25 * theirs[0], message
--    assert ours[1] <= theirs[1] + 1.0, message
-+    assert ours[0] <= 2.0**-8 and ours[1] <= 4.0, message
++    theirs = B12X_ERROR[f"attention at {rows} rows"]
++    message = (
++        f"{rows} rows: ours {ours[0]:.3e} relative, {ours[1]:.2f} steps; "
++        f"B12X {theirs[0]:.3e} relative, {theirs[1]:.2f} steps"
++    )
++    assert ours[0] <= min(2.0**-8, 1.25 * theirs[0]), message
+     assert ours[1] <= theirs[1] + 1.0, message
  
  
- def test_attention_ignores_stale_capacity_rows(real):
-@@ -1118,7 +856,7 @@ def test_attention_nonfinite_like_the_reference(real):
+@@ -1118,7 +914,7 @@ def test_attention_nonfinite_like_the_reference(real):
  # --- The tower and aligner ----------------------------------------------------------
  
  
@@ -1041,10 +1109,14 @@ index 67ea136f2..cc12a2814 100644
      rows = height * width
      patches = _patches(vit.config, rows, seed)
      encoded = vit(patches, height, width)
-@@ -1129,33 +867,17 @@ def _tower_case(vit, aligner, b12x, height, width, seed):
+@@ -1126,36 +922,25 @@ def _tower_case(vit, aligner, b12x, height, width, seed):
+     vit_ref = _vit_reference(vit, patches, height, width)
+     aligner_ref = _aligner_reference(aligner, encoded, height, width)
+     ours = (_relative(encoded, vit_ref), _relative(aligned, aligner_ref))
++    theirs = B12X_ERROR[f"tower {vit.config.vision_dim} {height}x{width}"]
      message = (
-         f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64"
-     )
+-        f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64"
+-    )
 -    if b12x is None:
 -        assert ours[0] <= 2.0**-7 and ours[1] <= 2.0**-7, message + " (no B12X)"
 -        return
@@ -1054,13 +1126,16 @@ index 67ea136f2..cc12a2814 100644
 -    theirs = (
 -        _relative(b12x_encoded, vit_ref),
 -        _relative(b12x_aligned, aligner_ref),
--    )
++        f"{height}x{width}: ViT {ours[0]:.3e}, aligner {ours[1]:.3e} relative to FP64; "
++        f"B12X {theirs[0]:.3e}, {theirs[1]:.3e}"
+     )
 -    message += f"; B12X {theirs[0]:.3e}, {theirs[1]:.3e}"
--    # Both round the same activations to BF16; their errors come from FP32
--    # accumulation orders and attention, so ours may differ by sampling noise.
+     # Both round the same activations to BF16; their errors come from FP32
+     # accumulation orders and attention, so ours may differ by sampling noise.
 -    assert ours[0] <= 1.5 * theirs[0] + 2.0**-14, message
 -    assert ours[1] <= 1.5 * theirs[1] + 2.0**-14, message
-+    assert ours[0] <= 2.0**-7 and ours[1] <= 2.0**-7, message
++    for stage in (0, 1):
++        assert ours[stage] <= min(2.0**-7, 1.5 * theirs[stage] + 2.0**-14), message
  
  
  @pytest.mark.parametrize("height, width", SMALL_GRIDS)
@@ -2329,7 +2404,7 @@ index 2e845ad71..465c2fb3d 100644
 +        # alias-list functionalization used to copy stale clones back here.
 +        torch.testing.assert_close(backing, torch.cat((hidden * 2, hidden * 3)))
 diff --git a/tests/models/test_deepseek_v4_1_compressor.py b/tests/models/test_deepseek_v4_1_compressor.py
-index ddb9ad232..a643541b0 100644
+index ddb9ad232..034b61c5f 100644
 --- a/tests/models/test_deepseek_v4_1_compressor.py
 +++ b/tests/models/test_deepseek_v4_1_compressor.py
 @@ -1,6 +1,6 @@
@@ -2376,15 +2451,41 @@ index ddb9ad232..a643541b0 100644
          parallel_config=SimpleNamespace(decode_context_parallel_size=1),
          speculative_config=None,
      )
-@@ -204,6 +206,7 @@ def native_compressor_runners(monkeypatch):
+@@ -178,9 +180,13 @@ def native_compressor_runners(monkeypatch):
+             for length in lengths:
+                 starts.append(starts[-1] + length)
+             n = starts[-1]
++            # With ``pad`` the last request's rows are graph padding, as the runner
++            # pads a captured step: past every request's range, without slots,
++            # while its block table row still names its pages.
++            live = len(identities) - pad
+             self.starts.copy_(
+                 torch.tensor(
+-                    starts + [n] * (requests + 1 - len(starts)),
++                    starts[: live + 1] + [starts[live]] * (requests - live),
+                     device=device,
+                     dtype=torch.int32,
+                 )
+@@ -204,14 +210,15 @@ def native_compressor_runners(monkeypatch):
                  self.table[:, null] = 0
              cm = SimpleNamespace(
                  query_start_loc=self.starts,
-+                query_start_loc_cpu=self.starts[: len(identities) + 1].cpu(),
++                query_start_loc_cpu=self.starts[: live + 1].cpu(),
                  seq_lens=self.seq,
                  block_table_tensor=self.table,
                  slot_mapping=self.input_slots,
-@@ -229,53 +232,34 @@ def native_compressor_runners(monkeypatch):
+-                num_reqs=len(identities),
++                num_reqs=live,
+                 num_actual_tokens=n,
+-                max_query_len=max(lengths, default=0),
++                max_query_len=max(lengths[:live], default=0),
+                 max_seq_len=max(
+-                    (pos + length for pos, length in zip(positions, lengths)),
++                    (pos + length for pos, length in zip(positions, lengths[:live])),
+                     default=0,
+                 ),
+             )
+@@ -229,53 +236,34 @@ def native_compressor_runners(monkeypatch):
              n = self.main.num_actual_tokens
              return self.module._latent[:n].clone(), self.module._slots[:n].clone()
  
@@ -2457,7 +2558,28 @@ index ddb9ad232..a643541b0 100644
      device = original.device
      width = candidate.table.shape[1]
      with torch.no_grad():
-@@ -326,11 +310,11 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -307,14 +295,17 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+                 assert (candidate.backing[0] == 123).all()
+                 assert (candidate.backing[:, candidate.state_width :] == 123).all()
+ 
+-        # A rejected/PAD request must not be resurrected by a real block table.
++        # Graph padding must not be resurrected by a real block table: the padded
++        # rows write neither latents nor the ring of the pages its table row names.
++        # Serving gives every row a request owns a slot; only rows past the step's
++        # requests are padding (the ring-writes test above).
+         before = candidate.pool[33:49].clone()
+         candidate.stage([0, 1, 2], [20, 20, 20], [2, 2, 2], replacement, pad=True)
+         _, slots = candidate.run()
+         assert slots[-2:].tolist() == [-1, -1]
+         torch.testing.assert_close(candidate.pool[33:49], before, atol=0, rtol=0)
+-        assert candidate.state.slot_mapping[6:].eq(-1).all()
+-        assert candidate.state.req_id_per_token[-1].item() == -1
++        assert candidate.state.slot_mapping[4:].eq(-1).all()
++        assert candidate.state.req_id_per_token[4:].eq(-1).all()
+ 
+         # An absent request-state block must neither supply carry nor receive
+         # partials, even if incoming token slots claim it is writable.
+@@ -326,11 +317,11 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
  
          # Sparse reads must also preserve holes rather than attending null page0.
          candidate.stage([0], [8], [1], replacement, null=1)
@@ -2471,7 +2593,7 @@ index ddb9ad232..a643541b0 100644
                  candidate.state.positions,
                  candidate.state.req_id_per_token,
                  candidate.table,
-@@ -341,12 +325,10 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -341,12 +332,10 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
                  candidate.state.query_start_loc,
                  candidate.state.request_positions,
                  0,
@@ -2488,7 +2610,7 @@ index ddb9ad232..a643541b0 100644
              )
              logical = list(range(0 if draft else 1, 9))
              expected = [
-@@ -357,15 +339,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -357,15 +346,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
  
          # Compressed/index page tables use the same null-block convention.
          pages = torch.empty((1, width), device=device, dtype=torch.int32)
@@ -2506,7 +2628,7 @@ index ddb9ad232..a643541b0 100644
          )
          expected_pages = list(range(1, width + 1))
          expected_pages[1] = -1
-@@ -378,8 +353,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
+@@ -378,8 +360,8 @@ def test_native_compressor_rejection_reorder_padding_and_page_boundaries(
          torch.testing.assert_close(candidate.backing, before, atol=0, rtol=0)
  
  

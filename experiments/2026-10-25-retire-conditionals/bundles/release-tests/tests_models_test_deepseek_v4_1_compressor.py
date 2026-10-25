@@ -180,9 +180,13 @@ def compressor_runners(monkeypatch):
             for length in lengths:
                 starts.append(starts[-1] + length)
             n = starts[-1]
+            # With ``pad`` the last request's rows are graph padding, as the runner
+            # pads a captured step: past every request's range, without slots,
+            # while its block table row still names its pages.
+            live = len(identities) - pad
             self.starts.copy_(
                 torch.tensor(
-                    starts + [n] * (requests + 1 - len(starts)),
+                    starts[: live + 1] + [starts[live]] * (requests - live),
                     device=device,
                     dtype=torch.int32,
                 )
@@ -206,15 +210,15 @@ def compressor_runners(monkeypatch):
                 self.table[:, null] = 0
             cm = SimpleNamespace(
                 query_start_loc=self.starts,
-                query_start_loc_cpu=self.starts[: len(identities) + 1].cpu(),
+                query_start_loc_cpu=self.starts[: live + 1].cpu(),
                 seq_lens=self.seq,
                 block_table_tensor=self.table,
                 slot_mapping=self.input_slots,
-                num_reqs=len(identities),
+                num_reqs=live,
                 num_actual_tokens=n,
-                max_query_len=max(lengths, default=0),
+                max_query_len=max(lengths[:live], default=0),
                 max_seq_len=max(
-                    (pos + length for pos, length in zip(positions, lengths)),
+                    (pos + length for pos, length in zip(positions, lengths[:live])),
                     default=0,
                 ),
             )
@@ -291,14 +295,17 @@ def test_compressor_rejection_reorder_padding_and_page_boundaries(
                 assert (candidate.backing[0] == 123).all()
                 assert (candidate.backing[:, candidate.state_width :] == 123).all()
 
-        # A rejected/PAD request must not be resurrected by a real block table.
+        # Graph padding must not be resurrected by a real block table: the padded
+        # rows write neither latents nor the ring of the pages its table row names.
+        # Serving gives every row a request owns a slot; only rows past the step's
+        # requests are padding (the ring-writes test above).
         before = candidate.pool[33:49].clone()
         candidate.stage([0, 1, 2], [20, 20, 20], [2, 2, 2], replacement, pad=True)
         _, slots = candidate.run()
         assert slots[-2:].tolist() == [-1, -1]
         torch.testing.assert_close(candidate.pool[33:49], before, atol=0, rtol=0)
-        assert candidate.state.slot_mapping[6:].eq(-1).all()
-        assert candidate.state.req_id_per_token[-1].item() == -1
+        assert candidate.state.slot_mapping[4:].eq(-1).all()
+        assert candidate.state.req_id_per_token[4:].eq(-1).all()
 
         # An absent request-state block must neither supply carry nor receive
         # partials, even if incoming token slots claim it is writable.
