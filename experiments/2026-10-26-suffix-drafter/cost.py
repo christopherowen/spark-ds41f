@@ -244,27 +244,15 @@ def width_table(shape: Shape, routes: dict[str, Routes]) -> list[dict]:
 
 
 def load_probe_routes(path: Path) -> dict[str, Routes]:
-    """N(r) per case from the route probe: windows of r consecutive reply rows, every layer."""
+    """N(r) per case from the route probe's summary (reference/routes_summary.py)."""
     data = json.load(open(path))
-    out = {}
-    for case in data["cases"]:
-        start = case["reply_start"]
-        layers = [r[start:] for r in case["routes"]]
-        n = len(layers[0])
-        table = {}
-        for r in range(1, min(96, n) + 1):
-            vals = []
-            for layer in layers:
-                for s in range(0, n - r + 1, max(1, r // 2)):
-                    vals.append(len({e for t in range(s, s + r) for e in layer[t]}))
-            table[r] = statistics.mean(vals)
-        out[case["case"]] = Routes(table, name=case["case"])
-    return out
+    return {name: Routes({int(r): v for r, v in case["distinct"].items()}, name=name)
+            for name, case in data["cases"].items()}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--routes", default=str(HERE / "runs" / "routes-dgx4.json"))
+    ap.add_argument("--routes", default=str(HERE / "runs" / "routes-summary.json"))
     ap.add_argument("--proxy", default=str(HERE / "runs" / "agent-proxy.json"))
     ap.add_argument("--cases", default=str(HERE / "runs" / "copy-cases.json"))
     ap.add_argument("--out", default=str(HERE / "results.json"))
@@ -294,11 +282,13 @@ def main() -> None:
             info["widths"] = width_table(shape, sources)
         results["shapes"][f"{name}-c{c}"] = info
 
-    copy_sources = {"shared": json8, "independent": sources["uniform"]}
-    if "copy" in probe:
-        copy_sources["probe"] = probe["copy"]
+    # Copied rows priced three ways: the probe's measured routes (each copy-probe category by its
+    # own case; the agent proxy by the tool-call case, the nearest to its tool-command and edit
+    # copies, else the reproduced file), ordinary-text sharing, and independent routes.
+    bounds = {"shared": json8, "independent": sources["uniform"]}
 
-    def evaluate(hists, **kw):
+    def evaluate(hists, probe_routes=None, extra=None, **kw):
+        copy_sources = dict(bounds, **({"probe": probe_routes} if probe_routes else {}), **(extra or {}))
         table = {}
         for key, hist in hists.items():
             row = {"walk": walk_stats(hist)}
@@ -308,20 +298,25 @@ def main() -> None:
             table[key] = row
         return table
 
+    case_probe = {"copy": "copy", "edit": "edit", "tool": "tool"}
     if Path(args.cases).exists():
         data = json.load(open(args.cases))
         results["copy_cases"] = {}
         for cat, v in data["categories"].items():
+            routes = probe.get(case_probe[cat], probe.get("copy"))
             results["copy_cases"][cat] = {
-                "walk": evaluate(v["histograms"]),
-                "measured_dspark": evaluate(v["histograms"], dspark_rates=DSPARK_MEASURED[cat]),
+                "walk": evaluate(v["histograms"], routes),
+                "measured_dspark": evaluate(v["histograms"], routes, dspark_rates=DSPARK_MEASURED[cat]),
             }
     if Path(args.proxy).exists():
         data = json.load(open(args.proxy))
+        routes = probe.get("tool", probe.get("copy"))
+        code = {"probe_code": probe["copy"]} if "copy" in probe and "tool" in probe else None
         results["agent_proxy"] = {
             "corpus": {k: v for k, v in data.items() if k != "histograms"},
-            "visible": evaluate(data["histograms"]),
-            "reasoning_1to1": evaluate(data["histograms"], reasoning=1.0),
+            "probe_case": "tool" if "tool" in probe else ("copy" if "copy" in probe else None),
+            "visible": evaluate(data["histograms"], routes, code),
+            "reasoning_1to1": evaluate(data["histograms"], routes, code, reasoning=1.0),
         }
     with open(args.out, "w") as handle:
         json.dump(results, handle, indent=1)

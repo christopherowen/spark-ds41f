@@ -22,58 +22,74 @@ Rules:
 - bound before building.
 
 Base: origin/main f89a89eb (spark-ds41f-1025 promoted, candidate 6's TP3 specs merged). No
-serving or cluster time was used: the cluster is qualifying TP3. One timing bundle ran on
-dgx4 with `kernel-local`. Nothing is built.
+serving or cluster time was used: the cluster is qualifying TP3. Two runs used dgx4: a timing
+bundle with `kernel-local`, and DeepSeek's reference forward on its CPU under the lab lock.
+Nothing is built.
 
 ## The short answer
 
 - **Wide verification is cheap per token at one stream.** One request's block of R copied rows
-  costs its distinct experts plus a per-row price:
+  costs its distinct experts plus a per-row price. Measured routes first, then the range of
+  the two bounds (ordinary-text extrapolation to independent routes):
 
   | Rows | TP4 step, ms | TP4 ms a token, all accepted | TP3 step, ms |
-  | ---: | ---: | ---: | ---: |
-  | 6 (DSpark's block) | 38-46 | 6.4-7.6 | 48-58 |
-  | 17 | 62-89 | 3.7-5.2 | 79-115 |
-  | 33 | 96-141 | 2.9-4.3 | 123-183 |
-  | 49 | 128-182 | 2.6-3.7 | 165-237 |
-  | 65 | 160-215 | 2.5-3.3 | 207-280 |
+  | ---: | --- | --- | --- |
+  | 6 (DSpark's block) | 38.2 (38.3-45.5) | 6.4 (6.4-7.6) | 48.2 (48.3-57.9) |
+  | 17 | 59.4 (62.0-88.7) | 3.5 (3.6-5.2) | 75.7 (79.2-114.8) |
+  | 33 | 81.7 (95.7-140.9) | 2.5 (2.9-4.3) | 104.3 (123.0-183.3) |
+  | 49 | 98.5 (127.8-181.6) | 2.0 (2.6-3.7) | 126.0 (165.0-236.7) |
+  | 65 | 113.3 (160.0-214.6) | 1.7 (2.5-3.3) | 144.8 (207.0-279.8) |
 
-  Each range runs from copied rows sharing experts like ordinary text to fully independent
-  routes. On copied text DSpark takes 5 tokens for 38 ms, 7.7 ms a token.
+  On copied text DSpark takes 5 tokens for 38 ms, 7.7 ms a token.
+- **One request's consecutive rows share experts strongly, copied or not.** DeepSeek's
+  reference forward on dgx4's CPU, over four conversations, measured how many distinct experts
+  65 consecutive reply rows reach in a layer:
+
+  | Reply | Distinct experts at 65 rows |
+  | --- | ---: |
+  | prose | 93 |
+  | a copied file | 98 |
+  | the file with comments added | 99 |
+  | an edit tool call | 105 |
+
+  The bounds were 166 (extrapolation) and 246 (independent routes). At 6 rows the reply rows
+  reach 22-24 experts, what json-count's eight tokens gave.
+
+  A copied row shares 38-48% of its six experts with its source row. The forced replies are
+  the model's own: the reference's greedy token is the forced one at 900 of 900, 904 of 904 and
+  162 of 165 reply positions.
 - **The expert stream holds its rate at wide blocks** (the wide-verify bundle on dgx4): FC1 costs
   12.2-12.5 µs and FC2 5.8 µs for each extra expert, at 6 to 65 rows, with rows spread evenly
   or piled on three experts. What grows with the width is a per-row cost, about 2 µs a row a
   layer at 65 rows, which the per-row price above includes.
-- **Do copied rows share experts?** Unmeasured. The CPU reference pass that would answer it
-  ([reference/routes_probe.py](reference/routes_probe.py)) is prepared and waits for an OK to
-  use dgx4's cores, so every result here is a bracket between the two routing bounds above.
-- **Agent traffic gains a little; long copies gain a lot.** At TP4 c1 (TP3 within 0.3 points):
+- **Agent traffic gains a little; long copies gain a lot.** At TP4, measured routes (TP3 within
+  0.3 points; the bounds' range in brackets):
 
-  | Workload | Best variant (exact per request, m = 16, at most 16 drafts) |
-  | --- | --- |
-  | agent proxy, visible output | +4.6% / +2.9% |
-  | agent proxy, hidden reasoning 1:1 decoded like prose | +2.1% / +1.4% |
-  | agent proxy at c8 | +2.3% / +0.0% |
-  | reproduce a file | +106% / +73% |
-  | the file with comments added | +69% / +47% |
-  | an edit tool call | +31% / +21% |
+  | Workload | Exact per request, m = 16, at most 16 drafts | At most 64, growing cap |
+  | --- | --- | --- |
+  | agent proxy, visible output, c1 | +4.9% (+2.9 to +4.6) | +4.4% |
+  | agent proxy, c8 | +2.8% (0.0 to +2.3) | +1.9% |
+  | agent proxy, hidden reasoning 1:1 decoded like prose, c1 | +2.2% | +2.0% |
+  | reproduce a file, c1 | +115% | +297% |
+  | the file with comments added, c1 | +74% | +140% |
+  | an edit tool call, c1 | +32% | +47% |
 
-  (Copied rows sharing experts like ordinary text / independent routes.) The earlier +7-17%
-  tokens a step shrinks for three reasons: DSpark already takes 5 tokens a step on copies; a
-  17-row block reaches 2.1-2.6 times the experts of a 6-row one; and drafts that miss waste
-  rows.
-- **Long drafts lose on agent traffic.** Maximum drafts of 32 or 64 never beat 16 on the proxy.
-  - With every proposal verified at its full length, 64 drafts cost −1 to −14% at c1 and
-    down to −29% at c8.
-  - With the cap growing only while drafts are accepted, 64 drafts are +3.3-3.4% at c1, but
-    gain +191% against +106% reproducing a file.
-  - The engine lays out a step's rows one step before it knows whether the copy continued.
-    That stale allocation costs the 16-draft cap 0.8 points and the 64-draft cap 1.6.
-- **Minimum match 8 loses at eight streams** (−1 to −8%): too many short, wrong copies.
-  Matches of 16 and 24 are within half a point of each other.
+  The earlier +7-17% tokens a step shrinks for three reasons:
+  - DSpark already takes 5 tokens a step on copies;
+  - a 17-row block reaches twice the experts of a 6-row one;
+  - drafts that miss waste rows.
+- **At most 64 drafts is a recipe choice to measure, not more code.**
+  - **Growing cap:** on agent traffic, 0.5 points below 16 at c1 and 0.9 at c8; on long
+    copies, +297% against +115% reproducing a file.
+  - **The stale allocation:** the engine lays out a step's rows one step before it knows
+    whether the copy continued. That costs the 16-draft cap 0.8 points and the 64-draft cap
+    1.6; without it, 64 beats 16 at c1 (+6.0% against +5.7%).
+  - **Every proposal verified at its full length:** 64 loses at c8 (−3 to −21%).
+- **Minimum match 8 loses at eight streams** (−0.6 to −1.2%, −8% under independent routes):
+  too many short, wrong copies. Matches of 16 and 24 are within half a point of each other.
 - **A global n-gram table across requests adds about 1.8 points:** exact first, the shared
-  table elsewhere (m = 24, at most 16) reaches +6.4% / +4.3% at TP4 c1 and +3.7% / +1.0% at c8.
-  The table alone reaches +6.0% / +3.9%. Three caveats:
+  table elsewhere (m = 24, at most 16) reaches +6.7% at TP4 c1 and +4.2% at c8. The table alone
+  reaches +6.3% and +3.6%. Three caveats:
   - the table is shared across requests, so how fast a reply comes back can reveal what other
     requests contained;
   - the simulated table is exact and never evicts, so it is an upper bound;
@@ -88,9 +104,10 @@ dgx4 with `kernel-local`. Nothing is built.
   - two more graphs a shape;
   - two TileLang kernels.
 
-  At most 64 drafts is a measured follow-up behind it, not part of the build. A shared table is
-  a second phase, scoped to one tenant, and only if a replay of many unrelated sessions (AgentX,
-  #574) keeps its gain.
+  The lookahead is a recipe value, so at most 64 drafts is a lab comparison against 16 on the
+  same build (copy probe and agent replay), not a second build. A shared table is a second
+  phase, scoped to one tenant, and only if a replay of many unrelated sessions (AgentX, #574)
+  keeps its gain.
 
 ## 1. What a verified row costs
 
@@ -121,10 +138,15 @@ step = overhead + (dense + drafter routed + 40 × U × expert) / 266.6 GB/s
 - **The overhead** is solved from each shape's release suite. At TP4 c1 that is 9.14 ms
   (#598's 8.70, plus the per-row cost of today's 4.07 rows). The c8 solves use the 1025 TP4
   and 1022 TP3 suites at 85.7 and 109.2 ms a step.
-- **N(r)** comes from two bounds:
+- **N(r)** comes from the reference routes measured here (below) and two bounds:
+  - **measured:** each copy-probe category is priced by its own case. The agent proxy is
+    priced by the edit tool call, the case nearest its tool-command and edit copies; the
+    copied file is a cross-check.
   - **ordinary text:** json-count's eight-token reference routes, extended at 2.4 experts a
     row (#598's extrapolation): 24, 51, 90, 128 and 166 experts at 6, 17, 33, 49 and 65 rows;
   - **independent:** uniform routing, 35, 90, 156, 206 and 246.
+
+  DSpark's prose steps keep the suite's calibration whatever the source.
 
 ### Measured: the expert stream at wide blocks ([bundles/wide-verify](bundles/wide-verify))
 
@@ -157,59 +179,85 @@ Fits, time = fixed + per expert × distinct experts (µs):
 
 ### The table
 
-| Rows (graph size) | TP4: experts a layer, step ms, ms a token if all accepted | TP3: step ms, ms a token |
-| --- | --- | --- |
-| 6 (6) | 24-35, 38.3-45.5, 6.4-7.6 | 48.3-57.9, 8.0-9.7 |
-| 17 (20) | 51-90, 62.0-88.7, 3.7-5.2 | 79.2-114.8, 4.7-6.8 |
-| 33 (40) | 90-156, 95.7-140.9, 2.9-4.3 | 123.0-183.3, 3.7-5.6 |
-| 49 (56) | 128-207, 127.9-181.6, 2.6-3.7 | 165.0-236.7, 3.4-4.8 |
-| 65 (72) | 166-246, 160.0-214.6, 2.5-3.3 | 207.0-279.8, 3.2-4.3 |
+Each cell is measured routes (the copied file) / ordinary-text sharing / independent routes:
 
-The ranges run from ordinary-text sharing to independent routes. TP3's 49 and 65 rows are past
-its graph ladder (48) today and assume the extended ladder of the design.
+| Rows (graph size) | Experts a layer | TP4 step, ms | TP4 ms a token if all accepted | TP3 step, ms | TP3 ms a token |
+| --- | --- | --- | --- | --- | --- |
+| 6 (6) | 24.0 / 24.1 / 34.6 | 38.2 / 38.3 / 45.5 | 6.4 / 6.4 / 7.6 | 48.2 / 48.3 / 57.9 | 8.0 / 8.1 / 9.7 |
+| 17 (20) | 47.4 / 51.2 / 90.2 | 59.4 / 62.0 / 88.7 | 3.5 / 3.6 / 5.2 | 75.7 / 79.2 / 114.8 | 4.5 / 4.7 / 6.8 |
+| 33 (40) | 69.2 / 89.6 / 155.6 | 81.7 / 95.7 / 140.9 | 2.5 / 2.9 / 4.3 | 104.3 / 123.0 / 183.3 | 3.2 / 3.7 / 5.5 |
+| 49 (56) | 85.3 / 128.0 / 206.5 | 98.5 / 127.8 / 181.6 | 2.0 / 2.6 / 3.7 | 126.0 / 165.0 / 236.7 | 2.6 / 3.4 / 4.8 |
+| 65 (72) | 98.3 / 166.4 / 246.0 | 113.3 / 160.0 / 214.6 | 1.7 / 2.5 / 3.3 | 144.8 / 207.0 / 279.8 | 2.2 / 3.2 / 4.3 |
+
+TP3's 49 and 65 rows are past its graph ladder (48) today and assume the extended ladder of the
+design.
 
 **Break-even.** On copied text DSpark's block takes 5 tokens for 38.3 ms (TP4). For a wide block
-to pay against DSpark it must accept, on average:
+to pay against DSpark it must accept, on average (measured routes, then the bounds):
 
 | Block | Tokens needed |
 | ---: | --- |
-| 17 rows | 8.1-11.6 |
-| 33 rows | 12.5-18.4 |
-| 65 rows | 20.9-28.0 |
+| 17 rows | 7.8 (8.1-11.6) |
+| 33 rows | 10.7 (12.5-18.4) |
+| 65 rows | 14.8 (20.9-28.0) |
 
-So the width pays only on copies longer than about a third to half of it. That is what the
+So the width pays on copies longer than about a quarter to a half of it. That is what the
 variants decide.
 
-### Do copied rows share experts?
+### Measured: do copied rows share experts?
 
 Two different sharings are possible:
 - **between the rows of the block,** which sets U;
 - **between a copy and its source.** A source's experts were read in an earlier step and are
   not resident at c1 (24 MiB L2), so this one saves nothing.
 
-Code repeats tokens (indentation, keywords), so its blocks may reach fewer experts than prose. No
-measurement says so yet:
-- json-count's routes are eight tokens of JSON;
-- the copy probe kept no token ids, and no router log exists.
+Before this run, json-count's routes (eight tokens of JSON) were the only reference routes, and
+the copy probe kept no token ids.
 
-[reference/routes_probe.py](reference/routes_probe.py) settles it. It runs DeepSeek's reference
-forward on CPU with json-count's loader and kernels, one teacher-forced prefill per conversation
-(prompt plus the copied reply, about 2,200 tokens). It records all 40 layers' top-6 routes at
-every position, and the reference's greedy token at each reply position, which checks how close
-the forced reply is to the model's own. Its cases:
-- a file reproduced;
-- an edit tool call;
-- the file with comments added;
-- prose.
+**The method.** [reference/routes_probe.py](reference/routes_probe.py) runs DeepSeek's reference
+forward on CPU with json-count's loader and kernels. It does one teacher-forced prefill per
+conversation, the prompt plus the reply. It records all 40 layers' top-6 routes at every
+position, and the reference's greedy token at each reply position, which checks how close the
+forced reply is to the model's own. The conversations are built by [cases.py](cases.py) from
+copy_probe.py's prompts, with 1,000-token documents:
 
-[run_routes.sh](reference/run_routes.sh) runs it in the serving image on dgx4's cores 0-4 and
-10-14, nice 10, with a 16 GiB cap and no network: about 15-25 minutes a case, roughly 290 GB read
-each.
+| Case | Prompt + reply tokens | Greedy agrees with the forced reply | Seconds |
+| --- | --- | --- | ---: |
+| a file reproduced | 922 + 900 | 900 / 900 | 698 |
+| prose (this repository's methodology, not the model's own reply) | 17 + 1,001 | 523 / 1,001 | 560 |
+| an edit tool call (old_string: the first function) | 961 + 165 | 162 / 165 | 626 |
+| the file with comments added | 940 + 904 | 904 / 904 | 711 |
 
-It is prepared, not run. Its CPU matmuls would share DRAM bandwidth with other sessions' dgx4
-kernel benchmarks, so it waits for the coordinator's OK. cost.py reads its output
-(`runs/routes-dgx4.json`) when present: N(r) per case becomes a third column, and the copy rows'
-price becomes the probe's.
+So the copies are what the model would write.
+[reference/routes_summary.py](reference/routes_summary.py) reduces the routes (7 MB, kept on
+dgx4) to [runs/routes-summary.json](runs/routes-summary.json).
+
+**Distinct experts a layer reached by r consecutive reply rows** (mean over layers and windows):
+
+| Rows | 1 | 2 | 6 | 17 | 33 | 49 | 65 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| a file reproduced | 6 | 10.5 | 24.0 | 47.4 | 69.2 | 85.3 | 98.3 |
+| the file with comments added | 6 | 10.6 | 24.4 | 47.9 | 69.7 | 85.6 | 98.6 |
+| an edit tool call | 6 | 10.5 | 23.9 | 48.0 | 72.0 | 89.9 | 105.2 |
+| prose | 6 | 10.1 | 22.2 | 44.4 | 65.7 | 80.8 | 93.4 |
+| ordinary-text bound (json-count + 2.4 a row) | 6 | 10.3 | 24.1 | 51.2 | 89.6 | 128.0 | 166.4 |
+| independent routes | 6 | 11.9 | 34.6 | 90.2 | 155.6 | 206.5 | 246.0 |
+
+- **Sharing is a property of one request's consecutive rows, not of code.** Prose shares as
+  much as copied code. Every case agrees with json-count's routes to 8 rows; the linear
+  extension past them was too steep.
+- **The spread between layers is wide.** At 65 rows the copied file's layers reach 69 to 138
+  experts (median 99), prose 51 to 153. The model prices the layers' mean.
+- **A copied row and its source share 38-48% of their experts** (891 copied rows: 48%; 885
+  edit rows: 43%; 38 tool rows: 38%; per layer 13-95%). It saves nothing at c1, but it bounds
+  how well a copy's experts could be known ahead of its step.
+
+**The run.** [run_routes.sh](reference/run_routes.sh) ran it in the serving image on dgx4's
+cores 0-4 and 10-14:
+- nice 10, a 16 GiB cap (1.4-2.7 GiB used), no network, the hub read-only, reads throttled to
+  800 MB/s: 848 GiB read in 43 minutes;
+- holding the kernel lab's lock (`/tmp/spark-lab-gpu.lock`), so no GPU bundle timed its
+  kernels beside it.
 
 ## 2. What each variant nets
 
@@ -267,65 +315,74 @@ Workloads:
 At c8, each step draws eight request-steps from a walk's step distribution (3,000 steps a
 point). At c8 DSpark's prose steps take the suite's 2.09 tokens a request.
 
-### The copy probe's categories (ordinary-text sharing / independent routes)
+### The copy probe's categories (measured routes / ordinary-text sharing / independent routes)
 
-DSpark alone, tok/s (ordinary-text / independent):
-- reproduce a file: 129 / 109 at TP4 c1, 272 / 222 at TP4 c8;
-- comments added: 133 / 112, and 280 / 228;
-- edit tool call: 141 / 119, and 297 / 242.
+Each category is priced by its own measured case.
+
+DSpark alone, tok/s (measured / ordinary-text / independent):
+
+| Category | TP4 c1 | TP4 c8 |
+| --- | --- | --- |
+| reproduce a file | 130 / 129 / 109 | 273 / 272 / 222 |
+| comments added | 132 / 133 / 112 | 278 / 280 / 228 |
+| edit tool call | 142 / 141 / 119 | 298 / 297 / 242 |
 
 | Variant | file: TP4 c1 | TP4 c8 | TP3 c1 | edit: TP4 c1 | TP4 c8 | tool call: TP4 c1 | TP4 c8 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| exact m8 k16 full | +108% / +73% | +95% / +97% | +105% / +70% | +75% / +50% | +64% / +63% | +36% / +24% | +28% / +25% |
-| exact m16 k16 grow | +106% / +73% | +93% / +95% | +104% / +70% | +69% / +47% | +57% / +55% | +31% / +21% | +24% / +21% |
-| exact m24 k16 grow | +105% / +72% | +92% / +94% | +103% / +69% | +66% / +46% | +55% / +53% | +28% / +19% | +22% / +20% |
-| exact m16 k64 grow | +191% / +158% | +242% / +312% | +184% / +152% | +101% / +82% | +90% / +108% | +37% / +29% | +28% / +31% |
-| exact m16 k64 full | +195% / +163% | +252% / +326% | +188% / +157% | +91% / +75% | +87% / +111% | +37% / +30% | +28% / +34% |
-| request m16 k16 grow (chained) | +98% / +66% | +85% / +87% | +96% / +64% | +66% / +44% | +55% / +53% | +31% / +21% | +24% / +21% |
+| exact m8 k16 full | +116% / +108% / +73% | +101% / +95% / +97% | +114% / +105% / +70% | +82% / +75% / +50% | +69% / +64% / +63% | +38% / +36% / +24% | +30% / +28% / +25% |
+| exact m16 k16 grow | +115% / +106% / +73% | +99% / +93% / +95% | +113% / +104% / +70% | +74% / +69% / +47% | +62% / +57% / +55% | +32% / +31% / +21% | +26% / +24% / +21% |
+| exact m24 k16 grow | +114% / +105% / +72% | +98% / +92% / +94% | +112% / +103% / +69% | +71% / +66% / +46% | +60% / +55% / +53% | +30% / +28% / +19% | +24% / +22% / +20% |
+| exact m16 k64 grow | +297% / +191% / +158% | +267% / +242% / +312% | +292% / +184% / +152% | +140% / +101% / +82% | +114% / +90% / +108% | +47% / +37% / +29% | +37% / +28% / +31% |
+| exact m16 k64 full | +307% / +195% / +163% | +277% / +252% / +326% | +302% / +188% / +157% | +141% / +91% / +75% | +114% / +87% / +111% | +52% / +37% / +30% | +40% / +28% / +34% |
+| request m16 k16 grow (chained) | +106% / +98% / +66% | +91% / +85% / +87% | +104% / +96% / +64% | +71% / +66% / +44% | +59% / +55% / +53% | +32% / +31% / +21% | +26% / +24% / +21% |
 
-Every exact variant pays on copies. Width pays in proportion to the copy's length.
+Every exact variant pays on copies. Width pays in proportion to the copy's length, and more with
+the measured routes, under which a 65-row block reaches 98 experts, not 166-246.
 
 The chained table is no better than exact here, and much worse with full verification at 64
-(+46% on the file against +195%). It follows the latest occurrence of a short n-gram, which in
-code is often the wrong place: `return self.` recurs everywhere. The exact match disambiguates
+(+46% on the file against +195%, ordinary-text sharing). It follows the latest occurrence of a
+short n-gram, which in code is often the wrong place: `return self.` recurs everywhere. The exact match disambiguates
 with up to 256 tokens of context.
 
-### The agent proxy (ordinary-text sharing / independent routes)
+### The agent proxy (measured routes / ordinary-text sharing / independent routes)
 
-DSpark alone (modelled), tok/s:
+Copy rows are priced by the edit tool call's measured routes. With the copied file's routes
+instead, the go variant is +5.0% at TP4 c1 and +3.0% at c8.
+
+DSpark alone (modelled), tok/s (measured / ordinary-text / independent):
 
 | | TP4 c1 | TP4 c8 | TP3 c1 | TP3 c8 |
-| --- | ---: | ---: | ---: | ---: |
-| visible output (2.83 tokens a step) | 86.8 | 208.3 | 69.5 | 162.6 |
-| with reasoning 1:1 | 80.1 | 201.6 | 64.1 | 157.7 |
+| --- | --- | --- | --- | --- |
+| visible output (2.83 tokens a step) | 86.9 / 86.8 / 82.0 | 208.7 / 208.2 / 187.8 | 69.6 / 69.5 / 65.4 | 163.0 / 162.6 / 146.1 |
+| with reasoning 1:1 | 80.1 / 80.1 / 78.0 | 201.8 / 201.6 / 190.9 | 64.2 / 64.1 / 62.3 | 157.9 / 157.7 / 149.0 |
 
 Visible output:
 
 | Variant | Tokens a step | Copy share of tokens | Drafts / accepted a copy step | Wasted rows a token | TP4 c1 | TP4 c8 | TP3 c1 | TP3 c8 |
 | --- | ---: | ---: | --- | ---: | --- | --- | --- | --- |
-| exact m16 k16 grow | 3.06 | 26% | 10.9 / 7.3 | 0.28 | +4.6 / +2.9 | +2.3 / +0.0 | +4.6 / +2.7 | +2.4 / +0.0 |
-| exact m16 k16 full | 3.07 | 26% | 12.2 / 7.5 | 0.26 | +4.6 / +2.4 | +2.3 / −0.5 | +4.5 / +2.2 | +2.4 / −0.5 |
-| exact m24 k16 grow | 3.02 | 20% | 11.5 / 8.2 | 0.17 | +4.3 / +3.0 | +2.6 / +0.9 | +4.2 / +2.9 | +2.7 / +0.9 |
-| exact m24 k16 full | 3.02 | 20% | 12.7 / 8.5 | 0.16 | +4.3 / +2.8 | +2.6 / +0.6 | +4.2 / +2.6 | +2.6 / +0.5 |
-| exact m8 k16 grow | 3.14 | 43% | 10.0 / 5.7 | 0.63 | +4.2 / +0.8 | −1.4 / −5.4 | +4.1 / +0.5 | −1.3 / −5.5 |
-| exact m8 k16 full | 3.17 | 43% | 11.5 / 5.9 | 0.60 | +3.7 / −0.6 | −2.3 / −7.5 | +3.5 / −1.1 | −2.2 / −7.6 |
-| exact m16 k32 grow | 3.08 | 26% | 13.3 / 8.0 | 0.43 | +4.1 / +2.2 | +1.0 / −1.3 | +4.0 / +2.0 | +1.1 / −1.3 |
-| exact m24 k32 grow | 3.04 | 20% | 14.4 / 9.2 | 0.29 | +3.9 / +2.5 | +2.1 / +0.3 | +3.8 / +2.4 | +2.1 / +0.3 |
-| exact m16 k32 full | 3.12 | 26% | 20.6 / 9.3 | 0.57 | +2.4 / −0.6 | −3.1 / −6.5 | +2.2 / −1.0 | −3.0 / −6.6 |
-| exact m16 k64 grow | 3.09 | 26% | 14.4 / 8.2 | 0.56 | +3.4 / +1.6 | +0.1 / −1.8 | +3.3 / +1.5 | +0.3 / −1.7 |
-| exact m24 k64 grow | 3.04 | 20% | 15.8 / 9.4 | 0.40 | +3.3 / +2.1 | −0.1 / −1.5 | +3.3 / +2.0 | −0.0 / −1.5 |
-| exact m24 k64 full | 3.08 | 20% | 38.6 / 12.4 | 0.77 | −0.9 / −2.5 | −7.8 / −8.9 | −1.1 / −2.9 | −7.8 / −9.0 |
-| exact m8 k64 full | 3.27 | 43% | 33.8 / 7.2 | 2.70 | −13.8 / −18.7 | −29.1 / −31.3 | −14.5 / −19.5 | −29.1 / −31.2 |
-| request m16 k16 grow | 3.05 | 26% | 10.7 / 7.1 | 0.29 | +4.3 / +2.6 | +1.9 / −0.4 | +4.3 / +2.4 | +2.0 / −0.4 |
-| global m24 k16 grow | 3.11 | 25% | 11.1 / 7.5 | 0.25 | +6.0 / +3.9 | +3.0 / +0.3 | +5.9 / +3.6 | +3.1 / +0.3 |
-| global m16 k16 grow | 3.16 | 33% | 10.4 / 6.2 | 0.43 | +5.6 / +2.4 | +1.3 / −2.5 | +5.4 / +2.1 | +1.4 / −2.6 |
-| global m24 k64 grow | 3.14 | 25% | 14.5 / 8.5 | 0.51 | +5.0 / +2.9 | +1.4 / −0.9 | +4.9 / +2.7 | +1.5 / −0.8 |
-| both m24 k16 grow | 3.12 | 25% | 11.3 / 7.8 | 0.23 | +6.4 / +4.3 | +3.7 / +1.0 | +6.3 / +4.1 | +3.7 / +0.9 |
-| both m24 k16 full | 3.13 | 25% | 12.9 / 8.1 | 0.21 | +6.3 / +3.7 | +3.6 / +0.3 | +6.1 / +3.4 | +3.6 / +0.2 |
-| both m16 k16 grow | 3.17 | 33% | 10.5 / 6.5 | 0.40 | +6.3 / +3.2 | +2.4 / −1.5 | +6.2 / +2.9 | +2.4 / −1.6 |
-| both m24 k64 grow | 3.15 | 25% | 15.2 / 9.0 | 0.49 | +5.4 / +3.3 | +1.8 / −0.4 | +5.2 / +3.1 | +1.9 / −0.4 |
+| exact m16 k16 grow | 3.06 | 26% | 10.9 / 7.3 | 0.28 | +4.9 / +4.6 / +2.9 | +2.8 / +2.3 / +0.0 | +4.9 / +4.6 / +2.7 | +2.9 / +2.4 / +0.0 |
+| exact m16 k16 full | 3.07 | 26% | 12.2 / 7.5 | 0.26 | +4.9 / +4.6 / +2.4 | +3.0 / +2.3 / −0.5 | +4.9 / +4.5 / +2.2 | +3.0 / +2.4 / −0.5 |
+| exact m24 k16 grow | 3.02 | 20% | 11.5 / 8.2 | 0.17 | +4.5 / +4.3 / +3.0 | +3.0 / +2.6 / +0.9 | +4.5 / +4.2 / +2.9 | +3.1 / +2.7 / +0.9 |
+| exact m24 k16 full | 3.02 | 20% | 12.7 / 8.5 | 0.16 | +4.5 / +4.3 / +2.8 | +3.1 / +2.6 / +0.6 | +4.5 / +4.2 / +2.6 | +3.1 / +2.6 / +0.5 |
+| exact m8 k16 grow | 3.14 | 43% | 10.0 / 5.7 | 0.63 | +4.7 / +4.2 / +0.8 | −0.6 / −1.4 / −5.4 | +4.6 / +4.1 / +0.5 | −0.4 / −1.3 / −5.5 |
+| exact m8 k16 full | 3.17 | 43% | 11.5 / 5.9 | 0.60 | +4.4 / +3.7 / −0.6 | −1.2 / −2.3 / −7.5 | +4.3 / +3.5 / −1.1 | −1.1 / −2.2 / −7.6 |
+| exact m16 k32 grow | 3.08 | 26% | 13.3 / 8.0 | 0.43 | +4.8 / +4.1 / +2.2 | +2.3 / +1.0 / −1.3 | +4.8 / +4.0 / +2.0 | +2.4 / +1.1 / −1.3 |
+| exact m24 k32 grow | 3.04 | 20% | 14.4 / 9.2 | 0.29 | +4.5 / +3.9 / +2.5 | +3.1 / +2.1 / +0.3 | +4.4 / +3.8 / +2.4 | +3.2 / +2.1 / +0.3 |
+| exact m16 k32 full | 3.12 | 26% | 20.6 / 9.3 | 0.57 | +4.0 / +2.4 / −0.6 | −0.5 / −3.1 / −6.5 | +3.9 / +2.2 / −1.0 | −0.3 / −3.0 / −6.6 |
+| exact m16 k64 grow | 3.09 | 26% | 14.4 / 8.2 | 0.56 | +4.4 / +3.4 / +1.6 | +1.9 / +0.1 / −1.8 | +4.4 / +3.3 / +1.5 | +2.1 / +0.3 / −1.7 |
+| exact m24 k64 grow | 3.04 | 20% | 15.8 / 9.4 | 0.40 | +4.2 / +3.3 / +2.1 | +1.4 / −0.1 / −1.5 | +4.2 / +3.3 / +2.0 | +1.6 / −0.0 / −1.5 |
+| exact m24 k64 full | 3.08 | 20% | 38.6 / 12.4 | 0.77 | +2.3 / −0.9 / −2.5 | −2.8 / −7.8 / −8.9 | +2.2 / −1.1 / −2.9 | −2.5 / −7.8 / −9.0 |
+| exact m8 k64 full | 3.27 | 43% | 33.8 / 7.2 | 2.70 | −6.5 / −13.8 / −18.7 | −21.0 / −29.1 / −31.3 | −6.7 / −14.5 / −19.5 | −20.5 / −29.1 / −31.2 |
+| request m16 k16 grow | 3.05 | 26% | 10.7 / 7.1 | 0.29 | +4.6 / +4.3 / +2.6 | +2.4 / +1.9 / −0.4 | +4.6 / +4.3 / +2.4 | +2.5 / +2.0 / −0.4 |
+| global m24 k16 grow | 3.11 | 25% | 11.1 / 7.5 | 0.25 | +6.3 / +6.0 / +3.9 | +3.6 / +3.0 / +0.3 | +6.2 / +5.9 / +3.6 | +3.6 / +3.1 / +0.3 |
+| global m16 k16 grow | 3.16 | 33% | 10.4 / 6.2 | 0.43 | +5.9 / +5.6 / +2.4 | +2.0 / +1.3 / −2.5 | +5.8 / +5.4 / +2.1 | +2.0 / +1.4 / −2.6 |
+| global m24 k64 grow | 3.14 | 25% | 14.5 / 8.5 | 0.51 | +5.9 / +5.0 / +2.9 | +3.0 / +1.4 / −0.9 | +5.9 / +4.9 / +2.7 | +3.2 / +1.5 / −0.8 |
+| both m24 k16 grow | 3.12 | 25% | 11.3 / 7.8 | 0.23 | +6.7 / +6.4 / +4.3 | +4.2 / +3.7 / +1.0 | +6.6 / +6.3 / +4.1 | +4.2 / +3.7 / +0.9 |
+| both m24 k16 full | 3.13 | 25% | 12.9 / 8.1 | 0.21 | +6.6 / +6.3 / +3.7 | +4.2 / +3.6 / +0.3 | +6.5 / +6.1 / +3.4 | +4.3 / +3.6 / +0.2 |
+| both m16 k16 grow | 3.17 | 33% | 10.5 / 6.5 | 0.40 | +6.7 / +6.3 / +3.2 | +3.0 / +2.4 / −1.5 | +6.6 / +6.2 / +2.9 | +3.1 / +2.4 / −1.6 |
+| both m24 k64 grow | 3.15 | 25% | 15.2 / 9.0 | 0.49 | +6.4 / +5.4 / +3.3 | +3.6 / +1.8 / −0.4 | +6.4 / +5.2 / +3.1 | +3.8 / +1.9 / −0.4 |
 
-Gains are in percent of DSpark alone at the same shape and concurrency. `request` is the
+Gains are in percent of DSpark alone at the same shape, concurrency and routes. `request` is the
 chained table per request; `global` is the chained table shared across requests in token-time
 order; `both` is exact where it matches and global elsewhere, both at the same m.
 
@@ -333,12 +390,13 @@ order; `both` is exact where it matches and global elsewhere, both at the same m
 
 | Variant | TP4 c1 | TP4 c8 |
 | --- | --- | --- |
-| exact m16 k16 grow | +5.4 / +3.4 | +3.9 / +1.2 |
-| exact m24 k16 grow | +4.9 / +3.6 | +3.4 / +1.5 |
-| exact m16 k64 grow | +5.0 / +3.0 | +1.9 / −0.7 |
-| both m24 k16 grow | +7.2 / +5.0 | +5.2 / +2.2 |
+| exact m16 k16 grow | +5.7 / +5.4 / +3.4 | +4.5 / +3.9 / +1.2 |
+| exact m24 k16 grow | +5.1 / +4.9 / +3.6 | +3.8 / +3.4 / +1.5 |
+| exact m16 k64 grow | +6.0 / +5.0 / +3.0 | +3.7 / +1.9 / −0.7 |
+| both m24 k16 grow | +7.5 / +7.2 / +5.0 | +5.7 / +5.2 / +2.2 |
 
-The lag is worth 0.8 points at 16 drafts, 1.6 at 64, and 0.8 for exact-then-global.
+With the measured routes, the lag is worth 0.8 points at 16 drafts, 1.6 at 64 and 0.8 for
+exact-then-global. Without it, 64 drafts beat 16 at c1 (+6.0 against +5.7) but not at c8.
 Synchronous layout of copy steps would recover it at the price of the asynchronous scheduler's
 overlap on those steps, which this record does not bound.
 
@@ -346,10 +404,10 @@ overlap on those steps, which this record does not bound.
 
 | Variant | TP4 c1 | TP4 c8 |
 | --- | --- | --- |
-| exact m16 k16 grow | +2.1 / +1.4 | +1.2 / −0.4 |
-| exact m24 k16 grow | +1.9 / +1.4 | +1.5 / +0.4 |
-| exact m16 k64 grow | +1.5 / +0.8 | −0.1 / −1.5 |
-| both m24 k16 grow | +2.8 / +2.0 | +1.9 / +0.2 |
+| exact m16 k16 grow | +2.2 / +2.1 / +1.4 | +1.5 / +1.2 / −0.4 |
+| exact m24 k16 grow | +2.0 / +1.9 / +1.4 | +1.7 / +1.5 / +0.4 |
+| exact m16 k64 grow | +2.0 / +1.5 / +0.8 | +0.7 / −0.1 / −1.5 |
+| both m24 k16 grow | +3.0 / +2.8 / +2.0 | +2.2 / +1.9 / +0.2 |
 
 Reasoning is unmeasured in both directions:
 - if it copies like prose, it halves the gain;
@@ -362,20 +420,21 @@ The post-build copy probe with thinking on measures it.
 
 | Variant | Verdict | Why |
 | --- | --- | --- |
-| exact, m 16, at most 16, grow | **go** | never below DSpark within the bracket: +4.6 / +2.9 at TP4 c1, +2.3 / 0.0 at c8, TP3 alike; +106% / +69% / +31% on the probe's copies |
-| exact, m 24, at most 16 | go (alternative) | 0.3 points behind at c1, 0.3 ahead at c8, fewer wasted rows; settle on the post-build agent replay |
-| exact, at most 32 or 64, grow | not now | −0.4 to −1.2 points against 16 on agent traffic at c1, −0.5 to −2.7 at c8; +85 points on long file copies. Revisit with synchronous copy steps or a cap tied to the source's remaining length |
-| exact, at most 32 or 64, full | no-go | wasted rows: at 64, −1 to −14% at c1 and down to −29% at c8; at 32, −2.3 to +3.1 at c1 and −0.8 to −12.8 at c8, 1.2-6 points below 16 at the same m |
-| minimum match 8 | no-go | −1 to −8% at c8 under the bracket: too many short wrong copies |
-| request-chained table | no-go | never better than exact, much worse on long copies |
+| exact, m 16, at most 16, grow | **go** | measured routes: +4.9% at TP4 c1, +2.8% at c8, TP3 alike; never below DSpark under either bound (+2.9 / 0.0 at worst); +115% / +74% / +32% on the probe's copies |
+| exact, m 24, at most 16 | go (alternative) | 0.4 points behind at c1, 0.2 ahead at c8, fewer wasted rows; settle on the post-build agent replay |
+| exact, at most 32 or 64, grow | a recipe comparison after the build | against 16 on agent traffic: −0.1 (32) and −0.5 (64) points at c1, −0.5 and −0.9 at c8; reproducing a file +297% against +115%. Without the allocation lag, 64 beats 16 at c1. The lookahead is a recipe value, so the lab compares them on one build |
+| exact, at most 32 or 64, full | no-go | wasted rows: at 64, −6.5% (m 8) to +2.3% (m 24) at c1 and −2.8 to −21% at c8; at 32, 0.2-4.1 points below 16 (growing cap, same m) at c1 and 1.8-8.1 at c8 |
+| minimum match 8 | no-go | −0.6 to −1.2% at c8 (to −8% under independent routes): too many short wrong copies |
+| request-chained table | no-go | never better than exact (+4.6% against +4.9%), much worse on long copies |
 | global table (chained, shared across requests) | second phase, measured first | +1.8 points at c1 and +1.4 at c8 over exact alone, as exact-then-global at m 24; an upper bound (exact, unbounded, one developer's sessions); a cross-request side channel unless scoped to one tenant |
 
 ## 3. The design
 
 What follows is the build for the variant that clears the cost: copies proposed per request,
 exact, from the request's own history, minimum match 16, at most 16 drafts with the cap growing
-from 8 (`L = 16`), and a long-copy extension to 64 behind it (`L = 64`, not built until it
-measures positive on agent traffic). DSpark stays the drafter everywhere else. Nothing is
+from 8 (`L = 16`). The lookahead `L` is a recipe value. The same build at `L = 64` is the lab's
+comparison: it costs half a point on agent traffic, gains 2.6 times on file copies, and wins at
+c1 without the allocation lag. DSpark stays the drafter everywhere else. Nothing is
 built; the vLLM work is a branch over `tilelang-ports` 26382f5cf (the frozen candidate 6 tree),
 for the release after spark-ds41f-1025.
 
@@ -557,8 +616,9 @@ once this record is on `origin/main`):
    - A cached 4,096-token prefix plus R new tokens is one step of R rows of one request. Its
      time to first token at R = 1, 6, 17, 33, 49 and 65 is measured for three kinds of tail:
      copied from the prefix, fresh text, and random ids.
-   - Copied against random at equal R is the routing's sharing in milliseconds. That is the
-     cluster measurement of the open N(r) question.
+   - Copied against random at equal R is the routing's sharing in milliseconds. It checks the
+     CPU reference's N(r) (98 experts at 65 rows against random's ~246) on the serving engine,
+     at production's arithmetic and a 4K context.
    - It runs on the prefill plan and piecewise graphs, so it prices the experts and the rows,
      not the decode plan's graphs.
    - About 10 minutes.
@@ -568,7 +628,8 @@ After the build (written once the branch exists; each needs the cluster):
 3. **copy-kernels:** a dgx4 `kernel-local` bundle for commits 3-5's row-invariance and kernel
    tests and the copy kernels' benchmark.
 4. **hybrid-gate:** the determinism case above, on both shapes.
-5. **hybrid-measure:** arms spark-ds41f-1025, the hybrid, spark-ds41f-1025 again:
+5. **hybrid-measure:** arms spark-ds41f-1025, the hybrid at `L = 16`, the hybrid at `L = 64`
+   (the same build, only the recipe's lookahead and ladder differ), spark-ds41f-1025 again:
    - the single-stream suite (the suite should not move);
    - the copy probe with thinking off and on (the reasoning copies this record could not
      see);
@@ -614,19 +675,34 @@ After the build (written once the branch exists; each needs the cluster):
      Walks 1-3 ordered the global table by session start, which let a parent session's later
      turns predict its subagents' output (+9% at c1). Exact and chained per-request results
      agree within 0.1 point across walks 2, 3 and 5.
-3. **`cost.py` and `report.py`** (standard library only; the c8 draws are seeded, so a rerun
+3. **The route probe on dgx4's CPU:** commit 105a3247, 22:19-23:03 CET, exit 0, all four cases.
+   The coordinating session approved it at 22:15 CET, with the lab lock held throughout and
+   23:30 CET as the last case start. The lock was free when asked; the run took 43 minutes and
+   read 848 GiB.
+   - The raw routes are `~/spark-lab/agents/suffix-drafter/out/routes.json` on dgx4 (7 MB, not
+     committed), with its log and status beside it.
+   - The node had no `~/spark-request.json`.
+
+   ```sh
+   bash experiments/2026-10-26-suffix-drafter/reference/run_routes.sh \
+     ~/spark-lab/agents/suffix-drafter/out 2026-10-25T22:30:00Z
+   python3 -I experiments/2026-10-26-suffix-drafter/reference/routes_summary.py routes.json \
+     experiments/2026-10-26-suffix-drafter/runs/routes-summary.json
+   ```
+4. **`cost.py` and `report.py`** (standard library only; the c8 draws are seeded, so a rerun
    writes the same [results.json](results.json)):
 
    ```sh
    python3 -I experiments/2026-10-26-suffix-drafter/cost.py --samples 3000
-   python3 -I experiments/2026-10-26-suffix-drafter/report.py
+   python3 -I experiments/2026-10-26-suffix-drafter/report.py --readme
    ```
 
 ## Caveats
 
-- **The routing bracket is wide.** Copied rows priced as ordinary text or as independent routes
-  move a variant by 1-6 points on agent traffic and by tens on long copies. The route probe
-  narrows it.
+- **The measured routes are four conversations** at a 1,000-token document, routed by the
+  CPU reference (whose logprobs sit within a few nats of production's; json-count). Agent
+  copies of shell commands and markup are priced by the edit tool call's routes. Sharing could
+  differ at 64-100K contexts. The bounds stay in every table.
 - **The models are models.** The c1 model is #598's, calibrated on the 1022 single stream. Its
   wide-block price adds the grid's per-row step and the bundle's per-expert time, but no
   serving step has run 17-65 rows of one request. wide-rows.json measures that on the cluster,
@@ -651,5 +727,7 @@ After the build (written once the branch exists; each needs the cluster):
   [runs/wide-verify-dgx4.txt](runs/wide-verify-dgx4.txt): the expert stream at wide blocks.
 - [wide_rows_probe.py](wide_rows_probe.py), [wide-rows.json](wide-rows.json),
   [arm-1025.json](arm-1025.json): the cluster measurement of R rows on real text (prepared).
-- [reference/routes_probe.py](reference/routes_probe.py), [reference/run_routes.sh](reference/run_routes.sh):
-  the expert sets of copied text (prepared).
+- [reference/routes_probe.py](reference/routes_probe.py), [reference/run_routes.sh](reference/run_routes.sh),
+  [reference/routes_summary.py](reference/routes_summary.py),
+  [runs/routes-summary.json](runs/routes-summary.json): the expert sets of copied text and prose
+  from the reference forward.
