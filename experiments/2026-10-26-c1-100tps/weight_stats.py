@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Two lossless-byte questions about the checkpoint, read on CPU (standard library only).
 
-usage: weight_stats.py SNAPSHOT_DIR [--sample-mib 8] [--out weight_stats.json]
+usage: weight_stats.py SNAPSHOT_DIR [--sample-mib 8] [--expert-stride 32] [--out weight_stats.json]
 
 1. The mHC mix projections (``*hc*fn*``, FP32): is every value exactly a BF16 (its low 16
    bits zero)? If so, storing them as BF16 and widening in the kernel reads half the bytes
@@ -9,7 +9,9 @@ usage: weight_stats.py SNAPSHOT_DIR [--sample-mib 8] [--out weight_stats.json]
 2. The empirical entropy of the stored codes, which bounds any lossless coding of them:
    E4M3 bytes of the FP8 weights, E2M1 nibbles of the packed FP4 experts, the exponent
    byte of BF16 weights. ``--sample-mib`` bytes are read from the middle of each tensor
-   (the whole tensor if smaller); the fn tensors are always read whole.
+   (the whole tensor if smaller), and of the routed experts only every
+   ``--expert-stride``-th one (each expert tensor is smaller than the sample, so all of
+   them would be about 130 GB); the fn tensors are always read whole.
 
 Tensors are read from the safetensors shards by offset, so a run touches only the sampled
 bytes. It sends nothing anywhere and writes one JSON file.
@@ -19,6 +21,7 @@ import glob
 import json
 import math
 import os
+import re
 import struct
 from collections import Counter
 
@@ -61,6 +64,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("snapshot")
     ap.add_argument("--sample-mib", type=float, default=8)
+    ap.add_argument("--expert-stride", type=int, default=32)
     ap.add_argument("--out", default="weight_stats.json")
     args = ap.parse_args()
     limit = int(args.sample_mib * (1 << 20))
@@ -90,6 +94,9 @@ def main():
                 if bad and len(fn["names_not_bf16"]) < 8:
                     fn["names_not_bf16"].append(name)
                 continue
+            expert = re.search(r"\.experts\.(\d+)\.", name)
+            if expert and int(expert.group(1)) % args.expert_stride:
+                continue
             data = read(path, base, t["data_offsets"], limit)
             sampled[k] += len(data)
             if k == "fp8":
@@ -102,6 +109,7 @@ def main():
             else:  # BF16 little-endian: the high byte holds the sign and seven exponent bits
                 hist["bf16_exponent"].update(data[1::2])
     out = {"snapshot": args.snapshot, "sample_mib_per_tensor": args.sample_mib,
+           "expert_stride": args.expert_stride,
            "stored_bytes": dict(stored), "sampled_bytes": dict(sampled), "mhc_fn": fn,
            "fn_exactly_bf16": fn["tensors"] > 0 and fn["not_bf16"] == 0,  # true too when stored as BF16
            "entropy_bits": {"fp8 (of 8)": round(entropy(hist["fp8"]), 3),

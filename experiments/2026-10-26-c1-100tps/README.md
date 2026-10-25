@@ -353,15 +353,21 @@ because the lab syncs the node checkouts to it, so they queue after the PR merge
      without adaptive verification.
    - About 40 minutes.
 3. **[weight_stats.py](weight_stats.py)** runs on CPU with the standard library only and
-   no GPU. It reads the snapshot by offset and sends nothing. It answers row 10 (is every
-   mHC `fn` value exactly BF16?) and row 5 (the entropy of the E4M3 codes, E2M1 nibbles and
-   BF16 exponents). It can run on dgx4's spare cores beside production, like the CPU
-   reference runner, once the owner allows it:
+   no GPU. It answers row 10 (is every mHC `fn` value exactly BF16?) and row 5 (the
+   entropy of the E4M3 codes, E2M1 nibbles and BF16 exponents). Read-only, it sends
+   nothing and writes one JSON file. It reads:
+   - the safetensors headers of the DS4.1-1017 snapshot's 48 shards;
+   - every mHC `fn` tensor whole (about 157 MB);
+   - at most 8 MiB from the middle of each FP8 and BF16 tensor;
+   - every 32nd routed expert's FP4 tensors (each expert tensor is smaller than the
+     sample, so all of them would be about 130 GB).
+
+   It waits for the owner's OK. Then, on dgx4:
 
    ```sh
-   taskset -c 0-4,10-14 python3 -I experiments/2026-10-26-c1-100tps/weight_stats.py \
+   python3 -I experiments/2026-10-26-c1-100tps/weight_stats.py \
      ~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170 \
-     --out results/private/c1-100tps/weight_stats.json
+     --out ~/spark-lab/agents/c1-100tps/out/weight_stats.json
    ```
 4. **The profiled step without Python stacks.** The kernel audit's `audit-profile.json`
    (#585) already profiles candidate 6 without them. floor.py runs on its traces unchanged
