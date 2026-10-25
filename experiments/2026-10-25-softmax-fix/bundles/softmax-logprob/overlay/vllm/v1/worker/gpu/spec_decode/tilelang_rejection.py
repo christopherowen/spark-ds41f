@@ -144,24 +144,62 @@ __device__ __forceinline__ float vllm_exp_from(float x, float m) {
 __device__ __forceinline__ float vllm_expm1(float x) { return expm1f(x); }
 
 // Barron, Gnanapragasam and Tschannen's log-softmax ("A Fix for Softmax and
-// Cross-Entropy", Eq. 5), from a row's maximum m. A logit's shift x - m, exactly 0
-// where x is the maximum (an infinite one included).
+// Cross-Entropy", Eq. 5), from a row's maximum m. These compute every value and
+// select, in PTX: a C conditional lets nvcc predicate the exponential instead,
+// which costs a column several instructions.
+//
+// A logit's shift x - m, exactly 0 where x is the maximum (an infinite one
+// included).
 __device__ __forceinline__ float vllm_shifted(float x, float m) {
-  return x == m ? 0.0f : vllm_sub(x, m);
+  float y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      ".reg .b32 d;\n"
+      "sub.rn.f32 d, %1, %2;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.f32 %0, 0f00000000, d, tie;\n"
+      "}"
+      : "=f"(y)
+      : "f"(x), "f"(m));
+  return y;
 }
 
 // tl.exp(x - m) of a column that is not the maximum (NaN is not), 0 for one that is.
 __device__ __forceinline__ float vllm_other_exp(float x, float m) {
-  return x == m ? 0.0f : vllm_exp_from(x, m);
+  float y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      ".reg .b32 t, e;\n"
+      "sub.rn.f32 t, %1, %2;\n"
+      "mul.rn.f32 t, t, 0f3FB8AA3B;\n"
+      "ex2.approx.f32 e, t;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.f32 %0, 0f00000000, e, tie;\n"
+      "}"
+      : "=f"(y)
+      : "f"(x), "f"(m));
+  return y;
 }
 
 // 1 for a column holding the maximum, else 0: its ties, counted exactly in FP32.
 __device__ __forceinline__ float vllm_tie(float x, float m) {
-  return x == m ? 1.0f : 0.0f;
+  float y;
+  asm("set.eq.f32.f32 %0, %1, %2;" : "=f"(y) : "f"(x), "f"(m));
+  return y;
 }
 
 // int: x is the maximum m.
-__device__ __forceinline__ int vllm_is_max(float x, float m) { return x == m; }
+__device__ __forceinline__ int vllm_is_max(float x, float m) {
+  int y;
+  asm("{\n"
+      ".reg .pred tie;\n"
+      "setp.eq.f32 tie, %1, %2;\n"
+      "selp.s32 %0, 1, 0, tie;\n"
+      "}"
+      : "=r"(y)
+      : "f"(x), "f"(m));
+  return y;
+}
 
 // S, the others' sum: the columns that are not the maximum (sum), and of the
 // maximum's ``ties`` all but one, exp(m - m) each (1; NaN for an infinite maximum,
@@ -471,7 +509,8 @@ def verify_kernel(
     its statistics, its draft and the draft's target logit at once, every load at an
     index that exists whatever the masks say, the masks as selects, and reduce them
     to the step's log-sum-exp and the draft's log probability (the paper's Eq. 5),
-    the greedy step's target argmax, and the step's uniform draw. Thread 0 then runs
+    the greedy step's target argmax, and the step's uniform draw; each step's first
+    thread then folds its cumulative log ratio and threshold. Thread 0 then runs
     both kernels' loops over the drafts from shared memory, where Triton's take two
     or three dependent round trips to memory a step. The step's cumulative log ratio
     is stored as the cumulative kernel stores it, for sampled requests only; the
@@ -532,6 +571,8 @@ def verify_kernel(
             uniform_s = T.alloc_shared((groups,), T.float32)
             draft_s = T.alloc_shared((groups,), T.int64)
             target_s = T.alloc_shared((groups,), T.int64)
+            cumulative_s = T.alloc_shared((groups,), T.float32)
+            threshold_s = T.alloc_shared((groups,), T.float32)
 
             start = T.alloc_var(T.int32, init=cu_num_logits[req])
             end = T.alloc_var(T.int32, init=cu_num_logits[req + 1])
@@ -631,11 +672,39 @@ def verify_kernel(
                 target_s[step] = target
             T.sync_threads()
 
+            # Each step's cumulative log ratio and block verification's threshold at
+            # once: the step's first thread folds the steps through it in order,
+            # with a -1 placeholder leaving the ratio as it was, so the bits are a
+            # serial loop's. The threshold is the prefix's joint ratio, or that of
+            # the residual mass when a valid draft follows (from the logs of the
+            # ratio and of the next step's draft probability).
+            if block == 0:  # noqa: SIM102
+                if step < steps:
+                    log_p = T.alloc_var(T.float32, init=T.float32(0))
+                    for k in tuple(range(steps)):
+                        if k <= step:
+                            log_p = T.if_then_else(
+                                draft_s[k] >= 0,
+                                T.call_extern(
+                                    "float32", "vllm_log_ratio", log_p, log_prob_s[k]
+                                ),
+                                log_p,
+                            )
+                    cumulative_s[step] = log_p
+                    after = T.alloc_var(T.int32, init=T.min(step + 1, steps - 1))
+                    threshold_s[step] = T.if_then_else(
+                        (step + 1 < steps) & (draft_s[after] >= 0),
+                        T.call_extern(
+                            "float32", "vllm_block_threshold", log_p, log_prob_s[after]
+                        ),
+                        T.call_extern("float32", "vllm_exp", log_p),
+                    )
+            T.sync_threads()
+
             if tx == 0:
                 greedy = T.alloc_var(
                     T.int32, init=T.cast(temp == T.float32(0), T.int32)
                 )
-                log_p = T.alloc_var(T.float32, init=T.float32(0))
                 accepted = T.alloc_var(T.int64, init=T.int64(0))
                 verifying = T.alloc_var(T.int32, init=1)
                 for i in tuple(range(steps)):
@@ -644,16 +713,9 @@ def verify_kernel(
                         valid = T.cast(drafted >= 0, T.int32)
                         token = T.max(drafted, T.int64(0))
                         if greedy == 0:
-                            # The cumulative ratio, which a -1 placeholder leaves
-                            # as it was; a placeholder ends verification.
-                            log_p = T.if_then_else(
-                                valid != 0,
-                                T.call_extern(
-                                    "float32", "vllm_log_ratio", log_p, log_prob_s[i]
-                                ),
-                                log_p,
-                            )
-                            cumulative[start + i] = log_p
+                            # The cumulative ratio; a placeholder ends
+                            # verification.
+                            cumulative[start + i] = cumulative_s[i]
                             verifying = verifying & valid
                         if verifying != 0:
                             if greedy != 0:
@@ -669,28 +731,14 @@ def verify_kernel(
                                 accepted = accepted + T.cast(hit, T.int64)
                                 verifying = hit
                             else:
-                                # Block verification: the prefix's joint ratio,
-                                # or the threshold of the residual mass when a
-                                # valid draft follows (from the logs of the ratio
-                                # and of the next step's draft probability).
-                                threshold = T.alloc_var(
-                                    T.float32,
-                                    init=T.call_extern("float32", "vllm_exp", log_p),
-                                )
-                                if i + 1 < steps:  # noqa: SIM102
-                                    if draft_s[i + 1] >= 0:
-                                        threshold = T.call_extern(
-                                            "float32",
-                                            "vllm_block_threshold",
-                                            log_p,
-                                            log_prob_s[i + 1],
-                                        )
+                                # Block verification: the last step whose draw is
+                                # at most its threshold ends the accepted block.
                                 accepted = T.if_then_else(
                                     T.call_extern(
                                         "int32",
                                         "vllm_at_most",
                                         uniform_s[i],
-                                        threshold,
+                                        threshold_s[i],
                                     )
                                     != 0,
                                     T.int64(i + 1),

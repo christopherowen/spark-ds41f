@@ -8,10 +8,10 @@ step. For the next release; spark-ds41f-1025 (candidate 5/6) stays frozen.
 
 Base: vLLM `tilelang-ports` at 26382f5cf, the candidate's package tree (image
 `spark-ds41f:19f2c20ed4d6-next-5`; candidate 6 adds two test patches only). The fix is vLLM
-branch `softmax-fix`, commit a7b65a167 (local, one commit over 26382f5cf). Nothing here has run
-on a GPU yet: the release window holds the cluster. Every number below is from served outputs
-already in this repository or from a CPU emulation of the kernels' FP32 arithmetic
-([emulate.py](emulate.py)).
+branch `softmax-fix`, four commits over 26382f5cf through 80e8c188c (local). The analysis's
+numbers are from served outputs already in this repository or from a CPU emulation of the
+kernels' FP32 arithmetic ([emulate.py](emulate.py)); the kernels' GPU tests and benchmarks ran
+on dgx4 (see "GPU results"). The serving check needs the cluster and waits for it.
 
 ## The paper, in short
 
@@ -118,19 +118,23 @@ probability 1 - p (the drafts' combined uncertainty, 1e-8 to 1e-5 in that regime
 distortion of the sampled distribution is at most about 1e-6 a verification step, consistent
 with triage's bound; the fix removes it.
 
-## The change (vLLM `softmax-fix` a7b65a167)
+## The change (vLLM `softmax-fix`, a7b65a167 to 80e8c188c)
 
 - `tilelang_logprob.topk_log_softmax`: the sum pass adds exp(x - max) only for columns that are
   not the maximum and counts the maximum's columns (exact in FP32); S adds the ties beyond the
   first (exp(max - max) each: 1, or NaN for an infinite maximum, as the paper's z - z_max);
-  lse = log1pf(S); a token's value is (x - max, exactly 0 at the maximum) - lse. Same layout,
-  chunking and block order; one more block reduction (the tie count).
+  lse = log1pf(S); a token's value is (x - max, exactly 0 at the maximum) - lse. A row takes
+  a block of 1024 threads, two vector loads each a step (the release took 128 threads in
+  Triton's layout); the maximum's pass reads the row last step first, so the sum starts on
+  the steps still in L2. One more block reduction (the tie count).
 - `tilelang_rejection.local_stats`: a sampled row's block sum leaves one column holding the
   block maximum out. `verify`: S is the block sums rescaled to the row maximum, each with its
   left-out column back (1 + sum) except the first block holding the row maximum; the draft's
   log probability is its shifted logit minus log1p(S); the rejected row's log-sum-exp
-  max + log1p(S); the threshold takes -expm1(log m) and -expm1(log p + log m) (IEEE division).
-  A row of two or more columns, all -inf, is NaN, as in the logprob kernel.
+  max + log1p(S); the threshold takes -expm1(log m) and -expm1(log p + log m) (IEEE division),
+  each step's on its own thread (its cumulative ratio folded in the serial loop's order, the
+  same bits), so thread 0 only compares the draws. A row of two or more columns, all -inf, is
+  NaN, as in the logprob kernel.
 - Unchanged bit for bit: argmaxes and maxima, greedy verification, the uniform draws, resampling
   and insertion. The Triton kernels stay for the configurations the recipe does not use.
 - One correct path: no flag, no fallback.
@@ -156,9 +160,8 @@ follow the kernels' NaN, infinity and block semantics:
 
 Benchmarks: `benchmark_tilelang_logprob_softmax.py` and `benchmark_tilelang_rejection.py` take
 `--baseline DIR` (the release's two modules) and gate the fix against the release's TileLang
-kernels, and without it against Triton's. The extra work: a compare, two selects and an add a
-column in the sum pass, one block reduction, and on verification's thread 0 two expm1f and a
-division a draft.
+kernels, and without it against Triton's. The Eq. 5 helpers are branch-free PTX: with a C
+conditional, nvcc predicated the exponential behind the compare.
 
 ## What changes in outputs (the next release)
 
