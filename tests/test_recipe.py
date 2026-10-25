@@ -605,6 +605,21 @@ class OverlayTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             recipe.overlay({"extends": {}, "container": {}}, base)
 
+    def test_serve_options_change_one_value_and_follow_every_other_argument(self):
+        base = recipe.resolve(load("config/cluster.json"), "tp3-triangle")
+        arm = {"extends": {"config": "config/cluster.json", "shape": "tp3-triangle"},
+               "serve_options": {"--load-format": "direct"}}
+        args = recipe.overlay(arm, base)["serve_args"]
+        at = base["serve_args"].index("--load-format") + 1
+        self.assertEqual(args[at], "direct")
+        self.assertEqual(args[:at] + args[at + 1:], base["serve_args"][:at] + base["serve_args"][at + 1:])
+        self.assertNotEqual(base["serve_args"][at], "direct")  # the base is not changed
+        for options, message in (({"--no-such-flag": "1"}, "do not pass once"),
+                                 ({"--enable-prefix-caching": "1"}, "do not pass once"),
+                                 ({"--load-format": 1}, "values are strings")):
+            with self.subTest(options=options), self.assertRaisesRegex(SystemExit, message):
+                recipe.overlay({"extends": {}, "serve_options": options}, base)
+
     def test_r6m_changes_only_its_own_settings_over_r6l(self):
         spark = load_spark()
         r6l = load("experiments/2026-10-14-r6l/r6l-release.json")

@@ -79,7 +79,10 @@ changes, so it cannot drift from what it is compared with:
 
 `extends` may name another arm (a dev arm extends its release arm); an arm of the recipe
 must name its shape. `set` merges into the base, `unset` removes dotted paths (an unset
-the base does not have is an error). An arm never carries the recipe's shape or
+the base does not have is an error). `set` replaces a list whole, so an arm that changes one
+serving option gives its new value in `serve_options` instead (`{"--load-format": "direct"}`)
+and keeps every other argument of its base; the flag must be one `serve_args` passes once
+with a value. An arm never carries the recipe's shape or
 qualifying benchmark. Older experiments keep their complete files.
 
 A window never opens while production serves requests (`queue run` refuses a busy cluster).

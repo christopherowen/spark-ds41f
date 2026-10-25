@@ -238,16 +238,29 @@ def is_overlay(cluster: dict) -> bool:
 
 def overlay(arm: dict, base: dict) -> dict:
     """An experiment arm: ``base`` (the recipe at a shape, or another arm, already
-    resolved) with ``set`` merged in and the dotted paths of ``unset`` removed.
+    resolved) with ``set`` merged in, the values of the ``serve_options`` it changes, and
+    the dotted paths of ``unset`` removed.
+
+    ``serve_options`` maps a flag that ``serve_args`` passes once, with a value, to the
+    arm's value, so an arm that changes one serving option still follows every other
+    argument of its base (``set`` replaces a list whole).
 
     An arm is not production: it carries neither the recipe's shape nor its
     qualifying benchmark, so starting it needs no qualification and a bench names
     its own reference.
     """
-    unknown = set(arm) - {"extends", "set", "unset", "notes"}
+    unknown = set(arm) - {"extends", "set", "serve_options", "unset", "notes"}
     if unknown:
-        raise SystemExit(f"an arm overlay holds extends, set, unset and notes; not {', '.join(sorted(unknown))}")
+        raise SystemExit("an arm overlay holds extends, set, serve_options, unset and notes; not "
+                         + ", ".join(sorted(unknown)))
     cluster = _merge(base, arm.get("set", {}))
+    for flag, value in arm.get("serve_options", {}).items():
+        args = cluster["serve_args"]
+        if args.count(flag) != 1 or args.index(flag) + 1 == len(args) or args[args.index(flag) + 1].startswith("--"):
+            raise SystemExit(f"the arm sets {flag}, which its base's serve_args do not pass once with a value")
+        if not isinstance(value, str):
+            raise SystemExit(f"the arm sets {flag} to {value!r}: serve_args values are strings")
+        args[args.index(flag) + 1] = value
     sets = arm.get("set", {})
     if "models" in cluster and ("model" in sets or "mounts" in sets.get("container", {})):
         # The arm serves its model (another of the recipe's, or the one it extends)
