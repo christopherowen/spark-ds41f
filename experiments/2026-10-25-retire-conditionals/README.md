@@ -9,15 +9,15 @@ paths that never run." Nothing here ran on a GPU, and nothing touches the frozen
 
 - **vLLM:** branch `retire-conditionals` (local, `~/projects/vllm-retire-conditionals`),
   four commits on candidate 6's vLLM (`3bdf9558c`: `tilelang-ports` 26382f5cf plus rc6's
-  0489-0490, tree `6f8e062f`). Head `3082ef9bf`, tree `474fe90e`. 56 files, +933 / -9941
+  0489-0490, tree `6f8e062f`). Head `b9d7e37b6`, tree `4377c31d`. 56 files, +1020 / -9953
   lines. The patches below are the branch, and they replay onto `3bdf9558c` to the same tree.
 
   | patch | commit | what goes |
   |-------|--------|-----------|
-  | [0493](vllm/0493-DS4.1-TileLang-is-the-model-s-only-kernel-family-the.patch) | ffbef693f | the B12X model family |
-  | [0494](vllm/0494-DS4.1-No-kernel-family-switch-VLLM_DS41_KERNEL_BACKE.patch) | 73188ee78 | `VLLM_DS41_KERNEL_BACKEND` and every engine branch it gated |
-  | [0495](vllm/0495-DS4.1-The-ported-model-kernels-Triton-originals-go.patch) | 043e0b8be | the Triton originals of the ported model kernels |
-  | [0496](vllm/0496-DS4.1-B12X-remnants-the-L2-prefetch-packed-weight-wa.patch) | 3082ef9bf | B12X remnants: the L2 prefetch packed-weight walk |
+  | [0493](vllm/0493-DS4.1-TileLang-is-the-model-s-only-kernel-family-the.patch) | a9b9addd2 | the B12X model family |
+  | [0494](vllm/0494-DS4.1-No-kernel-family-switch-VLLM_DS41_KERNEL_BACKE.patch) | 231959e4c | `VLLM_DS41_KERNEL_BACKEND` and every engine branch it gated |
+  | [0495](vllm/0495-DS4.1-The-ported-model-kernels-Triton-originals-go.patch) | 96d7d0b2f | the Triton originals of the ported model kernels |
+  | [0496](vllm/0496-DS4.1-B12X-remnants-the-L2-prefetch-packed-weight-wa.patch) | b9d7e37b6 | B12X remnants: the L2 prefetch packed-weight walk |
 
   [vllm/series](vllm/series) is candidate 6's series (375 patches, through 0490) followed by
   0493-0496 (379). 0491 (KV capacity) and 0492 (drafter window) are taken by other drafts and
@@ -79,10 +79,21 @@ Tests:
     the files stay excluded.
 - **Ported to TileLang:**
   - the compressor's rejection, reorder, page-boundary and high-offset scenarios (two of
-    the six former deselects; the other four were B12X attention-plan tests, which go);
+    the six former deselects; the other four were B12X attention-plan tests, which go).
+    Their padding is the runner's: rows past the step's requests, which must write
+    neither latents nor the ring of a stale table row's pages. The B12X form, a request
+    owning rows without slots, is not a step serving builds: every row a request owns
+    has a slot (candidate 6's ring-writes test, and the runner's block tables);
   - the Engram model tests (token ids, lookup-only preparation, a gate graph with the
-    image sentinel);
+    image sentinel), on a 1024-wide model: the TileLang gate's smallest width;
   - the SP Engram gate, the attention staging tests and the compressor-preparation tests.
+- **Vision bounds:** candidate 6's vision test bounded each FP64 comparison by B12X's
+  error on the same inputs. B12X's tower is gone, so its errors are numbers in the test
+  (`B12X_ERROR`, 38 of them), measured with candidate 6's own test on its image
+  ([bundles/vision-b12x-error](bundles/vision-b12x-error)). Each bound is the tighter of
+  candidate 6's B12X-relative one and a fixed one. The fixed ones alone were the base
+  test's never-run no-B12X branch: four BF16 steps for attention, where B12X itself
+  measured 10.7-14.8.
 - **Oracles moved to torch:** the metadata kernels (requests, tokens, chunk, pages,
   decode metadata), the state-ring gather and the lookback window. Before the Triton
   went, each torch reference was checked against a transliteration of the deleted
@@ -204,7 +215,7 @@ When a series includes 0493-0496:
 
 ## Verification done (laptop, CPU only)
 
-- **vLLM tests:** the touched and related test files on candidate 6's tree and on the
+- **vLLM tests** (at 3082ef9bf, before dgx4's test fixes): the touched and related test files on candidate 6's tree and on the
   branch, CPU venv (no CUDA, Triton or TileLang; b12x 236ddff on the path, TileLang
   stubbed):
   - 27 files. Candidate 6's tree: 458 passed, 61 failed, 161 skipped, 2 files that do not
@@ -220,12 +231,56 @@ When a series includes 0493-0496:
     only on SM12x. With a per-test SM12x platform shim all 3 pass: the config hook, the
     attention class and aligned chunks. On candidate 6's tree that file does not collect
     on the laptop.
-- **Patches:** 0493-0496 replay onto `3bdf9558c` to tree `474fe90e`, the branch's.
+- **Patches:** 0493-0496 replay onto `3bdf9558c` to tree `4377c31d`, the branch's.
 - **spark-ds41f:** `python3 -m unittest discover -s tests`: 485 tests OK (5 skipped).
 
-## GPU check (queued, not run)
+## GPU checks on dgx4
 
-[retire-check.json](retire-check.json), written by [make_bundles.py](make_bundles.py).
+Owner, 2026-10-25: sub-agents test on dgx4 (uncabled, serving nothing) while dgx1-3
+serve. Every run used `scripts/lab.py kernel-local BUNDLE --out OUT` on dgx4 itself.
+- **Checkout:** this branch, under `~/spark-lab/agents/retire-conditionals/spark-ds41f`.
+- **Outputs:** `~/spark-lab/agents/retire-conditionals/out/<run>`. Per-test JUnit files
+  are copied there from `~/.cache/spark-lab/compile/release-tests/<label>`.
+- **Image:** `spark-ds41f:19f2c20ed4d6-next-6` (`sha256:82b071b57485`), as it is.
+- **Request file:** `~/spark-request.json` was absent before each run.
+- **Targeted runs:** [make_targeted.py](make_targeted.py) copies the checkout's release-test
+  bundle with only the named gate files, under its own label.
+
+| run (CET) | commit | bundle | verdict |
+|-----------|--------|--------|---------|
+| release-tests, 19:01-19:54 | 289f38f4 (vLLM 3082ef9bf) | [bundles/release-tests](bundles/release-tests), 97 files | **FAIL**: 7 failed, 2 errors, 5712 passed, 161 skipped |
+| vision-b12x-error, 20:20 | 174c5d98 | [bundles/vision-b12x-error](bundles/vision-b12x-error) | FAIL in 1 s: the image has no `tblib`, which the conftest imports (bundle fixed to load the release tests' stand-in) |
+| targeted-1, 20:28-20:35 | 174c5d98 (vLLM 47a849319) | the metadata, compressor and Engram files | FAIL: 1 failed (compressor padding), 124 passed |
+| vision-b12x-error, 20:36-20:40 | 7c3f538c | [bundles/vision-b12x-error](bundles/vision-b12x-error) | pass: 23 passed, 38 B12X error records |
+| targeted-2, 20:50-20:51 | 354066f8 (vLLM b9d7e37b6) | the vision, metadata, compressor and Engram files | pass: 206 passed |
+| release-tests-2, 20:52-21:17 | 354066f8 (vLLM b9d7e37b6) | [bundles/release-tests](bundles/release-tests), 97 files | **pass**: 5721 passed, 161 skipped, 0 failed (1476 s) |
+
+The first run's failures, all in test files this branch changed. Serving code was not
+involved: the same TileLang kernels run in candidate 6.
+- **Metadata graph refresh, compressor setup (1 failed, 2 errors):** the tests'
+  `SimpleNamespace` metadata lacked `query_start_loc_cpu`, which the builder's
+  decode/prefill split reads. The graph-refresh test was in an excluded file before this
+  branch, and the compressor tests were deselected. The namespaces now carry the host
+  copy.
+- **Vision attention (3 failed):** the fixed four-step bound (see "Vision bounds"). With
+  B12X's numbers TileLang's worst elements are 8.8 / 8.8 / 12.7 steps against B12X's
+  10.7 / 14.8 / 12.5, inside candidate 6's rule (B12X's + 1).
+- **Engram model tests (3 failed):** the tests' 64-wide model reaches the TileLang gate,
+  which asserts a multiple of 1024. In candidate 6 they ran B12X's gate. The model is now
+  1024 wide.
+- **Compressor padding (targeted-1):** the TileLang compression saves the state ring for
+  every row its ring metadata assigns to a request. The B12X-era scenario gave a request
+  rows without slots, and the TileLang ring ignores the input slots (as the deleted
+  Triton `_tokens` did for ring groups). That step does not occur in serving. The
+  scenario now pads as the runner does, and the pages stay untouched.
+
+The release-test gate passes on the branch with its deleted modules failing to import:
+no gate test reaches them.
+
+## Serving check (queued, not run)
+
+[retire-check.json](retire-check.json), written by [make_bundles.py](make_bundles.py). Its
+kernel job repeats the release-test gate above on dgx2; its measure job needs the cluster.
 - **Image:** `spark-ds41f:19f2c20ed4d6-next-6` as it is, with nothing built.
 - **When it can run:** the lab runs origin/main's specs, so it runs after this PR merges.
   The owner can also run it outside the repository, as candidate 6's test preview ran.
