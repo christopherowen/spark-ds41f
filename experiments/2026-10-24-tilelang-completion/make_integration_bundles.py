@@ -141,6 +141,15 @@ PARTS = {
               "ENGRAM_ROWS_TEST_DIR": "/c/engram-rows-test"}),
             ("mHC benchmark", ["benchmarks/kernels/benchmark_deepseek_v41_mhc_post.py",
                                "--gate"], 3600),
+            # The vision tower in TileLang and the image span's row copies (run 21):
+            # bit for bit where B12X's order is defined, else against DeepSeek's
+            # math within B12X's own error; the gate times the tower against B12X's.
+            ("vision and image-span tests", PYTEST + [
+                "--basetemp", "/c/pytest-integration-vision",
+                "tests/kernels/test_deepseek_v41_tilelang_vision.py",
+                "tests/models/test_deepseek_v4_1_image_span.py"], 5400),
+            ("vision benchmark", ["benchmarks/kernels/benchmark_tilelang_vision.py",
+                                  "--gate"], 3600),
         ],
         {"io_uring": True},
     ),

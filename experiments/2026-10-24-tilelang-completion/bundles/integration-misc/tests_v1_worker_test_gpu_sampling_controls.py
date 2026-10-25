@@ -637,3 +637,79 @@ def test_bias_restore_decided_by_allowed_ids_whatever_biases_meet_outside(vocab)
     assert torch.isfinite(expected[2, :2]).all()
     assert (expected[1, :3] == -float("inf")).all()
     assert (expected[0, :3] == -float("inf")).all()
+
+
+@pytest.mark.parametrize("vocab", [8192, 8193, 129280])
+def test_bias_restore_scan_finds_the_last_live_column(vocab):
+    """The all-masked scan stops at the first tile with a live column: rows whose
+    only live column (after the stop mask) is in the first tile, a middle one, the
+    last whole tile or the partial tail, a row whose only other value is NaN, and a
+    dead row, against Triton's full-row maximum."""
+    from vllm.v1.worker.gpu.sample import tilelang_bias
+    from vllm.v1.worker.gpu.sample.logit_bias import _bias_kernel
+
+    torch.manual_seed(31337)
+    columns = sorted(
+        {5, vocab // 2, max(vocab - vocab % 8192 - 1, 5), vocab - 1} - {0, 1, 2}
+    )
+    rows = len(columns) + 2
+    states, width = rows, 8
+    logits = torch.full((rows, vocab), -float("inf"), device="cuda")
+    for row, column in enumerate(columns):
+        logits[row, column] = 1.5
+    logits[len(columns), vocab - 1] = float("nan")
+    logits[:, :3] = torch.randn(rows, 3, device="cuda")  # the stop tokens
+    mapping = torch.arange(rows, device="cuda", dtype=torch.int64)
+    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    zeros = torch.zeros(states, device="cuda", dtype=torch.int32)
+    allowed = torch.zeros((states, width), device="cuda", dtype=torch.int32)
+    bias_ids = torch.zeros((states, width), device="cuda", dtype=torch.int32)
+    biases = torch.zeros((states, width), device="cuda")
+    min_lens = zeros + 5
+    num_stops = zeros + 3
+    restore_rows = zeros + 1
+    stops = torch.zeros((states, width), device="cuda", dtype=torch.int32)
+    stops[:, :3] = torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32)
+    expected = logits.clone()
+    _bias_kernel[(rows,)](
+        expected,
+        expected.stride(0),
+        vocab,
+        mapping,
+        zeros,
+        allowed,
+        allowed.stride(0),
+        zeros,
+        bias_ids,
+        bias_ids.stride(0),
+        biases,
+        biases.stride(0),
+        positions,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        stops.stride(0),
+        BLOCK_SIZE=width,
+        LOGITS_BLOCK_SIZE=8192,
+        CHECK_ALL_MASKED_ROWS=True,
+    )
+    tilelang_bias.apply_logit_bias(
+        logits,
+        mapping,
+        positions,
+        zeros,
+        allowed,
+        zeros,
+        bias_ids,
+        biases,
+        min_lens,
+        num_stops,
+        restore_rows,
+        stops,
+        True,
+    )
+    assert_bits(logits, expected)
+    # Live rows keep their stops masked; the NaN and dead rows restore them.
+    assert (expected[: len(columns), :3] == -float("inf")).all()
+    assert torch.isfinite(expected[len(columns) :, :3]).all()

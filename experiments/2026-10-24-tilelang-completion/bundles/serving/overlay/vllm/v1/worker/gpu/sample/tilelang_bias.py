@@ -82,7 +82,6 @@ def bias_kernel(
     per = max(width // _THREADS, 1)
     row_per = _ROW_TILE // _THREADS
     full = vocab // _ROW_TILE
-    warps = _THREADS // 32
 
     def load_if(dtype, address, other, ok):
         helper = (
@@ -111,7 +110,13 @@ def bias_kernel(
 
     @T.macro
     def scan_row(logits, row, tx, row_values, alive):
-        for tile in T.serial(full):
+        """Whether some column of the row is above -inf, the block's verdict in every
+        thread's ``alive[0]``. Each tile ends with ``__syncthreads_or`` (one barrier
+        that ORs the block's flags), and the scan stops at the first tile with a
+        live column: the answer cannot change after it. A dead row reads every
+        column, as Triton's maximum does."""
+        tile = T.alloc_var(T.int32, init=0)
+        while (tile < full) & (alive[0] == 0):
             for r in T.unroll(row_per // run):
                 col0 = tile * _ROW_TILE + r * (_THREADS * run) + run * tx
                 for k in T.vectorized(run):
@@ -120,15 +125,20 @@ def bias_kernel(
                 alive[0] = alive[0] | T.cast(
                     row_values[j] > -T.infinity("float32"), "int32"
                 )
-        if vocab % _ROW_TILE:
-            # A repeated last column does not change whether any is alive.
-            for j in T.unroll(row_per):
-                col = full * _ROW_TILE + j * _THREADS + tx
-                row_values[j] = logits[row, T.min(col, vocab - 1)]
-            for j in T.unroll(row_per):
-                alive[0] = alive[0] | T.cast(
-                    row_values[j] > -T.infinity("float32"), "int32"
-                )
+            alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
+            tile = tile + 1
+        # A trace-time width check around a runtime test: not one condition.
+        if vocab % _ROW_TILE:  # noqa: SIM102
+            if alive[0] == 0:
+                # A repeated last column does not change whether any is alive.
+                for j in T.unroll(row_per):
+                    col = full * _ROW_TILE + j * _THREADS + tx
+                    row_values[j] = logits[row, T.min(col, vocab - 1)]
+                for j in T.unroll(row_per):
+                    alive[0] = alive[0] | T.cast(
+                        row_values[j] > -T.infinity("float32"), "int32"
+                    )
+                alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
 
     @T.prim_func
     def bias(
@@ -165,7 +175,6 @@ def bias_kernel(
             extra = T.alloc_local((per,), "float32")
             row_values = T.alloc_local((row_per,), "float32")
             alive = T.alloc_local((1,), "int32")
-            partial = T.alloc_shared((warps,), "int32")
             if n_allowed > 0:
                 for k in T.unroll(per):
                     col = k * _THREADS + tx
@@ -252,19 +261,9 @@ def bias_kernel(
                             alive[0] = alive[0] | T.cast(
                                 seen > -T.infinity("float32"), "int32"
                             )
+                        alive[0] = T.call_extern("int32", "__syncthreads_or", alive[0])
                     else:
                         scan_row(logits, row, tx, row_values, alive)
-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 16)
-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 8)
-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 4)
-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 2)
-                    alive[0] = alive[0] | T.shfl_xor(alive[0], 1)
-                    if tx % 32 == 0:
-                        partial[tx // 32] = alive[0]
-                    T.sync_threads()
-                    alive[0] = partial[0]
-                    for w in T.unroll(1, warps):
-                        alive[0] = alive[0] | partial[w]
                     for k in T.unroll(per):
                         store_if(
                             T.address_of(logits[row, ids[k]]),

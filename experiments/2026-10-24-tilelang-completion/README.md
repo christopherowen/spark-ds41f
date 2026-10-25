@@ -1541,3 +1541,48 @@ every declared kernel at startup), and the window restored production.
 vLLM `tilelang-ports` 98f24cd85: run 19's fixes above. The same bundles; then the fourth
 serving check and the second request inventory again, on this build
 (`~/spark-lab/integration20` on dgx1, "INTEGRATION20 DONE").
+
+### Twentieth integrated run (2026-10-25 03:07 CET)
+
+All four bundles passed: every test, and every gate. The structured min-tokens logit bias
+at 96 rows measured 221.1 µs against Triton's 220.0 µs, the interval spanning zero. That
+case has no allowed list (the grammar's mask is in the logits), so it takes the row scan,
+not run 19's allowed-ids read-back. The scan now stops at the first tile with a live
+column (below).
+
+## Twenty-first integrated run (run `tilelang-integration-kernels-21`)
+
+vLLM `tilelang-ports` d9305407d completes the port: the last B12X compute on the serving
+path and the image path's torch glue.
+- **The vision tower in TileLang** (870031916). Under the TileLang backend the ViT and
+  the aligner launch TileLang kernels only; B12X is not imported. The checkpoint's
+  parameter tree is unchanged.
+  - BF16 GEMMs add the bias in FP32 before their one rounding. Gate/up and SwiGLU share
+    an epilogue, as do bias and GELU in the aligner.
+  - RoPE rotates in place in the qkv buffer. A non-causal flash attention over one image
+    reads q, k and v from it, and masks the columns past the live rows.
+  - The residual add is fused with RMSNorm in B12X's reduction order. The spatial merge
+    stages through shared memory.
+  - Gates: the element- and row-wise ops are bit for bit with B12X's arithmetic. The
+    GEMMs and attention are checked against FP64 within B12X's own error, and the whole
+    tower and aligner against DeepSeek's math. `benchmark_tilelang_vision.py --gate`
+    times the tower against B12X's.
+- **The image span and its merge** (70bc46b06). The span builder's four masked
+  assignments (each a device sync) and three casts become two TileLang row copies. The
+  merge scatters each span at the host mask's slots instead of torch's `index_put`. The
+  processor keeps the span roles on the host, and the runner's mask is pinned host
+  memory, so neither needs a sync.
+- **The logit-bias restore scan stops at the first live tile** (d9305407d). Each
+  8192-column tile ends with `__syncthreads_or`, one barrier that ORs the block's flags.
+  A row with a live column reads one tile; a dead row still reads every column.
+
+Bundle changes: dgx3 gains the vision and image-span tests and the vision gate.
+
+Then, in the same driver (`~/spark-lab/integration21` on dgx1, "INTEGRATION21 DONE"):
+- [serving-ports-5.json](serving-ports-5.json): the fourth serving check plus
+  [image_digest.py](image_digest.py) on every arm. It sends four generated images, one at
+  a time and then together, and records the digests and the texts. The vision tower's
+  GEMMs and attention cannot reproduce B12X's bits, so image outputs may differ from
+  candidate 4's; the texts show how.
+- [../2026-10-25-request-inventory/inventory-3.json](../2026-10-25-request-inventory/inventory-3.json):
+  the request inventory at this build, the vision tower included.
