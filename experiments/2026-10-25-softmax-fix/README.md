@@ -163,6 +163,63 @@ Benchmarks: `benchmark_tilelang_logprob_softmax.py` and `benchmark_tilelang_reje
 kernels, and without it against Triton's. The Eq. 5 helpers are branch-free PTX: with a C
 conditional, nvcc predicated the exponential behind the compare.
 
+## GPU results (dgx4, 2026-10-25)
+
+dgx4 (uncabled, serving nothing) ran the kernel bundles with `scripts/lab.py kernel-local` from
+a checkout of this branch under `~/spark-lab/agents/softmax-fix/spark-ds41f`, outputs under
+`~/spark-lab/agents/softmax-fix/out/`, on image `spark-ds41f:19f2c20ed4d6-next-5`
+(`sha256:dce880d88d8e`, the candidate's package tree 26382f5cf; -next-6 differs only in two
+test files).
+
+| When (CET) | Bundle | spark-ds41f / vLLM | Verdict |
+| --- | --- | --- | --- |
+| 19:58 | `softmax-logprob` | 887eb67 / a7b65a167 | **fail**: tests pass (874 logprob, 44 sink); the gate against the release fails at 1 to 16 rows (FP32 30 us against 25, bf16 30 against 20); 3x faster than Triton |
+| 20:07 | `softmax-verification` | 887eb67 / a7b65a167 | **fail**: tests pass (427 verification, 146 rejection sampler, 1 skipped); `rejection_sample` 2-3% slower than the release at 16 FP32 and 48 bf16 rows |
+| 20:43 | `softmax-logprob` | 243b87c / 80e8c188c | **pass** in 56 s: 874 + 44 tests; no case slower than the release or Triton (`out/softmax-logprob-2`) |
+| 20:47 | `softmax-verification` | 243b87c / 80e8c188c | **pass** in 74 s: 427 + 146 tests (1 skipped); no case slower than the release or Triton (`out/softmax-verification-2`) |
+
+Command, from the checkout:
+`python3 scripts/lab.py kernel-local experiments/2026-10-25-softmax-fix/bundles/<bundle> --out ~/spark-lab/agents/softmax-fix/out/<bundle>-2`.
+
+**Root cause of the first run's slowdown.** In SASS (`cuobjdump -sass` of the compiled
+kernels), nvcc had compiled the helpers' C conditional `x == m ? 0 : exp(x - m)` by predicating
+the exponential behind the compare, with predicate shuffles and moves: twice the release's
+FSETP/FSEL a column. And the release's one 128-thread block a row reads the row in about 32
+round trips to memory, one after another, with the compute in between, so every added
+instruction lengthened the latency. The helpers are now branch-free PTX. A row takes 1024
+threads, each with two vector loads a step, and the maximum's pass reads the row last step
+first, as the release did. That way the sum starts on the steps still in L2, which a forward
+pass had evicted at 96 rows. Verification's thresholds moved off thread 0's serial loop.
+
+Layouts timed against the release on dgx4 (dev bundles outside git; FP32 96 rows, release
+about 198 us):
+
+| Threads x loads | Forward maximum pass | Reversed |
+| --- | --- | --- |
+| 512 x 4 | 258 | 200-205 |
+| 512 x 4, two blocks an SM | 337 (spills) | - |
+| 256 x 4 | 336 | 206-208 |
+| 1024 x 2 | 229 | 199-202, level; chosen |
+| 1024 x 4 | - | 209-210 (bf16 spills) |
+
+**The passing run's logprob kernel against the release's** (us, the 95% interval of the
+paired difference):
+
+| Logits | Rows | Tokens | Release | Fix | Difference |
+| --- | --- | --- | --- | --- | --- |
+| FP32 | 1 | 1 / 20 | 24.6 / 24.8 | 15.9 / 16.1 | -8.7 / -8.7 |
+| FP32 | 16 | 1 / 20 | 25.6 / 25.7 | 18.8 / 19.0 | -7.5 / -7.1 |
+| FP32 | 96 | 1 / 20 | 197.8 / 195.6 | 202.9 / 198.6 | -1.5 to +12.1 / -2.5 to +3.3 (level) |
+| bf16 | 1 | 1 / 20 | 20.2 / 20.2 | 13.4 / 13.4 | -6.9 / -6.9 |
+| bf16 | 16 | 1 / 20 | 20.4 / 20.6 | 13.8 / 13.9 | -6.7 / -6.7 |
+| bf16 | 96 | 1 / 20 | 53.7 / 52.7 | 54.0 / 55.4 | -2.7 to +2.9 / -2.3 to +4.8 (level) |
+
+Against Triton it is 2.7 to 6.4 times faster. Verification (`local_stats`, `verify`,
+`resample`, and `rejection_sample` end to end, 1 to 96 rows, FP32 and bf16, sampled and mixed
+temperatures) is level with the release everywhere. For example, `rejection_sample` at 16 FP32
+sampled rows takes 48.3 us against 46.9 (-0.7 to +3.2), and at 96 bf16 sampled rows 126.4 against
+125.7 (-1.5 to +1.7).
+
 ## What changes in outputs (the next release)
 
 - **Temperature 0 text: identical.** Greedy verification and every argmax are unchanged. The
@@ -181,7 +238,12 @@ conditional, nvcc predicated the exponential behind the compare.
   controls' logprob-id scenarios (`controls_digest.py`).
 - **Speed:** gated equal or better against the release's kernels.
 
-## Lab specs (run after the release window)
+## Lab specs
+
+The kernel bundles passed on dgx4 (above); [softmax-kernels.json](softmax-kernels.json) runs the
+same bundles in a lab window. The serving check needs the cluster and is still to run: its arm
+is candidate 5 at tp4-ring, so with the nodes cabled as the TP3 triangle it waits for the ring,
+or takes a TP3 arm of the release once one is merged.
 
 Regenerate the bundles and the arm from the vLLM branch with
 `python3 make_bundles.py ~/projects/vllm-softmax-fix 26382f5cf softmax-fix`.
