@@ -66,18 +66,25 @@ def vision_error_bundle(repo: str, base: str) -> None:
         source = source.replace(anchor, anchor + line)
     name = "test_deepseek_v41_tilelang_vision_b12x_error.py"
     (bundle / name).write_text(source)
+    # The release tests' plugins: the image lacks tblib, which the conftest imports.
+    plugins = ("tblib_stub.py", "offline_skip.py")
+    for plugin in plugins:
+        shutil.copyfile(REPO_ROOT / "scripts/release_tests" / plugin, bundle / plugin)
     candidate = {
         "description": (
             "Candidate 6's TileLang vision test on image -next-6 (its own tree, no overlay), "
             "printing B12X's error beside the TileLang tower's for each FP64 comparison: the "
             "numbers retire-conditionals' test bounds the tower by once B12X's tower is gone."),
         "image": IMAGE,
-        "env": {"HF_HUB_OFFLINE": "1", "TILELANG_CACHE_DIR": "/c/tilelang-vision-b12x-error"},
+        "env": {"HF_HUB_OFFLINE": "1", "PYTHONPATH": "/b",
+                "TILELANG_CACHE_DIR": "/c/tilelang-vision-b12x-error"},
         "workdir": "vllm",
         "argv": ["-m", "pytest", "-q", "-s", "-rfEs", "-p", "no:cacheprovider",
+                 "-p", "tblib_stub", "-p", "offline_skip",
                  f"tests/kernels/{name}", "-k", "against_fp64 or against_reference"],
         "verdict": "exit",
-        "mounts": [[name, f"{ROOT}/tests/kernels/{name}"]],
+        "mounts": [[name, f"{ROOT}/tests/kernels/{name}"],
+                   *([plugin, f"/b/{plugin}"] for plugin in plugins)],
     }
     (bundle / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\n")
 
