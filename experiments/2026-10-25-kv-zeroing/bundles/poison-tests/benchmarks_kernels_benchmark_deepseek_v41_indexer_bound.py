@@ -4,13 +4,15 @@
 the visible positions against the release's (``--baseline``, the release's
 ``tilelang/indexer.py``), which loads that tile's rows past them.
 
-The bound predicates the key and scale loads of rows past the extent off; addresses,
-the page read and the load count are the release's. Cases are decode steps (6 rows:
-one stream's 1 + 5 drafts; 96: sixteen streams') at extents ending inside a tile, on
-the ratio-2 caches' 128-row pages and layer 20's 256-row pages, up to a 1M-token
-context's 524,288 and 1,048,576 compressed positions. Candidate cases score a reindex
-layer's candidate list (``CANDIDATE_BLOCKS * CANDIDATE_BLOCK`` sorted positions with
--1 padding, one masked) at the deepest extents.
+The bound predicates a dense row's key and scale loads past its extent off; addresses,
+the page read and the load count are the release's. Candidate mode is the release's
+kernel (its lists are -1 padded, so rows past a list load position 0), timed to show
+it. Cases are decode steps (6 rows: one stream's 1 + 5 drafts; 96: sixteen streams')
+at extents ending inside a tile, on the ratio-2 caches' 128-row pages and layer 20's
+256-row pages, up to a 1M-token context's 524,288 and 1,048,576 compressed positions.
+Candidate cases score a reindex layer's candidate list (``CANDIDATE_BLOCKS *
+CANDIDATE_BLOCK`` sorted positions with -1 padding, one masked) at the deepest
+extents.
 
 For each case both kernels first score the same inputs, compared bit for bit over the
 visible positions. CUDA graphs of 20 launches of each then run back to back on eight

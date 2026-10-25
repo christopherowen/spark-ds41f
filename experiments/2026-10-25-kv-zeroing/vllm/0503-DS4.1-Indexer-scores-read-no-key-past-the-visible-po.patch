@@ -1,4 +1,4 @@
-From 33b748994ce88ac93827f02877771b27da77c949 Mon Sep 17 00:00:00 2001
+From 169078a4cc1a04d85a2cab57dc2bb922632fa5ca Mon Sep 17 00:00:00 2001
 From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 18:52:01 +0100
 Subject: [PATCH 503/503] [DS4.1] Indexer scores read no key past the visible
@@ -14,11 +14,12 @@ Only the loads are predicated: the page read stays unconditional, so a dense
 tile's addresses stay affine and its 32 loads a thread still issue together.
 The extent joins the bounds check TileLang already puts on each load; nvcc
 had unswitched the release's uniform form of that check into branches, and
-the per-row form compiles straight-line (127 registers dense, 96 by
-candidates; the release's 124 and 102). A masked or padding candidate is
-position 0, which is visible. Stored scores are bit for bit as before: rows
-are independent in the block-scaled MMA, and the rows that changed are the
-ones the store drops.
+the per-row form compiles straight-line (127 registers; the release's 124).
+Candidate mode is unchanged: its source layer writes the list whole, -1
+padded, so rows past a list's length load position 0, which is visible, as
+a masked candidate does. Stored scores are bit for bit as before: rows are
+independent in the block-scaled MMA, and the rows that changed are the ones
+the store drops.
 
 Tests: compute-sanitizer's initcheck scores a cache written only at the
 visible positions (dense and by candidates, 128- and 256-row pages, extents
@@ -29,34 +30,36 @@ benchmark_deepseek_v41_indexer_bound.py times the kernel against the
 release's at 1M-context depths, dense and by candidates, after a
 bit-for-bit comparison, and gates on it being slower at no case.
 ---
- .../benchmark_deepseek_v41_indexer_bound.py   | 199 ++++++++++++++++++
+ .../benchmark_deepseek_v41_indexer_bound.py   | 201 ++++++++++++++++++
  .../attention/deepseek_v41_indexer_reads.py   | 120 +++++++++++
  .../attention/test_deepseek_v41_tilelang.py   |  74 +++++++
  vllm/models/deepseek_v4_1/attention.py        |   6 +-
- vllm/models/deepseek_v4_1/tilelang/indexer.py |  27 ++-
- 5 files changed, 417 insertions(+), 9 deletions(-)
+ vllm/models/deepseek_v4_1/tilelang/indexer.py |  34 ++-
+ 5 files changed, 425 insertions(+), 10 deletions(-)
  create mode 100644 benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
  create mode 100644 tests/kernels/attention/deepseek_v41_indexer_reads.py
 
 diff --git a/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py b/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
 new file mode 100644
-index 000000000..d1671dfd2
+index 000000000..d3c7c104d
 --- /dev/null
 +++ b/benchmarks/kernels/benchmark_deepseek_v41_indexer_bound.py
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,201 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Paired timing of DeepSeek-V4.1's indexer score kernel with its last tile bounded to
 +the visible positions against the release's (``--baseline``, the release's
 +``tilelang/indexer.py``), which loads that tile's rows past them.
 +
-+The bound predicates the key and scale loads of rows past the extent off; addresses,
-+the page read and the load count are the release's. Cases are decode steps (6 rows:
-+one stream's 1 + 5 drafts; 96: sixteen streams') at extents ending inside a tile, on
-+the ratio-2 caches' 128-row pages and layer 20's 256-row pages, up to a 1M-token
-+context's 524,288 and 1,048,576 compressed positions. Candidate cases score a reindex
-+layer's candidate list (``CANDIDATE_BLOCKS * CANDIDATE_BLOCK`` sorted positions with
-+-1 padding, one masked) at the deepest extents.
++The bound predicates a dense row's key and scale loads past its extent off; addresses,
++the page read and the load count are the release's. Candidate mode is the release's
++kernel (its lists are -1 padded, so rows past a list load position 0), timed to show
++it. Cases are decode steps (6 rows: one stream's 1 + 5 drafts; 96: sixteen streams')
++at extents ending inside a tile, on the ratio-2 caches' 128-row pages and layer 20's
++256-row pages, up to a 1M-token context's 524,288 and 1,048,576 compressed positions.
++Candidate cases score a reindex layer's candidate list (``CANDIDATE_BLOCKS *
++CANDIDATE_BLOCK`` sorted positions with -1 padding, one masked) at the deepest
++extents.
 +
 +For each case both kernels first score the same inputs, compared bit for bit over the
 +visible positions. CUDA graphs of 20 launches of each then run back to back on eight
@@ -479,35 +482,50 @@ index c3608733b..191d13ace 100644
              block_size=self.block_size,
              num_kv_heads=1,
 diff --git a/vllm/models/deepseek_v4_1/tilelang/indexer.py b/vllm/models/deepseek_v4_1/tilelang/indexer.py
-index 19d0c3971..23e9e0547 100644
+index 19d0c3971..5e273fdbf 100644
 --- a/vllm/models/deepseek_v4_1/tilelang/indexer.py
 +++ b/vllm/models/deepseek_v4_1/tilelang/indexer.py
-@@ -113,9 +113,9 @@ def indexer_score_v41(
+@@ -109,13 +109,15 @@ def indexer_score_v41(
+     - ``Lengths``: ``[rows]`` int32 positions per row;
+     - ``Active``: ``[1]`` int32 width cap;
+     - candidate mode: ``Candidates`` ``[rows, width]`` int32 positions and
+-      ``CandidateLengths`` ``[rows]``.
++      ``CandidateLengths`` ``[rows]``; its source layer writes the list whole,
++      ``-1`` padded.
  
      Writes ``Scores`` (``[rows, width]`` BF16) up to each row's extent, ``-inf``
      for masked candidates; entries past the extent are left unwritten and the
 -    top-k never reads them. Each row gets at most ``max_ctas`` CTAs, which loop
 -    over its live tiles, so the launch scales with the context in use rather
 -    than the planned width.
-+    top-k never reads them. No key or scale is read past the extent either.
++    top-k never reads them. No key or scale is read past the visible positions
++    either.
 +    Each row gets at most ``max_ctas`` CTAs, which loop over its live tiles, so
 +    the launch scales with the context in use rather than the planned width.
      """
      assert page_size % block_P == 0 or candidates, (
          "dense tiles must not straddle a page"
-@@ -161,21 +161,36 @@ def indexer_score_v41(
+@@ -143,6 +145,7 @@ def indexer_score_v41(
+         extent,
+         position,
+         slot_valid,
++        loads,
+         Scores,
+     ):
+         K_shared = T.alloc_shared([block_P, D], fp4)
+@@ -161,21 +164,36 @@ def indexer_score_v41(
              W_shared[h] = T.cast(Weights[row, h], accum_dtype)
          for i in T.serial(T.ceildiv(T.max(T.ceildiv(extent, block_P) - cta, 0), ctas)):
              p0 = (cta + i * ctas) * block_P
 -            # Invalid slots load a clamped, in-pool key and are masked at the end.
-+            # Rows past the extent load no key or scale: their loads are predicated
-+            # off and they score zeros, which the store drops, so no load reaches
-+            # past the visible positions (DeepSeek's reference reads
-+            # ``index_k[:, : end_pos // ratio]``). Only the key and scale loads are
++            # No load reaches past the visible positions (DeepSeek's reference reads
++            # ``index_k[:, : end_pos // ratio]``). Tile rows that ``loads`` refuses
++            # (a dense row's rows past its extent) load no key or scale and score
++            # zeros, which the store drops. Only the key and scale loads are
 +            # predicated: the page read stays unconditional, so a dense tile's
-+            # addresses stay affine and its loads issue together. A masked or
-+            # padding candidate is position 0, which is visible; its score is
-+            # masked at the end.
++            # addresses stay affine and its loads issue together. Every candidate
++            # row loads: a masked or padding candidate is position 0, which is
++            # visible, and its score is masked at the end.
              for p, d in T.Parallel(block_P, D):
                  pos = position(p0, p)
                  page = T.min(
@@ -516,7 +534,7 @@ index 19d0c3971..23e9e0547 100644
                  )
 -                K_shared[p, d] = KPool[page, (pos % page_size) * D + d]
 +                K_shared[p, d] = T.if_then_else(
-+                    p0 + p < extent,
++                    loads(p0, p),
 +                    KPool[page, (pos % page_size) * D + d],
 +                    T.cast(0, fp4),
 +                )
@@ -528,13 +546,29 @@ index 19d0c3971..23e9e0547 100644
                  )
 -                SFK_shared[p, 0] = KScale[page, scale_word0 + pos % page_size]
 +                SFK_shared[p, 0] = T.if_then_else(
-+                    p0 + p < extent,
++                    loads(p0, p),
 +                    KScale[page, scale_word0 + pos % page_size],
 +                    T.cast(0, T.uint32),
 +                )
              T.mma_gemm_blockscaled(
                  K_shared,
                  Q_shared,
+@@ -236,6 +254,7 @@ def indexer_score_v41(
+                     extent,
+                     lambda p0, p: p0 + p,
+                     lambda p0, p: True,
++                    lambda p0, p: p0 + p < extent,
+                     Scores,
+                 )
+ 
+@@ -269,6 +288,7 @@ def indexer_score_v41(
+                 extent,
+                 lambda p0, p: T.max(Candidates[row, T.min(p0 + p, width - 1)], 0),
+                 lambda p0, p: Candidates[row, T.min(p0 + p, width - 1)] >= 0,
++                lambda p0, p: True,
+                 Scores,
+             )
+ 
 -- 
 2.54.0 (Apple Git-157)
 

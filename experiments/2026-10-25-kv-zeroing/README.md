@@ -154,19 +154,22 @@ keys and UE8M0 scale words at a time.
     page read stays uniform and its addresses affine, as in the release.
   - The extent joins the bounds check TileLang already puts on each load (`page` within
     the pool): the generated CUDA is the release's with one more term in that predicate.
-  - In candidate mode the index is into the candidate list, which its source layer writes
-    whole with -1 padding. A masked or padding candidate loads position 0, which is
-    visible, and its score is masked to -inf as before.
+  - **Candidate mode is unchanged**: it already read only written slots. There the index
+    is into the candidate list, which its source layer writes whole with -1 padding
+    (`write_final`). A row past the list's length is padding, so like a masked candidate it
+    loads position 0, which is visible, and its score is masked to -inf. The release's
+    initcheck errors confirm it (below): all 12,480 are the dense cases' rows past their
+    extents.
   - Rows are independent in the block-scaled MMA, and the store drops exactly the rows
     that changed, so **every stored score is bit for bit as before**.
 
 **Cost.** The first form of 0503 clamped the row index instead,
 `position(p0, T.min(p, extent - 1 - p0))`. It was bit-identical but 28-64% slower on
 dgx4, because it doubled the kernel's registers and halved its occupancy (below). The
-predicated form keeps the release's registers (127 dense, 96 by candidates; the release's
-124 and 102) and compiles its load phase straight-line, where nvcc had split the release's
-into branches. On dgx4 it is up to 20% faster than the release's kernel at 128-row pages,
-and level by candidates.
+predicated form keeps the release's registers (127; the release's 124) and compiles its
+load phase straight-line, where nvcc had split the release's into branches. On dgx4 it is
+3-24% faster than the release's kernel in every dense case. Candidate mode is the
+release's kernel.
 - **Gate:** `benchmark_deepseek_v41_indexer_bound.py` measures it. It times the kernel
   against the release's at 6 and 96 decode rows, on the ratio-2 caches' 128-row pages
   (extents up to 524,261 positions) and layer 20's 256-row pages (up to 1,048,549), dense
@@ -284,13 +287,15 @@ under `~/spark-lab/agents/kv-zeroing/out/` on dgx4:
 python3 scripts/lab.py kernel-local experiments/2026-10-25-kv-zeroing/bundles/BUNDLE --out ~/spark-lab/agents/kv-zeroing/out/OUTPUT
 ```
 
-| Bundle | Commit | Output | Verdict |
-| --- | --- | --- | --- |
-| indexer-initcheck | `329cebf2` | `indexer-initcheck` | **pass**, 53 s |
-| poison-tests | `6eed8307` | `poison-tests` | **fail**, 315 s: every test passed, the benchmark gate failed |
-| indexer-variants | `b679dbad` | `indexer-variants` | diagnosis: v1-v3 |
-| indexer-variants | `0b41a754` | `indexer-variants-v4` | diagnosis: v1-v4 |
-| indexer-variants | `64a303eb` | `indexer-variants-v5` | diagnosis: v5 and v4, dense and by candidates |
+| Bundle | Commit | 0503 | Output | Verdict |
+| --- | --- | --- | --- | --- |
+| indexer-initcheck | `329cebf2` | `57e5e748f`, clamped | `indexer-initcheck` | **pass**, 53 s |
+| poison-tests | `6eed8307` | `57e5e748f`, clamped | `poison-tests` | **fail**, 315 s: every test passed, the benchmark gate failed |
+| indexer-variants | `b679dbad` | | `indexer-variants` | diagnosis: v1-v3 |
+| indexer-variants | `0b41a754` | | `indexer-variants-v4` | diagnosis: v1-v4 |
+| indexer-variants | `64a303eb` | | `indexer-variants-v5` | diagnosis: v5 and v4, dense and by candidates |
+| poison-tests | `1f180481` | `33b748994`, predicated | `poison-tests-2` | **fail**, 105 s: every test passed; the gate: dense faster in 10 of 10, candidate mode slower in 2 of 4 |
+| indexer-initcheck | `1f180481` | `33b748994`, predicated | `indexer-initcheck-2` | **pass**, 38 s |
 
 **indexer-initcheck** (0503 as first committed, `57e5e748f`):
 - the bounded kernel: `ERROR SUMMARY: 0 errors` over the four cases (dense and candidate
@@ -376,8 +381,39 @@ By candidates (the reindex layers), from the v5 run, µs a call:
 | v4 | 43.8 vs 33.3: +32% | 990 vs 675: +47% |
 | **v5** | 34.2 vs 33.3: level (+0.0 ± 2.0) | 676 vs 709: level (-17 ± 30) |
 
-**0503 now has v5's form** (`33b748994`), and the benchmark gate covers candidate mode
-too. Its re-runs of both bundles are the last rows of the first table.
+**0503 took v5's form** (`33b748994`), and the benchmark gate gained candidate cases.
+Its poison-tests run passed every test. Its gate, µs a call:
+
+| Case | Pages | Extent | 0503 | Release | Change |
+| --- | --- | --- | --- | --- | --- |
+| c1 | 128 | 4,133 | 9.37 | 11.63 | -19% |
+| c1 | 128 | 65,573 | 99.6 | 131.6 | -24% |
+| c1 | 128 | 524,261 | 846 | 1,089 | -22% |
+| c1 | 256 | 8,229 | 15.0 | 19.3 | -22% |
+| c1 | 256 | 1,048,549 | 1,979 | 2,296 | -14% |
+| c16 | 128 | 4,133 | 114 | 145 | -22% |
+| c16 | 128 | 65,573 | 1,607 | 2,124 | -24% |
+| c16 | 128 | 524,261 | 13,504 | 16,745 | -19% |
+| c16 | 256 | 8,229 | 252 | 324 | -22% |
+| c16 | 256 | 1,048,549 | 35,468 | 36,381 | -3% |
+| c1, candidates | 128 | 524,261 | 33.8 | 32.8 | **+1.5 ± 1.2 µs, slower** |
+| c1, candidates | 256 | 1,048,549 | 35.0 | 34.1 | **+0.8 ± 0.5 µs, slower** |
+| c16, candidates | 128 | 524,261 | 537 | 541 | level (-7 ± 29) |
+| c16, candidates | 256 | 1,048,549 | 589 | 613 | level (-28 ± 29) |
+
+**Candidate mode never needed the predicate.** Its CUDA differs from the release's only
+by the extent term, which cost about 3% in the latency-bound c1 case. The term bounds
+nothing there:
+- the source layer's `write_final` writes the whole candidate list, -1 padded;
+- a row past the list's length is padding, which loads position 0, a visible slot;
+- the release kernel's initcheck errors are all dense. The 12,480 errors equal the dense
+  cases' rows past their extents, 65 reads a row (64 key bytes and a scale word):
+  (63 + 27 + 0 + 20) rows at 128-row pages plus (28 + 27 + 27) at 256-row pages.
+  The candidate cases added none.
+
+So 0503 (`169078a4c`) predicates only dense rows, through a per-mode `loads(p0, p)`
+beside the kernel's `position` and `slot_valid`. Candidate mode passes `True`, which TVM
+folds away, so its kernel is the release's.
 
 ## Lab spec: the gate before the removal is promoted
 

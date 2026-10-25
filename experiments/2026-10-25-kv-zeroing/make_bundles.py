@@ -52,7 +52,7 @@ ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BRANCH = "kv-zeroing-poison"
 BASE, POISON, FIX, REMOVAL, BOUND = (
-    "3bdf9558c", "341928840", "009ad2699", "8d2842981", "33b748994",
+    "3bdf9558c", "341928840", "009ad2699", "8d2842981", "169078a4c",
 )
 # The nodes' host CUDA toolkit's sanitizer (the container image's tools are not relied on).
 SANITIZER = "/usr/local/cuda-13.0/compute-sanitizer"
