@@ -480,3 +480,231 @@ def decode_metadata_grid8(
     return metadata_decode
 
 
+@tilelang.jit(pass_configs=_PASS)
+def decode_metadata_skip1(
+    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int, main_page: int
+):
+    """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+    of each row: the window metadata and the main page table (block 0 and holes as
+    -1)."""
+    rows = T.dynamic("rows")
+    src_rows = T.dynamic("src_rows")
+    table_rows = T.dynamic("table_rows")
+    table_cols = T.dynamic("table_cols")
+    table_stride = T.dynamic("table_stride")
+    main_src_rows = T.dynamic("main_src_rows")
+    main_rows = T.dynamic("main_rows")
+    main_cols = T.dynamic("main_cols")
+    main_stride = T.dynamic("main_stride")
+    req_count = T.dynamic("req_count")
+    starts_len = T.dynamic("starts_len")
+    replay_len = T.dynamic("replay_len")
+    # Blocks as wide as the window part; the page part loops (idle threads cost the
+    # prefill rows' blocks).
+    threads, per_thread = _threads(width)
+    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+    main_per_thread = (main_width + threads - 1) // threads
+
+    @T.prim_func
+    def metadata_decode(
+        positions: T.Tensor((src_rows,), T.int64),
+        reqs: T.Tensor((src_rows,), T.int32),
+        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+        swa: T.Tensor((rows, width), T.int32),
+        lengths: T.Tensor((rows,), T.int32),
+        top_lengths: T.Tensor((rows,), T.int32),
+        visible: T.Tensor((src_rows,), T.int32),
+        starts: T.Tensor((starts_len,), T.int32),
+        request_positions: T.Tensor((req_count,), T.int64),
+        replay_start: T.Tensor((replay_len,), T.int64),
+        main_reqs: T.Tensor((main_src_rows,), T.int32),
+        main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
+        main_pages: T.Tensor((rows, main_width), T.int32),
+        offset: T.int32,
+        main_read_width: T.int32,
+    ):
+        # Two blocks a row, one launch: the window metadata, then the page table.
+        with T.Kernel(rows, 2, threads=threads) as (row, part):
+            tx = T.get_thread_binding()
+            info = T.alloc_local((2,), T.int64)  # window start, clamped length
+            entries = T.alloc_local(((main_per_thread + 1 - 1) // 1 * 1,), T.int32)
+            live = T.alloc_var(T.int32)
+            if part == 0:
+                window_row(
+                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                    visible, starts, request_positions, replay_start, offset,
+                )  # fmt: skip
+            else:
+                req = main_reqs[offset + row]
+                live = T.min((T.max(visible[offset + row], 0) + main_page - 1) // main_page, T.min(main_read_width, main_width))
+                if req < 0:
+                    live = 0
+                for g in T.unroll((main_per_thread + 1 - 1) // 1):
+                    if g * 1 * threads < live:
+                        for k in T.unroll(1):
+                            entries[g * 1 + k] = T.if_then_else(
+                                (g * 1 + k) * threads + tx < live, main_table[req, (g * 1 + k) * threads + tx], 0
+                            )
+                for g in T.unroll((main_per_thread + 1 - 1) // 1):
+                    if g * 1 * threads < live:
+                        for k in T.unroll(1):
+                            if (g * 1 + k) * threads + tx < live:
+                                main_pages[row, (g * 1 + k) * threads + tx] = T.if_then_else(
+                                    entries[g * 1 + k] > 0, entries[g * 1 + k], -1
+                                )
+
+    return metadata_decode
+
+
+@tilelang.jit(pass_configs=_PASS)
+def decode_metadata_skip4(
+    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int, main_page: int
+):
+    """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+    of each row: the window metadata and the main page table (block 0 and holes as
+    -1)."""
+    rows = T.dynamic("rows")
+    src_rows = T.dynamic("src_rows")
+    table_rows = T.dynamic("table_rows")
+    table_cols = T.dynamic("table_cols")
+    table_stride = T.dynamic("table_stride")
+    main_src_rows = T.dynamic("main_src_rows")
+    main_rows = T.dynamic("main_rows")
+    main_cols = T.dynamic("main_cols")
+    main_stride = T.dynamic("main_stride")
+    req_count = T.dynamic("req_count")
+    starts_len = T.dynamic("starts_len")
+    replay_len = T.dynamic("replay_len")
+    # Blocks as wide as the window part; the page part loops (idle threads cost the
+    # prefill rows' blocks).
+    threads, per_thread = _threads(width)
+    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+    main_per_thread = (main_width + threads - 1) // threads
+
+    @T.prim_func
+    def metadata_decode(
+        positions: T.Tensor((src_rows,), T.int64),
+        reqs: T.Tensor((src_rows,), T.int32),
+        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+        swa: T.Tensor((rows, width), T.int32),
+        lengths: T.Tensor((rows,), T.int32),
+        top_lengths: T.Tensor((rows,), T.int32),
+        visible: T.Tensor((src_rows,), T.int32),
+        starts: T.Tensor((starts_len,), T.int32),
+        request_positions: T.Tensor((req_count,), T.int64),
+        replay_start: T.Tensor((replay_len,), T.int64),
+        main_reqs: T.Tensor((main_src_rows,), T.int32),
+        main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
+        main_pages: T.Tensor((rows, main_width), T.int32),
+        offset: T.int32,
+        main_read_width: T.int32,
+    ):
+        # Two blocks a row, one launch: the window metadata, then the page table.
+        with T.Kernel(rows, 2, threads=threads) as (row, part):
+            tx = T.get_thread_binding()
+            info = T.alloc_local((2,), T.int64)  # window start, clamped length
+            entries = T.alloc_local(((main_per_thread + 4 - 1) // 4 * 4,), T.int32)
+            live = T.alloc_var(T.int32)
+            if part == 0:
+                window_row(
+                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                    visible, starts, request_positions, replay_start, offset,
+                )  # fmt: skip
+            else:
+                req = main_reqs[offset + row]
+                live = T.min((T.max(visible[offset + row], 0) + main_page - 1) // main_page, T.min(main_read_width, main_width))
+                if req < 0:
+                    live = 0
+                for g in T.unroll((main_per_thread + 4 - 1) // 4):
+                    if g * 4 * threads < live:
+                        for k in T.unroll(4):
+                            entries[g * 4 + k] = T.if_then_else(
+                                (g * 4 + k) * threads + tx < live, main_table[req, (g * 4 + k) * threads + tx], 0
+                            )
+                for g in T.unroll((main_per_thread + 4 - 1) // 4):
+                    if g * 4 * threads < live:
+                        for k in T.unroll(4):
+                            if (g * 4 + k) * threads + tx < live:
+                                main_pages[row, (g * 4 + k) * threads + tx] = T.if_then_else(
+                                    entries[g * 4 + k] > 0, entries[g * 4 + k], -1
+                                )
+
+    return metadata_decode
+
+
+@tilelang.jit(pass_configs=_PASS)
+def decode_metadata_skip8(
+    page: int, window: int, width: int, draft: bool, replay: bool, main_width: int, main_page: int
+):
+    """``chunk`` and ``pages`` of the main cache in one launch, a block for each part
+    of each row: the window metadata and the main page table (block 0 and holes as
+    -1)."""
+    rows = T.dynamic("rows")
+    src_rows = T.dynamic("src_rows")
+    table_rows = T.dynamic("table_rows")
+    table_cols = T.dynamic("table_cols")
+    table_stride = T.dynamic("table_stride")
+    main_src_rows = T.dynamic("main_src_rows")
+    main_rows = T.dynamic("main_rows")
+    main_cols = T.dynamic("main_cols")
+    main_stride = T.dynamic("main_stride")
+    req_count = T.dynamic("req_count")
+    starts_len = T.dynamic("starts_len")
+    replay_len = T.dynamic("replay_len")
+    # Blocks as wide as the window part; the page part loops (idle threads cost the
+    # prefill rows' blocks).
+    threads, per_thread = _threads(width)
+    window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+    main_per_thread = (main_width + threads - 1) // threads
+
+    @T.prim_func
+    def metadata_decode(
+        positions: T.Tensor((src_rows,), T.int64),
+        reqs: T.Tensor((src_rows,), T.int32),
+        table: T.StridedTensor((table_rows, table_cols), (table_stride, 1), T.int32),
+        swa: T.Tensor((rows, width), T.int32),
+        lengths: T.Tensor((rows,), T.int32),
+        top_lengths: T.Tensor((rows,), T.int32),
+        visible: T.Tensor((src_rows,), T.int32),
+        starts: T.Tensor((starts_len,), T.int32),
+        request_positions: T.Tensor((req_count,), T.int64),
+        replay_start: T.Tensor((replay_len,), T.int64),
+        main_reqs: T.Tensor((main_src_rows,), T.int32),
+        main_table: T.StridedTensor((main_rows, main_cols), (main_stride, 1), T.int32),
+        main_pages: T.Tensor((rows, main_width), T.int32),
+        offset: T.int32,
+        main_read_width: T.int32,
+    ):
+        # Two blocks a row, one launch: the window metadata, then the page table.
+        with T.Kernel(rows, 2, threads=threads) as (row, part):
+            tx = T.get_thread_binding()
+            info = T.alloc_local((2,), T.int64)  # window start, clamped length
+            entries = T.alloc_local(((main_per_thread + 8 - 1) // 8 * 8,), T.int32)
+            live = T.alloc_var(T.int32)
+            if part == 0:
+                window_row(
+                    row, tx, info, positions, reqs, table, swa, lengths, top_lengths,
+                    visible, starts, request_positions, replay_start, offset,
+                )  # fmt: skip
+            else:
+                req = main_reqs[offset + row]
+                live = T.min((T.max(visible[offset + row], 0) + main_page - 1) // main_page, T.min(main_read_width, main_width))
+                if req < 0:
+                    live = 0
+                for g in T.unroll((main_per_thread + 8 - 1) // 8):
+                    if g * 8 * threads < live:
+                        for k in T.unroll(8):
+                            entries[g * 8 + k] = T.if_then_else(
+                                (g * 8 + k) * threads + tx < live, main_table[req, (g * 8 + k) * threads + tx], 0
+                            )
+                for g in T.unroll((main_per_thread + 8 - 1) // 8):
+                    if g * 8 * threads < live:
+                        for k in T.unroll(8):
+                            if (g * 8 + k) * threads + tx < live:
+                                main_pages[row, (g * 8 + k) * threads + tx] = T.if_then_else(
+                                    entries[g * 8 + k] > 0, entries[g * 8 + k], -1
+                                )
+
+    return metadata_decode
+
+

@@ -471,3 +471,14 @@ part spread over eight blocks a row), µs a call (main page 256):
 Output `~/spark-lab/agents/kernel-audit/out/audit-mhc-4/` on dgx4. Bundle exit 0, after
 waiting on the GPU lock since 20:53 CET. Rerun so both bundles are checked at the
 branch's head: 76 mHC tests and 73 model-forward tests (CED, SP prefill) passed.
+
+### Run 5 and diagnostics round 3 (branch after 'run 5' commit, vLLM 26f3c89d6): queued
+
+The coordinator's one improvement pass before the next candidate. vLLM 26f3c89d6 skips,
+in both passes, each group of four of a thread's columns past the row's live pages with
+one check the block shares, to recover the prefill time the loads-first form gave back,
+and adds a test whose rows span several column groups (up to a 1M context's 4,096
+columns; the other tests' 40-column tables fit in one group). Diagnostics round 3 times
+the group sizes 1, 4 and 8 (`skip1`, `skip4`, `skip8`) against `two_loop` (ef611d4a9),
+`dyn` and the old kernel, with c16 at 1M and a 16K prefill chunk 48K into a prompt
+added.

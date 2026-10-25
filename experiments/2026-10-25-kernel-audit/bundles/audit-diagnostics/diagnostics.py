@@ -87,7 +87,8 @@ def dump(kernel, name: str) -> str:
 
 BLOCK_TOKENS, MAIN_WIDTH, WIDTH, PAGE = 256, 4096, 128, 256
 PAGE_SHAPES = {"c1 4K": (1, 6, 4096), "c1 1M": (1, 6, 1 << 20),
-               "c16 64K": (16, 6, 65536), "prefill 16K": (1, 16384, 16384)}
+               "c16 64K": (16, 6, 65536), "c16 1M": (16, 6, 1 << 20),
+               "prefill 16K": (1, 16384, 16384), "prefill 64K": (1, 16384, 65536)}
 
 
 def page_step(requests, rows_each, context, main_page):
@@ -106,7 +107,8 @@ def page_step(requests, rows_each, context, main_page):
 def pages() -> dict:
     results = {}
     main_page = 256
-    names = ("old", "dyn", "static_var", "static_expr", "select", "two_loop", "grid8")
+    names = ("old", "dyn", "static_var", "static_expr", "select", "two_loop", "grid8",
+             "skip1", "skip4", "skip8")
     kernels = {}
     for name in names:
         try:

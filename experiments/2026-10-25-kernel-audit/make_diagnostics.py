@@ -18,9 +18,9 @@ kernel it is timed against only where its name says:
   (the same with the live pages as an expression); select (the old loop and select, the
   store under the live pages); round 2, after the first diagnostics: two_loop (each
   column's load a select, then the live columns' stores) and grid8 (the page part over
-  eight blocks a row).
+  eight blocks a row); round 3: skip1, skip4 and skip8 (two_loop with each group of 1,
+  4 or 8 of a thread's columns behind one check the block shares).
 """
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +40,7 @@ def source(repo: str, path: str) -> str:
 
 
 def function(text: str, name: str, end: str) -> str:
-    start = text.index(f"@tilelang.jit(pass_configs=", text.index(f"def {name}(") - 60)
+    start = text.index("@tilelang.jit(pass_configs=", text.index(f"def {name}(") - 60)
     stop = text.index(end, start) + len(end)
     return text[start:stop]
 
@@ -221,6 +221,34 @@ PAGES = {
                         main_pages[row, col] = T.if_then_else(entry > 0, entry, -1)
 ''',
 }
+
+
+def skip(group: int) -> str:
+    """two_loop with each group of ``group`` of a thread's columns past the row's live
+    pages skipped by one check the block shares (round 3)."""
+    col = f"(g * {group} + k) * threads + tx"
+    return f'''                req = main_reqs[offset + row]
+                live = {LIVE}
+                if req < 0:
+                    live = 0
+                for g in T.unroll((main_per_thread + {group} - 1) // {group}):
+                    if g * {group} * threads < live:
+                        for k in T.unroll({group}):
+                            entries[g * {group} + k] = T.if_then_else(
+                                {col} < live, main_table[req, {col}], 0
+                            )
+                for g in T.unroll((main_per_thread + {group} - 1) // {group}):
+                    if g * {group} * threads < live:
+                        for k in T.unroll({group}):
+                            if {col} < live:
+                                main_pages[row, {col}] = T.if_then_else(
+                                    entries[g * {group} + k] > 0, entries[g * {group} + k], -1
+                                )
+'''
+
+
+SKIPS = {f"skip{group}": group for group in (1, 4, 8)}
+PAGES.update({name: skip(group) for name, group in SKIPS.items()})
 # Columns of `threads` a page block of grid8 handles.
 GRID_COLS = 4
 
@@ -241,11 +269,16 @@ def metadata_variants(repo: str) -> str:
         code = code.replace(PAGE_OLD, page_part)
         anchor = "            info = T.alloc_local((2,), T.int64)  # window start, clamped length\n"
         assert code.count(anchor) == 1
-        if name in ("dyn", "static_var", "two_loop", "grid8"):
+        if name in ("dyn", "static_var", "two_loop", "grid8", *SKIPS):
             code = code.replace(anchor, anchor + "            live = T.alloc_var(T.int32)\n")
         if name == "two_loop":
             code = code.replace(anchor, anchor + "            entries = T.alloc_local("
                                 "(main_per_thread,), T.int32)\n")
+        if name in SKIPS:
+            group = SKIPS[name]
+            code = code.replace(anchor, anchor + "            entries = T.alloc_local("
+                                f"((main_per_thread + {group} - 1) // {group} * {group},),"
+                                " T.int32)\n")
         if name == "grid8":
             code = code.replace(anchor, anchor + "            entry = T.alloc_var(T.int32)\n")
             grid = "        with T.Kernel(rows, 2, threads=threads) as (row, part):\n"
