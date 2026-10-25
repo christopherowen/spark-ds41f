@@ -12,6 +12,8 @@ image's vLLM tree, so they run the branch's loader in candidate 6's image withou
 - kernel/rank-load: rank-load/rank_compare.py, which loads one TP4 rank's share of the
   served checkpoint (DeepSeek-V4.1-Flash-1017, the hub mounted at /hub as serving mounts
   it) with the direct loader, then with B12X's, and compares their weight digests.
+- kernel/plugins: plugins/plugins.py, what each VLLM_PLUGINS setting loads in the image
+  (the recipe's setting for the direct loader).
 
 Both build the native helper into /c/xdg-direct-loader (XDG_CACHE_HOME) and run with
 io_uring allowed (the serving container's seccomp and memlock).
@@ -83,6 +85,16 @@ def main() -> int:
         "io_uring": True,
         "mounts": [["rank_load.py", "/b/rank_load.py"], ["rank_compare.py", "/b/rank_compare.py"],
                    ["~/.cache/huggingface/hub", "/hub"], *package_mounts()],
+    })
+    write("plugins", {
+        "description": "The image's general plugins: what an unset, empty or b12x_loader VLLM_PLUGINS loads, "
+                       f"and the loader --load-format direct gets (vLLM {revision[:9]}); plugins.py.",
+        "image": args.image,
+        "env": ENV,
+        "workdir": "vllm",
+        "argv": ["/b/plugins.py"],
+        "verdict": "status",
+        "mounts": [["plugins.py", "/b/plugins.py"], *package_mounts()],
     })
     return 0
 
