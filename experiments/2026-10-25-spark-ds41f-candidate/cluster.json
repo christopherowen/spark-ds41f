@@ -257,7 +257,7 @@
    "benchmark_reference": "manifests/suites/2026-10-22-spark-ds41f-1022-tp4"
   },
   "tp3-triangle": {
-   "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 6,144 from the release after spark-ds41f-1022 (owner, 2026-10-25): with the CED skip, prefill +6-9% over 4,096 on the triangle, for decode steps beside a long prompt about a third longer and fewer KV tokens (about 4.15 full 1M contexts) (experiments/2026-10-19-prefill-budget-tp3, experiments/2026-10-25-spark-ds41f-candidate).",
+   "notes": "Three nodes fully cabled (a triangle); NCCL settings are sparknet's tp3-triangle profile. The embedding and head live in the display carve-out, which TP3's KV budget needs (docs/current-state.md). Since r6x it serves 1,048,576 tokens with a 4.90625 GiB KV pool (4.55 full 1M contexts), spent from the memory the expert scale codes freed; dgx1's 5 GiB startup guard bounds the pool (experiments/2026-10-19-r6x-tp3-1m). Its long-prefill budget is 8,192 from the release after spark-ds41f-1022 if it fits (owner, 2026-10-25), else 6,144: with the CED skip, prefill on the triangle +11-13% over 4,096 from 32K to 500K (+9.5% at 1M) and +3% over 6,144 at 1M, for decode steps beside a long prompt about 1.7 times as long; the pool still holds 5 full 1M contexts (experiments/2026-10-19-prefill-budget-tp3, experiments/2026-10-25-spark-ds41f-candidate).",
    "nodes": 3,
    "nodes_config": "config/nodes.json",
    "fabric": {
@@ -266,7 +266,7 @@
    "sizing": {
     "max_model_len": 1048576,
     "max_num_seqs": 8,
-    "max_num_batched_tokens": 6144,
+    "max_num_batched_tokens": 8192,
     "kv_cache_memory_bytes": 5268045824,
     "prefix_cache_retention_interval": 512
    },
@@ -299,7 +299,7 @@
    "benchmark_reference": "manifests/suites/2026-10-22-spark-ds41f-1022-tp3"
   },
   "tp3-triangle-4k": {
-   "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md). It keeps the 4,096-token budget: the triangle's 6,144 was measured with Memory Saver at 1M only.",
+   "notes": "TP3 on a stock 4 KiB-page kernel without Memory Saver: smaller KV and context (docs/memory-profiles.md). It keeps the 4,096-token budget: the triangle's larger budgets were measured with Memory Saver at 1M only.",
    "extends": "tp3-triangle",
    "host": {
     "kernel": {

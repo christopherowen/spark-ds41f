@@ -243,8 +243,9 @@ class RecipeTest(unittest.TestCase):
     def test_candidate_6_on_the_triangle_is_its_ring_arm(self):
         """Candidate 6's triangle arm is its ring arm at tp3-triangle (one image, labels and
         lock), so the triangle qualifies the build the ring did, at the recipe's TP3 sizing.
-        The triangle's budget is 6,144 from this release (owner, 2026-10-25); the ring and the
-        4 KiB variant keep theirs."""
+        The triangle's budget is 8,192 from this release if it fits (owner, 2026-10-25), and
+        the prepared 6,144 arm is the recipe at 6,144 exactly, so a promotion that falls back
+        to it serves what was measured; the ring and the 4 KiB variant keep theirs."""
         rc6 = "experiments/2026-10-25-spark-ds41f-candidate/rc6"
         spark = load_spark()
         tp3, tp4 = (spark.read_cluster(f"{rc6}/rc-{shape}.json") for shape in ("tp3", "tp4"))
@@ -258,7 +259,7 @@ class RecipeTest(unittest.TestCase):
         at_shape = recipe.resolve(candidate, "tp3-triangle")
         self.assertEqual(tp3["serve_args"], at_shape["serve_args"])
         self.assertEqual(tp3["environment"], at_shape["environment"])
-        budgets = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("6144", "6096"),
+        budgets = {"tp4-ring": ("16384", "16288"), "tp3-triangle": ("8192", "8144"),
                    "tp3-triangle-4k": ("4096", "4048")}
         self.assertEqual(set(candidate["shapes"]), set(budgets))
         for name, budget in budgets.items():
@@ -267,6 +268,17 @@ class RecipeTest(unittest.TestCase):
                              budget, name)
         self.assertEqual((argument(tp3, "--max-num-batched-tokens"), argument(tp3, "--long-prefill-token-threshold")),
                          budgets["tp3-triangle"])
+        fallback = spark.read_cluster(f"{rc6}/rc-tp3-6144.json")
+        at_6144 = json.loads(json.dumps(candidate))
+        at_6144["shapes"]["tp3-triangle"]["sizing"]["max_num_batched_tokens"] = 6144
+        self.assertEqual(fallback["serve_args"], recipe.resolve(at_6144, "tp3-triangle")["serve_args"])
+        self.assertEqual({k for k in fallback if fallback[k] != tp3.get(k)}, {"serve_args"})
+        self.assertEqual((argument(fallback, "--max-num-batched-tokens"),
+                          argument(fallback, "--long-prefill-token-threshold")), ("6144", "6096"))
+        for dev, base in (("rc-tp3-dev.json", tp3), ("rc-tp3-6144-dev.json", fallback)):
+            resolved = spark.read_cluster(f"{rc6}/{dev}")
+            self.assertEqual(resolved["environment"], {**base["environment"], "VLLM_SERVER_DEV_MODE": "1"}, dev)
+            self.assertEqual(resolved["serve_args"], base["serve_args"], dev)
 
     def test_the_model_profile_mounts_the_selected_checkpoint(self):
         """Every shape mounts the recipe's model (1017: the hub, since its blobs link on into
