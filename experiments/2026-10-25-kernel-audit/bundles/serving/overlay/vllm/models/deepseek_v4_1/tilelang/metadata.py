@@ -35,7 +35,7 @@ import tilelang.language as T
 _PASS = {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 _BLOCK = 128
 _TOP = 512  # top-k length cap
-_GROUP = 4  # decode_metadata's page columns a thread takes per live-page check
+_GROUP = 8  # decode_metadata's page columns a thread takes per live-page check
 
 
 def _search_steps(requests: int) -> int:

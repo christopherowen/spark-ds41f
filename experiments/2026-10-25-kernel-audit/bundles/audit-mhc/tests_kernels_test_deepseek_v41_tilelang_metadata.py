@@ -245,6 +245,7 @@ def test_decode_metadata_wide_tables(main_width, read_width, main_page):
     visible = torch.randint(
         -3, (read_width + 2) * main_page, (rows,), generator=g, dtype=torch.int32
     )
+    reqs[0], visible[0] = 0, (read_width + 2) * main_page  # past the table's width
     pos = torch.randint(0, 2000, (rows,), generator=g)
     table = torch.randint(
         0, 1 << 20, (R, read_width + 8), generator=g, dtype=torch.int32
@@ -282,5 +283,5 @@ def test_decode_metadata_wide_tables(main_width, read_width, main_page):
     for a, b in zip(outs[0][:3], outs[1][:3]):
         assert torch.equal(a, b)
     live = _live_columns(reqs, visible, 0, rows, main_page, read_width, main_width)
-    assert int(live.max()) > 4 * 128, "no row spans more than one column group"
+    assert int(live.max()) > metadata._GROUP * 128, "no row spans two column groups"
     _assert_live_equal(outs[0][3], outs[1][3], live, rows)
