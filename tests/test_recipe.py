@@ -164,7 +164,9 @@ class RecipeTest(unittest.TestCase):
             released = renamed(load_spark().read_cluster(arm))
             released["environment"] = {**{k: v for k, v in released["environment"].items()
                                           if k not in self.UNUSED_KERNEL_SETTINGS},
-                                       "MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "1048576"}
+                                       "MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "1048576",
+                                       # 16 MP an image since 2026-10-25 (experiments/2026-10-26-site-landmines).
+                                       "VLLM_MAX_IMAGE_PIXELS": "16777216"}
             released["container"]["image"] = "spark-ds41f:19f2c20ed4d6-next-6"
             released["container"]["expected_labels"]["local.spark-ds41f.vllm.tree"] = (
                 "6f8e062f0cfb5b5fe016df9ef965499ed5ea8519")
@@ -185,9 +187,11 @@ class RecipeTest(unittest.TestCase):
 
     def test_the_ring_is_candidate_6s_arm(self):
         """Promotion runs what the release measured: tp4-ring resolves to candidate 6's arm,
-        apart from the baseline, lock and reference that name it."""
+        apart from the baseline, lock and reference that name it, and the per-image pixel limit
+        added after the release (16 MP, experiments/2026-10-26-site-landmines)."""
         resolved = host_mounts(recipe.resolve(self.recipe, "tp4-ring"))
         released = host_mounts(load_spark().read_cluster("experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp4.json"))
+        released["environment"] = {**released["environment"], "VLLM_MAX_IMAGE_PIXELS": "16777216"}
         naming = ("promoted_baseline", "upstreams_config", "benchmark_reference", "shape", "notes")
         self.assertEqual({k: v for k, v in resolved.items() if k not in naming},
                          {k: v for k, v in released.items() if k not in naming})

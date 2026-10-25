@@ -278,13 +278,28 @@ own list ([setup.md](setup.md#a-site-profile-replaces-serve_args-wholesale)).
 
 The trade-off is memory per request, not at startup. The tower's weights load whenever
 images are allowed at all, and vLLM encodes a request's images within a per-step budget
-derived from the batched-token budget (4,096 tokens on the triangle, 8,192 on the ring), so
+derived from the batched-token budget (8,192 tokens on the triangle, 16,384 on the ring), so
 the encoder's working memory per step does not grow with the count. The request does: every
 image becomes prompt tokens that hold blocks of the fixed KV pool (`kv_cache_memory_bytes`)
 for the life of the request, beside every other stream's context, and lengthen its
 prefill; and the head's API server decodes and preprocesses every image in host memory,
 which on GB10 is the unified memory dgx1's steady guard watches. No count above four is
 qualified here.
+
+**Pixels per image: at most 16,777,216** (`VLLM_MAX_IMAGE_PIXELS` in the recipe, since
+2026-10-25). vLLM decodes every image at its source size before DS4.1 resizes it to about
+1K tokens, so a request's host memory follows the source pixels, not the tokens. Measured
+on the 1025 image (experiments/2026-10-26-site-landmines):
+- **Per image in flight:** about 19 MiB at 1,302 px, 61-74 MiB for a 12 MP photo, 310 MiB at
+  48 MP, and 790 MiB at vLLM's default ceiling of 178.9 MP.
+- **The danger at the default:** four images at that ceiling peaked at 5.2 GiB (JPEG) and
+  8.4 GiB (PNG with alpha). dgx1 serves the triangle with about 4.4 GiB above its 3 GiB
+  guard, so one such request could stop the service.
+
+The model never sees more than about 1.7 MP, so a 16 MP limit changes nothing for ordinary
+images. Larger photos, such as 48 MP phone originals, get a 400 before decoding: vLLM reads
+the dimensions from the header and refuses the image before any pixel is decoded. A higher
+per-request image count waits for its own measurement.
 
 Externally reported, not qualified here: a three-node TP3 site with the limit removed (r6
 image, 524,288-token context, eight sequences) completed a chat-history request with 13

@@ -297,7 +297,8 @@ yours to run, as root, with the service stopped:
    its module is built for the new kernel. The memory saver's [kernel guide](https://github.com/christopherowen/dgx-spark-memory-saver/blob/main/docs/kernel.md)
    lists the same steps.
 2. **Swap and memory policy.** Run
-   `sudo experiments/2026-10-02-kernel-64k/install-boot-support.sh`. It adds a
+   `sudo bash experiments/2026-10-02-kernel-64k/install-boot-support.sh` (the script is not
+   executable in the repository, so name `bash`). It adds a
    16 GiB `/swap-64k.img` with a 64 KiB header, marks the original
    `/swap.img` `noauto`, and enables `spark-ds41f-kernel-memory.service`, which at
    boot activates the swap file that matches the running page size and, on
