@@ -203,12 +203,9 @@ each tree's expectations. In the lab the gate file runs in the next candidate's 
 
 ## Follow-ups (not done here)
 
-- **The drafter's retained window token may be dropped.** The 23-layer window bucket mixes
-  target layers (`extra_retained_tokens` 0) and the drafter's (1); its groups 4-6 each hold one
-  drafter layer behind a target layer. The scheduler builds each group's manager from the
-  group's first layer (`generate_scheduler_kv_cache_config`), so those managers free the
-  drafter's windows one token early. Temperature-0 outputs cannot change (drafts are
-  verified), but a freed block can be reused while the drafter still reads it, which costs
-  draft quality. Not checked beyond reading the code.
+- **The drafter's retained window token was dropped** in the three window groups that hold
+  a drafter layer behind target layers: checked and fixed in
+  [experiments/2026-10-25-drafter-window-retention](../2026-10-25-drafter-window-retention/README.md)
+  (vLLM 0492, independent of 0491).
 - Chunked-local attention (Llama 4) has the same per-request charge in the figure; this
   deployment has none, so 0491 leaves it alone.
