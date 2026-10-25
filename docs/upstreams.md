@@ -4,45 +4,36 @@
 cluster profile may select a separate repository-relative lock through
 `upstreams_config`; build preparation, doctor and image builds use that lock.
 This lets candidates add patches without changing the promoted image identity.
-The current production chain is:
+The production chain (revisions and series in `upstreams.lock.json`; the image in
+`config/cluster.json`) is:
 
 ```text
-local-inference-lab/vllm integration/karmic-kraken-beta @ 04c30fa9
-        (canonical base vllm-project/vllm @ 0f8fa53a)
-        + patches/vllm/series (Engram projection TP padding,
-                               asynchronous Engram rows, DSML tool
-                               parameters, multimodal block hashes;
-                               dead verification rows; sequence-
-                               parallel prefill; one-read custom-op
-                               defaults; explicit collective policy;
-                               packed BF16 output head; vocabulary
-                               weights loaded into the display carve-
-                               out; disjoint profiling-context blocks;
-                               the TileLang kernel family: kernels,
-                               TileKernels router and mHC, vocabulary
-                               heads, sparknet collectives, race-free
-                               decode tiles; other DSpark tools off by
-                               default)
+local-inference-lab/vllm integration/karmic-kraken-beta
+        (canonical base vllm-project/vllm, parked)
+        + the release's vLLM series (Engram projection TP padding and
+          asynchronous rows, multimodal block hashes, DSpark verification
+          rules, sequence-parallel prefill, explicit collective policy,
+          packed BF16 output head, display carve-out weights, the TileLang
+          kernel family for every serving kernel, sparknet collectives,
+          the SPARK_DS41F_* variables)
                     \
-local-inference-lab/b12x integration/karmic-kraken-beta @ f8069b2c
-        + patches/b12x/series (switchless RoCEnante routing, CuTe DSL 4.7.1,
-          top-k position ties, TMA stage-release fences, four-node relay
-          and mesh transports, packed BF16 vocabulary projection)
+local-inference-lab/b12x integration/karmic-kraken-beta (archived; its last commit)
+        + its series; serving uses only its checkpoint loader
+          (--load-format b12x) and the modules vLLM still imports
                     |
-tile-ai/tilelang main @ b95ee4ff (0.1.15)
-        + patches/tilelang/series (SM120/SM121 block-scaled MMA:
-          MXFP8, FP8 x FP4, MXFP4)
-deepseek-ai/TileKernels main @ 66258df6 (2.0.0, unpatched)
-christopherowen/dgx-spark-networking main @ f73a3cea (sparknet 0.2.0)
-                     ---- vllm-ds41f-kkref:04c30fa98e79-r6 (sha256:b5225c98…)
+tile-ai/tilelang main (0.1.15)
+        + patches (SM120/SM121 block-scaled MMA: MXFP8, FP8 x FP4, MXFP4)
+deepseek-ai/TileKernels main (2.0.0) + patches/tile_kernels
+christopherowen/dgx-spark-networking (sparknet)
+                     ---- spark-ds41f:<vLLM base>-<release>
                     /
-NVIDIA/nccl v2.30.7-1 @ 73cf1122
-        + patches/nccl/series (IB send-path fence, bidirectional switchless
+NVIDIA/nccl v2.30.7-1
+        + its series (IB send-path fence, bidirectional switchless
           rings, balanced channels), replacing the base
           image's nvidia-nccl-cu13 libnccl.so.2
 
-deepseek-ai/DeepSeek-V4.1-Flash @ dba1be0a (unchanged; TP3 head padding is in
-        the serving source, so no config overlay is mounted)
+deepseek-ai/DeepSeek-V4.1-Flash-1017 (the recipe's model; unchanged, and TP3
+        head padding is in the serving source, so no config overlay is mounted)
 ```
 
 The official vLLM nightly at `af1c0149` supplies the CUDA/runtime base, including
@@ -56,7 +47,7 @@ Inference Lab integration branch is the serving source.
 |---|---|---|---|
 | `vllm` | `local-inference-lab/vllm` (`integration/karmic-kraken-beta`) | `christopherowen/vllm` | serving source; canonical `vllm-project/vllm` main is parked |
 | `vllm_base_image` | `docker.io/vllm/vllm-openai` | not applicable | official CUDA/Torch/native-extension foundation |
-| `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`) | not created yet | DS4.1 kernels and RoCEnante transport |
+| `b12x` | `local-inference-lab/b12x` (`integration/karmic-kraken-beta`, archived) | none (archived) | the checkpoint loader (`--load-format b12x`) and modules vLLM still imports; no B12X kernel runs in serving |
 | `nccl` | `NVIDIA/nccl` (tag `v2.30.7-1`) | not created yet | the base image's NCCL version, rebuilt for SM121 with `patches/nccl` |
 | `tilelang` | `tile-ai/tilelang` (`main`) | `christopherowen/tilelang` | the promoted kernel compiler, with `patches/tilelang` for SM120/SM121 |
 | `tile_kernels` | `deepseek-ai/TileKernels` (`main`) | not created yet | DeepSeek's TileLang kernels: MoE gate, casts, mHC |
@@ -106,9 +97,9 @@ Preserve tests and benchmark evidence alongside it. After acceptance:
 3. rebuild once and distribute the same digest;
 4. reproduce the accepted baseline before promotion.
 
-The B12X contribution fork does not yet exist, so its `contribution_remote` is
-currently `null`. Add the fork URL only when creating the first contribution.
-The same rule applies to FlashInfer and CUTLASS: do not invent a fork URL or use
+B12X is archived (the lock pins its last commit), so it gets no contribution fork
+and its `contribution_remote` stays `null`. FlashInfer and CUTLASS have no fork yet:
+add one only when creating the first contribution, and do not invent a fork URL or use
 this deployment repository as their `origin`.
 
 The GLM switchless repository is recorded as a research reference, not an
