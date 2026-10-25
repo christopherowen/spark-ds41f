@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Christopher Owen <3221756+christopherowen@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:07:00 +0100
+Subject: [PATCH 490/490] Tests: a host fill for the DFlash slot test's padding
+ rows
+
+Candidate 5's release tests: the DFlash speculator writes its padding rows
+with TileLang's launch since d0f5f9e5f, and the DCP slot test's stub holds
+host tensors. A host fill stands in for host tensors, as for the collectives'
+tests (26382f5cf); on CUDA the kernel runs. Package files are unchanged.
+---
+ tests/v1/spec_decode/test_dflash_dcp.py | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/tests/v1/spec_decode/test_dflash_dcp.py b/tests/v1/spec_decode/test_dflash_dcp.py
+index 0953d363f..78d0cd8d6 100644
+--- a/tests/v1/spec_decode/test_dflash_dcp.py
++++ b/tests/v1/spec_decode/test_dflash_dcp.py
+@@ -140,6 +140,20 @@ def test_dflash_uses_draft_group_dcp_slot_parameters(
+         "build_slot_mappings_by_layer",
+         lambda *_args, **_kwargs: {},
+     )
++    # The padding rows are a TileLang launch, a CUDA kernel. This stub's buffers are
++    # host tensors, where a host fill stands in for it; on CUDA the kernel runs.
++    from vllm.v1.worker.gpu import tilelang_inputs
++
++    padding_rows = tilelang_inputs.padding_rows
++    monkeypatch.setattr(
++        tilelang_inputs,
++        "padding_rows",
++        lambda is_padding, live, rows: (
++            padding_rows(is_padding, live, rows)
++            if is_padding.is_cuda
++            else is_padding[:rows].copy_(torch.arange(rows) >= live)
++        ),
++    )
+ 
+     block_tables = SimpleNamespace(
+         slot_mappings=torch.zeros((1, 1), dtype=torch.int64),
