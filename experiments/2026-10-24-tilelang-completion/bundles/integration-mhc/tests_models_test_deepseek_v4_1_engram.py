@@ -155,6 +155,16 @@ def tiny_engram_checkpoint(tmp_path, dist_init):
         language.hf_to_vllm_mapper = WeightsMapper()
         root = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
         nn.Module.__init__(root)
+        # The image span's learned delimiters, which loading stacks into a table.
+        root.embed_dtype = torch.bfloat16
+        for name in ("image_start", "image_end", "image_newline"):
+            setattr(
+                root,
+                name,
+                nn.Parameter(
+                    torch.zeros(config.hidden_size, device="cuda"), requires_grad=False
+                ),
+            )
         root.language_model = language
         root.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             "fp4", "weight_scale_inv"

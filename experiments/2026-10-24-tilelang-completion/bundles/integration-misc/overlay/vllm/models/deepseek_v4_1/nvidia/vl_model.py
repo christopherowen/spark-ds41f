@@ -195,13 +195,13 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
         span = image_embeds.new_empty(len(kinds), image_embeds.shape[-1])
         ced_kernels.copy_rows(
             self._image_delimiters,
-            async_tensor_h2d(delimiter_rows, torch.int64, device),
+            async_tensor_h2d(delimiter_rows, device=device, dtype=torch.int64),
             span,
             scatter=False,
         )
         ced_kernels.copy_rows(
             image_embeds,
-            async_tensor_h2d(image_slots, torch.int64, device),
+            async_tensor_h2d(image_slots, device=device, dtype=torch.int64),
             span,
             scatter=True,
         )
@@ -243,7 +243,9 @@ class DeepseekV41ForCausalLM(UpstreamDeepseekV41ForCausalLM):
             ced_kernels.copy_rows(
                 span,
                 async_tensor_h2d(
-                    slots[offset : offset + rows], torch.int64, inputs_embeds.device
+                    slots[offset : offset + rows],
+                    device=inputs_embeds.device,
+                    dtype=torch.int64,
                 ),
                 inputs_embeds,
                 scatter=True,

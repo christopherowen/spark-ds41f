@@ -1592,3 +1592,27 @@ Then, in the same driver (`~/spark-lab/integration21` on dgx1, "INTEGRATION21 DO
   candidate 4's; the texts show how.
 - [../2026-10-25-request-inventory/inventory-3.json](../2026-10-25-request-inventory/inventory-3.json):
   the request inventory at this build, the vision tower included.
+
+### Twenty-first integrated run (2026-10-25 03:32 CET)
+
+Runner, misc and sampling passed every test and gate. The mHC bundle failed in two steps;
+the driver stopped before the serving check, as it now does on any failed bundle.
+- **The vision tower compiled and its gate passed:** the TileLang tower is no slower than
+  B12X's at any grid. 78 vision tests passed, among them the bit-for-bit RMSNorm, RoPE
+  and merge against B12X's own kernels. Four failed:
+  - the bias-and-GELU epilogue differs from B12X in 21 of 327680 values;
+  - the projections round less accurately than B12X's: at one row 37 of 5120 outputs are
+    not the correctly rounded value (B12X: none), at 77 rows 116 of 78848 (B12X: 63);
+  - the tower at a 1×1 grid is 3.9e-4 from DeepSeek's FP64 math, where B12X's matches it.
+
+  The epilogue looks like semantics, not accuracy: B12X and the reference round the
+  biased projection to BF16 before the activation, in a separate kernel. The tower's
+  author is reworking the epilogues and the projections' accumulation. The bars stay as
+  they are: a port meets or exceeds the kernel it replaces.
+- **The image span's tests** failed on the host-to-device copies' arguments (the device
+  comes before the dtype), and the **Engram model tests** on their hand-built VL model,
+  which lacked the delimiters loading now stacks. vLLM af4ab248f fixes both.
+
+The fifth serving check and the third request inventory run at af4ab248f now. The text
+paths are complete and tested; the image digests record what the tower produces before
+its rework (`~/spark-lab/serving5` on dgx1, "SERVING5 DONE").
