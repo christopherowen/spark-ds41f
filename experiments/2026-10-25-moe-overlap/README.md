@@ -6,14 +6,16 @@ prepared for next week's release as TileLang changes, and the owner's L2 cache-p
 options were bounded beside them. The kernel bundles ran on dgx4 the same evening; the
 serving A/Bs are queued specs.
 
-**Status (2026-10-25, 21:15 CET):**
+**Status (2026-10-25, 21:35 CET):**
 - **mHC finalize writes its output's MXFP8 cast:** passes on GB10. 257 tests passed, and
   the gated benchmark is faster in every case: 4.3 µs a decode layer at c1, 6.2 µs at c16,
   and 0.88 ms a TP4 prefill SP layer. Its serving A/Bs on the ring and the triangle are
   ready, not run.
-- **Routed expert weights evict-first in L2:** fails on GB10: the TP4 down GEMM's hinted
-  8-byte K-tail `cp.async` faults with "Illegal Instruction Parameter" (root cause under
-  Results). Its ceiling is about 0 at c1 and 0.25% at c8. Dropped.
+- **Routed expert weights evict-first in L2:** fails on GB10. ptxas 13.0.88 miscompiles
+  the TP4 down GEMM's hinted 8-byte K-tail `cp.async`: the copies read a descriptor
+  register that is never written, and the SM rejects them as "Illegal Instruction
+  Parameter" (root cause under Results). Its ceiling is about 0 at c1 and 0.25% at c8.
+  Dropped.
 - **L2 priorities:** on GB10 evict-last lines already survive at set-aside 0, and a
   set-aside only takes L2 from default lines. No set-aside, evict-first or evict-last arm
   has a ceiling worth a window. The L2 loss the traces show is prefetch timing, which
@@ -44,7 +46,8 @@ as run and as rebased.
 | [evict-first-cause](bundles/evict-first-cause) | 20:43-20:44 | f0a466cc | diagnostic | At the gate/up shape (512x512, no K tail) the change's helper, the helper without a hint and the helper with the policy as a C operand all run, with the release's bits. Output in `results/evict-first-cause-512`. |
 | [evict-first-cause](bundles/evict-first-cause) | 20:46-20:49 | 4dfb4def | diagnostic | At TP4's down shape (384x576, a 64-wide K tail) the GEMM faults whenever the tail's 8-byte copy carries the hint, and runs with the release's bits without it, or with the hint on the scale codes only. |
 | [evict-first-sass](bundles/evict-first-sass) | 20:51-20:52 | 904741dc | diagnostic, no result | It compiled all four kernels, but its disassembly step printed nothing. dcee615c reads the cached cubins and reports the disassembler's errors. |
-| [evict-first-sass](bundles/evict-first-sass) | queued 20:52 | dcee615c | pending | Queued on dgx4's GPU lock behind other agents' kernel runs (still waiting at 21:13). Compile only; it adds the SASS, not the verdict. |
+| [evict-first-sass](bundles/evict-first-sass) | 21:17 (queued 20:52) | dcee615c | diagnostic, no SASS | The image has no `nvdisasm`, so `cuobjdump -sass` cannot disassemble in the container. |
+| SASS on the dgx4 host | 21:30 | (no bundle; reads cached cubins, no GPU) | **root cause** | `/usr/local/cuda/bin/nvdisasm -c` (CUDA 13.0) on the cause run's cubins in `~/.cache/spark-lab/compile/tilelang-moe-overlap-evict-first-cause/0.1.15/cuda-binaries/{432a844c,0eb2c43b,803007de}*/kernel.cubin` and cp-async-diag's `ff37c524*`. The tail copies read an unwritten, odd descriptor register (below). Saved as `results/evict-first-sass-host/*.sass`. |
 
 **The cast benchmark** (`benchmark_deepseek_v41_mhc_cast.py --gate`, bits compared
 first). Finalize writing the cast, against the release's finalize plus the
@@ -79,10 +82,25 @@ in TP4's down GEMM.
   So it is the tail's 8-byte `cp.async.ca.shared.global.L2::cache_hint`. The 16-byte
   `cp.async.cg` with the same hint runs, and so does the TMA tiles' hint
   (evict-first-diag).
-- **Not the instruction itself.** The same 8-byte hinted `cp.async.ca` runs in a kernel
-  of its own (cp-async-diag), so what GB10 rejects is the code ptxas generates for it in
-  this kernel. [evict-first-sass](bundles/evict-first-sass) disassembles the
-  three down GEMMs and the standalone kernel to show that code (Results).
+- **A ptxas miscompile, not the instruction.** The same 8-byte hinted `cp.async.ca` runs
+  in a kernel of its own (cp-async-diag). The SASS shows why (ptxas 13.0.88,
+  `-arch sm_121a`, from the cubins' `.note.nv.tkinfo`):
+  - **Standalone kernel (runs).** ptxas folds `createpolicy` into the descriptor
+    UR4:UR5 (UR5 = 0x12f << 20, UR4 = 0), and the copy reads it:
+    `LDGSTS.E.64 [R9], desc[UR4][R2.64]`.
+  - **Down GEMM (faults).** The setup writes the two values the copies need: the
+    evict-first word into UR7 (0x12f << 20) and the stage's shared base (UR18 = UR5 +
+    0x400) into UR6. But the four tail copies name other registers:
+    `LDGSTS.E.64 [R91+UR0+0x4000], desc[UR1][R106.64]`, at +0x1000 strides. UR0 and UR1
+    are written nowhere in the kernel, and UR1 is an odd base for a 64-bit descriptor,
+    which the SM rejects as an illegal parameter.
+  - **The passing variants** read registers their kernels set. The unhinted tail copies
+    read `desc[UR14]`. The hinted 16-byte codes copy builds UR7 = 0x12f << 20 and
+    UR6 = 0, then reads `desc[UR6]`.
+
+  Nothing in the release is exposed. Its only non-bulk hinted `cp.async` is a 16-byte `.cg`
+  (hadacore), the form that compiles correctly, and the L2 prefetch uses
+  `cp.async.bulk.prefetch`.
 - **Not the sync.** The tail's extern call makes TileLang's sync planner add a
   `__syncthreads` before the copies (the review's note). The passing no-hint variant has
   it too, so it is not the cause.
