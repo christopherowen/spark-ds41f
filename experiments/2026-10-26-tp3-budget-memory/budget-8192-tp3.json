@@ -1,0 +1,102 @@
+{
+ "notes": "Candidate 6 at tp3-triangle (rc6/rc-tp3.json) at a 8,192-token long-prefill budget (threshold 8,144), everything else unchanged, with the diagnostic memory trace of experiments/2026-10-26-tp3-budget-memory/memory (allocator totals every 0.1 s, start-up phase marks, pool summaries; serving behaviour unchanged) and the workspace manager's slot log.",
+ "extends": {
+  "config": "experiments/2026-10-25-spark-ds41f-candidate/rc6/rc-tp3.json"
+ },
+ "set": {
+  "serve_args": [
+   "/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170",
+   "--served-model-name",
+   "deepseek-v4.1-flash",
+   "--host",
+   "0.0.0.0",
+   "--port",
+   "8000",
+   "--tokenizer-mode",
+   "deepseek_v41",
+   "--dtype",
+   "bfloat16",
+   "--tensor-parallel-size",
+   "3",
+   "--load-format",
+   "b12x",
+   "--block-size",
+   "256",
+   "--enable-prefix-caching",
+   "--enable-prompt-tokens-details",
+   "--enable-chunked-prefill",
+   "--max-model-len",
+   "1048576",
+   "--max-num-seqs",
+   "8",
+   "--max-parallel-prefills",
+   "1",
+   "--gpu-memory-utilization",
+   "0.82",
+   "--max-num-batched-tokens",
+   "8192",
+   "--kv-cache-memory-bytes",
+   "5268045824",
+   "--max-cudagraph-capture-size",
+   "48",
+   "--generation-config",
+   "vllm",
+   "--override-generation-config",
+   "{\"temperature\":1.0,\"top_p\":1.0}",
+   "--engram-config",
+   "{\"table_memory\":\"disk\",\"disk_resident_scales\":false,\"projection_tp\":true}",
+   "--attention-backend",
+   "TILELANG",
+   "--linear-backend",
+   "tilelang",
+   "--moe-backend",
+   "tilelang",
+   "--speculative-config",
+   "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"draft_tensor_parallel_size\":3,\"attention_backend\":\"TILELANG\",\"draft_sample_method\":\"greedy\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":true,\"adaptive_verification_row_cost\":0.035}",
+   "--jit-monitor-mode",
+   "off",
+   "--compilation-config",
+   "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"],\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12,16,20,24,28,32,40,48]}",
+   "--prefix-cache-retention-interval",
+   "512",
+   "--long-prefill-token-threshold",
+   "8144",
+   "--async-scheduling",
+   "--reasoning-parser",
+   "deepseek_v41",
+   "--tool-call-parser",
+   "deepseek_v41",
+   "--enable-auto-tool-choice",
+   "--distributed-executor-backend",
+   "mp",
+   "--nnodes",
+   "3",
+   "--no-scheduler-reserve-full-isl",
+   "--no-enable-flashinfer-autotune",
+   "--limit-mm-per-prompt",
+   "{\"image\":4}",
+   "--mm-processor-cache-gb",
+   "0"
+  ],
+  "container": {
+   "mounts": [
+    [
+     "{home}/projects/spark-ds41f/cache",
+     "/cache",
+     "rw"
+    ],
+    [
+     "{home}/projects/spark-ds41f/experiments/2026-10-26-tp3-budget-memory/memory/overlays/vllm_v1_worker_gpu_worker.py",
+     "/opt/spark-ds41f/candidate/vllm/vllm/v1/worker/gpu_worker.py",
+     "ro"
+    ]
+   ]
+  },
+  "environment": {
+   "SPARK_DS41F_MEMORY_TRACE": "/cache/tp3-budget-memory/b8192",
+   "SPARK_DS41F_MEMORY_TRACE_SECONDS": "2700",
+   "SPARK_DS41F_MEMORY_TRACE_POOLS_AFTER": "600",
+   "VLLM_DEBUG_WORKSPACE": "1"
+  }
+ }
+}
