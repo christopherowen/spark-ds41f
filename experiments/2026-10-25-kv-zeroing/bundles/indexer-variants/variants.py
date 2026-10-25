@@ -6,25 +6,33 @@ variants, compiled, bit-compared and timed against candidate 6's.
 - v2: v1 with a dense tile's page read once a tile;
 - v3: candidate 6's loads, guarded by the extent (rows past it skip the loads);
 - v4: candidate 6's loads for whole tiles, v1's clamped loads only in the tile the
-  extent ends inside (a branch per tile, uniform across the CTA).
+  extent ends inside (a branch per tile, uniform across the CTA);
+- v5: candidate 6's addresses, with only the key and scale loads predicated on the
+  extent (rows past it score zeros).
+
+v1-v4 were measured in earlier runs of this bundle; this run measures v5 and v4.
 
 For each: the generated CUDA of the dense score kernel (between markers), bits against
 candidate 6's in dense and candidate mode, and paired CUDA-graph timings (eight inputs,
-alternating order) at decode shapes. Exits 0; this run only measures.
+alternating order) at decode shapes in both modes. Each compile prints its wall time
+first, so the compile cache's cubins can be matched to kernels by mtime. Exits 0; this
+run only measures.
 """
 import importlib.util
 import json
 import math
 import statistics
+import time
 
 import torch
 
 PACKAGE = "vllm.models.deepseek_v4_1.tilelang"
 DEVICE = "cuda"
 CALLS, INPUTS, T_95 = 20, 8, 2.365
-VARIANTS = ("v1", "v2", "v3", "v4")
-TIMED = [(6, 128, 524288, 4133), (6, 128, 524288, 524261), (96, 128, 524288, 524261),
-         (96, 256, 1048576, 1048549)]
+VARIANTS = ("v5", "v4")
+TIMED = [(False, 6, 128, 524288, 4133), (False, 6, 128, 524288, 524261),
+         (False, 96, 128, 524288, 524261), (False, 96, 256, 1048576, 1048549),
+         (True, 6, 128, 524288, 524261), (True, 96, 256, 1048576, 1048549)]
 BITS = [(6, 128, 524288, 4133), (96, 256, 1048576, 8229)]
 
 
@@ -70,6 +78,8 @@ def inputs(mod, rows, page_size, width, extent, seed, candidates=False):
 def plan(mod, page_size, width, candidates=False):
     if candidates:
         width = mod.CANDIDATE_BLOCKS * mod.CANDIDATE_BLOCK
+    print(json.dumps({"plan": mod.__name__.rsplit("_", 1)[-1], "page_size": page_size,
+                      "candidates": candidates, "time": time.time()}), flush=True)
     return mod.IndexerV41Plan(width, page_size, candidates=candidates).score, width
 
 
@@ -123,12 +133,13 @@ def main():
                 print(json.dumps({"bits": name, "candidates": candidates, "rows": rows,
                                   "page_size": page_size, "extent": extent, "equal": same}),
                       flush=True)
-        for rows, page_size, width, extent in TIMED:
-            mine, w = plan(mod, page_size, width)
-            theirs, _ = plan(release, page_size, width)
+        for candidates, rows, page_size, width, extent in TIMED:
+            mine, w = plan(mod, page_size, width, candidates)
+            theirs, _ = plan(release, page_size, width, candidates)
             diffs, times = [], {"variant": [], "release": []}
             for i in range(INPUTS):
-                args = inputs(release, rows, page_size, width, extent, 100 * i + extent)
+                args = inputs(release, rows, page_size, width, extent, 100 * i + extent,
+                              candidates)
                 outs = {"variant": torch.zeros((rows, w), dtype=torch.bfloat16, device=DEVICE),
                         "release": torch.zeros((rows, w), dtype=torch.bfloat16, device=DEVICE)}
                 graphs = {"variant": graph(mine, args, outs["variant"]),
@@ -140,8 +151,8 @@ def main():
                 diffs.append(measured["variant"] - measured["release"])
             mean = statistics.fmean(diffs)
             half = T_95 * statistics.stdev(diffs) / math.sqrt(INPUTS)
-            print(json.dumps({"timing": name, "rows": rows, "page_size": page_size,
-                              "extent": extent,
+            print(json.dumps({"timing": name, "candidates": candidates, "rows": rows,
+                              "page_size": page_size, "extent": extent,
                               "variant_us": statistics.median(times["variant"]),
                               "release_us": statistics.median(times["release"]),
                               "difference_us": mean, "ci95_us": half,
