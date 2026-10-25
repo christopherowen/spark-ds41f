@@ -568,6 +568,23 @@ The poison specs become the recurring check for any release that changes:
 
 - **retire-conditionals** (0495) deletes the Triton `_chunk` that 0501 also edits. Whichever
   lands second gives its torch reference the draft branch's replay bound.
+- **0492** (drafter-window retention) goes before 0500-0503. The two touch the same
+  drafter window but fix different reads:
+  - 0492 keeps the block holding `q0 - 128`, which the drafter reads legitimately after a
+    step whose rows are all rejected.
+  - 0501 raises the window start to CED's replay start, which in decode lies below
+    `q0 - 128`.
+
+  So 0492 stays necessary. Without it, the freed block can be reallocated: under the
+  poison its NaN would trip the router's assert, and without zeroing another request's
+  bytes would change drafts. **Run the poison serving gates on a build with 0492**, the
+  next candidate, not on next-6 with these overlays alone.
+  - On the base, 0492 then 0500-0503 apply cleanly with `git am`.
+  - The CPU tests of both pass together (`test_kv_cache_utils.py`,
+    `test_single_type_kv_cache_manager.py`, `test_kv_block_zeroer.py`). The only failures
+    are the base's 39 in `test_kv_cache_utils.py`.
+  - 0492's scheduler spec is a `dataclasses.replace` of the first layer's spec, so it keeps
+    0502's `uses_only_written_slots`.
 - **The initcheck bundle** mounts the nodes' host sanitizer at
   `/usr/local/cuda-13.0/compute-sanitizer`, the path the 2026-09-29 experiment used and
   dgx4 still has. If a host's toolkit has moved, point `SANITIZER` in make_bundles.py at
