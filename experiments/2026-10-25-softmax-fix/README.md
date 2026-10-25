@@ -177,6 +177,24 @@ test files).
 | 20:07 | `softmax-verification` | 887eb67 / a7b65a167 | **fail**: tests pass (427 verification, 146 rejection sampler, 1 skipped); `rejection_sample` 2-3% slower than the release at 16 FP32 and 48 bf16 rows |
 | 20:43 | `softmax-logprob` | 243b87c / 80e8c188c | **pass** in 56 s: 874 + 44 tests; no case slower than the release or Triton (`out/softmax-logprob-2`) |
 | 20:47 | `softmax-verification` | 243b87c / 80e8c188c | **pass** in 74 s: 427 + 146 tests (1 skipped); no case slower than the release or Triton (`out/softmax-verification-2`) |
+| 23:20 | `softmax-logprob`, image -next-6 | 75934de / 53b741efc | **fail** on one case: 964 + 44 tests pass (the whole-step widths added); against the release every case passes but FP32 at 96 rows (211.6 / 213.6 us against 199.8 / 197.2); against Triton all pass (`out/softmax-logprob-3`) |
+| 23:21 | `softmax-verification`, image -next-6 | 75934de / 53b741efc | **pass** in 73 s: 427 + 146 tests (1 skipped); no case slower (`out/softmax-verification-3`) |
+
+**FP32 at 96 rows.** The same kernel read 198.3 to 199.7 us there in the comparisons against
+Triton, the release's own time. Alternated with the release's kernel it read 198.6 to 213.6 us
+over three runs, two of them within the gate. A diagnostic (dev bundle `diag-96` outside git,
+23:24 CET, image -next-6) timed both kernels' graphs alone and alternated on the same inputs:
+
+| Logits, rows | Release (us) | Fix (us) |
+| --- | --- | --- |
+| FP32, 96 | 240-246 | 237-246 |
+| FP32, 48 | 45.0-52.6 | 36.2-37.1 |
+| bf16, 96 | 49.9-57.5 | 52.7-57.6 |
+| bf16, 48 | 22.0-24.1 | 16.3-17.5 |
+
+At 96 rows both kernels are bandwidth-bound and level. Their times move with where the inputs
+land (50 MB of fresh logits a sample, rows 512 KB apart): 198 us in the benchmark's
+allocations, 240 us in the diagnostic's. At 48 rows and fewer, the fix is 20-35% faster.
 
 Command, from the checkout:
 `python3 scripts/lab.py kernel-local experiments/2026-10-25-softmax-fix/bundles/<bundle> --out ~/spark-lab/agents/softmax-fix/out/<bundle>-2`.
