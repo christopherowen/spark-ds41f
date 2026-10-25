@@ -1698,3 +1698,22 @@ candidate4-2).
   | candidate4-2 |             93.16 |             191.13 |
 
   Ports is +2.1% at c1 and +0.3-0.5% at c8.
+
+## The JIT monitor's cost
+
+Owner, 2026-10-25: measure the JIT monitor's cost and drop it if it is redundant; remove
+warmups for kernels serving does not use, and their recipe settings.
+
+The monitor (`--jit-monitor-mode warn`, production's setting too) hooks Triton, CuTe DSL,
+dynamo and TileLang compiles once warm-up ends. Only the TileLang hook costs anything per
+launch. It wraps `JITImpl.__call__`, so every eager TileLang launch parses its cache key a
+second time; inventory 4's traced greedy window shows 1238 such calls in 15 steps.
+Inventory 5 found no Triton, CuTe or FlashInfer kernel in any request type, and the
+frozen TileLang cache already refuses an undeclared kernel by name. The monitor's only
+reports were the runner warm-up's Triton top-k/top-p compiles, for kernels nothing
+launches (serving filters in TileLang).
+
+vLLM 8f4512c59 adds `--jit-monitor-mode off`, which installs no hooks, and 4deb7d94b drops
+the Triton top-k/top-p warm-up. [jit-monitor-ab.json](jit-monitor-ab.json) measures the
+monitor alone, on the same build (4deb7d94b): [ports-nomon-tp4.json](ports-nomon-tp4.json)
+(off) against ports-tp4.json (warn), each twice, with outputs, controls, c1 and c8.

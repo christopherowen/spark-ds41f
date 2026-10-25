@@ -16,9 +16,10 @@ ids):
 Each request asks for the chosen tokens' logprobs. One JSON line per scenario and mode
 with the SHA-256 digest of the choices (message, logprobs, finish reason) and any prompt
 logprobs, then a summary of every digest. Two builds whose controls are the same bit for
-bit print the same digests. A scenario the server rejects (HTTP 400: vLLM rejects min_p
-and logit_bias under speculative decoding) is recorded with the server's message, and
-its digest is the message's. Exits 0 either way; the run records.
+bit print the same digests. A scenario vLLM rejects by design (HTTP 400 for min_p and
+logit_bias under speculative decoding, REJECTABLE) is recorded with the server's message,
+and its digest is the message's. Any other HTTP error is a failure: it is recorded, the
+remaining scenarios still run, and the script exits 1.
 """
 import argparse
 import hashlib
@@ -55,6 +56,8 @@ SCENARIOS = {
                         "chat_template_kwargs": {"thinking": True}},
     "logprob-ids": {"temperature": 0.0, "logprob_token_ids": LOGPROB_IDS},
 }
+# Scenarios vLLM refuses with HTTP 400 under speculative decoding.
+REJECTABLE = {"min-p", "logit-bias"}
 # Prompt logprobs kill candidate 4's engine (scheduler.py's "no partial prefill outputs"
 # assertion, 2026-10-24 run tilelang-ports-controls; fixed by 0266): named only with
 # --scenarios, for a build that carries the fix.
@@ -85,18 +88,23 @@ class Client:
 
 
 def together(client: Client, tokens: int, seeds: list[int], controls: dict) -> list:
+    """The eight at once; a request's error is raised here, as a request alone raises."""
     results: list = [None] * len(PROMPTS)
+    errors: list = []
 
     def run(index):
-        results[index] = client.complete(PROMPTS[index], tokens, seeds[index], controls)
+        try:
+            results[index] = client.complete(PROMPTS[index], tokens, seeds[index], controls)
+        except Exception as error:  # noqa: BLE001 - re-raised in the caller's thread
+            errors.append(error)
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(len(PROMPTS))]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    if any(r is None for r in results):
-        raise SystemExit("a request returned nothing")
+    if errors:
+        raise errors[0]
     return results
 
 
@@ -120,24 +128,33 @@ def main() -> None:
     client = Client(args.base_url.rstrip("/"))
     seeds = [args.seed + i for i in range(len(PROMPTS))]
     digests = {}
+    failed = []
     for name in names:
         controls = known[name]
         try:
             client.complete(PROMPTS[0], 1, seeds[0], controls)
+            alone = [client.complete(p, args.tokens, s, controls)
+                     for p, s in zip(PROMPTS, seeds)]
+            c8 = together(client, args.tokens, seeds, controls)
         except urllib.error.HTTPError as error:
             message = error.read().decode(errors="replace")
-            print(json.dumps({"scenario": name, "rejected": error.code, "message": message}),
-                  flush=True)
-            digests[f"{name}/rejected"] = hashlib.sha256(message.encode()).hexdigest()
+            if error.code == 400 and name in REJECTABLE:
+                print(json.dumps({"scenario": name, "rejected": error.code, "message": message}),
+                      flush=True)
+                digests[f"{name}/rejected"] = hashlib.sha256(message.encode()).hexdigest()
+            else:
+                print(json.dumps({"scenario": name, "failed": error.code, "message": message}),
+                      flush=True)
+                failed.append(name)
             continue
-        alone = [client.complete(p, args.tokens, s, controls) for p, s in zip(PROMPTS, seeds)]
-        c8 = together(client, args.tokens, seeds, controls)
         for mode, results in (("alone", alone), ("c8", c8)):
             digests[f"{name}/{mode}"] = digest(results)
             print(json.dumps({"scenario": name, "mode": mode, "sha256": digests[f"{name}/{mode}"],
                               "finish": [r[0]["finish_reason"] for r in results]}), flush=True)
     print(json.dumps({"summary": "controls digests", "tokens": args.tokens, "seed": args.seed,
-                      "digests": digests}), flush=True)
+                      "digests": digests, "failed": failed}), flush=True)
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
