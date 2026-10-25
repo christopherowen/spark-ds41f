@@ -178,7 +178,6 @@ def test_pages(lengths, width, read_width, page):
             )
         outs.append(out)
     live = _live_columns(reqs, visible, offset, rows, page, read_width, width)
-    assert int(live.max()) > 0, "the step has no live page"
     _assert_live_equal(*outs, live, rows)
 
 
@@ -191,7 +190,10 @@ def test_decode_metadata_equals_chunk_and_pages(lengths, draft, replay, main_pag
     page, window, width, main_width = 64, 128, 128, 256
     s, nr, nt = _step(lengths, seed=7 + 3 * draft + replay)
     pos, reqs, visible = _token_metadata(s, nr, nt, page)
-    main_reqs = torch.flip(reqs, (0,)).contiguous()
+    # The main rows' requests differ from the window rows' (the step's rows in
+    # reverse); every row has a written request or -1, as a builder leaves them.
+    main_reqs = torch.full_like(reqs, -1)
+    main_reqs[:nt] = torch.flip(reqs[:nt], (0,))
     request_positions = torch.randint(-5, 900, (R,), device=DEVICE)
     replay_start = torch.randint(0, 900, (R,), device=DEVICE) if replay else None
     rows, offset = min(nt, 600), 3 if nt > 10 else 0

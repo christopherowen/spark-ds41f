@@ -18,8 +18,8 @@ below is from existing traces; every fix still needs its window.
 
 - **vLLM:** `tilelang-ports` 26382f5cf, the package files of candidate 6's image
   (`spark-ds41f:19f2c20ed4d6-next-6`, spark-ds41f-1025). The fixes are on the local
-  branch `kernel-audit` (worktree `~/projects/vllm-kernel-audit`), three commits:
-  3cd92e872, bb2fb46ee, 8e596b329.
+  branch `kernel-audit` (worktree `~/projects/vllm-kernel-audit`): 3cd92e872,
+  bb2fb46ee, 8e596b329, and 1072d662b (fix 1's loop and tests, after the first dgx4 run).
 - **Traces:** request inventory 5
   ([experiments/2026-10-25-request-inventory](../2026-10-25-request-inventory/README.md)),
   `results/private/determinism/request-inventory-5/ports/`: TP4 ring, rank 0 (dgx1), the
@@ -100,11 +100,13 @@ Each commit is one change, with a bit-exact test and a gated benchmark against t
 kernel it replaces. The replaced kernels are kept verbatim: in the benchmark, or in
 `tests/kernels/deepseek_v41_baselines.py` when a test compares against them too.
 
-### 1. Page tables over each row's live pages (3cd92e872)
+### 1. Page tables over each row's live pages (3cd92e872, 1072d662b)
 
 `decode_metadata` and `pages` write only the columns of a row's visible entries:
 ceil(visible / page), at most the table's width, none for a row without a request. The
-rest of the buffer keeps whatever it held.
+rest of the buffer keeps whatever it held. The page loop keeps the table width's trip
+count (1072d662b): with the live pages as its bound it stopped unrolling, and a full 1M
+context's row took 6.7 µs instead of 3.2 (run 1).
 
 **Why this is safe.** The sparse MLA's kept lanes look up logical positions below the
 row's indexed length, and the indexer's tiles positions below its extent, all inside the
@@ -228,4 +230,45 @@ Run them in that order; stop at the first failure.
 
 ## Runs
 
-None yet.
+dgx4, single node, opened for GPU testing by the coordinator on 2026-10-25. Commands run
+on dgx4 from a checkout of this branch under `~/spark-lab/agents/kernel-audit/`:
+`scripts/lab.py kernel-local experiments/2026-10-25-kernel-audit/bundles/<bundle> --out
+~/spark-lab/agents/kernel-audit/out/<bundle>`, image `spark-ds41f:19f2c20ed4d6-next-6`
+(`sha256:82b071b57485`).
+
+### Run 1: `audit-attention`, 19:00-19:08 CET (branch e88dba66, vLLM 8e596b329): FAILED
+
+Output `~/spark-lab/agents/kernel-audit/out/audit-attention/` on dgx4. Bundle exit 1.
+
+| Step | Exit | Result |
+|---|---|---|
+| metadata and attention kernel tests | 1 | 134 passed, 10 failed, 1 xfailed. The sparse-MLA and indexer poison tests passed. |
+| attention layer tests | 0 | 4 passed |
+| live-page benchmark | 1 | Gate failed at c1 with a full 1M context; faster everywhere else |
+| one-launch builder benchmark | 0 | Gate passed |
+
+Root causes, both fixed in vLLM 1072d662b:
+
+- **The 1M regression is the kernel's.** The page loop took the live pages as its
+  bound, so it stopped unrolling and a long row's 32 table loads ran one after another.
+  It keeps the table width's trip count again, with the live pages as the predicate.
+
+  | decode_metadata (µs a call, both page sizes) | live pages | every column |
+  |---|---:|---:|
+  | c1, 4K-64K context | 1.7-1.9 | 3.3-3.4 |
+  | c16, 4K-64K context | 1.4-1.9 | 3.7-4.1 |
+  | c1, 1M context | 6.7 | 3.2 |
+  | prefill chunk of 16,384 rows at 16K | 37.8 | 1,405-1,415 |
+  | same chunk 48K into a prompt | 120-124 | 1,407-1,419 |
+
+  `pages`: 1.5 against 1.5 µs (c1), 2.9 against 3.9 (c16), 5.7 against 7.5 (a 256-row
+  prefill chunk). Every benchmark shape's live columns were equal before timing.
+- **The 10 test failures are the tests'.**
+  - `test_pages[*-lengths0]` (6): my assertion that every step has a live page is wrong
+    for a one-token step, whose tested rows (from offset 2) are all padding. The
+    assertion is gone.
+  - `test_decode_metadata_equals_chunk_and_pages[*-lengths1]` (4, seed-dependent): the
+    test built its main rows' requests by flipping a `torch.empty` buffer, so most rows
+    held uninitialized request ids and both kernels read past the table; the kernels that
+    wrote every column happened to agree on it. The main rows now hold the step's
+    requests in reverse, and -1 past them.

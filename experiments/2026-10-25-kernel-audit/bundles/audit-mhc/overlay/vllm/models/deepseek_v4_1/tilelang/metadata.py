@@ -270,9 +270,12 @@ def decode_metadata_kernel(
     starts_len = T.dynamic("starts_len")
     replay_len = T.dynamic("replay_len")
     # Blocks as wide as the window part; the page part loops over the row's live
-    # pages (idle threads cost the prefill rows' blocks).
+    # pages (idle threads cost the prefill rows' blocks). The loop keeps the table
+    # width's trip count, so it unrolls and a long context's loads overlap; past the
+    # live pages an iteration is a compare.
     threads, per_thread = _threads(width)
     window_row = _window_macro(page, window, width, draft, replay, threads, per_thread)
+    main_per_thread = (main_width + threads - 1) // threads
 
     @T.prim_func
     def metadata_decode(
@@ -309,7 +312,7 @@ def decode_metadata_kernel(
                 )
                 if req < 0:
                     live = 0
-                for k in T.serial(T.ceildiv(live, threads)):
+                for k in T.serial(main_per_thread):
                     col = k * threads + tx
                     if col < live:
                         page_id = main_table[req, col]
