@@ -226,7 +226,23 @@ alone, over its own time in the step; `harness_table.py`), head and prototype, T
 | Engram projection (ENGRAM) | - | > 1 | - | > 1 | - | > 1 |
 
 (The Engram projection's 39 MB cannot sit in L2, so its "floor" is its DRAM time and the
-prefetched run beats it.) Under PDL a kernel's own time is its end less its predecessor's
+prefetched run beats it.)
+
+The c1 IKET study ([#614](https://github.com/christopherowen/spark-ds41f/pull/614),
+experiments/2026-10-26-c1-iket, one GB10, 6 rows, next-candidate with PDL, no prefetch)
+gives these consumers' cold costs (TP4):
+
+| Consumer | Cold cost | Time spent waiting on its own weight copies | This harness, head | This harness, prototype |
+| --- | ---: | ---: | ---: | ---: |
+| fused Q-A/KV | 39.6 us | 62% | 13.0 us (window-only layers) | 12.7 us |
+| Q-B | 45.0 us | 57% | 19.6 us | 19.6 us |
+| WO-A and its reduce | 40.2 us | 49% | 32.8 us (window-only), 46.4 us (owner layers) | 33.4 us, 13.2 us |
+| WO-B | 46.6 us | 65% | 10.1 us (window-only), 29.3 us (owner layers) | 10.7 us, 18.7 us |
+
+- Cold, they run at 78-87% of the 266.6 GB/s expert-stream rate.
+- The owner layers' head WO-A at or above its cold cost is the lost-lines case: all of
+  WO-A read from DRAM, beside the WO fill.
+- The window-only layers sit between cold and L2 speed in both schedules. Under PDL a kernel's own time is its end less its predecessor's
 end, so a consumer's share also carries its prologue; the shares compare schedules, not
 absolute L2 speed.
 
