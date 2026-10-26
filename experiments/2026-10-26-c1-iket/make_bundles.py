@@ -312,6 +312,25 @@ BUNDLES = {
                  "tests/kernels/test_deepseek_v41_tilelang_rope.py",
                  "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py"], 3600)],
     ),
+    "front-wiring-tests": dict(
+        ref=FRONT,
+        what="the attention forward running the decode front's one kernel, Q-B reading its "
+             "input's cast: the attention model tests, the front, RoPE, cache-writer and TileLang "
+             "linear tests, every launched kernel source-checked",
+        tests=["tests/models/test_deepseek_v4_1_attention.py",
+               "tests/kernels/test_deepseek_v41_tilelang_front.py",
+               "tests/kernels/test_deepseek_v41_tilelang_rope.py",
+               "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py",
+               "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py",
+               "tests/kernels/deepseek_v41_pdl_sources.py", "tests/kernels/deepseek_v41_contracts.py"],
+        steps=[("attention model, front, RoPE, cache-writer and linear tests, kernels source-checked",
+                [*PYTEST_CHECKED, "--basetemp", "{out}/pytest",
+                 "tests/models/test_deepseek_v4_1_attention.py",
+                 "tests/kernels/test_deepseek_v41_tilelang_front.py",
+                 "tests/kernels/test_deepseek_v41_tilelang_rope.py",
+                 "tests/kernels/test_deepseek_v41_tilelang_cache_writer.py",
+                 "tests/kernels/quantization/test_deepseek_v41_tilelang_linear.py"], 3600)],
+    ),
     "front-ab": dict(
         ref=LEVER2_BASE,
         builds={"front": FRONT},
