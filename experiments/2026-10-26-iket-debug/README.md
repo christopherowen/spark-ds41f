@@ -580,9 +580,10 @@ What a serving trace on the cluster would take:
      under `hangcatch.sh`. When a dry run's log stops growing, it records GPU power and
      clocks, each thread's state, wait channel and kernel stack, py-spy, and gdb
      backtraces.
-   - **What the catcher has shown so far:** a dry run's exit is silent for minutes after
-     its last line (`Finalize Dump Json`). Its exit handler spends them in
-     `iket::to_json`, with the GPU idle.
+   - **The catcher's first capture was a false alarm.** TP3 c1's dry run had finished:
+     its log ends in `Finalize Dump Json`. The live harness was the measured run,
+     decoding its records at exit (`iket::to_json`, GPU idle). The catcher now skips a
+     log that ends that way.
 
 ## Timing a decode step with your own vLLM branch
 

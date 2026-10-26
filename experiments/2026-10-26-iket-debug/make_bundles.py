@@ -107,6 +107,30 @@ def step_spec(ref, tp=1, requests=1, tokens=32, ctas=4, iters=1, skip="^(vision_
     )
 
 
+def dry_loop_spec(what, harness, timeout=600, repeats=8):
+    """A bundle running the TP3 c1 step bundle's run-iket dry run ``repeats`` times, each
+    killed after ``timeout`` s, with ``harness`` as iket_step.py's mode and options."""
+    run = [*harness[:1], *(["--iket", "{out}/dry-{k}/run/iket"] if harness[0] == "on" else []),
+           *harness[1:]]
+    return dict(
+        ref=IKET,
+        what=what,
+        # step-tp3-c1's compile caches: each dry run starts as run 42's did.
+        env={**STEP_ENV, **{variable: f"/c/{prefix}-iket-step-tp3-c1" for variable, prefix in (
+            ("TILELANG_CACHE_DIR", "tilelang"), ("TRITON_CACHE_DIR", "triton"),
+            ("VLLM_CACHE_ROOT", "vllm"))}},
+        mounts=[HUB],
+        steps=[
+            (f"dry run {k}",
+             ["{python}", "/b/iket_profile.py", f"{{out}}/dry-{k}", "--timeout", str(timeout),
+              "--log-level", "debug", "--dry-only", "--", "{python}", STEP,
+              *(part.replace("{k}", str(k)) for part in run), "--tp-shape", "3", "--requests", "1",
+              "--tokens", "32", "--grid", "8", "--out", f"{{out}}/dry-{k}/run"], timeout + 300)
+            for k in range(1, repeats + 1)
+        ],
+    )
+
+
 # The decode step's instrumented kernels (run 18) by family. Each step-counts dry run
 # instruments one family, to find the kernel whose warps record past the static bound.
 COUNT_FAMILIES = {
@@ -347,24 +371,26 @@ BUNDLES = {
     # Run 42's TP3 c1 dry run stopped launching between a kernel and the next graph replay
     # (as run 30's did at TP4): the dry run repeated, each bounded, while a host-side
     # watcher (hangcatch.sh) records stacks and GPU power when a run's log stops growing.
-    "dry-loop-tp3-c1": dict(
-        ref=IKET,
-        what="the TP3 c1 step bundle's run-iket dry run eight times, each killed after 600 s, to "
-             "catch the hang of runs 30 and 42 with a host-side watcher",
-        # step-tp3-c1's compile caches: each dry run starts as run 42's did.
-        env={**STEP_ENV, **{variable: f"/c/{prefix}-iket-step-tp3-c1" for variable, prefix in (
-            ("TILELANG_CACHE_DIR", "tilelang"), ("TRITON_CACHE_DIR", "triton"),
-            ("VLLM_CACHE_ROOT", "vllm"))}},
-        mounts=[HUB],
-        steps=[
-            (f"dry run {k}",
-             ["{python}", "/b/iket_profile.py", f"{{out}}/dry-{k}", "--timeout", "600", "--log-level",
-              "debug", "--dry-only", "--", "{python}", STEP, "on", "--iket", f"{{out}}/dry-{k}/run/iket",
-              "--ctas", "4", "--iters", "1", "--skip", "^(vision_|topk_topp)", "--tp-shape", "3",
-              "--requests", "1", "--tokens", "32", "--grid", "8", "--out", f"{{out}}/dry-{k}/run"], 900)
-            for k in range(1, 9)
-        ],
-    ),
+    "dry-loop-tp3-c1": dry_loop_spec(
+        "the TP3 c1 step bundle's run-iket dry run eight times, each killed after 600 s, to "
+        "catch the hang of runs 30 and 42 with a host-side watcher",
+        ["on", "--ctas", "4", "--iters", "1", "--skip", "^(vision_|topk_topp)"]),
+    # Run 43: the dry run hangs in run-iket's graph-launch callback, waiting on the GPU, about
+    # every second time. Which part it needs: the mode's events at all (off), CUDA graphs
+    # (eager), or the events in the eager kernels before the graph launches it stops at.
+    "dry-skip-tp3-c1": dry_loop_spec(
+        "the TP3 c1 dry run eight times, each killed after 300 s, with metadata_builder_kernel "
+        "and padding_rows_kernel not instrumented (the eager kernels before each hang's graph "
+        "launch)",
+        ["on", "--ctas", "4", "--iters", "1", "--skip",
+         "^(vision_|topk_topp|metadata_builder|padding_rows)"], timeout=300),
+    "dry-off-tp3-c1": dry_loop_spec(
+        "the TP3 c1 dry run eight times, each killed after 300 s, with the IKET mode off: "
+        "run-iket's tracker over kernels without events",
+        ["off"], timeout=300),
+    "dry-eager-tp3-c1": dry_loop_spec(
+        "the TP3 c1 dry run eight times, each killed after 600 s, without CUDA graphs",
+        ["on", "--ctas", "4", "--iters", "1", "--skip", "^(vision_|topk_topp)", "--eager"]),
     "c8-nan": dict(
         ref=IKET,
         what="why c8 stops at boot (runs 33: route_partials' gate logits nan or inf in vLLM's sampler "
