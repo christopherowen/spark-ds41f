@@ -81,11 +81,13 @@ def shrink(config, overrides):
     return config
 
 
-def same_dummy_weights():
+def same_dummy_weights(uint8_fill=0):
     """vLLM's dummy loader seeds floating tensors but leaves integer ones (the packed FP4
     experts and their UE8M0 scales) as allocated, different in every process. Zero them,
     as it does on ROCm, so that every process loads the same weights and runs' tokens
-    can be compared bit for bit."""
+    can be compared bit for bit; ``uint8_fill`` fills the uint8 ones with that byte
+    instead (0x77: FP4 6.0 in a packed weight, 2^-8 as a UE8M0 scale), so that the
+    routed experts' outputs are not exactly zero."""
     import torch
     from vllm.model_executor.model_loader import dummy_loader, weight_utils
 
@@ -94,7 +96,10 @@ def same_dummy_weights():
     def initialize(param, *args, **kwargs):
         if (param.device.type != "meta" and not torch.is_floating_point(param)
                 and getattr(param, "dummy_weight_value", None) is None):
-            param.zero_()
+            if param.dtype == torch.uint8:
+                param.fill_(uint8_fill)
+            else:
+                param.zero_()
             return
         seeded(param, *args, **kwargs)
 
@@ -146,6 +151,8 @@ def main():
     parser.add_argument("--filled", action="store_true",
                         help="fill uninitialized tensors (torch's deterministic mode), for "
                              "token comparisons between processes; adds fill kernels")
+    parser.add_argument("--uint8-fill", type=lambda text: int(text, 0), default=0,
+                        help="the byte uint8 dummy weights hold (0: zero; 0x77: small nonzero experts)")
     parser.add_argument("--tp-shape", type=int, choices=sorted(TP_SHAPES), default=1,
                         help="one rank's shapes at this TP size (TP_SHAPES)")
     parser.add_argument("--overrides", default="{}",
@@ -178,7 +185,7 @@ def main():
 
     from vllm import LLM, SamplingParams
 
-    same_dummy_weights()
+    same_dummy_weights(args.uint8_fill)
     started = time.monotonic()
     llm = LLM(
         model=args.model,
@@ -289,6 +296,7 @@ def main():
         "iket_modules": sorted(m for m in sys.modules if m.endswith(".iket")),
         "grid": grid,
         "tp_shape": args.tp_shape,
+        "uint8_fill": args.uint8_fill,
         "text_overrides": overrides,
         "drafts": args.drafts,
     }

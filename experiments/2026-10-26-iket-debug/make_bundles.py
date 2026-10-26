@@ -314,6 +314,20 @@ BUNDLES = {
         ],
     ),
     **{f"step-tp{tp}-c{requests}": step_spec(IKET, tp, requests) for tp in (4, 3) for requests in (1, 8)},
+    "c8-nan": dict(
+        ref=IKET,
+        what="why c8 stops at boot (runs 33: route_partials' gate logits nan or inf in vLLM's sampler "
+             "warmup, eight 7-token requests): off at TP4 rank shapes with the packed FP4 experts and "
+             "their scales zeroed, then filled with 0x77, and c1 filled",
+        env=STEP_ENV,
+        mounts=[HUB],
+        steps=[
+            (f"off, TP4, c{requests}, uint8 {fill}",
+             ["{python}", STEP, "off", "--tp-shape", "4", "--requests", str(requests), "--uint8-fill", fill,
+              "--out", f"{{out}}/c{requests}-{fill}"], 1800)
+            for requests, fill in ((8, "0"), (8, "0x77"), (1, "0x77"))
+        ],
+    ),
     "tests": dict(
         ref=IKET,
         what="the IKET mode's tests alone",
