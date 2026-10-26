@@ -6,22 +6,24 @@ usage: make_bundles.py VLLM_REPO
 
 From experiments/2026-10-26-tp3-budget-memory/make_bundles.py. Everything runs a vLLM
 tree over candidate 6's image, whose tree is the release's (BASE, tilelang-ports
-26382f5cf). Three trees, one per arm:
+26382f5cf). Two trees, one per arm:
 
 - head: next-candidate with PDL (HEAD, 1bc005688);
-- chained: HEAD with the WO and FFN windows chained (CHAINED);
-- typed: chained with the owner and Engram layers' own windows (TYPED; later commits on
-  the branch ``l2-prefetch-schedule`` may add tests and benchmarks, no package file).
+- pertype: HEAD with the owner and Engram layers' own windows (PERTYPE, 650fe3679;
+  later commits on the branch ``l2-prefetch-schedule`` may add tests and benchmarks,
+  no package file). The branch's chained and typed commits before it were measured
+  and dropped (README).
 
-The benchmark and its chain (the branch's first commit, before CHAINED) change no
-package file, so every tree runs the branch head's copy of them.
+The benchmark and its chain change no package file, so both trees run the branch
+head's copy of them.
 
 overlay/ holds every package file HEAD changes from BASE (a module HEAD deletes is one
-that fails to import); overlay-chained/ and overlay-typed/ hold only the files their
-tree changes from HEAD. bench/ holds the tests and benchmarks the bundles run. Bundles
-and serving arms mount each package path from the most specific overlay that has it,
-so the three trees share one copy of HEAD's files. Overlays are rewritten in place;
-a file this run would not write stops it, for a person to remove.
+that fails to import); overlay-pertype/ holds only the files pertype changes from HEAD.
+bench/ holds every test and benchmark file the branch adds or changes over the image's
+tree, at its path. Bundles and serving arms mount
+each package path from the most specific overlay that has it, so the trees share one
+copy of HEAD's files. Overlays are rewritten in place; a file this run would not write
+stops it, for a person to remove.
 """
 
 import json
@@ -35,23 +37,15 @@ ROOT = "/opt/spark-ds41f/candidate/vllm"
 IMAGE = "spark-ds41f:19f2c20ed4d6-next-6"
 BASE = "26382f5cf"
 HEAD = "1bc005688"
-CHAINED = "980aed9a4"
-TYPED = "353085fb7"
+PERTYPE = "650fe3679"
 BRANCH = "l2-prefetch-schedule"
-TREES = {"head": HEAD, "chained": CHAINED, "typed": TYPED}
+TREES = {"head": HEAD, "pertype": PERTYPE}
 RC = "experiments/2026-10-25-spark-ds41f-candidate/rc6"
 MISSING = '''# Deleted at this ref; importing it fails as importing a missing module does.
 raise ModuleNotFoundError(f"No module named {__name__!r}", name=__name__)
 '''
 BENCH = "benchmarks/kernels/benchmark_deepseek_v41_l2_schedule.py"
 SCHEDULE_TESTS = "tests/models/test_deepseek_v4_1_l2_schedule.py"
-# Tests and benchmarks the image's tree lacks, mounted beside it from the branch head.
-BENCH_FILES = (
-    "tests/kernels/deepseek_v41_pdl_chains.py",
-    "tests/kernels/deepseek_v41_l2_schedule_chain.py",
-    BENCH,
-    SCHEDULE_TESTS,
-)
 FIXTURES = "experiments/2026-10-24-tilelang-completion/bundles/sampling/prepare_fixtures.py"
 PYTEST = ["-m", "pytest", "-q", "-rfEs", "-p", "no:cacheprovider", "--noconftest",
           "-p", "prepare_fixtures"]
@@ -71,18 +65,18 @@ PREFETCH_ENV = {"VLLM_L2_PREFETCH_KERNELS": "tilelang", "VLLM_L2_PREFETCH_GRID":
 # name: (tree, description, [(label, argv after python, timeout seconds[, env])])
 BUNDLES = {
     "schedule-smoke": (
-        "typed",
+        "pertype",
         "the schedule benchmark at 6 rows, two rounds: does the harness run",
         [("schedule benchmark, TP4, 6 rows", [BENCH, "--rows", "6", "--rounds", "2",
                                                "--replays", "3", "--trace", "2"], 3600)],
     ),
     "schedule-tp4": (
-        "typed",
+        "pertype",
         "the window schedules on the forty layers at TP4 shapes, 6, 48 and 96 rows",
         [("schedule benchmark, TP4", [BENCH, "--rows", "6,48,96", "--tp", "4"], 7200)],
     ),
     "schedule-tp3": (
-        "typed",
+        "pertype",
         "the window schedules on the forty layers at TP3 shapes, 6, 48 and 96 rows",
         [("schedule benchmark, TP3", [BENCH, "--rows", "6,48,96", "--tp", "3"], 7200)],
     ),
@@ -93,11 +87,11 @@ BUNDLES = {
         [("test files on head", PYTEST + ["--basetemp", "/c/pytest-l2-schedule-head",
                                          *TESTS], 5400)],  # not SCHEDULE_TESTS: head lacks the points
     ),
-    "tests-typed": (
-        "typed",
+    "tests-pertype": (
+        "pertype",
         "the prototype's test files on its tree",
-        [("test files on typed", PYTEST + ["--basetemp", "/c/pytest-l2-schedule-typed",
-                                          SCHEDULE_TESTS, *TESTS], 5400)],
+        [("test files on pertype", PYTEST + ["--basetemp", "/c/pytest-l2-schedule-pertype",
+                                            SCHEDULE_TESTS, *TESTS], 5400)],
     ),
 }
 
@@ -162,20 +156,26 @@ def main() -> None:
     repo = sys.argv[1]
     heads = {name: git(repo, "rev-parse", "--short=9", ref).strip()
              for name, ref in {**TREES, "branch": BRANCH}.items()}
-    # The branch head may only add tests and benchmarks over TYPED.
-    extra = [path for _, path in diff(repo, TYPED, BRANCH) if path.startswith("vllm/")]
-    assert not extra, f"{BRANCH} changes package files over {TYPED}: {extra}"
+    # The branch head may only add tests and benchmarks over PERTYPE.
+    extra = [path for _, path in diff(repo, PERTYPE, BRANCH) if path.startswith("vllm/")]
+    assert not extra, f"{BRANCH} changes package files over {PERTYPE}: {extra}"
     base = {path: (MISSING.encode() if kind == "D" else show(repo, HEAD, path))
             for kind, path in diff(repo, BASE, HEAD) if path.startswith("vllm/")}
     write_tree(HERE / "overlay", base)
     layers = {"head": {}}
-    for name in ("chained", "typed"):
+    for name in ("pertype",):
         changed = {path: show(repo, TREES[name], path)
                    for kind, path in diff(repo, HEAD, TREES[name]) if path.startswith("vllm/")}
         assert all(kind != "D" for kind, _ in diff(repo, HEAD, TREES[name]))
         write_tree(HERE / f"overlay-{name}", changed)
         layers[name] = changed
-    write_tree(HERE / "bench", {Path(p).name: show(repo, BRANCH, p) for p in BENCH_FILES})
+    # Every test and benchmark file the branch head adds or changes over the image's
+    # tree: the image's copies are the release's, written for modules next-candidate
+    # removed.
+    bench = [path for kind, path in diff(repo, BASE, BRANCH)
+             if kind != "D" and path.startswith(("tests/", "benchmarks/"))]
+    assert BENCH in bench and SCHEDULE_TESTS in bench
+    write_tree(HERE / "bench", {path: show(repo, BRANCH, path) for path in bench})
     package = sorted(set(base) | {p for files in layers.values() for p in files})
 
     def source(tree: str, path: str) -> str:
@@ -189,7 +189,7 @@ def main() -> None:
         mounts = [["run.py", "/b/run.py"], ["steps.json", "/b/steps.json"],
                   [FIXTURES, "/b/prepare_fixtures.py"]]
         mounts += [[source(tree, path), f"{ROOT}/{path}"] for path in package]
-        mounts += [[f"{EXPERIMENT}/bench/{Path(p).name}", f"{ROOT}/{p}"] for p in BENCH_FILES]
+        mounts += [[f"{EXPERIMENT}/bench/{path}", f"{ROOT}/{path}"] for path in bench]
         (bundle / "run.py").write_text(RUN)
         (bundle / "steps.json").write_text(json.dumps(steps, indent=1) + "\n")
         candidate = {
@@ -252,8 +252,8 @@ def main() -> None:
             "set": {"serve_args": [*SERVE_ARGS_TP4, "--profiler-config", json.dumps(profiler)]},
         })
     write_specs()
-    print(f"overlay: {len(base)} files; chained {len(layers['chained'])}, typed "
-          f"{len(layers['typed'])}; arms for {', '.join(TREES)} at tp4 and tp3")
+    print(f"overlay: {len(base)} files; pertype {len(layers['pertype'])}; arms for "
+          f"{', '.join(TREES)} at tp4 and tp3")
 
 
 # Candidate 6's tp4-ring serve_args as bin/recipe.py resolves them (the PDL experiment's
@@ -316,10 +316,9 @@ def write_specs() -> None:
                  "extras": determinism_extras(streams),
                  "arms": [{"config": f"{tree}-{shape}.json", "label": tree} for tree in TREES]},
                 {"kind": "measure", "suite": [suite, "single-stream"],
-                 "arms": [{"config": f"typed-{shape}-dev.json", "label": "typed"},
-                          {"config": f"chained-{shape}-dev.json", "label": "chained"},
+                 "arms": [{"config": f"pertype-{shape}-dev.json", "label": "pertype"},
                           {"config": f"head-{shape}-dev.json", "label": "head"},
-                          {"config": f"typed-{shape}-dev.json", "label": "typed-again"}]},
+                          {"config": f"pertype-{shape}-dev.json", "label": "pertype-again"}]},
             ],
         })
     write_json(HERE / "profile-tp4.json", {

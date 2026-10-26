@@ -8,11 +8,21 @@ step (experiments/2026-10-06-prefetch-fill-rate). The moe-overlap experiment
 consumers that start while their window still fills cost 1.67 ms a c1 step.
 
 This experiment asks where that loss comes from, layer by layer, what a different issue
-point could recover, and measures two prototypes on next-candidate with PDL (vLLM
+point could recover, and measures prototypes on next-candidate with PDL (vLLM
 1bc005688).
 
-**Status:** RESULTS PENDING (dgx4 runs below). Branches: vLLM `l2-prefetch-schedule`
-(local, on the shared object store, as `pdl-next`), this branch `l2-prefetch-schedule`.
+**Result (dgx2, forty TP4 decode layers at one rank's shapes):**
+- **Moving WO and FFN earlier loses 8-10%.** A window issued before the lines of the
+  one ahead of it are read evicts those unread lines.
+- **The owner and Engram layers' own points gain 1.5-1.6% at c1, 0.7% at c8 and 0.3% at
+  c16**, bit-identical. Those are the layers whose lines were lost before use.
+- TP3 shapes give 1.5 / 0.5 / 0.3%.
+- The bench's spin stand-ins make the prefetch worth 3-4 times what it is on the ring
+  (prefetch off: +19% here at c1, +5% on the ring), so expect about 0.4% at c1 and 0.2%
+  at c8 and c16 there. The cluster A/B (specs below) decides.
+
+Branches: vLLM `l2-prefetch-schedule` (local, on the shared object store, as
+`pdl-next`; the prototype is 650fe3679), this branch `l2-prefetch-schedule`.
 
 ## The loss, by layer type (cluster traces)
 
@@ -120,51 +130,173 @@ Options the brief named, bounded elsewhere or here:
 
 ## Prototypes (vLLM `l2-prefetch-schedule` on next-candidate 1bc005688)
 
-| Commit | What |
+| Commit | What | Outcome on dgx2 |
+| --- | --- | --- |
+| 5816ad749 | the schedule benchmark (below); no package file | |
+| 980aed9a4 | **chained** (S1, S2): WO right after the fused Q-A/KV in a layer without an indexer, FFN between WO-A and WO-B | +9.8 / +8.4 / +5.4% at c1 / c8 / c16: dropped |
+| 9e6d9d78a, 353085fb7 | **typed**: chained, plus an owner layer's IDX window after Q-B and WO after its compressor; before an Engram layer an ENGRAM window, and NEXT between the Engram projection's GEMM and all-gather | +8.1 / +7.9 / +5.1%: the chaining's loss; its own points pay (below) |
+| 95a067b0d, 71314ad6e | tests of every layer type's issue points on fake layers; benchmark fixes | |
+| 5e509b53a | **per-type**: typed without the chaining (WO and FFN back at their points) | -1.5 / -0.6 / -0.3% |
+| d2a196527 | Engram's projection as a module helper, `project_rows` (an SP test calls `Engram.forward` on a fake module) | |
+| **650fe3679** | **the prototype**: per-type with the owner layer's window before WO holding the compressor alone (COMP) | **-1.5 to -1.6 / -0.7 / -0.3%** |
+
+The prototype's package diff against next-candidate is four files, +93 / -9 lines:
+`attention.py` (WO's point and the COMP window), `nvidia/model.py` (the COMP and ENGRAM
+plans, NEXT's hook on the Engram module), `common/engram.py` (the hook between the GEMM
+and the all-gather), `l2_prefetch.py` (the windows' docstring). Cache hints only.
+
+## dgx2: the schedules on forty layers at kernel shapes
+
+The harness (vLLM `benchmarks/kernels/benchmark_deepseek_v41_l2_schedule.py` over
+`tests/kernels/deepseek_v41_l2_schedule_chain.py`) builds the target model's forty
+decoder layers at one rank's TP4 or TP3 shapes, each with its own weights, the Engram,
+owner and indexer layers in their places:
+- real kernels for every projection a window prefetches or competes with;
+- spin kernels (`torch.cuda._sleep`, no memory traffic) for the latency-bound work around
+  them (attention core, router top-k, all-reduces, Engram waits), each as long as rank
+  0's median in request-inventory-5's traces;
+- the model's own plans, budgets, grid 2 and side stream, issued at each schedule's
+  points.
+
+One CUDA graph per schedule; 8 rounds of 10 replays, the schedules' order rotating each
+round. Before timing, every schedule's replay must give the eager run's bits in every
+buffer the layers write.
+
+```sh
+scripts/lab.py kernel-local experiments/2026-10-26-l2-prefetch-schedule/bundles/schedule-tp4 --out OUT
+python3 experiments/2026-10-26-l2-prefetch-schedule/harness_table.py OUT/output.txt --schedules pertype2
+```
+
+Runs (dgx2, image `spark-ds41f:19f2c20ed4d6-next-6`, 2026-10-26 13:50-14:30 CET; outputs in
+[runs/](runs)):
+
+| Run | What |
 | --- | --- |
-| 5816ad749 | the schedule benchmark (below); no package file |
-| 980aed9a4 | **chained** (S1, S2): WO issued right after the fused Q-A/KV in a layer without an indexer, so its fill queues behind NEXT's; FFN issued between WO-A and WO-B (`TileLangWOProjection(after_a=...)`) |
-| 9e6d9d78a | **typed** (S4a, S4b, and a first S3): an owner layer issues an IDX window (compressor, indexer wk, wq_b, head weights) after Q-B and WO after the index query; before an Engram layer the MoE hook issues an ENGRAM window (the projection's first 20 MB) and the Engram layer issues NEXT between its projection's GEMM and all-gather |
-| 95a067b0d | tests of every layer type's issue points and plans, on fake layers (`tests/models/test_deepseek_v4_1_l2_schedule.py`) |
-| 71314ad6e | benchmark fixes found by reading it before its first run |
-| 353085fb7 | **typed, final** (S3): the owner layer's WO right after its compressor, behind IDX, not after the index query (above) |
+| smoke-1 | 6 rows, 2 rounds: head, chained, typed, off |
+| tp4-1 | TP4: head, pertype, typed, chained, off |
+| tp4-2, tp3-1 | TP4, TP3: head, pertype, own, eng, off (own and eng: pertype's owner and Engram points alone) |
+| tp4-3 | TP4: adds pertype2 (the owner window of the compressor alone) |
+| tp4-4, tp3-2 | TP4, TP3 on the prototype tree 650fe3679: head, pertype, pertype2, own, eng, off |
+| tp4-5 | TP4: pertype3 (pertype2 with the indexer's Q-B and head weights prefetched right after the compressor, ahead of WO) |
+| tests-head-2, tests-pertype-3, tests-pertype-4 | the prototype's test files on next-candidate and on the prototype |
 
-Risks the traces cannot settle, for the cluster A/B:
-- S1 starts the WO fill while Q-B's 8.8 MB of NEXT lines are unread. Under LRU the fill
-  evicts the consumed mHC and Q-A/KV lines first; if GB10's L2 does not, Q-B slows.
-- S3 moves the owner layers' WO fill from beside the compressor's projection
-  (DRAM-bound, so the fill costs nothing there) onto the compression, indexer and top-k
-  kernels, which slow beside a fill as sparse MLA does (11.3 to 14.8 us). At +20-30% on
-  about 110 us that is 20-30 us of the 60 us a layer S3 should recover.
-- S1 and S2 move fill time off sparse MLA and the attention all-reduce, which both slow
-  beside a fill: a gain the bounds do not count, and dgx4's spin stand-ins cannot show.
+**Bits:** every schedule's replay equals the eager run in every buffer, at every row count,
+in every run (`"equal": true`).
 
-Cache hints only: no kernel, buffer or value changes, so every output is bit-identical by
-construction; the benchmark and the cluster gate check it.
+**Step time against the head** (pertype2 is the prototype; each cell the run's median, the
+rounds' range in brackets):
 
-## dgx4: the schedules on forty layers at kernel shapes
+| | c1 (6 rows) | c8 (48 rows) | c16 (96 rows) |
+| --- | ---: | ---: | ---: |
+| TP4, tp4-4 | **-1.52%** [-1.56, -1.46], -397 us | **-0.66%** [-0.69, -0.63], -370 us | **-0.32%** [-0.35, -0.29], -280 us |
+| TP4, tp4-3 | -1.61% [-1.68, -1.55] | -0.69% [-0.75, -0.67] | -0.31% [-0.34, -0.23] |
+| TP3, tp3-2 | **-1.48%** [-1.58, -1.38], -481 us | **-0.52%** [-0.57, -0.48], -368 us | **-0.27%** [-0.30, -0.25], -292 us |
+| chained (tp4-1) | +9.79% | +8.44% | +5.40% |
+| prefetch off (tp4-4) | +18.91% | +8.89% | +4.72% |
 
-RESULTS PENDING.
+Owner and Engram points apart (tp4-4): owner layers -0.92 / -0.29 / -0.17%, Engram layers
+-0.55 / -0.30 / -0.13%; they add up.
+
+pertype3 (tp4-5): -1.63 / -0.74 / -0.31% against the prototype's -1.52 / -0.68 / -0.31%
+in the same run. It prefetches the indexer's Q-B and head weights right after the
+compressor, ahead of WO. That is 0.1 point at c1, 0.06 at c8 and none at c16 for a third
+window, a few hundredths of a percent on the ring at the harness's scale: not taken.
+
+**Where the time goes** (tp4-4, c1, head to prototype, a step): the compressor -185 us
+(87.9 to 39.8 us: COMP lands its first bytes, and WO's fill no longer runs beside it),
+owner-layer WO-A -122 us (46.4 to 13.2), WO-B -33 us, the Engram projection -94 us (163 to
+110 us), and the indexer's Q-B +48 us (22.9 to 34.8: WO's fill now runs beside it). The
+other layers' consumers are unchanged within noise.
+
+**Per-consumer L2-speed share** (the consumer GEMM's floor with its weight in L2, measured
+alone, over its own time in the step; `harness_table.py`), head and prototype, TP4:
+
+| Consumer | c1 head | c1 prototype | c8 head | c8 prototype | c16 head | c16 prototype |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| attention mHC | 0.44 | 0.46 | 0.61 | 0.60 | 0.69 | 0.69 |
+| fused Q-A/KV | 0.64 | 0.68 | 0.71 | 0.77 | 0.46 | 0.47 |
+| Q-B | 0.49 | 0.49 | 0.51 | 0.50 | 0.67 | 0.67 |
+| WO-A | 0.31 | 0.35 | 0.58 | 0.62 | 0.91 | 0.96 |
+| WO-B | 0.62 | 0.65 | 0.70 | 0.72 | 0.78 | 0.76 |
+| FFN mHC | 0.57 | 0.56 | 0.79 | 0.79 | 0.77 | 0.78 |
+| router | 0.34 | 0.34 | 0.88 | 0.86 | 0.28 | 0.28 |
+| shared gate/up | 0.57 | 0.57 | 0.80 | 0.79 | 0.50 | 0.49 |
+| shared down | 0.53 | 0.55 | 0.62 | 0.62 | 0.61 | 0.60 |
+| compressor (COMP) | - | 0.26 | - | 0.35 | - | 0.61 |
+| Engram projection (ENGRAM) | - | > 1 | - | > 1 | - | > 1 |
+
+(The Engram projection's 39 MB cannot sit in L2, so its "floor" is its DRAM time and the
+prefetched run beats it.) Under PDL a kernel's own time is its end less its predecessor's
+end, so a consumer's share also carries its prologue; the shares compare schedules, not
+absolute L2 speed.
+
+**What the harness shows that the traces could not:** a window issued before the one ahead
+of it has been read evicts that window's unread lines. The consumers' reads keep the lines
+they read, so the unread ones are the oldest. Chaining WO behind NEXT took the window-only
+layers' Q-B from 19.6 to 57.9 us, and chaining FFN behind WO took WO-B from 20.7 to 38 us.
+The owner-layer IDX window lost its indexer lines the same way to the WO fill behind it.
+Every point the prototype keeps starts a fill only once the window before it has been read,
+or puts the first-read bytes first.
+
+**How far the harness overstates:** with the prefetch off it runs 18.9% slower at c1, 8.9%
+at c8 and 4.7% at c16. On the ring the prefetch was worth 5.0%, 2.8% and 3.1%
+(2026-10-06). The spin stand-ins leave DRAM idle where real kernels contend, and there
+is no all-reduce to collide with. Scaled by those ratios, the prototype's 1.5 / 0.7 /
+0.3% would be about 0.4 / 0.2 / 0.2% on the ring.
+
+**Tests on dgx2:** next-candidate's and the prototype's test files
+(`tests-head-2`, `tests-pertype-4`):
+- next-candidate: 152 passed, 7 failed;
+- the prototype: 158 passed (the same 152 and its 6 new tests), the same 7 failed.
+
+The 7 are the disk-Engram loader tests, which need io_uring; the kernel-local container
+does not permit it ("io_uring initialization failed: Operation not permitted").
 
 ## Cluster A/B (specs, not run)
 
-RESULTS PENDING.
+Arms are candidate 6's recipe with next-candidate (`head-*.json`) and with the prototype
+(`pertype-*.json`) mounted over the image, at tp4-ring and tp3-triangle; `-dev` adds the
+dev-mode RPC the suites use.
+- [screen-tp4.json](screen-tp4.json): the determinism gate on head and pertype (the
+  prototype's hashes, sampled and controls digests and 16/8/4 distinct streams must be the
+  head's), then the screen and single-stream suites on pertype, head, pertype again.
+- [screen-tp3.json](screen-tp3.json): the same on the triangle (8/4 distinct streams,
+  `screen-tp3`).
+- [profile-tp4.json](profile-tp4.json): both arms under the torch profiler, decode request
+  types; then `schedule_bounds.py results/private/determinism/l2-schedule-profile/<label>`
+  on each to see the owner and Engram layers' consumers on the ring.
+
+```sh
+scripts/lab.py run experiments/2026-10-26-l2-prefetch-schedule/screen-tp4.json --production-config config/cluster.json
+scripts/lab.py run experiments/2026-10-26-l2-prefetch-schedule/screen-tp3.json --production-config config/cluster.json
+scripts/lab.py run experiments/2026-10-26-l2-prefetch-schedule/profile-tp4.json --production-config config/cluster.json
+```
+
+They plan cleanly with `--dry-run` and need this branch on origin/main (the lab syncs node
+checkouts to it). Acceptance: bits identical in the gate; c1 decode step faster on the
+screen; no suite row slower beyond the run's own repeat.
 
 ## Files
 
 - [traces.py](traces.py), [schedule_bounds.py](schedule_bounds.py),
   [schedule_bounds.json](schedule_bounds.json): the trace analysis.
 - [make_bundles.py](make_bundles.py): overlays, bundles, arms and specs from the vLLM branch.
+- [harness_table.py](harness_table.py): step times, consumer excess and L2-speed shares
+  from a benchmark run's output; [runs/](runs): every dgx2 run's output and verdict.
 - [harness_check.py](harness_check.py): the benchmark's bookkeeping checked on the CPU, no
   torch: the chain's own `_Layer.run()` with recording fakes, through the benchmark's
   `roles()`, `windows()` and `summarize()`. Per schedule it prints each window's fills and
   their anchors; every fill must find all its consumers.
   `python3 -I experiments/2026-10-26-l2-prefetch-schedule/harness_check.py VLLM_TREE`.
-- [overlay/](overlay), [overlay-chained/](overlay-chained), [overlay-typed/](overlay-typed):
-  next-candidate's 66 package files over the image's tree, and the files each prototype
-  changes from it. [bench/](bench): the benchmark and its chain.
-- [bundles/](bundles): kernel-lab bundles for dgx4.
-- `{head,chained,typed}-{tp4,tp3}[-dev].json`, `prof-*-tp4.json`: serving arms.
+- [overlay/](overlay), [overlay-pertype/](overlay-pertype): next-candidate's 66 package
+  files over the image's tree, and the 4 the prototype changes from it. [bench/](bench):
+  every test and benchmark file the vLLM branch adds or changes over the image's tree, at
+  its path (the image's copies are the release's).
+- [bundles/](bundles): kernel-lab bundles (`schedule-smoke`, `schedule-tp4`,
+  `schedule-tp3`, `tests-head`, `tests-pertype`), run on dgx2.
+- `{head,pertype}-{tp4,tp3}[-dev].json`, `prof-{head,pertype}-tp4.json`: serving arms.
+  The chained and typed arms and overlays were removed once dgx2 measured them (they are
+  in this branch's history at 26dbd21d).
 - [screen-tp4.json](screen-tp4.json), [screen-tp3.json](screen-tp3.json),
   [profile-tp4.json](profile-tp4.json): cluster specs.
 - [profile_decode.py](profile_decode.py): request-inventory's decode profiler, which the

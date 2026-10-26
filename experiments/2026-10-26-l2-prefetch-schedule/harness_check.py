@@ -133,10 +133,10 @@ for L, nxt in zip(layers, layers[1:] + [None]):
         if nxt.engram:
             L.plans["ENGRAM"] = "engram"
     if L.kind == "own":
-        L.plans["IDX"] = "idx"
+        L.plans.update(IDX="idx", IDXC="idxc", IDXQ="idxq")
 fake_chain = types.SimpleNamespace(layers=layers)
 
-for schedule in ("head", "chained", "typed", "off"):
+for schedule in ("head", "chained", "typed", "pertype", "pertype2", "pertype3", "own", "eng", "off"):
     launched.clear()
     previous = None
     for L in layers:
@@ -168,7 +168,7 @@ for schedule in ("head", "typed"):
 floor = {r: 0.25 for r in ("WO-A", "WO-B", "FFN mHC", "router", "shared gate/up", "shared down",
                            "attention mHC", "fused Q-A/KV", "Q-B", "compressor", "index Q-B",
                            "head weights", "engram")}
-win, con = bench.summarize(traced, fake_chain, floor)
-print(len(win), "window rows;", len(con), "consumer rows")
+win, con, named = bench.summarize(traced, fake_chain, floor)
+print(len(win), "window rows;", len(con), "consumer rows;", len(named), "role rows")
 print(list(win.items())[:2])
 print(list(con.items())[:2])
