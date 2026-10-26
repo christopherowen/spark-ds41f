@@ -62,7 +62,11 @@ RANK = {
     4: dict(heads=16, groups=2, inter=576, vocab=32320),
     3: dict(heads=24, groups=3, inter=768, vocab=43136),
 }
-ROUTES = Path(__file__).resolve().parents[2] / "2026-10-18-json-count" / "runs" / "ref-woa1.json"
+
+
+def default_routes():
+    """The json-count experiment's reference routes, beside this experiment's folder."""
+    return Path(__file__).resolve().parents[2] / "2026-10-18-json-count" / "runs" / "ref-woa1.json"
 
 
 def reference_routes(path, start, rows, live):
@@ -265,7 +269,7 @@ def main():
     ap.add_argument("--replays", type=int, default=20)
     ap.add_argument("--graph", action="store_true")
     ap.add_argument("--evict", action="store_true")
-    ap.add_argument("--routes", default=str(ROUTES))
+    ap.add_argument("--routes", help="reference routes (default: the json-count experiment's)")
     ap.add_argument("--start", type=int, default=0)
     ap.add_argument("--first-layer", type=int, default=0, help="reference layer of chain layer 0")
     ap.add_argument("--head", action="store_true")
@@ -285,7 +289,7 @@ def main():
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.models.deepseek_v4_1.tilelang import mhc, prepare
 
-    routes = reference_routes(args.routes, args.start, args.rows, args.live)
+    routes = reference_routes(args.routes or default_routes(), args.start, args.rows, args.live)
     gen = torch.Generator(device=DEVICE).manual_seed(args.seed)
     started = time.monotonic()
     with set_current_vllm_config(VllmConfig()):
